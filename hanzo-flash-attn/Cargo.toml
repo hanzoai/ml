@@ -11,14 +11,14 @@ readme = "README.md"
 
 [dependencies]
 hanzo-ml = { path = "../hanzo-ml", features = ["cuda"], package = "hanzo-ml", version = "0.9.2-alpha.2" }
-half = { workspace = true }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 
 [build-dependencies]
 bindgen_cuda = "0.1.5"
-anyhow = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
 
 [dev-dependencies]
-anyhow = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
 hanzo-ml-nn = { path = "../hanzo-ml-nn", features = ["cuda"] }
 
 [features]
