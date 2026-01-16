@@ -1,5 +1,5 @@
 use super::common::LayerNormNoWeights;
-use hanzo_ml_core::{Module, Result, Tensor};
+use hanzo_ml::{Module, Result, Tensor};
 use hanzo_nn::VarBuilder;
 
 #[derive(Debug)]

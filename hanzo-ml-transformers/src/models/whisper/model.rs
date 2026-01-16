@@ -1,6 +1,6 @@
 use super::Config;
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
-use hanzo_ml_core::{Device, IndexOp, Result, Tensor, D};
+use hanzo_ml::{Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{embedding, Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder};
 
 fn conv1d(
@@ -214,7 +214,7 @@ fn sinusoids(length: usize, channels: usize, device: &Device) -> Result<Tensor> 
         .collect();
     let inv_timescales = Tensor::new(inv_timescales.as_slice(), device)?.unsqueeze(0)?;
     let arange = Tensor::arange(0, length as u32, device)?
-        .to_dtype(hanzo_ml_core::DType::F32)?
+        .to_dtype(hanzo_ml::DType::F32)?
         .unsqueeze(1)?;
     let sh = (length, channels / 2);
     let scaled_time = (arange.broadcast_as(sh)? * inv_timescales.broadcast_as(sh)?)?;

@@ -17,7 +17,7 @@
 
 use crate::quantized_nn::{linear_b as linear, Embedding, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use std::sync::Arc;
 
 use crate::models::recurrent_gemma::{Config, Rglru, RmsNorm, RotaryEmbedding, TemporalBlockType};
@@ -150,7 +150,7 @@ impl RecurrentBlock {
                 .narrow(D::Minus1, 0, seq_len)?
         } else {
             let conv_state = match self.conv1d_state.as_ref() {
-                None => hanzo_ml_core::bail!("empty cache despite pos > 0"),
+                None => hanzo_ml::bail!("empty cache despite pos > 0"),
                 Some(s) => Tensor::cat(&[s, &x_branch], D::Minus1)?,
             };
             let w = self.conv_1d.weight().i((.., 0, ..))?;

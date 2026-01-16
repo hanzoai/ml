@@ -1,7 +1,7 @@
 use super::model::{attention, timestep_embedding, Config, EmbedNd};
 use crate::quantized_nn::{linear, linear_b, Linear};
 use crate::quantized_var_builder::VarBuilder;
-use hanzo_ml_core::{DType, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
 use hanzo_nn::{LayerNorm, RmsNorm};
 
 fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
@@ -26,7 +26,7 @@ impl MlpEmbedder {
     }
 }
 
-impl hanzo_ml_core::Module for MlpEmbedder {
+impl hanzo_ml::Module for MlpEmbedder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply(&self.in_layer)?.silu()?.apply(&self.out_layer)
     }
@@ -86,7 +86,7 @@ impl Modulation1 {
             .unsqueeze(1)?
             .chunk(3, D::Minus1)?;
         if ys.len() != 3 {
-            hanzo_ml_core::bail!("unexpected len from chunk {ys:?}")
+            hanzo_ml::bail!("unexpected len from chunk {ys:?}")
         }
         Ok(ModulationOut {
             shift: ys[0].clone(),
@@ -114,7 +114,7 @@ impl Modulation2 {
             .unsqueeze(1)?
             .chunk(6, D::Minus1)?;
         if ys.len() != 6 {
-            hanzo_ml_core::bail!("unexpected len from chunk {ys:?}")
+            hanzo_ml::bail!("unexpected len from chunk {ys:?}")
         }
         let mod1 = ModulationOut {
             shift: ys[0].clone(),
@@ -185,7 +185,7 @@ impl Mlp {
     }
 }
 
-impl hanzo_ml_core::Module for Mlp {
+impl hanzo_ml::Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply(&self.lin1)?.gelu()?.apply(&self.lin2)
     }
@@ -429,10 +429,10 @@ impl super::WithForward for Flux {
         guidance: Option<&Tensor>,
     ) -> Result<Tensor> {
         if txt.rank() != 3 {
-            hanzo_ml_core::bail!("unexpected shape for txt {:?}", txt.shape())
+            hanzo_ml::bail!("unexpected shape for txt {:?}", txt.shape())
         }
         if img.rank() != 3 {
-            hanzo_ml_core::bail!("unexpected shape for img {:?}", img.shape())
+            hanzo_ml::bail!("unexpected shape for img {:?}", img.shape())
         }
         let dtype = img.dtype();
         let pe = {

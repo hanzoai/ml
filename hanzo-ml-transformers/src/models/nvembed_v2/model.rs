@@ -3,7 +3,7 @@ use crate::models::{
     mistral::Config,
     with_tracing::{layer_norm, linear, linear_no_bias, LayerNorm, Linear},
 };
-use hanzo_ml_core::{DType, Device, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Result, Tensor, D};
 use hanzo_nn::{ops::softmax_last_dim, LayerNormConfig, Module, VarBuilder};
 
 // Geglu and feedforward from hanzo-ml-transformers/src/models/stable_diffusion/attention.rs

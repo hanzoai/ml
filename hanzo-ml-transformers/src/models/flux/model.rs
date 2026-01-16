@@ -1,4 +1,4 @@
-use hanzo_ml_core::{DType, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
 use hanzo_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
 
 // https://github.com/black-forest-labs/flux/blob/727e3a71faf37390f318cf9434f0939653302b60/src/flux/model.py#L12
@@ -79,7 +79,7 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
 
 fn rope(pos: &Tensor, dim: usize, theta: usize) -> Result<Tensor> {
     if dim % 2 == 1 {
-        hanzo_ml_core::bail!("dim {dim} is odd")
+        hanzo_ml::bail!("dim {dim} is odd")
     }
     let dev = pos.device();
     let theta = theta as f64;
@@ -120,16 +120,16 @@ pub(crate) fn timestep_embedding(t: &Tensor, dim: usize, dtype: DType) -> Result
     const TIME_FACTOR: f64 = 1000.;
     const MAX_PERIOD: f64 = 10000.;
     if dim % 2 == 1 {
-        hanzo_ml_core::bail!("{dim} is odd")
+        hanzo_ml::bail!("{dim} is odd")
     }
     let dev = t.device();
     let half = dim / 2;
     let t = (t * TIME_FACTOR)?;
-    let arange = Tensor::arange(0, half as u32, dev)?.to_dtype(hanzo_ml_core::DType::F32)?;
+    let arange = Tensor::arange(0, half as u32, dev)?.to_dtype(hanzo_ml::DType::F32)?;
     let freqs = (arange * (-MAX_PERIOD.ln() / half as f64))?.exp()?;
     let args = t
         .unsqueeze(1)?
-        .to_dtype(hanzo_ml_core::DType::F32)?
+        .to_dtype(hanzo_ml::DType::F32)?
         .broadcast_mul(&freqs.unsqueeze(0)?)?;
     let emb = Tensor::cat(&[args.cos()?, args.sin()?], D::Minus1)?.to_dtype(dtype)?;
     Ok(emb)
@@ -153,7 +153,7 @@ impl EmbedNd {
     }
 }
 
-impl hanzo_ml_core::Module for EmbedNd {
+impl hanzo_ml::Module for EmbedNd {
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         let n_axes = ids.dim(D::Minus1)?;
         let mut emb = Vec::with_capacity(n_axes);
@@ -187,7 +187,7 @@ impl MlpEmbedder {
     }
 }
 
-impl hanzo_ml_core::Module for MlpEmbedder {
+impl hanzo_ml::Module for MlpEmbedder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply(&self.in_layer)?.silu()?.apply(&self.out_layer)
     }
@@ -247,7 +247,7 @@ impl Modulation1 {
             .unsqueeze(1)?
             .chunk(3, D::Minus1)?;
         if ys.len() != 3 {
-            hanzo_ml_core::bail!("unexpected len from chunk {ys:?}")
+            hanzo_ml::bail!("unexpected len from chunk {ys:?}")
         }
         Ok(ModulationOut {
             shift: ys[0].clone(),
@@ -275,7 +275,7 @@ impl Modulation2 {
             .unsqueeze(1)?
             .chunk(6, D::Minus1)?;
         if ys.len() != 6 {
-            hanzo_ml_core::bail!("unexpected len from chunk {ys:?}")
+            hanzo_ml::bail!("unexpected len from chunk {ys:?}")
         }
         let mod1 = ModulationOut {
             shift: ys[0].clone(),
@@ -346,7 +346,7 @@ impl Mlp {
     }
 }
 
-impl hanzo_ml_core::Module for Mlp {
+impl hanzo_ml::Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply(&self.lin1)?.gelu()?.apply(&self.lin2)
     }
@@ -590,10 +590,10 @@ impl super::WithForward for Flux {
         guidance: Option<&Tensor>,
     ) -> Result<Tensor> {
         if txt.rank() != 3 {
-            hanzo_ml_core::bail!("unexpected shape for txt {:?}", txt.shape())
+            hanzo_ml::bail!("unexpected shape for txt {:?}", txt.shape())
         }
         if img.rank() != 3 {
-            hanzo_ml_core::bail!("unexpected shape for img {:?}", img.shape())
+            hanzo_ml::bail!("unexpected shape for img {:?}", img.shape())
         }
         let dtype = img.dtype();
         let pe = {

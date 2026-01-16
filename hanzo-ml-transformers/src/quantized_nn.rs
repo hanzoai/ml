@@ -6,8 +6,8 @@
 
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_var_builder::VarBuilder;
-use hanzo_ml_core::quantized::QTensor;
-use hanzo_ml_core::{Module, Result, Tensor};
+use hanzo_ml::quantized::QTensor;
+use hanzo_ml::{Module, Result, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct Embedding {
@@ -53,7 +53,7 @@ impl Linear {
 }
 
 impl Module for Linear {
-    fn forward(&self, x: &Tensor) -> hanzo_ml_core::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> hanzo_ml::Result<Tensor> {
         let x = x.apply(&self.weight)?;
         match &self.bias {
             None => Ok(x),

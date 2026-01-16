@@ -15,7 +15,7 @@
 //!
 
 use crate::models::with_tracing::{conv2d, linear, Conv2d, Linear};
-use hanzo_ml_core::{Context, Module, ModuleT, Result, Tensor, D};
+use hanzo_ml::{Context, Module, ModuleT, Result, Tensor, D};
 use hanzo_nn::{conv2d_no_bias, layer_norm, Activation, Conv2dConfig, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -107,7 +107,7 @@ impl SegformerEfficientSelfAttention {
         vb: VarBuilder,
     ) -> Result<Self> {
         if hidden_size % num_attention_heads != 0 {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "The hidden size {} is not a multiple of the number of attention heads {}",
                 hidden_size,
                 num_attention_heads
@@ -555,7 +555,7 @@ impl SegformerDecodeHead {
 
     fn forward(&self, encoder_hidden_states: &[Tensor]) -> Result<Tensor> {
         if encoder_hidden_states.len() != self.linear_c.len() {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "The number of encoder hidden states {} is not equal to the number of linear layers {}",
                 encoder_hidden_states.len(),
                 self.linear_c.len()

@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Result, Tensor};
+use hanzo_ml::{Result, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct DDPMWSchedulerConfig {

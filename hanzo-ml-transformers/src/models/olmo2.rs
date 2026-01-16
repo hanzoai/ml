@@ -5,7 +5,7 @@
 //! - [OLMo 2 Paper](https://arxiv.org/abs/2501.00656)
 //!
 //!
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{linear_b, linear_no_bias, rms_norm, Activation, Linear, RmsNorm, VarBuilder};
 use std::sync::Arc;
 

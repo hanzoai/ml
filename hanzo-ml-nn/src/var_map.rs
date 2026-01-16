@@ -1,6 +1,6 @@
 //! A `VarMap` is a store that holds named variables.
 //!
-use hanzo_ml_core::{DType, Device, Result, Shape, Tensor, Var};
+use hanzo_ml::{DType, Device, Result, Shape, Tensor, Var};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -42,12 +42,12 @@ impl VarMap {
     /// Note that values for variables that are currently not in the map are not kept.
     pub fn load<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let data = unsafe { hanzo_ml_core::safetensors::MmapedSafetensors::new(path)? };
+        let data = unsafe { hanzo_ml::safetensors::MmapedSafetensors::new(path)? };
         let mut tensor_data = self.data.lock().unwrap();
         for (name, var) in tensor_data.iter_mut() {
             let data = data.load(name, var.device())?;
             if let Err(err) = var.set(&data) {
-                hanzo_ml_core::bail!("error setting {name} using data from {path:?}: {err}",)
+                hanzo_ml::bail!("error setting {name} using data from {path:?}: {err}",)
             }
         }
         Ok(())
@@ -58,10 +58,10 @@ impl VarMap {
         let tensor_data = self.data.lock().unwrap();
         let name = name.as_ref();
         match tensor_data.get(name) {
-            None => hanzo_ml_core::bail!("cannot find {name} in VarMap"),
+            None => hanzo_ml::bail!("cannot find {name} in VarMap"),
             Some(var) => {
                 if let Err(err) = var.set(value.as_ref()) {
-                    hanzo_ml_core::bail!("error setting {name}: {err}",)
+                    hanzo_ml::bail!("error setting {name}: {err}",)
                 }
             }
         }
@@ -80,10 +80,10 @@ impl VarMap {
         for (name, value) in iter {
             let name = name.as_ref();
             match tensor_data.get(name) {
-                None => hanzo_ml_core::bail!("cannot find {name} in VarMap"),
+                None => hanzo_ml::bail!("cannot find {name} in VarMap"),
                 Some(var) => {
                     if let Err(err) = var.set(value.as_ref()) {
-                        hanzo_ml_core::bail!("error setting {name}: {err}",)
+                        hanzo_ml::bail!("error setting {name}: {err}",)
                     }
                 }
             }
@@ -105,7 +105,7 @@ impl VarMap {
         if let Some(tensor) = tensor_data.get(path) {
             let tensor_shape = tensor.shape();
             if &shape != tensor_shape {
-                hanzo_ml_core::bail!("shape mismatch on {path}: {shape:?} <> {tensor_shape:?}")
+                hanzo_ml::bail!("shape mismatch on {path}: {shape:?} <> {tensor_shape:?}")
             }
             return Ok(tensor.as_tensor().clone());
         }

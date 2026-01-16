@@ -8,8 +8,8 @@ use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
 
-use hanzo_ml_core::quantized::gguf_file;
-use hanzo_ml_core::Tensor;
+use hanzo_ml::quantized::gguf_file;
+use hanzo_ml::Tensor;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 
 use hanzo_examples::token_output_stream::TokenOutputStream;
@@ -184,10 +184,10 @@ fn main() -> anyhow::Result<()> {
 
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
@@ -306,7 +306,7 @@ fn main() -> anyhow::Result<()> {
             break;
         };
     }
-    if let Some(rest) = tos.decode_rest().map_err(hanzo_ml_core::Error::msg)? {
+    if let Some(rest) = tos.decode_rest().map_err(hanzo_ml::Error::msg)? {
         print!("{rest}");
     }
     std::io::stdout().flush()?;

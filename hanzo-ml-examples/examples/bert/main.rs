@@ -6,7 +6,7 @@ extern crate accelerate_src;
 use hanzo_transformers::models::bert::{BertModel, Config, HiddenAct, DTYPE};
 
 use anyhow::{Error as E, Result};
-use hanzo_ml_core::Tensor;
+use hanzo_ml::Tensor;
 use hanzo_nn::VarBuilder;
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};

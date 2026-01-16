@@ -2,7 +2,7 @@
 
 use crate::{InferenceModel, ModelType};
 use anyhow::Result;
-use hanzo_ml_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 use std::path::Path;
 
 pub struct LLMModel {

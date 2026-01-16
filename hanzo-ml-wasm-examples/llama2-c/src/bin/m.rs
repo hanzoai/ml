@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_wasm_example_llama2::worker::{Model as M, ModelData};
 use wasm_bindgen::prelude::*;
@@ -12,7 +12,7 @@ pub struct Model {
 }
 
 impl Model {
-    fn process(&mut self, tokens: &[u32]) -> hanzo_ml_core::Result<String> {
+    fn process(&mut self, tokens: &[u32]) -> hanzo_ml::Result<String> {
         const REPEAT_LAST_N: usize = 64;
         let dev = Device::Cpu;
         let input = Tensor::new(tokens, &dev)?.unsqueeze(0)?;

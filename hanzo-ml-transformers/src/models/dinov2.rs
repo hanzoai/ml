@@ -37,7 +37,7 @@
 //! ```
 //!
 
-use hanzo_ml_core::{IndexOp, Result, Tensor, D};
+use hanzo_ml::{IndexOp, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
 
 const IMG_SIZE: usize = 518;
@@ -217,10 +217,10 @@ impl Module for PatchEmbed {
         let (_b, _c, h, w) = xs.dims4()?;
         let (patch_h, patch_w) = self.patch_size;
         if (h % patch_h) != 0 {
-            hanzo_ml_core::bail!("image height {h} is not a multiple of patch height {patch_h}")
+            hanzo_ml::bail!("image height {h} is not a multiple of patch height {patch_h}")
         }
         if (w % patch_w) != 0 {
-            hanzo_ml_core::bail!("image width {w} is not a multiple of patch width {patch_w}")
+            hanzo_ml::bail!("image width {w} is not a multiple of patch width {patch_w}")
         }
         let xs = self.proj.forward(xs)?;
         let (b, c, h, w) = xs.dims4()?;
@@ -312,7 +312,7 @@ impl DinoVisionTransformer {
             }
         }
         if output.len() != blocks_to_take.len() {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "only {} / {} blocks found",
                 output.len(),
                 blocks_to_take.len()

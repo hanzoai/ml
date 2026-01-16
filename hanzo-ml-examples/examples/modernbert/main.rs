@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
-use hanzo_ml_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::modernbert;
 use clap::{Parser, ValueEnum};
@@ -98,12 +98,12 @@ fn main() -> Result<()> {
 
     let vb = if weights_filename.ends_with("model.safetensors") {
         unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_filename], hanzo_ml_core::DType::F32, &device)
+            VarBuilder::from_mmaped_safetensors(&[weights_filename], hanzo_ml::DType::F32, &device)
                 .unwrap()
         }
     } else {
         println!("Loading weights from pytorch_model.bin");
-        VarBuilder::from_pth(&weights_filename, hanzo_ml_core::DType::F32, &device).unwrap()
+        VarBuilder::from_pth(&weights_filename, hanzo_ml::DType::F32, &device).unwrap()
     };
     tokenizer
         .with_padding(Some(PaddingParams {
@@ -130,7 +130,7 @@ fn main() -> Result<()> {
 
     let output = model
         .forward(&input_ids, &attention_mask)?
-        .to_dtype(hanzo_ml_core::DType::F32)?;
+        .to_dtype(hanzo_ml::DType::F32)?;
 
     let max_outs = output.argmax(2)?;
 
@@ -157,7 +157,7 @@ pub fn tokenize_batch(
             let tokens = tokens.get_ids().to_vec();
             Tensor::new(tokens.as_slice(), device)
         })
-        .collect::<hanzo_ml_core::Result<Vec<_>>>()?;
+        .collect::<hanzo_ml::Result<Vec<_>>>()?;
 
     Ok(Tensor::stack(&token_ids, 0)?)
 }
@@ -175,6 +175,6 @@ pub fn get_attention_mask(
             let tokens = tokens.get_attention_mask().to_vec();
             Tensor::new(tokens.as_slice(), device)
         })
-        .collect::<hanzo_ml_core::Result<Vec<_>>>()?;
+        .collect::<hanzo_ml::Result<Vec<_>>>()?;
     Ok(Tensor::stack(&attention_mask, 0)?)
 }

@@ -1,5 +1,5 @@
 //! Layers defined by closures.
-use hanzo_ml_core::{Result, Tensor};
+use hanzo_ml::{Result, Tensor};
 use std::sync::Arc;
 
 /// A layer defined by a simple closure.

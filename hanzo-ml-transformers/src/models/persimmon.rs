@@ -12,7 +12,7 @@
 //! - 🤗 [Hugging Face](https://huggingface.co/adept/persimmon-8b-base)
 //!
 
-use hanzo_ml_core::DType;
+use hanzo_ml::DType;
 use serde::Deserialize;
 
 pub const DTYPE: DType = DType::F32;

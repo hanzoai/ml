@@ -1,6 +1,6 @@
 // Adapted from:
 // https://github.com/ChaoningZhang/MobileSAM/blob/master/mobile_sam/modeling/tiny_vit_sam.py
-use hanzo_ml_core::{IndexOp, Result, Tensor, D};
+use hanzo_ml::{IndexOp, Result, Tensor, D};
 use hanzo_nn::{Conv2dConfig, Module, VarBuilder};
 
 const MBCONV_EXPAND_RATIO: usize = 4;

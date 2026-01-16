@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::{
     generation::LogitsProcessor,
@@ -207,17 +207,17 @@ struct Args {
 
 /// Loads an image from disk using the image crate, this returns a tensor with shape
 /// (3, 378, 378).
-pub fn load_image<P: AsRef<std::path::Path>>(p: P) -> hanzo_ml_core::Result<Tensor> {
+pub fn load_image<P: AsRef<std::path::Path>>(p: P) -> hanzo_ml::Result<Tensor> {
     let img = image::ImageReader::open(p)?
         .decode()
-        .map_err(hanzo_ml_core::Error::wrap)?
+        .map_err(hanzo_ml::Error::wrap)?
         .resize_to_fill(378, 378, image::imageops::FilterType::Triangle); // Adjusted to 378x378
     let img = img.to_rgb8();
     let data = img.into_raw();
     let data = Tensor::from_vec(data, (378, 378, 3), &Device::Cpu)?.permute((2, 0, 1))?;
     let mean = Tensor::new(&[0.5f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
     let std = Tensor::new(&[0.5f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
-    (data.to_dtype(hanzo_ml_core::DType::F32)? / 255.)?
+    (data.to_dtype(hanzo_ml::DType::F32)? / 255.)?
         .broadcast_sub(&mean)?
         .broadcast_div(&std)
 }
@@ -238,10 +238,10 @@ async fn main() -> anyhow::Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",

@@ -1,4 +1,4 @@
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
@@ -125,7 +125,7 @@ impl Model {
 }
 
 impl Model {
-    fn process(&mut self, tokens: &[u32]) -> hanzo_ml_core::Result<String> {
+    fn process(&mut self, tokens: &[u32]) -> hanzo_ml::Result<String> {
         let dev = Device::Cpu;
         let input = Tensor::new(tokens, &dev)?.unsqueeze(0)?;
         let logits = match &mut self.model {

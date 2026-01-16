@@ -1,6 +1,6 @@
 use std::cmp::min;
 
-use hanzo_ml_core::{bail, DType, Device, Result, Tensor};
+use hanzo_ml::{bail, DType, Device, Result, Tensor};
 use hanzo_transformers::models::llava::{
     config::{HFPreProcessorConfig, LLaVAConfig},
     utils::select_best_resolution,
@@ -73,14 +73,14 @@ fn default_image_std() -> Vec<f32> {
 
 impl ImageProcessor {
     pub fn from_pretrained(clip_id: &str) -> Result<Self> {
-        let api = Api::new().map_err(|e| hanzo_ml_core::Error::Msg(e.to_string()))?;
+        let api = Api::new().map_err(|e| hanzo_ml::Error::Msg(e.to_string()))?;
         let api = api.model(clip_id.to_string());
         let config_filename = api
             .get("preprocessor_config.json")
-            .map_err(|e| hanzo_ml_core::Error::Msg(e.to_string()))?;
+            .map_err(|e| hanzo_ml::Error::Msg(e.to_string()))?;
         let image_processor =
-            serde_json::from_slice(&std::fs::read(config_filename).map_err(hanzo_ml_core::Error::Io)?)
-                .map_err(|e| hanzo_ml_core::Error::Msg(e.to_string()))?;
+            serde_json::from_slice(&std::fs::read(config_filename).map_err(hanzo_ml::Error::Io)?)
+                .map_err(|e| hanzo_ml::Error::Msg(e.to_string()))?;
         Ok(image_processor)
     }
 
@@ -201,7 +201,7 @@ pub fn process_image(
     image: &DynamicImage,
     processor: &ImageProcessor,
     llava_config: &LLaVAConfig,
-) -> hanzo_ml_core::Result<Tensor> {
+) -> hanzo_ml::Result<Tensor> {
     if llava_config.image_aspect_ratio == *"square" {
         processor.preprocess(image)?.unsqueeze(0)
     } else if llava_config.image_aspect_ratio == *"anyres" {
