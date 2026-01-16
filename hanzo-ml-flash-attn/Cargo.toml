@@ -1,0 +1,27 @@
+[package]
+name = "hanzo-ml-flash-attn"
+version = "0.9.1"
+edition = "2021"
+
+description = "Flash attention layer for the hanzo ML framework."
+repository = "https://github.com/huggingface/hanzo"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+hanzo = { path = "../hanzo-ml-core", features = ["cuda"], package = "hanzo-ml-core", version = "0.9.1" }
+half = { version = "2.3.1", features = ["num-traits"] }
+
+[build-dependencies]
+bindgen_cuda = "0.1.1"
+anyhow = { version = "1", features = ["backtrace"] }
+
+[dev-dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+hanzo-ml-nn = { path = "../hanzo-ml-nn", features = ["cuda"] }
+
+[features]
+default = []
+cudnn = ["hanzo/cudnn"]
