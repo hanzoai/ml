@@ -23,7 +23,7 @@ resolver = "2"
 version = "0.9.1"
 edition = "2021"
 description = "Minimalist ML framework."
-repository = "https://github.com/huggingface/hanzo"
+repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
@@ -33,7 +33,7 @@ ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
-hanzo = { path = "./hanzo-ml-core", package = "hanzo-ml-core", version = "0.9.1" }
+hanzo-ml = { path = "./hanzo-ml-core", package = "hanzo-ml-core", version = "0.9.1" }
 hanzo-ml-datasets = { path = "./hanzo-ml-datasets", version = "0.9.1" }
 hanzo-ml-flash-attn = { path = "./hanzo-ml-flash-attn", version = "0.9.1" }
 hanzo-ml-kernels = { path = "./hanzo-ml-kernels", version = "0.9.1" }
