@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
-hanzo = { workspace = true }
+hanzo-ml = { workspace = true }
 hanzo-ml-nn = { workspace = true }
 hanzo-ml-onnx = { workspace = true, optional = true }
 half = { workspace = true }

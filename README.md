@@ -1,18 +1,21 @@
-# hanzo
-[![discord server](https://dcbadge.vercel.app/api/server/hugging-face-879548962464493619)](https://discord.gg/hugging-face-879548962464493619)
+# Hanzo ML
 [![Latest version](https://img.shields.io/crates/v/hanzo-ml-core.svg)](https://crates.io/crates/hanzo-ml-core)
 [![Documentation](https://docs.rs/hanzo-ml-core/badge.svg)](https://docs.rs/hanzo-ml-core)
-[![License](https://img.shields.io/github/license/base-org/node?color=blue)](https://github.com/huggingface/hanzo/blob/main/LICENSE-MIT)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/huggingface/hanzo/blob/main/LICENSE-APACHE)
+[![License](https://img.shields.io/github/license/hanzoai/ml?color=blue)](https://github.com/hanzoai/ml/blob/main/LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/hanzoai/ml/blob/main/LICENSE-APACHE)
 
-ML is a minimalist ML framework for Rust with a focus on performance (including GPU support) 
-and ease of use. Try our online demos: 
-[whisper](https://huggingface.co/spaces/lmz/hanzo-ml-whisper),
-[LLaMA2](https://huggingface.co/spaces/lmz/hanzo-ml-llama2),
-[T5](https://huggingface.co/spaces/radames/ML-T5-Generation-Wasm),
-[yolo](https://huggingface.co/spaces/lmz/hanzo-ml-yolo),
-[Segment
-Anything](https://huggingface.co/spaces/radames/hanzo-ml-segment-anything-wasm).
+Hanzo ML is a minimalist ML framework for Rust with a focus on performance (including GPU support) 
+and ease of use. Based on Candle from Hugging Face, Hanzo ML provides optimizations for Edge AI, 
+quantization, and multimodal workloads.
+
+## Key Features
+
+- **High Performance**: GPU acceleration via CUDA, Metal (Apple Silicon), and CPU optimizations
+- **Edge AI Optimized**: Quantization support (GGUF, GGML, AFQ, GPTQ, AWQ)  
+- **Multimodal**: Text, vision, audio, and 3D model support
+- **WebAssembly**: Run models in the browser with WASM support
+- **Rust Native**: Memory-safe, zero-cost abstractions
+- **Hanzo Integration**: Works seamlessly with Hanzo Engine for inference
 
 ## Get started
 
@@ -21,7 +24,7 @@ Make sure that you have [`hanzo-ml-core`](https://github.com/huggingface/hanzo/t
 Let's see how to run a simple matrix multiplication.
 Write the following to your `myapp/src/main.rs` file:
 ```rust
-use hanzo_core::{Device, Tensor};
+use hanzo_ml_core::{Device, Tensor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::Cpu;
