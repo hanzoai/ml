@@ -6,7 +6,7 @@ use crate::models::{
 use hanzo_ml::{DType, Device, Result, Tensor, D};
 use hanzo_ml_nn::{ops::softmax_last_dim, LayerNormConfig, Module, VarBuilder};
 
-// Geglu and feedforward from hanzo-ml-transformers/src/models/stable_diffusion/attention.rs
+// Geglu and feedforward from hanzo-transformers/src/models/stable_diffusion/attention.rs
 #[derive(Debug)]
 struct GeGlu {
     proj: Linear,
@@ -60,7 +60,7 @@ impl Module for FeedForward {
     }
 }
 
-// CrossAttention from hanzo-ml-transformers/src/models/stable_diffusion/attention.rs
+// CrossAttention from hanzo-transformers/src/models/stable_diffusion/attention.rs
 #[derive(Debug)]
 struct CrossAttention {
     to_q: Linear,

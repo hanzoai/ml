@@ -2,10 +2,10 @@
 
 clean-ptx:
 	find target -name "*.ptx" -type f -delete
-	echo "" > hanzo-ml-kernels/src/lib.rs
-	touch hanzo-ml-kernels/build.rs
+	echo "" > hanzo-kernels/src/lib.rs
+	touch hanzo-kernels/build.rs
 	touch hanzo-ml-examples/build.rs
-	touch hanzo-ml-flash-attn/build.rs
+	touch hanzo-flash-attn/build.rs
 
 clean:
 	cargo clean

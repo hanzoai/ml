@@ -5,7 +5,7 @@ Training a 2 layer MLP on mnist in ML.
 ## Running an example
 
 ```bash
-$ cargo run --example mnist-training --features hanzo-ml-datasets
+$ cargo run --example mnist-training --features hanzo-datasets
 
 > train-images: [60000, 784]
 > train-labels: [60000]

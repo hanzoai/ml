@@ -52,14 +52,14 @@ This documents the main changes to the `hanzo` crate.
 ## v0.2.1 - 2023-09-11
 
 ### Added
-- Add some RNNs (GRU and LSTM) in `hanzo-ml-nn`
+- Add some RNNs (GRU and LSTM) in `hanzo-nn`
   [674](https://github.com/huggingface/hanzo/pull/674),
   [688](https://github.com/huggingface/hanzo/pull/688).
 - gguf v2 support
   [725](https://github.com/huggingface/hanzo/pull/725).
 - Quantized llama example in Python using the pyo3 api
   [716](https://github.com/huggingface/hanzo/pull/716).
-- `hanzo-ml-nn` layer for conv2d-transposed
+- `hanzo-nn` layer for conv2d-transposed
   [760](https://github.com/huggingface/hanzo/pull/760).
 - Add the Segment-Anything Model (SAM) as an example
   [773](https://github.com/huggingface/hanzo/pull/773).

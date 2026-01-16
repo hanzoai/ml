@@ -1,4 +1,4 @@
-//! hanzo-ml-nn
+//! hanzo-nn
 //!
 //! ## Other Crates
 //!
@@ -7,12 +7,12 @@
 //! to look at the docs for the other crates which can be found here:
 //!
 //! - [hanzo-ml](https://docs.rs/hanzo-ml/). Core Datastructures and DataTypes.
-//! - [hanzo-ml-nn](https://docs.rs/hanzo-ml-nn/). Building blocks for Neural Nets.
-//! - [hanzo-ml-datasets](https://docs.rs/hanzo-ml-datasets/). Rust access to commonly used Datasets like MNIST.
+//! - [hanzo-nn](https://docs.rs/hanzo-nn/). Building blocks for Neural Nets.
+//! - [hanzo-datasets](https://docs.rs/hanzo-datasets/). Rust access to commonly used Datasets like MNIST.
 //! - [hanzo-ml-examples](https://docs.rs/hanzo-ml-examples/). Examples of ML in Use.
-//! - [hanzo-ml-onnx](https://docs.rs/hanzo-ml-onnx/). Loading and using ONNX models.
+//! - [hanzo-onnx](https://docs.rs/hanzo-onnx/). Loading and using ONNX models.
 //! - [hanzo-ml-pyo3](https://docs.rs/hanzo-ml-pyo3/). Access to ML from Python.
-//! - [hanzo-ml-transformers](https://docs.rs/hanzo-ml-transformers/). ML implemntation of many published transformer models.
+//! - [hanzo-transformers](https://docs.rs/hanzo-transformers/). ML implemntation of many published transformer models.
 //!
 
 pub mod activation;

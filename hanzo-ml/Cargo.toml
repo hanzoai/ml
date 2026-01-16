@@ -12,8 +12,8 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
-hanzo-ml-kernels = { workspace = true, optional = true }
-hanzo-ml-metal-kernels = { workspace = true, optional = true }
+hanzo-kernels = { workspace = true, optional = true }
+hanzo-metal-kernels = { workspace = true, optional = true }
 metal = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
 gemm = { workspace = true }
@@ -43,12 +43,12 @@ criterion = { workspace = true }
 
 [features]
 default = []
-cuda = ["cudarc", "dep:hanzo-ml-kernels", "dep:ug-cuda"]
+cuda = ["cudarc", "dep:hanzo-kernels", "dep:ug-cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
-metal = ["dep:metal", "dep:hanzo-ml-metal-kernels", "dep:ug-metal"]
+metal = ["dep:metal", "dep:hanzo-metal-kernels", "dep:ug-metal"]
 
 [[bench]]
 name = "bench_main"

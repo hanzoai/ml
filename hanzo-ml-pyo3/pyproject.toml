@@ -1,5 +1,5 @@
 [project]
-name = 'hanzo-ml-nn'
+name = 'hanzo-nn'
 requires-python = '>=3.7'
 authors = [
     {name = 'The ML Team'},

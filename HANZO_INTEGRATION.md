@@ -22,8 +22,8 @@ Add to `~/work/hanzo/engine/Cargo.toml`:
 ```toml
 [dependencies]
 hanzo-ml = { git = "https://github.com/hanzoai/ml", branch = "main" }
-hanzo-ml-nn = { git = "https://github.com/hanzoai/ml", branch = "main" }
-hanzo-ml-transformers = { git = "https://github.com/hanzoai/ml", branch = "main" }
+hanzo-nn = { git = "https://github.com/hanzoai/ml", branch = "main" }
+hanzo-transformers = { git = "https://github.com/hanzoai/ml", branch = "main" }
 ```
 
 ### Feature Alignment
@@ -33,7 +33,7 @@ Both projects support consistent feature flags:
 ```toml
 [features]
 default = ["metal"]
-metal = ["hanzo-ml/metal", "hanzo-ml-nn/metal"]
+metal = ["hanzo-ml/metal", "hanzo-nn/metal"]
 cuda = ["hanzo-ml/cuda"] 
 mkl = ["hanzo-ml/mkl"]
 accelerate = ["hanzo-ml/accelerate"]
@@ -79,7 +79,7 @@ git push origin main
 
 ```bash
 cd ~/work/hanzo/engine
-cargo update hanzo-ml hanzo-ml-nn hanzo-ml-transformers
+cargo update hanzo-ml hanzo-nn hanzo-transformers
 cargo test
 ```
 
@@ -97,9 +97,9 @@ cargo run --features metal --release -- \
 
 The framework publishes these crates:
 - `hanzo-ml` - Core tensor operations
-- `hanzo-ml-nn` - Neural network layers  
-- `hanzo-ml-transformers` - Transformer models
-- `hanzo-ml-datasets` - Dataset utilities
+- `hanzo-nn` - Neural network layers  
+- `hanzo-transformers` - Transformer models
+- `hanzo-datasets` - Dataset utilities
 - `hanzo-ml-pyo3` - Python bindings
 
 ### Release Process

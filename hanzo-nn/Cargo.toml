@@ -1,5 +1,5 @@
 [package]
-name = "hanzo-ml-nn"
+name = "hanzo-nn"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -20,7 +20,7 @@ rayon = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 metal = { workspace = true, optional = true }
-hanzo-ml-metal-kernels = { workspace = true, optional = true }
+hanzo-metal-kernels = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -35,7 +35,7 @@ accelerate = ["dep:accelerate-src", "hanzo-ml/accelerate"]
 cuda = ["hanzo-ml/cuda"]
 cudnn = ["hanzo-ml/cudnn"]
 mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl"]
-metal = ["hanzo-ml/metal", "dep:hanzo-ml-metal-kernels", "dep:metal"]
+metal = ["hanzo-ml/metal", "dep:hanzo-metal-kernels", "dep:metal"]
 
 [[bench]]
 name = "bench_main"
