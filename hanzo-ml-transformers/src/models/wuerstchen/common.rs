@@ -1,4 +1,4 @@
-use hanzo::{DType, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Module, Result, Tensor, D};
 use hanzo_nn::VarBuilder;
 
 // https://github.com/huggingface/diffusers/blob/19edca82f1ff194c07317369a92b470dbae97f34/src/diffusers/pipelines/wuerstchen/modeling_wuerstchen_common.py#L22

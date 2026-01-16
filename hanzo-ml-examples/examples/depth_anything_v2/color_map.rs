@@ -2,7 +2,7 @@ use enterpolation::linear::ConstEquidistantLinear;
 use enterpolation::Generator;
 use palette::LinSrgb;
 
-use hanzo::Tensor;
+use hanzo_ml_core::Tensor;
 
 pub struct SpectralRColormap {
     gradient: ConstEquidistantLinear<f32, LinSrgb, 9>,

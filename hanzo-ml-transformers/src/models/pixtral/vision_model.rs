@@ -1,4 +1,4 @@
-use hanzo::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{linear_b, rms_norm, Linear, RmsNorm, VarBuilder};
 
 fn default_act() -> hanzo_nn::Activation {

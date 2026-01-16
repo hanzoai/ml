@@ -1,5 +1,5 @@
 use anyhow::{Error as E, Result};
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::colpali::Model;
 use hanzo_transformers::models::{colpali, paligemma};

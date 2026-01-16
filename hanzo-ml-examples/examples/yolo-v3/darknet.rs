@@ -1,4 +1,4 @@
-use hanzo::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{batch_norm, conv2d, conv2d_no_bias, Func, Module, VarBuilder};
 use std::collections::BTreeMap;
 use std::fs::File;

@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::Error as E;
 use clap::Parser;
 
-use hanzo::{DType, IndexOp, Tensor};
+use hanzo_ml_core::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::parler_tts::{Config, Model};
 use tokenizers::Tokenizer;

@@ -1,14 +1,14 @@
 //! Tensor ops.
 //!
 
-use hanzo::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
+use hanzo_ml_core::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
 /// a slice of fixed index on dimension `dim` are between 0 and 1 and sum to 1.
 ///
 /// ```rust
-/// use hanzo::{Tensor, Device, test_utils::to_vec2_round};
+/// use hanzo_ml_core::{Tensor, Device, test_utils::to_vec2_round};
 /// let a = Tensor::new(&[[0f32, 1., 0., 1.], [-2., 2., 3., -3.]], &Device::Cpu)?;
 /// let a = hanzo_nn::ops::softmax(&a, 1)?;
 /// assert_eq!(
@@ -54,7 +54,7 @@ impl hanzo::CustomOp1 for Sigmoid {
     }
 
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
 
         fn fwd<T: num_traits::Float>(v: T) -> T {
             (v.neg().exp() + T::one()).recip()
@@ -88,13 +88,13 @@ impl hanzo::CustomOp1 for Sigmoid {
         storage: &hanzo::CudaStorage,
         layout: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
-        use hanzo::cuda_backend::cudarc::driver::{
+        use hanzo_ml_core::backend::BackendStorage;
+        use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
         };
-        use hanzo::cuda_backend::SlicePtrOrNull;
-        use hanzo::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
-        use hanzo::{CudaDevice, WithDType};
+        use hanzo_ml_core::cuda_backend::SlicePtrOrNull;
+        use hanzo_ml_core::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
+        use hanzo_ml_core::{CudaDevice, WithDType};
 
         struct S;
         impl Map1 for S {
@@ -140,8 +140,8 @@ impl hanzo::CustomOp1 for Sigmoid {
         storage: &hanzo::MetalStorage,
         layout: &Layout,
     ) -> Result<(hanzo::MetalStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
-        use hanzo::MetalError;
+        use hanzo_ml_core::backend::BackendStorage;
+        use hanzo_ml_core::MetalError;
         let device = storage.device();
         let dtype = storage.dtype();
         let shape = layout.shape();
@@ -343,11 +343,11 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
         storage: &hanzo::CudaStorage,
         layout: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::cuda_backend::cudarc::driver::{
+        use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
-        use hanzo::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
-        use hanzo::{CudaDevice, WithDType};
+        use hanzo_ml_core::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
+        use hanzo_ml_core::{CudaDevice, WithDType};
 
         struct S;
         impl Map1 for S {
@@ -384,7 +384,7 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
             }
         }
 
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let dev = storage.device();
         let slice = S.map(&storage.slice, dev, layout)?;
         let dst = hanzo::cuda_backend::CudaStorage {
@@ -400,7 +400,7 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
         storage: &hanzo::MetalStorage,
         layout: &Layout,
     ) -> Result<(hanzo::MetalStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let device = storage.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();
@@ -458,7 +458,7 @@ impl hanzo::CustomOp2 for RmsNorm {
         s2: &CpuStorage,
         l2: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
 
         let eps = self.eps;
         fn inner<
@@ -522,11 +522,11 @@ impl hanzo::CustomOp2 for RmsNorm {
         s2: &hanzo::CudaStorage,
         l2: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::cuda_backend::cudarc::driver::{
+        use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
-        use hanzo::cuda_backend::{kernel_name, kernels, Map2, WrapErr};
-        use hanzo::{CudaDevice, WithDType};
+        use hanzo_ml_core::cuda_backend::{kernel_name, kernels, Map2, WrapErr};
+        use hanzo_ml_core::{CudaDevice, WithDType};
 
         struct S {
             eps: f32,
@@ -573,7 +573,7 @@ impl hanzo::CustomOp2 for RmsNorm {
             }
         }
 
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let dev = s1.device();
         let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, dev)?;
         let dst = hanzo::cuda_backend::CudaStorage {
@@ -591,7 +591,7 @@ impl hanzo::CustomOp2 for RmsNorm {
         s2: &hanzo::MetalStorage,
         l2: &Layout,
     ) -> Result<(hanzo::MetalStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let device = s1.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();
@@ -674,7 +674,7 @@ impl hanzo::CustomOp3 for LayerNorm {
         s3: &CpuStorage,
         l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
 
         let eps = self.eps;
         fn inner<
@@ -754,11 +754,11 @@ impl hanzo::CustomOp3 for LayerNorm {
         s3: &hanzo::CudaStorage,
         l3: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::cuda_backend::cudarc::driver::{
+        use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
-        use hanzo::cuda_backend::{kernel_name, kernels, Map3, WrapErr};
-        use hanzo::{CudaDevice, WithDType};
+        use hanzo_ml_core::cuda_backend::{kernel_name, kernels, Map3, WrapErr};
+        use hanzo_ml_core::{CudaDevice, WithDType};
 
         struct S {
             eps: f32,
@@ -813,7 +813,7 @@ impl hanzo::CustomOp3 for LayerNorm {
             }
         }
 
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let dev = s1.device();
         let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, &s3.slice, l3, dev)?;
         let dst = hanzo::cuda_backend::CudaStorage {
@@ -833,7 +833,7 @@ impl hanzo::CustomOp3 for LayerNorm {
         s3: &hanzo::MetalStorage,
         l3: &Layout,
     ) -> Result<(hanzo::MetalStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let device = s1.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();
@@ -1003,7 +1003,7 @@ impl hanzo::CustomOp3 for Sdpa {
         v: &hanzo::MetalStorage,
         v_l: &Layout,
     ) -> Result<(hanzo::MetalStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         use hanzo_metal_kernels::SdpaDType;
 
         let device = q.device();

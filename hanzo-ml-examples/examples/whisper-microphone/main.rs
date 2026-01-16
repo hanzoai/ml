@@ -5,7 +5,7 @@ extern crate accelerate_src;
 extern crate intel_mkl_src;
 
 use anyhow::{Error as E, Result};
-use hanzo::{Device, IndexOp, Tensor};
+use hanzo_ml_core::{Device, IndexOp, Tensor};
 use hanzo_nn::{ops::softmax, VarBuilder};
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};

@@ -6,7 +6,7 @@ extern crate accelerate_src;
 
 use clap::{Parser, ValueEnum};
 
-use hanzo::{DType, IndexOp, D};
+use hanzo_ml_core::{DType, IndexOp, D};
 use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::models::efficientvit;
 

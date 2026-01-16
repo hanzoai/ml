@@ -2,7 +2,7 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 
-use hanzo::{IndexOp, Layout, Result, Shape, Tensor, D};
+use hanzo_ml_core::{IndexOp, Layout, Result, Shape, Tensor, D};
 use hanzo_nn::{linear, Linear, VarBuilder};
 
 struct CodebookEncode;

@@ -1,4 +1,4 @@
-use hanzo::{test_device, Device, IndexOp, Result, Tensor};
+use hanzo_ml_core::{test_device, Device, IndexOp, Result, Tensor};
 use hanzo_core as hanzo;
 
 fn contiguous(device: &Device) -> Result<()> {
@@ -53,7 +53,7 @@ test_device!(contiguous, contiguous_cpu, contiguous_gpu, contiguous_metal);
 
 #[test]
 fn strided_blocks() -> Result<()> {
-    use hanzo::Device::Cpu;
+    use hanzo_ml_core::Device::Cpu;
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     match tensor.strided_blocks() {
         hanzo::StridedBlocks::SingleBlock { start_offset, len } => {

@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo::{test_utils::to_vec2_round, DType, Device, Result, Tensor};
+use hanzo_ml_core::{test_utils::to_vec2_round, DType, Device, Result, Tensor};
 use hanzo_nn::RNN;
 
 /* The following test can be verified against PyTorch using the following snippet.

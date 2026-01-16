@@ -1,5 +1,5 @@
-use hanzo::backend::BackendStorage;
-use hanzo::{CpuStorage, CustomOp1, DType, Device, IndexOp, Layout, Result, Shape, Tensor, D};
+use hanzo_ml_core::backend::BackendStorage;
+use hanzo_ml_core::{CpuStorage, CustomOp1, DType, Device, IndexOp, Layout, Result, Shape, Tensor, D};
 use hanzo_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use hanzo_nn::{Embedding, Linear, Module, RmsNorm};
 use cudarc::nccl::safe::{Comm, ReduceOp};
@@ -52,7 +52,7 @@ impl CustomOp1 for AllReduce {
         s: &hanzo::CudaStorage,
         l: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::cuda_backend::WrapErr;
+        use hanzo_ml_core::cuda_backend::WrapErr;
         use cudarc::driver::DeviceSlice;
         use half::{bf16, f16};
 

@@ -6,7 +6,7 @@
 //! output has shape `(b_sz, out_c)` and `(out_c,)` respectively.
 //!
 //! ```rust
-//! use hanzo::{Tensor, Device::Cpu};
+//! use hanzo_ml_core::{Tensor, Device::Cpu};
 //! use hanzo_nn::{Linear, Module};
 //! # fn main() -> hanzo::Result<()> {
 //!
@@ -17,7 +17,7 @@
 //! assert_eq!(ys.to_vec2::<f32>()?, &[[210.0, 430.0, 650.0]]);
 //! # Ok(()) }
 //! ```
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 
 #[derive(Clone, Debug)]
 pub struct Linear {

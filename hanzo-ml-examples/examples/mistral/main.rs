@@ -10,7 +10,7 @@ use clap::Parser;
 use hanzo_transformers::models::mistral::{Config, Model as Mistral};
 use hanzo_transformers::models::quantized_mistral::Model as QMistral;
 
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};

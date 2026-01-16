@@ -4,7 +4,7 @@
 //! - [Github](https://github.com/metavoiceio/metavoice-src)
 //! - [Website](https://studio.metavoice.ai/)
 
-use hanzo::{DType, Device, Error as E, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, Error as E, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{embedding, linear_b, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 // Equivalent to torch.repeat_interleave

@@ -6,7 +6,7 @@
 //! - See modernbert in [hanzo-ml-examples](https://github.com/huggingface/hanzo/tree/main/hanzo-ml-examples/) for runnable code
 //!
 
-use hanzo::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{
     embedding, layer_norm_no_bias, linear, linear_no_bias, ops::softmax, Embedding, LayerNorm,
     Linear, Module, VarBuilder,

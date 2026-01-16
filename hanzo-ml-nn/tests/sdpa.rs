@@ -1,6 +1,6 @@
 #[cfg(feature = "metal")]
 mod metal_sdpa_tests {
-    use hanzo::{DType, Device, Result, Shape, Tensor};
+    use hanzo_ml_core::{DType, Device, Result, Shape, Tensor};
     use rand::SeedableRng;
     use rand_distr::Distribution;
     use std::ops::{Div, Mul};

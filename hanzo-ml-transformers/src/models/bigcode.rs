@@ -21,7 +21,7 @@
 //! ```
 //!
 
-use hanzo::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
 
 fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<LayerNorm> {

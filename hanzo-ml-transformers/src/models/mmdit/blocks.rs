@@ -1,4 +1,4 @@
-use hanzo::{Module, Result, Tensor, D};
+use hanzo_ml_core::{Module, Result, Tensor, D};
 use hanzo_nn as nn;
 
 use super::projections::{AttnProjections, Mlp, Qkv, QkvOnlyAttnProjections};

@@ -8,7 +8,7 @@
 //! - 📝 [Paper](https://arxiv.org/abs/2201.12086)
 //!
 use super::with_tracing::{linear, Embedding, Linear};
-use hanzo::{Module, Result, Tensor, D};
+use hanzo_ml_core::{Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
 use serde::Deserialize;
 

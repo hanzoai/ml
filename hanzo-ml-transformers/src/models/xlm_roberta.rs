@@ -1,5 +1,5 @@
 use crate::models::with_tracing::{linear, Linear};
-use hanzo::{DType, Module, Result, Tensor};
+use hanzo_ml_core::{DType, Module, Result, Tensor};
 use hanzo_nn::{
     embedding, layer_norm, ops::softmax_last_dim, Activation, Embedding, LayerNorm, VarBuilder,
 };

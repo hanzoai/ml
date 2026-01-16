@@ -1,7 +1,7 @@
 /// This follows the lines of:
 /// https://github.com/johnma2006/mamba-minimal/blob/master/model.py
 /// Simple, minimal implementation of Mamba in one file of PyTorch.
-use hanzo::{IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{RmsNorm, VarBuilder};
 
 use hanzo_transformers::models::with_tracing::{linear, linear_no_bias, Linear};

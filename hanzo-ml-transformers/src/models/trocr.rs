@@ -15,7 +15,7 @@
 //!
 
 use crate::models::vit::{Config, Embeddings, Encoder};
-use hanzo::{DType, Result, Tensor};
+use hanzo_ml_core::{DType, Result, Tensor};
 use hanzo_nn::{
     embedding, layer_norm, linear_no_bias, Embedding, LayerNorm, Linear, Module, VarBuilder,
 };

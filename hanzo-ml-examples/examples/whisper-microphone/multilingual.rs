@@ -1,5 +1,5 @@
 use crate::{token_id, Model};
-use hanzo::{IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{IndexOp, Result, Tensor, D};
 use hanzo_transformers::models::whisper::{self as m};
 use tokenizers::Tokenizer;
 

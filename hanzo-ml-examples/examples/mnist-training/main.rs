@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 use rand::prelude::*;
 use rand::rng;
 
-use hanzo::{DType, Result, Tensor, D};
+use hanzo_ml_core::{DType, Result, Tensor, D};
 use hanzo_nn::{loss, ops, Conv2d, Linear, Module, ModuleT, Optimizer, VarBuilder, VarMap};
 
 const IMAGE_DIM: usize = 784;

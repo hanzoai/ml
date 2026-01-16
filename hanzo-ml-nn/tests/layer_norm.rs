@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use hanzo::{test_utils, Device, Tensor};
+use hanzo_ml_core::{test_utils, Device, Tensor};
 use hanzo_nn::{LayerNorm, Module};
 
 #[test]

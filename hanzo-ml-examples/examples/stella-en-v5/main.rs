@@ -13,7 +13,7 @@ use hanzo_transformers::models::stella_en_v5::{
     Config, EmbedDim as StellaEmbedDim, EmbeddingModel,
 };
 
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};

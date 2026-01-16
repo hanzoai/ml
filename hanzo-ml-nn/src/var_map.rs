@@ -1,6 +1,6 @@
 //! A `VarMap` is a store that holds named variables.
 //!
-use hanzo::{DType, Device, Result, Shape, Tensor, Var};
+use hanzo_ml_core::{DType, Device, Result, Shape, Tensor, Var};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

@@ -1,5 +1,5 @@
 use crate::model::{report_detect, report_pose, Bbox, Multiples, YoloV8, YoloV8Pose};
-use hanzo::{DType, Device, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Result, Tensor};
 use hanzo_nn::{Module, VarBuilder};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;

@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use hanzo_transformers::models::olmo::{Config, Model as OLMo};
 use hanzo_transformers::models::olmo2::{Config as Config2, Model as OLMo2};
 
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;

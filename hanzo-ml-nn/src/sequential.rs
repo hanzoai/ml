@@ -1,7 +1,7 @@
 //! Sequential Layer
 //!
 //! A sequential layer used to chain multiple layers and closures.
-use hanzo::{Module, Result, Tensor};
+use hanzo_ml_core::{Module, Result, Tensor};
 
 /// A sequential layer combining multiple other layers.
 pub struct Sequential {

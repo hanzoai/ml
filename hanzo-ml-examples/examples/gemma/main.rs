@@ -11,7 +11,7 @@ use hanzo_transformers::models::gemma::{Config as Config1, Model as Model1};
 use hanzo_transformers::models::gemma2::{Config as Config2, Model as Model2};
 use hanzo_transformers::models::gemma3::{Config as Config3, Model as Model3};
 
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;

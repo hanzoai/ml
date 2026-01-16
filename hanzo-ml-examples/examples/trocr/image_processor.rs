@@ -2,7 +2,7 @@ use image::{DynamicImage, ImageBuffer};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use hanzo::{DType, Device, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Result, Tensor};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProcessorConfig {

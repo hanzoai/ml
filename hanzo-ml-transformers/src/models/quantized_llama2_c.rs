@@ -17,7 +17,7 @@
 use super::llama2_c::{Cache, Config};
 use crate::quantized_nn::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo::{DType, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, IndexOp, Module, Result, Tensor, D};
 
 fn silu(xs: &Tensor) -> Result<Tensor> {
     xs / (xs.neg()?.exp()? + 1.0)?
