@@ -29,13 +29,13 @@ pub const DEFAULT_ROPE_FREQUENCY_SCALE_FACTOR: f32 = 1.;
 
 #[derive(Debug, Clone)]
 struct QMatMul {
-    inner: hanzo::quantized::QMatMul,
+    inner: hanzo_ml_core::quantized::QMatMul,
     span: tracing::Span,
 }
 
 impl QMatMul {
     fn from_qtensor(qtensor: QTensor) -> Result<Self> {
-        let inner = hanzo::quantized::QMatMul::from_qtensor(qtensor)?;
+        let inner = hanzo_ml_core::quantized::QMatMul::from_qtensor(qtensor)?;
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Ok(Self { inner, span })
     }
@@ -264,7 +264,7 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
-            None => hanzo::bail!("cannot find {s} in metadata"),
+            None => hanzo_ml_core::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 

@@ -536,7 +536,7 @@ impl Layer {
                 {
                     (attn_ln, input_ln)
                 } else {
-                    return Err(hanzo::error::Error::Msg(
+                    return Err(hanzo_ml_core::error::Error::Msg(
                         "Stella 1.5B expects RMSNorm".to_string(),
                     ));
                 };
@@ -556,7 +556,7 @@ impl Layer {
                     {
                         (attn_ln, input_ln)
                     } else {
-                        return Err(hanzo::error::Error::Msg(
+                        return Err(hanzo_ml_core::error::Error::Msg(
                             "Stella 400M expects RMSNorm".to_string(),
                         ));
                     };

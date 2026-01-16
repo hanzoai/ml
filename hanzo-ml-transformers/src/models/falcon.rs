@@ -73,13 +73,13 @@ impl Default for Config {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.alibi {
-            hanzo::bail!("alibi is not supported");
+            hanzo_ml_core::bail!("alibi is not supported");
         }
         if self.new_decoder_architecture {
-            hanzo::bail!("new_decoder_architecture is not supported");
+            hanzo_ml_core::bail!("new_decoder_architecture is not supported");
         }
         if self.n_head_kv.is_some() {
-            hanzo::bail!("n_head_kv is not supported");
+            hanzo_ml_core::bail!("n_head_kv is not supported");
         }
         Ok(())
     }

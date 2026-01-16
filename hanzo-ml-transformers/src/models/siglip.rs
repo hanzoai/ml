@@ -462,7 +462,7 @@ impl Mlp {
 }
 
 impl Module for Mlp {
-    fn forward(&self, xs: &hanzo::Tensor) -> Result<hanzo::Tensor> {
+    fn forward(&self, xs: &hanzo_ml_core::Tensor) -> Result<hanzo_ml_core::Tensor> {
         xs.apply(&self.fc1)?
             .apply(&self.activation_fn)?
             .apply(&self.fc2)

@@ -170,9 +170,9 @@ fn run(args: Args) -> Result<()> {
                 let img = flux::sampling::get_noise(1, height, width, &device)?.to_dtype(dtype)?;
                 let state = if quantized {
                     flux::sampling::State::new(
-                        &t5_emb.to_dtype(hanzo::DType::F32)?,
-                        &clip_emb.to_dtype(hanzo::DType::F32)?,
-                        &img.to_dtype(hanzo::DType::F32)?,
+                        &t5_emb.to_dtype(hanzo_ml_core::DType::F32)?,
+                        &clip_emb.to_dtype(hanzo_ml_core::DType::F32)?,
+                        &img.to_dtype(hanzo_ml_core::DType::F32)?,
                     )?
                 } else {
                     flux::sampling::State::new(&t5_emb, &clip_emb, &img)?
@@ -232,7 +232,7 @@ fn run(args: Args) -> Result<()> {
             flux::sampling::unpack(&img, height, width)?
         }
         Some(file) => {
-            let mut st = hanzo::safetensors::load(file, &device)?;
+            let mut st = hanzo_ml_core::safetensors::load(file, &device)?;
             st.remove("img").unwrap().to_dtype(dtype)?
         }
     };
@@ -249,7 +249,7 @@ fn run(args: Args) -> Result<()> {
         model.decode(&img)?
     };
     println!("img\n{img}");
-    let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(hanzo::DType::U8)?;
+    let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(hanzo_ml_core::DType::U8)?;
     let filename = match args.seed {
         None => "out.jpg".to_string(),
         Some(s) => format!("out-{s}.jpg"),
@@ -261,6 +261,6 @@ fn run(args: Args) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     #[cfg(feature = "cuda")]
-    hanzo::quantized::cuda::set_force_dmmv(args.use_dmmv);
+    hanzo_ml_core::quantized::cuda::set_force_dmmv(args.use_dmmv);
     run(args)
 }

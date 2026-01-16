@@ -43,15 +43,15 @@ impl CustomOp1 for AllReduce {
     }
 
     fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
-        hanzo::bail!("AllReduce is never used on cpu")
+        hanzo_ml_core::bail!("AllReduce is never used on cpu")
     }
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        s: &hanzo::CudaStorage,
+        s: &hanzo_ml_core::CudaStorage,
         l: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::cuda_backend::WrapErr;
         use cudarc::driver::DeviceSlice;
         use half::{bf16, f16};
@@ -63,27 +63,27 @@ impl CustomOp1 for AllReduce {
                 let s = s.as_cuda_slice::<bf16>()?;
                 let s = match l.contiguous_offsets() {
                     Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => hanzo::bail!("input has to be contiguous"),
+                    Some(_) | None => hanzo_ml_core::bail!("input has to be contiguous"),
                 };
                 let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }.w()?;
                 self.comm
                     .all_reduce(s, &mut dst, &ReduceOp::Sum)
-                    .map_err(hanzo::Error::debug)?;
-                hanzo::CudaStorage::wrap_cuda_slice(dst, dev)
+                    .map_err(hanzo_ml_core::Error::debug)?;
+                hanzo_ml_core::CudaStorage::wrap_cuda_slice(dst, dev)
             }
             DType::F16 => {
                 let s = s.as_cuda_slice::<f16>()?;
                 let s = match l.contiguous_offsets() {
                     Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => hanzo::bail!("input has to be contiguous"),
+                    Some(_) | None => hanzo_ml_core::bail!("input has to be contiguous"),
                 };
                 let mut dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
                 self.comm
                     .all_reduce(s, &mut dst, &ReduceOp::Sum)
-                    .map_err(hanzo::Error::debug)?;
-                hanzo::CudaStorage::wrap_cuda_slice(dst, dev)
+                    .map_err(hanzo_ml_core::Error::debug)?;
+                hanzo_ml_core::CudaStorage::wrap_cuda_slice(dst, dev)
             }
-            dtype => hanzo::bail!("unsupported dtype {dtype:?}"),
+            dtype => hanzo_ml_core::bail!("unsupported dtype {dtype:?}"),
         };
         Ok((dst, l.shape().clone()))
     }

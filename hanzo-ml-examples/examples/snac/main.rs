@@ -107,7 +107,7 @@ fn main() -> Result<()> {
 
     let codes = match args.action {
         Action::CodeToAudio => {
-            let codes = hanzo::safetensors::load(args.in_file, &device)?;
+            let codes = hanzo_ml_core::safetensors::load(args.in_file, &device)?;
             let num_codebooks = model.num_codebooks();
             (0..num_codebooks)
                 .map(|i| {
@@ -162,7 +162,7 @@ fn main() -> Result<()> {
             for (i, codes) in codes.iter().enumerate() {
                 tensors.insert(format!("codes-{i}"), codes.clone());
             }
-            hanzo::safetensors::save(&tensors, "codes.safetensors")?;
+            hanzo_ml_core::safetensors::save(&tensors, "codes.safetensors")?;
         }
         Action::AudioToAudio | Action::CodeToAudio => {
             let codes = codes.iter().collect::<Vec<_>>();

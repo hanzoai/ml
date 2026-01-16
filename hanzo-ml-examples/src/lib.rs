@@ -35,7 +35,7 @@ pub fn load_image<P: AsRef<std::path::Path>>(
 ) -> Result<(Tensor, usize, usize)> {
     let img = image::ImageReader::open(p)?
         .decode()
-        .map_err(hanzo::Error::wrap)?;
+        .map_err(hanzo_ml_core::Error::wrap)?;
     let (initial_h, initial_w) = (img.height() as usize, img.width() as usize);
     let img = match resize_longest {
         None => img,
@@ -66,7 +66,7 @@ pub fn load_image_and_resize<P: AsRef<std::path::Path>>(
 ) -> Result<Tensor> {
     let img = image::ImageReader::open(p)?
         .decode()
-        .map_err(hanzo::Error::wrap)?
+        .map_err(hanzo_ml_core::Error::wrap)?
         .resize_to_fill(
             width as u32,
             height as u32,
@@ -83,16 +83,16 @@ pub fn save_image<P: AsRef<std::path::Path>>(img: &Tensor, p: P) -> Result<()> {
     let p = p.as_ref();
     let (channel, height, width) = img.dims3()?;
     if channel != 3 {
-        hanzo::bail!("save_image expects an input of shape (3, height, width)")
+        hanzo_ml_core::bail!("save_image expects an input of shape (3, height, width)")
     }
     let img = img.permute((1, 2, 0))?.flatten_all()?;
     let pixels = img.to_vec1::<u8>()?;
     let image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
         match image::ImageBuffer::from_raw(width as u32, height as u32, pixels) {
             Some(image) => image,
-            None => hanzo::bail!("error saving image {p:?}"),
+            None => hanzo_ml_core::bail!("error saving image {p:?}"),
         };
-    image.save(p).map_err(hanzo::Error::wrap)?;
+    image.save(p).map_err(hanzo_ml_core::Error::wrap)?;
     Ok(())
 }
 
@@ -105,18 +105,18 @@ pub fn save_image_resize<P: AsRef<std::path::Path>>(
     let p = p.as_ref();
     let (channel, height, width) = img.dims3()?;
     if channel != 3 {
-        hanzo::bail!("save_image expects an input of shape (3, height, width)")
+        hanzo_ml_core::bail!("save_image expects an input of shape (3, height, width)")
     }
     let img = img.permute((1, 2, 0))?.flatten_all()?;
     let pixels = img.to_vec1::<u8>()?;
     let image: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
         match image::ImageBuffer::from_raw(width as u32, height as u32, pixels) {
             Some(image) => image,
-            None => hanzo::bail!("error saving image {p:?}"),
+            None => hanzo_ml_core::bail!("error saving image {p:?}"),
         };
     let image = image::DynamicImage::from(image);
     let image = image.resize_to_fill(w as u32, h as u32, image::imageops::FilterType::CatmullRom);
-    image.save(p).map_err(hanzo::Error::wrap)?;
+    image.save(p).map_err(hanzo_ml_core::Error::wrap)?;
     Ok(())
 }
 
@@ -125,14 +125,14 @@ pub fn hub_load_safetensors(
     repo: &hf_hub::api::sync::ApiRepo,
     json_file: &str,
 ) -> Result<Vec<std::path::PathBuf>> {
-    let json_file = repo.get(json_file).map_err(hanzo::Error::wrap)?;
+    let json_file = repo.get(json_file).map_err(hanzo_ml_core::Error::wrap)?;
     let json_file = std::fs::File::open(json_file)?;
     let json: serde_json::Value =
-        serde_json::from_reader(&json_file).map_err(hanzo::Error::wrap)?;
+        serde_json::from_reader(&json_file).map_err(hanzo_ml_core::Error::wrap)?;
     let weight_map = match json.get("weight_map") {
-        None => hanzo::bail!("no weight map in {json_file:?}"),
+        None => hanzo_ml_core::bail!("no weight map in {json_file:?}"),
         Some(serde_json::Value::Object(map)) => map,
-        Some(_) => hanzo::bail!("weight map in {json_file:?} is not a map"),
+        Some(_) => hanzo_ml_core::bail!("weight map in {json_file:?} is not a map"),
     };
     let mut safetensors_files = std::collections::HashSet::new();
     for value in weight_map.values() {
@@ -142,7 +142,7 @@ pub fn hub_load_safetensors(
     }
     let safetensors_files = safetensors_files
         .iter()
-        .map(|v| repo.get(v).map_err(hanzo::Error::wrap))
+        .map(|v| repo.get(v).map_err(hanzo_ml_core::Error::wrap))
         .collect::<Result<Vec<_>>>()?;
     Ok(safetensors_files)
 }
@@ -153,11 +153,11 @@ pub fn hub_load_local_safetensors<P: AsRef<std::path::Path>>(
 ) -> Result<Vec<std::path::PathBuf>> {
     let path = path.as_ref();
     let jsfile = std::fs::File::open(path.join(json_file))?;
-    let json: serde_json::Value = serde_json::from_reader(&jsfile).map_err(hanzo::Error::wrap)?;
+    let json: serde_json::Value = serde_json::from_reader(&jsfile).map_err(hanzo_ml_core::Error::wrap)?;
     let weight_map = match json.get("weight_map") {
-        None => hanzo::bail!("no weight map in {json_file:?}"),
+        None => hanzo_ml_core::bail!("no weight map in {json_file:?}"),
         Some(serde_json::Value::Object(map)) => map,
-        Some(_) => hanzo::bail!("weight map in {json_file:?} is not a map"),
+        Some(_) => hanzo_ml_core::bail!("weight map in {json_file:?} is not a map"),
     };
     let mut safetensors_files = std::collections::HashSet::new();
     for value in weight_map.values() {

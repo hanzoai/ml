@@ -67,7 +67,7 @@ impl PReLU {
     }
 }
 
-impl hanzo::Module for PReLU {
+impl hanzo_ml_core::Module for PReLU {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let weight = if self.is_scalar {
             self.weight.reshape(())?
@@ -77,7 +77,7 @@ impl hanzo::Module for PReLU {
             let num_channels = xs.dim(1)?;
             let num_weights = self.weight.elem_count();
             if num_weights != num_channels {
-                hanzo::bail!("error in prelu: unexpected number of channels for the input, got {num_channels}, weight dim is {num_weights}")
+                hanzo_ml_core::bail!("error in prelu: unexpected number of channels for the input, got {num_channels}, weight dim is {num_weights}")
             }
             let mut s = vec![1; xs.rank()];
             s[1] = num_weights;

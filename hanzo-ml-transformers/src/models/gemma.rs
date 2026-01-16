@@ -37,8 +37,8 @@ impl Config {
     fn hidden_act(&self) -> Result<Activation> {
         match (self.hidden_act, self.hidden_activation) {
             (None, Some(act)) | (Some(act), None) => Ok(act),
-            (Some(_), Some(_)) => hanzo::bail!("both hidden_act and hidden_activation are set"),
-            (None, None) => hanzo::bail!("none of hidden_act and hidden_activation are set"),
+            (Some(_), Some(_)) => hanzo_ml_core::bail!("both hidden_act and hidden_activation are set"),
+            (None, None) => hanzo_ml_core::bail!("none of hidden_act and hidden_activation are set"),
         }
     }
 }
