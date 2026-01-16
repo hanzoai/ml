@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use hanzo_ml::{DType, Device, Error, Module, Result, Tensor, Var};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     func, linear, sequential::seq, Activation, AdamW, Optimizer, ParamsAdamW, Sequential,
     VarBuilder, VarMap,
 };

@@ -1,6 +1,6 @@
 # Hanzo ML
-[![Latest version](https://img.shields.io/crates/v/hanzo-ml-core.svg)](https://crates.io/crates/hanzo-ml-core)
-[![Documentation](https://docs.rs/hanzo-ml-core/badge.svg)](https://docs.rs/hanzo-ml-core)
+[![Latest version](https://img.shields.io/crates/v/hanzo-ml.svg)](https://crates.io/crates/hanzo-ml)
+[![Documentation](https://docs.rs/hanzo-ml/badge.svg)](https://docs.rs/hanzo-ml)
 [![License](https://img.shields.io/github/license/hanzoai/ml?color=blue)](https://github.com/hanzoai/ml/blob/main/LICENSE-MIT)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/hanzoai/ml/blob/main/LICENSE-APACHE)
 
@@ -19,7 +19,7 @@ quantization, and multimodal workloads.
 
 ## Get started
 
-Make sure that you have [`hanzo-ml-core`](https://github.com/huggingface/hanzo/tree/main/hanzo-ml-core) correctly installed as described in [**Installation**](https://huggingface.github.io/hanzo/guide/installation.html).
+Make sure that you have [`hanzo-ml`](https://github.com/huggingface/hanzo/tree/main/hanzo-ml) correctly installed as described in [**Installation**](https://huggingface.github.io/hanzo/guide/installation.html).
 
 Let's see how to run a simple matrix multiplication.
 Write the following to your `myapp/src/main.rs` file:
@@ -280,7 +280,7 @@ Cheatsheet:
 
 ## Structure
 
-- [hanzo-ml-core](./hanzo-ml-core): Core ops, devices, and `Tensor` struct definition
+- [hanzo-ml](./hanzo-ml): Core ops, devices, and `Tensor` struct definition
 - [hanzo-ml-nn](./hanzo-ml-nn/): Tools to build real models
 - [hanzo-ml-examples](./hanzo-ml-examples/): Examples of using the library in realistic settings
 - [hanzo-ml-kernels](./hanzo-ml-kernels/): CUDA custom kernels

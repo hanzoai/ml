@@ -14,7 +14,7 @@ use hanzo_transformers::models::stella_en_v5::{
 };
 
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 

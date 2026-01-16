@@ -27,7 +27,7 @@ extern crate accelerate_src;
 use anyhow::Result;
 use hanzo_ml::test_utils::to_vec3_round;
 use hanzo_ml::{Device, Tensor};
-use hanzo_nn::{GroupNorm, Module};
+use hanzo_ml_nn::{GroupNorm, Module};
 
 #[test]
 fn group_norm() -> Result<()> {

@@ -12,7 +12,7 @@
 //!
 
 use hanzo_ml::{Result, Tensor, D};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     batch_norm, conv2d_no_bias, linear, BatchNorm, Conv2d, Conv2dConfig, Func, VarBuilder,
 };
 

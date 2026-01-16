@@ -61,7 +61,7 @@
 
 use crate::models::with_tracing::Embedding;
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_nn::{Activation, VarBuilder};
+use hanzo_ml_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -72,7 +72,7 @@ pub struct Linear {
 }
 
 pub fn linear_no_bias(d1: usize, d2: usize, vb: VarBuilder) -> Result<Linear> {
-    let init_ws = hanzo_nn::init::DEFAULT_KAIMING_NORMAL;
+    let init_ws = hanzo_ml_nn::init::DEFAULT_KAIMING_NORMAL;
     let weight = vb.get_with_hints((d2, d1), "weight", init_ws)?;
     let span = tracing::span!(tracing::Level::TRACE, "linear");
     Ok(Linear { weight, span })
@@ -124,7 +124,7 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
 #[derive(Debug, Deserialize, Default, Clone, PartialEq)]
 pub struct ActivationWithOptionalGating {
     pub gated: bool,
-    pub activation: hanzo_nn::Activation,
+    pub activation: hanzo_ml_nn::Activation,
 }
 
 pub fn deserialize_feed_forward_proj_activation<'de, D>(
@@ -136,11 +136,11 @@ where
     match String::deserialize(deserializer)?.as_str() {
         "gated-gelu" => Ok(ActivationWithOptionalGating {
             gated: true,
-            activation: hanzo_nn::Activation::NewGelu,
+            activation: hanzo_ml_nn::Activation::NewGelu,
         }),
         "gated-silu" => Ok(ActivationWithOptionalGating {
             gated: true,
-            activation: hanzo_nn::Activation::Silu,
+            activation: hanzo_ml_nn::Activation::Silu,
         }),
         buf => {
             let activation = serde_plain::from_str(buf).map_err(serde::de::Error::custom)?;
@@ -566,7 +566,7 @@ impl T5Attention {
 
         let attn_weights = {
             let _enter = self.span_sm.enter();
-            hanzo_nn::ops::softmax_last_dim(&scores)?
+            hanzo_ml_nn::ops::softmax_last_dim(&scores)?
         };
         let attn_output = attn_weights.matmul(&v)?;
         let attn_output = attn_output

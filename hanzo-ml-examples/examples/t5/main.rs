@@ -10,7 +10,7 @@ use hanzo_transformers::models::t5;
 
 use anyhow::{Error as E, Result};
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};

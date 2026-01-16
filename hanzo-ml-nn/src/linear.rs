@@ -7,7 +7,7 @@
 //!
 //! ```rust
 //! use hanzo_ml::{Tensor, Device::Cpu};
-//! use hanzo_nn::{Linear, Module};
+//! use hanzo_ml_nn::{Linear, Module};
 //! # fn main() -> hanzo_ml::Result<()> {
 //!
 //! let w = Tensor::new(&[[1f32, 2.], [3., 4.], [5., 6.]], &Cpu)?;

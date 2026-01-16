@@ -62,7 +62,7 @@ fn sample_gumbel() -> Result<()> {
         hanzo_transformers::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
     );
     let logits = Tensor::new(&[-1.0, 0.0, 0.2, 1.0], &Device::Cpu)?;
-    let sm = hanzo_nn::ops::softmax(&logits, 0)?.to_vec1::<f64>()?;
+    let sm = hanzo_ml_nn::ops::softmax(&logits, 0)?.to_vec1::<f64>()?;
     let mut counts = vec![0f64; 4];
     let samples = 100000;
     for _ in 0..samples {

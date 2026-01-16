@@ -1,7 +1,7 @@
 use hanzo_ml::backend::BackendStorage;
 use hanzo_ml::{CpuStorage, CustomOp1, DType, Device, IndexOp, Layout, Result, Shape, Tensor, D};
-use hanzo_nn::var_builder::ShardedVarBuilder as VarBuilder;
-use hanzo_nn::{Embedding, Linear, Module, RmsNorm};
+use hanzo_ml_nn::var_builder::ShardedVarBuilder as VarBuilder;
+use hanzo_ml_nn::{Embedding, Linear, Module, RmsNorm};
 use cudarc::nccl::safe::{Comm, ReduceOp};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -99,8 +99,8 @@ impl TensorParallelRowLinear {
     }
 }
 
-fn shard(dim: usize, rank: usize, world_size: usize) -> hanzo_nn::var_builder::Shard {
-    hanzo_nn::var_builder::Shard {
+fn shard(dim: usize, rank: usize, world_size: usize) -> hanzo_ml_nn::var_builder::Shard {
+    hanzo_ml_nn::var_builder::Shard {
         dim,
         rank,
         world_size,
@@ -197,7 +197,7 @@ impl CausalSelfAttention {
         let (_b_sz, _, seq_len, _hidden_size) = x.shape().dims4()?;
         let cos = self.cache.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.cache.sin.narrow(0, index_pos, seq_len)?;
-        hanzo_nn::rotary_emb::rope(x, &cos, &sin)
+        hanzo_ml_nn::rotary_emb::rope(x, &cos, &sin)
     }
 
     fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize) -> Result<Tensor> {

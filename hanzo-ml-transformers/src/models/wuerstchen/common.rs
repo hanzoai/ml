@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, Module, Result, Tensor, D};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 
 // https://github.com/huggingface/diffusers/blob/19edca82f1ff194c07317369a92b470dbae97f34/src/diffusers/pipelines/wuerstchen/modeling_wuerstchen_common.py#L22
 #[derive(Debug)]
@@ -64,12 +64,12 @@ impl Module for LayerNormNoWeights {
 
 #[derive(Debug)]
 pub struct TimestepBlock {
-    mapper: hanzo_nn::Linear,
+    mapper: hanzo_ml_nn::Linear,
 }
 
 impl TimestepBlock {
     pub fn new(c: usize, c_timestep: usize, vb: VarBuilder) -> Result<Self> {
-        let mapper = hanzo_nn::linear(c_timestep, c * 2, vb.pp("mapper"))?;
+        let mapper = hanzo_ml_nn::linear(c_timestep, c * 2, vb.pp("mapper"))?;
         Ok(Self { mapper })
     }
 
@@ -112,25 +112,25 @@ impl Module for GlobalResponseNorm {
 
 #[derive(Debug)]
 pub struct ResBlock {
-    depthwise: hanzo_nn::Conv2d,
+    depthwise: hanzo_ml_nn::Conv2d,
     norm: WLayerNorm,
-    channelwise_lin1: hanzo_nn::Linear,
+    channelwise_lin1: hanzo_ml_nn::Linear,
     channelwise_grn: GlobalResponseNorm,
-    channelwise_lin2: hanzo_nn::Linear,
+    channelwise_lin2: hanzo_ml_nn::Linear,
 }
 
 impl ResBlock {
     pub fn new(c: usize, c_skip: usize, ksize: usize, vb: VarBuilder) -> Result<Self> {
-        let cfg = hanzo_nn::Conv2dConfig {
+        let cfg = hanzo_ml_nn::Conv2dConfig {
             padding: ksize / 2,
             groups: c,
             ..Default::default()
         };
-        let depthwise = hanzo_nn::conv2d(c + c_skip, c, ksize, cfg, vb.pp("depthwise"))?;
+        let depthwise = hanzo_ml_nn::conv2d(c + c_skip, c, ksize, cfg, vb.pp("depthwise"))?;
         let norm = WLayerNorm::new(c)?;
-        let channelwise_lin1 = hanzo_nn::linear(c, c * 4, vb.pp("channelwise.0"))?;
+        let channelwise_lin1 = hanzo_ml_nn::linear(c, c * 4, vb.pp("channelwise.0"))?;
         let channelwise_grn = GlobalResponseNorm::new(c * 4, vb.pp("channelwise.2"))?;
-        let channelwise_lin2 = hanzo_nn::linear(c * 4, c, vb.pp("channelwise.4"))?;
+        let channelwise_lin2 = hanzo_ml_nn::linear(c * 4, c, vb.pp("channelwise.4"))?;
         Ok(Self {
             depthwise,
             norm,
@@ -165,7 +165,7 @@ pub struct AttnBlock {
     self_attn: bool,
     norm: WLayerNorm,
     attention: Attention,
-    kv_mapper_lin: hanzo_nn::Linear,
+    kv_mapper_lin: hanzo_ml_nn::Linear,
 }
 
 impl AttnBlock {
@@ -179,7 +179,7 @@ impl AttnBlock {
     ) -> Result<Self> {
         let norm = WLayerNorm::new(c)?;
         let attention = Attention::new(c, nhead, c / nhead, use_flash_attn, vb.pp("attention"))?;
-        let kv_mapper_lin = hanzo_nn::linear(c_cond, c, vb.pp("kv_mapper.1"))?;
+        let kv_mapper_lin = hanzo_ml_nn::linear(c_cond, c, vb.pp("kv_mapper.1"))?;
         Ok(Self {
             self_attn,
             norm,
@@ -189,7 +189,7 @@ impl AttnBlock {
     }
 
     pub fn forward(&self, xs: &Tensor, kv: &Tensor) -> Result<Tensor> {
-        let kv = hanzo_nn::ops::silu(kv)?.apply(&self.kv_mapper_lin)?;
+        let kv = hanzo_ml_nn::ops::silu(kv)?.apply(&self.kv_mapper_lin)?;
         let norm_xs = self.norm.forward(xs)?;
         let kv = if self.self_attn {
             let (b_size, channel, _, _) = xs.dims4()?;

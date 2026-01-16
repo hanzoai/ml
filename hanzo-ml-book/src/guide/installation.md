@@ -12,7 +12,7 @@ cd myapp
 ### Standard
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml-core
+cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml
 ```
 
 ### CUDA
@@ -32,30 +32,30 @@ You can also compile the Cuda kernels for a specific compute cap using the
 
 If any of the above commands errors out, please make sure to update your Cuda version.
 
-Add the `hanzo-ml-core` crate with the cuda feature:
+Add the `hanzo-ml` crate with the cuda feature:
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml-core --features "cuda"
+cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml --features "cuda"
 ```
 
 ### MKL
 
 You can also see the `mkl` feature which can get faster inference on CPU.
 
-Add the `hanzo-ml-core` crate with the mkl feature:
+Add the `hanzo-ml` crate with the mkl feature:
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml-core --features "mkl"
+cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml --features "mkl"
 ```
 
 ### Metal
 
 Metal is exclusive to MacOS.
 
-Add the `hanzo-ml-core` crate with the metal feature:
+Add the `hanzo-ml` crate with the metal feature:
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml-core --features "metal"
+cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml --features "metal"
 ```
 
 ## 3. Building

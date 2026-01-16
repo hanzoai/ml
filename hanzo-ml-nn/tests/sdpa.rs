@@ -34,11 +34,11 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
+            let att = hanzo_ml_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
                 .to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
-        let sdpa_output = hanzo_nn::ops::sdpa(&q, &k, &v, scale as f32, 1.)?;
+        let sdpa_output = hanzo_ml_nn::ops::sdpa(&q, &k, &v, scale as f32, 1.)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -64,11 +64,11 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
+            let att = hanzo_ml_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
                 .to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
-        let sdpa_output = hanzo_nn::ops::sdpa(&q, &k, &v, scale as f32, 1.)?;
+        let sdpa_output = hanzo_ml_nn::ops::sdpa(&q, &k, &v, scale as f32, 1.)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -95,7 +95,7 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = hanzo_nn::ops::softmax_last_dim(
+            let att = hanzo_ml_nn::ops::softmax_last_dim(
                 &att.to_dtype(DType::F32)?
                     .div(SOFTCAP)?
                     .tanh()?
@@ -104,7 +104,7 @@ mod metal_sdpa_tests {
             .to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
-        let sdpa_output = hanzo_nn::ops::sdpa(&q, &k, &v, scale as f32, SOFTCAP as f32)?;
+        let sdpa_output = hanzo_ml_nn::ops::sdpa(&q, &k, &v, scale as f32, SOFTCAP as f32)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -131,7 +131,7 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = hanzo_nn::ops::softmax_last_dim(
+            let att = hanzo_ml_nn::ops::softmax_last_dim(
                 &att.to_dtype(DType::F32)?
                     .div(SOFTCAP)?
                     .tanh()?
@@ -140,7 +140,7 @@ mod metal_sdpa_tests {
             .to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
-        let sdpa_output = hanzo_nn::ops::sdpa(&q, &k, &v, scale as f32, SOFTCAP as f32)?;
+        let sdpa_output = hanzo_ml_nn::ops::sdpa(&q, &k, &v, scale as f32, SOFTCAP as f32)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -166,11 +166,11 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
+            let att = hanzo_ml_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
                 .to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
-        let sdpa_output = hanzo_nn::ops::sdpa(&q, &k, &v, scale as f32, 1.)?;
+        let sdpa_output = hanzo_ml_nn::ops::sdpa(&q, &k, &v, scale as f32, 1.)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?

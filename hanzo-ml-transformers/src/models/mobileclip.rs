@@ -17,7 +17,7 @@
 use super::fastvit;
 use super::openclip::text_model;
 use hanzo_ml::{Result, Tensor, D};
-use hanzo_nn::{Func, VarBuilder};
+use hanzo_ml_nn::{Func, VarBuilder};
 
 #[derive(Clone, Debug)]
 pub struct MobileClipModel {

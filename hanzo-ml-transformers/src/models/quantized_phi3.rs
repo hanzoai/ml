@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use hanzo_ml::quantized::gguf_file;
 use hanzo_ml::quantized::QTensor;
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::{kv_cache::KvCache, Embedding, RmsNorm};
+use hanzo_ml_nn::{kv_cache::KvCache, Embedding, RmsNorm};
 
 #[derive(Debug, Clone)]
 struct QLinear {
@@ -101,7 +101,7 @@ impl LayerWeights {
         let (_b_sz, _h, seq_len, _n_embd) = xs.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        hanzo_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
+        hanzo_ml_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
     }
 
     fn forward_attn(
@@ -159,7 +159,7 @@ impl LayerWeights {
                     masked_fill(&att, &mask, &self.neg_inf)?
                 }
             };
-            let att = hanzo_nn::ops::softmax_last_dim(&att)?;
+            let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v)?
         };

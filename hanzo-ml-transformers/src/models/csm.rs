@@ -8,7 +8,7 @@
 ///
 use crate::generation::LogitsProcessor;
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::{embedding, linear_b, Embedding, Linear, RmsNorm, VarBuilder};
+use hanzo_ml_nn::{embedding, linear_b, Embedding, Linear, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
 #[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,8 +137,8 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = hanzo_nn::rotary_emb::rope_i(q, &cos, &sin)?;
-        let k_embed = hanzo_nn::rotary_emb::rope_i(k, &cos, &sin)?;
+        let q_embed = hanzo_ml_nn::rotary_emb::rope_i(q, &cos, &sin)?;
+        let k_embed = hanzo_ml_nn::rotary_emb::rope_i(k, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -234,7 +234,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?
         };
         attn_output

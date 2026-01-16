@@ -436,7 +436,7 @@ fn flash_compatible_attention(
     let k = k.transpose(1, 2)?.flatten_to(rank - 3)?;
     let v = v.transpose(1, 2)?.flatten_to(rank - 3)?;
     let attn_weights = (q.matmul(&k.t()?)? * softmax_scale as f64)?;
-    let attn_scores = hanzo_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?;
+    let attn_scores = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?;
     attn_scores.reshape(q_dims_for_matmul)?.transpose(1, 2)
 }
 

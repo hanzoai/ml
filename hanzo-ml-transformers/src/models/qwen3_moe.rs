@@ -3,7 +3,7 @@ use crate::models::{
     with_tracing::{linear_no_bias, Linear, RmsNorm},
 };
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_nn::{Activation, VarBuilder};
+use hanzo_ml_nn::{Activation, VarBuilder};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -122,7 +122,7 @@ impl Module for Qwen3SparseMoeBlock {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
         let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = hanzo_nn::ops::softmax_last_dim(&router_logits)?;
+        let routing_weights = hanzo_ml_nn::ops::softmax_last_dim(&router_logits)?;
 
         // Extract topk experts per token
         let experts_per_tok = routing_weights
@@ -244,7 +244,7 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: hanzo_nn::Embedding,
+    embed_tokens: hanzo_ml_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     device: Device,
@@ -254,7 +254,7 @@ pub struct Model {
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
-            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(
             vb.dtype(),
             &cfg.into(),

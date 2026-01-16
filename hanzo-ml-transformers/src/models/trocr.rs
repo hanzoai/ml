@@ -16,7 +16,7 @@
 
 use crate::models::vit::{Config, Embeddings, Encoder};
 use hanzo_ml::{DType, Result, Tensor};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     embedding, layer_norm, linear_no_bias, Embedding, LayerNorm, Linear, Module, VarBuilder,
 };
 
@@ -35,7 +35,7 @@ pub struct TrOCRConfig {
     pub decoder_layers: usize,
     pub decoder_attention_heads: usize,
     pub decoder_ffn_dim: usize,
-    pub activation_function: hanzo_nn::Activation,
+    pub activation_function: hanzo_ml_nn::Activation,
     pub max_position_embeddings: usize,
     pub dropout: f64,
     pub attention_dropout: f64,
@@ -64,7 +64,7 @@ impl Default for TrOCRConfig {
             decoder_layers: 12,
             decoder_attention_heads: 16,
             decoder_ffn_dim: 4096,
-            activation_function: hanzo_nn::Activation::Gelu,
+            activation_function: hanzo_ml_nn::Activation::Gelu,
             max_position_embeddings: 512,
             dropout: 0.1,
             attention_dropout: 0.0,
@@ -245,7 +245,7 @@ impl TrOCRAttention {
             None => attn_weights,
             Some(attn_mask) => attn_weights.broadcast_add(attn_mask)?,
         };
-        let attn_probs = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_probs = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_probs.matmul(&value_states)?;
         attn_output
             .reshape((b_sz, self.num_heads, tgt_len, self.head_dim))?
@@ -258,7 +258,7 @@ impl TrOCRAttention {
 #[derive(Debug, Clone)]
 struct TrOCRDecoderLayer {
     self_attn: TrOCRAttention,
-    activation_fn: hanzo_nn::Activation,
+    activation_fn: hanzo_ml_nn::Activation,
     self_attn_layer_norm: LayerNorm,
     encoder_attn: TrOCRAttention,
     encoder_attn_layer_norm: LayerNorm,
@@ -440,9 +440,9 @@ impl TrOCRForCausalLM {
     pub fn new(decoder_cfg: &TrOCRConfig, vb: VarBuilder) -> Result<Self> {
         let decoder = TrOCRDecoder::new(decoder_cfg, vb.clone())?;
         let output_projection = if decoder_cfg.tie_word_embeddings {
-            hanzo_nn::Linear::new(decoder.embed_tokens.embeddings().clone(), None)
+            hanzo_ml_nn::Linear::new(decoder.embed_tokens.embeddings().clone(), None)
         } else {
-            hanzo_nn::linear_no_bias(
+            hanzo_ml_nn::linear_no_bias(
                 decoder_cfg.d_model,
                 decoder_cfg.vocab_size,
                 vb.pp("decoder.output_projection"),

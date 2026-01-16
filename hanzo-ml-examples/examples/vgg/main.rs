@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use hanzo_ml::{DType, IndexOp, D};
-use hanzo_nn::{ModuleT, VarBuilder};
+use hanzo_ml_nn::{ModuleT, VarBuilder};
 use hanzo_transformers::models::vgg::{Models, Vgg};
 use clap::{Parser, ValueEnum};
 
@@ -55,7 +55,7 @@ pub fn main() -> anyhow::Result<()> {
     };
     let logits = model.forward_t(&image, /*train=*/ false)?;
 
-    let prs = hanzo_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = hanzo_ml_nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
 

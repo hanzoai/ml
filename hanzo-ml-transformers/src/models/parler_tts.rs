@@ -18,7 +18,7 @@
 use crate::generation::LogitsProcessor;
 use crate::models::t5;
 use hanzo_ml::{IndexOp, Result, Tensor};
-use hanzo_nn::{layer_norm, linear_b as linear, Activation, LayerNorm, Linear, VarBuilder};
+use hanzo_ml_nn::{layer_norm, linear_b as linear, Activation, LayerNorm, Linear, VarBuilder};
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct DecoderConfig {
@@ -147,7 +147,7 @@ impl Attention {
             None => attn_weights,
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
-        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&value_states)?;
         attn_output
             .transpose(1, 2)?
@@ -237,7 +237,7 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Decoder {
-    embed_tokens: Vec<hanzo_nn::Embedding>,
+    embed_tokens: Vec<hanzo_ml_nn::Embedding>,
     embed_positions: Tensor,
     layers: Vec<DecoderLayer>,
     layer_norm: LayerNorm,
@@ -253,7 +253,7 @@ impl Decoder {
         let mut embed_tokens = Vec::with_capacity(cfg.num_codebooks);
         let vb_e = vb_d.pp("embed_tokens");
         for embed_idx in 0..cfg.num_codebooks {
-            let e = hanzo_nn::embedding(cfg.vocab_size + 1, cfg.hidden_size, vb_e.pp(embed_idx))?;
+            let e = hanzo_ml_nn::embedding(cfg.vocab_size + 1, cfg.hidden_size, vb_e.pp(embed_idx))?;
             embed_tokens.push(e)
         }
         let embed_positions = vb_d.get(
@@ -337,7 +337,7 @@ impl Decoder {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    pub embed_prompts: hanzo_nn::Embedding,
+    pub embed_prompts: hanzo_ml_nn::Embedding,
     pub enc_to_dec_proj: Option<Linear>,
     pub decoder: Decoder,
     pub text_encoder: t5::T5EncoderModel,
@@ -350,7 +350,7 @@ impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let text_encoder = t5::T5EncoderModel::load(vb.pp("text_encoder"), &cfg.text_encoder)?;
         let decoder = Decoder::new(&cfg.decoder, vb.pp("decoder"))?;
-        let embed_prompts = hanzo_nn::embedding(
+        let embed_prompts = hanzo_ml_nn::embedding(
             cfg.vocab_size,
             cfg.decoder.hidden_size,
             vb.pp("embed_prompts"),
