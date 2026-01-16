@@ -79,7 +79,7 @@ impl XLMRobertaEmbeddings {
                         .to_dtype(input_embeddings.dtype())?
                         .to_device(input_embeddings.device())?,
                 )?
-                .to_dtype(hanzo::DType::U32)?;
+                .to_dtype(hanzo_ml_core::DType::U32)?;
             embeddings = embeddings.broadcast_add(&position_embeddings.forward(&position_ids)?)?;
         }
         let embeddings = self.layer_norm.forward(&embeddings)?;

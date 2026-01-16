@@ -156,7 +156,7 @@ impl Embeddings {
         let embeddings = self.patch_embeddings.forward(pixel_values)?;
         let embeddings = match (bool_masked_pos, &self.mask_token) {
             (None, _) => embeddings,
-            (Some(_), None) => hanzo::bail!("bool_masked_pos set without mask_token"),
+            (Some(_), None) => hanzo_ml_core::bail!("bool_masked_pos set without mask_token"),
             (Some(bool_masked_pos), Some(mask_tokens)) => {
                 let seq_len = embeddings.dim(1)?;
                 let mask_tokens = mask_tokens.broadcast_as((b_size, seq_len, self.hidden_size))?;

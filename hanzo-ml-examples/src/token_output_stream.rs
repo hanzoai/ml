@@ -26,7 +26,7 @@ impl TokenOutputStream {
     fn decode(&self, tokens: &[u32]) -> Result<String> {
         match self.tokenizer.decode(tokens, true) {
             Ok(str) => Ok(str),
-            Err(err) => hanzo::bail!("cannot decode: {err}"),
+            Err(err) => hanzo_ml_core::bail!("cannot decode: {err}"),
         }
     }
 

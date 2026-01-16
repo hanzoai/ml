@@ -34,7 +34,7 @@ pub struct SeaNetResnetBlock {
     block: Vec<StreamableConv1d>,
     shortcut: Option<StreamableConv1d>,
     activation: hanzo_nn::Activation,
-    skip_op: hanzo::StreamingBinOp,
+    skip_op: hanzo_ml_core::StreamingBinOp,
     span: tracing::Span,
 }
 
@@ -98,7 +98,7 @@ impl SeaNetResnetBlock {
             block,
             shortcut,
             activation,
-            skip_op: streaming::StreamingBinOp::new(streaming::BinOp::Add, hanzo::D::Minus1),
+            skip_op: streaming::StreamingBinOp::new(streaming::BinOp::Add, hanzo_ml_core::D::Minus1),
             span: tracing::span!(tracing::Level::TRACE, "sea-resnet"),
         })
     }
@@ -159,7 +159,7 @@ pub struct SeaNetEncoder {
 impl SeaNetEncoder {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         if cfg.lstm > 0 {
-            hanzo::bail!("seanet lstm is not supported")
+            hanzo_ml_core::bail!("seanet lstm is not supported")
         }
         let n_blocks = 2 + cfg.ratios.len();
         let mut mult = 1usize;
@@ -317,7 +317,7 @@ pub struct SeaNetDecoder {
 impl SeaNetDecoder {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         if cfg.lstm > 0 {
-            hanzo::bail!("seanet lstm is not supported")
+            hanzo_ml_core::bail!("seanet lstm is not supported")
         }
         let n_blocks = 2 + cfg.ratios.len();
         let mut mult = 1 << cfg.ratios.len();

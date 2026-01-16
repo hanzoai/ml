@@ -56,7 +56,7 @@ fn main() -> Result<()> {
 
     let codes = match args.action {
         Action::CodeToAudio => {
-            let codes = hanzo::safetensors::load(args.in_file, &device)?;
+            let codes = hanzo_ml_core::safetensors::load(args.in_file, &device)?;
             codes.get("codes").expect("no codes in input file").clone()
         }
         Action::AudioToCode | Action::AudioToAudio => {

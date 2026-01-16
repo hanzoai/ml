@@ -371,7 +371,7 @@ impl EdmDpmMultistepScheduler {
         let v = sample
             .abs()?
             .reshape((shape[0], shape[1] * shape[2..].iter().product::<usize>()))?
-            .to_dtype(hanzo::DType::F64)?
+            .to_dtype(hanzo_ml_core::DType::F64)?
             .to_vec2::<f64>()?;
         let q = stats::Quantile::new(self.config.dynamic_thresholding_ratio)
             .with_samples(v.into_iter().flatten());

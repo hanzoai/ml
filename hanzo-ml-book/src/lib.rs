@@ -20,7 +20,7 @@ let repo = api.model("bert-base-uncased".to_string());
 
 let weights_filename = repo.get("model.safetensors").await.unwrap();
 
-let weights = hanzo::safetensors::load(weights_filename, &Device::Cpu).unwrap();
+let weights = hanzo_ml_core::safetensors::load(weights_filename, &Device::Cpu).unwrap();
 // ANCHOR_END: book_hub_1
         assert_eq!(weights.len(), 206);
     }
@@ -41,7 +41,7 @@ let weights_filename = repo.get("model.safetensors").unwrap();
 
 let file = fs::File::open(weights_filename).unwrap();
 let mmap = unsafe { Mmap::map(&file).unwrap() };
-let weights = hanzo::safetensors::load_buffer(&mmap[..], &Device::Cpu).unwrap();
+let weights = hanzo_ml_core::safetensors::load_buffer(&mmap[..], &Device::Cpu).unwrap();
 // ANCHOR_END: book_hub_2
         assert_eq!(weights.len(), 206);
     }

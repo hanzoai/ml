@@ -161,7 +161,7 @@ pub fn main() -> Result<()> {
 
         let original_image = image::ImageReader::open(&image_name)?
             .decode()
-            .map_err(hanzo::Error::wrap)?;
+            .map_err(hanzo_ml_core::Error::wrap)?;
         let image = {
             let data = original_image
                 .resize_exact(

@@ -12,7 +12,7 @@ pub struct Model {
 }
 
 impl Model {
-    fn process(&mut self, tokens: &[u32]) -> hanzo::Result<String> {
+    fn process(&mut self, tokens: &[u32]) -> hanzo_ml_core::Result<String> {
         const REPEAT_LAST_N: usize = 64;
         let dev = Device::Cpu;
         let input = Tensor::new(tokens, &dev)?.unsqueeze(0)?;

@@ -17,7 +17,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use ::hanzo::{quantized::QTensor, DType, Device, Module, Tensor, WithDType};
+use ::hanzo_ml_core::{quantized::QTensor, DType, Device, Module, Tensor, WithDType};
 
 mod utils;
 use utils::wrap_err;
@@ -159,33 +159,33 @@ pydtype!(bf16, f32::from);
 pydtype!(f32, |v| v);
 pydtype!(f64, |v| v);
 
-fn actual_index(t: &Tensor, dim: usize, index: i64) -> ::hanzo::Result<usize> {
+fn actual_index(t: &Tensor, dim: usize, index: i64) -> ::hanzo_ml_core::Result<usize> {
     let dim = t.dim(dim)?;
     if 0 <= index {
         let index = index as usize;
         if dim <= index {
-            ::hanzo::bail!("index {index} is too large for tensor dimension {dim}")
+            ::hanzo_ml_core::bail!("index {index} is too large for tensor dimension {dim}")
         }
         Ok(index)
     } else {
         if (dim as i64) < -index {
-            ::hanzo::bail!("index {index} is too low for tensor dimension {dim}")
+            ::hanzo_ml_core::bail!("index {index} is too low for tensor dimension {dim}")
         }
         Ok((dim as i64 + index) as usize)
     }
 }
 
-fn actual_dim(t: &Tensor, dim: i64) -> ::hanzo::Result<usize> {
+fn actual_dim(t: &Tensor, dim: i64) -> ::hanzo_ml_core::Result<usize> {
     let rank = t.rank();
     if 0 <= dim {
         let dim = dim as usize;
         if rank <= dim {
-            ::hanzo::bail!("dimension index {dim} is too large for tensor rank {rank}")
+            ::hanzo_ml_core::bail!("dimension index {dim} is too large for tensor rank {rank}")
         }
         Ok(dim)
     } else {
         if (rank as i64) < -dim {
-            ::hanzo::bail!("dimension index {dim} is too low for tensor rank {rank}")
+            ::hanzo_ml_core::bail!("dimension index {dim} is too low for tensor rank {rank}")
         }
         Ok((rank as i64 + dim) as usize)
     }
@@ -1075,7 +1075,7 @@ impl PyTensor {
     /// Quantize the tensor.
     /// &RETURNS&: QTensor
     fn quantize(&self, quantized_dtype: &str) -> PyResult<PyQTensor> {
-        use ::hanzo::quantized;
+        use ::hanzo_ml_core::quantized;
         let res = match quantized_dtype.to_lowercase().as_str() {
             "q2k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q2K),
             "q3k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q3K),
@@ -1246,7 +1246,7 @@ impl PyQTensor {
     /// Performs a quantized matrix multiplication, with the quantized tensor as the right hand side.
     /// &RETURNS&: Tensor
     fn matmul_t(&self, lhs: &PyTensor) -> PyResult<PyTensor> {
-        let qmatmul = ::hanzo::quantized::QMatMul::from_arc(self.0.clone()).map_err(wrap_err)?;
+        let qmatmul = ::hanzo_ml_core::quantized::QMatMul::from_arc(self.0.clone()).map_err(wrap_err)?;
         let res = qmatmul.forward(lhs).map_err(wrap_err)?;
         Ok(PyTensor(res))
     }
@@ -1257,7 +1257,7 @@ impl PyQTensor {
 /// Loads a safetensors file. Returns a dictionary mapping tensor names to tensors.
 /// &RETURNS&: Dict[str,Tensor]
 fn load_safetensors(path: &str, py: Python<'_>) -> PyResult<PyObject> {
-    let res = ::hanzo::safetensors::load(path, &Device::Cpu).map_err(wrap_err)?;
+    let res = ::hanzo_ml_core::safetensors::load(path, &Device::Cpu).map_err(wrap_err)?;
     let res = res
         .into_iter()
         .map(|(key, value)| (key, PyTensor(value).into_py(py)))
@@ -1277,7 +1277,7 @@ fn save_safetensors(
         .into_iter()
         .map(|(s, t)| (s, t.0))
         .collect::<std::collections::HashMap<_, _>>();
-    ::hanzo::safetensors::save(&tensors, path).map_err(wrap_err)
+    ::hanzo_ml_core::safetensors::save(&tensors, path).map_err(wrap_err)
 }
 
 #[pyfunction]
@@ -1293,12 +1293,12 @@ fn load_ggml(
     let mut file = std::fs::File::open(path)?;
     let device = device.unwrap_or(PyDevice::Cpu).as_device()?;
     let ggml =
-        ::hanzo::quantized::ggml_file::Content::read(&mut file, &device).map_err(wrap_err)?;
+        ::hanzo_ml_core::quantized::ggml_file::Content::read(&mut file, &device).map_err(wrap_err)?;
     let tensors = ggml
         .tensors
         .into_iter()
         .map(|(key, qtensor)| Ok((key, PyQTensor(Arc::new(qtensor)).into_py(py))))
-        .collect::<::hanzo::Result<Vec<_>>>()
+        .collect::<::hanzo_ml_core::Result<Vec<_>>>()
         .map_err(wrap_err)?;
     let tensors = tensors.into_py_dict_bound(py).to_object(py);
     let hparams = [
@@ -1332,7 +1332,7 @@ fn load_gguf(
     py: Python<'_>,
 ) -> PyResult<(PyObject, PyObject)> {
     let device = device.unwrap_or(PyDevice::Cpu).as_device()?;
-    use ::hanzo::quantized::gguf_file;
+    use ::hanzo_ml_core::quantized::gguf_file;
     fn gguf_value_to_pyobject(v: &gguf_file::Value, py: Python<'_>) -> PyResult<PyObject> {
         let v: PyObject = match v {
             gguf_file::Value::U8(x) => x.into_py(py),
@@ -1366,7 +1366,7 @@ fn load_gguf(
             let qtensor = gguf.tensor(&mut file, key, &device)?;
             Ok((key, PyQTensor(Arc::new(qtensor)).into_py(py)))
         })
-        .collect::<::hanzo::Result<Vec<_>>>()
+        .collect::<::hanzo_ml_core::Result<Vec<_>>>()
         .map_err(wrap_err)?;
     let tensors = tensors.into_py_dict_bound(py).to_object(py);
     let metadata = gguf
@@ -1385,7 +1385,7 @@ fn load_gguf(
 )]
 /// Save quanitzed tensors and metadata to a GGUF file.
 fn save_gguf(path: &str, tensors: PyObject, metadata: PyObject, py: Python<'_>) -> PyResult<()> {
-    use ::hanzo::quantized::gguf_file;
+    use ::hanzo_ml_core::quantized::gguf_file;
 
     fn pyobject_to_gguf_value(v: &Bound<PyAny>, py: Python<'_>) -> PyResult<gguf_file::Value> {
         let v: gguf_file::Value = if let Ok(x) = v.extract::<u8>() {
@@ -1470,28 +1470,28 @@ fn save_gguf(path: &str, tensors: PyObject, metadata: PyObject, py: Python<'_>) 
 /// Returns true if the 'cuda' backend is available.
 /// &RETURNS&: bool
 fn cuda_is_available() -> bool {
-    ::hanzo::utils::cuda_is_available()
+    ::hanzo_ml_core::utils::cuda_is_available()
 }
 
 #[pyfunction]
 /// Returns true if hanzo was compiled with 'accelerate' support.
 /// &RETURNS&: bool
 fn has_accelerate() -> bool {
-    ::hanzo::utils::has_accelerate()
+    ::hanzo_ml_core::utils::has_accelerate()
 }
 
 #[pyfunction]
 /// Returns true if hanzo was compiled with MKL support.
 /// &RETURNS&: bool
 fn has_mkl() -> bool {
-    ::hanzo::utils::has_mkl()
+    ::hanzo_ml_core::utils::has_mkl()
 }
 
 #[pyfunction]
 /// Returns the number of threads used by the hanzo.
 /// &RETURNS&: int
 fn get_num_threads() -> usize {
-    ::hanzo::utils::get_num_threads()
+    ::hanzo_ml_core::utils::get_num_threads()
 }
 
 fn hanzo_utils(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -77,13 +77,13 @@ impl NormConv1d {
             Some(Norm::WeightNorm) => {
                 conv1d_weight_norm(in_c, out_c, k_size, bias, cfg, vb.pp("conv"))?
             }
-            Some(Norm::SpectralNorm) => hanzo::bail!("SpectralNorm is not supported yet."),
+            Some(Norm::SpectralNorm) => hanzo_ml_core::bail!("SpectralNorm is not supported yet."),
         };
         let norm = match norm {
             None | Some(Norm::WeightNorm) | Some(Norm::SpectralNorm) => None,
             Some(Norm::TimeGroupNorm) => {
                 if causal {
-                    hanzo::bail!("GroupNorm doesn't support causal evaluation.")
+                    hanzo_ml_core::bail!("GroupNorm doesn't support causal evaluation.")
                 }
                 let norm = hanzo_nn::group_norm(1, out_c, 1e-5, vb.pp("norm"))?;
                 Some(norm)
@@ -150,7 +150,7 @@ impl NormConvTranspose1d {
                     weight_v.broadcast_mul(&weight_g)?.broadcast_div(&norm_v)?
                 }
             }
-            Some(Norm::SpectralNorm) => hanzo::bail!("SpectralNorm is not supported yet."),
+            Some(Norm::SpectralNorm) => hanzo_ml_core::bail!("SpectralNorm is not supported yet."),
         };
         let (ws, groups) = if groups == out_c && in_c == out_c {
             let eye = Tensor::eye(out_c, ws.dtype(), ws.device())?;
@@ -165,7 +165,7 @@ impl NormConvTranspose1d {
             None | Some(Norm::WeightNorm) | Some(Norm::SpectralNorm) => None,
             Some(Norm::TimeGroupNorm) => {
                 if causal {
-                    hanzo::bail!("GroupNorm doesn't support causal evaluation.")
+                    hanzo_ml_core::bail!("GroupNorm doesn't support causal evaluation.")
                 }
                 let norm = hanzo_nn::group_norm(1, out_c, 1e-5, vb.pp("norm"))?;
                 Some(norm)
@@ -223,7 +223,7 @@ fn get_extra_padding_for_conv1d(
 fn pad1d(xs: &Tensor, pad_l: usize, pad_r: usize, mode: PadMode) -> Result<Tensor> {
     match mode {
         PadMode::Constant => xs.pad_with_zeros(D::Minus1, pad_l, pad_r),
-        PadMode::Reflect => hanzo::bail!("pad-mode 'reflect' is not supported"),
+        PadMode::Reflect => hanzo_ml_core::bail!("pad-mode 'reflect' is not supported"),
         PadMode::Replicate => xs.pad_with_same(D::Minus1, pad_l, pad_r),
     }
 }
@@ -231,7 +231,7 @@ fn pad1d(xs: &Tensor, pad_l: usize, pad_r: usize, mode: PadMode) -> Result<Tenso
 fn unpad1d(xs: &Tensor, unpad_l: usize, unpad_r: usize) -> Result<Tensor> {
     let len = xs.dim(D::Minus1)?;
     if len < unpad_l + unpad_r {
-        hanzo::bail!("unpad1d: tensor len {len} is too low, {unpad_l} + {unpad_r}")
+        hanzo_ml_core::bail!("unpad1d: tensor len {len} is too low, {unpad_l} + {unpad_r}")
     }
     xs.narrow(D::Minus1, unpad_l, len - (unpad_l + unpad_r))
 }
@@ -271,7 +271,7 @@ impl StreamableConv1d {
         };
         let conv = NormConv1d::new(in_c, out_c, k_size, causal, norm, bias, cfg, vb)?;
         if k_size < stride {
-            hanzo::bail!("kernel-size {k_size} is smaller than stride {stride}")
+            hanzo_ml_core::bail!("kernel-size {k_size} is smaller than stride {stride}")
         }
         Ok(Self {
             conv,
@@ -462,7 +462,7 @@ impl ConvDownsample1d {
         vb: VarBuilder,
     ) -> Result<Self> {
         if !learnt {
-            hanzo::bail!("only learnt=true is supported")
+            hanzo_ml_core::bail!("only learnt=true is supported")
         }
         let conv = StreamableConv1d::new(
             /* in_c */ dim,
@@ -511,7 +511,7 @@ impl ConvTrUpsample1d {
         vb: VarBuilder,
     ) -> Result<Self> {
         if !learnt {
-            hanzo::bail!("only learnt=true is supported")
+            hanzo_ml_core::bail!("only learnt=true is supported")
         }
         let convtr = StreamableConvTranspose1d::new(
             dim,
@@ -558,9 +558,9 @@ mod tests {
         bias: bool,
     ) -> Result<()> {
         // TODO: We should ensure for the seed to be constant when running these tests.
-        let dev = &hanzo::Device::Cpu;
+        let dev = &hanzo_ml_core::Device::Cpu;
         let vm = hanzo_nn::VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, hanzo::DType::F32, dev);
+        let vb = VarBuilder::from_varmap(&vm, hanzo_ml_core::DType::F32, dev);
         let conv1d = StreamableConv1d::new(
             /* in_c */ 2,
             /* out_c */ 3,
@@ -595,7 +595,7 @@ mod tests {
             println!("{xs}");
             println!("{ys}");
             println!("{ys_steps}");
-            hanzo::bail!("larger diff than expected {diff}")
+            hanzo_ml_core::bail!("larger diff than expected {diff}")
         }
         Ok(())
     }
@@ -608,9 +608,9 @@ mod tests {
         bias: bool,
     ) -> Result<()> {
         // TODO: We should ensure for the seed to be constant when running these tests.
-        let dev = &hanzo::Device::Cpu;
+        let dev = &hanzo_ml_core::Device::Cpu;
         let vm = hanzo_nn::VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, hanzo::DType::F32, dev);
+        let vb = VarBuilder::from_varmap(&vm, hanzo_ml_core::DType::F32, dev);
         let conv1d = StreamableConvTranspose1d::new(
             /* in_c */ 2, /* out_c */ 3, /* k_size */ k_size,
             /* stride */ stride, /* groups */ 1, /* bias */ bias,
@@ -637,7 +637,7 @@ mod tests {
             println!("{xs}");
             println!("{ys}");
             println!("{ys_steps}");
-            hanzo::bail!("larger diff than expected {diff}")
+            hanzo_ml_core::bail!("larger diff than expected {diff}")
         }
         Ok(())
     }

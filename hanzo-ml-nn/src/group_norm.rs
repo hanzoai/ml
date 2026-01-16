@@ -22,7 +22,7 @@ impl GroupNorm {
         eps: f64,
     ) -> Result<Self> {
         if num_channels % num_groups != 0 {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "GroupNorm: num_groups ({num_groups}) must divide num_channels ({num_channels})"
             )
         }
@@ -40,12 +40,12 @@ impl crate::Module for GroupNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x_shape = x.dims();
         if x_shape.len() <= 2 {
-            hanzo::bail!("input rank for GroupNorm should be at least 3");
+            hanzo_ml_core::bail!("input rank for GroupNorm should be at least 3");
         }
         let (b_sz, n_channels) = (x_shape[0], x_shape[1]);
         let hidden_size = x_shape[2..].iter().product::<usize>() * n_channels / self.num_groups;
         if n_channels != self.num_channels {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "unexpected num-channels in GroupNorm ({n_channels} <> {}",
                 self.num_channels
             )

@@ -43,13 +43,13 @@ impl CustomOp1 for NonZero {
             return Err(Error::RequiresContiguous { op: "nonzero" });
         }
         let result = match storage {
-            hanzo::CpuStorage::U8(vs) => self.nonzero(vs, layout),
-            hanzo::CpuStorage::U32(vs) => self.nonzero(vs, layout),
-            hanzo::CpuStorage::I64(vs) => self.nonzero(vs, layout),
-            hanzo::CpuStorage::BF16(vs) => self.nonzero(vs, layout),
-            hanzo::CpuStorage::F16(vs) => self.nonzero(vs, layout),
-            hanzo::CpuStorage::F32(vs) => self.nonzero(vs, layout),
-            hanzo::CpuStorage::F64(vs) => self.nonzero(vs, layout),
+            hanzo_ml_core::CpuStorage::U8(vs) => self.nonzero(vs, layout),
+            hanzo_ml_core::CpuStorage::U32(vs) => self.nonzero(vs, layout),
+            hanzo_ml_core::CpuStorage::I64(vs) => self.nonzero(vs, layout),
+            hanzo_ml_core::CpuStorage::BF16(vs) => self.nonzero(vs, layout),
+            hanzo_ml_core::CpuStorage::F16(vs) => self.nonzero(vs, layout),
+            hanzo_ml_core::CpuStorage::F32(vs) => self.nonzero(vs, layout),
+            hanzo_ml_core::CpuStorage::F64(vs) => self.nonzero(vs, layout),
         };
         let index_len = layout.dims().len();
         let result_len = result.len() / index_len;
@@ -66,10 +66,10 @@ pub trait NonZeroOp {
 impl NonZeroOp for Tensor {
     fn nonzero(&self) -> Result<Tensor> {
         if !self.is_contiguous() {
-            return Err(hanzo::Error::RequiresContiguous { op: "nonzero" });
+            return Err(hanzo_ml_core::Error::RequiresContiguous { op: "nonzero" });
         }
         let original_device = self.device();
-        self.to_device(&hanzo::Device::Cpu)?
+        self.to_device(&hanzo_ml_core::Device::Cpu)?
             .apply_op1_no_bwd(&NonZero {})?
             .to_device(original_device)
     }
@@ -434,7 +434,7 @@ impl DeepSeekV2RotaryEmbedding {
             Some(DeepSeekV2RopeScaling::LinearOrDynamic {
                 scaling_type: _,
                 factor: _,
-            }) => hanzo::bail!("linear and dynamic rope are not implemented yet!"),
+            }) => hanzo_ml_core::bail!("linear and dynamic rope are not implemented yet!"),
             Some(DeepSeekV2RopeScaling::Yarn {
                 original_max_position_embeddings,
                 beta_fast,

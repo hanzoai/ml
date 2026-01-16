@@ -26,7 +26,7 @@ impl Dataset {
             }
         }
         if bin_files.len() < 2 {
-            hanzo::bail!("found less than two bin files in {:?}", dir)
+            hanzo_ml_core::bail!("found less than two bin files in {:?}", dir)
         }
         bin_files.sort();
         let valid_tokens = mmap_file(&bin_files[0])?;
@@ -117,6 +117,6 @@ impl Iterator for DatasetRandomIter<'_> {
         let tokens = tokens.into_iter().map(|v| v as u32).collect::<Vec<_>>();
         let inputs = Tensor::new(&tokens[..seq_len], &self.device);
         let targets = Tensor::new(&tokens[1..], &self.device);
-        Some(hanzo::error::zip(inputs, targets))
+        Some(hanzo_ml_core::error::zip(inputs, targets))
     }
 }

@@ -37,7 +37,7 @@ impl HiddenActLayer {
 }
 
 impl Module for HiddenActLayer {
-    fn forward(&self, xs: &Tensor) -> hanzo::Result<Tensor> {
+    fn forward(&self, xs: &Tensor) -> hanzo_ml_core::Result<Tensor> {
         let _enter = self.span.enter();
         match self.act {
             // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/activations.py#L213
@@ -186,7 +186,7 @@ impl MultiHeadSelfAttention {
         let mask = attention_mask.broadcast_as(scores.shape())?;
 
         let scores = masked_fill(&scores.to_dtype(DType::F32)?, &mask, f32::NEG_INFINITY)?;
-        let weights = hanzo_nn::ops::softmax(&scores, hanzo::D::Minus1)?;
+        let weights = hanzo_nn::ops::softmax(&scores, hanzo_ml_core::D::Minus1)?;
 
         let context = weights.matmul(&v.contiguous()?)?;
         let context = context

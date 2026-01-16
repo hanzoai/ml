@@ -11,7 +11,7 @@ use rayon::prelude::*;
 #[derive(Debug, Clone)]
 struct RotaryEmbI;
 
-impl hanzo::CustomOp3 for RotaryEmbI {
+impl hanzo_ml_core::CustomOp3 for RotaryEmbI {
     fn name(&self) -> &'static str {
         "rotary-emb-int"
     }
@@ -25,7 +25,7 @@ impl hanzo::CustomOp3 for RotaryEmbI {
         s3: &CpuStorage,
         l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        fn inner<T: hanzo::WithDType + num_traits::Float>(
+        fn inner<T: hanzo_ml_core::WithDType + num_traits::Float>(
             src: &[T],
             l_src: &Layout,
             cos: &[T],
@@ -34,15 +34,15 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             l_sin: &Layout,
         ) -> Result<(CpuStorage, Shape)> {
             let src = match l_src.contiguous_offsets() {
-                None => hanzo::bail!("input src has to be contiguous"),
+                None => hanzo_ml_core::bail!("input src has to be contiguous"),
                 Some((o1, o2)) => &src[o1..o2],
             };
             let cos = match l_cos.contiguous_offsets() {
-                None => hanzo::bail!("input cos has to be contiguous"),
+                None => hanzo_ml_core::bail!("input cos has to be contiguous"),
                 Some((o1, o2)) => &cos[o1..o2],
             };
             let sin = match l_sin.contiguous_offsets() {
-                None => hanzo::bail!("input sin has to be contiguous"),
+                None => hanzo_ml_core::bail!("input sin has to be contiguous"),
                 Some((o1, o2)) => &sin[o1..o2],
             };
             let (b, h, t, d) = l_src.shape().dims4()?;
@@ -65,7 +65,7 @@ impl hanzo::CustomOp3 for RotaryEmbI {
                         dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
                     }
                 });
-            let storage = hanzo::WithDType::to_cpu_storage_owned(dst);
+            let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, (b, h, t, d).into()))
         }
 
@@ -76,7 +76,7 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             (F16(s1), F16(s2), F16(s3)) => inner(s1, l1, s2, l2, s3, l3),
             (F32(s1), F32(s2), F32(s3)) => inner(s1, l1, s2, l2, s3, l3),
             (F64(s1), F64(s2), F64(s3)) => inner(s1, l1, s2, l2, s3, l3),
-            _ => hanzo::bail!(
+            _ => hanzo_ml_core::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),
                 s2.dtype(),
@@ -88,13 +88,13 @@ impl hanzo::CustomOp3 for RotaryEmbI {
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        s1: &hanzo::CudaStorage,
+        s1: &hanzo_ml_core::CudaStorage,
         l1: &Layout,
-        s2: &hanzo::CudaStorage,
+        s2: &hanzo_ml_core::CudaStorage,
         l2: &Layout,
-        s3: &hanzo::CudaStorage,
+        s3: &hanzo_ml_core::CudaStorage,
         l3: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
@@ -111,15 +111,15 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             dev: &CudaDevice,
         ) -> Result<CudaSlice<T>> {
             let src = match l_src.contiguous_offsets() {
-                None => hanzo::bail!("src input has to be contiguous"),
+                None => hanzo_ml_core::bail!("src input has to be contiguous"),
                 Some((o1, o2)) => src.slice(o1..o2),
             };
             let cos = match l_cos.contiguous_offsets() {
-                None => hanzo::bail!("cos input has to be contiguous"),
+                None => hanzo_ml_core::bail!("cos input has to be contiguous"),
                 Some((o1, o2)) => cos.slice(o1..o2),
             };
             let sin = match l_sin.contiguous_offsets() {
-                None => hanzo::bail!("sin input has to be contiguous"),
+                None => hanzo_ml_core::bail!("sin input has to be contiguous"),
                 Some((o1, o2)) => sin.slice(o1..o2),
             };
             let (b, h, t, d) = l_src.shape().dims4()?;
@@ -138,7 +138,7 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             builder.arg(&cos);
             builder.arg(&sin);
             builder.arg(&dst);
-            hanzo::builder_arg!(builder, (b * h) as u32, (t * d) as u32, stride_b);
+            hanzo_ml_core::builder_arg!(builder, (b * h) as u32, (t * d) as u32, stride_b);
             // SAFETY: ffi.
             unsafe { builder.launch(cfg) }.w()?;
             Ok(dst)
@@ -152,14 +152,14 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            _ => hanzo::bail!(
+            _ => hanzo_ml_core::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),
                 s2.dtype(),
                 s3.dtype()
             ),
         };
-        let dst = hanzo::cuda_backend::CudaStorage {
+        let dst = hanzo_ml_core::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
         };
@@ -169,19 +169,19 @@ impl hanzo::CustomOp3 for RotaryEmbI {
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
-        src: &hanzo::MetalStorage,
+        src: &hanzo_ml_core::MetalStorage,
         l_src: &Layout,
-        cos: &hanzo::MetalStorage,
+        cos: &hanzo_ml_core::MetalStorage,
         l_cos: &Layout,
-        sin: &hanzo::MetalStorage,
+        sin: &hanzo_ml_core::MetalStorage,
         l_sin: &Layout,
-    ) -> Result<(hanzo::MetalStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         let device = src.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();
         if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "dtype mismatch in rope-i {:?} {:?} {:?}",
                 src.dtype(),
                 cos.dtype(),
@@ -189,10 +189,10 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             )
         }
         let name = match src.dtype() {
-            hanzo::DType::F32 => "rope_i_f32",
-            hanzo::DType::F16 => "rope_i_f16",
-            hanzo::DType::BF16 => "rope_i_bf16",
-            dtype => hanzo::bail!("rope-i is not implemented for {dtype:?}"),
+            hanzo_ml_core::DType::F32 => "rope_i_f32",
+            hanzo_ml_core::DType::F16 => "rope_i_f16",
+            hanzo_ml_core::DType::BF16 => "rope_i_bf16",
+            dtype => hanzo_ml_core::bail!("rope-i is not implemented for {dtype:?}"),
         };
         let (b, h, t, d) = l_src.shape().dims4()?;
         let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
@@ -218,8 +218,8 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             l_sin.start_offset() * sin.dtype().size_in_bytes(),
             &output,
         )
-        .map_err(hanzo::Error::wrap)?;
-        let out = hanzo::MetalStorage::new(output, device.clone(), el, src.dtype());
+        .map_err(hanzo_ml_core::Error::wrap)?;
+        let out = hanzo_ml_core::MetalStorage::new(output, device.clone(), el, src.dtype());
         Ok((out, l_src.shape().clone()))
     }
 }
@@ -229,11 +229,11 @@ fn rope_check_cs(cs: &Tensor, b_sz: usize) -> Result<(usize, usize)> {
         [t, d] => Ok((t, d)),
         [b, t, d] => {
             if b != b_sz {
-                hanzo::bail!("inconsistent batch size in rope {b_sz} {cs:?}",)
+                hanzo_ml_core::bail!("inconsistent batch size in rope {b_sz} {cs:?}",)
             }
             Ok((t, d))
         }
-        _ => hanzo::bail!("cos/sin has to be 2D or 3D in rope {b_sz} {cs:?}"),
+        _ => hanzo_ml_core::bail!("cos/sin has to be 2D or 3D in rope {b_sz} {cs:?}"),
     }
 }
 
@@ -246,7 +246,7 @@ pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         || seq_len > cos_seq_len
         || seq_len > sin_seq_len
     {
-        hanzo::bail!(
+        hanzo_ml_core::bail!(
             "inconsistent last dim size in rope {:?} {:?} {:?}",
             xs.shape(),
             cos.shape(),
@@ -254,13 +254,13 @@ pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         )
     }
     if !xs.is_contiguous() {
-        hanzo::bail!("xs has to be contiguous in rope")
+        hanzo_ml_core::bail!("xs has to be contiguous in rope")
     }
     if !cos.is_contiguous() {
-        hanzo::bail!("cos has to be contiguous in rope")
+        hanzo_ml_core::bail!("cos has to be contiguous in rope")
     }
     if !sin.is_contiguous() {
-        hanzo::bail!("sin has to be contiguous in rope")
+        hanzo_ml_core::bail!("sin has to be contiguous in rope")
     }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmbI)
 }
@@ -289,7 +289,7 @@ pub fn rope_i_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 #[derive(Debug, Clone)]
 struct RotaryEmb;
 
-impl hanzo::CustomOp3 for RotaryEmb {
+impl hanzo_ml_core::CustomOp3 for RotaryEmb {
     fn name(&self) -> &'static str {
         "rotary-emb"
     }
@@ -303,7 +303,7 @@ impl hanzo::CustomOp3 for RotaryEmb {
         s3: &CpuStorage,
         l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        fn inner<T: hanzo::WithDType + num_traits::Float>(
+        fn inner<T: hanzo_ml_core::WithDType + num_traits::Float>(
             src: &[T],
             l_src: &Layout,
             cos: &[T],
@@ -312,15 +312,15 @@ impl hanzo::CustomOp3 for RotaryEmb {
             l_sin: &Layout,
         ) -> Result<(CpuStorage, Shape)> {
             let src = match l_src.contiguous_offsets() {
-                None => hanzo::bail!("input src has to be contiguous"),
+                None => hanzo_ml_core::bail!("input src has to be contiguous"),
                 Some((o1, o2)) => &src[o1..o2],
             };
             let cos = match l_cos.contiguous_offsets() {
-                None => hanzo::bail!("input cos has to be contiguous"),
+                None => hanzo_ml_core::bail!("input cos has to be contiguous"),
                 Some((o1, o2)) => &cos[o1..o2],
             };
             let sin = match l_sin.contiguous_offsets() {
-                None => hanzo::bail!("input sin has to be contiguous"),
+                None => hanzo_ml_core::bail!("input sin has to be contiguous"),
                 Some((o1, o2)) => &sin[o1..o2],
             };
             let (b, h, t, d) = l_src.shape().dims4()?;
@@ -347,7 +347,7 @@ impl hanzo::CustomOp3 for RotaryEmb {
                         }
                     }
                 });
-            let storage = hanzo::WithDType::to_cpu_storage_owned(dst);
+            let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, (b, h, t, d).into()))
         }
 
@@ -358,7 +358,7 @@ impl hanzo::CustomOp3 for RotaryEmb {
             (F16(s1), F16(s2), F16(s3)) => inner(s1, l1, s2, l2, s3, l3),
             (F32(s1), F32(s2), F32(s3)) => inner(s1, l1, s2, l2, s3, l3),
             (F64(s1), F64(s2), F64(s3)) => inner(s1, l1, s2, l2, s3, l3),
-            _ => hanzo::bail!(
+            _ => hanzo_ml_core::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),
                 s2.dtype(),
@@ -370,13 +370,13 @@ impl hanzo::CustomOp3 for RotaryEmb {
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        s1: &hanzo::CudaStorage,
+        s1: &hanzo_ml_core::CudaStorage,
         l1: &Layout,
-        s2: &hanzo::CudaStorage,
+        s2: &hanzo_ml_core::CudaStorage,
         l2: &Layout,
-        s3: &hanzo::CudaStorage,
+        s3: &hanzo_ml_core::CudaStorage,
         l3: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
@@ -393,15 +393,15 @@ impl hanzo::CustomOp3 for RotaryEmb {
             dev: &CudaDevice,
         ) -> Result<CudaSlice<T>> {
             let src = match l_src.contiguous_offsets() {
-                None => hanzo::bail!("src input has to be contiguous"),
+                None => hanzo_ml_core::bail!("src input has to be contiguous"),
                 Some((o1, o2)) => src.slice(o1..o2),
             };
             let cos = match l_cos.contiguous_offsets() {
-                None => hanzo::bail!("cos input has to be contiguous"),
+                None => hanzo_ml_core::bail!("cos input has to be contiguous"),
                 Some((o1, o2)) => cos.slice(o1..o2),
             };
             let sin = match l_sin.contiguous_offsets() {
-                None => hanzo::bail!("sin input has to be contiguous"),
+                None => hanzo_ml_core::bail!("sin input has to be contiguous"),
                 Some((o1, o2)) => sin.slice(o1..o2),
             };
             let (b, h, t, d) = l_src.shape().dims4()?;
@@ -420,7 +420,7 @@ impl hanzo::CustomOp3 for RotaryEmb {
             builder.arg(&cos);
             builder.arg(&sin);
             builder.arg(&dst);
-            hanzo::builder_arg!(builder, (b * h) as u32, (t * d) as u32, d as u32, stride_b);
+            hanzo_ml_core::builder_arg!(builder, (b * h) as u32, (t * d) as u32, d as u32, stride_b);
             // SAFETY: ffi.
             unsafe { builder.launch(cfg) }.w()?;
             Ok(dst)
@@ -434,14 +434,14 @@ impl hanzo::CustomOp3 for RotaryEmb {
             (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            _ => hanzo::bail!(
+            _ => hanzo_ml_core::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),
                 s2.dtype(),
                 s3.dtype()
             ),
         };
-        let dst = hanzo::cuda_backend::CudaStorage {
+        let dst = hanzo_ml_core::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
         };
@@ -451,19 +451,19 @@ impl hanzo::CustomOp3 for RotaryEmb {
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
-        src: &hanzo::MetalStorage,
+        src: &hanzo_ml_core::MetalStorage,
         l_src: &Layout,
-        cos: &hanzo::MetalStorage,
+        cos: &hanzo_ml_core::MetalStorage,
         l_cos: &Layout,
-        sin: &hanzo::MetalStorage,
+        sin: &hanzo_ml_core::MetalStorage,
         l_sin: &Layout,
-    ) -> Result<(hanzo::MetalStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         let device = src.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();
         if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "dtype mismatch in rope {:?} {:?} {:?}",
                 src.dtype(),
                 cos.dtype(),
@@ -471,10 +471,10 @@ impl hanzo::CustomOp3 for RotaryEmb {
             )
         }
         let name = match src.dtype() {
-            hanzo::DType::F32 => "rope_f32",
-            hanzo::DType::F16 => "rope_f16",
-            hanzo::DType::BF16 => "rope_bf16",
-            dtype => hanzo::bail!("rope is not implemented for {dtype:?}"),
+            hanzo_ml_core::DType::F32 => "rope_f32",
+            hanzo_ml_core::DType::F16 => "rope_f16",
+            hanzo_ml_core::DType::BF16 => "rope_bf16",
+            dtype => hanzo_ml_core::bail!("rope is not implemented for {dtype:?}"),
         };
         let (b, h, t, d) = l_src.shape().dims4()?;
         let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
@@ -501,8 +501,8 @@ impl hanzo::CustomOp3 for RotaryEmb {
             l_sin.start_offset() * sin.dtype().size_in_bytes(),
             &output,
         )
-        .map_err(hanzo::Error::wrap)?;
-        let out = hanzo::MetalStorage::new(output, device.clone(), el, src.dtype());
+        .map_err(hanzo_ml_core::Error::wrap)?;
+        let out = hanzo_ml_core::MetalStorage::new(output, device.clone(), el, src.dtype());
         Ok((out, l_src.shape().clone()))
     }
 }
@@ -516,7 +516,7 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         || seq_len > cos_seq_len
         || seq_len > sin_seq_len
     {
-        hanzo::bail!(
+        hanzo_ml_core::bail!(
             "inconsistent last dim size in rope {:?} {:?} {:?}",
             xs.shape(),
             cos.shape(),
@@ -524,13 +524,13 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         )
     }
     if !xs.is_contiguous() {
-        hanzo::bail!("xs has to be contiguous in rope")
+        hanzo_ml_core::bail!("xs has to be contiguous in rope")
     }
     if !cos.is_contiguous() {
-        hanzo::bail!("cos has to be contiguous in rope")
+        hanzo_ml_core::bail!("cos has to be contiguous in rope")
     }
     if !sin.is_contiguous() {
-        hanzo::bail!("sin has to be contiguous in rope")
+        hanzo_ml_core::bail!("sin has to be contiguous in rope")
     }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
 }
@@ -557,7 +557,7 @@ pub fn rope_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 #[derive(Debug, Clone)]
 struct RotaryEmbThd;
 
-impl hanzo::CustomOp3 for RotaryEmbThd {
+impl hanzo_ml_core::CustomOp3 for RotaryEmbThd {
     fn name(&self) -> &'static str {
         "rotary-emb"
     }
@@ -571,7 +571,7 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
         s3: &CpuStorage,
         l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        fn inner<T: hanzo::WithDType + num_traits::Float>(
+        fn inner<T: hanzo_ml_core::WithDType + num_traits::Float>(
             src: &[T],
             l_src: &Layout,
             cos: &[T],
@@ -580,15 +580,15 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             l_sin: &Layout,
         ) -> Result<(CpuStorage, Shape)> {
             let src = match l_src.contiguous_offsets() {
-                None => hanzo::bail!("input src has to be contiguous"),
+                None => hanzo_ml_core::bail!("input src has to be contiguous"),
                 Some((o1, o2)) => &src[o1..o2],
             };
             let cos = match l_cos.contiguous_offsets() {
-                None => hanzo::bail!("input cos has to be contiguous"),
+                None => hanzo_ml_core::bail!("input cos has to be contiguous"),
                 Some((o1, o2)) => &cos[o1..o2],
             };
             let sin = match l_sin.contiguous_offsets() {
-                None => hanzo::bail!("input sin has to be contiguous"),
+                None => hanzo_ml_core::bail!("input sin has to be contiguous"),
                 Some((o1, o2)) => &sin[o1..o2],
             };
             let (b, t, h, d) = l_src.shape().dims4()?;
@@ -616,7 +616,7 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
                         }
                     }
                 });
-            let storage = hanzo::WithDType::to_cpu_storage_owned(dst);
+            let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, (b, t, h, d).into()))
         }
 
@@ -627,7 +627,7 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             (F16(s1), F16(s2), F16(s3)) => inner(s1, l1, s2, l2, s3, l3),
             (F32(s1), F32(s2), F32(s3)) => inner(s1, l1, s2, l2, s3, l3),
             (F64(s1), F64(s2), F64(s3)) => inner(s1, l1, s2, l2, s3, l3),
-            _ => hanzo::bail!(
+            _ => hanzo_ml_core::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),
                 s2.dtype(),
@@ -639,13 +639,13 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        s1: &hanzo::CudaStorage,
+        s1: &hanzo_ml_core::CudaStorage,
         l1: &Layout,
-        s2: &hanzo::CudaStorage,
+        s2: &hanzo_ml_core::CudaStorage,
         l2: &Layout,
-        s3: &hanzo::CudaStorage,
+        s3: &hanzo_ml_core::CudaStorage,
         l3: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
@@ -662,15 +662,15 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             dev: &CudaDevice,
         ) -> Result<CudaSlice<T>> {
             let src = match l_src.contiguous_offsets() {
-                None => hanzo::bail!("src input has to be contiguous"),
+                None => hanzo_ml_core::bail!("src input has to be contiguous"),
                 Some((o1, o2)) => src.slice(o1..o2),
             };
             let cos = match l_cos.contiguous_offsets() {
-                None => hanzo::bail!("cos input has to be contiguous"),
+                None => hanzo_ml_core::bail!("cos input has to be contiguous"),
                 Some((o1, o2)) => cos.slice(o1..o2),
             };
             let sin = match l_sin.contiguous_offsets() {
-                None => hanzo::bail!("sin input has to be contiguous"),
+                None => hanzo_ml_core::bail!("sin input has to be contiguous"),
                 Some((o1, o2)) => sin.slice(o1..o2),
             };
             let (b, t, h, d) = l_src.shape().dims4()?;
@@ -689,7 +689,7 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             builder.arg(&cos);
             builder.arg(&sin);
             builder.arg(&dst);
-            hanzo::builder_arg!(builder, b as u32, t as u32, h as u32, d as u32, stride_b);
+            hanzo_ml_core::builder_arg!(builder, b as u32, t as u32, h as u32, d as u32, stride_b);
             // SAFETY: ffi.
             unsafe { builder.launch(cfg) }.w()?;
             Ok(dst)
@@ -703,14 +703,14 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            _ => hanzo::bail!(
+            _ => hanzo_ml_core::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),
                 s2.dtype(),
                 s3.dtype()
             ),
         };
-        let dst = hanzo::cuda_backend::CudaStorage {
+        let dst = hanzo_ml_core::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
         };
@@ -720,19 +720,19 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
-        src: &hanzo::MetalStorage,
+        src: &hanzo_ml_core::MetalStorage,
         l_src: &Layout,
-        cos: &hanzo::MetalStorage,
+        cos: &hanzo_ml_core::MetalStorage,
         l_cos: &Layout,
-        sin: &hanzo::MetalStorage,
+        sin: &hanzo_ml_core::MetalStorage,
         l_sin: &Layout,
-    ) -> Result<(hanzo::MetalStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         let device = src.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();
         if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "dtype mismatch in rope {:?} {:?} {:?}",
                 src.dtype(),
                 cos.dtype(),
@@ -740,10 +740,10 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             )
         }
         let name = match src.dtype() {
-            hanzo::DType::F32 => "rope_thd_f32",
-            hanzo::DType::F16 => "rope_thd_f16",
-            hanzo::DType::BF16 => "rope_thd_bf16",
-            dtype => hanzo::bail!("rope_thd is not implemented for {dtype:?}"),
+            hanzo_ml_core::DType::F32 => "rope_thd_f32",
+            hanzo_ml_core::DType::F16 => "rope_thd_f16",
+            hanzo_ml_core::DType::BF16 => "rope_thd_bf16",
+            dtype => hanzo_ml_core::bail!("rope_thd is not implemented for {dtype:?}"),
         };
         let (b, t, h, d) = l_src.shape().dims4()?;
         let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
@@ -771,8 +771,8 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             l_sin.start_offset() * sin.dtype().size_in_bytes(),
             &output,
         )
-        .map_err(hanzo::Error::wrap)?;
-        let out = hanzo::MetalStorage::new(output, device.clone(), el, src.dtype());
+        .map_err(hanzo_ml_core::Error::wrap)?;
+        let out = hanzo_ml_core::MetalStorage::new(output, device.clone(), el, src.dtype());
         Ok((out, l_src.shape().clone()))
     }
 }
@@ -786,7 +786,7 @@ pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         || seq_len > cos_seq_len
         || seq_len > sin_seq_len
     {
-        hanzo::bail!(
+        hanzo_ml_core::bail!(
             "inconsistent last dim size in rope {:?} {:?} {:?}",
             xs.shape(),
             cos.shape(),
@@ -794,13 +794,13 @@ pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         )
     }
     if !xs.is_contiguous() {
-        hanzo::bail!("xs has to be contiguous in rope")
+        hanzo_ml_core::bail!("xs has to be contiguous in rope")
     }
     if !cos.is_contiguous() {
-        hanzo::bail!("cos has to be contiguous in rope")
+        hanzo_ml_core::bail!("cos has to be contiguous in rope")
     }
     if !sin.is_contiguous() {
-        hanzo::bail!("sin has to be contiguous in rope")
+        hanzo_ml_core::bail!("sin has to be contiguous in rope")
     }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmbThd)
 }

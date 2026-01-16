@@ -17,8 +17,8 @@ pub struct VecGymEnv {
     observation_space: Vec<usize>,
 }
 
-fn w(res: PyErr) -> hanzo::Error {
-    hanzo::Error::wrap(res)
+fn w(res: PyErr) -> hanzo_ml_core::Error {
+    hanzo_ml_core::Error::wrap(res)
 }
 
 #[allow(unused)]

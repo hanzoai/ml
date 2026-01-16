@@ -83,7 +83,7 @@ impl RotaryEmbedding {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (_b_size, seqlen, three, _, _headdim) = qkv.dims5()?;
         if three != 3 {
-            hanzo::bail!("unexpected shape for qkv {:?}", qkv.shape())
+            hanzo_ml_core::bail!("unexpected shape for qkv {:?}", qkv.shape())
         }
         let (_rotary_seqlen, rotary_dim) = self.cos.dims2()?;
         let rotary_dim = rotary_dim * 2;

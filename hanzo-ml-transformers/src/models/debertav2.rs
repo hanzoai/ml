@@ -334,7 +334,7 @@ impl DebertaV2DisentangledSelfAttention {
         let vb = vb.clone();
 
         if config.hidden_size % config.num_attention_heads != 0 {
-            return Err(hanzo::Error::Msg(format!(
+            return Err(hanzo_ml_core::Error::Msg(format!(
                 "The hidden size {} is not a multiple of the number of attention heads {}",
                 config.hidden_size, config.num_attention_heads
             )));
@@ -1402,8 +1402,8 @@ pub(crate) fn make_log_bucket_position(
     let gt_neg_mid = relative_pos.gt(-mid as i64)?;
 
     let condition = lt_mid
-        .to_dtype(hanzo::DType::F32)?
-        .mul(&gt_neg_mid.to_dtype(hanzo::DType::F32)?)?
+        .to_dtype(hanzo_ml_core::DType::F32)?
+        .mul(&gt_neg_mid.to_dtype(hanzo_ml_core::DType::F32)?)?
         .to_dtype(DType::U8)?;
 
     let on_true = Tensor::new(&[(mid - 1) as u32], device)?

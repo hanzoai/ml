@@ -115,7 +115,7 @@ impl TransformerWeights {
         // second matrix back. We detect this case here and as a temporary hack make the weight
         // matrix column major rather than row major. This ends up speeding up text generation from
         // 120 token/s to 220 token/s on a Ryzen 2600X.
-        let tr = device.is_cpu() && !hanzo::utils::has_mkl();
+        let tr = device.is_cpu() && !hanzo_ml_core::utils::has_mkl();
         let tr = |x: Tensor| if tr { x.t()?.contiguous()?.t() } else { Ok(x) };
         let mut ws = std::collections::HashMap::new();
         let mut insert = |name: &str, t: Tensor| {

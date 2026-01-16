@@ -57,7 +57,7 @@ const SEP_TOKEN_ID: u32 = 102;
 pub fn load_image<P: AsRef<std::path::Path>>(p: P) -> Result<Tensor> {
     let img = image::ImageReader::open(p)?
         .decode()
-        .map_err(hanzo::Error::wrap)?
+        .map_err(hanzo_ml_core::Error::wrap)?
         .resize_to_fill(384, 384, image::imageops::FilterType::Triangle);
     let img = img.to_rgb8();
     let data = img.into_raw();
@@ -66,7 +66,7 @@ pub fn load_image<P: AsRef<std::path::Path>>(p: P) -> Result<Tensor> {
         Tensor::new(&[0.48145466f32, 0.4578275, 0.40821073], &Device::Cpu)?.reshape((3, 1, 1))?;
     let std = Tensor::new(&[0.26862954f32, 0.261_302_6, 0.275_777_1], &Device::Cpu)?
         .reshape((3, 1, 1))?;
-    (data.to_dtype(hanzo::DType::F32)? / 255.)?
+    (data.to_dtype(hanzo_ml_core::DType::F32)? / 255.)?
         .broadcast_sub(&mean)?
         .broadcast_div(&std)
 }

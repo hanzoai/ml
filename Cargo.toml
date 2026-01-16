@@ -1,11 +1,12 @@
 [workspace]
 members = [
     "hanzo-ml-core",
-    "hanzo-ml-datasets",
+    "hanzo-ml-datasets", 
     "hanzo-ml-examples",
     "hanzo-ml-nn",
     "hanzo-ml-pyo3",
     "hanzo-ml-transformers",
+    "hanzo-ml-inference",
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
     "tensor-tools",
@@ -40,6 +41,7 @@ hanzo-ml-kernels = { path = "./hanzo-ml-kernels", version = "0.9.1" }
 hanzo-ml-metal-kernels = { path = "./hanzo-ml-metal-kernels", version = "0.9.1" }
 hanzo-ml-nn = { path = "./hanzo-ml-nn", version = "0.9.1" }
 hanzo-ml-onnx = { path = "./hanzo-ml-onnx", version = "0.9.1" }
+hanzo-ml-inference = { path = "./hanzo-ml-inference", version = "0.1.0" }
 hanzo-ml-transformers = { path = "./hanzo-ml-transformers", version = "0.9.1" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.5.1", default-features=false }

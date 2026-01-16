@@ -184,7 +184,7 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
-            None => hanzo::bail!("cannot find {s} in metadata"),
+            None => hanzo_ml_core::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 

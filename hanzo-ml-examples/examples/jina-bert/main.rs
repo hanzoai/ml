@@ -160,7 +160,7 @@ fn main() -> anyhow::Result<()> {
                 let tokens = tokens.get_ids().to_vec();
                 Tensor::new(tokens.as_slice(), device)
             })
-            .collect::<hanzo::Result<Vec<_>>>()?;
+            .collect::<hanzo_ml_core::Result<Vec<_>>>()?;
 
         let token_ids = Tensor::stack(&token_ids, 0)?;
         println!("running inference on batch {:?}", token_ids.shape());
@@ -196,6 +196,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn normalize_l2(v: &Tensor) -> hanzo::Result<Tensor> {
+pub fn normalize_l2(v: &Tensor) -> hanzo_ml_core::Result<Tensor> {
     v.broadcast_div(&v.sqr()?.sum_keepdim(1)?.sqrt()?)
 }

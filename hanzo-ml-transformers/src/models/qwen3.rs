@@ -118,7 +118,7 @@ impl Qwen3Attention {
         vb: VarBuilder,
     ) -> Result<Self> {
         if cfg.use_sliding_window {
-            hanzo::bail!("sliding window is not suppored")
+            hanzo_ml_core::bail!("sliding window is not suppored")
         }
 
         let head_dim = cfg.head_dim;

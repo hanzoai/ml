@@ -7,37 +7,37 @@ use hanzo_nn::{linear, Linear, VarBuilder};
 
 struct CodebookEncode;
 
-impl hanzo::CustomOp2 for CodebookEncode {
+impl hanzo_ml_core::CustomOp2 for CodebookEncode {
     fn name(&self) -> &'static str {
         "cb"
     }
 
     fn cpu_fwd(
         &self,
-        lhs_storage: &hanzo::CpuStorage,
+        lhs_storage: &hanzo_ml_core::CpuStorage,
         lhs_layout: &Layout,
-        rhs_storage: &hanzo::CpuStorage,
+        rhs_storage: &hanzo_ml_core::CpuStorage,
         rhs_layout: &Layout,
-    ) -> Result<(hanzo::CpuStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CpuStorage, Shape)> {
         use rayon::prelude::*;
 
         let (lhs_dim1, lhs_dim2) = lhs_layout.shape().dims2()?;
         let (rhs_dim1, rhs_dim2) = rhs_layout.shape().dims2()?;
         if lhs_dim2 != rhs_dim2 {
-            hanzo::bail!("CodebookEncode, mismatch on last dim, {lhs_layout:?} {rhs_layout:?}");
+            hanzo_ml_core::bail!("CodebookEncode, mismatch on last dim, {lhs_layout:?} {rhs_layout:?}");
         }
         if lhs_dim2 == 0 {
-            hanzo::bail!("CodebookEncode, empty last dim {lhs_layout:?}")
+            hanzo_ml_core::bail!("CodebookEncode, empty last dim {lhs_layout:?}")
         }
         let lhs = match lhs_layout.contiguous_offsets() {
-            None => hanzo::bail!("CodebookEncode, lhs has to be contiguous, got {lhs_layout:?}"),
+            None => hanzo_ml_core::bail!("CodebookEncode, lhs has to be contiguous, got {lhs_layout:?}"),
             Some((o1, o2)) => {
                 let slice = lhs_storage.as_slice::<f32>()?;
                 &slice[o1..o2]
             }
         };
         let rhs = match rhs_layout.contiguous_offsets() {
-            None => hanzo::bail!("CodebookEncode, rhs has to be contiguous, got {rhs_layout:?}"),
+            None => hanzo_ml_core::bail!("CodebookEncode, rhs has to be contiguous, got {rhs_layout:?}"),
             Some((o1, o2)) => {
                 let slice = rhs_storage.as_slice::<f32>()?;
                 &slice[o1..o2]
@@ -63,7 +63,7 @@ impl hanzo::CustomOp2 for CodebookEncode {
                 where_min as u32
             })
             .collect();
-        let storage = hanzo::WithDType::to_cpu_storage_owned(dst);
+        let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
         Ok((storage, (lhs_dim1,).into()))
     }
 }
@@ -237,10 +237,10 @@ impl ResidualVectorQuantization {
 
     pub fn decode(&self, xs: &Tensor) -> Result<Tensor> {
         if self.layers.is_empty() {
-            hanzo::bail!("empty layers in ResidualVectorQuantization")
+            hanzo_ml_core::bail!("empty layers in ResidualVectorQuantization")
         }
         if self.layers.len() != xs.dim(0)? {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "mismatch between the number of layers {} and the code shape {:?}",
                 self.layers.len(),
                 xs.shape()

@@ -34,7 +34,7 @@ impl HiddenActLayer {
         Self { act, span }
     }
 
-    fn forward(&self, xs: &Tensor) -> hanzo::Result<Tensor> {
+    fn forward(&self, xs: &Tensor) -> hanzo_ml_core::Result<Tensor> {
         let _enter = self.span.enter();
         match self.act {
             // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/activations.py#L213
@@ -258,13 +258,13 @@ impl BertSelfAttention {
         let attention_scores = attention_scores.broadcast_add(attention_mask)?;
         let attention_probs = {
             let _enter_sm = self.span_softmax.enter();
-            hanzo_nn::ops::softmax(&attention_scores, hanzo::D::Minus1)?
+            hanzo_nn::ops::softmax(&attention_scores, hanzo_ml_core::D::Minus1)?
         };
         let attention_probs = self.dropout.forward(&attention_probs)?;
 
         let context_layer = attention_probs.matmul(&value_layer)?;
         let context_layer = context_layer.transpose(1, 2)?.contiguous()?;
-        let context_layer = context_layer.flatten_from(hanzo::D::Minus2)?;
+        let context_layer = context_layer.flatten_from(hanzo_ml_core::D::Minus2)?;
         Ok(context_layer)
     }
 }
@@ -516,7 +516,7 @@ fn get_extended_attention_mask(attention_mask: &Tensor, dtype: DType) -> Result<
     let attention_mask = match attention_mask.rank() {
         3 => attention_mask.unsqueeze(1)?,
         2 => attention_mask.unsqueeze(1)?.unsqueeze(1)?,
-        _ => hanzo::bail!("Wrong shape for input_ids or attention_mask"),
+        _ => hanzo_ml_core::bail!("Wrong shape for input_ids or attention_mask"),
     };
     let attention_mask = attention_mask.to_dtype(dtype)?;
     // torch.finfo(dtype).min

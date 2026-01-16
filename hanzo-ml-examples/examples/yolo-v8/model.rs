@@ -65,7 +65,7 @@ impl Upsample {
 }
 
 impl Module for Upsample {
-    fn forward(&self, xs: &Tensor) -> hanzo::Result<Tensor> {
+    fn forward(&self, xs: &Tensor) -> hanzo_ml_core::Result<Tensor> {
         let (_b_size, _channels, h, w) = xs.dims4()?;
         xs.upsample_nearest2d(self.scale_factor * h, self.scale_factor * w)
     }

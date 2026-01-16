@@ -164,7 +164,7 @@ impl Attention {
         if query.dtype() != DType::F32 {
             // If we start supporting f16 models, we may need the upcasting scaling bits.
             // https://github.com/huggingface/transformers/blob/a0042379269bea9182c1f87e6b2eee4ba4c8cce8/src/transformers/models/gpt_bigcode/modeling_gpt_bigcode.py#L133
-            hanzo::bail!("upcasting is not supported {:?}", query.dtype())
+            hanzo_ml_core::bail!("upcasting is not supported {:?}", query.dtype())
         }
         let scale_factor = 1f64 / (self.head_dim as f64).sqrt();
         let initial_query_shape = query.shape();

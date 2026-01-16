@@ -205,7 +205,7 @@ impl Model {
         let data = Tensor::from_vec(data, (378, 378, 3), &Device::Cpu)?.permute((2, 0, 1))?;
         let mean = Tensor::new(&[0.5f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
         let std = Tensor::new(&[0.5f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
-        (data.to_dtype(hanzo::DType::F32)? / 255.)?
+        (data.to_dtype(hanzo_ml_core::DType::F32)? / 255.)?
             .broadcast_sub(&mean)?
             .broadcast_div(&std)
             .map_err(|e| JsError::new(&e.to_string()))

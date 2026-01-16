@@ -211,7 +211,7 @@ impl Sam {
             .broadcast_sub(&self.pixel_mean)?
             .broadcast_div(&self.pixel_std)?;
         if h > IMAGE_SIZE || w > IMAGE_SIZE {
-            hanzo::bail!("image is too large ({w}, {h}), maximum size {IMAGE_SIZE}")
+            hanzo_ml_core::bail!("image is too large ({w}, {h}), maximum size {IMAGE_SIZE}")
         }
         let img = img.pad_with_zeros(1, 0, IMAGE_SIZE - h)?;
         img.pad_with_zeros(2, 0, IMAGE_SIZE - w)

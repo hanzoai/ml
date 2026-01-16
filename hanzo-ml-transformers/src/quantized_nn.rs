@@ -53,7 +53,7 @@ impl Linear {
 }
 
 impl Module for Linear {
-    fn forward(&self, x: &Tensor) -> hanzo::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> hanzo_ml_core::Result<Tensor> {
         let x = x.apply(&self.weight)?;
         match &self.bias {
             None => Ok(x),

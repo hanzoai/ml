@@ -41,7 +41,7 @@ impl Model {
         let image = image::ImageReader::new(image_data)
             .with_guessed_format()?
             .decode()
-            .map_err(hanzo::Error::wrap)?;
+            .map_err(hanzo_ml_core::Error::wrap)?;
         let (original_height, original_width) = (image.height(), image.width());
         let (height, width) = (original_height, original_width);
         let resize_longest = sam::IMAGE_SIZE as u32;

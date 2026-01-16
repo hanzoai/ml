@@ -150,7 +150,7 @@ impl RecurrentBlock {
                 .narrow(D::Minus1, 0, seq_len)?
         } else {
             let conv_state = match self.conv1d_state.as_ref() {
-                None => hanzo::bail!("empty cache despite pos > 0"),
+                None => hanzo_ml_core::bail!("empty cache despite pos > 0"),
                 Some(s) => Tensor::cat(&[s, &x_branch], D::Minus1)?,
             };
             let w = self.conv_1d.weight().i((.., 0, ..))?;
