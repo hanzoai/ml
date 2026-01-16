@@ -9,7 +9,7 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-hanzo = { workspace = true }
+hanzo-ml = { workspace = true }
 hanzo-ml-nn = { workspace = true }
 num-traits = { workspace = true }
 serde = { workspace = true }

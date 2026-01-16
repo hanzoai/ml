@@ -4,7 +4,7 @@
 //!
 //! Based on implementation from [huggingface/transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/encodec/modeling_encodec.py)
 
-use hanzo::{DType, IndexOp, Layout, Module, Result, Shape, Tensor, D};
+use hanzo_ml_core::{DType, IndexOp, Layout, Module, Result, Shape, Tensor, D};
 use hanzo_nn::{conv1d, Conv1d, ConvTranspose1d, VarBuilder};
 
 // Encodec Model

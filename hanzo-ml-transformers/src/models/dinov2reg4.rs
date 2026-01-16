@@ -30,7 +30,7 @@
 //!   <img src="https://bs.plantnet.org/image/o/bd2d3830ac3270218ba82fd24e2290becd01317c" alt="" width=320>
 //! </div>
 //!
-use hanzo::{IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{IndexOp, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
 
 const IMG_SIZE: usize = 518;

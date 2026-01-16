@@ -1,5 +1,5 @@
 //! Embedding Layer.
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 
 #[derive(Clone, Debug)]
 pub struct Embedding {

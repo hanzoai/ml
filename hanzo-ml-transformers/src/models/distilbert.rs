@@ -4,7 +4,7 @@
 //! - ["DistilBERT, a distilled version of BERT: smaller, faster, cheaper and lighter"](https://arxiv.org/abs/1910.01108)
 //!
 use super::with_tracing::{layer_norm, linear, LayerNorm, Linear};
-use hanzo::{DType, Device, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Result, Tensor};
 use hanzo_nn::{Embedding, Module, VarBuilder};
 use serde::Deserialize;
 

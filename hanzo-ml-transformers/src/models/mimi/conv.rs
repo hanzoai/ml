@@ -2,7 +2,7 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 
-use hanzo::{Module, Result, StreamTensor, StreamingModule, Tensor, D};
+use hanzo_ml_core::{Module, Result, StreamTensor, StreamingModule, Tensor, D};
 use hanzo_nn::{Conv1d, VarBuilder};
 
 #[allow(clippy::enum_variant_names)]
@@ -547,7 +547,7 @@ impl StreamingModule for ConvTrUpsample1d {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hanzo::IndexOp;
+    use hanzo_ml_core::IndexOp;
 
     fn run_conv1d(
         k_size: usize,

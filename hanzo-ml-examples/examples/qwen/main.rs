@@ -12,7 +12,7 @@ use hanzo_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelM
 use hanzo_transformers::models::qwen3::{Config as Config3, ModelForCausalLM as Model3};
 use hanzo_transformers::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3};
 
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;

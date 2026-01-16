@@ -18,7 +18,7 @@
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_nn::{layer_norm, linear, Embedding, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo::{Module, Result, Tensor, D};
+use hanzo_ml_core::{Module, Result, Tensor, D};
 use hanzo_nn::LayerNorm;
 
 pub type Config = super::blip_text::Config;

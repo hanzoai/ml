@@ -9,7 +9,7 @@ use clap::Parser;
 
 use hanzo_transformers::models::pixtral::{vision_model, Config, Model};
 
-use hanzo::{DType, Device, Module, Tensor};
+use hanzo_ml_core::{DType, Device, Module, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;

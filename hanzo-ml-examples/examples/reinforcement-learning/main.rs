@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo::Result;
+use hanzo_ml_core::Result;
 use clap::{Parser, Subcommand};
 
 mod gym_env;

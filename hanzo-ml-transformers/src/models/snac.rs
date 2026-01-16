@@ -6,7 +6,7 @@
 /// Multi-Scale Neural Audio Codec (SNAC) compresses audio into discrete codes at a low bitrate.
 /// For more information, read the paper: https://arxiv.org/abs/2410.14411
 ///
-use hanzo::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{
     linear_b, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear,
     VarBuilder,

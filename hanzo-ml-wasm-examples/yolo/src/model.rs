@@ -1,4 +1,4 @@
-use hanzo::{DType, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{DType, IndexOp, Result, Tensor, D};
 use hanzo_nn::{
     batch_norm, conv2d, conv2d_no_bias, BatchNorm, Conv2d, Conv2dConfig, Module, VarBuilder,
 };

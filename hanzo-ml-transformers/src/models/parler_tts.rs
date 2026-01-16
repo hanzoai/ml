@@ -17,7 +17,7 @@
 
 use crate::generation::LogitsProcessor;
 use crate::models::t5;
-use hanzo::{IndexOp, Result, Tensor};
+use hanzo_ml_core::{IndexOp, Result, Tensor};
 use hanzo_nn::{layer_norm, linear_b as linear, Activation, LayerNorm, Linear, VarBuilder};
 
 #[derive(serde::Deserialize, Debug, Clone)]

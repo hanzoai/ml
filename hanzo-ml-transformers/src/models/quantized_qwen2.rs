@@ -14,7 +14,7 @@
 //!
 
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
-use hanzo::{
+use hanzo_ml_core::{
     quantized::{gguf_file, QMatMul},
     DType, Device, IndexOp, Result, Tensor,
 };

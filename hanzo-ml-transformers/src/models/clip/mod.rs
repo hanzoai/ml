@@ -12,7 +12,7 @@ use self::{
     text_model::{Activation, ClipTextTransformer},
     vision_model::ClipVisionTransformer,
 };
-use hanzo::{Result, Tensor, D};
+use hanzo_ml_core::{Result, Tensor, D};
 
 pub mod text_model;
 pub mod vision_model;

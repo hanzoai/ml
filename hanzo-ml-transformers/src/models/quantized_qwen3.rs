@@ -8,8 +8,8 @@
 //!
 use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
-use hanzo::quantized::{gguf_file, QTensor};
-use hanzo::{DType, Device, Result, Tensor};
+use hanzo_ml_core::quantized::{gguf_file, QTensor};
+use hanzo_ml_core::{DType, Device, Result, Tensor};
 use hanzo_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;

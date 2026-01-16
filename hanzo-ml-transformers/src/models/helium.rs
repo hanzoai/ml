@@ -3,7 +3,7 @@
 //! See the model card on Hugging Face's [hub](https://huggingface.co/kmhf/helium-2b).
 
 use super::with_tracing::{linear_b as linear, Linear, RmsNorm};
-use hanzo::{DType, Device, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, Result, Tensor, D};
 use hanzo_nn::{Module, VarBuilder};
 use std::sync::Arc;
 

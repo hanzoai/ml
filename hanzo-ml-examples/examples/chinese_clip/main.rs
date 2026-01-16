@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_nn as nn;
 use hanzo_transformers::models::chinese_clip::{ChineseClipConfig, ChineseClipModel};
 use clap::Parser;

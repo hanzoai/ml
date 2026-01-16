@@ -12,7 +12,7 @@ mod cuda_kernels;
 
 use clap::Parser;
 
-use hanzo::{CpuStorage, CustomOp1, Layout, Result, Shape, Tensor};
+use hanzo_ml_core::{CpuStorage, CustomOp1, Layout, Result, Shape, Tensor};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -55,9 +55,9 @@ impl CustomOp1 for LayerNorm {
         storage: &hanzo::CudaStorage,
         layout: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
-        use hanzo::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
-        use hanzo::cuda_backend::WrapErr;
+        use hanzo_ml_core::backend::BackendStorage;
+        use hanzo_ml_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use hanzo_ml_core::cuda_backend::WrapErr;
         let (d1, d2) = layout.shape().dims2()?;
         let d1 = d1 as u32;
         let d2 = d2 as u32;

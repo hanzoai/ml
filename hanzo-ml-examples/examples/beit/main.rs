@@ -9,7 +9,7 @@ extern crate accelerate_src;
 
 use clap::Parser;
 
-use hanzo::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::models::beit;
 

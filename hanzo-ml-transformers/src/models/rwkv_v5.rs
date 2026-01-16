@@ -32,7 +32,7 @@
 //! ```
 
 use super::with_tracing::{layer_norm, linear_no_bias as linear, LayerNorm, Linear};
-use hanzo::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
 use std::collections::{HashMap, HashSet};
 

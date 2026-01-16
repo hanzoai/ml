@@ -1,5 +1,5 @@
 //! Various optimization algorithms.
-use hanzo::{Result, Tensor, Var};
+use hanzo_ml_core::{Result, Tensor, Var};
 
 /// The interface optimizers should implement.
 pub trait Optimizer: Sized {

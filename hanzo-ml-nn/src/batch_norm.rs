@@ -7,7 +7,7 @@
 //! running stats.
 //!
 //! [`Batch Normalization`]: https://arxiv.org/abs/1502.03167
-use hanzo::{DType, Result, Tensor, Var};
+use hanzo_ml_core::{DType, Result, Tensor, Var};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BatchNormConfig {

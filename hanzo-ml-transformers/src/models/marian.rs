@@ -5,7 +5,7 @@
 //! - [Github](https://github.com/marian-nmt/marian)
 //!
 use super::with_tracing::{linear, Embedding, Linear};
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
 
 #[derive(Debug, Clone, serde::Deserialize)]

@@ -1,4 +1,4 @@
-use hanzo::{Module, Result, Tensor};
+use hanzo_ml_core::{Module, Result, Tensor};
 use hanzo_nn::{linear, Linear, VarBuilder};
 
 // A simplified version of:

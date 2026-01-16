@@ -1,5 +1,5 @@
 //! Vectorized version of the gym environment.
-use hanzo::{DType, Device, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Result, Tensor};
 use pyo3::prelude::*;
 
 #[allow(unused)]

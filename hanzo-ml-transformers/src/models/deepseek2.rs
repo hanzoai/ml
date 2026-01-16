@@ -2,7 +2,7 @@
 
 use std::{f32::consts::PI, sync::Arc};
 
-use hanzo::{
+use hanzo_ml_core::{
     shape::Dim, CpuStorage, CustomOp1, DType, Device, Error, IndexOp, Layout, Result, Shape,
     Tensor, WithDType, D,
 };

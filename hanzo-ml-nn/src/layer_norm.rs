@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```rust
-//! use hanzo::{Tensor, Device::Cpu, test_utils::to_vec3_round};
+//! use hanzo_ml_core::{Tensor, Device::Cpu, test_utils::to_vec3_round};
 //! use hanzo_nn::{LayerNorm, Module};
 //! # fn main() -> hanzo::Result<()> {
 //!
@@ -28,7 +28,7 @@
 //! ```
 //!
 //! [`Layer Normalization`]: https://arxiv.org/abs/1607.06450
-use hanzo::{DType, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Module, Result, Tensor, D};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerNormConfig {

@@ -53,7 +53,7 @@ pub mod vae;
 
 use std::sync::Arc;
 
-use hanzo::{DType, Device, Result};
+use hanzo_ml_core::{DType, Device, Result};
 use hanzo_nn as nn;
 
 use self::schedulers::{Scheduler, SchedulerConfig};

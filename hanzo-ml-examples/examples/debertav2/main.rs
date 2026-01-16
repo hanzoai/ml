@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 use anyhow::{Error as E, Result};
-use hanzo::{Device, Tensor};
+use hanzo_ml_core::{Device, Tensor};
 use hanzo_nn::ops::softmax;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::debertav2::{Config as DebertaV2Config, DebertaV2NERModel};

@@ -7,7 +7,7 @@
 //!
 
 use crate::models::with_tracing::{linear_b as linear, Linear};
-use hanzo::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::VarBuilder;
 
 fn default_one() -> usize {

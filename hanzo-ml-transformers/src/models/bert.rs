@@ -8,7 +8,7 @@
 //! - See bert in [hanzo-ml-examples](https://github.com/huggingface/hanzo/tree/main/hanzo-ml-examples/) for runnable code
 //!
 use super::with_tracing::{layer_norm, linear, LayerNorm, Linear};
-use hanzo::{DType, Device, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Result, Tensor};
 use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
 use serde::Deserialize;
 

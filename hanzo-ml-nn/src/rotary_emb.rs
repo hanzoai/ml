@@ -1,6 +1,6 @@
 //! Rotary Embeddings
 //!
-use hanzo::{CpuStorage, Layout, Result, Shape, Tensor, D};
+use hanzo_ml_core::{CpuStorage, Layout, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
 /// Interleaved variant of rotary embeddings.
@@ -69,7 +69,7 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             Ok((storage, (b, h, t, d).into()))
         }
 
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         use CpuStorage::{BF16, F16, F32, F64};
         match (s1, s2, s3) {
             (BF16(s1), BF16(s2), BF16(s3)) => inner(s1, l1, s2, l2, s3, l3),
@@ -95,11 +95,11 @@ impl hanzo::CustomOp3 for RotaryEmbI {
         s3: &hanzo::CudaStorage,
         l3: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::cuda_backend::cudarc::driver::{
+        use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
-        use hanzo::cuda_backend::{kernel_name, kernels, WrapErr};
-        use hanzo::{CudaDevice, WithDType};
+        use hanzo_ml_core::cuda_backend::{kernel_name, kernels, WrapErr};
+        use hanzo_ml_core::{CudaDevice, WithDType};
 
         fn inner<T: DeviceRepr + WithDType>(
             src: &CudaSlice<T>,
@@ -144,8 +144,8 @@ impl hanzo::CustomOp3 for RotaryEmbI {
             Ok(dst)
         }
 
-        use hanzo::backend::BackendStorage;
-        use hanzo::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
+        use hanzo_ml_core::backend::BackendStorage;
+        use hanzo_ml_core::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
         let dev = s1.device();
         let slice = match (&s1.slice, &s2.slice, &s3.slice) {
             (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
@@ -176,7 +176,7 @@ impl hanzo::CustomOp3 for RotaryEmbI {
         sin: &hanzo::MetalStorage,
         l_sin: &Layout,
     ) -> Result<(hanzo::MetalStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let device = src.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();
@@ -351,7 +351,7 @@ impl hanzo::CustomOp3 for RotaryEmb {
             Ok((storage, (b, h, t, d).into()))
         }
 
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         use CpuStorage::{BF16, F16, F32, F64};
         match (s1, s2, s3) {
             (BF16(s1), BF16(s2), BF16(s3)) => inner(s1, l1, s2, l2, s3, l3),
@@ -377,11 +377,11 @@ impl hanzo::CustomOp3 for RotaryEmb {
         s3: &hanzo::CudaStorage,
         l3: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::cuda_backend::cudarc::driver::{
+        use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
-        use hanzo::cuda_backend::{kernel_name, kernels, WrapErr};
-        use hanzo::{CudaDevice, WithDType};
+        use hanzo_ml_core::cuda_backend::{kernel_name, kernels, WrapErr};
+        use hanzo_ml_core::{CudaDevice, WithDType};
 
         fn inner<T: DeviceRepr + WithDType>(
             src: &CudaSlice<T>,
@@ -426,8 +426,8 @@ impl hanzo::CustomOp3 for RotaryEmb {
             Ok(dst)
         }
 
-        use hanzo::backend::BackendStorage;
-        use hanzo::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
+        use hanzo_ml_core::backend::BackendStorage;
+        use hanzo_ml_core::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
         let dev = s1.device();
         let slice = match (&s1.slice, &s2.slice, &s3.slice) {
             (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
@@ -458,7 +458,7 @@ impl hanzo::CustomOp3 for RotaryEmb {
         sin: &hanzo::MetalStorage,
         l_sin: &Layout,
     ) -> Result<(hanzo::MetalStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let device = src.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();
@@ -620,7 +620,7 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             Ok((storage, (b, t, h, d).into()))
         }
 
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         use CpuStorage::{BF16, F16, F32, F64};
         match (s1, s2, s3) {
             (BF16(s1), BF16(s2), BF16(s3)) => inner(s1, l1, s2, l2, s3, l3),
@@ -646,11 +646,11 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
         s3: &hanzo::CudaStorage,
         l3: &Layout,
     ) -> Result<(hanzo::CudaStorage, Shape)> {
-        use hanzo::cuda_backend::cudarc::driver::{
+        use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
-        use hanzo::cuda_backend::{kernel_name, kernels, WrapErr};
-        use hanzo::{CudaDevice, WithDType};
+        use hanzo_ml_core::cuda_backend::{kernel_name, kernels, WrapErr};
+        use hanzo_ml_core::{CudaDevice, WithDType};
 
         fn inner<T: DeviceRepr + WithDType>(
             src: &CudaSlice<T>,
@@ -695,8 +695,8 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
             Ok(dst)
         }
 
-        use hanzo::backend::BackendStorage;
-        use hanzo::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
+        use hanzo_ml_core::backend::BackendStorage;
+        use hanzo_ml_core::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
         let dev = s1.device();
         let slice = match (&s1.slice, &s2.slice, &s3.slice) {
             (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
@@ -727,7 +727,7 @@ impl hanzo::CustomOp3 for RotaryEmbThd {
         sin: &hanzo::MetalStorage,
         l_sin: &Layout,
     ) -> Result<(hanzo::MetalStorage, Shape)> {
-        use hanzo::backend::BackendStorage;
+        use hanzo_ml_core::backend::BackendStorage;
         let device = src.device();
         let command_buffer = device.command_buffer()?;
         let kernels = device.kernels();

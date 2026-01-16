@@ -1,6 +1,6 @@
 use crate::model::{Cache, Config, Llama};
 use byteorder::{LittleEndian, ReadBytesExt};
-use hanzo::{DType, Device, IndexOp, Result, Shape, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Shape, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use serde::{Deserialize, Serialize};

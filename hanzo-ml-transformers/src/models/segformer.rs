@@ -15,7 +15,7 @@
 //!
 
 use crate::models::with_tracing::{conv2d, linear, Conv2d, Linear};
-use hanzo::{Context, Module, ModuleT, Result, Tensor, D};
+use hanzo_ml_core::{Context, Module, ModuleT, Result, Tensor, D};
 use hanzo_nn::{conv2d_no_bias, layer_norm, Activation, Conv2dConfig, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;

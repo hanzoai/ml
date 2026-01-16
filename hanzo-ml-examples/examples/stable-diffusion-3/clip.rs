@@ -1,5 +1,5 @@
 use anyhow::{Error as E, Ok, Result};
-use hanzo::{DType, IndexOp, Module, Tensor, D};
+use hanzo_ml_core::{DType, IndexOp, Module, Tensor, D};
 use hanzo_transformers::models::{stable_diffusion, t5};
 use std::path::PathBuf;
 use tokenizers::tokenizer::Tokenizer;

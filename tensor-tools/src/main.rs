@@ -1,5 +1,5 @@
-use hanzo::quantized::{gguf_file, GgmlDType, QTensor};
-use hanzo::{Device, Result};
+use hanzo_ml_core::quantized::{gguf_file, GgmlDType, QTensor};
+use hanzo_ml_core::{Device, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 
@@ -211,7 +211,7 @@ fn run_print(
             }
         }
         Format::Safetensors => {
-            use hanzo::safetensors::Load;
+            use hanzo_ml_core::safetensors::Load;
             let tensors = unsafe { hanzo::safetensors::MmapedSafetensors::new(file)? };
             let tensors: std::collections::HashMap<_, _> = tensors.tensors().into_iter().collect();
             let names = if names.is_empty() {

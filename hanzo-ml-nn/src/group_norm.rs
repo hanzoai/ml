@@ -1,7 +1,7 @@
 //! Group Normalization.
 //!
 //! This layer applies Group Normalization over a mini-batch of inputs.
-use hanzo::{DType, Result, Tensor};
+use hanzo_ml_core::{DType, Result, Tensor};
 
 // This group norm version handles both weight and bias so removes the mean.
 #[derive(Clone, Debug)]

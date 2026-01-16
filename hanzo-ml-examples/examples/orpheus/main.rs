@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use hanzo::{DType, Device, IndexOp, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::llama::{Cache, Llama, LlamaConfig};
 use hanzo_transformers::models::snac::{Config as SnacConfig, Model as SnacModel};

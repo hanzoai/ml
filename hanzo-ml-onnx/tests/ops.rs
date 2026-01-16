@@ -1,5 +1,5 @@
-use hanzo::test_utils::to_vec2_round;
-use hanzo::{DType, Device, NdArray, Result, Tensor};
+use hanzo_ml_core::test_utils::to_vec2_round;
+use hanzo_ml_core::{DType, Device, NdArray, Result, Tensor};
 use hanzo_onnx::onnx::attribute_proto::AttributeType;
 use hanzo_onnx::onnx::tensor_proto::DataType;
 use hanzo_onnx::onnx::tensor_shape_proto::{dimension, Dimension};

@@ -17,7 +17,7 @@
 
 use crate::quantized_nn::{linear_b as linear, Embedding, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use std::sync::Arc;
 
 use crate::models::recurrent_gemma::{Config, Rglru, RmsNorm, RotaryEmbedding, TemporalBlockType};

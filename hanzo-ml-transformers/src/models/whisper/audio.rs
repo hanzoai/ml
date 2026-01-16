@@ -1,7 +1,7 @@
 // Audio processing code, adapted from whisper.cpp
 // https://github.com/ggerganov/whisper.cpp
 
-use hanzo::utils::get_num_threads;
+use hanzo_ml_core::utils::get_num_threads;
 use std::sync::Arc;
 use std::thread;
 

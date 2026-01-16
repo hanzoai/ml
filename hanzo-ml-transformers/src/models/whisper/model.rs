@@ -1,6 +1,6 @@
 use super::Config;
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
-use hanzo::{Device, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{embedding, Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder};
 
 fn conv1d(

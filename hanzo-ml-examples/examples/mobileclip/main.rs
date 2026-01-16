@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::Error as E;
 use clap::{Parser, ValueEnum};
 
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_nn::{ops::softmax, VarBuilder};
 use hanzo_transformers::models::mobileclip;
 

@@ -26,7 +26,7 @@
 //!   <img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg" alt="" width=640>
 //! </div>
 //!
-use hanzo::{IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{IndexOp, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
 
 const IMG_SIZE: usize = 448;

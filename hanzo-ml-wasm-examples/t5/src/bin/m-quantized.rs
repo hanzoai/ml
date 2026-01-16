@@ -1,4 +1,4 @@
-use hanzo::{Device, Tensor};
+use hanzo_ml_core::{Device, Tensor};
 use hanzo_transformers::generation::LogitsProcessor;
 pub use hanzo_transformers::models::quantized_t5::{
     Config, T5EncoderModel, T5ForConditionalGeneration, VarBuilder,

@@ -15,7 +15,7 @@ mod musicgen_model;
 use musicgen_model::{GenConfig, MusicgenForConditionalGeneration};
 
 use anyhow::{Error as E, Result};
-use hanzo::{DType, Tensor};
+use hanzo_ml_core::{DType, Tensor};
 use hanzo_nn::VarBuilder;
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};

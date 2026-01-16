@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use hanzo::{DType, IndexOp, Tensor};
+use hanzo_ml_core::{DType, IndexOp, Tensor};
 
 use hanzo_transformers::models::flux;
 use hanzo_transformers::models::mmdit::model::MMDiT;

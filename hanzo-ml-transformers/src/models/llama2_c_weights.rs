@@ -5,7 +5,7 @@
 //! Based on the [llama2.c](https://github.com/karpathy/llama2.c) implementation
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use hanzo::{DType, Device, IndexOp, Result, Shape, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Shape, Tensor};
 use hanzo_nn::VarBuilder;
 
 use super::llama2_c::Config;

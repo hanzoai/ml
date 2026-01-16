@@ -22,7 +22,7 @@ use super::{
     schedulers::{Scheduler, SchedulerConfig},
     utils::{interp, linspace},
 };
-use hanzo::{Error, IndexOp, Result, Tensor};
+use hanzo_ml_core::{Error, IndexOp, Result, Tensor};
 
 #[derive(Debug, Clone, Copy)]
 pub enum SigmaSchedule {
@@ -882,7 +882,7 @@ mod stats {
 }
 
 mod linalg {
-    use hanzo::{IndexOp, Result, Shape, Tensor};
+    use hanzo_ml_core::{IndexOp, Result, Shape, Tensor};
 
     pub fn inverse(m: &Tensor) -> Result<Tensor> {
         adjoint(m)? / determinant(m)?.to_scalar::<f64>()?

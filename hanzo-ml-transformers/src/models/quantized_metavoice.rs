@@ -18,7 +18,7 @@ use crate::quantized_nn::{linear_b, Embedding, Linear, RmsNorm};
 pub use crate::quantized_var_builder::VarBuilder;
 
 use crate::models::metavoice::repeat_interleave;
-use hanzo::{Module, Result, Tensor, D};
+use hanzo_ml_core::{Module, Result, Tensor, D};
 
 pub mod transformer {
     use super::*;

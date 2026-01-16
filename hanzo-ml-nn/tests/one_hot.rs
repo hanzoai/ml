@@ -1,4 +1,4 @@
-use hanzo::{Result, Shape, Tensor};
+use hanzo_ml_core::{Result, Shape, Tensor};
 use hanzo_nn::encoding::one_hot;
 
 #[test]

@@ -1,6 +1,6 @@
 //! Encoding Utilities. (e.g., one-hot/cold encoding)
 
-use hanzo::{bail, DType, Result, Tensor, WithDType};
+use hanzo_ml_core::{bail, DType, Result, Tensor, WithDType};
 
 /// One-hot/cold encoding.
 ///
@@ -32,7 +32,7 @@ use hanzo::{bail, DType, Result, Tensor, WithDType};
 /// ## One-hot encoding
 ///
 /// ```rust
-/// use hanzo::{Shape, Tensor, Device};
+/// use hanzo_ml_core::{Shape, Tensor, Device};
 /// use hanzo_nn::encoding::one_hot;
 ///
 /// let device = hanzo::Device::Cpu;
@@ -55,7 +55,7 @@ use hanzo::{bail, DType, Result, Tensor, WithDType};
 /// ## One-cold Encoding
 ///
 /// ```rust
-/// use hanzo::{Shape, Tensor, Device};
+/// use hanzo_ml_core::{Shape, Tensor, Device};
 /// use hanzo_nn::encoding::one_hot;
 ///
 ///

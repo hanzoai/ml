@@ -1,4 +1,4 @@
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_wasm_example_sam as sam;
 use wasm_bindgen::prelude::*;

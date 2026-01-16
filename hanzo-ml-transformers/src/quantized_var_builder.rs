@@ -4,8 +4,8 @@
 //! These tensors can be loaded from disk using `from_gguf` or from an in-memory
 //! buffer using `from_gguf_buffer`.
 
-use hanzo::quantized::QTensor;
-use hanzo::{Device, Result, Shape};
+use hanzo_ml_core::quantized::QTensor;
+use hanzo_ml_core::{Device, Result, Shape};
 use std::sync::Arc;
 
 // VarBuilder specialized for QTensors

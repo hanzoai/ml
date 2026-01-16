@@ -17,9 +17,9 @@
 
 use std::collections::HashMap;
 
-use hanzo::quantized::gguf_file;
-use hanzo::quantized::QTensor;
-use hanzo::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::quantized::gguf_file;
+use hanzo_ml_core::quantized::QTensor;
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{Embedding, LayerNorm};
 
 pub const MAX_SEQ_LEN: usize = 4096;

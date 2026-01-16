@@ -1,5 +1,5 @@
 use super::common::{AttnBlock, ResBlock, TimestepBlock};
-use hanzo::{DType, Result, Tensor, D};
+use hanzo_ml_core::{DType, Result, Tensor, D};
 use hanzo_nn::VarBuilder;
 
 #[derive(Debug)]

@@ -1,5 +1,5 @@
-use hanzo::Device;
-use hanzo::Module;
+use hanzo_ml_core::Device;
+use hanzo_ml_core::Module;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::segformer::{
     Config, ImageClassificationModel, SemanticSegmentationModel,

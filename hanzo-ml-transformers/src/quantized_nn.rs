@@ -6,8 +6,8 @@
 
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_var_builder::VarBuilder;
-use hanzo::quantized::QTensor;
-use hanzo::{Module, Result, Tensor};
+use hanzo_ml_core::quantized::QTensor;
+use hanzo_ml_core::{Module, Result, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct Embedding {

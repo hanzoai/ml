@@ -7,7 +7,7 @@ extern crate accelerate_src;
 mod model;
 use model::{Multiples, YoloV8, YoloV8Pose};
 
-use hanzo::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
 use clap::{Parser, ValueEnum};

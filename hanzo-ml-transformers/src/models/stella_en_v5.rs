@@ -16,7 +16,7 @@
 //!
 
 use crate::models::with_tracing::{linear, linear_no_bias, Linear, RmsNorm};
-use hanzo::{DType, Device, Error, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, Error, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, Activation, LayerNorm, VarBuilder};
 use std::sync::Arc;
 

@@ -19,7 +19,7 @@ use crate::models::t5::{deserialize_feed_forward_proj_activation, ActivationWith
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_nn::Embedding;
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::Activation;
 use serde::Deserialize;
 use std::sync::Arc;

@@ -6,7 +6,7 @@ use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 use hanzo_transformers::models::llama::Cache;
 
 use anyhow::{bail, Error as E, Result};
-use hanzo::{DType, Device, IndexOp, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::llava::config::{
     HFGenerationConfig, HFLLaVAConfig, HFPreProcessorConfig,

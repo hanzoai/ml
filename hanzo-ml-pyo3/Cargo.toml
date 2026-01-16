@@ -27,8 +27,8 @@ pyo3-build-config = "0.22"
 
 [features]
 default = []
-accelerate = ["dep:accelerate-src", "hanzo/accelerate"]
-cuda = ["hanzo/cuda"]
-mkl = ["dep:intel-mkl-src","hanzo/mkl"]
+accelerate = ["dep:accelerate-src", "hanzo-ml/accelerate"]
+cuda = ["hanzo-ml/cuda"]
+mkl = ["dep:intel-mkl-src","hanzo-ml/mkl"]
 onnx = ["dep:hanzo-ml-onnx"]
 

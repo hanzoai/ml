@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use rand::{distr::Uniform, rng, Rng};
 
-use hanzo::{DType, Device, Error, Module, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Error, Module, Result, Tensor};
 use hanzo_nn::loss::mse;
 use hanzo_nn::{linear, seq, Activation, AdamW, Optimizer, VarBuilder, VarMap};
 

@@ -17,7 +17,7 @@
 use super::quantized_blip_text as blip_text;
 use crate::quantized_nn::{layer_norm, linear, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo::{Module, Result, Tensor, D};
+use hanzo_ml_core::{Module, Result, Tensor, D};
 use hanzo_nn::{Conv2d, Conv2dConfig, LayerNorm};
 
 pub type VisionConfig = super::blip::VisionConfig;

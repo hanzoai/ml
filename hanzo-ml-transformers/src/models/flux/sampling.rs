@@ -1,4 +1,4 @@
-use hanzo::{Device, Result, Tensor};
+use hanzo_ml_core::{Device, Result, Tensor};
 
 pub fn get_noise(
     num_samples: usize,

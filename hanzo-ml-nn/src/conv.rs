@@ -1,6 +1,6 @@
 //! Convolution Layers.
 use crate::BatchNorm;
-use hanzo::{conv::CudnnFwdAlgo, Result, Tensor};
+use hanzo_ml_core::{conv::CudnnFwdAlgo, Result, Tensor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conv1dConfig {

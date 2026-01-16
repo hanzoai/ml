@@ -1,5 +1,5 @@
 #![allow(unused)]
-use hanzo::{
+use hanzo_ml_core::{
     quantized::{self, k_quants, GgmlDType, GgmlType},
     test_utils::to_vec2_round,
     Device, Module, Result, Tensor,

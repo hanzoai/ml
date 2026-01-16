@@ -1,8 +1,8 @@
 use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
 use crate::onnx::{self, GraphProto};
-use hanzo::Module;
-use hanzo::{bail, DType, Device, Result, Tensor};
+use hanzo_ml_core::Module;
+use hanzo_ml_core::{bail, DType, Device, Result, Tensor};
 use hanzo_nn::activation::PReLU;
 use std::collections::{HashMap, HashSet};
 

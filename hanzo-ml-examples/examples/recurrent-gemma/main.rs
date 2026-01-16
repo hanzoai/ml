@@ -10,7 +10,7 @@ use clap::Parser;
 use hanzo_transformers::models::quantized_recurrent_gemma::Model as QModel;
 use hanzo_transformers::models::recurrent_gemma::{Config, Model as BModel};
 
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;

@@ -58,4 +58,4 @@ pub use sequential::{seq, Sequential};
 pub use var_builder::VarBuilder;
 pub use var_map::VarMap;
 
-pub use hanzo::{Module, ModuleT};
+pub use hanzo_ml_core::{Module, ModuleT};
