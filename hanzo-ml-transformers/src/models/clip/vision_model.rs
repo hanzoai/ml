@@ -8,7 +8,7 @@
 
 use hanzo_ml::{Context, IndexOp, Result, Shape, Tensor, D};
 use hanzo_nn as nn;
-use hanzo_nn::Module;
+use hanzo_ml_nn::Module;
 use nn::Conv2dConfig;
 
 use super::{
@@ -64,14 +64,14 @@ impl ClipVisionConfig {
 // https://github.com/huggingface/transformers/blob/f6fa0f0bf0796ac66f201f23bdb8585de1609add/src/transformers/models/clip/modeling_clip.py#L112
 #[derive(Clone, Debug)]
 struct ClipVisionEmbeddings {
-    patch_embedding: hanzo_nn::Conv2d,
+    patch_embedding: hanzo_ml_nn::Conv2d,
     position_ids: Tensor,
     class_embedding: Tensor,
-    position_embedding: hanzo_nn::Embedding,
+    position_embedding: hanzo_ml_nn::Embedding,
 }
 
 impl ClipVisionEmbeddings {
-    fn new(vs: hanzo_nn::VarBuilder, c: &ClipVisionConfig) -> Result<Self> {
+    fn new(vs: hanzo_ml_nn::VarBuilder, c: &ClipVisionConfig) -> Result<Self> {
         // originally nn.Parameter
         let class_embedding = if vs.contains_tensor("class_embedding") {
             vs.get(c.embed_dim, "class_embedding")?
@@ -88,8 +88,8 @@ impl ClipVisionEmbeddings {
             ..Default::default()
         };
         let position_embedding =
-            hanzo_nn::embedding(num_positions, c.embed_dim, vs.pp("position_embedding"))?;
-        let patch_embedding = hanzo_nn::conv2d_no_bias(
+            hanzo_ml_nn::embedding(num_positions, c.embed_dim, vs.pp("position_embedding"))?;
+        let patch_embedding = hanzo_ml_nn::conv2d_no_bias(
             c.num_channels,
             c.embed_dim,
             c.patch_size,
@@ -126,16 +126,16 @@ impl Module for ClipVisionEmbeddings {
 pub struct ClipVisionTransformer {
     embeddings: ClipVisionEmbeddings,
     encoder: ClipEncoder,
-    pre_layer_norm: hanzo_nn::LayerNorm,
-    final_layer_norm: hanzo_nn::LayerNorm,
+    pre_layer_norm: hanzo_ml_nn::LayerNorm,
+    final_layer_norm: hanzo_ml_nn::LayerNorm,
 }
 
 impl ClipVisionTransformer {
-    pub fn new(vs: hanzo_nn::VarBuilder, c: &ClipVisionConfig) -> Result<Self> {
+    pub fn new(vs: hanzo_ml_nn::VarBuilder, c: &ClipVisionConfig) -> Result<Self> {
         let embeddings = ClipVisionEmbeddings::new(vs.pp("embeddings"), c)?;
-        let pre_layer_norm = hanzo_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("pre_layrnorm"))?;
+        let pre_layer_norm = hanzo_ml_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("pre_layrnorm"))?;
         let encoder = ClipEncoder::new(vs.pp("encoder"), &EncoderConfig::Vision(c.clone()))?;
-        let final_layer_norm = hanzo_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("post_layernorm"))?;
+        let final_layer_norm = hanzo_ml_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("post_layernorm"))?;
         Ok(Self {
             embeddings,
             encoder,

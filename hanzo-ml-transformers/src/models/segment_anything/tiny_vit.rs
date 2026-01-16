@@ -1,7 +1,7 @@
 // Adapted from:
 // https://github.com/ChaoningZhang/MobileSAM/blob/master/mobile_sam/modeling/tiny_vit_sam.py
 use hanzo_ml::{IndexOp, Result, Tensor, D};
-use hanzo_nn::{Conv2dConfig, Module, VarBuilder};
+use hanzo_ml_nn::{Conv2dConfig, Module, VarBuilder};
 
 const MBCONV_EXPAND_RATIO: usize = 4;
 const MLP_RATIO: usize = 4;
@@ -11,15 +11,15 @@ const IN_CHANNELS: usize = 3;
 
 #[derive(Debug)]
 struct Conv2dBN {
-    c: hanzo_nn::Conv2d,
-    bn: hanzo_nn::BatchNorm,
+    c: hanzo_ml_nn::Conv2d,
+    bn: hanzo_ml_nn::BatchNorm,
     span: tracing::Span,
 }
 
 impl Conv2dBN {
     fn new(in_: usize, out: usize, ks: usize, cfg: Conv2dConfig, vb: VarBuilder) -> Result<Self> {
-        let c = hanzo_nn::conv2d_no_bias(in_, out, ks, cfg, vb.pp("c"))?;
-        let bn = hanzo_nn::batch_norm(out, 1e-5, vb.pp("bn"))?;
+        let c = hanzo_ml_nn::conv2d_no_bias(in_, out, ks, cfg, vb.pp("c"))?;
+        let bn = hanzo_ml_nn::batch_norm(out, 1e-5, vb.pp("bn"))?;
         let span = tracing::span!(tracing::Level::TRACE, "conv2d-bn");
         Ok(Self { c, bn, span })
     }
@@ -41,7 +41,7 @@ struct PatchEmbed {
 
 impl PatchEmbed {
     fn new(in_chans: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let cfg = hanzo_nn::Conv2dConfig {
+        let cfg = hanzo_ml_nn::Conv2dConfig {
             stride: 2,
             padding: 1,
             ..Default::default()
@@ -71,7 +71,7 @@ struct MBConv {
 impl MBConv {
     fn new(in_: usize, out: usize, expand_ratio: usize, vb: VarBuilder) -> Result<Self> {
         let hidden = in_ * expand_ratio;
-        let cfg2 = hanzo_nn::Conv2dConfig {
+        let cfg2 = hanzo_ml_nn::Conv2dConfig {
             padding: 1,
             groups: hidden,
             ..Default::default()
@@ -120,7 +120,7 @@ impl PatchMerging {
         vb: VarBuilder,
     ) -> Result<Self> {
         let stride = if [320, 448, 576].contains(&out) { 1 } else { 2 };
-        let cfg2 = hanzo_nn::Conv2dConfig {
+        let cfg2 = hanzo_ml_nn::Conv2dConfig {
             padding: 1,
             stride,
             groups: out,
@@ -214,7 +214,7 @@ impl Module for ConvLayer {
 
 #[derive(Debug)]
 struct Mlp {
-    norm: hanzo_nn::LayerNorm,
+    norm: hanzo_ml_nn::LayerNorm,
     fc1: super::Linear,
     fc2: super::Linear,
     span: tracing::Span,
@@ -222,7 +222,7 @@ struct Mlp {
 
 impl Mlp {
     fn new(in_: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
-        let norm = hanzo_nn::layer_norm(in_, 1e-5, vb.pp("norm"))?;
+        let norm = hanzo_ml_nn::layer_norm(in_, 1e-5, vb.pp("norm"))?;
         let fc1 = super::linear(vb.pp("fc1"), in_, hidden, true)?;
         let fc2 = super::linear(vb.pp("fc2"), hidden, in_, true)?;
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
@@ -247,7 +247,7 @@ impl Module for Mlp {
 
 #[derive(Debug)]
 struct Attention {
-    norm: hanzo_nn::LayerNorm,
+    norm: hanzo_ml_nn::LayerNorm,
     qkv: super::Linear,
     proj: super::Linear,
     ab: Tensor,
@@ -274,7 +274,7 @@ impl Attention {
         let dh = d * num_heads;
         let nh_kd = key_dim * num_heads;
         let h = dh + nh_kd * 2;
-        let norm = hanzo_nn::layer_norm(dim, 1e-5, vb.pp("norm"))?;
+        let norm = hanzo_ml_nn::layer_norm(dim, 1e-5, vb.pp("norm"))?;
         let qkv = super::linear(vb.pp("qkv"), dim, h, true)?;
         let proj = super::linear(vb.pp("proj"), dh, dim, true)?;
 
@@ -342,7 +342,7 @@ impl Module for Attention {
         let attn = attn.broadcast_add(&self.ab)?;
         let attn = {
             let _enter = self.span_softmax.enter();
-            hanzo_nn::ops::softmax_last_dim(&attn)?
+            hanzo_ml_nn::ops::softmax_last_dim(&attn)?
         };
         let attn = {
             let _enter = self.span_matmul.enter();
@@ -382,7 +382,7 @@ impl TinyViTBlock {
             vb.pp("attn"),
         )?;
         let mlp = Mlp::new(dim, dim * MLP_RATIO, vb.pp("mlp"))?;
-        let cfg = hanzo_nn::Conv2dConfig {
+        let cfg = hanzo_ml_nn::Conv2dConfig {
             padding: LOCAL_CONV_SIZE / 2,
             groups: dim,
             ..Default::default()
@@ -523,11 +523,11 @@ pub struct TinyViT {
     patch_embed: PatchEmbed,
     layer0: ConvLayer,
     layers: Vec<BasicLayer>,
-    // norm_head: hanzo_nn::LayerNorm,
-    // head: hanzo_nn::Linear,
-    neck_conv1: hanzo_nn::Conv2d,
+    // norm_head: hanzo_ml_nn::LayerNorm,
+    // head: hanzo_ml_nn::Linear,
+    neck_conv1: hanzo_ml_nn::Conv2d,
     neck_ln1: super::LayerNorm2d,
-    neck_conv2: hanzo_nn::Conv2d,
+    neck_conv2: hanzo_ml_nn::Conv2d,
     neck_ln2: super::LayerNorm2d,
     span: tracing::Span,
     span_neck: tracing::Span,
@@ -574,16 +574,16 @@ impl TinyViT {
         }
 
         let last_embed_dim = embed_dims[embed_dims.len() - 1];
-        // let norm_head = hanzo_nn::layer_norm(last_embed_dim, 1e-5, vb.pp("norm_head"))?;
-        // let head = hanzo_nn::linear(last_embed_dim, num_classes, vb.pp("head"))?;
+        // let norm_head = hanzo_ml_nn::layer_norm(last_embed_dim, 1e-5, vb.pp("norm_head"))?;
+        // let head = hanzo_ml_nn::linear(last_embed_dim, num_classes, vb.pp("head"))?;
         let neck_conv1 =
-            hanzo_nn::conv2d_no_bias(last_embed_dim, 256, 1, Default::default(), vb.pp("neck.0"))?;
+            hanzo_ml_nn::conv2d_no_bias(last_embed_dim, 256, 1, Default::default(), vb.pp("neck.0"))?;
         let neck_ln1 = super::LayerNorm2d::new(256, 1e-6, vb.pp("neck.1"))?;
-        let cfg = hanzo_nn::Conv2dConfig {
+        let cfg = hanzo_ml_nn::Conv2dConfig {
             padding: 1,
             ..Default::default()
         };
-        let neck_conv2 = hanzo_nn::conv2d_no_bias(256, 256, 3, cfg, vb.pp("neck.2"))?;
+        let neck_conv2 = hanzo_ml_nn::conv2d_no_bias(256, 256, 3, cfg, vb.pp("neck.2"))?;
         let neck_ln2 = super::LayerNorm2d::new(256, 1e-6, vb.pp("neck.3"))?;
 
         let span = tracing::span!(tracing::Level::TRACE, "tiny-vit");

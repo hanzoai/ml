@@ -4,7 +4,7 @@ use crate::models::{
     with_tracing::{layer_norm, linear, linear_no_bias, LayerNorm, Linear},
 };
 use hanzo_ml::{DType, Device, Result, Tensor, D};
-use hanzo_nn::{ops::softmax_last_dim, LayerNormConfig, Module, VarBuilder};
+use hanzo_ml_nn::{ops::softmax_last_dim, LayerNormConfig, Module, VarBuilder};
 
 // Geglu and feedforward from hanzo-ml-transformers/src/models/stable_diffusion/attention.rs
 #[derive(Debug)]
@@ -180,7 +180,7 @@ impl Model {
         let cross_attn_norm = layer_norm(dim, LayerNormConfig::default(), vb.pp("0.norm"))?;
         let cross_attn_context_norm = layer_norm(
             dim,
-            hanzo_nn::LayerNormConfig::default(),
+            hanzo_ml_nn::LayerNormConfig::default(),
             vb.pp("0.norm_context"),
         )?;
         let cross_attn = CrossAttention::new(vb.pp("0.fn"), dim, None, 8, 4096)?;

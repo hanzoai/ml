@@ -4,7 +4,7 @@
 
 use super::with_tracing::{linear_b as linear, Linear, RmsNorm};
 use hanzo_ml::{DType, Device, Result, Tensor, D};
-use hanzo_nn::{Module, VarBuilder};
+use hanzo_ml_nn::{Module, VarBuilder};
 use std::sync::Arc;
 
 fn default_use_flash_attn() -> bool {
@@ -17,7 +17,7 @@ pub struct Config {
     pub bos_token_id: u32,
     pub eos_token_id: u32,
     pub head_dim: usize,
-    pub hidden_act: hanzo_nn::Activation,
+    pub hidden_act: hanzo_ml_nn::Activation,
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub max_position_embeddings: usize,
@@ -40,7 +40,7 @@ impl Config {
             bos_token_id: 1,
             eos_token_id: 2,
             head_dim: 128,
-            hidden_act: hanzo_nn::Activation::Silu,
+            hidden_act: hanzo_ml_nn::Activation::Silu,
             hidden_size: 2560,
             intermediate_size: 7040,
             max_position_embeddings: 4096,
@@ -93,8 +93,8 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = hanzo_nn::rotary_emb::rope_i(q, &cos, &sin)?;
-        let k_embed = hanzo_nn::rotary_emb::rope_i(k, &cos, &sin)?;
+        let q_embed = hanzo_ml_nn::rotary_emb::rope_i(q, &cos, &sin)?;
+        let k_embed = hanzo_ml_nn::rotary_emb::rope_i(k, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -105,7 +105,7 @@ struct MLP {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
-    act_fn: hanzo_nn::Activation,
+    act_fn: hanzo_ml_nn::Activation,
 }
 
 impl MLP {
@@ -248,7 +248,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?
         };
         attn_output
@@ -311,7 +311,7 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: hanzo_nn::Embedding,
+    embed_tokens: hanzo_ml_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
@@ -323,7 +323,7 @@ impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
-            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
@@ -366,7 +366,7 @@ impl Model {
             .to_dtype(self.dtype)
     }
 
-    pub fn embed_tokens(&self) -> &hanzo_nn::Embedding {
+    pub fn embed_tokens(&self) -> &hanzo_ml_nn::Embedding {
         &self.embed_tokens
     }
 

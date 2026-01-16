@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::codegeex4_9b::*;
 use clap::Parser;

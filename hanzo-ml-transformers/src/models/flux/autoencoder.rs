@@ -1,5 +1,5 @@
 use hanzo_ml::{Result, Tensor, D};
-use hanzo_nn::{conv2d, group_norm, Conv2d, GroupNorm, VarBuilder};
+use hanzo_ml_nn::{conv2d, group_norm, Conv2d, GroupNorm, VarBuilder};
 
 // https://github.com/black-forest-labs/flux/blob/727e3a71faf37390f318cf9434f0939653302b60/src/flux/modules/autoencoder.py#L9
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
     let dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (dim as f64).sqrt();
     let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
-    hanzo_nn::ops::softmax_last_dim(&attn_weights)?.matmul(v)
+    hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?.matmul(v)
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +108,7 @@ struct ResnetBlock {
 
 impl ResnetBlock {
     fn new(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
-        let conv_cfg = hanzo_nn::Conv2dConfig {
+        let conv_cfg = hanzo_ml_nn::Conv2dConfig {
             padding: 1,
             ..Default::default()
         };
@@ -141,10 +141,10 @@ impl hanzo_ml::Module for ResnetBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let h = xs
             .apply(&self.norm1)?
-            .apply(&hanzo_nn::Activation::Swish)?
+            .apply(&hanzo_ml_nn::Activation::Swish)?
             .apply(&self.conv1)?
             .apply(&self.norm2)?
-            .apply(&hanzo_nn::Activation::Swish)?
+            .apply(&hanzo_ml_nn::Activation::Swish)?
             .apply(&self.conv2)?;
         match self.nin_shortcut.as_ref() {
             None => xs + h,
@@ -160,7 +160,7 @@ struct Downsample {
 
 impl Downsample {
     fn new(in_c: usize, vb: VarBuilder) -> Result<Self> {
-        let conv_cfg = hanzo_nn::Conv2dConfig {
+        let conv_cfg = hanzo_ml_nn::Conv2dConfig {
             stride: 2,
             ..Default::default()
         };
@@ -184,7 +184,7 @@ struct Upsample {
 
 impl Upsample {
     fn new(in_c: usize, vb: VarBuilder) -> Result<Self> {
-        let conv_cfg = hanzo_nn::Conv2dConfig {
+        let conv_cfg = hanzo_ml_nn::Conv2dConfig {
             padding: 1,
             ..Default::default()
         };
@@ -219,7 +219,7 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let conv_cfg = hanzo_nn::Conv2dConfig {
+        let conv_cfg = hanzo_ml_nn::Conv2dConfig {
             padding: 1,
             ..Default::default()
         };
@@ -270,7 +270,7 @@ impl Encoder {
     }
 }
 
-impl hanzo_nn::Module for Encoder {
+impl hanzo_ml_nn::Module for Encoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut h = xs.apply(&self.conv_in)?;
         for block in self.down.iter() {
@@ -285,7 +285,7 @@ impl hanzo_nn::Module for Encoder {
             .apply(&self.mid_attn_1)?
             .apply(&self.mid_block_2)?
             .apply(&self.norm_out)?
-            .apply(&hanzo_nn::Activation::Swish)?
+            .apply(&hanzo_ml_nn::Activation::Swish)?
             .apply(&self.conv_out)
     }
 }
@@ -309,7 +309,7 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let conv_cfg = hanzo_nn::Conv2dConfig {
+        let conv_cfg = hanzo_ml_nn::Conv2dConfig {
             padding: 1,
             ..Default::default()
         };
@@ -355,7 +355,7 @@ impl Decoder {
     }
 }
 
-impl hanzo_nn::Module for Decoder {
+impl hanzo_ml_nn::Module for Decoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let h = xs.apply(&self.conv_in)?;
         let mut h = h
@@ -371,7 +371,7 @@ impl hanzo_nn::Module for Decoder {
             }
         }
         h.apply(&self.norm_out)?
-            .apply(&hanzo_nn::Activation::Swish)?
+            .apply(&hanzo_ml_nn::Activation::Swish)?
             .apply(&self.conv_out)
     }
 }
@@ -388,7 +388,7 @@ impl DiagonalGaussian {
     }
 }
 
-impl hanzo_nn::Module for DiagonalGaussian {
+impl hanzo_ml_nn::Module for DiagonalGaussian {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let chunks = xs.chunk(2, self.chunk_dim)?;
         if self.sample {

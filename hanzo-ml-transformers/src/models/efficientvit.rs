@@ -36,7 +36,7 @@
 //! </div>
 //!
 use hanzo_ml::{Result, Tensor, D};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     batch_norm, conv2d, conv2d_no_bias, linear, ops::sigmoid, ops::softmax, Conv2dConfig, Func,
     VarBuilder,
 };

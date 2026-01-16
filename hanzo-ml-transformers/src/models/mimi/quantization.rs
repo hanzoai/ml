@@ -3,7 +3,7 @@
 // LICENSE file in the root directory of this source tree.
 
 use hanzo_ml::{IndexOp, Layout, Result, Shape, Tensor, D};
-use hanzo_nn::{linear, Linear, VarBuilder};
+use hanzo_ml_nn::{linear, Linear, VarBuilder};
 
 struct CodebookEncode;
 
@@ -145,7 +145,7 @@ impl EuclideanCodebook {
 
     pub fn decode(&self, indexes: &Tensor) -> Result<Tensor> {
         let _enter = self.span_decode.enter();
-        // let ys = hanzo_nn::Embedding::new(self.embedding.clone(), self.dim).forward(xs)?;
+        // let ys = hanzo_ml_nn::Embedding::new(self.embedding.clone(), self.dim).forward(xs)?;
         let mut final_dims = indexes.dims().to_vec();
         final_dims.push(self.dim);
         let indexes = indexes.flatten_all()?;
@@ -259,8 +259,8 @@ impl ResidualVectorQuantization {
 #[derive(Debug, Clone)]
 pub struct ResidualVectorQuantizer {
     vq: ResidualVectorQuantization,
-    input_proj: Option<hanzo_nn::Conv1d>,
-    output_proj: Option<hanzo_nn::Conv1d>,
+    input_proj: Option<hanzo_ml_nn::Conv1d>,
+    output_proj: Option<hanzo_ml_nn::Conv1d>,
 }
 
 impl ResidualVectorQuantizer {
@@ -279,7 +279,7 @@ impl ResidualVectorQuantizer {
         let input_proj = if input_dim == dim && !force_projection {
             None
         } else {
-            let c = hanzo_nn::conv1d_no_bias(
+            let c = hanzo_ml_nn::conv1d_no_bias(
                 input_dim,
                 dim,
                 1,
@@ -291,7 +291,7 @@ impl ResidualVectorQuantizer {
         let output_proj = if output_dim == dim && !force_projection {
             None
         } else {
-            let c = hanzo_nn::conv1d_no_bias(
+            let c = hanzo_ml_nn::conv1d_no_bias(
                 dim,
                 output_dim,
                 1,

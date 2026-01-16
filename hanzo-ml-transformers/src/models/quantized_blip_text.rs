@@ -19,7 +19,7 @@ use crate::models::with_tracing::QMatMul;
 use crate::quantized_nn::{layer_norm, linear, Embedding, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
 use hanzo_ml::{Module, Result, Tensor, D};
-use hanzo_nn::LayerNorm;
+use hanzo_ml_nn::LayerNorm;
 
 pub type Config = super::blip_text::Config;
 
@@ -150,7 +150,7 @@ impl TextSelfAttention {
             Some(mask) => attention_scores.broadcast_add(mask)?,
             None => attention_scores,
         };
-        let attention_probs = hanzo_nn::ops::softmax_last_dim(&attention_scores)?;
+        let attention_probs = hanzo_ml_nn::ops::softmax_last_dim(&attention_scores)?;
         attention_probs
             .matmul(&value)?
             .permute((0, 2, 1, 3))?
@@ -209,7 +209,7 @@ impl TextAttention {
 #[derive(Debug, Clone)]
 struct TextIntermediate {
     dense: Linear,
-    intermediate_act_fn: hanzo_nn::Activation,
+    intermediate_act_fn: hanzo_ml_nn::Activation,
 }
 
 impl TextIntermediate {
@@ -353,7 +353,7 @@ impl Module for TextPooler {
 #[derive(Debug, Clone)]
 struct TextPredictionHeadTransform {
     dense: Linear,
-    transform_act_fn: hanzo_nn::Activation,
+    transform_act_fn: hanzo_ml_nn::Activation,
     layer_norm: LayerNorm,
 }
 

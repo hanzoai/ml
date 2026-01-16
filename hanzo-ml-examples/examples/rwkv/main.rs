@@ -13,7 +13,7 @@ use hanzo_transformers::models::rwkv_v5::{Config, Model as M5, State, Tokenizer}
 use hanzo_transformers::models::rwkv_v6::Model as M6;
 
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 

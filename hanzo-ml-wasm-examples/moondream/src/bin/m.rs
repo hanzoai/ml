@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::{
     generation::LogitsProcessor,
     models::{moondream, quantized_moondream},

@@ -31,7 +31,7 @@
 //!
 pub use crate::models::with_tracing::Linear;
 use hanzo_ml::{Result, Tensor};
-use hanzo_nn::{Module, VarBuilder};
+use hanzo_ml_nn::{Module, VarBuilder};
 
 pub mod image_encoder;
 pub mod mask_decoder;
@@ -84,7 +84,7 @@ impl Module for LayerNorm2d {
 pub struct MlpBlock {
     lin1: Linear,
     lin2: Linear,
-    activation: hanzo_nn::Activation,
+    activation: hanzo_ml_nn::Activation,
     span: tracing::Span,
 }
 
@@ -92,7 +92,7 @@ impl MlpBlock {
     pub fn new(
         embedding_dim: usize,
         mlp_dim: usize,
-        activation: hanzo_nn::Activation,
+        activation: hanzo_ml_nn::Activation,
         vb: VarBuilder,
     ) -> Result<Self> {
         let lin1 = linear(vb.pp("lin1"), embedding_dim, mlp_dim, true)?;

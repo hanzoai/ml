@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, Device, Result, Tensor, D};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     embedding, layer_norm, linear_no_bias, Activation, Embedding, LayerNorm, Linear, Module,
     VarBuilder,
 };
@@ -187,7 +187,7 @@ impl MusicgenAttention {
         let attn_weights = attn_weights
             .reshape((b_sz, self.num_heads, tgt_len, src_len))?
             .broadcast_add(attention_mask)?;
-        let attn_weights = hanzo_nn::ops::softmax(&attn_weights, D::Minus1)?;
+        let attn_weights = hanzo_ml_nn::ops::softmax(&attn_weights, D::Minus1)?;
         // TODO: layer_head_mask?
         let attn_output = attn_weights
             .matmul(&value_states)?

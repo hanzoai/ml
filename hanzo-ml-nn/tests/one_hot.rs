@@ -1,5 +1,5 @@
 use hanzo_ml::{Result, Shape, Tensor};
-use hanzo_nn::encoding::one_hot;
+use hanzo_ml_nn::encoding::one_hot;
 
 #[test]
 fn test_i64_one_hot() -> Result<()> {

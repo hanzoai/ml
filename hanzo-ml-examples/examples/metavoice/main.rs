@@ -14,7 +14,7 @@ use hanzo_transformers::models::metavoice::{adapters, gpt, tokenizers, transform
 use hanzo_transformers::models::quantized_metavoice::transformer as qtransformer;
 
 use hanzo_ml::{DType, IndexOp, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hf_hub::api::sync::Api;
 use rand::{distr::Distribution, SeedableRng};
 
@@ -249,7 +249,7 @@ fn main() -> Result<()> {
         for step in 0..seq_len {
             let logits = logits.i(step)?.to_dtype(DType::F32)?;
             let logits = &(&logits / 1.0)?;
-            let prs = hanzo_nn::ops::softmax_last_dim(logits)?.to_vec1::<f32>()?;
+            let prs = hanzo_ml_nn::ops::softmax_last_dim(logits)?.to_vec1::<f32>()?;
             let distr = rand::distr::weighted::WeightedIndex::new(prs.as_slice())?;
             let sample = distr.sample(&mut rng) as u32;
             codes_.push(sample)

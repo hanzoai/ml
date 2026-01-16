@@ -19,7 +19,7 @@ use hanzo_ml::quantized::gguf_file;
 use hanzo_ml::quantized::QTensor;
 use hanzo_ml::D;
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
-use hanzo_nn::{Embedding, Module};
+use hanzo_ml_nn::{Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 131072; // Gemma 3 supports 128K context window
 pub const DEFAULT_SLIDING_WINDOW_TYPE: usize = 6;
@@ -57,7 +57,7 @@ impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let gate = self.feed_forward_gate.forward(xs)?;
         let up = self.feed_forward_up.forward(xs)?;
-        let silu = hanzo_nn::ops::silu(&gate)?;
+        let silu = hanzo_ml_nn::ops::silu(&gate)?;
         let gated = (silu * up)?;
         self.feed_forward_down.forward(&gated)
     }
@@ -94,8 +94,8 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -235,7 +235,7 @@ impl LayerWeights {
             attn_weights = mask.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
         }
 
-        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&v)?;
 
         let attn_output = attn_output

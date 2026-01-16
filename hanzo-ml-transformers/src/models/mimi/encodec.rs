@@ -4,7 +4,7 @@
 
 use super::{conv, quantization, seanet, transformer};
 use hanzo_ml::{DType, Device, Module, Result, StreamTensor, StreamingModule, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ResampleMethod {
@@ -35,7 +35,7 @@ impl Config {
             causal: true,
             n_filters: 64,
             n_residual_layers: 1,
-            activation: hanzo_nn::Activation::Elu(1.),
+            activation: hanzo_ml_nn::Activation::Elu(1.),
             compress: 2,
             dilation_base: 2,
             disable_norm_outer_blocks: 0,
@@ -222,7 +222,7 @@ impl Encodec {
 
 pub fn load(model_file: &str, num_codebooks: Option<usize>, dev: &Device) -> Result<Encodec> {
     let vb =
-        unsafe { hanzo_nn::VarBuilder::from_mmaped_safetensors(&[model_file], DType::F32, dev)? };
+        unsafe { hanzo_ml_nn::VarBuilder::from_mmaped_safetensors(&[model_file], DType::F32, dev)? };
     let cfg = Config::v0_1(num_codebooks);
     let encodec = Encodec::new(cfg, vb)?;
     Ok(encodec)

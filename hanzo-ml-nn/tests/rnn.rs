@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use hanzo_ml::{test_utils::to_vec2_round, DType, Device, Result, Tensor};
-use hanzo_nn::RNN;
+use hanzo_ml_nn::RNN;
 
 /* The following test can be verified against PyTorch using the following snippet.
 import torch
@@ -42,8 +42,8 @@ fn lstm() -> Result<()> {
     ]
     .into_iter()
     .collect();
-    let vb = hanzo_nn::VarBuilder::from_tensors(tensors, DType::F32, cpu);
-    let lstm = hanzo_nn::lstm(2, 3, Default::default(), vb)?;
+    let vb = hanzo_ml_nn::VarBuilder::from_tensors(tensors, DType::F32, cpu);
+    let lstm = hanzo_ml_nn::lstm(2, 3, Default::default(), vb)?;
     let mut state = lstm.zero_state(1)?;
     for inp in [3f32, 1., 4., 1., 5., 9., 2.] {
         let inp = Tensor::new(&[[inp, inp * 0.5]], cpu)?;
@@ -88,8 +88,8 @@ fn gru() -> Result<()> {
     ]
     .into_iter()
     .collect();
-    let vb = hanzo_nn::VarBuilder::from_tensors(tensors, DType::F32, cpu);
-    let gru = hanzo_nn::gru(2, 3, Default::default(), vb)?;
+    let vb = hanzo_ml_nn::VarBuilder::from_tensors(tensors, DType::F32, cpu);
+    let gru = hanzo_ml_nn::gru(2, 3, Default::default(), vb)?;
     let mut state = gru.zero_state(1)?;
     for inp in [3f32, 1., 4., 1., 5., 9., 2.] {
         let inp = Tensor::new(&[[inp, inp * 0.5]], cpu)?;

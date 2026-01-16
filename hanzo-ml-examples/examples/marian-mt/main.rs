@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 
 use hanzo_ml::{DType, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::models::marian;
 
 use tokenizers::Tokenizer;

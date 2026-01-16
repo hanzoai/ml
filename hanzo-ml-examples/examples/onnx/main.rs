@@ -71,7 +71,7 @@ pub fn main() -> anyhow::Result<()> {
     let mut outputs = hanzo_onnx::simple_eval(&model, inputs)?;
     let output = outputs.remove(&graph.output[0].name).unwrap();
     let prs = match args.which {
-        Which::SqueezeNet => hanzo_nn::ops::softmax(&output, D::Minus1)?,
+        Which::SqueezeNet => hanzo_ml_nn::ops::softmax(&output, D::Minus1)?,
         Which::EfficientNet => output,
         Which::EsrGan => output,
     };

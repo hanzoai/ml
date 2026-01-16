@@ -1,14 +1,14 @@
 use super::common::LayerNormNoWeights;
 use hanzo_ml::{Module, Result, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 
 #[derive(Debug)]
 pub struct MixingResidualBlock {
     norm1: LayerNormNoWeights,
-    depthwise_conv: hanzo_nn::Conv2d,
+    depthwise_conv: hanzo_ml_nn::Conv2d,
     norm2: LayerNormNoWeights,
-    channelwise_lin1: hanzo_nn::Linear,
-    channelwise_lin2: hanzo_nn::Linear,
+    channelwise_lin1: hanzo_ml_nn::Linear,
+    channelwise_lin2: hanzo_ml_nn::Linear,
     gammas: Vec<f32>,
 }
 
@@ -16,13 +16,13 @@ impl MixingResidualBlock {
     pub fn new(inp: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
         let norm1 = LayerNormNoWeights::new(inp)?;
         let norm2 = LayerNormNoWeights::new(inp)?;
-        let cfg = hanzo_nn::Conv2dConfig {
+        let cfg = hanzo_ml_nn::Conv2dConfig {
             groups: inp,
             ..Default::default()
         };
-        let depthwise_conv = hanzo_nn::conv2d(inp, inp, 3, cfg, vb.pp("depthwise.1"))?;
-        let channelwise_lin1 = hanzo_nn::linear(inp, embed_dim, vb.pp("channelwise.0"))?;
-        let channelwise_lin2 = hanzo_nn::linear(embed_dim, inp, vb.pp("channelwise.2"))?;
+        let depthwise_conv = hanzo_ml_nn::conv2d(inp, inp, 3, cfg, vb.pp("depthwise.1"))?;
+        let channelwise_lin1 = hanzo_ml_nn::linear(inp, embed_dim, vb.pp("channelwise.0"))?;
+        let channelwise_lin2 = hanzo_ml_nn::linear(embed_dim, inp, vb.pp("channelwise.2"))?;
         let gammas = vb.get(6, "gammas")?.to_vec1::<f32>()?;
         Ok(Self {
             norm1,
@@ -43,7 +43,7 @@ impl Module for MixingResidualBlock {
             .apply(&self.norm1)?
             .permute((0, 3, 1, 2))?
             .affine(1. + mods[0] as f64, mods[1] as f64)?;
-        let x_temp = hanzo_nn::ops::replication_pad2d(&x_temp, 1)?;
+        let x_temp = hanzo_ml_nn::ops::replication_pad2d(&x_temp, 1)?;
         let xs = (xs + x_temp.apply(&self.depthwise_conv)? * mods[2] as f64)?;
         let x_temp = xs
             .permute((0, 2, 3, 1))?
@@ -63,13 +63,13 @@ impl Module for MixingResidualBlock {
 
 #[derive(Debug)]
 pub struct PaellaVQ {
-    in_block_conv: hanzo_nn::Conv2d,
-    out_block_conv: hanzo_nn::Conv2d,
-    down_blocks: Vec<(Option<hanzo_nn::Conv2d>, MixingResidualBlock)>,
-    down_blocks_conv: hanzo_nn::Conv2d,
-    down_blocks_bn: hanzo_nn::BatchNorm,
-    up_blocks_conv: hanzo_nn::Conv2d,
-    up_blocks: Vec<(Vec<MixingResidualBlock>, Option<hanzo_nn::ConvTranspose2d>)>,
+    in_block_conv: hanzo_ml_nn::Conv2d,
+    out_block_conv: hanzo_ml_nn::Conv2d,
+    down_blocks: Vec<(Option<hanzo_ml_nn::Conv2d>, MixingResidualBlock)>,
+    down_blocks_conv: hanzo_ml_nn::Conv2d,
+    down_blocks_bn: hanzo_ml_nn::BatchNorm,
+    up_blocks_conv: hanzo_ml_nn::Conv2d,
+    up_blocks: Vec<(Vec<MixingResidualBlock>, Option<hanzo_ml_nn::ConvTranspose2d>)>,
 }
 
 impl PaellaVQ {
@@ -81,14 +81,14 @@ impl PaellaVQ {
         const BOTTLENECK_BLOCKS: usize = 12;
         const C_LEVELS: [usize; 2] = [EMBED_DIM / 2, EMBED_DIM];
 
-        let in_block_conv = hanzo_nn::conv2d(
+        let in_block_conv = hanzo_ml_nn::conv2d(
             IN_CHANNELS * 4,
             C_LEVELS[0],
             1,
             Default::default(),
             vb.pp("in_block.1"),
         )?;
-        let out_block_conv = hanzo_nn::conv2d(
+        let out_block_conv = hanzo_ml_nn::conv2d(
             C_LEVELS[0],
             OUT_CHANNELS * 4,
             1,
@@ -101,12 +101,12 @@ impl PaellaVQ {
         let mut d_idx = 0;
         for (i, &c_level) in C_LEVELS.iter().enumerate() {
             let conv_block = if i > 0 {
-                let cfg = hanzo_nn::Conv2dConfig {
+                let cfg = hanzo_ml_nn::Conv2dConfig {
                     padding: 1,
                     stride: 2,
                     ..Default::default()
                 };
-                let block = hanzo_nn::conv2d(C_LEVELS[i - 1], c_level, 4, cfg, vb_d.pp(d_idx))?;
+                let block = hanzo_ml_nn::conv2d(C_LEVELS[i - 1], c_level, 4, cfg, vb_d.pp(d_idx))?;
                 d_idx += 1;
                 Some(block)
             } else {
@@ -117,19 +117,19 @@ impl PaellaVQ {
             down_blocks.push((conv_block, res_block))
         }
         let vb_d = vb_d.pp(d_idx);
-        let down_blocks_conv = hanzo_nn::conv2d_no_bias(
+        let down_blocks_conv = hanzo_ml_nn::conv2d_no_bias(
             C_LEVELS[1],
             LATENT_CHANNELS,
             1,
             Default::default(),
             vb_d.pp(0),
         )?;
-        let down_blocks_bn = hanzo_nn::batch_norm(LATENT_CHANNELS, 1e-5, vb_d.pp(1))?;
+        let down_blocks_bn = hanzo_ml_nn::batch_norm(LATENT_CHANNELS, 1e-5, vb_d.pp(1))?;
 
         let mut up_blocks = Vec::new();
         let vb_u = vb.pp("up_blocks");
         let mut u_idx = 0;
-        let up_blocks_conv = hanzo_nn::conv2d(
+        let up_blocks_conv = hanzo_ml_nn::conv2d(
             LATENT_CHANNELS,
             C_LEVELS[1],
             1,
@@ -146,12 +146,12 @@ impl PaellaVQ {
                 res_blocks.push(res_block)
             }
             let conv_block = if i < C_LEVELS.len() - 1 {
-                let cfg = hanzo_nn::ConvTranspose2dConfig {
+                let cfg = hanzo_ml_nn::ConvTranspose2dConfig {
                     padding: 1,
                     stride: 2,
                     ..Default::default()
                 };
-                let block = hanzo_nn::conv_transpose2d(
+                let block = hanzo_ml_nn::conv_transpose2d(
                     c_level,
                     C_LEVELS[C_LEVELS.len() - i - 2],
                     4,
@@ -177,7 +177,7 @@ impl PaellaVQ {
     }
 
     pub fn encode(&self, xs: &Tensor) -> Result<Tensor> {
-        let mut xs = hanzo_nn::ops::pixel_unshuffle(xs, 2)?.apply(&self.in_block_conv)?;
+        let mut xs = hanzo_ml_nn::ops::pixel_unshuffle(xs, 2)?.apply(&self.in_block_conv)?;
         for down_block in self.down_blocks.iter() {
             if let Some(conv) = &down_block.0 {
                 xs = xs.apply(conv)?
@@ -200,7 +200,7 @@ impl PaellaVQ {
             }
         }
         xs.apply(&self.out_block_conv)?
-            .apply(&|xs: &_| hanzo_nn::ops::pixel_shuffle(xs, 2))
+            .apply(&|xs: &_| hanzo_ml_nn::ops::pixel_shuffle(xs, 2))
     }
 }
 

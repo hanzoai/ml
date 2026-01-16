@@ -3,7 +3,7 @@
 // LICENSE file in the root directory of this source tree.
 
 use hanzo_ml::{Module, Result, StreamTensor, StreamingModule, Tensor, D};
-use hanzo_nn::{Conv1d, VarBuilder};
+use hanzo_ml_nn::{Conv1d, VarBuilder};
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -28,7 +28,7 @@ fn conv1d_weight_norm(
     out_c: usize,
     kernel_size: usize,
     bias: bool,
-    config: hanzo_nn::Conv1dConfig,
+    config: hanzo_ml_nn::Conv1dConfig,
     vb: VarBuilder,
 ) -> Result<Conv1d> {
     let weight = if vb.contains_tensor("weight") {
@@ -50,7 +50,7 @@ fn conv1d_weight_norm(
 #[derive(Debug, Clone)]
 pub struct NormConv1d {
     conv: Conv1d,
-    norm: Option<hanzo_nn::GroupNorm>,
+    norm: Option<hanzo_ml_nn::GroupNorm>,
     span: tracing::Span,
 }
 
@@ -63,15 +63,15 @@ impl NormConv1d {
         causal: bool,
         norm: Option<Norm>,
         bias: bool,
-        cfg: hanzo_nn::Conv1dConfig,
+        cfg: hanzo_ml_nn::Conv1dConfig,
         vb: VarBuilder,
     ) -> Result<Self> {
         let conv = match norm {
             None | Some(Norm::TimeGroupNorm) => {
                 if bias {
-                    hanzo_nn::conv1d(in_c, out_c, k_size, cfg, vb.pp("conv"))?
+                    hanzo_ml_nn::conv1d(in_c, out_c, k_size, cfg, vb.pp("conv"))?
                 } else {
-                    hanzo_nn::conv1d_no_bias(in_c, out_c, k_size, cfg, vb.pp("conv"))?
+                    hanzo_ml_nn::conv1d_no_bias(in_c, out_c, k_size, cfg, vb.pp("conv"))?
                 }
             }
             Some(Norm::WeightNorm) => {
@@ -85,7 +85,7 @@ impl NormConv1d {
                 if causal {
                     hanzo_ml::bail!("GroupNorm doesn't support causal evaluation.")
                 }
-                let norm = hanzo_nn::group_norm(1, out_c, 1e-5, vb.pp("norm"))?;
+                let norm = hanzo_ml_nn::group_norm(1, out_c, 1e-5, vb.pp("norm"))?;
                 Some(norm)
             }
         };
@@ -115,7 +115,7 @@ pub struct NormConvTranspose1d {
     k_size: usize,
     stride: usize,
     groups: usize,
-    norm: Option<hanzo_nn::GroupNorm>,
+    norm: Option<hanzo_ml_nn::GroupNorm>,
     span: tracing::Span,
 }
 
@@ -167,7 +167,7 @@ impl NormConvTranspose1d {
                 if causal {
                     hanzo_ml::bail!("GroupNorm doesn't support causal evaluation.")
                 }
-                let norm = hanzo_nn::group_norm(1, out_c, 1e-5, vb.pp("norm"))?;
+                let norm = hanzo_ml_nn::group_norm(1, out_c, 1e-5, vb.pp("norm"))?;
                 Some(norm)
             }
         };
@@ -262,7 +262,7 @@ impl StreamableConv1d {
         pad_mode: PadMode,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let cfg = hanzo_nn::Conv1dConfig {
+        let cfg = hanzo_ml_nn::Conv1dConfig {
             padding: 0,
             stride,
             dilation,
@@ -559,7 +559,7 @@ mod tests {
     ) -> Result<()> {
         // TODO: We should ensure for the seed to be constant when running these tests.
         let dev = &hanzo_ml::Device::Cpu;
-        let vm = hanzo_nn::VarMap::new();
+        let vm = hanzo_ml_nn::VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, hanzo_ml::DType::F32, dev);
         let conv1d = StreamableConv1d::new(
             /* in_c */ 2,
@@ -609,7 +609,7 @@ mod tests {
     ) -> Result<()> {
         // TODO: We should ensure for the seed to be constant when running these tests.
         let dev = &hanzo_ml::Device::Cpu;
-        let vm = hanzo_nn::VarMap::new();
+        let vm = hanzo_ml_nn::VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, hanzo_ml::DType::F32, dev);
         let conv1d = StreamableConvTranspose1d::new(
             /* in_c */ 2, /* out_c */ 3, /* k_size */ k_size,

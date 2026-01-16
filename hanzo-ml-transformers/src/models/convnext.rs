@@ -14,7 +14,7 @@
 
 use hanzo_ml::shape::ShapeWithOneHole;
 use hanzo_ml::{Result, D};
-use hanzo_nn::{conv2d, layer_norm, linear, Conv2dConfig, Func, VarBuilder};
+use hanzo_ml_nn::{conv2d, layer_norm, linear, Conv2dConfig, Func, VarBuilder};
 
 #[derive(Clone)]
 pub struct Config {
