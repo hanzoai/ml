@@ -50,10 +50,10 @@ impl Model {
 }
 ```
 
-Now, let's add the `hanzo-ml-datasets` package to our project to access the MNIST dataset:
+Now, let's add the `hanzo-datasets` package to our project to access the MNIST dataset:
 
 ```bash
-$ cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml-datasets
+$ cargo add --git https://github.com/huggingface/hanzo.git hanzo-datasets
 ```
 
 With the dataset available, we can implement our training loop:

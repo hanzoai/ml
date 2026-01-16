@@ -1,5 +1,5 @@
 [package]
-name = "hanzo-ml-flash-attn"
+name = "hanzo-flash-attn"
 version = "0.9.1"
 edition = "2021"
 
@@ -20,7 +20,7 @@ anyhow = { version = "1", features = ["backtrace"] }
 
 [dev-dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
-hanzo-ml-nn = { path = "../hanzo-ml-nn", features = ["cuda"] }
+hanzo-nn = { path = "../hanzo-nn", features = ["cuda"] }
 
 [features]
 default = []

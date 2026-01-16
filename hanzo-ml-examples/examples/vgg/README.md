@@ -2,7 +2,7 @@
 
 This example demonstrates the implementation of VGG models (VGG13, VGG16, VGG19) using the ML library.
 
-The VGG models are defined in `hanzo-ml-transformers/src/models/vgg.rs`. The main function in `hanzo-ml-examples/examples/vgg/main.rs` loads an image, selects the VGG model based on the provided argument, and applies the model to the loaded image.
+The VGG models are defined in `hanzo-transformers/src/models/vgg.rs`. The main function in `hanzo-ml-examples/examples/vgg/main.rs` loads an image, selects the VGG model based on the provided argument, and applies the model to the loaded image.
 
 You can run the example with the following command:
 

@@ -150,7 +150,7 @@ impl QMetalStorage {
         let mut dst_shape = src_shape.dims().to_vec();
 
         // We always use a single batch dimension and stack all the tensors in the batch on the
-        // second dimension as the implementation in hanzo-ml-metal-kernels doesn't handle batch
+        // second dimension as the implementation in hanzo-metal-kernels doesn't handle batch
         // properly.
         let m = match dst_shape.len() {
             3 => dst_shape[0] * dst_shape[1],
