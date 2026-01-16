@@ -10,7 +10,7 @@ repository = "https://github.com/hanzoai/ml"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-hanzo-ml-core = { path = "../hanzo-ml-core", version = "0.9.1" }
+hanzo-ml = { path = "../hanzo-ml", version = "0.9.1" }
 hanzo-ml-nn = { path = "../hanzo-ml-nn", version = "0.9.1" }
 hanzo-ml-transformers = { path = "../hanzo-ml-transformers", version = "0.9.1" }
 anyhow = "1.0"
@@ -20,7 +20,7 @@ tokio = { version = "1.0", features = ["full"] }
 
 [features]
 default = ["metal"]
-metal = ["hanzo-ml-core/metal", "hanzo-ml-nn/metal"]
-cuda = ["hanzo-ml-core/cuda"]
-mkl = ["hanzo-ml-core/mkl"]
-accelerate = ["hanzo-ml-core/accelerate"]
+metal = ["hanzo-ml/metal", "hanzo-ml-nn/metal"]
+cuda = ["hanzo-ml/cuda"]
+mkl = ["hanzo-ml/mkl"]
+accelerate = ["hanzo-ml/accelerate"]

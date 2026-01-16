@@ -6,7 +6,7 @@
 //! Implementation based on [timm model](https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/fastvit.py)
 
 use hanzo_ml::{Context, DType, Result, Tensor, D};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     batch_norm, conv2d, conv2d_no_bias, linear, linear_no_bias, ops::sigmoid, ops::softmax,
     BatchNorm, Conv2d, Conv2dConfig, Func, VarBuilder,
 };

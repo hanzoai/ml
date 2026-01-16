@@ -19,7 +19,7 @@ use crate::models::with_tracing::{layer_norm, linear, Embedding, LayerNorm, Line
 /// This corresponds to the model update made with the following commit:
 /// https://huggingface.co/microsoft/phi-2/commit/cb2f4533604d8b67de604e7df03bfe6f3ca22869
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::{Activation, VarBuilder};
+use hanzo_ml_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 
 // https://huggingface.co/microsoft/phi-2/blob/main/configuration_phi.py
@@ -83,7 +83,7 @@ impl RotaryEmbedding {
         let xs_pass = xs.i((.., .., .., self.dim..))?;
         let c = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let s = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let xs_rot = hanzo_nn::rotary_emb::rope(&xs_rot, &c, &s)?;
+        let xs_rot = hanzo_ml_nn::rotary_emb::rope(&xs_rot, &c, &s)?;
         Tensor::cat(&[&xs_rot, &xs_pass], D::Minus1)
     }
 }
@@ -254,7 +254,7 @@ impl Attention {
             )?,
         };
         let attn_weights =
-            hanzo_nn::ops::softmax_last_dim(&attn_weights)?.to_dtype(value_states.dtype())?;
+            hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?.to_dtype(value_states.dtype())?;
         let attn_output = attn_weights.matmul(&value_states)?;
         let attn_output = attn_output
             .transpose(1, 2)?

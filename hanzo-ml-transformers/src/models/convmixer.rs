@@ -6,7 +6,7 @@
 //! - 💻 [Github](https://github.com/locuslab/convmixer)
 //!
 use hanzo_ml::Result;
-use hanzo_nn::{batch_norm, Conv2dConfig, Module, VarBuilder};
+use hanzo_ml_nn::{batch_norm, Conv2dConfig, Module, VarBuilder};
 
 #[allow(clippy::many_single_char_names)]
 fn conv2d_same(
@@ -16,9 +16,9 @@ fn conv2d_same(
     c: Conv2dConfig,
     vb: VarBuilder,
 ) -> Result<impl Module> {
-    let conv2d = hanzo_nn::conv2d(i, o, k, c, vb)?;
+    let conv2d = hanzo_ml_nn::conv2d(i, o, k, c, vb)?;
     let s = c.stride;
-    let module = hanzo_nn::func(move |xs| {
+    let module = hanzo_ml_nn::func(move |xs| {
         let ih = xs.dim(2)?;
         let iw = xs.dim(3)?;
         let oh = ih.div_ceil(s);
@@ -44,9 +44,9 @@ fn block(dim: usize, kernel_size: usize, vb: VarBuilder) -> Result<impl Module> 
     let vb_fn = vb.pp(0).pp("fn");
     let conv1 = conv2d_same(dim, dim, kernel_size, conv2d_cfg, vb_fn.pp(0))?;
     let bn1 = batch_norm(dim, 1e-5, vb_fn.pp(2))?;
-    let conv2 = hanzo_nn::conv2d(dim, dim, 1, Default::default(), vb.pp(1))?;
+    let conv2 = hanzo_ml_nn::conv2d(dim, dim, 1, Default::default(), vb.pp(1))?;
     let bn2 = batch_norm(dim, 1e-5, vb.pp(3))?;
-    Ok(hanzo_nn::func(move |xs| {
+    Ok(hanzo_ml_nn::func(move |xs| {
         let ys = xs.apply(&conv1)?.gelu_erf()?.apply_t(&bn1, false)?;
         (xs + ys)?.apply(&conv2)?.gelu_erf()?.apply_t(&bn2, false)
     }))
@@ -59,18 +59,18 @@ fn convmixer(
     kernel_size: usize,
     patch_size: usize,
     vb: VarBuilder,
-) -> Result<hanzo_nn::Func<'static>> {
+) -> Result<hanzo_ml_nn::Func<'static>> {
     let conv2d_cfg = Conv2dConfig {
         stride: patch_size,
         ..Default::default()
     };
-    let conv1 = hanzo_nn::conv2d(3, dim, patch_size, conv2d_cfg, vb.pp(0))?;
+    let conv1 = hanzo_ml_nn::conv2d(3, dim, patch_size, conv2d_cfg, vb.pp(0))?;
     let bn1 = batch_norm(dim, 1e-5, vb.pp(2))?;
     let blocks: Vec<_> = (0..depth)
         .map(|index| block(dim, kernel_size, vb.pp(3 + index)))
         .collect::<Result<Vec<_>>>()?;
-    let fc = hanzo_nn::linear(dim, nclasses, vb.pp(25))?;
-    Ok(hanzo_nn::func(move |xs| {
+    let fc = hanzo_ml_nn::linear(dim, nclasses, vb.pp(25))?;
+    Ok(hanzo_ml_nn::func(move |xs| {
         let mut xs = xs.apply(&conv1)?.gelu_erf()?.apply_t(&bn1, false)?;
         for block in blocks.iter() {
             xs = xs.apply(block)?
@@ -80,10 +80,10 @@ fn convmixer(
     }))
 }
 
-pub fn c1536_20(nclasses: usize, vb: VarBuilder) -> Result<hanzo_nn::Func<'static>> {
+pub fn c1536_20(nclasses: usize, vb: VarBuilder) -> Result<hanzo_ml_nn::Func<'static>> {
     convmixer(nclasses, 1536, 20, 9, 7, vb)
 }
 
-pub fn c1024_20(nclasses: usize, vb: VarBuilder) -> Result<hanzo_nn::Func<'static>> {
+pub fn c1024_20(nclasses: usize, vb: VarBuilder) -> Result<hanzo_ml_nn::Func<'static>> {
     convmixer(nclasses, 1024, 20, 9, 14, vb)
 }

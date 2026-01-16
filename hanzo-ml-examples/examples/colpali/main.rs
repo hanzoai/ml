@@ -1,6 +1,6 @@
 use anyhow::{Error as E, Result};
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::models::colpali::Model;
 use hanzo_transformers::models::{colpali, paligemma};
 use clap::Parser;

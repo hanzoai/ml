@@ -181,7 +181,7 @@ fn main() -> Result<()> {
 
     println!("building the model");
     let vb = unsafe {
-        hanzo_nn::var_builder::ShardedSafeTensors::var_builder(&filenames, dtype, &device)?
+        hanzo_ml_nn::var_builder::ShardedSafeTensors::var_builder(&filenames, dtype, &device)?
     };
     let llama = Llama::load(vb, &cache, &config, comm)?;
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;

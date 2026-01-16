@@ -1,5 +1,5 @@
 use hanzo_ml::{IndexOp, Result, Tensor};
-use hanzo_nn::{Module, VarBuilder};
+use hanzo_ml_nn::{Module, VarBuilder};
 
 use super::transformer::TwoWayTransformer;
 
@@ -51,7 +51,7 @@ impl Module for MlpMaskDecoder {
             }
         }
         if self.sigmoid_output {
-            hanzo_nn::ops::sigmoid(&xs)
+            hanzo_ml_nn::ops::sigmoid(&xs)
         } else {
             Ok(xs)
         }
@@ -60,12 +60,12 @@ impl Module for MlpMaskDecoder {
 
 #[derive(Debug)]
 pub struct MaskDecoder {
-    iou_token: hanzo_nn::Embedding,
-    mask_tokens: hanzo_nn::Embedding,
+    iou_token: hanzo_ml_nn::Embedding,
+    mask_tokens: hanzo_ml_nn::Embedding,
     iou_prediction_head: MlpMaskDecoder,
-    output_upscaling_conv1: hanzo_nn::ConvTranspose2d,
+    output_upscaling_conv1: hanzo_ml_nn::ConvTranspose2d,
     output_upscaling_ln: super::LayerNorm2d,
-    output_upscaling_conv2: hanzo_nn::ConvTranspose2d,
+    output_upscaling_conv2: hanzo_ml_nn::ConvTranspose2d,
     num_mask_tokens: usize,
     output_hypernetworks_mlps: Vec<MlpMaskDecoder>,
     transformer: TwoWayTransformer,
@@ -89,14 +89,14 @@ impl MaskDecoder {
             false,
             vb.pp("iou_prediction_head"),
         )?;
-        let iou_token = hanzo_nn::embedding(1, transformer_dim, vb.pp("iou_token"))?;
+        let iou_token = hanzo_ml_nn::embedding(1, transformer_dim, vb.pp("iou_token"))?;
         let mask_tokens =
-            hanzo_nn::embedding(num_mask_tokens, transformer_dim, vb.pp("mask_tokens"))?;
-        let cfg = hanzo_nn::ConvTranspose2dConfig {
+            hanzo_ml_nn::embedding(num_mask_tokens, transformer_dim, vb.pp("mask_tokens"))?;
+        let cfg = hanzo_ml_nn::ConvTranspose2dConfig {
             stride: 2,
             ..Default::default()
         };
-        let output_upscaling_conv1 = hanzo_nn::conv_transpose2d(
+        let output_upscaling_conv1 = hanzo_ml_nn::conv_transpose2d(
             transformer_dim,
             transformer_dim / 4,
             2,
@@ -105,7 +105,7 @@ impl MaskDecoder {
         )?;
         let output_upscaling_ln =
             super::LayerNorm2d::new(transformer_dim / 4, 1e-6, vb.pp("output_upscaling.1"))?;
-        let output_upscaling_conv2 = hanzo_nn::conv_transpose2d(
+        let output_upscaling_conv2 = hanzo_ml_nn::conv_transpose2d(
             transformer_dim / 4,
             transformer_dim / 8,
             2,

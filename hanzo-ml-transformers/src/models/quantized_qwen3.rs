@@ -10,7 +10,7 @@ use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use hanzo_ml::quantized::{gguf_file, QTensor};
 use hanzo_ml::{DType, Device, Result, Tensor};
-use hanzo_nn::{kv_cache::KvCache, Activation, Embedding, Module};
+use hanzo_ml_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
@@ -117,8 +117,8 @@ impl RotaryEmbedding {
         let (_, _, seq_len, _) = q.dims4()?;
         let cos = self.cos.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
         let sin = self.sin.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
-        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -236,7 +236,7 @@ impl AttentionWeights {
             };
             scores = scores.broadcast_add(&mask)?;
         }
-        let probs = hanzo_nn::ops::softmax_last_dim(&scores)?;
+        let probs = hanzo_ml_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
         let reshaped_ctx = ctx
             .transpose(1, 2)?

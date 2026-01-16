@@ -32,10 +32,10 @@ fn nll_and_cross_entropy() -> Result<()> {
     )?;
     let target = Tensor::new(&[1u32, 0, 4], &cpu)?;
 
-    let log_softmax = hanzo_nn::ops::log_softmax(&input, 1)?;
-    let loss = hanzo_nn::loss::nll(&log_softmax, &target)?;
+    let log_softmax = hanzo_ml_nn::ops::log_softmax(&input, 1)?;
+    let loss = hanzo_ml_nn::loss::nll(&log_softmax, &target)?;
     assert_eq!(to_vec0_round(&loss, 4)?, 1.1312);
-    let loss = hanzo_nn::loss::cross_entropy(&input, &target)?;
+    let loss = hanzo_ml_nn::loss::cross_entropy(&input, &target)?;
     assert_eq!(to_vec0_round(&loss, 4)?, 1.1312);
     Ok(())
 }
@@ -81,7 +81,7 @@ fn binary_cross_entropy_with_logit() -> Result<()> {
     let inp = Tensor::new(&inp, &cpu)?;
     let target = Tensor::new(&target, &cpu)?;
 
-    let loss = hanzo_nn::loss::binary_cross_entropy_with_logit(&inp, &target)?;
+    let loss = hanzo_ml_nn::loss::binary_cross_entropy_with_logit(&inp, &target)?;
 
     assert_eq!(to_vec0_round(&loss, 4)?, 0.8224);
     Ok(())

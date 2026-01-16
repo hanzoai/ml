@@ -17,7 +17,7 @@
 
 use crate::models::with_tracing::{linear, linear_no_bias, Linear, RmsNorm};
 use hanzo_ml::{DType, Device, Error, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::{layer_norm, Activation, LayerNorm, VarBuilder};
+use hanzo_ml_nn::{layer_norm, Activation, LayerNorm, VarBuilder};
 use std::sync::Arc;
 
 // internal representation for identifying which model is being used
@@ -108,7 +108,7 @@ impl Config {
         // Removed `sliding_window` related config which is basically being carried forward from `qwen2` but not used here
         Self {
             variant: ModelVariant::Large,
-            activation_fn: hanzo_nn::Activation::Silu,
+            activation_fn: hanzo_ml_nn::Activation::Silu,
             vocab_size: 151646,
             hidden_size: 1536,
             intermediate_size: 8960,
@@ -204,8 +204,8 @@ impl RotaryEmbedding {
         let cos = self.cos.narrow(0, 0, seq_len)?;
         let sin = self.sin.narrow(0, 0, seq_len)?;
 
-        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -425,7 +425,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
 
             attn_weights.matmul(&value_states)?
         };
@@ -482,7 +482,7 @@ impl Layer {
             ModelVariant::Small => (
                 NormType::Layer(layer_norm(
                     cfg.hidden_size,
-                    hanzo_nn::LayerNormConfig {
+                    hanzo_ml_nn::LayerNormConfig {
                         eps: cfg.norm_eps,
                         ..Default::default()
                     },
@@ -490,7 +490,7 @@ impl Layer {
                 )?),
                 NormType::Layer(layer_norm(
                     cfg.hidden_size,
-                    hanzo_nn::LayerNormConfig {
+                    hanzo_ml_nn::LayerNormConfig {
                         eps: cfg.norm_eps,
                         ..Default::default()
                     },
@@ -578,9 +578,9 @@ pub struct Embeddings {
     variant: ModelVariant,
     // For 1.5B: this is the `embed_tokens`
     // For 400M: this is the `word_embeddings`
-    embeddings: hanzo_nn::Embedding,
+    embeddings: hanzo_ml_nn::Embedding,
     // folloing are specifically for 400M
-    token_type_embeddings: Option<hanzo_nn::Embedding>,
+    token_type_embeddings: Option<hanzo_ml_nn::Embedding>,
     layer_norm: Option<LayerNorm>,
     position_ids: Option<Tensor>,
 }
@@ -589,7 +589,7 @@ impl Embeddings {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let (embeddings, token_type_embeddings, layer_norm, position_ids) = match cfg.variant {
             ModelVariant::Large => (
-                hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?,
+                hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?,
                 None,
                 None,
                 None,
@@ -599,24 +599,24 @@ impl Embeddings {
                 let weight = vb.pp("LayerNorm").get_with_hints(
                     cfg.hidden_size,
                     "weight",
-                    hanzo_nn::Init::Const(1.0),
+                    hanzo_ml_nn::Init::Const(1.0),
                 )?;
                 let bias = vb.pp("LayerNorm").get_with_hints(
                     cfg.hidden_size,
                     "bias",
-                    hanzo_nn::Init::Const(0.0),
+                    hanzo_ml_nn::Init::Const(0.0),
                 )?;
                 let dev = bias.device().clone();
 
-                let layer_norm = hanzo_nn::LayerNorm::new(weight, bias, cfg.norm_eps);
+                let layer_norm = hanzo_ml_nn::LayerNorm::new(weight, bias, cfg.norm_eps);
 
                 (
-                    hanzo_nn::embedding(
+                    hanzo_ml_nn::embedding(
                         cfg.vocab_size,
                         cfg.hidden_size,
                         vb.pp("word_embeddings"),
                     )?,
-                    Some(hanzo_nn::embedding(
+                    Some(hanzo_ml_nn::embedding(
                         cfg.type_vocab_size,
                         cfg.hidden_size,
                         vb.pp("token_type_embeddings"),
@@ -690,7 +690,7 @@ impl Model {
             ModelVariant::Small => vb.pp("new"),
         };
         // let embed_tokens =
-        //     hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        //     hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let embeddings = Embeddings::new(cfg, vb_m.clone())?;
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);

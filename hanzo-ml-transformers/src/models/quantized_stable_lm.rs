@@ -16,7 +16,7 @@
 use crate::quantized_nn::{layer_norm, linear, linear_no_bias, Embedding, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_nn::{Activation, LayerNorm};
+use hanzo_ml_nn::{Activation, LayerNorm};
 use std::sync::Arc;
 
 pub use crate::models::stable_lm::Config;
@@ -167,7 +167,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?
         };
         attn_output

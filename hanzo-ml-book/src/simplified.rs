@@ -18,7 +18,7 @@
 mod tests {
 
 use hanzo_ml::{DType, Result, Tensor, D, Device};
-use hanzo_nn::{loss, ops, Linear, Module, VarBuilder, VarMap, Optimizer};
+use hanzo_ml_nn::{loss, ops, Linear, Module, VarBuilder, VarMap, Optimizer};
 
 // ANCHOR: book_training_simplified1
 const VOTE_DIM: usize = 2;
@@ -44,9 +44,9 @@ struct MultiLevelPerceptron {
 
 impl MultiLevelPerceptron {
     fn new(vs: VarBuilder) -> Result<Self> {
-        let ln1 = hanzo_nn::linear(VOTE_DIM, LAYER1_OUT_SIZE, vs.pp("ln1"))?;
-        let ln2 = hanzo_nn::linear(LAYER1_OUT_SIZE, LAYER2_OUT_SIZE, vs.pp("ln2"))?;
-        let ln3 = hanzo_nn::linear(LAYER2_OUT_SIZE, RESULTS + 1, vs.pp("ln3"))?;
+        let ln1 = hanzo_ml_nn::linear(VOTE_DIM, LAYER1_OUT_SIZE, vs.pp("ln1"))?;
+        let ln2 = hanzo_ml_nn::linear(LAYER1_OUT_SIZE, LAYER2_OUT_SIZE, vs.pp("ln2"))?;
+        let ln3 = hanzo_ml_nn::linear(LAYER2_OUT_SIZE, RESULTS + 1, vs.pp("ln3"))?;
         Ok(Self { ln1, ln2, ln3 })
     }
 
@@ -157,7 +157,7 @@ fn train(m: Dataset, dev: &Device) -> anyhow::Result<MultiLevelPerceptron> {
     let varmap = VarMap::new();
     let vs = VarBuilder::from_varmap(&varmap, DType::F32, dev);
     let model = MultiLevelPerceptron::new(vs.clone())?;
-    let mut sgd = hanzo_nn::SGD::new(varmap.all_vars(), LEARNING_RATE)?;
+    let mut sgd = hanzo_ml_nn::SGD::new(varmap.all_vars(), LEARNING_RATE)?;
     let test_votes = m.test_votes.to_device(dev)?;
     let test_results = m.test_results.to_device(dev)?;
     let mut final_accuracy: f32 = 0.0;

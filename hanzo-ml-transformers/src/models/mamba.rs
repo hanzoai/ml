@@ -7,7 +7,7 @@
 //! Based on Laurent Mazare's rust implementation: [mamba.rs](https://github.com/LaurentMazare/mamba.rs)
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::{RmsNorm, VarBuilder};
+use hanzo_ml_nn::{RmsNorm, VarBuilder};
 
 const D_CONV: usize = 4;
 const D_STATE: usize = 16;
@@ -119,7 +119,7 @@ impl MambaBlock {
                 + self.conv1d_weights[d_c]
                     .broadcast_mul(&state.prev_xs[li][(d_c + 1 + state.pos) % D_CONV])?)?;
         }
-        let proj_for_conv = hanzo_nn::ops::silu(&proj_for_conv)?;
+        let proj_for_conv = hanzo_ml_nn::ops::silu(&proj_for_conv)?;
         // SSM + Selection, we're doing inference here so only need the last step of
         // the sequence.
         // Algorithm 3.2 on page 6, https://arxiv.org/pdf/2312.00752.pdf
@@ -152,7 +152,7 @@ impl MambaBlock {
             .squeeze(D::Minus1)?
             + proj_for_conv.broadcast_mul(&d)?)?;
 
-        let ys = (ss * hanzo_nn::ops::silu(&proj_for_silu))?;
+        let ys = (ss * hanzo_ml_nn::ops::silu(&proj_for_silu))?;
         ys.apply(&self.out_proj)
     }
 }
@@ -165,7 +165,7 @@ pub struct ResidualBlock {
 
 impl ResidualBlock {
     pub fn new(layer_index: usize, cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let norm = hanzo_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm"))?;
+        let norm = hanzo_ml_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm"))?;
         let mixer = MambaBlock::new(layer_index, cfg, vb.pp("mixer"))?;
         Ok(Self { mixer, norm })
     }
@@ -178,7 +178,7 @@ impl ResidualBlock {
 // https://github.com/johnma2006/mamba-minimal/blob/61f01953ca153f8c4a850d7111beecbf4be9cee1/model.py#L56
 #[derive(Clone, Debug)]
 pub struct Model {
-    embedding: hanzo_nn::Embedding,
+    embedding: hanzo_ml_nn::Embedding,
     layers: Vec<ResidualBlock>,
     norm_f: RmsNorm,
     lm_head: Linear,
@@ -187,14 +187,14 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let embedding = hanzo_nn::embedding(cfg.vocab_size(), cfg.d_model, vb.pp("embedding"))?;
+        let embedding = hanzo_ml_nn::embedding(cfg.vocab_size(), cfg.d_model, vb.pp("embedding"))?;
         let mut layers = Vec::with_capacity(cfg.n_layer);
         let vb_l = vb.pp("layers");
         for layer_idx in 0..cfg.n_layer {
             let layer = ResidualBlock::new(layer_idx, cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
-        let norm_f = hanzo_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm_f"))?;
+        let norm_f = hanzo_ml_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm_f"))?;
         let lm_head = Linear::from_weights(embedding.embeddings().clone(), None);
         Ok(Self {
             embedding,

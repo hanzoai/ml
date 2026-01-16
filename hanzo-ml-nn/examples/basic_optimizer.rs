@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use hanzo_ml::{DType, Device, Result, Tensor};
-use hanzo_nn::{linear, AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use hanzo_ml_nn::{linear, AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 
 fn gen_data() -> Result<(Tensor, Tensor)> {
     // Generate some sample linear data.

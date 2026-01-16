@@ -7,7 +7,7 @@
 /// For more information, read the paper: https://arxiv.org/abs/2410.14411
 ///
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     linear_b, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear,
     VarBuilder,
 };
@@ -47,7 +47,7 @@ pub fn conv1d_weight_norm(
     in_c: usize,
     out_c: usize,
     kernel_size: usize,
-    config: hanzo_nn::Conv1dConfig,
+    config: hanzo_ml_nn::Conv1dConfig,
     vb: VarBuilder,
 ) -> Result<Conv1d> {
     let weight_g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
@@ -68,7 +68,7 @@ pub fn conv1d_weight_norm_no_bias(
     in_c: usize,
     out_c: usize,
     kernel_size: usize,
-    config: hanzo_nn::Conv1dConfig,
+    config: hanzo_ml_nn::Conv1dConfig,
     vb: VarBuilder,
 ) -> Result<Conv1d> {
     let weight_g = vb.get((out_c, 1, 1), "parametrizations.weight.original0")?;
@@ -89,7 +89,7 @@ pub fn conv_transpose1d_weight_norm(
     out_c: usize,
     kernel_size: usize,
     bias: bool,
-    config: hanzo_nn::ConvTranspose1dConfig,
+    config: hanzo_ml_nn::ConvTranspose1dConfig,
     vb: VarBuilder,
 ) -> Result<ConvTranspose1d> {
     let weight_g = vb.get((in_c, 1, 1), "parametrizations.weight.original0")?;
@@ -158,7 +158,7 @@ impl LocalMHA {
         use_rotary_pos_emb: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let norm = hanzo_nn::layer_norm(dim, 1e-5, vb.pp("norm"))?;
+        let norm = hanzo_ml_nn::layer_norm(dim, 1e-5, vb.pp("norm"))?;
         let to_qkv = linear_b(dim, dim * 3, false, vb.pp("to_qkv"))?;
         let to_out = linear_b(dim, dim, false, vb.pp("to_out"))?;
         let rel_pos = if use_rotary_pos_emb {
@@ -208,7 +208,7 @@ impl Module for LocalMHA {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
             let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
             // Non-causal attention
-            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&v)?
         };
         let out = out
@@ -596,7 +596,7 @@ fn normalize(v: &Tensor) -> Result<Tensor> {
 struct VectorQuantizer {
     in_proj: Conv1d,
     out_proj: Conv1d,
-    codebook: hanzo_nn::Embedding,
+    codebook: hanzo_ml_nn::Embedding,
     stride: usize,
 }
 
@@ -611,7 +611,7 @@ impl VectorQuantizer {
         let in_proj = conv1d_weight_norm(in_dim, cb_dim, 1, Default::default(), vb.pp("in_proj"))?;
         let out_proj =
             conv1d_weight_norm(cb_dim, in_dim, 1, Default::default(), vb.pp("out_proj"))?;
-        let codebook = hanzo_nn::embedding(cb_size, cb_dim, vb.pp("codebook"))?;
+        let codebook = hanzo_ml_nn::embedding(cb_size, cb_dim, vb.pp("codebook"))?;
         Ok(Self {
             in_proj,
             out_proj,

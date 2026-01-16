@@ -1,6 +1,6 @@
 use hanzo_ml::Device;
 use hanzo_ml::Module;
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::models::segformer::{
     Config, ImageClassificationModel, SemanticSegmentationModel,
 };
@@ -131,7 +131,7 @@ fn classification_task(args: ClassificationArgs, device: &Device) -> anyhow::Res
     let num_labels = 7;
     let model = ImageClassificationModel::new(&config, num_labels, vb)?;
     let classification = model.forward(&image)?;
-    let classification = hanzo_nn::ops::softmax_last_dim(&classification)?;
+    let classification = hanzo_ml_nn::ops::softmax_last_dim(&classification)?;
     let classification = classification.squeeze(0)?;
     println!(
         "classification logits {:?}",

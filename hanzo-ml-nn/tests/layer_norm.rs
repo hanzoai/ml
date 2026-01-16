@@ -6,7 +6,7 @@ extern crate accelerate_src;
 
 use anyhow::Result;
 use hanzo_ml::{test_utils, Device, Tensor};
-use hanzo_nn::{LayerNorm, Module};
+use hanzo_ml_nn::{LayerNorm, Module};
 
 #[test]
 fn layer_norm() -> Result<()> {

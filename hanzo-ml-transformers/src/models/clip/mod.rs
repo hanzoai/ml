@@ -21,8 +21,8 @@ pub mod vision_model;
 pub struct ClipModel {
     text_model: ClipTextTransformer,
     vision_model: ClipVisionTransformer,
-    visual_projection: hanzo_nn::Linear,
-    text_projection: hanzo_nn::Linear,
+    visual_projection: hanzo_ml_nn::Linear,
+    text_projection: hanzo_ml_nn::Linear,
     logit_scale: Tensor,
 }
 
@@ -93,15 +93,15 @@ impl ClipConfig {
 }
 
 impl ClipModel {
-    pub fn new(vs: hanzo_nn::VarBuilder, c: &ClipConfig) -> Result<Self> {
+    pub fn new(vs: hanzo_ml_nn::VarBuilder, c: &ClipConfig) -> Result<Self> {
         let text_model = ClipTextTransformer::new(vs.pp("text_model"), &c.text_config)?;
         let vision_model = ClipVisionTransformer::new(vs.pp("vision_model"), &c.vision_config)?;
-        let visual_projection = hanzo_nn::linear_no_bias(
+        let visual_projection = hanzo_ml_nn::linear_no_bias(
             c.vision_config.embed_dim,
             c.vision_config.projection_dim,
             vs.pp("visual_projection"),
         )?;
-        let text_projection = hanzo_nn::linear_no_bias(
+        let text_projection = hanzo_ml_nn::linear_no_bias(
             c.text_config.embed_dim,
             c.text_config.projection_dim,
             vs.pp("text_projection"),

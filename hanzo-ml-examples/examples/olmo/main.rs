@@ -12,7 +12,7 @@ use hanzo_transformers::models::olmo2::{Config as Config2, Model as OLMo2};
 
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;

@@ -11,7 +11,7 @@ use hanzo_transformers::models::mpt::{Config, Model as M};
 use hanzo_transformers::models::quantized_mpt::Model as Q;
 
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;

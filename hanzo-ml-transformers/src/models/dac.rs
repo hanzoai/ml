@@ -6,7 +6,7 @@
 ///
 use crate::models::encodec;
 use hanzo_ml::{IndexOp, Result, Tensor, D};
-use hanzo_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, VarBuilder};
+use hanzo_ml_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, VarBuilder};
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
@@ -220,7 +220,7 @@ impl DecoderBlock {
     }
 }
 
-impl hanzo_nn::Module for DecoderBlock {
+impl hanzo_ml_nn::Module for DecoderBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply(&self.snake1)?
             .apply(&self.conv_tr1)?
@@ -284,7 +284,7 @@ impl hanzo_ml::Module for Decoder {
 pub struct VectorQuantizer {
     in_proj: Conv1d,
     out_proj: Conv1d,
-    codebook: hanzo_nn::Embedding,
+    codebook: hanzo_ml_nn::Embedding,
 }
 
 impl VectorQuantizer {
@@ -293,7 +293,7 @@ impl VectorQuantizer {
             encodec::conv1d_weight_norm(in_dim, cb_dim, 1, Default::default(), vb.pp("in_proj"))?;
         let out_proj =
             encodec::conv1d_weight_norm(cb_dim, in_dim, 1, Default::default(), vb.pp("out_proj"))?;
-        let codebook = hanzo_nn::embedding(cb_size, cb_dim, vb.pp("codebook"))?;
+        let codebook = hanzo_ml_nn::embedding(cb_size, cb_dim, vb.pp("codebook"))?;
         Ok(Self {
             in_proj,
             out_proj,

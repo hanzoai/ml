@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use hanzo_ml::{bail, Context, DType, Device, Module, Result, Tensor, D};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     conv1d, embedding, layer_norm, Conv1d, Conv1dConfig, Embedding, LayerNorm, VarBuilder,
 };
 use serde::{Deserialize, Deserializer};
@@ -133,7 +133,7 @@ pub struct DebertaV2Embeddings {
     position_ids: Tensor,
     config: Config,
     embedding_size: usize,
-    embed_proj: Option<hanzo_nn::Linear>,
+    embed_proj: Option<hanzo_ml_nn::Linear>,
 }
 
 impl DebertaV2Embeddings {
@@ -157,7 +157,7 @@ impl DebertaV2Embeddings {
         };
 
         let token_type_embeddings: Option<Embedding> = if config.type_vocab_size > 0 {
-            Some(hanzo_nn::embedding(
+            Some(hanzo_ml_nn::embedding(
                 config.type_vocab_size,
                 config.hidden_size,
                 vb.pp("token_type_embeddings"),
@@ -166,8 +166,8 @@ impl DebertaV2Embeddings {
             None
         };
 
-        let embed_proj: Option<hanzo_nn::Linear> = if embedding_size != config.hidden_size {
-            Some(hanzo_nn::linear_no_bias(
+        let embed_proj: Option<hanzo_ml_nn::Linear> = if embedding_size != config.hidden_size {
+            Some(hanzo_ml_nn::linear_no_bias(
                 embedding_size,
                 config.hidden_size,
                 vb.pp("embed_proj"),
@@ -300,7 +300,7 @@ impl XSoftmax {
         let min_value_tensor = Tensor::new(&[f32::MIN], device)?.broadcast_as(input.shape())?;
         let mut output = rmask.where_cond(&min_value_tensor, input)?;
 
-        output = hanzo_nn::ops::softmax(&output, dim)?;
+        output = hanzo_ml_nn::ops::softmax(&output, dim)?;
 
         let t_zeroes = Tensor::new(&[0f32], device)?.broadcast_as(input.shape())?;
         output = rmask.where_cond(&t_zeroes, &output)?;
@@ -313,9 +313,9 @@ impl XSoftmax {
 pub struct DebertaV2DisentangledSelfAttention {
     config: Config,
     num_attention_heads: usize,
-    query_proj: hanzo_nn::Linear,
-    key_proj: hanzo_nn::Linear,
-    value_proj: hanzo_nn::Linear,
+    query_proj: hanzo_ml_nn::Linear,
+    key_proj: hanzo_ml_nn::Linear,
+    value_proj: hanzo_ml_nn::Linear,
     dropout: StableDropout,
     device: Device,
     relative_attention: bool,
@@ -324,8 +324,8 @@ pub struct DebertaV2DisentangledSelfAttention {
     max_relative_positions: isize,
     pos_ebd_size: isize,
     share_att_key: bool,
-    pos_key_proj: Option<hanzo_nn::Linear>,
-    pos_query_proj: Option<hanzo_nn::Linear>,
+    pos_key_proj: Option<hanzo_ml_nn::Linear>,
+    pos_query_proj: Option<hanzo_ml_nn::Linear>,
 }
 
 impl DebertaV2DisentangledSelfAttention {
@@ -348,9 +348,9 @@ impl DebertaV2DisentangledSelfAttention {
 
         let all_head_size = num_attention_heads * attention_head_size;
 
-        let query_proj = hanzo_nn::linear(config.hidden_size, all_head_size, vb.pp("query_proj"))?;
-        let key_proj = hanzo_nn::linear(config.hidden_size, all_head_size, vb.pp("key_proj"))?;
-        let value_proj = hanzo_nn::linear(config.hidden_size, all_head_size, vb.pp("value_proj"))?;
+        let query_proj = hanzo_ml_nn::linear(config.hidden_size, all_head_size, vb.pp("query_proj"))?;
+        let key_proj = hanzo_ml_nn::linear(config.hidden_size, all_head_size, vb.pp("key_proj"))?;
+        let value_proj = hanzo_ml_nn::linear(config.hidden_size, all_head_size, vb.pp("value_proj"))?;
 
         let share_att_key = config.share_att_key.unwrap_or(false);
         let relative_attention = config.relative_attention;
@@ -359,8 +359,8 @@ impl DebertaV2DisentangledSelfAttention {
         let mut pos_ebd_size: isize = 0;
         let position_buckets = config.position_buckets.unwrap_or(-1);
         let mut pos_dropout: Option<StableDropout> = None;
-        let mut pos_key_proj: Option<hanzo_nn::Linear> = None;
-        let mut pos_query_proj: Option<hanzo_nn::Linear> = None;
+        let mut pos_key_proj: Option<hanzo_ml_nn::Linear> = None;
+        let mut pos_query_proj: Option<hanzo_ml_nn::Linear> = None;
 
         if relative_attention {
             if max_relative_positions < 1 {
@@ -375,14 +375,14 @@ impl DebertaV2DisentangledSelfAttention {
 
             if !share_att_key {
                 if config.pos_att_type.iter().any(|s| s == "c2p") {
-                    pos_key_proj = Some(hanzo_nn::linear(
+                    pos_key_proj = Some(hanzo_ml_nn::linear(
                         config.hidden_size,
                         all_head_size,
                         vb.pp("pos_key_proj"),
                     )?);
                 }
                 if config.pos_att_type.iter().any(|s| s == "p2c") {
-                    pos_query_proj = Some(hanzo_nn::linear(
+                    pos_query_proj = Some(hanzo_ml_nn::linear(
                         config.hidden_size,
                         all_head_size,
                         vb.pp("pos_query_proj"),
@@ -736,15 +736,15 @@ impl DebertaV2Attention {
 
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L255
 pub struct DebertaV2SelfOutput {
-    dense: hanzo_nn::Linear,
+    dense: hanzo_ml_nn::Linear,
     layer_norm: LayerNorm,
     dropout: StableDropout,
 }
 
 impl DebertaV2SelfOutput {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let dense = hanzo_nn::linear(config.hidden_size, config.hidden_size, vb.pp("dense"))?;
-        let layer_norm = hanzo_nn::layer_norm(
+        let dense = hanzo_ml_nn::linear(config.hidden_size, config.hidden_size, vb.pp("dense"))?;
+        let layer_norm = hanzo_ml_nn::layer_norm(
             config.hidden_size,
             config.layer_norm_eps,
             vb.pp("LayerNorm"),
@@ -767,13 +767,13 @@ impl DebertaV2SelfOutput {
 
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L307
 pub struct DebertaV2Intermediate {
-    dense: hanzo_nn::Linear,
+    dense: hanzo_ml_nn::Linear,
     intermediate_act: HiddenActLayer,
 }
 
 impl DebertaV2Intermediate {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let dense = hanzo_nn::linear(
+        let dense = hanzo_ml_nn::linear(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("intermediate.dense"),
@@ -793,19 +793,19 @@ impl DebertaV2Intermediate {
 
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L323
 pub struct DebertaV2Output {
-    dense: hanzo_nn::Linear,
+    dense: hanzo_ml_nn::Linear,
     layer_norm: LayerNorm,
     dropout: StableDropout,
 }
 
 impl DebertaV2Output {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let dense = hanzo_nn::linear(
+        let dense = hanzo_ml_nn::linear(
             config.intermediate_size,
             config.hidden_size,
             vb.pp("output.dense"),
         )?;
-        let layer_norm = hanzo_nn::layer_norm(
+        let layer_norm = hanzo_ml_nn::layer_norm(
             config.hidden_size,
             config.layer_norm_eps,
             vb.pp("output.LayerNorm"),
@@ -1216,8 +1216,8 @@ pub struct TextClassificationItem {
 pub struct DebertaV2NERModel {
     pub device: Device,
     deberta: DebertaV2Model,
-    dropout: hanzo_nn::Dropout,
-    classifier: hanzo_nn::Linear,
+    dropout: hanzo_ml_nn::Dropout,
+    classifier: hanzo_ml_nn::Linear,
 }
 
 fn id2label_len(config: &Config, id2label: Option<HashMap<u32, String>>) -> Result<usize> {
@@ -1241,8 +1241,8 @@ impl DebertaV2NERModel {
         let id2label_len = id2label_len(config, id2label)?;
 
         let deberta = DebertaV2Model::load(vb.clone(), config)?;
-        let dropout = hanzo_nn::Dropout::new(config.hidden_dropout_prob as f32);
-        let classifier: hanzo_nn::Linear = hanzo_nn::linear_no_bias(
+        let dropout = hanzo_ml_nn::Dropout::new(config.hidden_dropout_prob as f32);
+        let classifier: hanzo_ml_nn::Linear = hanzo_ml_nn::linear_no_bias(
             config.hidden_size,
             id2label_len,
             vb.root().pp("classifier"),
@@ -1275,7 +1275,7 @@ pub struct DebertaV2SeqClassificationModel {
     deberta: DebertaV2Model,
     dropout: StableDropout,
     pooler: DebertaV2ContextPooler,
-    classifier: hanzo_nn::Linear,
+    classifier: hanzo_ml_nn::Linear,
 }
 
 impl DebertaV2SeqClassificationModel {
@@ -1284,7 +1284,7 @@ impl DebertaV2SeqClassificationModel {
         let deberta = DebertaV2Model::load(vb.clone(), config)?;
         let pooler = DebertaV2ContextPooler::load(vb.clone(), config)?;
         let output_dim = pooler.output_dim()?;
-        let classifier = hanzo_nn::linear(output_dim, id2label_len, vb.root().pp("classifier"))?;
+        let classifier = hanzo_ml_nn::linear(output_dim, id2label_len, vb.root().pp("classifier"))?;
         let dropout = match config.cls_dropout {
             Some(cls_dropout) => StableDropout::new(cls_dropout),
             None => StableDropout::new(config.hidden_dropout_prob),
@@ -1315,7 +1315,7 @@ impl DebertaV2SeqClassificationModel {
 }
 
 pub struct DebertaV2ContextPooler {
-    dense: hanzo_nn::Linear,
+    dense: hanzo_ml_nn::Linear,
     dropout: StableDropout,
     config: Config,
 }
@@ -1331,7 +1331,7 @@ impl DebertaV2ContextPooler {
             .pooler_dropout
             .context("config.pooler_dropout is required for DebertaV2ContextPooler")?;
 
-        let dense = hanzo_nn::linear(
+        let dense = hanzo_ml_nn::linear(
             pooler_hidden_size,
             pooler_hidden_size,
             vb.root().pp("pooler.dense"),

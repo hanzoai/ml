@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use rand::{distr::Uniform, rng, Rng};
 
 use hanzo_ml::{DType, Device, Error, Module, Result, Tensor};
-use hanzo_nn::loss::mse;
-use hanzo_nn::{linear, seq, Activation, AdamW, Optimizer, VarBuilder, VarMap};
+use hanzo_ml_nn::loss::mse;
+use hanzo_ml_nn::{linear, seq, Activation, AdamW, Optimizer, VarBuilder, VarMap};
 
 use crate::gym_env::GymEnv;
 

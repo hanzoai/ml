@@ -21,7 +21,7 @@ fn fa_acausal(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32) -> Result<
     let k = k.to_dtype(DType::F32)?;
     let v = v.to_dtype(DType::F32)?;
     let att = (q.matmul(&k.t()?)? * softmax_scale as f64)?;
-    let att = hanzo_nn::ops::softmax(&att, D::Minus1)?;
+    let att = hanzo_ml_nn::ops::softmax(&att, D::Minus1)?;
     // Convert to contiguous as matmul doesn't support strided vs for now.
     let output = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
     Ok(output)
@@ -35,7 +35,7 @@ fn fa_acausal_softcap(q: &Tensor, k: &Tensor, v: &Tensor, softcap: f32) -> Resul
     // let att = (q.matmul(&k.t()?)? * softmax_scale as f64)?;
     let att = q.matmul(&k.t()?)?;
     let att = (softcap as f64 * ((att / softcap as f64)?.tanh())?)?;
-    let att = hanzo_nn::ops::softmax(&att, D::Minus1)?;
+    let att = hanzo_ml_nn::ops::softmax(&att, D::Minus1)?;
     // Convert to contiguous as matmul doesn't support strided vs for now.
     let output = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
     Ok(output)

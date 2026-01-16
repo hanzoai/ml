@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
-use hanzo_nn::{batch_norm, conv2d, conv2d_no_bias, Func, Module, VarBuilder};
+use hanzo_ml_nn::{batch_norm, conv2d, conv2d_no_bias, Func, Module, VarBuilder};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -108,7 +108,7 @@ pub fn parse_config<T: AsRef<Path>>(path: T) -> Result<Darknet> {
 }
 
 enum Bl {
-    Layer(Box<dyn hanzo_nn::Module + Send + Sync>),
+    Layer(Box<dyn hanzo_ml_nn::Module + Send + Sync>),
     Route(Vec<usize>),
     Shortcut(usize),
     Yolo(usize, Vec<(usize, usize)>),
@@ -128,7 +128,7 @@ fn conv(vb: VarBuilder, index: usize, p: usize, b: &Block) -> Result<(usize, Bl)
         }
         Some(_) | None => (None, true),
     };
-    let conv_cfg = hanzo_nn::Conv2dConfig {
+    let conv_cfg = hanzo_ml_nn::Conv2dConfig {
         stride,
         padding,
         groups: 1,
@@ -145,7 +145,7 @@ fn conv(vb: VarBuilder, index: usize, p: usize, b: &Block) -> Result<(usize, Bl)
         "linear" => false,
         otherwise => hanzo_ml::bail!("unsupported activation {}", otherwise),
     };
-    let func = hanzo_nn::func(move |xs| {
+    let func = hanzo_ml_nn::func(move |xs| {
         let xs = conv.forward(xs)?;
         let xs = match &bn {
             Some(bn) => xs.apply_t(bn, false)?,
@@ -162,7 +162,7 @@ fn conv(vb: VarBuilder, index: usize, p: usize, b: &Block) -> Result<(usize, Bl)
 }
 
 fn upsample(prev_channels: usize) -> Result<(usize, Bl)> {
-    let layer = hanzo_nn::func(|xs| {
+    let layer = hanzo_ml_nn::func(|xs| {
         let (_n, _c, h, w) = xs.dims4()?;
         xs.upsample_nearest2d(2 * h, 2 * w)
     });
@@ -250,9 +250,9 @@ fn detect(
     let ys02 = xs.i((.., .., 0..2))?;
     let ys24 = xs.i((.., .., 2..4))?;
     let ys4 = xs.i((.., .., 4..))?;
-    let ys02 = (hanzo_nn::ops::sigmoid(&ys02)?.add(&xy_offset)? * stride as f64)?;
+    let ys02 = (hanzo_ml_nn::ops::sigmoid(&ys02)?.add(&xy_offset)? * stride as f64)?;
     let ys24 = (ys24.exp()?.mul(&anchors)? * stride as f64)?;
-    let ys4 = hanzo_nn::ops::sigmoid(&ys4)?;
+    let ys4 = hanzo_ml_nn::ops::sigmoid(&ys4)?;
     let ys = Tensor::cat(&[ys02, ys24, ys4], 2)?;
     Ok(ys)
 }
@@ -284,7 +284,7 @@ impl Darknet {
             blocks.push(channels_and_bl);
         }
         let image_height = self.height()?;
-        let func = hanzo_nn::func(move |xs| {
+        let func = hanzo_ml_nn::func(move |xs| {
             let mut prev_ys: Vec<Tensor> = vec![];
             let mut detections: Vec<Tensor> = vec![];
             for (_, b) in blocks.iter() {

@@ -9,7 +9,7 @@
 //!
 use super::with_tracing::{layer_norm, linear, LayerNorm, Linear};
 use hanzo_ml::{DType, Device, Result, Tensor};
-use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
+use hanzo_ml_nn::{embedding, Embedding, Module, VarBuilder};
 use serde::Deserialize;
 
 pub const DTYPE: DType = DType::F32;
@@ -258,7 +258,7 @@ impl BertSelfAttention {
         let attention_scores = attention_scores.broadcast_add(attention_mask)?;
         let attention_probs = {
             let _enter_sm = self.span_softmax.enter();
-            hanzo_nn::ops::softmax(&attention_scores, hanzo_ml::D::Minus1)?
+            hanzo_ml_nn::ops::softmax(&attention_scores, hanzo_ml::D::Minus1)?
         };
         let attention_probs = self.dropout.forward(&attention_probs)?;
 

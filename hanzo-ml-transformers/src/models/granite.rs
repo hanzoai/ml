@@ -7,7 +7,7 @@
 
 use super::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
+use hanzo_ml_nn::{embedding, Embedding, Module, VarBuilder};
 use std::{collections::HashMap, f32::consts::PI};
 
 pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
@@ -222,7 +222,7 @@ impl CausalSelfAttention {
         let (_b_sz, _, seq_len, _hidden_size) = x.dims4()?;
         let cos = cache.cos.narrow(0, index_pos, seq_len)?;
         let sin = cache.sin.narrow(0, index_pos, seq_len)?;
-        hanzo_nn::rotary_emb::rope(x, &cos, &sin)
+        hanzo_ml_nn::rotary_emb::rope(x, &cos, &sin)
     }
 
     fn forward(
@@ -303,7 +303,7 @@ impl CausalSelfAttention {
                 let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
                 masked_fill(&att, &mask, f32::NEG_INFINITY)?
             };
-            let att = hanzo_nn::ops::softmax(&att, D::Minus1)?;
+            let att = hanzo_ml_nn::ops::softmax(&att, D::Minus1)?;
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
         };
@@ -360,7 +360,7 @@ struct Mlp {
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let x = (hanzo_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
+        let x = (hanzo_ml_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
         self.c_proj.forward(&x)
     }
 

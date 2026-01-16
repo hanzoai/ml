@@ -16,7 +16,7 @@
 //!
 
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_nn::{layer_norm, linear_b, LayerNorm, Linear, VarBuilder};
+use hanzo_ml_nn::{layer_norm, linear_b, LayerNorm, Linear, VarBuilder};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -27,7 +27,7 @@ pub struct Config {
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
-    hidden_act: hanzo_nn::Activation,
+    hidden_act: hanzo_ml_nn::Activation,
     max_position_embeddings: usize,
     norm_epsilon: f64,
     rope_theta: f64,
@@ -91,7 +91,7 @@ impl RotaryEmbedding {
 struct MLP {
     c_fc: Linear,
     c_proj: Linear,
-    act: hanzo_nn::Activation,
+    act: hanzo_ml_nn::Activation,
 }
 
 impl MLP {
@@ -201,7 +201,7 @@ impl Attention {
             None => attn_weights,
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
-        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&value_states)?;
         attn_output
             .transpose(1, 2)?
@@ -263,7 +263,7 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: hanzo_nn::Embedding,
+    embed_tokens: hanzo_ml_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: LayerNorm,
     lm_head: Linear,
@@ -276,7 +276,7 @@ impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
-            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
@@ -285,7 +285,7 @@ impl Model {
             layers.push(layer)
         }
         let norm = layer_norm(cfg.hidden_size, cfg.norm_epsilon, vb_m.pp("norm"))?;
-        let lm_head = hanzo_nn::Linear::new(embed_tokens.embeddings().clone(), None);
+        let lm_head = hanzo_ml_nn::Linear::new(embed_tokens.embeddings().clone(), None);
         Ok(Self {
             embed_tokens,
             layers,

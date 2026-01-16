@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     batch_norm, conv2d, conv2d_no_bias, BatchNorm, Conv2d, Conv2dConfig, Module, VarBuilder,
 };
 use image::DynamicImage;
@@ -109,7 +109,7 @@ impl ConvBlock {
 impl Module for ConvBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.conv.forward(xs)?.apply_t(&self.bn, false)?;
-        hanzo_nn::ops::silu(&xs)
+        hanzo_ml_nn::ops::silu(&xs)
     }
 }
 
@@ -234,7 +234,7 @@ impl Module for Dfl {
         let xs = xs
             .reshape((b_sz, 4, self.num_classes, anchors))?
             .transpose(2, 1)?;
-        let xs = hanzo_nn::ops::softmax(&xs, 1)?;
+        let xs = hanzo_ml_nn::ops::softmax(&xs, 1)?;
         self.conv.forward(&xs)?.reshape((b_sz, 4, anchors))
     }
 }
@@ -585,7 +585,7 @@ impl DetectionHead {
 
         let dbox = dist2bbox(&self.dfl.forward(&box_)?, &anchors)?;
         let dbox = dbox.broadcast_mul(&strides)?;
-        let pred = Tensor::cat(&[dbox, hanzo_nn::ops::sigmoid(&cls)?], 1)?;
+        let pred = Tensor::cat(&[dbox, hanzo_ml_nn::ops::sigmoid(&cls)?], 1)?;
         Ok(DetectionHeadOut {
             pred,
             anchors,
@@ -644,7 +644,7 @@ impl PoseHead {
 
         let ys01 = ((xs.i((.., .., 0..2))? * 2.)?.broadcast_add(&d.anchors)? - 0.5)?
             .broadcast_mul(&d.strides)?;
-        let ys2 = hanzo_nn::ops::sigmoid(&xs.i((.., .., 2..3))?)?;
+        let ys2 = hanzo_ml_nn::ops::sigmoid(&xs.i((.., .., 2..3))?)?;
         let ys = Tensor::cat(&[ys01, ys2], 2)?.flatten(1, 2)?;
         Tensor::cat(&[d.pred, ys], 1)
     }

@@ -15,7 +15,7 @@
 
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_nn::{Activation, LayerNorm, VarBuilder};
+use hanzo_ml_nn::{Activation, LayerNorm, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -297,7 +297,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?
         };
         attn_output
@@ -320,12 +320,12 @@ impl DecoderLayer {
     fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
         let mlp = MLP::new(cfg, vb.pp("mlp"))?;
-        let input_layernorm = hanzo_nn::layer_norm(
+        let input_layernorm = hanzo_ml_nn::layer_norm(
             cfg.hidden_size,
             cfg.layer_norm_eps,
             vb.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = hanzo_nn::layer_norm(
+        let post_attention_layernorm = hanzo_ml_nn::layer_norm(
             cfg.hidden_size,
             cfg.layer_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -358,7 +358,7 @@ impl DecoderLayer {
 
 #[derive(Debug)]
 pub struct Model {
-    embed_tokens: hanzo_nn::Embedding,
+    embed_tokens: hanzo_ml_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: LayerNorm,
     lm_head: Linear,
@@ -371,7 +371,7 @@ impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
-            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
@@ -379,7 +379,7 @@ impl Model {
             let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
-        let norm = hanzo_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb_m.pp("norm"))?;
+        let norm = hanzo_ml_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb_m.pp("norm"))?;
         let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
         Ok(Self {
             embed_tokens,

@@ -6,7 +6,7 @@ use hanzo_ml::{
     shape::Dim, CpuStorage, CustomOp1, DType, Device, Error, IndexOp, Layout, Result, Shape,
     Tensor, WithDType, D,
 };
-use hanzo_nn::{embedding, rms_norm, Activation, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use hanzo_ml_nn::{embedding, rms_norm, Activation, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Deserialize;
 
@@ -469,8 +469,8 @@ impl DeepSeekV2RotaryEmbedding {
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
 
-        let q_embed = hanzo_nn::rotary_emb::rope_i(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_nn::rotary_emb::rope_i(&k.contiguous()?, &cos, &sin)?;
+        let q_embed = hanzo_ml_nn::rotary_emb::rope_i(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = hanzo_ml_nn::rotary_emb::rope_i(&k.contiguous()?, &cos, &sin)?;
 
         Ok((q_embed, k_embed))
     }
@@ -532,41 +532,41 @@ impl Attention {
         let q_head_dim = cfg.q_head_dim();
         let q = match cfg.q_lora_rank {
             Some(lora_rank) => {
-                let a = hanzo_nn::linear_b(
+                let a = hanzo_ml_nn::linear_b(
                     cfg.hidden_size,
                     lora_rank,
                     cfg.attention_bias,
                     vb.pp("q_a_proj"),
                 )?;
                 let norm = rms_norm(lora_rank, cfg.rms_norm_eps, vb.pp("q_a_layernorm"))?;
-                let b = hanzo_nn::linear_no_bias(
+                let b = hanzo_ml_nn::linear_no_bias(
                     lora_rank,
                     cfg.num_attention_heads * q_head_dim,
                     vb.pp("q_b_proj"),
                 )?;
                 QProj::Lora { a, norm, b }
             }
-            None => QProj::Plain(hanzo_nn::linear_no_bias(
+            None => QProj::Plain(hanzo_ml_nn::linear_no_bias(
                 cfg.hidden_size,
                 cfg.num_attention_heads * q_head_dim,
                 vb.pp("q_proj"),
             )?),
         };
 
-        let kv_a_proj_with_mqa = hanzo_nn::linear_b(
+        let kv_a_proj_with_mqa = hanzo_ml_nn::linear_b(
             cfg.hidden_size,
             cfg.kv_lora_rank + cfg.qk_rope_head_dim,
             cfg.attention_bias,
             vb.pp("kv_a_proj_with_mqa"),
         )?;
         let kv_a_layernorm = rms_norm(cfg.kv_lora_rank, cfg.rms_norm_eps, vb.pp("kv_a_layernorm"))?;
-        let kv_b_proj = hanzo_nn::linear_no_bias(
+        let kv_b_proj = hanzo_ml_nn::linear_no_bias(
             cfg.kv_lora_rank,
             cfg.num_attention_heads * (q_head_dim - cfg.qk_rope_head_dim + cfg.v_head_dim),
             vb.pp("kv_b_proj"),
         )?;
 
-        let o_proj = hanzo_nn::linear_b(
+        let o_proj = hanzo_ml_nn::linear_b(
             cfg.num_attention_heads * cfg.v_head_dim,
             cfg.hidden_size,
             cfg.attention_bias,
@@ -657,7 +657,7 @@ impl Attention {
                 None => att,
             };
 
-            let att = hanzo_nn::ops::softmax_last_dim(&att)?;
+            let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v.contiguous()?)?
         };
@@ -694,9 +694,9 @@ impl Mlp {
         let intermediate_size = intermediate_size.unwrap_or(cfg.intermediate_size);
 
         Ok(Self {
-            gate: hanzo_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-            up: hanzo_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-            down: hanzo_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
+            gate: hanzo_ml_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
+            up: hanzo_ml_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
+            down: hanzo_ml_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
             act: cfg.hidden_act,
         })
     }
@@ -735,7 +735,7 @@ impl MoeGate {
             .to_dtype(DType::F32)?
             .broadcast_matmul(&self.weight.t()?.to_dtype(DType::F32)?)?;
         let scores = match self.cfg.scoring_func {
-            ScoringFunc::Softmax => hanzo_nn::ops::softmax_last_dim(&logits)?,
+            ScoringFunc::Softmax => hanzo_ml_nn::ops::softmax_last_dim(&logits)?,
         };
 
         // Select top-k experts
@@ -966,9 +966,9 @@ impl DeepSeekV2 {
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let lm_head = if !cfg.tie_word_embeddings {
-            hanzo_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            hanzo_ml_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         } else {
-            hanzo_nn::Linear::new(embed_tokens.embeddings().clone(), None)
+            hanzo_ml_nn::Linear::new(embed_tokens.embeddings().clone(), None)
         };
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 

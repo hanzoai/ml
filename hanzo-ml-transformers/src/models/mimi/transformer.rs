@@ -3,12 +3,12 @@
 // LICENSE file in the root directory of this source tree.
 
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, StreamTensor, StreamingModule, Tensor, D};
-use hanzo_nn::{linear_no_bias, Linear, VarBuilder};
+use hanzo_ml_nn::{linear_no_bias, Linear, VarBuilder};
 use std::sync::Arc;
 
 fn linear(in_d: usize, out_d: usize, bias: bool, vb: VarBuilder) -> Result<Linear> {
     if bias {
-        hanzo_nn::linear(in_d, out_d, vb)
+        hanzo_ml_nn::linear(in_d, out_d, vb)
     } else {
         linear_no_bias(in_d, out_d, vb)
     }
@@ -36,7 +36,7 @@ pub struct Config {
     pub cross_attention: bool,
     pub conv_kernel_size: usize,
     pub use_conv_bias: bool,
-    pub gating: Option<hanzo_nn::Activation>,
+    pub gating: Option<hanzo_ml_nn::Activation>,
     pub norm: super::NormType,
     pub context: usize,
     pub max_period: usize,
@@ -79,7 +79,7 @@ impl RotaryEmbedding {
         let qk_dtype = qk.dtype();
         let c = self.cos.narrow(0, seqlen_offset, seqlen)?;
         let s = self.sin.narrow(0, seqlen_offset, seqlen)?;
-        hanzo_nn::rotary_emb::rope_i(&qk.to_dtype(DType::F32)?, &c, &s)?.to_dtype(qk_dtype)
+        hanzo_ml_nn::rotary_emb::rope_i(&qk.to_dtype(DType::F32)?, &c, &s)?.to_dtype(qk_dtype)
     }
 }
 
@@ -112,7 +112,7 @@ pub struct StreamingMultiheadAttention {
     context: usize,
     neg_inf: Tensor,
     rope: Option<Arc<RotaryEmbedding>>,
-    kv_cache: hanzo_nn::kv_cache::RotatingKvCache,
+    kv_cache: hanzo_ml_nn::kv_cache::RotatingKvCache,
     pos: usize,
     use_flash_attn: bool,
     span: tracing::Span,
@@ -138,7 +138,7 @@ impl StreamingMultiheadAttention {
             num_heads: cfg.num_heads,
             context: cfg.context,
             neg_inf,
-            kv_cache: hanzo_nn::kv_cache::RotatingKvCache::new(2, cfg.context),
+            kv_cache: hanzo_ml_nn::kv_cache::RotatingKvCache::new(2, cfg.context),
             pos: 0,
             use_flash_attn: false,
             span: tracing::span!(tracing::Level::TRACE, "mha"),
@@ -207,7 +207,7 @@ impl StreamingMultiheadAttention {
                 }
             };
 
-            let ws = hanzo_nn::ops::softmax_last_dim(&pre_ws)?; // b,h,t,k
+            let ws = hanzo_ml_nn::ops::softmax_last_dim(&pre_ws)?; // b,h,t,k
             ws.matmul(&v)? // b,h,t,d
         };
         let xs = xs
@@ -221,7 +221,7 @@ impl StreamingMultiheadAttention {
         self.kv_cache.reset()
     }
 
-    pub fn set_kv_cache(&mut self, kv_cache: hanzo_nn::kv_cache::RotatingKvCache) {
+    pub fn set_kv_cache(&mut self, kv_cache: hanzo_ml_nn::kv_cache::RotatingKvCache) {
         self.kv_cache = kv_cache
     }
 }
@@ -307,7 +307,7 @@ impl StreamingMultiheadCrossAttention {
             }
         };
 
-        let ws = hanzo_nn::ops::softmax_last_dim(&pre_ws)?; // b,h,t,k
+        let ws = hanzo_ml_nn::ops::softmax_last_dim(&pre_ws)?; // b,h,t,k
         let xs = ws.matmul(&v)?; // b,h,t,d
         let xs = xs
             .transpose(1, 2)? // b,t,h,d
@@ -329,7 +329,7 @@ pub enum Mlp {
     Gating {
         linear_in: Linear,
         linear_out: Linear,
-        activation: hanzo_nn::Activation,
+        activation: hanzo_ml_nn::Activation,
         span: tracing::Span,
     },
 }
@@ -427,13 +427,13 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        hanzo_nn::ops::rms_norm(xs, &self.alpha, self.eps)
+        hanzo_ml_nn::ops::rms_norm(xs, &self.alpha, self.eps)
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum Norm {
-    LayerNorm(hanzo_nn::LayerNorm),
+    LayerNorm(hanzo_ml_nn::LayerNorm),
     RmsNorm(RmsNorm),
 }
 
@@ -441,7 +441,7 @@ impl Norm {
     pub fn new(d_model: usize, cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let norm = match cfg.norm {
             super::NormType::LayerNorm => {
-                let norm = hanzo_nn::layer_norm(d_model, 1e-5, vb)?;
+                let norm = hanzo_ml_nn::layer_norm(d_model, 1e-5, vb)?;
                 Self::LayerNorm(norm)
             }
             super::NormType::RmsNorm => {
@@ -470,7 +470,7 @@ pub struct StreamingTransformerLayer {
     norm2: Norm,
     layer_scale_1: Option<LayerScale>,
     layer_scale_2: Option<LayerScale>,
-    cross_attn: Option<(hanzo_nn::LayerNorm, StreamingMultiheadCrossAttention)>,
+    cross_attn: Option<(hanzo_ml_nn::LayerNorm, StreamingMultiheadCrossAttention)>,
     norm_first: bool,
     span: tracing::Span,
 }
@@ -484,9 +484,9 @@ impl StreamingTransformerLayer {
         let mlp = Mlp::new(cfg, vb.clone())?;
         let (norm1, norm2) = match cfg.norm {
             super::NormType::LayerNorm => {
-                let norm1 = hanzo_nn::layer_norm(d_model, 1e-5, vb.pp("input_layernorm"))?;
+                let norm1 = hanzo_ml_nn::layer_norm(d_model, 1e-5, vb.pp("input_layernorm"))?;
                 let norm2 =
-                    hanzo_nn::layer_norm(d_model, 1e-5, vb.pp("post_attention_layernorm"))?;
+                    hanzo_ml_nn::layer_norm(d_model, 1e-5, vb.pp("post_attention_layernorm"))?;
                 (Norm::LayerNorm(norm1), Norm::LayerNorm(norm2))
             }
             super::NormType::RmsNorm => {
@@ -511,7 +511,7 @@ impl StreamingTransformerLayer {
         };
         let self_attn = StreamingMultiheadAttention::new(rope, cfg, vb.pp("self_attn"))?;
         let cross_attn = if cfg.cross_attention {
-            let norm_cross = hanzo_nn::layer_norm(cfg.d_model, 1e-5, vb.pp("norm_cross"))?;
+            let norm_cross = hanzo_ml_nn::layer_norm(cfg.d_model, 1e-5, vb.pp("norm_cross"))?;
             let cross_attn = StreamingMultiheadCrossAttention::new(cfg, vb.pp("cross_attention"))?;
             Some((norm_cross, cross_attn))
         } else {
@@ -567,7 +567,7 @@ impl StreamingTransformerLayer {
         self.self_attn.reset_kv_cache()
     }
 
-    pub fn set_kv_cache(&mut self, kv_cache: hanzo_nn::kv_cache::RotatingKvCache) {
+    pub fn set_kv_cache(&mut self, kv_cache: hanzo_ml_nn::kv_cache::RotatingKvCache) {
         self.self_attn.set_kv_cache(kv_cache)
     }
 }

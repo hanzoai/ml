@@ -38,7 +38,7 @@
 use crate::models::mixformer::{Config as PhiConfig, MixFormerSequentialForCausalLM as PhiModel};
 use crate::models::with_tracing::{layer_norm, linear_b, LayerNorm, Linear};
 use hanzo_ml::{IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
@@ -59,7 +59,7 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
     let dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (dim as f64).sqrt();
     let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
-    hanzo_nn::ops::softmax_last_dim(&attn_weights)?.matmul(v)
+    hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?.matmul(v)
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -72,7 +72,7 @@ pub struct VisionConfig {
     pub(crate) embed_dim: usize,
     pub(crate) num_blocks: usize,
     pub(crate) num_heads: usize,
-    pub(crate) act: hanzo_nn::Activation,
+    pub(crate) act: hanzo_ml_nn::Activation,
 }
 
 impl VisionConfig {
@@ -86,7 +86,7 @@ impl VisionConfig {
             embed_dim: 1152,
             num_blocks: 27,
             num_heads: 16,
-            act: hanzo_nn::Activation::GeluPytorchTanh,
+            act: hanzo_ml_nn::Activation::GeluPytorchTanh,
         }
     }
 }
@@ -254,7 +254,7 @@ impl Module for Encoder {
 #[derive(Debug, Clone)]
 struct Mlp {
     fc1: Linear,
-    act: hanzo_nn::Activation,
+    act: hanzo_ml_nn::Activation,
     fc2: Linear,
     span: tracing::Span,
 }
@@ -265,7 +265,7 @@ impl Mlp {
         in_features: usize,
         hidden_features: usize,
         out_features: usize,
-        act: hanzo_nn::Activation,
+        act: hanzo_ml_nn::Activation,
     ) -> Result<Self> {
         let fc1 = linear_b(in_features, hidden_features, true, vb.pp("fc1"))?;
         let fc2 = linear_b(hidden_features, out_features, true, vb.pp("fc2"))?;

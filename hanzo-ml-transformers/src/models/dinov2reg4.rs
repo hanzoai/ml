@@ -31,7 +31,7 @@
 //! </div>
 //!
 use hanzo_ml::{IndexOp, Result, Tensor, D};
-use hanzo_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
+use hanzo_ml_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
 
 const IMG_SIZE: usize = 518;
 const PATCH_SIZE: usize = 14;
@@ -39,9 +39,9 @@ const NUM_CLASSES: usize = 7806; // PlantCLEF2024 DINOv2 (https://zenodo.org/rec
 
 fn linear(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Result<Linear> {
     if bias {
-        hanzo_nn::linear(in_dim, out_dim, vb)
+        hanzo_ml_nn::linear(in_dim, out_dim, vb)
     } else {
-        hanzo_nn::linear_no_bias(in_dim, out_dim, vb)
+        hanzo_ml_nn::linear_no_bias(in_dim, out_dim, vb)
     }
 }
 
@@ -86,7 +86,7 @@ impl Module for Attention {
         let q = (qkv.i(0)? * self.scale)?;
         let k = qkv.i(1)?.contiguous()?;
         let v = qkv.i(2)?.contiguous()?;
-        let attn = hanzo_nn::ops::softmax(&q.matmul(&k.t()?)?, D::Minus1)?;
+        let attn = hanzo_ml_nn::ops::softmax(&q.matmul(&k.t()?)?, D::Minus1)?;
         let attn = attn.matmul(&v)?.transpose(1, 2)?.reshape((b, n, c))?;
         self.proj.forward(&attn)
     }
@@ -178,7 +178,7 @@ impl Module for Block {
 
 #[derive(Debug)]
 struct PatchEmbed {
-    proj: hanzo_nn::Conv2d,
+    proj: hanzo_ml_nn::Conv2d,
     patch_size: (usize, usize),
     num_patches: usize,
 }
@@ -191,11 +191,11 @@ impl PatchEmbed {
         in_chans: usize,
         embed_dim: usize,
     ) -> Result<Self> {
-        let config = hanzo_nn::Conv2dConfig {
+        let config = hanzo_ml_nn::Conv2dConfig {
             stride: patch_size,
             ..Default::default()
         };
-        let proj = hanzo_nn::conv2d(in_chans, embed_dim, patch_size, config, vb.pp("proj"))?;
+        let proj = hanzo_ml_nn::conv2d(in_chans, embed_dim, patch_size, config, vb.pp("proj"))?;
         let num_patches = (img_size / patch_size) * (img_size / patch_size);
         Ok(Self {
             proj,

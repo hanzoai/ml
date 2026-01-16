@@ -17,7 +17,7 @@ impl Mlp {
     pub fn new(
         in_features: usize,
         hidden_features: usize,
-        vb: hanzo_nn::VarBuilder,
+        vb: hanzo_ml_nn::VarBuilder,
     ) -> Result<Self> {
         let fc1 = nn::linear(in_features, hidden_features, vb.pp("fc1"))?;
         let act = nn::Activation::GeluPytorchTanh;
@@ -56,8 +56,8 @@ impl QkvOnlyAttnProjections {
 pub struct AttnProjections {
     head_dim: usize,
     qkv: nn::Linear,
-    ln_k: Option<hanzo_nn::RmsNorm>,
-    ln_q: Option<hanzo_nn::RmsNorm>,
+    ln_k: Option<hanzo_ml_nn::RmsNorm>,
+    ln_q: Option<hanzo_ml_nn::RmsNorm>,
     proj: nn::Linear,
 }
 
@@ -67,8 +67,8 @@ impl AttnProjections {
         let qkv = nn::linear(dim, dim * 3, vb.pp("qkv"))?;
         let proj = nn::linear(dim, dim, vb.pp("proj"))?;
         let (ln_k, ln_q) = if vb.contains_tensor("ln_k.weight") {
-            let ln_k = hanzo_nn::rms_norm(head_dim, 1e-6, vb.pp("ln_k"))?;
-            let ln_q = hanzo_nn::rms_norm(head_dim, 1e-6, vb.pp("ln_q"))?;
+            let ln_k = hanzo_ml_nn::rms_norm(head_dim, 1e-6, vb.pp("ln_k"))?;
+            let ln_q = hanzo_ml_nn::rms_norm(head_dim, 1e-6, vb.pp("ln_q"))?;
             (Some(ln_k), Some(ln_q))
         } else {
             (None, None)

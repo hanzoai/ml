@@ -10,7 +10,7 @@ use super::unet_2d_blocks::{
 };
 use hanzo_ml::{Result, Tensor};
 use hanzo_nn as nn;
-use hanzo_nn::Module;
+use hanzo_ml_nn::Module;
 
 #[derive(Debug, Clone)]
 struct EncoderConfig {

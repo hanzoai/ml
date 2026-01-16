@@ -3,7 +3,7 @@
 // LICENSE file in the root directory of this source tree.
 
 use hanzo_ml::{streaming, Module, Result, StreamTensor, StreamingModule, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 
 use super::conv::{StreamableConv1d, StreamableConvTranspose1d};
 
@@ -15,7 +15,7 @@ pub struct Config {
     pub n_filters: usize,
     pub n_residual_layers: usize,
     pub ratios: Vec<usize>,
-    pub activation: hanzo_nn::Activation,
+    pub activation: hanzo_ml_nn::Activation,
     pub norm: super::conv::Norm,
     pub kernel_size: usize,
     pub residual_kernel_size: usize,
@@ -26,14 +26,14 @@ pub struct Config {
     pub compress: usize,
     pub lstm: usize,
     pub disable_norm_outer_blocks: usize,
-    pub final_activation: Option<hanzo_nn::Activation>,
+    pub final_activation: Option<hanzo_ml_nn::Activation>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SeaNetResnetBlock {
     block: Vec<StreamableConv1d>,
     shortcut: Option<StreamableConv1d>,
-    activation: hanzo_nn::Activation,
+    activation: hanzo_ml_nn::Activation,
     skip_op: hanzo_ml::StreamingBinOp,
     span: tracing::Span,
 }
@@ -43,7 +43,7 @@ impl SeaNetResnetBlock {
     pub fn new(
         dim: usize,
         k_sizes_and_dilations: &[(usize, usize)],
-        activation: hanzo_nn::Activation,
+        activation: hanzo_ml_nn::Activation,
         norm: Option<super::conv::Norm>,
         causal: bool,
         pad_mode: super::conv::PadMode,
@@ -150,7 +150,7 @@ struct EncoderLayer {
 #[derive(Debug, Clone)]
 pub struct SeaNetEncoder {
     init_conv1d: StreamableConv1d,
-    activation: hanzo_nn::Activation,
+    activation: hanzo_ml_nn::Activation,
     layers: Vec<EncoderLayer>,
     final_conv1d: StreamableConv1d,
     span: tracing::Span,
@@ -307,10 +307,10 @@ struct DecoderLayer {
 #[derive(Debug, Clone)]
 pub struct SeaNetDecoder {
     init_conv1d: StreamableConv1d,
-    activation: hanzo_nn::Activation,
+    activation: hanzo_ml_nn::Activation,
     layers: Vec<DecoderLayer>,
     final_conv1d: StreamableConv1d,
-    final_activation: Option<hanzo_nn::Activation>,
+    final_activation: Option<hanzo_ml_nn::Activation>,
     span: tracing::Span,
 }
 

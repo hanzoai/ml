@@ -8,7 +8,7 @@ use hanzo_transformers::models::{clip, flux, t5};
 
 use anyhow::{Error as E, Result};
 use hanzo_ml::{IndexOp, Module, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use clap::Parser;
 use tokenizers::Tokenizer;
 

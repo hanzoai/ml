@@ -15,7 +15,7 @@ use crate::models::llama::{Cache, Llama};
 use crate::models::with_tracing::linear;
 
 use hanzo_ml::{bail, Context, Device, IndexOp, Result, Tensor};
-use hanzo_nn::{seq, Activation, Module, Sequential, VarBuilder};
+use hanzo_ml_nn::{seq, Activation, Module, Sequential, VarBuilder};
 use fancy_regex::Regex;
 use utils::get_anyres_image_grid_shape;
 

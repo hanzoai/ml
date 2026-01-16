@@ -5,7 +5,7 @@
 //!
 use crate::models::with_tracing::{linear_b as linear, Linear};
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -164,7 +164,7 @@ impl CoreAttention {
             )?,
             None => matmul_result,
         };
-        let attention_probs = hanzo_nn::ops::softmax_last_dim(&attention_scores)?;
+        let attention_probs = hanzo_ml_nn::ops::softmax_last_dim(&attention_scores)?;
 
         let output_size = (
             value_layer.dim(1)?,
@@ -362,16 +362,16 @@ impl MLP {
 impl Module for MLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply(&self.dense_h_to_4h)?
-            .apply(&hanzo_nn::Activation::Swiglu)?
+            .apply(&hanzo_ml_nn::Activation::Swiglu)?
             .apply(&self.dense_4h_to_h)
     }
 }
 
 #[derive(Debug, Clone)]
 struct Block {
-    input_layernorm: hanzo_nn::LayerNorm,
+    input_layernorm: hanzo_ml_nn::LayerNorm,
     self_attention: SelfAttention,
-    post_attention_layernorm: hanzo_nn::LayerNorm,
+    post_attention_layernorm: hanzo_ml_nn::LayerNorm,
     mlp: MLP,
     apply_residual_connection_post_layernorm: bool,
 }
@@ -379,28 +379,28 @@ struct Block {
 impl Block {
     fn new(layer_number: usize, cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let input_layernorm = if cfg.rmsnorm {
-            hanzo_nn::rms_norm(
+            hanzo_ml_nn::rms_norm(
                 cfg.hidden_size,
                 cfg.layernorm_epsilon,
                 vb.pp("input_layernorm"),
             )?
             .into_inner()
         } else {
-            hanzo_nn::layer_norm(
+            hanzo_ml_nn::layer_norm(
                 cfg.hidden_size,
                 cfg.layernorm_epsilon,
                 vb.pp("input_layernorm"),
             )?
         };
         let post_attention_layernorm = if cfg.rmsnorm {
-            hanzo_nn::rms_norm(
+            hanzo_ml_nn::rms_norm(
                 cfg.hidden_size,
                 cfg.layernorm_epsilon,
                 vb.pp("post_attention_layernorm"),
             )?
             .into_inner()
         } else {
-            hanzo_nn::layer_norm(
+            hanzo_ml_nn::layer_norm(
                 cfg.hidden_size,
                 cfg.layernorm_epsilon,
                 vb.pp("post_attention_layernorm"),
@@ -451,7 +451,7 @@ impl Block {
 #[derive(Debug, Clone)]
 struct Transformer {
     layers: Vec<Block>,
-    final_layernorm: Option<hanzo_nn::LayerNorm>,
+    final_layernorm: Option<hanzo_ml_nn::LayerNorm>,
     rotary_emb: RotaryEmbedding,
 }
 
@@ -465,14 +465,14 @@ impl Transformer {
         }
         let final_layernorm = if cfg.post_layer_norm {
             let ln = if cfg.rmsnorm {
-                hanzo_nn::rms_norm(
+                hanzo_ml_nn::rms_norm(
                     cfg.hidden_size,
                     cfg.layernorm_epsilon,
                     vb.pp("final_layernorm"),
                 )?
                 .into_inner()
             } else {
-                hanzo_nn::layer_norm(
+                hanzo_ml_nn::layer_norm(
                     cfg.hidden_size,
                     cfg.layernorm_epsilon,
                     vb.pp("final_layernorm"),
@@ -510,13 +510,13 @@ impl Transformer {
 
 #[derive(Debug, Clone)]
 struct Embedding {
-    word_embeddings: hanzo_nn::Embedding,
+    word_embeddings: hanzo_ml_nn::Embedding,
     fp32_residual_connection: bool,
 }
 
 impl Embedding {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let word_embeddings = hanzo_nn::embedding(
+        let word_embeddings = hanzo_ml_nn::embedding(
             cfg.padded_vocab_size,
             cfg.hidden_size,
             vb.pp("word_embeddings"),

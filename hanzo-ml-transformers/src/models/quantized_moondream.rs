@@ -23,7 +23,7 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
     let dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (dim as f64).sqrt();
     let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
-    hanzo_nn::ops::softmax_last_dim(&attn_weights)?.matmul(v)
+    hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?.matmul(v)
 }
 
 #[derive(Debug, Clone)]
@@ -88,8 +88,8 @@ impl Module for Attention {
 struct VitBlock {
     attn: Attention,
     mlp: Mlp,
-    norm1: hanzo_nn::LayerNorm,
-    norm2: hanzo_nn::LayerNorm,
+    norm1: hanzo_ml_nn::LayerNorm,
+    norm2: hanzo_ml_nn::LayerNorm,
 }
 
 impl VitBlock {
@@ -122,7 +122,7 @@ struct VisionTransformer {
     patch_embed: LinearPatchEmbedding,
     pos_embed: Tensor,
     blocks: Vec<VitBlock>,
-    norm: hanzo_nn::LayerNorm,
+    norm: hanzo_ml_nn::LayerNorm,
 }
 
 impl VisionTransformer {
@@ -182,7 +182,7 @@ impl Module for Encoder {
 #[derive(Debug, Clone)]
 struct Mlp {
     fc1: Linear,
-    act: hanzo_nn::Activation,
+    act: hanzo_ml_nn::Activation,
     fc2: Linear,
 }
 
@@ -192,7 +192,7 @@ impl Mlp {
         in_features: usize,
         hidden_features: usize,
         out_features: usize,
-        act: hanzo_nn::Activation,
+        act: hanzo_ml_nn::Activation,
     ) -> Result<Self> {
         let fc1 = linear_b(in_features, hidden_features, true, vb.pp("fc1"))?;
         let fc2 = linear_b(hidden_features, out_features, true, vb.pp("fc2"))?;

@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, IndexOp, Result, Tensor};
-use hanzo_nn::{Module, VarBuilder};
+use hanzo_ml_nn::{Module, VarBuilder};
 
 use super::image_encoder::ImageEncoderViT;
 use super::mask_decoder::MaskDecoder;

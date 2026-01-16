@@ -1,6 +1,6 @@
 use hanzo_ml::{Result, Tensor, D};
 use hanzo_nn as nn;
-use hanzo_nn::Module;
+use hanzo_ml_nn::Module;
 
 #[derive(Debug)]
 pub struct TimestepEmbedding {

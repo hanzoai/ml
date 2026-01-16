@@ -6,7 +6,7 @@
 //!
 use super::with_tracing::{linear, Embedding, Linear};
 use hanzo_ml::{Result, Tensor};
-use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
+use hanzo_ml_nn::{layer_norm, LayerNorm, VarBuilder};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
@@ -21,7 +21,7 @@ pub struct Config {
     pub decoder_attention_heads: usize,
     pub use_cache: bool,
     pub is_encoder_decoder: bool,
-    pub activation_function: hanzo_nn::Activation,
+    pub activation_function: hanzo_ml_nn::Activation,
     pub d_model: usize,
     pub decoder_start_token_id: u32,
     pub scale_embedding: bool,
@@ -35,7 +35,7 @@ impl Config {
     // https://huggingface.co/Helsinki-NLP/opus-mt-tc-big-fr-en/blob/main/config.json
     pub fn opus_mt_tc_big_fr_en() -> Self {
         Self {
-            activation_function: hanzo_nn::Activation::Relu,
+            activation_function: hanzo_ml_nn::Activation::Relu,
             d_model: 1024,
             decoder_attention_heads: 16,
             decoder_ffn_dim: 4096,
@@ -60,7 +60,7 @@ impl Config {
     // https://huggingface.co/Helsinki-NLP/opus-mt-fr-en/blob/main/config.json
     pub fn opus_mt_fr_en() -> Self {
         Self {
-            activation_function: hanzo_nn::Activation::Swish,
+            activation_function: hanzo_ml_nn::Activation::Swish,
             d_model: 512,
             decoder_attention_heads: 8,
             decoder_ffn_dim: 2048,
@@ -84,7 +84,7 @@ impl Config {
 
     pub fn opus_mt_en_zh() -> Self {
         Self {
-            activation_function: hanzo_nn::Activation::Swish,
+            activation_function: hanzo_ml_nn::Activation::Swish,
             d_model: 512,
             decoder_attention_heads: 8,
             decoder_ffn_dim: 2048,
@@ -108,7 +108,7 @@ impl Config {
 
     pub fn opus_mt_en_hi() -> Self {
         Self {
-            activation_function: hanzo_nn::Activation::Swish,
+            activation_function: hanzo_ml_nn::Activation::Swish,
             d_model: 512,
             decoder_attention_heads: 8,
             decoder_ffn_dim: 2048,
@@ -132,7 +132,7 @@ impl Config {
 
     pub fn opus_mt_en_es() -> Self {
         Self {
-            activation_function: hanzo_nn::Activation::Swish,
+            activation_function: hanzo_ml_nn::Activation::Swish,
             d_model: 512,
             decoder_attention_heads: 8,
             decoder_ffn_dim: 2048,
@@ -156,7 +156,7 @@ impl Config {
 
     pub fn opus_mt_en_fr() -> Self {
         Self {
-            activation_function: hanzo_nn::Activation::Swish,
+            activation_function: hanzo_ml_nn::Activation::Swish,
             d_model: 512,
             decoder_attention_heads: 8,
             decoder_ffn_dim: 2048,
@@ -180,7 +180,7 @@ impl Config {
 
     pub fn opus_mt_en_ru() -> Self {
         Self {
-            activation_function: hanzo_nn::Activation::Swish,
+            activation_function: hanzo_ml_nn::Activation::Swish,
             d_model: 512,
             decoder_attention_heads: 8,
             decoder_ffn_dim: 2048,
@@ -331,7 +331,7 @@ impl Attention {
             None => attn_weights,
             Some(attn_mask) => attn_weights.broadcast_add(attn_mask)?,
         };
-        let attn_probs = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_probs = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_probs.matmul(&value_states)?;
         attn_output
             .reshape((b_sz, self.num_heads, tgt_len, self.head_dim))?
@@ -349,7 +349,7 @@ impl Attention {
 struct EncoderLayer {
     self_attn: Attention,
     self_attn_layer_norm: LayerNorm,
-    activation_fn: hanzo_nn::Activation,
+    activation_fn: hanzo_ml_nn::Activation,
     fc1: Linear,
     fc2: Linear,
     final_layer_norm: LayerNorm,
@@ -393,7 +393,7 @@ impl EncoderLayer {
 struct DecoderLayer {
     self_attn: Attention,
     self_attn_layer_norm: LayerNorm,
-    activation_fn: hanzo_nn::Activation,
+    activation_fn: hanzo_ml_nn::Activation,
     encoder_attn: Attention,
     encoder_attn_layer_norm: LayerNorm,
     fc1: Linear,

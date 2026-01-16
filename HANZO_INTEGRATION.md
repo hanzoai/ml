@@ -21,7 +21,7 @@ Add to `~/work/hanzo/engine/Cargo.toml`:
 
 ```toml
 [dependencies]
-hanzo-ml-core = { git = "https://github.com/hanzoai/ml", branch = "main" }
+hanzo-ml = { git = "https://github.com/hanzoai/ml", branch = "main" }
 hanzo-ml-nn = { git = "https://github.com/hanzoai/ml", branch = "main" }
 hanzo-ml-transformers = { git = "https://github.com/hanzoai/ml", branch = "main" }
 ```
@@ -33,10 +33,10 @@ Both projects support consistent feature flags:
 ```toml
 [features]
 default = ["metal"]
-metal = ["hanzo-ml-core/metal", "hanzo-ml-nn/metal"]
-cuda = ["hanzo-ml-core/cuda"] 
-mkl = ["hanzo-ml-core/mkl"]
-accelerate = ["hanzo-ml-core/accelerate"]
+metal = ["hanzo-ml/metal", "hanzo-ml-nn/metal"]
+cuda = ["hanzo-ml/cuda"] 
+mkl = ["hanzo-ml/mkl"]
+accelerate = ["hanzo-ml/accelerate"]
 ```
 
 ## Model Loading Integration
@@ -79,7 +79,7 @@ git push origin main
 
 ```bash
 cd ~/work/hanzo/engine
-cargo update hanzo-ml-core hanzo-ml-nn hanzo-ml-transformers
+cargo update hanzo-ml hanzo-ml-nn hanzo-ml-transformers
 cargo test
 ```
 
@@ -96,7 +96,7 @@ cargo run --features metal --release -- \
 ### Hanzo ML Crates
 
 The framework publishes these crates:
-- `hanzo-ml-core` - Core tensor operations
+- `hanzo-ml` - Core tensor operations
 - `hanzo-ml-nn` - Neural network layers  
 - `hanzo-ml-transformers` - Transformer models
 - `hanzo-ml-datasets` - Dataset utilities
