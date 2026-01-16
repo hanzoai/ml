@@ -12,7 +12,7 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
-hanzo = { workspace = true }
+hanzo-ml = { workspace = true }
 hanzo-ml-flash-attn = { workspace = true, optional = true }
 hanzo-ml-nn = { workspace = true }
 fancy-regex = { workspace = true }

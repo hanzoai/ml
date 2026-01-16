@@ -10,7 +10,7 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-hanzo = { path = "../hanzo-ml-core", package = "hanzo-ml-core", version = "0.9.1" }
+hanzo-ml = { path = "../hanzo-ml-core", package = "hanzo-ml-core", version = "0.9.1" }
 hanzo-ml-nn = { path = "../hanzo-ml-nn", version = "0.9.1" }
 prost = "0.12.1"
 
