@@ -1,0 +1,15 @@
+[package]
+name = "hanzo-ml-kernels"
+version = "0.9.1"
+edition = "2021"
+
+description = "CUDA kernels for ML"
+repository = "https://github.com/huggingface/hanzo"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[build-dependencies]
+bindgen_cuda = "0.1.1"

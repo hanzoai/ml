@@ -1,0 +1,15 @@
+[package]
+name = "hanzo-ml-wasm-tests"
+version.workspace = true
+edition.workspace = true
+description = "WASM tests for hanzo"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+hanzo = { workspace = true }
+rand = { workspace = true }
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.0"
