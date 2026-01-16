@@ -1,4 +1,4 @@
-use hanzo_metal_kernels::{call_affine, Kernels};
+use hanzo_ml_metal_kernels::{call_affine, Kernels};
 use metal::objc::rc::autoreleasepool;
 use metal::{Device, MTLResourceOptions};
 use rand;

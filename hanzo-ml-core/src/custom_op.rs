@@ -426,7 +426,7 @@ impl InplaceOp1 for UgIOp1 {
     #[cfg(feature = "metal")]
     fn metal_fwd(&self, sto: &mut MetalStorage, layout: &Layout) -> Result<()> {
         use crate::backend::BackendStorage;
-        use hanzo_metal_kernels::utils::EncoderProvider;
+        use hanzo_ml_metal_kernels::utils::EncoderProvider;
 
         let elem_count = layout.shape().elem_count();
         if sto.dtype() != crate::DType::F32 {
@@ -450,8 +450,8 @@ impl InplaceOp1 for UgIOp1 {
             height: 1,
             depth: 1,
         };
-        let group_dims = hanzo_metal_kernels::utils::get_block_dims(b as u64, 1, 1);
-        hanzo_metal_kernels::utils::set_param(encoder, 0, (sto.buffer(), 0usize));
+        let group_dims = hanzo_ml_metal_kernels::utils::get_block_dims(b as u64, 1, 1);
+        hanzo_ml_metal_kernels::utils::set_param(encoder, 0, (sto.buffer(), 0usize));
 
         encoder.use_resource(sto.buffer(), metal::MTLResourceUsage::Write);
         encoder.dispatch_threads(grid_dims, group_dims);
