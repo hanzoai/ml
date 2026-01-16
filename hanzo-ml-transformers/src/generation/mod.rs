@@ -3,7 +3,7 @@
 //! Functionality for modeling sampling strategies and logits processing in text generation
 //! with support for temperature-based sampling, top-k filtering, nucleus sampling (top-p),
 //! and combinations thereof.
-use hanzo_ml_core::{Context, DType, Error, Result, Tensor};
+use hanzo_ml::{Context, DType, Error, Result, Tensor};
 use rand::{distr::Distribution, SeedableRng};
 
 #[derive(Clone, PartialEq, Debug)]
@@ -52,7 +52,7 @@ impl LogitsProcessor {
     }
 
     fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {
-        let sampled = hanzo_nn::sampling::gumbel_softmax(logits, temperature, hanzo_ml_core::D::Minus1)?;
+        let sampled = hanzo_nn::sampling::gumbel_softmax(logits, temperature, hanzo_ml::D::Minus1)?;
         sampled.to_vec0::<u32>()
     }
 

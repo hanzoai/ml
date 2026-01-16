@@ -18,7 +18,7 @@
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_nn::{layer_norm, linear, Embedding, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo_ml_core::{Module, Result, Tensor, D};
+use hanzo_ml::{Module, Result, Tensor, D};
 use hanzo_nn::LayerNorm;
 
 pub type Config = super::blip_text::Config;
@@ -288,7 +288,7 @@ impl TextLayer {
         let attention_output = self.attention.forward(xs, None, Some(attention_mask))?;
         let attention_output = match &mut self.cross_attention {
             Some(ca) => ca.forward(&attention_output, Some(encoder_hidden_states), None)?,
-            None => hanzo_ml_core::bail!("expected some cross-attn"),
+            None => hanzo_ml::bail!("expected some cross-attn"),
         };
         let intermediate_output = self.intermediate.forward(&attention_output)?;
         self.output.forward(&intermediate_output, &attention_output)

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
-use hanzo_ml_core::Tensor;
+use hanzo_ml::Tensor;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::bert::{self, BertForMaskedLM, Config};
 use clap::Parser;

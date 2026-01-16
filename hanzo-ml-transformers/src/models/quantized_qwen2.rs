@@ -14,7 +14,7 @@
 //!
 
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
-use hanzo_ml_core::{
+use hanzo_ml::{
     quantized::{gguf_file, QMatMul},
     DType, Device, IndexOp, Result, Tensor,
 };
@@ -184,7 +184,7 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
-            None => hanzo_ml_core::bail!("cannot find {s} in metadata"),
+            None => hanzo_ml::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 

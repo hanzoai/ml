@@ -19,7 +19,7 @@ use crate::models::with_tracing::{linear_no_bias, Linear, RmsNorm};
 /// Mixtral Model
 /// https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py
 /// https://mistral.ai/news/mixtral-of-experts/
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;

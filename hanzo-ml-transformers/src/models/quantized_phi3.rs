@@ -15,14 +15,14 @@
 
 use std::collections::HashMap;
 
-use hanzo_ml_core::quantized::gguf_file;
-use hanzo_ml_core::quantized::QTensor;
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::quantized::gguf_file;
+use hanzo_ml::quantized::QTensor;
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{kv_cache::KvCache, Embedding, RmsNorm};
 
 #[derive(Debug, Clone)]
 struct QLinear {
-    inner: hanzo_ml_core::quantized::QMatMul,
+    inner: hanzo_ml::quantized::QMatMul,
     span: tracing::Span,
 }
 
@@ -35,7 +35,7 @@ impl QLinear {
     ) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         let w = ct.tensor(r, &format!("{name}.weight"), device)?;
-        let inner = hanzo_ml_core::quantized::QMatMul::from_qtensor(w)?;
+        let inner = hanzo_ml::quantized::QMatMul::from_qtensor(w)?;
         Ok(Self { inner, span })
     }
 }
@@ -224,7 +224,7 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
-            None => hanzo_ml_core::bail!("cannot find {s} in metadata"),
+            None => hanzo_ml::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 

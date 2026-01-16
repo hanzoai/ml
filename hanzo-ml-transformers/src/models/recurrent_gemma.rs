@@ -17,7 +17,7 @@
 //! This implementation is based on the python version from huggingface/transformers.
 //! https://github.com/huggingface/transformers/blob/b109257f4fb8b1166e7c53cc5418632014ed53a5/src/transformers/models/recurrent_gemma/modeling_recurrent_gemma.py#L2
 //!
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{linear_b as linear, Linear, VarBuilder};
 use std::sync::Arc;
 
@@ -106,7 +106,7 @@ fn rotate_half(xs: &Tensor) -> Result<Tensor> {
 impl RotaryEmbedding {
     pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         if cfg.partial_rotary_factor != 0.5 {
-            hanzo_ml_core::bail!("partial-rotary-factor {} <> 0.5", cfg.partial_rotary_factor)
+            hanzo_ml::bail!("partial-rotary-factor {} <> 0.5", cfg.partial_rotary_factor)
         }
         let dim = cfg.head_dim / 2;
         let max_seq_len = cfg.max_seq_len;
@@ -383,7 +383,7 @@ impl RecurrentBlock {
                 .narrow(D::Minus1, 0, seq_len)?
         } else {
             let conv_state = match self.conv1d_state.as_ref() {
-                None => hanzo_ml_core::bail!("empty cache despite pos > 0"),
+                None => hanzo_ml::bail!("empty cache despite pos > 0"),
                 Some(s) => Tensor::cat(&[s, &x_branch], D::Minus1)?,
             };
             let w = self.conv_1d.weight().i((.., 0, ..))?;

@@ -1,5 +1,5 @@
 use crate::models::with_tracing::{linear, Linear};
-use hanzo_ml_core::{DType, Module, Result, Tensor};
+use hanzo_ml::{DType, Module, Result, Tensor};
 use hanzo_nn::{
     embedding, layer_norm, ops::softmax_last_dim, Activation, Embedding, LayerNorm, VarBuilder,
 };
@@ -79,7 +79,7 @@ impl XLMRobertaEmbeddings {
                         .to_dtype(input_embeddings.dtype())?
                         .to_device(input_embeddings.device())?,
                 )?
-                .to_dtype(hanzo_ml_core::DType::U32)?;
+                .to_dtype(hanzo_ml::DType::U32)?;
             embeddings = embeddings.broadcast_add(&position_embeddings.forward(&position_ids)?)?;
         }
         let embeddings = self.layer_norm.forward(&embeddings)?;

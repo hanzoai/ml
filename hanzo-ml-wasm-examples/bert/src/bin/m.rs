@@ -1,4 +1,4 @@
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::bert::{BertModel, Config};
 use hanzo_wasm_example_bert::console_log;

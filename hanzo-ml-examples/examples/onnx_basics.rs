@@ -1,5 +1,5 @@
 use anyhow::Result;
-use hanzo_ml_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 
 use clap::{Parser, Subcommand};
 

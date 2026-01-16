@@ -35,7 +35,7 @@
 //!   <img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg" alt="" width=640>
 //! </div>
 //!
-use hanzo_ml_core::{Result, Tensor, D};
+use hanzo_ml::{Result, Tensor, D};
 use hanzo_nn::{
     batch_norm, conv2d, conv2d_no_bias, linear, ops::sigmoid, ops::softmax, Conv2dConfig, Func,
     VarBuilder,

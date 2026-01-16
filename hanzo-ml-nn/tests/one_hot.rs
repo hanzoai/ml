@@ -1,9 +1,9 @@
-use hanzo_ml_core::{Result, Shape, Tensor};
+use hanzo_ml::{Result, Shape, Tensor};
 use hanzo_nn::encoding::one_hot;
 
 #[test]
 fn test_i64_one_hot() -> Result<()> {
-    let device = hanzo_ml_core::Device::Cpu;
+    let device = hanzo_ml::Device::Cpu;
 
     let indices = Tensor::new(vec![vec![0i64, 2], vec![1, -1]], &device)?;
     let depth = 4;
@@ -29,7 +29,7 @@ fn test_i64_one_hot() -> Result<()> {
 
 #[test]
 fn test_rank_3_one_hot() -> Result<()> {
-    let device = hanzo_ml_core::Device::Cpu;
+    let device = hanzo_ml::Device::Cpu;
 
     let indices = Tensor::new(
         vec![
@@ -72,7 +72,7 @@ fn test_rank_3_one_hot() -> Result<()> {
 
 #[test]
 fn test_u8_one_cold() -> Result<()> {
-    let device = hanzo_ml_core::Device::Cpu;
+    let device = hanzo_ml::Device::Cpu;
     let depth = 4;
     let indices = Tensor::new(vec![vec![0i64, 2], vec![1, -1]], &device)?;
 
@@ -95,7 +95,7 @@ fn test_u8_one_cold() -> Result<()> {
 
 #[test]
 fn test_iter() -> Result<()> {
-    let device = hanzo_ml_core::Device::Cpu;
+    let device = hanzo_ml::Device::Cpu;
     let depth = 4;
     let indices = Tensor::new(vec![vec![0i64, 2], vec![1, -1]], &device)?;
     let matrix = indices.to_vec2::<i64>()?;

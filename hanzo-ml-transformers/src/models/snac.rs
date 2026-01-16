@@ -6,7 +6,7 @@
 /// Multi-Scale Neural Audio Codec (SNAC) compresses audio into discrete codes at a low bitrate.
 /// For more information, read the paper: https://arxiv.org/abs/2410.14411
 ///
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{
     linear_b, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear,
     VarBuilder,
@@ -28,7 +28,7 @@ pub struct Config {
 }
 
 // Equivalent to torch.repeat_interleave
-pub fn repeat_interleave<D: hanzo_ml_core::shape::Dim>(
+pub fn repeat_interleave<D: hanzo_ml::shape::Dim>(
     img: &Tensor,
     repeats: usize,
     dim: D,
@@ -416,7 +416,7 @@ impl EncoderBlock {
     }
 }
 
-impl hanzo_ml_core::Module for EncoderBlock {
+impl hanzo_ml::Module for EncoderBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply(&self.res1)?
             .apply(&self.res2)?
@@ -434,7 +434,7 @@ pub struct Encoder {
     conv2: Conv1d,
 }
 
-impl hanzo_ml_core::Module for Encoder {
+impl hanzo_ml::Module for Encoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut xs = xs.apply(&self.conv1)?;
         for block in self.blocks.iter() {
@@ -573,7 +573,7 @@ impl Decoder {
     }
 }
 
-impl hanzo_ml_core::Module for Decoder {
+impl hanzo_ml::Module for Decoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut xs = match &self.conv1 {
             ConvInit::Standard(c) => xs.apply(c)?,
@@ -715,7 +715,7 @@ impl ResidualVectorQuantizer {
         }
         match sum {
             Some(s) => Ok(s),
-            None => hanzo_ml_core::bail!("empty codebooks"),
+            None => hanzo_ml::bail!("empty codebooks"),
         }
     }
 }

@@ -7,9 +7,9 @@
 //! # Example
 //!
 //! ```rust
-//! use hanzo_ml_core::{Tensor, Device::Cpu, test_utils::to_vec3_round};
+//! use hanzo_ml::{Tensor, Device::Cpu, test_utils::to_vec3_round};
 //! use hanzo_nn::{LayerNorm, Module};
-//! # fn main() -> hanzo_ml_core::Result<()> {
+//! # fn main() -> hanzo_ml::Result<()> {
 //!
 //! let w = Tensor::new(&[1f32, 1f32, 1f32], &Cpu)?;
 //! let b = Tensor::new(&[0f32, 0f32, 0f32], &Cpu)?;
@@ -28,7 +28,7 @@
 //! ```
 //!
 //! [`Layer Normalization`]: https://arxiv.org/abs/1607.06450
-use hanzo_ml_core::{DType, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Module, Result, Tensor, D};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerNormConfig {

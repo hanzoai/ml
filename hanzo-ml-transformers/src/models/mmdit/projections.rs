@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Module, Result, Tensor};
+use hanzo_ml::{Module, Result, Tensor};
 use hanzo_nn as nn;
 
 pub struct Qkv {

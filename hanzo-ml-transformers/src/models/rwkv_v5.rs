@@ -32,7 +32,7 @@
 //! ```
 
 use super::with_tracing::{layer_norm, linear_no_bias as linear, LayerNorm, Linear};
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
 use std::collections::{HashMap, HashSet};
 
@@ -363,7 +363,7 @@ impl Tokenizer {
     pub fn new<P: AsRef<std::path::Path>>(p: P) -> Result<Self> {
         let file = std::fs::File::open(p)?;
         let token2idx: HashMap<String, u32> =
-            serde_json::from_reader(file).map_err(hanzo_ml_core::Error::wrap)?;
+            serde_json::from_reader(file).map_err(hanzo_ml::Error::wrap)?;
         let token2idx = token2idx
             .into_iter()
             .map(|(key, value)| (key.into_bytes(), value))
@@ -408,7 +408,7 @@ impl Tokenizer {
 
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
         let bytes = self.decode_bytes(tokens);
-        String::from_utf8(bytes).map_err(hanzo_ml_core::Error::wrap)
+        String::from_utf8(bytes).map_err(hanzo_ml::Error::wrap)
     }
 
     pub fn encode_bytes(&self, bytes: &[u8]) -> Result<Vec<u32>> {
@@ -427,7 +427,7 @@ impl Tokenizer {
             }
             i += s.len();
             let token = match self.token2idx.get(&s) {
-                None => hanzo_ml_core::bail!("unexpected token '{}' {s:?}", String::from_utf8_lossy(&s)),
+                None => hanzo_ml::bail!("unexpected token '{}' {s:?}", String::from_utf8_lossy(&s)),
                 Some(token) => *token,
             };
             tokens.push(token)

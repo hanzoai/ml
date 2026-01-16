@@ -4,7 +4,7 @@
 //!
 //! Based on implementation from [Huggingface Transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/falcon)
 
-use hanzo_ml_core::{DType, Device, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Result, Tensor, D};
 use hanzo_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
 use serde::Deserialize;
 
@@ -73,13 +73,13 @@ impl Default for Config {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.alibi {
-            hanzo_ml_core::bail!("alibi is not supported");
+            hanzo_ml::bail!("alibi is not supported");
         }
         if self.new_decoder_architecture {
-            hanzo_ml_core::bail!("new_decoder_architecture is not supported");
+            hanzo_ml::bail!("new_decoder_architecture is not supported");
         }
         if self.n_head_kv.is_some() {
-            hanzo_ml_core::bail!("n_head_kv is not supported");
+            hanzo_ml::bail!("n_head_kv is not supported");
         }
         Ok(())
     }

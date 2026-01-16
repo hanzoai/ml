@@ -6,7 +6,7 @@
 //! - [GH](https://github.com/openai/CLIP)
 //! - [Code](https://github.com/huggingface/transformers/tree/f6fa0f0bf0796ac66f201f23bdb8585de1609add/src/transformers/models/clip)
 
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn as nn;
 use hanzo_nn::Module;
 

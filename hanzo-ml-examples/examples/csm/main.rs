@@ -9,7 +9,7 @@ use clap::Parser;
 
 use hanzo_transformers::models::csm::{Config, Model};
 
-use hanzo_ml_core::{DType, IndexOp, Tensor};
+use hanzo_ml::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
@@ -113,10 +113,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
@@ -187,7 +187,7 @@ fn main() -> Result<()> {
 
     println!("loaded the model in {:?}", start.elapsed());
 
-    let voices = hanzo_ml_core::safetensors::load(args.voices, &device)?;
+    let voices = hanzo_ml::safetensors::load(args.voices, &device)?;
     let mut lp = hanzo_transformers::generation::LogitsProcessor::new(
         args.seed,
         Some(args.temperature),

@@ -5,7 +5,7 @@
 //! - [Github Rep](https://github.com/HazyResearch/based)
 //! - [Blogpost](https://hazyresearch.stanford.edu/blog/2024-03-03-based)
 
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{
     conv1d_no_bias, linear, linear_no_bias, ops::softmax_last_dim, rms_norm, Conv1d, Conv1dConfig,
     Func, Linear, RmsNorm, VarBuilder,

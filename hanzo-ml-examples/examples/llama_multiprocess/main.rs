@@ -12,7 +12,7 @@ extern crate intel_mkl_src;
 use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::llama::LlamaEosToks;
 use cudarc::driver::safe::CudaDevice;

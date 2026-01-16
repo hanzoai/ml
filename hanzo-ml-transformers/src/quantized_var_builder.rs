@@ -4,8 +4,8 @@
 //! These tensors can be loaded from disk using `from_gguf` or from an in-memory
 //! buffer using `from_gguf_buffer`.
 
-use hanzo_ml_core::quantized::QTensor;
-use hanzo_ml_core::{Device, Result, Shape};
+use hanzo_ml::quantized::QTensor;
+use hanzo_ml::{Device, Result, Shape};
 use std::sync::Arc;
 
 // VarBuilder specialized for QTensors
@@ -19,7 +19,7 @@ pub struct VarBuilder {
 impl VarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
         let mut file = std::fs::File::open(p)?;
-        let content = hanzo_ml_core::quantized::gguf_file::Content::read(&mut file)?;
+        let content = hanzo_ml::quantized::gguf_file::Content::read(&mut file)?;
         let mut data = std::collections::HashMap::new();
         for tensor_name in content.tensor_infos.keys() {
             let tensor = content.tensor(&mut file, tensor_name, device)?;
@@ -34,7 +34,7 @@ impl VarBuilder {
 
     pub fn from_gguf_buffer(buffer: &[u8], device: &Device) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(buffer);
-        let content = hanzo_ml_core::quantized::gguf_file::Content::read(&mut cursor)?;
+        let content = hanzo_ml::quantized::gguf_file::Content::read(&mut cursor)?;
         let mut data = std::collections::HashMap::new();
         for tensor_name in content.tensor_infos.keys() {
             let tensor = content.tensor(&mut cursor, tensor_name, device)?;
@@ -69,12 +69,12 @@ impl VarBuilder {
         let path = self.path(name);
         match self.data.get(&path) {
             None => {
-                hanzo_ml_core::bail!("cannot find tensor {path}")
+                hanzo_ml::bail!("cannot find tensor {path}")
             }
             Some(qtensor) => {
                 let shape = s.into();
                 if qtensor.shape() != &shape {
-                    hanzo_ml_core::bail!(
+                    hanzo_ml::bail!(
                         "shape mismatch for {name}, got {:?}, expected {shape:?}",
                         qtensor.shape()
                     )
@@ -88,7 +88,7 @@ impl VarBuilder {
         let path = self.path(name);
         match self.data.get(&path) {
             None => {
-                hanzo_ml_core::bail!("cannot find tensor {name}")
+                hanzo_ml::bail!("cannot find tensor {name}")
             }
             Some(qtensor) => Ok(qtensor.clone()),
         }

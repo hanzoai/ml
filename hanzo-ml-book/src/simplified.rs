@@ -17,7 +17,7 @@
 #[rustfmt::skip]
 mod tests {
 
-use hanzo_ml_core::{DType, Result, Tensor, D, Device};
+use hanzo_ml::{DType, Result, Tensor, D, Device};
 use hanzo_nn::{loss, ops, Linear, Module, VarBuilder, VarMap, Optimizer};
 
 // ANCHOR: book_training_simplified1

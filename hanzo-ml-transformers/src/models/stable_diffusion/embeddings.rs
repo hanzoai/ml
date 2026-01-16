@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Result, Tensor, D};
+use hanzo_ml::{Result, Tensor, D};
 use hanzo_nn as nn;
 use hanzo_nn::Module;
 
@@ -44,7 +44,7 @@ impl Timesteps {
 impl Module for Timesteps {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let half_dim = (self.num_channels / 2) as u32;
-        let exponent = (Tensor::arange(0, half_dim, xs.device())?.to_dtype(hanzo_ml_core::DType::F32)?
+        let exponent = (Tensor::arange(0, half_dim, xs.device())?.to_dtype(hanzo_ml::DType::F32)?
             * -f64::ln(10000.))?;
         let exponent = (exponent / (half_dim as f64 - self.downscale_freq_shift))?;
         let emb = exponent.exp()?.to_dtype(xs.dtype())?;

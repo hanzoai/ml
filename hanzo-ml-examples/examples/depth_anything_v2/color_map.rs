@@ -2,7 +2,7 @@ use enterpolation::linear::ConstEquidistantLinear;
 use enterpolation::Generator;
 use palette::LinSrgb;
 
-use hanzo_ml_core::Tensor;
+use hanzo_ml::Tensor;
 
 pub struct SpectralRColormap {
     gradient: ConstEquidistantLinear<f32, LinSrgb, 9>,
@@ -30,7 +30,7 @@ impl SpectralRColormap {
         self.gradient.gen(value)
     }
 
-    pub fn gray2color(&self, gray: &Tensor) -> hanzo_ml_core::Result<Tensor> {
+    pub fn gray2color(&self, gray: &Tensor) -> hanzo_ml::Result<Tensor> {
         println!("Gray: {:?}", gray.dims());
         let gray_values: Vec<f32> = gray.flatten_all()?.to_vec1()?;
         let rgb_values: Vec<f32> = gray_values
@@ -40,7 +40,7 @@ impl SpectralRColormap {
             .collect();
 
         let [.., height, width] = gray.dims() else {
-            hanzo_ml_core::bail!("Not enough dims!")
+            hanzo_ml::bail!("Not enough dims!")
         };
 
         let color = Tensor::from_vec(rgb_values, (*height, *width, 3), gray.device())?;

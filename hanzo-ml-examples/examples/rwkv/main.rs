@@ -12,7 +12,7 @@ use hanzo_transformers::models::quantized_rwkv_v6::Model as Q6;
 use hanzo_transformers::models::rwkv_v5::{Config, Model as M5, State, Tokenizer};
 use hanzo_transformers::models::rwkv_v6::Model as M6;
 
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -27,7 +27,7 @@ enum Model {
 }
 
 impl Model {
-    fn forward(&self, xs: &Tensor, state: &mut State) -> hanzo_ml_core::Result<Tensor> {
+    fn forward(&self, xs: &Tensor, state: &mut State) -> hanzo_ml::Result<Tensor> {
         match self {
             Self::M5(m) => m.forward(xs, state),
             Self::Q5(m) => m.forward(xs, state),
@@ -231,10 +231,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",

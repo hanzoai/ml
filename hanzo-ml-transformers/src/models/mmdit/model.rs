@@ -4,7 +4,7 @@
 // https://github.com/comfyanonymous/ComfyUI/blob/78e133d0415784924cd2674e2ee48f3eeca8a2aa/comfy/ldm/modules/diffusionmodules/mmdit.py#L1
 // with MMDiT-X support following the Stability-AI/sd3.5 repository.
 // https://github.com/Stability-AI/sd3.5/blob/4e484e05308d83fb77ae6f680028e6c313f9da54/mmditx.py#L1
-use hanzo_ml_core::{Module, Result, Tensor, D};
+use hanzo_ml::{Module, Result, Tensor, D};
 use hanzo_nn as nn;
 
 use super::blocks::{

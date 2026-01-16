@@ -10,7 +10,7 @@ extern crate accelerate_src;
 extern crate intel_mkl_src;
 
 use anyhow::{Error as E, Result};
-use hanzo_ml_core::{Device, IndexOp, Tensor};
+use hanzo_ml::{Device, IndexOp, Tensor};
 use hanzo_nn::{ops::softmax, VarBuilder};
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -38,7 +38,7 @@ impl Model {
         }
     }
 
-    pub fn encoder_forward(&mut self, x: &Tensor, flush: bool) -> hanzo_ml_core::Result<Tensor> {
+    pub fn encoder_forward(&mut self, x: &Tensor, flush: bool) -> hanzo_ml::Result<Tensor> {
         match self {
             Self::Normal(m) => m.encoder.forward(x, flush),
             Self::Quantized(m) => m.encoder.forward(x, flush),
@@ -50,14 +50,14 @@ impl Model {
         x: &Tensor,
         xa: &Tensor,
         flush: bool,
-    ) -> hanzo_ml_core::Result<Tensor> {
+    ) -> hanzo_ml::Result<Tensor> {
         match self {
             Self::Normal(m) => m.decoder.forward(x, xa, flush),
             Self::Quantized(m) => m.decoder.forward(x, xa, flush),
         }
     }
 
-    pub fn decoder_final_linear(&self, x: &Tensor) -> hanzo_ml_core::Result<Tensor> {
+    pub fn decoder_final_linear(&self, x: &Tensor) -> hanzo_ml::Result<Tensor> {
         match self {
             Self::Normal(m) => m.decoder.final_linear(x),
             Self::Quantized(m) => m.decoder.final_linear(x),
@@ -222,7 +222,7 @@ impl Decoder {
                     .unwrap()
             };
             tokens.push(next_token);
-            let prob = softmax(&logits, hanzo_ml_core::D::Minus1)?
+            let prob = softmax(&logits, hanzo_ml::D::Minus1)?
                 .i(next_token as usize)?
                 .to_scalar::<f32>()? as f64;
             if next_token == self.eot_token || tokens.len() > model.config().max_target_positions {
@@ -342,9 +342,9 @@ impl Decoder {
     }
 }
 
-pub fn token_id(tokenizer: &Tokenizer, token: &str) -> hanzo_ml_core::Result<u32> {
+pub fn token_id(tokenizer: &Tokenizer, token: &str) -> hanzo_ml::Result<u32> {
     match tokenizer.token_to_id(token) {
-        None => hanzo_ml_core::bail!("no token-id for {token}"),
+        None => hanzo_ml::bail!("no token-id for {token}"),
         Some(id) => Ok(id),
     }
 }

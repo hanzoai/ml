@@ -4,8 +4,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo_ml_core::test_utils::to_vec0_round;
-use hanzo_ml_core::{Device, Result, Tensor};
+use hanzo_ml::test_utils::to_vec0_round;
+use hanzo_ml::{Device, Result, Tensor};
 
 /* Equivalent python code:
 import torch

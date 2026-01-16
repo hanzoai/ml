@@ -4,7 +4,7 @@
 //!
 //! Based on implementation from [huggingface/transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/encodec/modeling_encodec.py)
 
-use hanzo_ml_core::{DType, IndexOp, Layout, Module, Result, Shape, Tensor, D};
+use hanzo_ml::{DType, IndexOp, Layout, Module, Result, Shape, Tensor, D};
 use hanzo_nn::{conv1d, Conv1d, ConvTranspose1d, VarBuilder};
 
 // Encodec Model
@@ -118,7 +118,7 @@ fn get_extra_padding_for_conv1d(
 fn pad1d(xs: &Tensor, pad_l: usize, pad_r: usize, mode: PadMode) -> Result<Tensor> {
     match mode {
         PadMode::Constant => xs.pad_with_zeros(D::Minus1, pad_l, pad_r),
-        PadMode::Reflect => hanzo_ml_core::bail!("pad-mode 'reflect' is not supported"),
+        PadMode::Reflect => hanzo_ml::bail!("pad-mode 'reflect' is not supported"),
         PadMode::Replicate => xs.pad_with_same(D::Minus1, pad_l, pad_r),
     }
 }
@@ -177,37 +177,37 @@ pub fn conv_transpose1d_weight_norm(
 
 struct CodebookEncode;
 
-impl hanzo_ml_core::CustomOp2 for CodebookEncode {
+impl hanzo_ml::CustomOp2 for CodebookEncode {
     fn name(&self) -> &'static str {
         "cb"
     }
 
     fn cpu_fwd(
         &self,
-        lhs_storage: &hanzo_ml_core::CpuStorage,
+        lhs_storage: &hanzo_ml::CpuStorage,
         lhs_layout: &Layout,
-        rhs_storage: &hanzo_ml_core::CpuStorage,
+        rhs_storage: &hanzo_ml::CpuStorage,
         rhs_layout: &Layout,
-    ) -> Result<(hanzo_ml_core::CpuStorage, Shape)> {
+    ) -> Result<(hanzo_ml::CpuStorage, Shape)> {
         use rayon::prelude::*;
 
         let (lhs_dim1, lhs_dim2) = lhs_layout.shape().dims2()?;
         let (rhs_dim1, rhs_dim2) = rhs_layout.shape().dims2()?;
         if lhs_dim2 != rhs_dim2 {
-            hanzo_ml_core::bail!("CodebookEncode, mismatch on last dim, {lhs_layout:?} {rhs_layout:?}");
+            hanzo_ml::bail!("CodebookEncode, mismatch on last dim, {lhs_layout:?} {rhs_layout:?}");
         }
         if lhs_dim2 == 0 {
-            hanzo_ml_core::bail!("CodebookEncode, empty last dim {lhs_layout:?}")
+            hanzo_ml::bail!("CodebookEncode, empty last dim {lhs_layout:?}")
         }
         let lhs = match lhs_layout.contiguous_offsets() {
-            None => hanzo_ml_core::bail!("CodebookEncode, lhs has to be contiguous, got {lhs_layout:?}"),
+            None => hanzo_ml::bail!("CodebookEncode, lhs has to be contiguous, got {lhs_layout:?}"),
             Some((o1, o2)) => {
                 let slice = lhs_storage.as_slice::<f32>()?;
                 &slice[o1..o2]
             }
         };
         let rhs = match rhs_layout.contiguous_offsets() {
-            None => hanzo_ml_core::bail!("CodebookEncode, rhs has to be contiguous, got {rhs_layout:?}"),
+            None => hanzo_ml::bail!("CodebookEncode, rhs has to be contiguous, got {rhs_layout:?}"),
             Some((o1, o2)) => {
                 let slice = rhs_storage.as_slice::<f32>()?;
                 &slice[o1..o2]
@@ -233,7 +233,7 @@ impl hanzo_ml_core::CustomOp2 for CodebookEncode {
                 where_min as u32
             })
             .collect();
-        let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
+        let storage = hanzo_ml::WithDType::to_cpu_storage_owned(dst);
         Ok((storage, (lhs_dim1,).into()))
     }
 }
@@ -348,7 +348,7 @@ impl ResidualVectorQuantizer {
         let mut quantized_out = Tensor::zeros((), self.dtype, codes.device())?;
         let ncodes = codes.dim(0)?;
         if ncodes > self.layers.len() {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "codes shape {:?} does not match the number of quantization layers {}",
                 codes.shape(),
                 self.layers.len()

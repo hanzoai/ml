@@ -1,5 +1,5 @@
 #![allow(unused)]
-use hanzo_ml_core::{
+use hanzo_ml::{
     quantized::{self, k_quants, GgmlDType, GgmlType},
     test_utils::to_vec2_round,
     Device, Module, Result, Tensor,
@@ -86,7 +86,7 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
-        _ => hanzo_ml_core::bail!("No GGML results for quantization type {dtype:?}",),
+        _ => hanzo_ml::bail!("No GGML results for quantization type {dtype:?}",),
     };
     Ok(err)
 }
@@ -108,7 +108,7 @@ fn ggml_matmul_error_test<T: GgmlType>() -> Result<()> {
     let reference_result = vec_dot_reference(&a, &b);
 
     if (result - result_unopt).abs() / length as f32 > 1e-6 {
-        hanzo_ml_core::bail!(
+        hanzo_ml::bail!(
             "the opt and unopt vec-dot returned different values, opt {result}, unopt {result_unopt}"
         )
     }
@@ -118,7 +118,7 @@ fn ggml_matmul_error_test<T: GgmlType>() -> Result<()> {
     let ggml_error = ggml_reference_matmul_error(T::DTYPE)?;
 
     if !error.is_finite() || error > GGML_MAX_DOT_PRODUCT_ERROR {
-        hanzo_ml_core::bail!(
+        hanzo_ml::bail!(
             "Dot product error {} exceeds max error {}",
             error,
             GGML_MAX_DOT_PRODUCT_ERROR
@@ -129,7 +129,7 @@ fn ggml_matmul_error_test<T: GgmlType>() -> Result<()> {
     // => we use a slightly higher error threshold
     const ERROR_LENIENCY: f32 = 0.00001;
     if error - ERROR_LENIENCY > ggml_error {
-        hanzo_ml_core::bail!(
+        hanzo_ml::bail!(
             "Dot product error {} exceeds ggml reference error {}",
             error,
             ggml_error
@@ -140,54 +140,54 @@ fn ggml_matmul_error_test<T: GgmlType>() -> Result<()> {
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q40() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ4_0>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ4_0>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q50() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ5_0>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ5_0>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q80() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ8_0>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ8_0>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q2k() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ2K>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ2K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q3k() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ3K>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ3K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q4k() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ4K>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ4K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q5k() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ5K>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ5K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q6k() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ6K>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ6K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q8k() -> Result<()> {
-    ggml_matmul_error_test::<hanzo_ml_core::quantized::k_quants::BlockQ8K>()?;
+    ggml_matmul_error_test::<hanzo_ml::quantized::k_quants::BlockQ8K>()?;
     Ok(())
 }

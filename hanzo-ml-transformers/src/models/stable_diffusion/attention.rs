@@ -1,5 +1,5 @@
 //! Attention Based Building Blocks
-use hanzo_ml_core::{DType, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
 use hanzo_nn as nn;
 use hanzo_nn::Module;
 
@@ -175,15 +175,15 @@ impl CrossAttention {
         let xs = if self.use_flash_attn {
             let init_dtype = query.dtype();
             let q = query
-                .to_dtype(hanzo_ml_core::DType::F16)?
+                .to_dtype(hanzo_ml::DType::F16)?
                 .unsqueeze(0)?
                 .transpose(1, 2)?;
             let k = key
-                .to_dtype(hanzo_ml_core::DType::F16)?
+                .to_dtype(hanzo_ml::DType::F16)?
                 .unsqueeze(0)?
                 .transpose(1, 2)?;
             let v = value
-                .to_dtype(hanzo_ml_core::DType::F16)?
+                .to_dtype(hanzo_ml::DType::F16)?
                 .unsqueeze(0)?
                 .transpose(1, 2)?;
             flash_attn(&q, &k, &v, self.scale as f32, false)?

@@ -1,6 +1,6 @@
 use crate::model::{Cache, Config, Llama};
 use byteorder::{LittleEndian, ReadBytesExt};
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Shape, Tensor};
+use hanzo_ml::{DType, Device, IndexOp, Result, Shape, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use serde::{Deserialize, Serialize};
@@ -78,7 +78,7 @@ impl Model {
         let mut tokens = self
             .tokenizer
             .encode(prompt.to_string(), true)
-            .map_err(|m| hanzo_ml_core::Error::Msg(m.to_string()))?
+            .map_err(|m| hanzo_ml::Error::Msg(m.to_string()))?
             .get_ids()
             .to_vec();
         link.respond(id, Ok(WorkerOutput::Generated(prompt)));
@@ -256,7 +256,7 @@ impl Model {
         let cache = Cache::new(true, &config, vb.pp("rot"))?;
         let llama = Llama::load(vb, &cache, &config)?;
         let tokenizer =
-            Tokenizer::from_bytes(&md.tokenizer).map_err(|m| hanzo_ml_core::Error::Msg(m.to_string()))?;
+            Tokenizer::from_bytes(&md.tokenizer).map_err(|m| hanzo_ml::Error::Msg(m.to_string()))?;
         Ok(Self {
             cache,
             config,

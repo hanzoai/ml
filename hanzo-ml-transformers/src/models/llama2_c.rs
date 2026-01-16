@@ -6,7 +6,7 @@
 //! - 💻 llama2.c [GH Link](https://github.com/karpathy/llama2.c)
 //!
 
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::linear_no_bias as linear;
 use hanzo_nn::{embedding, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use std::collections::HashMap;

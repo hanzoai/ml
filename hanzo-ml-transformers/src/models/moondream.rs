@@ -37,7 +37,7 @@
 
 use crate::models::mixformer::{Config as PhiConfig, MixFormerSequentialForCausalLM as PhiModel};
 use crate::models::with_tracing::{layer_norm, linear_b, LayerNorm, Linear};
-use hanzo_ml_core::{IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::VarBuilder;
 
 #[derive(Debug, Clone, serde::Deserialize)]

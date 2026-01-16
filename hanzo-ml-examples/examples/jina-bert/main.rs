@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use hanzo_transformers::models::jina_bert::{BertModel, Config, PositionEmbeddingType};
 
 use anyhow::Error as E;
-use hanzo_ml_core::{DType, Module, Tensor};
+use hanzo_ml::{DType, Module, Tensor};
 use hanzo_nn::VarBuilder;
 use clap::Parser;
 
@@ -160,7 +160,7 @@ fn main() -> anyhow::Result<()> {
                 let tokens = tokens.get_ids().to_vec();
                 Tensor::new(tokens.as_slice(), device)
             })
-            .collect::<hanzo_ml_core::Result<Vec<_>>>()?;
+            .collect::<hanzo_ml::Result<Vec<_>>>()?;
 
         let token_ids = Tensor::stack(&token_ids, 0)?;
         println!("running inference on batch {:?}", token_ids.shape());
@@ -196,6 +196,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn normalize_l2(v: &Tensor) -> hanzo_ml_core::Result<Tensor> {
+pub fn normalize_l2(v: &Tensor) -> hanzo_ml::Result<Tensor> {
     v.broadcast_div(&v.sqr()?.sum_keepdim(1)?.sqrt()?)
 }

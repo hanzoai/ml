@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo_ml_core::{IndexOp, D};
+use hanzo_ml::{IndexOp, D};
 use hanzo_examples::save_image;
 use clap::{Parser, ValueEnum};
 
@@ -95,10 +95,10 @@ pub fn main() -> anyhow::Result<()> {
             }
         }
         Which::EsrGan => {
-            let max_pixel_val = hanzo_ml_core::Tensor::try_from(255.0f32)?
+            let max_pixel_val = hanzo_ml::Tensor::try_from(255.0f32)?
                 .to_device(prs.device())?
                 .broadcast_as(prs.shape())?;
-            let out = (prs * max_pixel_val)?.i(0)?.to_dtype(hanzo_ml_core::DType::U8)?;
+            let out = (prs * max_pixel_val)?.i(0)?.to_dtype(hanzo_ml::DType::U8)?;
 
             let pb = std::path::PathBuf::from(args.image);
             let input_file_name = pb.file_name().unwrap();

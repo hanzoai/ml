@@ -1,7 +1,7 @@
 //! Text encoder as used in most OpenCLIP pretrained models
 //! https://github.com/mlfoundations/open_clip
 
-use hanzo_ml_core::{DType, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
 use hanzo_nn::{
     embedding, layer_norm, linear, ops::softmax_last_dim, Embedding, LayerNorm, Linear, Module,
     VarBuilder,

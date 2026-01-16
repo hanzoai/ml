@@ -11,7 +11,7 @@ use hanzo_transformers::models::gemma::{Config as Config1, Model as Model1};
 use hanzo_transformers::models::gemma2::{Config as Config2, Model as Model2};
 use hanzo_transformers::models::gemma3::{Config as Config3, Model as Model3};
 
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -61,7 +61,7 @@ enum Model {
 }
 
 impl Model {
-    fn forward(&mut self, input_ids: &Tensor, pos: usize) -> hanzo_ml_core::Result<Tensor> {
+    fn forward(&mut self, input_ids: &Tensor, pos: usize) -> hanzo_ml::Result<Tensor> {
         match self {
             Self::V1(m) => m.forward(input_ids, pos),
             Self::V2(m) => m.forward(input_ids, pos),
@@ -253,10 +253,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",

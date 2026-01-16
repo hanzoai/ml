@@ -5,7 +5,7 @@
 //! Based on the [llama2.c](https://github.com/karpathy/llama2.c) implementation
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Shape, Tensor};
+use hanzo_ml::{DType, Device, IndexOp, Result, Shape, Tensor};
 use hanzo_nn::VarBuilder;
 
 use super::llama2_c::Config;
@@ -115,7 +115,7 @@ impl TransformerWeights {
         // second matrix back. We detect this case here and as a temporary hack make the weight
         // matrix column major rather than row major. This ends up speeding up text generation from
         // 120 token/s to 220 token/s on a Ryzen 2600X.
-        let tr = device.is_cpu() && !hanzo_ml_core::utils::has_mkl();
+        let tr = device.is_cpu() && !hanzo_ml::utils::has_mkl();
         let tr = |x: Tensor| if tr { x.t()?.contiguous()?.t() } else { Ok(x) };
         let mut ws = std::collections::HashMap::new();
         let mut insert = |name: &str, t: Tensor| {

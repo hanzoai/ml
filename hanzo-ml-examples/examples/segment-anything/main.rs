@@ -7,7 +7,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo_ml_core::DType;
+use hanzo_ml::DType;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::segment_anything::sam;
 use clap::Parser;
@@ -141,7 +141,7 @@ pub fn main() -> anyhow::Result<()> {
 
         let mut img = image::ImageReader::open(&args.image)?
             .decode()
-            .map_err(hanzo_ml_core::Error::wrap)?;
+            .map_err(hanzo_ml::Error::wrap)?;
         let mask_pixels = mask.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
         let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             match image::ImageBuffer::from_raw(w as u32, h as u32, mask_pixels) {

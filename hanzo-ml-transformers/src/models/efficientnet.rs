@@ -3,7 +3,7 @@
 //! See:
 //! - ["EfficientBERT: Progressively Searching Multilayer Perceptron Architectures for BERT"](https://arxiv.org/abs/2201.00462)
 //!
-use hanzo_ml_core::{Context, Result, Tensor, D};
+use hanzo_ml::{Context, Result, Tensor, D};
 use hanzo_nn as nn;
 use nn::{Module, VarBuilder};
 

@@ -9,7 +9,7 @@ use clap::Parser;
 
 use hanzo_transformers::models::pixtral::{vision_model, Config, Model};
 
-use hanzo_ml_core::{DType, Device, Module, Tensor};
+use hanzo_ml::{DType, Device, Module, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -232,10 +232,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
@@ -282,7 +282,7 @@ fn main() -> Result<()> {
         }
     };
     let image = if args.image.ends_with(".safetensors") {
-        match hanzo_ml_core::safetensors::load(&args.image, &device)?.remove("img") {
+        match hanzo_ml::safetensors::load(&args.image, &device)?.remove("img") {
             None => anyhow::bail!("no img tensor in {}", args.image),
             Some(v) => v,
         }

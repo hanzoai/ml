@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Result, Tensor};
+use hanzo_ml::{Result, Tensor};
 use hanzo_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
 
 #[derive(Debug)]

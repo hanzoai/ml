@@ -4,7 +4,7 @@ use crate::models::{
     with_tracing::{linear_no_bias, Linear, RmsNorm},
 };
 use crate::utils::repeat_kv;
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor};
+use hanzo_ml::{DType, Device, Module, Result, Tensor};
 use hanzo_nn::{Activation, VarBuilder};
 use std::sync::Arc;
 

@@ -15,7 +15,7 @@
 //! - 🤗 [Model Card](https://huggingface.co/bigcode/starcoder)
 //!
 
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, linear_b, LayerNorm, Linear, VarBuilder};
 use std::sync::Arc;
 

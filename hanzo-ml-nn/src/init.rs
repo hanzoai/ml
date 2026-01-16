@@ -1,7 +1,7 @@
 //! Variable initialization.
 // This is based on:
 // https://github.com/pytorch/pytorch/blob/07107919297db3f8ab37f11c12666b6d6d5f692e/torch/nn/init.py#
-use hanzo_ml_core::{DType, Device, Result, Shape, Tensor, Var};
+use hanzo_ml::{DType, Device, Result, Shape, Tensor, Var};
 
 /// Number of features as input or output of a layer.
 /// In Kaiming initialization, choosing `FanIn` preserves

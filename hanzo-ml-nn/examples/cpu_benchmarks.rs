@@ -5,8 +5,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo_ml_core::quantized::GgmlType;
-use hanzo_ml_core::{CpuStorage, Device, Layout, Module, Result, Shape, Tensor, D};
+use hanzo_ml::quantized::GgmlType;
+use hanzo_ml::{CpuStorage, Device, Layout, Module, Result, Shape, Tensor, D};
 use clap::{Parser, Subcommand};
 
 const CHECK_CONV2D: bool = false;
@@ -37,7 +37,7 @@ impl Im2Col {
     }
 }
 
-impl hanzo_ml_core::CustomOp1 for Im2Col {
+impl hanzo_ml::CustomOp1 for Im2Col {
     fn name(&self) -> &'static str {
         "im2col"
     }
@@ -97,7 +97,7 @@ impl hanzo_ml_core::CustomOp1 for Im2Col {
                 }
             }
         }
-        let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
+        let storage = hanzo_ml::WithDType::to_cpu_storage_owned(dst);
         Ok((storage, (b * h_out * w_out, c * h_k * w_k).into()))
     }
 }
@@ -218,15 +218,15 @@ impl Benchmark for MatVec {
 // https://github.com/ggerganov/llama.cpp/blob/master/examples/benchmark/benchmark-matmult.cpp
 struct QMatMul;
 impl Benchmark for QMatMul {
-    type PreProcessData = (hanzo_ml_core::quantized::QMatMul, Tensor);
+    type PreProcessData = (hanzo_ml::quantized::QMatMul, Tensor);
     type RunResult = Tensor;
     fn preprocess() -> Result<Self::PreProcessData> {
-        let zeros = vec![hanzo_ml_core::quantized::k_quants::BlockQ4_0::zeros(); 4096 * 11008 / 32];
-        let mm = hanzo_ml_core::quantized::QTensor::new(
-            hanzo_ml_core::quantized::QStorage::Cpu(Box::new(zeros)),
+        let zeros = vec![hanzo_ml::quantized::k_quants::BlockQ4_0::zeros(); 4096 * 11008 / 32];
+        let mm = hanzo_ml::quantized::QTensor::new(
+            hanzo_ml::quantized::QStorage::Cpu(Box::new(zeros)),
             (4096, 11008),
         )?;
-        let mm = hanzo_ml_core::quantized::QMatMul::from_qtensor(mm)?;
+        let mm = hanzo_ml::quantized::QMatMul::from_qtensor(mm)?;
         let arg = Tensor::randn(0f32, 1., (128, 11008), &Device::Cpu)?;
         Ok((mm, arg))
     }

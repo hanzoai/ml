@@ -7,7 +7,7 @@
 //! running stats.
 //!
 //! [`Batch Normalization`]: https://arxiv.org/abs/1502.03167
-use hanzo_ml_core::{DType, Result, Tensor, Var};
+use hanzo_ml::{DType, Result, Tensor, Var};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BatchNormConfig {
@@ -57,35 +57,35 @@ pub struct BatchNorm {
 impl BatchNorm {
     fn check_validity(&self, num_features: usize) -> Result<()> {
         if self.eps < 0. {
-            hanzo_ml_core::bail!("batch-norm eps cannot be negative {}", self.eps)
+            hanzo_ml::bail!("batch-norm eps cannot be negative {}", self.eps)
         }
         if !(0.0..=1.0).contains(&self.momentum) {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "batch-norm momentum must be between 0 and 1, is {}",
                 self.momentum
             )
         }
         if self.running_mean.dims() != [num_features] {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "batch-norm running mean has unexpected shape {:?} should have shape [{num_features}]",
                 self.running_mean.shape(),
             )
         }
         if self.running_var.dims() != [num_features] {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "batch-norm running variance has unexpected shape {:?} should have shape [{num_features}]",
                 self.running_var.shape(),
             )
         }
         if let Some((ref weight, ref bias)) = self.weight_and_bias.as_ref() {
             if weight.dims() != [num_features] {
-                hanzo_ml_core::bail!(
+                hanzo_ml::bail!(
                     "batch-norm weight has unexpected shape {:?} should have shape [{num_features}]",
                     weight.shape(),
                 )
             }
             if bias.dims() != [num_features] {
-                hanzo_ml_core::bail!(
+                hanzo_ml::bail!(
                     "batch-norm weight has unexpected shape {:?} should have shape [{num_features}]",
                     bias.shape(),
                 )
@@ -200,13 +200,13 @@ impl BatchNorm {
             d => d,
         };
         if x.rank() < 2 {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "batch-norm input tensor must have at least two dimensions ({:?})",
                 x.shape()
             )
         }
         if x.dim(1)? != num_features {
-            hanzo_ml_core::bail!(
+            hanzo_ml::bail!(
                 "batch-norm input doesn't have the expected number of features ({:?} <> {})",
                 x.shape(),
                 num_features
@@ -306,7 +306,7 @@ pub fn batch_norm<C: Into<BatchNormConfig>>(
     use crate::Init;
     let config = config.into();
     if config.eps < 0. {
-        hanzo_ml_core::bail!("batch-norm eps cannot be negative {}", config.eps)
+        hanzo_ml::bail!("batch-norm eps cannot be negative {}", config.eps)
     }
     let running_mean = vb.get_with_hints(num_features, "running_mean", Init::Const(0.))?;
     let running_var = vb.get_with_hints(num_features, "running_var", Init::Const(1.))?;

@@ -1,4 +1,4 @@
-use hanzo_ml_core::{DType, IndexOp, Result, Tensor};
+use hanzo_ml::{DType, IndexOp, Result, Tensor};
 use hanzo_nn::{layer_norm, LayerNorm, Module, VarBuilder};
 
 #[derive(Debug)]
@@ -42,36 +42,36 @@ impl Module for PatchEmbed {
 // Ideally we would perform this operation in place but this is not supported in hanzo at the
 // moment. We should also investigate using f16 rather than f32.
 struct Add3(usize, usize, usize, usize, usize);
-impl hanzo_ml_core::CustomOp3 for Add3 {
+impl hanzo_ml::CustomOp3 for Add3 {
     fn name(&self) -> &'static str {
         "add3"
     }
 
     fn cpu_fwd(
         &self,
-        s1: &hanzo_ml_core::CpuStorage,
-        l1: &hanzo_ml_core::Layout,
-        s2: &hanzo_ml_core::CpuStorage,
-        l2: &hanzo_ml_core::Layout,
-        s3: &hanzo_ml_core::CpuStorage,
-        l3: &hanzo_ml_core::Layout,
-    ) -> Result<(hanzo_ml_core::CpuStorage, hanzo_ml_core::Shape)> {
+        s1: &hanzo_ml::CpuStorage,
+        l1: &hanzo_ml::Layout,
+        s2: &hanzo_ml::CpuStorage,
+        l2: &hanzo_ml::Layout,
+        s3: &hanzo_ml::CpuStorage,
+        l3: &hanzo_ml::Layout,
+    ) -> Result<(hanzo_ml::CpuStorage, hanzo_ml::Shape)> {
         use rayon::prelude::*;
 
         let Add3(b, q_h, q_w, k_h, k_w) = *self;
         let s1 = s1.as_slice::<f32>()?;
         let s1 = match l1.contiguous_offsets() {
-            None => hanzo_ml_core::bail!("input1 has to be contiguous"),
+            None => hanzo_ml::bail!("input1 has to be contiguous"),
             Some((o1, o2)) => &s1[o1..o2],
         };
         let s2 = s2.as_slice::<f32>()?;
         let s2 = match l2.contiguous_offsets() {
-            None => hanzo_ml_core::bail!("input2 has to be contiguous"),
+            None => hanzo_ml::bail!("input2 has to be contiguous"),
             Some((o1, o2)) => &s2[o1..o2],
         };
         let s3 = s3.as_slice::<f32>()?;
         let s3 = match l3.contiguous_offsets() {
-            None => hanzo_ml_core::bail!("input3 has to be contiguous"),
+            None => hanzo_ml::bail!("input3 has to be contiguous"),
             Some((o1, o2)) => &s3[o1..o2],
         };
         let mut dst = vec![0f32; b * q_h * q_w * k_h * k_w];
@@ -93,7 +93,7 @@ impl hanzo_ml_core::CustomOp3 for Add3 {
                     }
                 }
             });
-        let dst = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
+        let dst = hanzo_ml::WithDType::to_cpu_storage_owned(dst);
         Ok((dst, (b, q_h * q_w, k_h * k_w).into()))
     }
 }

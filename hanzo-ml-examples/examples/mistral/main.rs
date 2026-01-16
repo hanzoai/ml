@@ -10,7 +10,7 @@ use clap::Parser;
 use hanzo_transformers::models::mistral::{Config, Model as Mistral};
 use hanzo_transformers::models::quantized_mistral::Model as QMistral;
 
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
@@ -233,7 +233,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     #[cfg(feature = "cuda")]
-    hanzo_ml_core::quantized::cuda::set_force_dmmv(args.force_dmmv);
+    hanzo_ml::quantized::cuda::set_force_dmmv(args.force_dmmv);
 
     let _guard = if args.tracing {
         let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
@@ -244,10 +244,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",

@@ -8,7 +8,7 @@ use hanzo_transformers::object_detection::{non_maximum_suppression, Bbox};
 mod darknet;
 
 use anyhow::Result;
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::{Module, VarBuilder};
 use clap::Parser;
 use image::{DynamicImage, ImageBuffer};
@@ -161,7 +161,7 @@ pub fn main() -> Result<()> {
 
         let original_image = image::ImageReader::open(&image_name)?
             .decode()
-            .map_err(hanzo_ml_core::Error::wrap)?;
+            .map_err(hanzo_ml::Error::wrap)?;
         let image = {
             let data = original_image
                 .resize_exact(

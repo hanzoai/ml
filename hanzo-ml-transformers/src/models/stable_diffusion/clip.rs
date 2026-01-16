@@ -4,7 +4,7 @@
 //! pairs of images with related texts.
 //!
 //! - [CLIP](https://github.com/openai/CLIP)
-use hanzo_ml_core::{DType, Device, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Result, Tensor, D};
 use hanzo_nn as nn;
 use hanzo_nn::Module;
 

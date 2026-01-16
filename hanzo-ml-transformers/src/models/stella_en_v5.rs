@@ -16,7 +16,7 @@
 //!
 
 use crate::models::with_tracing::{linear, linear_no_bias, Linear, RmsNorm};
-use hanzo_ml_core::{DType, Device, Error, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Error, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, Activation, LayerNorm, VarBuilder};
 use std::sync::Arc;
 
@@ -536,7 +536,7 @@ impl Layer {
                 {
                     (attn_ln, input_ln)
                 } else {
-                    return Err(hanzo_ml_core::error::Error::Msg(
+                    return Err(hanzo_ml::error::Error::Msg(
                         "Stella 1.5B expects RMSNorm".to_string(),
                     ));
                 };
@@ -556,7 +556,7 @@ impl Layer {
                     {
                         (attn_ln, input_ln)
                     } else {
-                        return Err(hanzo_ml_core::error::Error::Msg(
+                        return Err(hanzo_ml::error::Error::Msg(
                             "Stella 400M expects RMSNorm".to_string(),
                         ));
                     };
