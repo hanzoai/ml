@@ -1,5 +1,5 @@
 [package]
-name = "hanzo-ml-metal-kernels"
+name = "hanzo-metal-kernels"
 version = "0.9.1"
 edition = "2021"
 
