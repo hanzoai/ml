@@ -37,7 +37,7 @@ impl ClipWithTokenizer {
     fn encode_text_to_embedding(
         &self,
         prompt: &str,
-        device: &hanzo::Device,
+        device: &hanzo_ml_core::Device,
     ) -> Result<(Tensor, Tensor)> {
         let pad_id = match &self.config.pad_with {
             Some(padding) => *self
@@ -108,7 +108,7 @@ impl T5WithTokenizer {
     fn encode_text_to_embedding(
         &mut self,
         prompt: &str,
-        device: &hanzo::Device,
+        device: &hanzo_ml_core::Device,
     ) -> Result<Tensor> {
         let mut tokens = self
             .tokenizer
@@ -135,7 +135,7 @@ impl StableDiffusion3TripleClipWithTokenizer {
         clip_g_file: &PathBuf,
         clip_l_file: &PathBuf,
         t5xxl_file: &PathBuf,
-        device: &hanzo::Device,
+        device: &hanzo_ml_core::Device,
     ) -> Result<Self> {
         let vb_clip_g = unsafe {
             hanzo_nn::VarBuilder::from_mmaped_safetensors(&[clip_g_file], DType::F16, device)?
@@ -204,7 +204,7 @@ impl StableDiffusion3TripleClipWithTokenizer {
     pub fn encode_text_to_embedding(
         &mut self,
         prompt: &str,
-        device: &hanzo::Device,
+        device: &hanzo_ml_core::Device,
     ) -> Result<(Tensor, Tensor)> {
         let (clip_l_embeddings, clip_l_embeddings_pooled) =
             self.clip_l.encode_text_to_embedding(prompt, device)?;

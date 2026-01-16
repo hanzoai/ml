@@ -347,7 +347,7 @@ struct BertEncoder {
 impl BertEncoder {
     fn new(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         if cfg.position_embedding_type != PositionEmbeddingType::Alibi {
-            hanzo::bail!("only alibi is supported as a position-embedding-type")
+            hanzo_ml_core::bail!("only alibi is supported as a position-embedding-type")
         }
         let layers = (0..cfg.num_hidden_layers)
             .map(|index| BertLayer::new(vb.pp(format!("layer.{index}")), cfg))

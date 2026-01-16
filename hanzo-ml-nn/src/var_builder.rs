@@ -248,7 +248,7 @@ impl SimpleBackend for HashMap<String, Tensor> {
             })?
             .clone();
         if tensor.shape() != &s {
-            Err(hanzo::Error::UnexpectedShape {
+            Err(hanzo_ml_core::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -306,7 +306,7 @@ impl SimpleBackend for SafeTensorWithRouting<'_> {
             .load(dev)?
             .to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(hanzo::Error::UnexpectedShape {
+            Err(hanzo_ml_core::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {path}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -321,7 +321,7 @@ impl SimpleBackend for SafeTensorWithRouting<'_> {
     }
 }
 
-impl SimpleBackend for hanzo::npy::NpzTensors {
+impl SimpleBackend for hanzo_ml_core::npy::NpzTensors {
     fn get(
         &self,
         s: Shape,
@@ -339,7 +339,7 @@ impl SimpleBackend for hanzo::npy::NpzTensors {
         };
         let tensor = tensor.to_device(dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(hanzo::Error::UnexpectedShape {
+            Err(hanzo_ml_core::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {path}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -354,7 +354,7 @@ impl SimpleBackend for hanzo::npy::NpzTensors {
     }
 }
 
-impl SimpleBackend for hanzo::pickle::PthTensors {
+impl SimpleBackend for hanzo_ml_core::pickle::PthTensors {
     fn get(
         &self,
         s: Shape,
@@ -372,7 +372,7 @@ impl SimpleBackend for hanzo::pickle::PthTensors {
         };
         let tensor = tensor.to_device(dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(hanzo::Error::UnexpectedShape {
+            Err(hanzo_ml_core::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {path}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -387,7 +387,7 @@ impl SimpleBackend for hanzo::pickle::PthTensors {
     }
 }
 
-impl SimpleBackend for hanzo::safetensors::MmapedSafetensors {
+impl SimpleBackend for hanzo_ml_core::safetensors::MmapedSafetensors {
     fn get(
         &self,
         s: Shape,
@@ -398,7 +398,7 @@ impl SimpleBackend for hanzo::safetensors::MmapedSafetensors {
     ) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(hanzo::Error::UnexpectedShape {
+            Err(hanzo_ml_core::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -413,7 +413,7 @@ impl SimpleBackend for hanzo::safetensors::MmapedSafetensors {
     }
 }
 
-impl SimpleBackend for hanzo::safetensors::BufferedSafetensors {
+impl SimpleBackend for hanzo_ml_core::safetensors::BufferedSafetensors {
     fn get(
         &self,
         s: Shape,
@@ -424,7 +424,7 @@ impl SimpleBackend for hanzo::safetensors::BufferedSafetensors {
     ) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(hanzo::Error::UnexpectedShape {
+            Err(hanzo_ml_core::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -439,7 +439,7 @@ impl SimpleBackend for hanzo::safetensors::BufferedSafetensors {
     }
 }
 
-impl SimpleBackend for hanzo::safetensors::SliceSafetensors<'_> {
+impl SimpleBackend for hanzo_ml_core::safetensors::SliceSafetensors<'_> {
     fn get(
         &self,
         s: Shape,
@@ -450,7 +450,7 @@ impl SimpleBackend for hanzo::safetensors::SliceSafetensors<'_> {
     ) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(hanzo::Error::UnexpectedShape {
+            Err(hanzo_ml_core::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
                 expected: s,
                 got: tensor.shape().clone(),
@@ -517,31 +517,31 @@ impl<'a> VarBuilder<'a> {
         dtype: DType,
         dev: &Device,
     ) -> Result<Self> {
-        let tensors = hanzo::safetensors::MmapedSafetensors::multi(paths)?;
+        let tensors = hanzo_ml_core::safetensors::MmapedSafetensors::multi(paths)?;
         Ok(Self::from_backend(Box::new(tensors), dtype, dev.clone()))
     }
 
     /// Initializes a `VarBuilder` from a binary buffer in the safetensor format.
     pub fn from_buffered_safetensors(data: Vec<u8>, dtype: DType, dev: &Device) -> Result<Self> {
-        let tensors = hanzo::safetensors::BufferedSafetensors::new(data)?;
+        let tensors = hanzo_ml_core::safetensors::BufferedSafetensors::new(data)?;
         Ok(Self::from_backend(Box::new(tensors), dtype, dev.clone()))
     }
 
     /// Initializes a `VarBuilder` from a binary slice in the safetensor format.
     pub fn from_slice_safetensors(data: &'a [u8], dtype: DType, dev: &Device) -> Result<Self> {
-        let tensors = hanzo::safetensors::SliceSafetensors::new(data)?;
+        let tensors = hanzo_ml_core::safetensors::SliceSafetensors::new(data)?;
         Ok(Self::from_backend(Box::new(tensors), dtype, dev.clone()))
     }
 
     /// Initializes a `VarBuilder` that retrieves tensors stored in a numpy npz file.
     pub fn from_npz<P: AsRef<std::path::Path>>(p: P, dtype: DType, dev: &Device) -> Result<Self> {
-        let npz = hanzo::npy::NpzTensors::new(p)?;
+        let npz = hanzo_ml_core::npy::NpzTensors::new(p)?;
         Ok(Self::from_backend(Box::new(npz), dtype, dev.clone()))
     }
 
     /// Initializes a `VarBuilder` that retrieves tensors stored in a pytorch pth file.
     pub fn from_pth<P: AsRef<std::path::Path>>(p: P, dtype: DType, dev: &Device) -> Result<Self> {
-        let pth = hanzo::pickle::PthTensors::new(p, None)?;
+        let pth = hanzo_ml_core::pickle::PthTensors::new(p, None)?;
         Ok(Self::from_backend(Box::new(pth), dtype, dev.clone()))
     }
     /// Initializes a `VarBuilder` that retrieves tensors stored in a pytorch pth file.
@@ -552,7 +552,7 @@ impl<'a> VarBuilder<'a> {
         state_key: &str,
         dev: &Device,
     ) -> Result<Self> {
-        let pth = hanzo::pickle::PthTensors::new(p, Some(state_key))?;
+        let pth = hanzo_ml_core::pickle::PthTensors::new(p, Some(state_key))?;
         Ok(Self::from_backend(Box::new(pth), dtype, dev.clone()))
     }
     /// Gets a VarBuilder that applies some renaming function on tensor it gets queried for before
@@ -577,7 +577,7 @@ impl<'a> VarBuilder<'a> {
     /// assert!(vb.get((2, 3), "bar").is_ok());
     /// assert!(vb.get((2, 3), "foo").is_ok());
     /// assert!(!vb.contains_tensor("baz"));
-    /// # Ok::<(), hanzo::Error>(())
+    /// # Ok::<(), hanzo_ml_core::Error>(())
     /// ```
     pub fn rename_f<F: Fn(&str) -> String + Sync + Send + 'static>(self, f: F) -> Self {
         let f: Box<dyn Fn(&str) -> String + Sync + Send + 'static> = Box::new(f);
@@ -600,7 +600,7 @@ impl<'a> VarBuilder<'a> {
     }
 }
 
-pub struct ShardedSafeTensors(hanzo::safetensors::MmapedSafetensors);
+pub struct ShardedSafeTensors(hanzo_ml_core::safetensors::MmapedSafetensors);
 
 pub type ShardedVarBuilder<'a> = VarBuilderArgs<'a, ShardedSafeTensors>;
 
@@ -616,7 +616,7 @@ impl ShardedSafeTensors {
         dtype: DType,
         dev: &Device,
     ) -> Result<ShardedVarBuilder<'static>> {
-        let tensors = hanzo::safetensors::MmapedSafetensors::multi(paths)?;
+        let tensors = hanzo_ml_core::safetensors::MmapedSafetensors::multi(paths)?;
         let backend = ShardedSafeTensors(tensors);
         Ok(VarBuilderArgs::new_with_args(backend, dtype, dev))
     }
@@ -704,7 +704,7 @@ impl Backend for ShardedSafeTensors {
                 ))
             })?
         } else {
-            hanzo::bail!("Get sharded on dimensions != 0 or 1")
+            hanzo_ml_core::bail!("Get sharded on dimensions != 0 or 1")
         };
 
         shape[dim] = block_size;

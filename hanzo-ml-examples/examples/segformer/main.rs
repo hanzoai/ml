@@ -63,7 +63,7 @@ fn get_vb_and_config(model_name: String, device: &Device) -> anyhow::Result<(Var
     let model_file = api.get("model.safetensors")?;
     println!("model {model_name} downloaded and loaded");
     let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], hanzo::DType::F32, device)? };
+        unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], hanzo_ml_core::DType::F32, device)? };
     let config = std::fs::read_to_string(api.get("config.json")?)?;
     let config: Config = serde_json::from_str(&config)?;
     println!("{config:?}");

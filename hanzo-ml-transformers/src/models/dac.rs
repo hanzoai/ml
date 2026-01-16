@@ -30,7 +30,7 @@ impl Snake1d {
     }
 }
 
-impl hanzo::Module for Snake1d {
+impl hanzo_ml_core::Module for Snake1d {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs_shape = xs.shape();
         let xs = xs.flatten_from(2)?;
@@ -70,7 +70,7 @@ impl ResidualUnit {
     }
 }
 
-impl hanzo::Module for ResidualUnit {
+impl hanzo_ml_core::Module for ResidualUnit {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let ys = xs
             .apply(&self.snake1)?
@@ -118,7 +118,7 @@ impl EncoderBlock {
     }
 }
 
-impl hanzo::Module for EncoderBlock {
+impl hanzo_ml_core::Module for EncoderBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply(&self.res1)?
             .apply(&self.res2)?
@@ -136,7 +136,7 @@ pub struct Encoder {
     conv2: Conv1d,
 }
 
-impl hanzo::Module for Encoder {
+impl hanzo_ml_core::Module for Encoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut xs = xs.apply(&self.conv1)?;
         for block in self.blocks.iter() {
@@ -269,7 +269,7 @@ impl Decoder {
     }
 }
 
-impl hanzo::Module for Decoder {
+impl hanzo_ml_core::Module for Decoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut xs = xs.apply(&self.conv1)?;
         for block in self.blocks.iter() {
@@ -344,7 +344,7 @@ impl ResidualVectorQuantizer {
         }
         match sum {
             Some(s) => Ok(s),
-            None => hanzo::bail!("empty codebooks"),
+            None => hanzo_ml_core::bail!("empty codebooks"),
         }
     }
 }

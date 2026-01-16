@@ -14,15 +14,15 @@ use hanzo_ml_core::{Result, Tensor};
 pub fn nll(inp: &Tensor, target: &Tensor) -> Result<Tensor> {
     let b_sz = match target.dims() {
         &[b_sz] => b_sz,
-        dims => hanzo::bail!("the target tensor should have a single dimension ({dims:?})"),
+        dims => hanzo_ml_core::bail!("the target tensor should have a single dimension ({dims:?})"),
     };
     match inp.dims() {
         &[inp_b_sz, _] => {
             if inp_b_sz != b_sz {
-                hanzo::bail!("batch size mismatch between inp ({inp_b_sz}) and target ({b_sz})")
+                hanzo_ml_core::bail!("batch size mismatch between inp ({inp_b_sz}) and target ({b_sz})")
             }
         }
-        dims => hanzo::bail!("the target tensor should have two dimensions ({dims:?})"),
+        dims => hanzo_ml_core::bail!("the target tensor should have two dimensions ({dims:?})"),
     }
     inp.gather(&target.unsqueeze(1)?, 1)?
         .sum_all()?
@@ -40,7 +40,7 @@ pub fn nll(inp: &Tensor, target: &Tensor) -> Result<Tensor> {
 /// The resulting tensor is a scalar containing the average value over the batch.
 pub fn cross_entropy(inp: &Tensor, target: &Tensor) -> Result<Tensor> {
     if inp.rank() != 2 {
-        hanzo::bail!("cross_entropy expects an input tensor of rank 2")
+        hanzo_ml_core::bail!("cross_entropy expects an input tensor of rank 2")
     }
     let inp = crate::ops::log_softmax(inp, 1)?;
     nll(&inp, target)

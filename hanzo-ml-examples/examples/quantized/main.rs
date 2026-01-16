@@ -440,10 +440,10 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     #[cfg(feature = "cuda")]
-    hanzo::quantized::cuda::set_force_dmmv(args.force_dmmv);
+    hanzo_ml_core::quantized::cuda::set_force_dmmv(args.force_dmmv);
 
-    hanzo::cuda::set_gemm_reduced_precision_f16(true);
-    hanzo::cuda::set_gemm_reduced_precision_bf16(true);
+    hanzo_ml_core::cuda::set_gemm_reduced_precision_f16(true);
+    hanzo_ml_core::cuda::set_gemm_reduced_precision_bf16(true);
 
     let _guard = if args.tracing {
         let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
@@ -455,10 +455,10 @@ fn main() -> anyhow::Result<()> {
 
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo::utils::with_avx(),
-        hanzo::utils::with_neon(),
-        hanzo::utils::with_simd128(),
-        hanzo::utils::with_f16c()
+        hanzo_ml_core::utils::with_avx(),
+        hanzo_ml_core::utils::with_neon(),
+        hanzo_ml_core::utils::with_simd128(),
+        hanzo_ml_core::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
@@ -674,7 +674,7 @@ fn main() -> anyhow::Result<()> {
                 break;
             };
         }
-        if let Some(rest) = tos.decode_rest().map_err(hanzo::Error::msg)? {
+        if let Some(rest) = tos.decode_rest().map_err(hanzo_ml_core::Error::msg)? {
             print!("{rest}");
         }
         std::io::stdout().flush()?;

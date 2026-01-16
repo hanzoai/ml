@@ -14,7 +14,7 @@ pub fn load_image_with_std_mean<P: AsRef<std::path::Path>>(
 ) -> Result<Tensor> {
     let img = image::ImageReader::open(p)?
         .decode()
-        .map_err(hanzo::Error::wrap)?
+        .map_err(hanzo_ml_core::Error::wrap)?
         .resize_to_fill(
             res as u32,
             res as u32,
@@ -25,7 +25,7 @@ pub fn load_image_with_std_mean<P: AsRef<std::path::Path>>(
     let data = Tensor::from_vec(data, (res, res, 3), &Device::Cpu)?.permute((2, 0, 1))?;
     let mean = Tensor::new(mean, &Device::Cpu)?.reshape((3, 1, 1))?;
     let std = Tensor::new(std, &Device::Cpu)?.reshape((3, 1, 1))?;
-    (data.to_dtype(hanzo::DType::F32)? / 255.)?
+    (data.to_dtype(hanzo_ml_core::DType::F32)? / 255.)?
         .broadcast_sub(&mean)?
         .broadcast_div(&std)
 }

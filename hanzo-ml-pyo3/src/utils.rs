@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-pub fn wrap_err(err: ::hanzo::Error) -> PyErr {
+pub fn wrap_err(err: ::hanzo_ml_core::Error) -> PyErr {
     PyErr::new::<PyValueError, _>(format!("{err:?}"))
 }

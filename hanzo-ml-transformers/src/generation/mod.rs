@@ -52,7 +52,7 @@ impl LogitsProcessor {
     }
 
     fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {
-        let sampled = hanzo_nn::sampling::gumbel_softmax(logits, temperature, hanzo::D::Minus1)?;
+        let sampled = hanzo_nn::sampling::gumbel_softmax(logits, temperature, hanzo_ml_core::D::Minus1)?;
         sampled.to_vec0::<u32>()
     }
 

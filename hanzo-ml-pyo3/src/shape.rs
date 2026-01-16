@@ -1,4 +1,4 @@
-use ::hanzo::Tensor;
+use ::hanzo_ml_core::Tensor;
 use pyo3::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -25,7 +25,7 @@ impl<'source> pyo3::FromPyObject<'source> for PyShape {
     }
 }
 
-impl From<PyShape> for ::hanzo::Shape {
+impl From<PyShape> for ::hanzo_ml_core::Shape {
     fn from(val: PyShape) -> Self {
         val.0.into()
     }

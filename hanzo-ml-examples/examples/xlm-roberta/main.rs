@@ -131,12 +131,12 @@ fn main() -> Result<()> {
 
     let vb = if weights_filename.ends_with("model.safetensors") {
         unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_filename], hanzo::DType::F16, &device)
+            VarBuilder::from_mmaped_safetensors(&[weights_filename], hanzo_ml_core::DType::F16, &device)
                 .unwrap()
         }
     } else {
         println!("Loading weights from pytorch_model.bin");
-        VarBuilder::from_pth(&weights_filename, hanzo::DType::F16, &device).unwrap()
+        VarBuilder::from_pth(&weights_filename, hanzo_ml_core::DType::F16, &device).unwrap()
     };
     tokenizer
         .with_padding(Some(PaddingParams {
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
                     None,
                     None,
                 )?
-                .to_dtype(hanzo::DType::F32)?;
+                .to_dtype(hanzo_ml_core::DType::F32)?;
 
             let max_outs = output.argmax(2)?;
 
@@ -218,7 +218,7 @@ fn main() -> Result<()> {
                 let score = output
                     .get_on_dim(1, idx)
                     .unwrap()
-                    .to_dtype(hanzo::DType::F32)
+                    .to_dtype(hanzo_ml_core::DType::F32)
                     .unwrap()
                     .to_vec1::<f32>()
                     .unwrap();
@@ -243,7 +243,7 @@ fn main() -> Result<()> {
 
             let logits = model
                 .forward(&input_ids, &attention_mask, &token_type_ids)?
-                .to_dtype(hanzo::DType::F32)?;
+                .to_dtype(hanzo_ml_core::DType::F32)?;
 
             let probabilities = softmax(&logits, 1)?;
             let probs_vec = probabilities.to_vec2::<f32>()?;
@@ -286,7 +286,7 @@ pub fn tokenize_batch(
             let tokens = tokens.get_ids().to_vec();
             Tensor::new(tokens.as_slice(), device)
         })
-        .collect::<hanzo::Result<Vec<_>>>()?;
+        .collect::<hanzo_ml_core::Result<Vec<_>>>()?;
 
     Ok(Tensor::stack(&token_ids, 0)?)
 }
@@ -311,6 +311,6 @@ pub fn get_attention_mask(
             let tokens = tokens.get_attention_mask().to_vec();
             Tensor::new(tokens.as_slice(), device)
         })
-        .collect::<hanzo::Result<Vec<_>>>()?;
+        .collect::<hanzo_ml_core::Result<Vec<_>>>()?;
     Ok(Tensor::stack(&attention_mask, 0)?)
 }

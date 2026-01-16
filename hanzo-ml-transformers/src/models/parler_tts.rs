@@ -74,7 +74,7 @@ impl Attention {
         vb: VarBuilder,
     ) -> Result<Self> {
         if cfg.rope_embeddings {
-            hanzo::bail!("rope embeddings are not supported");
+            hanzo_ml_core::bail!("rope embeddings are not supported");
         }
         let embed_dim = cfg.hidden_size;
         let head_dim = embed_dim / cfg.num_attention_heads;
@@ -244,7 +244,7 @@ pub struct Decoder {
     num_codebooks: usize,
     hidden_size: usize,
     lm_heads: Vec<Linear>,
-    dtype: hanzo::DType,
+    dtype: hanzo_ml_core::DType,
 }
 
 impl Decoder {
@@ -297,7 +297,7 @@ impl Decoder {
     ) -> Result<Vec<Tensor>> {
         let (b_sz, num_codebooks, seq_len) = input_ids.dims3()?;
         if num_codebooks != self.num_codebooks {
-            hanzo::bail!("unexpected num codebooks in input {:?}", input_ids.shape())
+            hanzo_ml_core::bail!("unexpected num codebooks in input {:?}", input_ids.shape())
         }
         let mut inputs_embeds = Tensor::zeros(
             (b_sz, seq_len, self.hidden_size),
@@ -447,7 +447,7 @@ impl Model {
         all_audio_tokens.iter_mut().for_each(|v| {
             v.resize(min_len, 0);
         });
-        let all_audio_tokens = Tensor::new(all_audio_tokens, &hanzo::Device::Cpu)?;
+        let all_audio_tokens = Tensor::new(all_audio_tokens, &hanzo_ml_core::Device::Cpu)?;
         Ok(all_audio_tokens)
     }
 
@@ -455,7 +455,7 @@ impl Model {
         &self,
         q_len: usize,
         kv_len: usize,
-        device: &hanzo::Device,
+        device: &hanzo_ml_core::Device,
     ) -> Result<Tensor> {
         let mask: Vec<_> = (0..q_len)
             .flat_map(|i| {

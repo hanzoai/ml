@@ -210,10 +210,10 @@ impl Module for PatchEmbed {
         let (_b, _c, h, w) = xs.dims4()?;
         let (patch_h, patch_w) = self.patch_size;
         if (h % patch_h) != 0 {
-            hanzo::bail!("image height {h} is not a multiple of patch height {patch_h}")
+            hanzo_ml_core::bail!("image height {h} is not a multiple of patch height {patch_h}")
         }
         if (w % patch_w) != 0 {
-            hanzo::bail!("image width {w} is not a multiple of patch width {patch_w}")
+            hanzo_ml_core::bail!("image width {w} is not a multiple of patch width {patch_w}")
         }
         let xs = self.proj.forward(xs)?;
         let (b, c, h, w) = xs.dims4()?;

@@ -14,7 +14,7 @@ enum Model {
 }
 
 impl Model {
-    fn forward(&mut self, input_ids: &Tensor, pos: usize) -> hanzo::Result<Tensor> {
+    fn forward(&mut self, input_ids: &Tensor, pos: usize) -> hanzo_ml_core::Result<Tensor> {
         match self {
             Self::Old(m) => m.forward(input_ids),
             Self::New(m) => m.forward(input_ids, pos),
@@ -202,10 +202,10 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo::utils::with_avx(),
-        hanzo::utils::with_neon(),
-        hanzo::utils::with_simd128(),
-        hanzo::utils::with_f16c()
+        hanzo_ml_core::utils::with_avx(),
+        hanzo_ml_core::utils::with_neon(),
+        hanzo_ml_core::utils::with_simd128(),
+        hanzo_ml_core::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",

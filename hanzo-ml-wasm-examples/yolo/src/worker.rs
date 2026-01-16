@@ -51,7 +51,7 @@ impl Model {
         let original_image = image::ImageReader::new(image_data)
             .with_guessed_format()?
             .decode()
-            .map_err(hanzo::Error::wrap)?;
+            .map_err(hanzo_ml_core::Error::wrap)?;
         let (width, height) = {
             let w = original_image.width() as usize;
             let h = original_image.height() as usize;
@@ -99,7 +99,7 @@ impl Model {
             "m" => Multiples::m(),
             "l" => Multiples::l(),
             "x" => Multiples::x(),
-            _ => Err(hanzo::Error::Msg(
+            _ => Err(hanzo_ml_core::Error::Msg(
                 "invalid model size: must be n, s, m, l or x".to_string(),
             ))?,
         };
@@ -130,7 +130,7 @@ impl ModelPose {
         let original_image = image::ImageReader::new(image_data)
             .with_guessed_format()?
             .decode()
-            .map_err(hanzo::Error::wrap)?;
+            .map_err(hanzo_ml_core::Error::wrap)?;
         let (width, height) = {
             let w = original_image.width() as usize;
             let h = original_image.height() as usize;
@@ -178,7 +178,7 @@ impl ModelPose {
             "m" => Multiples::m(),
             "l" => Multiples::l(),
             "x" => Multiples::x(),
-            _ => Err(hanzo::Error::Msg(
+            _ => Err(hanzo_ml_core::Error::Msg(
                 "invalid model size: must be n, s, m, l or x".to_string(),
             ))?,
         };

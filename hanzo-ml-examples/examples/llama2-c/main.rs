@@ -257,7 +257,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
 
     let device = hanzo_examples::device(common_args.cpu)?;
     #[cfg(feature = "cuda")]
-    if let hanzo::Device::Cuda(d) = &device {
+    if let hanzo_ml_core::Device::Cuda(d) = &device {
         unsafe {
             d.disable_event_tracking();
         }
@@ -300,7 +300,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
             ]
             .into_iter()
             .collect(),
-            hanzo::DType::F32,
+            hanzo_ml_core::DType::F32,
             &device,
         );
         let cache = model::Cache::new(true, &config, fake_vb)?;
@@ -308,8 +308,8 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
         (model, config, cache)
     } else if is_safetensors {
         let config = Config::tiny_15m();
-        let tensors = hanzo::safetensors::load(config_path, &device)?;
-        let vb = hanzo_nn::VarBuilder::from_tensors(tensors, hanzo::DType::F32, &device);
+        let tensors = hanzo_ml_core::safetensors::load(config_path, &device)?;
+        let vb = hanzo_nn::VarBuilder::from_tensors(tensors, hanzo_ml_core::DType::F32, &device);
         let cache = model::Cache::new(true, &config, vb.pp("rot"))?;
         let model = Model::Llama(Llama::load(vb, config.clone())?);
         (model, config, cache)

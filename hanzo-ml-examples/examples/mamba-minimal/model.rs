@@ -82,8 +82,8 @@ impl MambaBlock {
 
     fn ssm(&self, xs: &Tensor) -> Result<Tensor> {
         let (_d_in, n) = self.a_log.dims2()?;
-        let a = self.a_log.to_dtype(hanzo::DType::F32)?.exp()?.neg()?;
-        let d = self.d.to_dtype(hanzo::DType::F32)?;
+        let a = self.a_log.to_dtype(hanzo_ml_core::DType::F32)?.exp()?.neg()?;
+        let d = self.d.to_dtype(hanzo_ml_core::DType::F32)?;
         let x_dbl = xs.apply(&self.x_proj)?;
         let delta = x_dbl.narrow(D::Minus1, 0, self.dt_rank)?;
         let b = x_dbl.narrow(D::Minus1, self.dt_rank, n)?;

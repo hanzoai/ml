@@ -19,17 +19,17 @@ fn round_multiple(x: usize, m: usize) -> usize {
 
 impl FlashAttn {
     fn cuda_fwd_t<
-        T: hanzo::cuda_backend::CudaDType + hanzo::cuda_backend::cudarc::driver::DeviceRepr,
+        T: hanzo_ml_core::cuda_backend::CudaDType + hanzo_ml_core::cuda_backend::cudarc::driver::DeviceRepr,
     >(
         &self,
-        q: &hanzo::CudaStorage,
+        q: &hanzo_ml_core::CudaStorage,
         q_l: &Layout,
-        k: &hanzo::CudaStorage,
+        k: &hanzo_ml_core::CudaStorage,
         k_l: &Layout,
-        v: &hanzo::CudaStorage,
+        v: &hanzo_ml_core::CudaStorage,
         v_l: &Layout,
         is_bf16: bool,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         // https://github.com/Dao-AILab/flash-attention/blob/b252072409e69c25f2b9d473cc534e49b24decd2/csrc/flash_attn/flash_api.cpp#L187
         let dev = q.device();
         let out_shape = q_l.shape().clone();
@@ -53,44 +53,44 @@ impl FlashAttn {
         let o_rank = o_stride.len();
 
         if q_rank != 4 || k_rank != 4 || v_rank != 4 {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "flash-attn expects input tensors of rank 4 (q: {q_rank}, k: {k_rank}, v: {v_rank}"
             )
         }
         if q_stride[q_rank - 1] != 1 {
-            hanzo::bail!("the last dim of q must be contiguous {q_stride:?}")
+            hanzo_ml_core::bail!("the last dim of q must be contiguous {q_stride:?}")
         }
         if k_stride[k_rank - 1] != 1 {
-            hanzo::bail!("the last dim of k must be contiguous {k_stride:?}")
+            hanzo_ml_core::bail!("the last dim of k must be contiguous {k_stride:?}")
         }
         if v_stride[v_rank - 1] != 1 {
-            hanzo::bail!("the last dim of v must be contiguous {v_stride:?}")
+            hanzo_ml_core::bail!("the last dim of v must be contiguous {v_stride:?}")
         }
 
         let (b_sz, seqlen_q, num_heads, head_size_og) = q_l.shape().dims4()?;
         let (_b_sz, seqlen_k, num_heads_k, _head_size_og) = k_l.shape().dims4()?;
         let expected_kv = (b_sz, seqlen_k, num_heads_k, head_size_og);
         if expected_kv != k_l.shape().dims4()? {
-            hanzo::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
+            hanzo_ml_core::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
         }
         if expected_kv != v_l.shape().dims4()? {
-            hanzo::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
+            hanzo_ml_core::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
         }
         if head_size_og > 256 {
-            hanzo::bail!("only supports head dimension at most 256 (got {head_size_og})")
+            hanzo_ml_core::bail!("only supports head dimension at most 256 (got {head_size_og})")
         }
         if head_size_og % 8 != 0 {
             // TODO: Handle head sizes that are not a multiple of 8 via some padding.
-            hanzo::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+            hanzo_ml_core::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
         }
         if num_heads % num_heads_k != 0 {
-            hanzo::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
+            hanzo_ml_core::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
         }
 
         let stream = dev.cuda_stream();
         let alibi_slopes_ptr = if let Some(alibi_slopes) = &self.alibi_slopes {
             if alibi_slopes.dtype() != DType::F32 {
-                hanzo::bail!(
+                hanzo_ml_core::bail!(
                     "DType mismatch alibi_slopes {:?}, expected {:?}",
                     alibi_slopes.dtype(),
                     DType::F32
@@ -100,7 +100,7 @@ impl FlashAttn {
             let (alibi_slopes, alibi_slopes_layout) = alibi_slopes.storage_and_layout();
 
             if num_heads != alibi_slopes_layout.shape().dims1()? {
-                hanzo::bail!(
+                hanzo_ml_core::bail!(
                     "shape mismatch alibi_slopes {:?}, expected {:?}",
                     alibi_slopes_layout.shape(),
                     (num_heads)
@@ -108,8 +108,8 @@ impl FlashAttn {
             }
 
             let alibi_slopes = match &*alibi_slopes {
-                hanzo::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                _ => hanzo::bail!("alibi_slopes must be a cuda tensor"),
+                hanzo_ml_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                _ => hanzo_ml_core::bail!("alibi_slopes must be a cuda tensor"),
             };
 
             let alibi_slopes = alibi_slopes.slice(alibi_slopes_layout.start_offset()..);
@@ -207,12 +207,12 @@ impl FlashAttn {
             )
         }
 
-        let dst = hanzo::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        let dst = hanzo_ml_core::CudaStorage::wrap_cuda_slice(dst, dev.clone());
         Ok((dst, out_shape))
     }
 }
 
-impl hanzo::CustomOp3 for FlashAttn {
+impl hanzo_ml_core::CustomOp3 for FlashAttn {
     fn name(&self) -> &'static str {
         "flash-attn"
     }
@@ -226,22 +226,22 @@ impl hanzo::CustomOp3 for FlashAttn {
         _: &CpuStorage,
         _: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        hanzo::bail!("no cpu support for flash-attn")
+        hanzo_ml_core::bail!("no cpu support for flash-attn")
     }
 
     fn cuda_fwd(
         &self,
-        q: &hanzo::CudaStorage,
+        q: &hanzo_ml_core::CudaStorage,
         q_l: &Layout,
-        k: &hanzo::CudaStorage,
+        k: &hanzo_ml_core::CudaStorage,
         k_l: &Layout,
-        v: &hanzo::CudaStorage,
+        v: &hanzo_ml_core::CudaStorage,
         v_l: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         match q.dtype() {
-            hanzo::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
-            hanzo::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
-            dt => hanzo::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+            hanzo_ml_core::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
+            hanzo_ml_core::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
+            dt => hanzo_ml_core::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
         }
     }
 }
@@ -451,17 +451,17 @@ struct FlashAttnVarLen {
 
 impl FlashAttnVarLen {
     fn cuda_fwd_t<
-        T: hanzo::cuda_backend::CudaDType + hanzo::cuda_backend::cudarc::driver::DeviceRepr,
+        T: hanzo_ml_core::cuda_backend::CudaDType + hanzo_ml_core::cuda_backend::cudarc::driver::DeviceRepr,
     >(
         &self,
-        q: &hanzo::CudaStorage,
+        q: &hanzo_ml_core::CudaStorage,
         q_l: &Layout,
-        k: &hanzo::CudaStorage,
+        k: &hanzo_ml_core::CudaStorage,
         k_l: &Layout,
-        v: &hanzo::CudaStorage,
+        v: &hanzo_ml_core::CudaStorage,
         v_l: &Layout,
         is_bf16: bool,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         // https://github.com/Dao-AILab/flash-attention/blob/184b992dcb2a0890adaa19eb9b541c3e4f9d2a08/csrc/flash_attn/flash_api.cpp#L327
         let dev = q.device();
         let out_shape = q_l.shape().clone();
@@ -469,22 +469,22 @@ impl FlashAttnVarLen {
 
         let (seqlens_q, seqlens_q_layout) = self.seqlens_q.storage_and_layout();
         let seqlens_q = match &*seqlens_q {
-            hanzo::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?, // Should be i32!
-            _ => hanzo::bail!("seqlens_q must be a cuda tensor"),
+            hanzo_ml_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?, // Should be i32!
+            _ => hanzo_ml_core::bail!("seqlens_q must be a cuda tensor"),
         };
         let seqlens_q = match seqlens_q_layout.contiguous_offsets() {
             Some((o1, o2)) => seqlens_q.slice(o1..o2),
-            None => hanzo::bail!("seqlens_q has to be contiguous"),
+            None => hanzo_ml_core::bail!("seqlens_q has to be contiguous"),
         };
 
         let (seqlens_k, seqlens_k_layout) = self.seqlens_k.storage_and_layout();
         let seqlens_k = match &*seqlens_k {
-            hanzo::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?, // Should be i32!
-            _ => hanzo::bail!("seqlens_k must be a cuda tensor"),
+            hanzo_ml_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?, // Should be i32!
+            _ => hanzo_ml_core::bail!("seqlens_k must be a cuda tensor"),
         };
         let seqlens_k = match seqlens_k_layout.contiguous_offsets() {
             Some((o1, o2)) => seqlens_k.slice(o1..o2),
-            None => hanzo::bail!("seqlens_k has to be contiguous"),
+            None => hanzo_ml_core::bail!("seqlens_k has to be contiguous"),
         };
 
         let q = q.as_cuda_slice::<f16>()?;
@@ -505,47 +505,47 @@ impl FlashAttnVarLen {
         let o_rank = o_stride.len();
 
         if q_rank != 3 || k_rank != 3 || v_rank != 3 {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "flash-attn-varlen expects input tensors of rank 3 (q: {q_rank}, k: {k_rank}, v: {v_rank}"
             )
         }
         if q_stride[q_rank - 1] != 1 {
-            hanzo::bail!("the last dim of q must be contiguous {q_stride:?}")
+            hanzo_ml_core::bail!("the last dim of q must be contiguous {q_stride:?}")
         }
         if k_stride[k_rank - 1] != 1 {
-            hanzo::bail!("the last dim of k must be contiguous {k_stride:?}")
+            hanzo_ml_core::bail!("the last dim of k must be contiguous {k_stride:?}")
         }
         if v_stride[v_rank - 1] != 1 {
-            hanzo::bail!("the last dim of v must be contiguous {v_stride:?}")
+            hanzo_ml_core::bail!("the last dim of v must be contiguous {v_stride:?}")
         }
 
         let (total_q, num_heads, head_size_og) = q_l.shape().dims3()?;
         let (total_k, num_heads_k, _head_size_og) = k_l.shape().dims3()?;
         let expected_kv = (total_k, num_heads_k, head_size_og);
         if expected_kv != k_l.shape().dims3()? {
-            hanzo::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
+            hanzo_ml_core::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
         }
         if expected_kv != v_l.shape().dims3()? {
-            hanzo::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
+            hanzo_ml_core::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
         }
         if head_size_og > 256 {
-            hanzo::bail!("only supports head dimension at most 256 (got {head_size_og})")
+            hanzo_ml_core::bail!("only supports head dimension at most 256 (got {head_size_og})")
         }
         if head_size_og % 8 != 0 {
             // TODO: Handle head sizes that are not a multiple of 8 via some padding.
-            hanzo::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+            hanzo_ml_core::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
         }
         if num_heads % num_heads_k != 0 {
-            hanzo::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
+            hanzo_ml_core::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
         }
 
         let nseqlens_q = seqlens_q_layout.shape().dims1()?;
         if nseqlens_q < 2 {
-            hanzo::bail!("seqlens_q should have a len >= 2 {nseqlens_q}")
+            hanzo_ml_core::bail!("seqlens_q should have a len >= 2 {nseqlens_q}")
         }
         let nseqlens_k = seqlens_k_layout.shape().dims1()?;
         if nseqlens_k != nseqlens_q {
-            hanzo::bail!("seqlens_q and seqlens_k should have the same number of elements {nseqlens_q} <> {nseqlens_k}")
+            hanzo_ml_core::bail!("seqlens_q and seqlens_k should have the same number of elements {nseqlens_q} <> {nseqlens_k}")
         }
 
         let batch_size = nseqlens_q - 1;
@@ -553,7 +553,7 @@ impl FlashAttnVarLen {
         let stream = dev.cuda_stream();
         let alibi_slopes_ptr = if let Some(alibi_slopes) = &self.alibi_slopes {
             if alibi_slopes.dtype() != DType::F32 {
-                hanzo::bail!(
+                hanzo_ml_core::bail!(
                     "DType mismatch alibi_slopes {:?}, expected {:?}",
                     alibi_slopes.dtype(),
                     DType::F32
@@ -563,7 +563,7 @@ impl FlashAttnVarLen {
             let (alibi_slopes, alibi_slopes_layout) = alibi_slopes.storage_and_layout();
 
             if num_heads != alibi_slopes_layout.shape().dims1()? {
-                hanzo::bail!(
+                hanzo_ml_core::bail!(
                     "shape mismatch alibi_slopes {:?}, expected {:?}",
                     alibi_slopes_layout.shape(),
                     (num_heads)
@@ -571,8 +571,8 @@ impl FlashAttnVarLen {
             }
 
             let alibi_slopes = match &*alibi_slopes {
-                hanzo::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                _ => hanzo::bail!("alibi_slopes must be a cuda tensor"),
+                hanzo_ml_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                _ => hanzo_ml_core::bail!("alibi_slopes must be a cuda tensor"),
             };
 
             let alibi_slopes = alibi_slopes.slice(alibi_slopes_layout.start_offset()..);
@@ -672,12 +672,12 @@ impl FlashAttnVarLen {
             )
         }
 
-        let dst = hanzo::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        let dst = hanzo_ml_core::CudaStorage::wrap_cuda_slice(dst, dev.clone());
         Ok((dst, out_shape))
     }
 }
 
-impl hanzo::CustomOp3 for FlashAttnVarLen {
+impl hanzo_ml_core::CustomOp3 for FlashAttnVarLen {
     fn name(&self) -> &'static str {
         "flash-attn-varlen"
     }
@@ -691,22 +691,22 @@ impl hanzo::CustomOp3 for FlashAttnVarLen {
         _: &CpuStorage,
         _: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        hanzo::bail!("no cpu support for flash-attn")
+        hanzo_ml_core::bail!("no cpu support for flash-attn")
     }
 
     fn cuda_fwd(
         &self,
-        q: &hanzo::CudaStorage,
+        q: &hanzo_ml_core::CudaStorage,
         q_l: &Layout,
-        k: &hanzo::CudaStorage,
+        k: &hanzo_ml_core::CudaStorage,
         k_l: &Layout,
-        v: &hanzo::CudaStorage,
+        v: &hanzo_ml_core::CudaStorage,
         v_l: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         match q.dtype() {
-            hanzo::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
-            hanzo::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
-            dt => hanzo::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+            hanzo_ml_core::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
+            hanzo_ml_core::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
+            dt => hanzo_ml_core::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
         }
     }
 }

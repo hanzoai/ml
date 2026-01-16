@@ -146,7 +146,7 @@ impl Args {
         };
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_filename)
-            .map_err(|e| hanzo::Error::Msg(format!("Tokenizer error: {e}")))?;
+            .map_err(|e| hanzo_ml_core::Error::Msg(format!("Tokenizer error: {e}")))?;
         tokenizer.with_padding(Some(PaddingParams::default()));
 
         let vb = if self.use_pth {
@@ -353,11 +353,11 @@ fn main() -> Result<()> {
 fn create_benchmark<F>(
     num_iters: usize,
     model_input: ModelInput,
-) -> impl Fn(F) -> Result<(), hanzo::Error>
+) -> impl Fn(F) -> Result<(), hanzo_ml_core::Error>
 where
-    F: Fn(&Tensor, Tensor, Tensor) -> Result<(), hanzo::Error>,
+    F: Fn(&Tensor, Tensor, Tensor) -> Result<(), hanzo_ml_core::Error>,
 {
-    move |code: F| -> Result<(), hanzo::Error> {
+    move |code: F| -> Result<(), hanzo_ml_core::Error> {
         println!("Running {num_iters} iterations...");
         let mut durations = Vec::with_capacity(num_iters);
         for _ in 0..num_iters {

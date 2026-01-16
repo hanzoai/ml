@@ -113,7 +113,7 @@ fn training_loop_cnn(
 ) -> anyhow::Result<()> {
     const BSIZE: usize = 64;
 
-    let dev = hanzo::Device::cuda_if_available(0)?;
+    let dev = hanzo_ml_core::Device::cuda_if_available(0)?;
 
     let train_labels = m.train_labels;
     let train_images = m.train_images.to_device(&dev)?;
@@ -176,7 +176,7 @@ fn training_loop<M: Model>(
     m: hanzo_datasets::vision::Dataset,
     args: &TrainingArgs,
 ) -> anyhow::Result<()> {
-    let dev = hanzo::Device::cuda_if_available(0)?;
+    let dev = hanzo_ml_core::Device::cuda_if_available(0)?;
 
     let train_labels = m.train_labels;
     let train_images = m.train_images.to_device(&dev)?;

@@ -1,7 +1,7 @@
 use hanzo_ml_core::{Result, Tensor};
 
 /// Sample according to the Gumbel-Softmax distribution.
-pub fn gumbel_softmax<D: hanzo::shape::Dim>(
+pub fn gumbel_softmax<D: hanzo_ml_core::shape::Dim>(
     logits: &Tensor,
     temperature: f64,
     dim: D,
@@ -10,7 +10,7 @@ pub fn gumbel_softmax<D: hanzo::shape::Dim>(
         logits.argmax(dim)
     } else {
         // Cast to f32, doing the Gumbel softmax in bf16 is a bit unstable.
-        let logits = logits.to_dtype(hanzo::DType::F32)?;
+        let logits = logits.to_dtype(hanzo_ml_core::DType::F32)?;
         let minus_g = logits.rand_like(1e-7, 0.999)?.log()?.neg()?.log()?;
         if temperature == 1.0 {
             let sampled = (logits - minus_g)?.argmax(dim)?;

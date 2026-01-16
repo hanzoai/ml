@@ -125,7 +125,7 @@ impl Model {
 }
 
 impl Model {
-    fn process(&mut self, tokens: &[u32]) -> hanzo::Result<String> {
+    fn process(&mut self, tokens: &[u32]) -> hanzo_ml_core::Result<String> {
         let dev = Device::Cpu;
         let input = Tensor::new(tokens, &dev)?.unsqueeze(0)?;
         let logits = match &mut self.model {

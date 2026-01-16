@@ -7,7 +7,7 @@ pub trait Optimizer: Sized {
 
     fn new(vars: Vec<Var>, config: Self::Config) -> Result<Self>;
 
-    fn step(&mut self, grads: &hanzo::backprop::GradStore) -> Result<()>;
+    fn step(&mut self, grads: &hanzo_ml_core::backprop::GradStore) -> Result<()>;
 
     fn learning_rate(&self) -> f64;
 
@@ -55,7 +55,7 @@ impl Optimizer for SGD {
         self.learning_rate
     }
 
-    fn step(&mut self, grads: &hanzo::backprop::GradStore) -> Result<()> {
+    fn step(&mut self, grads: &hanzo_ml_core::backprop::GradStore) -> Result<()> {
         for var in self.vars.iter() {
             if let Some(grad) = grads.get(var) {
                 var.set(&var.sub(&(grad * self.learning_rate)?)?)?;
@@ -149,7 +149,7 @@ impl Optimizer for AdamW {
         self.params.lr = lr
     }
 
-    fn step(&mut self, grads: &hanzo::backprop::GradStore) -> Result<()> {
+    fn step(&mut self, grads: &hanzo_ml_core::backprop::GradStore) -> Result<()> {
         self.step_t += 1;
         let lr = self.params.lr;
         let lambda = self.params.weight_decay;

@@ -8,7 +8,7 @@
 //! ```rust
 //! use hanzo_ml_core::{Tensor, Device::Cpu};
 //! use hanzo_nn::{Linear, Module};
-//! # fn main() -> hanzo::Result<()> {
+//! # fn main() -> hanzo_ml_core::Result<()> {
 //!
 //! let w = Tensor::new(&[[1f32, 2.], [3., 4.], [5., 6.]], &Cpu)?;
 //! let layer = Linear::new(w, None); // Use no bias.
@@ -40,7 +40,7 @@ impl Linear {
 }
 
 impl super::Module for Linear {
-    fn forward(&self, x: &Tensor) -> hanzo::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> hanzo_ml_core::Result<Tensor> {
         // When possible, we avoid using a broadcasted matmul as it is much slower
         // than the standard matmul for the cuda and cpu backends.
         let x = match *x.dims() {

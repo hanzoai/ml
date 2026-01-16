@@ -47,7 +47,7 @@ pub struct Model {
     pub language_model: mistral::Model,
     pub vision_tower: vision_model::Model,
     pub patch_size: usize,
-    pub dtype: hanzo::DType,
+    pub dtype: hanzo_ml_core::DType,
     pub pos: usize,
 }
 
@@ -56,11 +56,11 @@ impl Model {
         let language_model = mistral::Model::new(&cfg.text_config, vb.pp("language_model"))?;
         let vision_tower = vision_model::Model::new(
             &cfg.vision_config,
-            vb.pp("vision_tower").to_dtype(hanzo::DType::F32),
+            vb.pp("vision_tower").to_dtype(hanzo_ml_core::DType::F32),
         )?;
         let multi_modal_projector = MultiModalProjector::new(
             cfg,
-            vb.pp("multi_modal_projector").to_dtype(hanzo::DType::F32),
+            vb.pp("multi_modal_projector").to_dtype(hanzo_ml_core::DType::F32),
         )?;
         Ok(Self {
             multi_modal_projector,

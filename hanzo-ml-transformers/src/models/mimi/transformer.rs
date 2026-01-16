@@ -148,7 +148,7 @@ impl StreamingMultiheadAttention {
     pub fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
         if self.kv_repeat != 1 {
-            hanzo::bail!("only kv-repeat = 1 is supported")
+            hanzo_ml_core::bail!("only kv-repeat = 1 is supported")
         }
         let (b, t, hd) = xs.dims3()?;
         let head_dim = hd / self.num_heads;
@@ -277,7 +277,7 @@ impl StreamingMultiheadCrossAttention {
     pub fn forward(&self, xs: &Tensor, ca_src: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
         if self.kv_repeat != 1 {
-            hanzo::bail!("only kv-repeat = 1 is supported")
+            hanzo_ml_core::bail!("only kv-repeat = 1 is supported")
         }
         let (b, t, hd) = xs.dims3()?;
         let head_dim = hd / self.num_heads;
@@ -478,7 +478,7 @@ pub struct StreamingTransformerLayer {
 impl StreamingTransformerLayer {
     pub fn new(rope: &Option<Arc<RotaryEmbedding>>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
         if cfg.use_conv_block {
-            hanzo::bail!("conv-block is not supported")
+            hanzo_ml_core::bail!("conv-block is not supported")
         }
         let d_model = cfg.d_model;
         let mlp = Mlp::new(cfg, vb.clone())?;
@@ -538,7 +538,7 @@ impl StreamingTransformerLayer {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         if !self.norm_first {
-            hanzo::bail!("only norm_first = true is supported")
+            hanzo_ml_core::bail!("only norm_first = true is supported")
         }
         let norm1 = xs.apply(&self.norm1)?;
         let xs = (xs
@@ -645,7 +645,7 @@ impl StreamingTransformer {
 
     pub fn copy_state(&mut self, from: &Self) -> Result<()> {
         if self.layers.len() != from.layers.len() {
-            hanzo::bail!("cannot copy kv-caches as the transformers have different depths")
+            hanzo_ml_core::bail!("cannot copy kv-caches as the transformers have different depths")
         }
         self.layers
             .iter_mut()

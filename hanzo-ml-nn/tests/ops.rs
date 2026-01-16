@@ -85,7 +85,7 @@ fn rms_norml(device: &Device) -> Result<()> {
     let mut rng = StdRng::seed_from_u64(299792458);
     let src: Vec<f32> = (0..el_count).map(|_| rng.random::<f32>()).collect();
     let tensor = Tensor::new(src, device)?.reshape((b_size, seq_len, head_dim))?;
-    let alpha = Tensor::ones(head_dim, hanzo::DType::F32, device)?;
+    let alpha = Tensor::ones(head_dim, hanzo_ml_core::DType::F32, device)?;
     let t = hanzo_nn::ops::rms_norm(&tensor, &alpha, 1e-5)?;
     let t2 = hanzo_nn::ops::rms_norm_slow(&tensor, &alpha, 1e-5)?;
     let diff = (t - t2)?
@@ -132,8 +132,8 @@ fn layer_norml(device: &Device) -> Result<()> {
     let mut rng = StdRng::seed_from_u64(299792458);
     let src: Vec<f32> = (0..el_count).map(|_| rng.random::<f32>()).collect();
     let tensor = Tensor::new(src, device)?.reshape((b_size, seq_len, head_dim))?;
-    let alpha = Tensor::ones(head_dim, hanzo::DType::F32, device)?;
-    let beta = Tensor::zeros(head_dim, hanzo::DType::F32, device)?;
+    let alpha = Tensor::ones(head_dim, hanzo_ml_core::DType::F32, device)?;
+    let beta = Tensor::zeros(head_dim, hanzo_ml_core::DType::F32, device)?;
     let t = hanzo_nn::ops::layer_norm(&tensor, &alpha, &beta, 1e-5)?;
     let t2 = hanzo_nn::ops::layer_norm_slow(&tensor, &alpha, &beta, 1e-5)?;
     let diff = (t - t2)?
