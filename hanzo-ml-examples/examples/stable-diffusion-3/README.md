@@ -47,7 +47,7 @@ To display other options available,
 cargo run --example stable-diffusion-3 --release --features=cuda -- --help
 ```
 
-If GPU supports, Flash-Attention is a strongly recommended feature as it can greatly improve the speed of inference, as MMDiT is a transformer model heavily depends on attentions. To utilize [hanzo-ml-flash-attn](https://github.com/huggingface/hanzo/tree/main/hanzo-ml-flash-attn) in the demo, you will need both `--features flash-attn` and `--use-flash-attn`.
+If GPU supports, Flash-Attention is a strongly recommended feature as it can greatly improve the speed of inference, as MMDiT is a transformer model heavily depends on attentions. To utilize [hanzo-flash-attn](https://github.com/huggingface/hanzo/tree/main/hanzo-flash-attn) in the demo, you will need both `--features flash-attn` and `--use-flash-attn`.
 
 ```shell
 cargo run --example stable-diffusion-3 --release --features=cuda,flash-attn -- --use-flash-attn ...
@@ -57,7 +57,7 @@ cargo run --example stable-diffusion-3 --release --features=cuda,flash-attn -- -
 
 Below benchmark is done with Stable Diffusion 3 Medium by generating 1024-by-1024 image from 28 steps of Euler sampling and measure the average speed (iteration per seconds).
 
-[hanzo](https://github.com/huggingface/hanzo) and [hanzo-ml-flash-attn](https://github.com/huggingface/hanzo/tree/main/hanzo-ml-flash-attn) is based on the commit of [0d96ec3](https://github.com/huggingface/hanzo/commit/0d96ec31e8be03f844ed0aed636d6217dee9c7bc).
+[hanzo](https://github.com/huggingface/hanzo) and [hanzo-flash-attn](https://github.com/huggingface/hanzo/tree/main/hanzo-flash-attn) is based on the commit of [0d96ec3](https://github.com/huggingface/hanzo/commit/0d96ec31e8be03f844ed0aed636d6217dee9c7bc).
 
 System specs (Desktop PCIE 5 x8/x8 dual-GPU setup):
 

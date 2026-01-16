@@ -127,7 +127,7 @@ fn main() -> Result<()> {
             Which::Silero => hf_hub::api::sync::Api::new()?
                 .model("onnx-community/silero-vad".into())
                 .get("onnx/model.onnx")?,
-            // TODO: hanzo-ml-onnx doesn't support Int8 dtype
+            // TODO: hanzo-onnx doesn't support Int8 dtype
             // Which::SileroQuantized => hf_hub::api::sync::Api::new()?
             //     .model("onnx-community/silero-vad".into())
             //     .get("onnx/model_quantized.onnx")?,

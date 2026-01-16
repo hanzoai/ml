@@ -204,7 +204,7 @@ If you have an addition to this list, please submit a pull request.
 
 - Simple syntax, looks and feels like PyTorch.
     - Model training.
-    - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/huggingface/hanzo/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/hanzo-ml-flash-attn/src/lib.rs#L152).
+    - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/huggingface/hanzo/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/hanzo-flash-attn/src/lib.rs#L152).
 - Backends.
     - Optimized CPU backend with optional MKL support for x86 and Accelerate for macs.
     - CUDA backend for efficiently running on GPUs, multiple GPU distribution via NCCL.
@@ -281,13 +281,13 @@ Cheatsheet:
 ## Structure
 
 - [hanzo-ml](./hanzo-ml): Core ops, devices, and `Tensor` struct definition
-- [hanzo-ml-nn](./hanzo-ml-nn/): Tools to build real models
+- [hanzo-nn](./hanzo-nn/): Tools to build real models
 - [hanzo-ml-examples](./hanzo-ml-examples/): Examples of using the library in realistic settings
-- [hanzo-ml-kernels](./hanzo-ml-kernels/): CUDA custom kernels
-- [hanzo-ml-datasets](./hanzo-ml-datasets/): Datasets and data loaders.
-- [hanzo-ml-transformers](./hanzo-ml-transformers): transformers-related utilities.
-- [hanzo-ml-flash-attn](./hanzo-ml-flash-attn): Flash attention v2 layer.
-- [hanzo-ml-onnx](./hanzo-ml-onnx/): ONNX model evaluation.
+- [hanzo-kernels](./hanzo-kernels/): CUDA custom kernels
+- [hanzo-datasets](./hanzo-datasets/): Datasets and data loaders.
+- [hanzo-transformers](./hanzo-transformers): transformers-related utilities.
+- [hanzo-flash-attn](./hanzo-flash-attn): Flash attention v2 layer.
+- [hanzo-onnx](./hanzo-onnx/): ONNX model evaluation.
 
 ## FAQ
 

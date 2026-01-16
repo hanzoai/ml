@@ -16,8 +16,8 @@ crate-type = ["cdylib"]
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 hanzo-ml = { workspace = true }
-hanzo-ml-nn = { workspace = true }
-hanzo-ml-onnx = { workspace = true, optional = true }
+hanzo-nn = { workspace = true }
+hanzo-onnx = { workspace = true, optional = true }
 half = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
 pyo3 = { version = "0.22.0", features = ["extension-module", "abi3-py311"] }
@@ -30,5 +30,5 @@ default = []
 accelerate = ["dep:accelerate-src", "hanzo-ml/accelerate"]
 cuda = ["hanzo-ml/cuda"]
 mkl = ["dep:intel-mkl-src","hanzo-ml/mkl"]
-onnx = ["dep:hanzo-ml-onnx"]
+onnx = ["dep:hanzo-onnx"]
 

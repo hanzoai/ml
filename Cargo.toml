@@ -1,11 +1,11 @@
 [workspace]
 members = [
     "hanzo-ml",
-    "hanzo-ml-datasets", 
+    "hanzo-datasets", 
     "hanzo-ml-examples",
-    "hanzo-ml-nn",
+    "hanzo-nn",
     "hanzo-ml-pyo3",
-    "hanzo-ml-transformers",
+    "hanzo-transformers",
     "hanzo-ml-inference",
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
@@ -13,10 +13,10 @@ members = [
 ]
 exclude = [
    "hanzo-ml-book",
-   "hanzo-ml-flash-attn",
-   "hanzo-ml-kernels",
-   "hanzo-ml-metal-kernels",
-   "hanzo-ml-onnx",
+   "hanzo-flash-attn",
+   "hanzo-kernels",
+   "hanzo-metal-kernels",
+   "hanzo-onnx",
 ]
 resolver = "2"
 
@@ -35,14 +35,14 @@ accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.9.1" }
-hanzo-ml-datasets = { path = "./hanzo-ml-datasets", version = "0.9.1" }
-hanzo-ml-flash-attn = { path = "./hanzo-ml-flash-attn", version = "0.9.1" }
-hanzo-ml-kernels = { path = "./hanzo-ml-kernels", version = "0.9.1" }
-hanzo-ml-metal-kernels = { path = "./hanzo-ml-metal-kernels", version = "0.9.1" }
-hanzo-ml-nn = { path = "./hanzo-ml-nn", version = "0.9.1" }
-hanzo-ml-onnx = { path = "./hanzo-ml-onnx", version = "0.9.1" }
+hanzo-datasets = { path = "./hanzo-datasets", version = "0.9.1" }
+hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.9.1" }
+hanzo-kernels = { path = "./hanzo-kernels", version = "0.9.1" }
+hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.9.1" }
+hanzo-nn = { path = "./hanzo-nn", version = "0.9.1" }
+hanzo-onnx = { path = "./hanzo-onnx", version = "0.9.1" }
 hanzo-ml-inference = { path = "./hanzo-ml-inference", version = "0.1.0" }
-hanzo-ml-transformers = { path = "./hanzo-ml-transformers", version = "0.9.1" }
+hanzo-transformers = { path = "./hanzo-transformers", version = "0.9.1" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.5.1", default-features=false }
 cudarc = { version = "0.16.3", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"], default-features=false }

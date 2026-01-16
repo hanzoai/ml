@@ -74,7 +74,7 @@ impl MLP {
 }
 
 // Swiglu implementation.
-// Not using Activation::Swiglu because this has the gate and y arguments switched compared to the version in hanzo-ml-nn/src/ops.rs
+// Not using Activation::Swiglu because this has the gate and y arguments switched compared to the version in hanzo-nn/src/ops.rs
 fn swiglu(xs: &Tensor) -> Result<Tensor> {
     let xs = xs.chunk(2, D::Minus1)?;
     &xs[1].silu()? * &xs[0]

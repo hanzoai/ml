@@ -1,5 +1,5 @@
 [package]
-name = "hanzo-ml-transformers"
+name = "hanzo-transformers"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -13,8 +13,8 @@ readme = "README.md"
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
 hanzo-ml = { workspace = true }
-hanzo-ml-flash-attn = { workspace = true, optional = true }
-hanzo-ml-nn = { workspace = true }
+hanzo-flash-attn = { workspace = true, optional = true }
+hanzo-nn = { workspace = true }
 fancy-regex = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
 num-traits = { workspace = true }
@@ -27,9 +27,9 @@ tracing = { workspace = true }
 
 [features]
 default = []
-accelerate = ["dep:accelerate-src", "hanzo-ml/accelerate", "hanzo-ml-nn/accelerate"]
-cuda = ["hanzo-ml/cuda", "hanzo-ml-nn/cuda"]
-cudnn = ["hanzo-ml/cudnn", "hanzo-ml-nn/cudnn"]
-flash-attn = ["cuda", "dep:hanzo-ml-flash-attn"]
-mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl", "hanzo-ml-nn/mkl"]
-metal = ["hanzo-ml/metal", "hanzo-ml-nn/metal"]
+accelerate = ["dep:accelerate-src", "hanzo-ml/accelerate", "hanzo-nn/accelerate"]
+cuda = ["hanzo-ml/cuda", "hanzo-nn/cuda"]
+cudnn = ["hanzo-ml/cudnn", "hanzo-nn/cudnn"]
+flash-attn = ["cuda", "dep:hanzo-flash-attn"]
+mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl", "hanzo-nn/mkl"]
+metal = ["hanzo-ml/metal", "hanzo-nn/metal"]
