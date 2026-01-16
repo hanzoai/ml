@@ -12,8 +12,8 @@
 //! - 📝 [Paper](https://arxiv.org/abs/2301.00808) ConvNeXt V2: Co-designing and Scaling ConvNets with Masked Autoencoders
 //!
 
-use hanzo::shape::ShapeWithOneHole;
-use hanzo::{Result, D};
+use hanzo_ml_core::shape::ShapeWithOneHole;
+use hanzo_ml_core::{Result, D};
 use hanzo_nn::{conv2d, layer_norm, linear, Conv2dConfig, Func, VarBuilder};
 
 #[derive(Clone)]

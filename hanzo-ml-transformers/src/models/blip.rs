@@ -10,7 +10,7 @@
 
 use super::blip_text;
 use super::with_tracing::{conv2d, linear, Conv2d, Linear};
-use hanzo::{Module, Result, Tensor, D};
+use hanzo_ml_core::{Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, Conv2dConfig, LayerNorm, VarBuilder};
 use serde::Deserialize;
 

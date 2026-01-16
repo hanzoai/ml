@@ -4,7 +4,7 @@
 //!
 //! Based on implementation from [Huggingface Transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/falcon)
 
-use hanzo::{DType, Device, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, Result, Tensor, D};
 use hanzo_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
 use serde::Deserialize;
 

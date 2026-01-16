@@ -1,4 +1,4 @@
-use hanzo::{Device, Result, Tensor};
+use hanzo_ml_core::{Device, Result, Tensor};
 
 pub fn linspace(start: f64, stop: f64, steps: usize) -> Result<Tensor> {
     if steps == 0 {

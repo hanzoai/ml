@@ -1,7 +1,7 @@
 use super::Config;
 use crate::quantized_nn::{layer_norm, linear, linear_no_bias, Embedding, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo::{Device, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{Conv1d, Conv1dConfig, LayerNorm, Module};
 
 fn conv1d(

@@ -5,8 +5,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo::quantized::GgmlType;
-use hanzo::{CpuStorage, Device, Layout, Module, Result, Shape, Tensor, D};
+use hanzo_ml_core::quantized::GgmlType;
+use hanzo_ml_core::{CpuStorage, Device, Layout, Module, Result, Shape, Tensor, D};
 use clap::{Parser, Subcommand};
 
 const CHECK_CONV2D: bool = false;

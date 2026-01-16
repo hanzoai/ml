@@ -2,7 +2,7 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 
-use hanzo::{streaming, Module, Result, StreamTensor, StreamingModule, Tensor};
+use hanzo_ml_core::{streaming, Module, Result, StreamTensor, StreamingModule, Tensor};
 use hanzo_nn::VarBuilder;
 
 use super::conv::{StreamableConv1d, StreamableConvTranspose1d};

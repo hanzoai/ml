@@ -1,4 +1,4 @@
-use hanzo::{Device, Tensor};
+use hanzo_ml_core::{Device, Tensor};
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_wasm_example_llama2::worker::{Model as M, ModelData};
 use wasm_bindgen::prelude::*;

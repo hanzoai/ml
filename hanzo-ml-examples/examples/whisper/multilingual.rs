@@ -1,4 +1,4 @@
-use hanzo::{IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{IndexOp, Result, Tensor, D};
 use tokenizers::Tokenizer;
 
 const LANGUAGES: [(&str, &str); 99] = [

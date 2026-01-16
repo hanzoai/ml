@@ -8,8 +8,8 @@ use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
 
-use hanzo::quantized::{ggml_file, gguf_file};
-use hanzo::Tensor;
+use hanzo_ml_core::quantized::{ggml_file, gguf_file};
+use hanzo_ml_core::Tensor;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 
 use hanzo_examples::token_output_stream::TokenOutputStream;

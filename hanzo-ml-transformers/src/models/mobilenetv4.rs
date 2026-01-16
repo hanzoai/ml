@@ -10,7 +10,7 @@
 //!
 //! - [PyTorch Implementation](https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/mobilenetv3.py)
 
-use hanzo::{Result, Tensor, D};
+use hanzo_ml_core::{Result, Tensor, D};
 use hanzo_nn::{
     batch_norm, conv2d_no_bias, linear, ops::softmax, Activation, Conv2dConfig, Func, VarBuilder,
 };

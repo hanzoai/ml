@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use hanzo_transformers::models::jina_bert::{BertModel, Config, PositionEmbeddingType};
 
 use anyhow::Error as E;
-use hanzo::{DType, Module, Tensor};
+use hanzo_ml_core::{DType, Module, Tensor};
 use hanzo_nn::VarBuilder;
 use clap::Parser;
 

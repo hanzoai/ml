@@ -1,6 +1,6 @@
 //! Activation Functions
 //!
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "lowercase")]

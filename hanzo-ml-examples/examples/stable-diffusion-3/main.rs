@@ -2,7 +2,7 @@ mod clip;
 mod sampling;
 mod vae;
 
-use hanzo::{DType, IndexOp, Tensor};
+use hanzo_ml_core::{DType, IndexOp, Tensor};
 use hanzo_transformers::models::mmdit::model::{Config as MMDiTConfig, MMDiT};
 
 use crate::clip::StableDiffusion3TripleClipWithTokenizer;

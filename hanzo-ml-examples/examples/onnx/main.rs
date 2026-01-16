@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo::{IndexOp, D};
+use hanzo_ml_core::{IndexOp, D};
 use hanzo_examples::save_image;
 use clap::{Parser, ValueEnum};
 

@@ -9,7 +9,7 @@ extern crate intel_mkl_src;
 use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
-use hanzo::{DType, Tensor};
+use hanzo_ml_core::{DType, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};

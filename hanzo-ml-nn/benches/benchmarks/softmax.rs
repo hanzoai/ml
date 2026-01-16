@@ -1,5 +1,5 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_nn::ops::softmax_last_dim;
 use criterion::Throughput;
 use criterion::{black_box, criterion_group, Criterion};

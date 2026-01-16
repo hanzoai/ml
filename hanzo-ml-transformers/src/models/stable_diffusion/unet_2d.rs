@@ -5,7 +5,7 @@
 use super::embeddings::{TimestepEmbedding, Timesteps};
 use super::unet_2d_blocks::*;
 use crate::models::with_tracing::{conv2d, Conv2d};
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 use hanzo_nn as nn;
 use hanzo_nn::Module;
 

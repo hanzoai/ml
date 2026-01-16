@@ -13,7 +13,7 @@ use hanzo_transformers::models::phi::{Config as PhiConfig, Model as Phi};
 use hanzo_transformers::models::phi3::{Config as Phi3Config, Model as Phi3};
 use hanzo_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
 
-use hanzo::{DType, Device, IndexOp, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};

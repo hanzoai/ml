@@ -9,7 +9,7 @@ use clap::Parser;
 
 use hanzo_transformers::models::qwen2::{Config, Model};
 
-use hanzo::{DType, Tensor};
+use hanzo_ml_core::{DType, Tensor};
 use hanzo_nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{

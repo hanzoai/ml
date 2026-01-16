@@ -13,7 +13,7 @@ use hanzo_transformers::models::encodec;
 use hanzo_transformers::models::metavoice::{adapters, gpt, tokenizers, transformer};
 use hanzo_transformers::models::quantized_metavoice::transformer as qtransformer;
 
-use hanzo::{DType, IndexOp, Tensor};
+use hanzo_ml_core::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hf_hub::api::sync::Api;
 use rand::{distr::Distribution, SeedableRng};

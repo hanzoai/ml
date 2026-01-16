@@ -4,7 +4,7 @@ pub mod simplified;
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use hanzo::{DType, Device, Tensor};
+    use hanzo_ml_core::{DType, Device, Tensor};
     use parquet::file::reader::SerializedFileReader;
 
     // NOTE: Waiting on https://github.com/rust-lang/mdBook/pull/1856
@@ -12,7 +12,7 @@ mod tests {
     #[tokio::test]
     async fn book_hub_1() {
 // ANCHOR: book_hub_1
-use hanzo::Device;
+use hanzo_ml_core::Device;
 use hf_hub::api::tokio::Api;
 
 let api = Api::new().unwrap();
@@ -30,7 +30,7 @@ let weights = hanzo::safetensors::load(weights_filename, &Device::Cpu).unwrap();
     fn book_hub_2() {
         {
 // ANCHOR: book_hub_2
-use hanzo::Device;
+use hanzo_ml_core::Device;
 use hf_hub::api::sync::Api;
 use memmap2::Mmap;
 use std::fs;
@@ -51,7 +51,7 @@ let weights = hanzo::safetensors::load_buffer(&mmap[..], &Device::Cpu).unwrap();
     // fn book_hub_3() {
     {
 // ANCHOR: book_hub_3
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hf_hub::api::sync::Api;
 use memmap2::Mmap;
 use safetensors::slice::IndexOp;

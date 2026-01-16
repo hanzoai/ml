@@ -1,4 +1,4 @@
-use hanzo::{DType, IndexOp, Result, Tensor};
+use hanzo_ml_core::{DType, IndexOp, Result, Tensor};
 use hanzo_nn::{layer_norm, LayerNorm, Module, VarBuilder};
 
 #[derive(Debug)]
