@@ -1,9 +1,9 @@
 use hanzo_ml::{DType, IndexOp, Result, Tensor};
-use hanzo_nn::{layer_norm, LayerNorm, Module, VarBuilder};
+use hanzo_ml_nn::{layer_norm, LayerNorm, Module, VarBuilder};
 
 #[derive(Debug)]
 struct PatchEmbed {
-    proj: hanzo_nn::Conv2d,
+    proj: hanzo_ml_nn::Conv2d,
     span: tracing::Span,
 }
 
@@ -16,12 +16,12 @@ impl PatchEmbed {
         padding: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let cfg = hanzo_nn::Conv2dConfig {
+        let cfg = hanzo_ml_nn::Conv2dConfig {
             stride,
             padding,
             ..Default::default()
         };
-        let proj = hanzo_nn::conv2d(in_chans, embed_dim, k_size, cfg, vb.pp("proj"))?;
+        let proj = hanzo_ml_nn::conv2d(in_chans, embed_dim, k_size, cfg, vb.pp("proj"))?;
         let span = tracing::span!(tracing::Level::TRACE, "patch-embed");
         Ok(Self { proj, span })
     }
@@ -232,7 +232,7 @@ impl Module for Attention {
         };
         let attn = {
             let _enter = self.span_softmax.enter();
-            hanzo_nn::ops::softmax_last_dim(&attn)?
+            hanzo_ml_nn::ops::softmax_last_dim(&attn)?
         };
         let attn = {
             let _enter = self.span_matmul.enter();
@@ -281,7 +281,7 @@ impl Block {
             input_size_attn,
             vb.pp("attn"),
         )?;
-        let mlp = super::MlpBlock::new(dim, dim * 4, hanzo_nn::Activation::Gelu, vb.pp("mlp"))?;
+        let mlp = super::MlpBlock::new(dim, dim * 4, hanzo_ml_nn::Activation::Gelu, vb.pp("mlp"))?;
         let span = tracing::span!(tracing::Level::TRACE, "ie-block");
         Ok(Self {
             norm1,
@@ -374,9 +374,9 @@ impl Module for Block {
 pub struct ImageEncoderViT {
     patch_embed: PatchEmbed,
     blocks: Vec<Block>,
-    neck_conv1: hanzo_nn::Conv2d,
+    neck_conv1: hanzo_ml_nn::Conv2d,
     neck_ln1: super::LayerNorm2d,
-    neck_conv2: hanzo_nn::Conv2d,
+    neck_conv2: hanzo_ml_nn::Conv2d,
     neck_ln2: super::LayerNorm2d,
     pos_embed: Option<Tensor>,
     span: tracing::Span,
@@ -426,7 +426,7 @@ impl ImageEncoderViT {
             )?;
             blocks.push(block)
         }
-        let neck_conv1 = hanzo_nn::conv2d_no_bias(
+        let neck_conv1 = hanzo_ml_nn::conv2d_no_bias(
             embed_dim,
             out_chans,
             1,
@@ -434,11 +434,11 @@ impl ImageEncoderViT {
             vb.pp("neck.0"),
         )?;
         let neck_ln1 = super::LayerNorm2d::new(out_chans, 1e-6, vb.pp("neck.1"))?;
-        let cfg = hanzo_nn::Conv2dConfig {
+        let cfg = hanzo_ml_nn::Conv2dConfig {
             padding: 1,
             ..Default::default()
         };
-        let neck_conv2 = hanzo_nn::conv2d_no_bias(out_chans, out_chans, 3, cfg, vb.pp("neck.2"))?;
+        let neck_conv2 = hanzo_ml_nn::conv2d_no_bias(out_chans, out_chans, 3, cfg, vb.pp("neck.2"))?;
         let neck_ln2 = super::LayerNorm2d::new(out_chans, 1e-6, vb.pp("neck.3"))?;
         let pos_embed = if use_abs_pos {
             let p = vb.get(

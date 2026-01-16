@@ -7,8 +7,8 @@
 //!
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_nn::linear_no_bias as linear;
-use hanzo_nn::{embedding, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use hanzo_ml_nn::linear_no_bias as linear;
+use hanzo_ml_nn::{embedding, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -208,7 +208,7 @@ impl CausalSelfAttention {
             let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
             masked_fill(&att, &mask, f32::NEG_INFINITY)?
         };
-        let att = hanzo_nn::ops::softmax(&att, D::Minus1)?;
+        let att = hanzo_ml_nn::ops::softmax(&att, D::Minus1)?;
         // Convert to contiguous as matmul doesn't support strided vs for now.
         let y = att.matmul(&v.contiguous()?)?;
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;

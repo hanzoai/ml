@@ -5,7 +5,7 @@
 //! - [Website](https://studio.metavoice.ai/)
 
 use hanzo_ml::{DType, Device, Error as E, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::{embedding, linear_b, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use hanzo_ml_nn::{embedding, linear_b, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 // Equivalent to torch.repeat_interleave
 pub(crate) fn repeat_interleave(img: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> {
@@ -45,7 +45,7 @@ pub mod speaker_encoder {
     }
 
     pub struct Model {
-        lstms: Vec<hanzo_nn::LSTM>,
+        lstms: Vec<hanzo_ml_nn::LSTM>,
         linear: Linear,
         cfg: Config,
     }
@@ -57,11 +57,11 @@ pub mod speaker_encoder {
             let mut lstms = Vec::with_capacity(cfg.model_num_layers);
             let vb_l = vb.pp("lstm");
             for layer_idx in 0..cfg.model_num_layers {
-                let c = hanzo_nn::LSTMConfig {
+                let c = hanzo_ml_nn::LSTMConfig {
                     layer_idx,
                     ..Default::default()
                 };
-                let lstm = hanzo_nn::lstm(
+                let lstm = hanzo_ml_nn::lstm(
                     cfg.mel_n_channels,
                     cfg.model_hidden_size,
                     c,
@@ -159,7 +159,7 @@ pub mod speaker_encoder {
 
     impl Module for Model {
         fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-            use hanzo_nn::RNN;
+            use hanzo_ml_nn::RNN;
 
             // This is different from the Python transformers version as hanzo LSTM is batch first.
             let xs = xs.t()?;
@@ -356,8 +356,8 @@ pub mod gpt {
     }
 
     enum Norm {
-        RMSNorm(hanzo_nn::RmsNorm),
-        LayerNorm(hanzo_nn::LayerNorm),
+        RMSNorm(hanzo_ml_nn::RmsNorm),
+        LayerNorm(hanzo_ml_nn::LayerNorm),
     }
 
     // https://github.com/metavoiceio/metavoice-src/blob/11550bb4e8a1ad032cc1556cc924f7a4e767cbfa/fam/llm/model.py#L27
@@ -406,15 +406,15 @@ pub mod gpt {
         fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
             match cfg.norm_type {
                 NormType::RMSNorm => {
-                    let rms_norm = hanzo_nn::rms_norm(cfg.n_embd, cfg.rmsnorm_eps, vb)?;
+                    let rms_norm = hanzo_ml_nn::rms_norm(cfg.n_embd, cfg.rmsnorm_eps, vb)?;
                     Ok(Self::RMSNorm(rms_norm))
                 }
                 NormType::LayerNorm => {
-                    let ln_cfg = hanzo_nn::LayerNormConfig {
+                    let ln_cfg = hanzo_ml_nn::LayerNormConfig {
                         affine: cfg.bias,
                         ..Default::default()
                     };
-                    let layer_norm = hanzo_nn::layer_norm(cfg.n_embd, ln_cfg, vb)?;
+                    let layer_norm = hanzo_ml_nn::layer_norm(cfg.n_embd, ln_cfg, vb)?;
                     Ok(Self::LayerNorm(layer_norm))
                 }
             }
@@ -474,7 +474,7 @@ pub mod gpt {
             let v = v.transpose(1, 2)?.contiguous()?;
             let att = (q.matmul(&k.t()?)? / (k.dim(D::Minus1)? as f64).sqrt())?;
             // TODO: causal mask
-            let att = hanzo_nn::ops::softmax_last_dim(&att)?;
+            let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
             let att = att.matmul(&v)?.transpose(1, 2)?;
             att.reshape((b, t, c))?.apply(&self.c_proj)
         }
@@ -591,8 +591,8 @@ pub mod gpt {
     // https://github.com/metavoiceio/metavoice-src/blob/11550bb4e8a1ad032cc1556cc924f7a4e767cbfa/fam/llm/model.py#L79
     #[allow(clippy::upper_case_acronyms)]
     pub struct Model {
-        wtes: Vec<hanzo_nn::Embedding>,
-        wpe: hanzo_nn::Embedding,
+        wtes: Vec<hanzo_ml_nn::Embedding>,
+        wpe: hanzo_ml_nn::Embedding,
         h: Vec<Block>,
         ln_f: Norm,
         lm_heads: Vec<Linear>,
@@ -608,10 +608,10 @@ pub mod gpt {
             let mut wtes = Vec::with_capacity(cfg.vocab_sizes.len());
             let vb_w = vb_t.pp("wtes");
             for (idx, vocab_size) in cfg.vocab_sizes.iter().enumerate() {
-                let wte = hanzo_nn::embedding(*vocab_size, cfg.n_embd, vb_w.pp(idx))?;
+                let wte = hanzo_ml_nn::embedding(*vocab_size, cfg.n_embd, vb_w.pp(idx))?;
                 wtes.push(wte)
             }
-            let wpe = hanzo_nn::embedding(cfg.block_size, cfg.n_embd, vb_t.pp("wpe"))?;
+            let wpe = hanzo_ml_nn::embedding(cfg.block_size, cfg.n_embd, vb_t.pp("wpe"))?;
 
             let mut h = Vec::with_capacity(cfg.n_layer);
             let vb_h = vb_t.pp("h");
@@ -748,7 +748,7 @@ pub mod transformer {
     impl Module for FeedForward {
         fn forward(&self, xs: &Tensor) -> Result<Tensor> {
             let _enter = self.span.enter();
-            let swiglu = (hanzo_nn::ops::silu(&xs.apply(&self.w1)?)? * xs.apply(&self.w3))?;
+            let swiglu = (hanzo_ml_nn::ops::silu(&xs.apply(&self.w1)?)? * xs.apply(&self.w3))?;
             swiglu.apply(&self.w2)
         }
     }
@@ -822,7 +822,7 @@ pub mod transformer {
             let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
             let attn_weights = attn_weights.broadcast_add(mask)?;
-            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
             let attn_output = attn_weights.matmul(&v)?;
             attn_output
                 .transpose(1, 2)?

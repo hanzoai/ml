@@ -1,6 +1,6 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::ops::softmax_last_dim;
+use hanzo_ml_nn::ops::softmax_last_dim;
 use criterion::Throughput;
 use criterion::{black_box, criterion_group, Criterion};
 use std::time::Instant;

@@ -11,7 +11,7 @@
 use super::blip_text;
 use super::with_tracing::{conv2d, linear, Conv2d, Linear};
 use hanzo_ml::{Module, Result, Tensor, D};
-use hanzo_nn::{layer_norm, Conv2dConfig, LayerNorm, VarBuilder};
+use hanzo_ml_nn::{layer_norm, Conv2dConfig, LayerNorm, VarBuilder};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -23,7 +23,7 @@ pub struct VisionConfig {
     pub num_attention_heads: usize,
     pub image_size: usize,
     pub patch_size: usize,
-    pub hidden_act: hanzo_nn::Activation,
+    pub hidden_act: hanzo_ml_nn::Activation,
     pub layer_norm_eps: f64,
 }
 
@@ -46,7 +46,7 @@ impl Config {
             num_hidden_layers: 12,
             num_attention_heads: 12,
             max_position_embeddings: 512,
-            hidden_act: hanzo_nn::Activation::Gelu,
+            hidden_act: hanzo_ml_nn::Activation::Gelu,
             layer_norm_eps: 1e-12,
             is_decoder: true,
         };
@@ -58,7 +58,7 @@ impl Config {
             num_attention_heads: 16,
             image_size: 384,
             patch_size: 16,
-            hidden_act: hanzo_nn::Activation::Gelu,
+            hidden_act: hanzo_ml_nn::Activation::Gelu,
             layer_norm_eps: 1e-5,
         };
         Self {
@@ -155,7 +155,7 @@ impl Attention {
         let value = mixed_qkv.get(2)?;
         let attention_scores = query.matmul(&key.t()?)?;
         let attention_scores = (attention_scores * self.scale)?;
-        let attention_probs = hanzo_nn::ops::softmax_last_dim(&attention_scores)?;
+        let attention_probs = hanzo_ml_nn::ops::softmax_last_dim(&attention_scores)?;
         let attention_probs = match attn_mask {
             None => attention_probs,
             Some(attn_mask) => (attention_probs * attn_mask)?,
@@ -171,7 +171,7 @@ impl Attention {
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
 struct MLP {
-    activation_fn: hanzo_nn::Activation,
+    activation_fn: hanzo_ml_nn::Activation,
     fc1: Linear,
     fc2: Linear,
 }

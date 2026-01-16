@@ -1,7 +1,7 @@
 use crate::languages::LANGUAGES;
 use anyhow::Error as E;
 use hanzo_ml::{safetensors::Load, DType, Device, IndexOp, Tensor, D};
-use hanzo_nn::{ops::softmax, VarBuilder};
+use hanzo_ml_nn::{ops::softmax, VarBuilder};
 pub use hanzo_transformers::models::whisper::{self as m, Config};
 use rand::{distr::Distribution, rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -393,7 +393,7 @@ pub fn detect_language(model: &mut Model, tokenizer: &Tokenizer, mel: &Tensor) -
     let ys = model.decoder_forward(&tokens, &audio_features, true)?;
     let logits = model.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
     let logits = logits.index_select(&language_token_ids, 0)?;
-    let probs = hanzo_nn::ops::softmax(&logits, D::Minus1)?;
+    let probs = hanzo_ml_nn::ops::softmax(&logits, D::Minus1)?;
     let probs = probs.to_vec1::<f32>()?;
     let mut probs = LANGUAGES.iter().zip(probs.iter()).collect::<Vec<_>>();
     probs.sort_by(|(_, p1), (_, p2)| p2.total_cmp(p1));

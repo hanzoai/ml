@@ -1,22 +1,22 @@
 use hanzo_ml::{Module, Result, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 
 #[derive(Debug, Clone)]
 pub struct Embedding {
-    inner: hanzo_nn::Embedding,
+    inner: hanzo_ml_nn::Embedding,
     span: tracing::Span,
 }
 
 impl Embedding {
     pub fn new(d1: usize, d2: usize, vb: VarBuilder) -> Result<Self> {
-        let inner = hanzo_nn::embedding(d1, d2, vb)?;
+        let inner = hanzo_ml_nn::embedding(d1, d2, vb)?;
         let span = tracing::span!(tracing::Level::TRACE, "embedding");
         Ok(Self { inner, span })
     }
 
     pub fn from_weights(weights: Tensor) -> Result<Self> {
         let (_in_size, out_size) = weights.dims2()?;
-        let inner = hanzo_nn::Embedding::new(weights, out_size);
+        let inner = hanzo_ml_nn::Embedding::new(weights, out_size);
         let span = tracing::span!(tracing::Level::TRACE, "embedding");
         Ok(Self { inner, span })
     }
@@ -35,32 +35,32 @@ impl Module for Embedding {
 
 #[derive(Debug, Clone)]
 pub struct Linear {
-    inner: hanzo_nn::Linear,
+    inner: hanzo_ml_nn::Linear,
     span: tracing::Span,
 }
 
 impl Linear {
     pub fn from_weights(weights: Tensor, bias: Option<Tensor>) -> Self {
-        let inner = hanzo_nn::Linear::new(weights, bias);
+        let inner = hanzo_ml_nn::Linear::new(weights, bias);
         let span = tracing::span!(tracing::Level::TRACE, "linear");
         Self { inner, span }
     }
 }
 
 pub fn linear_b(d1: usize, d2: usize, b: bool, vb: VarBuilder) -> Result<Linear> {
-    let inner = hanzo_nn::linear_b(d1, d2, b, vb)?;
+    let inner = hanzo_ml_nn::linear_b(d1, d2, b, vb)?;
     let span = tracing::span!(tracing::Level::TRACE, "linear");
     Ok(Linear { inner, span })
 }
 
 pub fn linear(d1: usize, d2: usize, vb: VarBuilder) -> Result<Linear> {
-    let inner = hanzo_nn::linear(d1, d2, vb)?;
+    let inner = hanzo_ml_nn::linear(d1, d2, vb)?;
     let span = tracing::span!(tracing::Level::TRACE, "linear");
     Ok(Linear { inner, span })
 }
 
 pub fn linear_no_bias(d1: usize, d2: usize, vb: VarBuilder) -> Result<Linear> {
-    let inner = hanzo_nn::linear_no_bias(d1, d2, vb)?;
+    let inner = hanzo_ml_nn::linear_no_bias(d1, d2, vb)?;
     let span = tracing::span!(tracing::Level::TRACE, "linear");
     Ok(Linear { inner, span })
 }
@@ -75,7 +75,7 @@ impl Module for Linear {
 // Wrap the conv2d op to provide some tracing.
 #[derive(Debug, Clone)]
 pub struct Conv2d {
-    inner: hanzo_nn::Conv2d,
+    inner: hanzo_ml_nn::Conv2d,
     span: tracing::Span,
 }
 
@@ -90,11 +90,11 @@ pub fn conv2d(
     in_channels: usize,
     out_channels: usize,
     kernel_size: usize,
-    cfg: hanzo_nn::Conv2dConfig,
-    vs: hanzo_nn::VarBuilder,
+    cfg: hanzo_ml_nn::Conv2dConfig,
+    vs: hanzo_ml_nn::VarBuilder,
 ) -> Result<Conv2d> {
     let span = tracing::span!(tracing::Level::TRACE, "conv2d");
-    let inner = hanzo_nn::conv2d(in_channels, out_channels, kernel_size, cfg, vs)?;
+    let inner = hanzo_ml_nn::conv2d(in_channels, out_channels, kernel_size, cfg, vs)?;
     Ok(Conv2d { inner, span })
 }
 
@@ -139,13 +139,13 @@ impl std::fmt::Debug for QMatMul {
 
 #[derive(Clone, Debug)]
 pub struct LayerNorm {
-    inner: hanzo_nn::LayerNorm,
+    inner: hanzo_ml_nn::LayerNorm,
     span: tracing::Span,
 }
 
 impl LayerNorm {
     pub fn new(weight: Tensor, bias: Tensor, eps: f64) -> Self {
-        let inner = hanzo_nn::LayerNorm::new(weight, bias, eps);
+        let inner = hanzo_ml_nn::LayerNorm::new(weight, bias, eps);
         let span = tracing::span!(tracing::Level::TRACE, "layer-norm");
         Self { inner, span }
     }
@@ -158,26 +158,26 @@ impl Module for LayerNorm {
     }
 }
 
-pub fn layer_norm<C: Into<hanzo_nn::LayerNormConfig>>(
+pub fn layer_norm<C: Into<hanzo_ml_nn::LayerNormConfig>>(
     size: usize,
     c: C,
     vb: VarBuilder,
 ) -> Result<LayerNorm> {
-    let inner = hanzo_nn::layer_norm(size, c, vb)?;
+    let inner = hanzo_ml_nn::layer_norm(size, c, vb)?;
     let span = tracing::span!(tracing::Level::TRACE, "layer-norm");
     Ok(LayerNorm { inner, span })
 }
 
 #[derive(Debug, Clone)]
 pub struct RmsNorm {
-    inner: hanzo_nn::RmsNorm,
+    inner: hanzo_ml_nn::RmsNorm,
     span: tracing::Span,
 }
 
 impl RmsNorm {
     pub fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
-        let inner = hanzo_nn::rms_norm(size, eps, vb)?;
+        let inner = hanzo_ml_nn::rms_norm(size, eps, vb)?;
         Ok(Self { inner, span })
     }
 

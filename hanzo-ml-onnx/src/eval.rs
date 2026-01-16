@@ -3,7 +3,7 @@ use crate::onnx::tensor_proto::DataType;
 use crate::onnx::{self, GraphProto};
 use hanzo_ml::Module;
 use hanzo_ml::{bail, DType, Device, Result, Tensor};
-use hanzo_nn::activation::PReLU;
+use hanzo_ml_nn::activation::PReLU;
 use std::collections::{HashMap, HashSet};
 
 pub type Value = Tensor;
@@ -418,10 +418,10 @@ fn simple_eval_(
             "LogSoftmax" => {
                 let input = get(&node.input[0])?;
                 let output = match get_attr_opt::<i64>(node, "axis")? {
-                    None => hanzo_nn::ops::softmax_last_dim(input)?,
+                    None => hanzo_ml_nn::ops::softmax_last_dim(input)?,
                     Some(&axis) => {
                         let axis = input.normalize_axis(axis)?;
-                        hanzo_nn::ops::log_softmax(input, axis)?
+                        hanzo_ml_nn::ops::log_softmax(input, axis)?
                     }
                 };
                 values.insert(node.output[0].clone(), output);
@@ -429,10 +429,10 @@ fn simple_eval_(
             "Softmax" => {
                 let input = get(&node.input[0])?;
                 let output = match get_attr_opt::<i64>(node, "axis")? {
-                    None => hanzo_nn::ops::softmax_last_dim(input)?,
+                    None => hanzo_ml_nn::ops::softmax_last_dim(input)?,
                     Some(&axis) => {
                         let axis = input.normalize_axis(axis)?;
-                        hanzo_nn::ops::softmax(input, axis)?
+                        hanzo_ml_nn::ops::softmax(input, axis)?
                     }
                 };
                 values.insert(node.output[0].clone(), output);
@@ -986,7 +986,7 @@ fn simple_eval_(
             }
             "Sigmoid" => {
                 let input = get(&node.input[0])?;
-                let output = hanzo_nn::ops::sigmoid(input)?;
+                let output = hanzo_ml_nn::ops::sigmoid(input)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Gelu" => {
@@ -1703,7 +1703,7 @@ fn simple_eval_(
                     DType::BF16 | DType::F16 | DType::F32 | DType::F64 => {}
                 }
                 let alpha = get_attr_opt::<f32>(node, "alpha")?.copied().unwrap_or(0.01);
-                let output = hanzo_nn::ops::leaky_relu(input, alpha.into())?;
+                let output = hanzo_ml_nn::ops::leaky_relu(input, alpha.into())?;
                 values.insert(node.output[0].clone(), output);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Gemm
@@ -1888,22 +1888,22 @@ fn simple_eval_(
                 let r = r.index_select(&idx_ifco, 0)?;
                 let wb = wb.index_select(&idx_ifco, 0)?;
                 let rb = rb.index_select(&idx_ifco, 0)?;
-                let vmap = hanzo_nn::VarMap::new();
+                let vmap = hanzo_ml_nn::VarMap::new();
                 vmap.data().lock().unwrap().extend([
                     ("weight_ih_l0".to_string(), hanzo_ml::Var::from_tensor(&w)?),
                     ("weight_hh_l0".to_string(), hanzo_ml::Var::from_tensor(&r)?),
                     ("bias_ih_l0".to_string(), hanzo_ml::Var::from_tensor(&wb)?),
                     ("bias_hh_l0".to_string(), hanzo_ml::Var::from_tensor(&rb)?),
                 ]);
-                use hanzo_nn::rnn::RNN as _;
-                let lstm = hanzo_nn::rnn::lstm(
+                use hanzo_ml_nn::rnn::RNN as _;
+                let lstm = hanzo_ml_nn::rnn::lstm(
                     input_size,
                     hidden_size as usize,
-                    hanzo_nn::rnn::LSTMConfig::default(),
-                    hanzo_nn::VarBuilder::from_varmap(&vmap, w.dtype(), w.device()),
+                    hanzo_ml_nn::rnn::LSTMConfig::default(),
+                    hanzo_ml_nn::VarBuilder::from_varmap(&vmap, w.dtype(), w.device()),
                 )?;
 
-                let mut lstm_state = hanzo_nn::rnn::LSTMState::new(h, c);
+                let mut lstm_state = hanzo_ml_nn::rnn::LSTMState::new(h, c);
                 let mut h_acc = if node.output.first().map(String::as_str).unwrap_or("") != "" {
                     Some(vec![])
                 } else {
@@ -2167,7 +2167,7 @@ fn simple_eval_(
             }
             "HardSwish" => {
                 let input = get(&node.input[0])?;
-                let hard_sigmoid = hanzo_nn::ops::hard_sigmoid(&input)?;
+                let hard_sigmoid = hanzo_ml_nn::ops::hard_sigmoid(&input)?;
                 let output = input * hard_sigmoid;
                 values.insert(node.output[0].clone(), output?);
             }

@@ -5,7 +5,7 @@
 //! - 📝 [Paper](https://arxiv.org/abs/2306.00989). Hiera: A Hierarchical Vision Transformer without the Bells-and-Whistles
 
 use hanzo_ml::{Result, D};
-use hanzo_nn::{conv2d, layer_norm, linear, ops::softmax, Conv2dConfig, Func, VarBuilder};
+use hanzo_ml_nn::{conv2d, layer_norm, linear, ops::softmax, Conv2dConfig, Func, VarBuilder};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {

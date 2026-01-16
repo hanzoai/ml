@@ -7,7 +7,7 @@
 //!
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     embedding, layer_norm_no_bias, linear, linear_no_bias, ops::softmax, Embedding, LayerNorm,
     Linear, Module, VarBuilder,
 };
@@ -78,8 +78,8 @@ impl RotaryEmbedding {
     }
 
     fn apply_rotary_emb_qkv(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &self.cos, &self.sin)?;
-        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?;
+        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &self.cos, &self.sin)?;
+        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?;
         Ok((q_embed, k_embed))
     }
 }

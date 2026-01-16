@@ -4,7 +4,7 @@ use crate::{
     utils::repeat_kv,
 };
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_nn::{kv_cache::KvCache, Activation, VarBuilder};
+use hanzo_ml_nn::{kv_cache::KvCache, Activation, VarBuilder};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -72,7 +72,7 @@ impl RotaryEmbedding {
             .unsqueeze(0)?
             .contiguous()?;
         let xs_pass = xs.i((0, .., .., self.rotary_dim..))?.unsqueeze(0)?;
-        let xs_rot = hanzo_nn::rotary_emb::rope_i(&xs_rot, &cos, &sin).unwrap();
+        let xs_rot = hanzo_ml_nn::rotary_emb::rope_i(&xs_rot, &cos, &sin).unwrap();
         Tensor::cat(&[&xs_rot, &xs_pass], D::Minus1)?.contiguous()
     }
 }
@@ -221,7 +221,7 @@ impl Attention {
         if let Some(m) = attn_mask {
             scores = scores.broadcast_add(m)?;
         }
-        let probs = hanzo_nn::ops::softmax_last_dim(&scores)?;
+        let probs = hanzo_ml_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?;
 
         ctx.transpose(1, 2)?
@@ -297,7 +297,7 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: hanzo_nn::Embedding,
+    embed_tokens: hanzo_ml_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     device: Device,
@@ -307,7 +307,7 @@ pub struct Model {
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
-            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");

@@ -33,7 +33,7 @@ pub struct Config {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
-    pub hidden_act: hanzo_nn::Activation,
+    pub hidden_act: hanzo_ml_nn::Activation,
     pub max_position_embeddings: usize,
     pub initializer_range: f64,
     pub layer_norm_eps: f64,
@@ -49,7 +49,7 @@ impl Config {
     pub fn base_8b() -> Self {
         // https://huggingface.co/adept/persimmon-8b-base/blob/main/config.json
         Self {
-            hidden_act: hanzo_nn::Activation::Relu,
+            hidden_act: hanzo_ml_nn::Activation::Relu,
             hidden_size: 4096,
             initializer_range: 0.02,
             intermediate_size: 16384,

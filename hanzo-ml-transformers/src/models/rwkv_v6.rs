@@ -29,7 +29,7 @@
 
 use super::with_tracing::{layer_norm, linear_no_bias as linear, LayerNorm, Linear};
 use hanzo_ml::{IndexOp, Result, Tensor};
-use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
+use hanzo_ml_nn::{embedding, Embedding, Module, VarBuilder};
 
 pub use crate::models::rwkv_v5::{Config, State, Tokenizer};
 
@@ -40,7 +40,7 @@ struct SelfAttention {
     value: Linear,
     gate: Linear,
     output: Linear,
-    ln_x: hanzo_nn::GroupNorm,
+    ln_x: hanzo_ml_nn::GroupNorm,
     time_mix_x: Tensor,
     time_mix_w: Tensor,
     time_mix_key: Tensor,
@@ -66,7 +66,7 @@ impl SelfAttention {
         let value = linear(hidden_size, attn_hidden_size, vb.pp("value"))?;
         let gate = linear(hidden_size, attn_hidden_size, vb.pp("gate"))?;
         let output = linear(attn_hidden_size, hidden_size, vb.pp("output"))?;
-        let ln_x = hanzo_nn::group_norm(
+        let ln_x = hanzo_ml_nn::group_norm(
             hidden_size / cfg.head_size,
             hidden_size,
             1e-5,
@@ -151,7 +151,7 @@ impl SelfAttention {
             let key = self.key.forward(&xk)?;
             let value = self.value.forward(&xv)?;
             let receptance = self.receptance.forward(&xr)?;
-            let gate = hanzo_nn::ops::silu(&self.gate.forward(&xg)?)?;
+            let gate = hanzo_ml_nn::ops::silu(&self.gate.forward(&xg)?)?;
             state.per_layer[self.layer_id].extract_key_value = xs.i((.., t - 1))?;
             (receptance, key, value, gate, w)
         };
@@ -226,7 +226,7 @@ impl FeedForward {
         let receptance = (xs + shifted.broadcast_mul(&self.time_mix_receptance)?)?;
         let key = key.apply(&self.key)?.relu()?.sqr()?;
         let value = key.apply(&self.value)?;
-        let receptance = hanzo_nn::ops::sigmoid(&receptance.apply(&self.receptance)?)?;
+        let receptance = hanzo_ml_nn::ops::sigmoid(&receptance.apply(&self.receptance)?)?;
         state.per_layer[self.layer_id].feed_forward = xs.i((.., xs.dim(1)? - 1))?;
         let xs = (receptance * value)?;
         Ok(xs)

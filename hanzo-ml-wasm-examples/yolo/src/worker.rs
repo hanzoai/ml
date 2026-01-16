@@ -1,6 +1,6 @@
 use crate::model::{report_detect, report_pose, Bbox, Multiples, YoloV8, YoloV8Pose};
 use hanzo_ml::{DType, Device, Result, Tensor};
-use hanzo_nn::{Module, VarBuilder};
+use hanzo_ml_nn::{Module, VarBuilder};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use yew_agent::{HandlerId, Public, WorkerLink};

@@ -1,28 +1,28 @@
 use super::common::{AttnBlock, GlobalResponseNorm, LayerNormNoWeights, TimestepBlock, WLayerNorm};
 use hanzo_ml::{DType, Module, Result, Tensor, D};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 
 #[derive(Debug)]
 pub struct ResBlockStageB {
-    depthwise: hanzo_nn::Conv2d,
+    depthwise: hanzo_ml_nn::Conv2d,
     norm: WLayerNorm,
-    channelwise_lin1: hanzo_nn::Linear,
+    channelwise_lin1: hanzo_ml_nn::Linear,
     channelwise_grn: GlobalResponseNorm,
-    channelwise_lin2: hanzo_nn::Linear,
+    channelwise_lin2: hanzo_ml_nn::Linear,
 }
 
 impl ResBlockStageB {
     pub fn new(c: usize, c_skip: usize, ksize: usize, vb: VarBuilder) -> Result<Self> {
-        let cfg = hanzo_nn::Conv2dConfig {
+        let cfg = hanzo_ml_nn::Conv2dConfig {
             groups: c,
             padding: ksize / 2,
             ..Default::default()
         };
-        let depthwise = hanzo_nn::conv2d(c, c, ksize, cfg, vb.pp("depthwise"))?;
+        let depthwise = hanzo_ml_nn::conv2d(c, c, ksize, cfg, vb.pp("depthwise"))?;
         let norm = WLayerNorm::new(c)?;
-        let channelwise_lin1 = hanzo_nn::linear(c + c_skip, c * 4, vb.pp("channelwise.0"))?;
+        let channelwise_lin1 = hanzo_ml_nn::linear(c + c_skip, c * 4, vb.pp("channelwise.0"))?;
         let channelwise_grn = GlobalResponseNorm::new(4 * c, vb.pp("channelwise.2"))?;
-        let channelwise_lin2 = hanzo_nn::linear(c * 4, c, vb.pp("channelwise.4"))?;
+        let channelwise_lin2 = hanzo_ml_nn::linear(c * 4, c, vb.pp("channelwise.4"))?;
         Ok(Self {
             depthwise,
             norm,
@@ -61,7 +61,7 @@ struct SubBlock {
 #[derive(Debug)]
 struct DownBlock {
     layer_norm: Option<WLayerNorm>,
-    conv: Option<hanzo_nn::Conv2d>,
+    conv: Option<hanzo_ml_nn::Conv2d>,
     sub_blocks: Vec<SubBlock>,
 }
 
@@ -69,20 +69,20 @@ struct DownBlock {
 struct UpBlock {
     sub_blocks: Vec<SubBlock>,
     layer_norm: Option<WLayerNorm>,
-    conv: Option<hanzo_nn::ConvTranspose2d>,
+    conv: Option<hanzo_ml_nn::ConvTranspose2d>,
 }
 
 #[derive(Debug)]
 pub struct WDiffNeXt {
-    clip_mapper: hanzo_nn::Linear,
-    effnet_mappers: Vec<Option<hanzo_nn::Conv2d>>,
+    clip_mapper: hanzo_ml_nn::Linear,
+    effnet_mappers: Vec<Option<hanzo_ml_nn::Conv2d>>,
     seq_norm: LayerNormNoWeights,
-    embedding_conv: hanzo_nn::Conv2d,
+    embedding_conv: hanzo_ml_nn::Conv2d,
     embedding_ln: WLayerNorm,
     down_blocks: Vec<DownBlock>,
     up_blocks: Vec<UpBlock>,
     clf_ln: WLayerNorm,
-    clf_conv: hanzo_nn::Conv2d,
+    clf_conv: hanzo_ml_nn::Conv2d,
     c_r: usize,
     patch_size: usize,
 }
@@ -105,12 +105,12 @@ impl WDiffNeXt {
         const INJECT_EFFNET: [bool; 4] = [false, true, true, true];
         const EFFNET_EMBD: usize = 16;
 
-        let clip_mapper = hanzo_nn::linear(clip_embd, c_cond, vb.pp("clip_mapper"))?;
+        let clip_mapper = hanzo_ml_nn::linear(clip_embd, c_cond, vb.pp("clip_mapper"))?;
         let mut effnet_mappers = Vec::with_capacity(2 * INJECT_EFFNET.len());
         let vb_e = vb.pp("effnet_mappers");
         for (i, &inject) in INJECT_EFFNET.iter().enumerate() {
             let c = if inject {
-                Some(hanzo_nn::conv2d(
+                Some(hanzo_ml_nn::conv2d(
                     EFFNET_EMBD,
                     c_cond,
                     1,
@@ -124,7 +124,7 @@ impl WDiffNeXt {
         }
         for (i, &inject) in INJECT_EFFNET.iter().rev().enumerate() {
             let c = if inject {
-                Some(hanzo_nn::conv2d(
+                Some(hanzo_ml_nn::conv2d(
                     EFFNET_EMBD,
                     c_cond,
                     1,
@@ -138,7 +138,7 @@ impl WDiffNeXt {
         }
         let seq_norm = LayerNormNoWeights::new(c_cond)?;
         let embedding_ln = WLayerNorm::new(C_HIDDEN[0])?;
-        let embedding_conv = hanzo_nn::conv2d(
+        let embedding_conv = hanzo_ml_nn::conv2d(
             c_in * patch_size * patch_size,
             C_HIDDEN[0],
             1,
@@ -151,11 +151,11 @@ impl WDiffNeXt {
             let vb = vb.pp("down_blocks").pp(i);
             let (layer_norm, conv, start_layer_i) = if i > 0 {
                 let layer_norm = WLayerNorm::new(C_HIDDEN[i - 1])?;
-                let cfg = hanzo_nn::Conv2dConfig {
+                let cfg = hanzo_ml_nn::Conv2dConfig {
                     stride: 2,
                     ..Default::default()
                 };
-                let conv = hanzo_nn::conv2d(C_HIDDEN[i - 1], c_hidden, 2, cfg, vb.pp("0.1"))?;
+                let conv = hanzo_ml_nn::conv2d(C_HIDDEN[i - 1], c_hidden, 2, cfg, vb.pp("0.1"))?;
                 (Some(layer_norm), Some(conv), 1)
             } else {
                 (None, None, 0)
@@ -236,11 +236,11 @@ impl WDiffNeXt {
             }
             let (layer_norm, conv) = if i > 0 {
                 let layer_norm = WLayerNorm::new(C_HIDDEN[i - 1])?;
-                let cfg = hanzo_nn::ConvTranspose2dConfig {
+                let cfg = hanzo_ml_nn::ConvTranspose2dConfig {
                     stride: 2,
                     ..Default::default()
                 };
-                let conv = hanzo_nn::conv_transpose2d(
+                let conv = hanzo_ml_nn::conv_transpose2d(
                     c_hidden,
                     C_HIDDEN[i - 1],
                     2,
@@ -260,7 +260,7 @@ impl WDiffNeXt {
         }
 
         let clf_ln = WLayerNorm::new(C_HIDDEN[0])?;
-        let clf_conv = hanzo_nn::conv2d(
+        let clf_conv = hanzo_ml_nn::conv2d(
             C_HIDDEN[0],
             2 * c_out * patch_size * patch_size,
             1,
@@ -321,7 +321,7 @@ impl WDiffNeXt {
         let x_in = xs;
 
         let mut xs = xs
-            .apply(&|xs: &_| hanzo_nn::ops::pixel_unshuffle(xs, self.patch_size))?
+            .apply(&|xs: &_| hanzo_ml_nn::ops::pixel_unshuffle(xs, self.patch_size))?
             .apply(&self.embedding_conv)?
             .apply(&self.embedding_ln)?;
 
@@ -388,9 +388,9 @@ impl WDiffNeXt {
         let ab = xs
             .apply(&self.clf_ln)?
             .apply(&self.clf_conv)?
-            .apply(&|xs: &_| hanzo_nn::ops::pixel_shuffle(xs, self.patch_size))?
+            .apply(&|xs: &_| hanzo_ml_nn::ops::pixel_shuffle(xs, self.patch_size))?
             .chunk(2, 1)?;
-        let b = ((hanzo_nn::ops::sigmoid(&ab[1])? * (1. - EPS * 2.))? + EPS)?;
+        let b = ((hanzo_ml_nn::ops::sigmoid(&ab[1])? * (1. - EPS * 2.))? + EPS)?;
         (x_in - &ab[0])? / b
     }
 }

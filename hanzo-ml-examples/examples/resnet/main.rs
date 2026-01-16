@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use hanzo_ml::{DType, IndexOp, D};
-use hanzo_nn::{Module, VarBuilder};
+use hanzo_ml_nn::{Module, VarBuilder};
 use hanzo_transformers::models::resnet;
 use clap::{Parser, ValueEnum};
 
@@ -74,7 +74,7 @@ pub fn main() -> anyhow::Result<()> {
     };
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = hanzo_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = hanzo_ml_nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

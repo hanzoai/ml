@@ -1,7 +1,7 @@
 use super::Config;
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
 use hanzo_ml::{Device, IndexOp, Result, Tensor, D};
-use hanzo_nn::{embedding, Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder};
+use hanzo_ml_nn::{embedding, Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder};
 
 fn conv1d(
     in_channels: usize,
@@ -119,7 +119,7 @@ impl MultiHeadAttention {
         }
         let w = {
             let _enter = self.softmax_span.enter();
-            hanzo_nn::ops::softmax_last_dim(&qk)?
+            hanzo_ml_nn::ops::softmax_last_dim(&qk)?
         };
         let wv = {
             let _enter = self.matmul_span.enter();

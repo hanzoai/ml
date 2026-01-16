@@ -8,7 +8,7 @@ use anyhow::Error as E;
 use clap::Parser;
 
 use hanzo_ml::{DType, IndexOp, Tensor};
-use hanzo_nn::VarBuilder;
+use hanzo_ml_nn::VarBuilder;
 use hanzo_transformers::models::parler_tts::{Config, Model};
 use tokenizers::Tokenizer;
 

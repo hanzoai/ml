@@ -1,6 +1,6 @@
 use crate::models::with_tracing::{linear, Linear};
 use hanzo_ml::{DType, Module, Result, Tensor};
-use hanzo_nn::{
+use hanzo_ml_nn::{
     embedding, layer_norm, ops::softmax_last_dim, Activation, Embedding, LayerNorm, VarBuilder,
 };
 
@@ -198,7 +198,7 @@ impl XLMRobertaSelfOutput {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let dense = linear(cfg.hidden_size, cfg.hidden_size, vb.pp("dense"))?;
         let layernorm =
-            hanzo_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("LayerNorm"))?;
+            hanzo_ml_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("LayerNorm"))?;
         Ok(Self { dense, layernorm })
     }
 
@@ -253,7 +253,7 @@ impl XLMRobertaOutput {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let dense = linear(cfg.intermediate_size, cfg.hidden_size, vb.pp("dense"))?;
         let layernorm =
-            hanzo_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("LayerNorm"))?;
+            hanzo_ml_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("LayerNorm"))?;
         Ok(Self { dense, layernorm })
     }
 
@@ -411,13 +411,13 @@ impl XLMRobertaLMHead {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let dense = linear(cfg.hidden_size, cfg.hidden_size, vb.pp("dense"))?;
         let layer_norm =
-            hanzo_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("layer_norm"))?;
+            hanzo_ml_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("layer_norm"))?;
         Ok(Self { dense, layer_norm })
     }
 
     fn forward(&self, hidden_states: &Tensor, shared_embeddings: &Tensor) -> Result<Tensor> {
         let hidden_states = self.dense.forward(hidden_states)?;
-        let hidden_states = hanzo_nn::Activation::Gelu.forward(&hidden_states)?;
+        let hidden_states = hanzo_ml_nn::Activation::Gelu.forward(&hidden_states)?;
         let hidden_states = self.layer_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.broadcast_matmul(shared_embeddings)?;
         Ok(hidden_states)
