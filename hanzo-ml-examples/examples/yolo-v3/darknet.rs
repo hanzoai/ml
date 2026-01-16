@@ -14,7 +14,7 @@ struct Block {
 impl Block {
     fn get(&self, key: &str) -> Result<&str> {
         match self.parameters.get(key) {
-            None => hanzo::bail!("cannot find {} in {}", key, self.block_type),
+            None => hanzo_ml_core::bail!("cannot find {} in {}", key, self.block_type),
             Some(value) => Ok(value),
         }
     }
@@ -29,7 +29,7 @@ pub struct Darknet {
 impl Darknet {
     fn get(&self, key: &str) -> Result<&str> {
         match self.parameters.get(key) {
-            None => hanzo::bail!("cannot find {} in net parameters", key),
+            None => hanzo_ml_core::bail!("cannot find {} in net parameters", key),
             Some(value) => Ok(value),
         }
     }
@@ -84,7 +84,7 @@ pub fn parse_config<T: AsRef<Path>>(path: T) -> Result<Darknet> {
         let line = line.trim();
         if line.starts_with('[') {
             if !line.ends_with(']') {
-                hanzo::bail!("line does not end with ']' {line}")
+                hanzo_ml_core::bail!("line does not end with ']' {line}")
             }
             let line = &line[1..line.len() - 1];
             acc.finish_block();
@@ -92,14 +92,14 @@ pub fn parse_config<T: AsRef<Path>>(path: T) -> Result<Darknet> {
         } else {
             let key_value: Vec<&str> = line.splitn(2, '=').collect();
             if key_value.len() != 2 {
-                hanzo::bail!("missing equal {line}")
+                hanzo_ml_core::bail!("missing equal {line}")
             }
             let prev = acc.parameters.insert(
                 key_value[0].trim().to_owned(),
                 key_value[1].trim().to_owned(),
             );
             if prev.is_some() {
-                hanzo::bail!("multiple value for key {}", line)
+                hanzo_ml_core::bail!("multiple value for key {}", line)
             }
         }
     }
@@ -143,7 +143,7 @@ fn conv(vb: VarBuilder, index: usize, p: usize, b: &Block) -> Result<(usize, Bl)
     let leaky = match activation {
         "leaky" => true,
         "linear" => false,
-        otherwise => hanzo::bail!("unsupported activation {}", otherwise),
+        otherwise => hanzo_ml_core::bail!("unsupported activation {}", otherwise),
     };
     let func = hanzo_nn::func(move |xs| {
         let xs = conv.forward(xs)?;
@@ -202,7 +202,7 @@ fn yolo(p: usize, block: &Block) -> Result<(usize, Bl)> {
     let classes = block.get("classes")?.parse::<usize>()?;
     let flat = int_list_of_string(block.get("anchors")?)?;
     if flat.len() % 2 != 0 {
-        hanzo::bail!("even number of anchors");
+        hanzo_ml_core::bail!("even number of anchors");
     }
     let flat = flat.into_iter().map(|i| i as usize).collect::<Vec<_>>();
     let anchors: Vec<_> = (0..(flat.len() / 2))
@@ -278,7 +278,7 @@ impl Darknet {
                 "shortcut" => shortcut(index, prev_channels, block)?,
                 "route" => route(index, &blocks, block)?,
                 "yolo" => yolo(prev_channels, block)?,
-                otherwise => hanzo::bail!("unsupported block type {}", otherwise),
+                otherwise => hanzo_ml_core::bail!("unsupported block type {}", otherwise),
             };
             prev_channels = channels_and_bl.0;
             blocks.push(channels_and_bl);

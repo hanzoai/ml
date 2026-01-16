@@ -141,7 +141,7 @@ pub fn main() -> anyhow::Result<()> {
 
         let mut img = image::ImageReader::open(&args.image)?
             .decode()
-            .map_err(hanzo::Error::wrap)?;
+            .map_err(hanzo_ml_core::Error::wrap)?;
         let mask_pixels = mask.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
         let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             match image::ImageBuffer::from_raw(w as u32, h as u32, mask_pixels) {

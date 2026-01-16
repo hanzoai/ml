@@ -35,7 +35,7 @@ impl CustomOp1 for LayerNorm {
         let (dim1, dim2) = layout.shape().dims2()?;
         let slice = storage.as_slice::<f32>()?;
         let src = match layout.contiguous_offsets() {
-            None => hanzo::bail!("input has to be contiguous"),
+            None => hanzo_ml_core::bail!("input has to be contiguous"),
             Some((o1, o2)) => &slice[o1..o2],
         };
         let mut dst = Vec::with_capacity(dim1 * dim2);
@@ -45,16 +45,16 @@ impl CustomOp1 for LayerNorm {
             let s_variance = 1f32 / (variance / dim2 as f32 + self.eps).sqrt();
             dst.extend(src.iter().map(|x| x * s_variance))
         }
-        let storage = hanzo::WithDType::to_cpu_storage_owned(dst);
+        let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
         Ok((storage, layout.shape().clone()))
     }
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        storage: &hanzo::CudaStorage,
+        storage: &hanzo_ml_core::CudaStorage,
         layout: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         use hanzo_ml_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
         use hanzo_ml_core::cuda_backend::WrapErr;
@@ -64,7 +64,7 @@ impl CustomOp1 for LayerNorm {
         let dev = storage.device().clone();
         let slice = storage.as_cuda_slice::<f32>()?;
         let slice = match layout.contiguous_offsets() {
-            None => hanzo::bail!("input has to be contiguous"),
+            None => hanzo_ml_core::bail!("input has to be contiguous"),
             Some((o1, o2)) => slice.slice(o1..o2),
         };
         let elem_count = layout.shape().elem_count();
@@ -79,10 +79,10 @@ impl CustomOp1 for LayerNorm {
         let mut builder = func.builder();
         builder.arg(&dst);
         builder.arg(&slice);
-        hanzo::builder_arg!(builder, self.eps, d1, d2);
+        hanzo_ml_core::builder_arg!(builder, self.eps, d1, d2);
         unsafe { builder.launch(cfg) }.w()?;
 
-        let dst = hanzo::CudaStorage::wrap_cuda_slice(dst, dev);
+        let dst = hanzo_ml_core::CudaStorage::wrap_cuda_slice(dst, dev);
         Ok((dst, layout.shape().clone()))
     }
 }

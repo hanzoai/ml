@@ -106,7 +106,7 @@ fn rotate_half(xs: &Tensor) -> Result<Tensor> {
 impl RotaryEmbedding {
     pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         if cfg.partial_rotary_factor != 0.5 {
-            hanzo::bail!("partial-rotary-factor {} <> 0.5", cfg.partial_rotary_factor)
+            hanzo_ml_core::bail!("partial-rotary-factor {} <> 0.5", cfg.partial_rotary_factor)
         }
         let dim = cfg.head_dim / 2;
         let max_seq_len = cfg.max_seq_len;
@@ -383,7 +383,7 @@ impl RecurrentBlock {
                 .narrow(D::Minus1, 0, seq_len)?
         } else {
             let conv_state = match self.conv1d_state.as_ref() {
-                None => hanzo::bail!("empty cache despite pos > 0"),
+                None => hanzo_ml_core::bail!("empty cache despite pos > 0"),
                 Some(s) => Tensor::cat(&[s, &x_branch], D::Minus1)?,
             };
             let w = self.conv_1d.weight().i((.., 0, ..))?;

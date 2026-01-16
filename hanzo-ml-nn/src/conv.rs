@@ -209,7 +209,7 @@ impl Conv2d {
                 config: self.config,
             })
         } else {
-            hanzo::bail!("batch norm does not have weight_and_bias")
+            hanzo_ml_core::bail!("batch norm does not have weight_and_bias")
         }
     }
 }

@@ -26,7 +26,7 @@ pub const MAX_SEQ_LEN: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct QLinear {
-    inner: hanzo::quantized::QMatMul,
+    inner: hanzo_ml_core::quantized::QMatMul,
     bias: Tensor,
     span: tracing::Span,
 }
@@ -41,7 +41,7 @@ impl QLinear {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         let w = ct.tensor(r, &format!("{name}.weight"), device)?;
         let b = ct.tensor(r, &format!("{name}.bias"), device)?;
-        let inner = hanzo::quantized::QMatMul::from_qtensor(w)?;
+        let inner = hanzo_ml_core::quantized::QMatMul::from_qtensor(w)?;
         let bias = b.dequantize(device)?;
         Ok(Self { inner, bias, span })
     }
@@ -204,7 +204,7 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
-            None => hanzo::bail!("cannot find {s} in metadata"),
+            None => hanzo_ml_core::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 

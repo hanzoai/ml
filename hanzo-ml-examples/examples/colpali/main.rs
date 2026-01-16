@@ -59,7 +59,7 @@ impl PageRetriever {
                 let tokens = tokens.get_ids().to_vec();
                 Tensor::new(tokens.as_slice(), &self.device)
             })
-            .collect::<hanzo::Result<Vec<_>>>()?;
+            .collect::<hanzo_ml_core::Result<Vec<_>>>()?;
         let input = Tensor::stack(&token_ids, 0)?;
         Ok(input)
     }
@@ -189,10 +189,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo::utils::with_avx(),
-        hanzo::utils::with_neon(),
-        hanzo::utils::with_simd128(),
-        hanzo::utils::with_f16c()
+        hanzo_ml_core::utils::with_avx(),
+        hanzo_ml_core::utils::with_neon(),
+        hanzo_ml_core::utils::with_simd128(),
+        hanzo_ml_core::utils::with_f16c()
     );
 
     let api = Api::new()?;

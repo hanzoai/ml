@@ -17,9 +17,9 @@ use rayon::prelude::*;
 ///         [0.1345, 0.3655, 0.1345, 0.3655],
 ///         [0.0049, 0.2671, 0.7262, 0.0018]
 ///     ]);
-/// # Ok::<(), hanzo::Error>(())
+/// # Ok::<(), hanzo_ml_core::Error>(())
 /// ```
-pub fn softmax<D: hanzo::shape::Dim>(xs: &Tensor, dim: D) -> Result<Tensor> {
+pub fn softmax<D: hanzo_ml_core::shape::Dim>(xs: &Tensor, dim: D) -> Result<Tensor> {
     let dim = dim.to_index(xs.shape(), "softmax")?;
     let max = xs.max_keepdim(dim)?;
     let diff = xs.broadcast_sub(&max)?;
@@ -28,7 +28,7 @@ pub fn softmax<D: hanzo::shape::Dim>(xs: &Tensor, dim: D) -> Result<Tensor> {
     num.broadcast_div(&den)
 }
 
-pub fn log_softmax<D: hanzo::shape::Dim>(xs: &Tensor, d: D) -> Result<Tensor> {
+pub fn log_softmax<D: hanzo_ml_core::shape::Dim>(xs: &Tensor, d: D) -> Result<Tensor> {
     let d = d.to_index(xs.shape(), "log-softmax")?;
     let max = xs.max_keepdim(d)?;
     let diff = xs.broadcast_sub(&max)?;
@@ -48,7 +48,7 @@ pub fn swiglu(xs: &Tensor) -> Result<Tensor> {
 
 struct Sigmoid;
 
-impl hanzo::CustomOp1 for Sigmoid {
+impl hanzo_ml_core::CustomOp1 for Sigmoid {
     fn name(&self) -> &'static str {
         "sigmoid"
     }
@@ -60,21 +60,21 @@ impl hanzo::CustomOp1 for Sigmoid {
             (v.neg().exp() + T::one()).recip()
         }
 
-        // FIXME: using `hanzo::map_dtype` causes compilation errors.
+        // FIXME: using `hanzo_ml_core::map_dtype` causes compilation errors.
         let storage = match storage {
             CpuStorage::BF16(slice) => {
-                CpuStorage::BF16(hanzo::cpu_backend::unary_map(slice, layout, fwd))
+                CpuStorage::BF16(hanzo_ml_core::cpu_backend::unary_map(slice, layout, fwd))
             }
             CpuStorage::F16(slice) => {
-                CpuStorage::F16(hanzo::cpu_backend::unary_map(slice, layout, fwd))
+                CpuStorage::F16(hanzo_ml_core::cpu_backend::unary_map(slice, layout, fwd))
             }
             CpuStorage::F32(slice) => {
-                CpuStorage::F32(hanzo::cpu_backend::unary_map(slice, layout, fwd))
+                CpuStorage::F32(hanzo_ml_core::cpu_backend::unary_map(slice, layout, fwd))
             }
             CpuStorage::F64(slice) => {
-                CpuStorage::F64(hanzo::cpu_backend::unary_map(slice, layout, fwd))
+                CpuStorage::F64(hanzo_ml_core::cpu_backend::unary_map(slice, layout, fwd))
             }
-            _ => Err(hanzo::Error::UnsupportedDTypeForOp(
+            _ => Err(hanzo_ml_core::Error::UnsupportedDTypeForOp(
                 storage.dtype(),
                 self.name(),
             ))?,
@@ -85,9 +85,9 @@ impl hanzo::CustomOp1 for Sigmoid {
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        storage: &hanzo::CudaStorage,
+        storage: &hanzo_ml_core::CudaStorage,
         layout: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
@@ -115,7 +115,7 @@ impl hanzo::CustomOp1 for Sigmoid {
                 let out = unsafe { dev.alloc::<T>(el_count)? };
 
                 let mut builder = func.builder();
-                hanzo::builder_arg!(builder, el_count, dims.len());
+                hanzo_ml_core::builder_arg!(builder, el_count, dims.len());
                 ds.builder_arg(&mut builder);
                 builder.arg(src);
                 builder.arg(&out);
@@ -127,7 +127,7 @@ impl hanzo::CustomOp1 for Sigmoid {
 
         let dev = storage.device();
         let slice = S.map(&storage.slice, dev, layout)?;
-        let dst = hanzo::CudaStorage {
+        let dst = hanzo_ml_core::CudaStorage {
             slice,
             device: dev.clone(),
         };
@@ -137,9 +137,9 @@ impl hanzo::CustomOp1 for Sigmoid {
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
-        storage: &hanzo::MetalStorage,
+        storage: &hanzo_ml_core::MetalStorage,
         layout: &Layout,
-    ) -> Result<(hanzo::MetalStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         use hanzo_ml_core::MetalError;
         let device = storage.device();
@@ -162,7 +162,7 @@ impl hanzo::CustomOp1 for Sigmoid {
                     DType::F32 => contiguous_tiled::sigmoid::FLOAT,
                     DType::BF16 => contiguous_tiled::sigmoid::BFLOAT,
                     dtype => {
-                        hanzo::bail!(
+                        hanzo_ml_core::bail!(
                             "Metal contiguous_tiled unary sigmoid {dtype:?} not implemented"
                         )
                     }
@@ -185,7 +185,7 @@ impl hanzo::CustomOp1 for Sigmoid {
                     DType::F32 => contiguous::sigmoid::FLOAT,
                     DType::BF16 => contiguous::sigmoid::BFLOAT,
                     dtype => {
-                        hanzo::bail!("Metal contiguous unary sigmoid {dtype:?} not implemented")
+                        hanzo_ml_core::bail!("Metal contiguous unary sigmoid {dtype:?} not implemented")
                     }
                 };
                 hanzo_metal_kernels::call_unary_contiguous(
@@ -206,7 +206,7 @@ impl hanzo::CustomOp1 for Sigmoid {
                     DType::F32 => strided::sigmoid::FLOAT,
                     DType::BF16 => strided::sigmoid::BFLOAT,
                     dtype => {
-                        hanzo::bail!("Metal strided unary sigmoid {dtype:?} not implemented")
+                        hanzo_ml_core::bail!("Metal strided unary sigmoid {dtype:?} not implemented")
                     }
                 };
                 let dst = hanzo_metal_kernels::BufferOffset::zero_offset(&buffer);
@@ -224,7 +224,7 @@ impl hanzo::CustomOp1 for Sigmoid {
             }
         }
 
-        let new_storage = hanzo::MetalStorage::new(buffer, device.clone(), el_count, dtype);
+        let new_storage = hanzo_ml_core::MetalStorage::new(buffer, device.clone(), el_count, dtype);
         Ok((new_storage, layout.shape().clone()))
     }
 
@@ -256,7 +256,7 @@ pub fn dropout(xs: &Tensor, drop_p: f32) -> Result<Tensor> {
     // Another easier optimization would be to be able to generate boolean mask using just a bit of
     // entropy per element rather than generating a full float per element.
     if !(0. ..1.).contains(&drop_p) {
-        hanzo::bail!("dropout probability has to be in [0, 1), got {drop_p}")
+        hanzo_ml_core::bail!("dropout probability has to be in [0, 1), got {drop_p}")
     }
     let rand = Tensor::rand(0f32, 1f32, xs.shape(), xs.device())?;
     let scale = 1.0 / (1.0 - drop_p as f64);
@@ -284,7 +284,7 @@ impl Dropout {
     }
 }
 
-impl hanzo::ModuleT for Dropout {
+impl hanzo_ml_core::ModuleT for Dropout {
     fn forward_t(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
         self.forward(xs, train)
     }
@@ -292,18 +292,18 @@ impl hanzo::ModuleT for Dropout {
 
 struct SoftmaxLastDim;
 
-impl hanzo::CustomOp1 for SoftmaxLastDim {
+impl hanzo_ml_core::CustomOp1 for SoftmaxLastDim {
     fn name(&self) -> &'static str {
         "softmax-last-dim"
     }
 
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
-        fn softmax<T: hanzo::WithDType + num_traits::Float>(
+        fn softmax<T: hanzo_ml_core::WithDType + num_traits::Float>(
             src: &[T],
             layout: &Layout,
         ) -> Result<(CpuStorage, Shape)> {
             let src = match layout.contiguous_offsets() {
-                None => hanzo::bail!("input has to be contiguous"),
+                None => hanzo_ml_core::bail!("input has to be contiguous"),
                 Some((o1, o2)) => &src[o1..o2],
             };
             let el_count = layout.shape().elem_count();
@@ -324,7 +324,7 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
                         *d /= sum_exp
                     }
                 });
-            let storage = hanzo::WithDType::to_cpu_storage_owned(dst);
+            let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, Shape::from_dims(dims)))
         }
 
@@ -333,16 +333,16 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
             CpuStorage::F16(slice) => softmax::<half::f16>(slice, layout),
             CpuStorage::F32(slice) => softmax::<f32>(slice, layout),
             CpuStorage::F64(slice) => softmax::<f64>(slice, layout),
-            _ => hanzo::bail!("unsupported dtype for softmax {:?}", storage),
+            _ => hanzo_ml_core::bail!("unsupported dtype for softmax {:?}", storage),
         }
     }
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        storage: &hanzo::CudaStorage,
+        storage: &hanzo_ml_core::CudaStorage,
         layout: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
@@ -358,7 +358,7 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
                 layout: &Layout,
             ) -> Result<CudaSlice<T>> {
                 let src = match layout.contiguous_offsets() {
-                    None => hanzo::bail!("input has to be contiguous"),
+                    None => hanzo_ml_core::bail!("input has to be contiguous"),
                     Some((o1, o2)) => src.slice(o1..o2),
                 };
                 let el = layout.shape().elem_count();
@@ -377,7 +377,7 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
                 let mut builder = func.builder();
                 builder.arg(&src);
                 builder.arg(&dst);
-                hanzo::builder_arg!(builder, n_cols as i32);
+                hanzo_ml_core::builder_arg!(builder, n_cols as i32);
                 // SAFETY: ffi.
                 unsafe { builder.launch(cfg) }.w()?;
                 Ok(dst)
@@ -387,7 +387,7 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
         use hanzo_ml_core::backend::BackendStorage;
         let dev = storage.device();
         let slice = S.map(&storage.slice, dev, layout)?;
-        let dst = hanzo::cuda_backend::CudaStorage {
+        let dst = hanzo_ml_core::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
         };
@@ -397,9 +397,9 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
-        storage: &hanzo::MetalStorage,
+        storage: &hanzo_ml_core::MetalStorage,
         layout: &Layout,
-    ) -> Result<(hanzo::MetalStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         let device = storage.device();
         let command_buffer = device.command_buffer()?;
@@ -408,12 +408,12 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
             DType::F32 => "softmax_f32",
             DType::F16 => "softmax_f16",
             DType::BF16 => "softmax_bf16",
-            dtype => hanzo::bail!("softmax-last-dim is not implemented for {dtype:?}"),
+            dtype => hanzo_ml_core::bail!("softmax-last-dim is not implemented for {dtype:?}"),
         };
 
         let n = layout.stride().len();
         if !(layout.is_contiguous() && layout.stride()[n - 1] == 1) {
-            hanzo::bail!("Non contiguous softmax-last-dim is not implemented");
+            hanzo_ml_core::bail!("Non contiguous softmax-last-dim is not implemented");
         }
 
         let last_dim = layout.dims()[layout.shape().rank() - 1];
@@ -430,9 +430,9 @@ impl hanzo::CustomOp1 for SoftmaxLastDim {
             layout.start_offset() * storage.dtype().size_in_bytes(),
             &output,
         )
-        .map_err(hanzo::Error::wrap)?;
+        .map_err(hanzo_ml_core::Error::wrap)?;
         let newstorage =
-            hanzo::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
+            hanzo_ml_core::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
         Ok((newstorage, layout.shape().clone()))
     }
 }
@@ -446,7 +446,7 @@ struct RmsNorm {
     eps: f32,
 }
 
-impl hanzo::CustomOp2 for RmsNorm {
+impl hanzo_ml_core::CustomOp2 for RmsNorm {
     fn name(&self) -> &'static str {
         "rms-norm"
     }
@@ -462,7 +462,7 @@ impl hanzo::CustomOp2 for RmsNorm {
 
         let eps = self.eps;
         fn inner<
-            T: hanzo::WithDType
+            T: hanzo_ml_core::WithDType
                 + num_traits::Float
                 + num_traits::AsPrimitive<f32>
                 + num_traits::FromPrimitive,
@@ -474,11 +474,11 @@ impl hanzo::CustomOp2 for RmsNorm {
             eps: f32,
         ) -> Result<(CpuStorage, Shape)> {
             let src = match layout.contiguous_offsets() {
-                None => hanzo::bail!("input has to be contiguous"),
+                None => hanzo_ml_core::bail!("input has to be contiguous"),
                 Some((o1, o2)) => &src[o1..o2],
             };
             let alpha = match alpha_layout.contiguous_offsets() {
-                None => hanzo::bail!("alpha has to be contiguous"),
+                None => hanzo_ml_core::bail!("alpha has to be contiguous"),
                 Some((o1, o2)) => &alpha[o1..o2],
             };
             let el_count = layout.shape().elem_count();
@@ -501,7 +501,7 @@ impl hanzo::CustomOp2 for RmsNorm {
                         *d = *s / m * *alpha
                     }
                 });
-            let storage = hanzo::WithDType::to_cpu_storage_owned(dst);
+            let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, Shape::from_dims(dims)))
         }
 
@@ -510,18 +510,18 @@ impl hanzo::CustomOp2 for RmsNorm {
             (C::BF16(s1), C::BF16(s2)) => inner::<half::bf16>(s1, l1, s2, l2, eps),
             (C::F16(s1), C::F16(s2)) => inner::<half::f16>(s1, l1, s2, l2, eps),
             (C::F32(s1), C::F32(s2)) => inner::<f32>(s1, l1, s2, l2, eps),
-            _ => hanzo::bail!("unsupported dtype for rmsnorm {:?}", s1.dtype()),
+            _ => hanzo_ml_core::bail!("unsupported dtype for rmsnorm {:?}", s1.dtype()),
         }
     }
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        s1: &hanzo::CudaStorage,
+        s1: &hanzo_ml_core::CudaStorage,
         l1: &Layout,
-        s2: &hanzo::CudaStorage,
+        s2: &hanzo_ml_core::CudaStorage,
         l2: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
@@ -541,11 +541,11 @@ impl hanzo::CustomOp2 for RmsNorm {
                 dev: &CudaDevice,
             ) -> Result<CudaSlice<T>> {
                 let src = match layout.contiguous_offsets() {
-                    None => hanzo::bail!("input has to be contiguous"),
+                    None => hanzo_ml_core::bail!("input has to be contiguous"),
                     Some((o1, o2)) => src.slice(o1..o2),
                 };
                 let alpha = match alpha_layout.contiguous_offsets() {
-                    None => hanzo::bail!("alpha has to be contiguous"),
+                    None => hanzo_ml_core::bail!("alpha has to be contiguous"),
                     Some((o1, o2)) => alpha.slice(o1..o2),
                 };
                 let el = layout.shape().elem_count();
@@ -566,7 +566,7 @@ impl hanzo::CustomOp2 for RmsNorm {
                 builder.arg(&src);
                 builder.arg(&dst);
                 builder.arg(&alpha);
-                hanzo::builder_arg!(builder, n_cols as i32, block_size as i32, self.eps);
+                hanzo_ml_core::builder_arg!(builder, n_cols as i32, block_size as i32, self.eps);
                 // SAFETY: ffi.
                 unsafe { builder.launch(cfg) }.w()?;
                 Ok(dst)
@@ -576,7 +576,7 @@ impl hanzo::CustomOp2 for RmsNorm {
         use hanzo_ml_core::backend::BackendStorage;
         let dev = s1.device();
         let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, dev)?;
-        let dst = hanzo::cuda_backend::CudaStorage {
+        let dst = hanzo_ml_core::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
         };
@@ -586,11 +586,11 @@ impl hanzo::CustomOp2 for RmsNorm {
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
-        s1: &hanzo::MetalStorage,
+        s1: &hanzo_ml_core::MetalStorage,
         l1: &Layout,
-        s2: &hanzo::MetalStorage,
+        s2: &hanzo_ml_core::MetalStorage,
         l2: &Layout,
-    ) -> Result<(hanzo::MetalStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         let device = s1.device();
         let command_buffer = device.command_buffer()?;
@@ -599,11 +599,11 @@ impl hanzo::CustomOp2 for RmsNorm {
             (DType::F32, DType::F32) => "rmsnorm_f32",
             (DType::F16, DType::F16) => "rmsnorm_f16",
             (DType::BF16, DType::BF16) => "rmsnorm_bf16",
-            (dt1, dt2) => hanzo::bail!("rmsnorm is not implemented for {dt1:?} {dt2:?}"),
+            (dt1, dt2) => hanzo_ml_core::bail!("rmsnorm is not implemented for {dt1:?} {dt2:?}"),
         };
 
         if !(l1.is_contiguous() && l2.is_contiguous()) {
-            hanzo::bail!("Non contiguous rmsnorm is not implemented");
+            hanzo_ml_core::bail!("Non contiguous rmsnorm is not implemented");
         }
 
         let last_dim = l1.dims()[l1.shape().rank() - 1];
@@ -623,8 +623,8 @@ impl hanzo::CustomOp2 for RmsNorm {
             l2.start_offset() * s2.dtype().size_in_bytes(),
             &output,
         )
-        .map_err(hanzo::Error::wrap)?;
-        let newstorage = hanzo::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        .map_err(hanzo_ml_core::Error::wrap)?;
+        let newstorage = hanzo_ml_core::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
 }
@@ -646,7 +646,7 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let hidden_size_xs = xs.dim(D::Minus1)?;
     let hidden_size_alpha = alpha.dims1()?;
     if hidden_size_xs != hidden_size_alpha {
-        hanzo::bail!(
+        hanzo_ml_core::bail!(
             "shape mismatch in rms-norm {:?} {:?}",
             xs.shape(),
             alpha.shape()
@@ -660,7 +660,7 @@ struct LayerNorm {
     eps: f32,
 }
 
-impl hanzo::CustomOp3 for LayerNorm {
+impl hanzo_ml_core::CustomOp3 for LayerNorm {
     fn name(&self) -> &'static str {
         "layer-norm"
     }
@@ -678,7 +678,7 @@ impl hanzo::CustomOp3 for LayerNorm {
 
         let eps = self.eps;
         fn inner<
-            T: hanzo::WithDType
+            T: hanzo_ml_core::WithDType
                 + num_traits::Float
                 + num_traits::AsPrimitive<f32>
                 + num_traits::FromPrimitive,
@@ -692,15 +692,15 @@ impl hanzo::CustomOp3 for LayerNorm {
             eps: f32,
         ) -> Result<(CpuStorage, Shape)> {
             let src = match layout.contiguous_offsets() {
-                None => hanzo::bail!("input has to be contiguous"),
+                None => hanzo_ml_core::bail!("input has to be contiguous"),
                 Some((o1, o2)) => &src[o1..o2],
             };
             let alpha = match alpha_layout.contiguous_offsets() {
-                None => hanzo::bail!("alpha has to be contiguous"),
+                None => hanzo_ml_core::bail!("alpha has to be contiguous"),
                 Some((o1, o2)) => &alpha[o1..o2],
             };
             let beta = match beta_layout.contiguous_offsets() {
-                None => hanzo::bail!("beta has to be contiguous"),
+                None => hanzo_ml_core::bail!("beta has to be contiguous"),
                 Some((o1, o2)) => &beta[o1..o2],
             };
             let el_count = layout.shape().elem_count();
@@ -729,7 +729,7 @@ impl hanzo::CustomOp3 for LayerNorm {
                         *d = T::from_f32(d_).unwrap_or_else(T::nan);
                     }
                 });
-            let storage = hanzo::WithDType::to_cpu_storage_owned(dst);
+            let storage = hanzo_ml_core::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, Shape::from_dims(dims)))
         }
 
@@ -740,20 +740,20 @@ impl hanzo::CustomOp3 for LayerNorm {
             }
             (C::F16(s1), C::F16(s2), C::F16(s3)) => inner::<half::f16>(s1, l1, s2, l2, s3, l3, eps),
             (C::F32(s1), C::F32(s2), C::F32(s3)) => inner::<f32>(s1, l1, s2, l2, s3, l3, eps),
-            _ => hanzo::bail!("unsupported dtype for rmsnorm {:?}", s1.dtype()),
+            _ => hanzo_ml_core::bail!("unsupported dtype for rmsnorm {:?}", s1.dtype()),
         }
     }
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        s1: &hanzo::CudaStorage,
+        s1: &hanzo_ml_core::CudaStorage,
         l1: &Layout,
-        s2: &hanzo::CudaStorage,
+        s2: &hanzo_ml_core::CudaStorage,
         l2: &Layout,
-        s3: &hanzo::CudaStorage,
+        s3: &hanzo_ml_core::CudaStorage,
         l3: &Layout,
-    ) -> Result<(hanzo::CudaStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::CudaStorage, Shape)> {
         use hanzo_ml_core::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
@@ -775,15 +775,15 @@ impl hanzo::CustomOp3 for LayerNorm {
                 dev: &CudaDevice,
             ) -> Result<CudaSlice<T>> {
                 let src = match layout.contiguous_offsets() {
-                    None => hanzo::bail!("input has to be contiguous"),
+                    None => hanzo_ml_core::bail!("input has to be contiguous"),
                     Some((o1, o2)) => src.slice(o1..o2),
                 };
                 let alpha = match alpha_layout.contiguous_offsets() {
-                    None => hanzo::bail!("alpha has to be contiguous"),
+                    None => hanzo_ml_core::bail!("alpha has to be contiguous"),
                     Some((o1, o2)) => alpha.slice(o1..o2),
                 };
                 let beta = match beta_layout.contiguous_offsets() {
-                    None => hanzo::bail!("beta has to be contiguous"),
+                    None => hanzo_ml_core::bail!("beta has to be contiguous"),
                     Some((o1, o2)) => beta.slice(o1..o2),
                 };
                 let el = layout.shape().elem_count();
@@ -806,7 +806,7 @@ impl hanzo::CustomOp3 for LayerNorm {
                 builder.arg(&dst);
                 builder.arg(&alpha);
                 builder.arg(&beta);
-                hanzo::builder_arg!(builder, n_cols as i32, block_size as i32, self.eps);
+                hanzo_ml_core::builder_arg!(builder, n_cols as i32, block_size as i32, self.eps);
                 // SAFETY: ffi.
                 unsafe { builder.launch(cfg) }.w()?;
                 Ok(dst)
@@ -816,7 +816,7 @@ impl hanzo::CustomOp3 for LayerNorm {
         use hanzo_ml_core::backend::BackendStorage;
         let dev = s1.device();
         let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, &s3.slice, l3, dev)?;
-        let dst = hanzo::cuda_backend::CudaStorage {
+        let dst = hanzo_ml_core::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
         };
@@ -826,13 +826,13 @@ impl hanzo::CustomOp3 for LayerNorm {
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
-        s1: &hanzo::MetalStorage,
+        s1: &hanzo_ml_core::MetalStorage,
         l1: &Layout,
-        s2: &hanzo::MetalStorage,
+        s2: &hanzo_ml_core::MetalStorage,
         l2: &Layout,
-        s3: &hanzo::MetalStorage,
+        s3: &hanzo_ml_core::MetalStorage,
         l3: &Layout,
-    ) -> Result<(hanzo::MetalStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         let device = s1.device();
         let command_buffer = device.command_buffer()?;
@@ -842,12 +842,12 @@ impl hanzo::CustomOp3 for LayerNorm {
             (DType::F16, DType::F16, DType::F16) => "layernorm_f16",
             (DType::BF16, DType::BF16, DType::BF16) => "layernorm_bf16",
             (dt1, dt2, dt3) => {
-                hanzo::bail!("layernorm is not implemented for {dt1:?} {dt2:?} {dt3:?}")
+                hanzo_ml_core::bail!("layernorm is not implemented for {dt1:?} {dt2:?} {dt3:?}")
             }
         };
 
         if !(l1.is_contiguous() && l2.is_contiguous() && l3.is_contiguous()) {
-            hanzo::bail!("Non contiguous layernorm is not implemented");
+            hanzo_ml_core::bail!("Non contiguous layernorm is not implemented");
         }
 
         let last_dim = l1.dims()[l1.shape().rank() - 1];
@@ -869,8 +869,8 @@ impl hanzo::CustomOp3 for LayerNorm {
             l3.start_offset() * s3.dtype().size_in_bytes(),
             &output,
         )
-        .map_err(hanzo::Error::wrap)?;
-        let newstorage = hanzo::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        .map_err(hanzo_ml_core::Error::wrap)?;
+        let newstorage = hanzo_ml_core::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
 }
@@ -900,7 +900,7 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
     let hidden_size_alpha = alpha.dims1()?;
     let hidden_size_beta = beta.dims1()?;
     if hidden_size_xs != hidden_size_alpha || hidden_size_xs != hidden_size_beta {
-        hanzo::bail!(
+        hanzo_ml_core::bail!(
             "shape mismatch in layer-norm src: {:?} alpha: {:?} beta: {:?}",
             xs.shape(),
             alpha.shape(),
@@ -945,7 +945,7 @@ pub fn replication_pad2d(xs: &Tensor, pad: usize) -> Result<Tensor> {
             let (first, last) = (xs.narrow(2, 0, 1)?, xs.narrow(2, h - 1, 1)?);
             Tensor::cat(&[&first, &xs, &last], 2)
         }
-        n => hanzo::bail!("replication-pad with a size of {n} is not supported"),
+        n => hanzo_ml_core::bail!("replication-pad with a size of {n} is not supported"),
     }
 }
 
@@ -976,7 +976,7 @@ struct Sdpa {
     softcapping: f32,
 }
 
-impl hanzo::CustomOp3 for Sdpa {
+impl hanzo_ml_core::CustomOp3 for Sdpa {
     fn name(&self) -> &'static str {
         "metal-sdpa"
     }
@@ -990,19 +990,19 @@ impl hanzo::CustomOp3 for Sdpa {
         _s3: &CpuStorage,
         _l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        hanzo::bail!("SDPA has no cpu impl")
+        hanzo_ml_core::bail!("SDPA has no cpu impl")
     }
 
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
-        q: &hanzo::MetalStorage,
+        q: &hanzo_ml_core::MetalStorage,
         q_l: &Layout,
-        k: &hanzo::MetalStorage,
+        k: &hanzo_ml_core::MetalStorage,
         k_l: &Layout,
-        v: &hanzo::MetalStorage,
+        v: &hanzo_ml_core::MetalStorage,
         v_l: &Layout,
-    ) -> Result<(hanzo::MetalStorage, Shape)> {
+    ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
         use hanzo_metal_kernels::SdpaDType;
 
@@ -1015,17 +1015,17 @@ impl hanzo::CustomOp3 for Sdpa {
 
         // q,k must have matching emb dim
         if q_l.dim(D::Minus1)? != k_l.dim(D::Minus1)? {
-            hanzo::bail!("`q` and `k` last dims must match");
+            hanzo_ml_core::bail!("`q` and `k` last dims must match");
         }
 
         // k,v must have matching n kv heads
         if v_l.dim(D::Minus(3))? != k_l.dim(D::Minus(3))? {
-            hanzo::bail!("`k` and `v` head dims must match");
+            hanzo_ml_core::bail!("`k` and `v` head dims must match");
         }
 
         // n_heads % n_kv_heads == 0; n_heads >= 1, n_kv_heads >= 1.
         if q_l.dim(D::Minus(3))? % k_l.dim(D::Minus(3))? != 0 {
-            hanzo::bail!("query `n_heads` must be a multiple of `n_kv_heads`");
+            hanzo_ml_core::bail!("query `n_heads` must be a multiple of `n_kv_heads`");
         }
 
         let k_head = k_l.dim(D::Minus1)?;
@@ -1045,7 +1045,7 @@ impl hanzo::CustomOp3 for Sdpa {
         implementation_supports_use_case &= supports_sdpa_full || supports_sdpa_vector;
 
         if !supported_head_dim {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "Meta SDPA does not support q head dim {q_head}: q dims {:?}, k dims {:?}, v dims {:?}.",
                 q_l.dims(),
                 k_l.dims(),
@@ -1053,7 +1053,7 @@ impl hanzo::CustomOp3 for Sdpa {
             );
         }
         if !implementation_supports_use_case {
-            hanzo::bail!(
+            hanzo_ml_core::bail!(
                 "Meta SDPA does not support q dims {:?}, k dims {:?}, v dims {:?}.",
                 q_l.dims(),
                 k_l.dims(),
@@ -1063,7 +1063,7 @@ impl hanzo::CustomOp3 for Sdpa {
 
         for t in [k.dtype(), v.dtype()] {
             if q.dtype() != t {
-                hanzo::bail!("all q, k, v dtypes must match.");
+                hanzo_ml_core::bail!("all q, k, v dtypes must match.");
             }
         }
 
@@ -1071,7 +1071,7 @@ impl hanzo::CustomOp3 for Sdpa {
             DType::BF16 => SdpaDType::BF16,
             DType::F16 => SdpaDType::F16,
             DType::F32 => SdpaDType::F32,
-            other => hanzo::bail!("unsupported sdpa type {other:?}"),
+            other => hanzo_ml_core::bail!("unsupported sdpa type {other:?}"),
         };
 
         let command_buffer = q.device().command_buffer()?;
@@ -1126,7 +1126,7 @@ impl hanzo::CustomOp3 for Sdpa {
                     self.softcapping,
                     itype,
                 )
-                .map_err(hanzo::Error::wrap)?;
+                .map_err(hanzo_ml_core::Error::wrap)?;
             } else {
                 command_buffer.set_label("vector_attention");
                 hanzo_metal_kernels::call_sdpa_vector(
@@ -1148,11 +1148,11 @@ impl hanzo::CustomOp3 for Sdpa {
                     self.softcapping,
                     itype,
                 )
-                .map_err(hanzo::Error::wrap)?;
+                .map_err(hanzo_ml_core::Error::wrap)?;
             }
         } else if supports_sdpa_full {
             if q_l.dim(2)? != k_l.dim(2)? {
-                hanzo::bail!(
+                hanzo_ml_core::bail!(
                     "query and key sequence length must be equal if using full metal sdpa"
                 )
             }
@@ -1174,12 +1174,12 @@ impl hanzo::CustomOp3 for Sdpa {
                 self.softcapping,
                 itype,
             )
-            .map_err(hanzo::Error::wrap)?;
+            .map_err(hanzo_ml_core::Error::wrap)?;
         } else {
-            hanzo::bail!("must be vector or full sdpa kernel");
+            hanzo_ml_core::bail!("must be vector or full sdpa kernel");
         }
 
-        let newstorage = hanzo::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
+        let newstorage = hanzo_ml_core::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
         Ok((newstorage, Shape::from_dims(&out_dims)))
     }
 }

@@ -151,7 +151,7 @@ impl TimestepEmbedder {
 
         let half = dim / 2;
         let freqs = Tensor::arange(0f32, half as f32, t.device())?
-            .to_dtype(hanzo::DType::F32)?
+            .to_dtype(hanzo_ml_core::DType::F32)?
             .mul(&Tensor::full(
                 (-f64::ln(max_period) / half as f64) as f32,
                 half,
@@ -161,10 +161,10 @@ impl TimestepEmbedder {
 
         let args = t
             .unsqueeze(1)?
-            .to_dtype(hanzo::DType::F32)?
+            .to_dtype(hanzo_ml_core::DType::F32)?
             .matmul(&freqs.unsqueeze(0)?)?;
         let embedding = Tensor::cat(&[args.cos()?, args.sin()?], 1)?;
-        embedding.to_dtype(hanzo::DType::F16)
+        embedding.to_dtype(hanzo_ml_core::DType::F16)
     }
 }
 

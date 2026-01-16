@@ -4,7 +4,7 @@ use hanzo_ml_core::{Result, Tensor};
 
 pub fn apply_repeat_penalty(logits: &Tensor, penalty: f32, context: &[u32]) -> Result<Tensor> {
     let device = logits.device();
-    let mut logits = logits.to_dtype(hanzo::DType::F32)?.to_vec1::<f32>()?;
+    let mut logits = logits.to_dtype(hanzo_ml_core::DType::F32)?.to_vec1::<f32>()?;
     let mut already_seen = std::collections::HashSet::new();
     for token_id in context {
         if already_seen.contains(token_id) {

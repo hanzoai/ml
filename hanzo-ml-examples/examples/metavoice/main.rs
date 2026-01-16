@@ -103,10 +103,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo::utils::with_avx(),
-        hanzo::utils::with_neon(),
-        hanzo::utils::with_simd128(),
-        hanzo::utils::with_f16c()
+        hanzo_ml_core::utils::with_avx(),
+        hanzo_ml_core::utils::with_neon(),
+        hanzo_ml_core::utils::with_simd128(),
+        hanzo_ml_core::utils::with_f16c()
     );
     let device = hanzo_examples::device(args.cpu)?;
     let api = Api::new()?;
@@ -169,7 +169,7 @@ fn main() -> Result<()> {
     let second_stage_model = gpt::Model::new(second_stage_config.clone(), second_stage_vb)?;
 
     let encodec_device = if device.is_metal() {
-        &hanzo::Device::Cpu
+        &hanzo_ml_core::Device::Cpu
     } else {
         &device
     };
@@ -186,7 +186,7 @@ fn main() -> Result<()> {
         Some(w) => std::path::PathBuf::from(w),
         None => repo.get("spk_emb.safetensors")?,
     };
-    let spk_emb = hanzo::safetensors::load(&spk_emb_file, &hanzo::Device::Cpu)?;
+    let spk_emb = hanzo_ml_core::safetensors::load(&spk_emb_file, &hanzo_ml_core::Device::Cpu)?;
     let spk_emb = match spk_emb.get("spk_emb") {
         None => anyhow::bail!("missing spk_emb tensor in {spk_emb_file:?}"),
         Some(spk_emb) => spk_emb.to_dtype(dtype)?,

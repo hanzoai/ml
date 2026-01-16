@@ -9,7 +9,7 @@
 //! ```rust
 //! use hanzo_ml_core::{Tensor, Device::Cpu, test_utils::to_vec3_round};
 //! use hanzo_nn::{LayerNorm, Module};
-//! # fn main() -> hanzo::Result<()> {
+//! # fn main() -> hanzo_ml_core::Result<()> {
 //!
 //! let w = Tensor::new(&[1f32, 1f32, 1f32], &Cpu)?;
 //! let b = Tensor::new(&[0f32, 0f32, 0f32], &Cpu)?;
