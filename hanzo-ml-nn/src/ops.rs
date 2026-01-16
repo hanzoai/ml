@@ -149,14 +149,14 @@ impl hanzo_ml_core::CustomOp1 for Sigmoid {
         let buffer = device.new_buffer(el_count, dtype, "sigmoid")?;
         let command_buffer = device.command_buffer()?;
         command_buffer.set_label("sigmoid");
-        let src = hanzo_metal_kernels::BufferOffset {
+        let src = hanzo_ml_metal_kernels::BufferOffset {
             buffer: storage.buffer(),
             offset_in_bytes: layout.start_offset() * storage.dtype().size_in_bytes(),
         };
 
         match (el_count % 2, dtype, layout.is_contiguous()) {
             (0, DType::BF16 | DType::F16, true) => {
-                use hanzo_metal_kernels::unary::contiguous_tiled;
+                use hanzo_ml_metal_kernels::unary::contiguous_tiled;
                 let kernel_name = match dtype {
                     DType::F16 => contiguous_tiled::sigmoid::HALF,
                     DType::F32 => contiguous_tiled::sigmoid::FLOAT,
@@ -167,7 +167,7 @@ impl hanzo_ml_core::CustomOp1 for Sigmoid {
                         )
                     }
                 };
-                hanzo_metal_kernels::call_unary_contiguous_tiled(
+                hanzo_ml_metal_kernels::call_unary_contiguous_tiled(
                     device.metal_device(),
                     &command_buffer,
                     device.kernels(),
@@ -179,7 +179,7 @@ impl hanzo_ml_core::CustomOp1 for Sigmoid {
                 .map_err(MetalError::from)?;
             }
             (_, _, true) => {
-                use hanzo_metal_kernels::unary::contiguous;
+                use hanzo_ml_metal_kernels::unary::contiguous;
                 let kernel_name = match dtype {
                     DType::F16 => contiguous::sigmoid::HALF,
                     DType::F32 => contiguous::sigmoid::FLOAT,
@@ -188,7 +188,7 @@ impl hanzo_ml_core::CustomOp1 for Sigmoid {
                         hanzo_ml_core::bail!("Metal contiguous unary sigmoid {dtype:?} not implemented")
                     }
                 };
-                hanzo_metal_kernels::call_unary_contiguous(
+                hanzo_ml_metal_kernels::call_unary_contiguous(
                     device.metal_device(),
                     &command_buffer,
                     device.kernels(),
@@ -200,7 +200,7 @@ impl hanzo_ml_core::CustomOp1 for Sigmoid {
                 .map_err(MetalError::from)?;
             }
             (_, _, false) => {
-                use hanzo_metal_kernels::unary::strided;
+                use hanzo_ml_metal_kernels::unary::strided;
                 let kernel_name = match dtype {
                     DType::F16 => strided::sigmoid::HALF,
                     DType::F32 => strided::sigmoid::FLOAT,
@@ -209,8 +209,8 @@ impl hanzo_ml_core::CustomOp1 for Sigmoid {
                         hanzo_ml_core::bail!("Metal strided unary sigmoid {dtype:?} not implemented")
                     }
                 };
-                let dst = hanzo_metal_kernels::BufferOffset::zero_offset(&buffer);
-                hanzo_metal_kernels::call_unary_strided(
+                let dst = hanzo_ml_metal_kernels::BufferOffset::zero_offset(&buffer);
+                hanzo_ml_metal_kernels::call_unary_strided(
                     device.metal_device(),
                     &command_buffer,
                     device.kernels(),
@@ -419,7 +419,7 @@ impl hanzo_ml_core::CustomOp1 for SoftmaxLastDim {
         let last_dim = layout.dims()[layout.shape().rank() - 1];
         let elem_count = layout.shape().elem_count();
         let output = device.new_buffer(elem_count, storage.dtype(), "softmax")?;
-        hanzo_metal_kernels::call_last_softmax(
+        hanzo_ml_metal_kernels::call_last_softmax(
             device.metal_device(),
             &command_buffer,
             kernels,
@@ -609,7 +609,7 @@ impl hanzo_ml_core::CustomOp2 for RmsNorm {
         let last_dim = l1.dims()[l1.shape().rank() - 1];
         let elem_count = l1.shape().elem_count();
         let output = device.new_buffer(elem_count, s1.dtype(), "rmsnorm")?;
-        hanzo_metal_kernels::call_rms_norm(
+        hanzo_ml_metal_kernels::call_rms_norm(
             device.metal_device(),
             &command_buffer,
             kernels,
@@ -853,7 +853,7 @@ impl hanzo_ml_core::CustomOp3 for LayerNorm {
         let last_dim = l1.dims()[l1.shape().rank() - 1];
         let elem_count = l1.shape().elem_count();
         let output = device.new_buffer(elem_count, s1.dtype(), "layernorm")?;
-        hanzo_metal_kernels::call_layer_norm(
+        hanzo_ml_metal_kernels::call_layer_norm(
             device.metal_device(),
             &command_buffer,
             kernels,
@@ -1004,7 +1004,7 @@ impl hanzo_ml_core::CustomOp3 for Sdpa {
         v_l: &Layout,
     ) -> Result<(hanzo_ml_core::MetalStorage, Shape)> {
         use hanzo_ml_core::backend::BackendStorage;
-        use hanzo_metal_kernels::SdpaDType;
+        use hanzo_ml_metal_kernels::SdpaDType;
 
         let device = q.device();
 
@@ -1082,7 +1082,7 @@ impl hanzo_ml_core::CustomOp3 for Sdpa {
             if k_l.dim(2)? >= TWO_PASS_K_THRESHOLD {
                 let mut intermediate_shape = [
                     &out_dims[0..out_dims.len() - 2],
-                    &[hanzo_metal_kernels::SDPA_2PASS_BLOCKS],
+                    &[hanzo_ml_metal_kernels::SDPA_2PASS_BLOCKS],
                     &[out_dims[out_dims.len() - 1]],
                 ]
                 .concat();
@@ -1104,7 +1104,7 @@ impl hanzo_ml_core::CustomOp3 for Sdpa {
                 )?;
 
                 command_buffer.set_label("vector_attention");
-                hanzo_metal_kernels::call_sdpa_vector_2pass(
+                hanzo_ml_metal_kernels::call_sdpa_vector_2pass(
                     q.device().device(),
                     &command_buffer,
                     q.device().kernels(),
@@ -1129,7 +1129,7 @@ impl hanzo_ml_core::CustomOp3 for Sdpa {
                 .map_err(hanzo_ml_core::Error::wrap)?;
             } else {
                 command_buffer.set_label("vector_attention");
-                hanzo_metal_kernels::call_sdpa_vector(
+                hanzo_ml_metal_kernels::call_sdpa_vector(
                     q.device().device(),
                     &command_buffer,
                     q.device().kernels(),
@@ -1158,7 +1158,7 @@ impl hanzo_ml_core::CustomOp3 for Sdpa {
             }
 
             command_buffer.set_label("full_attention");
-            hanzo_metal_kernels::call_sdpa_full(
+            hanzo_ml_metal_kernels::call_sdpa_full(
                 q.device().device(),
                 &command_buffer,
                 q.device().kernels(),
