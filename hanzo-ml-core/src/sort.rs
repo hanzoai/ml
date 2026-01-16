@@ -185,7 +185,7 @@ impl crate::CustomOp1 for ArgSort {
         while ncols_pad < ncols {
             ncols_pad *= 2;
         }
-        hanzo_metal_kernels::call_arg_sort(
+        hanzo_ml_metal_kernels::call_arg_sort(
             device.metal_device(),
             &command_buffer,
             kernels,
