@@ -20,7 +20,7 @@ use crate::quantized_nn::{layer_norm_no_bias, linear_no_bias, Embedding, Linear}
 pub use crate::quantized_var_builder::VarBuilder;
 /// MPT model used by replit-code-v1_5-3b
 /// https://huggingface.co/replit/replit-code-v1_5-3b/blob/main/modeling_mpt.py
-use hanzo_ml_core::{IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::LayerNorm;
 
 pub use super::mpt::Config;

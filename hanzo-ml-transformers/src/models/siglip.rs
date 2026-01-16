@@ -7,7 +7,7 @@
 //!
 
 use crate::models::clip::div_l2_norm;
-use hanzo_ml_core::{IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, linear, LayerNorm, Linear, VarBuilder};
 
 fn default_text_vocab_size() -> usize {
@@ -462,7 +462,7 @@ impl Mlp {
 }
 
 impl Module for Mlp {
-    fn forward(&self, xs: &hanzo_ml_core::Tensor) -> Result<hanzo_ml_core::Tensor> {
+    fn forward(&self, xs: &hanzo_ml::Tensor) -> Result<hanzo_ml::Tensor> {
         xs.apply(&self.fc1)?
             .apply(&self.activation_fn)?
             .apply(&self.fc2)

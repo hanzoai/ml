@@ -1,4 +1,4 @@
-use hanzo_ml_core::Result;
+use hanzo_ml::Result;
 use hanzo_transformers::object_detection::{
     non_maximum_suppression, soft_non_maximum_suppression, Bbox,
 };

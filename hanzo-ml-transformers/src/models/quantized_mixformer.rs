@@ -13,7 +13,7 @@
 
 use crate::quantized_nn::{layer_norm, linear, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::Activation;
 
 pub use crate::models::mixformer::Config;
@@ -83,7 +83,7 @@ impl RotaryEmbedding {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (_b_size, seqlen, three, _, _headdim) = qkv.dims5()?;
         if three != 3 {
-            hanzo_ml_core::bail!("unexpected shape for qkv {:?}", qkv.shape())
+            hanzo_ml::bail!("unexpected shape for qkv {:?}", qkv.shape())
         }
         let (_rotary_seqlen, rotary_dim) = self.cos.dims2()?;
         let rotary_dim = rotary_dim * 2;

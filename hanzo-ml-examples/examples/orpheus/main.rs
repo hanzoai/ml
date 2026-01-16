@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use hanzo_ml_core::{DType, Device, IndexOp, Tensor};
+use hanzo_ml::{DType, Device, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::llama::{Cache, Llama, LlamaConfig};
 use hanzo_transformers::models::snac::{Config as SnacConfig, Model as SnacModel};
@@ -134,10 +134,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     let prompt = args.prompt.clone();
     let mut model = Model::load(args)?;

@@ -22,7 +22,7 @@ use super::{
     schedulers::{Scheduler, SchedulerConfig},
     utils::{interp, linspace},
 };
-use hanzo_ml_core::{Error, IndexOp, Result, Tensor};
+use hanzo_ml::{Error, IndexOp, Result, Tensor};
 
 #[derive(Debug, Clone, Copy)]
 pub enum SigmaSchedule {
@@ -371,7 +371,7 @@ impl EdmDpmMultistepScheduler {
         let v = sample
             .abs()?
             .reshape((shape[0], shape[1] * shape[2..].iter().product::<usize>()))?
-            .to_dtype(hanzo_ml_core::DType::F64)?
+            .to_dtype(hanzo_ml::DType::F64)?
             .to_vec2::<f64>()?;
         let q = stats::Quantile::new(self.config.dynamic_thresholding_ratio)
             .with_samples(v.into_iter().flatten());
@@ -882,7 +882,7 @@ mod stats {
 }
 
 mod linalg {
-    use hanzo_ml_core::{IndexOp, Result, Shape, Tensor};
+    use hanzo_ml::{IndexOp, Result, Shape, Tensor};
 
     pub fn inverse(m: &Tensor) -> Result<Tensor> {
         adjoint(m)? / determinant(m)?.to_scalar::<f64>()?

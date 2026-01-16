@@ -16,7 +16,7 @@
 //!
 
 use crate::models::with_tracing::{conv2d, linear, linear_no_bias, Conv2d, Linear};
-use hanzo_ml_core::{IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
 
 // https://github.com/huggingface/transformers/blob/main/src/transformers/models/vit/configuration_vit.py
@@ -156,7 +156,7 @@ impl Embeddings {
         let embeddings = self.patch_embeddings.forward(pixel_values)?;
         let embeddings = match (bool_masked_pos, &self.mask_token) {
             (None, _) => embeddings,
-            (Some(_), None) => hanzo_ml_core::bail!("bool_masked_pos set without mask_token"),
+            (Some(_), None) => hanzo_ml::bail!("bool_masked_pos set without mask_token"),
             (Some(bool_masked_pos), Some(mask_tokens)) => {
                 let seq_len = embeddings.dim(1)?;
                 let mask_tokens = mask_tokens.broadcast_as((b_size, seq_len, self.hidden_size))?;

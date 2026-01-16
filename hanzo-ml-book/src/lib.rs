@@ -4,7 +4,7 @@ pub mod simplified;
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use hanzo_ml_core::{DType, Device, Tensor};
+    use hanzo_ml::{DType, Device, Tensor};
     use parquet::file::reader::SerializedFileReader;
 
     // NOTE: Waiting on https://github.com/rust-lang/mdBook/pull/1856
@@ -12,7 +12,7 @@ mod tests {
     #[tokio::test]
     async fn book_hub_1() {
 // ANCHOR: book_hub_1
-use hanzo_ml_core::Device;
+use hanzo_ml::Device;
 use hf_hub::api::tokio::Api;
 
 let api = Api::new().unwrap();
@@ -20,7 +20,7 @@ let repo = api.model("bert-base-uncased".to_string());
 
 let weights_filename = repo.get("model.safetensors").await.unwrap();
 
-let weights = hanzo_ml_core::safetensors::load(weights_filename, &Device::Cpu).unwrap();
+let weights = hanzo_ml::safetensors::load(weights_filename, &Device::Cpu).unwrap();
 // ANCHOR_END: book_hub_1
         assert_eq!(weights.len(), 206);
     }
@@ -30,7 +30,7 @@ let weights = hanzo_ml_core::safetensors::load(weights_filename, &Device::Cpu).u
     fn book_hub_2() {
         {
 // ANCHOR: book_hub_2
-use hanzo_ml_core::Device;
+use hanzo_ml::Device;
 use hf_hub::api::sync::Api;
 use memmap2::Mmap;
 use std::fs;
@@ -41,7 +41,7 @@ let weights_filename = repo.get("model.safetensors").unwrap();
 
 let file = fs::File::open(weights_filename).unwrap();
 let mmap = unsafe { Mmap::map(&file).unwrap() };
-let weights = hanzo_ml_core::safetensors::load_buffer(&mmap[..], &Device::Cpu).unwrap();
+let weights = hanzo_ml::safetensors::load_buffer(&mmap[..], &Device::Cpu).unwrap();
 // ANCHOR_END: book_hub_2
         assert_eq!(weights.len(), 206);
     }
@@ -51,7 +51,7 @@ let weights = hanzo_ml_core::safetensors::load_buffer(&mmap[..], &Device::Cpu).u
     // fn book_hub_3() {
     {
 // ANCHOR: book_hub_3
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hf_hub::api::sync::Api;
 use memmap2::Mmap;
 use safetensors::slice::IndexOp;

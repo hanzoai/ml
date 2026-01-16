@@ -21,7 +21,7 @@
 //! </div>
 //!
 
-use hanzo_ml_core::{Result, Tensor};
+use hanzo_ml::{Result, Tensor};
 
 pub trait WithForward {
     #[allow(clippy::too_many_arguments)]

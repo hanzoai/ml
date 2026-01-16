@@ -1,4 +1,4 @@
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::blip;
@@ -136,7 +136,7 @@ impl Model {
             Tensor::new(&[0.48145466f32, 0.4578275, 0.40821073], device)?.reshape((3, 1, 1))?;
         let std =
             Tensor::new(&[0.26862954f32, 0.261_302_6, 0.275_777_1], device)?.reshape((3, 1, 1))?;
-        (data.to_dtype(hanzo_ml_core::DType::F32)? / 255.)?
+        (data.to_dtype(hanzo_ml::DType::F32)? / 255.)?
             .broadcast_sub(&mean)?
             .broadcast_div(&std)
             .map_err(|e| JsError::new(&e.to_string()))

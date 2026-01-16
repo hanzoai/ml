@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Result, Tensor, D};
+use hanzo_ml::{Result, Tensor, D};
 use hanzo_nn::{conv2d, group_norm, Conv2d, GroupNorm, VarBuilder};
 
 // https://github.com/black-forest-labs/flux/blob/727e3a71faf37390f318cf9434f0939653302b60/src/flux/modules/autoencoder.py#L9
@@ -80,7 +80,7 @@ impl AttnBlock {
     }
 }
 
-impl hanzo_ml_core::Module for AttnBlock {
+impl hanzo_ml::Module for AttnBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let init_xs = xs;
         let xs = xs.apply(&self.norm)?;
@@ -137,7 +137,7 @@ impl ResnetBlock {
     }
 }
 
-impl hanzo_ml_core::Module for ResnetBlock {
+impl hanzo_ml::Module for ResnetBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let h = xs
             .apply(&self.norm1)?
@@ -169,7 +169,7 @@ impl Downsample {
     }
 }
 
-impl hanzo_ml_core::Module for Downsample {
+impl hanzo_ml::Module for Downsample {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = xs.pad_with_zeros(D::Minus1, 0, 1)?;
         let xs = xs.pad_with_zeros(D::Minus2, 0, 1)?;
@@ -193,7 +193,7 @@ impl Upsample {
     }
 }
 
-impl hanzo_ml_core::Module for Upsample {
+impl hanzo_ml::Module for Upsample {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (_, _, h, w) = xs.dims4()?;
         xs.upsample_nearest2d(h * 2, w * 2)?.apply(&self.conv)
@@ -433,7 +433,7 @@ impl AutoEncoder {
     }
 }
 
-impl hanzo_ml_core::Module for AutoEncoder {
+impl hanzo_ml::Module for AutoEncoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         self.decode(&self.encode(xs)?)
     }

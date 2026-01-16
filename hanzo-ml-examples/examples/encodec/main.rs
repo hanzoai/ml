@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use hanzo_ml_core::{DType, IndexOp, Tensor};
+use hanzo_ml::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::encodec::{Config, Model};
 use clap::{Parser, ValueEnum};
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
 
     let codes = match args.action {
         Action::CodeToAudio => {
-            let codes = hanzo_ml_core::safetensors::load(args.in_file, &device)?;
+            let codes = hanzo_ml::safetensors::load(args.in_file, &device)?;
             codes.get("codes").expect("no codes in input file").clone()
         }
         Action::AudioToCode | Action::AudioToAudio => {

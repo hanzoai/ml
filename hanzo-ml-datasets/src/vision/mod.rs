@@ -1,4 +1,4 @@
-use hanzo_ml_core::Tensor;
+use hanzo_ml::Tensor;
 
 pub struct Dataset {
     pub train_images: Tensor,

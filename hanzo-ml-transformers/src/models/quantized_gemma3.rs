@@ -15,10 +15,10 @@
 //!
 
 use crate::quantized_nn::RmsNorm;
-use hanzo_ml_core::quantized::gguf_file;
-use hanzo_ml_core::quantized::QTensor;
-use hanzo_ml_core::D;
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml::quantized::gguf_file;
+use hanzo_ml::quantized::QTensor;
+use hanzo_ml::D;
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 131072; // Gemma 3 supports 128K context window
@@ -29,13 +29,13 @@ pub const DEFAULT_ROPE_FREQUENCY_SCALE_FACTOR: f32 = 1.;
 
 #[derive(Debug, Clone)]
 struct QMatMul {
-    inner: hanzo_ml_core::quantized::QMatMul,
+    inner: hanzo_ml::quantized::QMatMul,
     span: tracing::Span,
 }
 
 impl QMatMul {
     fn from_qtensor(qtensor: QTensor) -> Result<Self> {
-        let inner = hanzo_ml_core::quantized::QMatMul::from_qtensor(qtensor)?;
+        let inner = hanzo_ml::quantized::QMatMul::from_qtensor(qtensor)?;
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Ok(Self { inner, span })
     }
@@ -264,7 +264,7 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
-            None => hanzo_ml_core::bail!("cannot find {s} in metadata"),
+            None => hanzo_ml::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 

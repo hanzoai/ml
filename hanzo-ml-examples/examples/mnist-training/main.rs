@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 use rand::prelude::*;
 use rand::rng;
 
-use hanzo_ml_core::{DType, Result, Tensor, D};
+use hanzo_ml::{DType, Result, Tensor, D};
 use hanzo_nn::{loss, ops, Conv2d, Linear, Module, ModuleT, Optimizer, VarBuilder, VarMap};
 
 const IMAGE_DIM: usize = 784;
@@ -113,7 +113,7 @@ fn training_loop_cnn(
 ) -> anyhow::Result<()> {
     const BSIZE: usize = 64;
 
-    let dev = hanzo_ml_core::Device::cuda_if_available(0)?;
+    let dev = hanzo_ml::Device::cuda_if_available(0)?;
 
     let train_labels = m.train_labels;
     let train_images = m.train_images.to_device(&dev)?;
@@ -176,7 +176,7 @@ fn training_loop<M: Model>(
     m: hanzo_datasets::vision::Dataset,
     args: &TrainingArgs,
 ) -> anyhow::Result<()> {
-    let dev = hanzo_ml_core::Device::cuda_if_available(0)?;
+    let dev = hanzo_ml::Device::cuda_if_available(0)?;
 
     let train_labels = m.train_labels;
     let train_images = m.train_images.to_device(&dev)?;

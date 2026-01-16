@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Module, Result, Tensor};
+use hanzo_ml::{Module, Result, Tensor};
 use hanzo_nn::{linear, Linear, VarBuilder};
 
 // A simplified version of:
@@ -89,15 +89,15 @@ impl Attention {
         let xs = if self.use_flash_attn {
             let init_dtype = query.dtype();
             let q = query
-                .to_dtype(hanzo_ml_core::DType::F16)?
+                .to_dtype(hanzo_ml::DType::F16)?
                 .unsqueeze(0)?
                 .transpose(1, 2)?;
             let k = key
-                .to_dtype(hanzo_ml_core::DType::F16)?
+                .to_dtype(hanzo_ml::DType::F16)?
                 .unsqueeze(0)?
                 .transpose(1, 2)?;
             let v = value
-                .to_dtype(hanzo_ml_core::DType::F16)?
+                .to_dtype(hanzo_ml::DType::F16)?
                 .unsqueeze(0)?
                 .transpose(1, 2)?;
             flash_attn(&q, &k, &v, self.scale as f32, false)?

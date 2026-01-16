@@ -1,5 +1,5 @@
 use super::schedulers::{betas_for_alpha_bar, BetaSchedule, PredictionType};
-use hanzo_ml_core::{Result, Tensor};
+use hanzo_ml::{Result, Tensor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DDPMVarianceType {

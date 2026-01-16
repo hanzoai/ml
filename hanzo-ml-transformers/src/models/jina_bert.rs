@@ -5,7 +5,7 @@
 //! See: [Jina Embeddings on HuggingFace](https://huggingface.co/jinaai/jina-embeddings-v2-base-en)
 
 use super::with_tracing::{linear, linear_no_bias, Embedding, Linear};
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, Module, VarBuilder};
 use serde::Deserialize;
 
@@ -347,7 +347,7 @@ struct BertEncoder {
 impl BertEncoder {
     fn new(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         if cfg.position_embedding_type != PositionEmbeddingType::Alibi {
-            hanzo_ml_core::bail!("only alibi is supported as a position-embedding-type")
+            hanzo_ml::bail!("only alibi is supported as a position-embedding-type")
         }
         let layers = (0..cfg.num_hidden_layers)
             .map(|index| BertLayer::new(vb.pp(format!("layer.{index}")), cfg))

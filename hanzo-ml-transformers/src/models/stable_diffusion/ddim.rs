@@ -10,7 +10,7 @@
 use super::schedulers::{
     betas_for_alpha_bar, BetaSchedule, PredictionType, Scheduler, SchedulerConfig, TimestepSpacing,
 };
-use hanzo_ml_core::{Result, Tensor};
+use hanzo_ml::{Result, Tensor};
 
 /// The configuration for the DDIM scheduler.
 #[derive(Debug, Clone, Copy)]

@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
-use hanzo_ml_core::{DType, IndexOp, Shape, Tensor, D};
+use hanzo_ml::{DType, IndexOp, Shape, Tensor, D};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::nvembed_v2::model::Model;
 use clap::Parser;

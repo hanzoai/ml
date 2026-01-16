@@ -6,7 +6,7 @@
 //! - 💻 [Chinese-CLIP](https://github.com/OFA-Sys/Chinese-CLIP)
 //! - 💻 [HF](https://github.com/huggingface/transformers/blob/5af7d41e49bbfc8319f462eb45253dcb3863dfb7/src/transformers/models/chinese_clip/modeling_chinese_clip.py)
 
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor};
 use hanzo_nn as nn;
 
 use super::Activation;
@@ -266,13 +266,13 @@ impl ChineseClipTextSelfAttention {
         let attention_scores = attention_scores.broadcast_add(attention_mask)?;
         let attention_probs = {
             let _enter_sm = self.span_softmax.enter();
-            nn::ops::softmax(&attention_scores, hanzo_ml_core::D::Minus1)?
+            nn::ops::softmax(&attention_scores, hanzo_ml::D::Minus1)?
         };
         let attention_probs = self.dropout.forward(&attention_probs, false)?;
 
         let context_layer = attention_probs.matmul(&value_layer)?;
         let context_layer = context_layer.transpose(1, 2)?.contiguous()?;
-        let context_layer = context_layer.flatten_from(hanzo_ml_core::D::Minus2)?;
+        let context_layer = context_layer.flatten_from(hanzo_ml::D::Minus2)?;
         Ok(context_layer)
     }
 }
@@ -532,7 +532,7 @@ fn get_extended_attention_mask(attention_mask: &Tensor, dtype: DType) -> Result<
     let attention_mask = match attention_mask.rank() {
         3 => attention_mask.unsqueeze(1)?,
         2 => attention_mask.unsqueeze(1)?.unsqueeze(1)?,
-        _ => hanzo_ml_core::bail!("Wrong shape for input_ids or attention_mask"),
+        _ => hanzo_ml::bail!("Wrong shape for input_ids or attention_mask"),
     };
     let attention_mask = attention_mask.to_dtype(dtype)?;
     // torch.finfo(dtype).min

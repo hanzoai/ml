@@ -17,7 +17,7 @@
 
 use crate::quantized_nn::{linear_no_bias, Embedding, Linear, RmsNorm};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::Activation;
 use std::sync::Arc;
 

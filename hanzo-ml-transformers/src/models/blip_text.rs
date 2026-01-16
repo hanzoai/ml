@@ -8,7 +8,7 @@
 //! - 📝 [Paper](https://arxiv.org/abs/2201.12086)
 //!
 use super::with_tracing::{linear, Embedding, Linear};
-use hanzo_ml_core::{Module, Result, Tensor, D};
+use hanzo_ml::{Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
 use serde::Deserialize;
 
@@ -292,7 +292,7 @@ impl TextLayer {
         let attention_output = self.attention.forward(xs, None, Some(attention_mask))?;
         let attention_output = match &mut self.cross_attention {
             Some(ca) => ca.forward(&attention_output, Some(encoder_hidden_states), None)?,
-            None => hanzo_ml_core::bail!("expected some cross-attn"),
+            None => hanzo_ml::bail!("expected some cross-attn"),
         };
         let intermediate_output = self.intermediate.forward(&attention_output)?;
         self.output.forward(&intermediate_output, &attention_output)

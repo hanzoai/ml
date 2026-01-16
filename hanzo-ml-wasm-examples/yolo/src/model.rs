@@ -1,4 +1,4 @@
-use hanzo_ml_core::{DType, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
 use hanzo_nn::{
     batch_norm, conv2d, conv2d_no_bias, BatchNorm, Conv2d, Conv2dConfig, Module, VarBuilder,
 };
@@ -71,7 +71,7 @@ impl Upsample {
 }
 
 impl Module for Upsample {
-    fn forward(&self, xs: &Tensor) -> hanzo_ml_core::Result<Tensor> {
+    fn forward(&self, xs: &Tensor) -> hanzo_ml::Result<Tensor> {
         let (_b_size, _channels, h, w) = xs.dims4()?;
         xs.upsample_nearest2d(self.scale_factor * h, self.scale_factor * w)
     }
@@ -822,7 +822,7 @@ pub fn report_pose(
 ) -> Result<Vec<Bbox>> {
     let (pred_size, npreds) = pred.dims2()?;
     if pred_size != 17 * 3 + 4 + 1 {
-        hanzo_ml_core::bail!("unexpected pred-size {pred_size}");
+        hanzo_ml::bail!("unexpected pred-size {pred_size}");
     }
     let mut bboxes = vec![];
     // Extract the bounding boxes for which confidence is above the threshold.

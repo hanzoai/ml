@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::Error as E;
 use clap::{Parser, ValueEnum};
 
-use hanzo_ml_core::{DType, Tensor};
+use hanzo_ml::{DType, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::{trocr, vit};

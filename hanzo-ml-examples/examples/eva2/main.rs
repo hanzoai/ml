@@ -9,7 +9,7 @@ extern crate accelerate_src;
 
 use clap::Parser;
 
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::models::eva2;
 
@@ -18,7 +18,7 @@ use hanzo_transformers::models::eva2;
 pub fn load_image448_openai_norm<P: AsRef<std::path::Path>>(p: P) -> Result<Tensor> {
     let img = image::ImageReader::open(p)?
         .decode()
-        .map_err(hanzo_ml_core::Error::wrap)?
+        .map_err(hanzo_ml::Error::wrap)?
         .resize_to_fill(448, 448, image::imageops::FilterType::Triangle);
     let img = img.to_rgb8();
     let data = img.into_raw();
@@ -27,7 +27,7 @@ pub fn load_image448_openai_norm<P: AsRef<std::path::Path>>(p: P) -> Result<Tens
         Tensor::new(&[0.48145466f32, 0.4578275, 0.40821073], &Device::Cpu)?.reshape((3, 1, 1))?;
     let std = Tensor::new(&[0.26862954f32, 0.261_302_6, 0.275_777_1], &Device::Cpu)?
         .reshape((3, 1, 1))?;
-    (data.to_dtype(hanzo_ml_core::DType::F32)? / 255.)?
+    (data.to_dtype(hanzo_ml::DType::F32)? / 255.)?
         .broadcast_sub(&mean)?
         .broadcast_div(&std)
 }

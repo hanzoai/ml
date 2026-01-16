@@ -1,4 +1,4 @@
-use hanzo_ml_core::{IndexOp, Result, Tensor};
+use hanzo_ml::{IndexOp, Result, Tensor};
 use hanzo_nn::{Module, VarBuilder};
 
 use super::transformer::TwoWayTransformer;

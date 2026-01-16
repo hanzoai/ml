@@ -1,5 +1,5 @@
 //! Vectorized version of the gym environment.
-use hanzo_ml_core::{DType, Device, Result, Tensor};
+use hanzo_ml::{DType, Device, Result, Tensor};
 use pyo3::prelude::*;
 
 #[allow(unused)]
@@ -17,8 +17,8 @@ pub struct VecGymEnv {
     observation_space: Vec<usize>,
 }
 
-fn w(res: PyErr) -> hanzo_ml_core::Error {
-    hanzo_ml_core::Error::wrap(res)
+fn w(res: PyErr) -> hanzo_ml::Error {
+    hanzo_ml::Error::wrap(res)
 }
 
 #[allow(unused)]

@@ -15,7 +15,7 @@
 //!
 
 use crate::models::{gemma, siglip};
-use hanzo_ml_core::{Module, Result, Tensor};
+use hanzo_ml::{Module, Result, Tensor};
 use hanzo_nn::{linear, Linear, VarBuilder};
 
 #[derive(serde::Deserialize, Clone, Debug)]

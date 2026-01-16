@@ -13,7 +13,7 @@ use hanzo_transformers::models::phi::{Config as PhiConfig, Model as Phi};
 use hanzo_transformers::models::phi3::{Config as Phi3Config, Model as Phi3};
 use hanzo_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
 
-use hanzo_ml_core::{DType, Device, IndexOp, Tensor};
+use hanzo_ml::{DType, Device, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -237,10 +237,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",

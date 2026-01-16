@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use hanzo_ml_core::{DType, IndexOp, Tensor};
+use hanzo_ml::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::mimi::{Config, Model};
 use clap::{Parser, ValueEnum};
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
 
     let codes = match args.action {
         Action::CodeToAudio => {
-            let codes = hanzo_ml_core::safetensors::load(args.in_file, &device)?;
+            let codes = hanzo_ml::safetensors::load(args.in_file, &device)?;
             codes.get("codes").expect("no codes in input file").clone()
         }
         Action::AudioToCode | Action::AudioToAudio => {
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
                         let code_chunk = model.encode(&pcm)?;
                         code_chunks.push(code_chunk)
                     }
-                    Tensor::cat(&code_chunks, hanzo_ml_core::D::Minus1)?
+                    Tensor::cat(&code_chunks, hanzo_ml::D::Minus1)?
                 }
                 None => {
                     let pcm_len = pcm.len();
@@ -121,17 +121,17 @@ fn main() -> Result<()> {
         Action::AudioToAudio | Action::CodeToAudio => {
             let pcm = match args.streaming {
                 Some(chunk_size) => {
-                    let seq_len = codes.dim(hanzo_ml_core::D::Minus1)?;
+                    let seq_len = codes.dim(hanzo_ml::D::Minus1)?;
                     let mut pcm_chunks = vec![];
                     for chunk_start in (0..seq_len).step_by(chunk_size) {
                         let chunk_len = usize::min(chunk_size, seq_len - chunk_start);
-                        let codes = codes.narrow(hanzo_ml_core::D::Minus1, chunk_start, chunk_len)?;
+                        let codes = codes.narrow(hanzo_ml::D::Minus1, chunk_start, chunk_len)?;
                         let pcm = model.decode_step(&codes.into())?;
                         if let Some(pcm) = pcm.as_option() {
                             pcm_chunks.push(pcm.clone())
                         }
                     }
-                    Tensor::cat(&pcm_chunks, hanzo_ml_core::D::Minus1)?
+                    Tensor::cat(&pcm_chunks, hanzo_ml::D::Minus1)?
                 }
                 None => model.decode(&codes)?,
             };

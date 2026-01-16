@@ -4,7 +4,7 @@
 //! - [Github](https://github.com/metavoiceio/metavoice-src)
 //! - [Website](https://studio.metavoice.ai/)
 
-use hanzo_ml_core::{DType, Device, Error as E, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Error as E, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{embedding, linear_b, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 // Equivalent to torch.repeat_interleave
@@ -128,7 +128,7 @@ pub mod speaker_encoder {
             let (wav_slices, mel_slices) = self.compute_partial_slices(wav.len(), rate, min_c);
             let max_wave_length = match wav_slices.last() {
                 Some(v) => v.1,
-                None => hanzo_ml_core::bail!("empty wav slices"),
+                None => hanzo_ml::bail!("empty wav slices"),
             };
             let wav = if max_wave_length > wav.len() {
                 let mut wav = wav.to_vec();
@@ -193,20 +193,20 @@ pub mod tokenizers {
     impl BPE {
         pub fn from_json(json: &serde_json::Value, end_of_text: usize) -> Result<Self> {
             let json = match json.as_object() {
-                None => hanzo_ml_core::bail!("json value is not an object"),
+                None => hanzo_ml::bail!("json value is not an object"),
                 Some(json) => json,
             };
             let re = match json.get("pat_str") {
-                None => hanzo_ml_core::bail!("json object has no pat_str field"),
+                None => hanzo_ml::bail!("json object has no pat_str field"),
                 Some(pat_str) => match pat_str.as_str() {
-                    None => hanzo_ml_core::bail!("pat_str field is not a string"),
+                    None => hanzo_ml::bail!("pat_str field is not a string"),
                     Some(pat_str) => fancy_regex::Regex::new(pat_str).map_err(E::wrap)?,
                 },
             };
             let offset = match json.get("offset") {
-                None => hanzo_ml_core::bail!("json object has no offset field"),
+                None => hanzo_ml::bail!("json object has no offset field"),
                 Some(offset) => match offset.as_u64() {
-                    None => hanzo_ml_core::bail!("offset field is not a positive int"),
+                    None => hanzo_ml::bail!("offset field is not a positive int"),
                     Some(offset) => offset as usize,
                 },
             };
@@ -215,15 +215,15 @@ pub mod tokenizers {
                 ranks.insert(vec![id], id as u32);
             }
             let mergeable_ranks = match json.get("mergeable_ranks") {
-                None => hanzo_ml_core::bail!("json object has no mergeable_ranks field"),
+                None => hanzo_ml::bail!("json object has no mergeable_ranks field"),
                 Some(mr) => match mr.as_object() {
-                    None => hanzo_ml_core::bail!("mergeable_ranks is not an object"),
+                    None => hanzo_ml::bail!("mergeable_ranks is not an object"),
                     Some(mr) => mr,
                 },
             };
             for (key, value) in mergeable_ranks.iter() {
                 let value = match value.as_u64() {
-                    None => hanzo_ml_core::bail!("mergeable_ranks '{key}' is not a u64"),
+                    None => hanzo_ml::bail!("mergeable_ranks '{key}' is not a u64"),
                     Some(value) => value as u32,
                 };
                 if value < 256 {
@@ -443,10 +443,10 @@ pub mod gpt {
             // The different attention variants are likely to be identical but still we only accept
             // TorchAttn for now.
             if cfg.attn_kernel_type != AttnKernelType::TorchAttn {
-                hanzo_ml_core::bail!("only TorchAttn is supported")
+                hanzo_ml::bail!("only TorchAttn is supported")
             }
             if cfg.kv_cache_enabled {
-                hanzo_ml_core::bail!("kv_cache_enabled=true is not supported")
+                hanzo_ml::bail!("kv_cache_enabled=true is not supported")
             }
             let c_attn = linear_b(cfg.n_embd, cfg.n_embd * 3, cfg.bias, vb.pp("c_attn"))?;
             let c_proj = linear_b(cfg.n_embd, cfg.n_embd, cfg.bias, vb.pp("c_proj"))?;
@@ -512,7 +512,7 @@ pub mod gpt {
                 NonLinearityType::Swiglu => {
                     let hidden_dim = (2 * hidden_dim) / 3;
                     let swiglu_multiple_of = match cfg.swiglu_multiple_of {
-                        None => hanzo_ml_core::bail!("swiglu-multiple-of has to be set"),
+                        None => hanzo_ml::bail!("swiglu-multiple-of has to be set"),
                         Some(smo) => smo,
                     };
                     let hidden_dim = swiglu_multiple_of * (hidden_dim + swiglu_multiple_of - 1)

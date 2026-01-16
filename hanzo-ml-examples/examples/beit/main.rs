@@ -9,7 +9,7 @@ extern crate accelerate_src;
 
 use clap::Parser;
 
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::models::beit;
 
@@ -18,14 +18,14 @@ use hanzo_transformers::models::beit;
 pub fn load_image384_beit_norm<P: AsRef<std::path::Path>>(p: P) -> Result<Tensor> {
     let img = image::ImageReader::open(p)?
         .decode()
-        .map_err(hanzo_ml_core::Error::wrap)?
+        .map_err(hanzo_ml::Error::wrap)?
         .resize_to_fill(384, 384, image::imageops::FilterType::Triangle);
     let img = img.to_rgb8();
     let data = img.into_raw();
     let data = Tensor::from_vec(data, (384, 384, 3), &Device::Cpu)?.permute((2, 0, 1))?;
     let mean = Tensor::new(&[0.5f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
     let std = Tensor::new(&[0.5f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
-    (data.to_dtype(hanzo_ml_core::DType::F32)? / 255.)?
+    (data.to_dtype(hanzo_ml::DType::F32)? / 255.)?
         .broadcast_sub(&mean)?
         .broadcast_div(&std)
 }

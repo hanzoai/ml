@@ -1,7 +1,7 @@
 //! Distributed inference support
 
 use anyhow::Result;
-use hanzo_ml_core::Tensor;
+use hanzo_ml::Tensor;
 
 pub struct DistributedInference {
     nodes: Vec<String>,

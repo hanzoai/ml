@@ -2,7 +2,7 @@
 //!
 //! The files can be obtained from the following link:
 //! <http://yann.lecun.com/exdb/mnist/>
-use hanzo_ml_core::{DType, Device, Error, Result, Tensor};
+use hanzo_ml::{DType, Device, Error, Result, Tensor};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use std::fs::File;

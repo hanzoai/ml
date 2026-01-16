@@ -60,7 +60,7 @@
 //! ```
 
 use crate::models::with_tracing::Embedding;
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;

@@ -2,7 +2,7 @@
 
 use crate::InferenceModel;
 use anyhow::Result;
-use hanzo_ml_core::Tensor;
+use hanzo_ml::Tensor;
 
 pub struct Pipeline {
     models: Vec<Box<dyn InferenceModel>>,

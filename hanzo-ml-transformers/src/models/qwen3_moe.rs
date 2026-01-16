@@ -2,7 +2,7 @@ use crate::models::{
     qwen3::{Config as Qwen3Config, Qwen3Attention, Qwen3MLP, Qwen3RotaryEmbedding},
     with_tracing::{linear_no_bias, Linear, RmsNorm},
 };
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{Activation, VarBuilder};
 use std::sync::Arc;
 

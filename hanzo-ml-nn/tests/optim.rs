@@ -4,10 +4,10 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo_ml_core::test_utils::{to_vec0_round, to_vec2_round};
+use hanzo_ml::test_utils::{to_vec0_round, to_vec2_round};
 
 use anyhow::Result;
-use hanzo_ml_core::{DType, Device, Tensor, Var};
+use hanzo_ml::{DType, Device, Tensor, Var};
 use hanzo_nn::{AdamW, Linear, Module, Optimizer, ParamsAdamW, SGD};
 
 #[test]

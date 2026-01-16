@@ -5,7 +5,7 @@
 //! - 📝 [Arxiv](https://arxiv.org/abs/2201.09792)
 //! - 💻 [Github](https://github.com/locuslab/convmixer)
 //!
-use hanzo_ml_core::Result;
+use hanzo_ml::Result;
 use hanzo_nn::{batch_norm, Conv2dConfig, Module, VarBuilder};
 
 #[allow(clippy::many_single_char_names)]

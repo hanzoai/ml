@@ -8,8 +8,8 @@
 //!
 use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
-use hanzo_ml_core::quantized::{gguf_file, QTensor};
-use hanzo_ml_core::{DType, Device, Result, Tensor};
+use hanzo_ml::quantized::{gguf_file, QTensor};
+use hanzo_ml::{DType, Device, Result, Tensor};
 use hanzo_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -315,7 +315,7 @@ impl ModelWeights {
     ) -> Result<Self> {
         let mut gg = Gguf::new(ct, reader, device.clone());
         let md_get = |s: &str| match gg.metadata().get(s) {
-            None => hanzo_ml_core::bail!("cannot find {s} in metadata"),
+            None => hanzo_ml::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 

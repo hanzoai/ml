@@ -4,7 +4,7 @@
 //! hanzo-node, and other components that need AI inference.
 
 use anyhow::Result;
-use hanzo_ml_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 use std::path::Path;
 
 pub mod models;

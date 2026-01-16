@@ -16,7 +16,7 @@
 
 use super::fastvit;
 use super::openclip::text_model;
-use hanzo_ml_core::{Result, Tensor, D};
+use hanzo_ml::{Result, Tensor, D};
 use hanzo_nn::{Func, VarBuilder};
 
 #[derive(Clone, Debug)]

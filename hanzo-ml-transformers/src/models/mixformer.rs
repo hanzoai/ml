@@ -9,7 +9,7 @@ use crate::models::with_tracing::{linear, Embedding as E, Linear};
 /// MixFormer model.
 /// https://huggingface.co/microsoft/phi-1_5
 /// https://arxiv.org/abs/2309.05463
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 
@@ -171,7 +171,7 @@ impl RotaryEmbedding {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (_b_size, seqlen, three, _, _headdim) = qkv.dims5()?;
         if three != 3 {
-            hanzo_ml_core::bail!("unexpected shape for qkv {:?}", qkv.shape())
+            hanzo_ml::bail!("unexpected shape for qkv {:?}", qkv.shape())
         }
         let (_rotary_seqlen, rotary_dim) = self.cos.dims2()?;
         let rotary_dim = rotary_dim * 2;

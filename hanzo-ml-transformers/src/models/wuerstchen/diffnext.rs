@@ -1,5 +1,5 @@
 use super::common::{AttnBlock, GlobalResponseNorm, LayerNormNoWeights, TimestepBlock, WLayerNorm};
-use hanzo_ml_core::{DType, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Module, Result, Tensor, D};
 use hanzo_nn::VarBuilder;
 
 #[derive(Debug)]

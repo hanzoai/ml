@@ -2,7 +2,7 @@ use crate::{
     models::with_tracing::{linear_b, linear_no_bias, Linear, RmsNorm},
     utils::repeat_kv,
 };
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor};
+use hanzo_ml::{DType, Device, Module, Result, Tensor};
 use hanzo_nn::{kv_cache::KvCache, Activation, VarBuilder};
 use std::sync::Arc;
 
@@ -118,7 +118,7 @@ impl Qwen3Attention {
         vb: VarBuilder,
     ) -> Result<Self> {
         if cfg.use_sliding_window {
-            hanzo_ml_core::bail!("sliding window is not suppored")
+            hanzo_ml::bail!("sliding window is not suppored")
         }
 
         let head_dim = cfg.head_dim;

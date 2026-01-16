@@ -8,7 +8,7 @@ use hanzo_transformers::models::distilbert::{
 };
 
 use anyhow::{Context, Error as E, Result};
-use hanzo_ml_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 use hanzo_nn::VarBuilder;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};

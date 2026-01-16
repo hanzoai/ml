@@ -10,7 +10,7 @@ use clap::Parser;
 use hanzo_transformers::models::quantized_recurrent_gemma::Model as QModel;
 use hanzo_transformers::models::recurrent_gemma::{Config, Model as BModel};
 
-use hanzo_ml_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -23,7 +23,7 @@ enum Model {
 }
 
 impl Model {
-    fn forward(&mut self, xs: &Tensor, pos: usize) -> hanzo_ml_core::Result<Tensor> {
+    fn forward(&mut self, xs: &Tensor, pos: usize) -> hanzo_ml::Result<Tensor> {
         match self {
             Self::B(m) => m.forward(xs, pos),
             Self::Q(m) => m.forward(xs, pos),
@@ -229,10 +229,10 @@ fn main() -> Result<()> {
     };
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        hanzo_ml_core::utils::with_avx(),
-        hanzo_ml_core::utils::with_neon(),
-        hanzo_ml_core::utils::with_simd128(),
-        hanzo_ml_core::utils::with_f16c()
+        hanzo_ml::utils::with_avx(),
+        hanzo_ml::utils::with_neon(),
+        hanzo_ml::utils::with_simd128(),
+        hanzo_ml::utils::with_f16c()
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",

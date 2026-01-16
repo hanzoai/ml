@@ -9,7 +9,7 @@ use super::{
     },
     utils::interp,
 };
-use hanzo_ml_core::{bail, Error, Result, Tensor};
+use hanzo_ml::{bail, Error, Result, Tensor};
 
 /// The configuration for the EulerAncestral Discrete scheduler.
 #[derive(Debug, Clone, Copy)]

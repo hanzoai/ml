@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Module, Result, Tensor};
+use hanzo_ml::{Module, Result, Tensor};
 use hanzo_nn::VarBuilder;
 
 #[derive(Debug, Clone)]
@@ -101,7 +101,7 @@ pub fn conv2d(
 // QMatMul wrapper adding some tracing.
 #[derive(Clone)]
 pub struct QMatMul {
-    inner: hanzo_ml_core::quantized::QMatMul,
+    inner: hanzo_ml::quantized::QMatMul,
     span: tracing::Span,
 }
 
@@ -112,13 +112,13 @@ impl QMatMul {
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
         let ws = vb.get((in_dim, out_dim), "weight")?;
-        let inner = hanzo_ml_core::quantized::QMatMul::from_arc(ws)?;
+        let inner = hanzo_ml::quantized::QMatMul::from_arc(ws)?;
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Ok(Self { inner, span })
     }
 
-    pub fn from_weights(ws: std::sync::Arc<hanzo_ml_core::quantized::QTensor>) -> Result<Self> {
-        let inner = hanzo_ml_core::quantized::QMatMul::from_arc(ws)?;
+    pub fn from_weights(ws: std::sync::Arc<hanzo_ml::quantized::QTensor>) -> Result<Self> {
+        let inner = hanzo_ml::quantized::QMatMul::from_arc(ws)?;
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Ok(Self { inner, span })
     }

@@ -1,5 +1,5 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use hanzo_ml_core::{DType, Device, Module, Tensor};
+use hanzo_ml::{DType, Device, Module, Tensor};
 use hanzo_nn::{Conv2d, Conv2dConfig};
 use criterion::{black_box, criterion_group, Criterion};
 use std::time::Instant;

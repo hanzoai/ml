@@ -34,7 +34,7 @@ pub struct Config {
     pub suppress_tokens: Vec<u32>,
 }
 
-pub const DTYPE: hanzo_ml_core::DType = hanzo_ml_core::DType::F32;
+pub const DTYPE: hanzo_ml::DType = hanzo_ml::DType::F32;
 
 // Audio parameters.
 pub const SAMPLE_RATE: usize = 16000;
