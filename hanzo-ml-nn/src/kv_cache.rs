@@ -1,6 +1,6 @@
 //! Cache Implementations
 //!
-use hanzo::{DType, Device, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Result, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct Cache {
@@ -634,7 +634,7 @@ impl ScatteredCacheBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hanzo::IndexOp;
+    use hanzo_ml_core::IndexOp;
 
     #[test]
     fn test_scattered_kv_cache() -> Result<()> {

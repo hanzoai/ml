@@ -1,4 +1,4 @@
-use hanzo::Result;
+use hanzo_ml_core::Result;
 use prost::Message;
 
 pub mod onnx {

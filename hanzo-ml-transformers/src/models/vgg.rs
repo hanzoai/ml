@@ -13,7 +13,7 @@
 //! - [Very Deep Convolutional Networks for Large-Scale Image Recognition](https://arxiv.org/abs/1409.1556)
 //!
 
-use hanzo::{ModuleT, Result, Tensor};
+use hanzo_ml_core::{ModuleT, Result, Tensor};
 use hanzo_nn::{FuncT, VarBuilder};
 
 // Enum representing the different VGG models

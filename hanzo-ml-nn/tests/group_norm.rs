@@ -25,8 +25,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use hanzo::test_utils::to_vec3_round;
-use hanzo::{Device, Tensor};
+use hanzo_ml_core::test_utils::to_vec3_round;
+use hanzo_ml_core::{Device, Tensor};
 use hanzo_nn::{GroupNorm, Module};
 
 #[test]

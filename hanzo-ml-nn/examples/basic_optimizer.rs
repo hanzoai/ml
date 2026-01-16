@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo::{DType, Device, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Result, Tensor};
 use hanzo_nn::{linear, AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 
 fn gen_data() -> Result<(Tensor, Tensor)> {

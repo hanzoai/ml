@@ -4,7 +4,7 @@
 //! from a pre-trained checkpoint, e.g. using `VarBuilder::from_mmaped_safetensors`, or initialized
 //! for training, e.g. using `VarBuilder::from_varmap`.
 use crate::VarMap;
-use hanzo::{safetensors::Load, DType, Device, Error, Result, Shape, Tensor};
+use hanzo_ml_core::{safetensors::Load, DType, Device, Error, Result, Shape, Tensor};
 use safetensors::{slice::IndexOp, tensor::SafeTensors};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -559,7 +559,7 @@ impl<'a> VarBuilder<'a> {
     /// passing the new names to the inner VarBuilder.
     ///
     /// ```rust
-    /// use hanzo::{Tensor, DType, Device};
+    /// use hanzo_ml_core::{Tensor, DType, Device};
     ///
     /// let a = Tensor::arange(0f32, 6f32, &Device::Cpu)?.reshape((2, 3))?;
     /// let tensors: std::collections::HashMap<_, _> = [

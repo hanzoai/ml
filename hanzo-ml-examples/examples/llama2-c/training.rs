@@ -1,5 +1,5 @@
 use crate::model::{Cache, Config, Llama};
-use hanzo::{DType, Device, Result};
+use hanzo_ml_core::{DType, Device, Result};
 use hanzo_datasets::nlp::tinystories::{Dataset, DatasetRandomIter};
 use hanzo_nn::Optimizer;
 

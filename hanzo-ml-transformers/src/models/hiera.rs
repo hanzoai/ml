@@ -4,7 +4,7 @@
 //! - 💻 [Hiera](https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/hiera.py)
 //! - 📝 [Paper](https://arxiv.org/abs/2306.00989). Hiera: A Hierarchical Vision Transformer without the Bells-and-Whistles
 
-use hanzo::{Result, D};
+use hanzo_ml_core::{Result, D};
 use hanzo_nn::{conv2d, layer_norm, linear, ops::softmax, Conv2dConfig, Func, VarBuilder};
 
 #[derive(Debug, Clone, serde::Deserialize)]

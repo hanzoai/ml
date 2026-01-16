@@ -8,7 +8,7 @@ use hanzo_transformers::object_detection::{non_maximum_suppression, Bbox};
 mod darknet;
 
 use anyhow::Result;
-use hanzo::{DType, Device, Tensor};
+use hanzo_ml_core::{DType, Device, Tensor};
 use hanzo_nn::{Module, VarBuilder};
 use clap::Parser;
 use image::{DynamicImage, ImageBuffer};

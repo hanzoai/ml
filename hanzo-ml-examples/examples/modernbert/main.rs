@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
-use hanzo::{Device, Tensor};
+use hanzo_ml_core::{Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::modernbert;
 use clap::{Parser, ValueEnum};

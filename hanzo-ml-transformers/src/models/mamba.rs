@@ -6,7 +6,7 @@
 //! A fast implementation of mamba for inference only.
 //! Based on Laurent Mazare's rust implementation: [mamba.rs](https://github.com/LaurentMazare/mamba.rs)
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
-use hanzo::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{RmsNorm, VarBuilder};
 
 const D_CONV: usize = 4;

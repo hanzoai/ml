@@ -5,7 +5,7 @@
 /// An efficient neural codec for compressing/decompressing audio
 ///
 use crate::models::encodec;
-use hanzo::{IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{IndexOp, Result, Tensor, D};
 use hanzo_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, VarBuilder};
 
 #[derive(serde::Deserialize, Debug, Clone)]

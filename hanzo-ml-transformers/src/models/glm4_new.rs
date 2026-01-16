@@ -3,7 +3,7 @@ use crate::{
     models::with_tracing::{linear_b, linear_no_bias, Linear, RmsNorm},
     utils::repeat_kv,
 };
-use hanzo::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{kv_cache::KvCache, Activation, VarBuilder};
 use std::sync::Arc;
 

@@ -13,7 +13,7 @@
 
 use crate::quantized_nn::{layer_norm, linear, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use hanzo::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::Activation;
 
 pub use crate::models::mixformer::Config;

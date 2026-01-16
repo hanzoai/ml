@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo::{Device, Result, Tensor};
+use hanzo_ml_core::{Device, Result, Tensor};
 
 #[test]
 fn kv_cache() -> Result<()> {

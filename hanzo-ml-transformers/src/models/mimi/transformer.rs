@@ -2,7 +2,7 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 
-use hanzo::{DType, Device, IndexOp, Module, Result, StreamTensor, StreamingModule, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, StreamTensor, StreamingModule, Tensor, D};
 use hanzo_nn::{linear_no_bias, Linear, VarBuilder};
 use std::sync::Arc;
 

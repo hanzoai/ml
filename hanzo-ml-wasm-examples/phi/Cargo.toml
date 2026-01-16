@@ -9,7 +9,7 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-hanzo = { workspace = true }
+hanzo-ml = { workspace = true }
 hanzo-ml-nn = { workspace = true }
 hanzo-ml-transformers = { workspace = true }
 tokenizers = { workspace = true, features = ["unstable_wasm"] }

@@ -1,8 +1,8 @@
 mod ffi;
 
-use hanzo::backend::BackendStorage;
-use hanzo::cuda_backend::cudarc::driver::DevicePtr;
-use hanzo::{CpuStorage, DType, Layout, Result, Shape, Tensor};
+use hanzo_ml_core::backend::BackendStorage;
+use hanzo_ml_core::cuda_backend::cudarc::driver::DevicePtr;
+use hanzo_ml_core::{CpuStorage, DType, Layout, Result, Shape, Tensor};
 use half::{bf16, f16};
 
 pub struct FlashAttn {

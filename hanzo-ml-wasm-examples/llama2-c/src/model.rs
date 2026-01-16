@@ -1,4 +1,4 @@
-use hanzo::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{
     embedding, linear_no_bias as linear, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder,
 };

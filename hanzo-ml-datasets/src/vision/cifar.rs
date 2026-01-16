@@ -4,7 +4,7 @@
 //! <https://www.cs.toronto.edu/~kriz/cifar.html>
 //! The binary version of the dataset is used.
 use crate::vision::Dataset;
-use hanzo::{DType, Device, Error, Result, Tensor};
+use hanzo_ml_core::{DType, Device, Error, Result, Tensor};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use std::fs::File;

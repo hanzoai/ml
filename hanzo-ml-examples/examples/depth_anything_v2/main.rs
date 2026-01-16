@@ -9,8 +9,8 @@ extern crate intel_mkl_src;
 use clap::Parser;
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
-use hanzo::DType::{F32, U8};
-use hanzo::{DType, Device, Module, Result, Tensor};
+use hanzo_ml_core::DType::{F32, U8};
+use hanzo_ml_core::{DType, Device, Module, Result, Tensor};
 use hanzo_examples::{load_image, load_image_and_resize, save_image};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::depth_anything_v2::{DepthAnythingV2, DepthAnythingV2Config};

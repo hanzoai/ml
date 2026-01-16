@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 
 use anyhow::{Error as E, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
-use hanzo::{IndexOp, Tensor};
+use hanzo_ml_core::{IndexOp, Tensor};
 use hanzo_transformers::generation::LogitsProcessor;
 use std::io::Write;
 use tokenizers::Tokenizer;

@@ -3,7 +3,7 @@
 //!
 //! Noise schedulers can be used to set the trade-off between
 //! inference speed and quality.
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 
 pub trait SchedulerConfig: std::fmt::Debug + Send + Sync {
     fn build(&self, inference_steps: usize) -> Result<Box<dyn Scheduler>>;

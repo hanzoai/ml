@@ -1,5 +1,5 @@
 //! Wrappers around the Python API of Gymnasium (the new version of OpenAI gym)
-use hanzo::{Device, Result, Tensor};
+use hanzo_ml_core::{Device, Result, Tensor};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 

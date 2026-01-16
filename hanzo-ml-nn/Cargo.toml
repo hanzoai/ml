@@ -31,11 +31,11 @@ criterion = { workspace = true }
 
 [features]
 default = []
-accelerate = ["dep:accelerate-src", "hanzo/accelerate"]
-cuda = ["hanzo/cuda"]
-cudnn = ["hanzo/cudnn"]
-mkl = ["dep:intel-mkl-src", "hanzo/mkl"]
-metal = ["hanzo/metal", "dep:hanzo-ml-metal-kernels", "dep:metal"]
+accelerate = ["dep:accelerate-src", "hanzo-ml/accelerate"]
+cuda = ["hanzo-ml/cuda"]
+cudnn = ["hanzo-ml/cudnn"]
+mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl"]
+metal = ["hanzo-ml/metal", "dep:hanzo-ml-metal-kernels", "dep:metal"]
 
 [[bench]]
 name = "bench_main"

@@ -24,4 +24,4 @@ hanzo-ml-nn = { path = "../hanzo-ml-nn", features = ["cuda"] }
 
 [features]
 default = []
-cudnn = ["hanzo/cudnn"]
+cudnn = ["hanzo-ml/cudnn"]

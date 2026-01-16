@@ -1,4 +1,4 @@
-use hanzo::{bail, DType, Module, Result, Tensor};
+use hanzo_ml_core::{bail, DType, Module, Result, Tensor};
 use hanzo_nn as nn;
 
 pub struct PatchEmbedder {

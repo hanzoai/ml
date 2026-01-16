@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hanzo::{bail, Context, DType, Device, Module, Result, Tensor, D};
+use hanzo_ml_core::{bail, Context, DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{
     conv1d, embedding, layer_norm, Conv1d, Conv1dConfig, Embedding, LayerNorm, VarBuilder,
 };

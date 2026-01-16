@@ -8,7 +8,7 @@ use hanzo_transformers::models::stable_diffusion;
 use hanzo_transformers::models::wuerstchen;
 
 use anyhow::{Error as E, Result};
-use hanzo::{DType, Device, IndexOp, Tensor};
+use hanzo_ml_core::{DType, Device, IndexOp, Tensor};
 use clap::Parser;
 use tokenizers::Tokenizer;
 

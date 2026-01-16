@@ -1,6 +1,6 @@
 use std::cmp::min;
 
-use hanzo::{bail, DType, Device, Result, Tensor};
+use hanzo_ml_core::{bail, DType, Device, Result, Tensor};
 use hanzo_transformers::models::llava::{
     config::{HFPreProcessorConfig, LLaVAConfig},
     utils::select_best_resolution,

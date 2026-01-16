@@ -4,8 +4,8 @@ pub mod coco_classes;
 pub mod imagenet;
 pub mod token_output_stream;
 pub mod wav;
-use hanzo::utils::{cuda_is_available, metal_is_available};
-use hanzo::{Device, Result, Tensor};
+use hanzo_ml_core::utils::{cuda_is_available, metal_is_available};
+use hanzo_ml_core::{Device, Result, Tensor};
 
 pub fn device(cpu: bool) -> Result<Device> {
     if cpu {

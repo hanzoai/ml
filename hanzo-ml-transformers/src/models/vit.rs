@@ -16,7 +16,7 @@
 //!
 
 use crate::models::with_tracing::{conv2d, linear, linear_no_bias, Conv2d, Linear};
-use hanzo::{IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
 
 // https://github.com/huggingface/transformers/blob/main/src/transformers/models/vit/configuration_vit.py

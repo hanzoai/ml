@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use hanzo::{DType, IndexOp, Tensor};
+use hanzo_ml_core::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::snac::{Config, Model};
 use clap::{Parser, ValueEnum};

@@ -1,6 +1,6 @@
 //! Apply penalty and repeat_kv
 
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 
 pub fn apply_repeat_penalty(logits: &Tensor, penalty: f32, context: &[u32]) -> Result<Tensor> {
     let device = logits.device();

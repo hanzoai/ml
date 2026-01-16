@@ -19,9 +19,9 @@
 use std::collections::HashMap;
 
 use crate::quantized_nn::RmsNorm;
-use hanzo::quantized::QTensor;
-use hanzo::quantized::{ggml_file, gguf_file};
-use hanzo::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml_core::quantized::QTensor;
+use hanzo_ml_core::quantized::{ggml_file, gguf_file};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 4096;

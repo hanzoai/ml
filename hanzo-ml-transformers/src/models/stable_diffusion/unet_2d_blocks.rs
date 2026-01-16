@@ -5,7 +5,7 @@ use super::attention::{
 };
 use super::resnet::{ResnetBlock2D, ResnetBlock2DConfig};
 use crate::models::with_tracing::{conv2d, Conv2d};
-use hanzo::{Module, Result, Tensor, D};
+use hanzo_ml_core::{Module, Result, Tensor, D};
 use hanzo_nn as nn;
 
 #[derive(Debug)]

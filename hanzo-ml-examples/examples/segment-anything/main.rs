@@ -7,7 +7,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo::DType;
+use hanzo_ml_core::DType;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::segment_anything::sam;
 use clap::Parser;

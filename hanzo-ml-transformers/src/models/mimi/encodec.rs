@@ -3,7 +3,7 @@
 // LICENSE file in the root directory of this source tree.
 
 use super::{conv, quantization, seanet, transformer};
-use hanzo::{DType, Device, Module, Result, StreamTensor, StreamingModule, Tensor};
+use hanzo_ml_core::{DType, Device, Module, Result, StreamTensor, StreamingModule, Tensor};
 use hanzo_nn::VarBuilder;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

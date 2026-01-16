@@ -5,7 +5,7 @@
 //! Implementation based on Hugging Face's [transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py)
 
 use super::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
-use hanzo::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
 use std::{collections::HashMap, f32::consts::PI};
 

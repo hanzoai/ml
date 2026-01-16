@@ -14,7 +14,7 @@
 //! - [OLMo Paper](https://allenai.org/olmo)
 //!
 
-use hanzo::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{linear_b, linear_no_bias, Activation, LayerNorm, Linear, VarBuilder};
 use std::sync::Arc;
 

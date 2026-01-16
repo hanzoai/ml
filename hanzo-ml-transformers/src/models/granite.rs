@@ -6,7 +6,7 @@
 //! Based on implementation from [Nod.ai](https://github.com/nod-ai/granite)
 
 use super::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
-use hanzo::{DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
 use std::{collections::HashMap, f32::consts::PI};
 

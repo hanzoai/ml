@@ -1,6 +1,6 @@
 use crate::languages::LANGUAGES;
 use anyhow::Error as E;
-use hanzo::{safetensors::Load, DType, Device, IndexOp, Tensor, D};
+use hanzo_ml_core::{safetensors::Load, DType, Device, IndexOp, Tensor, D};
 use hanzo_nn::{ops::softmax, VarBuilder};
 pub use hanzo_transformers::models::whisper::{self as m, Config};
 use rand::{distr::Distribution, rngs::StdRng, SeedableRng};

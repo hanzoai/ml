@@ -9,7 +9,7 @@ use clap::Parser;
 
 use hanzo_transformers::models::csm::{Config, Model};
 
-use hanzo::{DType, IndexOp, Tensor};
+use hanzo_ml_core::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;

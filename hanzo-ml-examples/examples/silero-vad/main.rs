@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::Result;
 use clap::Parser;
 
-use hanzo::{DType, Tensor};
+use hanzo_ml_core::{DType, Tensor};
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Which {

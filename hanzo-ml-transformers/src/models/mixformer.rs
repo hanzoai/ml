@@ -9,7 +9,7 @@ use crate::models::with_tracing::{linear, Embedding as E, Linear};
 /// MixFormer model.
 /// https://huggingface.co/microsoft/phi-1_5
 /// https://arxiv.org/abs/2309.05463
-use hanzo::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 

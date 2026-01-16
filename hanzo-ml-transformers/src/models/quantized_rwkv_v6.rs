@@ -20,7 +20,7 @@ use crate::{
     quantized_nn::{layer_norm, linear_no_bias as linear, Embedding, Linear},
     quantized_var_builder::VarBuilder,
 };
-use hanzo::{IndexOp, Result, Tensor};
+use hanzo_ml_core::{IndexOp, Result, Tensor};
 use hanzo_nn::{GroupNorm, LayerNorm, Module};
 
 pub use crate::models::rwkv_v5::{Config, State, Tokenizer};

@@ -1,4 +1,4 @@
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 
 /// Sample according to the Gumbel-Softmax distribution.
 pub fn gumbel_softmax<D: hanzo::shape::Dim>(

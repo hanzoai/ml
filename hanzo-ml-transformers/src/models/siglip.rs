@@ -7,7 +7,7 @@
 //!
 
 use crate::models::clip::div_l2_norm;
-use hanzo::{IndexOp, Module, Result, Tensor, D};
+use hanzo_ml_core::{IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, linear, LayerNorm, Linear, VarBuilder};
 
 fn default_text_vocab_size() -> usize {

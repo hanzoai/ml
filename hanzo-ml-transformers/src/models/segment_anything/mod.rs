@@ -30,7 +30,7 @@
 //! > Original; Prompt with `--point 0.6,0.55`; Prompt with `--point 0.6,0.6 --point 0.6,0.55`
 //!
 pub use crate::models::with_tracing::Linear;
-use hanzo::{Result, Tensor};
+use hanzo_ml_core::{Result, Tensor};
 use hanzo_nn::{Module, VarBuilder};
 
 pub mod image_encoder;

@@ -15,10 +15,10 @@
 //!
 
 use crate::quantized_nn::RmsNorm;
-use hanzo::quantized::gguf_file;
-use hanzo::quantized::QTensor;
-use hanzo::D;
-use hanzo::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml_core::quantized::gguf_file;
+use hanzo_ml_core::quantized::QTensor;
+use hanzo_ml_core::D;
+use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 131072; // Gemma 3 supports 128K context window
