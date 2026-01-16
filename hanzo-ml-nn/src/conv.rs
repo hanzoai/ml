@@ -1,6 +1,6 @@
 //! Convolution Layers.
 use crate::BatchNorm;
-use hanzo_ml_core::{conv::CudnnFwdAlgo, Result, Tensor};
+use hanzo_ml::{conv::CudnnFwdAlgo, Result, Tensor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conv1dConfig {
@@ -209,7 +209,7 @@ impl Conv2d {
                 config: self.config,
             })
         } else {
-            hanzo_ml_core::bail!("batch norm does not have weight_and_bias")
+            hanzo_ml::bail!("batch norm does not have weight_and_bias")
         }
     }
 }

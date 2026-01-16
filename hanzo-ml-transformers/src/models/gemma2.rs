@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{linear_b as linear, Activation, Linear, VarBuilder};
 
 fn default_max_position_embeddings() -> usize {

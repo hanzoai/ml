@@ -9,7 +9,7 @@
 use crate::models::with_tracing::{linear_no_bias, Embedding, Linear};
 /// MPT model used by replit-code-v1_5-3b
 /// https://huggingface.co/replit/replit-code-v1_5-3b/blob/main/modeling_mpt.py
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
 
 // https://huggingface.co/replit/replit-code-v1_5-3b/blob/main/configuration_mpt.py

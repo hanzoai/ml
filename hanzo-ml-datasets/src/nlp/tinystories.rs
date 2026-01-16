@@ -1,6 +1,6 @@
 //! Helper functions for the tinystories dataset. This uses the pre-tokenized version as generated
 //! by the tools from https://github.com/karpathy/llama2.c
-use hanzo_ml_core::{Device, Result, Tensor};
+use hanzo_ml::{Device, Result, Tensor};
 
 pub struct Dataset {
     valid_tokens: Vec<memmap2::Mmap>,
@@ -26,7 +26,7 @@ impl Dataset {
             }
         }
         if bin_files.len() < 2 {
-            hanzo_ml_core::bail!("found less than two bin files in {:?}", dir)
+            hanzo_ml::bail!("found less than two bin files in {:?}", dir)
         }
         bin_files.sort();
         let valid_tokens = mmap_file(&bin_files[0])?;
@@ -117,6 +117,6 @@ impl Iterator for DatasetRandomIter<'_> {
         let tokens = tokens.into_iter().map(|v| v as u32).collect::<Vec<_>>();
         let inputs = Tensor::new(&tokens[..seq_len], &self.device);
         let targets = Tensor::new(&tokens[1..], &self.device);
-        Some(hanzo_ml_core::error::zip(inputs, targets))
+        Some(hanzo_ml::error::zip(inputs, targets))
     }
 }

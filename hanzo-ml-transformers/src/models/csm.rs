@@ -7,7 +7,7 @@
 /// smaller audio decoder that produces Mimi audio codes.
 ///
 use crate::generation::LogitsProcessor;
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::{embedding, linear_b, Embedding, Linear, RmsNorm, VarBuilder};
 use std::sync::Arc;
 

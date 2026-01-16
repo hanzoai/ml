@@ -5,7 +5,7 @@
 //! Based on implementation from [ChatGLM-6B](https://github.com/THUDM/ChatGLM-6B)
 
 use crate::models::with_tracing::{linear_b as linear, Linear};
-use hanzo_ml_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use hanzo_nn::VarBuilder;
 use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
@@ -283,7 +283,7 @@ impl SelfAttention {
     ) -> Result<Tensor> {
         let mixed_x_layer = xs.apply(&self.query_key_value)?;
         if !self.multi_query_attention {
-            hanzo_ml_core::bail!("only multi_query_attention=true is supported")
+            hanzo_ml::bail!("only multi_query_attention=true is supported")
         }
         let hpa = self.hidden_size_per_attention_head;
         let query_layer =
@@ -574,7 +574,7 @@ impl Module for Embedding {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.word_embeddings.forward(xs)?.transpose(0, 1)?; // b,s,h -> s,b,h
         if self.fp32_residual_connection {
-            xs.to_dtype(hanzo_ml_core::DType::F32)
+            xs.to_dtype(hanzo_ml::DType::F32)
         } else {
             xs.contiguous()
         }

@@ -1,6 +1,6 @@
 //! Encoding Utilities. (e.g., one-hot/cold encoding)
 
-use hanzo_ml_core::{bail, DType, Result, Tensor, WithDType};
+use hanzo_ml::{bail, DType, Result, Tensor, WithDType};
 
 /// One-hot/cold encoding.
 ///
@@ -32,10 +32,10 @@ use hanzo_ml_core::{bail, DType, Result, Tensor, WithDType};
 /// ## One-hot encoding
 ///
 /// ```rust
-/// use hanzo_ml_core::{Shape, Tensor, Device};
+/// use hanzo_ml::{Shape, Tensor, Device};
 /// use hanzo_nn::encoding::one_hot;
 ///
-/// let device = hanzo_ml_core::Device::Cpu;
+/// let device = hanzo_ml::Device::Cpu;
 ///
 /// let indices = Tensor::new(vec![vec![0i64, 2], vec![1, -1]], &device).unwrap();
 /// let depth = 4;
@@ -55,11 +55,11 @@ use hanzo_ml_core::{bail, DType, Result, Tensor, WithDType};
 /// ## One-cold Encoding
 ///
 /// ```rust
-/// use hanzo_ml_core::{Shape, Tensor, Device};
+/// use hanzo_ml::{Shape, Tensor, Device};
 /// use hanzo_nn::encoding::one_hot;
 ///
 ///
-/// let device = hanzo_ml_core::Device::Cpu;
+/// let device = hanzo_ml::Device::Cpu;
 /// let depth = 4;
 /// let indices = Tensor::new(vec![vec![0u8, 2], vec![1, 3]], &device).unwrap();
 /// let one_cold = one_hot(indices, depth, 0u8, 1u8).unwrap();

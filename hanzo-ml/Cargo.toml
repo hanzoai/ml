@@ -1,5 +1,5 @@
 [package]
-name = "hanzo-ml-core"
+name = "hanzo-ml"
 version.workspace = true
 edition.workspace = true
 description.workspace = true

@@ -7,7 +7,7 @@ extern crate accelerate_src;
 mod model;
 use model::{Multiples, YoloV8, YoloV8Pose};
 
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
 use clap::{Parser, ValueEnum};
@@ -99,7 +99,7 @@ pub fn report_detect(
     let h_ratio = initial_h as f32 / h as f32;
     let mut img = img.to_rgb8();
     let font = Vec::from(include_bytes!("roboto-mono-stripped.ttf") as &[u8]);
-    let font = ab_glyph::FontRef::try_from_slice(&font).map_err(hanzo_ml_core::Error::wrap)?;
+    let font = ab_glyph::FontRef::try_from_slice(&font).map_err(hanzo_ml::Error::wrap)?;
     for (class_index, bboxes_for_class) in bboxes.iter().enumerate() {
         for b in bboxes_for_class.iter() {
             println!(
@@ -158,7 +158,7 @@ pub fn report_pose(
     let pred = pred.to_device(&Device::Cpu)?;
     let (pred_size, npreds) = pred.dims2()?;
     if pred_size != 17 * 3 + 4 + 1 {
-        hanzo_ml_core::bail!("unexpected pred-size {pred_size}");
+        hanzo_ml::bail!("unexpected pred-size {pred_size}");
     }
     let mut bboxes = vec![];
     // Extract the bounding boxes for which confidence is above the threshold.
@@ -392,7 +392,7 @@ pub fn run<T: Task>(args: Args) -> anyhow::Result<()> {
         let mut image_name = std::path::PathBuf::from(image_name);
         let original_image = image::ImageReader::open(&image_name)?
             .decode()
-            .map_err(hanzo_ml_core::Error::wrap)?;
+            .map_err(hanzo_ml::Error::wrap)?;
         let (width, height) = {
             let w = original_image.width() as usize;
             let h = original_image.height() as usize;

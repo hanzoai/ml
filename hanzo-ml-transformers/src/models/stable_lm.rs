@@ -14,7 +14,7 @@
 //!
 
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
-use hanzo_ml_core::{DType, Device, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
 use hanzo_nn::{Activation, LayerNorm, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;

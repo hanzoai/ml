@@ -2,7 +2,7 @@ pub(crate) mod conv;
 pub(crate) mod layer_norm;
 pub(crate) mod softmax;
 
-use hanzo_ml_core::{Device, Result};
+use hanzo_ml::{Device, Result};
 
 pub(crate) trait BenchDevice {
     fn sync(&self) -> Result<()>;

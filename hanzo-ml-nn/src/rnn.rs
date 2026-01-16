@@ -1,5 +1,5 @@
 //! Recurrent Neural Networks
-use hanzo_ml_core::{DType, Device, IndexOp, Result, Tensor};
+use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
 
 /// Trait for Recurrent Neural Networks.
 #[allow(clippy::upper_case_acronyms)]

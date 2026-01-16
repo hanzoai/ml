@@ -1,4 +1,4 @@
-use hanzo_ml_core::Result;
+use hanzo_ml::Result;
 use prost::Message;
 
 pub mod onnx {
@@ -10,5 +10,5 @@ pub use eval::{dtype, simple_eval};
 
 pub fn read_file<P: AsRef<std::path::Path>>(p: P) -> Result<onnx::ModelProto> {
     let buf = std::fs::read(p)?;
-    onnx::ModelProto::decode(buf.as_slice()).map_err(hanzo_ml_core::Error::wrap)
+    onnx::ModelProto::decode(buf.as_slice()).map_err(hanzo_ml::Error::wrap)
 }

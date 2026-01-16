@@ -1,8 +1,8 @@
 use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
 use crate::onnx::{self, GraphProto};
-use hanzo_ml_core::Module;
-use hanzo_ml_core::{bail, DType, Device, Result, Tensor};
+use hanzo_ml::Module;
+use hanzo_ml::{bail, DType, Device, Result, Tensor};
 use hanzo_nn::activation::PReLU;
 use std::collections::{HashMap, HashSet};
 
@@ -55,7 +55,7 @@ impl Attr for [i64] {
 impl Attr for str {
     const TYPE: AttributeType = AttributeType::String;
     fn get(attr: &onnx::AttributeProto) -> Result<&Self> {
-        std::str::from_utf8(&attr.s).map_err(hanzo_ml_core::Error::wrap)
+        std::str::from_utf8(&attr.s).map_err(hanzo_ml::Error::wrap)
     }
 }
 
@@ -64,7 +64,7 @@ impl Attr for GraphProto {
     fn get(attr: &onnx::AttributeProto) -> Result<&Self> {
         attr.g
             .as_ref()
-            .ok_or_else(|| hanzo_ml_core::Error::Msg("attribute does not contain graph".to_string()))
+            .ok_or_else(|| hanzo_ml::Error::Msg("attribute does not contain graph".to_string()))
     }
 }
 
@@ -73,7 +73,7 @@ impl AttrOwned for Vec<String> {
     fn get(attr: &onnx::AttributeProto) -> Result<Self> {
         let mut ret = vec![];
         for bytes in attr.strings.iter() {
-            let s = String::from_utf8(bytes.clone()).map_err(hanzo_ml_core::Error::wrap)?;
+            let s = String::from_utf8(bytes.clone()).map_err(hanzo_ml::Error::wrap)?;
             ret.push(s);
         }
         Ok(ret)
@@ -1890,10 +1890,10 @@ fn simple_eval_(
                 let rb = rb.index_select(&idx_ifco, 0)?;
                 let vmap = hanzo_nn::VarMap::new();
                 vmap.data().lock().unwrap().extend([
-                    ("weight_ih_l0".to_string(), hanzo_ml_core::Var::from_tensor(&w)?),
-                    ("weight_hh_l0".to_string(), hanzo_ml_core::Var::from_tensor(&r)?),
-                    ("bias_ih_l0".to_string(), hanzo_ml_core::Var::from_tensor(&wb)?),
-                    ("bias_hh_l0".to_string(), hanzo_ml_core::Var::from_tensor(&rb)?),
+                    ("weight_ih_l0".to_string(), hanzo_ml::Var::from_tensor(&w)?),
+                    ("weight_hh_l0".to_string(), hanzo_ml::Var::from_tensor(&r)?),
+                    ("bias_ih_l0".to_string(), hanzo_ml::Var::from_tensor(&wb)?),
+                    ("bias_hh_l0".to_string(), hanzo_ml::Var::from_tensor(&rb)?),
                 ]);
                 use hanzo_nn::rnn::RNN as _;
                 let lstm = hanzo_nn::rnn::lstm(
@@ -2107,7 +2107,7 @@ fn simple_eval_(
                 let depth = depth_tensor.to_scalar::<i64>()? as usize;
                 let values_vec = values_tensor.to_vec1::<f32>()?;
                 if values_vec.len() != 2 {
-                    return Err(hanzo_ml_core::Error::Msg(
+                    return Err(hanzo_ml::Error::Msg(
                         "OneHot: expected 2-element values tensor".to_string(),
                     ));
                 }
@@ -2123,7 +2123,7 @@ fn simple_eval_(
 
                 let rank = indices.rank();
                 if axis < -((rank as i64) + 1) || axis > (rank as i64) {
-                    return Err(hanzo_ml_core::Error::Msg(format!(
+                    return Err(hanzo_ml::Error::Msg(format!(
                         "OneHot: invalid axis {axis} for rank {rank}"
                     )));
                 }

@@ -8,7 +8,7 @@ use super::unet_2d_blocks::{
     DownEncoderBlock2D, DownEncoderBlock2DConfig, UNetMidBlock2D, UNetMidBlock2DConfig,
     UpDecoderBlock2D, UpDecoderBlock2DConfig,
 };
-use hanzo_ml_core::{Result, Tensor};
+use hanzo_ml::{Result, Tensor};
 use hanzo_nn as nn;
 use hanzo_nn::Module;
 

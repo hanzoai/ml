@@ -28,7 +28,7 @@
 //! ```
 
 use super::with_tracing::{layer_norm, linear_no_bias as linear, LayerNorm, Linear};
-use hanzo_ml_core::{IndexOp, Result, Tensor};
+use hanzo_ml::{IndexOp, Result, Tensor};
 use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
 
 pub use crate::models::rwkv_v5::{Config, State, Tokenizer};

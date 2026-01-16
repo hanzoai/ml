@@ -1,4 +1,4 @@
-use hanzo_ml_core::{Device, Result, Tensor};
+use hanzo_ml::{Device, Result, Tensor};
 use hanzo_transformers::generation::LogitsProcessor;
 
 #[test]

@@ -10,7 +10,7 @@
 //! This paper introduced ResNet, a deep neural network architecture that utilizes
 //! skip connections ("residual connections") to enable training of very deep networks.
 
-use hanzo_ml_core::{Result, D};
+use hanzo_ml::{Result, D};
 use hanzo_nn::{batch_norm, Conv2d, Func, VarBuilder};
 
 fn conv2d(

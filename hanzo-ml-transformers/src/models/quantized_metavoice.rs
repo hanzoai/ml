@@ -18,7 +18,7 @@ use crate::quantized_nn::{linear_b, Embedding, Linear, RmsNorm};
 pub use crate::quantized_var_builder::VarBuilder;
 
 use crate::models::metavoice::repeat_interleave;
-use hanzo_ml_core::{Module, Result, Tensor, D};
+use hanzo_ml::{Module, Result, Tensor, D};
 
 pub mod transformer {
     use super::*;
@@ -206,8 +206,8 @@ pub mod transformer {
             let output = linear_b(cfg.dim, cfg.vocab_size, false, vb.pp("output"))?;
             let spk_cond_mask = Tensor::cat(
                 &[
-                    Tensor::ones((1, 1, cfg.dim), hanzo_ml_core::DType::F32, vb.device())?,
-                    Tensor::zeros((1, 1, cfg.dim), hanzo_ml_core::DType::F32, vb.device())?,
+                    Tensor::ones((1, 1, cfg.dim), hanzo_ml::DType::F32, vb.device())?,
+                    Tensor::zeros((1, 1, cfg.dim), hanzo_ml::DType::F32, vb.device())?,
                 ],
                 0,
             )?;

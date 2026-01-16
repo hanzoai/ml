@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo_ml_core::{DType, IndexOp, D};
+use hanzo_ml::{DType, IndexOp, D};
 use hanzo_nn::{ModuleT, VarBuilder};
 use hanzo_transformers::models::vgg::{Models, Vgg};
 use clap::{Parser, ValueEnum};

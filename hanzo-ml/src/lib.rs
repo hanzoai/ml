@@ -38,7 +38,7 @@
 //! ML consists of a number of crates. This crate holds core the common data structures but you may wish
 //! to look at the docs for the other crates which can be found here:
 //!
-//! - [hanzo-ml-core](https://docs.rs/hanzo-ml-core/). Core Datastructures and DataTypes.
+//! - [hanzo-ml](https://docs.rs/hanzo-ml/). Core Datastructures and DataTypes.
 //! - [hanzo-ml-nn](https://docs.rs/hanzo-ml-nn/). Building blocks for Neural Nets.
 //! - [hanzo-ml-datasets](https://docs.rs/hanzo-ml-datasets/). Rust access to commonly used Datasets like MNIST.
 //! - [hanzo-ml-examples](https://docs.rs/hanzo-ml-examples/). Examples of ML in Use.

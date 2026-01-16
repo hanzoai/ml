@@ -6,7 +6,7 @@
 //! - [Paper](https://arxiv.org/abs/1512.03385)
 //!
 use crate::models::with_tracing::{conv2d, Conv2d};
-use hanzo_ml_core::{Result, Tensor, D};
+use hanzo_ml::{Result, Tensor, D};
 use hanzo_nn as nn;
 use hanzo_nn::Module;
 
