@@ -1,5 +1,5 @@
 use crate::{DType, Result};
-use hanzo_metal_kernels::Kernels;
+use hanzo_ml_metal_kernels::Kernels;
 use metal::{Buffer, CommandBuffer, CommandQueue, MTLResourceOptions, NSUInteger};
 use std::collections::HashMap;
 use std::path::Path;

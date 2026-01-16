@@ -169,7 +169,7 @@ impl QMetalStorage {
         // In some cases it would be better to use the mm variant, though it has its drawbacks
         // around memory alignemnt.
         for batch_id in 0..m {
-            hanzo_metal_kernels::call_quantized_matmul_mv_t(
+            hanzo_ml_metal_kernels::call_quantized_matmul_mv_t(
                 device.device(),
                 &command_buffer,
                 device.kernels(),
@@ -208,23 +208,23 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     slice.to_vec()
 }
 
-impl From<GgmlDType> for hanzo_metal_kernels::GgmlDType {
+impl From<GgmlDType> for hanzo_ml_metal_kernels::GgmlDType {
     fn from(value: GgmlDType) -> Self {
         match value {
-            GgmlDType::Q4_0 => hanzo_metal_kernels::GgmlDType::Q4_0,
-            GgmlDType::Q4_1 => hanzo_metal_kernels::GgmlDType::Q4_1,
-            GgmlDType::Q5_0 => hanzo_metal_kernels::GgmlDType::Q5_0,
-            GgmlDType::Q5_1 => hanzo_metal_kernels::GgmlDType::Q5_1,
-            GgmlDType::Q8_0 => hanzo_metal_kernels::GgmlDType::Q8_0,
-            GgmlDType::Q8_1 => hanzo_metal_kernels::GgmlDType::Q8_1,
-            GgmlDType::Q2K => hanzo_metal_kernels::GgmlDType::Q2K,
-            GgmlDType::Q3K => hanzo_metal_kernels::GgmlDType::Q3K,
-            GgmlDType::Q4K => hanzo_metal_kernels::GgmlDType::Q4K,
-            GgmlDType::Q5K => hanzo_metal_kernels::GgmlDType::Q5K,
-            GgmlDType::Q6K => hanzo_metal_kernels::GgmlDType::Q6K,
-            GgmlDType::Q8K => hanzo_metal_kernels::GgmlDType::Q8K,
-            GgmlDType::F16 => hanzo_metal_kernels::GgmlDType::F16,
-            GgmlDType::F32 => hanzo_metal_kernels::GgmlDType::F32,
+            GgmlDType::Q4_0 => hanzo_ml_metal_kernels::GgmlDType::Q4_0,
+            GgmlDType::Q4_1 => hanzo_ml_metal_kernels::GgmlDType::Q4_1,
+            GgmlDType::Q5_0 => hanzo_ml_metal_kernels::GgmlDType::Q5_0,
+            GgmlDType::Q5_1 => hanzo_ml_metal_kernels::GgmlDType::Q5_1,
+            GgmlDType::Q8_0 => hanzo_ml_metal_kernels::GgmlDType::Q8_0,
+            GgmlDType::Q8_1 => hanzo_ml_metal_kernels::GgmlDType::Q8_1,
+            GgmlDType::Q2K => hanzo_ml_metal_kernels::GgmlDType::Q2K,
+            GgmlDType::Q3K => hanzo_ml_metal_kernels::GgmlDType::Q3K,
+            GgmlDType::Q4K => hanzo_ml_metal_kernels::GgmlDType::Q4K,
+            GgmlDType::Q5K => hanzo_ml_metal_kernels::GgmlDType::Q5K,
+            GgmlDType::Q6K => hanzo_ml_metal_kernels::GgmlDType::Q6K,
+            GgmlDType::Q8K => hanzo_ml_metal_kernels::GgmlDType::Q8K,
+            GgmlDType::F16 => hanzo_ml_metal_kernels::GgmlDType::F16,
+            GgmlDType::F32 => hanzo_ml_metal_kernels::GgmlDType::F32,
         }
     }
 }

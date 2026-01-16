@@ -202,7 +202,7 @@ impl hanzo_ml_core::CustomOp3 for RotaryEmbI {
         };
         let el = b * h * t * d;
         let output = device.new_buffer(el, src.dtype(), "rope-i")?;
-        hanzo_metal_kernels::call_rope_i(
+        hanzo_ml_metal_kernels::call_rope_i(
             device.metal_device(),
             &command_buffer,
             kernels,
@@ -484,7 +484,7 @@ impl hanzo_ml_core::CustomOp3 for RotaryEmb {
         };
         let el = b * h * t * d;
         let output = device.new_buffer(el, src.dtype(), "rope-i")?;
-        hanzo_metal_kernels::call_rope(
+        hanzo_ml_metal_kernels::call_rope(
             device.metal_device(),
             &command_buffer,
             kernels,
@@ -753,7 +753,7 @@ impl hanzo_ml_core::CustomOp3 for RotaryEmbThd {
         };
         let el = b * h * t * d;
         let output = device.new_buffer(el, src.dtype(), "rope-thd")?;
-        hanzo_metal_kernels::call_rope_thd(
+        hanzo_ml_metal_kernels::call_rope_thd(
             device.metal_device(),
             &command_buffer,
             kernels,

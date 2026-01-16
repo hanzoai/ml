@@ -1,5 +1,5 @@
 use anyhow::Result;
-use hanzo_metal_kernels::GemmDType;
+use hanzo_ml_metal_kernels::GemmDType;
 /// This example contains some simple benchmarks so that it's easy to run them in perf etc.
 use clap::{Parser, Subcommand};
 use half::f16;
@@ -11,7 +11,7 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
     let device = metal::Device::system_default().unwrap();
 
     let (b, m, n, k) = (1, n, n, n);
-    let kernels = hanzo_metal_kernels::Kernels::new();
+    let kernels = hanzo_ml_metal_kernels::Kernels::new();
     let command_queue = device.new_command_queue();
     let options = metal::MTLResourceOptions::StorageModeManaged;
 
@@ -56,7 +56,7 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
     for idx in 0.. {
         let command_buffer = command_queue.new_command_buffer();
         let start_time = std::time::Instant::now();
-        hanzo_metal_kernels::call_mlx_gemm(
+        hanzo_ml_metal_kernels::call_mlx_gemm(
             &device,
             command_buffer,
             &kernels,

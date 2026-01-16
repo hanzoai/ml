@@ -4,7 +4,7 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
-use hanzo_metal_kernels::{BufferOffset, CallConvTranspose2dCfg, Kernels};
+use hanzo_ml_metal_kernels::{BufferOffset, CallConvTranspose2dCfg, Kernels};
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -50,7 +50,7 @@ pub enum MetalError {
     #[error("{0}")]
     Message(String),
     #[error(transparent)]
-    KernelError(#[from] hanzo_metal_kernels::MetalKernelError),
+    KernelError(#[from] hanzo_ml_metal_kernels::MetalKernelError),
     #[error("{0:?}")]
     LockError(LockError),
     #[error("{msg}, expected: {expected:?}, got: {got:?}")]
@@ -125,7 +125,7 @@ impl BackendStorage for MetalStorage {
                 DType::U32 => "affine_u32",
                 dtype => crate::bail!("Metal contiguous affine {dtype:?} not implemented"),
             };
-            hanzo_metal_kernels::call_affine(
+            hanzo_ml_metal_kernels::call_affine(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -144,7 +144,7 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "affine_bf16_strided",
                 dtype => crate::bail!("Metal strided affine {dtype:?} not implemented"),
             };
-            hanzo_metal_kernels::call_affine_strided(
+            hanzo_ml_metal_kernels::call_affine_strided(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -178,7 +178,7 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "powf_bf16",
                 dtype => crate::bail!("Metal contiguous powf {dtype:?} not implemented"),
             };
-            hanzo_metal_kernels::call_powf(
+            hanzo_ml_metal_kernels::call_powf(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -196,7 +196,7 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "powf_bf16_strided",
                 dtype => crate::bail!("Metal strided powf {dtype:?} not implemented"),
             };
-            hanzo_metal_kernels::call_powf_strided(
+            hanzo_ml_metal_kernels::call_powf_strided(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -229,7 +229,7 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "elu_bf16",
                 dtype => crate::bail!("Metal contiguous elu {dtype:?} not implemented"),
             };
-            hanzo_metal_kernels::call_elu(
+            hanzo_ml_metal_kernels::call_elu(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -247,7 +247,7 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "elu_bf16_strided",
                 dtype => crate::bail!("Metal strided elu {dtype:?} not implemented"),
             };
-            hanzo_metal_kernels::call_elu_strided(
+            hanzo_ml_metal_kernels::call_elu_strided(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -330,7 +330,7 @@ impl BackendStorage for MetalStorage {
             let buffer = device.new_buffer(dst_el, dtype, "reduce")?;
             let command_buffer = self.device.command_buffer()?;
             let src = buffer_o(&self.buffer, layout, self.dtype);
-            hanzo_metal_kernels::call_reduce_contiguous(
+            hanzo_ml_metal_kernels::call_reduce_contiguous(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -385,7 +385,7 @@ impl BackendStorage for MetalStorage {
         let buffer = device.new_buffer(dst_el, dtype, "reduce")?;
         let command_buffer = self.device.command_buffer()?;
         let src = buffer_o(&self.buffer, layout, self.dtype);
-        hanzo_metal_kernels::call_reduce_strided(
+        hanzo_ml_metal_kernels::call_reduce_strided(
             &device.device,
             &command_buffer,
             &device.kernels,
@@ -415,7 +415,7 @@ impl BackendStorage for MetalStorage {
 
     fn const_set(&mut self, s: crate::scalar::Scalar, l: &Layout) -> Result<()> {
         use crate::scalar::Scalar;
-        fn set<S: crate::WithDType + hanzo_metal_kernels::utils::EncoderParam>(
+        fn set<S: crate::WithDType + hanzo_ml_metal_kernels::utils::EncoderParam>(
             self_: &mut MetalStorage,
             s: S,
             l: &Layout,
@@ -430,13 +430,13 @@ impl BackendStorage for MetalStorage {
 
             match (el_count % 2, dtype, l.is_contiguous()) {
                 (0, DType::BF16 | DType::F16, true) => {
-                    use hanzo_metal_kernels::unary::contiguous_tiled;
+                    use hanzo_ml_metal_kernels::unary::contiguous_tiled;
                     let kernel_name = match dtype {
                         DType::F16 => contiguous_tiled::const_set::HALF,
                         DType::BF16 => contiguous_tiled::const_set::BFLOAT,
                         _ => crate::bail!("internal bug in const_set"),
                     };
-                    hanzo_metal_kernels::call_const_set_contiguous_tiled(
+                    hanzo_ml_metal_kernels::call_const_set_contiguous_tiled(
                         &device.device,
                         &command_buffer,
                         &device.kernels,
@@ -448,7 +448,7 @@ impl BackendStorage for MetalStorage {
                     .map_err(MetalError::from)?;
                 }
                 (_, _, true) => {
-                    use hanzo_metal_kernels::unary::contiguous;
+                    use hanzo_ml_metal_kernels::unary::contiguous;
                     let kernel_name = match dtype {
                         DType::F16 => contiguous::const_set::HALF,
                         DType::BF16 => contiguous::const_set::BFLOAT,
@@ -458,7 +458,7 @@ impl BackendStorage for MetalStorage {
                         DType::U8 => contiguous::const_set::U8,
                         DType::F64 => crate::bail!("unsupported const-set f64"),
                     };
-                    hanzo_metal_kernels::call_const_set_contiguous(
+                    hanzo_ml_metal_kernels::call_const_set_contiguous(
                         &device.device,
                         &command_buffer,
                         &device.kernels,
@@ -470,7 +470,7 @@ impl BackendStorage for MetalStorage {
                     .map_err(MetalError::from)?;
                 }
                 (_, _, false) => {
-                    use hanzo_metal_kernels::unary::strided;
+                    use hanzo_ml_metal_kernels::unary::strided;
                     let kernel_name = match dtype {
                         DType::F16 => strided::const_set::HALF,
                         DType::BF16 => strided::const_set::BFLOAT,
@@ -480,7 +480,7 @@ impl BackendStorage for MetalStorage {
                         DType::U8 => strided::const_set::U8,
                         DType::F64 => crate::bail!("unsupported const-set f64"),
                     };
-                    hanzo_metal_kernels::call_const_set_strided(
+                    hanzo_ml_metal_kernels::call_const_set_strided(
                         &device.device,
                         &command_buffer,
                         &device.kernels,
@@ -556,7 +556,7 @@ impl BackendStorage for MetalStorage {
                     crate::bail!("Metal contiguous to_dtype {left:?} {right:?} not implemented")
                 }
             };
-            hanzo_metal_kernels::call_cast_contiguous(
+            hanzo_ml_metal_kernels::call_cast_contiguous(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -608,7 +608,7 @@ impl BackendStorage for MetalStorage {
                     crate::bail!("Metal strided to_dtype {left:?} {right:?} not implemented")
                 }
             };
-            hanzo_metal_kernels::call_cast_strided(
+            hanzo_ml_metal_kernels::call_cast_strided(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -636,7 +636,7 @@ impl BackendStorage for MetalStorage {
 
         match (el_count % 2, dtype, layout.is_contiguous()) {
             (0, DType::BF16 | DType::F16, true) => {
-                use hanzo_metal_kernels::unary::contiguous_tiled;
+                use hanzo_ml_metal_kernels::unary::contiguous_tiled;
                 let kernel_name = match (B::KERNEL, dtype) {
                     ("uabs", DType::F16) => contiguous_tiled::abs::HALF,
                     ("uabs", DType::F32) => contiguous_tiled::abs::FLOAT,
@@ -702,7 +702,7 @@ impl BackendStorage for MetalStorage {
                         )
                     }
                 };
-                hanzo_metal_kernels::call_unary_contiguous_tiled(
+                hanzo_ml_metal_kernels::call_unary_contiguous_tiled(
                     &device.device,
                     &command_buffer,
                     &device.kernels,
@@ -714,7 +714,7 @@ impl BackendStorage for MetalStorage {
                 .map_err(MetalError::from)?;
             }
             (_, _, true) => {
-                use hanzo_metal_kernels::unary::contiguous;
+                use hanzo_ml_metal_kernels::unary::contiguous;
                 let kernel_name = match (B::KERNEL, dtype) {
                     ("uabs", DType::F16) => contiguous::abs::HALF,
                     ("uabs", DType::F32) => contiguous::abs::FLOAT,
@@ -778,7 +778,7 @@ impl BackendStorage for MetalStorage {
                         crate::bail!("Metal contiguous unary {name} {dtype:?} not implemented")
                     }
                 };
-                hanzo_metal_kernels::call_unary_contiguous(
+                hanzo_ml_metal_kernels::call_unary_contiguous(
                     &device.device,
                     &command_buffer,
                     &device.kernels,
@@ -790,7 +790,7 @@ impl BackendStorage for MetalStorage {
                 .map_err(MetalError::from)?;
             }
             (_, _, false) => {
-                use hanzo_metal_kernels::unary::strided;
+                use hanzo_ml_metal_kernels::unary::strided;
                 let kernel_name = match (B::KERNEL, dtype) {
                     ("ucos", DType::F32) => strided::cos::FLOAT,
                     ("usin", DType::F32) => strided::sin::FLOAT,
@@ -851,7 +851,7 @@ impl BackendStorage for MetalStorage {
                     }
                 };
                 let dst = BufferOffset::zero_offset(&buffer);
-                hanzo_metal_kernels::call_unary_strided(
+                hanzo_ml_metal_kernels::call_unary_strided(
                     &device.device,
                     &command_buffer,
                     &device.kernels,
@@ -912,7 +912,7 @@ impl BackendStorage for MetalStorage {
         let src = buffer_o(&self.buffer, layout, self.dtype);
         let t = buffer_o(&t.buffer, t_l, t.dtype);
         let f = buffer_o(&f.buffer, f_l, f.dtype);
-        hanzo_metal_kernels::call_where_cond_strided(
+        hanzo_ml_metal_kernels::call_where_cond_strided(
             &device.device,
             &command_buffer,
             &device.kernels,
@@ -957,7 +957,7 @@ impl BackendStorage for MetalStorage {
             dtype => crate::bail!("Metal conv1d {dtype:?} not implemented"),
         };
         let src = buffer_o(&self.buffer, layout, self.dtype);
-        hanzo_metal_kernels::call_im2col1d_strided(
+        hanzo_ml_metal_kernels::call_im2col1d_strided(
             &self.device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1057,7 +1057,7 @@ impl BackendStorage for MetalStorage {
             // _status < MTLCommandBufferStatusCommitted >
             // -[IOGPUMetalCommandBuffer setCurrentCommandEncoder:]
             let command_buffer = self.device.command_buffer()?;
-            hanzo_metal_kernels::call_col2im1d(
+            hanzo_ml_metal_kernels::call_col2im1d(
                 &self.device.device,
                 &command_buffer,
                 &self.device.kernels,
@@ -1084,7 +1084,7 @@ impl BackendStorage for MetalStorage {
                 DType::U8 => "conv_transpose1d_u8",
                 dtype => crate::bail!("Metal conv_transpose1d {dtype:?} not implemented"),
             };
-            hanzo_metal_kernels::call_conv_transpose1d(
+            hanzo_ml_metal_kernels::call_conv_transpose1d(
                 &self.device.device,
                 &command_buffer,
                 &self.device.kernels,
@@ -1147,7 +1147,7 @@ impl BackendStorage for MetalStorage {
             dtype => crate::bail!("Metal conv2d {dtype:?} not implemented"),
         };
         let src = buffer_o(&self.buffer, layout, self.dtype);
-        hanzo_metal_kernels::call_im2col_strided(
+        hanzo_ml_metal_kernels::call_im2col_strided(
             &self.device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1229,7 +1229,7 @@ impl BackendStorage for MetalStorage {
             dtype => crate::bail!("Metal conv_transpose2d {dtype:?} not implemented"),
         };
 
-        hanzo_metal_kernels::call_conv_transpose2d(
+        hanzo_ml_metal_kernels::call_conv_transpose2d(
             &self.device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1280,7 +1280,7 @@ impl BackendStorage for MetalStorage {
         let dst_el = out_w * out_h * b_size * channels;
         let buffer = self.device.new_buffer(dst_el, self.dtype, "avg_pool2d")?;
         let command_buffers = self.device.command_buffer()?;
-        hanzo_metal_kernels::call_pool2d(
+        hanzo_ml_metal_kernels::call_pool2d(
             &self.device.device,
             &command_buffers,
             &self.device.kernels,
@@ -1322,7 +1322,7 @@ impl BackendStorage for MetalStorage {
         let dst_el = out_w * out_h * b_size * channels;
         let buffer = self.device.new_buffer(dst_el, self.dtype, "max_pool2d")?;
         let command_buffers = self.device.command_buffer()?;
-        hanzo_metal_kernels::call_pool2d(
+        hanzo_ml_metal_kernels::call_pool2d(
             &self.device.device,
             &command_buffers,
             &self.device.kernels,
@@ -1369,7 +1369,7 @@ impl BackendStorage for MetalStorage {
             .new_buffer(dst_el, self.dtype, "upsample_nearest2d")?;
         let command_buffer = self.device.command_buffer()?;
         let src = buffer_o(&self.buffer, inp_l, self.dtype);
-        hanzo_metal_kernels::call_upsample_nearest_2d(
+        hanzo_ml_metal_kernels::call_upsample_nearest_2d(
             &self.device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1410,7 +1410,7 @@ impl BackendStorage for MetalStorage {
         let command_buffer = self.device.command_buffer()?;
         let src = buffer_o(&self.buffer, src_l, dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        hanzo_metal_kernels::call_gather(
+        hanzo_ml_metal_kernels::call_gather(
             &device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1459,7 +1459,7 @@ impl BackendStorage for MetalStorage {
         let dst = buffer_o(&self.buffer, l, self.dtype);
         let src = buffer_o(&src.buffer, src_l, src.dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        hanzo_metal_kernels::call_scatter(
+        hanzo_ml_metal_kernels::call_scatter(
             &self.device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1508,7 +1508,7 @@ impl BackendStorage for MetalStorage {
         let dst = buffer_o(&self.buffer, l, self.dtype);
         let src = buffer_o(&src.buffer, src_l, src.dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        hanzo_metal_kernels::call_scatter(
+        hanzo_ml_metal_kernels::call_scatter(
             &self.device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1564,7 +1564,7 @@ impl BackendStorage for MetalStorage {
         let command_buffer = self.device.command_buffer()?;
         let src = buffer_o(&self.buffer, src_l, dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        hanzo_metal_kernels::call_index_select(
+        hanzo_ml_metal_kernels::call_index_select(
             &device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1628,7 +1628,7 @@ impl BackendStorage for MetalStorage {
         let command_buffer = self.device.command_buffer()?;
         let src = buffer_o(&src.buffer, src_l, src.dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        hanzo_metal_kernels::call_index_add(
+        hanzo_ml_metal_kernels::call_index_add(
             &self.device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1656,16 +1656,16 @@ impl BackendStorage for MetalStorage {
         let command_buffer = self.device.command_buffer()?;
         command_buffer.set_label("matmul");
         let dtype = match self.dtype {
-            DType::F32 => hanzo_metal_kernels::GemmDType::F32,
-            DType::F16 => hanzo_metal_kernels::GemmDType::F16,
-            DType::BF16 => hanzo_metal_kernels::GemmDType::BF16,
+            DType::F32 => hanzo_ml_metal_kernels::GemmDType::F32,
+            DType::F16 => hanzo_ml_metal_kernels::GemmDType::F16,
+            DType::BF16 => hanzo_ml_metal_kernels::GemmDType::BF16,
             dtype => {
                 return Err(
                     MetalError::Message(format!("mlx matmul doesn't support {dtype:?}")).into(),
                 )
             }
         };
-        hanzo_metal_kernels::call_mlx_gemm(
+        hanzo_ml_metal_kernels::call_mlx_gemm(
             &self.device.device,
             &command_buffer,
             &self.device.kernels,
@@ -1722,15 +1722,15 @@ impl BackendStorage for MetalStorage {
                 return Ok(());
             }
             let kernel_name = match self.dtype {
-                DType::F32 => hanzo_metal_kernels::copy2d::FLOAT,
-                DType::F16 => hanzo_metal_kernels::copy2d::HALF,
-                DType::BF16 => hanzo_metal_kernels::copy2d::BFLOAT,
-                DType::I64 => hanzo_metal_kernels::copy2d::I64,
-                DType::U32 => hanzo_metal_kernels::copy2d::U32,
-                DType::U8 => hanzo_metal_kernels::copy2d::U8,
+                DType::F32 => hanzo_ml_metal_kernels::copy2d::FLOAT,
+                DType::F16 => hanzo_ml_metal_kernels::copy2d::HALF,
+                DType::BF16 => hanzo_ml_metal_kernels::copy2d::BFLOAT,
+                DType::I64 => hanzo_ml_metal_kernels::copy2d::I64,
+                DType::U32 => hanzo_ml_metal_kernels::copy2d::U32,
+                DType::U8 => hanzo_ml_metal_kernels::copy2d::U8,
                 dtype => crate::bail!("Metal copy2d {dtype:?} not implemented"),
             };
-            hanzo_metal_kernels::call_copy2d(
+            hanzo_ml_metal_kernels::call_copy2d(
                 &self.device.device,
                 &command_buffer,
                 &self.device.kernels,
@@ -1768,12 +1768,12 @@ impl BackendStorage for MetalStorage {
                 return Ok(());
             }
             let kernel_name = match self.dtype {
-                DType::F32 => hanzo_metal_kernels::unary::strided::copy::FLOAT,
-                DType::F16 => hanzo_metal_kernels::unary::strided::copy::HALF,
-                DType::BF16 => hanzo_metal_kernels::unary::strided::copy::BFLOAT,
-                DType::I64 => hanzo_metal_kernels::unary::strided::copy::I64,
-                DType::U32 => hanzo_metal_kernels::unary::strided::copy::U32,
-                DType::U8 => hanzo_metal_kernels::unary::strided::copy::U8,
+                DType::F32 => hanzo_ml_metal_kernels::unary::strided::copy::FLOAT,
+                DType::F16 => hanzo_ml_metal_kernels::unary::strided::copy::HALF,
+                DType::BF16 => hanzo_ml_metal_kernels::unary::strided::copy::BFLOAT,
+                DType::I64 => hanzo_ml_metal_kernels::unary::strided::copy::I64,
+                DType::U32 => hanzo_ml_metal_kernels::unary::strided::copy::U32,
+                DType::U8 => hanzo_ml_metal_kernels::unary::strided::copy::U8,
                 dtype => crate::bail!("Metal copy_strided {dtype:?} not implemented"),
             };
             let src = buffer_o(&self.buffer, src_l, self.dtype);
@@ -1781,7 +1781,7 @@ impl BackendStorage for MetalStorage {
                 buffer: &dst.buffer,
                 offset_in_bytes: dst_offset * dst.dtype.size_in_bytes(),
             };
-            hanzo_metal_kernels::call_unary_strided(
+            hanzo_ml_metal_kernels::call_unary_strided(
                 &self.device.device,
                 &command_buffer,
                 &self.device.kernels,
@@ -1826,7 +1826,7 @@ impl MetalStorage {
         let lhs = buffer_o(&self.buffer, lhs_l, self.dtype);
         let rhs = buffer_o(&rhs.buffer, rhs_l, rhs.dtype);
         let (buffer, dtype) = if lhs_l.is_contiguous() && rhs_l.is_contiguous() && &op[..1] != "b" {
-            use hanzo_metal_kernels::binary::contiguous;
+            use hanzo_ml_metal_kernels::binary::contiguous;
 
             let (kernel_name, dtype) = match (op, self.dtype) {
                 ("add", DType::F32) => (contiguous::add::FLOAT, self.dtype),
@@ -1900,7 +1900,7 @@ impl MetalStorage {
                 }
             };
             let buffer = device.new_buffer(el_count, dtype, op)?;
-            hanzo_metal_kernels::call_binary_contiguous(
+            hanzo_ml_metal_kernels::call_binary_contiguous(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -1913,7 +1913,7 @@ impl MetalStorage {
             .map_err(MetalError::from)?;
             (buffer, dtype)
         } else {
-            use hanzo_metal_kernels::binary::strided;
+            use hanzo_ml_metal_kernels::binary::strided;
 
             let (kernel_name, dtype) = match (op, self.dtype) {
                 ("badd", DType::F32) => (strided::add::FLOAT, self.dtype),
@@ -1999,7 +1999,7 @@ impl MetalStorage {
                 }
             };
             let buffer = device.new_buffer(el_count, dtype, op)?;
-            hanzo_metal_kernels::call_binary_strided(
+            hanzo_ml_metal_kernels::call_binary_strided(
                 &device.device,
                 &command_buffer,
                 &device.kernels,
@@ -2139,7 +2139,7 @@ impl BackendDevice for MetalDevice {
         };
         let buffer = self.new_buffer(shape.elem_count(), dtype, "rand_uniform")?;
         let command_buffer = self.command_buffer()?;
-        hanzo_metal_kernels::call_random_uniform(
+        hanzo_ml_metal_kernels::call_random_uniform(
             &self.device,
             &command_buffer,
             &self.kernels,
@@ -2175,7 +2175,7 @@ impl BackendDevice for MetalDevice {
         };
         let buffer = self.new_buffer(shape.elem_count(), dtype, "rand_normal")?;
         let command_buffer = self.command_buffer()?;
-        hanzo_metal_kernels::call_random_normal(
+        hanzo_ml_metal_kernels::call_random_normal(
             &self.device,
             &command_buffer,
             &self.kernels,

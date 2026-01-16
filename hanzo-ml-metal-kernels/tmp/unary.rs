@@ -1,4 +1,4 @@
-use hanzo_metal_kernels::{call_unary_contiguous, call_unary_strided, unary, Kernels};
+use hanzo_ml_metal_kernels::{call_unary_contiguous, call_unary_strided, unary, Kernels};
 use half::{bf16, f16};
 use metal::objc::rc::autoreleasepool;
 use metal::{Device, MTLResourceOptions};

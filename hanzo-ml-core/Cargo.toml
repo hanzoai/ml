@@ -45,6 +45,7 @@ criterion = { workspace = true }
 default = []
 cuda = ["cudarc", "dep:hanzo-ml-kernels", "dep:ug-cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
+nccl = ["cuda"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = ["dep:metal", "dep:hanzo-ml-metal-kernels", "dep:ug-metal"]
