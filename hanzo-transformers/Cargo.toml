@@ -13,7 +13,6 @@ readme = "README.md"
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
 hanzo-ml = { workspace = true }
-hanzo-flash-attn = { workspace = true, optional = true }
 hanzo-nn = { workspace = true }
 fancy-regex = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
@@ -30,6 +29,6 @@ default = []
 accelerate = ["dep:accelerate-src", "hanzo-ml/accelerate", "hanzo-nn/accelerate"]
 cuda = ["hanzo-ml/cuda", "hanzo-nn/cuda"]
 cudnn = ["hanzo-ml/cudnn", "hanzo-nn/cudnn"]
-flash-attn = ["cuda", "dep:hanzo-flash-attn"]
+flash-attn = ["cuda"]
 mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl", "hanzo-nn/mkl"]
 metal = ["hanzo-ml/metal", "hanzo-nn/metal"]
