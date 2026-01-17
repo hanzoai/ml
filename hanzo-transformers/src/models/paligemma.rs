@@ -16,7 +16,7 @@
 
 use crate::models::{gemma, siglip};
 use hanzo_ml::{Module, Result, Tensor};
-use hanzo_ml_nn::{linear, Linear, VarBuilder};
+use hanzo_nn::{linear, Linear, VarBuilder};
 
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct Config {
@@ -40,7 +40,7 @@ impl Config {
                 // Default values.
                 rope_theta: 10000.,
                 head_dim: 256,
-                hidden_act: Some(hanzo_ml_nn::Activation::GeluPytorchTanh),
+                hidden_act: Some(hanzo_nn::Activation::GeluPytorchTanh),
                 hidden_activation: None,
                 attention_bias: false,
                 max_position_embeddings: 8192,
@@ -62,7 +62,7 @@ impl Config {
                 // Default values.
                 rope_theta: 10000.,
                 head_dim: 256,
-                hidden_act: Some(hanzo_ml_nn::Activation::GeluPytorchTanh),
+                hidden_act: Some(hanzo_nn::Activation::GeluPytorchTanh),
                 hidden_activation: None,
                 attention_bias: false,
                 max_position_embeddings: 8192,

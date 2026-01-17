@@ -2,7 +2,7 @@
 //!
 //! See "Textbooks Are All You Need II: phi-1.5 technical report", Lin et al. 2023
 //! - [Arxiv](https://arxiv.org/abs/2309.05463)
-//! - [Github](https://huggingface.co/microsoft/phi-1_5)
+//! - [GitHub](https://huggingface.co/microsoft/phi-1_5)
 //!
 
 use crate::models::with_tracing::{linear, Embedding as E, Linear};
@@ -10,7 +10,7 @@ use crate::models::with_tracing::{linear, Embedding as E, Linear};
 /// https://huggingface.co/microsoft/phi-1_5
 /// https://arxiv.org/abs/2309.05463
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{Activation, VarBuilder};
+use hanzo_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 
 const MAX_SEQ_LEN: usize = 4096;
@@ -181,8 +181,8 @@ impl RotaryEmbedding {
         let k_pass = qkv.i((.., .., 1, .., rotary_dim..))?;
         let c = self.cos.narrow(0, seqlen_offset, seqlen)?;
         let s = self.sin.narrow(0, seqlen_offset, seqlen)?;
-        let q_rot = hanzo_ml_nn::rotary_emb::rope_thd(&q_rot, &c, &s)?;
-        let k_rot = hanzo_ml_nn::rotary_emb::rope_thd(&k_rot, &c, &s)?;
+        let q_rot = hanzo_nn::rotary_emb::rope_thd(&q_rot, &c, &s)?;
+        let k_rot = hanzo_nn::rotary_emb::rope_thd(&k_rot, &c, &s)?;
         let q = Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?;
         let k = Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?;
         let v = qkv.i((.., .., 2))?;
@@ -222,13 +222,13 @@ impl Module for MLP {
 
 #[derive(Debug, Clone)]
 struct CausalLMHead {
-    ln: hanzo_ml_nn::LayerNorm,
+    ln: hanzo_nn::LayerNorm,
     linear: Linear,
 }
 
 impl CausalLMHead {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let ln = hanzo_ml_nn::layer_norm(cfg.n_embd, cfg.layer_norm_epsilon, vb.pp("ln"))?;
+        let ln = hanzo_nn::layer_norm(cfg.n_embd, cfg.layer_norm_epsilon, vb.pp("ln"))?;
         let linear = linear(cfg.n_embd, cfg.vocab_size, vb.pp("linear"))?;
         Ok(Self { ln, linear })
     }
@@ -322,7 +322,7 @@ impl MHA {
         };
         let attn_weights = {
             let _enter = self.span_softmax.enter();
-            hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?
+            hanzo_nn::ops::softmax_last_dim(&attn_weights)?
         };
 
         // output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
@@ -343,7 +343,7 @@ impl MHA {
 
 #[derive(Debug, Clone)]
 struct ParallelBlock {
-    ln: hanzo_ml_nn::LayerNorm,
+    ln: hanzo_nn::LayerNorm,
     mixer: MHA,
     mlp: MLP,
     span: tracing::Span,
@@ -351,7 +351,7 @@ struct ParallelBlock {
 
 impl ParallelBlock {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let ln = hanzo_ml_nn::layer_norm(cfg.n_embd, cfg.layer_norm_epsilon, vb.pp("ln"))?;
+        let ln = hanzo_nn::layer_norm(cfg.n_embd, cfg.layer_norm_epsilon, vb.pp("ln"))?;
         let mixer = MHA::new(cfg, vb.pp("mixer"))?;
         let mlp = MLP::new(cfg, vb.pp("mlp"))?;
         Ok(Self {

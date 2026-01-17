@@ -18,7 +18,7 @@ use super::quantized_blip_text as blip_text;
 use crate::quantized_nn::{layer_norm, linear, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
 use hanzo_ml::{Module, Result, Tensor, D};
-use hanzo_ml_nn::{Conv2d, Conv2dConfig, LayerNorm};
+use hanzo_nn::{Conv2d, Conv2dConfig, LayerNorm};
 
 pub type VisionConfig = super::blip::VisionConfig;
 pub type Config = super::blip::Config;
@@ -116,7 +116,7 @@ impl Attention {
         let value = mixed_qkv.get(2)?;
         let attention_scores = query.matmul(&key.t()?)?;
         let attention_scores = (attention_scores * self.scale)?;
-        let attention_probs = hanzo_ml_nn::ops::softmax_last_dim(&attention_scores)?;
+        let attention_probs = hanzo_nn::ops::softmax_last_dim(&attention_scores)?;
         let attention_probs = match attn_mask {
             None => attention_probs,
             Some(attn_mask) => (attention_probs * attn_mask)?,
@@ -132,7 +132,7 @@ impl Attention {
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
 struct MLP {
-    activation_fn: hanzo_ml_nn::Activation,
+    activation_fn: hanzo_nn::Activation,
     fc1: Linear,
     fc2: Linear,
 }

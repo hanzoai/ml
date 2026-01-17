@@ -5,7 +5,7 @@
 //! Based on implementation from [Huggingface Transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/falcon)
 
 use hanzo_ml::{DType, Device, Result, Tensor, D};
-use hanzo_ml_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
+use hanzo_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
 use serde::Deserialize;
 
 const MAX_SEQ_LEN: usize = 5000;
@@ -311,7 +311,7 @@ impl FalconAttention {
         };
 
         let attention_scores =
-            hanzo_ml_nn::ops::softmax(&attention_scores.to_dtype(DType::F32)?, D::Minus1)?
+            hanzo_nn::ops::softmax(&attention_scores.to_dtype(DType::F32)?, D::Minus1)?
                 .to_dtype(x.dtype())?;
         let attn_output = attention_scores
             .matmul(&value)?

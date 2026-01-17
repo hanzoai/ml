@@ -17,7 +17,7 @@
 //! ```
 //!
 //! <div align=center>
-//!   <img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/flux/assets/flux-robot.jpg" alt="" width=320>
+//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/flux/assets/flux-robot.jpg" alt="" width=320>
 //! </div>
 //!
 

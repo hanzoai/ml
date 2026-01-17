@@ -10,7 +10,7 @@
 //! ## Example
 //!
 //! <div align=center>
-//!   <img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/wuerstchen/assets/cat.jpg" alt="" width=320>
+//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/wuerstchen/assets/cat.jpg" alt="" width=320>
 //!   <p>"Anthropomorphic cat dressed as a fire fighter"</p>
 //! </div>
 

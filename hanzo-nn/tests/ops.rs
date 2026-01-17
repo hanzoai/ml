@@ -9,9 +9,9 @@ use hanzo_ml::{test_device, test_utils::to_vec3_round, Device, IndexOp, Result, 
 fn softmax(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;
-    let t0 = hanzo_ml_nn::ops::softmax(&tensor.log()?, 0)?;
-    let t1 = hanzo_ml_nn::ops::softmax(&tensor.log()?, 1)?;
-    let t2 = hanzo_ml_nn::ops::softmax(&tensor.log()?, 2)?;
+    let t0 = hanzo_nn::ops::softmax(&tensor.log()?, 0)?;
+    let t1 = hanzo_nn::ops::softmax(&tensor.log()?, 1)?;
+    let t2 = hanzo_nn::ops::softmax(&tensor.log()?, 2)?;
     assert_eq!(
         to_vec3_round(&t0, 4)?,
         &[
@@ -39,7 +39,7 @@ fn softmax(device: &Device) -> Result<()> {
             [[0.2, 0.1, 0.7], [0.4444, 0.1111, 0.4444]]
         ]
     );
-    let t2 = hanzo_ml_nn::ops::softmax_last_dim(&tensor.log()?)?;
+    let t2 = hanzo_nn::ops::softmax_last_dim(&tensor.log()?)?;
     assert_eq!(
         to_vec3_round(&t2, 4)?,
         &[
@@ -56,7 +56,7 @@ fn rms_norm(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;
     let alpha = Tensor::new(&[1f32, 2f32, 3f32], device)?;
-    let t = hanzo_ml_nn::ops::rms_norm(&tensor, &alpha, 1e-5)?;
+    let t = hanzo_nn::ops::rms_norm(&tensor, &alpha, 1e-5)?;
     assert_eq!(
         to_vec3_round(&t, 4)?,
         &[
@@ -64,7 +64,7 @@ fn rms_norm(device: &Device) -> Result<()> {
             [[0.4714, 0.4714, 4.9497], [1.206, 0.603, 3.6181]]
         ]
     );
-    let t2 = hanzo_ml_nn::ops::rms_norm_slow(&tensor, &alpha, 1e-5)?;
+    let t2 = hanzo_nn::ops::rms_norm_slow(&tensor, &alpha, 1e-5)?;
     assert_eq!(
         to_vec3_round(&t2, 4)?,
         &[
@@ -86,8 +86,8 @@ fn rms_norml(device: &Device) -> Result<()> {
     let src: Vec<f32> = (0..el_count).map(|_| rng.random::<f32>()).collect();
     let tensor = Tensor::new(src, device)?.reshape((b_size, seq_len, head_dim))?;
     let alpha = Tensor::ones(head_dim, hanzo_ml::DType::F32, device)?;
-    let t = hanzo_ml_nn::ops::rms_norm(&tensor, &alpha, 1e-5)?;
-    let t2 = hanzo_ml_nn::ops::rms_norm_slow(&tensor, &alpha, 1e-5)?;
+    let t = hanzo_nn::ops::rms_norm(&tensor, &alpha, 1e-5)?;
+    let t2 = hanzo_nn::ops::rms_norm_slow(&tensor, &alpha, 1e-5)?;
     let diff = (t - t2)?
         .abs()?
         .flatten_all()?
@@ -103,7 +103,7 @@ fn layer_norm(device: &Device) -> Result<()> {
     let tensor = Tensor::new(data, device)?;
     let alpha = Tensor::new(&[1f32, 2f32, 3f32], device)?;
     let beta = Tensor::new(&[0.5f32, 0f32, -0.2f32], device)?;
-    let t = hanzo_ml_nn::ops::layer_norm(&tensor, &alpha, &beta, 1e-5)?;
+    let t = hanzo_nn::ops::layer_norm(&tensor, &alpha, &beta, 1e-5)?;
     assert_eq!(
         to_vec3_round(&t, 4)?,
         &[
@@ -111,7 +111,7 @@ fn layer_norm(device: &Device) -> Result<()> {
             [[-0.008, -1.778, 3.991], [1.2071, -2.8284, 1.9213]]
         ]
     );
-    let t2 = hanzo_ml_nn::ops::layer_norm_slow(&tensor, &alpha, &beta, 1e-5)?;
+    let t2 = hanzo_nn::ops::layer_norm_slow(&tensor, &alpha, &beta, 1e-5)?;
     assert_eq!(
         to_vec3_round(&t2, 4)?,
         &[
@@ -134,8 +134,8 @@ fn layer_norml(device: &Device) -> Result<()> {
     let tensor = Tensor::new(src, device)?.reshape((b_size, seq_len, head_dim))?;
     let alpha = Tensor::ones(head_dim, hanzo_ml::DType::F32, device)?;
     let beta = Tensor::zeros(head_dim, hanzo_ml::DType::F32, device)?;
-    let t = hanzo_ml_nn::ops::layer_norm(&tensor, &alpha, &beta, 1e-5)?;
-    let t2 = hanzo_ml_nn::ops::layer_norm_slow(&tensor, &alpha, &beta, 1e-5)?;
+    let t = hanzo_nn::ops::layer_norm(&tensor, &alpha, &beta, 1e-5)?;
+    let t2 = hanzo_nn::ops::layer_norm_slow(&tensor, &alpha, &beta, 1e-5)?;
     let diff = (t - t2)?
         .abs()?
         .flatten_all()?
@@ -150,7 +150,7 @@ fn layer_norml(device: &Device) -> Result<()> {
 fn softmax_numerical_stability() -> Result<()> {
     let dev = &Device::Cpu;
     let xs = Tensor::new(&[1234f32, 0.], dev)?;
-    let softmax = hanzo_ml_nn::ops::softmax(&xs, 0)?;
+    let softmax = hanzo_nn::ops::softmax(&xs, 0)?;
     assert_eq!(softmax.to_vec1::<f32>()?, &[1f32, 0.]);
     Ok(())
 }
@@ -171,8 +171,8 @@ fn ropei(device: &Device) -> Result<()> {
     let src = Tensor::from_vec(src, (b_size, num_head, seq_len, head_dim), device)?;
     let cos = Tensor::from_vec(cos, (seq_len, head_dim / 2), device)?;
     let sin = Tensor::from_vec(sin, (seq_len, head_dim / 2), device)?;
-    let rope1 = hanzo_ml_nn::rotary_emb::rope_i(&src, &cos, &sin)?;
-    let rope2 = hanzo_ml_nn::rotary_emb::rope_i_slow(&src, &cos, &sin)?;
+    let rope1 = hanzo_nn::rotary_emb::rope_i(&src, &cos, &sin)?;
+    let rope2 = hanzo_nn::rotary_emb::rope_i_slow(&src, &cos, &sin)?;
     let sum_diff = (rope1 - rope2)?.abs()?.sum_all()?.to_vec0::<f32>()?;
     if device.is_cpu() {
         assert_eq!(sum_diff, 0.);
@@ -189,12 +189,12 @@ fn ropei(device: &Device) -> Result<()> {
         .collect();
     let cos2 = Tensor::from_vec(cos2, (seq_len, head_dim / 2), device)?;
     let sin2 = Tensor::from_vec(sin2, (seq_len, head_dim / 2), device)?;
-    let rope1 = hanzo_ml_nn::rotary_emb::rope_i(&src.i(0..1)?, &cos, &sin)?;
-    let rope2 = hanzo_ml_nn::rotary_emb::rope_i(&src.i(1..2)?, &cos2, &sin2)?;
+    let rope1 = hanzo_nn::rotary_emb::rope_i(&src.i(0..1)?, &cos, &sin)?;
+    let rope2 = hanzo_nn::rotary_emb::rope_i(&src.i(1..2)?, &cos2, &sin2)?;
 
     let both_cos = Tensor::stack(&[cos, cos2], 0)?;
     let both_sin = Tensor::stack(&[sin, sin2], 0)?;
-    let both_rope = hanzo_ml_nn::rotary_emb::rope_i(&src, &both_cos, &both_sin)?;
+    let both_rope = hanzo_nn::rotary_emb::rope_i(&src, &both_cos, &both_sin)?;
     let both_rope2 = Tensor::cat(&[rope1, rope2], 0)?;
     let sum_diff = (both_rope - both_rope2)?
         .abs()?
@@ -220,8 +220,8 @@ fn rope(device: &Device) -> Result<()> {
     let src = Tensor::from_vec(src, (b_size, num_head, seq_len, head_dim), device)?;
     let cos = Tensor::from_vec(cos, (seq_len, head_dim / 2), device)?;
     let sin = Tensor::from_vec(sin, (seq_len, head_dim / 2), device)?;
-    let rope1 = hanzo_ml_nn::rotary_emb::rope(&src, &cos, &sin)?;
-    let rope2 = hanzo_ml_nn::rotary_emb::rope_slow(&src, &cos, &sin)?;
+    let rope1 = hanzo_nn::rotary_emb::rope(&src, &cos, &sin)?;
+    let rope2 = hanzo_nn::rotary_emb::rope_slow(&src, &cos, &sin)?;
     let sum_diff = (rope1 - rope2)?.abs()?.sum_all()?.to_vec0::<f32>()?;
     if device.is_cpu() {
         assert_eq!(sum_diff, 0.);
@@ -238,12 +238,12 @@ fn rope(device: &Device) -> Result<()> {
         .collect();
     let cos2 = Tensor::from_vec(cos2, (seq_len, head_dim / 2), device)?;
     let sin2 = Tensor::from_vec(sin2, (seq_len, head_dim / 2), device)?;
-    let rope1 = hanzo_ml_nn::rotary_emb::rope(&src.i(0..1)?, &cos, &sin)?;
-    let rope2 = hanzo_ml_nn::rotary_emb::rope(&src.i(1..2)?, &cos2, &sin2)?;
+    let rope1 = hanzo_nn::rotary_emb::rope(&src.i(0..1)?, &cos, &sin)?;
+    let rope2 = hanzo_nn::rotary_emb::rope(&src.i(1..2)?, &cos2, &sin2)?;
 
     let both_cos = Tensor::stack(&[cos, cos2], 0)?;
     let both_sin = Tensor::stack(&[sin, sin2], 0)?;
-    let both_rope = hanzo_ml_nn::rotary_emb::rope(&src, &both_cos, &both_sin)?;
+    let both_rope = hanzo_nn::rotary_emb::rope(&src, &both_cos, &both_sin)?;
     let both_rope2 = Tensor::cat(&[rope1, rope2], 0)?;
     let sum_diff = (both_rope - both_rope2)?
         .abs()?
@@ -271,9 +271,9 @@ fn rope_thd(device: &Device) -> Result<()> {
     let sin = Tensor::from_vec(sin, (seq_len, head_dim / 2), device)?;
     let rope1 = {
         let src = src.transpose(1, 2)?.contiguous()?;
-        hanzo_ml_nn::rotary_emb::rope_thd(&src, &cos, &sin)?.transpose(1, 2)?
+        hanzo_nn::rotary_emb::rope_thd(&src, &cos, &sin)?.transpose(1, 2)?
     };
-    let rope2 = hanzo_ml_nn::rotary_emb::rope_slow(&src, &cos, &sin)?;
+    let rope2 = hanzo_nn::rotary_emb::rope_slow(&src, &cos, &sin)?;
     let sum_diff = (rope1 - rope2)?.abs()?.sum_all()?.to_vec0::<f32>()?;
     if device.is_cpu() {
         assert_eq!(sum_diff, 0.);
@@ -292,18 +292,18 @@ fn rope_thd(device: &Device) -> Result<()> {
     let sin2 = Tensor::from_vec(sin2, (seq_len, head_dim / 2), device)?;
     let rope1 = {
         let src = src.transpose(1, 2)?.contiguous()?;
-        hanzo_ml_nn::rotary_emb::rope_thd(&src.i(0..1)?, &cos, &sin)?
+        hanzo_nn::rotary_emb::rope_thd(&src.i(0..1)?, &cos, &sin)?
     };
     let rope2 = {
         let src = src.transpose(1, 2)?.contiguous()?;
-        hanzo_ml_nn::rotary_emb::rope_thd(&src.i(1..2)?, &cos2, &sin2)?
+        hanzo_nn::rotary_emb::rope_thd(&src.i(1..2)?, &cos2, &sin2)?
     };
 
     let both_cos = Tensor::stack(&[cos, cos2], 0)?;
     let both_sin = Tensor::stack(&[sin, sin2], 0)?;
     let both_rope = {
         let src = src.transpose(1, 2)?.contiguous()?;
-        hanzo_ml_nn::rotary_emb::rope_thd(&src, &both_cos, &both_sin)?
+        hanzo_nn::rotary_emb::rope_thd(&src, &both_cos, &both_sin)?
     };
     let both_rope2 = Tensor::cat(&[rope1, rope2], 0)?;
     let sum_diff = (both_rope - both_rope2)?
@@ -317,7 +317,7 @@ fn rope_thd(device: &Device) -> Result<()> {
 fn sigmoid(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;
-    let s1 = hanzo_ml_nn::ops::sigmoid(&tensor)?;
+    let s1 = hanzo_nn::ops::sigmoid(&tensor)?;
     let s2 = (1. / (1. + tensor.neg()?.exp()?)?)?;
     let diff = (s1 - s2)?.abs()?.sum_all()?.to_vec0::<f32>()?;
     assert_eq!(diff, 0.);

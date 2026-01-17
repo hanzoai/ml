@@ -5,7 +5,7 @@
 //! Based on implementation from [huggingface/transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/encodec/modeling_encodec.py)
 
 use hanzo_ml::{DType, IndexOp, Layout, Module, Result, Shape, Tensor, D};
-use hanzo_ml_nn::{conv1d, Conv1d, ConvTranspose1d, VarBuilder};
+use hanzo_nn::{conv1d, Conv1d, ConvTranspose1d, VarBuilder};
 
 // Encodec Model
 // https://github.com/huggingface/transformers/blob/main/src/transformers/models/encodec/modeling_encodec.py
@@ -70,7 +70,7 @@ impl Default for Config {
             residual_kernel_size: 3,
             dilation_growth_rate: 2,
             use_causal_conv: true,
-            // This should be PadMode::Reflect which is currently unsupported in hanzo.
+            // This should be PadMode::Reflect which is currently unsupported in hanzo_ml.
             pad_mode: PadMode::Replicate,
             compress: 2,
             num_lstm_layers: 2,
@@ -130,7 +130,7 @@ pub fn conv1d_weight_norm(
     in_c: usize,
     out_c: usize,
     kernel_size: usize,
-    config: hanzo_ml_nn::Conv1dConfig,
+    config: hanzo_nn::Conv1dConfig,
     vb: VarBuilder,
 ) -> Result<Conv1d> {
     let weight_g = vb.get((out_c, 1, 1), "weight_g")?;
@@ -145,7 +145,7 @@ pub fn conv1d_weight_norm_no_bias(
     in_c: usize,
     out_c: usize,
     kernel_size: usize,
-    config: hanzo_ml_nn::Conv1dConfig,
+    config: hanzo_nn::Conv1dConfig,
     vb: VarBuilder,
 ) -> Result<Conv1d> {
     let weight_g = vb.get((out_c, 1, 1), "weight_g")?;
@@ -160,7 +160,7 @@ pub fn conv_transpose1d_weight_norm(
     out_c: usize,
     kernel_size: usize,
     bias: bool,
-    config: hanzo_ml_nn::ConvTranspose1dConfig,
+    config: hanzo_nn::ConvTranspose1dConfig,
     vb: VarBuilder,
 ) -> Result<ConvTranspose1d> {
     let weight_g = vb.get((in_c, 1, 1), "weight_g")?;
@@ -244,7 +244,7 @@ impl hanzo_ml::CustomOp2 for CodebookEncode {
 pub struct EuclideanCodebook {
     inited: Tensor,
     cluster_size: Tensor,
-    embed: hanzo_ml_nn::Embedding,
+    embed: hanzo_nn::Embedding,
     embed_avg: Tensor,
     c2: Tensor,
 }
@@ -260,7 +260,7 @@ impl EuclideanCodebook {
         Ok(Self {
             inited,
             cluster_size,
-            embed: hanzo_ml_nn::Embedding::new(embed, cfg.codebook_dim()),
+            embed: hanzo_nn::Embedding::new(embed, cfg.codebook_dim()),
             embed_avg,
             c2,
         })
@@ -365,7 +365,7 @@ impl ResidualVectorQuantizer {
 // https://github.com/huggingface/transformers/blob/abaca9f9432a84cfaa95531de4c72334f38a42f2/src/transformers/models/encodec/modeling_encodec.py#L226
 #[derive(Clone, Debug)]
 pub struct EncodecLSTM {
-    layers: Vec<hanzo_ml_nn::LSTM>,
+    layers: Vec<hanzo_nn::LSTM>,
 }
 
 impl EncodecLSTM {
@@ -373,11 +373,11 @@ impl EncodecLSTM {
         let vb = &vb.pp("lstm");
         let mut layers = vec![];
         for layer_idx in 0..cfg.num_lstm_layers {
-            let config = hanzo_ml_nn::LSTMConfig {
+            let config = hanzo_nn::LSTMConfig {
                 layer_idx,
                 ..Default::default()
             };
-            let lstm = hanzo_ml_nn::lstm(dim, dim, config, vb.clone())?;
+            let lstm = hanzo_nn::lstm(dim, dim, config, vb.clone())?;
             layers.push(lstm)
         }
         Ok(Self { layers })
@@ -386,8 +386,8 @@ impl EncodecLSTM {
 
 impl Module for EncodecLSTM {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        use hanzo_ml_nn::RNN;
-        // This is different from the Python transformers version as hanzo LSTM is batch first.
+        use hanzo_nn::RNN;
+        // This is different from the Python transformers version as candle LSTM is batch first.
         let xs = xs.t()?;
         let residual = &xs;
         let mut xs = xs.clone();
@@ -414,7 +414,7 @@ impl EncodecConvTranspose1d {
         _cfg: &Config,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let cfg = hanzo_ml_nn::ConvTranspose1dConfig {
+        let cfg = hanzo_nn::ConvTranspose1dConfig {
             stride,
             ..Default::default()
         };
@@ -433,7 +433,7 @@ impl Module for EncodecConvTranspose1d {
 pub struct EncodecConv1d {
     causal: bool,
     conv: Conv1d,
-    norm: Option<hanzo_ml_nn::GroupNorm>,
+    norm: Option<hanzo_nn::GroupNorm>,
     pad_mode: PadMode,
 }
 
@@ -452,7 +452,7 @@ impl EncodecConv1d {
                 in_c,
                 out_c,
                 kernel_size,
-                hanzo_ml_nn::Conv1dConfig {
+                hanzo_nn::Conv1dConfig {
                     stride,
                     dilation,
                     ..Default::default()
@@ -463,7 +463,7 @@ impl EncodecConv1d {
                 in_c,
                 out_c,
                 kernel_size,
-                hanzo_ml_nn::Conv1dConfig {
+                hanzo_nn::Conv1dConfig {
                     padding: 0,
                     stride,
                     groups: 1,
@@ -476,7 +476,7 @@ impl EncodecConv1d {
         let norm = match cfg.norm_type {
             NormType::None | NormType::WeightNorm => None,
             NormType::TimeGroupNorm => {
-                let gn = hanzo_ml_nn::group_norm(1, out_c, 1e-5, vb.pp("norm"))?;
+                let gn = hanzo_nn::group_norm(1, out_c, 1e-5, vb.pp("norm"))?;
                 Some(gn)
             }
         };
@@ -591,7 +591,7 @@ impl<'a> Layer<'a> {
         self.cnt += 1;
     }
 
-    fn next(&mut self) -> VarBuilder {
+    fn next(&mut self) -> VarBuilder<'_> {
         let vb = self.vb.pp(self.cnt.to_string());
         self.cnt += 1;
         vb

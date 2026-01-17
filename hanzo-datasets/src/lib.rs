@@ -1,4 +1,4 @@
-//! Datasets & Dataloaders for ML
+//! Datasets & Dataloaders for Candle
 pub mod batcher;
 pub mod hub;
 pub mod nlp;

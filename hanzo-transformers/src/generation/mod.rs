@@ -3,7 +3,7 @@
 //! Functionality for modeling sampling strategies and logits processing in text generation
 //! with support for temperature-based sampling, top-k filtering, nucleus sampling (top-p),
 //! and combinations thereof.
-use hanzo_ml::{Context, DType, Error, Result, Tensor};
+use hanzo_ml::{DType, Error, Result, Tensor};
 use rand::{distr::Distribution, SeedableRng};
 
 #[derive(Clone, PartialEq, Debug)]
@@ -41,19 +41,12 @@ impl LogitsProcessor {
     }
 
     fn sample_argmax(&mut self, logits: Tensor) -> Result<u32> {
-        let logits_v: Vec<f32> = logits.to_vec1()?;
-        let next_token = logits_v
-            .iter()
-            .enumerate()
-            .max_by(|(_, u), (_, v)| u.total_cmp(v))
-            .map(|(i, _)| i as u32)
-            .context("empty logits")?;
-        Ok(next_token)
+        logits.argmax(hanzo_ml::D::Minus1)?.to_scalar::<u32>()
     }
 
     fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {
-        let sampled = hanzo_ml_nn::sampling::gumbel_softmax(logits, temperature, hanzo_ml::D::Minus1)?;
-        sampled.to_vec0::<u32>()
+        let sampled = hanzo_nn::sampling::gumbel_softmax(logits, temperature, hanzo_ml::D::Minus1)?;
+        sampled.to_scalar::<u32>()
     }
 
     fn sample_multinomial(&mut self, prs: &Vec<f32>) -> Result<u32> {
@@ -126,7 +119,7 @@ impl LogitsProcessor {
         let logits = logits.to_dtype(DType::F32)?;
         let prs = |temperature: f64| -> Result<Vec<f32>> {
             let logits = (&logits / temperature)?;
-            let prs = hanzo_ml_nn::ops::softmax_last_dim(&logits)?;
+            let prs = hanzo_nn::ops::softmax_last_dim(&logits)?;
             let mut prs = prs.to_vec1()?;
             f(&mut prs);
             Ok(prs)

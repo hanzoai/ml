@@ -19,7 +19,7 @@ use hanzo_ml::quantized::gguf_file;
 use hanzo_ml::quantized::QTensor;
 use hanzo_ml::D;
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
-use hanzo_ml_nn::{Embedding, Module};
+use hanzo_nn::{Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 131072; // Gemma 3 supports 128K context window
 pub const DEFAULT_SLIDING_WINDOW_TYPE: usize = 6;
@@ -57,7 +57,7 @@ impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let gate = self.feed_forward_gate.forward(xs)?;
         let up = self.feed_forward_up.forward(xs)?;
-        let silu = hanzo_ml_nn::ops::silu(&gate)?;
+        let silu = hanzo_nn::ops::silu(&gate)?;
         let gated = (silu * up)?;
         self.feed_forward_down.forward(&gated)
     }
@@ -94,8 +94,8 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -235,7 +235,7 @@ impl LayerWeights {
             attn_weights = mask.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
         }
 
-        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&v)?;
 
         let attn_output = attn_output
@@ -263,34 +263,48 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let md_get = |s: &str| match ct.metadata.get(s) {
-            None => hanzo_ml::bail!("cannot find {s} in metadata"),
-            Some(v) => Ok(v),
+        // Detect architecture prefix by probing which keys exist in metadata.
+        // This supports gemma3, gemma2, gemma, gemma-embedding, and future variants.
+        let prefix = ["gemma3", "gemma2", "gemma", "gemma-embedding"]
+            .iter()
+            .find(|p| {
+                ct.metadata
+                    .contains_key(&format!("{}.attention.head_count", p))
+            })
+            .copied()
+            .unwrap_or("gemma3");
+
+        let md_get = |s: &str| {
+            let key = format!("{prefix}.{s}");
+            match ct.metadata.get(&key) {
+                None => hanzo_ml::bail!("cannot find {key} in metadata"),
+                Some(v) => Ok(v),
+            }
         };
 
-        let head_count = md_get("gemma3.attention.head_count")?.to_u32()? as usize;
-        let head_count_kv = md_get("gemma3.attention.head_count_kv")?.to_u32()? as usize;
-        let block_count = md_get("gemma3.block_count")?.to_u32()? as usize;
-        let embedding_length = md_get("gemma3.embedding_length")?.to_u32()? as usize;
-        let key_length = md_get("gemma3.attention.key_length")?.to_u32()? as usize;
-        let _value_length = md_get("gemma3.attention.value_length")?.to_u32()? as usize;
-        let rms_norm_eps = md_get("gemma3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        let sliding_window_size = md_get("gemma3.attention.sliding_window")?.to_u32()? as usize;
+        let head_count = md_get("attention.head_count")?.to_u32()? as usize;
+        let head_count_kv = md_get("attention.head_count_kv")?.to_u32()? as usize;
+        let block_count = md_get("block_count")?.to_u32()? as usize;
+        let embedding_length = md_get("embedding_length")?.to_u32()? as usize;
+        let key_length = md_get("attention.key_length")?.to_u32()? as usize;
+        let _value_length = md_get("attention.value_length")?.to_u32()? as usize;
+        let rms_norm_eps = md_get("attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let sliding_window_size = md_get("attention.sliding_window")?.to_u32()? as usize;
 
-        let sliding_window_type = md_get("gemma3.attention.sliding_window_type")
+        let sliding_window_type = md_get("attention.sliding_window_type")
             .and_then(|m| Ok(m.to_u32()? as usize))
             .unwrap_or(DEFAULT_SLIDING_WINDOW_TYPE);
 
-        let rope_freq_base = md_get("gemma3.rope.freq_base")
+        let rope_freq_base = md_get("rope.freq_base")
             .and_then(|m| m.to_f32())
             .unwrap_or(DEFAULT_ROPE_FREQUENCY);
 
-        let rope_freq_base_sliding = md_get("gemma3.rope.local_freq_base")
+        let rope_freq_base_sliding = md_get("rope.local_freq_base")
             .and_then(|m| m.to_f32())
             .unwrap_or(DEFAULT_ROPE_FREQUENCY_SLIDING);
 
         // Unused in Llama.cpp so we aren't using it here.
-        let _rope_freq_scaling_factor = md_get("gemma3.rope.scaling.factor")
+        let _rope_freq_scaling_factor = md_get("rope.scaling.factor")
             .and_then(|m| m.to_f32())
             .unwrap_or(DEFAULT_ROPE_FREQUENCY_SCALE_FACTOR);
 

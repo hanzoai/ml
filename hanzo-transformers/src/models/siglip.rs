@@ -8,7 +8,7 @@
 
 use crate::models::clip::div_l2_norm;
 use hanzo_ml::{IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{layer_norm, linear, LayerNorm, Linear, VarBuilder};
+use hanzo_nn::{layer_norm, linear, LayerNorm, Linear, VarBuilder};
 
 fn default_text_vocab_size() -> usize {
     32000
@@ -50,8 +50,8 @@ fn default_text_eos_token_id() -> u32 {
     49407
 }
 
-fn default_text_hidden_act() -> hanzo_ml_nn::Activation {
-    hanzo_ml_nn::Activation::GeluPytorchTanh
+fn default_text_hidden_act() -> hanzo_nn::Activation {
+    hanzo_nn::Activation::GeluPytorchTanh
 }
 
 // https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/models/siglip/configuration_siglip.py#L27
@@ -70,7 +70,7 @@ pub struct TextConfig {
     #[serde(default = "default_text_max_position_embeddings")]
     pub max_position_embeddings: usize,
     #[serde(default = "default_text_hidden_act")]
-    pub hidden_act: hanzo_ml_nn::Activation,
+    pub hidden_act: hanzo_nn::Activation,
     #[serde(default = "default_text_layer_norm_eps")]
     pub layer_norm_eps: f64,
     #[serde(default = "default_text_pad_token_id")]
@@ -113,8 +113,8 @@ fn default_vision_layer_norm_eps() -> f64 {
     1e-6
 }
 
-fn default_vision_hidden_act() -> hanzo_ml_nn::Activation {
-    hanzo_ml_nn::Activation::GeluPytorchTanh
+fn default_vision_hidden_act() -> hanzo_nn::Activation {
+    hanzo_nn::Activation::GeluPytorchTanh
 }
 
 // https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/models/siglip/configuration_siglip.py#L132
@@ -135,7 +135,7 @@ pub struct VisionConfig {
     #[serde(default = "default_vision_batch_size")]
     pub patch_size: usize,
     #[serde(default = "default_vision_hidden_act")]
-    pub hidden_act: hanzo_ml_nn::Activation,
+    pub hidden_act: hanzo_nn::Activation,
     #[serde(default = "default_vision_layer_norm_eps")]
     pub layer_norm_eps: f64,
 }
@@ -146,7 +146,7 @@ trait TransformerConfig {
     fn num_attention_heads(&self) -> usize;
     fn num_hidden_layers(&self) -> usize;
     fn layer_norm_eps(&self) -> f64;
-    fn hidden_act(&self) -> hanzo_ml_nn::Activation;
+    fn hidden_act(&self) -> hanzo_nn::Activation;
 }
 
 impl TransformerConfig for TextConfig {
@@ -165,7 +165,7 @@ impl TransformerConfig for TextConfig {
     fn layer_norm_eps(&self) -> f64 {
         self.layer_norm_eps
     }
-    fn hidden_act(&self) -> hanzo_ml_nn::Activation {
+    fn hidden_act(&self) -> hanzo_nn::Activation {
         self.hidden_act
     }
 }
@@ -186,7 +186,7 @@ impl TransformerConfig for VisionConfig {
     fn layer_norm_eps(&self) -> f64 {
         self.layer_norm_eps
     }
-    fn hidden_act(&self) -> hanzo_ml_nn::Activation {
+    fn hidden_act(&self) -> hanzo_nn::Activation {
         self.hidden_act
     }
 }
@@ -203,7 +203,7 @@ impl VisionConfig {
             image_size: 224, // num_image_tokens: (224 / 14)^2 = 256
             // Default values.
             num_channels: 3,
-            hidden_act: hanzo_ml_nn::Activation::GeluPytorchTanh,
+            hidden_act: hanzo_nn::Activation::GeluPytorchTanh,
             layer_norm_eps: 1e-6,
         }
     }
@@ -219,7 +219,7 @@ impl VisionConfig {
             image_size: 448, // num_image_tokens: (448 / 14)^2 = 1024
             // Default values.
             num_channels: 3,
-            hidden_act: hanzo_ml_nn::Activation::GeluPytorchTanh,
+            hidden_act: hanzo_nn::Activation::GeluPytorchTanh,
             layer_norm_eps: 1e-6,
         }
     }
@@ -235,7 +235,7 @@ impl VisionConfig {
             image_size: 896, // num_image_tokens: (896 / 14)^2 = 4096
             // Default values.
             num_channels: 3,
-            hidden_act: hanzo_ml_nn::Activation::GeluPytorchTanh,
+            hidden_act: hanzo_nn::Activation::GeluPytorchTanh,
             layer_norm_eps: 1e-6,
         }
     }
@@ -265,7 +265,7 @@ impl Config {
             bos_token_id: 49406,
             eos_token_id: 49407,
             layer_norm_eps: 1e-6,
-            hidden_act: hanzo_ml_nn::Activation::GeluPytorchTanh,
+            hidden_act: hanzo_nn::Activation::GeluPytorchTanh,
             max_position_embeddings: 64,
             num_hidden_layers: 12,
         };
@@ -278,7 +278,7 @@ impl Config {
             num_attention_heads: 12,
             num_channels: 3,
             image_size: 224,
-            hidden_act: hanzo_ml_nn::Activation::GeluPytorchTanh,
+            hidden_act: hanzo_nn::Activation::GeluPytorchTanh,
             layer_norm_eps: 1e-6,
         };
         Self {
@@ -340,7 +340,7 @@ impl MultiheadAttention {
 
         let (_, _, _, c_per_head) = q.dims4()?;
         let attn = (q.matmul(&k.t()?)? / (c_per_head as f64).sqrt())?;
-        let attn = hanzo_ml_nn::ops::softmax_last_dim(&attn)?;
+        let attn = hanzo_nn::ops::softmax_last_dim(&attn)?;
 
         let out = attn.matmul(&v)?;
         self.recombine_heads(&out)?.apply(&self.out_proj)
@@ -428,8 +428,8 @@ impl Attention {
             None => attn_weights,
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
-        // The original implementation upcasts to f32 but hanzo_ml_nn::ops::softmax should handle this properly.
-        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+        // The original implementation upcasts to f32 but hanzo_nn::ops::softmax should handle this properly.
+        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_outputs = attn_weights
             .matmul(&value_states)?
             .transpose(1, 2)?
@@ -444,15 +444,15 @@ impl Attention {
 struct Mlp {
     fc1: Linear,
     fc2: Linear,
-    activation_fn: hanzo_ml_nn::Activation,
+    activation_fn: hanzo_nn::Activation,
 }
 
 impl Mlp {
     fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size();
         let intermediate_size = cfg.intermediate_size();
-        let fc1 = hanzo_ml_nn::linear(hidden_size, intermediate_size, vb.pp("fc1"))?;
-        let fc2 = hanzo_ml_nn::linear(intermediate_size, hidden_size, vb.pp("fc2"))?;
+        let fc1 = hanzo_nn::linear(hidden_size, intermediate_size, vb.pp("fc1"))?;
+        let fc2 = hanzo_nn::linear(intermediate_size, hidden_size, vb.pp("fc2"))?;
         Ok(Self {
             fc1,
             fc2,
@@ -533,7 +533,7 @@ impl Encoder {
 
 #[derive(Debug, Clone)]
 struct VisionEmbeddings {
-    patch_embedding: hanzo_ml_nn::Conv2d,
+    patch_embedding: hanzo_nn::Conv2d,
     position_embedding: Tensor,
     patch_size: usize,
     base_num_patches_per_side: usize,
@@ -541,11 +541,11 @@ struct VisionEmbeddings {
 
 impl VisionEmbeddings {
     fn new(cfg: &VisionConfig, vb: VarBuilder) -> Result<Self> {
-        let conv2d_cfg = hanzo_ml_nn::Conv2dConfig {
+        let conv2d_cfg = hanzo_nn::Conv2dConfig {
             stride: cfg.patch_size,
             ..Default::default()
         };
-        let patch_embedding = hanzo_ml_nn::conv2d(
+        let patch_embedding = hanzo_nn::conv2d(
             cfg.num_channels,
             cfg.hidden_size,
             cfg.patch_size,
@@ -553,7 +553,7 @@ impl VisionEmbeddings {
             vb.pp("patch_embedding"),
         )?;
         let num_patches_per_side = cfg.image_size / cfg.patch_size;
-        let embedder = hanzo_ml_nn::embedding(
+        let embedder = hanzo_nn::embedding(
             num_patches_per_side.pow(2),
             cfg.hidden_size(),
             vb.pp("position_embedding"),
@@ -661,16 +661,16 @@ impl Module for VisionModel {
 
 #[derive(Debug, Clone)]
 struct TextEmbeddings {
-    token_embedding: hanzo_ml_nn::Embedding,
-    position_embedding: hanzo_ml_nn::Embedding,
+    token_embedding: hanzo_nn::Embedding,
+    position_embedding: hanzo_nn::Embedding,
     position_ids: Tensor,
 }
 
 impl TextEmbeddings {
     fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
         let token_embedding =
-            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("token_embedding"))?;
-        let position_embedding = hanzo_ml_nn::embedding(
+            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("token_embedding"))?;
+        let position_embedding = hanzo_nn::embedding(
             cfg.max_position_embeddings,
             cfg.hidden_size,
             vb.pp("position_embedding"),

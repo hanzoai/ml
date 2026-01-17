@@ -1513,7 +1513,7 @@ fn hanzo_utils(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// &RETURNS&: Tensor
 fn softmax(tensor: PyTensor, dim: i64) -> PyResult<PyTensor> {
     let dim = actual_dim(&tensor, dim).map_err(wrap_err)?;
-    let sm = hanzo_ml_nn::ops::softmax(&tensor.0, dim).map_err(wrap_err)?;
+    let sm = hanzo_nn::ops::softmax(&tensor.0, dim).map_err(wrap_err)?;
     Ok(PyTensor(sm))
 }
 
@@ -1544,7 +1544,7 @@ fn max_pool2d(tensor: PyTensor, ksize: usize, stride: usize) -> PyResult<PyTenso
 /// Applies the Sigmoid Linear Unit (SiLU) function to a given tensor.
 /// &RETURNS&: Tensor
 fn silu(tensor: PyTensor) -> PyResult<PyTensor> {
-    let s = hanzo_ml_nn::ops::silu(&tensor.0).map_err(wrap_err)?;
+    let s = hanzo_nn::ops::silu(&tensor.0).map_err(wrap_err)?;
     Ok(PyTensor(s))
 }
 

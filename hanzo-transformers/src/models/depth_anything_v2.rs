@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use hanzo_ml::D::Minus1;
 use hanzo_ml::{Module, Result, Tensor};
-use hanzo_ml_nn::ops::Identity;
-use hanzo_ml_nn::{
+use hanzo_nn::ops::Identity;
+use hanzo_nn::{
     batch_norm, conv2d, conv2d_no_bias, conv_transpose2d, linear, seq, Activation, BatchNorm,
     BatchNormConfig, Conv2d, Conv2dConfig, ConvTranspose2dConfig, Sequential, VarBuilder,
 };

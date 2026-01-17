@@ -236,7 +236,7 @@ fn run_eval(args: &EvaluationCmd, common_args: &Args) -> Result<()> {
     for inp_tgt in batch_iter {
         let (inp, tgt) = inp_tgt?;
         let logits = model.forward(&inp, 0, &mut cache)?;
-        let loss = hanzo_ml_nn::loss::cross_entropy(&logits.flatten_to(1)?, &tgt.flatten_to(1)?)?;
+        let loss = hanzo_nn::loss::cross_entropy(&logits.flatten_to(1)?, &tgt.flatten_to(1)?)?;
         println!("{}", loss.to_vec0::<f32>()?);
     }
     Ok(())
@@ -293,7 +293,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
             )?
             .dequantize(&device)?;
 
-        let fake_vb = hanzo_ml_nn::VarBuilder::from_tensors(
+        let fake_vb = hanzo_nn::VarBuilder::from_tensors(
             [
                 ("freq_cis_real".to_string(), freq_cis_real),
                 ("freq_cis_imag".to_string(), freq_cis_imag),
@@ -309,7 +309,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
     } else if is_safetensors {
         let config = Config::tiny_15m();
         let tensors = hanzo_ml::safetensors::load(config_path, &device)?;
-        let vb = hanzo_ml_nn::VarBuilder::from_tensors(tensors, hanzo_ml::DType::F32, &device);
+        let vb = hanzo_nn::VarBuilder::from_tensors(tensors, hanzo_ml::DType::F32, &device);
         let cache = model::Cache::new(true, &config, vb.pp("rot"))?;
         let model = Model::Llama(Llama::load(vb, config.clone())?);
         (model, config, cache)

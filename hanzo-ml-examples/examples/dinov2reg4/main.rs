@@ -12,7 +12,7 @@ extern crate accelerate_src;
 use clap::Parser;
 
 use hanzo_ml::{DType, IndexOp, D};
-use hanzo_ml_nn::{Module, VarBuilder};
+use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::models::dinov2reg4;
 
 #[derive(Parser)]
@@ -58,7 +58,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = dinov2reg4::vit_base(vb)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = hanzo_ml_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = hanzo_nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

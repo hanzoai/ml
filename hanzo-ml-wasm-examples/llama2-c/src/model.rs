@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{
+use hanzo_nn::{
     embedding, linear_no_bias as linear, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder,
 };
 use std::collections::HashMap;
@@ -120,7 +120,7 @@ impl CausalSelfAttention {
         let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
         let mask = self.cache.mask(seq_len)?.broadcast_as(att.shape())?;
         let att = masked_fill(&att, &mask, f32::NEG_INFINITY)?;
-        let att = hanzo_ml_nn::ops::softmax(&att, D::Minus1)?;
+        let att = hanzo_nn::ops::softmax(&att, D::Minus1)?;
         // Convert to contiguous as matmul doesn't support strided vs for now.
         let y = att.matmul(&v.contiguous()?)?;
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
@@ -186,7 +186,7 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = (hanzo_ml_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
+        let x = (hanzo_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
         self.c_proj.forward(&x)
     }
 

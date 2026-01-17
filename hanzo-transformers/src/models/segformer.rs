@@ -16,7 +16,7 @@
 
 use crate::models::with_tracing::{conv2d, linear, Conv2d, Linear};
 use hanzo_ml::{Context, Module, ModuleT, Result, Tensor, D};
-use hanzo_ml_nn::{conv2d_no_bias, layer_norm, Activation, Conv2dConfig, VarBuilder};
+use hanzo_nn::{conv2d_no_bias, layer_norm, Activation, Conv2dConfig, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -34,7 +34,7 @@ pub struct Config {
     pub strides: Vec<usize>,
     pub num_attention_heads: Vec<usize>,
     pub mlp_ratios: Vec<usize>,
-    pub hidden_act: hanzo_ml_nn::Activation,
+    pub hidden_act: hanzo_nn::Activation,
     pub layer_norm_eps: f64,
     pub decoder_hidden_size: usize,
 }
@@ -42,7 +42,7 @@ pub struct Config {
 #[derive(Debug, Clone)]
 struct SegformerOverlapPatchEmbeddings {
     projection: Conv2d,
-    layer_norm: hanzo_ml_nn::LayerNorm,
+    layer_norm: hanzo_nn::LayerNorm,
 }
 
 impl SegformerOverlapPatchEmbeddings {
@@ -66,7 +66,7 @@ impl SegformerOverlapPatchEmbeddings {
             vb.pp("proj"),
         )?;
         let layer_norm =
-            hanzo_ml_nn::layer_norm(hidden_size, config.layer_norm_eps, vb.pp("layer_norm"))?;
+            hanzo_nn::layer_norm(hidden_size, config.layer_norm_eps, vb.pp("layer_norm"))?;
         Ok(Self {
             projection,
             layer_norm,
@@ -106,7 +106,7 @@ impl SegformerEfficientSelfAttention {
         sequence_reduction_ratio: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        if hidden_size % num_attention_heads != 0 {
+        if !hidden_size.is_multiple_of(num_attention_heads) {
             hanzo_ml::bail!(
                 "The hidden size {} is not a multiple of the number of attention heads {}",
                 hidden_size,
@@ -130,7 +130,7 @@ impl SegformerEfficientSelfAttention {
                     },
                     vb.pp("sr"),
                 )?),
-                Some(hanzo_ml_nn::layer_norm(
+                Some(hanzo_nn::layer_norm(
                     hidden_size,
                     config.layer_norm_eps,
                     vb.pp("layer_norm"),
@@ -189,7 +189,7 @@ impl Module for SegformerEfficientSelfAttention {
             .contiguous()?;
         let attention_scores =
             (query.matmul(&key.t()?)? / f64::sqrt(self.attention_head_size as f64))?;
-        let attention_scores = hanzo_ml_nn::ops::softmax_last_dim(&attention_scores)?;
+        let attention_scores = hanzo_nn::ops::softmax_last_dim(&attention_scores)?;
         let result = attention_scores.matmul(&value)?;
         let result = result.permute((0, 2, 1, 3))?.contiguous()?;
         result.flatten_from(D::Minus2)
@@ -330,9 +330,9 @@ impl Module for SegformerMixFFN {
 
 #[derive(Debug, Clone)]
 struct SegformerLayer {
-    layer_norm_1: hanzo_ml_nn::LayerNorm,
+    layer_norm_1: hanzo_nn::LayerNorm,
     attention: SegformerAttention,
-    layer_norm_2: hanzo_ml_nn::LayerNorm,
+    layer_norm_2: hanzo_nn::LayerNorm,
     mlp: SegformerMixFFN,
 }
 
@@ -397,7 +397,7 @@ struct SegformerEncoder {
     /// a list of attention blocks, each consisting of layers
     blocks: Vec<Vec<SegformerLayer>>,
     /// a final list of layer norms
-    layer_norms: Vec<hanzo_ml_nn::LayerNorm>,
+    layer_norms: Vec<hanzo_nn::LayerNorm>,
 }
 
 impl SegformerEncoder {
@@ -510,9 +510,9 @@ impl Module for SegformerMLP {
 #[derive(Debug, Clone)]
 struct SegformerDecodeHead {
     linear_c: Vec<SegformerMLP>,
-    linear_fuse: hanzo_ml_nn::Conv2d,
-    batch_norm: hanzo_ml_nn::BatchNorm,
-    classifier: hanzo_ml_nn::Conv2d,
+    linear_fuse: hanzo_nn::Conv2d,
+    batch_norm: hanzo_nn::BatchNorm,
+    classifier: hanzo_nn::Conv2d,
 }
 
 impl SegformerDecodeHead {
@@ -533,7 +533,7 @@ impl SegformerDecodeHead {
             Conv2dConfig::default(),
             vb.pp("linear_fuse"),
         )?;
-        let batch_norm = hanzo_ml_nn::batch_norm(
+        let batch_norm = hanzo_nn::batch_norm(
             config.decoder_hidden_size,
             config.layer_norm_eps,
             vb.pp("batch_norm"),

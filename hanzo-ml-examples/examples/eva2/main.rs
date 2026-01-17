@@ -10,7 +10,7 @@ extern crate accelerate_src;
 use clap::Parser;
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{Module, VarBuilder};
+use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::models::eva2;
 
 /// Loads an image from disk using the image crate, this returns a tensor with shape
@@ -66,7 +66,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = eva2::vit_base(vb)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = hanzo_ml_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = hanzo_nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

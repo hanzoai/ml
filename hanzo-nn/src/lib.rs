@@ -1,23 +1,24 @@
-//! hanzo-nn
+//! candle-nn
 //!
 //! ## Other Crates
 //!
-//! ML consists of a number of crates. This crate holds structs and functions
+//! Candle consists of a number of crates. This crate holds structs and functions
 //! that allow you to build and train neural nets. You may wish
 //! to look at the docs for the other crates which can be found here:
 //!
-//! - [hanzo-ml](https://docs.rs/hanzo-ml/). Core Datastructures and DataTypes.
-//! - [hanzo-nn](https://docs.rs/hanzo-nn/). Building blocks for Neural Nets.
-//! - [hanzo-datasets](https://docs.rs/hanzo-datasets/). Rust access to commonly used Datasets like MNIST.
-//! - [hanzo-ml-examples](https://docs.rs/hanzo-ml-examples/). Examples of ML in Use.
-//! - [hanzo-onnx](https://docs.rs/hanzo-onnx/). Loading and using ONNX models.
-//! - [hanzo-ml-pyo3](https://docs.rs/hanzo-ml-pyo3/). Access to ML from Python.
-//! - [hanzo-transformers](https://docs.rs/hanzo-transformers/). ML implemntation of many published transformer models.
+//! - [candle-core](https://docs.rs/candle-core/). Core Datastructures and DataTypes.
+//! - [candle-nn](https://docs.rs/candle-nn/). Building blocks for Neural Nets.
+//! - [candle-datasets](https://docs.rs/candle-datasets/). Rust access to commonly used Datasets like MNIST.
+//! - [candle-examples](https://docs.rs/candle-examples/). Examples of Candle in Use.
+//! - [candle-onnx](https://docs.rs/candle-onnx/). Loading and using ONNX models.
+//! - [candle-pyo3](https://docs.rs/candle-pyo3/). Access to Candle from Python.
+//! - [candle-transformers](https://docs.rs/candle-transformers/). Candle implementation of many published transformer models.
 //!
 
 pub mod activation;
 pub mod batch_norm;
 pub mod conv;
+pub mod cpu_flash_attention;
 pub mod embedding;
 pub mod encoding;
 pub mod func;
@@ -27,6 +28,7 @@ pub mod kv_cache;
 pub mod layer_norm;
 pub mod linear;
 pub mod loss;
+pub mod moe;
 pub mod ops;
 pub mod optim;
 pub mod rnn;

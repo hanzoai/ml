@@ -2,8 +2,8 @@ use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
 use crate::onnx::{self, GraphProto};
 use hanzo_ml::Module;
-use hanzo_ml::{bail, DType, Device, Result, Tensor};
-use hanzo_ml_nn::activation::PReLU;
+use hanzo_ml::{bail, DType, Device, IndexOp, Result, Tensor};
+use hanzo_nn::activation::PReLU;
 use std::collections::{HashMap, HashSet};
 
 pub type Value = Tensor;
@@ -363,7 +363,7 @@ fn simple_eval_(
                 let input1 = get(&node.input[1])?;
                 // HACK: current implementation of broadcast_pow cannot handle negative base,
                 // so we use powf where we can, which *does* correctly handle negative base.
-                if let Ok(exp) = (|| input1.to_dtype(DType::F64)?.to_scalar::<f64>())() {
+                if let Ok(exp) = to_scalar_flexible::<f64>(&input1.to_dtype(DType::F64)?) {
                     let output = input0.powf(exp)?;
                     values.insert(node.output[0].clone(), output);
                 } else {
@@ -418,10 +418,10 @@ fn simple_eval_(
             "LogSoftmax" => {
                 let input = get(&node.input[0])?;
                 let output = match get_attr_opt::<i64>(node, "axis")? {
-                    None => hanzo_ml_nn::ops::softmax_last_dim(input)?,
+                    None => hanzo_nn::ops::softmax_last_dim(input)?,
                     Some(&axis) => {
                         let axis = input.normalize_axis(axis)?;
-                        hanzo_ml_nn::ops::log_softmax(input, axis)?
+                        hanzo_nn::ops::log_softmax(input, axis)?
                     }
                 };
                 values.insert(node.output[0].clone(), output);
@@ -429,10 +429,10 @@ fn simple_eval_(
             "Softmax" => {
                 let input = get(&node.input[0])?;
                 let output = match get_attr_opt::<i64>(node, "axis")? {
-                    None => hanzo_ml_nn::ops::softmax_last_dim(input)?,
+                    None => hanzo_nn::ops::softmax_last_dim(input)?,
                     Some(&axis) => {
                         let axis = input.normalize_axis(axis)?;
-                        hanzo_ml_nn::ops::softmax(input, axis)?
+                        hanzo_nn::ops::softmax(input, axis)?
                     }
                 };
                 values.insert(node.output[0].clone(), output);
@@ -443,7 +443,7 @@ fn simple_eval_(
                     None => input.t()?,
                     Some(perm) => {
                         let perm = perm.iter().map(|&v| v as usize).collect::<Vec<_>>();
-                        input.permute(perm)?
+                        input.permute(perm)?.contiguous()?
                     }
                 };
                 values.insert(node.output[0].clone(), output);
@@ -655,7 +655,7 @@ fn simple_eval_(
                 };
 
                 // In Pytorch or Numpy this can be done by indexing the xs tensor using the indices
-                // tensor directly, but hanzo does not support tensor indexing at the moment, so
+                // tensor directly, but candle does not support tensor indexing at the moment, so
                 // some workarounds must be done.
                 let xs = match indices.dims() {
                     [] => {
@@ -757,9 +757,9 @@ fn simple_eval_(
                 macro_rules! arange_step {
                     ($t: ty) => {
                         Tensor::arange_step(
-                            start.to_vec0::<$t>()?,
-                            limit.to_vec0::<$t>()?,
-                            delta.to_vec0::<$t>()?,
+                            to_vec0_flexible::<$t>(start)?,
+                            to_vec0_flexible::<$t>(limit)?,
+                            to_vec0_flexible::<$t>(delta)?,
                             &Device::Cpu,
                         )?
                     };
@@ -773,6 +773,15 @@ fn simple_eval_(
                     DType::F16 => arange_step!(f32),
                     DType::F32 => arange_step!(f32),
                     DType::F64 => arange_step!(f64),
+                    DType::F8E4M3 => arange_step!(f32),
+                    DType::I32
+                    | DType::I16
+                    | DType::F6E2M3
+                    | DType::F6E3M2
+                    | DType::F4
+                    | DType::F8E8M0 => {
+                        bail!("unsupported Range type i32/i16/f6e2m3/f6e3m2/f4/f8e8m0")
+                    }
                 };
 
                 values.insert(node.output[0].clone(), output);
@@ -791,6 +800,22 @@ fn simple_eval_(
                 let b = get(&node.input[1])?;
 
                 let output = a.broadcast_lt(b)?;
+                values.insert(node.output[0].clone(), output);
+            }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#LessOrEqual
+            "LessOrEqual" => {
+                let a = get(&node.input[0])?;
+                let b = get(&node.input[1])?;
+
+                let output = a.broadcast_le(b)?;
+                values.insert(node.output[0].clone(), output);
+            }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#GreaterOrEqual
+            "GreaterOrEqual" => {
+                let a = get(&node.input[0])?;
+                let b = get(&node.input[1])?;
+
+                let output = a.broadcast_ge(b)?;
                 values.insert(node.output[0].clone(), output);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Log
@@ -950,8 +975,31 @@ fn simple_eval_(
                 if inputs.is_empty() {
                     bail!("empty concat")
                 };
+                // Find minimum rank among inputs and squeeze trailing singleton dims to match
+                let min_rank = inputs.iter().map(|t| t.rank()).min().unwrap();
+                let inputs: Vec<_> = inputs
+                    .into_iter()
+                    .map(|t| {
+                        let mut t = t;
+                        while t.rank() > min_rank {
+                            let last_dim = t.rank() - 1;
+                            if t.dims()[last_dim] == 1 {
+                                t = t.squeeze(last_dim).unwrap_or(t);
+                            } else {
+                                break;
+                            }
+                        }
+                        t
+                    })
+                    .collect();
                 let axis = inputs[0].normalize_axis(axis)?;
-                let output = Tensor::cat(&inputs, axis)?;
+                let output = Tensor::cat(&inputs, axis).map_err(|e| {
+                    let shapes: Vec<_> = inputs.iter().map(|t| format!("{:?}", t.dims())).collect();
+                    hanzo_ml::Error::Msg(format!(
+                        "Concat failed for node '{}': {} (input shapes: {:?})",
+                        node.name, e, shapes
+                    ))
+                })?;
                 values.insert(node.output[0].clone(), output);
             }
             "Abs" => {
@@ -971,7 +1019,14 @@ fn simple_eval_(
             }
             "Neg" => {
                 let input = get(&node.input[0])?;
-                let output = input.neg()?;
+                // neg() not implemented for i64, work around with multiply by -1
+                let output = if input.dtype() == DType::I64 {
+                    let minus_one =
+                        Tensor::new(&[-1i64], input.device())?.broadcast_as(input.shape())?;
+                    input.mul(&minus_one)?
+                } else {
+                    input.neg()?
+                };
                 values.insert(node.output[0].clone(), output);
             }
             "Erf" => {
@@ -986,7 +1041,7 @@ fn simple_eval_(
             }
             "Sigmoid" => {
                 let input = get(&node.input[0])?;
-                let output = hanzo_ml_nn::ops::sigmoid(input)?;
+                let output = hanzo_nn::ops::sigmoid(input)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Gelu" => {
@@ -1068,9 +1123,7 @@ fn simple_eval_(
                     bail!("only reverse == 0 is supported in CumSum")
                 }
                 let input = get(&node.input[0])?;
-                let axis = get(&node.input[1])?
-                    .to_dtype(DType::U32)?
-                    .to_vec0::<u32>()?;
+                let axis = to_vec0_flexible::<u32>(&get(&node.input[1])?.to_dtype(DType::U32)?)?;
                 let output = input.cumsum(axis as usize)?;
                 values.insert(node.output[0].clone(), output);
             }
@@ -1092,7 +1145,7 @@ fn simple_eval_(
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#if
             "If" => {
                 // protobuf encodes boolean false as 0 and true as 1
-                let cond = get(&node.input[0])?.get(0)?.to_scalar::<u8>()?;
+                let cond = to_scalar_flexible::<u8>(&get(&node.input[0])?.get(0)?)?;
                 let attr_name = if cond != 0 {
                     "then_branch"
                 } else {
@@ -1216,8 +1269,8 @@ fn simple_eval_(
                     } as usize;
 
                     let data_dim = data.dims()[axis] as i64;
-                    let mut s = starts.get(i)?.to_scalar::<i64>()?;
-                    let mut e = ends.get(i)?.to_scalar::<i64>()?;
+                    let mut s = to_scalar_flexible::<i64>(&starts.get(i)?)?;
+                    let mut e = to_scalar_flexible::<i64>(&ends.get(i)?)?;
                     // All negative values in starts[i] and ends[i] have
                     // dims[axes[i]] added to them, where dims are the
                     // dimensions of input.
@@ -1228,7 +1281,7 @@ fn simple_eval_(
                         e += data_dim;
                     }
 
-                    let p = steps.get(i)?.to_scalar::<i64>()?;
+                    let p = to_scalar_flexible::<i64>(&steps.get(i)?)?;
                     // starts[i] is clamped into the range [0, dims[axes[i]]]
                     // for positive stepping and [0, dims[axes[i]]-1] for
                     // negative stepping.
@@ -1258,7 +1311,7 @@ fn simple_eval_(
                     // Satisfies version 18+
                     axes.to_vec1::<i64>().ok()
                 } else if let Ok(Some(axes)) = get_attr_opt::<[i64]>(node, "axes") {
-                    // Backward compatiblity with version 13 and below
+                    // Backward compatibility with version 13 and below
                     Some(axes.to_vec())
                 } else {
                     None
@@ -1367,7 +1420,7 @@ fn simple_eval_(
                     // Satisfies version 18+
                     axes.to_vec1::<i64>().ok()
                 } else if let Ok(Some(axes)) = get_attr_opt::<[i64]>(node, "axes") {
-                    // Backward compatiblity with version 13 and below
+                    // Backward compatibility with version 13 and below
                     Some(axes.to_vec())
                 } else {
                     None
@@ -1519,6 +1572,21 @@ fn simple_eval_(
                 let expanded_tensor = input_tensor.broadcast_as(target_shape)?;
 
                 values.insert(node.output[0].clone(), expanded_tensor);
+            }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Tile
+            "Tile" => {
+                let input = get(&node.input[0])?;
+                let repeats = get(&node.input[1])?.to_vec1::<i64>()?;
+
+                let mut result = input.clone();
+                for (dim, &repeat) in repeats.iter().enumerate() {
+                    if repeat > 1 {
+                        let repeat = repeat as usize;
+                        let tensors: Vec<_> = (0..repeat).map(|_| result.clone()).collect();
+                        result = Tensor::cat(&tensors, dim)?;
+                    }
+                }
+                values.insert(node.output[0].clone(), result);
             }
             //https://github.com/onnx/onnx/blob/main/docs/Operators.md#ReduceSum
             // Version 13 impl
@@ -1694,16 +1762,24 @@ fn simple_eval_(
                 let input = get(&node.input[0])?;
                 let dt = input.dtype();
                 match dt {
-                    DType::U8 | DType::U32 | DType::I64 => {
+                    DType::U8
+                    | DType::U32
+                    | DType::I64
+                    | DType::I32
+                    | DType::I16
+                    | DType::F6E2M3
+                    | DType::F6E3M2
+                    | DType::F4
+                    | DType::F8E8M0 => {
                         bail!(
                             "unsupported dtype {}, only float types are allowed for LeakyRelu",
                             dt.as_str()
                         )
                     }
-                    DType::BF16 | DType::F16 | DType::F32 | DType::F64 => {}
+                    DType::BF16 | DType::F16 | DType::F32 | DType::F64 | DType::F8E4M3 => {}
                 }
                 let alpha = get_attr_opt::<f32>(node, "alpha")?.copied().unwrap_or(0.01);
-                let output = hanzo_ml_nn::ops::leaky_relu(input, alpha.into())?;
+                let output = hanzo_nn::ops::leaky_relu(input, alpha.into())?;
                 values.insert(node.output[0].clone(), output);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Gemm
@@ -1888,22 +1964,22 @@ fn simple_eval_(
                 let r = r.index_select(&idx_ifco, 0)?;
                 let wb = wb.index_select(&idx_ifco, 0)?;
                 let rb = rb.index_select(&idx_ifco, 0)?;
-                let vmap = hanzo_ml_nn::VarMap::new();
+                let vmap = hanzo_nn::VarMap::new();
                 vmap.data().lock().unwrap().extend([
                     ("weight_ih_l0".to_string(), hanzo_ml::Var::from_tensor(&w)?),
                     ("weight_hh_l0".to_string(), hanzo_ml::Var::from_tensor(&r)?),
                     ("bias_ih_l0".to_string(), hanzo_ml::Var::from_tensor(&wb)?),
                     ("bias_hh_l0".to_string(), hanzo_ml::Var::from_tensor(&rb)?),
                 ]);
-                use hanzo_ml_nn::rnn::RNN as _;
-                let lstm = hanzo_ml_nn::rnn::lstm(
+                use hanzo_nn::rnn::RNN as _;
+                let lstm = hanzo_nn::rnn::lstm(
                     input_size,
                     hidden_size as usize,
-                    hanzo_ml_nn::rnn::LSTMConfig::default(),
-                    hanzo_ml_nn::VarBuilder::from_varmap(&vmap, w.dtype(), w.device()),
+                    hanzo_nn::rnn::LSTMConfig::default(),
+                    hanzo_nn::VarBuilder::from_varmap(&vmap, w.dtype(), w.device()),
                 )?;
 
-                let mut lstm_state = hanzo_ml_nn::rnn::LSTMState::new(h, c);
+                let mut lstm_state = hanzo_nn::rnn::LSTMState::new(h, c);
                 let mut h_acc = if node.output.first().map(String::as_str).unwrap_or("") != "" {
                     Some(vec![])
                 } else {
@@ -2091,12 +2167,43 @@ fn simple_eval_(
 
                 values.insert(node.output[0].clone(), out);
             }
+            // https://onnx.ai/onnx/operators/onnx__And.html
+            "And" => {
+                let a = get(&node.input[0])?.gt(0_u8)?;
+                let b = get(&node.input[1])?.gt(0_u8)?;
+
+                let out = a.broadcast_mul(&b)?;
+
+                values.insert(node.output[0].clone(), out);
+            }
+            // https://onnx.ai/onnx/operators/onnx__Or.html
+            "Or" => {
+                let a = get(&node.input[0])?.gt(0_u8)?;
+                let b = get(&node.input[1])?.gt(0_u8)?;
+
+                let out = a.broadcast_add(&b)?.gt(0_u8)?;
+
+                values.insert(node.output[0].clone(), out);
+            }
             // https://onnx.ai/onnx/operators/onnx__Sign.html
             "Sign" => {
                 let input = get(&node.input[0])?;
                 let output = input.sign()?;
                 values.insert(node.output[0].clone(), output);
             }
+            // https://onnx.ai/onnx/operators/onnx__Selu.html
+            "Selu" => {
+                let input = get(&node.input[0])?;
+                let alpha = get_attr_opt::<f32>(node, "alpha")?
+                    .copied()
+                    .unwrap_or(1.6732632);
+                let gamma = get_attr_opt::<f32>(node, "gamma")?
+                    .copied()
+                    .unwrap_or(1.050701);
+                let out = hanzo_nn::ops::selu(input, alpha as f32, gamma as f32)?;
+                values.insert(node.output[0].clone(), out);
+            }
+
             // https://onnx.ai/onnx/operators/onnx__OneHot.html
             "OneHot" => {
                 let indices = get(&node.input[0])?;
@@ -2104,7 +2211,7 @@ fn simple_eval_(
                 let depth_tensor = get(&node.input[1])?;
                 let values_tensor = get(&node.input[2])?;
 
-                let depth = depth_tensor.to_scalar::<i64>()? as usize;
+                let depth = to_scalar_flexible::<i64>(depth_tensor)? as usize;
                 let values_vec = values_tensor.to_vec1::<f32>()?;
                 if values_vec.len() != 2 {
                     return Err(hanzo_ml::Error::Msg(
@@ -2167,7 +2274,7 @@ fn simple_eval_(
             }
             "HardSwish" => {
                 let input = get(&node.input[0])?;
-                let hard_sigmoid = hanzo_ml_nn::ops::hard_sigmoid(&input)?;
+                let hard_sigmoid = hanzo_nn::ops::hard_sigmoid(&input)?;
                 let output = input * hard_sigmoid;
                 values.insert(node.output[0].clone(), output?);
             }
@@ -2246,7 +2353,7 @@ fn simple_eval_(
 
                 // Get the diagonal offset 'k' from the second input if provided
                 let k = if node.input.len() > 1 && !node.input[1].is_empty() {
-                    get(&node.input[1])?.to_vec0::<i64>()?
+                    to_vec0_flexible::<i64>(get(&node.input[1])?)?
                 } else {
                     0
                 };
@@ -2306,7 +2413,7 @@ fn simple_eval_(
 
                 let indices_shape = indices.dims();
                 let data_shape = data.dims();
-                let updates_shape = updates.dims();
+                let _updates_shape = updates.dims();
 
                 // Last dimension of indices represents the depth of indexing
                 let k = indices_shape.last().unwrap().clone();
@@ -2482,4 +2589,24 @@ fn broadcast_shape_from_many(shapes: &[&[usize]]) -> Result<Vec<usize>> {
         shape_out = broadcast_shape(&shape_out, shape)?;
     }
     Ok(shape_out)
+}
+
+/// Extract scalar from tensors that may be wrapped in extra dimensions.
+/// Some ONNX exports use shape [1] or [1,1] where scalars are expected.
+/// Only accepts single-element tensors; multi-element tensors still fail.
+fn to_scalar_flexible<T: hanzo_ml::WithDType>(t: &Tensor) -> Result<T> {
+    if t.rank() > 0 && t.elem_count() == 1 {
+        t.flatten_all()?.i(0)?.to_scalar::<T>()
+    } else {
+        t.to_scalar::<T>()
+    }
+}
+
+/// Same as to_scalar_flexible but returns via to_vec0 for types that need it.
+fn to_vec0_flexible<T: hanzo_ml::WithDType>(t: &Tensor) -> Result<T> {
+    if t.rank() > 0 && t.elem_count() == 1 {
+        t.flatten_all()?.i(0)?.to_vec0::<T>()
+    } else {
+        t.to_vec0::<T>()
+    }
 }

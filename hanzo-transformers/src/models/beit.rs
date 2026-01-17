@@ -2,11 +2,11 @@
 //!
 //! See "BEIT: BERT Pre-Training of Image Transformers", Bao et al. 2021
 //! - [Arxiv](https://arxiv.org/abs/2106.08254)
-//! - [Github](https://github.com/microsoft/unilm/tree/master/beit)
+//! - [GitHub](https://github.com/microsoft/unilm/tree/master/beit)
 //!
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
+use hanzo_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
 
 const IMG_SIZE: usize = 384;
 const PATCH_SIZE: usize = 16;
@@ -16,9 +16,9 @@ const NB_TOKENS: usize = WINDOW_SIZE * WINDOW_SIZE + 1; // 24 * 24 + 1 = 577
 
 fn linear(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Result<Linear> {
     if bias {
-        hanzo_ml_nn::linear(in_dim, out_dim, vb)
+        hanzo_nn::linear(in_dim, out_dim, vb)
     } else {
-        hanzo_ml_nn::linear_no_bias(in_dim, out_dim, vb)
+        hanzo_nn::linear_no_bias(in_dim, out_dim, vb)
     }
 }
 
@@ -151,7 +151,7 @@ impl Module for Attention {
         let k = qkv.i(1)?.contiguous()?;
         let v = qkv.i(2)?.contiguous()?;
         let attn = (&q.matmul(&k.t()?)? + self._get_rel_pos_bias())?;
-        let attn = hanzo_ml_nn::ops::softmax(&attn, D::Minus1)?;
+        let attn = hanzo_nn::ops::softmax(&attn, D::Minus1)?;
         let attn = attn.matmul(&v)?.transpose(1, 2)?.reshape((b, n, c))?;
         self.proj.forward(&attn)
     }
@@ -243,17 +243,17 @@ impl Module for Block {
 
 #[derive(Debug)]
 struct PatchEmbed {
-    proj: hanzo_ml_nn::Conv2d,
+    proj: hanzo_nn::Conv2d,
     patch_size: (usize, usize),
 }
 
 impl PatchEmbed {
     fn new(vb: VarBuilder, patch_size: usize, in_chans: usize, embed_dim: usize) -> Result<Self> {
-        let config = hanzo_ml_nn::Conv2dConfig {
+        let config = hanzo_nn::Conv2dConfig {
             stride: patch_size,
             ..Default::default()
         };
-        let proj = hanzo_ml_nn::conv2d(in_chans, embed_dim, patch_size, config, vb.pp("proj"))?;
+        let proj = hanzo_nn::conv2d(in_chans, embed_dim, patch_size, config, vb.pp("proj"))?;
         Ok(Self {
             proj,
             patch_size: (patch_size, patch_size),

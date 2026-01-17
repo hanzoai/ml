@@ -32,7 +32,7 @@ struct Mlp {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
-    act_fn: hanzo_ml_nn::Activation,
+    act_fn: hanzo_nn::Activation,
 }
 
 impl Mlp {
@@ -86,11 +86,11 @@ struct RecurrentBlock {
     linear_y: Linear,
     linear_x: Linear,
     linear_out: Linear,
-    conv_1d: hanzo_ml_nn::Conv1d,
+    conv_1d: hanzo_nn::Conv1d,
     conv1d_state: Option<Tensor>,
     conv1d_width: usize,
     rg_lru: Rglru,
-    act_fn: hanzo_ml_nn::Activation,
+    act_fn: hanzo_nn::Activation,
 }
 
 impl RecurrentBlock {
@@ -106,12 +106,12 @@ impl RecurrentBlock {
                 .get((lru_width, 1, cfg.conv1d_width), "conv_1d.weight")?
                 .dequantize(vb.device())?;
             let bs = vb.get(lru_width, "conv_1d.bias")?.dequantize(vb.device())?;
-            let config = hanzo_ml_nn::Conv1dConfig {
+            let config = hanzo_nn::Conv1dConfig {
                 groups: lru_width,
                 padding: cfg.conv1d_width - 1,
                 ..Default::default()
             };
-            hanzo_ml_nn::Conv1d::new(ws, Some(bs), config)
+            hanzo_nn::Conv1d::new(ws, Some(bs), config)
         };
         let rg_lru = rglru(cfg, vb.pp("rg_lru"))?;
         Ok(Self {
@@ -263,7 +263,7 @@ impl SdpaAttention {
                     Some(mask) => att.broadcast_add(mask)?,
                 }
             };
-            let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
+            let att = hanzo_nn::ops::softmax_last_dim(&att)?;
             att.matmul(&value_states.contiguous()?)?
         };
 

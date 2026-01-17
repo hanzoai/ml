@@ -8,7 +8,7 @@ use anyhow::Error as E;
 use clap::Parser;
 
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_ml_nn::{ops::softmax, VarBuilder};
+use hanzo_nn::{ops::softmax, VarBuilder};
 use hanzo_transformers::models::siglip;
 
 use tokenizers::Tokenizer;

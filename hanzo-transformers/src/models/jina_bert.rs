@@ -6,7 +6,7 @@
 
 use super::with_tracing::{linear, linear_no_bias, Embedding, Linear};
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{layer_norm, LayerNorm, Module, VarBuilder};
+use hanzo_nn::{layer_norm, LayerNorm, Module, VarBuilder};
 use serde::Deserialize;
 
 pub const DTYPE: DType = DType::F32;
@@ -26,7 +26,7 @@ pub struct Config {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub intermediate_size: usize,
-    pub hidden_act: hanzo_ml_nn::Activation,
+    pub hidden_act: hanzo_nn::Activation,
     pub max_position_embeddings: usize,
     pub type_vocab_size: usize,
     pub initializer_range: f64,
@@ -44,7 +44,7 @@ impl Config {
             num_hidden_layers: 12,
             num_attention_heads: 12,
             intermediate_size: 3072,
-            hidden_act: hanzo_ml_nn::Activation::Gelu,
+            hidden_act: hanzo_nn::Activation::Gelu,
             max_position_embeddings: 8192,
             type_vocab_size: 2,
             initializer_range: 0.02,
@@ -61,7 +61,7 @@ impl Config {
         num_hidden_layers: usize,
         num_attention_heads: usize,
         intermediate_size: usize,
-        hidden_act: hanzo_ml_nn::Activation,
+        hidden_act: hanzo_nn::Activation,
         max_position_embeddings: usize,
         type_vocab_size: usize,
         initializer_range: f64,
@@ -181,7 +181,7 @@ impl BertSelfAttention {
         let attention_scores = attention_scores.broadcast_add(bias)?;
         let attention_probs = {
             let _enter_sm = self.span_softmax.enter();
-            hanzo_ml_nn::ops::softmax_last_dim(&attention_scores)?
+            hanzo_nn::ops::softmax_last_dim(&attention_scores)?
         };
         let context_layer = attention_probs.matmul(&value_layer)?;
         let context_layer = context_layer.transpose(1, 2)?.contiguous()?;
@@ -244,7 +244,7 @@ impl BertAttention {
 #[derive(Clone, Debug)]
 struct BertGLUMLP {
     gated_layers: Linear,
-    act: hanzo_ml_nn::Activation,
+    act: hanzo_nn::Activation,
     wo: Linear,
     layernorm: LayerNorm,
     intermediate_size: usize,
@@ -257,7 +257,7 @@ impl BertGLUMLP {
             cfg.intermediate_size * 2,
             vb.pp("gated_layers"),
         )?;
-        let act = hanzo_ml_nn::Activation::Gelu; // geglu
+        let act = hanzo_nn::Activation::Gelu; // geglu
         let wo = linear(cfg.intermediate_size, cfg.hidden_size, vb.pp("wo"))?;
         let layernorm = layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("layernorm"))?;
         Ok(Self {

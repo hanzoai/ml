@@ -51,7 +51,7 @@ pub mod transformer {
     impl Module for FeedForward {
         fn forward(&self, xs: &Tensor) -> Result<Tensor> {
             let _enter = self.span.enter();
-            let swiglu = (hanzo_ml_nn::ops::silu(&xs.apply(&self.w1)?)? * xs.apply(&self.w3))?;
+            let swiglu = (hanzo_nn::ops::silu(&xs.apply(&self.w1)?)? * xs.apply(&self.w3))?;
             swiglu.apply(&self.w2)
         }
     }
@@ -125,7 +125,7 @@ pub mod transformer {
             let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
             let attn_weights = attn_weights.broadcast_add(mask)?;
-            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
             let attn_output = attn_weights.matmul(&v)?;
             attn_output
                 .transpose(1, 2)?

@@ -17,7 +17,7 @@
 
 use crate::models::with_tracing::{conv2d, linear, linear_no_bias, Conv2d, Linear};
 use hanzo_ml::{IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{layer_norm, LayerNorm, VarBuilder};
+use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
 
 // https://github.com/huggingface/transformers/blob/main/src/transformers/models/vit/configuration_vit.py
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -26,7 +26,7 @@ pub struct Config {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub intermediate_size: usize,
-    pub hidden_act: hanzo_ml_nn::Activation,
+    pub hidden_act: hanzo_nn::Activation,
     pub layer_norm_eps: f64,
     pub image_size: usize,
     pub patch_size: usize,
@@ -42,7 +42,7 @@ impl Config {
             num_hidden_layers: 12,
             num_attention_heads: 12,
             intermediate_size: 3072,
-            hidden_act: hanzo_ml_nn::Activation::Gelu,
+            hidden_act: hanzo_nn::Activation::Gelu,
             layer_norm_eps: 1e-12,
             image_size: 224,
             patch_size: 16,
@@ -57,7 +57,7 @@ impl Config {
             num_hidden_layers: 12,
             num_attention_heads: 12,
             intermediate_size: 3072,
-            hidden_act: hanzo_ml_nn::Activation::Gelu,
+            hidden_act: hanzo_nn::Activation::Gelu,
             layer_norm_eps: 1e-12,
             image_size: 384,
             patch_size: 16,
@@ -78,7 +78,7 @@ impl PatchEmbeddings {
         let image_size = cfg.image_size;
         let patch_size = cfg.patch_size;
         let num_patches = (image_size / patch_size) * (image_size / patch_size);
-        let conv_cfg = hanzo_ml_nn::Conv2dConfig {
+        let conv_cfg = hanzo_nn::Conv2dConfig {
             stride: patch_size,
             ..Default::default()
         };
@@ -234,7 +234,7 @@ impl Module for SelfAttention {
 
         let attention_scores =
             (query.matmul(&key.t()?)? / f64::sqrt(self.attention_head_size as f64))?;
-        let attention_probs = hanzo_ml_nn::ops::softmax_last_dim(&attention_scores)?;
+        let attention_probs = hanzo_nn::ops::softmax_last_dim(&attention_scores)?;
         attention_probs
             .matmul(&value)?
             .permute((0, 2, 1, 3))?
@@ -284,7 +284,7 @@ impl Module for Attention {
 #[derive(Debug, Clone)]
 struct Intermediate {
     dense: Linear,
-    intermediate_act_fn: hanzo_ml_nn::Activation,
+    intermediate_act_fn: hanzo_nn::Activation,
 }
 
 impl Intermediate {

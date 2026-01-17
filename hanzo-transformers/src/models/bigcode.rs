@@ -4,7 +4,7 @@
 //! model specialized to code generation. The initial model was trained on 80
 //! programming languages. See "StarCoder: A State-of-the-Art LLM for Code", Mukherjee et al. 2023
 //! - [Arxiv](https://arxiv.org/abs/2305.06161)
-//! - [Github](https://github.com/bigcode-project/starcoder)
+//! - [GitHub](https://github.com/bigcode-project/starcoder)
 //!
 //! ## Running some example
 //!
@@ -22,7 +22,7 @@
 //!
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
+use hanzo_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
 
 fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<LayerNorm> {
     let weight = vb.get(size, "weight")?;
@@ -190,7 +190,7 @@ impl Attention {
         let mask_value =
             Tensor::new(f32::NEG_INFINITY, query.device())?.broadcast_as(attn_shape)?;
         let attn_weights = attention_mask.where_cond(&attn_weights, &mask_value)?;
-        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
         let value = value.contiguous()?;
         let attn_output = if self.multi_query {
             attn_weights

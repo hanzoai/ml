@@ -20,7 +20,7 @@ use crate::models::with_tracing::{linear_no_bias, Linear, RmsNorm};
 /// https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py
 /// https://mistral.ai/news/mixtral-of-experts/
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_ml_nn::{Activation, VarBuilder};
+use hanzo_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -124,7 +124,7 @@ fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
-    hanzo_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
 #[cfg(not(feature = "flash-attn"))]
@@ -229,7 +229,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?
         };
         attn_output
@@ -300,7 +300,7 @@ impl Module for SparseMoeBlock {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
         let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = hanzo_ml_nn::ops::softmax_last_dim(&router_logits)?;
+        let routing_weights = hanzo_nn::ops::softmax_last_dim(&router_logits)?;
 
         // In order to extract topk, we extract the data from the tensor and manipulate it
         // directly. Maybe we will want to use some custom ops instead at some point.
@@ -401,7 +401,7 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: hanzo_ml_nn::Embedding,
+    embed_tokens: hanzo_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
@@ -414,7 +414,7 @@ impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
-            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");

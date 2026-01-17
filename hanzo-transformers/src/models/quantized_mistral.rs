@@ -18,7 +18,7 @@
 use crate::quantized_nn::{linear_no_bias, Embedding, Linear, RmsNorm};
 pub use crate::quantized_var_builder::VarBuilder;
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_ml_nn::Activation;
+use hanzo_nn::Activation;
 use std::sync::Arc;
 
 pub use crate::models::mistral::Config;
@@ -59,8 +59,8 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = hanzo_ml_nn::rotary_emb::rope(q, &cos, &sin)?;
-        let k_embed = hanzo_ml_nn::rotary_emb::rope(k, &cos, &sin)?;
+        let q_embed = hanzo_nn::rotary_emb::rope(q, &cos, &sin)?;
+        let k_embed = hanzo_nn::rotary_emb::rope(k, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -188,7 +188,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?
         };
         attn_output

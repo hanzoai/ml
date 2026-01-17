@@ -2,7 +2,7 @@
 //!
 //! The [RWKV model](https://wiki.rwkv.com/) is a recurrent neural network model
 //! with performance on par with transformer architectures. Several variants are
-//! available, hanzo implements the v5 and v6 versions and can be used with
+//! available, candle implements the v5 and v6 versions and can be used with
 //! Eagle 7B([blog post](https://blog.rwkv.com/p/eagle-7b-soaring-past-transformers)).
 //!
 //! Key characteristics:
@@ -33,7 +33,7 @@
 
 use super::with_tracing::{layer_norm, linear_no_bias as linear, LayerNorm, Linear};
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
-use hanzo_ml_nn::{embedding, Embedding, Module, VarBuilder};
+use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
 use std::collections::{HashMap, HashSet};
 
 fn default_num_attention_heads() -> usize {
@@ -101,7 +101,7 @@ struct SelfAttention {
     value: Linear,
     gate: Linear,
     output: Linear,
-    ln_x: hanzo_ml_nn::GroupNorm,
+    ln_x: hanzo_nn::GroupNorm,
     time_mix_key: Tensor,
     time_mix_value: Tensor,
     time_mix_receptance: Tensor,
@@ -121,7 +121,7 @@ impl SelfAttention {
         let value = linear(hidden_size, attn_hidden_size, vb.pp("value"))?;
         let gate = linear(hidden_size, attn_hidden_size, vb.pp("gate"))?;
         let output = linear(attn_hidden_size, hidden_size, vb.pp("output"))?;
-        let ln_x = hanzo_ml_nn::group_norm(
+        let ln_x = hanzo_nn::group_norm(
             hidden_size / cfg.head_size,
             hidden_size,
             1e-5,
@@ -173,7 +173,7 @@ impl SelfAttention {
             let key = self.key.forward(&key)?;
             let value = self.value.forward(&value)?;
             let receptance = self.receptance.forward(&receptance)?;
-            let gate = hanzo_ml_nn::ops::silu(&self.gate.forward(&gate)?)?;
+            let gate = hanzo_nn::ops::silu(&self.gate.forward(&gate)?)?;
             state.per_layer[self.layer_id].extract_key_value = xs.i((.., t - 1))?;
             (receptance, key, value, gate)
         };
@@ -252,7 +252,7 @@ impl FeedForward {
             + shifted.broadcast_mul(&(1.0 - &self.time_mix_receptance)?)?)?;
         let key = key.apply(&self.key)?.relu()?.sqr()?;
         let value = key.apply(&self.value)?;
-        let receptance = hanzo_ml_nn::ops::sigmoid(&receptance.apply(&self.receptance)?)?;
+        let receptance = hanzo_nn::ops::sigmoid(&receptance.apply(&self.receptance)?)?;
         state.per_layer[self.layer_id].feed_forward = xs.i((.., xs.dim(1)? - 1))?;
         let xs = (receptance * value)?;
         Ok(xs)

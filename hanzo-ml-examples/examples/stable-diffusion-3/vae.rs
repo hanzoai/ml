@@ -1,7 +1,7 @@
 use anyhow::{Ok, Result};
 use hanzo_transformers::models::stable_diffusion::vae;
 
-pub fn build_sd3_vae_autoencoder(vb: hanzo_ml_nn::VarBuilder) -> Result<vae::AutoEncoderKL> {
+pub fn build_sd3_vae_autoencoder(vb: hanzo_nn::VarBuilder) -> Result<vae::AutoEncoderKL> {
     let config = vae::AutoEncoderKLConfig {
         block_out_channels: vec![128, 256, 512, 512],
         layers_per_block: 2,

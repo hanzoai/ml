@@ -17,20 +17,15 @@
 
 use crate::models::with_tracing::{linear, linear_no_bias, Linear, RmsNorm};
 use hanzo_ml::{DType, Device, Error, IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{layer_norm, Activation, LayerNorm, VarBuilder};
+use hanzo_nn::{layer_norm, Activation, LayerNorm, VarBuilder};
 use std::sync::Arc;
 
 // internal representation for identifying which model is being used
-#[derive(Debug, Copy, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, serde::Deserialize)]
 pub enum ModelVariant {
+    #[default]
     Large, // 1.5B
     Small, // 400M
-}
-
-impl Default for ModelVariant {
-    fn default() -> Self {
-        Self::Large
-    }
 }
 
 // Same as `qwen2` family of models with the exception being the `embed_head`
@@ -66,21 +61,16 @@ pub struct EmbedHead {
 
 /// An enum variant representing the Embedding head dimensions `stella` is trained on
 /// As the [model-card](https://huggingface.co/dunzhang/stella_en_1.5B_v5#introduction) suggests, D1024 is good enough for most cases
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum EmbedDim {
     Dim256,
     Dim768,
+    #[default]
     Dim1024,
     Dim2048,
     Dim4096,
     Dim6144,
     Dim8192,
-}
-
-impl Default for EmbedDim {
-    fn default() -> Self {
-        Self::Dim1024
-    }
 }
 
 impl EmbedDim {
@@ -108,7 +98,7 @@ impl Config {
         // Removed `sliding_window` related config which is basically being carried forward from `qwen2` but not used here
         Self {
             variant: ModelVariant::Large,
-            activation_fn: hanzo_ml_nn::Activation::Silu,
+            activation_fn: hanzo_nn::Activation::Silu,
             vocab_size: 151646,
             hidden_size: 1536,
             intermediate_size: 8960,
@@ -204,8 +194,8 @@ impl RotaryEmbedding {
         let cos = self.cos.narrow(0, 0, seq_len)?;
         let sin = self.sin.narrow(0, 0, seq_len)?;
 
-        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -425,7 +415,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
 
             attn_weights.matmul(&value_states)?
         };
@@ -482,7 +472,7 @@ impl Layer {
             ModelVariant::Small => (
                 NormType::Layer(layer_norm(
                     cfg.hidden_size,
-                    hanzo_ml_nn::LayerNormConfig {
+                    hanzo_nn::LayerNormConfig {
                         eps: cfg.norm_eps,
                         ..Default::default()
                     },
@@ -490,7 +480,7 @@ impl Layer {
                 )?),
                 NormType::Layer(layer_norm(
                     cfg.hidden_size,
-                    hanzo_ml_nn::LayerNormConfig {
+                    hanzo_nn::LayerNormConfig {
                         eps: cfg.norm_eps,
                         ..Default::default()
                     },
@@ -578,9 +568,9 @@ pub struct Embeddings {
     variant: ModelVariant,
     // For 1.5B: this is the `embed_tokens`
     // For 400M: this is the `word_embeddings`
-    embeddings: hanzo_ml_nn::Embedding,
-    // folloing are specifically for 400M
-    token_type_embeddings: Option<hanzo_ml_nn::Embedding>,
+    embeddings: hanzo_nn::Embedding,
+    // following are specifically for 400M
+    token_type_embeddings: Option<hanzo_nn::Embedding>,
     layer_norm: Option<LayerNorm>,
     position_ids: Option<Tensor>,
 }
@@ -589,7 +579,7 @@ impl Embeddings {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let (embeddings, token_type_embeddings, layer_norm, position_ids) = match cfg.variant {
             ModelVariant::Large => (
-                hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?,
+                hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?,
                 None,
                 None,
                 None,
@@ -599,24 +589,24 @@ impl Embeddings {
                 let weight = vb.pp("LayerNorm").get_with_hints(
                     cfg.hidden_size,
                     "weight",
-                    hanzo_ml_nn::Init::Const(1.0),
+                    hanzo_nn::Init::Const(1.0),
                 )?;
                 let bias = vb.pp("LayerNorm").get_with_hints(
                     cfg.hidden_size,
                     "bias",
-                    hanzo_ml_nn::Init::Const(0.0),
+                    hanzo_nn::Init::Const(0.0),
                 )?;
                 let dev = bias.device().clone();
 
-                let layer_norm = hanzo_ml_nn::LayerNorm::new(weight, bias, cfg.norm_eps);
+                let layer_norm = hanzo_nn::LayerNorm::new(weight, bias, cfg.norm_eps);
 
                 (
-                    hanzo_ml_nn::embedding(
+                    hanzo_nn::embedding(
                         cfg.vocab_size,
                         cfg.hidden_size,
                         vb.pp("word_embeddings"),
                     )?,
-                    Some(hanzo_ml_nn::embedding(
+                    Some(hanzo_nn::embedding(
                         cfg.type_vocab_size,
                         cfg.hidden_size,
                         vb.pp("token_type_embeddings"),
@@ -690,7 +680,7 @@ impl Model {
             ModelVariant::Small => vb.pp("new"),
         };
         // let embed_tokens =
-        //     hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        //     hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let embeddings = Embeddings::new(cfg, vb_m.clone())?;
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);

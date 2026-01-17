@@ -1,6 +1,6 @@
 use super::gym_env::{GymEnv, Step};
 use hanzo_ml::{DType, Device, Error, Module, Result, Tensor};
-use hanzo_ml_nn::{
+use hanzo_nn::{
     linear, ops::log_softmax, ops::softmax, sequential::seq, Activation, AdamW, Optimizer,
     ParamsAdamW, VarBuilder, VarMap,
 };

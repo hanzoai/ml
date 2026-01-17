@@ -10,7 +10,7 @@ use clap::Parser;
 use hanzo_transformers::models::bigcode::{Config, GPTBigCode};
 
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;

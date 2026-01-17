@@ -1,9 +1,12 @@
-use crate::models::{
-    qwen3::{Config as Qwen3Config, Qwen3Attention, Qwen3MLP, Qwen3RotaryEmbedding},
-    with_tracing::{linear_no_bias, Linear, RmsNorm},
+use crate::{
+    fused_moe::{FusedMoe, MoeCfg},
+    models::{
+        qwen3::{Config as Qwen3Config, Qwen3Attention, Qwen3MLP, Qwen3RotaryEmbedding},
+        with_tracing::{linear_no_bias, Linear, RmsNorm},
+    },
 };
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_ml_nn::{Activation, VarBuilder};
+use hanzo_nn::{Activation, VarBuilder};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -122,7 +125,7 @@ impl Module for Qwen3SparseMoeBlock {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
         let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = hanzo_ml_nn::ops::softmax_last_dim(&router_logits)?;
+        let routing_weights = hanzo_nn::ops::softmax_last_dim(&router_logits)?;
 
         // Extract topk experts per token
         let experts_per_tok = routing_weights
@@ -176,14 +179,16 @@ impl Module for Qwen3SparseMoeBlock {
 #[derive(Debug, Clone)]
 enum Qwen3FeedForward {
     Mlp(Qwen3MLP),
-    MoE(Qwen3SparseMoeBlock),
+    NaiveMoE(Qwen3SparseMoeBlock),
+    FusedMoE(FusedMoe),
 }
 
-impl Module for Qwen3FeedForward {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+impl Qwen3FeedForward {
+    fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
         match self {
             Self::Mlp(m) => m.forward(xs),
-            Self::MoE(m) => m.forward(xs),
+            Self::NaiveMoE(m) => m.forward(xs),
+            Self::FusedMoE(m) => m.forward(xs, is_prefill),
         }
     }
 }
@@ -205,13 +210,27 @@ impl DecoderLayer {
     ) -> Result<Self> {
         let self_attn = Qwen3Attention::new(&cfg.into(), rotary, vb.pp("self_attn"))?;
 
-        // Decide whether to use MoE or regular MLP based on layer_idx and decoder_sparse_step
-        let feed_forward = if cfg.num_experts > 0 && (layer_idx + 1) % cfg.decoder_sparse_step == 0
-        {
-            Qwen3FeedForward::MoE(Qwen3SparseMoeBlock::new(cfg, vb.pp("mlp"))?)
-        } else {
-            Qwen3FeedForward::Mlp(Qwen3MLP::new(&cfg.into(), vb.pp("mlp"))?)
+        let moe_cfg = MoeCfg {
+            hidden_size: cfg.hidden_size,
+            num_experts: cfg.num_experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            norm_topk_prob: cfg.norm_topk_prob,
+            act: cfg.hidden_act,
+            decoder_sparse_step: None,
         };
+        // Decide whether to use MoE or regular MLP based on layer_idx and decoder_sparse_step
+        let feed_forward =
+            if cfg.num_experts > 0 && (layer_idx + 1).is_multiple_of(cfg.decoder_sparse_step) {
+                if cfg!(feature = "cuda") {
+                    // Use fused MoE kernel on CUDA
+                    Qwen3FeedForward::FusedMoE(FusedMoe::new(&moe_cfg, vb.pp("mlp"), vb.dtype())?)
+                } else {
+                    Qwen3FeedForward::NaiveMoE(Qwen3SparseMoeBlock::new(cfg, vb.pp("mlp"))?)
+                }
+            } else {
+                Qwen3FeedForward::Mlp(Qwen3MLP::new(&cfg.into(), vb.pp("mlp"))?)
+            };
 
         let ln1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let ln2 = RmsNorm::new(
@@ -233,7 +252,7 @@ impl DecoderLayer {
         let h = self.self_attn.forward(&h, mask, offset)?;
         let x = (x + h)?;
         let h2 = self.ln2.forward(&x)?;
-        let h2 = h2.apply(&self.feed_forward)?;
+        let h2 = self.feed_forward.forward(&h2, mask.is_some())?;
         x + h2
     }
 
@@ -244,7 +263,7 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: hanzo_ml_nn::Embedding,
+    embed_tokens: hanzo_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     device: Device,
@@ -254,7 +273,7 @@ pub struct Model {
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
-            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(
             vb.dtype(),
             &cfg.into(),

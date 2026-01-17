@@ -1,5 +1,5 @@
 use anyhow::Result;
-use hanzo_ml::{DType, Device, IndexOp, Tensor, D};
+use candle::{DType, Device, IndexOp, Tensor, D};
 
 fn to_vec3_round(t: Tensor, digits: i32) -> Result<Vec<Vec<Vec<f32>>>> {
     let b = 10f32.powi(digits);
@@ -21,7 +21,7 @@ fn fa_acausal(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32) -> Result<
     let k = k.to_dtype(DType::F32)?;
     let v = v.to_dtype(DType::F32)?;
     let att = (q.matmul(&k.t()?)? * softmax_scale as f64)?;
-    let att = hanzo_ml_nn::ops::softmax(&att, D::Minus1)?;
+    let att = candle_nn::ops::softmax(&att, D::Minus1)?;
     // Convert to contiguous as matmul doesn't support strided vs for now.
     let output = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
     Ok(output)
@@ -35,7 +35,7 @@ fn fa_acausal_softcap(q: &Tensor, k: &Tensor, v: &Tensor, softcap: f32) -> Resul
     // let att = (q.matmul(&k.t()?)? * softmax_scale as f64)?;
     let att = q.matmul(&k.t()?)?;
     let att = (softcap as f64 * ((att / softcap as f64)?.tanh())?)?;
-    let att = hanzo_ml_nn::ops::softmax(&att, D::Minus1)?;
+    let att = candle_nn::ops::softmax(&att, D::Minus1)?;
     // Convert to contiguous as matmul doesn't support strided vs for now.
     let output = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
     Ok(output)
@@ -57,7 +57,7 @@ fn flash_attn_acausal() -> Result<()> {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        hanzo_flash_attn::flash_attn(&q, &k, &v, 0.5, false)?.transpose(1, 2)?
+        candle_flash_attn::flash_attn(&q, &k, &v, 0.5, false)?.transpose(1, 2)?
     };
     let ys2 = ys2.i(0)?.to_dtype(DType::F32)?;
     let diff = ys1.sub(&ys2)?.abs()?.flatten_all()?.max(0)?;
@@ -120,7 +120,7 @@ fn flash_attn_acausal_softcap() -> Result<()> {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        hanzo_flash_attn::flash_attn_alibi_windowed_softcap(
+        candle_flash_attn::flash_attn_alibi_windowed_softcap(
             &q,
             &k,
             &v,
@@ -158,7 +158,7 @@ fn flash_attn_varlen() -> Result<()> {
         let q = q.transpose(0, 1)?;
         let k = k.transpose(0, 1)?;
         let v = v.transpose(0, 1)?;
-        hanzo_flash_attn::flash_attn_varlen(
+        candle_flash_attn::flash_attn_varlen(
             &q, &k, &v, &seqlens_q, &seqlens_k, 32, 32, 0.5, false,
         )?
         .transpose(0, 1)?

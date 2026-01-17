@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
 use hanzo_ml::{Device, Tensor};
-use hanzo_ml_nn::ops::softmax;
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::ops::softmax;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::xlm_roberta::{
     Config, XLMRobertaForMaskedLM, XLMRobertaForSequenceClassification,
 };
@@ -204,7 +204,7 @@ fn main() -> Result<()> {
             let model = XLMRobertaForSequenceClassification::new(1, &config, vb)?;
 
             let output = model.forward(&input_ids, &attention_mask, &token_type_ids)?;
-            let output = hanzo_ml_nn::ops::sigmoid(&output)?.t().unwrap();
+            let output = hanzo_nn::ops::sigmoid(&output)?.t().unwrap();
             let ranks = output
                 .arg_sort_last_dim(false)?
                 .to_vec2::<u32>()?

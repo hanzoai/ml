@@ -14,7 +14,7 @@ use hanzo_transformers::models::phi3::{Config as Phi3Config, Model as Phi3};
 use hanzo_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
 
 use hanzo_ml::{DType, Device, IndexOp, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;

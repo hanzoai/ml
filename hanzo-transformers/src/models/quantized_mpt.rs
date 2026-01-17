@@ -21,7 +21,7 @@ pub use crate::quantized_var_builder::VarBuilder;
 /// MPT model used by replit-code-v1_5-3b
 /// https://huggingface.co/replit/replit-code-v1_5-3b/blob/main/modeling_mpt.py
 use hanzo_ml::{IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::LayerNorm;
+use hanzo_nn::LayerNorm;
 
 pub use super::mpt::Config;
 
@@ -109,7 +109,7 @@ impl GroupedQueryAttention {
                 f32::NEG_INFINITY,
             )?,
         };
-        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights
             .matmul(&value)?
             .transpose(1, 2)?
