@@ -11,14 +11,14 @@ use hanzo_ml::{Module, Result, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct Embedding {
-    inner: hanzo_ml_nn::Embedding,
+    inner: hanzo_nn::Embedding,
     span: tracing::Span,
 }
 
 impl Embedding {
     pub fn new(d1: usize, d2: usize, vb: VarBuilder) -> Result<Self> {
         let embeddings = vb.get((d1, d2), "weight")?.dequantize(vb.device())?;
-        let inner = hanzo_ml_nn::Embedding::new(embeddings, d2);
+        let inner = hanzo_nn::Embedding::new(embeddings, d2);
         let span = tracing::span!(tracing::Level::TRACE, "embedding");
         Ok(Self { inner, span })
     }
@@ -81,15 +81,15 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
     })
 }
 
-pub fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<hanzo_ml_nn::LayerNorm> {
+pub fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<hanzo_nn::LayerNorm> {
     let weight = vb.get(size, "weight")?.dequantize(vb.device())?;
     let bias = vb.get(size, "bias")?.dequantize(vb.device())?;
-    Ok(hanzo_ml_nn::LayerNorm::new(weight, bias, eps))
+    Ok(hanzo_nn::LayerNorm::new(weight, bias, eps))
 }
 
-pub fn layer_norm_no_bias(size: usize, eps: f64, vb: VarBuilder) -> Result<hanzo_ml_nn::LayerNorm> {
+pub fn layer_norm_no_bias(size: usize, eps: f64, vb: VarBuilder) -> Result<hanzo_nn::LayerNorm> {
     let weight = vb.get(size, "weight")?.dequantize(vb.device())?;
-    Ok(hanzo_ml_nn::LayerNorm::new_no_bias(weight, eps))
+    Ok(hanzo_nn::LayerNorm::new_no_bias(weight, eps))
 }
 
 pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
@@ -121,6 +121,6 @@ impl RmsNorm {
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        hanzo_ml_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
+        hanzo_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
     }
 }

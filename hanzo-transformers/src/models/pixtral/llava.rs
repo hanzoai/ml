@@ -1,12 +1,12 @@
 use hanzo_ml::{Module, Result, Tensor};
-use hanzo_ml_nn::{linear, Linear, VarBuilder};
+use hanzo_nn::{linear, Linear, VarBuilder};
 
 use super::vision_model;
 use crate::models::mistral;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
-    pub projector_hidden_act: hanzo_ml_nn::Activation,
+    pub projector_hidden_act: hanzo_nn::Activation,
     pub text_config: mistral::Config,
     pub vision_config: vision_model::Config,
     pub image_token_index: usize,
@@ -16,7 +16,7 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct MultiModalProjector {
     linear_1: Linear,
-    act: hanzo_ml_nn::Activation,
+    act: hanzo_nn::Activation,
     linear_2: Linear,
 }
 

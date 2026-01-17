@@ -9,7 +9,7 @@ use hanzo_transformers::models::distilbert::{
 
 use anyhow::{Context, Error as E, Result};
 use hanzo_ml::{Device, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::path::PathBuf;
@@ -246,7 +246,7 @@ fn process_masked_output(
             println!("Predictions for [MASK] at position {token_idx}:");
 
             let pos_logits = output.get(0)?.get(token_idx)?;
-            let probs = hanzo_ml_nn::ops::softmax(&pos_logits, 0)?;
+            let probs = hanzo_nn::ops::softmax(&pos_logits, 0)?;
             let (top_values, top_indices) = get_top_k(&probs, args.top_k)?;
 
             let values = top_values.to_vec1::<f32>()?;

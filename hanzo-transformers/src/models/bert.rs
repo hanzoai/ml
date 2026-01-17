@@ -4,12 +4,12 @@
 //! - Compute sentence embeddings for a prompt.
 //! - Compute similarities between a set of sentences.
 //! - [Arxiv](https://arxiv.org/abs/1810.04805) "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"
-//! - Upstream [Github repo](https://github.com/google-research/bert).
-//! - See bert in [hanzo-ml-examples](https://github.com/huggingface/hanzo/tree/main/hanzo-ml-examples/) for runnable code
+//! - Upstream [GitHub repo](https://github.com/google-research/bert).
+//! - See bert in [candle-examples](https://github.com/huggingface/candle/tree/main/candle-examples/) for runnable code
 //!
 use super::with_tracing::{layer_norm, linear, LayerNorm, Linear};
 use hanzo_ml::{DType, Device, Result, Tensor};
-use hanzo_ml_nn::{embedding, Embedding, Module, VarBuilder};
+use hanzo_nn::{embedding, Embedding, Module, VarBuilder};
 use serde::Deserialize;
 
 pub const DTYPE: DType = DType::F32;
@@ -258,7 +258,7 @@ impl BertSelfAttention {
         let attention_scores = attention_scores.broadcast_add(attention_mask)?;
         let attention_probs = {
             let _enter_sm = self.span_softmax.enter();
-            hanzo_ml_nn::ops::softmax(&attention_scores, hanzo_ml::D::Minus1)?
+            hanzo_nn::ops::softmax(&attention_scores, hanzo_ml::D::Minus1)?
         };
         let attention_probs = self.dropout.forward(&attention_probs)?;
 

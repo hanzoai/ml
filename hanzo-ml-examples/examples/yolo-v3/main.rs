@@ -9,7 +9,7 @@ mod darknet;
 
 use anyhow::Result;
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_ml_nn::{Module, VarBuilder};
+use hanzo_nn::{Module, VarBuilder};
 use clap::Parser;
 use image::{DynamicImage, ImageBuffer};
 

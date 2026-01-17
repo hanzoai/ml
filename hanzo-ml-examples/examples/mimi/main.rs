@@ -6,7 +6,7 @@ extern crate accelerate_src;
 
 use anyhow::Result;
 use hanzo_ml::{DType, IndexOp, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::mimi::{Config, Model};
 use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::Api;

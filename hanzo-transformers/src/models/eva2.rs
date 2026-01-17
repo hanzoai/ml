@@ -13,7 +13,7 @@
 //! cargo run \
 //!   --example eva2 \
 //!   --release -- \
-//!   --image hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg
+//!   --image candle-examples/examples/yolo-v8/assets/bike.jpg
 //!
 //! > mountain bike, all-terrain bike, off-roader: 37.09%
 //! > maillot                 : 8.30%
@@ -23,11 +23,11 @@
 //! ```
 //!
 //! <div align=center>
-//!   <img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg" alt="" width=640>
+//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/yolo-v8/assets/bike.jpg" alt="" width=640>
 //! </div>
 //!
 use hanzo_ml::{IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
+use hanzo_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
 
 const IMG_SIZE: usize = 448;
 const PATCH_SIZE: usize = 14;
@@ -35,9 +35,9 @@ const NUM_CLASSES: usize = 1000;
 
 fn linear(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Result<Linear> {
     if bias {
-        hanzo_ml_nn::linear(in_dim, out_dim, vb)
+        hanzo_nn::linear(in_dim, out_dim, vb)
     } else {
-        hanzo_ml_nn::linear_no_bias(in_dim, out_dim, vb)
+        hanzo_nn::linear_no_bias(in_dim, out_dim, vb)
     }
 }
 
@@ -142,7 +142,7 @@ impl Module for Attention {
 
         let q = (q * self.scale)?;
         let attn = &q.matmul(&k.t()?)?;
-        let attn = hanzo_ml_nn::ops::softmax(attn, D::Minus1)?;
+        let attn = hanzo_nn::ops::softmax(attn, D::Minus1)?;
         let attn = attn.matmul(&v)?.transpose(1, 2)?.reshape((b, n, c))?;
         self.proj.forward(&attn)
     }
@@ -218,7 +218,7 @@ impl Module for Block {
 
 #[derive(Debug)]
 struct PatchEmbed {
-    proj: hanzo_ml_nn::Conv2d,
+    proj: hanzo_nn::Conv2d,
     patch_size: (usize, usize),
     num_patches: usize,
 }
@@ -231,11 +231,11 @@ impl PatchEmbed {
         in_chans: usize,
         embed_dim: usize,
     ) -> Result<Self> {
-        let config = hanzo_ml_nn::Conv2dConfig {
+        let config = hanzo_nn::Conv2dConfig {
             stride: patch_size,
             ..Default::default()
         };
-        let proj = hanzo_ml_nn::conv2d(in_chans, embed_dim, patch_size, config, vb.pp("proj"))?;
+        let proj = hanzo_nn::conv2d(in_chans, embed_dim, patch_size, config, vb.pp("proj"))?;
         let num_patches = (img_size / patch_size) * (img_size / patch_size);
         Ok(Self {
             proj,

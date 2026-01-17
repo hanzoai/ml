@@ -8,7 +8,7 @@ use hanzo_transformers::models::jina_bert::{BertModel, Config, PositionEmbedding
 
 use anyhow::Error as E;
 use hanzo_ml::{DType, Module, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -72,7 +72,7 @@ impl Args {
             12,
             12,
             3072,
-            hanzo_ml_nn::Activation::Gelu,
+            hanzo_nn::Activation::Gelu,
             8192,
             2,
             0.02,

@@ -2,7 +2,7 @@
 //! https://github.com/mlfoundations/open_clip
 
 use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{
+use hanzo_nn::{
     embedding, layer_norm, linear, ops::softmax_last_dim, Embedding, LayerNorm, Linear, Module,
     VarBuilder,
 };
@@ -67,9 +67,9 @@ impl Module for TextEmbeddings {
 
 #[derive(Clone, Debug)]
 struct Attention {
-    k_proj: hanzo_ml_nn::Linear,
-    v_proj: hanzo_ml_nn::Linear,
-    q_proj: hanzo_ml_nn::Linear,
+    k_proj: hanzo_nn::Linear,
+    v_proj: hanzo_nn::Linear,
+    q_proj: hanzo_nn::Linear,
     out_proj: Linear,
     head_dim: usize,
     scale: f64,
@@ -77,7 +77,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(vs: hanzo_ml_nn::VarBuilder, c: &Config) -> Result<Self> {
+    fn new(vs: hanzo_nn::VarBuilder, c: &Config) -> Result<Self> {
         let embed_dim = c.embed_dim;
         let num_attention_heads = c.num_attention_heads;
 
@@ -95,7 +95,7 @@ impl Attention {
         let q_proj = Linear::new(q_w.clone(), Some(q_b.clone()));
         let k_proj = Linear::new(k_w.clone(), Some(k_b.clone()));
         let v_proj = Linear::new(v_w.clone(), Some(v_b.clone()));
-        let out_proj = hanzo_ml_nn::linear(embed_dim, embed_dim, vs.pp("out_proj"))?;
+        let out_proj = hanzo_nn::linear(embed_dim, embed_dim, vs.pp("out_proj"))?;
         let head_dim = embed_dim / num_attention_heads;
         let scale = (head_dim as f64).powf(-0.5);
 

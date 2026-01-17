@@ -178,7 +178,8 @@ impl hanzo_ml::CustomOp3 for RotaryEmbI {
     ) -> Result<(hanzo_ml::MetalStorage, Shape)> {
         use hanzo_ml::backend::BackendStorage;
         let device = src.device();
-        let command_buffer = device.command_buffer()?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("rope_i");
         let kernels = device.kernels();
         if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
             hanzo_ml::bail!(
@@ -201,10 +202,10 @@ impl hanzo_ml::CustomOp3 for RotaryEmbI {
             0usize
         };
         let el = b * h * t * d;
-        let output = device.new_buffer(el, src.dtype(), "rope-i")?;
-        hanzo_ml_metal_kernels::call_rope_i(
+        let output = device.new_buffer(el, src.dtype(), "rope_i")?;
+        candle_metal_kernels::call_rope_i(
             device.metal_device(),
-            &command_buffer,
+            &encoder,
             kernels,
             name,
             b * h,
@@ -460,7 +461,8 @@ impl hanzo_ml::CustomOp3 for RotaryEmb {
     ) -> Result<(hanzo_ml::MetalStorage, Shape)> {
         use hanzo_ml::backend::BackendStorage;
         let device = src.device();
-        let command_buffer = device.command_buffer()?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("rope");
         let kernels = device.kernels();
         if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
             hanzo_ml::bail!(
@@ -483,10 +485,10 @@ impl hanzo_ml::CustomOp3 for RotaryEmb {
             0usize
         };
         let el = b * h * t * d;
-        let output = device.new_buffer(el, src.dtype(), "rope-i")?;
-        hanzo_ml_metal_kernels::call_rope(
+        let output = device.new_buffer(el, src.dtype(), "rope")?;
+        candle_metal_kernels::call_rope(
             device.metal_device(),
-            &command_buffer,
+            &encoder,
             kernels,
             name,
             b * h,
@@ -729,7 +731,8 @@ impl hanzo_ml::CustomOp3 for RotaryEmbThd {
     ) -> Result<(hanzo_ml::MetalStorage, Shape)> {
         use hanzo_ml::backend::BackendStorage;
         let device = src.device();
-        let command_buffer = device.command_buffer()?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("rope_thd");
         let kernels = device.kernels();
         if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
             hanzo_ml::bail!(
@@ -752,10 +755,10 @@ impl hanzo_ml::CustomOp3 for RotaryEmbThd {
             0usize
         };
         let el = b * h * t * d;
-        let output = device.new_buffer(el, src.dtype(), "rope-thd")?;
-        hanzo_ml_metal_kernels::call_rope_thd(
+        let output = device.new_buffer(el, src.dtype(), "rope_thd")?;
+        candle_metal_kernels::call_rope_thd(
             device.metal_device(),
-            &command_buffer,
+            &encoder,
             kernels,
             name,
             b,

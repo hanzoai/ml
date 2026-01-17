@@ -12,7 +12,7 @@
 //!
 //! # Example Usage
 //!
-//! This hanzo implementation uses a pre-trained EfficientViT (from Microsoft Research Asia) network for inference.
+//! This candle implementation uses a pre-trained EfficientViT (from Microsoft Research Asia) network for inference.
 //! The classification head has been trained on the ImageNet dataset and returns the probabilities for the top-5 classes.
 //!
 //!
@@ -20,7 +20,7 @@
 //! cargo run
 //!   --example efficientvit \
 //!   --release -- \
-//!   --image hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg --which m1
+//!   --image candle-examples/examples/yolo-v8/assets/bike.jpg --which m1
 //!
 //! > loaded image Tensor[dims 3, 224, 224; f32]
 //! > model built
@@ -32,11 +32,11 @@
 //! ```
 //!
 //! <div align=center>
-//!   <img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg" alt="" width=640>
+//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/yolo-v8/assets/bike.jpg" alt="" width=640>
 //! </div>
 //!
 use hanzo_ml::{Result, Tensor, D};
-use hanzo_ml_nn::{
+use hanzo_nn::{
     batch_norm, conv2d, conv2d_no_bias, linear, ops::sigmoid, ops::softmax, Conv2dConfig, Func,
     VarBuilder,
 };

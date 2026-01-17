@@ -14,7 +14,7 @@
 use crate::quantized_nn::{layer_norm, linear, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::Activation;
+use hanzo_nn::Activation;
 
 pub use crate::models::mixformer::Config;
 
@@ -147,7 +147,7 @@ impl Module for MLP {
 
 #[derive(Debug, Clone)]
 struct CausalLMHead {
-    ln: hanzo_ml_nn::LayerNorm,
+    ln: hanzo_nn::LayerNorm,
     linear: Linear,
 }
 
@@ -238,7 +238,7 @@ impl MHA {
                 f32::NEG_INFINITY,
             )?,
         };
-        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
 
         // output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
         // attn_weights: b*h,t,s, v: b*h,s,d
@@ -258,7 +258,7 @@ impl MHA {
 
 #[derive(Debug, Clone)]
 struct ParallelBlock {
-    ln: hanzo_ml_nn::LayerNorm,
+    ln: hanzo_nn::LayerNorm,
     mixer: MHA,
     mlp: MLP,
     span: tracing::Span,

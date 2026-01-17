@@ -8,7 +8,7 @@ use anyhow::{Error as E, Result};
 use clap::Parser;
 
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::{
     generation::LogitsProcessor,
     models::{moondream, quantized_moondream},

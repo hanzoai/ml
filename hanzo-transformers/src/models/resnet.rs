@@ -11,7 +11,7 @@
 //! skip connections ("residual connections") to enable training of very deep networks.
 
 use hanzo_ml::{Result, D};
-use hanzo_ml_nn::{batch_norm, Conv2d, Func, VarBuilder};
+use hanzo_nn::{batch_norm, Conv2d, Func, VarBuilder};
 
 fn conv2d(
     c_in: usize,
@@ -21,12 +21,12 @@ fn conv2d(
     stride: usize,
     vb: VarBuilder,
 ) -> Result<Conv2d> {
-    let conv2d_cfg = hanzo_ml_nn::Conv2dConfig {
+    let conv2d_cfg = hanzo_nn::Conv2dConfig {
         stride,
         padding,
         ..Default::default()
     };
-    hanzo_ml_nn::conv2d_no_bias(c_in, c_out, ksize, conv2d_cfg, vb)
+    hanzo_nn::conv2d_no_bias(c_in, c_out, ksize, conv2d_cfg, vb)
 }
 
 fn downsample(c_in: usize, c_out: usize, stride: usize, vb: VarBuilder) -> Result<Func> {
@@ -95,7 +95,7 @@ fn resnet(
     let fc = match nclasses {
         None => None,
         Some(nclasses) => {
-            let linear = hanzo_ml_nn::linear(512, nclasses, vb.pp("fc"))?;
+            let linear = hanzo_nn::linear(512, nclasses, vb.pp("fc"))?;
             Some(linear)
         }
     };
@@ -207,7 +207,7 @@ fn bottleneck_resnet(
     let fc = match nclasses {
         None => None,
         Some(nclasses) => {
-            let linear = hanzo_ml_nn::linear(4 * 512, nclasses, vb.pp("fc"))?;
+            let linear = hanzo_nn::linear(4 * 512, nclasses, vb.pp("fc"))?;
             Some(linear)
         }
     };

@@ -83,7 +83,7 @@ fn load_parquet(parquet: SerializedFileReader<std::fs::File>) -> Result<(Tensor,
             }
         }
     }
-    // Reorder image-rs convention (width, height, channels) to hanzo/pytorch convolution convention (channels, height, width)
+    // Reorder image-rs convention (width, height, channels) to candle/pytorch convolution convention (channels, height, width)
     let images = (Tensor::from_vec(buffer_images, (samples, 32, 32, 3), &Device::Cpu)?
         .to_dtype(DType::F32)?
         .permute((0, 3, 2, 1))?

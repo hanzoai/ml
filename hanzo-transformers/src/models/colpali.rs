@@ -4,10 +4,10 @@
 //!
 
 use hanzo_ml::{Module, Result, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 
 use super::paligemma;
-use hanzo_ml_nn::{linear, Linear};
+use hanzo_nn::{linear, Linear};
 
 pub struct Model {
     pub model: paligemma::Model,

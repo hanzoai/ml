@@ -2,12 +2,12 @@
 //!
 //! ModernBERT is a modernized bidirectional encoder-only Transformer model.
 //! - [Arxiv](https://arxiv.org/abs/2412.13663) "Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder for Fast, Memory Efficient, and Long Context Finetuning and Inference"
-//! - Upstream [Github repo](https://github.com/AnswerDotAI/ModernBERT).
-//! - See modernbert in [hanzo-ml-examples](https://github.com/huggingface/hanzo/tree/main/hanzo-ml-examples/) for runnable code
+//! - Upstream [GitHub repo](https://github.com/AnswerDotAI/ModernBERT).
+//! - See modernbert in [candle-examples](https://github.com/huggingface/candle/tree/main/candle-examples/) for runnable code
 //!
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{
+use hanzo_nn::{
     embedding, layer_norm_no_bias, linear, linear_no_bias, ops::softmax, Embedding, LayerNorm,
     Linear, Module, VarBuilder,
 };
@@ -78,8 +78,8 @@ impl RotaryEmbedding {
     }
 
     fn apply_rotary_emb_qkv(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &self.cos, &self.sin)?;
-        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?;
+        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &self.cos, &self.sin)?;
+        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -488,7 +488,7 @@ impl ModernBertForSequenceClassification {
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let output = self.model.forward(xs, mask)?;
         let last_hidden_state = match self.classifier_pooling {
-            ClassifierPooling::CLS => output.i((.., .., 0))?,
+            ClassifierPooling::CLS => output.i((.., 0, ..))?.contiguous()?,
             ClassifierPooling::MEAN => {
                 let unsqueezed_mask = &mask.unsqueeze(D::Minus1)?.to_dtype(DType::F32)?;
                 let sum_output = output.broadcast_mul(unsqueezed_mask)?.sum(1)?;

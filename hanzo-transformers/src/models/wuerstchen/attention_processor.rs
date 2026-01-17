@@ -1,5 +1,5 @@
 use hanzo_ml::{Module, Result, Tensor};
-use hanzo_ml_nn::{linear, Linear, VarBuilder};
+use hanzo_nn::{linear, Linear, VarBuilder};
 
 // A simplified version of:
 // https://github.com/huggingface/diffusers/blob/119ad2c3dc8a8fb8446a83f4bf6f20929487b47f/src/diffusers/models/attention_processor.py#L38
@@ -22,7 +22,7 @@ fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
-    hanzo_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
 #[cfg(not(feature = "flash-attn"))]
@@ -71,7 +71,7 @@ impl Attention {
 
     fn get_attention_scores(&self, query: &Tensor, key: &Tensor) -> Result<Tensor> {
         let attn_probs = (query.matmul(&key.t()?)? * self.scale)?;
-        hanzo_ml_nn::ops::softmax_last_dim(&attn_probs)
+        hanzo_nn::ops::softmax_last_dim(&attn_probs)
     }
 
     pub fn forward(&self, xs: &Tensor, encoder_hidden_states: &Tensor) -> Result<Tensor> {

@@ -1,3 +1,3 @@
-# hanzo-metal-kernels
+# candle-metal-kernels
 
-This crate contains Metal kernels used from hanzo.
+This crate contains Metal kernels used from candle.

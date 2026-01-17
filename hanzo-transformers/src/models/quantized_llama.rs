@@ -13,7 +13,7 @@
 //! - 💻 [GH Link](https://github.com/facebookresearch/llama)
 //! - 📝 [Paper](https://arxiv.org/abs/2302.13971)
 //!
-//! ![](https://raw.githubusercontent.com/huggingface/hanzo/main/hanzo-ml-examples/examples/quantized/assets/aoc.gif)
+//! ![](https://raw.githubusercontent.com/huggingface/candle/main/candle-examples/examples/quantized/assets/aoc.gif)
 //!
 
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ use crate::quantized_nn::RmsNorm;
 use hanzo_ml::quantized::QTensor;
 use hanzo_ml::quantized::{ggml_file, gguf_file};
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
-use hanzo_ml_nn::{Embedding, Module};
+use hanzo_nn::{Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 4096;
 
@@ -58,7 +58,7 @@ impl Module for Mlp {
         let w1 = self.feed_forward_w1.forward(xs)?;
         let w3 = self.feed_forward_w3.forward(xs)?;
         self.feed_forward_w2
-            .forward(&(hanzo_ml_nn::ops::silu(&w1)? * w3)?)
+            .forward(&(hanzo_nn::ops::silu(&w1)? * w3)?)
     }
 }
 
@@ -83,7 +83,7 @@ impl Module for MlpOrMoe {
                 let (b_size, seq_len, hidden_dim) = xs.dims3()?;
                 let xs = xs.reshape(((), hidden_dim))?;
                 let router_logits = feed_forward_gate_inp.forward(&xs)?;
-                let routing_weights = hanzo_ml_nn::ops::softmax_last_dim(&router_logits)?;
+                let routing_weights = hanzo_nn::ops::softmax_last_dim(&router_logits)?;
 
                 // In order to extract topk, we extract the data from the tensor and manipulate it
                 // directly. Maybe we will want to use some custom ops instead at some point.
@@ -177,7 +177,7 @@ impl LayerWeights {
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
         // The call to contiguous below is only necessary when processing the prompt.
         // When the seq_len is 1 in the inference loop, this is a no-op.
-        hanzo_ml_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        hanzo_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
     }
 
     fn forward_attn(
@@ -225,7 +225,15 @@ impl LayerWeights {
 
         let y = if q.device().is_metal() && seq_len == 1 {
             // SDPA will do MQA for us
-            hanzo_ml_nn::ops::sdpa(&q, &k, &v, 1. / (self.head_dim as f32).sqrt(), 1.)?
+            hanzo_nn::ops::sdpa(
+                &q,
+                &k,
+                &v,
+                None,
+                false,
+                1. / (self.head_dim as f32).sqrt(),
+                1.,
+            )?
         } else {
             // Support for MQA, useful for 70B models and mistral.
             let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
@@ -239,7 +247,7 @@ impl LayerWeights {
                     masked_fill(&att, &mask, &self.neg_inf)?
                 }
             };
-            let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
+            let att = hanzo_nn::ops::softmax_last_dim(&att)?;
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v.contiguous()?)?
         };

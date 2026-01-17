@@ -1,7 +1,7 @@
 //! Attention Based Building Blocks
 use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
 use hanzo_nn as nn;
-use hanzo_ml_nn::Module;
+use hanzo_nn::Module;
 
 #[derive(Debug)]
 struct GeGlu {
@@ -69,7 +69,7 @@ fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
-    hanzo_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
 #[cfg(not(feature = "flash-attn"))]

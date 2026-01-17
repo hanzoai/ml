@@ -1,4 +1,4 @@
-//! ML implementations for various deep learning models
+//! Candle implementations for various deep learning models
 //!
 //! This crate provides implementations of popular machine learning models and architectures for different modalities.
 //!
@@ -48,6 +48,7 @@ pub mod gemma3;
 pub mod glm4;
 pub mod glm4_new;
 pub mod granite;
+pub mod granitemoehybrid;
 pub mod helium;
 pub mod hiera;
 pub mod jina_bert;
@@ -56,6 +57,7 @@ pub mod llama2_c;
 pub mod llama2_c_weights;
 pub mod llava;
 pub mod mamba;
+pub mod mamba2;
 pub mod marian;
 pub mod metavoice;
 pub mod mimi;
@@ -73,6 +75,7 @@ pub mod nvembed_v2;
 pub mod olmo;
 pub mod olmo2;
 pub mod openclip;
+pub mod paddleocr_vl;
 pub mod paligemma;
 pub mod parler_tts;
 pub mod persimmon;
@@ -93,6 +96,7 @@ pub mod quantized_phi;
 pub mod quantized_phi3;
 pub mod quantized_qwen2;
 pub mod quantized_qwen3;
+pub mod quantized_qwen3_moe;
 pub mod quantized_recurrent_gemma;
 pub mod quantized_rwkv_v5;
 pub mod quantized_rwkv_v6;
@@ -102,6 +106,7 @@ pub mod qwen2;
 pub mod qwen2_moe;
 pub mod qwen3;
 pub mod qwen3_moe;
+pub mod qwen3_vl;
 pub mod recurrent_gemma;
 pub mod repvgg;
 pub mod resnet;
@@ -110,6 +115,7 @@ pub mod rwkv_v6;
 pub mod segformer;
 pub mod segment_anything;
 pub mod siglip;
+pub mod smol;
 pub mod snac;
 pub mod stable_diffusion;
 pub mod stable_lm;
@@ -119,8 +125,10 @@ pub mod t5;
 pub mod trocr;
 pub mod vgg;
 pub mod vit;
+pub mod voxtral;
 pub mod whisper;
 pub mod with_tracing;
 pub mod wuerstchen;
 pub mod xlm_roberta;
 pub mod yi;
+pub mod z_image;

@@ -11,14 +11,14 @@
 //! # Example
 //!
 //! <div align=center>
-//!   <img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/flux/assets/flux-robot.jpg" alt="" width=320>
+//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/flux/assets/flux-robot.jpg" alt="" width=320>
 //! </div>
 //!
 //! ```bash
 //! cargo run --profile=release-with-debug \
 //!    --features cuda \
 //!    --example pixtral -- \
-//!    --image hanzo-ml-examples/examples/flux/assets/flux-robot.jpg
+//!    --image candle-examples/examples/flux/assets/flux-robot.jpg
 //! ```
 //!
 //! ```txt

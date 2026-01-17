@@ -55,13 +55,13 @@ impl AsRef<Tensor> for Tensor {
 /// The core struct for manipulating tensors.
 ///
 /// ```rust
-/// use hanzo_core::{Tensor, DType, Device};
+/// use candle_core::{Tensor, DType, Device};
 ///
 /// let a = Tensor::arange(0f32, 6f32, &Device::Cpu)?.reshape((2, 3))?;
 /// let b = Tensor::arange(0f32, 12f32, &Device::Cpu)?.reshape((3, 4))?;
 ///
 /// let c = a.matmul(&b)?;
-/// # Ok::<(), hanzo_core::Error>(())
+/// # Ok::<(), candle_core::Error>(())
 /// ```
 ///
 /// Tensors are reference counted with [`Arc`] so cloning them is cheap.
@@ -194,11 +194,11 @@ impl Tensor {
     /// Creates a new tensor filled with ones.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, DType, Device};
+    /// use candle_core::{Tensor, DType, Device};
     /// let a = Tensor::ones((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0], (2, 3), &Device::Cpu)?;
     /// // a == b
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn ones<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         Self::ones_impl(shape, dtype, device, false)
@@ -219,11 +219,11 @@ impl Tensor {
     /// Creates a new tensor filled with ones with same shape, dtype, and device as the other tensor.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, DType, Device};
+    /// use candle_core::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = a.ones_like()?;
     /// // b == a + 1
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn ones_like(&self) -> Result<Self> {
         Tensor::ones(self.shape(), self.dtype(), self.device())
@@ -246,11 +246,11 @@ impl Tensor {
     /// Creates a new tensor filled with zeros.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, DType, Device};
+    /// use candle_core::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = Tensor::from_slice(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0], (2, 3), &Device::Cpu)?;
     /// // a == b
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn zeros<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         Self::zeros_impl(shape, dtype, device, false)
@@ -260,14 +260,59 @@ impl Tensor {
     /// tensor.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, DType, Device};
+    /// use candle_core::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = a.zeros_like()?;
     /// // b is on CPU f32.
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn zeros_like(&self) -> Result<Self> {
         Tensor::zeros(self.shape(), self.dtype(), self.device())
+    }
+
+    // Do not expose outside of the crate, the `is_variable=true` case should only be accessed from
+    // the variable module.
+    pub(crate) unsafe fn empty_impl<S: Into<Shape>>(
+        shape: S,
+        dtype: DType,
+        device: &Device,
+        is_variable: bool,
+    ) -> Result<Self> {
+        let none = BackpropOp::none();
+        let shape = shape.into();
+        let storage = device.alloc_uninit(&shape, dtype)?;
+        Ok(from_storage(storage, shape, none, is_variable))
+    }
+
+    /// Creates a new tensor filled with uninitialized memory.
+    ///
+    /// # Safety
+    /// This returns uninitialized memory.
+    ///
+    /// ```rust
+    /// use candle_core::{Tensor, DType, Device};
+    /// let a = unsafe { Tensor::empty((2, 3), DType::F32, &Device::Cpu)? };
+    /// // a == b
+    /// # Ok::<(), candle_core::Error>(())
+    /// ```
+    pub unsafe fn empty<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
+        Self::empty_impl(shape, dtype, device, false)
+    }
+
+    /// Creates a new tensor filled with uninitialized memory of the same shape, dtype, and device as the other
+    /// tensor.
+    ///
+    /// # Safety
+    /// This returns uninitialized memory.
+    ///
+    /// ```rust
+    /// use candle_core::{Tensor, DType, Device};
+    /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
+    /// let b = unsafe { a.empty_like()? };
+    /// # Ok::<(), candle_core::Error>(())
+    /// ```
+    pub unsafe fn empty_like(&self) -> Result<Self> {
+        Tensor::empty(self.shape(), self.dtype(), self.device())
     }
 
     pub(crate) fn rand_impl<S: Into<Shape>, T: crate::FloatDType>(
@@ -384,14 +429,14 @@ impl Tensor {
 
     /// Returns a new tensor with all the elements having the same specified value.
     ///```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::full(3.5, (2, 4), &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec2::<f64>()?, &[
     ///     [3.5, 3.5, 3.5, 3.5],
     ///     [3.5, 3.5, 3.5, 3.5],
     /// ]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     pub fn full<D: crate::WithDType, S: Into<Shape>>(
         value: D,
         shape: S,
@@ -407,11 +452,11 @@ impl Tensor {
 
     /// Creates a new 1D tensor from an iterator.
     ///```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::from_iter( [1.0, 2.0, 3.0, 4.0].into_iter(), &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec1::<f64>()?, &[1.0, 2.0, 3.0, 4.0]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn from_iter<D: crate::WithDType>(
         iter: impl IntoIterator<Item = D>,
@@ -425,11 +470,11 @@ impl Tensor {
     /// Creates a new 1D tensor with values from the interval `[start, end)` taken with a common
     /// difference `1` from `start`.
     ///```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::arange(2., 5., &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec1::<f64>()?, &[2., 3., 4.]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn arange<D: crate::WithDType>(start: D, end: D, device: &Device) -> Result<Self> {
         Self::arange_step(start, end, D::one(), device)
@@ -438,11 +483,11 @@ impl Tensor {
     /// Creates a new 1D tensor with values from the interval `[start, end)` taken with a common
     /// difference `step` from `start`.
     ///```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::arange_step(2.0, 4.0, 0.5, &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec1::<f64>()?, &[2.0, 2.5, 3.0, 3.5]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn arange_step<D: crate::WithDType>(
         start: D,
@@ -486,14 +531,14 @@ impl Tensor {
     /// in this vector must be the same as the number of elements defined by the shape.
     /// If the device is cpu, no data copy is made.
     ///```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::from_vec(vec!{1., 2., 3., 4., 5., 6.}, (2, 3), &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec2::<f64>()?, &[
     ///     [1., 2., 3.],
     ///     [4., 5., 6.]
     /// ]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn from_vec<S: ShapeWithOneHole, D: crate::WithDType>(
         data: Vec<D>,
@@ -506,7 +551,7 @@ impl Tensor {
     /// Creates a new tensor initialized with values from the input slice. The number of elements
     /// in this vector must be the same as the number of elements defined by the shape.
     ///```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let values = vec![1., 2., 3., 4., 5., 6., 7., 8.];
     /// let a = Tensor::from_slice(&values[1..7], (2, 3), &Device::Cpu)?;
     ///
@@ -514,7 +559,7 @@ impl Tensor {
     ///     [2., 3., 4.],
     ///     [5., 6., 7.]
     /// ]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn from_slice<S: ShapeWithOneHole, D: crate::WithDType>(
         array: &[D],
@@ -546,6 +591,20 @@ impl Tensor {
     /// a variable or if it has some variable as dependencies.
     pub fn track_op(&self) -> bool {
         self.is_variable || self.op.is_some()
+    }
+
+    /// Creates a fresh tensor structure based on a storage and a shape.
+    ///
+    /// # Note
+    /// - This uses contiguous strides
+    /// - Ensure the shape is compatible with the shape of the storage.
+    pub fn from_storage<S: Into<Shape>>(
+        storage: Storage,
+        shape: S,
+        op: BackpropOp,
+        is_variable: bool,
+    ) -> Tensor {
+        from_storage(storage, shape, op, is_variable)
     }
 
     // TODO: Also make an inplace version or a pre-allocated? This could be tricky
@@ -657,7 +716,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device, Shape};
+    /// use candle_core::{Tensor, Device, Shape};
     /// let x = Tensor::new(&[1f32, 2., 3.], &Device::Cpu)?;
     /// let y = Tensor::new(&[4f32, 5., 6.], &Device::Cpu)?;
     ///
@@ -673,7 +732,7 @@ impl Tensor {
     ///
     /// assert_eq!(grids_ij[0].to_vec2::<f32>()?, &[[1., 1., 1.], [2., 2., 2.], [3., 3., 3.]]);
     /// assert_eq!(grids_ij[1].to_vec2::<f32>()?, &[[4., 5., 6.], [4., 5., 6.], [4., 5., 6.]]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     ///
     /// # Errors
@@ -716,11 +775,11 @@ impl Tensor {
     /// be performed.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::new(&[[0f32, 1.], [2., 3.]], &Device::Cpu)?;
     /// let a = a.affine(4., -2.)?;
     /// assert_eq!(a.to_vec2::<f32>()?, &[[-2.0, 2.0], [6.0, 10.0]]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn affine(&self, mul: f64, add: f64) -> Result<Self> {
         if self.elem_count() == 0 {
@@ -793,7 +852,7 @@ impl Tensor {
     /// Returns a new tensor that is a narrowed version of the input, the dimension `dim`
     /// ranges from `start` to `start + len`.
     /// ```
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::new(&[
     ///     [0f32, 1., 2.],
     ///     [3.  , 4., 5.],
@@ -814,7 +873,7 @@ impl Tensor {
     ///     [4.],
     ///     [7.]
     /// ]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn narrow<D: Dim>(&self, dim: D, start: usize, len: usize) -> Result<Self> {
         let dims = self.dims();
@@ -918,14 +977,14 @@ impl Tensor {
     /// Elements that are shifted beyond the last position are re-introduced at the first position.
     ///
     /// ```rust
-    /// # use hanzo_core::{Tensor, Device};
+    /// # use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.roll(1, 0)?;
     /// assert_eq!(tensor.to_vec2::<f32>()?, &[[4., 5.], [0., 1.], [2., 3.]]);
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.roll(-1, 0)?;
     /// assert_eq!(tensor.to_vec2::<f32>()?, &[[2., 3.], [4., 5.], [0., 1.]]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn roll<D>(&self, shift: i32, dim: D) -> Result<Self>
     where
@@ -950,7 +1009,7 @@ impl Tensor {
     /// that the number of elements for each dimension index in `sum_dims` is 1.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::new(&[[0f32, 1.], [2., 3.]], &Device::Cpu)?;
     /// let s = a.sum_keepdim(0)?;
     /// assert_eq!(s.to_vec2::<f32>()?, &[[2., 4.]]);
@@ -958,7 +1017,7 @@ impl Tensor {
     /// assert_eq!(s.to_vec2::<f32>()?, &[[1.], [5.]]);
     /// let s = a.sum_keepdim((0, 1))?;
     /// assert_eq!(s.to_vec2::<f32>()?, &[[6.]]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn sum_keepdim<D: Dims>(&self, sum_dims: D) -> Result<Self> {
         self.sum_impl(sum_dims, true)
@@ -978,7 +1037,7 @@ impl Tensor {
     /// that the number of elements for each dimension index in `mean_dims` is 1.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let a = Tensor::new(&[[0f32, 1.], [2., 3.]], &Device::Cpu)?;
     /// let s = a.mean_keepdim(0)?;
     /// assert_eq!(s.to_vec2::<f32>()?, &[[1., 2.]]);
@@ -986,7 +1045,7 @@ impl Tensor {
     /// assert_eq!(s.to_vec2::<f32>()?, &[[0.5], [2.5]]);
     /// let s = a.mean_keepdim((0, 1))?;
     /// assert_eq!(s.to_vec2::<f32>()?, &[[1.5]]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn mean_keepdim<D: Dims>(&self, mean_dims: D) -> Result<Self> {
         let mean_dims = mean_dims.to_indexes(self.shape(), "mean-keepdim")?;
@@ -1159,6 +1218,119 @@ impl Tensor {
         self.interpolate2d(target_h, target_w)
     }
 
+    /// Bilinear interpolation to resize the input tensor to the specified size.
+    ///
+    /// The input tensor should have four dimensions: `(batch, channels, h, w)`.
+    /// The returned tensor also has four dimensions: `(batch, channels, target_h, target_w)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `target_h` - Target height
+    /// * `target_w` - Target width  
+    /// * `align_corners` - If true, corner pixels are aligned. If false (default),
+    ///   pixels are treated as areas (matches PyTorch default behavior).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use candle_core::{Tensor, Device};
+    /// # fn main() -> candle_core::Result<()> {
+    /// let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    /// let upsampled = t.upsample_bilinear2d(8, 8, false)?;
+    /// assert_eq!(upsampled.dims(), &[1, 1, 8, 8]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn upsample_bilinear2d(
+        &self,
+        target_h: usize,
+        target_w: usize,
+        align_corners: bool,
+    ) -> Result<Self> {
+        let (n, c, _h, _w) = self.dims4()?;
+        let op = BackpropOp::new1(self, |arg| Op::UpsampleBilinear2D {
+            arg,
+            target_h,
+            target_w,
+            align_corners,
+        });
+        // Pass None for scale factors (size mode)
+        let storage = self.storage().upsample_bilinear2d(
+            self.layout(),
+            target_h,
+            target_w,
+            align_corners,
+            None,
+            None,
+        )?;
+        Ok(from_storage(storage, (n, c, target_h, target_w), op, false))
+    }
+
+    /// Bilinear interpolation using scale factors.
+    ///
+    /// Similar to `upsample_bilinear2d` but uses scale factors instead of absolute sizes.
+    /// This matches PyTorch's `interpolate(scale_factor=...)` behavior.
+    ///
+    /// # Arguments
+    ///
+    /// * `scale_h` - Height scaling factor
+    /// * `scale_w` - Width scaling factor
+    /// * `align_corners` - If true, corner pixels are aligned
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use candle_core::{Tensor, Device};
+    /// # fn main() -> candle_core::Result<()> {
+    /// let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    /// // Scale by 2x in both dimensions
+    /// let upsampled = t.upsample_bilinear2d_with_scale(2.0, 2.0, false)?;
+    /// assert_eq!(upsampled.dims(), &[1, 1, 8, 8]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn upsample_bilinear2d_with_scale(
+        &self,
+        scale_h: f64,
+        scale_w: f64,
+        align_corners: bool,
+    ) -> Result<Self> {
+        let (n, c, height_in, width_in) = self.dims4()?;
+
+        // Calculate output size (floor, matching PyTorch)
+        let height_out = (height_in as f64 * scale_h).floor() as usize;
+        let width_out = (width_in as f64 * scale_w).floor() as usize;
+
+        // Early return if size unchanged
+        if height_in == height_out && width_in == width_out {
+            return Ok(self.clone());
+        }
+
+        let op = BackpropOp::new1(self, |arg| Op::UpsampleBilinear2D {
+            arg,
+            target_h: height_out,
+            target_w: width_out,
+            align_corners,
+        });
+
+        // Pass original scale factors (scale_factor mode)
+        // This ensures PyTorch-compatible scale calculation
+        let storage = self.storage().upsample_bilinear2d(
+            self.layout(),
+            height_out,
+            width_out,
+            align_corners,
+            Some(scale_h),
+            Some(scale_w),
+        )?;
+        Ok(from_storage(
+            storage,
+            (n, c, height_out, width_out),
+            op,
+            false,
+        ))
+    }
+
     /// 2D average pooling over an input tensor with multiple channels.
     ///
     /// The input tensor should have four dimensions, `(batch, channels, h, w)`, the returned
@@ -1243,12 +1415,12 @@ impl Tensor {
     ///
     /// # Example (vectors)
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let t1 = Tensor::new(&[1.0, 2.0, 3.0], &Device::Cpu)?;
     /// let t2 = Tensor::new(&[4.0, 5.0, 6.0], &Device::Cpu)?;
     /// let res = t1.dot(&t2)?;
     /// assert_eq!(res.to_scalar::<f64>()?, 32.);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn dot(&self, rhs: &Self) -> Result<Self> {
         if self.dims().len() != 1 || rhs.dims().len() != 1 {
@@ -1268,11 +1440,11 @@ impl Tensor {
     ///
     /// # Example
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let t = Tensor::new(&[[3., 4.], [0., 0.]], &Device::Cpu)?;
     /// let norm = t.norm()?;
     /// assert_eq!(norm.to_scalar::<f64>()?, 5.);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn norm(&self) -> Result<Self> {
         if self.dtype().is_int() {
@@ -1289,12 +1461,12 @@ impl Tensor {
     ///
     /// # Example
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let mat = Tensor::new(&[[1., 2., 3.], [4., 5., 6.]], &Device::Cpu)?;
     /// let vec = Tensor::new(&[1., 1., 1.], &Device::Cpu)?;
     /// let res = mat.mv(&vec)?;
     /// assert_eq!(res.to_vec1::<f64>()?, [6., 15.]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn mv(&self, rhs: &Self) -> Result<Self> {
         // Strict shape checks
@@ -1416,12 +1588,12 @@ impl Tensor {
     /// vocabulary size, and `h` the hidden size.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let values = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let ids = Tensor::new(&[2u32, 1u32, 2u32], &Device::Cpu)?;
     /// let emb = values.embedding(&ids)?;
     /// assert_eq!(emb.to_vec2::<f32>()?, &[[4., 5.], [2., 3.], [4., 5.]]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn embedding(&self, ids: &Self) -> Result<Self> {
         if self.rank() != 2 || ids.rank() != 1 {
@@ -1742,7 +1914,7 @@ impl Tensor {
 
     /// Returns an iterator over position of the elements in the storage when ranging over the
     /// index tuples in lexicographic order.
-    pub fn strided_index(&self) -> crate::StridedIndex {
+    pub fn strided_index(&self) -> crate::StridedIndex<'_> {
         self.layout.strided_index()
     }
 
@@ -1750,7 +1922,7 @@ impl Tensor {
     /// as well as the length of the contiguous blocks. For a contiguous tensor, the index iterator
     /// will only return the start offset and the size would be the number of elements in the
     /// tensor.
-    pub fn strided_blocks(&self) -> crate::StridedBlocks {
+    pub fn strided_blocks(&self) -> crate::StridedBlocks<'_> {
         self.layout.strided_blocks()
     }
 
@@ -1916,11 +2088,11 @@ impl Tensor {
     /// scalar with zero dimensions.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.max_all()?;
     /// assert_eq!(tensor.to_scalar::<f32>()?, 5.);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn max_all(&self) -> Result<Tensor> {
         if self.rank() == 0 {
@@ -1934,11 +2106,11 @@ impl Tensor {
     /// scalar with zero dimensions.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.min_all()?;
     /// assert_eq!(tensor.to_scalar::<f32>()?, 0.);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn min_all(&self) -> Result<Tensor> {
         if self.rank() == 0 {
@@ -1952,11 +2124,11 @@ impl Tensor {
     /// scalar with zero dimensions.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.sum_all()?;
     /// assert_eq!(tensor.to_scalar::<f32>()?, 15.);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn sum_all(&self) -> Result<Tensor> {
         let dims: Vec<_> = (0..self.rank()).collect();
@@ -2017,11 +2189,11 @@ impl Tensor {
     /// Flattens the input tensor by reshaping it into a one dimension tensor.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.flatten_all()?;
     /// assert_eq!(tensor.to_vec1::<f32>()?, &[0., 1., 2., 3., 4., 5.]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn flatten_all(&self) -> Result<Tensor> {
         self.flatten_(None::<usize>, None::<usize>)
@@ -2030,13 +2202,13 @@ impl Tensor {
     /// Returns the sub-tensor fixing the index at `i` on the first dimension.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let t = tensor.get(0)?;
     /// assert_eq!(t.to_vec1::<f32>()?, &[0., 1.]);
     /// let t = tensor.get(1)?;
     /// assert_eq!(t.to_vec1::<f32>()?, &[2., 3.]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn get(&self, i: usize) -> Result<Tensor> {
         let dims = self.dims();
@@ -2050,7 +2222,7 @@ impl Tensor {
     /// Returns the sub-tensor fixing the index at `index` on the dimension `dim`.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let t = tensor.get_on_dim(1, 0)?;
     /// assert_eq!(t.to_vec1::<f32>()?, &[0., 2., 4.]);
@@ -2058,7 +2230,7 @@ impl Tensor {
     /// assert_eq!(t.to_vec1::<f32>()?, &[1., 3., 5.]);
     /// let t = tensor.get_on_dim(0, 1)?;
     /// assert_eq!(t.to_vec1::<f32>()?, &[2., 3.]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn get_on_dim<D: Dim>(&self, dim: D, index: usize) -> Result<Tensor> {
         let dim = dim.to_index(self.shape(), "get_on_dim")?;
@@ -2069,11 +2241,11 @@ impl Tensor {
     /// input are swapped.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.t()?;
     /// assert_eq!(tensor.to_vec2::<f32>()?, &[[0.0, 2.0, 4.0], [1.0, 3.0, 5.0]]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn t(&self) -> Result<Tensor> {
         let rank = self.rank();
@@ -2113,12 +2285,12 @@ impl Tensor {
     /// dims must be a permutation, i.e. include each dimension index exactly once.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::arange(0u32, 120u32, &Device::Cpu)?.reshape((2, 3, 4, 5))?;
     /// assert_eq!(tensor.dims(), &[2, 3, 4, 5]);
     /// let tensor = tensor.permute((2, 3, 1, 0))?;
     /// assert_eq!(tensor.dims(), &[4, 5, 3, 2]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn permute<D: Dims>(&self, dims: D) -> Result<Tensor> {
         let dims = dims.to_indexes(self.shape(), "permute")?;
@@ -2272,12 +2444,12 @@ impl Tensor {
     /// Casts the input tensor to the target `dtype`.
     ///
     /// ```rust
-    /// use hanzo_core::{Tensor, Device};
+    /// use candle_core::{Tensor, Device};
     /// let tensor = Tensor::new(3.14159265358979f64, &Device::Cpu)?;
     /// assert_eq!(tensor.to_scalar::<f64>()?, 3.14159265358979);
-    /// let tensor = tensor.to_dtype(hanzo_core::DType::F32)?;
+    /// let tensor = tensor.to_dtype(candle_core::DType::F32)?;
     /// assert_eq!(tensor.to_scalar::<f32>()?, 3.1415927);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn to_dtype(&self, dtype: DType) -> Result<Self> {
         if self.dtype() == dtype {
@@ -2335,7 +2507,7 @@ impl Tensor {
     /// as to match the number of elements in the tensor.
     ///
     /// ```rust
-    /// # use hanzo_core::{Tensor, DType, Device, D};
+    /// # use candle_core::{Tensor, DType, Device, D};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
     /// let c = a.reshape((1, 6))?;
@@ -2347,7 +2519,7 @@ impl Tensor {
     /// let c = a.reshape((2, (), 1))?;
     /// assert_eq!(c.shape().dims(), &[2, 3, 1]);
     ///
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn reshape<S: ShapeWithOneHole>(&self, s: S) -> Result<Tensor> {
         let shape = s.into_shape(self.elem_count())?;
@@ -2382,7 +2554,7 @@ impl Tensor {
     /// Creates a new tensor with the specified dimension removed if its size was one.
     ///
     /// ```rust
-    /// # use hanzo_core::{Tensor, DType, Device, D};
+    /// # use candle_core::{Tensor, DType, Device, D};
     /// let a = Tensor::zeros((2, 3, 1), DType::F32, &Device::Cpu)?;
     ///
     /// let c = a.squeeze(2)?;
@@ -2390,7 +2562,7 @@ impl Tensor {
     ///
     /// let c = a.squeeze(D::Minus1)?;
     /// assert_eq!(c.shape().dims(), &[2, 3]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn squeeze<D: Dim>(&self, dim: D) -> Result<Self> {
         // The PyTorch semantics are to return the same tensor if the target dimension
@@ -2420,7 +2592,7 @@ impl Tensor {
     /// Creates a new tensor with a dimension of size one inserted at the specified position.
     ///
     /// ```rust
-    /// # use hanzo_core::{Tensor, DType, Device, D};
+    /// # use candle_core::{Tensor, DType, Device, D};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
     /// let c = a.unsqueeze(0)?;
@@ -2428,7 +2600,7 @@ impl Tensor {
     ///
     /// let c = a.unsqueeze(D::Minus1)?;
     /// assert_eq!(c.shape().dims(), &[2, 3, 1]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn unsqueeze<D: Dim>(&self, dim: D) -> Result<Self> {
         let mut dims = self.dims().to_vec();
@@ -2457,7 +2629,7 @@ impl Tensor {
     /// All tensors must have the same rank, and the output has one additional rank
     ///
     /// ```rust
-    /// # use hanzo_core::{Tensor, DType, Device};
+    /// # use candle_core::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
@@ -2466,7 +2638,7 @@ impl Tensor {
     ///
     /// let c = Tensor::stack(&[&a, &b], 2)?;
     /// assert_eq!(c.shape().dims(), &[2, 3, 2]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn stack<A: AsRef<Tensor>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
         if args.is_empty() {
@@ -2737,12 +2909,12 @@ impl Tensor {
     /// This function makes a copy of the tensor’s data.
     ///
     /// ```rust
-    /// # use hanzo_core::{Tensor, Device};
+    /// # use candle_core::{Tensor, Device};
     /// let t = Tensor::arange(0., 6., &Device::Cpu)?.reshape((2, 3))?;
     /// assert_eq!(t.to_vec2::<f64>()?, &[[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]);
     /// let t_flipped = t.flip(&[0])?;
     /// assert_eq!(t_flipped.to_vec2::<f64>()?, &[[3.0, 4.0, 5.0], [0.0, 1.0, 2.0]]);
-    /// # Ok::<(), hanzo_core::Error>(())
+    /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn flip(&self, dims: &[usize]) -> Result<Tensor> {
         let mut result = self.clone();
@@ -2753,6 +2925,49 @@ impl Tensor {
             result = result.index_select(&indices_tensor, dim)?;
         }
         Ok(result)
+    }
+
+    /// Returns a view of which contains all slices of size `size` from self tensor in the dimension
+    /// `dim` and stepped by `step`.
+    pub fn unfold<D: Dim>(&self, dim: D, size: usize, step: usize) -> Result<Self> {
+        // https://github.com/pytorch/pytorch/blob/75b0720a97ac5d82e8a7a1a6ae7c5f7a87d7183d/aten/src/ATen/native/TensorShape.cpp#L3785-L3804
+        let mut sizes = self.dims().to_vec();
+        let mut strides = self.stride().to_vec();
+
+        let dim = dim.to_index(self.shape(), "unfold")?;
+
+        let max_len = if self.dims().is_empty() {
+            1
+        } else {
+            sizes[dim]
+        };
+        if size > max_len {
+            bail!(
+                "unsqueeze: maximum size for tensor at dimension {dim} is {max_len} but size is {size}"
+            )
+        }
+        sizes.push(size);
+        strides.push(if self.dims().is_empty() {
+            1
+        } else {
+            strides[dim]
+        });
+
+        if !self.dims().is_empty() {
+            sizes[dim] = ((sizes[dim] as f32 - size as f32) / step as f32 + 1.) as usize;
+            strides[dim] *= step;
+        }
+
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout: Layout::new(sizes.into(), strides, self.layout.start_offset()),
+            op: BackpropOp::new1(self, Op::Reshape),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
     }
 }
 
@@ -2892,5 +3107,11 @@ impl std::ops::Div<&Tensor> for f64 {
     #[allow(clippy::suspicious_arithmetic_impl)]
     fn div(self, rhs: &Tensor) -> Self::Output {
         rhs.recip()? * self
+    }
+}
+
+impl<S: Into<Shape>> From<(Storage, S)> for Tensor {
+    fn from((storage, shape): (Storage, S)) -> Self {
+        from_storage(storage, shape, BackpropOp::none(), false)
     }
 }

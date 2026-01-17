@@ -2,11 +2,13 @@
 members = [
     "hanzo-ml",
     "hanzo-datasets", 
+    "hanzo-ml-examples",
     "hanzo-nn",
     "hanzo-ml-pyo3",
     "hanzo-transformers",
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
+    "hanzo-ug",
     "tensor-tools",
 ]
 exclude = [
@@ -19,7 +21,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.1"
+version = "0.9.2-alpha.2"
 edition = "2021"
 description = "Minimalist ML framework."
 repository = "https://github.com/hanzoai/ml"
@@ -32,14 +34,15 @@ ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
-hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.9.1" }
-hanzo-datasets = { path = "./hanzo-datasets", version = "0.9.1" }
-hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.9.1" }
-hanzo-kernels = { path = "./hanzo-kernels", version = "0.9.1" }
-hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.9.1" }
-hanzo-nn = { path = "./hanzo-nn", version = "0.9.1" }
-hanzo-onnx = { path = "./hanzo-onnx", version = "0.9.1" }
-hanzo-transformers = { path = "./hanzo-transformers", version = "0.9.1" }
+hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.9.2-alpha.2" }
+hanzo-datasets = { path = "./hanzo-datasets", version = "0.9.2-alpha.2" }
+hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.9.2-alpha.2" }
+hanzo-kernels = { path = "./hanzo-kernels", version = "0.9.2-alpha.2" }
+hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.9.2-alpha.2" }
+hanzo-nn = { path = "./hanzo-nn", version = "0.9.2-alpha.2" }
+hanzo-onnx = { path = "./hanzo-onnx", version = "0.9.2-alpha.2" }
+hanzo-transformers = { path = "./hanzo-transformers", version = "0.9.2-alpha.2" }
+hanzo-ug = { path = "./hanzo-ug", version = "0.9.2-alpha.2" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.7.0", default-features = false }
 cudarc = { version = "0.18.2", features = [

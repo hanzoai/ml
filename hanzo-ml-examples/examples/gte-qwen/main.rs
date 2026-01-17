@@ -10,7 +10,7 @@ use clap::Parser;
 use hanzo_transformers::models::qwen2::{Config, Model};
 
 use hanzo_ml::{DType, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{
     utils::padding::{PaddingDirection, PaddingParams, PaddingStrategy},

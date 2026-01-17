@@ -1,8 +1,8 @@
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_ml_nn::{linear_b, rms_norm, Linear, RmsNorm, VarBuilder};
+use hanzo_nn::{linear_b, rms_norm, Linear, RmsNorm, VarBuilder};
 
-fn default_act() -> hanzo_ml_nn::Activation {
-    hanzo_ml_nn::Activation::Silu
+fn default_act() -> hanzo_nn::Activation {
+    hanzo_nn::Activation::Silu
 }
 
 fn default_hidden_size() -> usize {
@@ -42,7 +42,7 @@ pub struct Config {
     #[serde(default = "default_num_attention_heads")]
     pub num_attention_heads: usize,
     #[serde(default = "default_act")]
-    pub hidden_act: hanzo_ml_nn::Activation,
+    pub hidden_act: hanzo_nn::Activation,
 }
 
 impl Config {
@@ -58,7 +58,7 @@ impl Config {
             num_attention_heads: 16,
             head_dim: None,
             // Default
-            hidden_act: hanzo_ml_nn::Activation::Silu,
+            hidden_act: hanzo_nn::Activation::Silu,
         }
     }
 
@@ -126,7 +126,7 @@ impl Attention {
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
 
-        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
         attn_weights
             .matmul(&value_states)?
             .transpose(1, 2)?
@@ -140,7 +140,7 @@ struct Mlp {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
-    act_fn: hanzo_ml_nn::Activation,
+    act_fn: hanzo_nn::Activation,
 }
 
 impl Mlp {
@@ -291,15 +291,15 @@ impl RotaryEmbedding {
                 &self.sin.index_select(pos, 0)?,
             ),
         };
-        let q_embed = hanzo_ml_nn::rotary_emb::rope(q, cos, sin)?;
-        let k_embed = hanzo_ml_nn::rotary_emb::rope(k, cos, sin)?;
+        let q_embed = hanzo_nn::rotary_emb::rope(q, cos, sin)?;
+        let k_embed = hanzo_nn::rotary_emb::rope(k, cos, sin)?;
         Ok((q_embed, k_embed))
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    patch_conv: hanzo_ml_nn::Conv2d,
+    patch_conv: hanzo_nn::Conv2d,
     ln_pre: RmsNorm,
     transformer: Transformer,
     patch_positional_embedding: RotaryEmbedding,
@@ -308,18 +308,18 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let conv2d_cfg = hanzo_ml_nn::Conv2dConfig {
+        let conv2d_cfg = hanzo_nn::Conv2dConfig {
             stride: cfg.patch_size,
             ..Default::default()
         };
-        let patch_conv = hanzo_ml_nn::conv2d_no_bias(
+        let patch_conv = hanzo_nn::conv2d_no_bias(
             cfg.num_channels,
             cfg.hidden_size,
             cfg.patch_size,
             conv2d_cfg,
             vb.pp("patch_conv"),
         )?;
-        let ln_pre = hanzo_ml_nn::rms_norm(cfg.hidden_size, 1e-5, vb.pp("ln_pre"))?;
+        let ln_pre = hanzo_nn::rms_norm(cfg.hidden_size, 1e-5, vb.pp("ln_pre"))?;
         let transformer = Transformer::new(cfg, vb.pp("transformer"))?;
         let patch_positional_embedding =
             RotaryEmbedding::new(cfg, vb.pp("patch_positional_embedding"))?;
