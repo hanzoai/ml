@@ -6,6 +6,7 @@ members = [
     "hanzo-nn",
     "hanzo-ml-pyo3",
     "hanzo-transformers",
+    "hanzo-training",
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
     "hanzo-ug",
@@ -104,3 +105,4 @@ objc2-foundation = { version = "0.3.1" }
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+chrono = "0.4"
