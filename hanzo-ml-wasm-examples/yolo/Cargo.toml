@@ -6,7 +6,7 @@ description = "Minimalist ML framework."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
-license = "MIT OR Apache-2.0"
+license = "BSD-3-Clause OR Apache-2.0"
 
 [dependencies]
 hanzo-ml = { workspace = true }
