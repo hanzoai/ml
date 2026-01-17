@@ -12,8 +12,6 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
-hanzo-kernels = { workspace = true, optional = true }
-hanzo-metal-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
@@ -44,7 +42,7 @@ criterion = { workspace = true }
 
 [features]
 default = []
-cuda = ["cudarc", "dep:hanzo-kernels", "hanzo-ug?/cuda", "float8/cuda"]
+cuda = ["cudarc", "hanzo-ug?/cuda", "float8/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
@@ -52,7 +50,6 @@ accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = [
     "dep:objc2-metal",
     "dep:objc2-foundation", 
-    "dep:hanzo-metal-kernels",
     "hanzo-ug?/metal",
 ]
 ug = ["dep:hanzo-ug"]
