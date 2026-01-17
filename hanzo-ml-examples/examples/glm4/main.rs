@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::glm4::{Config as ConfigOld, EosTokenId, Model as ModelOld};
 use hanzo_transformers::models::glm4_new::{Config as ConfigNew, ModelForCausalLM as ModelNew};

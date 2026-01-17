@@ -20,7 +20,7 @@ use crate::models::with_tracing::QMatMul;
 use crate::quantized_nn::Embedding;
 pub use crate::quantized_var_builder::VarBuilder;
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_ml_nn::Activation;
+use hanzo_nn::Activation;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -436,7 +436,7 @@ impl T5Attention {
 
         let attn_weights = {
             let _enter = self.span_sm.enter();
-            hanzo_ml_nn::ops::softmax_last_dim(&scores)?
+            hanzo_nn::ops::softmax_last_dim(&scores)?
         };
         let attn_output = attn_weights.matmul(&v)?;
         let attn_output = attn_output

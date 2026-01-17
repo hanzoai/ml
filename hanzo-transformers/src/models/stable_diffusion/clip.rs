@@ -6,7 +6,7 @@
 //! - [CLIP](https://github.com/openai/CLIP)
 use hanzo_ml::{DType, Device, Result, Tensor, D};
 use hanzo_nn as nn;
-use hanzo_ml_nn::Module;
+use hanzo_nn::Module;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Activation {
@@ -145,16 +145,16 @@ impl Config {
 // https://github.com/huggingface/transformers/blob/674f750a57431222fa2832503a108df3badf1564/src/transformers/models/clip/modeling_clip.py
 #[derive(Debug)]
 struct ClipTextEmbeddings {
-    token_embedding: hanzo_ml_nn::Embedding,
-    position_embedding: hanzo_ml_nn::Embedding,
+    token_embedding: hanzo_nn::Embedding,
+    position_embedding: hanzo_nn::Embedding,
     position_ids: Tensor,
 }
 
 impl ClipTextEmbeddings {
-    fn new(vs: hanzo_ml_nn::VarBuilder, c: &Config) -> Result<Self> {
+    fn new(vs: hanzo_nn::VarBuilder, c: &Config) -> Result<Self> {
         let token_embedding =
-            hanzo_ml_nn::embedding(c.vocab_size, c.embed_dim, vs.pp("token_embedding"))?;
-        let position_embedding = hanzo_ml_nn::embedding(
+            hanzo_nn::embedding(c.vocab_size, c.embed_dim, vs.pp("token_embedding"))?;
+        let position_embedding = hanzo_nn::embedding(
             c.max_position_embeddings,
             c.embed_dim,
             vs.pp("position_embedding"),
@@ -179,23 +179,23 @@ impl Module for ClipTextEmbeddings {
 
 #[derive(Debug)]
 struct ClipAttention {
-    k_proj: hanzo_ml_nn::Linear,
-    v_proj: hanzo_ml_nn::Linear,
-    q_proj: hanzo_ml_nn::Linear,
-    out_proj: hanzo_ml_nn::Linear,
+    k_proj: hanzo_nn::Linear,
+    v_proj: hanzo_nn::Linear,
+    q_proj: hanzo_nn::Linear,
+    out_proj: hanzo_nn::Linear,
     head_dim: usize,
     scale: f64,
     num_attention_heads: usize,
 }
 
 impl ClipAttention {
-    fn new(vs: hanzo_ml_nn::VarBuilder, c: &Config) -> Result<Self> {
+    fn new(vs: hanzo_nn::VarBuilder, c: &Config) -> Result<Self> {
         let embed_dim = c.embed_dim;
         let num_attention_heads = c.num_attention_heads;
-        let k_proj = hanzo_ml_nn::linear(embed_dim, embed_dim, vs.pp("k_proj"))?;
-        let v_proj = hanzo_ml_nn::linear(embed_dim, embed_dim, vs.pp("v_proj"))?;
-        let q_proj = hanzo_ml_nn::linear(embed_dim, embed_dim, vs.pp("q_proj"))?;
-        let out_proj = hanzo_ml_nn::linear(embed_dim, embed_dim, vs.pp("out_proj"))?;
+        let k_proj = hanzo_nn::linear(embed_dim, embed_dim, vs.pp("k_proj"))?;
+        let v_proj = hanzo_nn::linear(embed_dim, embed_dim, vs.pp("v_proj"))?;
+        let q_proj = hanzo_nn::linear(embed_dim, embed_dim, vs.pp("q_proj"))?;
+        let out_proj = hanzo_nn::linear(embed_dim, embed_dim, vs.pp("out_proj"))?;
         let head_dim = embed_dim / num_attention_heads;
         let scale = (head_dim as f64).powf(-0.5);
         Ok(ClipAttention {
@@ -240,7 +240,7 @@ impl ClipAttention {
             .broadcast_add(causal_attention_mask)?;
         let attn_weights =
             attn_weights.reshape((bsz * self.num_attention_heads, seq_len, src_len))?;
-        let attn_weights = hanzo_ml_nn::ops::softmax(&attn_weights, D::Minus1)?;
+        let attn_weights = hanzo_nn::ops::softmax(&attn_weights, D::Minus1)?;
 
         let attn_output = attn_weights.matmul(&value_states)?.to_dtype(in_dtype)?;
         let attn_output = attn_output
@@ -253,15 +253,15 @@ impl ClipAttention {
 
 #[derive(Debug)]
 struct ClipMlp {
-    fc1: hanzo_ml_nn::Linear,
-    fc2: hanzo_ml_nn::Linear,
+    fc1: hanzo_nn::Linear,
+    fc2: hanzo_nn::Linear,
     activation: Activation,
 }
 
 impl ClipMlp {
-    fn new(vs: hanzo_ml_nn::VarBuilder, c: &Config) -> Result<Self> {
-        let fc1 = hanzo_ml_nn::linear(c.embed_dim, c.intermediate_size, vs.pp("fc1"))?;
-        let fc2 = hanzo_ml_nn::linear(c.intermediate_size, c.embed_dim, vs.pp("fc2"))?;
+    fn new(vs: hanzo_nn::VarBuilder, c: &Config) -> Result<Self> {
+        let fc1 = hanzo_nn::linear(c.embed_dim, c.intermediate_size, vs.pp("fc1"))?;
+        let fc2 = hanzo_nn::linear(c.intermediate_size, c.embed_dim, vs.pp("fc2"))?;
         Ok(ClipMlp {
             fc1,
             fc2,
@@ -280,17 +280,17 @@ impl ClipMlp {
 #[derive(Debug)]
 struct ClipEncoderLayer {
     self_attn: ClipAttention,
-    layer_norm1: hanzo_ml_nn::LayerNorm,
+    layer_norm1: hanzo_nn::LayerNorm,
     mlp: ClipMlp,
-    layer_norm2: hanzo_ml_nn::LayerNorm,
+    layer_norm2: hanzo_nn::LayerNorm,
 }
 
 impl ClipEncoderLayer {
-    fn new(vs: hanzo_ml_nn::VarBuilder, c: &Config) -> Result<Self> {
+    fn new(vs: hanzo_nn::VarBuilder, c: &Config) -> Result<Self> {
         let self_attn = ClipAttention::new(vs.pp("self_attn"), c)?;
-        let layer_norm1 = hanzo_ml_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("layer_norm1"))?;
+        let layer_norm1 = hanzo_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("layer_norm1"))?;
         let mlp = ClipMlp::new(vs.pp("mlp"), c)?;
-        let layer_norm2 = hanzo_ml_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("layer_norm2"))?;
+        let layer_norm2 = hanzo_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("layer_norm2"))?;
         Ok(ClipEncoderLayer {
             self_attn,
             layer_norm1,
@@ -318,7 +318,7 @@ struct ClipEncoder {
 }
 
 impl ClipEncoder {
-    fn new(vs: hanzo_ml_nn::VarBuilder, c: &Config) -> Result<Self> {
+    fn new(vs: hanzo_nn::VarBuilder, c: &Config) -> Result<Self> {
         let vs = vs.pp("layers");
         let mut layers: Vec<ClipEncoderLayer> = Vec::new();
         for index in 0..c.num_hidden_layers {
@@ -342,15 +342,15 @@ impl ClipEncoder {
 pub struct ClipTextTransformer {
     embeddings: ClipTextEmbeddings,
     encoder: ClipEncoder,
-    final_layer_norm: hanzo_ml_nn::LayerNorm,
+    final_layer_norm: hanzo_nn::LayerNorm,
 }
 
 impl ClipTextTransformer {
-    pub fn new(vs: hanzo_ml_nn::VarBuilder, c: &Config) -> Result<Self> {
+    pub fn new(vs: hanzo_nn::VarBuilder, c: &Config) -> Result<Self> {
         let vs = vs.pp("text_model");
         let embeddings = ClipTextEmbeddings::new(vs.pp("embeddings"), c)?;
         let encoder = ClipEncoder::new(vs.pp("encoder"), c)?;
-        let final_layer_norm = hanzo_ml_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("final_layer_norm"))?;
+        let final_layer_norm = hanzo_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("final_layer_norm"))?;
         Ok(ClipTextTransformer {
             embeddings,
             encoder,

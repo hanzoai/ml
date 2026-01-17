@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
+use hanzo_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
 
 // https://github.com/black-forest-labs/flux/blob/727e3a71faf37390f318cf9434f0939653302b60/src/flux/model.py#L12
 #[derive(Debug, Clone)]
@@ -71,7 +71,7 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
     let k = k.flatten_to(batch_dims.len() - 1)?;
     let v = v.flatten_to(batch_dims.len() - 1)?;
     let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
-    let attn_scores = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?;
+    let attn_scores = hanzo_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?;
     batch_dims.push(attn_scores.dim(D::Minus2)?);
     batch_dims.push(attn_scores.dim(D::Minus1)?);
     attn_scores.reshape(batch_dims)
@@ -178,8 +178,8 @@ pub struct MlpEmbedder {
 
 impl MlpEmbedder {
     fn new(in_sz: usize, h_sz: usize, vb: VarBuilder) -> Result<Self> {
-        let in_layer = hanzo_ml_nn::linear(in_sz, h_sz, vb.pp("in_layer"))?;
-        let out_layer = hanzo_ml_nn::linear(h_sz, h_sz, vb.pp("out_layer"))?;
+        let in_layer = hanzo_nn::linear(in_sz, h_sz, vb.pp("in_layer"))?;
+        let out_layer = hanzo_nn::linear(h_sz, h_sz, vb.pp("out_layer"))?;
         Ok(Self {
             in_layer,
             out_layer,
@@ -236,7 +236,7 @@ struct Modulation1 {
 
 impl Modulation1 {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let lin = hanzo_ml_nn::linear(dim, 3 * dim, vb.pp("lin"))?;
+        let lin = hanzo_nn::linear(dim, 3 * dim, vb.pp("lin"))?;
         Ok(Self { lin })
     }
 
@@ -264,7 +264,7 @@ struct Modulation2 {
 
 impl Modulation2 {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let lin = hanzo_ml_nn::linear(dim, 6 * dim, vb.pp("lin"))?;
+        let lin = hanzo_nn::linear(dim, 6 * dim, vb.pp("lin"))?;
         Ok(Self { lin })
     }
 
@@ -302,9 +302,9 @@ pub struct SelfAttention {
 impl SelfAttention {
     fn new(dim: usize, num_heads: usize, qkv_bias: bool, vb: VarBuilder) -> Result<Self> {
         let head_dim = dim / num_heads;
-        let qkv = hanzo_ml_nn::linear_b(dim, dim * 3, qkv_bias, vb.pp("qkv"))?;
+        let qkv = hanzo_nn::linear_b(dim, dim * 3, qkv_bias, vb.pp("qkv"))?;
         let norm = QkNorm::new(head_dim, vb.pp("norm"))?;
-        let proj = hanzo_ml_nn::linear(dim, dim, vb.pp("proj"))?;
+        let proj = hanzo_nn::linear(dim, dim, vb.pp("proj"))?;
         Ok(Self {
             qkv,
             norm,
@@ -340,8 +340,8 @@ struct Mlp {
 
 impl Mlp {
     fn new(in_sz: usize, mlp_sz: usize, vb: VarBuilder) -> Result<Self> {
-        let lin1 = hanzo_ml_nn::linear(in_sz, mlp_sz, vb.pp("0"))?;
-        let lin2 = hanzo_ml_nn::linear(mlp_sz, in_sz, vb.pp("2"))?;
+        let lin1 = hanzo_nn::linear(in_sz, mlp_sz, vb.pp("0"))?;
+        let lin2 = hanzo_nn::linear(mlp_sz, in_sz, vb.pp("2"))?;
         Ok(Self { lin1, lin2 })
     }
 }
@@ -456,8 +456,8 @@ impl SingleStreamBlock {
         let h_sz = cfg.hidden_size;
         let mlp_sz = (h_sz as f64 * cfg.mlp_ratio) as usize;
         let head_dim = h_sz / cfg.num_heads;
-        let linear1 = hanzo_ml_nn::linear(h_sz, h_sz * 3 + mlp_sz, vb.pp("linear1"))?;
-        let linear2 = hanzo_ml_nn::linear(h_sz + mlp_sz, h_sz, vb.pp("linear2"))?;
+        let linear1 = hanzo_nn::linear(h_sz, h_sz * 3 + mlp_sz, vb.pp("linear1"))?;
+        let linear2 = hanzo_nn::linear(h_sz + mlp_sz, h_sz, vb.pp("linear2"))?;
         let norm = QkNorm::new(head_dim, vb.pp("norm"))?;
         let pre_norm = layer_norm(h_sz, vb.pp("pre_norm"))?;
         let modulation = Modulation1::new(h_sz, vb.pp("modulation"))?;
@@ -502,8 +502,8 @@ pub struct LastLayer {
 impl LastLayer {
     fn new(h_sz: usize, p_sz: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
         let norm_final = layer_norm(h_sz, vb.pp("norm_final"))?;
-        let linear = hanzo_ml_nn::linear(h_sz, p_sz * p_sz * out_c, vb.pp("linear"))?;
-        let ada_ln_modulation = hanzo_ml_nn::linear(h_sz, 2 * h_sz, vb.pp("adaLN_modulation.1"))?;
+        let linear = hanzo_nn::linear(h_sz, p_sz * p_sz * out_c, vb.pp("linear"))?;
+        let ada_ln_modulation = hanzo_nn::linear(h_sz, 2 * h_sz, vb.pp("adaLN_modulation.1"))?;
         Ok(Self {
             norm_final,
             linear,
@@ -537,8 +537,8 @@ pub struct Flux {
 
 impl Flux {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let img_in = hanzo_ml_nn::linear(cfg.in_channels, cfg.hidden_size, vb.pp("img_in"))?;
-        let txt_in = hanzo_ml_nn::linear(cfg.context_in_dim, cfg.hidden_size, vb.pp("txt_in"))?;
+        let img_in = hanzo_nn::linear(cfg.in_channels, cfg.hidden_size, vb.pp("img_in"))?;
+        let txt_in = hanzo_nn::linear(cfg.context_in_dim, cfg.hidden_size, vb.pp("txt_in"))?;
         let mut double_blocks = Vec::with_capacity(cfg.depth);
         let vb_d = vb.pp("double_blocks");
         for idx in 0..cfg.depth {

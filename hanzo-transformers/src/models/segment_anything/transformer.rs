@@ -1,5 +1,5 @@
 use hanzo_ml::{Result, Tensor};
-use hanzo_ml_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
+use hanzo_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
 
 #[derive(Debug)]
 struct Attention {
@@ -18,10 +18,10 @@ impl Attention {
         vb: VarBuilder,
     ) -> Result<Self> {
         let internal_dim = embedding_dim / downsample_rate;
-        let q_proj = hanzo_ml_nn::linear(embedding_dim, internal_dim, vb.pp("q_proj"))?;
-        let k_proj = hanzo_ml_nn::linear(embedding_dim, internal_dim, vb.pp("k_proj"))?;
-        let v_proj = hanzo_ml_nn::linear(embedding_dim, internal_dim, vb.pp("v_proj"))?;
-        let out_proj = hanzo_ml_nn::linear(internal_dim, embedding_dim, vb.pp("out_proj"))?;
+        let q_proj = hanzo_nn::linear(embedding_dim, internal_dim, vb.pp("q_proj"))?;
+        let k_proj = hanzo_nn::linear(embedding_dim, internal_dim, vb.pp("k_proj"))?;
+        let v_proj = hanzo_nn::linear(embedding_dim, internal_dim, vb.pp("v_proj"))?;
+        let out_proj = hanzo_nn::linear(internal_dim, embedding_dim, vb.pp("out_proj"))?;
         Ok(Self {
             q_proj,
             k_proj,
@@ -55,7 +55,7 @@ impl Attention {
 
         let (_, _, _, c_per_head) = q.dims4()?;
         let attn = (q.matmul(&k.t()?)? / (c_per_head as f64).sqrt())?;
-        let attn = hanzo_ml_nn::ops::softmax_last_dim(&attn)?;
+        let attn = hanzo_nn::ops::softmax_last_dim(&attn)?;
 
         let out = attn.matmul(&v)?;
         self.recombine_heads(&out)?.apply(&self.out_proj)
@@ -103,7 +103,7 @@ impl TwoWayAttentionBlock {
         let mlp = super::MlpBlock::new(
             embedding_dim,
             mlp_dim,
-            hanzo_ml_nn::Activation::Relu,
+            hanzo_nn::Activation::Relu,
             vb.pp("mlp"),
         )?;
         Ok(Self {

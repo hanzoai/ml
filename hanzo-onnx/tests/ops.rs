@@ -1,11 +1,11 @@
-use hanzo_ml::test_utils::to_vec2_round;
-use hanzo_ml::{DType, Device, NdArray, Result, Tensor};
-use hanzo_onnx::onnx::attribute_proto::AttributeType;
-use hanzo_onnx::onnx::tensor_proto::DataType;
-use hanzo_onnx::onnx::tensor_shape_proto::{dimension, Dimension};
-use hanzo_onnx::onnx::{type_proto, TensorProto, TensorShapeProto, TypeProto};
-use hanzo_onnx::onnx::{AttributeProto, GraphProto, ModelProto, NodeProto, ValueInfoProto};
-use hanzo_onnx::simple_eval;
+use candle::test_utils::to_vec2_round;
+use candle::{DType, Device, NdArray, Result, Tensor};
+use candle_onnx::onnx::attribute_proto::AttributeType;
+use candle_onnx::onnx::tensor_proto::DataType;
+use candle_onnx::onnx::tensor_shape_proto::{dimension, Dimension};
+use candle_onnx::onnx::{type_proto, TensorProto, TensorShapeProto, TypeProto};
+use candle_onnx::onnx::{AttributeProto, GraphProto, ModelProto, NodeProto, ValueInfoProto};
+use candle_onnx::simple_eval;
 use std::collections::HashMap;
 
 const INPUT_X: &str = "x";
@@ -33,7 +33,7 @@ fn create_model_proto_with_graph(graph: Option<GraphProto>) -> ModelProto {
 fn test_evaluation_fails_without_defined_graph() -> Result<()> {
     let manual_graph = create_model_proto_with_graph(None);
     let inputs: HashMap<String, Tensor> = HashMap::new();
-    match hanzo_onnx::simple_eval(&manual_graph, inputs) {
+    match candle_onnx::simple_eval(&manual_graph, inputs) {
         Err(err) => assert_eq!(err.to_string(), "no graph defined in proto"),
         Ok(_) => panic!("Expected an error due to undefined graph"),
     }
@@ -71,7 +71,7 @@ fn test_add_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -111,7 +111,7 @@ fn test_sub_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -151,7 +151,7 @@ fn test_mul_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -191,7 +191,7 @@ fn test_div_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -232,7 +232,7 @@ fn test_exp_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -277,11 +277,11 @@ fn test_equal_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
-    let first = z.to_dtype(hanzo_ml::DType::U8)?.to_vec1::<u8>()?.to_vec()[0];
+    let first = z.to_dtype(candle::DType::U8)?.to_vec1::<u8>()?.to_vec()[0];
     assert_eq!(first, 1);
 
     Ok(())
@@ -317,11 +317,11 @@ fn test_not_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[0.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
-    let first = z.to_dtype(hanzo_ml::DType::U8)?.to_vec1::<u8>()?.to_vec()[0];
+    let first = z.to_dtype(candle::DType::U8)?.to_vec1::<u8>()?.to_vec()[0];
     assert_eq!(first, 1);
 
     Ok(())
@@ -374,7 +374,7 @@ fn test_matmul_operation() -> Result<()> {
         )?,
     );
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -439,7 +439,7 @@ fn test_reshape_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), x);
     inputs.insert(INPUT_Y.to_string(), y);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -499,7 +499,7 @@ fn test_logsoftmax_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -562,7 +562,7 @@ fn test_softmax_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -625,7 +625,7 @@ fn test_transpose_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -684,7 +684,7 @@ fn test_dropout_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -764,7 +764,7 @@ fn test_flatten_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs.clone())?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs.clone())?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -809,7 +809,7 @@ fn test_flatten_operation() -> Result<()> {
         quantization_annotation: vec![],
     }));
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -958,7 +958,7 @@ fn test_constant_of_shape() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(input, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -1022,7 +1022,7 @@ fn test_unsqueeze() -> Result<()> {
 
     let inputs = HashMap::from_iter([(INPUT_X.to_string(), x.clone()), (INPUT_Y.to_string(), y)]);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1149,7 +1149,7 @@ fn test_gather_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
         inputs.insert(INPUT_Y.to_string(), Tensor::new(indices, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1306,7 +1306,7 @@ fn test_gather_elements() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
         inputs.insert(INPUT_Y.to_string(), Tensor::new(indices, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1360,7 +1360,7 @@ fn test_size_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1405,7 +1405,7 @@ fn test_shape_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1467,7 +1467,7 @@ fn test_abs_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1521,7 +1521,7 @@ fn test_cos_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1569,7 +1569,7 @@ fn test_sin_operation() -> Result<()> {
     let x = Tensor::from_vec(vec![0.0f32, 1.0f32, 2.0f32, 3.0f32], &[2, 2], &Device::Cpu)?;
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
     assert_eq!(to_vec2_round(z, 4)?, [[0.0, 0.8415], [0.9093, 0.1411]]);
@@ -1618,7 +1618,7 @@ fn test_neg_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1675,7 +1675,7 @@ fn test_tanh_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1732,7 +1732,7 @@ fn test_sigmoid_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1789,7 +1789,7 @@ fn test_gelu_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1843,7 +1843,7 @@ fn test_relu_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1904,7 +1904,7 @@ fn test_prelu_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), x);
     inputs.insert(INPUT_Y.to_string(), y);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1924,7 +1924,7 @@ fn test_prelu_operation() -> Result<()> {
 fn test_reduce_max() -> Result<()> {
     // Tests with random data generated with `np.random.uniform`
     // https://github.com/onnx/onnx/blob/main/docs/Operators.md#examples-119 bool_inputs
-    // No special treatment reqired for bool
+    // No special treatment required for bool
     // `np.maximum.reduce(data, axis=axes, keepdims=True)`
     test(
         &[[1_u8, 1], [1, 0], [0, 1], [0, 0]],
@@ -2217,7 +2217,7 @@ fn test_reduce_max() -> Result<()> {
         false,
     )?;
 
-    // `noop_with_empty_axes = true (1)` should yield tensor equivallent to the input tensor
+    // `noop_with_empty_axes = true (1)` should yield tensor equivalent to the input tensor
     test(
         &[
             [[-7.648377, -5.4018507], [-7.318765, 7.2374434]],
@@ -2394,7 +2394,7 @@ fn test_reduce_max() -> Result<()> {
             }
         }
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -2443,7 +2443,7 @@ fn test_reduce_max() -> Result<()> {
 fn test_reduce_min() -> Result<()> {
     // Tests with random data generated with `np.random.uniform`
     // https://github.com/onnx/onnx/blob/main/docs/Operators.md#examples-121 bool_inputs
-    // No special treatment reqired for bool
+    // No special treatment required for bool
     // `np.minimum.reduce(data, axis=axes, keepdims=True)`
     test(
         &[[1_u8, 1], [1, 0], [0, 1], [0, 0]],
@@ -2736,7 +2736,7 @@ fn test_reduce_min() -> Result<()> {
         false,
     )?;
 
-    // `noop_with_empty_axes = true (1)` should yield tensor equivallent to the input tensor
+    // `noop_with_empty_axes = true (1)` should yield tensor equivalent to the input tensor
     test(
         &[
             [[-7.648377, -5.4018507], [-7.318765, 7.2374434]],
@@ -2913,7 +2913,7 @@ fn test_reduce_min() -> Result<()> {
             }
         }
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3114,7 +3114,7 @@ fn test_reduce_mean() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3168,7 +3168,7 @@ fn test_sqrt() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3310,7 +3310,7 @@ fn test_random_uniform() -> Result<()> {
             sparse_initializer: vec![],
             quantization_annotation: vec![],
         }));
-        let eval = hanzo_onnx::simple_eval(&manual_graph, HashMap::new())?;
+        let eval = candle_onnx::simple_eval(&manual_graph, HashMap::new())?;
         assert_eq!(eval.len(), 1);
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
         let min = z
@@ -3456,7 +3456,7 @@ fn test_random_normal() -> Result<()> {
             sparse_initializer: vec![],
             quantization_annotation: vec![],
         }));
-        let eval = hanzo_onnx::simple_eval(&manual_graph, HashMap::new())?;
+        let eval = candle_onnx::simple_eval(&manual_graph, HashMap::new())?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3526,7 +3526,7 @@ fn test_range() -> Result<()> {
         inputs.insert(INPUT_Y.to_string(), Tensor::new(limit, &Device::Cpu)?);
         inputs.insert(INPUT_A.to_string(), Tensor::new(delta, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -3587,7 +3587,7 @@ fn test_greater() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), Tensor::new(a, &Device::Cpu)?);
         inputs.insert(INPUT_Y.to_string(), Tensor::new(b, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -3648,7 +3648,7 @@ fn test_less() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), Tensor::new(a, &Device::Cpu)?);
         inputs.insert(INPUT_Y.to_string(), Tensor::new(b, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -3705,7 +3705,7 @@ fn test_log() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3770,7 +3770,7 @@ fn test_min() -> Result<()> {
         inputs.insert(INPUT_Y.to_string(), Tensor::new(b, &Device::Cpu)?);
         inputs.insert(INPUT_A.to_string(), Tensor::new(c, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3848,7 +3848,7 @@ fn test_where() -> Result<()> {
         inputs.insert(INPUT_Y.to_string(), Tensor::new(x, &Device::Cpu)?);
         inputs.insert(INPUT_A.to_string(), Tensor::new(y, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -3921,7 +3921,7 @@ fn test_floor() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3997,7 +3997,7 @@ fn test_ceil() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -4189,7 +4189,7 @@ fn test_argmin() -> Result<()> {
         }));
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
 
         let expected = Tensor::new(expected, &Device::Cpu)?;
@@ -4371,7 +4371,7 @@ fn test_argmax() -> Result<()> {
         }));
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
 
         let expected = Tensor::new(expected, &Device::Cpu)?;
@@ -4446,7 +4446,7 @@ fn test_leakyrelu() -> Result<()> {
         }));
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
 
         let expected = Tensor::new(expected, &Device::Cpu)?;
@@ -4565,10 +4565,10 @@ fn test_if() -> Result<()> {
     for cond in [1u8, 0] {
         let inputs =
             HashMap::from_iter([("cond".to_string(), Tensor::full(cond, (1,), &Device::Cpu)?)]);
-        let outputs = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let outputs = candle_onnx::simple_eval(&manual_graph, inputs)?;
         let expected = if cond != 0 { &x } else { &y };
         let Some(res) = outputs.get("res") else {
-            hanzo_ml::bail!("outputs didn't contain expected key `res`: {outputs:?}");
+            candle::bail!("outputs didn't contain expected key `res`: {outputs:?}");
         };
         assert_eq!(&res.to_vec1::<f32>()?, expected);
     }
@@ -4628,9 +4628,9 @@ fn test_pad() -> Result<()> {
     }));
 
     let inputs = HashMap::from_iter([("data".to_string(), data), ("pads".to_string(), pads)]);
-    let res = hanzo_onnx::simple_eval(&model, inputs)?;
+    let res = candle_onnx::simple_eval(&model, inputs)?;
     let Some(actual) = res.get("output") else {
-        hanzo_ml::bail!("outputs didn't contain expected key `output`: {res:?}");
+        candle::bail!("outputs didn't contain expected key `output`: {res:?}");
     };
 
     assert_eq!(actual.to_vec2::<f64>()?, expected.to_vec2::<f64>()?);
@@ -4685,7 +4685,7 @@ fn test_slice() -> Result<()> {
     ]
     */
 
-    let outputs = hanzo_onnx::simple_eval(
+    let outputs = candle_onnx::simple_eval(
         &model,
         HashMap::from_iter([
             (
@@ -4749,7 +4749,7 @@ fn test_slice() -> Result<()> {
             .collect(),
         ..GraphProto::default()
     }));
-    let outputs = hanzo_onnx::simple_eval(
+    let outputs = candle_onnx::simple_eval(
         &model,
         HashMap::from_iter([
             (
@@ -5561,7 +5561,7 @@ fn test_expand_dim_changed() -> Result<()> {
         ("data".to_string(), data),
         ("new_shape".to_string(), new_shape),
     ]);
-    let result = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let result = candle_onnx::simple_eval(&manual_graph, inputs)?;
 
     // Retrieve and compare the result
     let expanded = result.get("expanded").expect("Output 'expanded' not found");
@@ -5631,7 +5631,7 @@ fn test_expand_dim_unchanged() -> Result<()> {
         ("data".to_string(), data),
         ("new_shape".to_string(), new_shape),
     ]);
-    let result = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let result = candle_onnx::simple_eval(&manual_graph, inputs)?;
 
     // Retrieve and compare the result
     let expanded = result.get("expanded").expect("Output 'expanded' not found");
@@ -5664,7 +5664,7 @@ fn test_split_equal_parts_1d_opset13() -> Result<()> {
     {
         let manual_graph =
             make_split_graph_helper(&["input"], &["output_1", "output_2", "output_3"], 0);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs.clone())?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs.clone())?;
         assert_eq!(eval.len(), 3);
 
         let out1 = eval.get("output_1").expect("Output 'output_1' not found");
@@ -5682,7 +5682,7 @@ fn test_split_equal_parts_1d_opset13() -> Result<()> {
 
         let manual_graph =
             make_split_graph_helper(&["input", "split"], &["output_1", "output_2"], 0);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 2);
 
         let out1 = eval.get("output_1").expect("Output 'output_1' not found");
@@ -5739,7 +5739,7 @@ fn test_reduce_sum_default_axes_keepdims() -> Result<()> {
         inputs.insert("data".to_string(), data);
         // inputs.insert("axes".to_string(), axes);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let reduced = eval.get("reduced").expect("Output 'reduced' not found");
@@ -5760,7 +5760,7 @@ fn test_reduce_sum_default_axes_keepdims() -> Result<()> {
         let mut inputs = HashMap::new();
         inputs.insert("data".to_string(), data.clone());
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let reduced = eval.get("reduced").expect("Output 'reduced' not found");
@@ -5791,7 +5791,7 @@ fn test_reduce_sum_do_not_keep_dims() -> Result<()> {
         inputs.insert("data".to_string(), data);
         inputs.insert("axes".to_string(), axes);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let reduced = eval.get("reduced").expect("Output 'reduced' not found");
@@ -5820,7 +5820,7 @@ fn test_reduce_sum_do_not_keep_dims() -> Result<()> {
         inputs.insert("data".to_string(), data.clone());
         inputs.insert("axes".to_string(), axes);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let reduced = eval.get("reduced").expect("Output 'reduced' not found");
@@ -6170,7 +6170,7 @@ fn test_xor() -> Result<()> {
             (INPUT_Y.to_string(), Tensor::new(other, &Device::Cpu)?),
         ]);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6191,7 +6191,7 @@ fn test_xor() -> Result<()> {
                 assert_eq!(z.to_vec3::<u8>()?, expected.to_vec3::<u8>()?)
             }
             4 => {
-                // ML has no method equivallent to `to_vec4()`
+                // Candle has no method equivalent to `to_vec4()`
                 // So, as a hack, we flatten it to a single dim vec to test the results
                 assert_eq!(
                     z.flatten_all()?.to_vec1::<u8>()?,
@@ -6237,18 +6237,213 @@ fn test_sign_operation() -> Result<()> {
         INPUT_X.to_string(),
         Tensor::new(vec![-2f32, -1., 0., 1., 2.], &Device::Cpu)?,
     );
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
     assert_eq!(
-        z.to_dtype(hanzo_ml::DType::I64)?.to_vec1::<i64>()?.to_vec(),
+        z.to_dtype(candle::DType::I64)?.to_vec1::<i64>()?.to_vec(),
         vec![-1, -1, 0, 1, 1]
     );
     Ok(())
 }
 
 #[test]
-fn test_hard_swish() -> hanzo_ml::Result<()> {
+fn test_selu_operator() -> Result<()> {
+    {
+        // Test 1: Default alpha and gamma
+        let default_graph = create_model_proto_with_graph(Some(GraphProto {
+            node: vec![NodeProto {
+                op_type: "Selu".to_string(),
+                domain: "".to_string(),
+                input: vec!["input".to_string()],
+                output: vec!["output".to_string()],
+                ..Default::default()
+            }],
+            input: vec![ValueInfoProto {
+                name: "input".to_string(),
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "output".to_string(),
+                r#type: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+
+        let input = Tensor::from_vec(vec![-1.0f32, 0.0, 1.0, 2.0], (2, 2), &Device::Cpu)?;
+        let mut inputs = HashMap::new();
+        inputs.insert("input".to_string(), input);
+
+        let eval = simple_eval(&default_graph, inputs)?;
+        let output = eval.get("output").unwrap();
+        let out_vec = to_vec2_round(output, 4)?;
+        assert_eq!(out_vec, vec![vec![-1.1113, 0.0], vec![1.0507, 2.1014]]);
+    }
+
+    {
+        // Test 2: Change alpha and gamma
+        let custom_graph = create_model_proto_with_graph(Some(GraphProto {
+            node: vec![NodeProto {
+                op_type: "Selu".to_string(),
+                attribute: vec![
+                    AttributeProto {
+                        name: "alpha".to_string(),
+                        r#type: AttributeType::Float as i32,
+                        f: 2.0,
+                        ..Default::default()
+                    },
+                    AttributeProto {
+                        name: "gamma".to_string(),
+                        r#type: AttributeType::Float as i32,
+                        f: 0.5,
+                        ..Default::default()
+                    },
+                ],
+                input: vec!["input".to_string()],
+                output: vec!["output".to_string()],
+                ..Default::default()
+            }],
+            input: vec![ValueInfoProto {
+                name: "input".to_string(),
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "output".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+
+        let input = Tensor::from_vec(vec![-1.0f32, 0.0, 1.0, 2.0], (2, 2), &Device::Cpu)?;
+        let mut inputs = HashMap::new();
+        inputs.insert("input".to_string(), input);
+        let eval = simple_eval(&custom_graph, inputs)?;
+        let output = eval.get("output").unwrap();
+        let out_vec = to_vec2_round(output, 4)?;
+        assert_eq!(out_vec, vec![vec![-0.6321, 0.0], vec![0.5, 1.0]]);
+    }
+
+    {
+        // Test 3: Different input values
+        let manual_graph = create_model_proto_with_graph(Some(GraphProto {
+            node: vec![NodeProto {
+                op_type: "Selu".to_string(),
+                domain: "".to_string(),
+                input: vec!["input".to_string()],
+                output: vec!["output".to_string()],
+                ..Default::default()
+            }],
+            input: vec![ValueInfoProto {
+                name: "input".to_string(),
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "output".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+
+        let expected = vec![-1.758, -1.7463, 0.0, 10.507];
+
+        let input = Tensor::from_vec(vec![-10.0f32, -5.0, 0.0, 10.0], (2, 2), &Device::Cpu)?;
+        let mut inputs = HashMap::new();
+        inputs.insert("input".to_string(), input);
+        let eval = simple_eval(&manual_graph, inputs)?;
+        let output = eval.get("output").unwrap();
+        let out_vec = to_vec2_round(output, 4)?;
+        assert_eq!(
+            out_vec,
+            vec![
+                vec![expected[0], expected[1]],
+                vec![expected[2], expected[3]]
+            ]
+        );
+    }
+
+    {
+        // Test 4: Test based on https://github.com/onnx/onnx/blob/main/docs/Operators.md#Selu
+        let graph = create_model_proto_with_graph(Some(GraphProto {
+            node: vec![NodeProto {
+                op_type: "Selu".to_string(),
+                input: vec!["input".to_string()],
+                output: vec!["output".to_string()],
+                attribute: vec![
+                    AttributeProto {
+                        name: "alpha".to_string(),
+                        r#type: AttributeType::Float as i32,
+                        f: 2.0,
+                        ..Default::default()
+                    },
+                    AttributeProto {
+                        name: "gamma".to_string(),
+                        r#type: AttributeType::Float as i32,
+                        f: 3.0,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            input: vec![ValueInfoProto {
+                name: "input".to_string(),
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "output".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+
+        let input = Tensor::from_vec(vec![-1.0f32, 0.0, 1.0], (3,), &Device::Cpu)?;
+        let mut inputs = HashMap::new();
+        inputs.insert("input".to_string(), input);
+
+        let eval = simple_eval(&graph, inputs)?;
+        let output = eval.get("output").unwrap();
+        let out_vec = output.to_vec1::<f32>()?;
+        let expected = vec![-3.7927232, 0.0, 3.0];
+
+        for (o, e) in out_vec.iter().zip(expected.iter()) {
+            assert!((o - e).abs() < 1e-5, "Got {o}, expected {e}");
+        }
+    }
+
+    {
+        // Test 5: Empty tensor
+        let manual_graph = create_model_proto_with_graph(Some(GraphProto {
+            node: vec![NodeProto {
+                op_type: "Selu".to_string(),
+                domain: "".to_string(),
+                input: vec!["input".to_string()],
+                output: vec!["output".to_string()],
+                ..Default::default()
+            }],
+            input: vec![ValueInfoProto {
+                name: "input".to_string(),
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "output".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+
+        let input = Tensor::from_vec(vec![] as Vec<f32>, (0, 2), &Device::Cpu)?;
+        let mut inputs = HashMap::new();
+        inputs.insert("input".to_string(), input);
+        let eval = simple_eval(&manual_graph, inputs)?;
+        let output = eval.get("output").unwrap();
+        assert_eq!(output.dims(), &[0, 2]);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_hard_swish() -> candle::Result<()> {
     {
         let manual_graph = create_model_proto_with_graph(Some(GraphProto {
             node: vec![NodeProto {
@@ -6399,7 +6594,7 @@ fn test_scatternd_operation() -> Result<()> {
         inputs.insert(INPUT_Y.to_string(), Tensor::new(indices, &Device::Cpu)?);
         inputs.insert(INPUT_A.to_string(), Tensor::new(updates, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6461,7 +6656,7 @@ fn test_trilu_operation() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), x);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6527,7 +6722,7 @@ fn test_trilu_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), x);
         inputs.insert(INPUT_Y.to_string(), k);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6583,7 +6778,7 @@ fn test_trilu_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), x);
         inputs.insert(INPUT_Y.to_string(), k);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6658,7 +6853,7 @@ fn test_trilu_operation() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), x);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6737,7 +6932,7 @@ fn test_trilu_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), x);
         inputs.insert(INPUT_Y.to_string(), k);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6815,7 +7010,7 @@ fn test_trilu_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), x);
         inputs.insert(INPUT_Y.to_string(), k);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");

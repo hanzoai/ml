@@ -11,7 +11,7 @@
 //! - Support for sequence-to-sequence tasks
 //!
 //! References:
-//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/radames/ML-T5-Generation-Wasm)
+//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/radames/Candle-T5-Generation-Wasm)
 //! - 💻[GH Model](https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/modeling_t5.py)
 //! - 🤗 [HF Link](https://huggingface.co/docs/transformers/model_doc/t5)
 //! - 📝 [T5 Paper](https://arxiv.org/abs/1910.10683)
@@ -21,7 +21,7 @@
 //! ```bash
 //! cargo run --example t5 --release -- \
 //!   --model-id "t5-small" \
-//!   --prompt "translate to German: A beautiful hanzo." \
+//!   --prompt "translate to German: A beautiful hanzo_ml." \
 //!   --decode
 //! > ...
 //! >  Eine schöne Kerze.
@@ -48,7 +48,7 @@
 //!
 //! ```bash
 //! cargo run --example t5 --release -- \
-//!   --model-id "t5-small" --prompt "A beautiful hanzo."
+//!   --model-id "t5-small" --prompt "A beautiful hanzo_ml."
 //! ...
 //! [[[ 0.0515, -0.0541, -0.0761, ..., -0.0392,  0.1511, -0.0265],
 //!   [-0.0974,  0.0998, -0.1659, ..., -0.2450,  0.1738, -0.0164],
@@ -61,7 +61,7 @@
 
 use crate::models::with_tracing::Embedding;
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_ml_nn::{Activation, VarBuilder};
+use hanzo_nn::{Activation, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -72,7 +72,7 @@ pub struct Linear {
 }
 
 pub fn linear_no_bias(d1: usize, d2: usize, vb: VarBuilder) -> Result<Linear> {
-    let init_ws = hanzo_ml_nn::init::DEFAULT_KAIMING_NORMAL;
+    let init_ws = hanzo_nn::init::DEFAULT_KAIMING_NORMAL;
     let weight = vb.get_with_hints((d2, d1), "weight", init_ws)?;
     let span = tracing::span!(tracing::Level::TRACE, "linear");
     Ok(Linear { weight, span })
@@ -124,7 +124,7 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
 #[derive(Debug, Deserialize, Default, Clone, PartialEq)]
 pub struct ActivationWithOptionalGating {
     pub gated: bool,
-    pub activation: hanzo_ml_nn::Activation,
+    pub activation: hanzo_nn::Activation,
 }
 
 pub fn deserialize_feed_forward_proj_activation<'de, D>(
@@ -136,11 +136,11 @@ where
     match String::deserialize(deserializer)?.as_str() {
         "gated-gelu" => Ok(ActivationWithOptionalGating {
             gated: true,
-            activation: hanzo_ml_nn::Activation::NewGelu,
+            activation: hanzo_nn::Activation::NewGelu,
         }),
         "gated-silu" => Ok(ActivationWithOptionalGating {
             gated: true,
-            activation: hanzo_ml_nn::Activation::Silu,
+            activation: hanzo_nn::Activation::Silu,
         }),
         buf => {
             let activation = serde_plain::from_str(buf).map_err(serde::de::Error::custom)?;
@@ -566,7 +566,7 @@ impl T5Attention {
 
         let attn_weights = {
             let _enter = self.span_sm.enter();
-            hanzo_ml_nn::ops::softmax_last_dim(&scores)?
+            hanzo_nn::ops::softmax_last_dim(&scores)?
         };
         let attn_output = attn_weights.matmul(&v)?;
         let attn_output = attn_output

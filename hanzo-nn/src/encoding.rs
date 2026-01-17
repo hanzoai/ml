@@ -33,7 +33,7 @@ use hanzo_ml::{bail, DType, Result, Tensor, WithDType};
 ///
 /// ```rust
 /// use hanzo_ml::{Shape, Tensor, Device};
-/// use hanzo_ml_nn::encoding::one_hot;
+/// use hanzo_nn::encoding::one_hot;
 ///
 /// let device = hanzo_ml::Device::Cpu;
 ///
@@ -56,7 +56,7 @@ use hanzo_ml::{bail, DType, Result, Tensor, WithDType};
 ///
 /// ```rust
 /// use hanzo_ml::{Shape, Tensor, Device};
-/// use hanzo_ml_nn::encoding::one_hot;
+/// use hanzo_nn::encoding::one_hot;
 ///
 ///
 /// let device = hanzo_ml::Device::Cpu;

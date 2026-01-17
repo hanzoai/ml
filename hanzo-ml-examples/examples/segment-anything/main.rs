@@ -8,7 +8,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use hanzo_ml::DType;
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::segment_anything::sam;
 use clap::Parser;
 

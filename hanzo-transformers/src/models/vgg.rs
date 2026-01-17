@@ -14,7 +14,7 @@
 //!
 
 use hanzo_ml::{ModuleT, Result, Tensor};
-use hanzo_ml_nn::{FuncT, VarBuilder};
+use hanzo_nn::{FuncT, VarBuilder};
 
 // Enum representing the different VGG models
 pub enum Models {
@@ -66,11 +66,11 @@ fn conv2d_block(convs: &[(usize, usize, &str)], vb: &VarBuilder) -> Result<FuncT
     let layers = convs
         .iter()
         .map(|&(in_c, out_c, name)| {
-            hanzo_ml_nn::conv2d(
+            hanzo_nn::conv2d(
                 in_c,
                 out_c,
                 3,
-                hanzo_ml_nn::Conv2dConfig {
+                hanzo_nn::Conv2dConfig {
                     stride: 1,
                     padding: 1,
                     ..Default::default()
@@ -110,14 +110,14 @@ fn fully_connected(
         pre_logit_2.target_in,
         pre_logit_2.target_out,
     )?;
-    let dropout1 = hanzo_ml_nn::Dropout::new(0.5);
-    let dropout2 = hanzo_ml_nn::Dropout::new(0.5);
-    let dropout3 = hanzo_ml_nn::Dropout::new(0.5);
+    let dropout1 = hanzo_nn::Dropout::new(0.5);
+    let dropout2 = hanzo_nn::Dropout::new(0.5);
+    let dropout3 = hanzo_nn::Dropout::new(0.5);
     Ok(FuncT::new(move |xs, train| {
         let xs = xs.reshape((1, pre_logit_1.target_out))?;
         let xs = xs.apply_t(&dropout1, train)?.apply(&lin)?.relu()?;
         let xs = xs.apply_t(&dropout2, train)?.apply(&lin2)?.relu()?;
-        let lin3 = hanzo_ml_nn::linear(4096, num_classes, vb.pp("head.fc"))?;
+        let lin3 = hanzo_nn::linear(4096, num_classes, vb.pp("head.fc"))?;
         let xs = xs.apply_t(&dropout3, train)?.apply(&lin3)?.relu()?;
         Ok(xs)
     }))
@@ -130,17 +130,17 @@ fn get_weights_and_biases(
     in_dim: (usize, usize, usize, usize),
     target_in: usize,
     target_out: usize,
-) -> Result<hanzo_ml_nn::Linear> {
-    let init_ws = hanzo_ml_nn::init::DEFAULT_KAIMING_NORMAL;
+) -> Result<hanzo_nn::Linear> {
+    let init_ws = hanzo_nn::init::DEFAULT_KAIMING_NORMAL;
     let ws = vs.get_with_hints(in_dim, "weight", init_ws)?;
     let ws = ws.reshape((target_in, target_out))?;
     let bound = 1. / (target_out as f64).sqrt();
-    let init_bs = hanzo_ml_nn::Init::Uniform {
+    let init_bs = hanzo_nn::Init::Uniform {
         lo: -bound,
         up: bound,
     };
     let bs = vs.get_with_hints(target_in, "bias", init_bs)?;
-    Ok(hanzo_ml_nn::Linear::new(ws, Some(bs)))
+    Ok(hanzo_nn::Linear::new(ws, Some(bs)))
 }
 
 fn vgg13_blocks(vb: VarBuilder) -> Result<Vec<FuncT>> {

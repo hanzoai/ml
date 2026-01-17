@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use hanzo_ml::quantized::gguf_file;
 use hanzo_ml::quantized::QTensor;
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{Embedding, LayerNorm};
+use hanzo_nn::{Embedding, LayerNorm};
 
 pub const MAX_SEQ_LEN: usize = 4096;
 
@@ -98,7 +98,7 @@ impl LayerWeights {
         let xs_pass = xs.i((.., .., .., self.rope_dim..))?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        let xs_rot = hanzo_ml_nn::rotary_emb::rope(&xs_rot.contiguous()?, &cos, &sin)?;
+        let xs_rot = hanzo_nn::rotary_emb::rope(&xs_rot.contiguous()?, &cos, &sin)?;
         Tensor::cat(&[&xs_rot, &xs_pass], D::Minus1)
     }
 
@@ -151,7 +151,7 @@ impl LayerWeights {
                 masked_fill(&att, &mask, &self.neg_inf)?
             }
         };
-        let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
+        let att = hanzo_nn::ops::softmax_last_dim(&att)?;
         // Convert to contiguous as matmul doesn't support strided vs for now.
         let y = att.matmul(&v.contiguous()?)?;
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;

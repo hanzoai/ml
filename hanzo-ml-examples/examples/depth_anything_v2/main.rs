@@ -12,7 +12,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use hanzo_ml::DType::{F32, U8};
 use hanzo_ml::{DType, Device, Module, Result, Tensor};
 use hanzo_examples::{load_image, load_image_and_resize, save_image};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::depth_anything_v2::{DepthAnythingV2, DepthAnythingV2Config};
 use hanzo_transformers::models::dinov2;
 

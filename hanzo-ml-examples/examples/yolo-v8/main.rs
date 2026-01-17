@@ -8,7 +8,7 @@ mod model;
 use model::{Multiples, YoloV8, YoloV8Pose};
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
-use hanzo_ml_nn::{Module, VarBuilder};
+use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
 use clap::{Parser, ValueEnum};
 use image::DynamicImage;

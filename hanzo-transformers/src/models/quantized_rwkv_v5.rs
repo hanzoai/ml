@@ -20,7 +20,7 @@ use crate::{
     quantized_var_builder::VarBuilder,
 };
 use hanzo_ml::{IndexOp, Result, Tensor};
-use hanzo_ml_nn::{GroupNorm, LayerNorm, Module};
+use hanzo_nn::{GroupNorm, LayerNorm, Module};
 
 pub use crate::models::rwkv_v5::{Config, State, Tokenizer};
 
@@ -31,7 +31,7 @@ struct SelfAttention {
     value: Linear,
     gate: Linear,
     output: Linear,
-    ln_x: hanzo_ml_nn::GroupNorm,
+    ln_x: hanzo_nn::GroupNorm,
     time_mix_key: Tensor,
     time_mix_value: Tensor,
     time_mix_receptance: Tensor,
@@ -122,7 +122,7 @@ impl SelfAttention {
             let key = self.key.forward(&key)?;
             let value = self.value.forward(&value)?;
             let receptance = self.receptance.forward(&receptance)?;
-            let gate = hanzo_ml_nn::ops::silu(&self.gate.forward(&gate)?)?;
+            let gate = hanzo_nn::ops::silu(&self.gate.forward(&gate)?)?;
             state.per_layer[self.layer_id].extract_key_value = xs.i((.., t - 1))?;
             (receptance, key, value, gate)
         };
@@ -205,7 +205,7 @@ impl FeedForward {
             + shifted.broadcast_mul(&(1.0 - &self.time_mix_receptance)?)?)?;
         let key = key.apply(&self.key)?.relu()?.sqr()?;
         let value = key.apply(&self.value)?;
-        let receptance = hanzo_ml_nn::ops::sigmoid(&receptance.apply(&self.receptance)?)?;
+        let receptance = hanzo_nn::ops::sigmoid(&receptance.apply(&self.receptance)?)?;
         state.per_layer[self.layer_id].feed_forward = xs.i((.., xs.dim(1)? - 1))?;
         let xs = (receptance * value)?;
         Ok(xs)

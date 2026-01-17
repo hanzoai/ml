@@ -2,7 +2,7 @@ use super::model::{attention, timestep_embedding, Config, EmbedNd};
 use crate::quantized_nn::{linear, linear_b, Linear};
 use crate::quantized_var_builder::VarBuilder;
 use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::{LayerNorm, RmsNorm};
+use hanzo_nn::{LayerNorm, RmsNorm};
 
 fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
     let ws = Tensor::ones(dim, DType::F32, vb.device())?;

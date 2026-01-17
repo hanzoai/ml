@@ -8,7 +8,7 @@
 use crate::models::with_tracing::{conv2d, Conv2d};
 use hanzo_ml::{Result, Tensor, D};
 use hanzo_nn as nn;
-use hanzo_ml_nn::Module;
+use hanzo_nn::Module;
 
 /// Configuration for a ResNet block.
 #[derive(Debug, Clone, Copy)]

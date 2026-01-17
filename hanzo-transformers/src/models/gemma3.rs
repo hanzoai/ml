@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use hanzo_ml::{DType, Device, Module, Result, Tensor, D};
-use hanzo_ml_nn::{linear_b as linear, Activation, Linear, VarBuilder};
+use hanzo_nn::{linear_b as linear, Activation, Linear, VarBuilder};
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
@@ -106,8 +106,8 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -118,7 +118,7 @@ struct MLP {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
-    act_fn: hanzo_ml_nn::Activation,
+    act_fn: hanzo_nn::Activation,
 }
 
 impl MLP {
@@ -147,8 +147,8 @@ impl Module for MLP {
 
 #[derive(Debug, Clone)]
 enum KvCache {
-    Normal(hanzo_ml_nn::kv_cache::KvCache),
-    Rotating(hanzo_ml_nn::kv_cache::RotatingKvCache),
+    Normal(hanzo_nn::kv_cache::KvCache),
+    Rotating(hanzo_nn::kv_cache::RotatingKvCache),
 }
 
 #[derive(Debug, Clone)]
@@ -190,9 +190,9 @@ impl Attention {
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
         let kv_cache = if let Some(sliding_window) = sliding_window {
-            KvCache::Rotating(hanzo_ml_nn::kv_cache::RotatingKvCache::new(2, sliding_window))
+            KvCache::Rotating(hanzo_nn::kv_cache::RotatingKvCache::new(2, sliding_window))
         } else {
-            KvCache::Normal(hanzo_ml_nn::kv_cache::KvCache::new(
+            KvCache::Normal(hanzo_nn::kv_cache::KvCache::new(
                 2,
                 cfg.max_position_embeddings,
             ))
@@ -272,7 +272,7 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?
         };
         attn_output
@@ -297,7 +297,7 @@ fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
-    hanzo_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
 #[cfg(not(feature = "flash-attn"))]
@@ -426,7 +426,7 @@ fn prepare_decoder_attention_mask(
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: hanzo_ml_nn::Embedding,
+    embed_tokens: hanzo_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
@@ -441,7 +441,7 @@ impl Model {
     pub fn new(use_flash_attn: bool, cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
-            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
