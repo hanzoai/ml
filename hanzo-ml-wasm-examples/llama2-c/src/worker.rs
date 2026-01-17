@@ -1,7 +1,7 @@
 use crate::model::{Cache, Config, Llama};
 use byteorder::{LittleEndian, ReadBytesExt};
 use hanzo_ml::{DType, Device, IndexOp, Result, Shape, Tensor};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;

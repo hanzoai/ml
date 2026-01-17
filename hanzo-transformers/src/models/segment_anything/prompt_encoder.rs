@@ -1,5 +1,5 @@
 use hanzo_ml::{DType, IndexOp, Result, Tensor, D};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 
 #[derive(Debug)]
 struct PositionEmbeddingRandom {
@@ -53,14 +53,14 @@ impl PositionEmbeddingRandom {
 #[derive(Debug)]
 pub struct PromptEncoder {
     pe_layer: PositionEmbeddingRandom,
-    point_embeddings: Vec<hanzo_ml_nn::Embedding>,
-    not_a_point_embed: hanzo_ml_nn::Embedding,
-    mask_downscaling_conv1: hanzo_ml_nn::Conv2d,
+    point_embeddings: Vec<hanzo_nn::Embedding>,
+    not_a_point_embed: hanzo_nn::Embedding,
+    mask_downscaling_conv1: hanzo_nn::Conv2d,
     mask_downscaling_ln1: super::LayerNorm2d,
-    mask_downscaling_conv2: hanzo_ml_nn::Conv2d,
+    mask_downscaling_conv2: hanzo_nn::Conv2d,
     mask_downscaling_ln2: super::LayerNorm2d,
-    mask_downscaling_conv3: hanzo_ml_nn::Conv2d,
-    no_mask_embed: hanzo_ml_nn::Embedding,
+    mask_downscaling_conv3: hanzo_nn::Conv2d,
+    no_mask_embed: hanzo_nn::Embedding,
     image_embedding_size: (usize, usize),
     input_image_size: (usize, usize),
     embed_dim: usize,
@@ -77,22 +77,22 @@ impl PromptEncoder {
     ) -> Result<Self> {
         let num_points_embeddings = 4;
         let pe_layer = PositionEmbeddingRandom::new(embed_dim / 2, vb.pp("pe_layer"))?;
-        let not_a_point_embed = hanzo_ml_nn::embedding(1, embed_dim, vb.pp("not_a_point_embed"))?;
-        let no_mask_embed = hanzo_ml_nn::embedding(1, embed_dim, vb.pp("no_mask_embed"))?;
-        let cfg = hanzo_ml_nn::Conv2dConfig {
+        let not_a_point_embed = hanzo_nn::embedding(1, embed_dim, vb.pp("not_a_point_embed"))?;
+        let no_mask_embed = hanzo_nn::embedding(1, embed_dim, vb.pp("no_mask_embed"))?;
+        let cfg = hanzo_nn::Conv2dConfig {
             stride: 2,
             ..Default::default()
         };
         let mask_downscaling_conv1 =
-            hanzo_ml_nn::conv2d(1, mask_in_chans / 4, 2, cfg, vb.pp("mask_downscaling.0"))?;
-        let mask_downscaling_conv2 = hanzo_ml_nn::conv2d(
+            hanzo_nn::conv2d(1, mask_in_chans / 4, 2, cfg, vb.pp("mask_downscaling.0"))?;
+        let mask_downscaling_conv2 = hanzo_nn::conv2d(
             mask_in_chans / 4,
             mask_in_chans,
             2,
             cfg,
             vb.pp("mask_downscaling.3"),
         )?;
-        let mask_downscaling_conv3 = hanzo_ml_nn::conv2d(
+        let mask_downscaling_conv3 = hanzo_nn::conv2d(
             mask_in_chans,
             embed_dim,
             1,
@@ -106,7 +106,7 @@ impl PromptEncoder {
         let mut point_embeddings = Vec::with_capacity(num_points_embeddings);
         let vb_e = vb.pp("point_embeddings");
         for i in 0..num_points_embeddings {
-            let emb = hanzo_ml_nn::embedding(1, embed_dim, vb_e.pp(i))?;
+            let emb = hanzo_nn::embedding(1, embed_dim, vb_e.pp(i))?;
             point_embeddings.push(emb)
         }
         let span = tracing::span!(tracing::Level::TRACE, "prompt-encoder");

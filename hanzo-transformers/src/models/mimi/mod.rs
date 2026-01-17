@@ -2,7 +2,7 @@
 //!
 //! [Mimi](https://huggingface.co/kyutai/mimi) is a state of the art audio
 //! compression model using an encoder/decoder architecture with residual vector
-//! quantization. The hanzo implementation supports streaming meaning that it's
+//! quantization. The candle implementation supports streaming meaning that it's
 //! possible to encode or decode a stream of audio tokens on the flight to provide
 //! low latency interaction with an audio model.
 //!
@@ -27,7 +27,7 @@
 // Copyright (c) Kyutai, all rights reserved.
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
-pub use hanzo;
+pub use hanzo_ml;
 pub use hanzo_nn;
 
 pub mod conv;

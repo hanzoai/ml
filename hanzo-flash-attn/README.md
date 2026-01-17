@@ -1,1 +1,1 @@
-# hanzo-flash-attn
+# candle-flash-attn

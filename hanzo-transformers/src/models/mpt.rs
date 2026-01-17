@@ -10,7 +10,7 @@ use crate::models::with_tracing::{linear_no_bias, Embedding, Linear};
 /// MPT model used by replit-code-v1_5-3b
 /// https://huggingface.co/replit/replit-code-v1_5-3b/blob/main/modeling_mpt.py
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{layer_norm, LayerNorm, VarBuilder};
+use hanzo_nn::{layer_norm, LayerNorm, VarBuilder};
 
 // https://huggingface.co/replit/replit-code-v1_5-3b/blob/main/configuration_mpt.py
 #[derive(Debug, Clone, PartialEq)]
@@ -132,7 +132,7 @@ impl GroupedQueryAttention {
                 f32::NEG_INFINITY,
             )?,
         };
-        let attn_weights = hanzo_ml_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights
             .matmul(&value)?
             .transpose(1, 2)?
@@ -173,7 +173,7 @@ struct MPTBlock {
 
 impl MPTBlock {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let ln_cfg = hanzo_ml_nn::LayerNormConfig {
+        let ln_cfg = hanzo_nn::LayerNormConfig {
             affine: false,
             ..Default::default()
         };
@@ -250,11 +250,11 @@ impl Model {
             let block = MPTBlock::new(cfg, vb_b.pp(i))?;
             blocks.push(block)
         }
-        let ln_cfg = hanzo_ml_nn::LayerNormConfig {
+        let ln_cfg = hanzo_nn::LayerNormConfig {
             affine: false,
             ..Default::default()
         };
-        let norm_f = hanzo_ml_nn::layer_norm(cfg.d_model, ln_cfg, vb.pp("norm_f"))?;
+        let norm_f = hanzo_nn::layer_norm(cfg.d_model, ln_cfg, vb.pp("norm_f"))?;
         Ok(Self {
             wte,
             blocks,

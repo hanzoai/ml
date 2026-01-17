@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use hanzo_ml::quantized::gguf_file;
 use hanzo_ml::quantized::QTensor;
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{kv_cache::KvCache, Embedding, RmsNorm};
+use hanzo_nn::{kv_cache::KvCache, Embedding, RmsNorm};
 
 #[derive(Debug, Clone)]
 struct QLinear {
@@ -101,7 +101,7 @@ impl LayerWeights {
         let (_b_sz, _h, seq_len, _n_embd) = xs.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        hanzo_ml_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
+        hanzo_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
     }
 
     fn forward_attn(
@@ -136,6 +136,9 @@ impl LayerWeights {
         let q = self.apply_rotary_emb(&q, index_pos)?.contiguous()?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
+        if index_pos == 0 {
+            self.kv_cache.reset();
+        }
         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
@@ -159,7 +162,7 @@ impl LayerWeights {
                     masked_fill(&att, &mask, &self.neg_inf)?
                 }
             };
-            let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
+            let att = hanzo_nn::ops::softmax_last_dim(&att)?;
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v)?
         };
@@ -177,7 +180,7 @@ fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
-    hanzo_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
 #[cfg(not(feature = "flash-attn"))]

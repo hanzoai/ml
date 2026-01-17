@@ -1,11 +1,11 @@
 //! # MobileOne
 //!
-//! MobileOne inference implementation based on timm and hanzo-ml-repvgg
+//! MobileOne inference implementation based on timm and candle-repvgg
 //!
 //! See ["MobileOne: An Improved One millisecond Mobile Backbone"](https://arxiv.org/abs/2206.04040)
 
 use hanzo_ml::{DType, Result, Tensor, D};
-use hanzo_ml_nn::{
+use hanzo_nn::{
     batch_norm, conv2d, conv2d_no_bias, linear, ops::sigmoid, BatchNorm, Conv2d, Conv2dConfig,
     Func, VarBuilder,
 };

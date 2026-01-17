@@ -18,7 +18,7 @@ use hanzo_ml::{
     quantized::{gguf_file, QMatMul},
     DType, Device, IndexOp, Result, Tensor,
 };
-use hanzo_ml_nn::{Embedding, Module};
+use hanzo_nn::{Embedding, Module};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -33,7 +33,7 @@ impl Module for Mlp {
         let w1 = self.feed_forward_w1.forward(xs)?;
         let w3 = self.feed_forward_w3.forward(xs)?;
         self.feed_forward_w2
-            .forward(&(hanzo_ml_nn::ops::silu(&w1)? * w3)?)
+            .forward(&(hanzo_nn::ops::silu(&w1)? * w3)?)
     }
 }
 
@@ -73,7 +73,7 @@ impl LayerWeights {
         let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        hanzo_ml_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+        hanzo_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
     }
 
     fn forward_attn(
@@ -138,7 +138,7 @@ impl LayerWeights {
                 masked_fill(&att, &mask, &self.neg_inf)?
             }
         };
-        let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
+        let att = hanzo_nn::ops::softmax_last_dim(&att)?;
         // Convert to contiguous as matmul doesn't support strided vs for now.
         let y = att.matmul(&v.contiguous()?)?;
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;

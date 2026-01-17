@@ -18,7 +18,7 @@
 //! https://github.com/huggingface/transformers/blob/b109257f4fb8b1166e7c53cc5418632014ed53a5/src/transformers/models/recurrent_gemma/modeling_recurrent_gemma.py#L2
 //!
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{linear_b as linear, Linear, VarBuilder};
+use hanzo_nn::{linear_b as linear, Linear, VarBuilder};
 use std::sync::Arc;
 
 #[derive(serde::Deserialize, Debug, Clone, Copy)]
@@ -41,7 +41,7 @@ pub struct Config {
     pub attention_window_size: usize,
     pub conv1d_width: usize,
     pub logits_soft_cap: f64,
-    pub hidden_activation: hanzo_ml_nn::Activation,
+    pub hidden_activation: hanzo_nn::Activation,
     pub partial_rotary_factor: f64,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
@@ -149,7 +149,7 @@ struct Mlp {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
-    act_fn: hanzo_ml_nn::Activation,
+    act_fn: hanzo_nn::Activation,
 }
 
 impl Mlp {
@@ -236,14 +236,14 @@ impl Rglru {
             &self.input_gate_weight,
         )?;
         let input_gate = res.transpose(0, 1)?.reshape((b_sz, seq_len, lru_width))?;
-        let input_gate = hanzo_ml_nn::ops::sigmoid(&input_gate)?;
+        let input_gate = hanzo_nn::ops::sigmoid(&input_gate)?;
         let res = baddbmm(
             &self.recurrent_gate_bias.unsqueeze(1)?,
             &reshape_act,
             &self.recurrent_gate_weight,
         )?;
         let recurrent_gate = res.transpose(0, 1)?.reshape((b_sz, seq_len, lru_width))?;
-        let recurrent_gate = hanzo_ml_nn::ops::sigmoid(&recurrent_gate)?;
+        let recurrent_gate = hanzo_nn::ops::sigmoid(&recurrent_gate)?;
 
         let log_recurrent_gate =
             (recurrent_gate * (-8.0))?.broadcast_mul(&softplus(&self.recurrent_param)?)?;
@@ -321,11 +321,11 @@ struct RecurrentBlock {
     linear_y: Linear,
     linear_x: Linear,
     linear_out: Linear,
-    conv_1d: hanzo_ml_nn::Conv1d,
+    conv_1d: hanzo_nn::Conv1d,
     conv1d_state: Option<Tensor>,
     conv1d_width: usize,
     rg_lru: Rglru,
-    act_fn: hanzo_ml_nn::Activation,
+    act_fn: hanzo_nn::Activation,
 }
 
 impl RecurrentBlock {
@@ -335,11 +335,11 @@ impl RecurrentBlock {
         let linear_y = linear(h, lru_width, true, vb.pp("linear_y"))?;
         let linear_x = linear(h, lru_width, true, vb.pp("linear_x"))?;
         let linear_out = linear(lru_width, h, true, vb.pp("linear_out"))?;
-        let conv_1d = hanzo_ml_nn::conv1d(
+        let conv_1d = hanzo_nn::conv1d(
             lru_width,
             lru_width,
             cfg.conv1d_width,
-            hanzo_ml_nn::Conv1dConfig {
+            hanzo_nn::Conv1dConfig {
                 groups: lru_width,
                 padding: cfg.conv1d_width - 1,
                 ..Default::default()
@@ -496,7 +496,7 @@ impl SdpaAttention {
                     Some(mask) => att.broadcast_add(mask)?,
                 }
             };
-            let att = hanzo_ml_nn::ops::softmax_last_dim(&att)?;
+            let att = hanzo_nn::ops::softmax_last_dim(&att)?;
             att.matmul(&value_states.contiguous()?)?
         };
 
@@ -582,7 +582,7 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: hanzo_ml_nn::Embedding,
+    embed_tokens: hanzo_nn::Embedding,
     layers: Vec<DecoderLayer>,
     final_norm: RmsNorm,
     lm_head: Linear,
@@ -595,7 +595,7 @@ pub struct Model {
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
-            hanzo_ml_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
+            hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let vb_b = vb.pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);

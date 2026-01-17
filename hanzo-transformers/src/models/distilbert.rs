@@ -5,7 +5,7 @@
 //!
 use super::with_tracing::{layer_norm, linear, LayerNorm, Linear};
 use hanzo_ml::{DType, Device, Result, Tensor};
-use hanzo_ml_nn::{Embedding, Module, VarBuilder};
+use hanzo_nn::{Embedding, Module, VarBuilder};
 use serde::Deserialize;
 
 pub const DTYPE: DType = DType::F32;
@@ -101,8 +101,8 @@ struct Embeddings {
 impl Embeddings {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
         let word_embeddings =
-            hanzo_ml_nn::embedding(config.vocab_size, config.dim, vb.pp("word_embeddings"))?;
-        let position_embeddings = hanzo_ml_nn::embedding(
+            hanzo_nn::embedding(config.vocab_size, config.dim, vb.pp("word_embeddings"))?;
+        let position_embeddings = hanzo_nn::embedding(
             config.max_position_embeddings,
             config.dim,
             vb.pp("position_embeddings"),
@@ -186,7 +186,7 @@ impl MultiHeadSelfAttention {
         let mask = attention_mask.broadcast_as(scores.shape())?;
 
         let scores = masked_fill(&scores.to_dtype(DType::F32)?, &mask, f32::NEG_INFINITY)?;
-        let weights = hanzo_ml_nn::ops::softmax(&scores, hanzo_ml::D::Minus1)?;
+        let weights = hanzo_nn::ops::softmax(&scores, hanzo_ml::D::Minus1)?;
 
         let context = weights.matmul(&v.contiguous()?)?;
         let context = context
@@ -386,14 +386,14 @@ impl DistilBertLMPredictionHead {
 
         // distil_bert_uncased uses the word embeddings for the vocab projector weight, but has a separate vocab_projector bias
         let vocab_projector_weight_vb = vb.pp("distilbert.embeddings.word_embeddings");
-        let init_ws = hanzo_ml_nn::init::DEFAULT_KAIMING_NORMAL;
+        let init_ws = hanzo_nn::init::DEFAULT_KAIMING_NORMAL;
         let ws = vocab_projector_weight_vb.get_with_hints(
             (config.vocab_size, config.dim),
             "weight",
             init_ws,
         )?;
         let bound = 1. / (config.dim as f64).sqrt();
-        let init_bs = hanzo_ml_nn::Init::Uniform {
+        let init_bs = hanzo_nn::Init::Uniform {
             lo: -bound,
             up: bound,
         };

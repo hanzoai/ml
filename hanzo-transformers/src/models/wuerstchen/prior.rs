@@ -1,6 +1,6 @@
 use super::common::{AttnBlock, ResBlock, TimestepBlock};
 use hanzo_ml::{DType, Result, Tensor, D};
-use hanzo_ml_nn::VarBuilder;
+use hanzo_nn::VarBuilder;
 
 #[derive(Debug)]
 struct Block {
@@ -11,12 +11,12 @@ struct Block {
 
 #[derive(Debug)]
 pub struct WPrior {
-    projection: hanzo_ml_nn::Conv2d,
-    cond_mapper_lin1: hanzo_ml_nn::Linear,
-    cond_mapper_lin2: hanzo_ml_nn::Linear,
+    projection: hanzo_nn::Conv2d,
+    cond_mapper_lin1: hanzo_nn::Linear,
+    cond_mapper_lin2: hanzo_nn::Linear,
     blocks: Vec<Block>,
     out_ln: super::common::WLayerNorm,
-    out_conv: hanzo_ml_nn::Conv2d,
+    out_conv: hanzo_nn::Conv2d,
     c_r: usize,
 }
 
@@ -32,11 +32,11 @@ impl WPrior {
         use_flash_attn: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let projection = hanzo_ml_nn::conv2d(c_in, c, 1, Default::default(), vb.pp("projection"))?;
-        let cond_mapper_lin1 = hanzo_ml_nn::linear(c_cond, c, vb.pp("cond_mapper.0"))?;
-        let cond_mapper_lin2 = hanzo_ml_nn::linear(c, c, vb.pp("cond_mapper.2"))?;
+        let projection = hanzo_nn::conv2d(c_in, c, 1, Default::default(), vb.pp("projection"))?;
+        let cond_mapper_lin1 = hanzo_nn::linear(c_cond, c, vb.pp("cond_mapper.0"))?;
+        let cond_mapper_lin2 = hanzo_nn::linear(c, c, vb.pp("cond_mapper.2"))?;
         let out_ln = super::common::WLayerNorm::new(c)?;
-        let out_conv = hanzo_ml_nn::conv2d(c, c_in * 2, 1, Default::default(), vb.pp("out.1"))?;
+        let out_conv = hanzo_nn::conv2d(c, c_in * 2, 1, Default::default(), vb.pp("out.1"))?;
         let mut blocks = Vec::with_capacity(depth);
         for index in 0..depth {
             let res_block = ResBlock::new(c, 0, 3, vb.pp(format!("blocks.{}", 3 * index)))?;
@@ -89,7 +89,7 @@ impl WPrior {
         let mut xs = xs.apply(&self.projection)?;
         let c_embed = c
             .apply(&self.cond_mapper_lin1)?
-            .apply(&|xs: &_| hanzo_ml_nn::ops::leaky_relu(xs, 0.2))?
+            .apply(&|xs: &_| hanzo_nn::ops::leaky_relu(xs, 0.2))?
             .apply(&self.cond_mapper_lin2)?;
         let r_embed = self.gen_r_embedding(r)?;
         for block in self.blocks.iter() {

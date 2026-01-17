@@ -2,11 +2,11 @@
 //!
 //! See "Simple linear attention language models balance the recall-throughput tradeoff", Arora et al. 2024
 //! - Simple linear attention language models balance the recall-throughput tradeoff. [Arxiv](https://arxiv.org/abs/2402.18668)
-//! - [Github Rep](https://github.com/HazyResearch/based)
+//! - [GitHub Rep](https://github.com/HazyResearch/based)
 //! - [Blogpost](https://hazyresearch.stanford.edu/blog/2024-03-03-based)
 
 use hanzo_ml::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use hanzo_ml_nn::{
+use hanzo_nn::{
     conv1d_no_bias, linear, linear_no_bias, ops::softmax_last_dim, rms_norm, Conv1d, Conv1dConfig,
     Func, Linear, RmsNorm, VarBuilder,
 };
@@ -74,7 +74,7 @@ impl MLP {
 }
 
 // Swiglu implementation.
-// Not using Activation::Swiglu because this has the gate and y arguments switched compared to the version in hanzo-nn/src/ops.rs
+// Not using Activation::Swiglu because this has the gate and y arguments switched compared to the version in candle-nn/src/ops.rs
 fn swiglu(xs: &Tensor) -> Result<Tensor> {
     let xs = xs.chunk(2, D::Minus1)?;
     &xs[1].silu()? * &xs[0]
@@ -339,8 +339,8 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = hanzo_ml_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_ml_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }

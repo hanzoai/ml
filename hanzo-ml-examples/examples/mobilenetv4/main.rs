@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use clap::{Parser, ValueEnum};
 
 use hanzo_ml::{DType, IndexOp, D};
-use hanzo_ml_nn::{Module, VarBuilder};
+use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::models::mobilenetv4;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -91,7 +91,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = mobilenetv4::mobilenetv4(&args.which.config(), 1000, vb)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = hanzo_ml_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = hanzo_nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

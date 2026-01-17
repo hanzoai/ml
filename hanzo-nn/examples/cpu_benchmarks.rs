@@ -266,7 +266,7 @@ impl Benchmark for Softmax {
     }
 
     fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
-        hanzo_ml_nn::ops::softmax(d, D::Minus1)
+        hanzo_nn::ops::softmax(d, D::Minus1)
     }
 
     const ITERS: usize = 100;
@@ -283,7 +283,7 @@ impl Benchmark for SoftmaxLastDim {
     }
 
     fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
-        hanzo_ml_nn::ops::softmax_last_dim(d)
+        hanzo_nn::ops::softmax_last_dim(d)
     }
 
     const ITERS: usize = 100;

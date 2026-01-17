@@ -15,7 +15,7 @@ use crate::models::llama::{Cache, Llama};
 use crate::models::with_tracing::linear;
 
 use hanzo_ml::{bail, Context, Device, IndexOp, Result, Tensor};
-use hanzo_ml_nn::{seq, Activation, Module, Sequential, VarBuilder};
+use hanzo_nn::{seq, Activation, Module, Sequential, VarBuilder};
 use fancy_regex::Regex;
 use utils::get_anyres_image_grid_shape;
 
@@ -329,7 +329,7 @@ impl LLaVA {
         } else {
             bail!("Unexpected mm_patch_merge_type: {mm_patch_merge_type}")
         };
-        // can easily be replaced by nonzero if it is implemented in hanzo
+        // can easily be replaced by nonzero if it is implemented in candle
         let input_ids_vec = input_ids.squeeze(0)?.to_vec1::<i64>()?;
         let mut image_indices = {
             let mut image_indices = vec![0_i64];
@@ -367,7 +367,7 @@ impl LLaVA {
         image_indices.push((input_ids_noim_len) as i64);
         let input_ids_noim = Tensor::from_vec(input_ids_noim, input_ids_noim_len, &self.device)?;
         let cur_input_embeds = self.llama.embed(&input_ids_noim)?;
-        // can be replace by split if it is implemented in hanzo
+        // can be replace by split if it is implemented in candle
         let input_embed_no_ims = {
             let mut input_embeds = Vec::new();
             for i in 0..image_indices.len() - 1 {
@@ -385,7 +385,7 @@ impl LLaVA {
         }
         cur_new_input_embeds.push(input_embed_no_ims[image_features.len()].clone());
         let new_input_embeds = Tensor::cat(&cur_new_input_embeds, 0)?;
-        //trancate
+        //truncate
         let new_input_embeds =
             if let Some(tokenizer_model_max_length) = self.config.tokenizer_model_max_length {
                 let (new_input_embeds_length, _) = new_input_embeds.shape().dims2()?;
