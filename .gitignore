@@ -21,6 +21,8 @@ Cargo.lock
 
 *tokenizer*.json
 *.npz
+# Exception for test files
+!hanzo-ml/tests/test.npz
 
 perf.data
 flamegraph.svg
