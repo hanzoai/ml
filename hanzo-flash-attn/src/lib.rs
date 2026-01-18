@@ -1,9 +1,9 @@
 mod ffi;
 
+use half::{bf16, f16};
 use hanzo_ml::backend::BackendStorage;
 use hanzo_ml::cuda_backend::cudarc::driver::DevicePtr;
 use hanzo_ml::{CpuStorage, DType, Layout, Result, Shape, Tensor};
-use half::{bf16, f16};
 
 pub struct FlashAttn {
     pub softmax_scale: f32,
@@ -81,7 +81,9 @@ impl FlashAttn {
         }
         if head_size_og % 8 != 0 {
             // TODO: Handle head sizes that are not a multiple of 8 via some padding.
-            hanzo_ml::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+            hanzo_ml::bail!(
+                "only supports head sizes that are a multiple of 8 (got {head_size_og})"
+            )
         }
         if num_heads % num_heads_k != 0 {
             hanzo_ml::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
@@ -533,7 +535,9 @@ impl FlashAttnVarLen {
         }
         if head_size_og % 8 != 0 {
             // TODO: Handle head sizes that are not a multiple of 8 via some padding.
-            hanzo_ml::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+            hanzo_ml::bail!(
+                "only supports head sizes that are a multiple of 8 (got {head_size_og})"
+            )
         }
         if num_heads % num_heads_k != 0 {
             hanzo_ml::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
