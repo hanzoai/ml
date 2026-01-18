@@ -11,8 +11,8 @@ use hanzo_transformers::models::gemma::{Config as Config1, Model as Model1};
 use hanzo_transformers::models::gemma2::{Config as Config2, Model as Model2};
 use hanzo_transformers::models::gemma3::{Config as Config3, Model as Model3};
 
-use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
