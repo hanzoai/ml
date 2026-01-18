@@ -196,66 +196,66 @@ impl TrainingConfig {
     pub fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", path.display(), e))?;
 
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("yaml") | Some("yml") => Self::from_yaml(&content),
             Some("json") => Self::from_json(&content),
             Some("toml") => Self::from_toml(&content),
-            _ => Err("Unsupported config file format. Use .yaml, .json, or .toml".into()),
+            _ => Err(anyhow::anyhow!("Unsupported config file format. Use .yaml, .json, or .toml")),
         }
     }
 
     /// Parse configuration from YAML string
     pub fn from_yaml(content: &str) -> crate::Result<Self> {
         serde_yaml::from_str(content)
-            .map_err(|e| format!("Failed to parse YAML config: {}", e).into())
+            .map_err(|e| anyhow::anyhow!("Failed to parse YAML config: {}", e))
     }
 
     /// Parse configuration from JSON string
     pub fn from_json(content: &str) -> crate::Result<Self> {
         serde_json::from_str(content)
-            .map_err(|e| format!("Failed to parse JSON config: {}", e).into())
+            .map_err(|e| anyhow::anyhow!("Failed to parse JSON config: {}", e))
     }
 
     /// Parse configuration from TOML string
     pub fn from_toml(content: &str) -> crate::Result<Self> {
         toml::from_str(content)
-            .map_err(|e| format!("Failed to parse TOML config: {}", e).into())
+            .map_err(|e| anyhow::anyhow!("Failed to parse TOML config: {}", e))
     }
 
     /// Validate the configuration
     pub fn validate(&self) -> crate::Result<()> {
         // Model validation
         if self.model.name.is_empty() {
-            return Err("Model name cannot be empty".into());
+            return Err(anyhow::anyhow!("Model name cannot be empty"));
         }
 
         if self.model.max_seq_length == 0 {
-            return Err("Model max_seq_length must be greater than 0".into());
+            return Err(anyhow::anyhow!("Model max_seq_length must be greater than 0"));
         }
 
         // Dataset validation
         if self.dataset.path.is_empty() {
-            return Err("Dataset path cannot be empty".into());
+            return Err(anyhow::anyhow!("Dataset path cannot be empty"));
         }
 
         if self.dataset.max_seq_length == 0 {
-            return Err("Dataset max_seq_length must be greater than 0".into());
+            return Err(anyhow::anyhow!("Dataset max_seq_length must be greater than 0"));
         }
 
         // Training validation
         if self.training.batch_size == 0 {
-            return Err("Batch size must be greater than 0".into());
+            return Err(anyhow::anyhow!("Batch size must be greater than 0"));
         }
 
         if self.training.learning_rate <= 0.0 {
-            return Err("Learning rate must be positive".into());
+            return Err(anyhow::anyhow!("Learning rate must be positive"));
         }
 
         // Must have either epochs or max_steps
         if self.training.epochs.is_none() && self.training.max_steps.is_none() {
-            return Err("Must specify either epochs or max_steps".into());
+            return Err(anyhow::anyhow!("Must specify either epochs or max_steps"));
         }
 
         Ok(())

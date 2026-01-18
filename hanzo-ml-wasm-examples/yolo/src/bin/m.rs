@@ -1,7 +1,7 @@
-use hanzo_wasm_example_yolo::coco_classes;
-use hanzo_wasm_example_yolo::model::Bbox;
-use hanzo_wasm_example_yolo::worker::Model as M;
-use hanzo_wasm_example_yolo::worker::ModelPose as P;
+use hanzo_ml_wasm_example_yolo::coco_classes;
+use hanzo_ml_wasm_example_yolo::model::Bbox;
+use hanzo_ml_wasm_example_yolo::worker::Model as M;
+use hanzo_ml_wasm_example_yolo::worker::ModelPose as P;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
