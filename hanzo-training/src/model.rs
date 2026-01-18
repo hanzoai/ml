@@ -50,18 +50,18 @@ impl TrainableModel for ModelWrapper {
     fn save(&self, path: &std::path::Path) -> Result<()> {
         let path: &Path = path.as_ref();
         std::fs::create_dir_all(path)?;
-        
+
         // Save model metadata
         let metadata = serde_json::json!({
             "model_type": self.model_type,
             "device": format!("{:?}", self.device),
         });
-        
+
         std::fs::write(
             path.join("model_config.json"),
-            serde_json::to_string_pretty(&metadata)?
+            serde_json::to_string_pretty(&metadata)?,
         )?;
-        
+
         Ok(())
     }
 }

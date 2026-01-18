@@ -1,8 +1,8 @@
+use cudarc::nccl::safe::{Comm, ReduceOp};
 use hanzo_ml::backend::BackendStorage;
 use hanzo_ml::{CpuStorage, CustomOp1, DType, Device, IndexOp, Layout, Result, Shape, Tensor, D};
 use hanzo_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use hanzo_nn::{Embedding, Linear, Module, RmsNorm};
-use cudarc::nccl::safe::{Comm, ReduceOp};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -52,9 +52,9 @@ impl CustomOp1 for AllReduce {
         s: &hanzo_ml::CudaStorage,
         l: &Layout,
     ) -> Result<(hanzo_ml::CudaStorage, Shape)> {
-        use hanzo_ml::cuda_backend::WrapErr;
         use cudarc::driver::DeviceSlice;
         use half::{bf16, f16};
+        use hanzo_ml::cuda_backend::WrapErr;
 
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
@@ -262,8 +262,11 @@ impl CausalSelfAttention {
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
         let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-        let y = hanzo_flash_attn::flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?
-            .reshape((b_sz, seq_len, hidden_size))?;
+        let y = hanzo_flash_attn::flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?.reshape((
+            b_sz,
+            seq_len,
+            hidden_size,
+        ))?;
         let y = self.o_proj.forward(&y)?;
         Ok(y)
     }

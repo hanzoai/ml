@@ -9,13 +9,13 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 use anyhow::{Error as E, Result};
+use clap::{ArgGroup, Parser, ValueEnum};
 use hanzo_ml::{Device, Tensor};
 use hanzo_nn::ops::softmax;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::debertav2::{Config as DebertaV2Config, DebertaV2NERModel};
 use hanzo_transformers::models::debertav2::{DebertaV2SeqClassificationModel, Id2Label};
 use hanzo_transformers::models::debertav2::{NERItem, TextClassificationItem};
-use clap::{ArgGroup, Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 

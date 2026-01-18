@@ -12,11 +12,11 @@ extern crate intel_mkl_src;
 use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
+use cudarc::driver::safe::CudaDevice;
+use cudarc::nccl::safe::{Comm, Id};
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::llama::LlamaEosToks;
-use cudarc::driver::safe::CudaDevice;
-use cudarc::nccl::safe::{Comm, Id};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::io::Write;
 use std::rc::Rc;

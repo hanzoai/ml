@@ -7,8 +7,8 @@ extern crate accelerate_src;
 use anyhow::Error as E;
 use clap::Parser;
 
-use hanzo_ml::{DType, Device, Result, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml::{DType, Device, Result, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::blip;
 use hanzo_transformers::models::quantized_blip;

@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
+use clap::Parser;
 use hanzo_ml::Tensor;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::bert::{self, BertForMaskedLM, Config};
-use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer};
 

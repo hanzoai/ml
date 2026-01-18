@@ -1,9 +1,9 @@
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_wasm_example_phi::console_log;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
 use hanzo_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
-use hanzo_ml_wasm_example_phi::console_log;
 use js_sys::Date;
 use serde::Deserialize;
 use tokenizers::Tokenizer;

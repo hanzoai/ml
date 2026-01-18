@@ -5,9 +5,9 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
+use clap::{Parser, ValueEnum};
 use hanzo_ml::{DType, Tensor};
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
-use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::Api;
 use serde::Deserialize;
 use std::io::Write;

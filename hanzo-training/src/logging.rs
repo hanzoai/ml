@@ -1,7 +1,7 @@
 //! Logging and monitoring
 
+use crate::config::{FileLoggingConfig, LoggingConfig};
 use crate::Result;
-use crate::config::{LoggingConfig, FileLoggingConfig};
 
 /// Logger trait
 pub trait Logger: Send + Sync {
@@ -34,7 +34,10 @@ impl Logger for ConsoleLogger {
     }
 
     fn log_config(&self, config: &serde_json::Value) {
-        println!("Config: {}", serde_json::to_string_pretty(config).unwrap_or_default());
+        println!(
+            "Config: {}",
+            serde_json::to_string_pretty(config).unwrap_or_default()
+        );
     }
 
     fn finish(&self) {
@@ -67,7 +70,7 @@ impl FileLogger {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        
+
         let timestamp = chrono::Utc::now().to_rfc3339();
         writeln!(file, "[{}] {}", timestamp, message)?;
         Ok(())
@@ -86,7 +89,10 @@ impl Logger for FileLogger {
     }
 
     fn log_config(&self, config: &serde_json::Value) {
-        let message = format!("Config: {}", serde_json::to_string_pretty(config).unwrap_or_default());
+        let message = format!(
+            "Config: {}",
+            serde_json::to_string_pretty(config).unwrap_or_default()
+        );
         let _ = self.write_log(&message);
     }
 

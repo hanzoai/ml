@@ -10,8 +10,8 @@ use clap::Parser;
 use hanzo_transformers::models::mistral::{Config, Model as Mistral};
 use hanzo_transformers::models::quantized_mistral::Model as QMistral;
 
-use hanzo_ml::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};

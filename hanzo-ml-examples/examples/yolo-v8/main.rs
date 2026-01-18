@@ -7,10 +7,10 @@ extern crate accelerate_src;
 mod model;
 use model::{Multiples, YoloV8, YoloV8Pose};
 
+use clap::{Parser, ValueEnum};
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{Module, VarBuilder};
 use hanzo_transformers::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
-use clap::{Parser, ValueEnum};
 use image::DynamicImage;
 
 // Keypoints as reported by ChatGPT :)

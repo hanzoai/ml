@@ -8,9 +8,9 @@ use hanzo_transformers::object_detection::{non_maximum_suppression, Bbox};
 mod darknet;
 
 use anyhow::Result;
+use clap::Parser;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::{Module, VarBuilder};
-use clap::Parser;
 use image::{DynamicImage, ImageBuffer};
 
 // Assumes x1 <= x2 and y1 <= y2

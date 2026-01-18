@@ -4,10 +4,10 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
+use clap::Parser;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn as nn;
 use hanzo_transformers::models::chinese_clip::{ChineseClipConfig, ChineseClipModel};
-use clap::Parser;
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
@@ -182,7 +182,8 @@ pub fn load_images(
     let vec_imgs = match images {
         Some(imgs) => imgs,
         None => vec![
-            "hanzo-ml-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg".to_string(),
+            "hanzo-ml-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg"
+                .to_string(),
             "hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg".to_string(),
         ],
     };

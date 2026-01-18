@@ -601,11 +601,7 @@ impl Embeddings {
                 let layer_norm = hanzo_nn::LayerNorm::new(weight, bias, cfg.norm_eps);
 
                 (
-                    hanzo_nn::embedding(
-                        cfg.vocab_size,
-                        cfg.hidden_size,
-                        vb.pp("word_embeddings"),
-                    )?,
+                    hanzo_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("word_embeddings"))?,
                     Some(hanzo_nn::embedding(
                         cfg.type_vocab_size,
                         cfg.hidden_size,

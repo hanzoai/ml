@@ -195,14 +195,17 @@ impl TrainingConfig {
     /// Load configuration from a file (YAML or JSON)
     pub fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
         let path = path.as_ref();
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", path.display(), e))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!("Failed to read config file '{}': {}", path.display(), e)
+        })?;
 
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("yaml") | Some("yml") => Self::from_yaml(&content),
             Some("json") => Self::from_json(&content),
             Some("toml") => Self::from_toml(&content),
-            _ => Err(anyhow::anyhow!("Unsupported config file format. Use .yaml, .json, or .toml")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported config file format. Use .yaml, .json, or .toml"
+            )),
         }
     }
 
@@ -220,8 +223,7 @@ impl TrainingConfig {
 
     /// Parse configuration from TOML string
     pub fn from_toml(content: &str) -> crate::Result<Self> {
-        toml::from_str(content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse TOML config: {}", e))
+        toml::from_str(content).map_err(|e| anyhow::anyhow!("Failed to parse TOML config: {}", e))
     }
 
     /// Validate the configuration
@@ -232,7 +234,9 @@ impl TrainingConfig {
         }
 
         if self.model.max_seq_length == 0 {
-            return Err(anyhow::anyhow!("Model max_seq_length must be greater than 0"));
+            return Err(anyhow::anyhow!(
+                "Model max_seq_length must be greater than 0"
+            ));
         }
 
         // Dataset validation
@@ -241,7 +245,9 @@ impl TrainingConfig {
         }
 
         if self.dataset.max_seq_length == 0 {
-            return Err(anyhow::anyhow!("Dataset max_seq_length must be greater than 0"));
+            return Err(anyhow::anyhow!(
+                "Dataset max_seq_length must be greater than 0"
+            ));
         }
 
         // Training validation
@@ -283,11 +289,7 @@ impl TrainingConfig {
 
     /// Get the effective batch size (including gradient accumulation)
     pub fn effective_batch_size(&self) -> usize {
-        self.training.batch_size
-            * self
-                .training
-                .gradient_accumulation_steps
-                .unwrap_or(1)
+        self.training.batch_size * self.training.gradient_accumulation_steps.unwrap_or(1)
     }
 }
 

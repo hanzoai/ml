@@ -1,6 +1,6 @@
 use crate::model::{Cache, Config, Llama};
-use hanzo_ml::{DType, Device, Result};
 use hanzo_datasets::nlp::tinystories::{Dataset, DatasetRandomIter};
+use hanzo_ml::{DType, Device, Result};
 use hanzo_nn::Optimizer;
 
 fn valid_loss(

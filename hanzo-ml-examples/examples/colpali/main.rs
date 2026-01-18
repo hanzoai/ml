@@ -1,9 +1,9 @@
 use anyhow::{Error as E, Result};
+use clap::Parser;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::colpali::Model;
 use hanzo_transformers::models::{colpali, paligemma};
-use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use image::DynamicImage;
 use pdf2image::{RenderOptionsBuilder, PDF};

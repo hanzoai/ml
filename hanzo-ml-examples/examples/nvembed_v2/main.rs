@@ -5,10 +5,10 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
+use clap::Parser;
 use hanzo_ml::{DType, IndexOp, Shape, Tensor, D};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::nvembed_v2::model::Model;
-use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};
 

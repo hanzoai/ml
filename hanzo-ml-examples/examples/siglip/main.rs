@@ -130,7 +130,8 @@ pub fn main() -> anyhow::Result<()> {
     let vec_imgs = match args.images {
         Some(imgs) => imgs,
         None => vec![
-            "hanzo-ml-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg".to_string(),
+            "hanzo-ml-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg"
+                .to_string(),
             "hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg".to_string(),
         ],
     };

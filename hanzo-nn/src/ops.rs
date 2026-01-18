@@ -614,7 +614,8 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
             &output,
         )
         .map_err(hanzo_ml::Error::wrap)?;
-        let newstorage = hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        let newstorage =
+            hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
 }
@@ -861,7 +862,8 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
             &output,
         )
         .map_err(hanzo_ml::Error::wrap)?;
-        let newstorage = hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        let newstorage =
+            hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
 }
@@ -996,8 +998,8 @@ impl hanzo_ml::CustomOp3 for Sdpa {
         v: &hanzo_ml::MetalStorage,
         v_l: &Layout,
     ) -> Result<(hanzo_ml::MetalStorage, Shape)> {
-        use hanzo_ml::backend::BackendStorage;
         use candle_metal_kernels::SdpaDType;
+        use hanzo_ml::backend::BackendStorage;
 
         let device = q.device();
 

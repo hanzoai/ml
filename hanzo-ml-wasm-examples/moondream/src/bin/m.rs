@@ -1,10 +1,10 @@
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_wasm_example_moondream::console_log;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::{
     generation::LogitsProcessor,
     models::{moondream, quantized_moondream},
 };
-use hanzo_ml_wasm_example_moondream::console_log;
 use js_sys::Date;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
