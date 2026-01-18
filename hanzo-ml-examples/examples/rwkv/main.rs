@@ -296,7 +296,7 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let model = if args.quantized {
         let filename = &filenames[0];
         let vb =

@@ -60,7 +60,7 @@ fn load_from_hub(model_id: &str, revision: &str) -> Result<ConfigFiles> {
     Ok(ConfigFiles {
         config: repo.get("config.json")?,
         tokenizer: repo.get("tokenizer.json")?,
-        weights: hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+        weights: hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
     })
 }
 
@@ -130,7 +130,7 @@ fn main() -> Result<()> {
     tokenizer.with_padding(Some(padding));
 
     // Model initialization
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = if device.is_cuda() {
         DType::BF16
     } else {

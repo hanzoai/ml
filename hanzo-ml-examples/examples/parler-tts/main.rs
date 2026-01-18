@@ -147,7 +147,7 @@ fn main() -> anyhow::Result<()> {
         None => match args.which {
             Which::MiniV1 => vec![repo.get("model.safetensors")?],
             Which::LargeV1 => {
-                hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+                hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
             }
         },
     };
@@ -163,7 +163,7 @@ fn main() -> anyhow::Result<()> {
     let tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg)?;
 
     let start = std::time::Instant::now();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, DType::F32, &device)? };
     let config: Config = serde_json::from_reader(std::fs::File::open(config)?)?;
     let mut model = Model::new(&config, vb)?;
@@ -197,10 +197,10 @@ fn main() -> anyhow::Result<()> {
         .decode_codes(&codes.to_device(&device)?)?;
     println!("{pcm}");
     let pcm = pcm.i((0, 0))?;
-    let pcm = hanzo_examples::audio::normalize_loudness(&pcm, 24_000, true)?;
+    let pcm = hanzo_ml_examples::audio::normalize_loudness(&pcm, 24_000, true)?;
     let pcm = pcm.to_vec1::<f32>()?;
     let mut output = std::fs::File::create(&args.out_file)?;
-    hanzo_examples::wav::write_pcm_as_wav(&mut output, &pcm, config.audio_encoder.sampling_rate)?;
+    hanzo_ml_examples::wav::write_pcm_as_wav(&mut output, &pcm, config.audio_encoder.sampling_rate)?;
 
     Ok(())
 }

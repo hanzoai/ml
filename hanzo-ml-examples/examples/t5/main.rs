@@ -105,7 +105,7 @@ struct T5ModelBuilder {
 
 impl T5ModelBuilder {
     pub fn load(args: &Args) -> Result<(Self, Tokenizer)> {
-        let device = hanzo_examples::device(args.cpu)?;
+        let device = hanzo_ml_examples::device(args.cpu)?;
         let (default_model, default_revision) = match args.which {
             Which::T5Base => ("t5-base", "main"),
             Which::T5Small => ("t5-small", "refs/pr/15"),
@@ -150,7 +150,7 @@ impl T5ModelBuilder {
             Some(f) => f.split(',').map(|v| v.into()).collect::<Vec<_>>(),
             None => {
                 if model_id == "google/flan-t5-xxl" || model_id == "google/flan-ul2" {
-                    hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+                    hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
                 } else {
                     vec![repo.get("model.safetensors")?]
                 }

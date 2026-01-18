@@ -104,7 +104,7 @@ pub fn report_detect(
         for b in bboxes_for_class.iter() {
             println!(
                 "{}: {:?}",
-                hanzo_examples::coco_classes::NAMES[class_index],
+                hanzo_ml_examples::coco_classes::NAMES[class_index],
                 b
             );
             let xmin = (b.xmin * w_ratio) as i32;
@@ -126,7 +126,7 @@ pub fn report_detect(
                 );
                 let legend = format!(
                     "{}   {:.0}%",
-                    hanzo_examples::coco_classes::NAMES[class_index],
+                    hanzo_ml_examples::coco_classes::NAMES[class_index],
                     100. * b.confidence
                 );
                 imageproc::drawing::draw_text_mut(
@@ -374,7 +374,7 @@ impl Task for YoloV8Pose {
 }
 
 pub fn run<T: Task>(args: Args) -> anyhow::Result<()> {
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     // Create the model and load the weights from the file.
     let multiples = match args.which {
         Which::N => Multiples::n(),

@@ -9,7 +9,7 @@ extern crate intel_mkl_src;
 use clap::Parser;
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
-use hanzo_examples::{load_image, load_image_and_resize, save_image};
+use hanzo_ml_examples::{load_image, load_image_and_resize, save_image};
 use hanzo_ml::DType::{F32, U8};
 use hanzo_ml::{DType, Device, Module, Result, Tensor};
 use hanzo_nn::VarBuilder;
@@ -49,7 +49,7 @@ struct Args {
 
 pub fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
     let dinov2_model_file = match args.dinov2_model {
         None => {

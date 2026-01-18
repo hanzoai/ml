@@ -64,10 +64,10 @@ pub fn main() -> anyhow::Result<()> {
         None
     };
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
     let (image, initial_h, initial_w) =
-        hanzo_examples::load_image(&args.image, Some(sam::IMAGE_SIZE))?;
+        hanzo_ml_examples::load_image(&args.image, Some(sam::IMAGE_SIZE))?;
     let image = image.to_device(&device)?;
     println!("loaded image {image:?}");
 
@@ -105,7 +105,7 @@ pub fn main() -> anyhow::Result<()> {
             let mask = (&bbox.data.to_dtype(DType::U8)? * 255.)?;
             let (h, w) = mask.dims2()?;
             let mask = mask.broadcast_as((3, h, w))?;
-            hanzo_examples::save_image_resize(
+            hanzo_ml_examples::save_image_resize(
                 &mask,
                 format!("sam_mask{idx}.png"),
                 initial_h,

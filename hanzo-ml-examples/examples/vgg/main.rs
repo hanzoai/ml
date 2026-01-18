@@ -32,8 +32,8 @@ struct Args {
 
 pub fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let device = hanzo_examples::device(args.cpu)?;
-    let image = hanzo_examples::imagenet::load_image224(args.image)?.to_device(&device)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
+    let image = hanzo_ml_examples::imagenet::load_image224(args.image)?.to_device(&device)?;
 
     println!("loaded image {image:?}");
 
@@ -68,7 +68,7 @@ pub fn main() -> anyhow::Result<()> {
     for &(i, p) in &top {
         println!(
             "{:50}: {:.2}%",
-            hanzo_examples::imagenet::CLASSES[i],
+            hanzo_ml_examples::imagenet::CLASSES[i],
             p * 100.0
         );
     }

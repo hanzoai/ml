@@ -106,7 +106,7 @@ fn main() -> Result<()> {
         None
     };
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = match args.dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("bf16") => DType::BF16,
@@ -130,7 +130,7 @@ fn main() -> Result<()> {
 
         let filenames = match args.model_type {
             GraniteModel::Granite7bInstruct => {
-                hanzo_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
+                hanzo_ml_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
             }
         };
         let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
         .map_err(E::msg)?
         .get_ids()
         .to_vec();
-    let mut tokenizer = hanzo_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+    let mut tokenizer = hanzo_ml_examples::token_output_stream::TokenOutputStream::new(tokenizer);
 
     println!("Starting the inference loop:");
     print!("{prompt}");

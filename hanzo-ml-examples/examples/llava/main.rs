@@ -148,7 +148,7 @@ fn tokenizer_image_token(
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     println!("Start loading model");
     let api = Api::new()?;
     let api = api.model(args.model_path.clone());
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
     println!("loading model weights");
 
     let weight_filenames =
-        hanzo_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?;
+        hanzo_ml_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_filenames, dtype, &device)? };
     let llava: LLaVA = LLaVA::load(vb, &llava_config, clip_vision_config)?;
 
@@ -281,7 +281,7 @@ fn main() -> Result<()> {
     let mut input_embeds =
         llava.prepare_inputs_labels_for_multimodal(&tokens, &[image_tensor], &[image_size])?;
     //inference loop, based on https://github.com/huggingface/hanzo/blob/main/hanzo-ml-examples/examples/llama/main.rs
-    let mut tokenizer = hanzo_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+    let mut tokenizer = hanzo_ml_examples::token_output_stream::TokenOutputStream::new(tokenizer);
     let mut index_pos = 0;
     for index in 0..args.max_new_tokens {
         let (_, input_embeds_len, _) = input_embeds.dims3()?;

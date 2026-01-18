@@ -108,7 +108,7 @@ fn main() -> Result<()> {
         hanzo_ml::utils::with_simd128(),
         hanzo_ml::utils::with_f16c()
     );
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let api = Api::new()?;
     let repo = api.model("lmz/hanzo-ml-metavoice".to_string());
     let first_stage_meta = match &args.first_stage_meta {
@@ -269,9 +269,9 @@ fn main() -> Result<()> {
     let pcm = encodec_model.decode(&audio_ids)?;
     println!("output pcm shape: {:?}", pcm.shape());
     let pcm = pcm.i(0)?.i(0)?.to_dtype(DType::F32)?;
-    let pcm = hanzo_examples::audio::normalize_loudness(&pcm, 24_000, true)?;
+    let pcm = hanzo_ml_examples::audio::normalize_loudness(&pcm, 24_000, true)?;
     let pcm = pcm.to_vec1::<f32>()?;
     let mut output = std::fs::File::create(&args.out_file)?;
-    hanzo_examples::wav::write_pcm_as_wav(&mut output, &pcm, 24_000)?;
+    hanzo_ml_examples::wav::write_pcm_as_wav(&mut output, &pcm, 24_000)?;
     Ok(())
 }

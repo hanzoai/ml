@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use hanzo_transformers::models::olmo::{Config, Model as OLMo};
 use hanzo_transformers::models::olmo2::{Config as Config2, Model as OLMo2};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -247,7 +247,7 @@ fn main() -> Result<()> {
             Which::W1b | Which::V2W1b => {
                 vec![repo.get("model.safetensors")?]
             }
-            _ => hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+            _ => hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
         },
     };
 
@@ -256,7 +256,7 @@ fn main() -> Result<()> {
 
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
     let start = std::time::Instant::now();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = if device.is_cuda() {
         DType::BF16
     } else {

@@ -12,7 +12,7 @@ use hanzo_ml::quantized::gguf_file;
 use hanzo_ml::Tensor;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_transformers::models::quantized_gemma3::ModelWeights;
 
 const DEFAULT_PROMPT: &str = "Write a function to calculate fibonacci num";
@@ -173,7 +173,7 @@ fn main() -> anyhow::Result<()> {
     let model_path = args.model()?;
     let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
     let mut model = {
         let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&model_path))?;

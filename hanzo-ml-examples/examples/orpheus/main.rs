@@ -192,7 +192,7 @@ impl Model {
             Some(m) => vec![m.into()],
             None => match args.which {
                 Which::ThreeB0_1Ft => {
-                    hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+                    hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
                 }
             },
         };
@@ -208,7 +208,7 @@ impl Model {
         let tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg)?;
 
         let start = std::time::Instant::now();
-        let device = hanzo_examples::device(args.cpu)?;
+        let device = hanzo_ml_examples::device(args.cpu)?;
         let dtype = device.bf16_default_to_f32();
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
         let config: LlamaConfig = serde_json::from_reader(std::fs::File::open(config)?)?;
@@ -323,7 +323,7 @@ impl Model {
         println!("decoded to pcm {pcm:?}");
         let mut output = std::fs::File::create(&self.out_file)?;
         let pcm = pcm.i(0)?.i(0)?.to_vec1::<f32>()?;
-        hanzo_examples::wav::write_pcm_as_wav(&mut output, &pcm, 24000)?;
+        hanzo_ml_examples::wav::write_pcm_as_wav(&mut output, &pcm, 24000)?;
         Ok(())
     }
 }

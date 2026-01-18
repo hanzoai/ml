@@ -64,7 +64,7 @@ impl Args {
                 .repo(Repo::new(model_name.to_string(), RepoType::Model))
                 .get("tokenizer.json")?,
         };
-        let device = hanzo_examples::device(self.cpu)?;
+        let device = hanzo_ml_examples::device(self.cpu)?;
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer).map_err(E::msg)?;
         let config = Config::new(
             tokenizer.get_vocab_size(true),

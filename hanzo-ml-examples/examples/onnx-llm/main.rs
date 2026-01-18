@@ -63,7 +63,7 @@ struct Args {
 
 pub fn main() -> Result<()> {
     let args = Args::parse();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
     let (model_id, tokenizer_id) = match args.which {
         Which::SmolLM135M => ("HuggingFaceTB/SmolLM-135M", "HuggingFaceTB/SmolLM-135M"),

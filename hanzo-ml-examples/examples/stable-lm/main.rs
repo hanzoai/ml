@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use hanzo_transformers::models::quantized_stable_lm::Model as QStableLM;
 use hanzo_transformers::models::stable_lm::{Config, Model as StableLM};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -267,7 +267,7 @@ fn main() -> Result<()> {
                 vec![repo.get("model.safetensors")?]
             }
             (Which::Code, false) => {
-                hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+                hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
             }
         },
     };
@@ -287,7 +287,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let model = if args.quantized {
         let filename = &filenames[0];
         let vb =
