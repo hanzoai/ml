@@ -328,9 +328,10 @@ fn main() -> Result<()> {
                     | WhichModel::V2Old
                     | WhichModel::V3
                     | WhichModel::V3Medium
-                    | WhichModel::V4Mini => {
-                        hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
-                    }
+                    | WhichModel::V4Mini => hanzo_ml_examples::hub_load_safetensors(
+                        &repo,
+                        "model.safetensors.index.json",
+                    )?,
                     WhichModel::PuffinPhiV2 => vec![repo.get("model-puffin-phi-v2.safetensors")?],
                     WhichModel::PhiHermes => vec![repo.get("model-phi-hermes-1_3B.safetensors")?],
                 }

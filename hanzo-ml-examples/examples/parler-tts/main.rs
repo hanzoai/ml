@@ -200,7 +200,11 @@ fn main() -> anyhow::Result<()> {
     let pcm = hanzo_ml_examples::audio::normalize_loudness(&pcm, 24_000, true)?;
     let pcm = pcm.to_vec1::<f32>()?;
     let mut output = std::fs::File::create(&args.out_file)?;
-    hanzo_ml_examples::wav::write_pcm_as_wav(&mut output, &pcm, config.audio_encoder.sampling_rate)?;
+    hanzo_ml_examples::wav::write_pcm_as_wav(
+        &mut output,
+        &pcm,
+        config.audio_encoder.sampling_rate,
+    )?;
 
     Ok(())
 }
