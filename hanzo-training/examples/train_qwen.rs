@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     info!("Training time: {:.2}s", result.training_time);
 
     // Save final model
-    trainer.save_checkpoint("./output/qwen3-4b-zen-agentic")?;
+    trainer.save_checkpoint(std::path::Path::new("./output/qwen3-4b-zen-agentic"))?;
     info!("💾 Model saved to ./output/qwen3-4b-zen-agentic");
 
     Ok(())
