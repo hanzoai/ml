@@ -53,7 +53,7 @@ struct Args {
 
 impl Args {
     fn build_model_and_tokenizer(&self) -> Result<(BertModel, Tokenizer)> {
-        let device = hanzo_examples::device(self.cpu)?;
+        let device = hanzo_ml_examples::device(self.cpu)?;
         let default_model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
         let default_revision = "refs/pr/21".to_string();
         let (model_id, revision) = match (self.model_id.to_owned(), self.revision.to_owned()) {

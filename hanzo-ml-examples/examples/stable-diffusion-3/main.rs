@@ -121,7 +121,7 @@ fn main() -> Result<()> {
         None
     };
 
-    let device = hanzo_examples::device(cpu)?;
+    let device = hanzo_ml_examples::device(cpu)?;
     let default_inference_steps = match which {
         Which::V3_5Large => 28,
         Which::V3_5LargeTurbo => 4,
@@ -268,6 +268,6 @@ fn main() -> Result<()> {
         autoencoder.decode(&((x / 1.5305)? + 0.0609)?)?
     };
     let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(hanzo_ml::DType::U8)?;
-    hanzo_examples::save_image(&img.i(0)?, "out.jpg")?;
+    hanzo_ml_examples::save_image(&img.i(0)?, "out.jpg")?;
     Ok(())
 }

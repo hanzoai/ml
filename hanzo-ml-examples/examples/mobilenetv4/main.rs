@@ -70,9 +70,9 @@ struct Args {
 pub fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
-    let image = hanzo_examples::imagenet::load_image(args.image, args.which.resolution() as usize)?
+    let image = hanzo_ml_examples::imagenet::load_image(args.image, args.which.resolution() as usize)?
         .to_device(&device)?;
     println!("loaded image {image:?}");
 
@@ -98,7 +98,7 @@ pub fn main() -> anyhow::Result<()> {
     for &(category_idx, pr) in prs.iter().take(5) {
         println!(
             "{:24}: {:.2}%",
-            hanzo_examples::imagenet::CLASSES[category_idx],
+            hanzo_ml_examples::imagenet::CLASSES[category_idx],
             100. * pr
         );
     }

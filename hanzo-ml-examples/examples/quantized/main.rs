@@ -12,7 +12,7 @@ use hanzo_ml::quantized::{ggml_file, gguf_file};
 use hanzo_ml::Tensor;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_transformers::models::quantized_llama as model;
 use model::ModelWeights;
 
@@ -468,7 +468,7 @@ fn main() -> anyhow::Result<()> {
     let model_path = args.model()?;
     let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
     let mut model = match model_path.extension().and_then(|v| v.to_str()) {
         Some("gguf") => {

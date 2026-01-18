@@ -219,16 +219,16 @@ fn main() -> anyhow::Result<()> {
 
     let filenames = match &args.weight_path {
         Some(path) => {
-            hanzo_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
+            hanzo_ml_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
         }
-        _ => hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+        _ => hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
     };
     println!("retrieved the files in {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file(tokenizer_filename).expect("Tokenizer Error");
 
     let start = std::time::Instant::now();
     let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = if device.is_cuda() {
         DType::BF16
     } else {

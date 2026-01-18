@@ -293,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
     let tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg)?;
 
     let start = std::time::Instant::now();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let config = moondream::Config::v2();
     let dtype = if args.quantized {
         if args.f16 {

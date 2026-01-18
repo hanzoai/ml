@@ -156,7 +156,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let start = std::time::Instant::now();
     let api = Api::new()?;
     let repo = api.repo(Repo::with_revision(
@@ -165,7 +165,7 @@ fn main() -> Result<()> {
         args.revision,
     ));
     let tokenizer_filename = repo.get("tokenizer.json")?;
-    let filenames = hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?;
+    let filenames = hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?;
     println!("retrieved the files in {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 

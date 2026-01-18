@@ -25,7 +25,7 @@ fn valid_loss(
 }
 
 pub fn run(args: &crate::TrainingCmd, common_args: &crate::Args) -> Result<()> {
-    let device = hanzo_examples::device(common_args.cpu)?;
+    let device = hanzo_ml_examples::device(common_args.cpu)?;
     let dataset = Dataset::new(&args.pretokenized_dir)?;
     println!(
         "loaded dataset, train: {} files, valid: {} files",

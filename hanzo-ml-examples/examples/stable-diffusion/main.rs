@@ -336,7 +336,7 @@ fn save_image(
             batch + num_samples,
             timestep_ids,
         );
-        hanzo_examples::save_image(&image, image_filename)?;
+        hanzo_ml_examples::save_image(&image, image_filename)?;
     }
     Ok(())
 }
@@ -615,7 +615,7 @@ fn run(args: Args) -> Result<()> {
     };
 
     let mut scheduler = sd_config.build_scheduler(n_steps)?;
-    let device = hanzo_examples::device(cpu)?;
+    let device = hanzo_ml_examples::device(cpu)?;
     // If a seed is not given, generate a random seed and print it
     let seed = seed.unwrap_or(rand::rng().random_range(0u64..u64::MAX));
     println!("Using seed {seed}");

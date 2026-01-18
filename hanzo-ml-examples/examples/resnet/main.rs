@@ -43,9 +43,9 @@ struct Args {
 pub fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
-    let image = hanzo_examples::imagenet::load_image224(args.image)?.to_device(&device)?;
+    let image = hanzo_ml_examples::imagenet::load_image224(args.image)?.to_device(&device)?;
     println!("loaded image {image:?}");
 
     let model_file = match args.model {
@@ -64,7 +64,7 @@ pub fn main() -> anyhow::Result<()> {
         Some(model) => model.into(),
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], DType::F32, &device)? };
-    let class_count = hanzo_examples::imagenet::CLASS_COUNT as usize;
+    let class_count = hanzo_ml_examples::imagenet::CLASS_COUNT as usize;
     let model = match args.which {
         Which::Resnet18 => resnet::resnet18(class_count, vb)?,
         Which::Resnet34 => resnet::resnet34(class_count, vb)?,
@@ -82,7 +82,7 @@ pub fn main() -> anyhow::Result<()> {
     for &(category_idx, pr) in prs.iter().take(5) {
         println!(
             "{:24}: {:.2}%",
-            hanzo_examples::imagenet::CLASSES[category_idx],
+            hanzo_ml_examples::imagenet::CLASSES[category_idx],
             100. * pr
         );
     }

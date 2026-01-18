@@ -11,7 +11,7 @@ use hanzo_transformers::models::gemma::{Config as Config1, Model as Model1};
 use hanzo_transformers::models::gemma2::{Config as Config2, Model as Model2};
 use hanzo_transformers::models::gemma3::{Config as Config3, Model as Model3};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -308,14 +308,14 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>(),
         None => match args.which {
             Which::BaseV3_1B | Which::InstructV3_1B => vec![repo.get("model.safetensors")?],
-            _ => hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+            _ => hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
         },
     };
     println!("retrieved the files in {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
     let start = std::time::Instant::now();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = if device.is_cuda() {
         DType::BF16
     } else {

@@ -82,7 +82,7 @@ pub fn report(
         for b in bboxes_for_class.iter() {
             println!(
                 "{}: {:?}",
-                hanzo_examples::coco_classes::NAMES[class_index],
+                hanzo_ml_examples::coco_classes::NAMES[class_index],
                 b
             );
             let xmin = ((b.xmin * w_ratio) as u32).clamp(0, initial_w - 1);

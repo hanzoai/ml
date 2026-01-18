@@ -94,7 +94,7 @@ impl Args {
     fn build_model_and_tokenizer(
         &self,
     ) -> Result<(TaskType, DebertaV2Config, Tokenizer, Id2Label)> {
-        let device = hanzo_examples::device(self.cpu)?;
+        let device = hanzo_ml_examples::device(self.cpu)?;
 
         // Get files from either the HuggingFace API, or from a specified local directory.
         let (config_filename, tokenizer_filename, weights_filename) = {

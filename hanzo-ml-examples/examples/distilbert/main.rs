@@ -86,7 +86,7 @@ struct Args {
 
 impl Args {
     fn build_model_and_tokenizer(&self) -> Result<(ModelType, Tokenizer)> {
-        let device = hanzo_examples::device(self.cpu)?;
+        let device = hanzo_ml_examples::device(self.cpu)?;
 
         let (model_id, revision) = self.resolve_model_and_revision();
         let (config_path, tokenizer_path, weights_path) =

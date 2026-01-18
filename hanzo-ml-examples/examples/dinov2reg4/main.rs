@@ -31,9 +31,9 @@ struct Args {
 pub fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
-    let image = hanzo_examples::imagenet::load_image518(args.image)?.to_device(&device)?;
+    let image = hanzo_ml_examples::imagenet::load_image518(args.image)?.to_device(&device)?;
     println!("loaded image {image:?}");
 
     let f_species_id_mapping = "hanzo-ml-examples/examples/dinov2reg4/species_id_mapping.txt";

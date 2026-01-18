@@ -94,7 +94,7 @@ fn run(args: Args) -> Result<()> {
         };
         api.repo(hf_hub::Repo::model(name.to_string()))
     };
-    let device = hanzo_examples::device(cpu)?;
+    let device = hanzo_ml_examples::device(cpu)?;
     if let Some(seed) = args.seed {
         device.set_seed(seed)?;
     }
@@ -254,7 +254,7 @@ fn run(args: Args) -> Result<()> {
         None => "out.jpg".to_string(),
         Some(s) => format!("out-{s}.jpg"),
     };
-    hanzo_examples::save_image(&img.i(0)?, filename)?;
+    hanzo_ml_examples::save_image(&img.i(0)?, filename)?;
     Ok(())
 }
 

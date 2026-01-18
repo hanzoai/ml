@@ -61,7 +61,7 @@ fn load_images<T: AsRef<std::path::Path>>(
 ) -> anyhow::Result<Tensor> {
     let mut images = vec![];
     for path in paths {
-        let tensor = hanzo_examples::imagenet::load_image_with_std_mean(
+        let tensor = hanzo_ml_examples::imagenet::load_image_with_std_mean(
             path,
             image_size,
             &[0.0, 0.0, 0.0],
@@ -87,7 +87,7 @@ pub fn main() -> anyhow::Result<()> {
     let tokenizer = api.get("tokenizer.json")?;
     let tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg)?;
     let config = &args.which.config();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let vec_imgs = match args.images {
         Some(imgs) => imgs,
         None => vec![

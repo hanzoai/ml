@@ -93,7 +93,7 @@ fn segmentation_task(args: SegmentationArgs, device: &Device) -> anyhow::Result<
         })
         .collect();
 
-    let image = hanzo_examples::imagenet::load_image224(args.image)?
+    let image = hanzo_ml_examples::imagenet::load_image224(args.image)?
         .unsqueeze(0)?
         .to_device(device)?;
     let (vb, config) = get_vb_and_config(args.model_name, device)?;
@@ -125,7 +125,7 @@ fn segmentation_task(args: SegmentationArgs, device: &Device) -> anyhow::Result<
 }
 
 fn classification_task(args: ClassificationArgs, device: &Device) -> anyhow::Result<()> {
-    let image = hanzo_examples::imagenet::load_image224(args.image)?
+    let image = hanzo_ml_examples::imagenet::load_image224(args.image)?
         .unsqueeze(0)?
         .to_device(device)?;
     let (vb, config) = get_vb_and_config(args.model_name, device)?;
@@ -146,7 +146,7 @@ fn classification_task(args: ClassificationArgs, device: &Device) -> anyhow::Res
 
 pub fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     if let Commands::Segment(args) = args.command {
         segmentation_task(args, &device)?
     } else if let Commands::Classify(args) = args.command {

@@ -12,7 +12,7 @@ use hanzo_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelM
 use hanzo_transformers::models::qwen3::{Config as Config3, ModelForCausalLM as Model3};
 use hanzo_transformers::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -316,7 +316,7 @@ fn main() -> Result<()> {
             | WhichModel::W3_4b
             | WhichModel::W3_8b
             | WhichModel::W3MoeA3b => {
-                hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+                hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
             }
         },
     };
@@ -325,7 +325,7 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let config_file = repo.get("config.json")?;
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = if device.is_cuda() || device.is_metal() {
         DType::BF16
     } else {

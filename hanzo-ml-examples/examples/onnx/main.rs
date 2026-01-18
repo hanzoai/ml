@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use clap::{Parser, ValueEnum};
-use hanzo_examples::save_image;
+use hanzo_ml_examples::save_image;
 use hanzo_ml::{IndexOp, D};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -32,9 +32,9 @@ pub fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let image = match args.which {
         Which::SqueezeNet | Which::EfficientNet => {
-            hanzo_examples::imagenet::load_image224(&args.image)?
+            hanzo_ml_examples::imagenet::load_image224(&args.image)?
         }
-        Which::EsrGan => hanzo_examples::imagenet::load_image_with_std_mean(
+        Which::EsrGan => hanzo_ml_examples::imagenet::load_image_with_std_mean(
             &args.image,
             128,
             &[0.0f32, 0.0, 0.0],
@@ -89,7 +89,7 @@ pub fn main() -> anyhow::Result<()> {
             for &(i, p) in &top {
                 println!(
                     "{:50}: {:.2}%",
-                    hanzo_examples::imagenet::CLASSES[i],
+                    hanzo_ml_examples::imagenet::CLASSES[i],
                     p * 100.0
                 );
             }

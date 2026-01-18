@@ -487,7 +487,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let (default_model, default_revision) = if args.quantized {
         ("lmz/hanzo-ml-whisper", "main")
     } else {

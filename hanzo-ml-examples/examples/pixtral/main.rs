@@ -9,7 +9,7 @@ use clap::Parser;
 
 use hanzo_transformers::models::pixtral::{vision_model, Config, Model};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Module, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -264,11 +264,11 @@ fn main() -> Result<()> {
             .split(',')
             .map(std::path::PathBuf::from)
             .collect::<Vec<_>>(),
-        None => hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+        None => hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
     };
     println!("retrieved the files in {:?}", start.elapsed());
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = if device.supports_bf16() && !args.vision_only {
         DType::BF16
     } else {
@@ -287,7 +287,7 @@ fn main() -> Result<()> {
             Some(v) => v,
         }
     } else {
-        hanzo_examples::imagenet::load_image_with_std_mean(
+        hanzo_ml_examples::imagenet::load_image_with_std_mean(
             &args.image,
             1024,
             &[0.48145466, 0.4578275, 0.40821073],

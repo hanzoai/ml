@@ -169,7 +169,7 @@ fn main() -> Result<()> {
             serde_json::from_slice(&std::fs::read(config_file)?)?
         }
     };
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let (mut model, device) = {
         let dtype = device.bf16_default_to_f32();
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
@@ -230,14 +230,14 @@ fn main() -> Result<()> {
         let generated_tokens = Tensor::cat(&generated_tokens, 1)?.narrow(2, 0, cb)?.t()?;
         let pcm = mimi_model.decode(&generated_tokens)?;
         let pcm = pcm.i(0)?.i(0)?.to_dtype(DType::F32)?;
-        let pcm = hanzo_examples::audio::normalize_loudness(&pcm, 24_000, true)?;
+        let pcm = hanzo_ml_examples::audio::normalize_loudness(&pcm, 24_000, true)?;
         all_pcms.push(pcm);
     }
     let pcm = Tensor::cat(&all_pcms, 0)?;
     let pcm = pcm.to_vec1::<f32>()?;
     println!("writing output file {}", args.out_file);
     let mut output = std::fs::File::create(args.out_file)?;
-    hanzo_examples::wav::write_pcm_as_wav(&mut output, &pcm, 24_000)?;
+    hanzo_ml_examples::wav::write_pcm_as_wav(&mut output, &pcm, 24_000)?;
 
     Ok(())
 }
