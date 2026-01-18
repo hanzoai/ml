@@ -149,13 +149,13 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
         let buffer = device.new_buffer(el_count, dtype, "sigmoid")?;
         let encoder = device.command_encoder()?;
         encoder.set_label("sigmoid");
-        let src = candle_metal_kernels::BufferOffset {
+        let src = hanzo_metal_kernels::BufferOffset {
             buffer: storage.buffer(),
             offset_in_bytes: layout.start_offset() * storage.dtype().size_in_bytes(),
         };
 
         if layout.is_contiguous() {
-            use candle_metal_kernels::unary::contiguous;
+            use hanzo_metal_kernels::unary::contiguous;
             let kernel_name = match dtype {
                 DType::F16 => contiguous::sigmoid::HALF,
                 DType::F32 => contiguous::sigmoid::FLOAT,
@@ -164,7 +164,7 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
                     hanzo_ml::bail!("Metal contiguous unary sigmoid {dtype:?} not implemented")
                 }
             };
-            candle_metal_kernels::call_unary_contiguous(
+            hanzo_metal_kernels::call_unary_contiguous(
                 device.metal_device(),
                 &encoder,
                 device.kernels(),
@@ -176,7 +176,7 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
             )
             .map_err(MetalError::from)?;
         } else {
-            use candle_metal_kernels::unary::strided;
+            use hanzo_metal_kernels::unary::strided;
             let kernel_name = match dtype {
                 DType::F16 => strided::sigmoid::HALF,
                 DType::F32 => strided::sigmoid::FLOAT,
@@ -185,8 +185,8 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
                     hanzo_ml::bail!("Metal strided unary sigmoid {dtype:?} not implemented")
                 }
             };
-            let dst = candle_metal_kernels::BufferOffset::zero_offset(&buffer);
-            candle_metal_kernels::call_unary_strided(
+            let dst = hanzo_metal_kernels::BufferOffset::zero_offset(&buffer);
+            hanzo_metal_kernels::call_unary_strided(
                 device.metal_device(),
                 &encoder,
                 device.kernels(),
@@ -408,7 +408,7 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
         let last_dim = layout.dims()[layout.shape().rank() - 1];
         let elem_count = layout.shape().elem_count();
         let output = device.new_buffer(elem_count, storage.dtype(), "softmax")?;
-        candle_metal_kernels::call_last_softmax(
+        hanzo_metal_kernels::call_last_softmax(
             device.metal_device(),
             &encoder,
             kernels,
@@ -599,7 +599,7 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
         let last_dim = l1.dims()[l1.shape().rank() - 1];
         let elem_count = l1.shape().elem_count();
         let output = device.new_buffer(elem_count, s1.dtype(), "rmsnorm")?;
-        candle_metal_kernels::call_rms_norm(
+        hanzo_metal_kernels::call_rms_norm(
             device.metal_device(),
             &encoder,
             kernels,
@@ -845,7 +845,7 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
         let last_dim = l1.dims()[l1.shape().rank() - 1];
         let elem_count = l1.shape().elem_count();
         let output = device.new_buffer(elem_count, s1.dtype(), "layernorm")?;
-        candle_metal_kernels::call_layer_norm(
+        hanzo_metal_kernels::call_layer_norm(
             device.metal_device(),
             &encoder,
             kernels,
@@ -998,7 +998,7 @@ impl hanzo_ml::CustomOp3 for Sdpa {
         v: &hanzo_ml::MetalStorage,
         v_l: &Layout,
     ) -> Result<(hanzo_ml::MetalStorage, Shape)> {
-        use candle_metal_kernels::SdpaDType;
+        use hanzo_metal_kernels::SdpaDType;
         use hanzo_ml::backend::BackendStorage;
 
         let device = q.device();
@@ -1083,7 +1083,7 @@ impl hanzo_ml::CustomOp3 for Sdpa {
             if k_seq >= TWO_PASS_K_THRESHOLD {
                 let mut intermediate_shape = [
                     &out_dims[0..out_dims.len() - 2],
-                    &[candle_metal_kernels::SDPA_2PASS_BLOCKS],
+                    &[hanzo_metal_kernels::SDPA_2PASS_BLOCKS],
                     &[out_dims[out_dims.len() - 1]],
                 ]
                 .concat();
@@ -1105,7 +1105,7 @@ impl hanzo_ml::CustomOp3 for Sdpa {
                 )?;
 
                 encoder.set_label("vector_attention");
-                candle_metal_kernels::call_sdpa_vector_2pass(
+                hanzo_metal_kernels::call_sdpa_vector_2pass(
                     q.device().device(),
                     &encoder,
                     q.device().kernels(),
@@ -1130,7 +1130,7 @@ impl hanzo_ml::CustomOp3 for Sdpa {
                 .map_err(hanzo_ml::Error::wrap)?;
             } else {
                 encoder.set_label("vector_attention");
-                candle_metal_kernels::call_sdpa_vector(
+                hanzo_metal_kernels::call_sdpa_vector(
                     q.device().device(),
                     &encoder,
                     q.device().kernels(),
@@ -1194,7 +1194,7 @@ impl hanzo_ml::CustomOp3 for Sdpa {
                 (None, None, None)
             };
 
-            candle_metal_kernels::call_sdpa_full(
+            hanzo_metal_kernels::call_sdpa_full(
                 q.device().device(),
                 &encoder,
                 q.device().kernels(),
