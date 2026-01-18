@@ -114,7 +114,7 @@ impl PyDevice {
     }
 }
 
-impl<'source> FromPyObject<'source> for PyDevice {
+impl<'source> FromPyObject<'source, 'source> for PyDevice {
     fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
         let device: String = ob.extract()?;
         let device = match device.as_str() {
@@ -220,7 +220,7 @@ enum Indexer {
 #[derive(Debug)]
 struct TorchTensor(PyObject);
 
-impl<'source> pyo3::FromPyObject<'source> for TorchTensor {
+impl<'source> pyo3::FromPyObject<'source, 'source> for TorchTensor {
     fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
         let numpy_value: PyObject = ob.getattr("numpy")?.call0()?.extract()?;
         Ok(TorchTensor(numpy_value))

@@ -1,34 +1,7 @@
 //! Logging and monitoring
 
 use crate::Result;
-use serde::{Deserialize, Serialize};
-
-/// Logging configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoggingConfig {
-    pub wandb: Option<WandbConfig>,
-    pub tensorboard: Option<bool>,
-    pub console_level: Option<String>,
-    pub file_logging: Option<FileLoggingConfig>,
-}
-
-/// Weights & Biases configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WandbConfig {
-    pub enabled: bool,
-    pub project: String,
-    pub name: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub notes: Option<String>,
-}
-
-/// File logging configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileLoggingConfig {
-    pub enabled: bool,
-    pub path: String,
-    pub level: Option<String>,
-}
+use crate::config::{LoggingConfig, FileLoggingConfig};
 
 /// Logger trait
 pub trait Logger: Send + Sync {
