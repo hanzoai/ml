@@ -1,5 +1,5 @@
 use anyhow::Result;
-use hanzo_core::{DType, Device::Cpu, Tensor};
+use hanzo_ml::{DType, Device::Cpu, Tensor};
 
 #[test]
 fn display_scalar() -> Result<()> {

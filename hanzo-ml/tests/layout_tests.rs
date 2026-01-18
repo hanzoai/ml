@@ -1,4 +1,4 @@
-use hanzo_core as hanzo;
+use hanzo_ml as hanzo;
 use hanzo_ml::{test_device, Device, IndexOp, Result, Tensor};
 
 fn contiguous(device: &Device) -> Result<()> {

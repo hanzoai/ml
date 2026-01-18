@@ -1,4 +1,4 @@
-use hanzo_core::{test_device, test_utils, Device, IndexOp, Result, Tensor};
+use hanzo_ml::{test_device, test_utils, Device, IndexOp, Result, Tensor};
 
 // https://github.com/huggingface/hanzo/issues/364
 fn avg_pool2d(dev: &Device) -> Result<()> {

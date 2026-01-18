@@ -1,21 +1,21 @@
 /// Regression test for pth files not loading on Windows.
 #[test]
 fn test_pth() {
-    let tensors = hanzo_core::pickle::PthTensors::new("tests/test.pt", None).unwrap();
+    let tensors = hanzo_ml::pickle::PthTensors::new("tests/test.pt", None).unwrap();
     tensors.get("test").unwrap().unwrap();
 }
 
 #[test]
 fn test_pth_with_key() {
     let tensors =
-        hanzo_core::pickle::PthTensors::new("tests/test_with_key.pt", Some("model_state_dict"))
+        hanzo_ml::pickle::PthTensors::new("tests/test_with_key.pt", Some("model_state_dict"))
             .unwrap();
     tensors.get("test").unwrap().unwrap();
 }
 
 #[test]
 fn test_pth_fortran_congiguous() {
-    let tensors = hanzo_core::pickle::PthTensors::new("tests/fortran_tensor_3d.pth", None).unwrap();
+    let tensors = hanzo_ml::pickle::PthTensors::new("tests/fortran_tensor_3d.pth", None).unwrap();
     let tensor = tensors.get("tensor_fortran").unwrap().unwrap();
 
     assert_eq!(tensor.dims3().unwrap(), (2, 3, 4));

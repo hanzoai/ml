@@ -8,7 +8,7 @@ pub(crate) mod reduce;
 pub(crate) mod unary;
 pub(crate) mod where_cond;
 
-use hanzo_core::{Device, Result};
+use hanzo_ml::{Device, Result};
 
 pub(crate) trait BenchDevice {
     fn sync(&self) -> Result<()>;
@@ -24,7 +24,7 @@ impl BenchDevice for Device {
                 #[cfg(feature = "cuda")]
                 return Ok(device
                     .synchronize()
-                    .map_err(|e| hanzo_core::Error::Cuda(Box::new(e)))?);
+                    .map_err(|e| hanzo_ml::Error::Cuda(Box::new(e)))?);
                 #[cfg(not(feature = "cuda"))]
                 panic!("Cuda device without cuda feature enabled: {:?}", device)
             }

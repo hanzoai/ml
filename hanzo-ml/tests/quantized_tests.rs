@@ -1,4 +1,4 @@
-use hanzo_core::{
+use hanzo_ml::{
     bail,
     quantized::{self, GgmlDType},
     test_device,

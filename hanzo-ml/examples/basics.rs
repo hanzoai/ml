@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use hanzo_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 
 fn main() -> Result<()> {
     let a = Tensor::new(&[[0.0f32, 1.0, 2.0], [3.0, 4.0, 5.0]], &Device::Cpu)?;

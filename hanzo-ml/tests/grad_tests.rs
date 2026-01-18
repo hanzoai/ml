@@ -1,6 +1,6 @@
 #![allow(clippy::approx_constant)]
 use anyhow::{Context, Result};
-use hanzo_core::{test_device, test_utils, DType, Device, Shape, Tensor, Var};
+use hanzo_ml::{test_device, test_utils, DType, Device, Shape, Tensor, Var};
 
 fn simple_grad(device: &Device) -> Result<()> {
     let x = Var::new(&[3f32, 1., 4.], device)?;
@@ -515,11 +515,11 @@ fn test_flip_backprop() -> Result<()> {
 
     let y = x.matmul(&weights)?;
     let expected_y = Tensor::from_vec(vec![4.0, 6.0, 4.0, 6.0], (2, 2), device)?;
-    hanzo_core::test_utils::assert_tensor_eq(&y, &expected_y)?;
+    hanzo_ml::test_utils::assert_tensor_eq(&y, &expected_y)?;
 
     let z = y.flip(&[1])?;
     let expected_z = Tensor::from_vec(vec![6.0, 4.0, 6.0, 4.0], (2, 2), device)?;
-    hanzo_core::test_utils::assert_tensor_eq(&z, &expected_z)?;
+    hanzo_ml::test_utils::assert_tensor_eq(&z, &expected_z)?;
 
     let loss = z.sum_all()?;
 
@@ -530,7 +530,7 @@ fn test_flip_backprop() -> Result<()> {
     let dloss_dy = Tensor::ones((2, 2), DType::F64, device)?;
     // dloss/dx = dloss/dy @ dy/dx = ones @ weight.flip.T
     let expected_grad = dloss_dy.matmul(&flipped_weights.t()?)?;
-    hanzo_core::test_utils::assert_tensor_eq(grad_x, &expected_grad)?;
+    hanzo_ml::test_utils::assert_tensor_eq(grad_x, &expected_grad)?;
 
     Ok(())
 }
