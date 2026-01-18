@@ -4,7 +4,7 @@ pub use hanzo_transformers::models::quantized_t5::{
     Config, T5EncoderModel, T5ForConditionalGeneration, VarBuilder,
 };
 
-use hanzo_wasm_example_t5::console_log;
+use hanzo_ml_wasm_example_t5::console_log;
 use tokenizers::Tokenizer;
 use wasm_bindgen::prelude::*;
 const DEVICE: Device = Device::Cpu;

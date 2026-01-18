@@ -1,4 +1,4 @@
-use hanzo_wasm_example_whisper::worker::{Decoder as D, ModelData};
+use hanzo_ml_wasm_example_whisper::worker::{Decoder as D, ModelData};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]

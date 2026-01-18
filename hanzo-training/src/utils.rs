@@ -132,13 +132,13 @@ impl ConfigValidator {
     pub fn validate_paths(config: &crate::config::TrainingConfig) -> Result<()> {
         // Check if dataset path exists
         if !Path::new(&config.dataset.path).exists() {
-            return Err(format!("Dataset path does not exist: {}", config.dataset.path).into());
+            return Err(anyhow::anyhow!("Dataset path does not exist: {}", config.dataset.path));
         }
 
         // Check if checkpoint path exists (if specified)
         if let Some(checkpoint) = &config.model.checkpoint {
             if !checkpoint.starts_with("http") && !Path::new(checkpoint).exists() {
-                return Err(format!("Checkpoint path does not exist: {}", checkpoint).into());
+                return Err(anyhow::anyhow!("Checkpoint path does not exist: {}", checkpoint));
             }
         }
 
@@ -160,11 +160,11 @@ impl ConfigValidator {
                     .unwrap_or(0);
                 
                 Device::cuda_if_available(device_id)
-                    .map_err(|e| format!("CUDA device not available: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("CUDA device not available: {}", e))?;
             }
             #[cfg(not(feature = "cuda"))]
             {
-                return Err("CUDA support not compiled".into());
+                return Err(anyhow::anyhow!("CUDA support not compiled"));
             }
         }
 

@@ -192,8 +192,9 @@ impl Trainer {
 
         // Accumulate gradients over batch
         for sample_idx in start_idx..end_idx {
-            if let Ok(sample) = self.dataset.get_item(sample_idx) {
-                let loss = self.model.forward(&sample.input_ids)?;
+            if let Ok(sample) = self.dataset.get(sample_idx) {
+                let input_tensor = sample.input_ids(&self.device)?;
+                let loss = self.model.forward(&input_tensor)?;
                 self.model.backward(&loss)?;
                 
                 // Extract scalar loss value (simplified)
@@ -225,9 +226,10 @@ impl Trainer {
         let mut valid_samples = 0;
 
         for i in 0..num_eval_samples {
-            if let Ok(sample) = self.dataset.get_item(i) {
+            if let Ok(sample) = self.dataset.get(i) {
                 // Forward pass only (no gradients)
-                let loss = self.model.forward(&sample.input_ids)?;
+                let input_tensor = sample.input_ids(&self.device)?;
+                let loss = self.model.forward(&input_tensor)?;
                 let loss_val = loss.to_vec1::<f32>()?[0] as f64;
                 eval_loss += loss_val;
                 valid_samples += 1;
@@ -267,7 +269,7 @@ impl Trainer {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             Device::cuda_if_available(device_id)
-                .map_err(|e| format!("Failed to setup CUDA device: {}", e).into())
+                .map_err(|e| anyhow::anyhow!("Failed to setup CUDA device: {}", e))
         } else if device_str == "metal" {
             #[cfg(feature = "metal")]
             {
@@ -276,7 +278,7 @@ impl Trainer {
             }
             #[cfg(not(feature = "metal"))]
             {
-                Err("Metal support not enabled".into())
+                Err(anyhow::anyhow!("Metal support not enabled"))
             }
         } else {
             Ok(Device::Cpu)
@@ -284,28 +286,16 @@ impl Trainer {
     }
 
     /// Load dataset based on configuration
-    fn load_dataset(config: &TrainingConfig, device: &Device) -> Result<Box<dyn Dataset>> {
+    fn load_dataset(config: &TrainingConfig, _device: &Device) -> Result<Box<dyn Dataset>> {
         let dataset: Box<dyn Dataset> = match config.dataset.name.as_str() {
-            "zen-agentic" => Box::new(ZenAgenticDataset::new(
-                &config.dataset.path,
-                config.dataset.max_seq_length,
-                device.clone(),
-            )?),
-            "zen-identity" => Box::new(ZenIdentityDataset::new(
-                &config.dataset.path,
-                config.dataset.max_seq_length,
-                device.clone(),
-            )?),
+            "zen-agentic" => Box::new(ZenAgenticDataset::load(&config.dataset.path)?),
+            "zen-identity" => Box::new(ZenIdentityDataset::load(&config.dataset.path)?),
+            "jsonl" => Box::new(JsonlDataset::load(&config.dataset.path)?),
             _ => {
                 // Default to generic JSONL dataset
-                Box::new(JsonlDataset::new(
-                    &config.dataset.path,
-                    config.dataset.max_seq_length,
-                    device.clone(),
-                )?)
+                Box::new(JsonlDataset::load(&config.dataset.path)?)
             }
         };
-
         Ok(dataset)
     }
 
