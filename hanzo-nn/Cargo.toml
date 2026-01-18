@@ -12,6 +12,7 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 hanzo-ml = { workspace = true }
+hanzo-metal-kernels = { workspace = true, optional = true }
 half = { workspace = true }
 thiserror = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
@@ -35,7 +36,7 @@ accelerate = ["dep:accelerate-src", "hanzo-ml/accelerate"]
 cuda = ["hanzo-ml/cuda"]
 cudnn = ["hanzo-ml/cudnn"]
 mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl"]
-metal = ["hanzo-ml/metal", "dep:objc2-metal"]
+metal = ["hanzo-ml/metal", "dep:hanzo-metal-kernels", "dep:objc2-metal"]
 
 [[bench]]
 name = "bench_main"
