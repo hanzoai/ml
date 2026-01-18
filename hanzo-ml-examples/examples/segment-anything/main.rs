@@ -7,10 +7,10 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
+use clap::Parser;
 use hanzo_ml::DType;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::segment_anything::sam;
-use clap::Parser;
 
 #[derive(Parser)]
 struct Args {

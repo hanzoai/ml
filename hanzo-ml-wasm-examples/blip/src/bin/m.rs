@@ -1,10 +1,10 @@
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_wasm_example_blip::console_log;
+use hanzo_ml_wasm_example_blip::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::blip;
 use hanzo_transformers::models::quantized_blip;
-use hanzo_ml_wasm_example_blip::console_log;
-use hanzo_ml_wasm_example_blip::token_output_stream::TokenOutputStream;
 use js_sys::Date;
 use tokenizers::Tokenizer;
 use wasm_bindgen::prelude::*;

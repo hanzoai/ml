@@ -255,8 +255,8 @@ impl Model {
         let vb = weights.var_builder(&config, &dev)?;
         let cache = Cache::new(true, &config, vb.pp("rot"))?;
         let llama = Llama::load(vb, &cache, &config)?;
-        let tokenizer =
-            Tokenizer::from_bytes(&md.tokenizer).map_err(|m| hanzo_ml::Error::Msg(m.to_string()))?;
+        let tokenizer = Tokenizer::from_bytes(&md.tokenizer)
+            .map_err(|m| hanzo_ml::Error::Msg(m.to_string()))?;
         Ok(Self {
             cache,
             config,

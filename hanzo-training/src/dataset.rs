@@ -2,9 +2,9 @@
 
 use crate::Result;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetConfig {
@@ -24,10 +24,8 @@ impl TrainingSample {
     /// Convert input text to tensor (simplified tokenization)
     pub fn input_ids(&self, device: &hanzo_ml::Device) -> crate::Result<hanzo_ml::Tensor> {
         // This is a simplified implementation - in practice you'd use a proper tokenizer
-        let tokens: Vec<u32> = self.input.chars()
-            .map(|c| c as u32)
-            .collect();
-        
+        let tokens: Vec<u32> = self.input.chars().map(|c| c as u32).collect();
+
         hanzo_ml::Tensor::new(tokens, device)
             .map_err(|e| anyhow::anyhow!("Failed to create input tensor: {}", e))
     }
@@ -57,11 +55,11 @@ impl BasicDataset {
             samples: Vec::new(),
         }
     }
-    
+
     pub fn add_sample(&mut self, sample: TrainingSample) {
         self.samples.push(sample);
     }
-    
+
     pub fn load<P: AsRef<Path>>(path: P, config: &DatasetConfig) -> Result<Self> {
         // Placeholder implementation
         Ok(BasicDataset::new(config.name.clone()))
@@ -72,16 +70,17 @@ impl Dataset for BasicDataset {
     fn name(&self) -> &str {
         &self.name
     }
-    
+
     fn len(&self) -> usize {
         self.samples.len()
     }
-    
+
     fn get(&self, index: usize) -> Result<&TrainingSample> {
-        self.samples.get(index)
+        self.samples
+            .get(index)
             .ok_or_else(|| anyhow::anyhow!("Index {} out of bounds", index))
     }
-    
+
     fn iter(&self) -> Box<dyn Iterator<Item = &TrainingSample> + '_> {
         Box::new(self.samples.iter())
     }
@@ -95,7 +94,7 @@ pub struct ZenAgenticDataset {
 impl ZenAgenticDataset {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut dataset = BasicDataset::new("zen-agentic".to_string());
-        
+
         // Load from zen-agentic-dataset directory
         let path = path.as_ref();
         if path.exists() {
@@ -103,7 +102,7 @@ impl ZenAgenticDataset {
             // This would typically load from the actual zen-agentic-dataset format
             log::info!("Loading Zen Agentic Dataset from {:?}", path);
         }
-        
+
         Ok(Self { dataset })
     }
 }
@@ -112,15 +111,15 @@ impl Dataset for ZenAgenticDataset {
     fn name(&self) -> &str {
         self.dataset.name()
     }
-    
+
     fn len(&self) -> usize {
         self.dataset.len()
     }
-    
+
     fn get(&self, index: usize) -> Result<&TrainingSample> {
         self.dataset.get(index)
     }
-    
+
     fn iter(&self) -> Box<dyn Iterator<Item = &TrainingSample> + '_> {
         self.dataset.iter()
     }
@@ -134,10 +133,10 @@ pub struct ZenIdentityDataset {
 impl ZenIdentityDataset {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut dataset = BasicDataset::new("zen-identity".to_string());
-        
+
         // Load identity training data
         log::info!("Loading Zen Identity Dataset from {:?}", path.as_ref());
-        
+
         Ok(Self { dataset })
     }
 }
@@ -146,15 +145,15 @@ impl Dataset for ZenIdentityDataset {
     fn name(&self) -> &str {
         self.dataset.name()
     }
-    
+
     fn len(&self) -> usize {
         self.dataset.len()
     }
-    
+
     fn get(&self, index: usize) -> Result<&TrainingSample> {
         self.dataset.get(index)
     }
-    
+
     fn iter(&self) -> Box<dyn Iterator<Item = &TrainingSample> + '_> {
         self.dataset.iter()
     }
@@ -174,16 +173,16 @@ struct JsonlSample {
 impl JsonlDataset {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut dataset = BasicDataset::new("jsonl".to_string());
-        
+
         let file = File::open(&path)?;
         let reader = BufReader::new(file);
-        
+
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            
+
             match serde_json::from_str::<JsonlSample>(&line) {
                 Ok(sample) => {
                     dataset.add_sample(TrainingSample {
@@ -196,9 +195,12 @@ impl JsonlDataset {
                 }
             }
         }
-        
-        log::info!("Loaded {} samples from JSONL dataset", dataset.samples.len());
-        
+
+        log::info!(
+            "Loaded {} samples from JSONL dataset",
+            dataset.samples.len()
+        );
+
         Ok(Self { dataset })
     }
 }
@@ -207,15 +209,15 @@ impl Dataset for JsonlDataset {
     fn name(&self) -> &str {
         self.dataset.name()
     }
-    
+
     fn len(&self) -> usize {
         self.dataset.len()
     }
-    
+
     fn get(&self, index: usize) -> Result<&TrainingSample> {
         self.dataset.get(index)
     }
-    
+
     fn iter(&self) -> Box<dyn Iterator<Item = &TrainingSample> + '_> {
         self.dataset.iter()
     }

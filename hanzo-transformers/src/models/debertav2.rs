@@ -1238,11 +1238,8 @@ impl DebertaV2NERModel {
 
         let deberta = DebertaV2Model::load(vb.clone(), config)?;
         let dropout = hanzo_nn::Dropout::new(config.hidden_dropout_prob as f32);
-        let classifier: hanzo_nn::Linear = hanzo_nn::linear_no_bias(
-            config.hidden_size,
-            id2label_len,
-            vb.root().pp("classifier"),
-        )?;
+        let classifier: hanzo_nn::Linear =
+            hanzo_nn::linear_no_bias(config.hidden_size, id2label_len, vb.root().pp("classifier"))?;
 
         Ok(Self {
             device: vb.device().clone(),

@@ -3,8 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hanzo_training::{
-    evaluation::{BenchmarkRunner, PerplexityBenchmark, AccuracyBenchmark},
-    init_logging
+    evaluation::{AccuracyBenchmark, BenchmarkRunner, PerplexityBenchmark},
+    init_logging,
 };
 use std::path::PathBuf;
 use tracing::info;
@@ -25,27 +25,27 @@ enum Commands {
         /// Path to trained model
         #[arg(short, long, value_name = "PATH")]
         model: PathBuf,
-        
+
         /// Output directory for results
         #[arg(short, long, value_name = "DIR")]
         output: Option<PathBuf>,
     },
-    
+
     /// Run specific benchmark
     Benchmark {
         /// Path to trained model
         #[arg(short, long, value_name = "PATH")]
         model: PathBuf,
-        
+
         /// Benchmark name
         #[arg(short, long, value_name = "NAME")]
         benchmark: String,
-        
+
         /// Output directory for results
         #[arg(short, long, value_name = "DIR")]
         output: Option<PathBuf>,
     },
-    
+
     /// List available benchmarks
     List,
 }
@@ -56,15 +56,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::All { model, output } => {
-            run_all_benchmarks(model, output).await
-        }
-        Commands::Benchmark { model, benchmark, output } => {
-            run_single_benchmark(model, benchmark, output).await
-        }
-        Commands::List => {
-            list_benchmarks().await
-        }
+        Commands::All { model, output } => run_all_benchmarks(model, output).await,
+        Commands::Benchmark {
+            model,
+            benchmark,
+            output,
+        } => run_single_benchmark(model, benchmark, output).await,
+        Commands::List => list_benchmarks().await,
     }
 }
 
@@ -103,9 +101,13 @@ async fn run_all_benchmarks(model_path: PathBuf, output_dir: Option<PathBuf>) ->
 async fn run_single_benchmark(
     model_path: PathBuf,
     benchmark_name: String,
-    output_dir: Option<PathBuf>
+    output_dir: Option<PathBuf>,
 ) -> Result<()> {
-    info!("Running {} benchmark for model: {}", benchmark_name, model_path.display());
+    info!(
+        "Running {} benchmark for model: {}",
+        benchmark_name,
+        model_path.display()
+    );
 
     let benchmark: Box<dyn hanzo_training::evaluation::Benchmark> = match benchmark_name.as_str() {
         "perplexity" => Box::new(PerplexityBenchmark::new()),
@@ -147,6 +149,6 @@ async fn list_benchmarks() -> Result<()> {
     println!("Usage:");
     println!("  hanzo-eval all --model ./path/to/model");
     println!("  hanzo-eval benchmark --model ./path/to/model --benchmark perplexity");
-    
+
     Ok(())
 }

@@ -1,6 +1,9 @@
 //! Optimizer implementations for training
 
-use crate::{config::{TrainingParameters, OptimizerType, SchedulerType}, Result};
+use crate::{
+    config::{OptimizerType, SchedulerType, TrainingParameters},
+    Result,
+};
 use hanzo_ml::Tensor;
 
 /// Optimizer configuration
@@ -55,14 +58,15 @@ impl OptimizerWrapper {
                 SchedulerType::Linear => {
                     if let Some(warmup_steps) = self.config.warmup_steps {
                         if self.step_count < warmup_steps {
-                            self.current_lr = self.config.learning_rate * 
-                                (self.step_count as f64 / warmup_steps as f64);
+                            self.current_lr = self.config.learning_rate
+                                * (self.step_count as f64 / warmup_steps as f64);
                         }
                     }
                 }
                 SchedulerType::Cosine => {
                     // Simplified cosine decay
-                    let decay_factor = 0.5 * (1.0 + (self.step_count as f64 * std::f64::consts::PI / 1000.0).cos());
+                    let decay_factor = 0.5
+                        * (1.0 + (self.step_count as f64 * std::f64::consts::PI / 1000.0).cos());
                     self.current_lr = self.config.learning_rate * decay_factor;
                 }
                 _ => {

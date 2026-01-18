@@ -55,22 +55,30 @@ impl CustomOp1 for NonZero {
             hanzo_ml::CpuStorage::F8E4M3(vs) => self.nonzero(vs, layout),
             // Dummy types don't support nonzero operation
             hanzo_ml::CpuStorage::F6E2M3(_) => {
-                return Err(
-                    hanzo_ml::Error::UnsupportedDTypeForOp(hanzo_ml::DType::F6E2M3, "nonzero").bt(),
+                return Err(hanzo_ml::Error::UnsupportedDTypeForOp(
+                    hanzo_ml::DType::F6E2M3,
+                    "nonzero",
                 )
+                .bt())
             }
             hanzo_ml::CpuStorage::F6E3M2(_) => {
-                return Err(
-                    hanzo_ml::Error::UnsupportedDTypeForOp(hanzo_ml::DType::F6E3M2, "nonzero").bt(),
+                return Err(hanzo_ml::Error::UnsupportedDTypeForOp(
+                    hanzo_ml::DType::F6E3M2,
+                    "nonzero",
                 )
+                .bt())
             }
             hanzo_ml::CpuStorage::F4(_) => {
-                return Err(hanzo_ml::Error::UnsupportedDTypeForOp(hanzo_ml::DType::F4, "nonzero").bt())
+                return Err(
+                    hanzo_ml::Error::UnsupportedDTypeForOp(hanzo_ml::DType::F4, "nonzero").bt(),
+                )
             }
             hanzo_ml::CpuStorage::F8E8M0(_) => {
-                return Err(
-                    hanzo_ml::Error::UnsupportedDTypeForOp(hanzo_ml::DType::F8E8M0, "nonzero").bt(),
+                return Err(hanzo_ml::Error::UnsupportedDTypeForOp(
+                    hanzo_ml::DType::F8E8M0,
+                    "nonzero",
                 )
+                .bt())
             }
         };
         let index_len = layout.dims().len();
