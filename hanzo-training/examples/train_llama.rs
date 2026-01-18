@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     info!("Training time: {}", utils::format_duration(result.training_time));
 
     // Save final model
-    trainer.save_checkpoint("./output/llama3-8b-zen-agentic")?;
+    trainer.save_checkpoint(std::path::Path::new("./output/llama3-8b-zen-agentic"))?;
     info!("💾 Model saved to ./output/llama3-8b-zen-agentic");
 
     Ok(())
