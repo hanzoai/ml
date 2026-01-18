@@ -1,7 +1,7 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
 use criterion::{black_box, criterion_group, Criterion, Throughput};
 use half::{bf16, f16};
-use hanzo_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use std::time::Instant;
 
 fn run_sum(a: &Tensor) {
@@ -33,7 +33,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     }
 }
 
-fn run_reduce<T: hanzo_core::FloatDType>(
+fn run_reduce<T: hanzo_ml::FloatDType>(
     c: &mut Criterion,
     device: &Device,
     (lo, up): (T, T),
@@ -94,7 +94,7 @@ fn run_reduce<T: hanzo_core::FloatDType>(
     group.finish();
 }
 
-fn run_arg_reduce<T: hanzo_core::FloatDType>(
+fn run_arg_reduce<T: hanzo_ml::FloatDType>(
     c: &mut Criterion,
     device: &Device,
     (lo, up): (T, T),

@@ -5,7 +5,7 @@ extern crate accelerate_src;
 extern crate intel_mkl_src;
 
 use anyhow::Result;
-use hanzo_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 // xs: [1024, 64, 1924], c Tensor[dims 128, 64, 8; f32, cuda:0] Conv1dConfig { padding: 0, stride: 4, dilation: 1, groups: 1 }
 fn main() -> Result<()> {
     let device = Device::new_cuda(0)?;

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use hanzo_core::{Device, IndexOp, Tensor};
+use hanzo_ml::{Device, IndexOp, Tensor};
 
 #[test]
 fn integer_index() -> Result<()> {

@@ -1,4 +1,4 @@
-use hanzo_core::{test_device, test_utils, DType, Device, IndexOp, Result, Tensor, D};
+use hanzo_ml::{test_device, test_utils, DType, Device, IndexOp, Result, Tensor, D};
 
 fn zeros(device: &Device) -> Result<()> {
     let tensor = Tensor::zeros((5, 2), DType::F32, device)?;
@@ -1663,7 +1663,7 @@ test_device!(zero_dim, zero_dim_cpu, zero_dim_gpu, zero_dim_metal);
 fn randn_hasneg() -> Result<()> {
     let t = Tensor::randn(0f32, 1f32, 200, &Device::Cpu)?.to_vec1::<f32>()?;
     if t.iter().all(|&v| v >= 0.) {
-        hanzo_core::bail!("all values in tensors are non-negative")
+        hanzo_ml::bail!("all values in tensors are non-negative")
     }
     Ok(())
 }
@@ -1814,7 +1814,7 @@ fn test_flip_1d() -> Result<()> {
     let flipped = t.flip(&[0])?;
     // Expected: [4, 3, 2, 1, 0]
     let expected = Tensor::from_vec(vec![4.0, 3.0, 2.0, 1.0, 0.0], (5,), &Device::Cpu)?;
-    hanzo_core::test_utils::assert_tensor_eq(&flipped, &expected)?;
+    hanzo_ml::test_utils::assert_tensor_eq(&flipped, &expected)?;
     Ok(())
 }
 
@@ -1829,7 +1829,7 @@ fn test_flip_2d() -> Result<()> {
     // [[5, 4, 3],
     //  [2, 1, 0]]
     let expected = Tensor::from_vec(vec![5.0, 4.0, 3.0, 2.0, 1.0, 0.0], (2, 3), &Device::Cpu)?;
-    hanzo_core::test_utils::assert_tensor_eq(&flipped, &expected)?;
+    hanzo_ml::test_utils::assert_tensor_eq(&flipped, &expected)?;
     Ok(())
 }
 
@@ -1854,7 +1854,7 @@ fn test_flip_3d_channels() -> Result<()> {
         (2, 2, 3),
         &Device::Cpu,
     )?;
-    hanzo_core::test_utils::assert_tensor_eq(&flipped, &expected)?;
+    hanzo_ml::test_utils::assert_tensor_eq(&flipped, &expected)?;
     Ok(())
 }
 

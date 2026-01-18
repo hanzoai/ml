@@ -1,5 +1,5 @@
 use anyhow::Result;
-use hanzo_core::{test_device, test_utils, Device, IndexOp, Tensor};
+use hanzo_ml::{test_device, test_utils, Device, IndexOp, Tensor};
 
 /* This test is based on the following script.
 import torch
@@ -415,7 +415,7 @@ print(w.grad[0])
 */
 fn conv2d_grad(dev: &Device) -> Result<()> {
     // conv-transposes are not implemented for metal
-    use hanzo_core::Var;
+    use hanzo_ml::Var;
     let t = Var::from_slice(
         &[
             0.4056f32, -0.8689, -0.0773, -1.5630, -2.8012, -1.5059, 0.3972, 1.0852, 0.4997, 3.0616,
