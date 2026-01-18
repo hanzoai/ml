@@ -1,6 +1,6 @@
 use hanzo_ml::{DType, Device, Tensor};
-use hanzo_nn::VarBuilder;
 use hanzo_ml_wasm_example_sam as sam;
+use hanzo_nn::VarBuilder;
 use wasm_bindgen::prelude::*;
 
 struct Embeddings {

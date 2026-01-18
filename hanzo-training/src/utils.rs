@@ -14,11 +14,11 @@ pub fn estimate_training_time(
     let total_tokens = dataset_size * epochs;
     let batches = (dataset_size + batch_size - 1) / batch_size;
     let total_batches = batches * epochs;
-    
+
     // Rough estimation based on model size and throughput
     let time_per_batch = (batch_size as f64) / (tokens_per_second as f64);
     let total_time = (total_batches as f64) * time_per_batch;
-    
+
     total_time
 }
 
@@ -31,16 +31,16 @@ pub fn estimate_memory_requirements(
 ) -> usize {
     // Model parameters
     let model_memory = model_parameters * precision_bytes;
-    
+
     // Gradients (same size as model)
     let gradient_memory = model_parameters * precision_bytes;
-    
+
     // Optimizer states (Adam: 2x model size)
     let optimizer_memory = model_parameters * precision_bytes * 2;
-    
+
     // Activations (rough estimate)
     let activation_memory = batch_size * sequence_length * 1024 * precision_bytes;
-    
+
     model_memory + gradient_memory + optimizer_memory + activation_memory
 }
 
@@ -49,12 +49,12 @@ pub fn format_bytes(bytes: usize) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
     let mut unit_index = 0;
-    
+
     while size >= 1024.0 && unit_index < UNITS.len() - 1 {
         size /= 1024.0;
         unit_index += 1;
     }
-    
+
     format!("{:.2} {}", size, UNITS[unit_index])
 }
 
@@ -63,7 +63,7 @@ pub fn format_duration(seconds: f64) -> String {
     let hours = (seconds / 3600.0) as u64;
     let minutes = ((seconds % 3600.0) / 60.0) as u64;
     let secs = (seconds % 60.0) as u64;
-    
+
     if hours > 0 {
         format!("{}h {}m {}s", hours, minutes, secs)
     } else if minutes > 0 {
@@ -76,23 +76,26 @@ pub fn format_duration(seconds: f64) -> String {
 /// Create output directory structure
 pub fn create_output_dirs<P: AsRef<Path>>(base_dir: P) -> Result<()> {
     let base_dir = base_dir.as_ref();
-    
+
     // Create main output directory
     std::fs::create_dir_all(base_dir)?;
-    
+
     // Create subdirectories
     std::fs::create_dir_all(base_dir.join("checkpoints"))?;
     std::fs::create_dir_all(base_dir.join("logs"))?;
     std::fs::create_dir_all(base_dir.join("tensorboard"))?;
     std::fs::create_dir_all(base_dir.join("evaluation"))?;
-    
+
     Ok(())
 }
 
 /// Generate a unique run name based on timestamp and config
 pub fn generate_run_name(config: &crate::config::TrainingConfig) -> String {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    format!("{}_{}_{}", config.model.name, config.dataset.name, timestamp)
+    format!(
+        "{}_{}_{}",
+        config.model.name, config.dataset.name, timestamp
+    )
 }
 
 /// Progress bar wrapper
@@ -132,13 +135,19 @@ impl ConfigValidator {
     pub fn validate_paths(config: &crate::config::TrainingConfig) -> Result<()> {
         // Check if dataset path exists
         if !Path::new(&config.dataset.path).exists() {
-            return Err(anyhow::anyhow!("Dataset path does not exist: {}", config.dataset.path));
+            return Err(anyhow::anyhow!(
+                "Dataset path does not exist: {}",
+                config.dataset.path
+            ));
         }
 
         // Check if checkpoint path exists (if specified)
         if let Some(checkpoint) = &config.model.checkpoint {
             if !checkpoint.starts_with("http") && !Path::new(checkpoint).exists() {
-                return Err(anyhow::anyhow!("Checkpoint path does not exist: {}", checkpoint));
+                return Err(anyhow::anyhow!(
+                    "Checkpoint path does not exist: {}",
+                    checkpoint
+                ));
             }
         }
 
@@ -147,7 +156,7 @@ impl ConfigValidator {
 
     pub fn validate_hardware(config: &crate::config::TrainingConfig) -> Result<()> {
         let device_str = config.device();
-        
+
         if device_str.starts_with("cuda") {
             // Check if CUDA is available
             #[cfg(feature = "cuda")]
@@ -158,7 +167,7 @@ impl ConfigValidator {
                     .nth(1)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
-                
+
                 Device::cuda_if_available(device_id)
                     .map_err(|e| anyhow::anyhow!("CUDA device not available: {}", e))?;
             }

@@ -485,8 +485,7 @@ impl StreamingTransformerLayer {
         let (norm1, norm2) = match cfg.norm {
             super::NormType::LayerNorm => {
                 let norm1 = hanzo_nn::layer_norm(d_model, 1e-5, vb.pp("input_layernorm"))?;
-                let norm2 =
-                    hanzo_nn::layer_norm(d_model, 1e-5, vb.pp("post_attention_layernorm"))?;
+                let norm2 = hanzo_nn::layer_norm(d_model, 1e-5, vb.pp("post_attention_layernorm"))?;
                 (Norm::LayerNorm(norm1), Norm::LayerNorm(norm2))
             }
             super::NormType::RmsNorm => {

@@ -1,7 +1,7 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
+use criterion::{black_box, criterion_group, Criterion};
 use hanzo_ml::{DType, Device, Module, Tensor};
 use hanzo_nn::LayerNorm;
-use criterion::{black_box, criterion_group, Criterion};
 use std::time::Instant;
 
 fn run(input: &Tensor, weight: &Tensor, bias: &Tensor) {

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use hanzo_training::{TrainingConfig, Trainer, init_logging};
+use hanzo_training::{init_logging, Trainer, TrainingConfig};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -46,33 +46,33 @@ enum Commands {
         /// Configuration file
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
-        
+
         /// Override dataset path
         #[arg(short, long, value_name = "PATH")]
         dataset: Option<PathBuf>,
-        
+
         /// Override output directory
         #[arg(short, long, value_name = "DIR")]
         output: Option<PathBuf>,
-        
+
         /// Resume from checkpoint
         #[arg(long, value_name = "PATH")]
         resume: Option<PathBuf>,
     },
-    
+
     /// Validate configuration
     Validate {
         /// Configuration file to validate
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
     },
-    
+
     /// Create a template configuration
     Template {
         /// Output path for template
         #[arg(short, long, value_name = "FILE")]
         output: PathBuf,
-        
+
         /// Template type
         #[arg(short, long, default_value = "qwen")]
         template: String,
@@ -90,15 +90,14 @@ async fn main() -> Result<()> {
     init_logging()?;
 
     match &cli.command {
-        Some(Commands::Train { config, dataset, output, resume }) => {
-            train_command(config, dataset, output, resume).await
-        }
-        Some(Commands::Validate { config }) => {
-            validate_command(config).await
-        }
-        Some(Commands::Template { output, template }) => {
-            template_command(output, template).await
-        }
+        Some(Commands::Train {
+            config,
+            dataset,
+            output,
+            resume,
+        }) => train_command(config, dataset, output, resume).await,
+        Some(Commands::Validate { config }) => validate_command(config).await,
+        Some(Commands::Template { output, template }) => template_command(output, template).await,
         None => {
             // Legacy mode - use global args
             if let Some(config) = cli.config {
@@ -155,7 +154,7 @@ async fn train_command(
     // Start training
     info!("Starting training...");
     let result = trainer.train()?;
-    
+
     info!("Training completed successfully!");
     info!("Final loss: {:.6}", result.final_loss);
     info!("Total steps: {}", result.total_steps);
@@ -166,18 +165,24 @@ async fn train_command(
 
 async fn validate_command(config_path: &PathBuf) -> Result<()> {
     info!("Validating configuration: {}", config_path.display());
-    
+
     let config = TrainingConfig::from_file(config_path)?;
     config.validate()?;
-    
+
     println!("✅ Configuration is valid");
     println!("📋 Summary:");
-    println!("  Model: {} ({})", config.model.name, config.model.architecture);
-    println!("  Dataset: {} ({})", config.dataset.name, config.dataset.path);
+    println!(
+        "  Model: {} ({})",
+        config.model.name, config.model.architecture
+    );
+    println!(
+        "  Dataset: {} ({})",
+        config.dataset.name, config.dataset.path
+    );
     println!("  Batch size: {}", config.training.batch_size);
     println!("  Learning rate: {}", config.training.learning_rate);
     println!("  Device: {}", config.device());
-    
+
     if config.is_lora_enabled() {
         if let Some(lora) = &config.training.lora {
             println!("  LoRA: enabled (r={}, α={})", lora.r, lora.alpha);
@@ -307,11 +312,11 @@ fn create_llama_template() -> TrainingConfig {
     config.model.hidden_size = Some(4096);
     config.model.num_layers = Some(32);
     config.model.num_heads = Some(32);
-    
+
     if let Some(ref mut preprocessing) = config.dataset.preprocessing {
         preprocessing.tokenizer = "meta-llama/Meta-Llama-3-8B-Instruct".to_string();
     }
-    
+
     config
 }
 
@@ -324,11 +329,11 @@ fn create_mistral_template() -> TrainingConfig {
     config.model.hidden_size = Some(4096);
     config.model.num_layers = Some(32);
     config.model.num_heads = Some(32);
-    
+
     if let Some(ref mut preprocessing) = config.dataset.preprocessing {
         preprocessing.tokenizer = "mistralai/Mistral-7B-Instruct-v0.2".to_string();
     }
-    
+
     config
 }
 
@@ -339,12 +344,12 @@ fn create_identity_template() -> TrainingConfig {
     config.training.learning_rate = 1e-4;
     config.training.epochs = Some(3);
     config.training.max_steps = Some(5000);
-    
+
     if let Some(ref mut wandb) = config.logging.as_mut().and_then(|l| l.wandb.as_mut()) {
         wandb.name = Some("qwen3-4b-zen-identity".to_string());
         wandb.tags = Some(vec!["qwen".to_string(), "identity".to_string()]);
         wandb.notes = Some("Identity fine-tuning on zen-identity-dataset".to_string());
     }
-    
+
     config
 }

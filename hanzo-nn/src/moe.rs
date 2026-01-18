@@ -15,9 +15,9 @@ pub fn moe_gemm(
     topk: usize,
     is_prefill: bool,
 ) -> Result<Tensor> {
+    use half::{bf16, f16};
     use hanzo_ml::cuda_backend::cudarc::driver::DevicePtr;
     use hanzo_ml::DType;
-    use half::{bf16, f16};
 
     fn cuda_fwd<
         T: hanzo_ml::cuda_backend::CudaDType + hanzo_ml::cuda_backend::cudarc::driver::DeviceRepr,
@@ -175,10 +175,10 @@ pub fn moe_gemm_gguf(
     is_prefill: bool,
     dtype: hanzo_ml::DType,
 ) -> Result<Tensor> {
+    use half::{bf16, f16};
     use hanzo_ml::cuda_backend::cudarc::driver::DevicePtr;
     use hanzo_ml::quantized::GgmlDType;
     use hanzo_ml::DType;
-    use half::{bf16, f16};
 
     fn cuda_fwd(
         input: &Tensor,
@@ -245,8 +245,8 @@ pub fn moe_gemm_gguf(
 
         let output = unsafe { dev.alloc::<f32>(size_m * size_n) }?;
         let stream = dev.cuda_stream().cu_stream() as i64;
-        use hanzo_ml::op::BackpropOp;
         use core::ffi::c_void;
+        use hanzo_ml::op::BackpropOp;
 
         assert!(size_k % 8 == 0, "size_k must divisible by 8");
         unsafe {

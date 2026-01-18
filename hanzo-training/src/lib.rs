@@ -14,16 +14,15 @@ pub mod utils;
 
 // Re-exports
 pub use config::{
-    TrainingConfig, ModelConfig, DatasetConfig, TrainingParameters,
-    EvaluationConfig, LoggingConfig,
+    DatasetConfig, EvaluationConfig, LoggingConfig, ModelConfig, TrainingConfig, TrainingParameters,
 };
-pub use dataset::{Dataset, TrainingSample, ZenAgenticDataset, ZenIdentityDataset, JsonlDataset};
-pub use evaluation::{Benchmark, BenchmarkRunner, PerplexityBenchmark, AccuracyBenchmark};
-pub use trainer::Trainer;
+pub use dataset::{Dataset, JsonlDataset, TrainingSample, ZenAgenticDataset, ZenIdentityDataset};
+pub use evaluation::{AccuracyBenchmark, Benchmark, BenchmarkRunner, PerplexityBenchmark};
+pub use logging::{ConsoleLogger, Logger, MultiLogger};
+pub use metrics::{EvaluationMetrics, MetricsCollector, TrainingMetrics};
 pub use model::TrainableModel;
 pub use optimizer::OptimizerConfig;
-pub use metrics::{TrainingMetrics, MetricsCollector, EvaluationMetrics};
-pub use logging::{Logger, ConsoleLogger, MultiLogger};
+pub use trainer::Trainer;
 
 // Use anyhow for error handling
 pub type Result<T> = anyhow::Result<T>;
@@ -33,8 +32,10 @@ pub fn init_logging() -> Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "hanzo_training=info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "hanzo_training=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .try_init()
         .map_err(|e| anyhow::anyhow!("Failed to initialize logging: {}", e))?;
