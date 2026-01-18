@@ -114,12 +114,13 @@ impl PyDevice {
     }
 }
 
-impl<'source> FromPyObject<'source, 'source> for PyDevice {
-    fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
+impl<'py> FromPyObject<'py> for PyDevice {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
         let device: String = ob.extract()?;
         let device = match device.as_str() {
             "cpu" => PyDevice::Cpu,
             "cuda" => PyDevice::Cuda,
+            "metal" => PyDevice::Metal,
             _ => Err(PyTypeError::new_err(format!("invalid device '{device}'")))?,
         };
         Ok(device)
@@ -205,6 +206,10 @@ trait MapDType {
             DType::F16 => self.f::<f16>(t),
             DType::F32 => self.f::<f32>(t),
             DType::F64 => self.f::<f64>(t),
+            dt => Err(PyTypeError::new_err(format!(
+                "dtype {:?} is not yet supported in Python bindings",
+                dt
+            )))?,
         }
     }
 }
@@ -220,8 +225,8 @@ enum Indexer {
 #[derive(Debug)]
 struct TorchTensor(PyObject);
 
-impl<'source> pyo3::FromPyObject<'source, 'source> for TorchTensor {
-    fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
+impl<'py> pyo3::FromPyObject<'py> for TorchTensor {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
         let numpy_value: PyObject = ob.getattr("numpy")?.call0()?.extract()?;
         Ok(TorchTensor(numpy_value))
     }
