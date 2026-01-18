@@ -1,7 +1,7 @@
-use hanzo_core::backend::BackendStorage;
-use hanzo_core::cpu_backend;
-use hanzo_core::test_utils::to_vec1_round;
-use hanzo_core::{CpuStorage, CustomOp1, DType, Device, Error, Layout, Result, Shape, Tensor};
+use hanzo_ml::backend::BackendStorage;
+use hanzo_ml::cpu_backend;
+use hanzo_ml::test_utils::to_vec1_round;
+use hanzo_ml::{CpuStorage, CustomOp1, DType, Device, Error, Layout, Result, Shape, Tensor};
 
 fn fwd<T: num_traits::Float>(v: T, alpha: f64) -> T {
     if v.is_sign_positive() {
@@ -22,7 +22,7 @@ impl CustomOp1 for Elu {
     }
 
     fn cpu_fwd(&self, s: &CpuStorage, l: &Layout) -> Result<(CpuStorage, Shape)> {
-        let storage = hanzo_core::map_dtype!(
+        let storage = hanzo_ml::map_dtype!(
             "elu",
             s,
             |s| cpu_backend::unary_map(s, l, |v| fwd(v, self.alpha)),
@@ -65,7 +65,7 @@ impl CustomOp1 for EluBackward {
     }
 
     fn cpu_fwd(&self, s: &CpuStorage, l: &Layout) -> Result<(CpuStorage, Shape)> {
-        let storage = hanzo_core::map_dtype!(
+        let storage = hanzo_ml::map_dtype!(
             "elu-bwd",
             s,
             |s| cpu_backend::unary_map(s, l, |v| bwd(v, self.alpha)),
@@ -102,7 +102,7 @@ impl CustomOp1 for EluWithBackward {
 #[test]
 fn custom_op1_with_backward() -> Result<()> {
     let cpu = &Device::Cpu;
-    let t = hanzo_core::Var::new(&[-2f32, 0f32, 2f32], cpu)?;
+    let t = hanzo_ml::Var::new(&[-2f32, 0f32, 2f32], cpu)?;
     let elu_t = t.apply_op1(EluWithBackward::new(2.))?;
     assert_eq!(to_vec1_round(&elu_t, 4)?, &[-1.7293, 0.0, 2.0]);
 
@@ -113,7 +113,7 @@ fn custom_op1_with_backward() -> Result<()> {
     Ok(())
 }
 
-impl hanzo_core::InplaceOp1 for Elu {
+impl hanzo_ml::InplaceOp1 for Elu {
     fn name(&self) -> &'static str {
         "elu"
     }
@@ -125,7 +125,7 @@ impl hanzo_core::InplaceOp1 for Elu {
             CpuStorage::F16(s) => s.iter_mut().for_each(|v| *v = fwd(*v, alpha)),
             CpuStorage::F32(s) => s.iter_mut().for_each(|v| *v = fwd(*v, alpha)),
             CpuStorage::F64(s) => s.iter_mut().for_each(|v| *v = fwd(*v, alpha)),
-            _ => hanzo_core::bail!("unsupported dtype for inplace elu"),
+            _ => hanzo_ml::bail!("unsupported dtype for inplace elu"),
         }
         Ok(())
     }
@@ -160,14 +160,14 @@ fn ug_op() -> Result<()> {
         let opts: ug::lower_op::Opts = Default::default();
         kernel.lower(&opts)?
     };
-    let device = if hanzo_core::utils::cuda_is_available() {
+    let device = if hanzo_ml::utils::cuda_is_available() {
         Device::new_cuda(0)?
-    } else if hanzo_core::utils::metal_is_available() {
+    } else if hanzo_ml::utils::metal_is_available() {
         Device::new_metal(0)?
     } else {
-        hanzo_core::bail!("metal/cuda is mandatory for this test")
+        hanzo_ml::bail!("metal/cuda is mandatory for this test")
     };
-    let op = hanzo_core::UgIOp1::new("test", kernel, &device)?;
+    let op = hanzo_ml::UgIOp1::new("test", kernel, &device)?;
     let t = Tensor::arange(0u32, 12u32, &device)?.to_dtype(DType::F32)?;
     t.inplace_op1(&op)?;
     assert_eq!(

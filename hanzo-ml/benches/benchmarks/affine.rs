@@ -1,6 +1,6 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
 use criterion::{black_box, criterion_group, Criterion, Throughput};
-use hanzo_core::{DType, Device, Tensor};
+use hanzo_ml::{DType, Device, Tensor};
 use std::time::Instant;
 
 fn run(a: &Tensor) {

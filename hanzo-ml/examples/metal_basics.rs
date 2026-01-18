@@ -5,7 +5,7 @@ extern crate accelerate_src;
 extern crate intel_mkl_src;
 
 use anyhow::Result;
-use hanzo_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 
 fn main() -> Result<()> {
     // This requires the code to be run with MTL_CAPTURE_ENABLED=1

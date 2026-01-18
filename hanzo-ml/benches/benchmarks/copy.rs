@@ -1,6 +1,6 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
 use criterion::{black_box, criterion_group, Criterion, Throughput};
-use hanzo_core::{Device, Tensor, WithDType};
+use hanzo_ml::{Device, Tensor, WithDType};
 use std::time::Instant;
 
 fn run_copy_mask_benchmark<D: WithDType>(c: &mut Criterion, device: &Device, name: &str) {

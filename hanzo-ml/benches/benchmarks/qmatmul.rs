@@ -1,6 +1,6 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
 use criterion::{black_box, criterion_group, Criterion, Throughput};
-use hanzo_core::{
+use hanzo_ml::{
     quantized::{self, GgmlDType, QMatMul},
     Device, Module, Tensor,
 };
