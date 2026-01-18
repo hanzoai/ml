@@ -12,8 +12,8 @@ use hanzo_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelM
 use hanzo_transformers::models::qwen3::{Config as Config3, ModelForCausalLM as Model3};
 use hanzo_transformers::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3};
 
-use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};

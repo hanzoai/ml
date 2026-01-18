@@ -45,7 +45,8 @@ impl Logger for ConsoleLogger {
     }
 }
 
-/// File logger implementation  
+/// File logger implementation
+#[allow(dead_code)]
 pub struct FileLogger {
     path: String,
     level: String,
