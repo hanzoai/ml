@@ -5,21 +5,19 @@ use std::path::Path;
 
 /// Calculate estimated training time based on model size and dataset
 pub fn estimate_training_time(
-    model_parameters: usize,
+    _model_parameters: usize,
     dataset_size: usize,
     batch_size: usize,
     epochs: usize,
     tokens_per_second: usize,
 ) -> f64 {
-    let total_tokens = dataset_size * epochs;
-    let batches = (dataset_size + batch_size - 1) / batch_size;
+    let _total_tokens = dataset_size * epochs;
+    let batches = dataset_size.div_ceil(batch_size);
     let total_batches = batches * epochs;
 
     // Rough estimation based on model size and throughput
     let time_per_batch = (batch_size as f64) / (tokens_per_second as f64);
-    let total_time = (total_batches as f64) * time_per_batch;
-
-    total_time
+    (total_batches as f64) * time_per_batch
 }
 
 /// Calculate memory requirements for training

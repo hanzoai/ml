@@ -83,11 +83,17 @@ pub struct AccuracyBenchmark {
     name: String,
 }
 
-impl AccuracyBenchmark {
-    pub fn new() -> Self {
+impl Default for AccuracyBenchmark {
+    fn default() -> Self {
         Self {
             name: "accuracy".to_string(),
         }
+    }
+}
+
+impl AccuracyBenchmark {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
