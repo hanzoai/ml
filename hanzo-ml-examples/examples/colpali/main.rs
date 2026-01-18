@@ -222,7 +222,7 @@ fn main() -> Result<()> {
             .split(',')
             .map(std::path::PathBuf::from)
             .collect::<Vec<_>>(),
-        None => hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+        None => hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
     };
 
     let start = std::time::Instant::now();
@@ -232,7 +232,7 @@ fn main() -> Result<()> {
     println!("retrieved the files in {:?}", start.elapsed());
 
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
-    let device = hanzo_examples::device(false)?;
+    let device = hanzo_ml_examples::device(false)?;
     let dtype = if device.is_cuda() {
         DType::BF16
     } else {

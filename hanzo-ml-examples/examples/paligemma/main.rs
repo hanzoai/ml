@@ -9,7 +9,7 @@ use clap::Parser;
 
 use hanzo_transformers::models::paligemma::{Config, Model};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -237,12 +237,12 @@ fn main() -> Result<()> {
             .split(',')
             .map(std::path::PathBuf::from)
             .collect::<Vec<_>>(),
-        None => hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+        None => hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
     };
     println!("retrieved the files in {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = if device.is_cuda() {
         DType::BF16
     } else {

@@ -183,7 +183,7 @@ fn run_eval(args: &EvaluationCmd, common_args: &Args) -> Result<()> {
 
     let tokenizer = common_args.tokenizer()?;
 
-    let device = hanzo_examples::device(common_args.cpu)?;
+    let device = hanzo_ml_examples::device(common_args.cpu)?;
     let mut file = std::fs::File::open(config_path)?;
     let config = Config::from_reader(&mut file)?;
     let weights = TransformerWeights::from_reader(&mut file, &config, &device)?;
@@ -255,7 +255,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
 
     let tokenizer = common_args.tokenizer()?;
 
-    let device = hanzo_examples::device(common_args.cpu)?;
+    let device = hanzo_ml_examples::device(common_args.cpu)?;
     #[cfg(feature = "cuda")]
     if let hanzo_ml::Device::Cuda(d) = &device {
         unsafe {
@@ -334,7 +334,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
         .map_err(E::msg)?
         .get_ids()
         .to_vec();
-    let mut tokenizer = hanzo_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+    let mut tokenizer = hanzo_ml_examples::token_output_stream::TokenOutputStream::new(tokenizer);
 
     let start_gen = std::time::Instant::now();
     for index in 0.. {

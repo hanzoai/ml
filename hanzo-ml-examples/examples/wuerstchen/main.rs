@@ -229,7 +229,7 @@ fn run(args: Args) -> Result<()> {
         None
     };
 
-    let device = hanzo_examples::device(cpu)?;
+    let device = hanzo_ml_examples::device(cpu)?;
     let height = height.unwrap_or(1024);
     let width = width.unwrap_or(1024);
 
@@ -372,7 +372,7 @@ fn run(args: Args) -> Result<()> {
             .to_dtype(DType::U8)?
             .i(0)?;
         let image_filename = output_filename(&final_image, idx + 1, num_samples, None);
-        hanzo_examples::save_image(&image, image_filename)?
+        hanzo_ml_examples::save_image(&image, image_filename)?
     }
     Ok(())
 }

@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 mod model;
 use model::{Config, Model};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Module, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -267,7 +267,7 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, DType::F32, &device)? };
     let model = Model::new(&config, vb.pp("backbone"))?;
     println!("loaded the model in {:?}", start.elapsed());

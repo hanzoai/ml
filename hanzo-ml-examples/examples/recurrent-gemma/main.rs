@@ -10,7 +10,7 @@ use clap::Parser;
 use hanzo_transformers::models::quantized_recurrent_gemma::Model as QModel;
 use hanzo_transformers::models::recurrent_gemma::{Config, Model as BModel};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
@@ -277,7 +277,7 @@ fn main() -> Result<()> {
                 let filename = api.model("lmz/hanzo-ml-gemma".to_string()).get(filename)?;
                 vec![filename]
             } else {
-                hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+                hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
             }
         }
     };
@@ -286,7 +286,7 @@ fn main() -> Result<()> {
     let config: Config = serde_json::from_reader(std::fs::File::open(config_filename)?)?;
 
     let start = std::time::Instant::now();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = if device.is_cuda() {
         DType::BF16
     } else {

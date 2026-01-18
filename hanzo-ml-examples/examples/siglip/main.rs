@@ -126,7 +126,7 @@ pub fn main() -> anyhow::Result<()> {
     };
     let tokenizer = get_tokenizer(hf_repo, args.tokenizer)?;
     let config: siglip::Config = serde_json::from_slice(&std::fs::read(config_file)?)?;
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let vec_imgs = match args.images {
         Some(imgs) => imgs,
         None => vec![

@@ -208,14 +208,14 @@ fn main() -> Result<()> {
     };
     let filenames = match args.weight_file {
         Some(weight_file) => vec![std::path::PathBuf::from(weight_file)],
-        None => hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+        None => hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
     };
     println!("retrieved the files in {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
     let start = std::time::Instant::now();
     let config = Config::glm3_6b();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, DType::F32, &device)? };
     let model = Model::new(&config, vb)?;
 

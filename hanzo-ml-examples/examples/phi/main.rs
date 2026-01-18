@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::{Parser, ValueEnum};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
 use hanzo_transformers::models::phi::{Config as PhiConfig, Model as Phi};
 use hanzo_transformers::models::phi3::{Config as Phi3Config, Model as Phi3};
@@ -329,7 +329,7 @@ fn main() -> Result<()> {
                     | WhichModel::V3
                     | WhichModel::V3Medium
                     | WhichModel::V4Mini => {
-                        hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+                        hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
                     }
                     WhichModel::PuffinPhiV2 => vec![repo.get("model-puffin-phi-v2.safetensors")?],
                     WhichModel::PhiHermes => vec![repo.get("model-phi-hermes-1_3B.safetensors")?],
@@ -351,7 +351,7 @@ fn main() -> Result<()> {
             panic!("use the quantized or quantized-phi examples for quantized phi-v3")
         }
     };
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let model = if args.quantized {
         let config = config();
         let vb = hanzo_transformers::quantized_var_builder::VarBuilder::from_gguf(

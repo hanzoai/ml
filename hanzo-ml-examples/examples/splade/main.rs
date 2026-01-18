@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     let config: Config = serde_json::from_str(&config)?;
     let mut tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = bert::DTYPE;
 
     let vb = if weights_filename.ends_with("model.safetensors") {

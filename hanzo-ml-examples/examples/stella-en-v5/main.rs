@@ -366,7 +366,7 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = DType::F32;
 
     let base_vb =

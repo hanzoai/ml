@@ -79,7 +79,7 @@ pub fn main() -> anyhow::Result<()> {
     };
     let tokenizer = get_tokenizer(args.tokenizer)?;
     let config = clip::ClipConfig::vit_base_patch32();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let vec_imgs = match args.images {
         Some(imgs) => imgs,
         None => vec![
