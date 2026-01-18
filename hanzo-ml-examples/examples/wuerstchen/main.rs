@@ -8,8 +8,8 @@ use hanzo_transformers::models::stable_diffusion;
 use hanzo_transformers::models::wuerstchen;
 
 use anyhow::{Error as E, Result};
-use hanzo_ml::{DType, Device, IndexOp, Tensor};
 use clap::Parser;
+use hanzo_ml::{DType, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
 const PRIOR_GUIDANCE_SCALE: f64 = 4.0;
@@ -313,9 +313,8 @@ fn run(args: Args) -> Result<()> {
     println!("Building the vqgan.");
     let vqgan = {
         let file = ModelFile::VqGan.get(vqgan_weights)?;
-        let vb = unsafe {
-            hanzo_nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)?
-        };
+        let vb =
+            unsafe { hanzo_nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)? };
         wuerstchen::paella_vq::PaellaVQ::new(vb)?
     };
 
@@ -324,9 +323,8 @@ fn run(args: Args) -> Result<()> {
     // https://huggingface.co/warp-ai/wuerstchen/blob/main/decoder/config.json
     let decoder = {
         let file = ModelFile::Decoder.get(decoder_weights)?;
-        let vb = unsafe {
-            hanzo_nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)?
-        };
+        let vb =
+            unsafe { hanzo_nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)? };
         wuerstchen::diffnext::WDiffNeXt::new(
             /* c_in */ DECODER_CIN,
             /* c_out */ DECODER_CIN,

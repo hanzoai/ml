@@ -1,7 +1,7 @@
 //! Training metrics and evaluation utilities
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Training metrics collected during training
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,18 +78,16 @@ impl MetricsCollector {
         if self.metrics.is_empty() {
             return None;
         }
-        
+
         let start = if self.metrics.len() > last_n {
             self.metrics.len() - last_n
         } else {
             0
         };
-        
-        let sum: f64 = self.metrics[start..].iter()
-            .map(|m| m.loss)
-            .sum();
+
+        let sum: f64 = self.metrics[start..].iter().map(|m| m.loss).sum();
         let count = self.metrics.len() - start;
-        
+
         Some(sum / count as f64)
     }
 

@@ -1,7 +1,7 @@
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_wasm_example_bert::console_log;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::bert::{BertModel, Config};
-use hanzo_ml_wasm_example_bert::console_log;
 use tokenizers::{PaddingParams, Tokenizer};
 use wasm_bindgen::prelude::*;
 

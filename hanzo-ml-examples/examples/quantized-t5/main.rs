@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use hanzo_transformers::models::quantized_t5 as t5;
 
 use anyhow::{Error as E, Result};
+use clap::{Parser, ValueEnum};
 use hanzo_ml::{Device, Tensor};
 use hanzo_transformers::generation::LogitsProcessor;
-use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, api::sync::ApiRepo, Repo, RepoType};
 use tokenizers::Tokenizer;
 

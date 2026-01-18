@@ -9,8 +9,8 @@ use clap::Parser;
 
 use hanzo_transformers::models::deepseek2::{DeepSeekV2, DeepSeekV2Config};
 
-use hanzo_ml::{DType, Device, Tensor};
 use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};

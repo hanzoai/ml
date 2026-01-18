@@ -1,10 +1,10 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
-pub use hanzo_kernels as kernels;
 pub use cudarc;
 use cudarc::driver::CudaFunction;
 use float8::F8E4M3;
 use half::{bf16, f16};
+pub use hanzo_kernels as kernels;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 

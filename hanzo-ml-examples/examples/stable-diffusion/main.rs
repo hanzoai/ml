@@ -8,8 +8,8 @@ use hanzo_transformers::models::stable_diffusion;
 use std::ops::Div;
 
 use anyhow::{Error as E, Result};
-use hanzo_ml::{DType, Device, IndexOp, Module, Tensor, D};
 use clap::Parser;
+use hanzo_ml::{DType, Device, IndexOp, Module, Tensor, D};
 use rand::Rng;
 use stable_diffusion::vae::AutoEncoderKL;
 use tokenizers::Tokenizer;

@@ -153,7 +153,8 @@ pub fn hub_load_local_safetensors<P: AsRef<std::path::Path>>(
 ) -> Result<Vec<std::path::PathBuf>> {
     let path = path.as_ref();
     let jsfile = std::fs::File::open(path.join(json_file))?;
-    let json: serde_json::Value = serde_json::from_reader(&jsfile).map_err(hanzo_ml::Error::wrap)?;
+    let json: serde_json::Value =
+        serde_json::from_reader(&jsfile).map_err(hanzo_ml::Error::wrap)?;
     let weight_map = match json.get("weight_map") {
         None => hanzo_ml::bail!("no weight map in {json_file:?}"),
         Some(serde_json::Value::Object(map)) => map,

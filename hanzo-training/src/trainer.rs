@@ -1,11 +1,11 @@
 //! Core trainer implementation
 
 use crate::{
-    config::TrainingConfig, 
-    dataset::{Dataset, ZenAgenticDataset, ZenIdentityDataset, JsonlDataset}, 
-    model::{TrainableModel, ModelWrapper},
-    optimizer::{OptimizerWrapper, OptimizerConfig},
-    Result
+    config::TrainingConfig,
+    dataset::{Dataset, JsonlDataset, ZenAgenticDataset, ZenIdentityDataset},
+    model::{ModelWrapper, TrainableModel},
+    optimizer::{OptimizerConfig, OptimizerWrapper},
+    Result,
 };
 use hanzo_ml::Device;
 use std::time::Instant;
@@ -70,7 +70,7 @@ impl Trainer {
     pub fn train(&mut self) -> Result<TrainingResult> {
         info!("Starting training...");
         let start_time = Instant::now();
-        
+
         let mut total_loss = 0.0;
         let mut step_count = 0;
         let mut best_eval_loss = None;
@@ -112,7 +112,10 @@ impl Trainer {
             // Save checkpoint
             if let Some(save_steps) = self.config.training.save_steps {
                 if self.current_step % save_steps == 0 {
-                    let checkpoint_path = std::path::PathBuf::from(format!("./checkpoint-step-{}", self.current_step));
+                    let checkpoint_path = std::path::PathBuf::from(format!(
+                        "./checkpoint-step-{}",
+                        self.current_step
+                    ));
                     if let Err(e) = self.save_checkpoint(&checkpoint_path) {
                         warn!("Failed to save checkpoint: {}", e);
                     } else {
@@ -148,9 +151,9 @@ impl Trainer {
         let dataset_len = self.dataset.len();
         let batch_size = self.config.training.batch_size;
         let num_batches = (dataset_len + batch_size - 1) / batch_size;
-        
+
         let mut epoch_loss = 0.0;
-        
+
         for batch_idx in 0..num_batches {
             let batch_loss = self.train_step(batch_idx)?;
             epoch_loss += batch_loss;
@@ -183,10 +186,10 @@ impl Trainer {
     fn train_step(&mut self, batch_idx: usize) -> Result<f64> {
         let batch_size = self.config.training.batch_size;
         let dataset_len = self.dataset.len();
-        
+
         let start_idx = batch_idx * batch_size;
         let end_idx = (start_idx + batch_size).min(dataset_len);
-        
+
         let mut batch_loss = 0.0;
         let mut valid_samples = 0;
 
@@ -196,7 +199,7 @@ impl Trainer {
                 let input_tensor = sample.input_ids(&self.device)?;
                 let loss = self.model.forward(&input_tensor)?;
                 self.model.backward(&loss)?;
-                
+
                 // Extract scalar loss value (simplified)
                 let loss_val = loss.to_vec1::<f32>()?[0] as f64;
                 batch_loss += loss_val;
@@ -206,7 +209,7 @@ impl Trainer {
 
         if valid_samples > 0 {
             batch_loss /= valid_samples as f64;
-            
+
             // Apply gradients
             self.optimizer.step(self.model.parameters())?;
             self.optimizer.zero_grad(self.model.parameters())?;
@@ -218,7 +221,7 @@ impl Trainer {
     /// Evaluate the model
     pub fn evaluate(&self) -> Result<f64> {
         info!("Running evaluation...");
-        
+
         // For now, just compute loss on a subset of training data
         // In practice, you'd use a separate validation dataset
         let num_eval_samples = 100.min(self.dataset.len());
@@ -261,7 +264,7 @@ impl Trainer {
     /// Setup device for training
     fn setup_device(config: &TrainingConfig) -> Result<Device> {
         let device_str = config.device();
-        
+
         if device_str.starts_with("cuda") {
             let device_id = device_str
                 .split(':')

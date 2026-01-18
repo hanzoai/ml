@@ -4,9 +4,9 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use hanzo_ml::{IndexOp, D};
-use hanzo_examples::save_image;
 use clap::{Parser, ValueEnum};
+use hanzo_examples::save_image;
+use hanzo_ml::{IndexOp, D};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Which {

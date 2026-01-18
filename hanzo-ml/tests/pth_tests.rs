@@ -15,8 +15,7 @@ fn test_pth_with_key() {
 
 #[test]
 fn test_pth_fortran_congiguous() {
-    let tensors =
-        hanzo_core::pickle::PthTensors::new("tests/fortran_tensor_3d.pth", None).unwrap();
+    let tensors = hanzo_core::pickle::PthTensors::new("tests/fortran_tensor_3d.pth", None).unwrap();
     let tensor = tensors.get("tensor_fortran").unwrap().unwrap();
 
     assert_eq!(tensor.dims3().unwrap(), (2, 3, 4));

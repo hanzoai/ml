@@ -426,13 +426,8 @@ impl ImageEncoderViT {
             )?;
             blocks.push(block)
         }
-        let neck_conv1 = hanzo_nn::conv2d_no_bias(
-            embed_dim,
-            out_chans,
-            1,
-            Default::default(),
-            vb.pp("neck.0"),
-        )?;
+        let neck_conv1 =
+            hanzo_nn::conv2d_no_bias(embed_dim, out_chans, 1, Default::default(), vb.pp("neck.0"))?;
         let neck_ln1 = super::LayerNorm2d::new(out_chans, 1e-6, vb.pp("neck.1"))?;
         let cfg = hanzo_nn::Conv2dConfig {
             padding: 1,

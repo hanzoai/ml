@@ -5,10 +5,10 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
+use clap::{Parser, ValueEnum};
 use hanzo_ml::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::snac::{Config, Model};
-use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::Api;
 
 mod audio_io;

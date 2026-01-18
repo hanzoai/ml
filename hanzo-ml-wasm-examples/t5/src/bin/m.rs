@@ -1,8 +1,8 @@
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_wasm_example_t5::console_log;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 pub use hanzo_transformers::models::t5::{Config, T5EncoderModel, T5ForConditionalGeneration};
-use hanzo_ml_wasm_example_t5::console_log;
 use tokenizers::Tokenizer;
 use wasm_bindgen::prelude::*;
 #[wasm_bindgen]

@@ -1,19 +1,19 @@
 //! Example: Train Qwen3-4B on zen-agentic-dataset
 
 use anyhow::Result;
-use hanzo_training::{TrainingConfig, Trainer, init_logging};
+use hanzo_training::{init_logging, Trainer, TrainingConfig};
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     init_logging()?;
-    
+
     info!("🚀 Starting Qwen3-4B training on zen-agentic-dataset");
 
     // Load configuration
     let config = TrainingConfig::from_file("configs/zen-agentic-qwen4b.yaml")?;
-    
+
     // Validate configuration
     config.validate()?;
     info!("✅ Configuration validated");

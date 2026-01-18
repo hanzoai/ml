@@ -5,9 +5,9 @@ extern crate accelerate_src;
 extern crate intel_mkl_src;
 
 use anyhow::{Error as E, Result};
+use clap::{Parser, ValueEnum};
 use hanzo_ml::{Device, IndexOp, Tensor};
 use hanzo_nn::{ops::softmax, VarBuilder};
-use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use rand::{distr::Distribution, SeedableRng};
 use tokenizers::Tokenizer;

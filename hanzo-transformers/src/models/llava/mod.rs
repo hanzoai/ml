@@ -14,9 +14,9 @@ use crate::models::clip::vision_model::{ClipVisionConfig, ClipVisionTransformer}
 use crate::models::llama::{Cache, Llama};
 use crate::models::with_tracing::linear;
 
+use fancy_regex::Regex;
 use hanzo_ml::{bail, Context, Device, IndexOp, Result, Tensor};
 use hanzo_nn::{seq, Activation, Module, Sequential, VarBuilder};
-use fancy_regex::Regex;
 use utils::get_anyres_image_grid_shape;
 
 use config::LLaVAConfig;
