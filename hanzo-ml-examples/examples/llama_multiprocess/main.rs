@@ -121,7 +121,7 @@ fn main() -> Result<()> {
     let config_filename = api.get("config.json")?;
     let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
     let tokenizer_filename = api.get("tokenizer.json")?;
-    let filenames = hanzo_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?;
+    let filenames = hanzo_ml_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?;
 
     let rank = match args.rank {
         None => {
@@ -192,7 +192,7 @@ fn main() -> Result<()> {
         .map_err(E::msg)?
         .get_ids()
         .to_vec();
-    let mut tokenizer = hanzo_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+    let mut tokenizer = hanzo_ml_examples::token_output_stream::TokenOutputStream::new(tokenizer);
 
     println!("starting the inference loop");
     let temperature = if args.temperature <= 0. {

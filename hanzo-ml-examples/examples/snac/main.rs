@@ -87,7 +87,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let model_sample_rate = args.which.sample_rate();
     let config = match args.config {
         Some(c) => std::path::PathBuf::from(c),
@@ -169,7 +169,7 @@ fn main() -> Result<()> {
             let pcm = model.decode(&codes)?;
             println!("output pcm shape: {:?}", pcm.shape());
             let pcm = pcm.i(0)?.i(0)?;
-            let pcm = hanzo_examples::audio::normalize_loudness(&pcm, model_sample_rate, true)?;
+            let pcm = hanzo_ml_examples::audio::normalize_loudness(&pcm, model_sample_rate, true)?;
             let pcm = pcm.to_vec1::<f32>()?;
             if args.out_file == "-" {
                 let (stream, ad) = audio_io::setup_output_stream()?;
@@ -189,7 +189,7 @@ fn main() -> Result<()> {
                 drop(stream)
             } else {
                 let mut output = std::fs::File::create(&args.out_file)?;
-                hanzo_examples::wav::write_pcm_as_wav(&mut output, &pcm, model_sample_rate)?;
+                hanzo_ml_examples::wav::write_pcm_as_wav(&mut output, &pcm, model_sample_rate)?;
             }
         }
     }

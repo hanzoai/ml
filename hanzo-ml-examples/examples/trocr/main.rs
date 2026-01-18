@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::Error as E;
 use clap::{Parser, ValueEnum};
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::{trocr, vit};
@@ -78,7 +78,7 @@ pub fn main() -> anyhow::Result<()> {
         let tokenizer = Tokenizer::from_file(&tokenizer_file).map_err(E::msg)?;
         TokenOutputStream::new(tokenizer)
     };
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
 
     let vb = {
         let model = match args.model {

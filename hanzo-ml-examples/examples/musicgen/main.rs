@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     use tokenizers::Tokenizer;
 
     let args = Args::parse();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let tokenizer = match args.tokenizer {
         Some(tokenizer) => std::path::PathBuf::from(tokenizer),
         None => Api::new()?

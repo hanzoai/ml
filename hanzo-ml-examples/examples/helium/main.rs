@@ -12,7 +12,7 @@ use hanzo_transformers::models::llama::{
     Cache as CacheV1, Llama as ModelV1, LlamaConfig as ConfigV1, LlamaEosToks,
 };
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
@@ -311,7 +311,7 @@ fn main() -> Result<()> {
         Which::V1Preview => Config::Preview(serde_json::from_slice(&std::fs::read(config_file)?)?),
         Which::V1 => Config::V1(serde_json::from_slice(&std::fs::read(config_file)?)?),
     };
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let (model, device) = {
         let dtype = device.bf16_default_to_f32();
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };

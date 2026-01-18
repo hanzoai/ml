@@ -57,7 +57,7 @@ impl Args {
                 .split(',')
                 .map(std::path::PathBuf::from)
                 .collect::<Vec<_>>(),
-            None => hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+            None => hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
         };
 
         let tokenizer_file = match &self.tokenizer {
@@ -65,7 +65,7 @@ impl Args {
             None => repo.get("tokenizer.json")?,
         };
 
-        let device = hanzo_examples::device(self.cpu)?;
+        let device = hanzo_ml_examples::device(self.cpu)?;
 
         let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_file).map_err(E::msg)?;
 

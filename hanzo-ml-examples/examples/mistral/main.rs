@@ -10,7 +10,7 @@ use clap::Parser;
 use hanzo_transformers::models::mistral::{Config, Model as Mistral};
 use hanzo_transformers::models::quantized_mistral::Model as QMistral;
 
-use hanzo_examples::token_output_stream::TokenOutputStream;
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
@@ -298,7 +298,7 @@ fn main() -> Result<()> {
             if args.quantized {
                 vec![repo.get("model-q4k.gguf")?]
             } else {
-                hanzo_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+                hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
             }
         }
     };
@@ -317,7 +317,7 @@ fn main() -> Result<()> {
             }
         }
     };
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let (model, device) = if args.quantized {
         let filename = &filenames[0];
         let vb =

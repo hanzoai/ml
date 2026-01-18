@@ -140,7 +140,7 @@ fn main() -> Result<()> {
     println!("retrieved the files in {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let model = hanzo_onnx::read_file(model_id)?;
 
     println!("loaded the model in {:?}", start.elapsed());

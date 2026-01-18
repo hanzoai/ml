@@ -136,7 +136,7 @@ fn main() -> Result<()> {
         None
     };
 
-    let device = hanzo_examples::device(args.cpu)?;
+    let device = hanzo_ml_examples::device(args.cpu)?;
     let dtype = match args.dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("bf16") => DType::BF16,
@@ -188,7 +188,7 @@ fn main() -> Result<()> {
             | Which::V32_3b
             | Which::V32_3bInstruct
             | Which::Solar10_7B => {
-                hanzo_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
+                hanzo_ml_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
             }
             Which::SmolLM2_360M
             | Which::SmolLM2_360MInstruct
@@ -219,7 +219,7 @@ fn main() -> Result<()> {
         .map_err(E::msg)?
         .get_ids()
         .to_vec();
-    let mut tokenizer = hanzo_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+    let mut tokenizer = hanzo_ml_examples::token_output_stream::TokenOutputStream::new(tokenizer);
 
     println!("starting the inference loop");
     print!("{prompt}");
