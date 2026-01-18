@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use std::str::FromStr;
 
 use anyhow::Result;
-use hanzo_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 
 fn cos_sin(n: usize, device: &Device) -> Result<Tensor> {
     let thetas: Vec<_> = (0..n).map(|i| (i as f32 / n as f32)).collect();
