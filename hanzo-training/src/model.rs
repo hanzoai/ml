@@ -2,7 +2,6 @@
 
 use crate::{config::ModelConfig, Result};
 use hanzo_ml::{Device, Tensor};
-use std::path::Path;
 
 /// Trait for trainable models
 pub trait TrainableModel: Send + Sync {
@@ -48,7 +47,6 @@ impl TrainableModel for ModelWrapper {
     }
 
     fn save(&self, path: &std::path::Path) -> Result<()> {
-        let path: &Path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
         // Save model metadata

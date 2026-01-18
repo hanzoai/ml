@@ -12,6 +12,7 @@ pub trait Logger: Send + Sync {
 }
 
 /// Console logger implementation
+#[allow(dead_code)]
 pub struct ConsoleLogger {
     level: String,
 }
@@ -103,15 +104,14 @@ impl Logger for FileLogger {
 }
 
 /// Multi-logger that combines multiple loggers
+#[derive(Default)]
 pub struct MultiLogger {
     loggers: Vec<Box<dyn Logger>>,
 }
 
 impl MultiLogger {
     pub fn new() -> Self {
-        Self {
-            loggers: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn add_logger(&mut self, logger: Box<dyn Logger>) {

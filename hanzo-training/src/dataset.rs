@@ -60,7 +60,7 @@ impl BasicDataset {
         self.samples.push(sample);
     }
 
-    pub fn load<P: AsRef<Path>>(path: P, config: &DatasetConfig) -> Result<Self> {
+    pub fn load<P: AsRef<Path>>(_path: P, config: &DatasetConfig) -> Result<Self> {
         // Placeholder implementation
         Ok(BasicDataset::new(config.name.clone()))
     }
@@ -93,7 +93,7 @@ pub struct ZenAgenticDataset {
 
 impl ZenAgenticDataset {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut dataset = BasicDataset::new("zen-agentic".to_string());
+        let dataset = BasicDataset::new("zen-agentic".to_string());
 
         // Load from zen-agentic-dataset directory
         let path = path.as_ref();
@@ -132,7 +132,7 @@ pub struct ZenIdentityDataset {
 
 impl ZenIdentityDataset {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut dataset = BasicDataset::new("zen-identity".to_string());
+        let dataset = BasicDataset::new("zen-identity".to_string());
 
         // Load identity training data
         log::info!("Loading Zen Identity Dataset from {:?}", path.as_ref());
