@@ -9,8 +9,8 @@ use clap::Parser;
 
 use hanzo_transformers::models::mixtral::{Config, Model};
 
-use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};

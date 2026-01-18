@@ -41,11 +41,17 @@ pub struct PerplexityBenchmark {
     name: String,
 }
 
-impl PerplexityBenchmark {
-    pub fn new() -> Self {
+impl Default for PerplexityBenchmark {
+    fn default() -> Self {
         Self {
             name: "perplexity".to_string(),
         }
+    }
+}
+
+impl PerplexityBenchmark {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
