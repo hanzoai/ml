@@ -4,7 +4,7 @@ use hanzo_transformers::{
     generation::LogitsProcessor,
     models::{moondream, quantized_moondream},
 };
-use hanzo_wasm_example_moondream::console_log;
+use hanzo_ml_wasm_example_moondream::console_log;
 use js_sys::Date;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
