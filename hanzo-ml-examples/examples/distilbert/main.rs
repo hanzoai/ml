@@ -134,7 +134,7 @@ impl Args {
         Ok((config, tokenizer, weights))
     }
 
-    fn load_variables(&self, weights_path: &PathBuf, device: &Device) -> Result<VarBuilder> {
+    fn load_variables(&self, weights_path: &PathBuf, device: &Device) -> Result<VarBuilder<'_>> {
         if self.use_pth {
             Ok(VarBuilder::from_pth(weights_path, DTYPE, device)?)
         } else {
@@ -142,7 +142,7 @@ impl Args {
         }
     }
 
-    fn create_model(&self, config: &Config, vb: VarBuilder) -> Result<ModelType> {
+    fn create_model(&self, config: &Config, vb: VarBuilder<'_>) -> Result<ModelType> {
         match self.model {
             Which::DistilbertForMaskedLM => Ok(ModelType::Masked(
                 DistilBertForMaskedLM::load(vb, config)?.into(),
