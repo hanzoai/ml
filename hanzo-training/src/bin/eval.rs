@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
 async fn run_all_benchmarks(model_path: PathBuf, output_dir: Option<PathBuf>) -> Result<()> {
     info!("Running all benchmarks for model: {}", model_path.display());
 
-    let mut runner = BenchmarkRunner::default();
+    let runner = BenchmarkRunner::default();
     let results = runner.run_all()?;
 
     println!("\n📊 Evaluation Results");

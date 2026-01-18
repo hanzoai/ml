@@ -98,7 +98,7 @@ impl Trainer {
 
             // Evaluation
             if let Some(eval_steps) = self.config.training.eval_steps {
-                if self.current_step % eval_steps == 0 {
+                if self.current_step.is_multiple_of(eval_steps) {
                     if let Ok(eval_loss) = self.evaluate() {
                         info!("Evaluation loss: {:.6}", eval_loss);
                         if best_eval_loss.is_none() || eval_loss < best_eval_loss.unwrap() {
@@ -111,7 +111,7 @@ impl Trainer {
 
             // Save checkpoint
             if let Some(save_steps) = self.config.training.save_steps {
-                if self.current_step % save_steps == 0 {
+                if self.current_step.is_multiple_of(save_steps) {
                     let checkpoint_path = std::path::PathBuf::from(format!(
                         "./checkpoint-step-{}",
                         self.current_step
@@ -150,7 +150,7 @@ impl Trainer {
     fn train_epoch(&mut self) -> Result<f64> {
         let dataset_len = self.dataset.len();
         let batch_size = self.config.training.batch_size;
-        let num_batches = (dataset_len + batch_size - 1) / batch_size;
+        let num_batches = dataset_len.div_ceil(batch_size);
 
         let mut epoch_loss = 0.0;
 
@@ -161,7 +161,7 @@ impl Trainer {
 
             // Logging
             if let Some(logging_steps) = self.config.training.logging_steps {
-                if self.current_step % logging_steps == 0 {
+                if self.current_step.is_multiple_of(logging_steps) {
                     info!(
                         "Step {}: loss = {:.6}, lr = {:.2e}",
                         self.current_step,
@@ -313,7 +313,6 @@ impl Trainer {
 mod tests {
     use super::*;
     use crate::config::TrainingConfig;
-    use tempfile::TempDir;
 
     #[test]
     fn test_trainer_creation() {

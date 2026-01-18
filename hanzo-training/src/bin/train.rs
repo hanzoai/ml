@@ -125,7 +125,7 @@ async fn train_command(
         info!("Overriding dataset path: {}", config.dataset.path);
     }
 
-    if let Some(output_path) = output_override {
+    if let Some(_output_path) = output_override {
         // Store output path in logging config for now
         if config.logging.is_none() {
             config.logging = Some(hanzo_training::LoggingConfig {
