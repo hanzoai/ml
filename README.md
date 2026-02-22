@@ -1,27 +1,30 @@
-# candle
-[![discord server](https://dcbadge.limes.pink/api/server/hugging-face-879548962464493619)](https://discord.gg/hugging-face-879548962464493619)
-[![Latest version](https://img.shields.io/crates/v/candle-core.svg)](https://crates.io/crates/candle-core)
-[![Documentation](https://docs.rs/candle-core/badge.svg)](https://docs.rs/candle-core)
-[![License](https://img.shields.io/github/license/base-org/node?color=blue)](https://github.com/huggingface/candle/blob/main/LICENSE-MIT)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/huggingface/candle/blob/main/LICENSE-APACHE)
+# Hanzo ML
+[![Latest version](https://img.shields.io/crates/v/hanzo-ml.svg)](https://crates.io/crates/hanzo-ml)
+[![Documentation](https://docs.rs/hanzo-ml/badge.svg)](https://docs.rs/hanzo-ml)
+[![License](https://img.shields.io/github/license/hanzoai/ml?color=blue)](https://github.com/hanzoai/ml/blob/main/LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/hanzoai/ml/blob/main/LICENSE-APACHE)
 
-Candle is a minimalist ML framework for Rust with a focus on performance (including GPU support) 
-and ease of use. Try our online demos: 
-[whisper](https://huggingface.co/spaces/lmz/candle-whisper),
-[LLaMA2](https://huggingface.co/spaces/lmz/candle-llama2),
-[T5](https://huggingface.co/spaces/radames/Candle-T5-Generation-Wasm),
-[yolo](https://huggingface.co/spaces/lmz/candle-yolo),
-[Segment
-Anything](https://huggingface.co/spaces/radames/candle-segment-anything-wasm).
+Hanzo ML is a minimalist ML framework for Rust with a focus on performance (including GPU support) 
+and ease of use. Based on Candle from Hugging Face, Hanzo ML provides optimizations for Edge AI, 
+quantization, and multimodal workloads.
+
+## Key Features
+
+- **High Performance**: GPU acceleration via CUDA, Metal (Apple Silicon), and CPU optimizations
+- **Edge AI Optimized**: Quantization support (GGUF, GGML, AFQ, GPTQ, AWQ)  
+- **Multimodal**: Text, vision, audio, and 3D model support
+- **WebAssembly**: Run models in the browser with WASM support
+- **Rust Native**: Memory-safe, zero-cost abstractions
+- **Hanzo Integration**: Works seamlessly with Hanzo Engine for inference
 
 ## Get started
 
-Make sure that you have [`candle-core`](https://github.com/huggingface/candle/tree/main/candle-core) correctly installed as described in [**Installation**](https://huggingface.github.io/candle/guide/installation.html).
+Make sure that you have [`hanzo-ml`](https://github.com/huggingface/hanzo/tree/main/hanzo-ml) correctly installed as described in [**Installation**](https://huggingface.github.io/hanzo/guide/installation.html).
 
 Let's see how to run a simple matrix multiplication.
 Write the following to your `myapp/src/main.rs` file:
 ```rust
-use candle_core::{Device, Tensor};
+use hanzo_ml_core::{Device, Tensor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::Cpu;
@@ -38,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `cargo run` should display a tensor of shape `Tensor[[2, 4], f32]`.
 
 
-Having installed `candle` with Cuda support, simply define the `device` to be on GPU:
+Having installed `hanzo` with Cuda support, simply define the `device` to be on GPU:
 
 ```diff
 - let device = Device::Cpu;
@@ -50,96 +53,95 @@ For more advanced examples, please have a look at the following section.
 ## Check out our examples
 
 These online demos run entirely in your browser:
-- [yolo](https://huggingface.co/spaces/lmz/candle-yolo): pose estimation and
+- [yolo](https://huggingface.co/spaces/lmz/hanzo-ml-yolo): pose estimation and
   object recognition.
-- [whisper](https://huggingface.co/spaces/lmz/candle-whisper): speech recognition.
-- [LLaMA2](https://huggingface.co/spaces/lmz/candle-llama2): text generation.
-- [T5](https://huggingface.co/spaces/radames/Candle-T5-Generation-Wasm): text generation.
-- [Phi-1.5, and Phi-2](https://huggingface.co/spaces/radames/Candle-Phi-1.5-Wasm): text generation.
-- [Segment Anything Model](https://huggingface.co/spaces/radames/candle-segment-anything-wasm): Image segmentation.
-- [BLIP](https://huggingface.co/spaces/radames/Candle-BLIP-Image-Captioning): image captioning.
+- [whisper](https://huggingface.co/spaces/lmz/hanzo-ml-whisper): speech recognition.
+- [LLaMA2](https://huggingface.co/spaces/lmz/hanzo-ml-llama2): text generation.
+- [T5](https://huggingface.co/spaces/radames/ML-T5-Generation-Wasm): text generation.
+- [Phi-1.5, and Phi-2](https://huggingface.co/spaces/radames/ML-Phi-1.5-Wasm): text generation.
+- [Segment Anything Model](https://huggingface.co/spaces/radames/hanzo-ml-segment-anything-wasm): Image segmentation.
+- [BLIP](https://huggingface.co/spaces/radames/ML-BLIP-Image-Captioning): image captioning.
 
 We also provide some command line based examples using state of the art models:
 
-- [LLaMA v1, v2, and v3](./candle-examples/examples/llama/): general LLM, includes
+- [LLaMA v1, v2, and v3](./hanzo-ml-examples/examples/llama/): general LLM, includes
   the SOLAR-10.7B variant.
-- [Falcon](./candle-examples/examples/falcon/): general LLM.
-- [Codegeex4](./candle-examples/examples/codegeex4-9b/): Code completion, code interpreter, web search, function calling, repository-level
-- [GLM4](./candle-examples/examples/glm4/): Open Multilingual Multimodal Chat LMs by THUDM
-- [Gemma v1 and v2](./candle-examples/examples/gemma/): 2b and 7b+/9b general LLMs from Google Deepmind.
-- [RecurrentGemma](./candle-examples/examples/recurrent-gemma/): 2b and 7b
+- [Falcon](./hanzo-ml-examples/examples/falcon/): general LLM.
+- [Codegeex4](./hanzo-ml-examples/examples/codegeex4-9b/): Code completion, code interpreter, web search, function calling, repository-level
+- [GLM4](./hanzo-ml-examples/examples/glm4/): Open Multilingual Multimodal Chat LMs by THUDM
+- [Gemma v1 and v2](./hanzo-ml-examples/examples/gemma/): 2b and 7b+/9b general LLMs from Google Deepmind.
+- [RecurrentGemma](./hanzo-ml-examples/examples/recurrent-gemma/): 2b and 7b
   Griffin based models from Google that mix attention with a RNN like state.
-- [Phi-1, Phi-1.5, Phi-2, and Phi-3](./candle-examples/examples/phi/): 1.3b,
+- [Phi-1, Phi-1.5, Phi-2, and Phi-3](./hanzo-ml-examples/examples/phi/): 1.3b,
   2.7b, and 3.8b general LLMs with performance on par with 7b models.
-- [StableLM-3B-4E1T](./candle-examples/examples/stable-lm/): a 3b general LLM
+- [StableLM-3B-4E1T](./hanzo-ml-examples/examples/stable-lm/): a 3b general LLM
   pre-trained on 1T tokens of English and code datasets. Also supports
   StableLM-2, a 1.6b LLM trained on 2T tokens, as well as the code variants.
-- [Mamba](./candle-examples/examples/mamba/): an inference only
+- [Mamba](./hanzo-ml-examples/examples/mamba/): an inference only
   implementation of the Mamba state space model.
-- [Mistral7b-v0.1](./candle-examples/examples/mistral/): a 7b general LLM with
+- [Mistral7b-v0.1](./hanzo-ml-examples/examples/mistral/): a 7b general LLM with
   better performance than all publicly available 13b models as of 2023-09-28.
-- [Mixtral8x7b-v0.1](./candle-examples/examples/mixtral/): a sparse mixture of
+- [Mixtral8x7b-v0.1](./hanzo-ml-examples/examples/mixtral/): a sparse mixture of
   experts 8x7b general LLM with better performance than a Llama 2 70B model with
   much faster inference.
-- [StarCoder](./candle-examples/examples/bigcode/) and
-  [StarCoder2](./candle-examples/examples/starcoder2/): LLM specialized to code generation.
-- [Qwen1.5](./candle-examples/examples/qwen/): Bilingual (English/Chinese) LLMs.
-- [RWKV v5 and v6](./candle-examples/examples/rwkv/): An RNN with transformer level LLM
+- [StarCoder](./hanzo-ml-examples/examples/bigcode/) and
+  [StarCoder2](./hanzo-ml-examples/examples/starcoder2/): LLM specialized to code generation.
+- [Qwen1.5](./hanzo-ml-examples/examples/qwen/): Bilingual (English/Chinese) LLMs.
+- [RWKV v5 and v6](./hanzo-ml-examples/examples/rwkv/): An RNN with transformer level LLM
   performance.
-- [Replit-code-v1.5](./candle-examples/examples/replit-code/): a 3.3b LLM specialized for code completion.
-- [Yi-6B / Yi-34B](./candle-examples/examples/yi/): two bilingual
+- [Replit-code-v1.5](./hanzo-ml-examples/examples/replit-code/): a 3.3b LLM specialized for code completion.
+- [Yi-6B / Yi-34B](./hanzo-ml-examples/examples/yi/): two bilingual
   (English/Chinese) general LLMs with 6b and 34b parameters.
-- [Quantized LLaMA](./candle-examples/examples/quantized/): quantized version of
+- [Quantized LLaMA](./hanzo-ml-examples/examples/quantized/): quantized version of
   the LLaMA model using the same quantization techniques as
   [llama.cpp](https://github.com/ggerganov/llama.cpp).
-- [Quantized Qwen3 MoE](./candle-examples/examples/quantized-qwen3-moe/): support gguf quantized models of Qwen3 MoE models.
 
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/quantized/assets/aoc.gif" width="600">
+<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/quantized/assets/aoc.gif" width="600">
   
-- [Stable Diffusion](./candle-examples/examples/stable-diffusion/): text to
+- [Stable Diffusion](./hanzo-ml-examples/examples/stable-diffusion/): text to
   image generative model, support for the 1.5, 2.1, SDXL 1.0 and Turbo versions.
 
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg" width="200">
+<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg" width="200">
 
-- [Wuerstchen](./candle-examples/examples/wuerstchen/): another text to
+- [Wuerstchen](./hanzo-ml-examples/examples/wuerstchen/): another text to
   image generative model.
 
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/wuerstchen/assets/cat.jpg" width="200">
+<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/wuerstchen/assets/cat.jpg" width="200">
 
-- [yolo-v3](./candle-examples/examples/yolo-v3/) and
-  [yolo-v8](./candle-examples/examples/yolo-v8/): object detection and pose
+- [yolo-v3](./hanzo-ml-examples/examples/yolo-v3/) and
+  [yolo-v8](./hanzo-ml-examples/examples/yolo-v8/): object detection and pose
   estimation models.
 
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/yolo-v8/assets/bike.od.jpg" width="200"><img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/yolo-v8/assets/bike.pose.jpg" width="200">
-- [segment-anything](./candle-examples/examples/segment-anything/): image
+<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.od.jpg" width="200"><img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.pose.jpg" width="200">
+- [segment-anything](./hanzo-ml-examples/examples/segment-anything/): image
   segmentation model with prompt.
 
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/segment-anything/assets/sam_merged.jpg" width="200">
+<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/segment-anything/assets/sam_merged.jpg" width="200">
 
-- [SegFormer](./candle-examples/examples/segformer/): transformer based semantic segmentation model.
-- [Whisper](./candle-examples/examples/whisper/): speech recognition model.
-- [EnCodec](./candle-examples/examples/encodec/): high-quality audio compression
+- [SegFormer](./hanzo-ml-examples/examples/segformer/): transformer based semantic segmentation model.
+- [Whisper](./hanzo-ml-examples/examples/whisper/): speech recognition model.
+- [EnCodec](./hanzo-ml-examples/examples/encodec/): high-quality audio compression
   model using residual vector quantization.
-- [MetaVoice](./candle-examples/examples/metavoice/): foundational model for
+- [MetaVoice](./hanzo-ml-examples/examples/metavoice/): foundational model for
   text-to-speech.
-- [Parler-TTS](./candle-examples/examples/parler-tts/): large text-to-speech
+- [Parler-TTS](./hanzo-ml-examples/examples/parler-tts/): large text-to-speech
   model.
-- [T5](./candle-examples/examples/t5), [Bert](./candle-examples/examples/bert/),
-  [JinaBert](./candle-examples/examples/jina-bert/) : useful for sentence embeddings.
-- [DINOv2](./candle-examples/examples/dinov2/): computer vision model trained
+- [T5](./hanzo-ml-examples/examples/t5), [Bert](./hanzo-ml-examples/examples/bert/),
+  [JinaBert](./hanzo-ml-examples/examples/jina-bert/) : useful for sentence embeddings.
+- [DINOv2](./hanzo-ml-examples/examples/dinov2/): computer vision model trained
   using self-supervision (can be used for imagenet classification, depth
   evaluation, segmentation).
-- [VGG](./candle-examples/examples/vgg/),
-  [RepVGG](./candle-examples/examples/repvgg): computer vision models.
-- [BLIP](./candle-examples/examples/blip/): image to text model, can be used to
+- [VGG](./hanzo-ml-examples/examples/vgg/),
+  [RepVGG](./hanzo-ml-examples/examples/repvgg): computer vision models.
+- [BLIP](./hanzo-ml-examples/examples/blip/): image to text model, can be used to
   generate captions for an image.
-- [CLIP](./candle-examples/examples/clip/): multi-model vision and language
+- [CLIP](./hanzo-ml-examples/examples/clip/): multi-model vision and language
   model.
-- [TrOCR](./candle-examples/examples/trocr/): a transformer OCR model, with
+- [TrOCR](./hanzo-ml-examples/examples/trocr/): a transformer OCR model, with
   dedicated submodels for hand-writing and printed recognition.
-- [Marian-MT](./candle-examples/examples/marian-mt/): neural machine translation
+- [Marian-MT](./hanzo-ml-examples/examples/marian-mt/): neural machine translation
   model, generates the translated text from the input text.
-- [Moondream](./candle-examples/examples/moondream/): tiny computer-vision model 
+- [Moondream](./hanzo-ml-examples/examples/moondream/): tiny computer-vision model 
   that can answer real-world questions about images.
 
 Run them using commands like:
@@ -153,18 +155,18 @@ you have cuDNN installed, use `--features cudnn` for even more speedups.
 There are also some wasm examples for whisper and
 [llama2.c](https://github.com/karpathy/llama2.c). You can either build them with
 `trunk` or try them online:
-[whisper](https://huggingface.co/spaces/lmz/candle-whisper),
-[llama2](https://huggingface.co/spaces/lmz/candle-llama2),
-[T5](https://huggingface.co/spaces/radames/Candle-T5-Generation-Wasm),
-[Phi-1.5, and Phi-2](https://huggingface.co/spaces/radames/Candle-Phi-1.5-Wasm),
-[Segment Anything Model](https://huggingface.co/spaces/radames/candle-segment-anything-wasm).
+[whisper](https://huggingface.co/spaces/lmz/hanzo-ml-whisper),
+[llama2](https://huggingface.co/spaces/lmz/hanzo-ml-llama2),
+[T5](https://huggingface.co/spaces/radames/ML-T5-Generation-Wasm),
+[Phi-1.5, and Phi-2](https://huggingface.co/spaces/radames/ML-Phi-1.5-Wasm),
+[Segment Anything Model](https://huggingface.co/spaces/radames/hanzo-ml-segment-anything-wasm).
 
 For LLaMA2, run the following command to retrieve the weight files and start a
 test server:
 ```bash
-cd candle-wasm-examples/llama2-c
-wget https://huggingface.co/spaces/lmz/candle-llama2/resolve/main/model.bin
-wget https://huggingface.co/spaces/lmz/candle-llama2/resolve/main/tokenizer.json
+cd hanzo-ml-wasm-examples/llama2-c
+wget https://huggingface.co/spaces/lmz/hanzo-ml-llama2/resolve/main/model.bin
+wget https://huggingface.co/spaces/lmz/hanzo-ml-llama2/resolve/main/tokenizer.json
 trunk serve --release --port 8081
 ```
 And then head over to
@@ -173,26 +175,24 @@ And then head over to
 <!--- ANCHOR: useful_libraries --->
 
 ## Useful External Resources
-- [`candle-tutorial`](https://github.com/ToluClassics/candle-tutorial): A
-  very detailed tutorial showing how to convert a PyTorch model to Candle.
-- [`candle-lora`](https://github.com/EricLBuehler/candle-lora): Efficient and
-  ergonomic LoRA implementation for Candle. `candle-lora` has      
-  out-of-the-box LoRA support for many models from Candle, which can be found
-  [here](https://github.com/EricLBuehler/candle-lora/tree/master/candle-lora-transformers/examples).
-- [`candle-video`](https://github.com/FerrisMind/candle-video): Rust library for text-to-video generation (LTX-Video and related models) built on Candle, focused on fast, Python-free inference.
+- [`hanzo-ml-tutorial`](https://github.com/ToluClassics/hanzo-ml-tutorial): A
+  very detailed tutorial showing how to convert a PyTorch model to ML.
+- [`hanzo-ml-lora`](https://github.com/EricLBuehler/hanzo-ml-lora): Efficient and
+  ergonomic LoRA implementation for ML. `hanzo-ml-lora` has      
+  out-of-the-box LoRA support for many models from ML, which can be found
+  [here](https://github.com/EricLBuehler/hanzo-ml-lora/tree/master/hanzo-ml-lora-transformers/examples).
 - [`optimisers`](https://github.com/KGrewal1/optimisers): A collection of optimisers
   including SGD with momentum, AdaGrad, AdaDelta, AdaMax, NAdam, RAdam, and RMSprop.
-- [`candle-vllm`](https://github.com/EricLBuehler/candle-vllm): Efficient platform for inference and
+- [`hanzo-ml-vllm`](https://github.com/EricLBuehler/hanzo-ml-vllm): Efficient platform for inference and
   serving local LLMs including an OpenAI compatible API server.
-- [`candle-ext`](https://github.com/mokeyish/candle-ext): An extension library to Candle that provides PyTorch functions not currently available in Candle.
-- [`candle-coursera-ml`](https://github.com/vishpat/candle-coursera-ml): Implementation of ML algorithms from Coursera's [Machine Learning Specialization](https://www.coursera.org/specializations/machine-learning-introduction) course.
+- [`hanzo-ml-ext`](https://github.com/mokeyish/hanzo-ml-ext): An extension library to ML that provides PyTorch functions not currently available in ML.
+- [`hanzo-ml-coursera-ml`](https://github.com/vishpat/hanzo-ml-coursera-ml): Implementation of ML algorithms from Coursera's [Machine Learning Specialization](https://www.coursera.org/specializations/machine-learning-introduction) course.
 - [`kalosm`](https://github.com/floneum/floneum/tree/master/interfaces/kalosm): A multi-modal meta-framework in Rust for interfacing with local pre-trained models with support for controlled generation, custom samplers, in-memory vector databases, audio transcription, and more.
-- [`candle-sampling`](https://github.com/EricLBuehler/candle-sampling): Sampling techniques for Candle.
-- [`gpt-from-scratch-rs`](https://github.com/jeroenvlek/gpt-from-scratch-rs): A port of Andrej Karpathy's _Let's build GPT_ tutorial on YouTube showcasing the Candle API on a toy problem.
-- [`candle-einops`](https://github.com/tomsanbear/candle-einops): A pure rust implementation of the python [einops](https://github.com/arogozhnikov/einops) library.
+- [`hanzo-ml-sampling`](https://github.com/EricLBuehler/hanzo-ml-sampling): Sampling techniques for ML.
+- [`gpt-from-scratch-rs`](https://github.com/jeroenvlek/gpt-from-scratch-rs): A port of Andrej Karpathy's _Let's build GPT_ tutorial on YouTube showcasing the ML API on a toy problem.
+- [`hanzo-ml-einops`](https://github.com/tomsanbear/hanzo-ml-einops): A pure rust implementation of the python [einops](https://github.com/arogozhnikov/einops) library.
 - [`atoma-infer`](https://github.com/atoma-network/atoma-infer): A Rust library for fast inference at scale, leveraging FlashAttention2 for efficient attention computation, PagedAttention for efficient KV-cache memory management, and multi-GPU support. It is OpenAI api compatible.
 - [`llms-from-scratch-rs`](https://github.com/nerdai/llms-from-scratch-rs): A comprehensive Rust translation of the code from Sebastian Raschka's Build an LLM from Scratch book.
-- [`vllm.rs`](https://github.com/guoqingbao/vllm.rs): A minimalist vLLM implementation in Rust based on Candle.
 
 If you have an addition to this list, please submit a pull request.
 
@@ -204,7 +204,7 @@ If you have an addition to this list, please submit a pull request.
 
 - Simple syntax, looks and feels like PyTorch.
     - Model training.
-    - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/huggingface/candle/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/candle-flash-attn/src/lib.rs#L152).
+    - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/huggingface/hanzo/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/hanzo-flash-attn/src/lib.rs#L152).
 - Backends.
     - Optimized CPU backend with optional MKL support for x86 and Accelerate for macs.
     - CUDA backend for efficiently running on GPUs, multiple GPU distribution via NCCL.
@@ -223,7 +223,7 @@ If you have an addition to this list, please submit a pull request.
         - Replit-code-v1.5-3B.
         - Bert.
         - Yi-6B and Yi-34B.
-        - Qwen1.5, Qwen1.5 MoE, Qwen3 MoE.
+        - Qwen1.5, Qwen1.5 MoE.
         - RWKV v5 and v6.
     - Quantized LLMs.
         - Llama 7b, 13b, 70b, as well as the chat and code variants.
@@ -231,7 +231,6 @@ If you have an addition to this list, please submit a pull request.
         - Mixtral 8x7b.
         - Zephyr 7b a and b (Mistral-7b based).
         - OpenChat 3.5 (Mistral-7b based).
-        - Qwen3 MoE (16B-A3B, 32B-A3B)
     - Text to text.
         - T5 and its variants: FlanT5, UL2, MADLAD400 (translation), CoEdit (Grammar correction).
         - Marian MT (Machine Translation).
@@ -263,7 +262,7 @@ If you have an addition to this list, please submit a pull request.
 <!--- ANCHOR: cheatsheet --->
 Cheatsheet:
 
-|            | Using PyTorch                            | Using Candle                                                     |
+|            | Using PyTorch                            | Using ML                                                     |
 |------------|------------------------------------------|------------------------------------------------------------------|
 | Creation   | `torch.Tensor([[1, 2], [3, 4]])`         | `Tensor::new(&[[1f32, 2.], [3., 4.]], &Device::Cpu)?`           |
 | Creation   | `torch.zeros((2, 2))`                    | `Tensor::zeros((2, 2), DType::F32, &Device::Cpu)?`               |
@@ -273,34 +272,34 @@ Cheatsheet:
 | Arithmetic | `a + b`                                  | `&a + &b`                                                        |
 | Device     | `tensor.to(device="cuda")`               | `tensor.to_device(&Device::new_cuda(0)?)?`                            |
 | Dtype      | `tensor.to(dtype=torch.float16)`         | `tensor.to_dtype(&DType::F16)?`                                  |
-| Saving     | `torch.save({"A": A}, "model.bin")`      | `candle::safetensors::save(&HashMap::from([("A", A)]), "model.safetensors")?` |
-| Loading    | `weights = torch.load("model.bin")`      | `candle::safetensors::load("model.safetensors", &device)`        |
+| Saving     | `torch.save({"A": A}, "model.bin")`      | `hanzo::safetensors::save(&HashMap::from([("A", A)]), "model.safetensors")?` |
+| Loading    | `weights = torch.load("model.bin")`      | `hanzo::safetensors::load("model.safetensors", &device)`        |
 
 <!--- ANCHOR_END: cheatsheet --->
 
 
 ## Structure
 
-- [candle-core](./candle-core): Core ops, devices, and `Tensor` struct definition
-- [candle-nn](./candle-nn/): Tools to build real models
-- [candle-examples](./candle-examples/): Examples of using the library in realistic settings
-- [candle-kernels](./candle-kernels/): CUDA custom kernels
-- [candle-datasets](./candle-datasets/): Datasets and data loaders.
-- [candle-transformers](./candle-transformers): transformers-related utilities.
-- [candle-flash-attn](./candle-flash-attn): Flash attention v2 layer.
-- [candle-onnx](./candle-onnx/): ONNX model evaluation.
+- [hanzo-ml](./hanzo-ml): Core ops, devices, and `Tensor` struct definition
+- [hanzo-nn](./hanzo-nn/): Tools to build real models
+- [hanzo-ml-examples](./hanzo-ml-examples/): Examples of using the library in realistic settings
+- [hanzo-kernels](./hanzo-kernels/): CUDA custom kernels
+- [hanzo-datasets](./hanzo-datasets/): Datasets and data loaders.
+- [hanzo-transformers](./hanzo-transformers): transformers-related utilities.
+- [hanzo-flash-attn](./hanzo-flash-attn): Flash attention v2 layer.
+- [hanzo-onnx](./hanzo-onnx/): ONNX model evaluation.
 
 ## FAQ
 
-### Why should I use Candle?
+### Why should I use ML?
 
 <!--- ANCHOR: goals --->
 
-Candle's core goal is to *make serverless inference possible*. Full machine learning frameworks like PyTorch
-are very large, which makes creating instances on a cluster slow. Candle allows deployment of lightweight
+ML's core goal is to *make serverless inference possible*. Full machine learning frameworks like PyTorch
+are very large, which makes creating instances on a cluster slow. ML allows deployment of lightweight
 binaries.
 
-Secondly, Candle lets you *remove Python* from production workloads. Python overhead can seriously hurt performance,
+Secondly, ML lets you *remove Python* from production workloads. Python overhead can seriously hurt performance,
 and the [GIL](https://www.backblaze.com/blog/the-python-gil-past-present-and-future/) is a notorious source of headaches.
 
 Finally, Rust is cool! A lot of the HF ecosystem already has Rust crates, like [safetensors](https://github.com/huggingface/safetensors) and [tokenizers](https://github.com/huggingface/tokenizers).
@@ -321,7 +320,7 @@ Finally, Rust is cool! A lot of the HF ecosystem already has Rust crates, like [
 
 - [tch-rs](https://github.com/LaurentMazare/tch-rs.git) Bindings to the torch library in Rust. Extremely versatile, but they 
   bring in the entire torch library into the runtime. The main contributor of `tch-rs` is also involved in the development
-  of `candle`.
+  of `hanzo`.
 
 ### Common Errors
 
@@ -341,9 +340,9 @@ or for accelerate:
 ```
 Undefined symbols for architecture arm64:
             "_dgemm_", referenced from:
-                candle_core::accelerate::dgemm::h1b71a038552bcabe in libcandle_core...
+                hanzo_core::accelerate::dgemm::h1b71a038552bcabe in libhanzo_core...
             "_sgemm_", referenced from:
-                candle_core::accelerate::sgemm::h2cf21c592cba3c47 in libcandle_core...
+                hanzo_core::accelerate::sgemm::h2cf21c592cba3c47 in libhanzo_core...
           ld: symbol(s) not found for architecture arm64
 ```
 
@@ -367,36 +366,22 @@ This is likely because you're not permissioned for the LLaMA-v2 model. To fix
 this, you have to register on the huggingface-hub, accept the [LLaMA-v2 model
 conditions](https://huggingface.co/meta-llama/Llama-2-7b-hf), and set up your
 authentication token. See issue
-[#350](https://github.com/huggingface/candle/issues/350) for more details.
+[#350](https://github.com/huggingface/hanzo/issues/350) for more details.
 
-#### Docker build
-
-When building CUDA kernels inside a Dockerfile, nvidia-smi cannot be used to auto-detect compute capability.
-
-You must explicitly set CUDA_COMPUTE_CAP, for example:
+#### Missing cute/cutlass headers when compiling flash-attn
 
 ```
-FROM nvidia/cuda:12.9.0-devel-ubuntu22.04
-
-# Install git and curl
-RUN set -eux; \
-  apt-get update; \
-  apt-get install -y curl git ca-certificates;
-
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-# Clone candle repo
-RUN git clone https://github.com/huggingface/candle.git
-
-# Set compute capability for the build
-ARG CUDA_COMPUTE_CAP=90
-ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
-
-# Build with explicit compute cap
-WORKDIR /app
-COPY . .
-RUN cargo build --release features cuda
+  In file included from kernels/flash_fwd_launch_template.h:11:0,
+                   from kernels/flash_fwd_hdim224_fp16_sm80.cu:5:
+  kernels/flash_fwd_kernel.h:8:10: fatal error: cute/algorithm/copy.hpp: No such file or directory
+   #include <cute/algorithm/copy.hpp>
+            ^~~~~~~~~~~~~~~~~~~~~~~~~
+  compilation terminated.
+  Error: nvcc error while compiling:
+```
+[cutlass](https://github.com/NVIDIA/cutlass) is provided as a git submodule so you may want to run the following command to check it in properly.
+```bash
+git submodule update --init
 ```
 
 #### Compiling with flash-attention fails
@@ -414,7 +399,7 @@ env NVCC_CCBIN=/usr/lib/gcc/x86_64-linux-gnu/10 cargo ...
 
 ```
 Couldn't compile the test.
----- .\candle-book\src\inference\hub.md - Using_the_hub::Using_in_a_real_model_ (line 50) stdout ----
+---- .\hanzo-ml-book\src\inference\hub.md - Using_the_hub::Using_in_a_real_model_ (line 50) stdout ----
 error: linking with `link.exe` failed: exit code: 1181
 //very long chain of linking
  = note: LINK : fatal error LNK1181: cannot open input file 'windows.0.48.5.lib'
@@ -423,7 +408,7 @@ error: linking with `link.exe` failed: exit code: 1181
 Make sure you link all native libraries that might be located outside a project target, e.g., to run mdbook tests, you should run:
 
 ```
-mdbook test candle-book -L .\target\debug\deps\ `
+mdbook test hanzo-ml-book -L .\target\debug\deps\ `
 -L native=$env:USERPROFILE\.cargo\registry\src\index.crates.io-6f17d22bba15001f\windows_x86_64_msvc-0.42.2\lib `
 -L native=$env:USERPROFILE\.cargo\registry\src\index.crates.io-6f17d22bba15001f\windows_x86_64_msvc-0.48.5\lib
 ```
@@ -435,7 +420,7 @@ This may be caused by the models being loaded from `/mnt/c`, more details on
 
 #### Tracking down errors
 
-You can set `RUST_BACKTRACE=1` to be provided with backtraces when a candle
+You can set `RUST_BACKTRACE=1` to be provided with backtraces when a hanzo
 error is generated.
 
 #### CudaRC error
