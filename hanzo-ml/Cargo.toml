@@ -43,7 +43,7 @@ criterion = { workspace = true }
 
 [features]
 default = []
-cuda = ["cudarc", "hanzo-ug?/cuda", "float8/cuda"]
+cuda = ["cudarc", "hanzo-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
