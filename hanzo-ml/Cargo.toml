@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-ml"
-version = "0.9.2-alpha.2"
+version = "0.9.2-alpha.3"
 edition = "2021"
 description = "Minimalist ML framework."
 repository = "https://github.com/hanzoai/ml"
@@ -12,6 +12,7 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
+hanzo-kernels = { workspace = true, optional = true }
 hanzo-metal-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
@@ -43,7 +44,7 @@ criterion = { workspace = true }
 
 [features]
 default = []
-cuda = ["cudarc", "hanzo-ug?/cuda"]
+cuda = ["cudarc", "dep:hanzo-kernels", "hanzo-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
