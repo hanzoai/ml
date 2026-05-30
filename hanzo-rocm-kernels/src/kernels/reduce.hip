@@ -692,4 +692,151 @@ extern "C" __global__ void layernorm_f16(const __half *src, __half *dst, const _
     layernorm<__half>(src, dst, alpha, beta, n_cols, block_size, eps);
 }
 
+// ---- FAST_OP for 16-bit floats: accumulate/compare in float (hip_bfloat16 and
+// __half have no reliable device arithmetic operators) ----
+#include <hip/hip_bfloat16.h>
+
+template <typename T>
+__device__ void fast_sum_f(const size_t src_numel, const size_t el_to_sum_per_block,
+         const size_t num_dims, const size_t *info, const T *src, T *dst) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    __shared__ float shr[BLOCK_SIZE];
+    size_t tid = threadIdx.x;
+    size_t dst_id = blockIdx.x;
+    shr[tid] = 0.0f;
+    size_t start_idx = dst_id * el_to_sum_per_block;
+    size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
+    size_t idx = start_idx + tid;
+    while (idx < stop_idx) {
+        shr[tid] += (float)src[get_strided_index(idx, num_dims, dims, strides)];
+        idx += blockDim.x;
+    }
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (tid < s) shr[tid] += shr[tid + s];
+    }
+    if (tid == 0) dst[dst_id] = (T)shr[0];
+}
+
+template <typename T>
+__device__ void fast_max_f(const size_t src_numel, const size_t el_to_sum_per_block,
+         const size_t num_dims, const size_t *info, const T *src, T *dst) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    __shared__ float shr[BLOCK_SIZE];
+    size_t tid = threadIdx.x;
+    size_t dst_id = blockIdx.x;
+    shr[tid] = -INFINITY;
+    size_t start_idx = dst_id * el_to_sum_per_block;
+    size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
+    size_t idx = start_idx + tid;
+    while (idx < stop_idx) {
+        shr[tid] = fmaxf(shr[tid], (float)src[get_strided_index(idx, num_dims, dims, strides)]);
+        idx += blockDim.x;
+    }
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (tid < s) shr[tid] = fmaxf(shr[tid], shr[tid + s]);
+    }
+    if (tid == 0) dst[dst_id] = (T)shr[0];
+}
+
+template <typename T>
+__device__ void fast_min_f(const size_t src_numel, const size_t el_to_sum_per_block,
+         const size_t num_dims, const size_t *info, const T *src, T *dst) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    __shared__ float shr[BLOCK_SIZE];
+    size_t tid = threadIdx.x;
+    size_t dst_id = blockIdx.x;
+    shr[tid] = INFINITY;
+    size_t start_idx = dst_id * el_to_sum_per_block;
+    size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
+    size_t idx = start_idx + tid;
+    while (idx < stop_idx) {
+        shr[tid] = fminf(shr[tid], (float)src[get_strided_index(idx, num_dims, dims, strides)]);
+        idx += blockDim.x;
+    }
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (tid < s) shr[tid] = fminf(shr[tid], shr[tid + s]);
+    }
+    if (tid == 0) dst[dst_id] = (T)shr[0];
+}
+
+template <typename T>
+__device__ void fast_argmax_f(const size_t src_numel, const size_t el_to_sum_per_block,
+            const size_t num_dims, const size_t *info, const T *src, uint32_t *dst) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    __shared__ float shr[BLOCK_SIZE];
+    __shared__ uint32_t shr_index[BLOCK_SIZE];
+    size_t tid = threadIdx.x;
+    size_t dst_id = blockIdx.x;
+    shr[tid] = -INFINITY;
+    shr_index[tid] = 0xFFFFFFFF;
+    bool not_set = true;
+    size_t start_idx = dst_id * el_to_sum_per_block;
+    size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
+    size_t idx = start_idx + tid;
+    while (idx < stop_idx) {
+        float v = (float)src[get_strided_index(idx, num_dims, dims, strides)];
+        if (not_set || v > shr[tid]) { shr[tid] = v; shr_index[tid] = idx % dims[num_dims - 1]; not_set = false; }
+        idx += blockDim.x;
+    }
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (tid < s && shr[tid + s] > shr[tid]) { shr[tid] = shr[tid + s]; shr_index[tid] = shr_index[tid + s]; }
+    }
+    if (tid == 0) dst[dst_id] = shr_index[0];
+}
+
+template <typename T>
+__device__ void fast_argmin_f(const size_t src_numel, const size_t el_to_sum_per_block,
+            const size_t num_dims, const size_t *info, const T *src, uint32_t *dst) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    __shared__ float shr[BLOCK_SIZE];
+    __shared__ uint32_t shr_index[BLOCK_SIZE];
+    size_t tid = threadIdx.x;
+    size_t dst_id = blockIdx.x;
+    shr[tid] = INFINITY;
+    shr_index[tid] = 0xFFFFFFFF;
+    bool not_set = true;
+    size_t start_idx = dst_id * el_to_sum_per_block;
+    size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
+    size_t idx = start_idx + tid;
+    while (idx < stop_idx) {
+        float v = (float)src[get_strided_index(idx, num_dims, dims, strides)];
+        if (not_set || v < shr[tid]) { shr[tid] = v; shr_index[tid] = idx % dims[num_dims - 1]; not_set = false; }
+        idx += blockDim.x;
+    }
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (tid < s && shr[tid + s] < shr[tid]) { shr[tid] = shr[tid + s]; shr_index[tid] = shr_index[tid + s]; }
+    }
+    if (tid == 0) dst[dst_id] = shr_index[0];
+}
+
+#define FAST_OP_F(TYPENAME, MIN_NAME, MAX_NAME, ARGMIN_NAME, ARGMAX_NAME, SUM_NAME) \
+  extern "C" __global__ void ARGMIN_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
+      const size_t num_dims, const size_t *info, const TYPENAME *src, uint32_t *dst) { \
+    fast_argmin_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); } \
+  extern "C" __global__ void ARGMAX_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
+      const size_t num_dims, const size_t *info, const TYPENAME *src, uint32_t *dst) { \
+    fast_argmax_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); } \
+  extern "C" __global__ void MIN_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
+      const size_t num_dims, const size_t *info, const TYPENAME *src, TYPENAME *dst) { \
+    fast_min_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); } \
+  extern "C" __global__ void MAX_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
+      const size_t num_dims, const size_t *info, const TYPENAME *src, TYPENAME *dst) { \
+    fast_max_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); } \
+  extern "C" __global__ void SUM_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
+      const size_t num_dims, const size_t *info, const TYPENAME *src, TYPENAME *dst) { \
+    fast_sum_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); }
+
+FAST_OP_F(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
+FAST_OP_F(hip_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argmax_bf16, fast_sum_bf16)
+
 #endif // __HIPCC__
