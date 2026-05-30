@@ -39,6 +39,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "tanh" => spv!("tanh"),
         "matmul" => spv!("matmul"),
         "bmm" => spv!("bmm"),
+        "bmm_coopmat" => spv!("bmm_coopmat"),
+        "cast_f2h" => spv!("cast_f2h"),
         "copy" => spv!("copy"),
         "reduce_sum" => spv!("reduce_sum"),
         "reduce_max" => spv!("reduce_max"),
@@ -123,9 +125,14 @@ struct VkInner {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     // Cooperative-matrix (matrix-core / WMMA) availability and the chosen MxNxK tile for an
     // fp16xfp16 -> fp32 subgroup config. Present on native AMD/NV drivers (RDNA3.5 8060S),
-    // absent on WSL/Dozen — matmul picks the coopmat kernel only when `coopmat` is true.
+    // absent on WSL/Dozen.
     coopmat: bool,
     cm_mnk: (u32, u32, u32),
+    // Whether matmul actually uses the coopmat kernel. Opt-in via HANZO_VK_COOPMAT=1 because the
+    // current naive (no shared-mem) coopmat GEMM is fp16-precision and not yet faster than the
+    // tiled fp32 kernel; default off so it can't regress correctness or speed. Flip the default
+    // once the shared-memory-tiled coopmat kernel lands.
+    cm_use: bool,
     // CPU-side RNG seed (kernels are deterministic; randoms are generated on the CPU then uploaded).
     seed: Mutex<u64>,
     // kernel name -> built pipeline. &'static str keys: kernel names are compile-time literals.
@@ -440,6 +447,13 @@ impl VulkanDevice {
         Ok(VulkanStorage { buffer, memory, count, dtype: DType::F32, device: self.clone() })
     }
 
+    // Raw fp16 scratch buffer (2 bytes/elem) for cooperative-matrix matmul inputs. Returns just
+    // the handle; like the rest of the backend the backing memory is not individually freed.
+    fn alloc_f16(&self, count: usize) -> Result<vk::Buffer> {
+        let (buffer, _memory) = unsafe { self.raw_buffer((count * 2).max(2) as u64)? };
+        Ok(buffer)
+    }
+
     fn upload_f32(&self, data: &[f32]) -> Result<VulkanStorage> {
         let s = self.alloc_f32(data.len())?;
         unsafe { self.write_f32(s.memory, data)? };
@@ -566,6 +580,8 @@ impl BackendDevice for VulkanDevice {
             };
             let coopmat = cm_mnk.is_some();
             let cm_mnk = cm_mnk.unwrap_or((0, 0, 0));
+            let cm_use =
+                coopmat && std::env::var("HANZO_VK_COOPMAT").map(|v| v == "1").unwrap_or(false);
 
             // Enable the coopmat extension + the features its SPIR-V needs (cooperative matrix,
             // Vulkan memory model, fp16 arithmetic, 16-bit storage) only when supported.
@@ -640,6 +656,7 @@ impl BackendDevice for VulkanDevice {
                 submitter,
                 coopmat,
                 cm_mnk,
+                cm_use,
             };
             Ok(Self { inner: Arc::new(inner) })
         }
@@ -1409,6 +1426,37 @@ impl BackendStorage for VulkanStorage {
         let rc = rhs.contiguous(rhs_l)?;
         // C[b,m,n] = A[b,m,k] * B[b,k,n], row-major. Kernel push order is {batch,m,k,n}.
         let out = self.device.alloc_f32(b * m * n)?;
+
+        // Matrix-core path: when the device has a 16x16x16 fp16 coopmat config and every tile
+        // dimension is a multiple of 16, cast the operands to fp16 and run the WMMA GEMM. This
+        // is fp16-precision matmul (as inference engines like llama.cpp do) — far faster on the
+        // matrix cores than the scalar tiled kernel. Falls back below otherwise.
+        if self.device.inner.cm_use
+            && matches!(self.device.coopmat_info(), Some((16, 16, 16)))
+            && m % 16 == 0
+            && n % 16 == 0
+            && k % 16 == 0
+        {
+            let a16 = self.device.alloc_f16(b * m * k)?;
+            let b16 = self.device.alloc_f16(b * k * n)?;
+            self.device.dispatch(
+                "cast_f2h",
+                &[lc.buffer, a16],
+                &push_u32(&[(b * m * k) as u32]),
+                Self::groups_1d(b * m * k),
+            )?;
+            self.device.dispatch(
+                "cast_f2h",
+                &[rc.buffer, b16],
+                &push_u32(&[(b * k * n) as u32]),
+                Self::groups_1d(b * k * n),
+            )?;
+            let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
+            let groups = ((n / 16) as u32, (m / 16) as u32, b as u32);
+            self.device.dispatch("bmm_coopmat", &[a16, b16, out.buffer], &push, groups)?;
+            return Ok(out);
+        }
+
         let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
         let groups = ((n as u32).div_ceil(16), (m as u32).div_ceil(16), b as u32);
         self.device
