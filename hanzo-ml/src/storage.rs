@@ -257,10 +257,7 @@ impl Storage {
                 Ok((Self::Metal(storage), shape))
             }
             #[cfg(feature = "rocm")]
-            Self::Rocm(storage) => {
-                let (storage, shape) = c.metal_fwd(storage, l)?;
-                Ok((Self::Rocm(storage), shape))
-            }
+            Self::Rocm(storage) => crate::bail!("not supported on rocm yet"),
         }
     }
 
@@ -323,7 +320,7 @@ impl Storage {
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
             #[cfg(feature = "rocm")]
-            Self::Rocm(storage) => c.metal_fwd(storage, l),
+            Self::Rocm(storage) => crate::bail!("not supported on rocm yet"),
         }
     }
 
