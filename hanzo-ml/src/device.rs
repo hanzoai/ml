@@ -270,8 +270,6 @@ impl Device {
             Self::Cuda(_) => crate::bail!("expected a rocm device, got cuda"),
             Self::Cpu => crate::bail!("expected a rocm device, got cpu"),
             Self::Metal(_) => crate::bail!("expected a rocm device, got Metal"),
-            #[cfg(feature = "rocm")]
-            Self::Rocm(_) => crate::bail!("expected a rocm device, got Metal"),
             Self::Rocm(d) => Ok(d),
         }
     }
