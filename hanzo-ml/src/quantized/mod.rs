@@ -72,6 +72,8 @@ impl Device {
             }
             #[cfg(feature = "rocm")]
             Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(_) => crate::bail!("quantized tensors on vulkan are not supported yet"),
         }
     }
 }
@@ -122,6 +124,8 @@ impl QStorage {
             },
             #[cfg(feature = "rocm")]
             Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(_) => crate::bail!("quantized tensors on vulkan are not supported yet"),
         }
     }
 
