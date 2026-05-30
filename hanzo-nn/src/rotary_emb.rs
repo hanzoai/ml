@@ -263,6 +263,9 @@ pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         hanzo_ml::bail!("sin has to be contiguous in rope")
     }
+    if xs.device().is_rocm() {
+        return rope_i_slow(xs, cos, sin);
+    }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmbI)
 }
 
@@ -533,6 +536,9 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     }
     if !sin.is_contiguous() {
         hanzo_ml::bail!("sin has to be contiguous in rope")
+    }
+    if xs.device().is_rocm() {
+        return rope_slow(xs, cos, sin);
     }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
 }
