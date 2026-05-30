@@ -84,3 +84,13 @@ CONST_SET_OP(double, const_set_f64)
 CONST_SET_OP(uint8_t, const_set_u8)
 CONST_SET_OP(uint32_t, const_set_u32)
 CONST_SET_OP(int64_t, const_set_i64)
+
+// 16-bit float variants (plain assignment, no arithmetic).
+#if defined(__HIPCC__)
+#include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
+FILL_OP(__half, fill_f16)
+FILL_OP(hip_bfloat16, fill_bf16)
+CONST_SET_OP(__half, const_set_f16)
+CONST_SET_OP(hip_bfloat16, const_set_bf16)
+#endif
