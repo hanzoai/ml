@@ -270,8 +270,24 @@ impl Tensor {
                         );
                         Storage::Metal(storage)
                     }
+                    #[cfg(feature = "rocm")]
+                    Device::Rocm(device) => {
+                        let buffer = device.new_buffer_with_data(data)?;
+
+                        let storage = crate::metal_backend::RocmStorage::new(
+                            buffer,
+                            device.clone(),
+                            data.len(),
+                            dtype,
+                        );
+                        Storage::Rocm(storage)
+                    }
                     #[cfg(not(feature = "metal"))]
                     Device::Metal(_) => {
+                        return Err(Error::Msg("Metal support not compiled".to_string()));
+                    }
+                    #[cfg(feature = "rocm")]
+                    Device::Rocm(_) => {
                         return Err(Error::Msg("Metal support not compiled".to_string()));
                     }
                 };
@@ -366,8 +382,20 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
                 crate::metal_backend::MetalStorage::new(buffer, device.clone(), data.len(), dtype);
             Storage::Metal(storage)
         }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(device) => {
+            let buffer = device.new_buffer_with_data(data)?;
+
+            let storage =
+                crate::metal_backend::RocmStorage::new(buffer, device.clone(), data.len(), dtype);
+            Storage::Rocm(storage)
+        }
         #[cfg(not(feature = "metal"))]
         Device::Metal(_) => {
+            return Err(Error::Msg("Metal support not compiled".to_string()));
+        }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => {
             return Err(Error::Msg("Metal support not compiled".to_string()));
         }
     };

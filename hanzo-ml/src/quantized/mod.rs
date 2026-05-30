@@ -675,7 +675,51 @@ impl QTensor {
                 }
             },
             _ => {
-                panic!("indexed_moe_forward is not implemented in this platform!");
+                // CPU / non-CUDA fallback: per-expert quantized matmul. The packed expert bank
+                // [E, n, k] is sliced into equal, contiguous per-expert quantized blocks; for
+                // each expert that is actually selected we run candle's native quantized matmul
+                // on just the tokens routed to it. Nothing is dequantized, so quantized MoE runs
+                // on any backend (CPU, Metal, ...) at a cost proportional to the active experts.
+                use crate::Module; // brings QMatMul::forward into scope
+                use std::collections::HashMap;
+                use std::sync::Arc;
+                let device = x.device();
+                let out_dtype = x.dtype();
+                let (e_cnt, n, k) = self.shape().dims3()?;
+                let (t, topk) = ids.dims2()?;
+                let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+                let x_exp = if s == topk { x.clone() } else { x.broadcast_as((t, topk, k))? };
+                let x_flat = x_exp
+                    .reshape((t * topk, k))?
+                    .to_dtype(crate::DType::F32)?
+                    .contiguous()?;
+                let ids_flat = ids.reshape((t * topk,))?.to_dtype(crate::DType::U32)?;
+                let ids_vec = ids_flat.to_vec1::<u32>()?;
+                let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+                for (slot, eid) in ids_vec.iter().enumerate() {
+                    groups.entry(*eid).or_default().push(slot as u32);
+                }
+                let dtype = self.storage.dtype();
+                let all_bytes = self.data()?;
+                let expert_bytes = all_bytes.len() / e_cnt;
+                let mut out_flat = Tensor::zeros((t * topk, n), crate::DType::F32, device)?;
+                for (eid, slots) in groups.into_iter() {
+                    let off = eid as usize * expert_bytes;
+                    let qs = QStorage::from_data(
+                        std::borrow::Cow::Borrowed(&all_bytes[off..off + expert_bytes]),
+                        device,
+                        dtype,
+                    )?;
+                    let shape: crate::Shape = (n, k).into();
+                    let w_e = QTensor { storage: qs, shape };
+                    let qm = QMatMul::from_arc(Arc::new(w_e))?;
+                    let m = slots.len();
+                    let idx = Tensor::from_vec(slots, (m,), device)?;
+                    let x_e = x_flat.index_select(&idx, 0)?; // [m, k]
+                    let y_e = qm.forward(&x_e)?.to_dtype(crate::DType::F32)?; // [m, n]
+                    out_flat = out_flat.index_add(&idx, &y_e, 0)?;
+                }
+                out_flat.reshape((t, topk, n))?.to_dtype(out_dtype)
             }
         }
     }

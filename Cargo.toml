@@ -25,6 +25,7 @@ exclude = [
     "candle-flash-attn-v3",
     "candle-kernels",
     "candle-metal-kernels",
+    "candle-rocm-kernels",
     "candle-onnx",
     "hanzo-flash-attn",
     "hanzo-kernels",
@@ -46,6 +47,8 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+rocm-rs = "0.5"
+candle-rocm-kernels = { path = "./candle-rocm-kernels", version = "0.10.2" }
 ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
