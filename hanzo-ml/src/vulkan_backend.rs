@@ -121,6 +121,11 @@ struct VkInner {
     qfi: u32,
     gpu_id: usize,
     mem_props: vk::PhysicalDeviceMemoryProperties,
+    // Cooperative-matrix (matrix-core / WMMA) availability and the chosen MxNxK tile for an
+    // fp16xfp16 -> fp32 subgroup config. Present on native AMD/NV drivers (RDNA3.5 8060S),
+    // absent on WSL/Dozen — matmul picks the coopmat kernel only when `coopmat` is true.
+    coopmat: bool,
+    cm_mnk: (u32, u32, u32),
     // CPU-side RNG seed (kernels are deterministic; randoms are generated on the CPU then uploaded).
     seed: Mutex<u64>,
     // kernel name -> built pipeline. &'static str keys: kernel names are compile-time literals.
@@ -177,6 +182,12 @@ impl std::fmt::Debug for VulkanStorage {
 impl VulkanDevice {
     fn dev(&self) -> &ash::Device {
         &self.inner.device
+    }
+
+    /// Cooperative-matrix (matrix-core) tile `(M, N, K)` if the device supports an
+    /// fp16xfp16 -> fp32 subgroup config, else `None`. Used to pick the coopmat matmul path.
+    pub fn coopmat_info(&self) -> Option<(u32, u32, u32)> {
+        self.inner.coopmat.then_some(self.inner.cm_mnk)
     }
 
     // Allocate a host-visible+coherent storage buffer of `bytes` bytes.
@@ -494,7 +505,7 @@ impl BackendDevice for VulkanDevice {
         unsafe {
             let entry = ash::Entry::load()
                 .map_err(|e| Error::Msg(format!("vulkan: loader not found: {e}")))?;
-            let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 2, 0));
+            let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
             let instance = entry
                 .create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)
                 .map_err(vkerr)?;
@@ -527,9 +538,56 @@ impl BackendDevice for VulkanDevice {
             let qci = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qfi)
                 .queue_priorities(&prios)];
-            let device = instance
-                .create_device(pdev, &vk::DeviceCreateInfo::default().queue_create_infos(&qci), None)
-                .map_err(vkerr)?;
+
+            // Probe cooperative-matrix support: need the device extension AND a config with
+            // fp16 A/B, fp32 C/result at subgroup scope. Guard the query on the extension being
+            // advertised (the loader's fn pointer is only valid then) so WSL/Dozen stays on the
+            // plain tiled path.
+            let dev_exts = instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
+            let has_cm_ext = dev_exts.iter().any(|e| {
+                CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::cooperative_matrix::NAME
+            });
+            let cm_mnk = if has_cm_ext {
+                let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+                cm.get_physical_device_cooperative_matrix_properties(pdev)
+                    .ok()
+                    .and_then(|props| {
+                        props.into_iter().find(|p| {
+                            p.a_type == vk::ComponentTypeKHR::FLOAT16
+                                && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                                && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                                && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                                && p.scope == vk::ScopeKHR::SUBGROUP
+                        })
+                    })
+                    .map(|p| (p.m_size, p.n_size, p.k_size))
+            } else {
+                None
+            };
+            let coopmat = cm_mnk.is_some();
+            let cm_mnk = cm_mnk.unwrap_or((0, 0, 0));
+
+            // Enable the coopmat extension + the features its SPIR-V needs (cooperative matrix,
+            // Vulkan memory model, fp16 arithmetic, 16-bit storage) only when supported.
+            let cm_ext_names = [ash::khr::cooperative_matrix::NAME.as_ptr()];
+            let mut cm_feat =
+                vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+            let mut mm_feat =
+                vk::PhysicalDeviceVulkanMemoryModelFeatures::default().vulkan_memory_model(true);
+            let mut f16_feat =
+                vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
+            let mut s16_feat = vk::PhysicalDevice16BitStorageFeatures::default()
+                .storage_buffer16_bit_access(true);
+            let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
+            if coopmat {
+                dci = dci
+                    .enabled_extension_names(&cm_ext_names)
+                    .push_next(&mut cm_feat)
+                    .push_next(&mut mm_feat)
+                    .push_next(&mut f16_feat)
+                    .push_next(&mut s16_feat);
+            }
+            let device = instance.create_device(pdev, &dci, None).map_err(vkerr)?;
             let queue = device.get_device_queue(qfi, 0);
             let mem_props = instance.get_physical_device_memory_properties(pdev);
 
@@ -580,6 +638,8 @@ impl BackendDevice for VulkanDevice {
                 seed: Mutex::new(299792458),
                 pipelines: Mutex::new(HashMap::new()),
                 submitter,
+                coopmat,
+                cm_mnk,
             };
             Ok(Self { inner: Arc::new(inner) })
         }
