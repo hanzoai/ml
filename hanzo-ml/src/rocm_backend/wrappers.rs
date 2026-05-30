@@ -13,6 +13,17 @@ impl<T> SendSyncDeviceMemory<T> {
     pub fn new(len: usize) -> Result<Self, rocm_rs::hip::error::Error> {
         Ok(Self(DeviceMemory::new(len)?))
     }
+
+    /// Pointer advanced by `offset` ELEMENTS (not bytes), returned as a byte
+    /// (`c_void`) pointer. `DeviceMemory::as_ptr()` is a `*mut c_void`, so a bare
+    /// `.as_ptr().add(offset)` would advance by bytes — wrong for any T larger
+    /// than 1 byte. Cast to the element type first so `.add` scales correctly.
+    ///
+    /// # Safety
+    /// `offset` must be within the allocation.
+    pub unsafe fn offset_ptr(&self, offset: usize) -> *mut std::ffi::c_void {
+        (self.as_ptr() as *mut T).add(offset) as *mut std::ffi::c_void
+    }
 }
 
 impl<T> Deref for SendSyncDeviceMemory<T> {
