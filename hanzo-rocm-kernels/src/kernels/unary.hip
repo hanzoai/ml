@@ -162,3 +162,101 @@ UNARY_OP_SCALAR(double, uelu_f64, (x > 0.0 ? x : scalar * (exp(x) - 1.0)))
 
 UNARY_OP_SCALAR(float, upowf_f32, powf(x, scalar))
 UNARY_OP_SCALAR(double, upowf_f64, pow(x, scalar))
+
+// 16-bit float variants: load/compute in float, cast result back.
+#if defined(__HIPCC__)
+#include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
+
+#define UNARY_OP_F(TYPENAME, FN_NAME, FUNC) \
+extern "C" __global__ void FN_NAME( \
+    const size_t numel, \
+    const size_t num_dims, \
+    const size_t *dims_and_strides, \
+    const TYPENAME *input, \
+    TYPENAME *out \
+) { \
+    const size_t *dims = dims_and_strides; \
+    const size_t *strides = dims_and_strides + num_dims; \
+    bool contiguous = dims_and_strides == nullptr || is_contiguous(num_dims, dims, strides); \
+    if (contiguous) { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            float x = (float)input[i]; \
+            out[i] = (TYPENAME)(FUNC); \
+        } \
+    } else { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            unsigned int tmp_i = i; \
+            unsigned int src_i = 0; \
+            for (int d = num_dims - 1; d >= 0; d--) { \
+                unsigned int i_dim = tmp_i % dims[d]; \
+                src_i += i_dim * strides[d]; \
+                tmp_i /= dims[d]; \
+            } \
+            float x = (float)input[src_i]; \
+            out[i] = (TYPENAME)(FUNC); \
+        } \
+    } \
+}
+
+#define UNARY_OP_SCALAR_F(TYPENAME, FN_NAME, FUNC) \
+extern "C" __global__ void FN_NAME( \
+    const size_t numel, \
+    const size_t num_dims, \
+    const size_t *dims_and_strides, \
+    const TYPENAME *input, \
+    TYPENAME *out, \
+    TYPENAME scalar_in \
+) { \
+    const size_t *dims = dims_and_strides; \
+    const size_t *strides = dims_and_strides + num_dims; \
+    float scalar = (float)scalar_in; \
+    bool contiguous = dims_and_strides == nullptr || is_contiguous(num_dims, dims, strides); \
+    if (contiguous) { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            float x = (float)input[i]; \
+            out[i] = (TYPENAME)(FUNC); \
+        } \
+    } else { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            unsigned int tmp_i = i; \
+            unsigned int src_i = 0; \
+            for (int d = num_dims - 1; d >= 0; d--) { \
+                unsigned int i_dim = tmp_i % dims[d]; \
+                src_i += i_dim * strides[d]; \
+                tmp_i /= dims[d]; \
+            } \
+            float x = (float)input[src_i]; \
+            out[i] = (TYPENAME)(FUNC); \
+        } \
+    } \
+}
+
+#define UNARY_ALL_F(T, SUF) \
+UNARY_OP_F(T, ucopy_##SUF, x) \
+UNARY_OP_F(T, urelu_##SUF, (x > 0.0f ? x : 0.0f)) \
+UNARY_OP_F(T, usigmoid_##SUF, (1.0f / (1.0f + expf(-x)))) \
+UNARY_OP_F(T, utan_##SUF, tanhf(x)) \
+UNARY_OP_F(T, uexp_##SUF, expf(x)) \
+UNARY_OP_F(T, ulog_##SUF, logf(x)) \
+UNARY_OP_F(T, usin_##SUF, sinf(x)) \
+UNARY_OP_F(T, ucos_##SUF, cosf(x)) \
+UNARY_OP_F(T, usqrt_##SUF, sqrtf(x)) \
+UNARY_OP_F(T, uabs_##SUF, fabsf(x)) \
+UNARY_OP_F(T, uneg_##SUF, -x) \
+UNARY_OP_F(T, urecip_##SUF, (1.0f / x)) \
+UNARY_OP_F(T, ufloor_##SUF, floorf(x)) \
+UNARY_OP_F(T, uceil_##SUF, ceilf(x)) \
+UNARY_OP_F(T, uround_##SUF, roundf(x)) \
+UNARY_OP_F(T, usqr_##SUF, (x * x)) \
+UNARY_OP_F(T, usign_##SUF, (x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f))) \
+UNARY_OP_F(T, ugelu_##SUF, (0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))))) \
+UNARY_OP_F(T, ugelu_erf_##SUF, (0.5f * x * (1.0f + erff(x * 0.7071067811865475f)))) \
+UNARY_OP_F(T, usilu_##SUF, (x / (1.0f + expf(-x)))) \
+UNARY_OP_F(T, uerf_##SUF, erff(x)) \
+UNARY_OP_SCALAR_F(T, uelu_##SUF, (x > 0.0f ? x : scalar * (expf(x) - 1.0f))) \
+UNARY_OP_SCALAR_F(T, upowf_##SUF, powf(x, scalar))
+
+UNARY_ALL_F(__half, f16)
+UNARY_ALL_F(hip_bfloat16, bf16)
+#endif
