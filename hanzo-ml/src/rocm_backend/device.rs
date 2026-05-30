@@ -2,11 +2,12 @@ use crate::backend::BackendDevice;
 use crate::{CpuStorage, DType, Layout, Result, Shape};
 use hanzo_rocm_kernels::compile::KernelCache;
 use half::{bf16, f16};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::wrappers::{
-    SendSyncDeviceMemory, SendSyncMIOpenHandle, SendSyncPseudoRng, SendSyncRocblasHandle,
-    SendSyncStream,
+    DevicePool, SendSyncDeviceMemory, SendSyncMIOpenHandle, SendSyncPseudoRng,
+    SendSyncRocblasHandle, SendSyncStream,
 };
 use super::{Affine, RocmError, RocmStorage, RocmStorageSlice};
 use rocm_rs::hip::Device as HipDevice;
@@ -32,6 +33,8 @@ pub struct RocmDevice {
     pub(crate) blas: Arc<SendSyncRocblasHandle>,
     pub(crate) miopen: Arc<SendSyncMIOpenHandle>,
     kernel_manager: Arc<Mutex<KernelCache>>,
+    /// Caching allocator pool (avoids the synchronizing per-op hipMalloc).
+    pool: DevicePool,
 }
 
 impl std::fmt::Debug for RocmDevice {
@@ -74,6 +77,7 @@ impl RocmDevice {
             blas: Arc::new(blas),
             miopen: Arc::new(miopen),
             kernel_manager,
+            pool: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -82,12 +86,12 @@ impl RocmDevice {
     }
 
     pub fn alloc<T>(&self, len: usize) -> Result<SendSyncDeviceMemory<T>> {
-        SendSyncDeviceMemory::new(len)
+        SendSyncDeviceMemory::new_pooled(len, Some(self.pool.clone()))
             .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))
     }
 
     pub fn alloc_zeros<T: Default + Clone>(&self, len: usize) -> Result<SendSyncDeviceMemory<T>> {
-        let mut mem = SendSyncDeviceMemory::new(len)
+        let mut mem = SendSyncDeviceMemory::new_pooled(len, Some(self.pool.clone()))
             .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))?;
         mem.memset(0)
             .map_err(|e| crate::Error::Msg(format!("Failed to memset: {}", e)))?;
@@ -96,7 +100,7 @@ impl RocmDevice {
 
     pub fn clone_htod<T: Clone>(&self, src: &[T]) -> Result<SendSyncDeviceMemory<T>> {
         let count = src.len();
-        let mut dst = SendSyncDeviceMemory::new(count)
+        let mut dst = SendSyncDeviceMemory::new_pooled(count, Some(self.pool.clone()))
             .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))?;
         dst.copy_from_host(src)
             .map_err(|e| crate::Error::Msg(format!("Failed to copy host to device: {}", e)))?;
@@ -138,17 +142,16 @@ impl RocmDevice {
         kernel_name: &'static str,
         source: &'static str,
     ) -> crate::Result<rocm_rs::hip::Function> {
-        let kernel_manager = self
-            .kernel_manager
-            .lock()
-            .map_err(|_| crate::Error::Msg("Failed to lock kernel manager".to_string()))?;
-        let module = kernel_manager
-            .get_or_load(kernel_name, source)
-            .map_err(|e| crate::Error::Msg(e.to_string()))?;
-        let func = module
-            .get_function(kernel_name)
-            .map_err(|e| crate::Error::Msg(format!("Kernel {} not found: {}", kernel_name, e)))?;
-        Ok(func)
+        let raw = {
+            let kernel_manager = self
+                .kernel_manager
+                .lock()
+                .map_err(|_| crate::Error::Msg("Failed to lock kernel manager".to_string()))?;
+            kernel_manager
+                .get_func_raw(kernel_name, source, kernel_name)
+                .map_err(|e| crate::Error::Msg(e.to_string()))?
+        };
+        Ok(unsafe { rocm_rs::hip::Function::from_raw(raw as _) })
     }
 }
 
@@ -363,18 +366,20 @@ impl BackendDevice for RocmDevice {
                 )));
             }
             DType::F32 => {
-                let mut data = self.alloc::<f32>(elem_count)?;
+                let mut data = rocm_rs::hip::DeviceMemory::<f32>::new(elem_count)
+                    .map_err(|e| crate::Error::Msg(format!("rocm rand alloc failed: {}", e)))?;
                 rocrand.generate_uniform(&mut data).map_err(|e| {
                     crate::Error::Msg(format!("rocrand generate_uniform failed: {}", e))
                 })?;
-                RocmStorageSlice::F32(data)
+                RocmStorageSlice::F32(SendSyncDeviceMemory::from_device_memory(data))
             }
             DType::F64 => {
-                let mut data = self.alloc::<f64>(elem_count)?;
+                let mut data = rocm_rs::hip::DeviceMemory::<f64>::new(elem_count)
+                    .map_err(|e| crate::Error::Msg(format!("rocm rand alloc failed: {}", e)))?;
                 rocrand.generate_uniform_double(&mut data).map_err(|e| {
                     crate::Error::Msg(format!("rocrand generate_uniform_double failed: {}", e))
                 })?;
-                RocmStorageSlice::F64(data)
+                RocmStorageSlice::F64(SendSyncDeviceMemory::from_device_memory(data))
             }
         };
         let slice = if lo == 0. && hi == 1.0 {
@@ -423,22 +428,24 @@ impl BackendDevice for RocmDevice {
                 )));
             }
             DType::F32 => {
-                let mut data = self.alloc::<f32>(elem_count_round)?;
+                let mut data = rocm_rs::hip::DeviceMemory::<f32>::new(elem_count_round)
+                    .map_err(|e| crate::Error::Msg(format!("rocm rand alloc failed: {}", e)))?;
                 rocrand
                     .generate_normal(&mut data, mean as f32, std as f32)
                     .map_err(|e| {
                         crate::Error::Msg(format!("rocrand generate_normal failed: {}", e))
                     })?;
-                RocmStorageSlice::F32(data)
+                RocmStorageSlice::F32(SendSyncDeviceMemory::from_device_memory(data))
             }
             DType::F64 => {
-                let mut data = self.alloc::<f64>(elem_count_round)?;
+                let mut data = rocm_rs::hip::DeviceMemory::<f64>::new(elem_count_round)
+                    .map_err(|e| crate::Error::Msg(format!("rocm rand alloc failed: {}", e)))?;
                 rocrand
                     .generate_normal_double(&mut data, mean, std)
                     .map_err(|e| {
                         crate::Error::Msg(format!("rocrand generate_normal_double failed: {}", e))
                     })?;
-                RocmStorageSlice::F64(data)
+                RocmStorageSlice::F64(SendSyncDeviceMemory::from_device_memory(data))
             }
         };
         Ok(RocmStorage {
