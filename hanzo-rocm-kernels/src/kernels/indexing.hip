@@ -123,6 +123,58 @@ IS_OP(uint8_t, uint8_t, is_u8_u8)
 IS_OP(uint32_t, uint8_t, is_u8_u32)
 IS_OP(int64_t, uint8_t, is_u8_i64)
 
+// gather: ids has the same shape as out; each ids[i] replaces the `dim`
+// coordinate when reading from inp. Requires contiguous inp + ids.
+template <typename T, typename I>
+__device__ void gather(
+    const size_t numel,
+    const I *ids,
+    const T *inp,
+    T *out,
+    const size_t left_size,
+    const size_t src_dim_size,
+    const size_t ids_dim_size,
+    const size_t right_size
+) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+        size_t post = i % right_size;
+        size_t pre = i / (ids_dim_size * right_size);
+        size_t j = (size_t)ids[i];
+        size_t src_i = (pre * src_dim_size + j) * right_size + post;
+        out[i] = inp[src_i];
+    }
+}
+
+#define GATHER_OP(TYPENAME, INDEX_TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const size_t numel, \
+    const INDEX_TYPENAME *ids, \
+    const TYPENAME *inp, \
+    TYPENAME *out, \
+    const size_t left_size, \
+    const size_t src_dim_size, \
+    const size_t ids_dim_size, \
+    const size_t right_size \
+) { gather(numel, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size); }
+
+GATHER_OP(float, int64_t, gather_i64_f32)
+GATHER_OP(double, int64_t, gather_i64_f64)
+GATHER_OP(uint8_t, int64_t, gather_i64_u8)
+GATHER_OP(uint32_t, int64_t, gather_i64_u32)
+GATHER_OP(int64_t, int64_t, gather_i64_i64)
+
+GATHER_OP(float, uint32_t, gather_u32_f32)
+GATHER_OP(double, uint32_t, gather_u32_f64)
+GATHER_OP(uint8_t, uint32_t, gather_u32_u8)
+GATHER_OP(uint32_t, uint32_t, gather_u32_u32)
+GATHER_OP(int64_t, uint32_t, gather_u32_i64)
+
+GATHER_OP(float, uint8_t, gather_u8_f32)
+GATHER_OP(double, uint8_t, gather_u8_f64)
+GATHER_OP(uint8_t, uint8_t, gather_u8_u8)
+GATHER_OP(uint32_t, uint8_t, gather_u8_u32)
+GATHER_OP(int64_t, uint8_t, gather_u8_i64)
+
 #if defined(__HIPCC__)
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -134,4 +186,12 @@ IS_OP(hip_bfloat16, uint8_t, is_u8_bf16)
 IS_OP(__half, int64_t, is_i64_f16)
 IS_OP(__half, uint32_t, is_u32_f16)
 IS_OP(__half, uint8_t, is_u8_f16)
+
+GATHER_OP(hip_bfloat16, int64_t, gather_i64_bf16)
+GATHER_OP(hip_bfloat16, uint32_t, gather_u32_bf16)
+GATHER_OP(hip_bfloat16, uint8_t, gather_u8_bf16)
+
+GATHER_OP(__half, int64_t, gather_i64_f16)
+GATHER_OP(__half, uint32_t, gather_u32_f16)
+GATHER_OP(__half, uint8_t, gather_u8_f16)
 #endif
