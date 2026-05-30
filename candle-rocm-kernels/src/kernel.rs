@@ -67,6 +67,12 @@ impl KernelSource for CastKernel {
     const CODE: &'static str = include_str!("kernels/cast.hip");
 }
 
+pub struct TernaryKernel;
+impl KernelSource for TernaryKernel {
+    const NAME: &'static str = "ternary";
+    const CODE: &'static str = include_str!("kernels/ternary.hip");
+}
+
 /// Binary operation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
