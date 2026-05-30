@@ -507,16 +507,16 @@ unsafe fn launch_kernel(
     block: rocm_rs::hip::Dim3,
     args: &mut [*mut std::ffi::c_void],
 ) -> Result<()> {
-    let kernel_manager = dev
-        .kernel_manager()
-        .lock()
-        .map_err(|_| crate::Error::Msg("Failed to lock kernel manager".to_string()))?;
-    let module = kernel_manager
-        .get_or_load(module_name, module_source)
-        .map_err(|e| crate::Error::Msg(e.to_string()))?;
-    let kernel = module
-        .get_function(func_name)
-        .map_err(|e| crate::Error::Msg(format!("Kernel {} not found: {}", func_name, e)))?;
+    let raw = {
+        let kernel_manager = dev
+            .kernel_manager()
+            .lock()
+            .map_err(|_| crate::Error::Msg("Failed to lock kernel manager".to_string()))?;
+        kernel_manager
+            .get_func_raw(module_name, module_source, func_name)
+            .map_err(|e| crate::Error::Msg(e.to_string()))?
+    };
+    let kernel = rocm_rs::hip::Function::from_raw(raw as _);
     kernel
         .launch(grid, block, 0, Some(&dev.stream), args)
         .map_err(|e| crate::Error::Msg(format!("Kernel launch failed: {}", e)))
@@ -533,16 +533,16 @@ unsafe fn launch_kernel_shmem(
     shared_mem: u32,
     args: &mut [*mut std::ffi::c_void],
 ) -> Result<()> {
-    let kernel_manager = dev
-        .kernel_manager()
-        .lock()
-        .map_err(|_| crate::Error::Msg("Failed to lock kernel manager".to_string()))?;
-    let module = kernel_manager
-        .get_or_load(module_name, module_source)
-        .map_err(|e| crate::Error::Msg(e.to_string()))?;
-    let kernel = module
-        .get_function(func_name)
-        .map_err(|e| crate::Error::Msg(format!("Kernel {} not found: {}", func_name, e)))?;
+    let raw = {
+        let kernel_manager = dev
+            .kernel_manager()
+            .lock()
+            .map_err(|_| crate::Error::Msg("Failed to lock kernel manager".to_string()))?;
+        kernel_manager
+            .get_func_raw(module_name, module_source, func_name)
+            .map_err(|e| crate::Error::Msg(e.to_string()))?
+    };
+    let kernel = rocm_rs::hip::Function::from_raw(raw as _);
     kernel
         .launch(grid, block, shared_mem, Some(&dev.stream), args)
         .map_err(|e| crate::Error::Msg(format!("Kernel launch failed: {}", e)))
