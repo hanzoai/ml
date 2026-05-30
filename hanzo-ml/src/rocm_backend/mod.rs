@@ -1259,6 +1259,46 @@ fn index_select_typed<T: Copy + Send + Sync + WithDType + 'static>(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn gather_typed<T: Copy + Send + Sync + WithDType + 'static>(
+    ids_prefix: &str,
+    ids_ptr: *mut std::ffi::c_void,
+    src_ptr: *mut std::ffi::c_void,
+    left_size: usize,
+    src_dim_size: usize,
+    ids_dim_size: usize,
+    right_size: usize,
+    dst_el: usize,
+    device: &RocmDevice,
+) -> Result<SendSyncDeviceMemory<T>> {
+    use hanzo_rocm_kernels::kernel::IndexingKernel;
+    let func_name = kernel_name::<T>(ids_prefix);
+    let output = device.alloc::<T>(dst_el)?;
+    let (grid, block) = launch_config(dst_el);
+    unsafe {
+        let out_ptr = output.as_ptr();
+        launch_kernel(
+            device,
+            IndexingKernel::NAME,
+            IndexingKernel::CODE,
+            &func_name,
+            grid,
+            block,
+            &mut [
+                &dst_el as *const usize as *mut std::ffi::c_void,
+                (&ids_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &left_size as *const usize as *mut std::ffi::c_void,
+                &src_dim_size as *const usize as *mut std::ffi::c_void,
+                &ids_dim_size as *const usize as *mut std::ffi::c_void,
+                &right_size as *const usize as *mut std::ffi::c_void,
+            ],
+        )?;
+    }
+    Ok(output)
+}
+
 impl BackendStorage for RocmStorage {
     type Device = RocmDevice;
 
@@ -1708,10 +1748,54 @@ impl BackendStorage for RocmStorage {
         ))
     }
 
-    fn gather(&self, _l: &Layout, _idx: &Self, _il: &Layout, _dim: usize) -> Result<Self> {
-        Err(crate::Error::Msg(
-            "gather not yet implemented for ROCm".to_string(),
-        ))
+    fn gather(&self, l: &Layout, idx: &Self, il: &Layout, dim: usize) -> Result<Self> {
+        let device = self.device.clone();
+        let src_dims = l.dims();
+        let ids_dims = il.dims();
+        let left_size: usize = src_dims[..dim].iter().product();
+        let right_size: usize = src_dims[dim + 1..].iter().product();
+        let src_dim_size = src_dims[dim];
+        let ids_dim_size = ids_dims[dim];
+        let dst_el: usize = ids_dims.iter().product();
+
+        let src_ptr = match l.contiguous_offsets() {
+            Some((o1, _)) => unsafe { self.slice.offset_ptr(o1) },
+            None => Err(crate::Error::RequiresContiguous { op: "gather" }.bt())?,
+        };
+        let (ids_prefix, ids_ptr) = match &idx.slice {
+            RocmStorageSlice::U32(s) => ("gather_u32", unsafe {
+                s.offset_ptr(il.start_offset())
+            }),
+            RocmStorageSlice::U8(s) => ("gather_u8", unsafe { s.offset_ptr(il.start_offset()) }),
+            RocmStorageSlice::I64(s) => ("gather_i64", unsafe { s.offset_ptr(il.start_offset()) }),
+            _ => crate::bail!("gather ids should be u8, u32, or i64"),
+        };
+        macro_rules! g {
+            ($variant:ident, $ty:ty) => {
+                RocmStorageSlice::$variant(gather_typed::<$ty>(
+                    ids_prefix,
+                    ids_ptr,
+                    src_ptr,
+                    left_size,
+                    src_dim_size,
+                    ids_dim_size,
+                    right_size,
+                    dst_el,
+                    &device,
+                )?)
+            };
+        }
+        let slice = match &self.slice {
+            RocmStorageSlice::F32(_) => g!(F32, f32),
+            RocmStorageSlice::F64(_) => g!(F64, f64),
+            RocmStorageSlice::U8(_) => g!(U8, u8),
+            RocmStorageSlice::U32(_) => g!(U32, u32),
+            RocmStorageSlice::I64(_) => g!(I64, i64),
+            RocmStorageSlice::BF16(_) => g!(BF16, half::bf16),
+            RocmStorageSlice::F16(_) => g!(F16, half::f16),
+            _ => crate::bail!("gather does not support this dtype for ROCm"),
+        };
+        Ok(Self { slice, device })
     }
 
     fn scatter_set(
