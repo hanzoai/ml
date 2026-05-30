@@ -132,13 +132,18 @@ struct VkInner {
     submitter: Mutex<Submitter>,
 }
 
-// Reusable submit resources. Created once at device init; per dispatch we reset the command
-// pool + descriptor pool + fence rather than allocating fresh ones.
+// Reusable submit resources, created once at device init. Many dispatches are recorded into
+// the single `cmd` and submitted together on flush (see `dispatch`/`flush_locked`), so the
+// per-op CPU<->GPU fence stall is paid once per batch instead of once per op.
 struct Submitter {
     cpool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     dpool: vk::DescriptorPool,
+    // Is `cmd` currently open with recorded-but-unsubmitted dispatches?
+    recording: bool,
+    // Dispatches recorded into `cmd` since it was begun (bounded by BATCH_CAP).
+    n: u32,
 }
 // Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex.
 unsafe impl Send for Submitter {}
@@ -226,6 +231,8 @@ impl VulkanDevice {
         if n == 0 {
             return Ok(Vec::new());
         }
+        // Ensure all recorded GPU work that may write this buffer has completed.
+        self.flush()?;
         let dev = self.dev();
         let ptr = dev
             .map_memory(mem, 0, (n * 4) as u64, vk::MemoryMapFlags::empty())
@@ -253,6 +260,8 @@ impl VulkanDevice {
         if n == 0 {
             return Ok(Vec::new());
         }
+        // Ensure all recorded GPU work that may write this buffer has completed.
+        self.flush()?;
         let dev = self.dev();
         let ptr = dev
             .map_memory(mem, 0, (n * 4) as u64, vk::MemoryMapFlags::empty())
@@ -334,11 +343,22 @@ impl VulkanDevice {
         let p = self.pipeline(name, bufs.len(), push.len())?;
         debug_assert_eq!(p.n_buffers, bufs.len(), "vulkan: kernel `{name}` binding count drift");
         let dev = self.dev();
-        let s = self.inner.submitter.lock().unwrap();
+        let queue = self.inner.queue;
+        let mut s = self.inner.submitter.lock().unwrap();
         unsafe {
-            // Reset + reallocate the one descriptor set from the persistent pool.
-            dev.reset_descriptor_pool(s.dpool, vk::DescriptorPoolResetFlags::empty())
-                .map_err(vkerr)?;
+            if !s.recording {
+                // Start a fresh batch: free the previous batch's descriptor sets (its GPU work
+                // already completed at the last flush) and open the command buffer.
+                dev.reset_descriptor_pool(s.dpool, vk::DescriptorPoolResetFlags::empty())
+                    .map_err(vkerr)?;
+                dev.begin_command_buffer(s.cmd, &vk::CommandBufferBeginInfo::default())
+                    .map_err(vkerr)?;
+                s.recording = true;
+                s.n = 0;
+            }
+            // Allocate a fresh descriptor set for this dispatch. Sets accumulate within the
+            // batch (each recorded dispatch keeps its own); the pool is reset only when the
+            // next batch begins, after the current one has been submitted and awaited.
             let set_layouts = [p.set_layout];
             let set = dev
                 .allocate_descriptor_sets(
@@ -362,23 +382,45 @@ impl VulkanDevice {
                 .collect();
             dev.update_descriptor_sets(&writes, &[]);
 
-            // Re-record the persistent command buffer (RESET_COMMAND_BUFFER pool flag).
             let cmd = s.cmd;
-            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).map_err(vkerr)?;
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
             dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, &[set], &[]);
             if !push.is_empty() {
                 dev.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
             dev.cmd_dispatch(cmd, groups.0, groups.1, groups.2);
-            dev.end_command_buffer(cmd).map_err(vkerr)?;
-            let cmds = [cmd];
-            dev.reset_fences(&[s.fence]).map_err(vkerr)?;
-            dev.queue_submit(self.inner.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], s.fence)
-                .map_err(vkerr)?;
-            dev.wait_for_fences(&[s.fence], true, u64::MAX).map_err(vkerr)?;
+            // Guard RAW/WAW hazards between consecutive dispatches that share a buffer. A single
+            // global memory barrier is conservative (it serializes the batch on the GPU) but
+            // correct for any buffer aliasing; the win here is removing host stalls, not overlap.
+            let bar = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &bar,
+                &[],
+                &[],
+            );
+            s.n += 1;
+            // Bound the descriptor-set budget: a forward longer than BATCH_CAP ops just flushes
+            // a handful of times instead of once.
+            if s.n >= BATCH_CAP {
+                flush_locked(dev, queue, &mut s)?;
+            }
         }
         Ok(())
+    }
+
+    // Submit and await any pending recorded dispatches. Must be called before the host maps a
+    // buffer (readback) or relies on prior GPU work having completed.
+    fn flush(&self) -> Result<()> {
+        let dev = self.dev();
+        let queue = self.inner.queue;
+        let mut s = self.inner.submitter.lock().unwrap();
+        flush_locked(dev, queue, &mut s)
     }
 
     // Allocate an f32 storage holding `count` elements (uninitialized device memory).
@@ -408,6 +450,30 @@ impl VulkanDevice {
 
 fn vkerr(e: vk::Result) -> Error {
     Error::Msg(format!("vulkan: {e:?}"))
+}
+
+// Max dispatches recorded into one command buffer before an automatic flush. Bounds the
+// descriptor-set pool; this is large enough that a typical transformer forward submits once
+// (or a few times), turning hundreds of per-op fence stalls into a handful.
+const BATCH_CAP: u32 = 4096;
+
+// End, submit, and block on the current command batch, then mark the submitter idle. A no-op
+// when nothing is recorded. Caller must hold the submitter lock.
+fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter) -> Result<()> {
+    if !s.recording {
+        return Ok(());
+    }
+    unsafe {
+        dev.end_command_buffer(s.cmd).map_err(vkerr)?;
+        dev.reset_fences(&[s.fence]).map_err(vkerr)?;
+        let cmds = [s.cmd];
+        dev.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], s.fence)
+            .map_err(vkerr)?;
+        dev.wait_for_fences(&[s.fence], true, u64::MAX).map_err(vkerr)?;
+    }
+    s.recording = false;
+    s.n = 0;
+    Ok(())
 }
 
 // push-constant helpers (std430 scalar layout: tightly packed u32/f32).
@@ -487,16 +553,21 @@ impl BackendDevice for VulkanDevice {
                 )
                 .map_err(vkerr)?[0];
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vkerr)?;
+            // Sized for a whole batch: one descriptor set per recorded dispatch (up to
+            // BATCH_CAP), each binding up to 4 storage buffers (the widest kernel).
             let dpool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(8)];
+                .descriptor_count(BATCH_CAP * 4)];
             let dpool = device
                 .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default().pool_sizes(&dpool_sizes).max_sets(1),
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .pool_sizes(&dpool_sizes)
+                        .max_sets(BATCH_CAP),
                     None,
                 )
                 .map_err(vkerr)?;
-            let submitter = Mutex::new(Submitter { cpool, cmd, fence, dpool });
+            let submitter =
+                Mutex::new(Submitter { cpool, cmd, fence, dpool, recording: false, n: 0 });
 
             let inner = VkInner {
                 _entry: entry,
@@ -595,6 +666,7 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn synchronize(&self) -> Result<()> {
+        self.flush()?;
         unsafe { self.dev().device_wait_idle().map_err(vkerr) }
     }
 }
