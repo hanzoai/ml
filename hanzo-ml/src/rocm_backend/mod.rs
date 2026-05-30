@@ -1089,6 +1089,44 @@ impl std::fmt::Debug for RocmStorage {
     }
 }
 
+fn where_cond_typed<T: Copy + Send + Sync + WithDType + 'static>(
+    cond_prefix: &str,
+    cond_ptr: *mut std::ffi::c_void,
+    t_ptr: *mut std::ffi::c_void,
+    f_ptr: *mut std::ffi::c_void,
+    ds: &SendSyncDeviceMemory<usize>,
+    numel: usize,
+    num_dims: usize,
+    device: &RocmDevice,
+) -> Result<SendSyncDeviceMemory<T>> {
+    use candle_rocm_kernels::kernel::{KernelSource, TernaryKernel};
+    let func_name = kernel_name::<T>(cond_prefix);
+    let output = device.alloc::<T>(numel)?;
+    let (grid, block) = launch_config(numel);
+    unsafe {
+        let out_ptr = output.as_ptr();
+        let ds_ptr = ds.as_ptr() as *const usize;
+        launch_kernel(
+            device,
+            TernaryKernel::NAME,
+            TernaryKernel::CODE,
+            &func_name,
+            grid,
+            block,
+            &mut [
+                &numel as *const usize as *mut std::ffi::c_void,
+                &num_dims as *const usize as *mut std::ffi::c_void,
+                (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                (&cond_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&t_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&f_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+            ],
+        )?;
+    }
+    Ok(output)
+}
+
 fn index_select_typed<T: Copy + Send + Sync + WithDType + 'static>(
     ids_prefix: &str,
     ids_ptr: *mut std::ffi::c_void,
@@ -1388,15 +1426,35 @@ impl BackendStorage for RocmStorage {
 
     fn where_cond(
         &self,
-        _l: &Layout,
-        _a: &Self,
-        _la: &Layout,
-        _b: &Self,
-        _lb: &Layout,
+        l: &Layout,
+        a: &Self,
+        la: &Layout,
+        b: &Self,
+        lb: &Layout,
     ) -> Result<Self> {
-        Err(crate::Error::Msg(
-            "where_cond not yet implemented for ROCm".to_string(),
-        ))
+        let device = self.device.clone();
+        let numel = l.shape().elem_count();
+        let num_dims = l.dims().len();
+        let ds = device.clone_htod(&[l.dims(), l.stride(), la.stride(), lb.stride()].concat())?;
+        let (cond_prefix, cond_ptr) = match &self.slice {
+            RocmStorageSlice::U8(s) => ("where_u8", unsafe { s.as_ptr().add(l.start_offset()) } as *mut std::ffi::c_void),
+            RocmStorageSlice::U32(s) => ("where_u32", unsafe { s.as_ptr().add(l.start_offset()) } as *mut std::ffi::c_void),
+            RocmStorageSlice::I64(s) => ("where_i64", unsafe { s.as_ptr().add(l.start_offset()) } as *mut std::ffi::c_void),
+            _ => crate::bail!("where_cond condition must be u8, u32, or i64"),
+        };
+        let t_ptr = unsafe { a.slice.offset_ptr(la.start_offset()) };
+        let f_ptr = unsafe { b.slice.offset_ptr(lb.start_offset()) };
+        let slice = match &a.slice {
+            RocmStorageSlice::F32(_) => RocmStorageSlice::F32(where_cond_typed::<f32>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
+            RocmStorageSlice::F64(_) => RocmStorageSlice::F64(where_cond_typed::<f64>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
+            RocmStorageSlice::U8(_) => RocmStorageSlice::U8(where_cond_typed::<u8>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
+            RocmStorageSlice::U32(_) => RocmStorageSlice::U32(where_cond_typed::<u32>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
+            RocmStorageSlice::I64(_) => RocmStorageSlice::I64(where_cond_typed::<i64>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
+            RocmStorageSlice::BF16(_) => RocmStorageSlice::BF16(where_cond_typed::<half::bf16>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
+            RocmStorageSlice::F16(_) => RocmStorageSlice::F16(where_cond_typed::<half::f16>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
+            _ => crate::bail!("where_cond does not support this dtype for ROCm"),
+        };
+        Ok(Self { slice, device })
     }
 
     fn conv1d(
