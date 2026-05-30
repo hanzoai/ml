@@ -272,12 +272,18 @@ impl Tensor {
                     }
                     #[cfg(feature = "rocm")]
                     Device::Rocm(device) => crate::bail!("not supported on rocm yet"),
+                    #[cfg(feature = "vulkan")]
+                    Device::Vulkan(device) => crate::bail!("not supported on vulkan yet"),
                     #[cfg(not(feature = "metal"))]
                     Device::Metal(_) => {
                         return Err(Error::Msg("Metal support not compiled".to_string()));
                     }
                     #[cfg(feature = "rocm")]
                     Device::Rocm(_) => {
+                        return Err(Error::Msg("Metal support not compiled".to_string()));
+                    }
+                    #[cfg(feature = "vulkan")]
+                    Device::Vulkan(_) => {
                         return Err(Error::Msg("Metal support not compiled".to_string()));
                     }
                 };
@@ -374,12 +380,18 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         }
         #[cfg(feature = "rocm")]
         Device::Rocm(device) => crate::bail!("not supported on rocm yet"),
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(device) => crate::bail!("not supported on vulkan yet"),
         #[cfg(not(feature = "metal"))]
         Device::Metal(_) => {
             return Err(Error::Msg("Metal support not compiled".to_string()));
         }
         #[cfg(feature = "rocm")]
         Device::Rocm(_) => {
+            return Err(Error::Msg("Metal support not compiled".to_string()));
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(_) => {
             return Err(Error::Msg("Metal support not compiled".to_string()));
         }
     };
