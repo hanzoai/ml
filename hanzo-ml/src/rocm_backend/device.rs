@@ -1,6 +1,6 @@
 use crate::backend::BackendDevice;
 use crate::{CpuStorage, DType, Layout, Result, Shape};
-use candle_rocm_kernels::compile::KernelCache;
+use hanzo_rocm_kernels::compile::KernelCache;
 use half::{bf16, f16};
 use std::sync::{Arc, Mutex, RwLock};
 
