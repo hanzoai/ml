@@ -17,6 +17,11 @@ pub struct KernelCache {
     arch: String,
     rocm_version: String,
     modules: Mutex<HashMap<&'static str, Arc<SendSyncModule>>>,
+    /// Resolved kernel function handles (hipFunction_t as usize), keyed by func name.
+    /// hipModuleGetFunction is a slow driver round-trip through the WSL bridge (~90us),
+    /// so resolving once per function (not per op) is a major decode speedup. The handle
+    /// stays valid because its module is held forever in `modules`.
+    functions: Mutex<HashMap<String, usize>>,
 }
 
 impl KernelCache {
@@ -42,7 +47,37 @@ impl KernelCache {
             arch,
             rocm_version,
             modules: Mutex::new(HashMap::new()),
+            functions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Get a resolved kernel function handle (hipFunction_t as usize), caching it so
+    /// hipModuleGetFunction runs once per function instead of once per op.
+    pub fn get_func_raw(
+        &self,
+        module_name: &'static str,
+        source: &'static str,
+        func_name: &str,
+    ) -> Result<usize, KernelError> {
+        {
+            let funcs = self
+                .functions
+                .lock()
+                .map_err(|_| KernelError::Internal("Failed to lock functions cache".to_string()))?;
+            if let Some(&ptr) = funcs.get(func_name) {
+                return Ok(ptr);
+            }
+        }
+        let module = self.get_or_load(module_name, source)?;
+        let func = module.get_function(func_name).map_err(|e| {
+            KernelError::Compilation(format!("Kernel function {} not found: {}", func_name, e))
+        })?;
+        let raw = func.as_raw() as usize;
+        self.functions
+            .lock()
+            .map_err(|_| KernelError::Internal("Failed to lock functions cache".to_string()))?
+            .insert(func_name.to_string(), raw);
+        Ok(raw)
     }
 
     /// Get or compile a kernel module.
