@@ -262,7 +262,10 @@ impl Storage {
                 Ok((Self::Metal(storage), shape))
             }
             #[cfg(feature = "rocm")]
-            Self::Rocm(storage) => crate::bail!("not supported on rocm yet"),
+            Self::Rocm(storage) => {
+                let (storage, shape) = c.rocm_fwd(storage, l)?;
+                Ok((Self::Rocm(storage), shape))
+            }
         }
     }
 
@@ -288,7 +291,10 @@ impl Storage {
                 Ok((Self::Metal(s), shape))
             }
             #[cfg(feature = "rocm")]
-            (Self::Rocm(_), Self::Rocm(_)) => crate::bail!("custom op not supported on rocm yet"),
+            (Self::Rocm(s1), Self::Rocm(s2)) => {
+                let (s, shape) = c.rocm_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Rocm(s), shape))
+            }
             _ => unreachable!(),
         }
     }
@@ -318,7 +324,10 @@ impl Storage {
                 Ok((Self::Metal(s), shape))
             }
             #[cfg(feature = "rocm")]
-            (Self::Rocm(_), Self::Rocm(_), Self::Rocm(_)) => crate::bail!("custom op not supported on rocm yet"),
+            (Self::Rocm(s1), Self::Rocm(s2), Self::Rocm(s3)) => {
+                let (s, shape) = c.rocm_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Rocm(s), shape))
+            }
             _ => unreachable!(),
         }
     }
@@ -329,7 +338,7 @@ impl Storage {
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
             #[cfg(feature = "rocm")]
-            Self::Rocm(storage) => crate::bail!("not supported on rocm yet"),
+            Self::Rocm(storage) => c.rocm_fwd(storage, l),
         }
     }
 
@@ -346,7 +355,7 @@ impl Storage {
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
             #[cfg(feature = "rocm")]
-            (Self::Rocm(_), Self::Rocm(_)) => crate::bail!("custom op not supported on rocm yet"),
+            (Self::Rocm(s1), Self::Rocm(s2)) => c.rocm_fwd(s1, l1, s2, l2),
             _ => unreachable!(),
         }
     }
@@ -369,7 +378,7 @@ impl Storage {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
             #[cfg(feature = "rocm")]
-            (Self::Rocm(_), Self::Rocm(_), Self::Rocm(_)) => crate::bail!("custom op not supported on rocm yet"),
+            (Self::Rocm(s1), Self::Rocm(s2), Self::Rocm(s3)) => c.rocm_fwd(s1, l1, s2, l2, s3, l3),
             _ => unreachable!(),
         }
     }

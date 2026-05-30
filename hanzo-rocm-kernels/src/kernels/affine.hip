@@ -70,3 +70,37 @@ AFFINE_OP(double, affine_f64)
 AFFINE_OP(uint8_t, affine_u8)
 AFFINE_OP(uint32_t, affine_u32)
 AFFINE_OP(int64_t, affine_i64)
+
+// 16-bit float variants: compute in float, cast back.
+#if defined(__HIPCC__)
+#include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
+
+#define AFFINE_OP_F(TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const size_t numel, \
+    const size_t num_dims, \
+    const size_t *info, \
+    const TYPENAME *inp, \
+    TYPENAME *out, \
+    const TYPENAME mul, \
+    const TYPENAME add \
+) { \
+    float mulf = (float)mul; \
+    float addf = (float)add; \
+    if (info == nullptr || is_contiguous(num_dims, info, info + num_dims)) { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            out[i] = (TYPENAME)((float)inp[i] * mulf + addf); \
+        } \
+    } else { \
+        const size_t *strides = info + num_dims; \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            unsigned int src_i = get_strided_index(i, num_dims, info, strides); \
+            out[i] = (TYPENAME)((float)inp[src_i] * mulf + addf); \
+        } \
+    } \
+}
+
+AFFINE_OP_F(__half, affine_f16)
+AFFINE_OP_F(hip_bfloat16, affine_bf16)
+#endif
