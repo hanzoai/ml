@@ -70,6 +70,8 @@ impl Device {
                 let storage = cuda::QCudaStorage::zeros(cuda, elem_count, dtype)?;
                 Ok(QStorage::Cuda(storage))
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
         }
     }
 }
@@ -118,6 +120,8 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
+            #[cfg(feature = "rocm")]
+            Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
         }
     }
 
