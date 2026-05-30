@@ -522,6 +522,90 @@ unsafe fn launch_kernel(
         .map_err(|e| crate::Error::Msg(format!("Kernel launch failed: {}", e)))
 }
 
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_kernel_shmem(
+    dev: &RocmDevice,
+    module_name: &'static str,
+    module_source: &'static str,
+    func_name: &str,
+    grid: rocm_rs::hip::Dim3,
+    block: rocm_rs::hip::Dim3,
+    shared_mem: u32,
+    args: &mut [*mut std::ffi::c_void],
+) -> Result<()> {
+    let kernel_manager = dev
+        .kernel_manager()
+        .lock()
+        .map_err(|_| crate::Error::Msg("Failed to lock kernel manager".to_string()))?;
+    let module = kernel_manager
+        .get_or_load(module_name, module_source)
+        .map_err(|e| crate::Error::Msg(e.to_string()))?;
+    let kernel = module
+        .get_function(func_name)
+        .map_err(|e| crate::Error::Msg(format!("Kernel {} not found: {}", func_name, e)))?;
+    kernel
+        .launch(grid, block, shared_mem, Some(&dev.stream), args)
+        .map_err(|e| crate::Error::Msg(format!("Kernel launch failed: {}", e)))
+}
+
+impl RocmStorage {
+    /// Argsort along the last dim: returns u32 indices that sort each row.
+    /// Single-block bitonic sort (one block per row); used by Tensor::arg_sort_last_dim.
+    pub fn asort(&self, layout: &Layout, asc: bool, last_dim: usize) -> Result<Self> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, SortKernel};
+        let device = self.device.clone();
+        let elem_count = layout.shape().elem_count();
+        let ncols = last_dim as i32;
+        let nrows = (elem_count / last_dim) as u32;
+        let mut ncols_pad = 1usize;
+        while ncols_pad < last_dim {
+            ncols_pad *= 2;
+        }
+        let block_dim = ncols_pad.min(1024) as u32;
+        let shared_mem = (ncols_pad * std::mem::size_of::<u32>()) as u32;
+        let ncols_pad_i = ncols_pad as i32;
+
+        let suffix = match &self.slice {
+            RocmStorageSlice::F32(_) => "f32",
+            RocmStorageSlice::F64(_) => "f64",
+            RocmStorageSlice::U8(_) => "u8",
+            RocmStorageSlice::U32(_) => "u32",
+            RocmStorageSlice::I64(_) => "i64",
+            RocmStorageSlice::BF16(_) => "bf16",
+            RocmStorageSlice::F16(_) => "f16",
+            _ => crate::bail!("unsupported dtype for argsort on rocm"),
+        };
+        let func_name = format!("asort_{}_{}", if asc { "asc" } else { "desc" }, suffix);
+
+        let dst = device.alloc::<u32>(elem_count)?;
+        let x_ptr = unsafe { self.slice.offset_ptr(layout.start_offset()) };
+        let dst_ptr = dst.as_ptr();
+        let grid = rocm_rs::hip::Dim3::from(nrows);
+        let block = rocm_rs::hip::Dim3::from(block_dim);
+        unsafe {
+            launch_kernel_shmem(
+                &device,
+                SortKernel::NAME,
+                SortKernel::CODE,
+                &func_name,
+                grid,
+                block,
+                shared_mem,
+                &mut [
+                    (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                    (&dst_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                    &ncols as *const i32 as *mut std::ffi::c_void,
+                    &ncols_pad_i as *const i32 as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(Self {
+            slice: RocmStorageSlice::U32(dst),
+            device,
+        })
+    }
+}
+
 fn dims_and_strides(
     dev: &RocmDevice,
     layout: &Layout,

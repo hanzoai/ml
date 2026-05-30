@@ -73,6 +73,13 @@ impl KernelSource for TernaryKernel {
     const CODE: &'static str = include_str!("kernels/ternary.hip");
 }
 
+/// Argsort (bitonic, one block per row) kernel source
+pub struct SortKernel;
+impl KernelSource for SortKernel {
+    const NAME: &'static str = "sort";
+    const CODE: &'static str = include_str!("kernels/sort.hip");
+}
+
 /// Binary operation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
