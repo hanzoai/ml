@@ -135,3 +135,88 @@ BINARY_OP(double, bmaximum_f64, (x > y ? x : y))
 BINARY_OP(uint8_t, bmaximum_u8, (x > y ? x : y))
 BINARY_OP(uint32_t, bmaximum_u32, (x > y ? x : y))
 BINARY_OP(int64_t, bmaximum_i64, (x > y ? x : y))
+
+// 16-bit float variants. hip_bfloat16/__half lack reliable arithmetic
+// operators, so load+compute in float and cast the result back.
+#if defined(__HIPCC__)
+#include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
+
+#define BINARY_OP_F(TYPENAME, FN_NAME, FUNC) \
+extern "C" __global__ void FN_NAME( \
+    const size_t numel, \
+    const size_t num_dims, \
+    const size_t *dims_and_strides, \
+    const TYPENAME *lhs, \
+    const TYPENAME *rhs, \
+    TYPENAME *out \
+) { \
+    const size_t *dims = dims_and_strides; \
+    const size_t *lhs_strides = dims_and_strides + 1 * num_dims; \
+    const size_t *rhs_strides = dims_and_strides + 2 * num_dims; \
+    bool lhs_cont = dims_and_strides == nullptr || is_contiguous(num_dims, dims, lhs_strides); \
+    bool rhs_cont = dims_and_strides == nullptr || is_contiguous(num_dims, dims, rhs_strides); \
+    if (lhs_cont && rhs_cont) { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            float x = (float)lhs[i]; \
+            float y = (float)rhs[i]; \
+            out[i] = (TYPENAME)(FUNC); \
+        } \
+    } else if (lhs_cont) { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            unsigned int tmp_i = i; \
+            unsigned int rhs_i = 0; \
+            for (int d = num_dims - 1; d >= 0; d--) { \
+                unsigned int i_dim = tmp_i % dims[d]; \
+                rhs_i += i_dim * rhs_strides[d]; \
+                tmp_i /= dims[d]; \
+            } \
+            float x = (float)lhs[i]; \
+            float y = (float)rhs[rhs_i]; \
+            out[i] = (TYPENAME)(FUNC); \
+        } \
+    } else if (rhs_cont) { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            unsigned int tmp_i = i; \
+            unsigned int lhs_i = 0; \
+            for (int d = num_dims - 1; d >= 0; d--) { \
+                unsigned int i_dim = tmp_i % dims[d]; \
+                lhs_i += i_dim * lhs_strides[d]; \
+                tmp_i /= dims[d]; \
+            } \
+            float x = (float)lhs[lhs_i]; \
+            float y = (float)rhs[i]; \
+            out[i] = (TYPENAME)(FUNC); \
+        } \
+    } else { \
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
+            unsigned int tmp_i = i; \
+            unsigned int lhs_i = 0; \
+            unsigned int rhs_i = 0; \
+            for (int d = num_dims - 1; d >= 0; d--) { \
+                unsigned int i_dim = tmp_i % dims[d]; \
+                lhs_i += i_dim * lhs_strides[d]; \
+                rhs_i += i_dim * rhs_strides[d]; \
+                tmp_i /= dims[d]; \
+            } \
+            float x = (float)lhs[lhs_i]; \
+            float y = (float)rhs[rhs_i]; \
+            out[i] = (TYPENAME)(FUNC); \
+        } \
+    } \
+}
+
+BINARY_OP_F(__half, badd_f16, x + y)
+BINARY_OP_F(__half, bdiv_f16, x / y)
+BINARY_OP_F(__half, bmul_f16, x * y)
+BINARY_OP_F(__half, bsub_f16, x - y)
+BINARY_OP_F(__half, bminimum_f16, (x < y ? x : y))
+BINARY_OP_F(__half, bmaximum_f16, (x > y ? x : y))
+
+BINARY_OP_F(hip_bfloat16, badd_bf16, x + y)
+BINARY_OP_F(hip_bfloat16, bdiv_bf16, x / y)
+BINARY_OP_F(hip_bfloat16, bmul_bf16, x * y)
+BINARY_OP_F(hip_bfloat16, bsub_bf16, x - y)
+BINARY_OP_F(hip_bfloat16, bminimum_bf16, (x < y ? x : y))
+BINARY_OP_F(hip_bfloat16, bmaximum_bf16, (x > y ? x : y))
+#endif
