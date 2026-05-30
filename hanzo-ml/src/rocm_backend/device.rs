@@ -276,7 +276,10 @@ impl BackendDevice for RocmDevice {
     }
 
     fn same_device(&self, other: &Self) -> bool {
-        self.id == other.id
+        // Same physical GPU (by ordinal) == same device. The per-instance DeviceId
+        // counter is too strict: separately-constructed RocmDevices for gpu 0 must
+        // compare equal, otherwise matmul rejects two tensors on the same GPU.
+        self.device.id() == other.device.id()
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
