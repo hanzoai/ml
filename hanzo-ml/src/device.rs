@@ -335,6 +335,17 @@ impl Device {
         matches!(self, Self::Metal(_))
     }
 
+    pub fn is_rocm(&self) -> bool {
+        #[cfg(feature = "rocm")]
+        {
+            matches!(self, Self::Rocm(_))
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            false
+        }
+    }
+
     pub fn supports_bf16(&self) -> bool {
         match self {
             Self::Cuda(_) | Self::Metal(_) => true,
