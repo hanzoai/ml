@@ -427,6 +427,9 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
+    if xs.device().is_rocm() {
+        return softmax(xs, D::Minus1);
+    }
     xs.apply_op1_no_bwd(&SoftmaxLastDim)
 }
 
@@ -642,6 +645,11 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             xs.shape(),
             alpha.shape()
         )
+    }
+    // ROCm has no fused rms-norm kernel; use the unfused tensor-op path
+    // (real HIP kernels for each sub-op).
+    if xs.device().is_rocm() {
+        return rms_norm_slow(xs, alpha, eps);
     }
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }
@@ -899,6 +907,9 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
             alpha.shape(),
             beta.shape()
         )
+    }
+    if xs.device().is_rocm() {
+        return layer_norm_slow(xs, alpha, beta, eps);
     }
     xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
 }

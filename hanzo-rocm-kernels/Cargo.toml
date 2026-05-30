@@ -1,5 +1,5 @@
 [package]
-name = "candle-rocm-kernels"
+name = "hanzo-rocm-kernels"
 version = "0.10.2"
 edition = "2021"
 
