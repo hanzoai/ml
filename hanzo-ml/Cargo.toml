@@ -17,6 +17,9 @@ hanzo-metal-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
+rocm-rs = { workspace = true, optional = true }
+hanzo-rocm-kernels = { workspace = true, optional = true }
+ash = { version = "0.38", optional = true }
 gemm = { workspace = true }
 half = { workspace = true }
 float8 = { workspace = true }
@@ -47,6 +50,8 @@ default = []
 cuda = ["cudarc", "dep:hanzo-kernels", "hanzo-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
+rocm = ["dep:rocm-rs", "dep:hanzo-rocm-kernels"]
+vulkan = ["dep:ash"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = [

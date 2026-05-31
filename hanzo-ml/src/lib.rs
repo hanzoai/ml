@@ -69,6 +69,11 @@ mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
+#[cfg(feature = "rocm")]
+pub mod rocm_backend;
+pub mod dummy_vulkan_backend;
+#[cfg(feature = "vulkan")]
+pub mod vulkan_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
 pub mod npy;
@@ -121,6 +126,17 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
+
+#[cfg(feature = "rocm")]
+pub use rocm_backend::{RocmDevice, RocmError, RocmStorage};
+
+#[cfg(feature = "vulkan")]
+pub use vulkan_backend as vulkan;
+
+#[cfg(not(feature = "vulkan"))]
+pub use dummy_vulkan_backend as vulkan;
+
+pub use vulkan::{VulkanDevice, VulkanStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
