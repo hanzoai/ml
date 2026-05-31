@@ -2,6 +2,10 @@ use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
 use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
 use std::sync::Arc;
+#[cfg(feature = "rocm")]
+use crate::RocmStorage;
+#[cfg(feature = "vulkan")]
+use crate::VulkanStorage;
 
 /// Unary ops that can be defined in user-land.
 pub trait CustomOp1 {
@@ -18,6 +22,21 @@ pub trait CustomOp1 {
         Err(crate::Error::Cuda(
             format!("no cuda implementation for {}", self.name()).into(),
         ))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(&self, _storage: &RocmStorage, _layout: &Layout) -> Result<(RocmStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no rocm implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(&self, _storage: &VulkanStorage, _layout: &Layout) -> Result<(VulkanStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -65,6 +84,33 @@ pub trait CustomOp2 {
         Err(crate::Error::Cuda(
             format!("no cuda implementation for {}", self.name()).into(),
         ))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        _: &RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no rocm implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -121,6 +167,37 @@ pub trait CustomOp3 {
         Err(crate::Error::Cuda(
             format!("no cuda implementation for {}", self.name()).into(),
         ))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        _: &RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no rocm implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -263,6 +340,21 @@ pub trait InplaceOp1 {
         ))
     }
 
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(&self, _storage: &mut RocmStorage, _layout: &Layout) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no rocm implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(&self, _storage: &mut VulkanStorage, _layout: &Layout) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
+    }
+
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
     /// offsets etc so the associated layout should be used to access it.
     fn metal_fwd(&self, _storage: &mut MetalStorage, _layout: &Layout) -> Result<()> {
@@ -286,6 +378,21 @@ pub trait InplaceOp2 {
         Err(crate::Error::Cuda(
             format!("no cuda implementation for {}", self.name()).into(),
         ))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(&self, _: &mut RocmStorage, _: &Layout, _: &RocmStorage, _: &Layout) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no rocm implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(&self, _: &mut VulkanStorage, _: &Layout, _: &VulkanStorage, _: &Layout) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -332,6 +439,37 @@ pub trait InplaceOp3 {
         Err(crate::Error::Cuda(
             format!("no cuda implementation for {}", self.name()).into(),
         ))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        _: &mut RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no rocm implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        _: &mut VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
