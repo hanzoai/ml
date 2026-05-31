@@ -41,6 +41,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm" => spv!("bmm"),
         "bmm_coopmat" => spv!("bmm_coopmat"),
         "cast_f2h" => spv!("cast_f2h"),
+        "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "copy" => spv!("copy"),
         "reduce_sum" => spv!("reduce_sum"),
         "reduce_max" => spv!("reduce_max"),
@@ -195,6 +196,58 @@ impl VulkanDevice {
     /// fp16xfp16 -> fp32 subgroup config, else `None`. Used to pick the coopmat matmul path.
     pub fn coopmat_info(&self) -> Option<(u32, u32, u32)> {
         self.inner.coopmat.then_some(self.inner.cm_mnk)
+    }
+
+    /// Quantize `W[nout x k]` (row-major fp32) to Q8_0 and upload it to the GPU once. Per 32-block:
+    /// one fp16 scale + 32 int8, packed into 9 u32. Returns the device buffer to reuse across many
+    /// matvecs (weights are constant during decode). `k` must be a multiple of 32.
+    pub fn quantize_q8(&self, w: &[f32], nout: usize, k: usize) -> Result<VulkanStorage> {
+        if k % 32 != 0 {
+            crate::bail!("quantize_q8: k must be a multiple of 32, got {k}");
+        }
+        if w.len() != nout * k {
+            crate::bail!("quantize_q8: w len {} != {nout}*{k}", w.len());
+        }
+        let nblocks = k / 32;
+        let mut packed = vec![0u32; nout * nblocks * 9];
+        for n in 0..nout {
+            for b in 0..nblocks {
+                let blk = &w[n * k + b * 32..n * k + b * 32 + 32];
+                let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                let o = (n * nblocks + b) * 9;
+                packed[o] = half::f16::from_f32(scale).to_bits() as u32;
+                for j in 0..8 {
+                    let mut word = 0u32;
+                    for l in 0..4 {
+                        let q = (blk[j * 4 + l] * inv).round().clamp(-127.0, 127.0) as i32 as i8;
+                        word |= ((q as u8) as u32) << (l * 8);
+                    }
+                    packed[o + 1 + j] = word;
+                }
+            }
+        }
+        self.upload_u32(&packed)
+    }
+
+    /// Q8_0 matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q8`]. The kernel
+    /// reads weights at ~1.125 bytes/elem instead of 4 — the bandwidth lever for memory-bound
+    /// decode on this APU. Expect ~1e-2 error (fp16-scale int8 quantization).
+    pub fn matvec_q8(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q8: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q8",
+            &[wq.buffer, xs.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        out.to_vec_f32()
     }
 
     // Allocate a host-visible+coherent storage buffer of `bytes` bytes.
