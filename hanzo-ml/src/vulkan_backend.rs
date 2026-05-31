@@ -745,10 +745,14 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn storage_from_cpu_storage(&self, s: &CpuStorage) -> Result<Self::Storage> {
+        // Vulkan computes in f32; f16/bf16 weights are upcast on upload so real
+        // fp16/bf16 safetensors load on the GPU (uniform, so half tensors stay dtype-consistent).
         match s {
             CpuStorage::F32(v) => self.upload_f32(v),
             CpuStorage::U32(v) => self.upload_u32(v),
-            _ => crate::bail!("vulkan: only f32/u32 supported, got {:?}", s.dtype()),
+            CpuStorage::F16(v) => self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>()),
+            CpuStorage::BF16(v) => self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>()),
+            _ => crate::bail!("vulkan: only f32/u32/f16/bf16 supported, got {:?}", s.dtype()),
         }
     }
 
