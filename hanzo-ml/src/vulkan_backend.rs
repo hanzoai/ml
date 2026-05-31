@@ -143,6 +143,9 @@ struct VkInner {
     // serialized through this Mutex (ops are sequential per tensor graph anyway), which both
     // makes reuse sound and kills the per-op allocation churn that dominated dispatch latency.
     submitter: Mutex<Submitter>,
+    // Deferred-safe buffer reuse pool (see BufPool). Separate mutex from `submitter`: drop only
+    // touches this lock, never `submitter`, so there's no lock cycle.
+    bufpool: Mutex<BufPool>,
 }
 
 // Reusable submit resources, created once at device init. Many dispatches are recorded into
@@ -183,6 +186,32 @@ pub struct VulkanStorage {
 impl std::fmt::Debug for VulkanStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "VulkanStorage(count={}, dtype={:?})", self.count, self.dtype)
+    }
+}
+
+// Deferred-safe buffer pool. Buffers are never freed inline: deferred dispatch may still hold a
+// buffer's handle in an unflushed command buffer, so freeing on drop would be use-after-free. On
+// drop a buffer parks in `pending`; after the next flush+fence (the awaited batch is provably done
+// on the GPU) `reclaim` moves it to the size-keyed `free` list, where `raw_buffer` reuses it. This
+// bounds device memory to the peak working set and reuses buffers across tokens, instead of leaking
+// every allocation (which OOM'd a full unquantized forward on Dozen's ~8GB heap).
+#[derive(Default)]
+struct BufPool {
+    pending: Vec<(u64, vk::Buffer, vk::DeviceMemory)>,
+    free: HashMap<u64, Vec<(vk::Buffer, vk::DeviceMemory)>>,
+}
+
+// drop: park (size, buffer, memory) for reuse after the next fence. No Vulkan calls here, just
+// bookkeeping, so it's cheap and can't race the GPU.
+impl Drop for VulkanStorage {
+    fn drop(&mut self) {
+        if self.buffer == vk::Buffer::null() {
+            return;
+        }
+        let bytes = ((self.count * self.dtype.size_in_bytes()).max(4)) as u64;
+        if let Ok(mut pool) = self.device.inner.bufpool.lock() {
+            pool.pending.push((bytes, self.buffer, self.memory));
+        }
     }
 }
 
@@ -253,6 +282,11 @@ impl VulkanDevice {
     // Allocate a host-visible+coherent storage buffer of `bytes` bytes.
     unsafe fn raw_buffer(&self, bytes: u64) -> Result<(vk::Buffer, vk::DeviceMemory)> {
         let bytes = bytes.max(4); // zero-size buffers are illegal; round up to one f32.
+        // Reuse a same-size buffer reclaimed from a completed batch before allocating fresh.
+        if let Some(pair) = self.inner.bufpool.lock().unwrap().free.get_mut(&bytes).and_then(Vec::pop)
+        {
+            return Ok(pair);
+        }
         let dev = self.dev();
         let info = vk::BufferCreateInfo::default()
             .size(bytes)
@@ -480,6 +514,8 @@ impl VulkanDevice {
             // a handful of times instead of once.
             if s.n >= BATCH_CAP {
                 flush_locked(dev, queue, &mut s)?;
+                drop(s);
+                self.reclaim();
             }
         }
         Ok(())
@@ -490,8 +526,22 @@ impl VulkanDevice {
     fn flush(&self) -> Result<()> {
         let dev = self.dev();
         let queue = self.inner.queue;
-        let mut s = self.inner.submitter.lock().unwrap();
-        flush_locked(dev, queue, &mut s)
+        {
+            let mut s = self.inner.submitter.lock().unwrap();
+            flush_locked(dev, queue, &mut s)?;
+        }
+        self.reclaim();
+        Ok(())
+    }
+
+    // Move buffers dropped before this point into the reuse pool. Sound only right after a
+    // flush+fence: the awaited batch (the last that could reference them) is done on the GPU.
+    fn reclaim(&self) {
+        let mut pool = self.inner.bufpool.lock().unwrap();
+        let pending = std::mem::take(&mut pool.pending);
+        for (bytes, buf, mem) in pending {
+            pool.free.entry(bytes).or_default().push((buf, mem));
+        }
     }
 
     // Allocate an f32 storage holding `count` elements (uninitialized device memory).
@@ -707,6 +757,7 @@ impl BackendDevice for VulkanDevice {
                 seed: Mutex::new(299792458),
                 pipelines: Mutex::new(HashMap::new()),
                 submitter,
+                bufpool: Mutex::new(BufPool::default()),
                 coopmat,
                 cm_mnk,
                 cm_use,
