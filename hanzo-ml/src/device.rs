@@ -9,6 +9,10 @@ pub enum DeviceLocation {
     Cpu,
     Cuda { gpu_id: usize },
     Metal { gpu_id: usize },
+    #[cfg(feature = "rocm")]
+    Rocm { gpu_id: usize },
+    #[cfg(feature = "vulkan")]
+    Vulkan { gpu_id: usize },
 }
 
 /// Cpu, Cuda, or Metal
@@ -17,6 +21,10 @@ pub enum Device {
     Cpu,
     Cuda(crate::CudaDevice),
     Metal(crate::MetalDevice),
+    #[cfg(feature = "rocm")]
+    Rocm(crate::RocmDevice),
+    #[cfg(feature = "vulkan")]
+    Vulkan(crate::VulkanDevice),
 }
 
 pub trait NdArray {
@@ -235,11 +243,24 @@ impl Device {
         Ok(Self::Cuda(crate::CudaDevice::new(ordinal)?))
     }
 
+    #[cfg(feature = "rocm")]
+    pub fn new_rocm(ordinal: usize) -> Result<Self> {
+        Ok(Self::Rocm(crate::RocmDevice::new(ordinal)?))
+    }
+    #[cfg(feature = "vulkan")]
+    pub fn new_vulkan(ordinal: usize) -> Result<Self> {
+        Ok(Self::Vulkan(crate::VulkanDevice::new(ordinal)?))
+    }
+
     pub fn as_cuda_device(&self) -> Result<&crate::CudaDevice> {
         match self {
             Self::Cuda(d) => Ok(d),
             Self::Cpu => crate::bail!("expected a cuda device, got cpu"),
             Self::Metal(_) => crate::bail!("expected a cuda device, got Metal"),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(_) => crate::bail!("expected a cuda device, got rocm"),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(_) => crate::bail!("expected a cuda device, got vulkan"),
         }
     }
 
@@ -248,6 +269,29 @@ impl Device {
             Self::Cuda(_) => crate::bail!("expected a metal device, got cuda"),
             Self::Cpu => crate::bail!("expected a metal device, got cpu"),
             Self::Metal(d) => Ok(d),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(_) => crate::bail!("expected a metal device, got rocm"),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(_) => crate::bail!("expected a metal device, got vulkan"),
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    pub fn as_rocm_device(&self) -> Result<&crate::RocmDevice> {
+        match self {
+            Self::Cuda(_) => crate::bail!("expected a rocm device, got cuda"),
+            Self::Cpu => crate::bail!("expected a rocm device, got cpu"),
+            Self::Metal(_) => crate::bail!("expected a rocm device, got Metal"),
+            Self::Rocm(d) => Ok(d),
+        }
+    }
+    #[cfg(feature = "vulkan")]
+    pub fn as_vulkan_device(&self) -> Result<&crate::VulkanDevice> {
+        match self {
+            Self::Cuda(_) => crate::bail!("expected a vulkan device, got cuda"),
+            Self::Cpu => crate::bail!("expected a vulkan device, got cpu"),
+            Self::Metal(_) => crate::bail!("expected a vulkan device, got Metal"),
+            Self::Vulkan(d) => Ok(d),
         }
     }
 
@@ -264,6 +308,10 @@ impl Device {
             Self::Cpu => CpuDevice.set_seed(seed),
             Self::Cuda(c) => c.set_seed(seed),
             Self::Metal(m) => m.set_seed(seed),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(r) => r.set_seed(seed),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(r) => r.set_seed(seed),
         }
     }
 
@@ -272,6 +320,10 @@ impl Device {
             Self::Cpu => CpuDevice.get_current_seed(),
             Self::Cuda(c) => c.get_current_seed(),
             Self::Metal(m) => m.get_current_seed(),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(r) => r.get_current_seed(),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(r) => r.get_current_seed(),
         }
     }
 
@@ -280,6 +332,10 @@ impl Device {
             (Self::Cpu, Self::Cpu) => true,
             (Self::Cuda(lhs), Self::Cuda(rhs)) => lhs.same_device(rhs),
             (Self::Metal(lhs), Self::Metal(rhs)) => lhs.same_device(rhs),
+            #[cfg(feature = "rocm")]
+            (Self::Rocm(lhs), Self::Rocm(rhs)) => lhs.same_device(rhs),
+            #[cfg(feature = "vulkan")]
+            (Self::Vulkan(lhs), Self::Vulkan(rhs)) => lhs.same_device(rhs),
             _ => false,
         }
     }
@@ -289,6 +345,10 @@ impl Device {
             Self::Cpu => DeviceLocation::Cpu,
             Self::Cuda(device) => device.location(),
             Device::Metal(device) => device.location(),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(device) => device.location(),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(device) => device.location(),
         }
     }
 
@@ -304,10 +364,38 @@ impl Device {
         matches!(self, Self::Metal(_))
     }
 
+    pub fn is_rocm(&self) -> bool {
+        #[cfg(feature = "rocm")]
+        {
+            matches!(self, Self::Rocm(_))
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            false
+        }
+    }
+
+    pub fn is_vulkan(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        {
+            matches!(self, Self::Vulkan(_))
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            false
+        }
+    }
+
     pub fn supports_bf16(&self) -> bool {
         match self {
             Self::Cuda(_) | Self::Metal(_) => true,
             Self::Cpu => false,
+            #[cfg(feature = "rocm")]
+            Self::Rocm(_) => true,
+            // Dozen/D3D12 Vulkan path on the 8060S has no native bf16; the
+            // backend is f32/u32-only, so default away from bf16.
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(_) => false,
         }
     }
 
@@ -362,6 +450,16 @@ impl Device {
                 let storage = device.rand_uniform(shape, dtype, lo, up)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::Rocm(storage))
+            }
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -400,6 +498,16 @@ impl Device {
                 let storage = device.rand_normal(shape, dtype, mean, std)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::Rocm(storage))
+            }
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -426,6 +534,16 @@ impl Device {
                 let storage = device.zeros_impl(shape, dtype)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(device) => {
+                let storage = device.zeros_impl(shape, dtype)?;
+                Ok(Storage::Rocm(storage))
+            }
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(device) => {
+                let storage = device.zeros_impl(shape, dtype)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -443,6 +561,16 @@ impl Device {
                 let storage = device.alloc_uninit(shape, dtype)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(device) => {
+                let storage = device.alloc_uninit(shape, dtype)?;
+                Ok(Storage::Rocm(storage))
+            }
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(device) => {
+                let storage = device.alloc_uninit(shape, dtype)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -456,6 +584,16 @@ impl Device {
             Device::Metal(device) => {
                 let storage = device.storage_from_slice(data)?;
                 Ok(Storage::Metal(storage))
+            }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(device) => {
+                let storage = device.storage_from_slice(data)?;
+                Ok(Storage::Rocm(storage))
+            }
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(device) => {
+                let storage = device.storage_from_slice(data)?;
+                Ok(Storage::Vulkan(storage))
             }
         }
     }
@@ -473,6 +611,18 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(device) => {
+                let storage = array.to_cpu_storage();
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Rocm(storage))
+            }
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(device) => {
+                let storage = array.to_cpu_storage();
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -489,6 +639,18 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(device) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Rocm(storage))
+            }
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(device) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -497,6 +659,10 @@ impl Device {
             Self::Cpu => Ok(()),
             Self::Cuda(d) => d.synchronize(),
             Self::Metal(d) => d.synchronize(),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(d) => d.synchronize(),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(d) => d.synchronize(),
         }
     }
 }
