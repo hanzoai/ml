@@ -70,6 +70,10 @@ impl Device {
                 let storage = cuda::QCudaStorage::zeros(cuda, elem_count, dtype)?;
                 Ok(QStorage::Cuda(storage))
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(_) => crate::bail!("quantized tensors on vulkan are not supported yet"),
         }
     }
 }
@@ -78,6 +82,11 @@ pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
+    // Vulkan keeps the quantized blocks in a CPU box and dequantizes to an f32 Vulkan tensor on
+    // demand (QMatMul forces dequantize for Vulkan). Lets GGUF-quantized models run on the GPU;
+    // a direct quantized matmul (the Q8 kernel) is the bandwidth-win follow-up.
+    #[cfg(feature = "vulkan")]
+    Vulkan(Box<dyn QuantizedType>, crate::VulkanDevice),
 }
 
 impl QStorage {
@@ -118,6 +127,10 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
+            #[cfg(feature = "rocm")]
+            Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
+            #[cfg(feature = "vulkan")]
+            Device::Vulkan(d) => Ok(Self::Vulkan(dtype.from_data(data), d.clone())),
         }
     }
 
@@ -126,6 +139,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.block_size(),
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, _) => storage.block_size(),
         }
     }
 
@@ -134,6 +149,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.dtype(),
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, _) => storage.dtype(),
         }
     }
 
@@ -142,6 +159,8 @@ impl QStorage {
             QStorage::Cpu(_storage) => Device::Cpu,
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(_storage, device) => Device::Vulkan(device.clone()),
         }
     }
 
@@ -150,6 +169,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.storage_size_in_bytes(),
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, _) => storage.storage_size_in_bytes(),
         }
     }
 
@@ -224,6 +245,12 @@ impl QStorage {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, device) => {
+                // Dequantize on the CPU, then upload the f32 weights to the GPU.
+                let cpu = storage.dequantize(elem_count)?;
+                Ok(Storage::Vulkan(device.upload_f32(cpu.as_slice::<f32>()?)?))
+            }
         }
     }
 
@@ -237,12 +264,21 @@ impl QStorage {
             }
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, _) => {
+                let data_ptr = storage.as_ptr();
+                let size_in_bytes = storage.storage_size_in_bytes();
+                let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
+                Ok(Cow::from(data))
+            }
         }
     }
 
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(..) => crate::bail!("not implemented"),
             QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
@@ -675,7 +711,51 @@ impl QTensor {
                 }
             },
             _ => {
-                panic!("indexed_moe_forward is not implemented in this platform!");
+                // CPU / non-CUDA fallback: per-expert quantized matmul. The packed expert bank
+                // [E, n, k] is sliced into equal, contiguous per-expert quantized blocks; for
+                // each expert that is actually selected we run candle's native quantized matmul
+                // on just the tokens routed to it. Nothing is dequantized, so quantized MoE runs
+                // on any backend (CPU, Metal, ...) at a cost proportional to the active experts.
+                use crate::Module; // brings QMatMul::forward into scope
+                use std::collections::HashMap;
+                use std::sync::Arc;
+                let device = x.device();
+                let out_dtype = x.dtype();
+                let (e_cnt, n, k) = self.shape().dims3()?;
+                let (t, topk) = ids.dims2()?;
+                let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+                let x_exp = if s == topk { x.clone() } else { x.broadcast_as((t, topk, k))? };
+                let x_flat = x_exp
+                    .reshape((t * topk, k))?
+                    .to_dtype(crate::DType::F32)?
+                    .contiguous()?;
+                let ids_flat = ids.reshape((t * topk,))?.to_dtype(crate::DType::U32)?;
+                let ids_vec = ids_flat.to_vec1::<u32>()?;
+                let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+                for (slot, eid) in ids_vec.iter().enumerate() {
+                    groups.entry(*eid).or_default().push(slot as u32);
+                }
+                let dtype = self.storage.dtype();
+                let all_bytes = self.data()?;
+                let expert_bytes = all_bytes.len() / e_cnt;
+                let mut out_flat = Tensor::zeros((t * topk, n), crate::DType::F32, device)?;
+                for (eid, slots) in groups.into_iter() {
+                    let off = eid as usize * expert_bytes;
+                    let qs = QStorage::from_data(
+                        std::borrow::Cow::Borrowed(&all_bytes[off..off + expert_bytes]),
+                        device,
+                        dtype,
+                    )?;
+                    let shape: crate::Shape = (n, k).into();
+                    let w_e = QTensor { storage: qs, shape };
+                    let qm = QMatMul::from_arc(Arc::new(w_e))?;
+                    let m = slots.len();
+                    let idx = Tensor::from_vec(slots, (m,), device)?;
+                    let x_e = x_flat.index_select(&idx, 0)?; // [m, k]
+                    let y_e = qm.forward(&x_e)?.to_dtype(crate::DType::F32)?; // [m, n]
+                    out_flat = out_flat.index_add(&idx, &y_e, 0)?;
+                }
+                out_flat.reshape((t, topk, n))?.to_dtype(out_dtype)
             }
         }
     }
@@ -683,6 +763,8 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(..) => crate::bail!("not implemented"),
             QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
@@ -723,7 +805,9 @@ impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
         let dequantize = match qtensor.dtype() {
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            _ => DEQUANTIZE_ALL.with(|b| *b),
+            // The Vulkan backend has no native quantized matmul yet, so dequantize to f32 here
+            // (once, at construction) and run the regular f32 GPU matmul.
+            _ => DEQUANTIZE_ALL.with(|b| *b) || qtensor.device().is_vulkan(),
         };
         let t = if dequantize {
             let tensor = qtensor.dequantize(&qtensor.device())?;
@@ -799,6 +883,8 @@ impl crate::CustomOp1 for QTensor {
         #[allow(clippy::infallible_destructuring_match)]
         let self_storage = match &self.storage {
             QStorage::Cpu(storage) => storage,
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(..) => crate::bail!("Invalid storage"),
             QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
         };
         match storage.dtype() {
