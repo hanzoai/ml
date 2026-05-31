@@ -82,6 +82,11 @@ pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
+    // Vulkan keeps the quantized blocks in a CPU box and dequantizes to an f32 Vulkan tensor on
+    // demand (QMatMul forces dequantize for Vulkan). Lets GGUF-quantized models run on the GPU;
+    // a direct quantized matmul (the Q8 kernel) is the bandwidth-win follow-up.
+    #[cfg(feature = "vulkan")]
+    Vulkan(Box<dyn QuantizedType>, crate::VulkanDevice),
 }
 
 impl QStorage {
@@ -125,7 +130,7 @@ impl QStorage {
             #[cfg(feature = "rocm")]
             Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
             #[cfg(feature = "vulkan")]
-            Device::Vulkan(_) => crate::bail!("quantized tensors on vulkan are not supported yet"),
+            Device::Vulkan(d) => Ok(Self::Vulkan(dtype.from_data(data), d.clone())),
         }
     }
 
@@ -134,6 +139,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.block_size(),
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, _) => storage.block_size(),
         }
     }
 
@@ -142,6 +149,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.dtype(),
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, _) => storage.dtype(),
         }
     }
 
@@ -150,6 +159,8 @@ impl QStorage {
             QStorage::Cpu(_storage) => Device::Cpu,
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(_storage, device) => Device::Vulkan(device.clone()),
         }
     }
 
@@ -158,6 +169,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.storage_size_in_bytes(),
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, _) => storage.storage_size_in_bytes(),
         }
     }
 
@@ -232,6 +245,12 @@ impl QStorage {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, device) => {
+                // Dequantize on the CPU, then upload the f32 weights to the GPU.
+                let cpu = storage.dequantize(elem_count)?;
+                Ok(Storage::Vulkan(device.upload_f32(cpu.as_slice::<f32>()?)?))
+            }
         }
     }
 
@@ -245,12 +264,21 @@ impl QStorage {
             }
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(storage, _) => {
+                let data_ptr = storage.as_ptr();
+                let size_in_bytes = storage.storage_size_in_bytes();
+                let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
+                Ok(Cow::from(data))
+            }
         }
     }
 
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(..) => crate::bail!("not implemented"),
             QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
@@ -735,6 +763,8 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(..) => crate::bail!("not implemented"),
             QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
@@ -775,7 +805,9 @@ impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
         let dequantize = match qtensor.dtype() {
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            _ => DEQUANTIZE_ALL.with(|b| *b),
+            // The Vulkan backend has no native quantized matmul yet, so dequantize to f32 here
+            // (once, at construction) and run the regular f32 GPU matmul.
+            _ => DEQUANTIZE_ALL.with(|b| *b) || qtensor.device().is_vulkan(),
         };
         let t = if dequantize {
             let tensor = qtensor.dequantize(&qtensor.device())?;
@@ -851,6 +883,8 @@ impl crate::CustomOp1 for QTensor {
         #[allow(clippy::infallible_destructuring_match)]
         let self_storage = match &self.storage {
             QStorage::Cpu(storage) => storage,
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(..) => crate::bail!("Invalid storage"),
             QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
         };
         match storage.dtype() {

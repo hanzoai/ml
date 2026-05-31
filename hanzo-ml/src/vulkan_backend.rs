@@ -507,7 +507,7 @@ impl VulkanDevice {
         Ok(buffer)
     }
 
-    fn upload_f32(&self, data: &[f32]) -> Result<VulkanStorage> {
+    pub(crate) fn upload_f32(&self, data: &[f32]) -> Result<VulkanStorage> {
         let s = self.alloc_f32(data.len())?;
         unsafe { self.write_f32(s.memory, data)? };
         Ok(s)
