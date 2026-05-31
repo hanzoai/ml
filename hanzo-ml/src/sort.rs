@@ -240,6 +240,16 @@ impl crate::CustomOp1 for ArgSort {
         let dst = crate::MetalStorage::new(dst, device.clone(), el, DType::U32);
         Ok((dst, layout.shape().clone()))
     }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        storage: &crate::RocmStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::RocmStorage, crate::Shape)> {
+        let dst = storage.asort(layout, self.asc, self.last_dim)?;
+        Ok((dst, layout.shape().clone()))
+    }
 }
 
 #[allow(unused)]

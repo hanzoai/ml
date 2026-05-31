@@ -325,6 +325,16 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
         }
     }
 
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &hanzo_ml::VulkanStorage,
+        layout: &Layout,
+    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
+        let out = storage.softmax_last_dim(layout)?;
+        Ok((out, layout.shape().clone()))
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
@@ -427,6 +437,9 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
+    if xs.device().is_rocm() {
+        return softmax(xs, D::Minus1);
+    }
     xs.apply_op1_no_bwd(&SoftmaxLastDim)
 }
 
@@ -501,6 +514,18 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
             (C::F32(s1), C::F32(s2)) => inner::<f32>(s1, l1, s2, l2, eps),
             _ => hanzo_ml::bail!("unsupported dtype for rmsnorm {:?}", s1.dtype()),
         }
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &hanzo_ml::VulkanStorage,
+        l1: &Layout,
+        s2: &hanzo_ml::VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
+        let out = s1.rms_norm(l1, s2, l2, self.eps)?;
+        Ok((out, l1.shape().clone()))
     }
 
     #[cfg(feature = "cuda")]
@@ -642,6 +667,11 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             xs.shape(),
             alpha.shape()
         )
+    }
+    // ROCm has no fused rms-norm kernel; use the unfused tensor-op path
+    // (real HIP kernels for each sub-op).
+    if xs.device().is_rocm() {
+        return rms_norm_slow(xs, alpha, eps);
     }
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }
@@ -899,6 +929,9 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
             alpha.shape(),
             beta.shape()
         )
+    }
+    if xs.device().is_rocm() {
+        return layer_norm_slow(xs, alpha, beta, eps);
     }
     xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
 }
