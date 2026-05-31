@@ -1,0 +1,14 @@
+#version 450
+// Affine transform: out[i] = mul * in[i] + add.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly  buffer In  { float inp[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform Pc { uint n; float mul; float add; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < n) {
+        o[i] = mul * inp[i] + add;
+    }
+}
