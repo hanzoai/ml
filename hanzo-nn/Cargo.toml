@@ -43,3 +43,6 @@ metal = ["hanzo-ml/metal", "dep:hanzo-metal-kernels", "dep:objc2-metal"]
 [[bench]]
 name = "bench_main"
 harness = false
+
+[lints]
+workspace = true
