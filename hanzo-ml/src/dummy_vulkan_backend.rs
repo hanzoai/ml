@@ -22,7 +22,7 @@ impl From<String> for VulkanError {
 
 fn err<T>() -> Result<T> {
     Err(Error::Msg(
-        "candle was not compiled with vulkan support".into(),
+        "hanzo was not compiled with vulkan support".into(),
     ))
 }
 
