@@ -14,7 +14,7 @@ use rocm_rs::rocrand::PseudoRng;
 /// call on HIP — it blocks the CPU until all pending GPU work completes. Without
 /// pooling, every tensor op (each allocates its output) silently serializes the
 /// stream, so the GPU sits ~95% idle waiting on the CPU: the WSL-bridge ~1 tok/s
-/// killer. This mirrors candle-cuda's caching allocator. Buffers are returned to
+/// killer. This mirrors hanzo-ml-cuda's caching allocator. Buffers are returned to
 /// the pool on Drop instead of being freed.
 pub type DevicePool = Arc<Mutex<HashMap<usize, Vec<usize>>>>;
 
