@@ -7,12 +7,20 @@ use crate::{CpuStorage, DType, Result, Shape, Storage, WithDType};
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum DeviceLocation {
     Cpu,
-    Cuda { gpu_id: usize },
-    Metal { gpu_id: usize },
+    Cuda {
+        gpu_id: usize,
+    },
+    Metal {
+        gpu_id: usize,
+    },
     #[cfg(feature = "rocm")]
-    Rocm { gpu_id: usize },
+    Rocm {
+        gpu_id: usize,
+    },
     #[cfg(feature = "vulkan")]
-    Vulkan { gpu_id: usize },
+    Vulkan {
+        gpu_id: usize,
+    },
 }
 
 /// Cpu, Cuda, or Metal
