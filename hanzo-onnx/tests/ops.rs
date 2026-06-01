@@ -1,5 +1,5 @@
-use hanzo-ml::test_utils::to_vec2_round;
-use hanzo-ml::{DType, Device, NdArray, Result, Tensor};
+use hanzo_ml::test_utils::to_vec2_round;
+use hanzo_ml::{DType, Device, NdArray, Result, Tensor};
 use hanzo_onnx::onnx::attribute_proto::AttributeType;
 use hanzo_onnx::onnx::tensor_proto::DataType;
 use hanzo_onnx::onnx::tensor_shape_proto::{dimension, Dimension};
@@ -281,7 +281,7 @@ fn test_equal_operation() -> Result<()> {
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
-    let first = z.to_dtype(hanzo-ml::DType::U8)?.to_vec1::<u8>()?.to_vec()[0];
+    let first = z.to_dtype(hanzo_ml::DType::U8)?.to_vec1::<u8>()?.to_vec()[0];
     assert_eq!(first, 1);
 
     Ok(())
@@ -321,7 +321,7 @@ fn test_not_operation() -> Result<()> {
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
-    let first = z.to_dtype(hanzo-ml::DType::U8)?.to_vec1::<u8>()?.to_vec()[0];
+    let first = z.to_dtype(hanzo_ml::DType::U8)?.to_vec1::<u8>()?.to_vec()[0];
     assert_eq!(first, 1);
 
     Ok(())
@@ -4568,7 +4568,7 @@ fn test_if() -> Result<()> {
         let outputs = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
         let expected = if cond != 0 { &x } else { &y };
         let Some(res) = outputs.get("res") else {
-            hanzo-ml::bail!("outputs didn't contain expected key `res`: {outputs:?}");
+            hanzo_ml::bail!("outputs didn't contain expected key `res`: {outputs:?}");
         };
         assert_eq!(&res.to_vec1::<f32>()?, expected);
     }
@@ -4630,7 +4630,7 @@ fn test_pad() -> Result<()> {
     let inputs = HashMap::from_iter([("data".to_string(), data), ("pads".to_string(), pads)]);
     let res = hanzo_onnx::simple_eval(&model, inputs)?;
     let Some(actual) = res.get("output") else {
-        hanzo-ml::bail!("outputs didn't contain expected key `output`: {res:?}");
+        hanzo_ml::bail!("outputs didn't contain expected key `output`: {res:?}");
     };
 
     assert_eq!(actual.to_vec2::<f64>()?, expected.to_vec2::<f64>()?);
@@ -6241,7 +6241,7 @@ fn test_sign_operation() -> Result<()> {
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
     assert_eq!(
-        z.to_dtype(hanzo-ml::DType::I64)?.to_vec1::<i64>()?.to_vec(),
+        z.to_dtype(hanzo_ml::DType::I64)?.to_vec1::<i64>()?.to_vec(),
         vec![-1, -1, 0, 1, 1]
     );
     Ok(())
@@ -6443,7 +6443,7 @@ fn test_selu_operator() -> Result<()> {
 }
 
 #[test]
-fn test_hard_swish() -> hanzo-ml::Result<()> {
+fn test_hard_swish() -> hanzo_ml::Result<()> {
     {
         let manual_graph = create_model_proto_with_graph(Some(GraphProto {
             node: vec![NodeProto {
