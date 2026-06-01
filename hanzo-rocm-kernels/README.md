@@ -1,10 +1,10 @@
-# candle-rocm-kernels
+# hanzo-ml-rocm-kernels
 
-ROCm/HIP kernel support for the Candle deep learning framework.
+ROCm/HIP kernel support for the Hanzo deep learning framework.
 
 ## Overview
 
-This crate provides ROCm (AMD GPU) kernel support for Candle. Unlike CUDA which can embed PTX directly, ROCm/HIP requires ahead-of-time (AOT) compilation for specific GPU architectures.
+This crate provides ROCm (AMD GPU) kernel support for Hanzo. Unlike CUDA which can embed PTX directly, ROCm/HIP requires ahead-of-time (AOT) compilation for specific GPU architectures.
 
 ## Architecture
 
@@ -22,12 +22,12 @@ We use an **Ahead-of-Time (AOT) compilation cache** approach:
 Compiled binaries are stored at:
 
 ```
-~/.cache/candle-rocm/{arch}-{rocm_version}/
+~/.cache/hanzo-ml-rocm/{arch}-{rocm_version}/
 ```
 
 For example:
-- `~/.cache/candle-rocm/gfx908-6.1/binary_a1b2c3d4.cso`
-- `~/.cache/candle-rocm/gfx942-6.2/binary_a1b2c3d4.cso`
+- `~/.cache/hanzo-ml-rocm/gfx908-6.1/binary_a1b2c3d4.cso`
+- `~/.cache/hanzo-ml-rocm/gfx942-6.2/binary_a1b2c3d4.cso`
 
 Where:
 - `{arch}` = GPU architecture (gfx908, gfx90a, gfx942, etc.)
@@ -50,7 +50,7 @@ Manages the AOT compilation cache:
 
 Usage:
 ```rust
-use candle_rocm_kernels::CacheManager;
+use hanzo_rocm_kernels::CacheManager;
 use rocm_rs::hip::Device;
 
 let device = Device::new(0)?;
@@ -69,8 +69,8 @@ Higher-level manager that:
 
 Usage:
 ```rust
-use candle_rocm_kernels::KernelManager;
-use candle_rocm_kernels::source::Source;
+use hanzo_rocm_kernels::KernelManager;
+use hanzo_rocm_kernels::source::Source;
 
 let device = Device::new(0)?;
 let manager = KernelManager::new(&device)?;
@@ -95,7 +95,7 @@ Currently supports:
 ## Building
 
 ```bash
-cd candle-rocm-kernels
+cd hanzo-ml-rocm-kernels
 cargo build
 ```
 

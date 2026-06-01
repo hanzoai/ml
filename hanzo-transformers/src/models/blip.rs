@@ -2,7 +2,7 @@
 //!
 //! The blip-image-captioning model can generate captions for an input image.
 //!
-//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/radames/Candle-BLIP-Image-Captioning)
+//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/radames/Hanzo-BLIP-Image-Captioning)
 //! - 💻 [GH Link](https://github.com/salesforce/BLIP)
 //! - 🤗 [HF Link](https://huggingface.co/Salesforce/blip-image-captioning-base)
 //! - 📝 [Paper](https://arxiv.org/abs/2201.12086)

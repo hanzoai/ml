@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/hanzoai/ml/blob/main/LICENSE-APACHE)
 
 Hanzo ML is a minimalist ML framework for Rust with a focus on performance (including GPU support) 
-and ease of use. Based on Candle from Hugging Face, Hanzo ML provides optimizations for Edge AI, 
+and ease of use. Based on Hanzo from Hugging Face, Hanzo ML provides optimizations for Edge AI, 
 quantization, and multimodal workloads.
 
 ## Key Features
@@ -177,18 +177,18 @@ And then head over to
 ## Useful External Resources
 - [`hanzo-ml-tutorial`](https://github.com/ToluClassics/hanzo-ml-tutorial): A
   very detailed tutorial showing how to convert a PyTorch model to ML.
-- [`hanzo-ml-lora`](https://github.com/EricLBuehler/hanzo-ml-lora): Efficient and
+- [`hanzo-ml-lora`](https://github.com/hanzoai/hanzo-ml-lora): Efficient and
   ergonomic LoRA implementation for ML. `hanzo-ml-lora` has      
   out-of-the-box LoRA support for many models from ML, which can be found
-  [here](https://github.com/EricLBuehler/hanzo-ml-lora/tree/master/hanzo-ml-lora-transformers/examples).
+  [here](https://github.com/hanzoai/hanzo-ml-lora/tree/master/hanzo-ml-lora-transformers/examples).
 - [`optimisers`](https://github.com/KGrewal1/optimisers): A collection of optimisers
   including SGD with momentum, AdaGrad, AdaDelta, AdaMax, NAdam, RAdam, and RMSprop.
-- [`hanzo-ml-vllm`](https://github.com/EricLBuehler/hanzo-ml-vllm): Efficient platform for inference and
+- [`hanzo-ml-vllm`](https://github.com/hanzoai/hanzo-ml-vllm): Efficient platform for inference and
   serving local LLMs including an OpenAI compatible API server.
 - [`hanzo-ml-ext`](https://github.com/mokeyish/hanzo-ml-ext): An extension library to ML that provides PyTorch functions not currently available in ML.
 - [`hanzo-ml-coursera-ml`](https://github.com/vishpat/hanzo-ml-coursera-ml): Implementation of ML algorithms from Coursera's [Machine Learning Specialization](https://www.coursera.org/specializations/machine-learning-introduction) course.
 - [`kalosm`](https://github.com/floneum/floneum/tree/master/interfaces/kalosm): A multi-modal meta-framework in Rust for interfacing with local pre-trained models with support for controlled generation, custom samplers, in-memory vector databases, audio transcription, and more.
-- [`hanzo-ml-sampling`](https://github.com/EricLBuehler/hanzo-ml-sampling): Sampling techniques for ML.
+- [`hanzo-ml-sampling`](https://github.com/hanzoai/hanzo-ml-sampling): Sampling techniques for ML.
 - [`gpt-from-scratch-rs`](https://github.com/jeroenvlek/gpt-from-scratch-rs): A port of Andrej Karpathy's _Let's build GPT_ tutorial on YouTube showcasing the ML API on a toy problem.
 - [`hanzo-ml-einops`](https://github.com/tomsanbear/hanzo-ml-einops): A pure rust implementation of the python [einops](https://github.com/arogozhnikov/einops) library.
 - [`atoma-infer`](https://github.com/atoma-network/atoma-infer): A Rust library for fast inference at scale, leveraging FlashAttention2 for efficient attention computation, PagedAttention for efficient KV-cache memory management, and multi-GPU support. It is OpenAI api compatible.

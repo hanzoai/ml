@@ -11,7 +11,7 @@
 //!
 //! ```bash
 //! # Download classes names and a plant picture to identify
-//! # see candle/examples/dinov2reg4 for full code.
+//! # see hanzo-ml/examples/dinov2reg4 for full code.
 //!
 //! # Perform inference
 //! cargo run \

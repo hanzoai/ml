@@ -8,7 +8,7 @@
 //! - Layer normalization
 //! - QK normalization
 //!
-//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/radames/Candle-phi1-phi2-wasm-demo)
+//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/radames/Hanzo-phi1-phi2-wasm-demo)
 //! - 🤗 [HF Link](https://huggingface.co/microsoft/phi-2)
 //!
 
