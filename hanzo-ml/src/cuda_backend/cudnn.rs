@@ -97,9 +97,7 @@ pub(crate) fn launch_conv2d<
     let alg = match params.cudnn_fwd_algo {
         None => conv2d.pick_algorithm()?,
         Some(HanzoAlgo::ImplicitGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
-        Some(HanzoAlgo::ImplicitPrecompGemm) => {
-            A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
-        }
+        Some(HanzoAlgo::ImplicitPrecompGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
         Some(HanzoAlgo::Gemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
         Some(HanzoAlgo::Direct) => A::CUDNN_CONVOLUTION_FWD_ALGO_DIRECT,
         Some(HanzoAlgo::Fft) => A::CUDNN_CONVOLUTION_FWD_ALGO_FFT,
@@ -198,9 +196,7 @@ pub(crate) fn launch_conv1d<
     let alg = match params.cudnn_fwd_algo {
         None => conv1d.pick_algorithm()?,
         Some(HanzoAlgo::ImplicitGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
-        Some(HanzoAlgo::ImplicitPrecompGemm) => {
-            A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
-        }
+        Some(HanzoAlgo::ImplicitPrecompGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
         Some(HanzoAlgo::Gemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
         Some(HanzoAlgo::Direct) => A::CUDNN_CONVOLUTION_FWD_ALGO_DIRECT,
         Some(HanzoAlgo::Fft) => A::CUDNN_CONVOLUTION_FWD_ALGO_FFT,
