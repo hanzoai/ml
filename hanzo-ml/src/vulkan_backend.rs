@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::{Arc, Mutex};
 
-// --- SPIR-V kernels (compiled by candle-core build.rs from src/vulkan/shaders/*.comp) ---
+// --- SPIR-V kernels (compiled by hanzo-ml build.rs from src/vulkan/shaders/*.comp) ---
 macro_rules! spv {
     ($name:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
@@ -971,7 +971,7 @@ impl VulkanStorage {
         Ok(out)
     }
 
-    // rms-norm over the last dim. `self`=x, `alpha`=scale [m]. Matches candle rms-norm.
+    // rms-norm over the last dim. `self`=x, `alpha`=scale [m]. Matches hanzo-ml rms-norm.
     pub fn rms_norm(
         &self,
         layout: &Layout,
@@ -1298,7 +1298,7 @@ impl BackendStorage for VulkanStorage {
                 return self.device.storage_from_cpu_storage(&r);
             }
         };
-        // candle pre-broadcasts both layouts to the output shape (possibly with stride-0 dims);
+        // hanzo-ml pre-broadcasts both layouts to the output shape (possibly with stride-0 dims);
         // broadcast layouts aren't contiguous so contig_buf still materializes them, but
         // same-shape contiguous operands skip the copy (one fewer dispatch each).
         let mut lk = None;

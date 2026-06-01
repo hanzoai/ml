@@ -6,7 +6,7 @@
 //! points to be part of the background so _not_ in the target mask, specifying some
 //! bounding box).
 //!
-//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/radames/candle-segment-anything-wasm)
+//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/radames/hanzo-ml-segment-anything-wasm)
 //! - 💻 [GH Link](https://github.com/facebookresearch/segment-anything)
 //! - 📝 [Paper](https://arxiv.org/abs/2304.02643)
 //! - 💡 The default backbone can be replaced by the smaller and faster TinyViT model based on [MobileSAM](https://github.com/ChaoningZhang/MobileSAM).
@@ -16,14 +16,14 @@
 //!
 //! ```bash
 //! cargo run --example segment-anything --release -- \
-//!     --image candle-examples/examples/yolo-v8/assets/bike.jpg
+//!     --image hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg
 //!     --use-tiny --point 0.6,0.6 --point 0.6,0.55
 //! ```
 //!
 //! <div align=center style="display: flex; justify-content: center; gap: 10px;">
-//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/yolo-v8/assets/bike.jpg" alt="" width="30%">
-//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/segment-anything/assets/single_pt_prompt.jpg" alt="" width="30%">
-//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/segment-anything/assets/two_pt_prompt.jpg" alt="" width="30%">
+//!   <img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg" alt="" width="30%">
+//!   <img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/segment-anything/assets/single_pt_prompt.jpg" alt="" width="30%">
+//!   <img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/segment-anything/assets/two_pt_prompt.jpg" alt="" width="30%">
 //! </div>
 //!
 //!

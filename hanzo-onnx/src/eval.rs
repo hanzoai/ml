@@ -655,7 +655,7 @@ fn simple_eval_(
                 };
 
                 // In Pytorch or Numpy this can be done by indexing the xs tensor using the indices
-                // tensor directly, but candle does not support tensor indexing at the moment, so
+                // tensor directly, but hanzo-ml does not support tensor indexing at the moment, so
                 // some workarounds must be done.
                 let xs = match indices.dims() {
                     [] => {

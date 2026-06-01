@@ -1,7 +1,7 @@
 #version 450
 // scatter set along `dim`. ids/src share a shape; for src flat index g = (outer, j, inner)
 // with inner < right and j < dim_src, write dst[outer*(dim_dst*right) + ids[g]*right + inner] = src[g].
-// (Duplicate ids -> last writer wins, which is unspecified but matches candle's contract.)
+// (Duplicate ids -> last writer wins, which is unspecified but matches hanzo-ml's contract.)
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0) buffer Dst { float dst[]; };
 layout(set = 0, binding = 1) readonly buffer Src { float src[]; };

@@ -1,4 +1,4 @@
-// Build script for candle-core.
+// Build script for hanzo-ml.
 //
 // Vulkan backend: provides every GLSL compute kernel under
 // `src/vulkan/shaders/*.comp` to the backend as `$OUT_DIR/<name>.spv`, which

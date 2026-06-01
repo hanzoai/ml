@@ -26,10 +26,10 @@ ml/
   LLM.md
   Makefile
   README.md
-  candle-book/
-  candle-core/
-  candle-datasets/
-  candle-examples/
+  hanzo-ml-book/
+  hanzo-ml/
+  hanzo-datasets/
+  hanzo-ml-examples/
 ```
 
 ## Key Files
