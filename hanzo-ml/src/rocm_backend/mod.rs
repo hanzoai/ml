@@ -3,9 +3,9 @@
 use crate::backend::BackendStorage;
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Layout, Result, WithDType};
+use half::{bf16, f16};
 pub use hanzo_rocm_kernels as kernels;
 use hanzo_rocm_kernels::kernel::KernelSource;
-use half::{bf16, f16};
 pub use rocm_rs;
 use rocm_rs::hip::bindings;
 use rocm_rs::rocblas::{self, level3::GemmStridedBatchedType, types::Operation};
@@ -1548,34 +1548,93 @@ impl BackendStorage for RocmStorage {
         Ok(Self { slice, device })
     }
 
-    fn where_cond(
-        &self,
-        l: &Layout,
-        a: &Self,
-        la: &Layout,
-        b: &Self,
-        lb: &Layout,
-    ) -> Result<Self> {
+    fn where_cond(&self, l: &Layout, a: &Self, la: &Layout, b: &Self, lb: &Layout) -> Result<Self> {
         let device = self.device.clone();
         let numel = l.shape().elem_count();
         let num_dims = l.dims().len();
         let ds = device.clone_htod(&[l.dims(), l.stride(), la.stride(), lb.stride()].concat())?;
         let (cond_prefix, cond_ptr) = match &self.slice {
-            RocmStorageSlice::U8(s) => ("where_u8", unsafe { s.offset_ptr(l.start_offset()) } as *mut std::ffi::c_void),
-            RocmStorageSlice::U32(s) => ("where_u32", unsafe { s.offset_ptr(l.start_offset()) } as *mut std::ffi::c_void),
-            RocmStorageSlice::I64(s) => ("where_i64", unsafe { s.offset_ptr(l.start_offset()) } as *mut std::ffi::c_void),
+            RocmStorageSlice::U8(s) => ("where_u8", unsafe { s.offset_ptr(l.start_offset()) }
+                as *mut std::ffi::c_void),
+            RocmStorageSlice::U32(s) => ("where_u32", unsafe { s.offset_ptr(l.start_offset()) }
+                as *mut std::ffi::c_void),
+            RocmStorageSlice::I64(s) => ("where_i64", unsafe { s.offset_ptr(l.start_offset()) }
+                as *mut std::ffi::c_void),
             _ => crate::bail!("where_cond condition must be u8, u32, or i64"),
         };
         let t_ptr = unsafe { a.slice.offset_ptr(la.start_offset()) };
         let f_ptr = unsafe { b.slice.offset_ptr(lb.start_offset()) };
         let slice = match &a.slice {
-            RocmStorageSlice::F32(_) => RocmStorageSlice::F32(where_cond_typed::<f32>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
-            RocmStorageSlice::F64(_) => RocmStorageSlice::F64(where_cond_typed::<f64>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
-            RocmStorageSlice::U8(_) => RocmStorageSlice::U8(where_cond_typed::<u8>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
-            RocmStorageSlice::U32(_) => RocmStorageSlice::U32(where_cond_typed::<u32>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
-            RocmStorageSlice::I64(_) => RocmStorageSlice::I64(where_cond_typed::<i64>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
-            RocmStorageSlice::BF16(_) => RocmStorageSlice::BF16(where_cond_typed::<half::bf16>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
-            RocmStorageSlice::F16(_) => RocmStorageSlice::F16(where_cond_typed::<half::f16>(cond_prefix, cond_ptr, t_ptr, f_ptr, &ds, numel, num_dims, &device)?),
+            RocmStorageSlice::F32(_) => RocmStorageSlice::F32(where_cond_typed::<f32>(
+                cond_prefix,
+                cond_ptr,
+                t_ptr,
+                f_ptr,
+                &ds,
+                numel,
+                num_dims,
+                &device,
+            )?),
+            RocmStorageSlice::F64(_) => RocmStorageSlice::F64(where_cond_typed::<f64>(
+                cond_prefix,
+                cond_ptr,
+                t_ptr,
+                f_ptr,
+                &ds,
+                numel,
+                num_dims,
+                &device,
+            )?),
+            RocmStorageSlice::U8(_) => RocmStorageSlice::U8(where_cond_typed::<u8>(
+                cond_prefix,
+                cond_ptr,
+                t_ptr,
+                f_ptr,
+                &ds,
+                numel,
+                num_dims,
+                &device,
+            )?),
+            RocmStorageSlice::U32(_) => RocmStorageSlice::U32(where_cond_typed::<u32>(
+                cond_prefix,
+                cond_ptr,
+                t_ptr,
+                f_ptr,
+                &ds,
+                numel,
+                num_dims,
+                &device,
+            )?),
+            RocmStorageSlice::I64(_) => RocmStorageSlice::I64(where_cond_typed::<i64>(
+                cond_prefix,
+                cond_ptr,
+                t_ptr,
+                f_ptr,
+                &ds,
+                numel,
+                num_dims,
+                &device,
+            )?),
+            RocmStorageSlice::BF16(_) => RocmStorageSlice::BF16(where_cond_typed::<half::bf16>(
+                cond_prefix,
+                cond_ptr,
+                t_ptr,
+                f_ptr,
+                &ds,
+                numel,
+                num_dims,
+                &device,
+            )?),
+            RocmStorageSlice::F16(_) => RocmStorageSlice::F16(where_cond_typed::<half::f16>(
+                cond_prefix,
+                cond_ptr,
+                t_ptr,
+                f_ptr,
+                &ds,
+                numel,
+                num_dims,
+                &device,
+            )?),
             _ => crate::bail!("where_cond does not support this dtype for ROCm"),
         };
         Ok(Self { slice, device })
@@ -1763,9 +1822,7 @@ impl BackendStorage for RocmStorage {
             None => Err(crate::Error::RequiresContiguous { op: "gather" }.bt())?,
         };
         let (ids_prefix, ids_ptr) = match &idx.slice {
-            RocmStorageSlice::U32(s) => ("gather_u32", unsafe {
-                s.offset_ptr(il.start_offset())
-            }),
+            RocmStorageSlice::U32(s) => ("gather_u32", unsafe { s.offset_ptr(il.start_offset()) }),
             RocmStorageSlice::U8(s) => ("gather_u8", unsafe { s.offset_ptr(il.start_offset()) }),
             RocmStorageSlice::I64(s) => ("gather_i64", unsafe { s.offset_ptr(il.start_offset()) }),
             _ => crate::bail!("gather ids should be u8, u32, or i64"),
