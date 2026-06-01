@@ -16,12 +16,17 @@ members = [
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
     "hanzo-nn",
+    # hanzo-quantize and hanzo-rlhf are their own workspace roots (see their
+    # Cargo.toml `[workspace]` markers). Excluded here so they don't get
+    # dragged into the parent ml workspace's pyo3-0.22-vs-0.27 conflict.
     "hanzo-transformers",
     "tensor-tools",
 ]
 exclude = [
     "candle-book",
     "candle-flash-attn",
+    "hanzo-quantize",                    # standalone via own [workspace]; see members comment
+    "hanzo-rlhf",                        # standalone via own [workspace]; see members comment
     "candle-flash-attn-v3",
     "candle-kernels",
     "candle-metal-kernels",
@@ -31,6 +36,7 @@ exclude = [
     "hanzo-metal-kernels",
     "hanzo-ml-book",
     "hanzo-onnx",
+    "hanzo-train",
     "hanzo-training",
     "hanzo-ug",
 ]
@@ -51,6 +57,9 @@ accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 candle = { path = "./candle-core", package = "candle-core", version = "0.9.2" }
+# Alias so workspace members can use either `candle` or `candle-core` interchangeably.
+# Used by hanzo-quantize and hanzo-rlhf which prefer the explicit `candle-core` name.
+candle-core = { path = "./candle-core", version = "0.9.2" }
 candle-datasets = { path = "./candle-datasets", version = "0.9.2" }
 candle-flash-attn = { path = "./candle-flash-attn", version = "0.9.2" }
 candle-flash-attn-v3 = { path = "./candle-flash-attn-v3", version = "0.9.2" }
