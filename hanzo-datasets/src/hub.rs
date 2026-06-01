@@ -18,7 +18,7 @@ use std::fs::File;
 ///
 /// # Example
 /// ```
-/// use candle_datasets::hub::{from_hub, FileReader};  // Re-exported trait
+/// use hanzo_datasets::hub::{from_hub, FileReader};  // Re-exported trait
 /// let api = hf_hub::api::sync::Api::new().unwrap();
 /// let files = from_hub(&api, "hf-internal-testing/dummy_image_text_data".to_string()).unwrap();
 /// let num_rows = files[0].metadata().file_metadata().num_rows();
@@ -52,7 +52,7 @@ fn sibling_to_parquet(
 ///
 /// # Example
 /// ```
-/// use candle_datasets::hub::{from_hub, FileReader};
+/// use hanzo_datasets::hub::{from_hub, FileReader};
 /// let api = hf_hub::api::sync::Api::new().unwrap();
 /// let readers = from_hub(&api, "hf-internal-testing/dummy_image_text_data".to_string()).unwrap();
 /// let metadata = readers[0].metadata();
