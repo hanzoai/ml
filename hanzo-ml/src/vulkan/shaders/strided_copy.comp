@@ -13,6 +13,7 @@ layout(push_constant) uniform Pc {
     uint n;
     uint rank;
     uint offset;
+    uint dst_offset;
     uint shape[6];
     uint strides[6];
 };
@@ -30,6 +31,6 @@ void main() {
             rem = rem / dim;
             src += idx * strides[dd];
         }
-        outp[gid] = inp[src];
+        outp[gid + dst_offset] = inp[src];
     }
 }
