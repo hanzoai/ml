@@ -1,5 +1,5 @@
 use anyhow::Result;
-use hanzo-ml::{DType, Device, IndexOp, Tensor, D};
+use hanzo_ml::{DType, Device, IndexOp, Tensor, D};
 
 fn to_vec3_round(t: Tensor, digits: i32) -> Result<Vec<Vec<Vec<f32>>>> {
     let b = 10f32.powi(digits);
@@ -158,10 +158,8 @@ fn flash_attn_varlen() -> Result<()> {
         let q = q.transpose(0, 1)?;
         let k = k.transpose(0, 1)?;
         let v = v.transpose(0, 1)?;
-        hanzo_flash_attn::flash_attn_varlen(
-            &q, &k, &v, &seqlens_q, &seqlens_k, 32, 32, 0.5, false,
-        )?
-        .transpose(0, 1)?
+        hanzo_flash_attn::flash_attn_varlen(&q, &k, &v, &seqlens_q, &seqlens_k, 32, 32, 0.5, false)?
+            .transpose(0, 1)?
     };
     let ys = ys.to_dtype(DType::F32)?;
 

@@ -727,7 +727,11 @@ impl QTensor {
                 let (e_cnt, n, k) = self.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
                 let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
-                let x_exp = if s == topk { x.clone() } else { x.broadcast_as((t, topk, k))? };
+                let x_exp = if s == topk {
+                    x.clone()
+                } else {
+                    x.broadcast_as((t, topk, k))?
+                };
                 let x_flat = x_exp
                     .reshape((t * topk, k))?
                     .to_dtype(crate::DType::F32)?
@@ -784,7 +788,12 @@ pub enum QMatMul {
     // runs the GPU Q8 matvec directly (bandwidth-optimal); prefill dequantizes to a temporary f32.
     // `qtensor` is the original (CPU-side) for the prefill dequant; `n`/`k` are the weight dims.
     #[cfg(feature = "vulkan")]
-    VulkanQuant { qtensor: std::sync::Arc<QTensor>, wq: std::sync::Arc<crate::VulkanStorage>, n: usize, k: usize },
+    VulkanQuant {
+        qtensor: std::sync::Arc<QTensor>,
+        wq: std::sync::Arc<crate::VulkanStorage>,
+        n: usize,
+        k: usize,
+    },
 }
 
 thread_local! {
@@ -818,9 +827,17 @@ impl QMatMul {
             if let Device::Vulkan(d) = qtensor.device() {
                 if let Ok((n, k)) = qtensor.shape().dims2() {
                     if k % 32 == 0 {
-                        let wf = qtensor.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                        let wf = qtensor
+                            .dequantize(&Device::Cpu)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?;
                         let wq = d.quantize_q8(&wf, n, k)?;
-                        return Ok(Self::VulkanQuant { qtensor, wq: std::sync::Arc::new(wq), n, k });
+                        return Ok(Self::VulkanQuant {
+                            qtensor,
+                            wq: std::sync::Arc::new(wq),
+                            n,
+                            k,
+                        });
                     }
                 }
             }
