@@ -164,6 +164,9 @@ pub enum Error {
     #[error("the candle crate has not been built with metal support")]
     NotCompiledWithMetalSupport,
 
+    #[error("the candle crate has not been built with vulkan support")]
+    NotCompiledWithVulkanSupport,
+
     #[error("cannot find tensor {path}")]
     CannotFindTensor { path: String },
 
@@ -173,6 +176,9 @@ pub enum Error {
 
     #[error("Metal error {0}")]
     Metal(#[from] MetalError),
+
+    #[error(transparent)]
+    Vulkan(Box<dyn std::error::Error + Send + Sync>),
 
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios"), feature = "ug"))]
     #[error(transparent)]
