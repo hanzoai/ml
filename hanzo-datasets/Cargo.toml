@@ -21,3 +21,6 @@ rand = { workspace = true }
 thiserror = { workspace = true }
 parquet = { workspace = true}
 image = { workspace = true }
+
+[lints]
+workspace = true
