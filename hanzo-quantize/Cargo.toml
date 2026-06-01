@@ -1,0 +1,36 @@
+# Empty workspace table marks this crate as its own root. Same pattern as
+# hanzo-train. Keeps the crate out of the parent ml workspace's pyo3-0.22-vs-
+# pyo3-0.27 conflict (candle-pyo3 vs hanzo-ml-pyo3) so it can build + test
+# independently. When that conflict is resolved upstream the empty marker can
+# be removed and the crate re-added to ml/Cargo.toml's `members`.
+[workspace]
+
+[package]
+name = "hanzo-quantize"
+version = "0.9.2"
+edition = "2021"
+description = "Native-candle BitDelta / DeltaQuant / DeltaSoup quantization. Plugs into candle_core::quantized::{QTensor, GgmlDType} so compressed adapters can be applied on top of GGUF-quantized base weights."
+repository = "https://github.com/hanzoai/ml"
+keywords = ["candle", "quantization", "bitdelta", "ml"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Direct path dep on the in-tree candle-core (mirrors hanzo-train's approach).
+candle-core = { path = "../candle-core", version = "0.9.2" }
+half = { version = "2.5.0", features = ["bytemuck", "num-traits"] }
+serde = { version = "1.0.171", features = ["derive"] }
+bincode = "1.3"
+thiserror = "2"
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+
+[dev-dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+
+[[example]]
+name = "quantize_and_save"
+path = "examples/quantize_and_save.rs"
+
+[[example]]
+name = "federation_apply"
+path = "examples/federation_apply.rs"
