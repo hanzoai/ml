@@ -49,15 +49,15 @@ accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 # Hanzo-renamed workspace dependencies
-hanzo-datasets = { path = "./hanzo-datasets", version = "0.9.2-alpha.2" }
-hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.9.2-alpha.2" }
-hanzo-kernels = { path = "./hanzo-kernels", version = "0.9.2-alpha.2" }
-hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.9.2-alpha.2" }
-hanzo-ml = { path = "./hanzo-ml", version = "0.9.2-alpha.3" }
-hanzo-nn = { path = "./hanzo-nn", version = "0.9.2-alpha.2" }
-hanzo-onnx = { path = "./hanzo-onnx", version = "0.9.2-alpha.2" }
-hanzo-transformers = { path = "./hanzo-transformers", version = "0.9.2-alpha.2" }
-hanzo-ug = { path = "./hanzo-ug", version = "0.9.2-alpha.2" }
+hanzo-datasets = { path = "./hanzo-datasets", version = "0.9.2" }
+hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.9.2" }
+hanzo-kernels = { path = "./hanzo-kernels", version = "0.9.2" }
+hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.9.2" }
+hanzo-ml = { path = "./hanzo-ml", version = "0.9.2" }
+hanzo-nn = { path = "./hanzo-nn", version = "0.9.2" }
+hanzo-onnx = { path = "./hanzo-onnx", version = "0.9.2" }
+hanzo-transformers = { path = "./hanzo-transformers", version = "0.9.2" }
+hanzo-ug = { path = "./hanzo-ug", version = "0.9.2" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
 cudarc = { version = "0.19.1", features = [
