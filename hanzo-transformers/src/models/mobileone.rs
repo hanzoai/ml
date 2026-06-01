@@ -1,6 +1,6 @@
 //! # MobileOne
 //!
-//! MobileOne inference implementation based on timm and candle-repvgg
+//! MobileOne inference implementation based on timm and hanzo-ml-repvgg
 //!
 //! See ["MobileOne: An Improved One millisecond Mobile Backbone"](https://arxiv.org/abs/2206.04040)
 
