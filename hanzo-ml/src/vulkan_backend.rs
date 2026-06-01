@@ -551,11 +551,21 @@ impl VulkanDevice {
         Ok(VulkanStorage { buffer, memory, count, dtype: DType::F32, device: self.clone() })
     }
 
-    // Raw fp16 scratch buffer (2 bytes/elem) for cooperative-matrix matmul inputs. Returns just
-    // the handle; like the rest of the backend the backing memory is not individually freed.
-    fn alloc_f16(&self, count: usize) -> Result<vk::Buffer> {
-        let (buffer, _memory) = unsafe { self.raw_buffer((count * 2).max(2) as u64)? };
-        Ok(buffer)
+    // fp16 scratch (2 bytes/elem) for coopmat matmul inputs. Returns the buffer plus its memory and
+    // byte size so the caller can return it to the pool via free_scratch once recorded.
+    fn alloc_f16(&self, count: usize) -> Result<(vk::Buffer, vk::DeviceMemory, u64)> {
+        let bytes = ((count * 2).max(4)) as u64;
+        let (buffer, memory) = unsafe { self.raw_buffer(bytes)? };
+        Ok((buffer, memory, bytes))
+    }
+
+    // Return a scratch buffer to the pool. Deferred-safe like VulkanStorage::drop: it parks in
+    // `pending` and is reclaimed only after the next flush+fence, by which point the dispatch that
+    // referenced it has completed on the GPU.
+    fn free_scratch(&self, bytes: u64, buffer: vk::Buffer, memory: vk::DeviceMemory) {
+        if let Ok(mut pool) = self.inner.bufpool.lock() {
+            pool.pending.push((bytes, buffer, memory));
+        }
     }
 
     pub(crate) fn upload_f32(&self, data: &[f32]) -> Result<VulkanStorage> {
@@ -1550,8 +1560,8 @@ impl BackendStorage for VulkanStorage {
             && n % 16 == 0
             && k % 16 == 0
         {
-            let a16 = self.device.alloc_f16(b * m * k)?;
-            let b16 = self.device.alloc_f16(b * k * n)?;
+            let (a16, a16_mem, a16_bytes) = self.device.alloc_f16(b * m * k)?;
+            let (b16, b16_mem, b16_bytes) = self.device.alloc_f16(b * k * n)?;
             self.device.dispatch(
                 "cast_f2h",
                 &[lc.buffer, a16],
@@ -1564,13 +1574,16 @@ impl BackendStorage for VulkanStorage {
                 &push_u32(&[(b * k * n) as u32]),
                 Self::groups_1d(b * k * n),
             )?;
-            // Register-blocked coopmat: one subgroup owns a 2x2 grid of 16x16 tiles (32x32),
-            // reusing each loaded fragment across the grid. groups cover ceil over the 2x2 block.
+            // Register-blocked coopmat: one subgroup owns a 4x4 grid of 16x16 tiles (64x64),
+            // reusing each loaded fragment across the grid. groups cover ceil over the 4x4 block.
             let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
             let mt = (m / 16) as u32;
             let nt = (n / 16) as u32;
             let groups = (nt.div_ceil(4), mt.div_ceil(4), b as u32);
             self.device.dispatch("bmm_coopmat_rb", &[a16, b16, out.buffer], &push, groups)?;
+            // Scratch is dead after the kernel reads it; return to the pool (reclaimed post-flush).
+            self.device.free_scratch(a16_bytes, a16, a16_mem);
+            self.device.free_scratch(b16_bytes, b16, b16_mem);
             return Ok(out);
         }
 
