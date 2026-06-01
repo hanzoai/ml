@@ -1,7 +1,7 @@
 [workspace]
-# Only the hanzo-* crates are workspace members. The legacy candle-* crates are an orphaned
+# Only the hanzo-* crates are workspace members. The legacy hanzo-ml-* crates are an orphaned
 # duplicate cluster (no hanzo crate depends on them); keeping them out of the build drops the
-# `candle` name from the workspace and resolves the candle-pyo3 vs hanzo-ml-pyo3 `links="python"`
+# `hanzo-ml` name from the workspace and resolves the hanzo-ml-pyo3 vs hanzo-ml-pyo3 `links="python"`
 # conflict. The dirs remain on disk for now and can be deleted in a follow-up.
 members = [
     "hanzo-datasets",
@@ -15,13 +15,13 @@ members = [
     "tensor-tools",
 ]
 exclude = [
-    "candle-book",
-    "candle-flash-attn",
-    "candle-flash-attn-v3",
-    "candle-kernels",
-    "candle-metal-kernels",
+    "hanzo-ml-book",
+    "hanzo-flash-attn",
+    "hanzo-flash-attn-v3",
+    "hanzo-kernels",
+    "hanzo-metal-kernels",
     "hanzo-rocm-kernels",
-    "candle-onnx",
+    "hanzo-onnx",
     "hanzo-flash-attn",
     "hanzo-kernels",
     "hanzo-metal-kernels",
@@ -36,7 +36,7 @@ resolver = "2"
 version = "0.9.2"
 edition = "2021"
 description = "Minimalist ML framework."
-repository = "https://github.com/huggingface/candle"
+repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"

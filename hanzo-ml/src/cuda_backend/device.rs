@@ -426,7 +426,7 @@ impl BackendDevice for CudaDevice {
         let elem_count = shape.elem_count();
         let curand = self.curand.lock().unwrap();
         // curand can only generate an odd number of values.
-        // https://github.com/huggingface/candle/issues/734
+        // https://github.com/hanzoai/ml/issues/734
         let elem_count_round = if elem_count % 2 == 1 {
             elem_count + 1
         } else {

@@ -3,7 +3,7 @@ name = "hanzo-rocm-kernels"
 version = "0.10.2"
 edition = "2021"
 
-description = "ROCm/HIP kernels for Candle"
+description = "ROCm/HIP kernels for Hanzo"
 
 [dependencies]
 dirs = "5"
