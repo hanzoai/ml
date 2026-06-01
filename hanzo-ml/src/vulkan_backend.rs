@@ -1544,9 +1544,29 @@ impl BackendStorage for VulkanStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        // Materialize operands contiguous: lhs -> [b,m,k], rhs -> [b,k,n], packed.
-        let lc = self.contiguous(lhs_l)?;
-        let rc = rhs.contiguous(rhs_l)?;
+        // Operands must be packed [b,m,k] / [b,k,n]. Use the buffer directly when the layout is
+        // already contiguous from offset 0; only materialize a copy otherwise. Skips re-copying
+        // constant weights / contiguous activations on every matmul -- a large per-token cost in a
+        // transformer forward (contiguous() always allocates + strided_copy).
+        let mut lkeep = None;
+        let mut rkeep = None;
+        let lc_buf = if lhs_l.is_contiguous() && lhs_l.start_offset() == 0 {
+            self.buffer
+        } else {
+            let s = self.contiguous(lhs_l)?;
+            let bf = s.buffer;
+            lkeep = Some(s);
+            bf
+        };
+        let rc_buf = if rhs_l.is_contiguous() && rhs_l.start_offset() == 0 {
+            rhs.buffer
+        } else {
+            let s = rhs.contiguous(rhs_l)?;
+            let bf = s.buffer;
+            rkeep = Some(s);
+            bf
+        };
+        let _ = (&lkeep, &rkeep); // keep any materialized copies alive until the dispatch is recorded
         // C[b,m,n] = A[b,m,k] * B[b,k,n], row-major. Kernel push order is {batch,m,k,n}.
         let out = self.device.alloc_f32(b * m * n)?;
 
@@ -1564,13 +1584,13 @@ impl BackendStorage for VulkanStorage {
             let (b16, b16_mem, b16_bytes) = self.device.alloc_f16(b * k * n)?;
             self.device.dispatch(
                 "cast_f2h",
-                &[lc.buffer, a16],
+                &[lc_buf, a16],
                 &push_u32(&[(b * m * k) as u32]),
                 Self::groups_1d(b * m * k),
             )?;
             self.device.dispatch(
                 "cast_f2h",
-                &[rc.buffer, b16],
+                &[rc_buf, b16],
                 &push_u32(&[(b * k * n) as u32]),
                 Self::groups_1d(b * k * n),
             )?;
@@ -1592,7 +1612,7 @@ impl BackendStorage for VulkanStorage {
         let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
         let groups = ((n as u32).div_ceil(64), (m as u32).div_ceil(64), b as u32);
         self.device
-            .dispatch("bmm_reg", &[lc.buffer, rc.buffer, out.buffer], &push, groups)?;
+            .dispatch("bmm_reg", &[lc_buf, rc_buf, out.buffer], &push, groups)?;
         Ok(out)
     }
 
