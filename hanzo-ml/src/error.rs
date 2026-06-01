@@ -158,10 +158,10 @@ pub enum Error {
     BackwardNotSupported { op: &'static str },
 
     // === Other Errors ===
-    #[error("the candle crate has not been built with cuda support")]
+    #[error("the hanzo crate has not been built with cuda support")]
     NotCompiledWithCudaSupport,
 
-    #[error("the candle crate has not been built with metal support")]
+    #[error("the hanzo crate has not been built with metal support")]
     NotCompiledWithMetalSupport,
 
     #[error("cannot find tensor {path}")]
@@ -176,7 +176,7 @@ pub enum Error {
 
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios"), feature = "ug"))]
     #[error(transparent)]
-    Ug(#[from] candle_ug::Error),
+    Ug(#[from] hanzo_ug::Error),
 
     #[error(transparent)]
     TryFromIntError(#[from] core::num::TryFromIntError),
