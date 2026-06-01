@@ -131,10 +131,9 @@ struct VkInner {
     // absent on WSL/Dozen.
     coopmat: bool,
     cm_mnk: (u32, u32, u32),
-    // Whether matmul actually uses the coopmat kernel. Opt-in via HANZO_VK_COOPMAT=1 because the
-    // current naive (no shared-mem) coopmat GEMM is fp16-precision and not yet faster than the
-    // tiled fp32 kernel; default off so it can't regress correctness or speed. Flip the default
-    // once the shared-memory-tiled coopmat kernel lands.
+    // Whether matmul uses the register-blocked coopmat kernel (bmm_coopmat_rb). Default ON when the
+    // device advertises coopmat (measured 1.3-2.7x over fp32 bmm_reg on the real AMD driver, full
+    // forward argmax matches CPU); HANZO_VK_COOPMAT=0 forces the fp32 path.
     cm_use: bool,
     // CPU-side RNG seed (kernels are deterministic; randoms are generated on the CPU then uploaded).
     seed: Mutex<u64>,
@@ -685,8 +684,12 @@ impl BackendDevice for VulkanDevice {
             };
             let coopmat = cm_mnk.is_some();
             let cm_mnk = cm_mnk.unwrap_or((0, 0, 0));
+            // Default ON when the device advertises coopmat: the register-blocked kernel
+            // (bmm_coopmat_rb) measured 1.3-2.7x over the fp32 bmm_reg on the real AMD driver and a
+            // full Qwen3-0.6B forward's argmax matched CPU exactly (fp16 inputs, fp32 accumulate).
+            // Set HANZO_VK_COOPMAT=0 to force the fp32 path (e.g. if precision matters).
             let cm_use =
-                coopmat && std::env::var("HANZO_VK_COOPMAT").map(|v| v == "1").unwrap_or(false);
+                coopmat && std::env::var("HANZO_VK_COOPMAT").map(|v| v != "0").unwrap_or(true);
 
             // Enable the coopmat extension + the features its SPIR-V needs (cooperative matrix,
             // Vulkan memory model, fp16 arithmetic, 16-bit storage) only when supported.
