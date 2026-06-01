@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_metal_kernels::{
+use hanzo_metal_kernels::{
     metal::{create_command_buffer, CommandSemaphore, Device},
     GemmDType, RESOURCE_OPTIONS,
 };
@@ -15,7 +15,7 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
     let device = Device::system_default().unwrap();
 
     let (b, m, n, k) = (1, n, n, n);
-    let kernels = candle_metal_kernels::Kernels::new();
+    let kernels = hanzo_metal_kernels::Kernels::new();
     let command_queue = device.new_command_queue().unwrap();
     let options = RESOURCE_OPTIONS;
 
@@ -69,7 +69,7 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
         let semaphore = Arc::new(CommandSemaphore::new());
         let command_buffer = create_command_buffer(&command_queue, semaphore).unwrap();
         let start_time = std::time::Instant::now();
-        candle_metal_kernels::call_mlx_gemm(
+        hanzo_metal_kernels::call_mlx_gemm(
             &device,
             &command_buffer,
             &kernels,

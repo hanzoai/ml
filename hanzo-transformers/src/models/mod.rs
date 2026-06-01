@@ -1,4 +1,4 @@
-//! Candle implementations for various deep learning models
+//! Hanzo implementations for various deep learning models
 //!
 //! This crate provides implementations of popular machine learning models and architectures for different modalities.
 //!

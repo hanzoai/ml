@@ -39,7 +39,7 @@ impl Module for PatchEmbed {
 //   (attn.reshape((b, q_h, q_w, k_h, k_w))?
 //       + rel_h.unsqueeze(4)?.broadcast_add(&rel_w.unsqueeze(3)?)?)?
 //   .reshape((b, q_h * q_w, k_h * k_w))
-// Ideally we would perform this operation in place but this is not supported in candle at the
+// Ideally we would perform this operation in place but this is not supported in hanzo-ml at the
 // moment. We should also investigate using f16 rather than f32.
 struct Add3(usize, usize, usize, usize, usize);
 impl hanzo_ml::CustomOp3 for Add3 {

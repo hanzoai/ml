@@ -336,7 +336,7 @@ fn flash_attn_cpu_single_q<T: WithDType + Sum + num_traits::real::Real>(
 }
 
 /// Main forward flash-attention CPU routine.
-/// Shapes follow Candle convention: (B, S, H, D)
+/// Shapes follow Hanzo convention: (B, S, H, D)
 #[allow(clippy::too_many_arguments)]
 fn flash_attn_cpu<T: WithDType + Sum + num_traits::real::Real>(
     q_data: &[T],

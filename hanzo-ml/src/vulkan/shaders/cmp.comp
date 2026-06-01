@@ -1,5 +1,5 @@
 #version 450
-// Elementwise compare -> u32 {0,1}. op: 0=Eq 1=Ne 2=Le 3=Ge 4=Lt 5=Gt (candle CmpOp order).
+// Elementwise compare -> u32 {0,1}. op: 0=Eq 1=Ne 2=Le 3=Ge 4=Lt 5=Gt (hanzo-ml CmpOp order).
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0) readonly  buffer A   { float a[]; };
 layout(set = 0, binding = 1) readonly  buffer B   { float b[]; };
