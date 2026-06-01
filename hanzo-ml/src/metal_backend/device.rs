@@ -96,10 +96,10 @@ impl MetalDevice {
     pub fn compile(
         &self,
         func_name: &'static str,
-        kernel: candle_ug::lang::ssa::Kernel,
+        kernel: hanzo_ug::lang::ssa::Kernel,
     ) -> Result<ComputePipeline> {
         let mut buf = vec![];
-        candle_ug::metal::code_gen::gen(&mut buf, func_name, &kernel)?;
+        hanzo_ug::metal::code_gen::gen(&mut buf, func_name, &kernel)?;
         let metal_code = String::from_utf8(buf)?;
         let lib = self
             .device
