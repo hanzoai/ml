@@ -20,8 +20,8 @@
 //! # Example Usage
 //!
 //! ```ignore
-//! use candle_transformers::models::smol::smollm3::{Config, ModelForCausalLM};
-//! use candle_transformers::models::smol::quantized_smollm3::QuantizedModelForCausalLM;
+//! use hanzo_transformers::models::smol::smollm3::{Config, ModelForCausalLM};
+//! use hanzo_transformers::models::smol::quantized_smollm3::QuantizedModelForCausalLM;
 //! use hanzo_ml::{Device, Tensor};
 //! use hanzo_nn::VarBuilder;
 //!
