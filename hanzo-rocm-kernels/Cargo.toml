@@ -1,6 +1,7 @@
 [package]
 name = "hanzo-rocm-kernels"
 version = "0.10.2"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 description = "ROCm/HIP kernels for Hanzo"
