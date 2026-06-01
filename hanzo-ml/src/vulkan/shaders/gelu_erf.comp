@@ -1,5 +1,5 @@
 #version 450
-// Exact GELU: out = 0.5 * x * (1 + erf(x / sqrt(2))).  (candle "gelu_erf")
+// Exact GELU: out = 0.5 * x * (1 + erf(x / sqrt(2))).  (hanzo-ml "gelu_erf")
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0) readonly  buffer In  { float inp[]; };
 layout(set = 0, binding = 1) writeonly buffer Out { float o[]; };

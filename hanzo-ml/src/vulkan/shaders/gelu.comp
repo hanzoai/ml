@@ -1,5 +1,5 @@
 #version 450
-// Unary GELU (tanh approximation, matching candle's CPU Gelu):
+// Unary GELU (tanh approximation, matching hanzo-ml's CPU Gelu):
 //   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 layout(local_size_x = 64) in;
 
