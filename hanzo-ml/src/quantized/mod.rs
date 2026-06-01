@@ -76,7 +76,12 @@ impl Device {
             #[cfg(feature = "rocm")]
             Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
             #[cfg(feature = "vulkan")]
-            Device::Vulkan(_) => crate::bail!("quantized tensors on vulkan are not supported yet"),
+            Device::Vulkan(d) => {
+                // Keep quantized blocks in a CPU box + the device (same as from_data); QMatMul's
+                // VulkanQuant path uploads/dequantizes them to the GPU on use.
+                let storage = dtype.cpu_zeros(elem_count);
+                Ok(QStorage::Vulkan(storage, d.clone()))
+            }
         }
     }
 }
