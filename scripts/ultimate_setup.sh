@@ -1,18 +1,18 @@
 #!/bin/bash
 # Hanzo ML Setup Script
-# Updates from upstream Candle, checks compilation, sets up training
+# Updates from upstream Hanzo, checks compilation, sets up training
 
 set -e
 
 HANZO_ML_DIR="/Users/z/work/hanzo/ml"
-UPSTREAM_CANDLE="/Users/z/work/hf/candle"
+UPSTREAM_CANDLE="/Users/z/work/hf/hanzo-ml"
 ZEN_DATASET="/Users/z/work/zen/zen-agentic-dataset"
 HANZO_ENGINE="/Users/z/work/hanzo/engine"
 
 cd "$HANZO_ML_DIR"
 
 # Pull latest upstream changes
-echo "Pulling latest Candle upstream changes..."
+echo "Pulling latest Hanzo upstream changes..."
 if [ -d "$UPSTREAM_CANDLE" ]; then
     cd "$UPSTREAM_CANDLE"
     git pull origin main || true

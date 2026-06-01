@@ -1,4 +1,4 @@
-//! Datasets & Dataloaders for Candle
+//! Datasets & Dataloaders for Hanzo
 pub mod batcher;
 pub mod hub;
 pub mod nlp;

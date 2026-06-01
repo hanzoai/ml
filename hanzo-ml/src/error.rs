@@ -1,4 +1,4 @@
-//! Candle-specific Error and Result
+//! Hanzo-specific Error and Result
 use std::{convert::Infallible, fmt::Display};
 
 use crate::{DType, DeviceLocation, Layout, MetalError, Shape};

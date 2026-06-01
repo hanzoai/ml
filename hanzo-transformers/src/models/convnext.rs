@@ -1,6 +1,6 @@
 //! ConvNeXt implementation.
 //!
-//! This candle implementation uses a pre-trained ConvNeXt network for inference. The
+//! This hanzo-ml implementation uses a pre-trained ConvNeXt network for inference. The
 //! classification head has been trained on the ImageNet dataset and returns the
 //! probabilities for the top-5 classes.
 //!
