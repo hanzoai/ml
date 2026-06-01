@@ -41,6 +41,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm" => spv!("bmm"),
         "bmm_reg" => spv!("bmm_reg"),
         "bmm_coopmat" => spv!("bmm_coopmat"),
+        "bmm_coopmat_rb" => spv!("bmm_coopmat_rb"),
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "copy" => spv!("copy"),
@@ -1560,9 +1561,13 @@ impl BackendStorage for VulkanStorage {
                 &push_u32(&[(b * k * n) as u32]),
                 Self::groups_1d(b * k * n),
             )?;
+            // Register-blocked coopmat: one subgroup owns a 2x2 grid of 16x16 tiles (32x32),
+            // reusing each loaded fragment across the grid. groups cover ceil over the 2x2 block.
             let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
-            let groups = ((n / 16) as u32, (m / 16) as u32, b as u32);
-            self.device.dispatch("bmm_coopmat", &[a16, b16, out.buffer], &push, groups)?;
+            let mt = (m / 16) as u32;
+            let nt = (n / 16) as u32;
+            let groups = (nt.div_ceil(4), mt.div_ceil(4), b as u32);
+            self.device.dispatch("bmm_coopmat_rb", &[a16, b16, out.buffer], &push, groups)?;
             return Ok(out);
         }
 
