@@ -57,11 +57,14 @@ pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(feature = "vulkan")]
+pub mod vulkan_backend;
 mod custom_op;
 mod device;
 pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;
+pub mod dummy_vulkan_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
 pub mod error;
@@ -115,6 +118,14 @@ pub use cuda_backend as cuda;
 pub use dummy_cuda_backend as cuda;
 
 pub use cuda::{CudaDevice, CudaStorage};
+
+#[cfg(feature = "vulkan")]
+pub use vulkan_backend as vulkan;
+
+#[cfg(not(feature = "vulkan"))]
+pub use dummy_vulkan_backend as vulkan;
+
+pub use vulkan::{VulkanDevice, VulkanStorage};
 
 #[cfg(feature = "metal")]
 pub use metal_backend::{MetalDevice, MetalError, MetalStorage};

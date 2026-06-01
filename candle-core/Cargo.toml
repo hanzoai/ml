@@ -57,6 +57,11 @@ metal = [
     "candle-ug?/metal",
 ]
 ug = ["dep:candle-ug"]
+# Native Vulkan compute backend (Strix Halo / cross-vendor iGPU).
+# Implemented via wgpu (WebGPU -> Vulkan/Metal/DX12). Kernels live in
+# vulkan_backend/. Until enabled, dummy_vulkan_backend provides the types.
+# NOTE: deps (wgpu/bytemuck/pollster) are added when vulkan_backend lands.
+vulkan = []
 
 [[bench]]
 name = "bench_main"

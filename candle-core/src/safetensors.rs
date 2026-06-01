@@ -274,6 +274,9 @@ impl Tensor {
                     Device::Metal(_) => {
                         return Err(Error::Msg("Metal support not compiled".to_string()));
                     }
+                    Device::Vulkan(_) => {
+                        return Err(Error::Msg("Vulkan support not compiled".to_string()));
+                    }
                 };
 
                 let op = BackpropOp::none();
@@ -369,6 +372,9 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         #[cfg(not(feature = "metal"))]
         Device::Metal(_) => {
             return Err(Error::Msg("Metal support not compiled".to_string()));
+        }
+        Device::Vulkan(_) => {
+            return Err(Error::Msg("Vulkan support not compiled".to_string()));
         }
     };
 
