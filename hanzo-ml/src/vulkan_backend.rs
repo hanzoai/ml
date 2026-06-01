@@ -899,18 +899,21 @@ impl BackendDevice for VulkanDevice {
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let count = shape.elem_count();
+        // Invariant: Vulkan computes in f32; f16/bf16 are represented as f32 and u8 as u32. So
+        // e.g. zeros(bf16) yields an f32 buffer of zeros (zero is the same in any of these reprs).
         match dtype {
-            DType::F32 => self.upload_f32(&vec![0f32; count]),
-            DType::U32 => self.upload_u32(&vec![0u32; count]),
-            _ => crate::bail!("vulkan: only f32/u32 supported, got {dtype:?}"),
+            DType::F32 | DType::F16 | DType::BF16 => self.upload_f32(&vec![0f32; count]),
+            DType::U32 | DType::U8 => self.upload_u32(&vec![0u32; count]),
+            _ => crate::bail!("vulkan: only f32/u32/f16/bf16/u8 supported, got {dtype:?}"),
         }
     }
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
+        // Same dtype mapping as zeros_impl: f16/bf16 -> f32 storage, u8 -> u32 storage.
         match dtype {
-            DType::F32 => self.alloc_f32(shape.elem_count()),
-            DType::U32 => self.alloc_u32(shape.elem_count()),
-            _ => crate::bail!("vulkan: only f32/u32 supported, got {dtype:?}"),
+            DType::F32 | DType::F16 | DType::BF16 => self.alloc_f32(shape.elem_count()),
+            DType::U32 | DType::U8 => self.alloc_u32(shape.elem_count()),
+            _ => crate::bail!("vulkan: only f32/u32/f16/bf16/u8 supported, got {dtype:?}"),
         }
     }
 
@@ -930,8 +933,10 @@ impl BackendDevice for VulkanDevice {
             CpuStorage::BF16(v) => {
                 self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>())
             }
+            // u8 (e.g. boolean attention masks) -> u32: where_cond and casts use u32 on Vulkan.
+            CpuStorage::U8(v) => self.upload_u32(&v.iter().map(|&x| x as u32).collect::<Vec<_>>()),
             _ => crate::bail!(
-                "vulkan: only f32/u32/f16/bf16 supported, got {:?}",
+                "vulkan: only f32/u32/f16/bf16/u8 supported, got {:?}",
                 s.dtype()
             ),
         }
@@ -1030,7 +1035,11 @@ impl VulkanStorage {
         let n = layout.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
         let strides = layout.stride();
-        let mut p = vec![n as u32, rank as u32, layout.start_offset() as u32];
+        // Push block MUST match strided_copy.comp exactly: {n, rank, offset, dst_offset, shape[6],
+        // strides[6]}. dst_offset is 0 here (we materialize into a packed offset-0 buffer); it was
+        // the missing 4th field that previously shifted shape/strides by one slot and silently
+        // corrupted every materialized (broadcast/transpose) operand consumed in-batch.
+        let mut p = vec![n as u32, rank as u32, layout.start_offset() as u32, 0u32];
         let mut shape6 = [0u32; 6];
         let mut stride6 = [0u32; 6];
         for d in 0..rank {
@@ -1046,6 +1055,22 @@ impl VulkanStorage {
             Self::groups_1d(n),
         )?;
         Ok(out)
+    }
+
+    // Materialize a u32 storage (ids / where_cond mask) into a fresh contiguous, offset-0 buffer.
+    // Identity (raw clone) when already contiguous from offset 0. Done on the CPU via the layout's
+    // strided index so it's bit-exact for arbitrary u32 values -- reusing the float strided_copy
+    // would reinterpret small integers as denormal floats, which load-time flush-to-zero could
+    // corrupt. These tensors (token/position ids, attention masks) are tiny, so the round-trip is
+    // cheap relative to correctness.
+    fn contiguous_u32(&self, layout: &Layout) -> Result<VulkanStorage> {
+        debug_assert_eq!(self.dtype, DType::U32);
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            return self.device.upload_u32(&self.to_vec_u32()?);
+        }
+        let src = self.to_vec_u32()?;
+        let gathered: Vec<u32> = layout.strided_index().map(|i| src[i]).collect();
+        self.device.upload_u32(&gathered)
     }
 
     // Buffer for a contiguous, offset-0 view of `layout`: no copy when the storage already is one
@@ -1225,11 +1250,12 @@ impl BackendStorage for VulkanStorage {
 
     fn try_clone(&self, _: &Layout) -> Result<Self> {
         // Raw device-memory copy of the whole buffer (ignores layout; assumes contiguous).
-        // Buffers are just bytes (4 bytes/elem), so copy regardless of dtype.
+        // Buffers are just bytes (4 bytes/elem). Vulkan storage physically holds f32 or u32; per
+        // the upload invariant f16/bf16 live as f32 and u8 as u32, so clone them through the same
+        // 4-byte representation rather than bailing.
         match self.dtype {
-            DType::F32 => self.device.upload_f32(&self.to_vec_f32()?),
-            DType::U32 => self.device.upload_u32(&self.to_vec_u32()?),
-            dt => crate::bail!("vulkan: try_clone unsupported dtype {dt:?}"),
+            DType::U32 | DType::U8 => self.device.upload_u32(&self.to_vec_u32()?),
+            _ => self.device.upload_f32(&self.to_vec_f32()?),
         }
     }
 
@@ -1249,25 +1275,27 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
-        let c = self.contiguous(layout)?;
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
         let n = layout.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
         let mut push = (n as u32).to_ne_bytes().to_vec();
         push.extend_from_slice(&(mul as f32).to_ne_bytes());
         push.extend_from_slice(&(add as f32).to_ne_bytes());
         self.device
-            .dispatch("affine", &[c.buffer, out.buffer], &push, Self::groups_1d(n))?;
+            .dispatch("affine", &[cb, out.buffer], &push, Self::groups_1d(n))?;
         Ok(out)
     }
 
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
-        let c = self.contiguous(layout)?;
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
         let n = layout.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
         let mut push = (n as u32).to_ne_bytes().to_vec();
         push.extend_from_slice(&(e as f32).to_ne_bytes());
         self.device
-            .dispatch("powf", &[c.buffer, out.buffer], &push, Self::groups_1d(n))?;
+            .dispatch("powf", &[cb, out.buffer], &push, Self::groups_1d(n))?;
         Ok(out)
     }
 
@@ -1463,16 +1491,24 @@ impl BackendStorage for VulkanStorage {
         f: &Self,
         f_l: &Layout,
     ) -> Result<Self> {
-        // self is the condition mask (u32). Kernel reads it directly, so it must be contiguous.
+        // self is the condition mask (u32). The kernel reads it linearly, so materialize a
+        // contiguous, offset-0 copy when the condition layout isn't already one.
         if self.dtype != DType::U32 {
             crate::bail!(
                 "vulkan: where_cond requires u32 condition, got {:?}",
                 self.dtype
             );
         }
-        if !l.is_contiguous() {
-            crate::bail!("vulkan: where_cond requires contiguous condition");
-        }
+        let mut condk = None;
+        let condb = if l.is_contiguous() && l.start_offset() == 0 {
+            self.buffer
+        } else {
+            let s = self.contiguous_u32(l)?;
+            let b = s.buffer;
+            condk = Some(s);
+            b
+        };
+        let _ = &condk; // keep the materialized condition alive until the dispatch is recorded
         let mut tk = None;
         let mut fk = None;
         let tb = t.contig_buf(t_l, &mut tk)?;
@@ -1482,7 +1518,7 @@ impl BackendStorage for VulkanStorage {
         let push = push_u32(&[n as u32]);
         self.device.dispatch(
             "where_cond",
-            &[self.buffer, tb, fb, out.buffer],
+            &[condb, tb, fb, out.buffer],
             &push,
             Self::groups_1d(n),
         )?;
@@ -1756,10 +1792,18 @@ impl BackendStorage for VulkanStorage {
         if ids.dtype != DType::U32 {
             crate::bail!("vulkan: index_select requires u32 ids, got {:?}", ids.dtype);
         }
-        // Kernel reads ids directly, so it must be contiguous.
-        if !ids_l.is_contiguous() {
-            crate::bail!("vulkan: index_select requires contiguous ids");
-        }
+        // The kernel reads ids linearly (ids[i]), so materialize a contiguous, offset-0 copy when
+        // the ids layout isn't already one.
+        let mut idk = None;
+        let ids_buf = if ids_l.is_contiguous() && ids_l.start_offset() == 0 {
+            ids.buffer
+        } else {
+            let s = ids.contiguous_u32(ids_l)?;
+            let b = s.buffer;
+            idk = Some(s);
+            b
+        };
+        let _ = &idk; // keep the materialized ids alive until the dispatch is recorded
         let src_c = self.contiguous(l)?;
         let dims = l.dims();
         let left: usize = dims[..dim].iter().product();
@@ -1771,7 +1815,7 @@ impl BackendStorage for VulkanStorage {
         let push = push_u32(&[left as u32, dim_size as u32, right as u32, n_ids as u32]);
         self.device.dispatch(
             "index_select",
-            &[ids.buffer, src_c.buffer, out.buffer],
+            &[ids_buf, src_c.buffer, out.buffer],
             &push,
             Self::groups_1d(total),
         )?;
@@ -1888,23 +1932,22 @@ impl BackendStorage for VulkanStorage {
         if n == 0 {
             return Ok(());
         }
-        if dst_offset != 0 {
-            crate::bail!("vulkan: copy_strided_src with non-zero dst offset not supported");
-        }
-        if dst.count() < n {
+        if dst.count() < dst_offset + n {
             crate::bail!(
-                "vulkan: copy_strided_src dst too small ({} < {n})",
-                dst.count()
+                "vulkan: copy_strided_src dst too small ({} < {})",
+                dst.count(),
+                dst_offset + n
             );
         }
-        // Materialize src_l (any strided/broadcast layout) directly into dst via strided_copy.
+        // Materialize src_l (any strided/broadcast layout) into dst starting at dst_offset (the
+        // KV-cache append pattern: write new tokens' K/V at an offset into the cache buffer).
         let dims = src_l.dims();
         let rank = dims.len();
         if rank > 6 {
             crate::bail!("vulkan: copy_strided_src supports rank <= 6, got {rank}");
         }
         let strides = src_l.stride();
-        let mut p = vec![n as u32, rank as u32, src_l.start_offset() as u32];
+        let mut p = vec![n as u32, rank as u32, src_l.start_offset() as u32, dst_offset as u32];
         let mut shape6 = [0u32; 6];
         let mut stride6 = [0u32; 6];
         for d in 0..rank {
@@ -1944,21 +1987,31 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn const_set(&mut self, s: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
-        if !layout.is_contiguous() {
-            crate::bail!("vulkan: const_set requires contiguous layout");
+        // Host-visible memory: read the whole buffer, set every element the layout addresses
+        // (the strided index handles non-contiguous / offset / broadcast-free views as well as
+        // the contiguous fast path), then write it back. Read-modify-write so elements outside
+        // the addressed set are preserved. u32 storage is set as an integer; everything else
+        // (f32, and f16/bf16 which live as f32) as a float.
+        if self.dtype == DType::U32 || self.dtype == DType::U8 {
+            let v = s.to_f64() as u32;
+            let mut data = self.to_vec_u32()?;
+            for i in layout.strided_index() {
+                if i >= data.len() {
+                    crate::bail!("vulkan: const_set out of range");
+                }
+                data[i] = v;
+            }
+            unsafe { self.device.write_u32(self.memory, &data) }
+        } else {
+            let v = s.to_f64() as f32;
+            let mut data = self.to_vec_f32()?;
+            for i in layout.strided_index() {
+                if i >= data.len() {
+                    crate::bail!("vulkan: const_set out of range");
+                }
+                data[i] = v;
+            }
+            unsafe { self.device.write_f32(self.memory, &data) }
         }
-        let v = s.to_f64() as f32;
-        // Host-visible memory: fill on the CPU then map+write the contiguous region.
-        let n = layout.shape().elem_count();
-        let off = layout.start_offset();
-        // Read-modify-write so we don't clobber elements outside [off, off+n).
-        let mut data = self.to_vec_f32()?;
-        if off + n > data.len() {
-            crate::bail!("vulkan: const_set out of range");
-        }
-        for x in &mut data[off..off + n] {
-            *x = v;
-        }
-        unsafe { self.device.write_f32(self.memory, &data) }
     }
 }
