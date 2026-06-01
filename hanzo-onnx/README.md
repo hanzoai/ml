@@ -1,17 +1,17 @@
-# candle-onnx
+# hanzo-onnx
 
-This crate adds ONNX support to candle
+This crate adds ONNX support to hanzo-ml
 
 ## FAQ
 
-#### Missing protoc installation when compiling candle-onnx
+#### Missing protoc installation when compiling hanzo-onnx
 
-The candle-onnx dependency prost-build no longer comes bundled with prost
+The hanzo-onnx dependency prost-build no longer comes bundled with prost
 binaries. This could cause the following error when attempting to compile
-candle-onnx:
+hanzo-onnx:
 
 ```
-error: failed to run custom build command for `candle-onnx`
+error: failed to run custom build command for `hanzo-onnx`
 Caused by: // (...)
   Could not find `protoc` installation and this build crate cannot proceed without this knowledge.
 ```

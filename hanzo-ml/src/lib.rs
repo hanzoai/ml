@@ -23,9 +23,9 @@
 //!
 //! ## FAQ
 //!
-//! - Why Candle?
+//! - Why Hanzo?
 //!
-//! Candle stems from the need to reduce binary size in order to *enable serverless*
+//! Hanzo stems from the need to reduce binary size in order to *enable serverless*
 //! possible by making the whole engine smaller than PyTorch very large library volume
 //!
 //! And simply *removing Python* from production workloads.
@@ -35,16 +35,16 @@
 //!
 //! ## Other Crates
 //!
-//! Candle consists of a number of crates. This crate holds core the common data structures but you may wish
+//! Hanzo consists of a number of crates. This crate holds core the common data structures but you may wish
 //! to look at the docs for the other crates which can be found here:
 //!
-//! - [candle-core](https://docs.rs/candle-core/). Core Datastructures and DataTypes.
-//! - [candle-nn](https://docs.rs/candle-nn/). Building blocks for Neural Nets.
-//! - [candle-datasets](https://docs.rs/candle-datasets/). Rust access to commonly used Datasets like MNIST.
-//! - [candle-examples](https://docs.rs/candle-examples/). Examples of Candle in Use.
-//! - [candle-onnx](https://docs.rs/candle-onnx/). Loading and using ONNX models.
-//! - [candle-pyo3](https://docs.rs/candle-pyo3/). Access to Candle from Python.
-//! - [candle-transformers](https://docs.rs/candle-transformers/). Candle implementation of many published transformer models.
+//! - [hanzo-ml](https://docs.rs/hanzo-ml/). Core Datastructures and DataTypes.
+//! - [hanzo-nn](https://docs.rs/hanzo-nn/). Building blocks for Neural Nets.
+//! - [hanzo-datasets](https://docs.rs/hanzo-datasets/). Rust access to commonly used Datasets like MNIST.
+//! - [hanzo-ml-examples](https://docs.rs/hanzo-ml-examples/). Examples of Hanzo in Use.
+//! - [hanzo-onnx](https://docs.rs/hanzo-onnx/). Loading and using ONNX models.
+//! - [hanzo-ml-pyo3](https://docs.rs/hanzo-ml-pyo3/). Access to Hanzo from Python.
+//! - [hanzo-transformers](https://docs.rs/hanzo-transformers/). Hanzo implementation of many published transformer models.
 //!
 
 #[cfg(feature = "accelerate")]
