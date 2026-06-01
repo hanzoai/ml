@@ -3,7 +3,7 @@
 //! ModernBERT is a modernized bidirectional encoder-only Transformer model.
 //! - [Arxiv](https://arxiv.org/abs/2412.13663) "Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder for Fast, Memory Efficient, and Long Context Finetuning and Inference"
 //! - Upstream [GitHub repo](https://github.com/AnswerDotAI/ModernBERT).
-//! - See modernbert in [candle-examples](https://github.com/huggingface/candle/tree/main/candle-examples/) for runnable code
+//! - See modernbert in [hanzo-ml-examples](https://github.com/hanzoai/ml/tree/main/hanzo-ml-examples/) for runnable code
 //!
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};

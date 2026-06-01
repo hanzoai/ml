@@ -1,4 +1,4 @@
-// ROCm/HIP single-block bitonic argsort (ported from candle/ggml argsort.cu).
+// ROCm/HIP single-block bitonic argsort (ported from hanzo-ml/ggml argsort.cu).
 // One block per row; shared memory holds the row's indices. Compiled at runtime.
 #ifndef __HIPCC__
 #define __device__

@@ -1,4 +1,4 @@
-//! Helper functions to plug ROCm kernels in candle.
+//! Helper functions to plug ROCm kernels in hanzo-ml.
 use crate::{Layout, Result};
 
 use super::wrappers::SendSyncDeviceMemory;

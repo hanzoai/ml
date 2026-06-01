@@ -329,7 +329,7 @@ impl LLaVA {
         } else {
             bail!("Unexpected mm_patch_merge_type: {mm_patch_merge_type}")
         };
-        // can easily be replaced by nonzero if it is implemented in candle
+        // can easily be replaced by nonzero if it is implemented in hanzo-ml
         let input_ids_vec = input_ids.squeeze(0)?.to_vec1::<i64>()?;
         let mut image_indices = {
             let mut image_indices = vec![0_i64];
@@ -367,7 +367,7 @@ impl LLaVA {
         image_indices.push((input_ids_noim_len) as i64);
         let input_ids_noim = Tensor::from_vec(input_ids_noim, input_ids_noim_len, &self.device)?;
         let cur_input_embeds = self.llama.embed(&input_ids_noim)?;
-        // can be replace by split if it is implemented in candle
+        // can be replace by split if it is implemented in hanzo-ml
         let input_embed_no_ims = {
             let mut input_embeds = Vec::new();
             for i in 0..image_indices.len() - 1 {

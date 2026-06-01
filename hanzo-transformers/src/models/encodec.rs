@@ -387,7 +387,7 @@ impl EncodecLSTM {
 impl Module for EncodecLSTM {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         use hanzo_nn::RNN;
-        // This is different from the Python transformers version as candle LSTM is batch first.
+        // This is different from the Python transformers version as hanzo-ml LSTM is batch first.
         let xs = xs.t()?;
         let residual = &xs;
         let mut xs = xs.clone();

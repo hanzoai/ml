@@ -1,5 +1,5 @@
 #version 450
-// GPT-NeoX style rotary embedding (candle "rotary-emb"). src is [b,h,t,d] contiguous;
+// GPT-NeoX style rotary embedding (hanzo-ml "rotary-emb"). src is [b,h,t,d] contiguous;
 // cos/sin are [t,d/2] (unbatched) or [b,t,d/2]. One invocation per (bh, t, d/2) triple.
 //   dst[i1] = src[i1]*cos - src[i2]*sin ;  dst[i2] = src[i1]*sin + src[i2]*cos
 // with i1 = i_t*d + i_d, i2 = i1 + d/2, cs index = i_t*(d/2)+i_d (+ b_i*t*d/2 if unbatched).
