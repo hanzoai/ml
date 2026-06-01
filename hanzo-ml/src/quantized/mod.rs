@@ -668,7 +668,7 @@ impl QTensor {
 
     pub fn dequantize_f16(&self, device: &Device) -> Result<Tensor> {
         // In the CUDA case, we have a specialized kernel as this can be useful for volta
-        // architectures. https://github.com/huggingface/candle/issues/2136
+        // architectures. https://github.com/hanzoai/ml/issues/2136
         match &self.storage {
             QStorage::Cuda(s) => {
                 let s = s.dequantize_f16(self.shape.elem_count())?;
@@ -716,7 +716,7 @@ impl QTensor {
             _ => {
                 // CPU / non-CUDA fallback: per-expert quantized matmul. The packed expert bank
                 // [E, n, k] is sliced into equal, contiguous per-expert quantized blocks; for
-                // each expert that is actually selected we run candle's native quantized matmul
+                // each expert that is actually selected we run hanzo-ml's native quantized matmul
                 // on just the tokens routed to it. Nothing is dequantized, so quantized MoE runs
                 // on any backend (CPU, Metal, ...) at a cost proportional to the active experts.
                 use crate::Module; // brings QMatMul::forward into scope

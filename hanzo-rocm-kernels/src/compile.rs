@@ -31,7 +31,7 @@ impl KernelCache {
         let rocm_version = detect_rocm_version()?;
         let cache_dir = get_cache_dir()?;
 
-        // Create cache directory structure: ~/.cache/candle-rocm/{arch}-{rocm_version}/
+        // Create cache directory structure: ~/.cache/hanzo-ml-rocm/{arch}-{rocm_version}/
         let arch_version = format!("{}-{}", arch, rocm_version);
         let kernel_dir = cache_dir.join(&arch_version);
         fs::create_dir_all(&kernel_dir).map_err(|e| {
@@ -242,7 +242,7 @@ fn get_cache_dir() -> Result<PathBuf, KernelError> {
         .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
         .ok_or_else(|| KernelError::Internal("Could not determine cache directory".to_string()))?;
 
-    Ok(home.join("candle-rocm"))
+    Ok(home.join("hanzo-ml-rocm"))
 }
 
 /// Compute a hash of the source code
@@ -263,10 +263,10 @@ fn compile_kernel(
 ) -> Result<Vec<u8>, KernelError> {
     let temp_dir = std::env::temp_dir();
     let source_hash = compute_source_hash(source);
-    let source_file = temp_dir.join(format!("candle_{}_{}.hip", name, source_hash));
-    let obj_file = temp_dir.join(format!("candle_{}_{}.o", name, source_hash));
-    let fatbin_file = temp_dir.join(format!("candle_{}_{}.fatbin", name, source_hash));
-    let hsaco_file = temp_dir.join(format!("candle_{}_{}.hsaco", name, source_hash));
+    let source_file = temp_dir.join(format!("hanzo_{}_{}.hip", name, source_hash));
+    let obj_file = temp_dir.join(format!("hanzo_{}_{}.o", name, source_hash));
+    let fatbin_file = temp_dir.join(format!("hanzo_{}_{}.fatbin", name, source_hash));
+    let hsaco_file = temp_dir.join(format!("hanzo_{}_{}.hsaco", name, source_hash));
 
     // Clean up temp files on any error
     let _cleanup = TempFileCleanup {
