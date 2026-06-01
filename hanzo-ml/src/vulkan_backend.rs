@@ -39,6 +39,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "tanh" => spv!("tanh"),
         "matmul" => spv!("matmul"),
         "bmm" => spv!("bmm"),
+        "bmm_reg" => spv!("bmm_reg"),
         "bmm_coopmat" => spv!("bmm_coopmat"),
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
@@ -1565,10 +1566,12 @@ impl BackendStorage for VulkanStorage {
             return Ok(out);
         }
 
+        // Register-blocked tiled GEMM (64x64 tile, 4x4 per thread): higher arithmetic intensity
+        // than the 1-output-per-thread `bmm`, so it wins on prefill-shaped (large-M) matmuls.
         let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
-        let groups = ((n as u32).div_ceil(16), (m as u32).div_ceil(16), b as u32);
+        let groups = ((n as u32).div_ceil(64), (m as u32).div_ceil(64), b as u32);
         self.device
-            .dispatch("bmm", &[lc.buffer, rc.buffer, out.buffer], &push, groups)?;
+            .dispatch("bmm_reg", &[lc.buffer, rc.buffer, out.buffer], &push, groups)?;
         Ok(out)
     }
 
