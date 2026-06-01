@@ -529,7 +529,7 @@ impl UgIOp1 {
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
     pub fn new(
         name: &'static str,
-        kernel: candle_ug::lang::ssa::Kernel,
+        kernel: hanzo_ug::lang::ssa::Kernel,
         device: &crate::Device,
     ) -> Result<Self> {
         #[cfg(feature = "cuda")]

@@ -172,7 +172,7 @@ impl Tensor {
             }
             let grad = grads
                 .remove(node)
-                .expect("candle internal error - grad not populated");
+                .expect("hanzo internal error - grad not populated");
             // https://github.com/huggingface/candle/issues/1241
             // Ideally, we would make these operations in place where possible to ensure that we
             // do not have to allocate too often. Here we just call `.detach` to avoid computing
