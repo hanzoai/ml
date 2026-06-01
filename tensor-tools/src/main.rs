@@ -1,6 +1,6 @@
+use clap::{Parser, Subcommand, ValueEnum};
 use hanzo_ml::quantized::{gguf_file, GgmlDType, QTensor};
 use hanzo_ml::{Device, Result};
-use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 
 #[derive(ValueEnum, Debug, Clone)]
