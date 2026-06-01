@@ -73,3 +73,6 @@ required-features = ["metal"]
 [[example]]
 name = "cuda_basics"
 required-features = ["cuda"]
+
+[lints]
+workspace = true
