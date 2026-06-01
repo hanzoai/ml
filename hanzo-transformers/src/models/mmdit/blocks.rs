@@ -422,7 +422,7 @@ impl ContextQkvOnlyJointBlock {
     }
 }
 
-// A QKV-attention that is compatible with the interface of candle_flash_attn::flash_attn
+// A QKV-attention that is compatible with the interface of hanzo_flash_attn::flash_attn
 // Flash attention regards q, k, v dimensions as (batch_size, seqlen, nheads, headdim)
 fn flash_compatible_attention(
     q: &Tensor,
@@ -448,7 +448,7 @@ fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
-    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+    hanzo_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
 #[cfg(not(feature = "flash-attn"))]
