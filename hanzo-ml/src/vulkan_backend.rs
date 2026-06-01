@@ -271,15 +271,31 @@ impl VulkanDevice {
             crate::bail!("matvec_q8: x len {} != k {k}", x.len());
         }
         let xs = self.upload_f32(x)?;
+        self.matvec_q8_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Q8_0 matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, no host round-trip.
+    /// This is the engine decode path -- weights stay quantized in VRAM (~1.125 B/elem) instead of
+    /// dequantizing to f32, so decode reads ~3.5x less memory (the bandwidth lever vs llama.cpp).
+    pub fn matvec_q8_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if x.count < k {
+            crate::bail!("matvec_q8_gpu: x count {} < k {k}", x.count);
+        }
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32]);
         self.dispatch(
             "mul_mat_vec_q8",
-            &[wq.buffer, xs.buffer, out.buffer],
+            &[wq.buffer, x.buffer, out.buffer],
             &push,
             ((nout as u32).div_ceil(WG1D), 1, 1),
         )?;
-        out.to_vec_f32()
+        Ok(out)
     }
 
     // Allocate a host-visible+coherent storage buffer of `bytes` bytes.
