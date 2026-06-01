@@ -1,6 +1,6 @@
 #version 450
 // upsample_nearest2d. input [b,c,ih,iw], out [b,c,oh,ow].
-// src idx = min(in-1, (out_idx*in)/out) per axis (matches candle's floor(out*scale)).
+// src idx = min(in-1, (out_idx*in)/out) per axis (matches hanzo-ml's floor(out*scale)).
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0) readonly  buffer In  { float inp[]; };
 layout(set = 0, binding = 1) writeonly buffer Out { float o[]; };
