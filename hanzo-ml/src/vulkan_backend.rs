@@ -40,8 +40,10 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "matmul" => spv!("matmul"),
         "bmm" => spv!("bmm"),
         "bmm_reg" => spv!("bmm_reg"),
+        "bmm_reg_nt" => spv!("bmm_reg_nt"),
         "bmm_coopmat" => spv!("bmm_coopmat"),
         "bmm_coopmat_rb" => spv!("bmm_coopmat_rb"),
+        "bmm_coopmat_rb_nt" => spv!("bmm_coopmat_rb_nt"),
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "copy" => spv!("copy"),
@@ -1565,12 +1567,8 @@ impl BackendStorage for VulkanStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        // Operands must be packed [b,m,k] / [b,k,n]. Use the buffer directly when the layout is
-        // already contiguous from offset 0; only materialize a copy otherwise. Skips re-copying
-        // constant weights / contiguous activations on every matmul -- a large per-token cost in a
-        // transformer forward (contiguous() always allocates + strided_copy).
+        // lhs packed [b,m,k]: use directly if contiguous from offset 0, else materialize.
         let mut lkeep = None;
-        let mut rkeep = None;
         let lc_buf = if lhs_l.is_contiguous() && lhs_l.start_offset() == 0 {
             self.buffer
         } else {
@@ -1579,7 +1577,24 @@ impl BackendStorage for VulkanStorage {
             lkeep = Some(s);
             bf
         };
-        let rc_buf = if rhs_l.is_contiguous() && rhs_l.start_offset() == 0 {
+        // rhs is [b,k,n]. A Linear passes W.t() where W is contiguous [b,n,k]; detect that
+        // transposed-contiguous layout and feed W's natural [n,k] buffer to an NT kernel -- skipping
+        // the transpose strided_copy, which the bench showed is 14-23x the matmul itself and the
+        // dominant per-matmul cost in a forward. Otherwise use the buffer directly (already packed)
+        // or materialize a [b,k,n] copy.
+        let d = rhs_l.dims();
+        let st = rhs_l.stride();
+        let nt = rhs_l.start_offset() == 0
+            && ((d.len() == 2 && d[0] == k && d[1] == n && st[0] == 1 && st[1] == k)
+                || (d.len() == 3
+                    && d[0] == b
+                    && d[1] == k
+                    && d[2] == n
+                    && st[0] == n * k
+                    && st[1] == 1
+                    && st[2] == k));
+        let mut rkeep = None;
+        let rc_buf = if nt || (rhs_l.is_contiguous() && rhs_l.start_offset() == 0) {
             rhs.buffer
         } else {
             let s = rhs.contiguous(rhs_l)?;
@@ -1588,13 +1603,12 @@ impl BackendStorage for VulkanStorage {
             bf
         };
         let _ = (&lkeep, &rkeep); // keep any materialized copies alive until the dispatch is recorded
-        // C[b,m,n] = A[b,m,k] * B[b,k,n], row-major. Kernel push order is {batch,m,k,n}.
+        // C[b,m,n] = A[b,m,k] * B[b,k,n] (B = W[n,k]^T when nt), row-major. Push order {batch,m,k,n}.
         let out = self.device.alloc_f32(b * m * n)?;
+        let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
 
-        // Matrix-core path: when the device has a 16x16x16 fp16 coopmat config and every tile
-        // dimension is a multiple of 16, cast the operands to fp16 and run the WMMA GEMM. This
-        // is fp16-precision matmul (as inference engines like llama.cpp do) — far faster on the
-        // matrix cores than the scalar tiled kernel. Falls back below otherwise.
+        // Matrix-core path: 16x16x16 fp16 coopmat when every tile dim is a multiple of 16. Casts
+        // operands to fp16 (as llama.cpp does) and runs the register-blocked WMMA GEMM.
         if self.device.inner.cm_use
             && matches!(self.device.coopmat_info(), Some((16, 16, 16)))
             && m % 16 == 0
@@ -1615,25 +1629,21 @@ impl BackendStorage for VulkanStorage {
                 &push_u32(&[(b * k * n) as u32]),
                 Self::groups_1d(b * k * n),
             )?;
-            // Register-blocked coopmat: one subgroup owns a 4x4 grid of 16x16 tiles (64x64),
-            // reusing each loaded fragment across the grid. groups cover ceil over the 4x4 block.
-            let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
             let mt = (m / 16) as u32;
-            let nt = (n / 16) as u32;
-            let groups = (nt.div_ceil(4), mt.div_ceil(4), b as u32);
-            self.device.dispatch("bmm_coopmat_rb", &[a16, b16, out.buffer], &push, groups)?;
+            let nt_tiles = (n / 16) as u32;
+            let groups = (nt_tiles.div_ceil(4), mt.div_ceil(4), b as u32);
+            let kernel = if nt { "bmm_coopmat_rb_nt" } else { "bmm_coopmat_rb" };
+            self.device.dispatch(kernel, &[a16, b16, out.buffer], &push, groups)?;
             // Scratch is dead after the kernel reads it; return to the pool (reclaimed post-flush).
             self.device.free_scratch(a16_bytes, a16, a16_mem);
             self.device.free_scratch(b16_bytes, b16, b16_mem);
             return Ok(out);
         }
 
-        // Register-blocked tiled GEMM (64x64 tile, 4x4 per thread): higher arithmetic intensity
-        // than the 1-output-per-thread `bmm`, so it wins on prefill-shaped (large-M) matmuls.
-        let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
+        // Register-blocked fp32 tiled GEMM (64x64 tile, 4x4 per thread); NT variant reads W[n,k].
         let groups = ((n as u32).div_ceil(64), (m as u32).div_ceil(64), b as u32);
-        self.device
-            .dispatch("bmm_reg", &[lc_buf, rc_buf, out.buffer], &push, groups)?;
+        let kernel = if nt { "bmm_reg_nt" } else { "bmm_reg" };
+        self.device.dispatch(kernel, &[lc_buf, rc_buf, out.buffer], &push, groups)?;
         Ok(out)
     }
 
