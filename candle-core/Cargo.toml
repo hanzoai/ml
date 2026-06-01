@@ -17,6 +17,9 @@ candle-metal-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
 gemm = { workspace = true }
 half = { workspace = true }
 float8 = { workspace = true }
@@ -59,9 +62,10 @@ metal = [
 ug = ["dep:candle-ug"]
 # Native Vulkan compute backend (Strix Halo / cross-vendor iGPU).
 # Implemented via wgpu (WebGPU -> Vulkan/Metal/DX12). Kernels live in
-# vulkan_backend/. Until enabled, dummy_vulkan_backend provides the types.
-# NOTE: deps (wgpu/bytemuck/pollster) are added when vulkan_backend lands.
-vulkan = []
+# vulkan_backend.rs. Until enabled, dummy_vulkan_backend provides the types.
+# NOTE: must be built NATIVELY on Windows (or Linux+RADV) to reach the GPU;
+# under WSL wgpu only sees llvmpipe (CPU). See memory: strix_halo_gpu_paths.
+vulkan = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [[bench]]
 name = "bench_main"

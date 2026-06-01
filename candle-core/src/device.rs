@@ -263,6 +263,20 @@ impl Device {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
     }
 
+    pub fn new_vulkan(ordinal: usize) -> Result<Self> {
+        Ok(Self::Vulkan(crate::VulkanDevice::new(ordinal)?))
+    }
+
+    /// Use a Vulkan GPU if one is reachable (native Windows AMD driver / Linux
+    /// RADV), otherwise fall back to CPU. Under WSL this returns CPU because
+    /// wgpu only sees the llvmpipe software adapter there.
+    pub fn vulkan_if_available(ordinal: usize) -> Result<Self> {
+        match Self::new_vulkan(ordinal) {
+            Ok(d) => Ok(d),
+            Err(_) => Ok(Self::Cpu),
+        }
+    }
+
     pub fn set_seed(&self, seed: u64) -> Result<()> {
         match self {
             Self::Cpu => CpuDevice.set_seed(seed),
