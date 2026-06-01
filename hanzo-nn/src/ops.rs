@@ -691,7 +691,12 @@ impl hanzo_ml::CustomOp2 for SiluMul {
         s2: &CpuStorage,
         l2: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        fn inner<T: hanzo_ml::WithDType + num_traits::Float + num_traits::AsPrimitive<f32> + num_traits::FromPrimitive>(
+        fn inner<
+            T: hanzo_ml::WithDType
+                + num_traits::Float
+                + num_traits::AsPrimitive<f32>
+                + num_traits::FromPrimitive,
+        >(
             a: &[T],
             la: &Layout,
             b: &[T],
@@ -713,7 +718,10 @@ impl hanzo_ml::CustomOp2 for SiluMul {
                     T::from_f32(xf / (1.0 + (-xf).exp()) * y.as_()).unwrap_or_else(T::nan)
                 })
                 .collect();
-            Ok((hanzo_ml::WithDType::to_cpu_storage_owned(dst), Shape::from_dims(la.shape().dims())))
+            Ok((
+                hanzo_ml::WithDType::to_cpu_storage_owned(dst),
+                Shape::from_dims(la.shape().dims()),
+            ))
         }
         use hanzo_ml::backend::BackendStorage;
         use CpuStorage as C;

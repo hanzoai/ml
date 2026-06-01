@@ -64,22 +64,20 @@ mod dtype;
 pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
+pub mod dummy_vulkan_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
-#[cfg(feature = "rocm")]
-pub mod rocm_backend;
-pub mod dummy_vulkan_backend;
-#[cfg(feature = "vulkan")]
-pub mod vulkan_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
 pub mod npy;
 pub mod op;
 pub mod pickle;
 pub mod quantized;
+#[cfg(feature = "rocm")]
+pub mod rocm_backend;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
@@ -92,6 +90,8 @@ mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
 mod variable;
+#[cfg(feature = "vulkan")]
+pub mod vulkan_backend;
 
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;
