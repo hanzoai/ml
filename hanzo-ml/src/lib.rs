@@ -1,8 +1,8 @@
 //! ML framework for Rust
 //!
 //! ```rust
-//! use candle_core::{Tensor, DType, Device};
-//! # use candle_core::Error;
+//! use hanzo_ml::{Tensor, DType, Device};
+//! # use hanzo_ml::Error;
 //! # fn main() -> Result<(), Error>{
 //!
 //! let a = Tensor::arange(0f32, 6f32, &Device::Cpu)?.reshape((2, 3))?;
