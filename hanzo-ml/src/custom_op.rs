@@ -1,11 +1,11 @@
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
-use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
-use std::sync::Arc;
 #[cfg(feature = "rocm")]
 use crate::RocmStorage;
 #[cfg(feature = "vulkan")]
 use crate::VulkanStorage;
+use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
+use std::sync::Arc;
 
 /// Unary ops that can be defined in user-land.
 pub trait CustomOp1 {
@@ -32,7 +32,11 @@ pub trait CustomOp1 {
         )))
     }
     #[cfg(feature = "vulkan")]
-    fn vulkan_fwd(&self, _storage: &VulkanStorage, _layout: &Layout) -> Result<(VulkanStorage, Shape)> {
+    fn vulkan_fwd(
+        &self,
+        _storage: &VulkanStorage,
+        _layout: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
             self.name()
@@ -388,7 +392,13 @@ pub trait InplaceOp2 {
         )))
     }
     #[cfg(feature = "vulkan")]
-    fn vulkan_fwd(&self, _: &mut VulkanStorage, _: &Layout, _: &VulkanStorage, _: &Layout) -> Result<()> {
+    fn vulkan_fwd(
+        &self,
+        _: &mut VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<()> {
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
             self.name()

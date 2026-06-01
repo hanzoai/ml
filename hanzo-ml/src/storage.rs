@@ -1,10 +1,10 @@
 use crate::backend::BackendStorage;
+use crate::op::{self, CmpOp, ReduceOp};
+use crate::scalar::Scalar;
 #[cfg(feature = "rocm")]
 use crate::RocmStorage;
 #[cfg(feature = "vulkan")]
 use crate::VulkanStorage;
-use crate::op::{self, CmpOp, ReduceOp};
-use crate::scalar::Scalar;
 use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape};
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
@@ -444,7 +444,9 @@ impl Storage {
             #[cfg(feature = "rocm")]
             (Self::Rocm(s1), Self::Rocm(s2), Self::Rocm(s3)) => c.rocm_fwd(s1, l1, s2, l2, s3, l3),
             #[cfg(feature = "vulkan")]
-            (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => c.vulkan_fwd(s1, l1, s2, l2, s3, l3),
+            (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
+                c.vulkan_fwd(s1, l1, s2, l2, s3, l3)
+            }
             _ => unreachable!(),
         }
     }
@@ -1121,9 +1123,7 @@ impl Storage {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
             #[cfg(feature = "rocm")]
-            (Self::Rocm(src), Self::Rocm(dst)) => {
-                Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
-            }
+            (Self::Rocm(src), Self::Rocm(dst)) => Ok(src.copy_strided_src(dst, dst_offset, src_l)?),
             #[cfg(feature = "vulkan")]
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
