@@ -2,14 +2,14 @@
 
 ## Overview
 
-Hanzo ML is the official ML framework for the Hanzo ecosystem, based on Candle from Hugging Face with optimizations for edge AI, multimodal workloads, and integration with Hanzo Engine.
+Hanzo ML is the official ML framework for the Hanzo ecosystem, based on Hanzo from Hugging Face with optimizations for edge AI, multimodal workloads, and integration with Hanzo Engine.
 
 ## Integration with Hanzo Engine
 
 ### Repository Structure
 ```
 ~/work/hanzo/
-├── ml/                 # hanzoai/ml - ML framework (based on HF candle)
+├── ml/                 # hanzoai/ml - ML framework (based on HF hanzo-ml)
 ├── engine/             # hanzoai/engine - Inference engine (based on mistral-rs)
 ├── jin/                # Jin multimodal models
 └── llm/                # LLM Gateway proxy
@@ -70,7 +70,7 @@ Both frameworks support:
 ```bash
 cd ~/work/hanzo/ml
 git fetch upstream
-git merge upstream/main  # Merge HF candle updates
+git merge upstream/main  # Merge HF hanzo-ml updates
 cargo test --workspace
 git push origin main
 ```
@@ -113,7 +113,7 @@ git push --tags
 ## Sync Status
 
 ### Latest Upstream Sync
-- **HF Candle**: `a2029da3` (Jan 2025)
+- **HF Hanzo**: `a2029da3` (Jan 2025)
 - **Features Added**: SmolLM3, Qwen3 WASM, Mamba2, PaddleOCR-VL
 
 ### Engine Integration Status

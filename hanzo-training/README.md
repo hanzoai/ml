@@ -94,9 +94,9 @@ zen-agentic-dataset-private/
   "code_blocks": [
     {
       "language": "rust",
-      "content": "use candle_core::*;\n\nstruct NeuralNet {\n    layers: Vec<Linear>,\n}",
+      "content": "use hanzo_ml::*;\n\nstruct NeuralNet {\n    layers: Vec<Linear>,\n}",
       "file_path": "src/neural_net.rs",
-      "diff": "+use candle_core::*;\n+\n+struct NeuralNet {"
+      "diff": "+use hanzo_ml::*;\n+\n+struct NeuralNet {"
     }
   ],
   "git_context": {

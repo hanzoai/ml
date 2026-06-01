@@ -7,10 +7,10 @@ on:
     tags:
       - '*'
     paths:
-      - candle-pyo3/**
+      - hanzo-ml-pyo3/**
   pull_request:
     paths:
-      - candle-pyo3/**
+      - hanzo-ml-pyo3/**
   workflow_dispatch:
 
 permissions:
@@ -39,12 +39,12 @@ jobs:
           args: --release --out dist --find-interpreter
           sccache: 'true'
           manylinux: auto
-          working-directory: ./candle-pyo3
+          working-directory: ./hanzo-ml-pyo3
       - name: Upload wheels
         uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-${{ matrix.target }}
-          path: ./candle-pyo3/dist
+          path: ./hanzo-ml-pyo3/dist
 
   windows:
     runs-on: windows-latest
@@ -68,12 +68,12 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter ${{ env.FEATURES_FLAG }}
           sccache: 'true'
-          working-directory: ./candle-pyo3
+          working-directory: ./hanzo-ml-pyo3
       - name: Upload wheels
         uses: actions/upload-artifact@v6
         with:
           name: wheels-windows-${{ matrix.target }}
-          path: ./candle-pyo3/dist
+          path: ./hanzo-ml-pyo3/dist
 
   macos:
     runs-on: macos-latest
@@ -96,12 +96,12 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter ${{ env.FEATURES_FLAG }}
           sccache: 'true'
-          working-directory: ./candle-pyo3
+          working-directory: ./hanzo-ml-pyo3
       - name: Upload wheels
         uses: actions/upload-artifact@v6
         with:
           name: wheels-macos-${{ matrix.target }}
-          path: ./candle-pyo3/dist
+          path: ./hanzo-ml-pyo3/dist
 
   sdist:
     runs-on: ubuntu-latest
@@ -117,10 +117,10 @@ jobs:
         with:
           command: sdist
           args: --out dist
-          working-directory: ./candle-pyo3
+          working-directory: ./hanzo-ml-pyo3
       - name: Upload sdist
         uses: actions/upload-artifact@v6
         with:
           name: wheels-sdist
-          path: ./candle-pyo3/dist
+          path: ./hanzo-ml-pyo3/dist
 

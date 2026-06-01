@@ -2,7 +2,7 @@
 //!
 //! See ["LLaMA 2: Open Foundation and Fine-Tuned Chat Models"](https://arxiv.org/abs/2307.09288)
 //!
-//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/lmz/candle-llama2)
+//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/lmz/hanzo-ml-llama2)
 //! - 💻 llama2.c [GH Link](https://github.com/karpathy/llama2.c)
 //!
 

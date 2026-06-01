@@ -1,6 +1,6 @@
 //! Yi model implementation.
 //!
-//! This candle implementation uses a pre-trained Yi decoder-only large language model for inference.
+//! This hanzo-ml implementation uses a pre-trained Yi decoder-only large language model for inference.
 //! The model was trained by 01.AI and follows a standard transformer architecture similar to LLaMA.
 //!
 //! Original code:

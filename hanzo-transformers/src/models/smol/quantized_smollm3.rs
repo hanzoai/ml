@@ -336,7 +336,7 @@ impl QuantizedAttention {
             (q, k)
         };
 
-        // can remove this continguous call if using ConcatKV-Cache https://github.com/huggingface/candle/pull/3143
+        // can remove this continguous call if using ConcatKV-Cache https://github.com/hanzoai/ml/pull/3143
         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         let k = repeat_kv(k, self.num_kv_groups)?;

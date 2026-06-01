@@ -1,6 +1,6 @@
 #version 450
 // RMS norm over the last dim: y = x / sqrt(mean(x^2) + eps) * alpha. One invocation per row.
-// Matches candle CPU rms-norm: m = sqrt(sum(x^2)/dim + eps); y = x / m * alpha.
+// Matches hanzo-ml CPU rms-norm: m = sqrt(sum(x^2)/dim + eps); y = x / m * alpha.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
 layout(set = 0, binding = 1) readonly  buffer A { float alpha[]; };
