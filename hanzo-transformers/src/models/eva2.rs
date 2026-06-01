@@ -13,7 +13,7 @@
 //! cargo run \
 //!   --example eva2 \
 //!   --release -- \
-//!   --image candle-examples/examples/yolo-v8/assets/bike.jpg
+//!   --image hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg
 //!
 //! > mountain bike, all-terrain bike, off-roader: 37.09%
 //! > maillot                 : 8.30%
@@ -23,7 +23,7 @@
 //! ```
 //!
 //! <div align=center>
-//!   <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/yolo-v8/assets/bike.jpg" alt="" width=640>
+//!   <img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.jpg" alt="" width=640>
 //! </div>
 //!
 use hanzo_ml::{IndexOp, Result, Tensor, D};

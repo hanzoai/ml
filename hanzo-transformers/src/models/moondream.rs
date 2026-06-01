@@ -18,7 +18,7 @@
 //! # download an example image
 //! wget https://raw.githubusercontent.com/vikhyat/moondream/main/assets/demo-1.jpg
 //!
-//! # Now you can run Moondream from the `candle-examples` crate:
+//! # Now you can run Moondream from the `hanzo-ml-examples` crate:
 //! cargo run --example moondream \
 //!   --release -- \
 //!   --prompt "What is the girl eating?"
