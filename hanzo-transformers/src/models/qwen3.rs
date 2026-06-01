@@ -84,9 +84,15 @@ impl Qwen3MLP {
 
 impl Module for Qwen3MLP {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let lhs = x.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = x.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        let gate = x.apply(&self.gate_proj)?;
+        let up = x.apply(&self.up_proj)?;
+        // Fused SwiGLU when the activation is SiLU (Qwen3): one op instead of silu + mul.
+        let h = if matches!(self.act_fn, Activation::Silu) {
+            hanzo_nn::ops::silu_mul(&gate, &up)?
+        } else {
+            (gate.apply(&self.act_fn)? * up)?
+        };
+        h.apply(&self.down_proj)
     }
 }
 
