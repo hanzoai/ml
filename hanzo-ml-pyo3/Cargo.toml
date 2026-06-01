@@ -33,3 +33,6 @@ cuda = ["hanzo-ml/cuda"]
 mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl"]
 onnx = ["dep:hanzo-onnx"]
 
+
+[lints]
+workspace = true
