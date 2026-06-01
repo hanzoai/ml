@@ -1,7 +1,8 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use criterion::{black_box, criterion_group, Criterion, Throughput};
+use criterion::{criterion_group, Criterion, Throughput};
 use half::{bf16, f16};
 use hanzo_ml::{DType, Device, Tensor};
+use std::hint::black_box;
 use std::time::Instant;
 
 fn run_sum(a: &Tensor) {
