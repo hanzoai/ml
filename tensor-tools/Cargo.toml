@@ -14,3 +14,6 @@ hanzo-ml = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }
+
+[lints]
+workspace = true

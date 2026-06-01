@@ -120,3 +120,11 @@ objc2-foundation = { version = "0.3.1" }
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+[workspace.lints.clippy]
+# Stylistic lints in inherited model/bench code; allowed so CI clippy -D warnings is green.
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
