@@ -170,8 +170,8 @@ The quantization work enables running SmolLM3 efficiently on consumer hardware w
 
 ## Implementation Credits
 
-### This Candle Implementation
-**Implemented for**: Candle ML Framework  
+### This Hanzo Implementation
+**Implemented for**: Hanzo ML Framework  
 **Implementation Date**: Nov 2025  
 **Features**:
 - Full precision model (F32/F16/BF16)
@@ -185,8 +185,8 @@ The quantization work enables running SmolLM3 efficiently on consumer hardware w
 
 ### Related Tools & Frameworks
 
-**Candle**: Minimalist ML framework in Rust by HuggingFace  
-- GitHub: https://github.com/huggingface/candle
+**Hanzo**: Minimalist ML framework in Rust by HuggingFace  
+- GitHub: https://github.com/hanzoai/ml
 
 **llama.cpp**: Efficient LLM inference in C/C++  
 - GitHub: https://github.com/ggerganov/llama.cpp
@@ -203,7 +203,7 @@ Special thanks to:
 1. **HuggingFace Team** - For developing SmolLM3 and making it openly available under Apache 2.0 license
 2. **NoPE Researchers** - For advancing the field with novel positional encoding approaches
 3. **Unsloth** - For providing optimized quantized versions
-4. **Candle Contributors** - For building an excellent ML framework in Rust
+4. **Hanzo Contributors** - For building an excellent ML framework in Rust
 5. **Open Source Community** - For tools like llama.cpp that enable verification and benchmarking
 
 ## Citation
@@ -231,28 +231,28 @@ If you use SmolLM3 in your research or applications, please cite:
 }
 ```
 
-### Candle Framework
+### Hanzo Framework
 ```bibtex
-@software{candle,
-  title={Candle: Minimalist ML Framework},
+@software{hanzo-ml,
+  title={Hanzo: Minimalist ML Framework},
   author={HuggingFace},
   year={2024},
-  url={https://github.com/huggingface/candle}
+  url={https://github.com/hanzoai/ml}
 }
 ```
 
 ## License
 
 - **SmolLM3 Model**: Apache 2.0
-- **This Implementation**: Follows Candle framework license
-- **Candle Framework**: Apache 2.0 and MIT dual-licensed
+- **This Implementation**: Follows Hanzo framework license
+- **Hanzo Framework**: Apache 2.0 and MIT dual-licensed
 
 ## Further Reading
 
 - **SmolLM Blog Series**: https://huggingface.co/blog/smollm and https://huggingface.co/blog/smollm3
 - **Model Card Details**: https://huggingface.co/HuggingFaceTB/SmolLM3-3B
 - **NoPE Paper**: https://arxiv.org/abs/2410.01926
-- **Candle Documentation**: https://huggingface.github.io/candle/
+- **Hanzo Documentation**: https://huggingface.github.io/hanzo-ml/
 
 ---
 

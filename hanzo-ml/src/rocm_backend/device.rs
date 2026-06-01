@@ -130,13 +130,13 @@ impl RocmDevice {
     }
 
     /// Get a reference to the underlying HIP stream.
-    /// This is public so that candle-nn and other crates can launch custom kernels.
+    /// This is public so that hanzo-nn and other crates can launch custom kernels.
     pub fn stream(&self) -> &rocm_rs::hip::Stream {
         &self.stream.0
     }
 
     /// Get or load a kernel function from the cache.
-    /// This is public so that candle-nn and other crates can launch custom kernels.
+    /// This is public so that hanzo-nn and other crates can launch custom kernels.
     pub fn get_or_load_func(
         &self,
         kernel_name: &'static str,

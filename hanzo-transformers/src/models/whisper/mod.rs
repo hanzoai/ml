@@ -5,7 +5,7 @@
 //! convert audio files (in the `.wav` format) to text. Supported features include
 //! language detection as well as multilingual speech recognition.
 //!
-//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/lmz/candle-whisper)
+//! - ⚡ [Interactive Wasm Example](https://huggingface.co/spaces/lmz/hanzo-ml-whisper)
 //! - 💻 [GH Link](https://github.com/openai/whisper)
 //! - 💻 Transformers Python [reference implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/whisper/modeling_whisper.py)
 //!
