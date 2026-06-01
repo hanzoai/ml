@@ -283,7 +283,7 @@ struct XSoftmax {}
 
 impl XSoftmax {
     pub fn apply(input: &Tensor, mask: &Tensor, dim: D, device: &Device) -> Result<Tensor> {
-        // NOTE: At the time of this writing, candle does not have a logical-not operator.
+        // NOTE: At the time of this writing, hanzo-ml does not have a logical-not operator.
         let mut rmask = mask.broadcast_as(input.shape())?.to_dtype(DType::F32)?;
 
         rmask = rmask
