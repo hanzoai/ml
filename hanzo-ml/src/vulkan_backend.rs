@@ -917,18 +917,35 @@ impl VulkanStorage {
         Ok(out)
     }
 
+    // Buffer for a contiguous, offset-0 view of `layout`: no copy when the storage already is one
+    // (returns its own buffer), otherwise materializes a packed copy returned via `keep` (held
+    // alive by the caller until the dispatch is recorded). Each avoided contiguous() is one fewer
+    // dispatch, which dominates per-op cost in a forward. Use only for transient op inputs -- the
+    // result `out` must be a fresh alloc, never this buffer (it may alias `self`).
+    fn contig_buf(&self, layout: &Layout, keep: &mut Option<VulkanStorage>) -> Result<vk::Buffer> {
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            Ok(self.buffer)
+        } else {
+            let s = self.contiguous(layout)?;
+            let b = s.buffer;
+            *keep = Some(s);
+            Ok(b)
+        }
+    }
+
     // --- native fused ops (replace the GPU<->CPU round-trip fallbacks) ---
 
     // softmax over the last dim. `self` is the input; `layout` its layout. One row per thread.
     pub fn softmax_last_dim(&self, layout: &Layout) -> Result<VulkanStorage> {
-        let x = self.contiguous(layout)?;
+        let mut xk = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
         let dims = layout.dims();
         let m = *dims.last().unwrap_or(&1);
         let nrows = layout.shape().elem_count() / m.max(1);
         let out = self.device.alloc_f32(nrows * m)?;
         self.device.dispatch(
             "softmax_rows",
-            &[x.buffer, out.buffer],
+            &[xb, out.buffer],
             &push_u32(&[nrows as u32, m as u32]),
             Self::groups_1d(nrows),
         )?;
@@ -943,20 +960,17 @@ impl VulkanStorage {
         alpha_l: &Layout,
         eps: f32,
     ) -> Result<VulkanStorage> {
-        let x = self.contiguous(layout)?;
-        let a = alpha.contiguous(alpha_l)?;
+        let mut xk = None;
+        let mut ak = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
+        let ab = alpha.contig_buf(alpha_l, &mut ak)?;
         let dims = layout.dims();
         let m = *dims.last().unwrap_or(&1);
         let nrows = layout.shape().elem_count() / m.max(1);
         let out = self.device.alloc_f32(nrows * m)?;
         let mut push = push_u32(&[nrows as u32, m as u32]);
         push.extend_from_slice(&eps.to_ne_bytes());
-        self.device.dispatch(
-            "rms_norm",
-            &[x.buffer, a.buffer, out.buffer],
-            &push,
-            Self::groups_1d(nrows),
-        )?;
+        self.device.dispatch("rms_norm", &[xb, ab, out.buffer], &push, Self::groups_1d(nrows))?;
         Ok(out)
     }
 
@@ -969,16 +983,19 @@ impl VulkanStorage {
         sin: &VulkanStorage,
         sin_l: &Layout,
     ) -> Result<VulkanStorage> {
-        let src = self.contiguous(layout)?;
-        let c = cos.contiguous(cos_l)?;
-        let s = sin.contiguous(sin_l)?;
+        let mut srck = None;
+        let mut ck = None;
+        let mut sk = None;
+        let srcb = self.contig_buf(layout, &mut srck)?;
+        let cb = cos.contig_buf(cos_l, &mut ck)?;
+        let sb = sin.contig_buf(sin_l, &mut sk)?;
         let (b, h, t, d) = layout.shape().dims4()?;
         let unbatched = (cos_l.dims().len() == 3 && sin_l.dims().len() == 3) as u32;
         let out = self.device.alloc_f32(b * h * t * d)?;
         let pairs = b * h * t * (d / 2);
         self.device.dispatch(
             "rope",
-            &[src.buffer, c.buffer, s.buffer, out.buffer],
+            &[srcb, cb, sb, out.buffer],
             &push_u32(&[b as u32, h as u32, t as u32, d as u32, unbatched]),
             Self::groups_1d(pairs),
         )?;
@@ -1224,12 +1241,12 @@ impl BackendStorage for VulkanStorage {
                 return self.device.storage_from_cpu_storage(&r);
             }
         };
-        let c = self.contiguous(layout)?;
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
         let n = layout.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
         let push = (n as u32).to_ne_bytes();
-        self.device
-            .dispatch(kernel, &[c.buffer, out.buffer], &push, Self::groups_1d(n))?;
+        self.device.dispatch(kernel, &[cb, out.buffer], &push, Self::groups_1d(n))?;
         Ok(out)
     }
 
@@ -1249,15 +1266,17 @@ impl BackendStorage for VulkanStorage {
                 return self.device.storage_from_cpu_storage(&r);
             }
         };
-        // candle pre-broadcasts both layouts to the output shape (possibly with
-        // stride-0 dims); contiguous() materializes each to n elements.
-        let lc = self.contiguous(lhs_l)?;
-        let rc = rhs.contiguous(rhs_l)?;
+        // candle pre-broadcasts both layouts to the output shape (possibly with stride-0 dims);
+        // broadcast layouts aren't contiguous so contig_buf still materializes them, but
+        // same-shape contiguous operands skip the copy (one fewer dispatch each).
+        let mut lk = None;
+        let mut rk = None;
+        let lb = self.contig_buf(lhs_l, &mut lk)?;
+        let rb = rhs.contig_buf(rhs_l, &mut rk)?;
         let n = lhs_l.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
         let push = (n as u32).to_ne_bytes();
-        self.device
-            .dispatch(kernel, &[lc.buffer, rc.buffer, out.buffer], &push, Self::groups_1d(n))?;
+        self.device.dispatch(kernel, &[lb, rb, out.buffer], &push, Self::groups_1d(n))?;
         Ok(out)
     }
 
@@ -1269,14 +1288,16 @@ impl BackendStorage for VulkanStorage {
         if !l.is_contiguous() {
             crate::bail!("vulkan: where_cond requires contiguous condition");
         }
-        let tc = t.contiguous(t_l)?;
-        let fc = f.contiguous(f_l)?;
+        let mut tk = None;
+        let mut fk = None;
+        let tb = t.contig_buf(t_l, &mut tk)?;
+        let fb = f.contig_buf(f_l, &mut fk)?;
         let n = l.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
         let push = push_u32(&[n as u32]);
         self.device.dispatch(
             "where_cond",
-            &[self.buffer, tc.buffer, fc.buffer, out.buffer],
+            &[self.buffer, tb, fb, out.buffer],
             &push,
             Self::groups_1d(n),
         )?;
