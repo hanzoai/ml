@@ -777,6 +777,11 @@ pub enum QMatMul {
     QTensor(std::sync::Arc<QTensor>),
     Tensor(Tensor),
     TensorF16(Tensor),
+    // Native Vulkan quantized weight: Q8_0 blocks resident in VRAM (~1.125 B/elem). Decode (1 row)
+    // runs the GPU Q8 matvec directly (bandwidth-optimal); prefill dequantizes to a temporary f32.
+    // `qtensor` is the original (CPU-side) for the prefill dequant; `n`/`k` are the weight dims.
+    #[cfg(feature = "vulkan")]
+    VulkanQuant { qtensor: std::sync::Arc<QTensor>, wq: std::sync::Arc<crate::VulkanStorage>, n: usize, k: usize },
 }
 
 thread_local! {
@@ -803,6 +808,20 @@ thread_local! {
 
 impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
+        // Native Vulkan quantized path: keep Q8_0 weights quantized in VRAM and run the GPU matvec
+        // for decode, instead of dequantizing the whole model to f32 (4x the decode bandwidth).
+        #[cfg(feature = "vulkan")]
+        if qtensor.dtype() == GgmlDType::Q8_0 {
+            if let Device::Vulkan(d) = qtensor.device() {
+                if let Ok((n, k)) = qtensor.shape().dims2() {
+                    if k % 32 == 0 {
+                        let wf = qtensor.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                        let wq = d.quantize_q8(&wf, n, k)?;
+                        return Ok(Self::VulkanQuant { qtensor, wq: std::sync::Arc::new(wq), n, k });
+                    }
+                }
+            }
+        }
         let dequantize = match qtensor.dtype() {
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
             // The Vulkan backend has no native quantized matmul yet, so dequantize to f32 here
@@ -830,6 +849,8 @@ impl QMatMul {
             Self::QTensor(t) => t.dequantize_f16(&t.device()),
             Self::Tensor(t) => t.to_dtype(DType::F16),
             Self::TensorF16(t) => Ok(t.clone()),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
         }
     }
 
@@ -847,6 +868,8 @@ impl QMatMul {
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
             _ => {
                 panic!("Not implemented!")
             }
@@ -944,6 +967,44 @@ impl crate::CustomOp1 for QTensor {
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuant { qtensor, wq, n, k } => {
+                let rows: usize = xs.elem_count() / *k;
+                if rows == 1 {
+                    // Decode: weights stay quantized in VRAM, GPU Q8 matvec (no dequant, no copy).
+                    let xs = xs.contiguous()?;
+                    let d = match xs.device() {
+                        Device::Vulkan(d) => d,
+                        _ => crate::bail!("VulkanQuant input not on vulkan"),
+                    };
+                    let y = {
+                        let (store, _) = xs.storage_and_layout();
+                        let xv = match &*store {
+                            crate::Storage::Vulkan(v) => v,
+                            _ => crate::bail!("VulkanQuant expected vulkan storage"),
+                        };
+                        d.matvec_q8_gpu(wq, xv, *n, *k)?
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Vulkan(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                } else {
+                    // Prefill: dequantize to a temporary f32 weight (reuses the NT matmul path).
+                    let w = qtensor.dequantize(&xs.device())?;
+                    let w = match *xs.dims() {
+                        [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                        [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                        _ => w.t()?,
+                    };
+                    xs.matmul(&w)
+                }
+            }
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
             Self::Tensor(w) => {
                 let w = match *xs.dims() {
