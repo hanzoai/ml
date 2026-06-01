@@ -31,6 +31,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "neg" => spv!("neg"),
         "exp" => spv!("exp"),
         "silu" => spv!("silu"),
+        "silu_mul" => spv!("silu_mul"),
         "gelu" => spv!("gelu"),
         "relu" => spv!("relu"),
         "sqr" => spv!("sqr"),
@@ -989,6 +990,19 @@ impl VulkanStorage {
         let mut push = push_u32(&[nrows as u32, m as u32]);
         push.extend_from_slice(&eps.to_ne_bytes());
         self.device.dispatch("rms_norm", &[xb, ab, out.buffer], &push, Self::groups_1d(nrows))?;
+        Ok(out)
+    }
+
+    // Fused SwiGLU: out = silu(self) * rhs, elementwise. One dispatch instead of silu + mul.
+    pub fn silu_mul(&self, layout: &Layout, rhs: &VulkanStorage, rhs_l: &Layout) -> Result<VulkanStorage> {
+        let mut ak = None;
+        let mut bk = None;
+        let ab = self.contig_buf(layout, &mut ak)?;
+        let bb = rhs.contig_buf(rhs_l, &mut bk)?;
+        let n = layout.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        self.device
+            .dispatch("silu_mul", &[ab, bb, out.buffer], &(n as u32).to_ne_bytes(), Self::groups_1d(n))?;
         Ok(out)
     }
 
