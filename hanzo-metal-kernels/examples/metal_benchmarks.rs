@@ -1,11 +1,11 @@
 use anyhow::Result;
+/// This example contains some simple benchmarks so that it's easy to run them in perf etc.
+use clap::{Parser, Subcommand};
+use half::f16;
 use hanzo_metal_kernels::{
     metal::{create_command_buffer, CommandSemaphore, Device},
     GemmDType, RESOURCE_OPTIONS,
 };
-/// This example contains some simple benchmarks so that it's easy to run them in perf etc.
-use clap::{Parser, Subcommand};
-use half::f16;
 use std::sync::Arc;
 
 fn run_gemm(f32: bool, n: usize) -> Result<()> {

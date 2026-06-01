@@ -189,7 +189,11 @@ pub struct VulkanStorage {
 
 impl std::fmt::Debug for VulkanStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "VulkanStorage(count={}, dtype={:?})", self.count, self.dtype)
+        write!(
+            f,
+            "VulkanStorage(count={}, dtype={:?})",
+            self.count, self.dtype
+        )
     }
 }
 
@@ -267,7 +271,13 @@ impl VulkanDevice {
     /// Q8_0 matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q8`]. The kernel
     /// reads weights at ~1.125 bytes/elem instead of 4 — the bandwidth lever for memory-bound
     /// decode on this APU. Expect ~1e-2 error (fp16-scale int8 quantization).
-    pub fn matvec_q8(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+    pub fn matvec_q8(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
         if x.len() != k {
             crate::bail!("matvec_q8: x len {} != k {k}", x.len());
         }
@@ -302,8 +312,15 @@ impl VulkanDevice {
     // Allocate a host-visible+coherent storage buffer of `bytes` bytes.
     unsafe fn raw_buffer(&self, bytes: u64) -> Result<(vk::Buffer, vk::DeviceMemory)> {
         let bytes = bytes.max(4); // zero-size buffers are illegal; round up to one f32.
-        // Reuse a same-size buffer reclaimed from a completed batch before allocating fresh.
-        if let Some(pair) = self.inner.bufpool.lock().unwrap().free.get_mut(&bytes).and_then(Vec::pop)
+                                  // Reuse a same-size buffer reclaimed from a completed batch before allocating fresh.
+        if let Some(pair) = self
+            .inner
+            .bufpool
+            .lock()
+            .unwrap()
+            .free
+            .get_mut(&bytes)
+            .and_then(Vec::pop)
         {
             return Ok(pair);
         }
@@ -331,7 +348,9 @@ impl VulkanDevice {
             .ok_or_else(|| Error::Msg("vulkan: no host-visible memory type".into()))?;
         let mem = dev
             .allocate_memory(
-                &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(idx),
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(idx),
                 None,
             )
             .map_err(vkerr)?;
@@ -398,7 +417,12 @@ impl VulkanDevice {
 
     // Build (or fetch cached) compute pipeline for `name` with `n_buffers` storage bindings
     // and a push-constant range of `push_size` bytes.
-    fn pipeline(&self, name: &'static str, n_buffers: usize, push_size: usize) -> Result<CachedPipeline> {
+    fn pipeline(
+        &self,
+        name: &'static str,
+        n_buffers: usize,
+        push_size: usize,
+    ) -> Result<CachedPipeline> {
         if let Some(p) = self.inner.pipelines.lock().unwrap().get(name) {
             return Ok(p.clone());
         }
@@ -445,14 +469,25 @@ impl VulkanDevice {
             let pipeline = dev
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(layout)],
                     None,
                 )
                 .map_err(|(_, e)| vkerr(e))?[0];
             dev.destroy_shader_module(module, None);
-            CachedPipeline { pipeline, layout, set_layout, n_buffers }
+            CachedPipeline {
+                pipeline,
+                layout,
+                set_layout,
+                n_buffers,
+            }
         };
-        self.inner.pipelines.lock().unwrap().insert(name, cached.clone());
+        self.inner
+            .pipelines
+            .lock()
+            .unwrap()
+            .insert(name, cached.clone());
         Ok(cached)
     }
 
@@ -466,7 +501,11 @@ impl VulkanDevice {
         groups: (u32, u32, u32),
     ) -> Result<()> {
         let p = self.pipeline(name, bufs.len(), push.len())?;
-        debug_assert_eq!(p.n_buffers, bufs.len(), "vulkan: kernel `{name}` binding count drift");
+        debug_assert_eq!(
+            p.n_buffers,
+            bufs.len(),
+            "vulkan: kernel `{name}` binding count drift"
+        );
         let dev = self.dev();
         let queue = self.inner.queue;
         let mut s = self.inner.submitter.lock().unwrap();
@@ -494,7 +533,11 @@ impl VulkanDevice {
                 .map_err(vkerr)?[0];
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
                 .iter()
-                .map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)])
+                .map(|&b| {
+                    [vk::DescriptorBufferInfo::default()
+                        .buffer(b)
+                        .range(vk::WHOLE_SIZE)]
+                })
                 .collect();
             let writes: Vec<_> = (0..bufs.len())
                 .map(|i| {
@@ -509,7 +552,14 @@ impl VulkanDevice {
 
             let cmd = s.cmd;
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
-            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, p.layout, 0, &[set], &[]);
+            dev.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                p.layout,
+                0,
+                &[set],
+                &[],
+            );
             if !push.is_empty() {
                 dev.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
@@ -567,7 +617,13 @@ impl VulkanDevice {
     // Allocate an f32 storage holding `count` elements (uninitialized device memory).
     fn alloc_f32(&self, count: usize) -> Result<VulkanStorage> {
         let (buffer, memory) = unsafe { self.raw_buffer((count * 4) as u64)? };
-        Ok(VulkanStorage { buffer, memory, count, dtype: DType::F32, device: self.clone() })
+        Ok(VulkanStorage {
+            buffer,
+            memory,
+            count,
+            dtype: DType::F32,
+            device: self.clone(),
+        })
     }
 
     // fp16 scratch (2 bytes/elem) for coopmat matmul inputs. Returns the buffer plus its memory and
@@ -596,7 +652,13 @@ impl VulkanDevice {
     // u32 storage (ids/cond). 4 bytes/elem, same as f32.
     fn alloc_u32(&self, count: usize) -> Result<VulkanStorage> {
         let (buffer, memory) = unsafe { self.raw_buffer((count * 4) as u64)? };
-        Ok(VulkanStorage { buffer, memory, count, dtype: DType::U32, device: self.clone() })
+        Ok(VulkanStorage {
+            buffer,
+            memory,
+            count,
+            dtype: DType::U32,
+            device: self.clone(),
+        })
     }
 
     fn upload_u32(&self, data: &[u32]) -> Result<VulkanStorage> {
@@ -625,9 +687,14 @@ fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter) -> Resul
         dev.end_command_buffer(s.cmd).map_err(vkerr)?;
         dev.reset_fences(&[s.fence]).map_err(vkerr)?;
         let cmds = [s.cmd];
-        dev.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], s.fence)
+        dev.queue_submit(
+            queue,
+            &[vk::SubmitInfo::default().command_buffers(&cmds)],
+            s.fence,
+        )
+        .map_err(vkerr)?;
+        dev.wait_for_fences(&[s.fence], true, u64::MAX)
             .map_err(vkerr)?;
-        dev.wait_for_fences(&[s.fence], true, u64::MAX).map_err(vkerr)?;
     }
     s.recording = false;
     s.n = 0;
@@ -654,14 +721,19 @@ impl BackendDevice for VulkanDevice {
                 .map_err(|e| Error::Msg(format!("vulkan: loader not found: {e}")))?;
             let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
             let instance = entry
-                .create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)
+                .create_instance(
+                    &vk::InstanceCreateInfo::default().application_info(&app),
+                    None,
+                )
                 .map_err(vkerr)?;
 
             // Collect non-CPU adapters in enumeration order; pick the `ordinal`-th (like the probe).
             let mut gpus = Vec::new();
             for pd in instance.enumerate_physical_devices().map_err(vkerr)? {
                 let p = instance.get_physical_device_properties(pd);
-                let name = CStr::from_ptr(p.device_name.as_ptr()).to_string_lossy().into_owned();
+                let name = CStr::from_ptr(p.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
                 let is_cpu = p.device_type == vk::PhysicalDeviceType::CPU
                     || name.to_lowercase().contains("llvmpipe");
                 if !is_cpu {
@@ -680,7 +752,8 @@ impl BackendDevice for VulkanDevice {
                 .get_physical_device_queue_family_properties(pdev)
                 .iter()
                 .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                .ok_or_else(|| Error::Msg("vulkan: no compute queue".into()))? as u32;
+                .ok_or_else(|| Error::Msg("vulkan: no compute queue".into()))?
+                as u32;
             let prios = [1.0f32];
             let qci = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qfi)
@@ -690,7 +763,9 @@ impl BackendDevice for VulkanDevice {
             // fp16 A/B, fp32 C/result at subgroup scope. Guard the query on the extension being
             // advertised (the loader's fn pointer is only valid then) so WSL/Dozen stays on the
             // plain tiled path.
-            let dev_exts = instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
+            let dev_exts = instance
+                .enumerate_device_extension_properties(pdev)
+                .unwrap_or_default();
             let has_cm_ext = dev_exts.iter().any(|e| {
                 CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::cooperative_matrix::NAME
             });
@@ -717,8 +792,10 @@ impl BackendDevice for VulkanDevice {
             // (bmm_coopmat_rb) measured 1.3-2.7x over the fp32 bmm_reg on the real AMD driver and a
             // full Qwen3-0.6B forward's argmax matched CPU exactly (fp16 inputs, fp32 accumulate).
             // Set HANZO_VK_COOPMAT=0 to force the fp32 path (e.g. if precision matters).
-            let cm_use =
-                coopmat && std::env::var("HANZO_VK_COOPMAT").map(|v| v != "0").unwrap_or(true);
+            let cm_use = coopmat
+                && std::env::var("HANZO_VK_COOPMAT")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
 
             // Enable the coopmat extension + the features its SPIR-V needs (cooperative matrix,
             // Vulkan memory model, fp16 arithmetic, 16-bit storage) only when supported.
@@ -729,8 +806,8 @@ impl BackendDevice for VulkanDevice {
                 vk::PhysicalDeviceVulkanMemoryModelFeatures::default().vulkan_memory_model(true);
             let mut f16_feat =
                 vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
-            let mut s16_feat = vk::PhysicalDevice16BitStorageFeatures::default()
-                .storage_buffer16_bit_access(true);
+            let mut s16_feat =
+                vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
             let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
             if coopmat {
                 dci = dci
@@ -763,7 +840,9 @@ impl BackendDevice for VulkanDevice {
                         .command_buffer_count(1),
                 )
                 .map_err(vkerr)?[0];
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vkerr)?;
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(vkerr)?;
             // Sized for a whole batch: one descriptor set per recorded dispatch (up to
             // BATCH_CAP), each binding up to 4 storage buffers (the widest kernel).
             let dpool_sizes = [vk::DescriptorPoolSize::default()
@@ -777,8 +856,14 @@ impl BackendDevice for VulkanDevice {
                     None,
                 )
                 .map_err(vkerr)?;
-            let submitter =
-                Mutex::new(Submitter { cpool, cmd, fence, dpool, recording: false, n: 0 });
+            let submitter = Mutex::new(Submitter {
+                cpool,
+                cmd,
+                fence,
+                dpool,
+                recording: false,
+                n: 0,
+            });
 
             let inner = VkInner {
                 _entry: entry,
@@ -796,12 +881,16 @@ impl BackendDevice for VulkanDevice {
                 cm_mnk,
                 cm_use,
             };
-            Ok(Self { inner: Arc::new(inner) })
+            Ok(Self {
+                inner: Arc::new(inner),
+            })
         }
     }
 
     fn location(&self) -> crate::DeviceLocation {
-        crate::DeviceLocation::Vulkan { gpu_id: self.inner.gpu_id }
+        crate::DeviceLocation::Vulkan {
+            gpu_id: self.inner.gpu_id,
+        }
     }
 
     fn same_device(&self, rhs: &Self) -> bool {
@@ -835,9 +924,16 @@ impl BackendDevice for VulkanDevice {
         match s {
             CpuStorage::F32(v) => self.upload_f32(v),
             CpuStorage::U32(v) => self.upload_u32(v),
-            CpuStorage::F16(v) => self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>()),
-            CpuStorage::BF16(v) => self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>()),
-            _ => crate::bail!("vulkan: only f32/u32/f16/bf16 supported, got {:?}", s.dtype()),
+            CpuStorage::F16(v) => {
+                self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>())
+            }
+            CpuStorage::BF16(v) => {
+                self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>())
+            }
+            _ => crate::bail!(
+                "vulkan: only f32/u32/f16/bf16 supported, got {:?}",
+                s.dtype()
+            ),
         }
     }
 
@@ -845,7 +941,13 @@ impl BackendDevice for VulkanDevice {
         self.storage_from_cpu_storage(&s)
     }
 
-    fn rand_uniform(&self, shape: &Shape, dtype: DType, min: f64, max: f64) -> Result<Self::Storage> {
+    fn rand_uniform(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        min: f64,
+        max: f64,
+    ) -> Result<Self::Storage> {
         if dtype != DType::F32 {
             crate::bail!("vulkan: rand_uniform only f32, got {dtype:?}");
         }
@@ -860,7 +962,13 @@ impl BackendDevice for VulkanDevice {
         self.upload_f32(&data)
     }
 
-    fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<Self::Storage> {
+    fn rand_normal(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        mean: f64,
+        std: f64,
+    ) -> Result<Self::Storage> {
         if dtype != DType::F32 {
             crate::bail!("vulkan: rand_normal only f32, got {dtype:?}");
         }
@@ -931,8 +1039,12 @@ impl VulkanStorage {
         }
         p.extend_from_slice(&shape6);
         p.extend_from_slice(&stride6);
-        self.device
-            .dispatch("strided_copy", &[self.buffer, out.buffer], &push_u32(&p), Self::groups_1d(n))?;
+        self.device.dispatch(
+            "strided_copy",
+            &[self.buffer, out.buffer],
+            &push_u32(&p),
+            Self::groups_1d(n),
+        )?;
         Ok(out)
     }
 
@@ -989,20 +1101,34 @@ impl VulkanStorage {
         let out = self.device.alloc_f32(nrows * m)?;
         let mut push = push_u32(&[nrows as u32, m as u32]);
         push.extend_from_slice(&eps.to_ne_bytes());
-        self.device.dispatch("rms_norm", &[xb, ab, out.buffer], &push, Self::groups_1d(nrows))?;
+        self.device.dispatch(
+            "rms_norm",
+            &[xb, ab, out.buffer],
+            &push,
+            Self::groups_1d(nrows),
+        )?;
         Ok(out)
     }
 
     // Fused SwiGLU: out = silu(self) * rhs, elementwise. One dispatch instead of silu + mul.
-    pub fn silu_mul(&self, layout: &Layout, rhs: &VulkanStorage, rhs_l: &Layout) -> Result<VulkanStorage> {
+    pub fn silu_mul(
+        &self,
+        layout: &Layout,
+        rhs: &VulkanStorage,
+        rhs_l: &Layout,
+    ) -> Result<VulkanStorage> {
         let mut ak = None;
         let mut bk = None;
         let ab = self.contig_buf(layout, &mut ak)?;
         let bb = rhs.contig_buf(rhs_l, &mut bk)?;
         let n = layout.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
-        self.device
-            .dispatch("silu_mul", &[ab, bb, out.buffer], &(n as u32).to_ne_bytes(), Self::groups_1d(n))?;
+        self.device.dispatch(
+            "silu_mul",
+            &[ab, bb, out.buffer],
+            &(n as u32).to_ne_bytes(),
+            Self::groups_1d(n),
+        )?;
         Ok(out)
     }
 
@@ -1085,8 +1211,8 @@ impl VulkanStorage {
             kernel,
             &[inp.buffer, out.buffer],
             &push_u32(&[
-                b as u32, c as u32, ih as u32, iw as u32, oh as u32, ow as u32,
-                kh as u32, kw as u32, sh as u32, sw as u32,
+                b as u32, c as u32, ih as u32, iw as u32, oh as u32, ow as u32, kh as u32,
+                kw as u32, sh as u32, sw as u32,
             ]),
             Self::groups_1d(b * c * oh * ow),
         )?;
@@ -1140,7 +1266,8 @@ impl BackendStorage for VulkanStorage {
         let out = self.device.alloc_f32(n)?;
         let mut push = (n as u32).to_ne_bytes().to_vec();
         push.extend_from_slice(&(e as f32).to_ne_bytes());
-        self.device.dispatch("powf", &[c.buffer, out.buffer], &push, Self::groups_1d(n))?;
+        self.device
+            .dispatch("powf", &[c.buffer, out.buffer], &push, Self::groups_1d(n))?;
         Ok(out)
     }
 
@@ -1150,7 +1277,8 @@ impl BackendStorage for VulkanStorage {
         let out = self.device.alloc_f32(n)?;
         let mut push = (n as u32).to_ne_bytes().to_vec();
         push.extend_from_slice(&(alpha as f32).to_ne_bytes());
-        self.device.dispatch("elu", &[c.buffer, out.buffer], &push, Self::groups_1d(n))?;
+        self.device
+            .dispatch("elu", &[c.buffer, out.buffer], &push, Self::groups_1d(n))?;
         Ok(out)
     }
 
@@ -1177,11 +1305,19 @@ impl BackendStorage for VulkanStorage {
         let cols = dims[rank - 1];
         let rows: usize = dims[..rank - 1].iter().product();
         // arg-reductions return u32 indices; value reductions return f32.
-        let out = if is_arg { self.device.alloc_u32(rows)? } else { self.device.alloc_f32(rows)? };
+        let out = if is_arg {
+            self.device.alloc_u32(rows)?
+        } else {
+            self.device.alloc_f32(rows)?
+        };
         let push = push_u32(&[rows as u32, cols as u32]);
         // one invocation per row
-        self.device
-            .dispatch(kernel, &[c.buffer, out.buffer], &push, Self::groups_1d(rows))?;
+        self.device.dispatch(
+            kernel,
+            &[c.buffer, out.buffer],
+            &push,
+            Self::groups_1d(rows),
+        )?;
         Ok(out)
     }
 
@@ -1278,11 +1414,17 @@ impl BackendStorage for VulkanStorage {
         let n = layout.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
         let push = (n as u32).to_ne_bytes();
-        self.device.dispatch(kernel, &[cb, out.buffer], &push, Self::groups_1d(n))?;
+        self.device
+            .dispatch(kernel, &[cb, out.buffer], &push, Self::groups_1d(n))?;
         Ok(out)
     }
 
-    fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+    fn binary_impl<B: BinaryOpT>(
+        &self,
+        rhs: &Self,
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<Self> {
         let kernel: &'static str = match B::NAME {
             "add" => "add",
             "sub" => "sub",
@@ -1308,14 +1450,25 @@ impl BackendStorage for VulkanStorage {
         let n = lhs_l.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
         let push = (n as u32).to_ne_bytes();
-        self.device.dispatch(kernel, &[lb, rb, out.buffer], &push, Self::groups_1d(n))?;
+        self.device
+            .dispatch(kernel, &[lb, rb, out.buffer], &push, Self::groups_1d(n))?;
         Ok(out)
     }
 
-    fn where_cond(&self, l: &Layout, t: &Self, t_l: &Layout, f: &Self, f_l: &Layout) -> Result<Self> {
+    fn where_cond(
+        &self,
+        l: &Layout,
+        t: &Self,
+        t_l: &Layout,
+        f: &Self,
+        f_l: &Layout,
+    ) -> Result<Self> {
         // self is the condition mask (u32). Kernel reads it directly, so it must be contiguous.
         if self.dtype != DType::U32 {
-            crate::bail!("vulkan: where_cond requires u32 condition, got {:?}", self.dtype);
+            crate::bail!(
+                "vulkan: where_cond requires u32 condition, got {:?}",
+                self.dtype
+            );
         }
         if !l.is_contiguous() {
             crate::bail!("vulkan: where_cond requires contiguous condition");
@@ -1348,8 +1501,15 @@ impl BackendStorage for VulkanStorage {
         let l_out = p.l_out();
         let out = self.device.alloc_f32(p.b_size * p.c_out * l_out)?;
         let push = push_u32(&[
-            p.b_size as u32, p.c_in as u32, p.c_out as u32, p.l_in as u32, l_out as u32,
-            p.k_size as u32, p.padding as u32, p.stride as u32, p.dilation as u32,
+            p.b_size as u32,
+            p.c_in as u32,
+            p.c_out as u32,
+            p.l_in as u32,
+            l_out as u32,
+            p.k_size as u32,
+            p.padding as u32,
+            p.stride as u32,
+            p.dilation as u32,
         ]);
         self.device.dispatch(
             "conv1d",
@@ -1372,8 +1532,15 @@ impl BackendStorage for VulkanStorage {
         let l_out = p.l_out();
         let out = self.device.alloc_f32(p.b_size * p.c_out * l_out)?;
         let push = push_u32(&[
-            p.b_size as u32, p.c_in as u32, p.c_out as u32, p.l_in as u32, l_out as u32,
-            p.k_size as u32, p.padding as u32, p.stride as u32, p.dilation as u32,
+            p.b_size as u32,
+            p.c_in as u32,
+            p.c_out as u32,
+            p.l_in as u32,
+            l_out as u32,
+            p.k_size as u32,
+            p.padding as u32,
+            p.stride as u32,
+            p.dilation as u32,
         ]);
         self.device.dispatch(
             "conv_transpose1d",
@@ -1396,9 +1563,18 @@ impl BackendStorage for VulkanStorage {
         let (oh, ow) = (p.out_h(), p.out_w());
         let out = self.device.alloc_f32(p.b_size * p.c_out * oh * ow)?;
         let push = push_u32(&[
-            p.b_size as u32, p.c_in as u32, p.c_out as u32, p.i_h as u32, p.i_w as u32,
-            oh as u32, ow as u32, p.k_h as u32, p.k_w as u32, p.padding as u32,
-            p.stride as u32, p.dilation as u32,
+            p.b_size as u32,
+            p.c_in as u32,
+            p.c_out as u32,
+            p.i_h as u32,
+            p.i_w as u32,
+            oh as u32,
+            ow as u32,
+            p.k_h as u32,
+            p.k_w as u32,
+            p.padding as u32,
+            p.stride as u32,
+            p.dilation as u32,
         ]);
         self.device.dispatch(
             "conv2d",
@@ -1421,9 +1597,18 @@ impl BackendStorage for VulkanStorage {
         let (oh, ow) = (p.out_h(), p.out_w());
         let out = self.device.alloc_f32(p.b_size * p.c_out * oh * ow)?;
         let push = push_u32(&[
-            p.b_size as u32, p.c_in as u32, p.c_out as u32, p.i_h as u32, p.i_w as u32,
-            oh as u32, ow as u32, p.k_h as u32, p.k_w as u32, p.padding as u32,
-            p.stride as u32, p.dilation as u32,
+            p.b_size as u32,
+            p.c_in as u32,
+            p.c_out as u32,
+            p.i_h as u32,
+            p.i_w as u32,
+            oh as u32,
+            ow as u32,
+            p.k_h as u32,
+            p.k_w as u32,
+            p.padding as u32,
+            p.stride as u32,
+            p.dilation as u32,
         ]);
         self.device.dispatch(
             "conv_transpose2d",
@@ -1462,7 +1647,9 @@ impl BackendStorage for VulkanStorage {
         self.device.dispatch(
             "upsample_nearest2d",
             &[inp.buffer, out.buffer],
-            &push_u32(&[b as u32, c as u32, ih as u32, iw as u32, oh as u32, ow as u32]),
+            &push_u32(&[
+                b as u32, c as u32, ih as u32, iw as u32, oh as u32, ow as u32,
+            ]),
             Self::groups_1d(b * c * oh * ow),
         )?;
         Ok(out)
@@ -1481,18 +1668,31 @@ impl BackendStorage for VulkanStorage {
         let (b, c, ih, iw) = l.shape().dims4()?;
         // PyTorch area_pixel scale logic, mirrored from the CPU backend.
         let sh = if align_corners {
-            if oh > 1 { (ih - 1) as f64 / (oh - 1) as f64 } else { 0.0 }
+            if oh > 1 {
+                (ih - 1) as f64 / (oh - 1) as f64
+            } else {
+                0.0
+            }
         } else {
             scale_h.map(|s| 1.0 / s).unwrap_or(ih as f64 / oh as f64)
         };
         let sw = if align_corners {
-            if ow > 1 { (iw - 1) as f64 / (ow - 1) as f64 } else { 0.0 }
+            if ow > 1 {
+                (iw - 1) as f64 / (ow - 1) as f64
+            } else {
+                0.0
+            }
         } else {
             scale_w.map(|s| 1.0 / s).unwrap_or(iw as f64 / ow as f64)
         };
         let out = self.device.alloc_f32(b * c * oh * ow)?;
         let mut push = push_u32(&[
-            b as u32, c as u32, ih as u32, iw as u32, oh as u32, ow as u32,
+            b as u32,
+            c as u32,
+            ih as u32,
+            iw as u32,
+            oh as u32,
+            ow as u32,
             align_corners as u32,
         ]);
         push.extend_from_slice(&(sh as f32).to_ne_bytes());
@@ -1633,7 +1833,7 @@ impl BackendStorage for VulkanStorage {
             bf
         };
         let _ = (&lkeep, &rkeep); // keep any materialized copies alive until the dispatch is recorded
-        // C[b,m,n] = A[b,m,k] * B[b,k,n] (B = W[n,k]^T when nt), row-major. Push order {batch,m,k,n}.
+                                  // C[b,m,n] = A[b,m,k] * B[b,k,n] (B = W[n,k]^T when nt), row-major. Push order {batch,m,k,n}.
         let out = self.device.alloc_f32(b * m * n)?;
         let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
 
@@ -1662,8 +1862,13 @@ impl BackendStorage for VulkanStorage {
             let mt = (m / 16) as u32;
             let nt_tiles = (n / 16) as u32;
             let groups = (nt_tiles.div_ceil(4), mt.div_ceil(4), b as u32);
-            let kernel = if nt { "bmm_coopmat_rb_nt" } else { "bmm_coopmat_rb" };
-            self.device.dispatch(kernel, &[a16, b16, out.buffer], &push, groups)?;
+            let kernel = if nt {
+                "bmm_coopmat_rb_nt"
+            } else {
+                "bmm_coopmat_rb"
+            };
+            self.device
+                .dispatch(kernel, &[a16, b16, out.buffer], &push, groups)?;
             // Scratch is dead after the kernel reads it; return to the pool (reclaimed post-flush).
             self.device.free_scratch(a16_bytes, a16, a16_mem);
             self.device.free_scratch(b16_bytes, b16, b16_mem);
@@ -1673,7 +1878,8 @@ impl BackendStorage for VulkanStorage {
         // Register-blocked fp32 tiled GEMM (64x64 tile, 4x4 per thread); NT variant reads W[n,k].
         let groups = ((n as u32).div_ceil(64), (m as u32).div_ceil(64), b as u32);
         let kernel = if nt { "bmm_reg_nt" } else { "bmm_reg" };
-        self.device.dispatch(kernel, &[lc_buf, rc_buf, out.buffer], &push, groups)?;
+        self.device
+            .dispatch(kernel, &[lc_buf, rc_buf, out.buffer], &push, groups)?;
         Ok(out)
     }
 
@@ -1686,7 +1892,10 @@ impl BackendStorage for VulkanStorage {
             crate::bail!("vulkan: copy_strided_src with non-zero dst offset not supported");
         }
         if dst.count() < n {
-            crate::bail!("vulkan: copy_strided_src dst too small ({} < {n})", dst.count());
+            crate::bail!(
+                "vulkan: copy_strided_src dst too small ({} < {n})",
+                dst.count()
+            );
         }
         // Materialize src_l (any strided/broadcast layout) directly into dst via strided_copy.
         let dims = src_l.dims();
@@ -1704,8 +1913,12 @@ impl BackendStorage for VulkanStorage {
         }
         p.extend_from_slice(&shape6);
         p.extend_from_slice(&stride6);
-        self.device
-            .dispatch("strided_copy", &[self.buffer, dst.buffer], &push_u32(&p), Self::groups_1d(n))
+        self.device.dispatch(
+            "strided_copy",
+            &[self.buffer, dst.buffer],
+            &push_u32(&p),
+            Self::groups_1d(n),
+        )
     }
 
     fn copy2d(
