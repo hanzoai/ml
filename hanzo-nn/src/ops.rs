@@ -676,6 +676,77 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }
 
+// Fused SwiGLU: silu(a) * b, elementwise (both same shape). One op instead of silu + mul.
+struct SiluMul;
+
+impl hanzo_ml::CustomOp2 for SiluMul {
+    fn name(&self) -> &'static str {
+        "silu-mul"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        fn inner<T: hanzo_ml::WithDType + num_traits::Float + num_traits::AsPrimitive<f32> + num_traits::FromPrimitive>(
+            a: &[T],
+            la: &Layout,
+            b: &[T],
+            lb: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            let a = match la.contiguous_offsets() {
+                Some((o1, o2)) => &a[o1..o2],
+                None => hanzo_ml::bail!("silu-mul: a must be contiguous"),
+            };
+            let b = match lb.contiguous_offsets() {
+                Some((o1, o2)) => &b[o1..o2],
+                None => hanzo_ml::bail!("silu-mul: b must be contiguous"),
+            };
+            let dst: Vec<T> = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| {
+                    let xf = x.as_();
+                    T::from_f32(xf / (1.0 + (-xf).exp()) * y.as_()).unwrap_or_else(T::nan)
+                })
+                .collect();
+            Ok((hanzo_ml::WithDType::to_cpu_storage_owned(dst), Shape::from_dims(la.shape().dims())))
+        }
+        use hanzo_ml::backend::BackendStorage;
+        use CpuStorage as C;
+        match (s1, s2) {
+            (C::BF16(a), C::BF16(b)) => inner::<half::bf16>(a, l1, b, l2),
+            (C::F16(a), C::F16(b)) => inner::<half::f16>(a, l1, b, l2),
+            (C::F32(a), C::F32(b)) => inner::<f32>(a, l1, b, l2),
+            _ => hanzo_ml::bail!("silu-mul: unsupported dtype {:?}", s1.dtype()),
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &hanzo_ml::VulkanStorage,
+        l1: &Layout,
+        s2: &hanzo_ml::VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
+        let out = s1.silu_mul(l1, s2, l2)?;
+        Ok((out, l1.shape().clone()))
+    }
+}
+
+/// Fused SwiGLU: `silu(gate) * up`. Falls back to the unfused tensor ops where there's no kernel.
+pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if gate.device().is_cuda() || gate.device().is_metal() {
+        // No fused kernel on these yet; compose (silu then mul).
+        return silu(gate)?.mul(up);
+    }
+    gate.apply_op2_no_bwd(up, &SiluMul)
+}
+
 #[derive(Debug, Clone)]
 struct LayerNorm {
     eps: f32,
