@@ -32,6 +32,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "exp" => spv!("exp"),
         "silu" => spv!("silu"),
         "silu_mul" => spv!("silu_mul"),
+        "sigmoid" => spv!("sigmoid"),
         "gelu" => spv!("gelu"),
         "relu" => spv!("relu"),
         "sqr" => spv!("sqr"),
@@ -1979,6 +1980,24 @@ impl VulkanStorage {
         self.device.dispatch(
             "silu_mul",
             &[ab, bb, out.buffer],
+            &(n as u32).to_ne_bytes(),
+            Self::groups_1d(n),
+        )?;
+        Ok(out)
+    }
+
+    // Unary sigmoid: out = 1 / (1 + exp(-self)). Vulkan path for hanzo_nn::ops::sigmoid.
+    pub fn sigmoid(&self, layout: &Layout) -> Result<VulkanStorage> {
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
+        let n = layout.shape().elem_count();
+        let mut out = self.device.alloc_f32(n)?;
+        // Preserve the input's logical dtype (storage is f32 regardless); callers multiply the
+        // result against a same-dtype tensor without an intervening cast (output-gate path).
+        out.dtype = self.dtype;
+        self.device.dispatch(
+            "sigmoid",
+            &[cb, out.buffer],
             &(n as u32).to_ne_bytes(),
             Self::groups_1d(n),
         )?;
