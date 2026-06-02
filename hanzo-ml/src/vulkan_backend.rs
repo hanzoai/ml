@@ -49,13 +49,21 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
+        "mul_mat_vec_q8_0" => spv!("mul_mat_vec_q8_0"),
+        "mul_mat_vec_q4_0" => spv!("mul_mat_vec_q4_0"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
+        "mul_mat_q5k" => spv!("mul_mat_q5k"),
+        "mul_mat_q6k" => spv!("mul_mat_q6k"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
+        "mul_mat_vec_q4k_sg" => spv!("mul_mat_vec_q4k_sg"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
+        "mul_mat_vec_q5k_sg" => spv!("mul_mat_vec_q5k_sg"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
+        "mul_mat_vec_q6k_sg" => spv!("mul_mat_vec_q6k_sg"),
         "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
         "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
+        "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -480,6 +488,64 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// Q4_0 matrix-vector reading the *native GGML* 18-byte block format straight from a buffer
+    /// uploaded verbatim by [`upload_qweight`] (no requantize): `y[nout] = Wq * x[k]`. Weights stay
+    /// quantized (~0.56 B/elem) instead of dequantizing to f32, so decode reads ~7x less weight
+    /// memory — the bandwidth lever on this APU. Decode is byte-exact with `BlockQ4_0::to_float`.
+    /// `k` must be a multiple of 32. One invocation per output row (scalar kernel).
+    pub fn matvec_q4_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matvec_q4_0_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q4_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q4_0",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Q8_0 matrix-vector reading the *native GGML* 34-byte block format straight from a buffer
+    /// uploaded verbatim by [`upload_qweight`] (no re-pack): `y[nout] = Wq * x[k]`. Distinct from
+    /// [`matvec_q8_gpu`], which consumes the repacked 9-u32 layout from [`quantize_q8_blocks`]; this
+    /// one byte-addresses raw GGUF bytes. Weights stay quantized (~1.06 B/elem) so decode reads ~3.8x
+    /// less weight memory. Decode is byte-exact with `BlockQ8_0::to_float`. `k` a multiple of 32.
+    pub fn matvec_q8_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matvec_q8_0_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q8_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q8_0",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
     /// Upload Q4_K weights to the GPU once, verbatim in the GGUF super-block layout (144 B = 36 u32
     /// per 256-weight block, `nout * k/256` blocks total). No requantize: the bytes are the same
     /// blocks the CPU `k_quants::BlockQ4K` holds, so the in-shader decode matches the CPU dequant
@@ -555,12 +621,27 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32, woff as u32]);
-        self.dispatch(
-            "mul_mat_vec_q4k",
-            &[wq.buffer, x.buffer, out.buffer],
-            &push,
-            ((nout as u32).div_ceil(WG1D), 1, 1),
-        )?;
+        if self.inner.subgroup_matvec {
+            // Subgroup-reduced kernel: one subgroup per output row, fused subgroupAdd, more
+            // memory-level parallelism on this bandwidth-bound APU. Q4_K decode is the dense-layer
+            // decode hot path. A WG1D (64) workgroup holds WG1D/subgroup_size subgroups (rows), so
+            // dispatch ceil(nout / rows_per_wg) workgroups. Decode is bit-identical to the scalar
+            // mul_mat_vec_q4k kernel.
+            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
+            self.dispatch(
+                "mul_mat_vec_q4k_sg",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(rows_per_wg), 1, 1),
+            )?;
+        } else {
+            self.dispatch(
+                "mul_mat_vec_q4k",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(WG1D), 1, 1),
+            )?;
+        }
         Ok(out)
     }
 
@@ -700,6 +781,113 @@ impl VulkanDevice {
             let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
             self.dispatch(
                 "mul_mat_q4k",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
+        Ok(out)
+    }
+
+    /// Q5_K matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
+    /// (verbatim GGUF Q5_K super-blocks, same decode as [`matvec_q5k_gpu`]). Decodes each weight value
+    /// once and reuses it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so weight memory traffic
+    /// matches a single matvec per output column instead of issuing M independent matvecs (the old
+    /// per-row prefill loop) or dequantizing the whole weight to f32. `x` is a contiguous `[m, k]`
+    /// device buffer; returns `[m, nout]` row-major.
+    pub fn matmul_q5k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        self.matmul_q5k_gpu_off(wq, x, m, nout, k, 0)
+    }
+
+    /// Q5_K prefill matmul into a slice of `wq` starting at `woff` u32 words. `woff == 0` is
+    /// bit-identical to [`matmul_q5k_gpu`]; a non-zero offset selects one expert's weight block of a
+    /// resident MoE bank (`woff = e * nout * (k/256) * 44`) so a prefill expert with M>1 routed rows
+    /// runs one banked matmul without re-uploading the weight.
+    pub fn matmul_q5k_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matmul_q5k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q5k_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mat_q5k",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
+        Ok(out)
+    }
+
+    /// Q6_K matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
+    /// (padded 53-u32 Q6_K super-blocks from [`quantize_q6k`], same decode as [`matvec_q6k_gpu`]).
+    /// Decodes each weight value once and reuses it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so
+    /// weight memory traffic matches a single matvec per output column instead of issuing M
+    /// independent matvecs (the old per-row prefill loop). Q6_K is the common Q4_K_M down-expert
+    /// dtype, so this is the prefill hot path for that quant. `x` is a contiguous `[m, k]` device
+    /// buffer; returns `[m, nout]` row-major.
+    pub fn matmul_q6k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        self.matmul_q6k_gpu_off(wq, x, m, nout, k, 0)
+    }
+
+    /// Q6_K prefill matmul into a slice of `wq` starting at `woff` u32 words. `woff == 0` is
+    /// bit-identical to [`matmul_q6k_gpu`]; a non-zero offset selects one expert's weight block of a
+    /// resident MoE bank (`woff = e * nout * (k/256) * 53`, 53 u32 = padded Q6_K block) so a prefill
+    /// expert with M>1 routed rows runs one banked matmul without re-uploading the weight.
+    pub fn matmul_q6k_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matmul_q6k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q6k_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mat_q6k",
                 &[wq.buffer, x.buffer, out.buffer],
                 &push,
                 (cols, 1, 1),
@@ -957,12 +1145,24 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32, woff as u32]);
-        self.dispatch(
-            "mul_mat_vec_q5k",
-            &[wq.buffer, x.buffer, out.buffer],
-            &push,
-            ((nout as u32).div_ceil(WG1D), 1, 1),
-        )?;
+        if self.inner.subgroup_matvec {
+            // Subgroup-reduced kernel (one subgroup per output row, fused subgroupAdd); bit-identical
+            // decode to the scalar mul_mat_vec_q5k. See matvec_q4k_gpu_off for the dispatch geometry.
+            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
+            self.dispatch(
+                "mul_mat_vec_q5k_sg",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(rows_per_wg), 1, 1),
+            )?;
+        } else {
+            self.dispatch(
+                "mul_mat_vec_q5k",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(WG1D), 1, 1),
+            )?;
+        }
         Ok(out)
     }
 
@@ -1050,12 +1250,24 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32, woff as u32]);
-        self.dispatch(
-            "mul_mat_vec_q6k",
-            &[wq.buffer, x.buffer, out.buffer],
-            &push,
-            ((nout as u32).div_ceil(WG1D), 1, 1),
-        )?;
+        if self.inner.subgroup_matvec {
+            // Subgroup-reduced kernel (one subgroup per output row, fused subgroupAdd); bit-identical
+            // decode to the scalar mul_mat_vec_q6k. See matvec_q4k_gpu_off for the dispatch geometry.
+            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
+            self.dispatch(
+                "mul_mat_vec_q6k_sg",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(rows_per_wg), 1, 1),
+            )?;
+        } else {
+            self.dispatch(
+                "mul_mat_vec_q6k",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(WG1D), 1, 1),
+            )?;
+        }
         Ok(out)
     }
 
@@ -1929,6 +2141,30 @@ impl VulkanDevice {
         Ok(s)
     }
 
+    /// Upload raw GGML quantized weight bytes to the GPU VERBATIM (no requantize, no re-pack), as a
+    /// `uint w[]` buffer the native-GGML quant kernels (`mul_mat_vec_q4_0`/`q8_0`, `mul_mat_vec_q4k`,
+    /// `moe_matvec_q4_0`/`q4k`) byte-address straight out of. This is the decode/MoE-bank weight path:
+    /// the bytes stay quantized in VRAM and the in-shader decode matches the CPU `BlockQ*::to_float`
+    /// exactly. `data` is a packed run of GGML blocks (e.g. 18 B Q4_0, 34 B Q8_0, 144 B Q4_K); its
+    /// length need not be a u32 multiple (an 18 B Q4_0 row is not), so the buffer is rounded up to the
+    /// next u32 and the trailing pad bytes are never read (every kernel bounds its block walk by `k`).
+    pub fn upload_qweight(&self, data: &[u8]) -> Result<VulkanStorage> {
+        // Round the byte length up to a whole u32; copy the bytes into the (possibly 1-3 B larger)
+        // word buffer so a non-4-aligned block run (Q4_0=18 B, Q8_0=34 B, Q6_K=210 B) is legal.
+        let nwords = data.len().div_ceil(4);
+        let mut words = vec![0u32; nwords.max(1)];
+        let dst: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, nwords * 4) };
+        dst[..data.len()].copy_from_slice(data);
+        self.upload_u32(&words)
+    }
+
+    /// Upload a slice of u32 routing ids (one expert id per routed MoE slot) to a device buffer,
+    /// consumed by the fused `moe_matvec_*` kernels' `Ids` binding (never read back to host).
+    pub fn upload_ids(&self, ids: &[u32]) -> Result<VulkanStorage> {
+        self.upload_u32(ids)
+    }
+
     // Name a CPU-fallback round-trip when HANZO_VK_PROFILE is set. Each fallback op reads its
     // operand(s) back to the host, computes on the (UNtimed) CPU, and re-uploads -- a hidden
     // bottleneck the size-only readback log can't attribute to an op. This names the culprit so a
@@ -2244,10 +2480,15 @@ impl BackendDevice for VulkanDevice {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(vkerr)?;
             // Sized for a whole batch: one descriptor set per recorded dispatch (up to
-            // BATCH_CAP), each binding up to 4 storage buffers (the widest kernel).
+            // BATCH_CAP), each binding up to MAX_BINDINGS (8) storage buffers. The widest kernels
+            // are the GDN mixers (gdn_recurrence/gdn_chunked bind 7: q,k,v,g,beta,state,out); sizing
+            // at 4 starved the pool on the legacy (non-push-descriptor: Dozen/WSL) allocate-set path,
+            // which drew STORAGE_BUFFER descriptors here and hit OUT_OF_POOL_MEMORY. MAX_BINDINGS
+            // matches the per-dispatch bind cap in `dispatch_outs`, so no kernel can exceed it.
+            const MAX_BINDINGS: u32 = 8;
             let dpool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(BATCH_CAP * 4)];
+                .descriptor_count(BATCH_CAP * MAX_BINDINGS)];
             let dpool = device
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
