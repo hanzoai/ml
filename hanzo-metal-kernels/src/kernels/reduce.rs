@@ -3,7 +3,7 @@ use crate::utils::{BufferOffset, EncoderProvider};
 use crate::{
     set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Output, Source,
 };
-use objc2_metal::MTLSize;
+use objc2_metal::{MTLResourceUsage, MTLSize};
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_reduce_contiguous(
