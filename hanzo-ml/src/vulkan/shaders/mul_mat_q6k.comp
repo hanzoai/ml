@@ -1,0 +1,98 @@
+#version 450
+// Q6_K matrix-matrix product (the prefill/compute path): y[m,n] = sum_k x[m,k]*W[n,k] with W stored
+// as GGUF Q6_K super-blocks, SAME padded layout and decode as mul_mat_vec_q6k. One Q6_K super-block
+// packs 256 weights into 210 bytes (ql[128] low 4 bits; qh[64] high 2 bits; scales[16] i8; d f16);
+// 210 is not u32-aligned, so the host repacks each block into a PADDED 212-byte (53 u32) stride
+// (`BLK_U32`), trailing 2 bytes unused. Prefill has M>1 activation rows sharing one weight matrix, so
+// the old path dequantized the whole weight to f32 every forward (massive VRAM + bandwidth). This
+// kernel keeps W quantized and decodes each weight value ONCE per output column, reusing it across
+// all M rows: weight traffic equals a single matvec while M rows are produced. One invocation
+// computes one output column n for up to MAX_M rows (the host tiles M by MAX_M). Decode MUST match
+// the CPU k_quants BlockQ6K::to_float (identical to mul_mat_vec_q6k).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // Q6_K blocks, 53 u32 (padded) / 256-block
+layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activations, row-major [M, k]
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, row-major [M, nout]
+// m0: first activation row this dispatch handles; mcount: rows in this tile (1..MAX_M); nout: total
+// columns; k: contraction dim (multiple of 256). x row stride is k, y row stride is nout. woff: u32
+// offset into w[] where this weight matrix starts (0 for a plain 2D weight; e*nout*(k/256)*53 to
+// select expert e of a resident MoE bank, 53 u32 = padded Q6_K block).
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
+
+const uint QK_K = 256u;
+const uint BLK_U32 = 53u;     // 212 bytes (210 padded to a u32 multiple) / 4
+const uint QL_BYTE = 0u;      // byte offset of ql[128]
+const uint QH_BYTE = 128u;    // byte offset of qh[64]
+const uint SC_BYTE = 192u;    // byte offset of scales[16] (signed i8)
+const uint D_BYTE  = 208u;    // byte offset of d (f16)
+const uint MAX_M = 8u;        // register accumulators per invocation; host tiles M by this
+
+// Unsigned byte `b` (0-based) within the block at u32 index `base`.
+uint byte_u(uint base, uint b) {
+    uint word = w[base + (b >> 2u)];
+    return (word >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+// Signed byte `b` (0-based) within the block (sign-extended).
+int byte_s(uint base, uint b) {
+    uint word = w[base + (b >> 2u)];
+    return bitfieldExtract(int(word), int((b & 3u) * 8u), 8);
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / QK_K;
+    uint rowbase = woff + n * nblocks * BLK_U32; // u32 offset of weight row n within the selected matrix
+    float acc[MAX_M];
+    for (uint r = 0u; r < MAX_M; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint blk = 0u; blk < nblocks; blk++) {
+        uint base = rowbase + blk * BLK_U32;
+        // d is the f16 at byte 208; it sits in the low half of u32[52].
+        float d = float(unpackHalf2x16(w[base + (D_BYTE >> 2u)]).x);
+        uint xblk = blk * QK_K;
+        // 2 super-chunks of 128 weights (QK_K/128). Chunk idx uses scales[8*idx..], ql[64*idx..],
+        // qh[32*idx..]; the 4 lanes within a byte map to outputs l, l+32, l+64, l+96.
+        for (uint idx = 0u; idx < 2u; idx++) {
+            uint scoff = SC_BYTE + 8u * idx;
+            uint qloff = QL_BYTE + 64u * idx;
+            uint qhoff = QH_BYTE + 32u * idx;
+            uint xbase = xblk + idx * 128u;
+            for (uint l = 0u; l < 32u; l++) {
+                uint is = l >> 4u;                 // 0 for l<16, 1 otherwise
+                uint qll  = byte_u(base, qloff + l);
+                uint qlh  = byte_u(base, qloff + l + 32u);
+                uint qhv  = byte_u(base, qhoff + l);
+                int q1 = int((qll & 0x0Fu) | ((qhv & 3u) << 4u)) - 32;
+                int q2 = int((qlh & 0x0Fu) | (((qhv >> 2u) & 3u) << 4u)) - 32;
+                int q3 = int((qll >> 4u)   | (((qhv >> 4u) & 3u) << 4u)) - 32;
+                int q4 = int((qlh >> 4u)   | (((qhv >> 6u) & 3u) << 4u)) - 32;
+                // Decode the 4 weights this byte-triple produces ONCE, then reuse across all rows.
+                float s1 = d * float(byte_s(base, scoff + is));
+                float s2 = d * float(byte_s(base, scoff + is + 2u));
+                float s3 = d * float(byte_s(base, scoff + is + 4u));
+                float s4 = d * float(byte_s(base, scoff + is + 6u));
+                float w1 = s1 * float(q1);
+                float w2 = s2 * float(q2);
+                float w3 = s3 * float(q3);
+                float w4 = s4 * float(q4);
+                for (uint r = 0u; r < mcount; r++) {
+                    uint xrow = (m0 + r) * k + xbase;
+                    acc[r] += w1 * x[xrow + l];
+                    acc[r] += w2 * x[xrow + l + 32u];
+                    acc[r] += w3 * x[xrow + l + 64u];
+                    acc[r] += w4 * x[xrow + l + 96u];
+                }
+            }
+        }
+    }
+    for (uint r = 0u; r < mcount; r++) {
+        y[(m0 + r) * nout + n] = acc[r];
+    }
+}
