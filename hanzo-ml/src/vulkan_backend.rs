@@ -2266,14 +2266,20 @@ impl BackendStorage for VulkanStorage {
         if rank == 0 {
             crate::bail!("vulkan: reduce_op on scalar not supported");
         }
-        if sum_dims != [rank - 1] {
-            crate::bail!(
-                "vulkan: reduce_op only supports the last dim (got dims={sum_dims:?}, rank={rank})"
-            );
-        }
-        let c = self.contiguous(layout)?;
-        let cols = dims[rank - 1];
-        let rows: usize = dims[..rank - 1].iter().product();
+        // The SPIR-V reduce kernel collapses the last (contiguous) dim into one output per row. For
+        // any other single axis, permute it to the end first so the same kernel runs on the GPU; the
+        // resulting row-major order matches the framework's keep-dim wrap exactly.
+        let (c, cols) = if sum_dims == [rank - 1] {
+            (self.contiguous(layout)?, dims[rank - 1])
+        } else if sum_dims.len() == 1 {
+            let d = sum_dims[0];
+            let mut perm: Vec<usize> = (0..rank).filter(|&x| x != d).collect();
+            perm.push(d);
+            (self.contiguous(&layout.permute(&perm)?)?, dims[d])
+        } else {
+            crate::bail!("vulkan: reduce over multiple axes at once not supported (got {sum_dims:?})");
+        };
+        let rows: usize = layout.shape().elem_count() / cols;
         // arg-reductions return u32 indices; value reductions return f32.
         let out = if is_arg {
             self.device.alloc_u32(rows)?
