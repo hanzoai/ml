@@ -53,6 +53,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q8_dp4a" => spv!("mul_mat_q8_dp4a"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
+        "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
@@ -818,13 +819,17 @@ impl VulkanDevice {
         }
         let nblocks = k / 32;
         // Quantize the whole activation tile to int8 once (reused across all nout columns): xq is
-        // m*nblocks*8 u32 (32 int8/block, 4 per word), xs is m*nblocks f32 block scales.
+        // m*nblocks*8 u32 (32 int8/block, 4 per word), xs is m*nblocks f32 block scales. quantize_act_q8
+        // also writes xsum (dequant block sums) for the Q4_K dp4a min correction; the Q8_0 weight is
+        // symmetric (no min term) so xsum is unused here, but the kernel declares 4 bindings, so bind a
+        // throwaway xsum to keep the binding count consistent with the Q4_K dp4a caller.
         let xq = self.alloc_u32(m * nblocks * 8)?;
         let xs = self.alloc_f32(m * nblocks)?;
+        let xsum = self.alloc_f32(m * nblocks)?;
         let qpush = push_u32(&[m as u32, k as u32]);
         self.dispatch(
             "quantize_act_q8",
-            &[x.buffer, xq.buffer, xs.buffer],
+            &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
             &qpush,
             (((m * nblocks) as u32).div_ceil(WG1D), 1, 1),
         )?;
@@ -889,6 +894,76 @@ impl VulkanDevice {
             self.dispatch(
                 "mul_mat_q4k",
                 &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
+        Ok(out)
+    }
+
+    /// Q4_K prefill matmul via hardware int8 dp4a -- the compute-bound prefill lever for Q4_K weights
+    /// (attention projections + MoE gate/up experts in Q4_K_M/XL). Same result as [`matmul_q4k_gpu`]
+    /// (`y[m, nout] = x[m, k] * Wq^T`) but instead of decoding each weight to f32 and doing f32 MACs,
+    /// it quantizes the activation tile to int8 ONCE ([`quantize_act_q8`] -> codes + per-block scales +
+    /// dequant block sums) then dispatches [`mul_mat_q4k_dp4a`], which dp4a's the 4-bit codes vs the
+    /// int8 activations (`d1*xs*dot - m1*xsum` per 32-sub-block). Only valid when [`int_dot8`] is true;
+    /// callers fall back to [`matmul_q4k_gpu`] otherwise (this fn does NOT re-check, so the activation
+    /// quant runs unconditionally -- gate at the call site). Drop-in for [`matmul_q4k_gpu`].
+    pub fn matmul_q4k_dp4a_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        self.matmul_q4k_dp4a_gpu_off(wq, x, m, nout, k, 0)
+    }
+
+    /// [`matmul_q4k_dp4a_gpu`] into a slice of `wq` starting at `woff` u32 words (`woff == 0` matches
+    /// the plain form; `woff = e * nout * (k/256) * 36` selects expert `e` of a resident Q4_K MoE bank).
+    /// Mirrors [`matmul_q4k_gpu_off`] so it is a drop-in on the banked prefill path.
+    pub fn matmul_q4k_dp4a_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matmul_q4k_dp4a_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q4k_dp4a_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        // Activation 32-blocks (the dp4a contraction granularity), k/32 per row. The Q4_K 32-weight
+        // sub-blocks align 1:1 with these, so the same quantize_act_q8 output feeds both dp4a matmuls.
+        let nb32 = k / 32;
+        // Quantize the whole activation tile to int8 once (reused across all nout columns): xq is
+        // m*nb32*8 u32 (32 int8/block, 4 per word), xs is m*nb32 f32 block scales, xsum is m*nb32 f32
+        // dequant block sums (xs*sum(codes)) for the -m*xsum min correction.
+        let xq = self.alloc_u32(m * nb32 * 8)?;
+        let xs = self.alloc_f32(m * nb32)?;
+        let xsum = self.alloc_f32(m * nb32)?;
+        let qpush = push_u32(&[m as u32, k as u32]);
+        self.dispatch(
+            "quantize_act_q8",
+            &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
+            &qpush,
+            (((m * nb32) as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mat_q4k_dp4a",
+                &[wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer],
                 &push,
                 (cols, 1, 1),
             )?;
