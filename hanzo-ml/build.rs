@@ -60,11 +60,25 @@ fn main() {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    if !have_glslc {
+    // Second-choice compiler: glslangValidator (the `glslang-tools` package, present on hosts
+    // that ship glslang but not shaderc/glslc). `-V` emits Vulkan SPIR-V; the same `.comp`
+    // sources compile under it (incl. GL_EXT_shader_explicit_arithmetic_types_float16). Only
+    // probed when glslc is missing so the glslc fast path is unchanged.
+    let glslang = std::env::var("GLSLANG").unwrap_or_else(|_| "glslangValidator".to_string());
+    let have_glslang = !have_glslc
+        && Command::new(&glslang)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+    if !have_glslc && !have_glslang {
         println!(
-            "cargo:warning=glslc not found; using pre-compiled SPIR-V from {}",
+            "cargo:warning=neither glslc nor glslangValidator found; using pre-compiled SPIR-V from {}",
             prebuilt_dir.display()
         );
+    } else if have_glslang {
+        println!("cargo:warning=glslc not found; compiling shaders with glslangValidator");
     }
 
     for src in &entries {
@@ -86,6 +100,16 @@ fn main() {
             assert!(
                 status.success(),
                 "glslc failed to compile {src_str} (exit status: {status})"
+            );
+        } else if have_glslang {
+            // Compile fresh with glslangValidator (`-V` => Vulkan SPIR-V binary).
+            let status = Command::new(&glslang)
+                .args(["--target-env", "vulkan1.2", "-V", src_str, "-o", &dst])
+                .status()
+                .unwrap_or_else(|e| panic!("failed to run `{glslang}`: {e}"));
+            assert!(
+                status.success(),
+                "glslangValidator failed to compile {src_str} (exit status: {status})"
             );
         } else {
             // Fallback: copy the committed pre-compiled SPIR-V.
