@@ -83,6 +83,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "scatter_set" => spv!("scatter_set"),
         "scatter_add_set" => spv!("scatter_add_set"),
         "conv1d" => spv!("conv1d"),
+        "gdn_step" => spv!("gdn_step"),
+        "gdn_conv1d_step" => spv!("gdn_conv1d_step"),
         "conv2d" => spv!("conv2d"),
         "conv_transpose1d" => spv!("conv_transpose1d"),
         "conv_transpose2d" => spv!("conv_transpose2d"),
@@ -1000,7 +1002,7 @@ impl VulkanDevice {
         groups: (u32, u32, u32),
     ) -> Result<()> {
         let out_idx = bufs.len().saturating_sub(1);
-        self.dispatch_out(name, bufs, out_idx, push, groups)
+        self.dispatch_outs(name, bufs, &[out_idx], push, groups)
     }
 
     // Like `dispatch`, but `out_idx` names which binding the kernel writes (its output). Used for
@@ -1011,6 +1013,21 @@ impl VulkanDevice {
         name: &'static str,
         bufs: &[vk::Buffer],
         out_idx: usize,
+        push: &[u8],
+        groups: (u32, u32, u32),
+    ) -> Result<()> {
+        self.dispatch_outs(name, bufs, &[out_idx], push, groups)
+    }
+
+    // Like `dispatch_out`, but names ALL bindings the kernel writes. A fused kernel can both update a
+    // state buffer in place and write a fresh output (gdn_step); every such write must be tracked so a
+    // later in-batch reader of either gets the RAW barrier. The read-side check already tests all
+    // bindings, so the only generalization needed is marking each output below.
+    fn dispatch_outs(
+        &self,
+        name: &'static str,
+        bufs: &[vk::Buffer],
+        out_idxs: &[usize],
         push: &[u8],
         groups: (u32, u32, u32),
     ) -> Result<()> {
@@ -1146,8 +1163,10 @@ impl VulkanDevice {
             // runs post-fence), so no two live allocations in one batch share a handle -- thus the
             // only intra-batch hazard is RAW, which this set captures. Cross-batch ordering is the
             // full queue_submit + fence wait in flush_locked.
-            if let Some(&out_buf) = bufs.get(out_idx) {
-                s.written_since_barrier.insert(out_buf);
+            for &out_idx in out_idxs {
+                if let Some(&out_buf) = bufs.get(out_idx) {
+                    s.written_since_barrier.insert(out_buf);
+                }
             }
             s.n += 1;
             if profile {
@@ -1338,6 +1357,11 @@ fn push_u32(v: &[u32]) -> Vec<u8> {
 }
 
 const WG1D: u32 = 64;
+
+// Compile-time per-invocation array bounds in gdn_step.comp / gdn_conv1d_step.comp (MAX_K #defines).
+// head_k_dim must be <= GDN_STEP_MAX_K and the conv kernel <= GDN_CONV_MAX_K; both checked host-side.
+const GDN_STEP_MAX_K: usize = 256;
+const GDN_CONV_MAX_K: usize = 8;
 
 impl BackendDevice for VulkanDevice {
     type Storage = VulkanStorage;
@@ -1915,6 +1939,97 @@ impl VulkanStorage {
             &[srcb, cb, sb, out.buffer],
             &push_u32(&[b as u32, h as u32, t as u32, d as u32, unbatched]),
             Self::groups_1d(pairs),
+        )?;
+        Ok(out)
+    }
+
+    // Gated delta rule, single decode step (seq_len==1). `self`=q, plus k,v,g,beta; `state` is the
+    // recurrent state [BH, K, V], updated IN PLACE in VRAM (kept across tokens by the caller's state
+    // pool). q,k: [BH, K]; v: [BH, V]; g,beta: [BH]. q must be pre-scaled by 1/sqrt(K). Returns
+    // y [BH, V]. Mirrors gated_delta_rule_recurrence for seq=1 and the CUDA single-step kernel.
+    // GDN_STEP_MAX_K bounds the shader's per-invocation k array; head_k_dim must not exceed it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_step(
+        &self,
+        q_l: &Layout,
+        k: &VulkanStorage,
+        k_l: &Layout,
+        v: &VulkanStorage,
+        v_l: &Layout,
+        g: &VulkanStorage,
+        g_l: &Layout,
+        beta: &VulkanStorage,
+        beta_l: &Layout,
+        state: &VulkanStorage,
+        state_l: &Layout,
+        bh: usize,
+        k_dim: usize,
+        v_dim: usize,
+    ) -> Result<VulkanStorage> {
+        if k_dim > GDN_STEP_MAX_K {
+            crate::bail!("vulkan: gdn_step head_k_dim {k_dim} exceeds GDN_STEP_MAX_K {GDN_STEP_MAX_K}");
+        }
+        if !(state_l.is_contiguous() && state_l.start_offset() == 0) {
+            crate::bail!("vulkan: gdn_step state must be contiguous and offset 0 (it is updated in place)");
+        }
+        let mut qk = None;
+        let mut kk = None;
+        let mut vk_ = None;
+        let mut gk = None;
+        let mut bk = None;
+        let qb = self.contig_buf(q_l, &mut qk)?;
+        let kb = k.contig_buf(k_l, &mut kk)?;
+        let vb = v.contig_buf(v_l, &mut vk_)?;
+        let gb = g.contig_buf(g_l, &mut gk)?;
+        let betab = beta.contig_buf(beta_l, &mut bk)?;
+        let out = self.device.alloc_f32(bh * v_dim)?;
+        // State (binding 5) is read-modify-written in place; the fresh output (binding 6) is written
+        // too. Mark BOTH so a later in-batch reader (scatter of state, RMSNorm of the output) gets the
+        // RAW barrier. The read-side hazard check already tests all bindings, including the state input
+        // gathered earlier this batch.
+        self.device.dispatch_outs(
+            "gdn_step",
+            &[qb, kb, vb, gb, betab, state.buffer, out.buffer],
+            &[5, 6],
+            &push_u32(&[bh as u32, k_dim as u32, v_dim as u32]),
+            Self::groups_1d(bh * v_dim),
+        )?;
+        Ok(out)
+    }
+
+    // Causal depthwise conv1d, single decode step (seq_len==1, batch==1). `self`=conv_state
+    // [conv_dim, k_size], updated IN PLACE (drop oldest column, append `x`); `x` is the new column
+    // [conv_dim]; `w` the weight [conv_dim, k_size]. Returns silu(conv) [conv_dim]. Mirrors
+    // causal_conv1d_update for seq=1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv1d_step(
+        &self,
+        state_l: &Layout,
+        x: &VulkanStorage,
+        x_l: &Layout,
+        w: &VulkanStorage,
+        w_l: &Layout,
+        conv_dim: usize,
+        k_size: usize,
+    ) -> Result<VulkanStorage> {
+        if k_size > GDN_CONV_MAX_K {
+            crate::bail!("vulkan: gdn_conv1d_step kernel {k_size} exceeds GDN_CONV_MAX_K {GDN_CONV_MAX_K}");
+        }
+        if !(state_l.is_contiguous() && state_l.start_offset() == 0) {
+            crate::bail!("vulkan: gdn_conv1d_step conv_state must be contiguous and offset 0 (updated in place)");
+        }
+        let mut xk = None;
+        let mut wk = None;
+        let xb = x.contig_buf(x_l, &mut xk)?;
+        let wb = w.contig_buf(w_l, &mut wk)?;
+        let out = self.device.alloc_f32(conv_dim)?;
+        // conv_state (binding 0) is updated in place; output (binding 3) is fresh. Mark both.
+        self.device.dispatch_outs(
+            "gdn_conv1d_step",
+            &[self.buffer, xb, wb, out.buffer],
+            &[0, 3],
+            &push_u32(&[conv_dim as u32, k_size as u32]),
+            Self::groups_1d(conv_dim),
         )?;
         Ok(out)
     }
