@@ -32,6 +32,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "exp" => spv!("exp"),
         "silu" => spv!("silu"),
         "silu_mul" => spv!("silu_mul"),
+        "sigmoid" => spv!("sigmoid"),
         "gelu" => spv!("gelu"),
         "relu" => spv!("relu"),
         "sqr" => spv!("sqr"),
@@ -82,10 +83,13 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "reduce_min" => spv!("reduce_min"),
         "reduce_argmin" => spv!("reduce_argmin"),
         "reduce_argmax" => spv!("reduce_argmax"),
+        "argsort" => spv!("argsort"),
         "gather" => spv!("gather"),
         "scatter_set" => spv!("scatter_set"),
         "scatter_add_set" => spv!("scatter_add_set"),
         "conv1d" => spv!("conv1d"),
+        "gdn_step" => spv!("gdn_step"),
+        "gdn_conv1d_step" => spv!("gdn_conv1d_step"),
         "conv2d" => spv!("conv2d"),
         "conv_transpose1d" => spv!("conv_transpose1d"),
         "conv_transpose2d" => spv!("conv_transpose2d"),
@@ -1400,7 +1404,7 @@ impl VulkanDevice {
         groups: (u32, u32, u32),
     ) -> Result<()> {
         let out_idx = bufs.len().saturating_sub(1);
-        self.dispatch_out(name, bufs, out_idx, push, groups)
+        self.dispatch_outs(name, bufs, &[out_idx], push, groups)
     }
 
     // Like `dispatch`, but `out_idx` names which binding the kernel writes (its output). Used for
@@ -1411,6 +1415,21 @@ impl VulkanDevice {
         name: &'static str,
         bufs: &[vk::Buffer],
         out_idx: usize,
+        push: &[u8],
+        groups: (u32, u32, u32),
+    ) -> Result<()> {
+        self.dispatch_outs(name, bufs, &[out_idx], push, groups)
+    }
+
+    // Like `dispatch_out`, but names ALL bindings the kernel writes. A fused kernel can both update a
+    // state buffer in place and write a fresh output (gdn_step); every such write must be tracked so a
+    // later in-batch reader of either gets the RAW barrier. The read-side check already tests all
+    // bindings, so the only generalization needed is marking each output below.
+    fn dispatch_outs(
+        &self,
+        name: &'static str,
+        bufs: &[vk::Buffer],
+        out_idxs: &[usize],
         push: &[u8],
         groups: (u32, u32, u32),
     ) -> Result<()> {
@@ -1556,8 +1575,10 @@ impl VulkanDevice {
             // runs post-fence), so no two live allocations in one batch share a handle -- thus the
             // only intra-batch hazard is RAW, which this set captures. Cross-batch ordering is the
             // full queue_submit + fence wait in flush_locked.
-            if let Some(&out_buf) = bufs.get(out_idx) {
-                s.written_since_barrier.insert(out_buf);
+            for &out_idx in out_idxs {
+                if let Some(&out_buf) = bufs.get(out_idx) {
+                    s.written_since_barrier.insert(out_buf);
+                }
             }
             s.n += 1;
             if profile {
@@ -1748,6 +1769,16 @@ fn push_u32(v: &[u32]) -> Vec<u8> {
 }
 
 const WG1D: u32 = 64;
+
+// Compile-time per-invocation array bounds in gdn_step.comp / gdn_conv1d_step.comp (MAX_K #defines).
+// head_k_dim must be <= GDN_STEP_MAX_K and the conv kernel <= GDN_CONV_MAX_K; both checked host-side.
+const GDN_STEP_MAX_K: usize = 256;
+const GDN_CONV_MAX_K: usize = 8;
+
+// Compile-time MAX_COLS_PAD bound on argsort.comp's shared index scratch. cols_pad (next pow2 of the
+// sorted dim) must be <= ARGSORT_MAX_COLS_PAD; wider rows fall back to the CPU argsort (not on the
+// MoE routing hot path, where cols == num_experts ~128).
+const ARGSORT_MAX_COLS_PAD: usize = 1024;
 
 impl BackendDevice for VulkanDevice {
     type Storage = VulkanStorage;
@@ -2235,6 +2266,33 @@ impl VulkanStorage {
 
     // --- native fused ops (replace the GPU<->CPU round-trip fallbacks) ---
 
+    // Row-wise argsort over the last (contiguous) dim via the bitonic argsort kernel. Returns the u32
+    // index permutation (shape == input shape) entirely on the GPU. `Ok(None)` when cols_pad exceeds
+    // the shader's shared-scratch bound (ARGSORT_MAX_COLS_PAD); the caller then uses the CPU argsort.
+    // MoE routing (cols == num_experts ~128) always stays on the GPU path.
+    pub fn arg_sort_last_dim(
+        &self,
+        layout: &Layout,
+        asc: bool,
+        last_dim: usize,
+    ) -> Result<Option<VulkanStorage>> {
+        let cols = last_dim;
+        let cols_pad = cols.next_power_of_two();
+        if cols_pad > ARGSORT_MAX_COLS_PAD {
+            return Ok(None);
+        }
+        let mut xk = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
+        let n = layout.shape().elem_count();
+        let rows = n / cols.max(1);
+        let out = self.device.alloc_u32(n)?;
+        let push = push_u32(&[rows as u32, cols as u32, cols_pad as u32, asc as u32]);
+        // One workgroup per row; the shader threads cooperate over cols_pad inside it.
+        self.device
+            .dispatch("argsort", &[xb, out.buffer], &push, (rows as u32, 1, 1))?;
+        Ok(Some(out))
+    }
+
     // softmax over the last dim. `self` is the input; `layout` its layout. One row per thread.
     pub fn softmax_last_dim(&self, layout: &Layout) -> Result<VulkanStorage> {
         let mut xk = None;
@@ -2301,6 +2359,24 @@ impl VulkanStorage {
         Ok(out)
     }
 
+    // Unary sigmoid: out = 1 / (1 + exp(-self)). Vulkan path for hanzo_nn::ops::sigmoid.
+    pub fn sigmoid(&self, layout: &Layout) -> Result<VulkanStorage> {
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
+        let n = layout.shape().elem_count();
+        let mut out = self.device.alloc_f32(n)?;
+        // Preserve the input's logical dtype (storage is f32 regardless); callers multiply the
+        // result against a same-dtype tensor without an intervening cast (output-gate path).
+        out.dtype = self.dtype;
+        self.device.dispatch(
+            "sigmoid",
+            &[cb, out.buffer],
+            &(n as u32).to_ne_bytes(),
+            Self::groups_1d(n),
+        )?;
+        Ok(out)
+    }
+
     // GPT-NeoX rotary embedding. `self`=src [b,h,t,d], cos/sin [t,d/2] or [b,t,d/2].
     pub fn rope(
         &self,
@@ -2325,6 +2401,97 @@ impl VulkanStorage {
             &[srcb, cb, sb, out.buffer],
             &push_u32(&[b as u32, h as u32, t as u32, d as u32, unbatched]),
             Self::groups_1d(pairs),
+        )?;
+        Ok(out)
+    }
+
+    // Gated delta rule, single decode step (seq_len==1). `self`=q, plus k,v,g,beta; `state` is the
+    // recurrent state [BH, K, V], updated IN PLACE in VRAM (kept across tokens by the caller's state
+    // pool). q,k: [BH, K]; v: [BH, V]; g,beta: [BH]. q must be pre-scaled by 1/sqrt(K). Returns
+    // y [BH, V]. Mirrors gated_delta_rule_recurrence for seq=1 and the CUDA single-step kernel.
+    // GDN_STEP_MAX_K bounds the shader's per-invocation k array; head_k_dim must not exceed it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_step(
+        &self,
+        q_l: &Layout,
+        k: &VulkanStorage,
+        k_l: &Layout,
+        v: &VulkanStorage,
+        v_l: &Layout,
+        g: &VulkanStorage,
+        g_l: &Layout,
+        beta: &VulkanStorage,
+        beta_l: &Layout,
+        state: &VulkanStorage,
+        state_l: &Layout,
+        bh: usize,
+        k_dim: usize,
+        v_dim: usize,
+    ) -> Result<VulkanStorage> {
+        if k_dim > GDN_STEP_MAX_K {
+            crate::bail!("vulkan: gdn_step head_k_dim {k_dim} exceeds GDN_STEP_MAX_K {GDN_STEP_MAX_K}");
+        }
+        if !(state_l.is_contiguous() && state_l.start_offset() == 0) {
+            crate::bail!("vulkan: gdn_step state must be contiguous and offset 0 (it is updated in place)");
+        }
+        let mut qk = None;
+        let mut kk = None;
+        let mut vk_ = None;
+        let mut gk = None;
+        let mut bk = None;
+        let qb = self.contig_buf(q_l, &mut qk)?;
+        let kb = k.contig_buf(k_l, &mut kk)?;
+        let vb = v.contig_buf(v_l, &mut vk_)?;
+        let gb = g.contig_buf(g_l, &mut gk)?;
+        let betab = beta.contig_buf(beta_l, &mut bk)?;
+        let out = self.device.alloc_f32(bh * v_dim)?;
+        // State (binding 5) is read-modify-written in place; the fresh output (binding 6) is written
+        // too. Mark BOTH so a later in-batch reader (scatter of state, RMSNorm of the output) gets the
+        // RAW barrier. The read-side hazard check already tests all bindings, including the state input
+        // gathered earlier this batch.
+        self.device.dispatch_outs(
+            "gdn_step",
+            &[qb, kb, vb, gb, betab, state.buffer, out.buffer],
+            &[5, 6],
+            &push_u32(&[bh as u32, k_dim as u32, v_dim as u32]),
+            Self::groups_1d(bh * v_dim),
+        )?;
+        Ok(out)
+    }
+
+    // Causal depthwise conv1d, single decode step (seq_len==1, batch==1). `self`=conv_state
+    // [conv_dim, k_size], updated IN PLACE (drop oldest column, append `x`); `x` is the new column
+    // [conv_dim]; `w` the weight [conv_dim, k_size]. Returns silu(conv) [conv_dim]. Mirrors
+    // causal_conv1d_update for seq=1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv1d_step(
+        &self,
+        state_l: &Layout,
+        x: &VulkanStorage,
+        x_l: &Layout,
+        w: &VulkanStorage,
+        w_l: &Layout,
+        conv_dim: usize,
+        k_size: usize,
+    ) -> Result<VulkanStorage> {
+        if k_size > GDN_CONV_MAX_K {
+            crate::bail!("vulkan: gdn_conv1d_step kernel {k_size} exceeds GDN_CONV_MAX_K {GDN_CONV_MAX_K}");
+        }
+        if !(state_l.is_contiguous() && state_l.start_offset() == 0) {
+            crate::bail!("vulkan: gdn_conv1d_step conv_state must be contiguous and offset 0 (updated in place)");
+        }
+        let mut xk = None;
+        let mut wk = None;
+        let xb = x.contig_buf(x_l, &mut xk)?;
+        let wb = w.contig_buf(w_l, &mut wk)?;
+        let out = self.device.alloc_f32(conv_dim)?;
+        // conv_state (binding 0) is updated in place; output (binding 3) is fresh. Mark both.
+        self.device.dispatch_outs(
+            "gdn_conv1d_step",
+            &[self.buffer, xb, wb, out.buffer],
+            &[0, 3],
+            &push_u32(&[conv_dim as u32, k_size as u32]),
+            Self::groups_1d(conv_dim),
         )?;
         Ok(out)
     }
@@ -2472,14 +2639,20 @@ impl BackendStorage for VulkanStorage {
         if rank == 0 {
             crate::bail!("vulkan: reduce_op on scalar not supported");
         }
-        if sum_dims != [rank - 1] {
-            crate::bail!(
-                "vulkan: reduce_op only supports the last dim (got dims={sum_dims:?}, rank={rank})"
-            );
-        }
-        let c = self.contiguous(layout)?;
-        let cols = dims[rank - 1];
-        let rows: usize = dims[..rank - 1].iter().product();
+        // The SPIR-V reduce kernel collapses the last (contiguous) dim into one output per row. For
+        // any other single axis, permute it to the end first so the same kernel runs on the GPU; the
+        // resulting row-major order matches the framework's keep-dim wrap exactly.
+        let (c, cols) = if sum_dims == [rank - 1] {
+            (self.contiguous(layout)?, dims[rank - 1])
+        } else if sum_dims.len() == 1 {
+            let d = sum_dims[0];
+            let mut perm: Vec<usize> = (0..rank).filter(|&x| x != d).collect();
+            perm.push(d);
+            (self.contiguous(&layout.permute(&perm)?)?, dims[d])
+        } else {
+            crate::bail!("vulkan: reduce over multiple axes at once not supported (got {sum_dims:?})");
+        };
+        let rows: usize = layout.shape().elem_count() / cols;
         // arg-reductions return u32 indices; value reductions return f32.
         let out = if is_arg {
             self.device.alloc_u32(rows)?
