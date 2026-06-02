@@ -66,12 +66,13 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
     let mut sum_dt = 0f64;
     let mut iters = 0usize;
     for idx in 0.. {
-        let semaphore = Arc::new(CommandSemaphore::new());
-        let command_buffer = create_command_buffer(&command_queue, semaphore).unwrap();
+        let command_queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let encoder = commands.command_encoder().unwrap();
         let start_time = std::time::Instant::now();
         hanzo_metal_kernels::call_mlx_gemm(
             &device,
-            &command_buffer,
+            &encoder,
             &kernels,
             dtype,
             (b, m, n, k),
@@ -83,8 +84,8 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
             &rhs,
             &output,
         )?;
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
         let dt = start_time.elapsed().as_secs_f64();
         if idx < WARMUP_ITERS {
             continue;

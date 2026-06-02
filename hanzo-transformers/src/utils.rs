@@ -1,4 +1,4 @@
-//! Apply penalty and repeat_kv
+//! Shared utilities: repeat_kv, repeat_penalty, causal mask.
 
 use hanzo_ml::{Result, Tensor};
 
