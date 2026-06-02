@@ -1,8 +1,10 @@
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_var_builder::VarBuilder;
 use hanzo_ml::quantized::gguf_file;
-use hanzo_ml::{DType, Device, Module, Result, Tensor};
-use hanzo_nn::kv_cache::KvCache;
+use hanzo_ml::{DType, Device, Module, Result, Storage, Tensor};
+use hanzo_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
+use hanzo_nn::attention::{flash_attn, AttnMask};
+use hanzo_nn::kv_cache::{rope_i_inplace, InterleavedKvCache, KvCache, RawInterleavedKvCache};
 use hanzo_nn::Activation;
 use std::io::Write;
 use std::sync::Arc;
@@ -216,8 +218,17 @@ impl RotaryEmbedding {
         let (_, _, seq_len, _) = q.dims4()?;
         let cos = self.cos.narrow(0, offset, seq_len)?;
         let sin = self.sin.narrow(0, offset, seq_len)?;
-        let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let (q_embed, k_embed) = if self.use_interleaved {
+            // Interleaved RoPE: pairs adjacent elements (2i, 2i+1)
+            // Correct for interlaced GGUF weight layout
+            let q_embed = hanzo_nn::rotary_emb::rope_i(&q.contiguous()?, &cos, &sin)?;
+            let k_embed = hanzo_nn::rotary_emb::rope_i(&k.contiguous()?, &cos, &sin)?;
+            (q_embed, k_embed)
+        } else {
+            let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+            let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+            (q_embed, k_embed)
+        };
         Ok((q_embed, k_embed))
     }
 
@@ -327,11 +338,13 @@ impl QuantizedAttention {
             drop(q_weight_raw);
             drop(q_weight);
 
-        // Re-quantize (now on GPU)
-        use hanzo_ml::quantized::{GgmlDType, QTensor};
-        let q_weight_qtensor = QTensor::quantize(&q_weight, GgmlDType::Q8_0)?;
-        drop(q_weight_raw); // Explicitly free CPU memory
-        drop(q_weight);
+            let k_weight_qtensor = vb.get_no_shape("attn_k.weight")?;
+            let k_weight_raw = k_weight_qtensor.dequantize(&cpu)?;
+            let k_weight = reconstruct_qk_weights(&k_weight_raw, num_kv_heads)?;
+            let k_weight = k_weight.to_device(device)?;
+            let k_weight_qtensor = QTensor::quantize(&k_weight, GgmlDType::Q8_0)?;
+            drop(k_weight_raw);
+            drop(k_weight);
 
             let q_proj = QMatMul::from_weights(Arc::new(q_weight_qtensor))?;
             let k_proj = QMatMul::from_weights(Arc::new(k_weight_qtensor))?;
@@ -483,8 +496,28 @@ impl QuantizedAttention {
             (q, k)
         };
 
-        // can remove this continguous call if using ConcatKV-Cache https://github.com/hanzoai/ml/pull/3143
-        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        if self.use_flash_attn && x.device().is_cpu() && b == 1 {
+            // Prefill (B=1 only): use InterleavedKvCache + flash_attn
+            let kv = self.interleaved_cache.as_mut().unwrap().append(&k, &v)?;
+            // Also populate raw cache for subsequent decode steps
+            {
+                let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                let (kg, kl) = k_cont.storage_and_layout();
+                let k_data: &[f32] = match &*kg {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
+                    _ => hanzo_ml::bail!("Expected CPU"),
+                };
+                let (vg, vl) = v_cont.storage_and_layout();
+                let v_data: &[f32] = match &*vg {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
+                    _ => hanzo_ml::bail!("Expected CPU"),
+                };
+                self.raw_cache
+                    .as_mut()
+                    .unwrap()
+                    .write_kv_batch(k_data, v_data, seq_len);
+            }
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let kv_k = kv.narrow(2, 0, self.head_dim)?.unsqueeze(0)?;
@@ -514,8 +547,8 @@ impl QuantizedAttention {
                 .unwrap()
                 .append(&k.contiguous()?, &v.contiguous()?)?;
 
-        attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
+            let k = repeat_kv(k, self.num_kv_groups)?;
+            let v = repeat_kv(v, self.num_kv_groups)?;
 
             let scale = 1.0 / (self.head_dim as f64).sqrt();
             let q = q.contiguous()?;
@@ -620,7 +653,11 @@ pub struct QuantizedModelForCausalLM {
 }
 
 impl QuantizedModelForCausalLM {
-    pub fn from_gguf<P: AsRef<std::path::Path>>(path: P, device: &Device) -> Result<Self> {
+    pub fn from_gguf<P: AsRef<std::path::Path>>(
+        path: P,
+        device: &Device,
+        use_flash_attn: bool,
+    ) -> Result<Self> {
         use hanzo_ml::quantized::{GgmlDType, QTensor};
 
         // Open file once to read metadata

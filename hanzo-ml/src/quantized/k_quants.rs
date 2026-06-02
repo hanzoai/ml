@@ -238,6 +238,14 @@ impl GgmlType for BlockQ4_0 {
     // https://github.com/ggerganov/llama.cpp/blob/b5ffb2849d23afe73647f68eec7b68187af09be6/ggml.c#L2361C10-L2361C122
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vnni"
+        ))]
+        return super::avx::vec_dot_q4_0_q8_0_avx512(n, xs, ys);
+
         #[cfg(target_feature = "avx2")]
         return super::avx::vec_dot_q4_0_q8_0(n, xs, ys);
 
@@ -647,6 +655,14 @@ impl GgmlType for BlockQ8_0 {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vnni"
+        ))]
+        return super::avx::vec_dot_q8_0_q8_0_avx512(n, xs, ys);
+
         #[cfg(target_feature = "avx2")]
         return super::avx::vec_dot_q8_0_q8_0(n, xs, ys);
 
@@ -1357,6 +1373,14 @@ impl GgmlType for BlockQ4K {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vnni"
+        ))]
+        return super::avx::vec_dot_q4k_q8k_avx512(n, xs, ys);
+
         #[cfg(target_feature = "avx2")]
         return super::avx::vec_dot_q4k_q8k(n, xs, ys);
 
@@ -2180,6 +2204,14 @@ impl GgmlType for BlockQ8K {
 
     #[allow(unreachable_code)]
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vnni"
+        ))]
+        return super::avx::vec_dot_q8k_q8k_avx512(n, xs, ys);
+
         #[cfg(target_feature = "avx2")]
         return super::avx::vec_dot_q8k_q8k(n, xs, ys);
 
@@ -2297,6 +2329,30 @@ pub fn matmul<T: GgmlType>(
         }
     }
 
+    // Adaptive parallel granularity.
+    //
+    // For batch=1 decode (m == 1) the only available parallelism is across the
+    // `n` output columns of a single row. The previous fixed `min_len = 128`
+    // forced rayon to hand each worker a chunk of at least 128 columns, which
+    // under-parallelizes the decode step on many-core CPUs (e.g. the Ryzen AI
+    // MAX+ 395) — most cores sit idle while a few churn through huge chunks.
+    // Dropping `min_len` to 8 for the m == 1 case lets every core pick up work
+    // while still keeping chunks large enough to amortize task overhead. For
+    // prefill / batched matmul (m > 1) we keep the conservative 128, which
+    // already has plenty of work to spread.
+    //
+    // `HANZO_MIN_LEN` overrides the heuristic entirely (must be >= 1).
+    let min_len = match std::env::var("HANZO_MIN_LEN").ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(v) if v >= 1 => v,
+        _ => {
+            if m == 1 {
+                8
+            } else {
+                128
+            }
+        }
+    };
+
     for row_idx in 0..m {
         let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
         let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
@@ -2304,7 +2360,7 @@ pub fn matmul<T: GgmlType>(
         dst_row
             .into_par_iter()
             .enumerate()
-            .with_min_len(128)
+            .with_min_len(min_len)
             .with_max_len(512)
             .for_each(|(col_idx, dst)| {
                 let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
