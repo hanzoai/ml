@@ -4,8 +4,9 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
+use hanzo_metal_kernels::kernels::binary::contiguous;
 use hanzo_metal_kernels::{
-    metal::{Buffer, Commands, Device},
+    metal::{Buffer, Commands, Device, ResidencySet},
     BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
 };
 use objc2_foundation::NSRange;
@@ -1750,6 +1751,8 @@ impl BackendStorage for MetalStorage {
                 DType::F16 => hanzo_metal_kernels::copy2d::HALF,
                 DType::BF16 => hanzo_metal_kernels::copy2d::BFLOAT,
                 DType::I64 => hanzo_metal_kernels::copy2d::I64,
+                DType::I32 => hanzo_metal_kernels::copy2d::I32,
+                DType::I16 => hanzo_metal_kernels::copy2d::I16,
                 DType::U32 => hanzo_metal_kernels::copy2d::U32,
                 DType::U8 => hanzo_metal_kernels::copy2d::U8,
                 dtype => crate::bail!("Metal copy2d {dtype:?} not implemented"),
