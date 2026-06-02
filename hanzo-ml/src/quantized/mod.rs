@@ -1100,7 +1100,45 @@ impl QMatMul {
             .reshape((t * topk, k))?
             .to_dtype(crate::DType::F32)?
             .contiguous()?;
-        let ids_flat = ids.reshape((t * topk,))?.to_dtype(crate::DType::U32)?;
+        let ids_flat = ids
+            .reshape((t * topk,))?
+            .to_dtype(crate::DType::U32)?
+            .contiguous()?;
+        let m_all = t * topk;
+        // Fused grouped matvec: ONE dispatch per projection reads the routed expert id per slot from a
+        // GPU buffer and computes every routed-slot output at once -- NO routing-ids GPU->CPU sync, NO
+        // HashMap, NO Tensor::zeros, NO index_select/index_add. Decode is bit-identical to the
+        // matvec_*_gpu_off kernels. Handles BOTH decode (t==1) and prefill (t>1): slots index
+        // x_flat/ids_flat directly. Banks are only ever stored Q4K (gate/up) or Q8_0 (down, and any
+        // Q5K/Q6K requantized at load); any other dtype falls through to the loop below.
+        if matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0) {
+            let (xstore, _) = x_flat.storage_and_layout();
+            let xv = match &*xstore {
+                crate::Storage::Vulkan(v) => v,
+                _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
+            };
+            let (istore, _) = ids_flat.storage_and_layout();
+            let iv = match &*istore {
+                crate::Storage::Vulkan(v) => v,
+                _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
+            };
+            let y_store = match dtype {
+                GgmlDType::Q4K => {
+                    d.mul_mat_vec_id_q4k_gpu(bank, xv, iv, m_all, n, k, per_expert_words)?
+                }
+                _ => d.mul_mat_vec_id_q8_gpu(bank, xv, iv, m_all, n, k, per_expert_words)?,
+            };
+            let y = crate::tensor::from_storage(
+                crate::Storage::Vulkan(y_store),
+                (m_all, n),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            return y.reshape((t, topk, n))?.to_dtype(out_dtype);
+        }
+        // Fallback (no id-kernel for this bank dtype): group slots by expert on the CPU and run a
+        // banked matvec/matmul per expert. The one-edit revert to this path: replace the
+        // `matches!(dtype, ..)` guard above with `false`.
         let ids_vec = ids_flat.to_vec1::<u32>()?;
         let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
         for (slot, eid) in ids_vec.iter().enumerate() {
