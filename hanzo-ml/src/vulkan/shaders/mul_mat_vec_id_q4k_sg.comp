@@ -1,0 +1,102 @@
+#version 450
+// Subgroup-reduced fused grouped Q4_K matvec for MoE decode: ONE dispatch computes every routed slot's
+// output y[m, nout] where y[slot][col] = dequant(bank[ids[slot]])[col, :] . x_flat[slot, :]. This is the
+// subgroup variant of mul_mat_vec_id_q4k.comp: instead of one INVOCATION per (slot,col) reading that
+// expert-row's super-blocks serially (adjacent invocations stride distinct rows -> uncoalesced reads),
+// one SUBGROUP owns each output and its lanes stride that single row's super-blocks (consecutive lanes
+// touch consecutive 256-blocks -> coalesced), then fuse the partials with a single subgroupAdd. The Q4_K
+// block decode below is COPIED VERBATIM from mul_mat_vec_id_q4k.comp / mul_mat_vec_q4k.comp and MUST stay
+// bit-identical (a wrong reduction silently garbles all MoE output). Dispatched ONLY when the device
+// advertises subgroup ARITHMETIC support (gated host-side in vulkan_backend.rs); the scalar
+// mul_mat_vec_id_q4k kernel is the fallback. Bank is [E,n,k] verbatim GGUF Q4_K blocks; expert e starts
+// at woff = ids[slot] * per_expert_words u32 words. k is a multiple of 256.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// 64 invocations/workgroup: on RDNA (subgroup size 32 or 64) that is 1-2 subgroups, each computing one
+// output element. gl_NumSubgroups outputs are produced per workgroup.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W   { uint   w[]; };   // Q4_K bank, 36 u32 / 256-block
+layout(set = 0, binding = 1) readonly buffer X   { float  x[]; };   // x_flat [m, k] row-major
+layout(set = 0, binding = 2) writeonly buffer Y  { float  y[]; };   // out [m, nout] row-major
+layout(set = 0, binding = 3) readonly buffer IDS { uint  ids[]; };  // per-slot expert id, length m
+layout(push_constant) uniform Pc { uint nout; uint k; uint per_expert_words; uint m; };
+
+const uint QK_K = 256u;
+const uint BLK_U32 = 36u; // 144 bytes / 4
+
+// Byte `b` (0-based) out of the block's scale region (u32[1..4], i.e. the 12 scale bytes).
+uint scale_byte(uint base, uint b) {
+    uint word = w[base + 1u + (b >> 2u)];
+    return (word >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+// get_scale_min_k4 from k_quants/utils.rs: returns packed (sc<<8 | m), each 6-bit.
+uint get_scale_min_k4(uint base, uint j) {
+    uint sc, m;
+    if (j < 4u) {
+        sc = scale_byte(base, j) & 63u;
+        m  = scale_byte(base, j + 4u) & 63u;
+    } else {
+        uint s_j4 = scale_byte(base, j + 4u);
+        uint s_jm4 = scale_byte(base, j - 4u);
+        uint s_j = scale_byte(base, j);
+        sc = (s_j4 & 0x0Fu) | ((s_jm4 >> 6u) << 4u);
+        m  = (s_j4 >> 4u)   | ((s_j   >> 6u) << 4u);
+    }
+    return (sc << 8u) | m;
+}
+
+void main() {
+    // One subgroup per output element. Global subgroup index g -> (slot, col), row-major over [m, nout].
+    uint g = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint slot = g / nout;
+    uint col  = g % nout;
+    if (slot >= m) {
+        return;
+    }
+    uint nblocks = k / QK_K;
+    uint woff = ids[slot] * per_expert_words;        // expert id[slot]'s block base in the bank
+    uint rowbase = woff + col * nblocks * BLK_U32;    // u32 offset of row col within that expert
+    uint xbase = slot * k;                            // this slot's activation row in x_flat
+    uint lane = gl_SubgroupInvocationID;
+    uint lanes = gl_SubgroupSize;
+    // Each lane sums a strided subset of the 256-weight super-blocks; partials reduced across subgroup.
+    float acc = 0.0;
+    for (uint blk = lane; blk < nblocks; blk += lanes) {
+        uint base = rowbase + blk * BLK_U32;
+        float d    = float(unpackHalf2x16(w[base]).x);
+        float dmin = float(unpackHalf2x16(w[base]).y);
+        uint qbase = base + 4u;     // u32 index where the 128 quant bytes start
+        uint xblk  = xbase + blk * QK_K;    // activation offset for this super-block
+        // 4 chunks of 64 weights; chunk c uses scale-pair (2c, 2c+1) and qs bytes [c*32, c*32+32).
+        for (uint c = 0u; c < 4u; c++) {
+            uint is = c * 2u;
+            uint sm1 = get_scale_min_k4(base, is);
+            uint sm2 = get_scale_min_k4(base, is + 1u);
+            float d1 = d * float(sm1 >> 8u);
+            float m1 = dmin * float(sm1 & 0xFFu);
+            float d2 = d * float(sm2 >> 8u);
+            float m2 = dmin * float(sm2 & 0xFFu);
+            uint qoff = c * 32u;            // byte offset into qs for this chunk
+            uint xlo = xblk + c * 64u;      // lower-nibble outputs land here
+            uint xhi = xlo + 32u;           // upper-nibble outputs
+            for (uint l = 0u; l < 32u; l++) {
+                uint qb = qoff + l;
+                uint qword = w[qbase + (qb >> 2u)];
+                uint q = (qword >> ((qb & 3u) * 8u)) & 0xFFu;
+                float wlo = d1 * float(q & 0x0Fu) - m1;
+                float whi = d2 * float(q >> 4u)  - m2;
+                acc += wlo * x[xlo + l];
+                acc += whi * x[xhi + l];
+            }
+        }
+    }
+    // Single subgroup reduction over all lanes' partials; lane 0 writes the output element.
+    float total = subgroupAdd(acc);
+    if (subgroupElect()) {
+        y[slot * nout + col] = total;
+    }
+}
