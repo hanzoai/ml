@@ -1,0 +1,56 @@
+#version 450
+// Fused MoE grouped quant matvec (Q8_0): for each routed slot s and each output row r,
+//   y[s, r] = sum_k W[ ids[s], r, k ] * x[s, k]
+// reading the per-expert weight slice out of a single Q8_0 weight bank [E, n, k] resident in
+// VRAM -- the router gather (which expert) and the per-expert GEMM happen in ONE dispatch, so the
+// whole Qwen3-MoE expert compute runs on the GPU (no CPU expert loop, no index_add scatter, no
+// per-call weight re-upload). Each invocation computes one output element.
+//
+// IMPORTANT: the resident Q8 bank is uploaded by `quantize_q8_blocks` REPACKED into the kernel's
+// 9-u32 (36-byte) block layout -- u32[0] low half = the fp16 scale bits, u32[1..9] = the 32 int8
+// (4 per word) -- NOT the raw 34-byte GGUF block. So the unpack here mirrors mul_mat_vec_q8.comp /
+// matvec_q8_gpu exactly: block stride = 9 u32, scale via unpackHalf2x16, int8 via bitfieldExtract.
+// Weight = qs*scale (byte-exact with the resident-bank Q8 matvec decode).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W   { uint  w[];   };  // expert bank, 9 u32 / 32-block
+layout(set = 0, binding = 1) readonly buffer X   { float x[];   };  // [S, k] activations
+layout(set = 0, binding = 2) readonly buffer Ids { uint  ids[]; };  // [S] expert id per slot
+layout(set = 0, binding = 3) writeonly buffer Y  { float y[];   };  // [S, n] outputs
+// n = rows/expert, k = inner dim (mult of 32), nrows = S (total routed slots).
+layout(push_constant) uniform Pc { uint n; uint k; uint nrows; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = nrows * n;
+    if (gid >= total) {
+        return;
+    }
+    uint s = gid / n;          // routed slot
+    uint r = gid - s * n;      // output row within the expert
+    uint expert = ids[s];
+    uint nblocks = k / 32u;
+    // u32 offset of weight row r of `expert` in the bank: each row is nblocks blocks of 9 u32,
+    // and each expert owns n rows -- mirrors the `eid * n` row base of the host path.
+    uint rowbase = (expert * n + r) * nblocks * 9u;
+    uint xbase = s * k;
+    float acc = 0.0;
+    for (uint b = 0u; b < nblocks; b++) {
+        uint off = rowbase + b * 9u;
+        float scale = unpackHalf2x16(w[off]).x;
+        float bsum = 0.0;
+        uint xb = xbase + b * 32u;
+        for (uint j = 0u; j < 8u; j++) {
+            uint word = w[off + 1u + j];
+            uint xo = xb + j * 4u;
+            // bitfieldExtract on a signed int sign-extends the 8-bit lane.
+            bsum += float(bitfieldExtract(int(word), 0, 8))  * x[xo + 0u];
+            bsum += float(bitfieldExtract(int(word), 8, 8))  * x[xo + 1u];
+            bsum += float(bitfieldExtract(int(word), 16, 8)) * x[xo + 2u];
+            bsum += float(bitfieldExtract(int(word), 24, 8)) * x[xo + 3u];
+        }
+        acc += scale * bsum;
+    }
+    y[gid] = acc;
+}
