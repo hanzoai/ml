@@ -32,7 +32,6 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "exp" => spv!("exp"),
         "silu" => spv!("silu"),
         "silu_mul" => spv!("silu_mul"),
-        "sigmoid" => spv!("sigmoid"),
         "gelu" => spv!("gelu"),
         "relu" => spv!("relu"),
         "sqr" => spv!("sqr"),
@@ -48,12 +47,13 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm_coopmat_rb_nt" => spv!("bmm_coopmat_rb_nt"),
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
-        "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
-        "mul_mat_q8" => spv!("mul_mat_q8"),
-        "mul_mat_q4k" => spv!("mul_mat_q4k"),
+        "mul_mat_vec_q8_0" => spv!("mul_mat_vec_q8_0"),
+        "mul_mat_vec_q4_0" => spv!("mul_mat_vec_q4_0"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
-        "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
-        "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
+        "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
+        "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
+        "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
+        "flash_attn" => spv!("flash_attn"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -85,13 +85,11 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "reduce_min" => spv!("reduce_min"),
         "reduce_argmin" => spv!("reduce_argmin"),
         "reduce_argmax" => spv!("reduce_argmax"),
-        "argsort" => spv!("argsort"),
         "gather" => spv!("gather"),
         "scatter_set" => spv!("scatter_set"),
         "scatter_add_set" => spv!("scatter_add_set"),
+        "index_add" => spv!("index_add"),
         "conv1d" => spv!("conv1d"),
-        "gdn_step" => spv!("gdn_step"),
-        "gdn_conv1d_step" => spv!("gdn_conv1d_step"),
         "conv2d" => spv!("conv2d"),
         "conv_transpose1d" => spv!("conv_transpose1d"),
         "conv_transpose2d" => spv!("conv_transpose2d"),
@@ -100,12 +98,6 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "upsample_nearest1d" => spv!("upsample_nearest1d"),
         "upsample_nearest2d" => spv!("upsample_nearest2d"),
         "upsample_bilinear2d" => spv!("upsample_bilinear2d"),
-        "gdn_recurrence" => spv!("gdn_recurrence"),
-        "gdn_chunked" => spv!("gdn_chunked"),
-        "gdn_conv_update" => spv!("gdn_conv_update"),
-        "gdn_conv_full" => spv!("gdn_conv_full"),
-        "gdn_conv_state_save" => spv!("gdn_conv_state_save"),
-        "gdn_gating" => spv!("gdn_gating"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -175,14 +167,6 @@ struct VkInner {
     // instead of only the static total heap `size`. When absent we fall back to total heap size as
     // a conservative upper bound for the scratch guard.
     has_mem_budget: bool,
-    // Subgroup arithmetic support for the COMPUTE stage (queried from PhysicalDeviceSubgroupProperties
-    // at init). When true the q8 mat-vec uses the subgroup-reduced kernel (one subgroup per output
-    // row, fused subgroupAdd) instead of the scalar one-thread-per-row kernel; this raises memory-
-    // level parallelism per row and halves the dispatch count on the decode hot path. Gated because
-    // the subgroup SPIR-V needs GroupNonUniformArithmetic, which not every driver (e.g. some WSL/
-    // Dozen configs) provides. `subgroup_size` is the reported subgroup width.
-    subgroup_matvec: bool,
-    subgroup_size: u32,
     // Cooperative-matrix (matrix-core / WMMA) availability and the chosen MxNxK tile for an
     // fp16xfp16 -> fp32 subgroup config. Present on native AMD/NV drivers (RDNA3.5 8060S),
     // absent on WSL/Dozen.
@@ -375,39 +359,6 @@ impl VulkanDevice {
         self.upload_u32(&packed)
     }
 
-    /// Upload an already-Q8_0-quantized weight to the GPU verbatim. `data` is the GGUF `BlockQ8_0`
-    /// bytes (34 B/block = f16 scale + 32 int8), repacked LOSSLESLY into the kernel's 9-u32 layout
-    /// (scale in u32[0] low half, 32 int8 four-per-word in u32[1..9]) -- the same layout
-    /// [`quantize_q8`] emits, so the matvec/matmul decode is identical and no f32 round-trip is
-    /// needed. This is the MoE-bank path: a Q8_0 [E,n,k] expert bank uploads once with `nout = E*n`
-    /// and stays quantized. `data` must be exactly `nout * (k/32) * 34` bytes; `k` a multiple of 32.
-    pub fn quantize_q8_blocks(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(32) {
-            crate::bail!("quantize_q8_blocks: k must be a multiple of 32, got {k}");
-        }
-        let nblocks = k / 32;
-        let want = nout * nblocks * 34;
-        if data.len() != want {
-            crate::bail!(
-                "quantize_q8_blocks: data len {} != {nout}*{nblocks}*34 = {want}",
-                data.len()
-            );
-        }
-        // Source block: bytes [0,2) = f16 scale (LE), bytes [2,34) = 32 int8. Repack each block into
-        // 9 u32: u32[0] low half = the scale bits verbatim; u32[1..9] = the 32 int8, 4 per word.
-        let mut packed = vec![0u32; nout * nblocks * 9];
-        for blk in 0..nout * nblocks {
-            let src = &data[blk * 34..blk * 34 + 34];
-            let o = blk * 9;
-            packed[o] = u16::from_le_bytes([src[0], src[1]]) as u32;
-            for j in 0..8 {
-                let b = 2 + j * 4;
-                packed[o + 1 + j] = u32::from_le_bytes([src[b], src[b + 1], src[b + 2], src[b + 3]]);
-            }
-        }
-        self.upload_u32(&packed)
-    }
-
     /// Q8_0 matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q8`]. The kernel
     /// reads weights at ~1.125 bytes/elem instead of 4 — the bandwidth lever for memory-bound
     /// decode on this APU. Expect ~1e-2 error (fp16-scale int8 quantization).
@@ -435,115 +386,103 @@ impl VulkanDevice {
         nout: usize,
         k: usize,
     ) -> Result<VulkanStorage> {
-        self.matvec_q8_gpu_off(wq, x, nout, k, 0)
+        if x.count < k {
+            crate::bail!("matvec_q8_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q8",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
     }
 
-    /// Q8_0 matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
-    /// `woff == 0` is bit-identical to [`matvec_q8_gpu`]; a non-zero offset selects one expert's row
-    /// block of a resident MoE bank (`woff = e * nout * (k/32) * 9`), so the whole [E,n,k] Q8 bank
-    /// stays uploaded once and each routed expert reads only its own slice (no per-token re-upload).
-    pub fn matvec_q8_gpu_off(
+    /// Upload a `u32` index/id vector to a GPU buffer (e.g. the MoE router's per-slot expert ids).
+    pub fn upload_ids(&self, ids: &[u32]) -> Result<VulkanStorage> {
+        self.upload_u32(ids)
+    }
+
+    /// Upload native GGML quantized weight bytes verbatim to a GPU buffer (reused across decode
+    /// matvecs). The matvec kernels read the GGML block format straight out of this buffer — no CPU
+    /// dequant, no re-pack — so weights stay quantized in VRAM (Q4_0 ~0.56 B/elem, Q4_K ~0.56 B/elem,
+    /// Q8_0 ~1.06 B/elem) instead of being dequantized to 4 B/elem f32. `bytes` is the exact
+    /// `QTensor::data()` slice; it is zero-padded to a u32 multiple for the std430 SSBO.
+    pub fn upload_qweight(&self, bytes: &[u8]) -> Result<VulkanStorage> {
+        let nwords = bytes.len().div_ceil(4);
+        let mut words = vec![0u32; nwords.max(1)];
+        // SAFETY: words is 4-byte aligned and large enough to hold every input byte.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, nwords * 4)
+        };
+        dst[..bytes.len()].copy_from_slice(bytes);
+        self.upload_u32(&words)
+    }
+
+    /// Native-GGML Q4_0 matvec with both operands on the GPU: `y[nout] = Wq * x[k]`, where `Wq` is
+    /// the raw Q4_0 block bytes from [`upload_qweight`]. Byte-exact dequant vs the CPU reference
+    /// (within int4 quantization error). `k` must be a multiple of 32. No host round-trip.
+    pub fn matvec_q4_0_gpu(
         &self,
         wq: &VulkanStorage,
         x: &VulkanStorage,
         nout: usize,
         k: usize,
-        woff: usize,
     ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matvec_q4_0_gpu: k must be a multiple of 32, got {k}");
+        }
         if x.count < k {
-            crate::bail!("matvec_q8_gpu: x count {} < k {k}", x.count);
+            crate::bail!("matvec_q4_0_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        let push = push_u32(&[nout as u32, k as u32, woff as u32]);
-        if self.inner.subgroup_matvec {
-            // Subgroup-reduced kernel: one subgroup per output row, fused subgroupAdd. A workgroup
-            // of WG1D (64) invocations holds WG1D/subgroup_size subgroups, so it produces that many
-            // rows; dispatch ceil(nout / rows_per_wg) workgroups. subgroup_size is >=2 (checked at
-            // init) and <=64 in practice, so rows_per_wg is in [1, 32].
-            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
-            self.dispatch(
-                "mul_mat_vec_q8_sg",
-                &[wq.buffer, x.buffer, out.buffer],
-                &push,
-                ((nout as u32).div_ceil(rows_per_wg), 1, 1),
-            )?;
-        } else {
-            self.dispatch(
-                "mul_mat_vec_q8",
-                &[wq.buffer, x.buffer, out.buffer],
-                &push,
-                ((nout as u32).div_ceil(WG1D), 1, 1),
-            )?;
-        }
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q4_0",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
         Ok(out)
     }
 
-    /// Upload Q4_K weights to the GPU once, verbatim in the GGUF super-block layout (144 B = 36 u32
-    /// per 256-weight block, `nout * k/256` blocks total). No requantize: the bytes are the same
-    /// blocks the CPU `k_quants::BlockQ4K` holds, so the in-shader decode matches the CPU dequant
-    /// exactly. Returns the device buffer to reuse across matvecs. `data` must be exactly the
-    /// `nout * (k/256) * 144` packed block bytes; `k` must be a multiple of 256.
-    pub fn quantize_q4k(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(256) {
-            crate::bail!("quantize_q4k: k must be a multiple of 256, got {k}");
-        }
-        let nblocks = k / 256;
-        let want = nout * nblocks * 144;
-        if data.len() != want {
-            crate::bail!(
-                "quantize_q4k: data len {} != {nout}*{nblocks}*144 = {want}",
-                data.len()
-            );
-        }
-        // Reinterpret the packed block bytes as u32 words for the kernel's `uint w[]` binding. GGUF
-        // blocks are 144 bytes (a multiple of 4), so the length is u32-aligned by construction.
-        let words: &[u32] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
-        self.upload_u32(words)
-    }
-
-    /// Q4_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q4k`]. Reads weights
-    /// at ~4.5 bits/elem instead of 32 -- the bandwidth lever for memory-bound decode on this APU.
-    /// Decode matches the CPU `BlockQ4K::to_float` so expect ~1e-3 relative error vs CPU f32 (the
-    /// quantization error is already baked into the stored blocks).
-    pub fn matvec_q4k(
+    /// Native-GGML Q8_0 matvec (reads the 34-byte BlockQ8_0 directly, no re-pack). Both operands on
+    /// the GPU: `y[nout] = Wq * x[k]`, `Wq` from [`upload_qweight`]. `k` multiple of 32.
+    pub fn matvec_q8_0_gpu(
         &self,
         wq: &VulkanStorage,
-        x: &[f32],
+        x: &VulkanStorage,
         nout: usize,
         k: usize,
-    ) -> Result<Vec<f32>> {
-        if x.len() != k {
-            crate::bail!("matvec_q4k: x len {} != k {k}", x.len());
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matvec_q8_0_gpu: k must be a multiple of 32, got {k}");
         }
-        let xs = self.upload_f32(x)?;
-        self.matvec_q4k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+        if x.count < k {
+            crate::bail!("matvec_q8_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q8_0",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
     }
 
-    /// Q4_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, no host round-trip.
-    /// Weights stay quantized in VRAM (~4.5 bits/elem) instead of dequantizing to f32, so decode
-    /// reads ~7x less weight memory. One invocation per output row (scalar kernel).
+    /// Native-GGML Q4_K matvec with both operands on the GPU: `y[nout] = Wq * x[k]`, `Wq` is the raw
+    /// 144-byte Q4_K super-block bytes from [`upload_qweight`]. Byte-exact dequant vs the CPU
+    /// reference. `k` must be a multiple of 256. No host round-trip.
     pub fn matvec_q4k_gpu(
         &self,
         wq: &VulkanStorage,
         x: &VulkanStorage,
         nout: usize,
         k: usize,
-    ) -> Result<VulkanStorage> {
-        self.matvec_q4k_gpu_off(wq, x, nout, k, 0)
-    }
-
-    /// Q4_K matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
-    /// `woff == 0` is bit-identical to [`matvec_q4k_gpu`]; a non-zero offset selects one expert's row
-    /// block of a resident MoE bank (`woff = e * nout * (k/256) * 36`), so the whole [E,n,k] Q4_K
-    /// bank stays uploaded once and each routed expert reads only its own slice.
-    pub fn matvec_q4k_gpu_off(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        nout: usize,
-        k: usize,
-        woff: usize,
     ) -> Result<VulkanStorage> {
         if !k.is_multiple_of(256) {
             crate::bail!("matvec_q4k_gpu: k must be a multiple of 256, got {k}");
@@ -552,7 +491,7 @@ impl VulkanDevice {
             crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        let push = push_u32(&[nout as u32, k as u32, woff as u32]);
+        let push = push_u32(&[nout as u32, k as u32]);
         self.dispatch(
             "mul_mat_vec_q4k",
             &[wq.buffer, x.buffer, out.buffer],
@@ -562,458 +501,130 @@ impl VulkanDevice {
         Ok(out)
     }
 
-    /// Q8_0 matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
-    /// (same blocks as [`quantize_q8`] / [`matvec_q8_gpu`]). Decodes each weight block once and reuses
-    /// it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so weight memory traffic matches a single
-    /// matvec per output column instead of dequantizing the whole weight to f32 every forward. `x`
-    /// must be a contiguous `[m, k]` device buffer; returns `[m, nout]` row-major.
-    pub fn matmul_q8_gpu(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-    ) -> Result<VulkanStorage> {
-        self.matmul_q8_gpu_off(wq, x, m, nout, k, 0)
+    /// Host-input convenience: uploads `x` then runs [`matvec_q4_0_gpu`]. Returns the f32 result.
+    pub fn matvec_q4_0(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q4_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q4_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
     }
 
-    /// Q8_0 prefill matmul into a slice of `wq` starting at `woff` u32 words. `woff == 0` is
-    /// bit-identical to [`matmul_q8_gpu`]; a non-zero offset selects one expert's weight block of a
-    /// resident MoE bank (`woff = e * nout * (k/32) * 9`) so a prefill expert with M>1 routed rows
-    /// runs one banked matmul without re-uploading the weight.
-    pub fn matmul_q8_gpu_off(
+    /// Host-input convenience: uploads `x` then runs [`matvec_q8_0_gpu`]. Returns the f32 result.
+    pub fn matvec_q8_0(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q8_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q8_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Host-input convenience: uploads `x` then runs [`matvec_q4k_gpu`]. Returns the f32 result.
+    pub fn matvec_q4k(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q4k: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q4k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Fused MoE grouped quant matvec on the GPU: for each routed slot `s` (`0..nrows`) and output
+    /// row `r` (`0..n`), computes `y[s, r] = sum_k W[ids[s], r, k] * x[s, k]`, reading the per-expert
+    /// slice from a single GGML weight bank `[E, n, k]` already uploaded via [`upload_qweight`]. The
+    /// router gather and the per-expert GEMM run in one dispatch — the whole MoE expert compute on
+    /// the GPU (no CPU expert loop, no per-call weight upload, no scatter). `kernel` selects the
+    /// dtype variant ("moe_matvec_q4_0" / "moe_matvec_q8_0" / "moe_matvec_q4k"). `wbank`/`x`/`ids`
+    /// are device buffers; output is `[nrows, n]` f32.
+    pub fn moe_matvec_gpu(
         &self,
-        wq: &VulkanStorage,
+        kernel: &'static str,
+        wbank: &VulkanStorage,
         x: &VulkanStorage,
-        m: usize,
-        nout: usize,
+        ids: &VulkanStorage,
+        nrows: usize,
+        n: usize,
         k: usize,
-        woff: usize,
     ) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(32) {
-            crate::bail!("matmul_q8_gpu: k must be a multiple of 32, got {k}");
+        if x.count < nrows * k {
+            crate::bail!("moe_matvec_gpu: x count {} < nrows*k {}", x.count, nrows * k);
         }
-        if x.count < m * k {
-            crate::bail!("matmul_q8_gpu: x count {} < m*k {}", x.count, m * k);
+        if ids.count < nrows {
+            crate::bail!("moe_matvec_gpu: ids count {} < nrows {nrows}", ids.count);
         }
-        let out = self.alloc_f32(m * nout)?;
-        let cols = (nout as u32).div_ceil(WG1D);
-        let mut m0 = 0usize;
-        while m0 < m {
-            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
-            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
-            self.dispatch(
-                "mul_mat_q8",
-                &[wq.buffer, x.buffer, out.buffer],
-                &push,
-                (cols, 1, 1),
-            )?;
-            m0 += mcount;
-        }
+        let total = nrows * n;
+        let out = self.alloc_f32(total)?;
+        let push = push_u32(&[n as u32, k as u32, nrows as u32]);
+        self.dispatch(
+            kernel,
+            &[wbank.buffer, x.buffer, ids.buffer, out.buffer],
+            &push,
+            ((total as u32).div_ceil(WG1D), 1, 1),
+        )?;
         Ok(out)
     }
 
-    /// Q4_K matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
-    /// (verbatim GGUF Q4_K super-blocks, same decode as [`matvec_q4k_gpu`]). Decodes each weight value
-    /// once and reuses it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so weight memory traffic
-    /// matches a single matvec per output column instead of dequantizing the whole weight to f32 every
-    /// forward. `x` must be a contiguous `[m, k]` device buffer; returns `[m, nout]` row-major.
-    pub fn matmul_q4k_gpu(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-    ) -> Result<VulkanStorage> {
-        self.matmul_q4k_gpu_off(wq, x, m, nout, k, 0)
-    }
-
-    /// Q4_K prefill matmul into a slice of `wq` starting at `woff` u32 words. `woff == 0` is
-    /// bit-identical to [`matmul_q4k_gpu`]; a non-zero offset selects one expert's weight block of a
-    /// resident MoE bank (`woff = e * nout * (k/256) * 36`) so a prefill expert with M>1 routed rows
-    /// runs one banked matmul without re-uploading the weight.
-    pub fn matmul_q4k_gpu_off(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-        woff: usize,
-    ) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(256) {
-            crate::bail!("matmul_q4k_gpu: k must be a multiple of 256, got {k}");
-        }
-        if x.count < m * k {
-            crate::bail!("matmul_q4k_gpu: x count {} < m*k {}", x.count, m * k);
-        }
-        let out = self.alloc_f32(m * nout)?;
-        let cols = (nout as u32).div_ceil(WG1D);
-        let mut m0 = 0usize;
-        while m0 < m {
-            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
-            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
-            self.dispatch(
-                "mul_mat_q4k",
-                &[wq.buffer, x.buffer, out.buffer],
-                &push,
-                (cols, 1, 1),
-            )?;
-            m0 += mcount;
-        }
-        Ok(out)
-    }
-
-    /// Gated delta-rule recurrence on the GPU (hybrid GDN / Qwen3.6 mixer), mirroring the CUDA
-    /// `gated_delta_rule_recurrence` math. All operands are f32 device buffers laid out exactly as
-    /// the CUDA kernel expects: `q,k` `[BH,S,K]`, `v` `[BH,S,V]`, `g,beta` `[BH,S]`, `state` `[BH,K,V]`
-    /// (updated in place). Returns the output `[BH,S,V]`. `seq_len==1` is the decode path (sequential
-    /// `gdn_recurrence`); a longer prefill uses the chunked kernel when `k_dim<=128`, else the
-    /// sequential one (its private state array bounds `k_dim<=256`, covering shipping GDN configs).
-    /// One workgroup per (V-tile, batch*head); V-tile width is 64 (matches the kernels' BV).
+    /// Fused scaled-dot-product (flash) attention on the GPU, online-softmax: streams over keys so
+    /// the `[Lq, Lk]` score matrix is never materialized, replacing eager bmm + softmax + bmm. Q is
+    /// `[BH, Lq, D]`, K/V are `[BH, Lk, D]` (contiguous f32 device buffers, head_dim D ≤ 256); output
+    /// is `[BH, Lq, D]`. `scale` multiplies the QK^T scores; `causal` applies aligned causal masking
+    /// (query qi attends to keys ≤ qi + (Lk - Lq)). One invocation per (bh, query) output row.
     #[allow(clippy::too_many_arguments)]
-    pub fn gdn_recurrence_gpu(
+    pub fn flash_attn_gpu(
         &self,
         q: &VulkanStorage,
         k: &VulkanStorage,
         v: &VulkanStorage,
-        g: &VulkanStorage,
-        beta: &VulkanStorage,
-        state: &VulkanStorage,
         bh: usize,
-        seq_len: usize,
-        k_dim: usize,
-        v_dim: usize,
+        lq: usize,
+        lk: usize,
+        d: usize,
+        scale: f32,
+        causal: bool,
     ) -> Result<VulkanStorage> {
-        if k_dim > 256 {
-            crate::bail!("gdn_recurrence_gpu: k_dim {k_dim} exceeds the kernel bound of 256");
+        if d > 256 {
+            crate::bail!("flash_attn_gpu: head_dim {d} > 256 (kernel limit)");
         }
-        let out = self.alloc_f32(bh * seq_len * v_dim)?;
-        let push = push_u32(&[seq_len as u32, k_dim as u32, v_dim as u32]);
-        let bufs = [
-            q.buffer, k.buffer, v.buffer, g.buffer, beta.buffer, state.buffer, out.buffer,
-        ];
-        let v_tiles = (v_dim as u32).div_ceil(WG1D);
-        // Chunked prefill kernel bounds its shared key array at K<=128; fall back to the sequential
-        // kernel (private array bound K<=256) for the rare wider config. Decode (seq_len==1) always
-        // uses the sequential kernel -- there are no chunks to amortize over a single token.
-        let kernel = if seq_len > 1 && k_dim <= 128 {
-            "gdn_chunked"
-        } else {
-            "gdn_recurrence"
-        };
-        // The kernel writes BOTH `state` (binding 5, in place) and `out` (binding 6). Mark both
-        // live so a later dispatch in this batch that reads either inserts the RAW barrier.
-        self.dispatch_multi_out(kernel, &bufs, &[5, 6], &push, (v_tiles, bh as u32, 1))?;
-        Ok(out)
-    }
-
-    /// Causal conv1d single-step update (GDN decode path), mirroring CUDA `causal_conv1d_update`.
-    /// `x` `[B,conv_dim,1]`, `weight` `[conv_dim,kernel_size]`, `conv_state` `[B,conv_dim,kernel_size]`
-    /// (shifted+updated in place). Returns the SiLU-activated output `[B,conv_dim,1]`. f32 on this
-    /// backend (f16/bf16 GDN tensors are stored as f32). `kernel_size<=8` (the kernel's window bound).
-    pub fn gdn_conv_update_gpu(
-        &self,
-        x: &VulkanStorage,
-        weight: &VulkanStorage,
-        conv_state: &VulkanStorage,
-        batch_size: usize,
-        conv_dim: usize,
-        kernel_size: usize,
-    ) -> Result<VulkanStorage> {
-        if !(1..=8).contains(&kernel_size) {
-            crate::bail!("gdn_conv_update_gpu: kernel_size {kernel_size} out of range 1..=8");
+        if q.count < bh * lq * d {
+            crate::bail!("flash_attn_gpu: q count {} < bh*lq*d {}", q.count, bh * lq * d);
         }
-        let out = self.alloc_f32(batch_size * conv_dim)?;
-        let push = push_u32(&[batch_size as u32, conv_dim as u32, kernel_size as u32]);
-        let bufs = [x.buffer, weight.buffer, conv_state.buffer, out.buffer];
-        // Writes conv_state (binding 2, in place) and out (binding 3); track both for hazards.
-        self.dispatch_multi_out(
-            "gdn_conv_update",
-            &bufs,
-            &[2, 3],
-            &push,
-            ((conv_dim as u32).div_ceil(WG1D), batch_size as u32, 1),
-        )?;
-        Ok(out)
-    }
-
-    /// Causal conv1d over a full sequence (GDN prefill path), mirroring CUDA `causal_conv1d_full`
-    /// plus `save_conv_state`. `x` `[B,conv_dim,S]`, `weight` `[conv_dim,kernel_size]`. Returns the
-    /// SiLU output `[B,conv_dim,S]` and the trailing window saved into a fresh conv_state
-    /// `[B,conv_dim,kernel_size]` (left zero-padded when `S<kernel_size`). f32 throughout.
-    pub fn gdn_conv_full_gpu(
-        &self,
-        x: &VulkanStorage,
-        weight: &VulkanStorage,
-        batch_size: usize,
-        conv_dim: usize,
-        seq_len: usize,
-        kernel_size: usize,
-    ) -> Result<(VulkanStorage, VulkanStorage)> {
-        let out = self.alloc_f32(batch_size * conv_dim * seq_len)?;
-        let cs = self.alloc_f32(batch_size * conv_dim * kernel_size)?;
-        let push_full = push_u32(&[
-            batch_size as u32,
-            conv_dim as u32,
-            seq_len as u32,
-            kernel_size as u32,
-        ]);
-        let total = (batch_size * conv_dim * seq_len) as u32;
+        if k.count < bh * lk * d || v.count < bh * lk * d {
+            crate::bail!("flash_attn_gpu: k/v count too small for bh*lk*d {}", bh * lk * d);
+        }
+        let out = self.alloc_f32(bh * lq * d)?;
+        // Push block matches flash_attn.comp: {u32 bh, lq, lk, d; f32 scale; u32 causal}.
+        let mut push = push_u32(&[bh as u32, lq as u32, lk as u32, d as u32]);
+        push.extend_from_slice(&scale.to_ne_bytes());
+        push.extend_from_slice(&(causal as u32).to_ne_bytes());
+        let total = bh * lq;
         self.dispatch(
-            "gdn_conv_full",
-            &[x.buffer, weight.buffer, out.buffer],
-            &push_full,
-            (total.div_ceil(WG1D), 1, 1),
-        )?;
-        // Independent of the conv output (reads x, writes a disjoint buffer), so no barrier needed.
-        self.dispatch(
-            "gdn_conv_state_save",
-            &[x.buffer, cs.buffer],
-            &push_full,
-            ((conv_dim as u32).div_ceil(WG1D), batch_size as u32, 1),
-        )?;
-        Ok((out, cs))
-    }
-
-    /// Fused GDN gating, mirroring CUDA `fused_gdn_gating`: `beta=sigmoid(b)`,
-    /// `g=-exp(a_log)*softplus(a+dt_bias)`. `b,a` are `[total]`; `a_log,dt_bias` are per-head
-    /// `[num_heads]` (indexed by `idx % num_heads`). Returns `(beta, g)`, each `[total]`. f32.
-    pub fn gdn_gating_gpu(
-        &self,
-        b: &VulkanStorage,
-        a: &VulkanStorage,
-        a_log: &VulkanStorage,
-        dt_bias: &VulkanStorage,
-        total: usize,
-        num_heads: usize,
-    ) -> Result<(VulkanStorage, VulkanStorage)> {
-        let beta = self.alloc_f32(total)?;
-        let g = self.alloc_f32(total)?;
-        let push = push_u32(&[total as u32, num_heads as u32]);
-        let bufs = [
-            b.buffer,
-            a.buffer,
-            a_log.buffer,
-            dt_bias.buffer,
-            beta.buffer,
-            g.buffer,
-        ];
-        // Writes beta (binding 4) and g (binding 5); both are consumed downstream, track both.
-        self.dispatch_multi_out(
-            "gdn_gating",
-            &bufs,
-            &[4, 5],
+            "flash_attn",
+            &[q.buffer, k.buffer, v.buffer, out.buffer],
             &push,
             ((total as u32).div_ceil(WG1D), 1, 1),
         )?;
-        Ok((beta, g))
-    }
-
-    /// Like [`Self::dispatch_out`] but the kernel writes several output bindings (named by
-    /// `out_idxs`); each is marked live in the in-batch hazard set so a later dispatch reading any of
-    /// them gets the RAW barrier. Used by the GDN kernels (recurrence updates state AND writes output;
-    /// gating writes beta AND g; conv-update updates state AND writes output). Shares `dispatch_out`'s
-    /// recording path by issuing the dispatch with the first output index, then registering the rest.
-    fn dispatch_multi_out(
-        &self,
-        name: &'static str,
-        bufs: &[vk::Buffer],
-        out_idxs: &[usize],
-        push: &[u8],
-        groups: (u32, u32, u32),
-    ) -> Result<()> {
-        let first = out_idxs
-            .first()
-            .copied()
-            .unwrap_or(bufs.len().saturating_sub(1));
-        self.dispatch_out(name, bufs, first, push, groups)?;
-        if out_idxs.len() > 1 {
-            let mut s = self.inner.submitter.lock().unwrap();
-            for &i in &out_idxs[1..] {
-                if let Some(&buf) = bufs.get(i) {
-                    s.written_since_barrier.insert(buf);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Upload Q5_K weights to the GPU once, verbatim in the GGUF super-block layout (176 B = 44 u32
-    /// per 256-weight block, `nout * k/256` blocks total). No requantize: the bytes are the same
-    /// blocks the CPU `k_quants::BlockQ5K` holds (d, dmin, 12 scale bytes, 32 qh bytes, 128 qs
-    /// bytes), so the in-shader decode matches the CPU dequant exactly. `data` must be exactly the
-    /// `nout * (k/256) * 176` packed block bytes; `k` must be a multiple of 256.
-    pub fn quantize_q5k(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(256) {
-            crate::bail!("quantize_q5k: k must be a multiple of 256, got {k}");
-        }
-        let nblocks = k / 256;
-        let want = nout * nblocks * 176;
-        if data.len() != want {
-            crate::bail!(
-                "quantize_q5k: data len {} != {nout}*{nblocks}*176 = {want}",
-                data.len()
-            );
-        }
-        // Q5_K blocks are 176 bytes (a multiple of 4), so the buffer is u32-aligned by construction
-        // and can be reinterpreted verbatim for the kernel's `uint w[]` binding.
-        let words: &[u32] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
-        self.upload_u32(words)
-    }
-
-    /// Q5_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q5k`]. Reads weights
-    /// at ~5.5 bits/elem instead of 32 -- the bandwidth lever for memory-bound decode on this APU.
-    /// Decode matches the CPU `BlockQ5K::to_float`.
-    pub fn matvec_q5k(
-        &self,
-        wq: &VulkanStorage,
-        x: &[f32],
-        nout: usize,
-        k: usize,
-    ) -> Result<Vec<f32>> {
-        if x.len() != k {
-            crate::bail!("matvec_q5k: x len {} != k {k}", x.len());
-        }
-        let xs = self.upload_f32(x)?;
-        self.matvec_q5k_gpu(wq, &xs, nout, k)?.to_vec_f32()
-    }
-
-    /// Q5_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, no host round-trip.
-    /// Weights stay quantized in VRAM (~5.5 bits/elem) instead of dequantizing to f32, so decode
-    /// reads ~6x less weight memory. One invocation per output row (scalar kernel).
-    pub fn matvec_q5k_gpu(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        nout: usize,
-        k: usize,
-    ) -> Result<VulkanStorage> {
-        self.matvec_q5k_gpu_off(wq, x, nout, k, 0)
-    }
-
-    /// Q5_K matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
-    /// `woff == 0` is bit-identical to [`matvec_q5k_gpu`]; a non-zero offset selects one expert's row
-    /// block of a resident MoE bank (`woff = e * nout * (k/256) * 44`).
-    pub fn matvec_q5k_gpu_off(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        nout: usize,
-        k: usize,
-        woff: usize,
-    ) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(256) {
-            crate::bail!("matvec_q5k_gpu: k must be a multiple of 256, got {k}");
-        }
-        if x.count < k {
-            crate::bail!("matvec_q5k_gpu: x count {} < k {k}", x.count);
-        }
-        let out = self.alloc_f32(nout)?;
-        let push = push_u32(&[nout as u32, k as u32, woff as u32]);
-        self.dispatch(
-            "mul_mat_vec_q5k",
-            &[wq.buffer, x.buffer, out.buffer],
-            &push,
-            ((nout as u32).div_ceil(WG1D), 1, 1),
-        )?;
         Ok(out)
     }
 
-    /// Upload Q6_K weights to the GPU once. The CPU `k_quants::BlockQ6K` block is 210 bytes
-    /// (ql[128], qh[64], scales[16] i8, d f16) which is NOT u32-aligned, so each block is repacked
-    /// into a PADDED 212-byte (53 u32) stride here (trailing 2 bytes unused); the shader uses the
-    /// same 53 u32 stride and byte-addressed reads, so the in-shader decode matches the CPU dequant
-    /// exactly. `data` must be exactly the `nout * (k/256) * 210` packed block bytes; `k` must be a
-    /// multiple of 256.
-    pub fn quantize_q6k(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(256) {
-            crate::bail!("quantize_q6k: k must be a multiple of 256, got {k}");
-        }
-        let nblocks = k / 256;
-        let total = nout * nblocks;
-        let want = total * 210;
-        if data.len() != want {
-            crate::bail!(
-                "quantize_q6k: data len {} != {nout}*{nblocks}*210 = {want}",
-                data.len()
-            );
-        }
-        // Repack 210-byte source blocks into 53-u32 (212-byte) padded blocks so the device buffer is
-        // u32-aligned and every block starts on a u32 boundary. Trailing 2 bytes of each block are
-        // zero pad and never read by the shader.
-        let mut words = vec![0u32; total * 53];
-        for blk in 0..total {
-            let src = &data[blk * 210..blk * 210 + 210];
-            let dst = &mut words[blk * 53..blk * 53 + 53];
-            // Copy the 210 bytes into the low 210 bytes of the 212-byte (53 u32) padded block.
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, 53 * 4)
-            };
-            dst_bytes[..210].copy_from_slice(src);
-        }
-        self.upload_u32(&words)
-    }
-
-    /// Q6_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q6k`]. Reads weights
-    /// at ~6.5 bits/elem (incl. pad) instead of 32 -- the bandwidth lever for memory-bound decode on
-    /// this APU. Decode matches the CPU `BlockQ6K::to_float`.
-    pub fn matvec_q6k(
+    /// Host-input convenience for [`flash_attn_gpu`]: uploads Q/K/V and returns the `[BH*Lq*D]`
+    /// output as an f32 vector. For tests/standalone use.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn(
         &self,
-        wq: &VulkanStorage,
-        x: &[f32],
-        nout: usize,
-        k: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        bh: usize,
+        lq: usize,
+        lk: usize,
+        d: usize,
+        scale: f32,
+        causal: bool,
     ) -> Result<Vec<f32>> {
-        if x.len() != k {
-            crate::bail!("matvec_q6k: x len {} != k {k}", x.len());
-        }
-        let xs = self.upload_f32(x)?;
-        self.matvec_q6k_gpu(wq, &xs, nout, k)?.to_vec_f32()
-    }
-
-    /// Q6_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, no host round-trip.
-    /// Weights stay quantized in VRAM (~6.5 bits/elem incl. pad) instead of dequantizing to f32, so
-    /// decode reads ~5x less weight memory. One invocation per output row (scalar kernel).
-    pub fn matvec_q6k_gpu(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        nout: usize,
-        k: usize,
-    ) -> Result<VulkanStorage> {
-        self.matvec_q6k_gpu_off(wq, x, nout, k, 0)
-    }
-
-    /// Q6_K matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
-    /// `woff == 0` is bit-identical to [`matvec_q6k_gpu`]; a non-zero offset selects one expert's row
-    /// block of a resident MoE bank (`woff = e * nout * (k/256) * 53`, 53 u32 = padded Q6_K block).
-    pub fn matvec_q6k_gpu_off(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        nout: usize,
-        k: usize,
-        woff: usize,
-    ) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(256) {
-            crate::bail!("matvec_q6k_gpu: k must be a multiple of 256, got {k}");
-        }
-        if x.count < k {
-            crate::bail!("matvec_q6k_gpu: x count {} < k {k}", x.count);
-        }
-        let out = self.alloc_f32(nout)?;
-        let push = push_u32(&[nout as u32, k as u32, woff as u32]);
-        self.dispatch(
-            "mul_mat_vec_q6k",
-            &[wq.buffer, x.buffer, out.buffer],
-            &push,
-            ((nout as u32).div_ceil(WG1D), 1, 1),
-        )?;
-        Ok(out)
+        let qs = self.upload_f32(q)?;
+        let ks = self.upload_f32(k)?;
+        let vs = self.upload_f32(v)?;
+        self.flash_attn_gpu(&qs, &ks, &vs, bh, lq, lk, d, scale, causal)?
+            .to_vec_f32()
     }
 
     // Allocate a storage buffer of `bytes` bytes, returning it plus whether its memory is
@@ -1100,6 +711,125 @@ impl VulkanDevice {
         Ok((buf, mem, host_visible))
     }
 
+    // Upload `bytes` of raw data into device-local (non-host-visible) `dst` via a transient
+    // host-visible staging buffer and a GPU buffer copy. `dst` carries TRANSFER_DST usage (set in
+    // raw_buffer). The copy is submitted on its own one-shot command buffer and awaited before the
+    // staging buffer is freed, so it's correct regardless of the deferred-dispatch batch state (we
+    // flush that batch first). Used only for big DEVICE_LOCAL weight buffers; activations stay
+    // host-visible and take the direct-map fast path.
+    unsafe fn staged_upload(&self, dst: vk::Buffer, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        // Any recorded work that might read `dst` must be retired first (the copy mutates it).
+        self.flush()?;
+        let dev = self.dev();
+        let bytes = data.len() as u64;
+        let (staging, staging_mem, _hv) = self.raw_buffer_host_visible(bytes)?;
+        // staging is guaranteed host-visible by raw_buffer_host_visible; map + memcpy.
+        let ptr = dev
+            .map_memory(staging_mem, 0, bytes, vk::MemoryMapFlags::empty())
+            .map_err(vkerr)? as *mut u8;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        dev.unmap_memory(staging_mem);
+        self.copy_buffer_blocking(staging, dst, bytes)?;
+        // staging is dead now (copy completed); destroy it directly — it never entered the pool.
+        dev.destroy_buffer(staging, None);
+        dev.free_memory(staging_mem, None);
+        Ok(())
+    }
+
+    // Read `bytes` of raw data out of device-local (non-host-visible) `src` via a transient
+    // host-visible staging buffer and a GPU buffer copy. Mirror of staged_upload.
+    unsafe fn staged_readback(&self, src: vk::Buffer, bytes: u64) -> Result<Vec<u8>> {
+        if bytes == 0 {
+            return Ok(Vec::new());
+        }
+        self.flush()?;
+        let dev = self.dev();
+        let (staging, staging_mem, _hv) = self.raw_buffer_host_visible(bytes)?;
+        self.copy_buffer_blocking(src, staging, bytes)?;
+        let ptr = dev
+            .map_memory(staging_mem, 0, bytes, vk::MemoryMapFlags::empty())
+            .map_err(vkerr)? as *const u8;
+        let v = std::slice::from_raw_parts(ptr, bytes as usize).to_vec();
+        dev.unmap_memory(staging_mem);
+        dev.destroy_buffer(staging, None);
+        dev.free_memory(staging_mem, None);
+        Ok(v)
+    }
+
+    // Allocate a buffer that is guaranteed HOST_VISIBLE (for staging). Forces the host-visible
+    // policy regardless of the device strategy; staging buffers are transient and always small
+    // relative to the host-visible heap (one tensor's worth at a time).
+    unsafe fn raw_buffer_host_visible(
+        &self,
+        bytes: u64,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory, bool)> {
+        let bytes = bytes.max(4);
+        let dev = self.dev();
+        let info = vk::BufferCreateInfo::default()
+            .size(bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buf = dev.create_buffer(&info, None).map_err(vkerr)?;
+        let req = dev.get_buffer_memory_requirements(buf);
+        let mp = &self.inner.mem_props;
+        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let idx = (0..mp.memory_type_count)
+            .find(|&i| {
+                (req.memory_type_bits & (1 << i)) != 0
+                    && mp.memory_types[i as usize].property_flags.contains(host)
+            })
+            .ok_or_else(|| {
+                dev.destroy_buffer(buf, None);
+                Error::Msg("vulkan: no host-visible memory type for staging buffer".into())
+            })?;
+        let mem = dev
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(idx),
+                None,
+            )
+            .map_err(|e| {
+                dev.destroy_buffer(buf, None);
+                vkerr(e)
+            })?;
+        dev.bind_buffer_memory(buf, mem, 0).map_err(vkerr)?;
+        Ok((buf, mem, true))
+    }
+
+    // Copy `bytes` from `src` to `dst` on a one-shot command buffer and block until done. Uses the
+    // submitter's command pool + a fresh transient fence. The submitter lock is held for the whole
+    // copy so it can't interleave with a concurrent batch on the same `cmd`.
+    unsafe fn copy_buffer_blocking(&self, src: vk::Buffer, dst: vk::Buffer, bytes: u64) -> Result<()> {
+        let dev = self.dev();
+        let mut s = self.inner.submitter.lock().unwrap();
+        // `cmd` is idle here: flush() in the staged_* callers retired any batch and a flush leaves
+        // recording=false. Re-record a single copy into it.
+        dev.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty())
+            .map_err(vkerr)?;
+        dev.begin_command_buffer(
+            s.cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .map_err(vkerr)?;
+        let region = [vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes)];
+        dev.cmd_copy_buffer(s.cmd, src, dst, &region);
+        dev.end_command_buffer(s.cmd).map_err(vkerr)?;
+        dev.reset_fences(&[s.fence]).map_err(vkerr)?;
+        let cmds = [s.cmd];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        dev.queue_submit(self.inner.queue, &submit, s.fence).map_err(vkerr)?;
+        dev.wait_for_fences(&[s.fence], true, u64::MAX).map_err(vkerr)?;
+        s.recording = false;
+        s.n = 0;
+        s.written_since_barrier.clear();
+        Ok(())
+    }
+
     // Free bytes available in heap `h`. Uses VK_EXT_memory_budget (heapBudget = driver's estimate of
     // what this process may still allocate from the heap) when advertised; otherwise falls back to
     // the heap's total `size` as a conservative upper bound. Budget is re-queried each call because
@@ -1112,15 +842,10 @@ impl VulkanDevice {
         }
         unsafe {
             let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-            {
-                // props2 mutably borrows budget via push_next; scope it so the borrow ends before
-                // we read budget back.
-                let mut props2 =
-                    vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-                self.inner
-                    .instance
-                    .get_physical_device_memory_properties2(self.inner.pdev, &mut props2);
-            }
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            self.inner
+                .instance
+                .get_physical_device_memory_properties2(self.inner.pdev, &mut props2);
             // heap_budget is 0 for heaps the driver doesn't report; treat that as "unknown" and use
             // the static size so we never under-report and wrongly refuse a valid allocation.
             let b = budget.heap_budget[h as usize];
@@ -1152,8 +877,9 @@ impl VulkanDevice {
 
     // Will a transient scratch buffer of `bytes` total bytes fit in the largest usable heap's free
     // space, keeping a margin so we don't allocate the very last byte (which the driver may need for
-    // command-buffer / descriptor backing)? Used to decide between the fp16 coopmat path (extra
-    // scratch) and the fp32 path (none) without risking an OOM abort.
+    // command-buffer / descriptor backing)? `type_bits = !0` because scratch is a plain
+    // STORAGE_BUFFER with no special memory-type constraint. Used to decide between the fp16 coopmat
+    // path (extra scratch) and the fp32 path (none) without risking an OOM abort.
     fn scratch_fits(&self, bytes: u64) -> bool {
         // 64 MiB margin or 1/16 of the request, whichever is larger.
         let margin = (bytes / 16).max(64 * 1024 * 1024);
@@ -1172,16 +898,16 @@ impl VulkanDevice {
     // The shapes we must handle on the AMD 8060S UMA part:
     //  - a small HOST_VISIBLE|DEVICE_LOCAL "carveout" heap (hundreds of MB), and
     //  - a large DEVICE_LOCAL-only heap (the GTT pool, tens of GB).
-    // Placing an 18.6GB weight buffer demands the large heap, which may not be host-visible; the
-    // upload/readback path stages through a host-visible buffer for those (see write_/read_).
+    // Placing an 18.6GB weight buffer demands the large heap, which is NOT host-visible. Buffers are
+    // never CPU-mapped for the matvec weight path (they're uploaded via this allocation then read
+    // only by shaders), so DEVICE_LOCAL placement is correct; the host-visible types stay reserved
+    // for buffers we actually map (activations, readback) which are always small.
     fn pick_memory_type(&self, type_bits: u32, bytes: u64) -> Option<u32> {
         let mp = &self.inner.mem_props;
         // host-visible candidates whose heap fits, cached-coherent preferred then plain coherent.
-        let host_cached = vk::MemoryPropertyFlags::HOST_VISIBLE
-            | vk::MemoryPropertyFlags::HOST_COHERENT
-            | vk::MemoryPropertyFlags::HOST_CACHED;
-        let host_base =
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let host_cached =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED;
+        let host_base = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let fits = |i: u32| -> bool {
             let h = mp.memory_types[i as usize].heap_index;
             self.free_heap_bytes(h) >= bytes
@@ -1203,16 +929,10 @@ impl VulkanDevice {
                         .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
                 })
         };
-        let any_largest = || {
-            self.usable_types_by_heap_desc(type_bits, bytes)
-                .into_iter()
-                .next()
-        };
+        let any_largest = || self.usable_types_by_heap_desc(type_bits, bytes).into_iter().next();
 
         match self.inner.mem_strategy {
-            MemStrategy::HostOnly => {
-                host_visible_pick(host_cached).or_else(|| host_visible_pick(host_base))
-            }
+            MemStrategy::HostOnly => host_visible_pick(host_cached).or_else(|| host_visible_pick(host_base)),
             MemStrategy::DeviceFirst => device_local_pick()
                 .or_else(|| host_visible_pick(host_cached))
                 .or_else(|| host_visible_pick(host_base))
@@ -1226,178 +946,9 @@ impl VulkanDevice {
         }
     }
 
-    // Allocate a buffer that is guaranteed HOST_VISIBLE (for staging). Forces the host-visible
-    // policy regardless of the device strategy; staging buffers are transient and always small
-    // relative to the host-visible heap (one tensor's worth at a time). Not pooled.
-    unsafe fn raw_buffer_host_visible(
-        &self,
-        bytes: u64,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-        let bytes = bytes.max(4);
-        let dev = self.dev();
-        let info = vk::BufferCreateInfo::default()
-            .size(bytes)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buf = dev.create_buffer(&info, None).map_err(vkerr)?;
-        let req = dev.get_buffer_memory_requirements(buf);
-        let mp = &self.inner.mem_props;
-        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let idx = match (0..mp.memory_type_count).find(|&i| {
-            (req.memory_type_bits & (1 << i)) != 0
-                && mp.memory_types[i as usize].property_flags.contains(host)
-        }) {
-            Some(i) => i,
-            None => {
-                dev.destroy_buffer(buf, None);
-                return Err(Error::Msg(
-                    "vulkan: no host-visible memory type for staging buffer".into(),
-                ));
-            }
-        };
-        let mem = match dev.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(idx),
-            None,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                dev.destroy_buffer(buf, None);
-                return Err(vkerr(e));
-            }
-        };
-        dev.bind_buffer_memory(buf, mem, 0).map_err(vkerr)?;
-        Ok((buf, mem))
-    }
-
-    // Copy `bytes` from `src[src_off..]` to `dst[dst_off..]` on a one-shot command buffer and block
-    // until done. Uses the submitter's command pool + its fence. The submitter lock is held for the
-    // whole copy so it can't interleave with a concurrent batch on the same `cmd`; callers flush
-    // first so `cmd` is idle on entry.
-    unsafe fn copy_buffer_blocking(
-        &self,
-        src: vk::Buffer,
-        src_off: u64,
-        dst: vk::Buffer,
-        dst_off: u64,
-        bytes: u64,
-    ) -> Result<()> {
-        let dev = self.dev();
-        let mut s = self.inner.submitter.lock().unwrap();
-        dev.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty())
-            .map_err(vkerr)?;
-        dev.begin_command_buffer(
-            s.cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .map_err(vkerr)?;
-        let region = [vk::BufferCopy::default()
-            .src_offset(src_off)
-            .dst_offset(dst_off)
-            .size(bytes)];
-        dev.cmd_copy_buffer(s.cmd, src, dst, &region);
-        dev.end_command_buffer(s.cmd).map_err(vkerr)?;
-        dev.reset_fences(&[s.fence]).map_err(vkerr)?;
-        let cmds = [s.cmd];
-        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
-        dev.queue_submit(self.inner.queue, &submit, s.fence)
-            .map_err(vkerr)?;
-        dev.wait_for_fences(&[s.fence], true, u64::MAX)
-            .map_err(vkerr)?;
-        s.recording = false;
-        s.n = 0;
-        s.written_since_barrier.clear();
-        Ok(())
-    }
-
-    // Bound on a single staging chunk. A non-host-visible buffer can be many GB (the 18.6GB model),
-    // but the host-visible heap on this UMA part is a small carveout — so we stage in chunks of at
-    // most this size, reusing one small staging buffer, instead of needing a full-size host-visible
-    // mirror. 256 MiB is a good balance of per-copy submit overhead vs staging footprint.
-    const STAGE_CHUNK: u64 = 256 * 1024 * 1024;
-
-    // Upload raw `data` into device-local (non-host-visible) `dst` via a transient host-visible
-    // staging buffer + GPU copy. `dst` carries TRANSFER_DST usage (set in raw_buffer). Any recorded
-    // batch is flushed first (the copy mutates `dst`), then the copy runs on its own one-shot submit.
-    unsafe fn staged_upload(&self, dst: vk::Buffer, data: &[u8]) -> Result<()> {
+    unsafe fn write_f32(&self, mem: vk::DeviceMemory, data: &[f32]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
-        }
-        self.flush()?;
-        let dev = self.dev();
-        let total = data.len() as u64;
-        // One small staging buffer (<= STAGE_CHUNK), reused across chunks, so the host-visible heap
-        // never needs the full buffer's worth — the lever that lets an 18.6GB DEVICE_LOCAL buffer
-        // load through a few-hundred-MB host-visible carveout.
-        let chunk = total.min(Self::STAGE_CHUNK);
-        let (staging, staging_mem) = self.raw_buffer_host_visible(chunk)?;
-        let mut off = 0u64;
-        let result = (|| -> Result<()> {
-            while off < total {
-                let n = (total - off).min(chunk);
-                let ptr = dev
-                    .map_memory(staging_mem, 0, n, vk::MemoryMapFlags::empty())
-                    .map_err(vkerr)? as *mut u8;
-                std::ptr::copy_nonoverlapping(data.as_ptr().add(off as usize), ptr, n as usize);
-                dev.unmap_memory(staging_mem);
-                self.copy_buffer_blocking(staging, 0, dst, off, n)?;
-                off += n;
-            }
-            Ok(())
-        })();
-        dev.destroy_buffer(staging, None);
-        dev.free_memory(staging_mem, None);
-        result
-    }
-
-    // Read `bytes` out of device-local (non-host-visible) `src` via a transient host-visible staging
-    // buffer + GPU copy, chunked like staged_upload. Mirror of staged_upload.
-    unsafe fn staged_readback(&self, src: vk::Buffer, bytes: u64) -> Result<Vec<u8>> {
-        if bytes == 0 {
-            return Ok(Vec::new());
-        }
-        self.flush()?;
-        let dev = self.dev();
-        let chunk = bytes.min(Self::STAGE_CHUNK);
-        let (staging, staging_mem) = self.raw_buffer_host_visible(chunk)?;
-        let mut out = vec![0u8; bytes as usize];
-        let mut off = 0u64;
-        let result = (|| -> Result<()> {
-            while off < bytes {
-                let n = (bytes - off).min(chunk);
-                self.copy_buffer_blocking(src, off, staging, 0, n)?;
-                let ptr = dev
-                    .map_memory(staging_mem, 0, n, vk::MemoryMapFlags::empty())
-                    .map_err(vkerr)? as *const u8;
-                std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr().add(off as usize), n as usize);
-                dev.unmap_memory(staging_mem);
-                off += n;
-            }
-            Ok(())
-        })();
-        dev.destroy_buffer(staging, None);
-        dev.free_memory(staging_mem, None);
-        result.map(|()| out)
-    }
-
-    // Upload f32 `data` into a storage buffer. Host-visible memory takes the direct-map fast path;
-    // DEVICE_LOCAL-only memory (big weight buffers on UMA) goes through a staging copy. `buffer` is
-    // unused on the host-visible path but required to issue the staging GPU copy on the other.
-    unsafe fn write_f32(
-        &self,
-        buffer: vk::Buffer,
-        mem: vk::DeviceMemory,
-        host_visible: bool,
-        data: &[f32],
-    ) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        if !host_visible {
-            let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4);
-            return self.staged_upload(buffer, bytes);
         }
         let dev = self.dev();
         let ptr = dev
@@ -1408,21 +959,9 @@ impl VulkanDevice {
         Ok(())
     }
 
-    unsafe fn read_f32(
-        &self,
-        buffer: vk::Buffer,
-        mem: vk::DeviceMemory,
-        host_visible: bool,
-        n: usize,
-    ) -> Result<Vec<f32>> {
+    unsafe fn read_f32(&self, mem: vk::DeviceMemory, n: usize) -> Result<Vec<f32>> {
         if n == 0 {
             return Ok(Vec::new());
-        }
-        if !host_visible {
-            let raw = self.staged_readback(buffer, (n * 4) as u64)?;
-            let mut v = vec![0f32; n];
-            std::ptr::copy_nonoverlapping(raw.as_ptr(), v.as_mut_ptr() as *mut u8, n * 4);
-            return Ok(v);
         }
         // Ensure all recorded GPU work that may write this buffer has completed.
         self.flush()?;
@@ -1445,19 +984,9 @@ impl VulkanDevice {
     }
 
     // u32 mirrors of write_f32/read_f32 (buffers are just bytes; 4 bytes/elem).
-    unsafe fn write_u32(
-        &self,
-        buffer: vk::Buffer,
-        mem: vk::DeviceMemory,
-        host_visible: bool,
-        data: &[u32],
-    ) -> Result<()> {
+    unsafe fn write_u32(&self, mem: vk::DeviceMemory, data: &[u32]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
-        }
-        if !host_visible {
-            let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4);
-            return self.staged_upload(buffer, bytes);
         }
         let dev = self.dev();
         let ptr = dev
@@ -1468,21 +997,9 @@ impl VulkanDevice {
         Ok(())
     }
 
-    unsafe fn read_u32(
-        &self,
-        buffer: vk::Buffer,
-        mem: vk::DeviceMemory,
-        host_visible: bool,
-        n: usize,
-    ) -> Result<Vec<u32>> {
+    unsafe fn read_u32(&self, mem: vk::DeviceMemory, n: usize) -> Result<Vec<u32>> {
         if n == 0 {
             return Ok(Vec::new());
-        }
-        if !host_visible {
-            let raw = self.staged_readback(buffer, (n * 4) as u64)?;
-            let mut v = vec![0u32; n];
-            std::ptr::copy_nonoverlapping(raw.as_ptr(), v.as_mut_ptr() as *mut u8, n * 4);
-            return Ok(v);
         }
         // Ensure all recorded GPU work that may write this buffer has completed.
         self.flush()?;
@@ -1601,7 +1118,7 @@ impl VulkanDevice {
         groups: (u32, u32, u32),
     ) -> Result<()> {
         let out_idx = bufs.len().saturating_sub(1);
-        self.dispatch_outs(name, bufs, &[out_idx], push, groups)
+        self.dispatch_out(name, bufs, out_idx, push, groups)
     }
 
     // Like `dispatch`, but `out_idx` names which binding the kernel writes (its output). Used for
@@ -1612,21 +1129,6 @@ impl VulkanDevice {
         name: &'static str,
         bufs: &[vk::Buffer],
         out_idx: usize,
-        push: &[u8],
-        groups: (u32, u32, u32),
-    ) -> Result<()> {
-        self.dispatch_outs(name, bufs, &[out_idx], push, groups)
-    }
-
-    // Like `dispatch_out`, but names ALL bindings the kernel writes. A fused kernel can both update a
-    // state buffer in place and write a fresh output (gdn_step); every such write must be tracked so a
-    // later in-batch reader of either gets the RAW barrier. The read-side check already tests all
-    // bindings, so the only generalization needed is marking each output below.
-    fn dispatch_outs(
-        &self,
-        name: &'static str,
-        bufs: &[vk::Buffer],
-        out_idxs: &[usize],
         push: &[u8],
         groups: (u32, u32, u32),
     ) -> Result<()> {
@@ -1687,27 +1189,15 @@ impl VulkanDevice {
                 s.barriers += 1;
             }
             // Buffer infos are needed by both paths; build them once. (WriteDescriptorSet borrows
-            // these, so they must outlive the update/push call below.) Built on the stack into a
-            // fixed array — never a heap Vec — because this is the decode hot path: hundreds of
-            // dispatches x N layers re-recorded every token, where a per-dispatch Vec alloc+free for
-            // both `infos` and `writes` was pure CPU churn the GPU then stalled on. MAX_BINDINGS (8)
-            // comfortably covers the widest kernel (4 buffers: where_cond/index_select); only the
-            // first `nb = bufs.len()` entries are populated and passed on, and the debug_assert
-            // above (kernel binding-count drift) plus the one here pin the bound, so it can never be
-            // exceeded in a correct build. The arrays live for the rest of this unsafe block,
-            // satisfying the borrows the push/update calls hold on them.
-            const MAX_BINDINGS: usize = 8;
-            let nb = bufs.len();
-            debug_assert!(
-                nb <= MAX_BINDINGS,
-                "vulkan: kernel `{name}` binds {nb} buffers > MAX_BINDINGS {MAX_BINDINGS}"
-            );
-            let mut infos = [[vk::DescriptorBufferInfo::default(); 1]; MAX_BINDINGS];
-            for (i, &b) in bufs.iter().enumerate() {
-                infos[i] = [vk::DescriptorBufferInfo::default()
-                    .buffer(b)
-                    .range(vk::WHOLE_SIZE)];
-            }
+            // these, so they must outlive the update/push call below.)
+            let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
+                .iter()
+                .map(|&b| {
+                    [vk::DescriptorBufferInfo::default()
+                        .buffer(b)
+                        .range(vk::WHOLE_SIZE)]
+                })
+                .collect();
             let cmd = s.cmd;
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
 
@@ -1716,20 +1206,21 @@ impl VulkanDevice {
                 // object is allocated and nothing is written to pool-backed GPU memory — the driver
                 // records the bindings directly, eliminating the per-op allocate + update + bind
                 // (three driver calls + descriptor-pool traffic) that dominated decode CPU time.
-                let mut writes = [vk::WriteDescriptorSet::default(); MAX_BINDINGS];
-                for (i, w) in writes.iter_mut().enumerate().take(nb) {
-                    // dst_set is ignored by vkCmdPushDescriptorSetKHR (left default/null).
-                    *w = vk::WriteDescriptorSet::default()
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&infos[i]);
-                }
+                let writes: Vec<_> = (0..bufs.len())
+                    .map(|i| {
+                        // dst_set is ignored by vkCmdPushDescriptorSetKHR (left default/null).
+                        vk::WriteDescriptorSet::default()
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&infos[i])
+                    })
+                    .collect();
                 pd.cmd_push_descriptor_set(
                     cmd,
                     vk::PipelineBindPoint::COMPUTE,
                     p.layout,
                     0,
-                    &writes[..nb],
+                    &writes,
                 );
             } else {
                 // Legacy path: allocate a fresh descriptor set for this dispatch. Sets accumulate
@@ -1743,15 +1234,16 @@ impl VulkanDevice {
                             .set_layouts(&set_layouts),
                     )
                     .map_err(vkerr)?[0];
-                let mut writes = [vk::WriteDescriptorSet::default(); MAX_BINDINGS];
-                for (i, w) in writes.iter_mut().enumerate().take(nb) {
-                    *w = vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&infos[i]);
-                }
-                dev.update_descriptor_sets(&writes[..nb], &[]);
+                let writes: Vec<_> = (0..bufs.len())
+                    .map(|i| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&infos[i])
+                    })
+                    .collect();
+                dev.update_descriptor_sets(&writes, &[]);
                 dev.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::COMPUTE,
@@ -1772,10 +1264,8 @@ impl VulkanDevice {
             // runs post-fence), so no two live allocations in one batch share a handle -- thus the
             // only intra-batch hazard is RAW, which this set captures. Cross-batch ordering is the
             // full queue_submit + fence wait in flush_locked.
-            for &out_idx in out_idxs {
-                if let Some(&out_buf) = bufs.get(out_idx) {
-                    s.written_since_barrier.insert(out_buf);
-                }
+            if let Some(&out_buf) = bufs.get(out_idx) {
+                s.written_since_barrier.insert(out_buf);
             }
             s.n += 1;
             if profile {
@@ -1813,8 +1303,8 @@ impl VulkanDevice {
     fn reclaim(&self) {
         let mut pool = self.inner.bufpool.lock().unwrap();
         let pending = std::mem::take(&mut pool.pending);
-        for (bytes, p) in pending {
-            pool.free.entry(bytes).or_default().push(p);
+        for (bytes, pooled) in pending {
+            pool.free.entry(bytes).or_default().push(pooled);
         }
     }
 
@@ -1826,29 +1316,23 @@ impl VulkanDevice {
             memory,
             count,
             dtype: DType::F32,
-            host_visible,
             device: self.clone(),
+            host_visible,
         })
     }
 
     // fp16 scratch (2 bytes/elem) for coopmat matmul inputs. Returns the buffer plus its memory,
-    // host-visibility, and byte size so the caller can return it to the pool via free_scratch.
-    fn alloc_f16(&self, count: usize) -> Result<(vk::Buffer, vk::DeviceMemory, bool, u64)> {
+    // byte size, and host-visibility so the caller can return it to the pool via free_scratch.
+    fn alloc_f16(&self, count: usize) -> Result<(vk::Buffer, vk::DeviceMemory, u64, bool)> {
         let bytes = ((count * 2).max(4)) as u64;
         let (buffer, memory, host_visible) = unsafe { self.raw_buffer(bytes)? };
-        Ok((buffer, memory, host_visible, bytes))
+        Ok((buffer, memory, bytes, host_visible))
     }
 
     // Return a scratch buffer to the pool. Deferred-safe like VulkanStorage::drop: it parks in
     // `pending` and is reclaimed only after the next flush+fence, by which point the dispatch that
     // referenced it has completed on the GPU.
-    fn free_scratch(
-        &self,
-        bytes: u64,
-        buffer: vk::Buffer,
-        memory: vk::DeviceMemory,
-        host_visible: bool,
-    ) {
+    fn free_scratch(&self, bytes: u64, buffer: vk::Buffer, memory: vk::DeviceMemory, host_visible: bool) {
         if let Ok(mut pool) = self.inner.bufpool.lock() {
             pool.pending.push((
                 bytes,
@@ -1863,7 +1347,7 @@ impl VulkanDevice {
 
     pub(crate) fn upload_f32(&self, data: &[f32]) -> Result<VulkanStorage> {
         let s = self.alloc_f32(data.len())?;
-        unsafe { self.write_f32(s.buffer, s.memory, s.host_visible, data)? };
+        unsafe { self.write_f32(s.memory, data)? };
         Ok(s)
     }
 
@@ -1875,14 +1359,14 @@ impl VulkanDevice {
             memory,
             count,
             dtype: DType::U32,
-            host_visible,
             device: self.clone(),
+            host_visible,
         })
     }
 
     fn upload_u32(&self, data: &[u32]) -> Result<VulkanStorage> {
         let s = self.alloc_u32(data.len())?;
-        unsafe { self.write_u32(s.buffer, s.memory, s.host_visible, data)? };
+        unsafe { self.write_u32(s.memory, data)? };
         Ok(s)
     }
 
@@ -1966,22 +1450,6 @@ fn push_u32(v: &[u32]) -> Vec<u8> {
 }
 
 const WG1D: u32 = 64;
-
-// Activation rows decoded per invocation in the quantized prefill matmul kernels (mul_mat_q8 /
-// mul_mat_q4k). MUST equal the MAX_M const in those .comp shaders (their register accumulator array
-// bound). The host tiles the M dimension by this so each weight block is still read once per output
-// column across a tile of up to MATMUL_Q_MAX_M rows.
-const MATMUL_Q_MAX_M: usize = 8;
-
-// Compile-time per-invocation array bounds in gdn_step.comp / gdn_conv1d_step.comp (MAX_K #defines).
-// head_k_dim must be <= GDN_STEP_MAX_K and the conv kernel <= GDN_CONV_MAX_K; both checked host-side.
-const GDN_STEP_MAX_K: usize = 256;
-const GDN_CONV_MAX_K: usize = 8;
-
-// Compile-time MAX_COLS_PAD bound on argsort.comp's shared index scratch. cols_pad (next pow2 of the
-// sorted dim) must be <= ARGSORT_MAX_COLS_PAD; wider rows fall back to the CPU argsort (not on the
-// MoE routing hot path, where cols == num_experts ~128).
-const ARGSORT_MAX_COLS_PAD: usize = 1024;
 
 impl BackendDevice for VulkanDevice {
     type Storage = VulkanStorage;
@@ -2111,32 +1579,6 @@ impl BackendDevice for VulkanDevice {
                 CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::memory_budget::NAME
             });
 
-            // Subgroup capability (core in Vulkan 1.1+, which the 1.3 instance guarantees). The q8
-            // mat-vec subgroup kernel uses subgroupAdd (ARITHMETIC) at COMPUTE-stage scope, so we
-            // require both before enabling it. HANZO_VK_SUBGROUP_MATVEC=0 forces the scalar kernel.
-            let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
-            {
-                // p2 mutably borrows sg_props via push_next; scope it so the borrow ends before we
-                // read sg_props back below.
-                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg_props);
-                instance.get_physical_device_properties2(pdev, &mut p2);
-            }
-            let sg_compute = sg_props
-                .supported_stages
-                .contains(vk::ShaderStageFlags::COMPUTE);
-            let sg_arith = sg_props
-                .supported_operations
-                .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC);
-            // subgroupElect needs BASIC; subgroupAdd needs ARITHMETIC. Require a sane width (>=2)
-            // so the reduction is actually parallel.
-            let subgroup_size = sg_props.subgroup_size;
-            let subgroup_matvec = sg_compute
-                && sg_arith
-                && subgroup_size >= 2
-                && std::env::var("HANZO_VK_SUBGROUP_MATVEC")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
-
             // Build the enabled-extension list dynamically: coopmat and push_descriptor are
             // independent and either may be present. push_descriptor needs no extra device feature
             // struct (just the extension + a fn-pointer load), so it's a bare name here.
@@ -2241,8 +1683,6 @@ impl BackendDevice for VulkanDevice {
                 mem_props,
                 mem_strategy,
                 has_mem_budget,
-                subgroup_matvec,
-                subgroup_size,
                 seed: Mutex::new(299792458),
                 profile,
                 push_descriptor,
@@ -2380,27 +1820,14 @@ impl VulkanStorage {
         self.count
     }
 
-    /// Number of u32 words in this buffer. For a quantized weight/bank uploaded via the `quantize_*`
-    /// helpers (all `upload_u32`-backed, dtype U32) this is the block-word count -- used to assert a
-    /// resident MoE bank's per-expert stride covers exactly E experts.
-    pub fn len_words(&self) -> usize {
-        self.count
-    }
-
     // Download the whole buffer as f32 (used internally + by to_cpu_storage).
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        unsafe {
-            self.device
-                .read_f32(self.buffer, self.memory, self.host_visible, self.count)
-        }
+        unsafe { self.device.read_f32(self.memory, self.count) }
     }
 
     // Download the whole buffer as u32 (used by to_cpu_storage for U32 storage).
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
-        unsafe {
-            self.device
-                .read_u32(self.buffer, self.memory, self.host_visible, self.count)
-        }
+        unsafe { self.device.read_u32(self.memory, self.count) }
     }
 
     // 1D elementwise dispatch over `n` elements: ceil(n/64) workgroups.
@@ -2476,33 +1903,6 @@ impl VulkanStorage {
 
     // --- native fused ops (replace the GPU<->CPU round-trip fallbacks) ---
 
-    // Row-wise argsort over the last (contiguous) dim via the bitonic argsort kernel. Returns the u32
-    // index permutation (shape == input shape) entirely on the GPU. `Ok(None)` when cols_pad exceeds
-    // the shader's shared-scratch bound (ARGSORT_MAX_COLS_PAD); the caller then uses the CPU argsort.
-    // MoE routing (cols == num_experts ~128) always stays on the GPU path.
-    pub fn arg_sort_last_dim(
-        &self,
-        layout: &Layout,
-        asc: bool,
-        last_dim: usize,
-    ) -> Result<Option<VulkanStorage>> {
-        let cols = last_dim;
-        let cols_pad = cols.next_power_of_two();
-        if cols_pad > ARGSORT_MAX_COLS_PAD {
-            return Ok(None);
-        }
-        let mut xk = None;
-        let xb = self.contig_buf(layout, &mut xk)?;
-        let n = layout.shape().elem_count();
-        let rows = n / cols.max(1);
-        let out = self.device.alloc_u32(n)?;
-        let push = push_u32(&[rows as u32, cols as u32, cols_pad as u32, asc as u32]);
-        // One workgroup per row; the shader threads cooperate over cols_pad inside it.
-        self.device
-            .dispatch("argsort", &[xb, out.buffer], &push, (rows as u32, 1, 1))?;
-        Ok(Some(out))
-    }
-
     // softmax over the last dim. `self` is the input; `layout` its layout. One row per thread.
     pub fn softmax_last_dim(&self, layout: &Layout) -> Result<VulkanStorage> {
         let mut xk = None;
@@ -2569,24 +1969,6 @@ impl VulkanStorage {
         Ok(out)
     }
 
-    // Unary sigmoid: out = 1 / (1 + exp(-self)). Vulkan path for hanzo_nn::ops::sigmoid.
-    pub fn sigmoid(&self, layout: &Layout) -> Result<VulkanStorage> {
-        let mut ck = None;
-        let cb = self.contig_buf(layout, &mut ck)?;
-        let n = layout.shape().elem_count();
-        let mut out = self.device.alloc_f32(n)?;
-        // Preserve the input's logical dtype (storage is f32 regardless); callers multiply the
-        // result against a same-dtype tensor without an intervening cast (output-gate path).
-        out.dtype = self.dtype;
-        self.device.dispatch(
-            "sigmoid",
-            &[cb, out.buffer],
-            &(n as u32).to_ne_bytes(),
-            Self::groups_1d(n),
-        )?;
-        Ok(out)
-    }
-
     // GPT-NeoX rotary embedding. `self`=src [b,h,t,d], cos/sin [t,d/2] or [b,t,d/2].
     pub fn rope(
         &self,
@@ -2611,97 +1993,6 @@ impl VulkanStorage {
             &[srcb, cb, sb, out.buffer],
             &push_u32(&[b as u32, h as u32, t as u32, d as u32, unbatched]),
             Self::groups_1d(pairs),
-        )?;
-        Ok(out)
-    }
-
-    // Gated delta rule, single decode step (seq_len==1). `self`=q, plus k,v,g,beta; `state` is the
-    // recurrent state [BH, K, V], updated IN PLACE in VRAM (kept across tokens by the caller's state
-    // pool). q,k: [BH, K]; v: [BH, V]; g,beta: [BH]. q must be pre-scaled by 1/sqrt(K). Returns
-    // y [BH, V]. Mirrors gated_delta_rule_recurrence for seq=1 and the CUDA single-step kernel.
-    // GDN_STEP_MAX_K bounds the shader's per-invocation k array; head_k_dim must not exceed it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gdn_step(
-        &self,
-        q_l: &Layout,
-        k: &VulkanStorage,
-        k_l: &Layout,
-        v: &VulkanStorage,
-        v_l: &Layout,
-        g: &VulkanStorage,
-        g_l: &Layout,
-        beta: &VulkanStorage,
-        beta_l: &Layout,
-        state: &VulkanStorage,
-        state_l: &Layout,
-        bh: usize,
-        k_dim: usize,
-        v_dim: usize,
-    ) -> Result<VulkanStorage> {
-        if k_dim > GDN_STEP_MAX_K {
-            crate::bail!("vulkan: gdn_step head_k_dim {k_dim} exceeds GDN_STEP_MAX_K {GDN_STEP_MAX_K}");
-        }
-        if !(state_l.is_contiguous() && state_l.start_offset() == 0) {
-            crate::bail!("vulkan: gdn_step state must be contiguous and offset 0 (it is updated in place)");
-        }
-        let mut qk = None;
-        let mut kk = None;
-        let mut vk_ = None;
-        let mut gk = None;
-        let mut bk = None;
-        let qb = self.contig_buf(q_l, &mut qk)?;
-        let kb = k.contig_buf(k_l, &mut kk)?;
-        let vb = v.contig_buf(v_l, &mut vk_)?;
-        let gb = g.contig_buf(g_l, &mut gk)?;
-        let betab = beta.contig_buf(beta_l, &mut bk)?;
-        let out = self.device.alloc_f32(bh * v_dim)?;
-        // State (binding 5) is read-modify-written in place; the fresh output (binding 6) is written
-        // too. Mark BOTH so a later in-batch reader (scatter of state, RMSNorm of the output) gets the
-        // RAW barrier. The read-side hazard check already tests all bindings, including the state input
-        // gathered earlier this batch.
-        self.device.dispatch_outs(
-            "gdn_step",
-            &[qb, kb, vb, gb, betab, state.buffer, out.buffer],
-            &[5, 6],
-            &push_u32(&[bh as u32, k_dim as u32, v_dim as u32]),
-            Self::groups_1d(bh * v_dim),
-        )?;
-        Ok(out)
-    }
-
-    // Causal depthwise conv1d, single decode step (seq_len==1, batch==1). `self`=conv_state
-    // [conv_dim, k_size], updated IN PLACE (drop oldest column, append `x`); `x` is the new column
-    // [conv_dim]; `w` the weight [conv_dim, k_size]. Returns silu(conv) [conv_dim]. Mirrors
-    // causal_conv1d_update for seq=1.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gdn_conv1d_step(
-        &self,
-        state_l: &Layout,
-        x: &VulkanStorage,
-        x_l: &Layout,
-        w: &VulkanStorage,
-        w_l: &Layout,
-        conv_dim: usize,
-        k_size: usize,
-    ) -> Result<VulkanStorage> {
-        if k_size > GDN_CONV_MAX_K {
-            crate::bail!("vulkan: gdn_conv1d_step kernel {k_size} exceeds GDN_CONV_MAX_K {GDN_CONV_MAX_K}");
-        }
-        if !(state_l.is_contiguous() && state_l.start_offset() == 0) {
-            crate::bail!("vulkan: gdn_conv1d_step conv_state must be contiguous and offset 0 (updated in place)");
-        }
-        let mut xk = None;
-        let mut wk = None;
-        let xb = x.contig_buf(x_l, &mut xk)?;
-        let wb = w.contig_buf(w_l, &mut wk)?;
-        let out = self.device.alloc_f32(conv_dim)?;
-        // conv_state (binding 0) is updated in place; output (binding 3) is fresh. Mark both.
-        self.device.dispatch_outs(
-            "gdn_conv1d_step",
-            &[self.buffer, xb, wb, out.buffer],
-            &[0, 3],
-            &push_u32(&[conv_dim as u32, k_size as u32]),
-            Self::groups_1d(conv_dim),
         )?;
         Ok(out)
     }
@@ -2849,20 +2140,14 @@ impl BackendStorage for VulkanStorage {
         if rank == 0 {
             crate::bail!("vulkan: reduce_op on scalar not supported");
         }
-        // The SPIR-V reduce kernel collapses the last (contiguous) dim into one output per row. For
-        // any other single axis, permute it to the end first so the same kernel runs on the GPU; the
-        // resulting row-major order matches the framework's keep-dim wrap exactly.
-        let (c, cols) = if sum_dims == [rank - 1] {
-            (self.contiguous(layout)?, dims[rank - 1])
-        } else if sum_dims.len() == 1 {
-            let d = sum_dims[0];
-            let mut perm: Vec<usize> = (0..rank).filter(|&x| x != d).collect();
-            perm.push(d);
-            (self.contiguous(&layout.permute(&perm)?)?, dims[d])
-        } else {
-            crate::bail!("vulkan: reduce over multiple axes at once not supported (got {sum_dims:?})");
-        };
-        let rows: usize = layout.shape().elem_count() / cols;
+        if sum_dims != [rank - 1] {
+            crate::bail!(
+                "vulkan: reduce_op only supports the last dim (got dims={sum_dims:?}, rank={rank})"
+            );
+        }
+        let c = self.contiguous(layout)?;
+        let cols = dims[rank - 1];
+        let rows: usize = dims[..rank - 1].iter().product();
         // arg-reductions return u32 indices; value reductions return f32.
         let out = if is_arg {
             self.device.alloc_u32(rows)?
@@ -3374,48 +2659,36 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
-        // index_add: out = self.clone(); out[.., ids[i], ..] += src[.., i, ..] along `dim`. ids is
-        // 1D of length src.dims()[dim]. We reuse the device scatter_add kernel, which wants ids
-        // shaped like src, so broadcast the 1D ids across src's pre/post dims first. ids is tiny
-        // (one entry per src dim slot) so the broadcast is built on the host and re-uploaded.
+        // PyTorch index_add semantics: out = copy(self), then out[.., ids[j], ..] += src[.., j, ..]
+        // along `dim` for each j in 0..src_dim_sz. Kept entirely on the GPU (no host round-trip):
+        // materialize self into the output, then one scatter-add dispatch keyed by the 1D ids. The
+        // MoE decode scatter (one index_add per routed expert, up to 24x/token) is the hot caller.
         if ids.dtype != DType::U32 {
             crate::bail!("vulkan: index_add requires u32 ids, got {:?}", ids.dtype);
         }
-        let ids_host = ids.to_vec_u32()?;
-        let ids_host = match ids_l.contiguous_offsets() {
-            Some((a, b)) => &ids_host[a..b],
-            None => crate::bail!("vulkan: index_add requires contiguous ids"),
-        };
+        // out starts as a contiguous copy of self (its existing values are the add base).
+        let dst_n = l.shape().elem_count();
+        let mut out = self.device.alloc_f32(dst_n)?;
+        self.copy_strided_src(&mut out, 0, l)?;
+        let idc = ids.contiguous_u32(ids_l)?;
+        let srcc = src.contiguous(src_l)?;
         let src_dims = src_l.dims();
-        let dim_src = src_dims[dim];
-        if ids_host.len() != dim_src {
-            crate::bail!(
-                "vulkan: index_add ids len {} != src dim {dim} size {dim_src}",
-                ids_host.len()
-            );
-        }
-        let pre: usize = src_dims[..dim].iter().product();
-        let post: usize = src_dims[dim + 1..].iter().product();
-        let mut ids_full = vec![0u32; pre * dim_src * post];
-        for p in 0..pre {
-            for (s, &id) in ids_host.iter().enumerate() {
-                let base = (p * dim_src + s) * post;
-                for r in 0..post {
-                    ids_full[base + r] = id;
-                }
-            }
-        }
-        let ids_full = self.device.upload_u32(&ids_full)?;
-        let ids_full_layout = Layout::contiguous(src_dims);
-        // Fresh contiguous copy of self to accumulate into (scatter writes binding 0 in place).
-        let mut out = self.contiguous(l)?;
-        out.scatter_add_set(
-            &Layout::contiguous(l.dims()),
-            &ids_full,
-            &ids_full_layout,
-            src,
-            src_l,
-            dim,
+        let post_dim: usize = src_dims[dim + 1..].iter().product();
+        let src_dim_sz = src_dims[dim];
+        let max_idx = l.dims()[dim];
+        let n = src_l.shape().elem_count();
+        // out is written (binding 0) AND read (atomic add), so name out_idx=0 for the hazard tracker.
+        self.device.dispatch_out(
+            "index_add",
+            &[out.buffer, srcc.buffer, idc.buffer],
+            0,
+            &push_u32(&[
+                n as u32,
+                post_dim as u32,
+                src_dim_sz as u32,
+                max_idx as u32,
+            ]),
+            Self::groups_1d(n),
         )?;
         Ok(out)
     }
@@ -3471,21 +2744,23 @@ impl BackendStorage for VulkanStorage {
         // operands to fp16 (as llama.cpp does) and runs the register-blocked WMMA GEMM.
         //
         // The fp16 scratch (a16 + b16) is an extra, transient 2 B/elem allocation on top of the
-        // already-resident operands and output. On the UMA part a large model already fills most of
-        // the GTT heap, so a big GEMM's scratch can be the allocation that tips over the edge. Guard
-        // it: if the two scratch buffers won't fit in the largest usable heap's *free* bytes (plus a
-        // margin), fall through to the fp32 tiled GEMM, which needs no extra f16 buffers — correct
-        // result, just slower, instead of an OOM abort.
-        let scratch_bytes = ((b * m * k * 2).max(4) as u64).saturating_add((b * k * n * 2).max(4) as u64);
+        // already-resident operands and output. On the UMA part the large model already fills most
+        // of the GTT heap, so a big GEMM's scratch can be the allocation that tips over the edge.
+        // Guard it: if the two scratch buffers won't fit in the largest usable heap's *free* bytes
+        // (with a small safety margin), fall through to the fp32 tiled GEMM, which needs no extra
+        // f16 buffers — correct result, just slower, instead of an OOM abort.
+        let a16_bytes = ((b * m * k * 2).max(4)) as u64;
+        let b16_bytes = ((b * k * n * 2).max(4)) as u64;
+        let scratch_fits = self.device.scratch_fits(a16_bytes.saturating_add(b16_bytes));
         if self.device.inner.cm_use
-            && self.device.scratch_fits(scratch_bytes)
+            && scratch_fits
             && matches!(self.device.coopmat_info(), Some((16, 16, 16)))
             && m % 16 == 0
             && n % 16 == 0
             && k % 16 == 0
         {
-            let (a16, a16_mem, a16_hv, a16_bytes) = self.device.alloc_f16(b * m * k)?;
-            let (b16, b16_mem, b16_hv, b16_bytes) = self.device.alloc_f16(b * k * n)?;
+            let (a16, a16_mem, a16_bytes, a16_hv) = self.device.alloc_f16(b * m * k)?;
+            let (b16, b16_mem, b16_bytes, b16_hv) = self.device.alloc_f16(b * k * n)?;
             self.device.dispatch(
                 "cast_f2h",
                 &[lc_buf, a16],
@@ -3639,10 +2914,7 @@ impl BackendStorage for VulkanStorage {
                 }
                 data[i] = v;
             }
-            unsafe {
-                self.device
-                    .write_u32(self.buffer, self.memory, self.host_visible, &data)
-            }
+            unsafe { self.device.write_u32(self.memory, &data) }
         } else {
             let v = s.to_f64() as f32;
             let mut data = self.to_vec_f32()?;
@@ -3652,10 +2924,7 @@ impl BackendStorage for VulkanStorage {
                 }
                 data[i] = v;
             }
-            unsafe {
-                self.device
-                    .write_f32(self.buffer, self.memory, self.host_visible, &data)
-            }
+            unsafe { self.device.write_f32(self.memory, &data) }
         }
     }
 }
