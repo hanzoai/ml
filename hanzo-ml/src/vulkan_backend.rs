@@ -48,6 +48,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
+        "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -414,6 +415,75 @@ impl VulkanDevice {
                 ((nout as u32).div_ceil(WG1D), 1, 1),
             )?;
         }
+        Ok(out)
+    }
+
+    /// Upload Q4_K weights to the GPU once, verbatim in the GGUF super-block layout (144 B = 36 u32
+    /// per 256-weight block, `nout * k/256` blocks total). No requantize: the bytes are the same
+    /// blocks the CPU `k_quants::BlockQ4K` holds, so the in-shader decode matches the CPU dequant
+    /// exactly. Returns the device buffer to reuse across matvecs. `data` must be exactly the
+    /// `nout * (k/256) * 144` packed block bytes; `k` must be a multiple of 256.
+    pub fn quantize_q4k(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("quantize_q4k: k must be a multiple of 256, got {k}");
+        }
+        let nblocks = k / 256;
+        let want = nout * nblocks * 144;
+        if data.len() != want {
+            crate::bail!(
+                "quantize_q4k: data len {} != {nout}*{nblocks}*144 = {want}",
+                data.len()
+            );
+        }
+        // Reinterpret the packed block bytes as u32 words for the kernel's `uint w[]` binding. GGUF
+        // blocks are 144 bytes (a multiple of 4), so the length is u32-aligned by construction.
+        let words: &[u32] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
+        self.upload_u32(words)
+    }
+
+    /// Q4_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q4k`]. Reads weights
+    /// at ~4.5 bits/elem instead of 32 -- the bandwidth lever for memory-bound decode on this APU.
+    /// Decode matches the CPU `BlockQ4K::to_float` so expect ~1e-3 relative error vs CPU f32 (the
+    /// quantization error is already baked into the stored blocks).
+    pub fn matvec_q4k(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q4k: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q4k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Q4_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, no host round-trip.
+    /// Weights stay quantized in VRAM (~4.5 bits/elem) instead of dequantizing to f32, so decode
+    /// reads ~7x less weight memory. One invocation per output row (scalar kernel).
+    pub fn matvec_q4k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_q4k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q4k",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
         Ok(out)
     }
 
@@ -2689,14 +2759,57 @@ impl BackendStorage for VulkanStorage {
 
     fn index_add(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<Self> {
-        crate::bail!("vulkan: index_add not implemented")
+        // index_add: out = self.clone(); out[.., ids[i], ..] += src[.., i, ..] along `dim`. ids is
+        // 1D of length src.dims()[dim]. We reuse the device scatter_add kernel, which wants ids
+        // shaped like src, so broadcast the 1D ids across src's pre/post dims first. ids is tiny
+        // (one entry per src dim slot) so the broadcast is built on the host and re-uploaded.
+        if ids.dtype != DType::U32 {
+            crate::bail!("vulkan: index_add requires u32 ids, got {:?}", ids.dtype);
+        }
+        let ids_host = ids.to_vec_u32()?;
+        let ids_host = match ids_l.contiguous_offsets() {
+            Some((a, b)) => &ids_host[a..b],
+            None => crate::bail!("vulkan: index_add requires contiguous ids"),
+        };
+        let src_dims = src_l.dims();
+        let dim_src = src_dims[dim];
+        if ids_host.len() != dim_src {
+            crate::bail!(
+                "vulkan: index_add ids len {} != src dim {dim} size {dim_src}",
+                ids_host.len()
+            );
+        }
+        let pre: usize = src_dims[..dim].iter().product();
+        let post: usize = src_dims[dim + 1..].iter().product();
+        let mut ids_full = vec![0u32; pre * dim_src * post];
+        for p in 0..pre {
+            for (s, &id) in ids_host.iter().enumerate() {
+                let base = (p * dim_src + s) * post;
+                for r in 0..post {
+                    ids_full[base + r] = id;
+                }
+            }
+        }
+        let ids_full = self.device.upload_u32(&ids_full)?;
+        let ids_full_layout = Layout::contiguous(src_dims);
+        // Fresh contiguous copy of self to accumulate into (scatter writes binding 0 in place).
+        let mut out = self.contiguous(l)?;
+        out.scatter_add_set(
+            &Layout::contiguous(l.dims()),
+            &ids_full,
+            &ids_full_layout,
+            src,
+            src_l,
+            dim,
+        )?;
+        Ok(out)
     }
 
     fn matmul(
