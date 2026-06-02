@@ -766,7 +766,11 @@ impl QTensor {
                     let m = slots.len();
                     let idx = Tensor::from_vec(slots, (m,), device)?;
                     let x_e = x_flat.index_select(&idx, 0)?; // [m, k]
-                    let y_e = qm.forward(&x_e)?.to_dtype(crate::DType::F32)?; // [m, n]
+                    // VulkanQuant's single-row matvec returns rank-1 [n]; force [m, n] for index_add.
+                    let y_e = qm
+                        .forward(&x_e)?
+                        .to_dtype(crate::DType::F32)?
+                        .reshape((m, n))?;
                     out_flat = out_flat.index_add(&idx, &y_e, 0)?;
                 }
                 out_flat.reshape((t, topk, n))?.to_dtype(out_dtype)
@@ -1105,7 +1109,21 @@ impl crate::Module for QMatMul {
                     xs.matmul(&w)
                 }
             }
-            Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
+            Self::QTensor(t) => {
+                // The `qmatmul` CustomOp1 has no correct Vulkan path for non-VulkanQuant weights
+                // (e.g. Q6_K MoE down experts); dequantize this one weight and matmul like Self::Tensor.
+                #[cfg(feature = "vulkan")]
+                if xs.device().is_vulkan() {
+                    let w = t.dequantize(xs.device())?;
+                    let w = match *xs.dims() {
+                        [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                        [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                        _ => w.t()?,
+                    };
+                    return xs.matmul(&w);
+                }
+                xs.apply_op1_no_bwd(t.as_ref())
+            }
             Self::Tensor(w) => {
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
