@@ -134,6 +134,8 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
         #[cfg(feature = "vulkan")]
         Device::Vulkan(d) => QStorage::Vulkan(Box::new(data.to_vec()), d.clone()),
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(d) => QStorage::Wgpu(Box::new(data.to_vec()), d.clone()),
     };
     super::QTensor::new(data, dims)
 }
