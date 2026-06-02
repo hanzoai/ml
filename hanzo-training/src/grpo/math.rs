@@ -185,8 +185,8 @@ mod tests {
         let r = vec![0.0f32, 10.0];
         let a = group_advantages(&r, true, 1e-4);
         // With ddof=1 std of {0,10} is ~7.071; (10-5)/7.071 ~= 0.707
-        assert!((a[1] - 0.7071).abs() < 1e-2, "got {}", a[1]);
-        assert!((a[0] + 0.7071).abs() < 1e-2, "got {}", a[0]);
+        assert!((a[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-2, "got {}", a[1]);
+        assert!((a[0] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-2, "got {}", a[0]);
     }
 
     #[test]
