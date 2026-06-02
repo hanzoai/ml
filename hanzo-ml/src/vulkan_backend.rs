@@ -54,6 +54,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
+        "mul_mat_vec_id_q4k" => spv!("mul_mat_vec_id_q4k"),
+        "mul_mat_vec_id_q8" => spv!("mul_mat_vec_id_q8"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -558,6 +560,91 @@ impl VulkanDevice {
             &[wq.buffer, x.buffer, out.buffer],
             &push,
             ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Fused grouped Q4_K matvec for resident-bank MoE: ONE dispatch computes `y[m*nout]` where
+    /// `y[slot*nout + col] = dequant(bank[ids[slot]])[col, :] . x_flat[slot*k ..]`. `ids` is a GPU u32
+    /// buffer of length `m` (the routed expert per slot), `x_flat` is `[m, k]` f32 contiguous, `bank`
+    /// is the verbatim [E,n,k] Q4_K bank, `per_expert_words = n * (k/256) * 36`. Replaces the
+    /// per-expert index_select/matvec/index_add loop -- and its routing-ids GPU->CPU sync -- with one
+    /// kernel reading ids straight from VRAM. Decode is bit-identical to [`matvec_q4k_gpu_off`] (same
+    /// in-shader block decode). One invocation per (slot,col); grid ceil(m*nout / WG1D).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mul_mat_vec_id_q4k_gpu(
+        &self,
+        bank: &VulkanStorage,
+        x_flat: &VulkanStorage,
+        ids: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+        per_expert_words: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("mul_mat_vec_id_q4k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x_flat.count < m * k {
+            crate::bail!(
+                "mul_mat_vec_id_q4k_gpu: x_flat count {} < m*k {}",
+                x_flat.count,
+                m * k
+            );
+        }
+        if ids.count < m {
+            crate::bail!("mul_mat_vec_id_q4k_gpu: ids count {} < m {m}", ids.count);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let push = push_u32(&[nout as u32, k as u32, per_expert_words as u32, m as u32]);
+        // Y is binding 2, not the last buffer (IDS is 3); name it so the RAW hazard tracker keys on
+        // the buffer the kernel actually writes.
+        self.dispatch_out(
+            "mul_mat_vec_id_q4k",
+            &[bank.buffer, x_flat.buffer, out.buffer, ids.buffer],
+            2,
+            &push,
+            (((m * nout) as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Fused grouped Q8_0 matvec for resident-bank MoE: ONE dispatch computes `y[m*nout]` where
+    /// `y[slot*nout + col] = dequant(bank[ids[slot]])[col, :] . x_flat[slot*k ..]`. Q8_0 analog of
+    /// [`mul_mat_vec_id_q4k_gpu`]; `per_expert_words = n * (k/32) * 9`. Decode is bit-identical to
+    /// [`matvec_q8_gpu_off`]. One invocation per (slot,col); grid ceil(m*nout / WG1D).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mul_mat_vec_id_q8_gpu(
+        &self,
+        bank: &VulkanStorage,
+        x_flat: &VulkanStorage,
+        ids: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+        per_expert_words: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("mul_mat_vec_id_q8_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x_flat.count < m * k {
+            crate::bail!(
+                "mul_mat_vec_id_q8_gpu: x_flat count {} < m*k {}",
+                x_flat.count,
+                m * k
+            );
+        }
+        if ids.count < m {
+            crate::bail!("mul_mat_vec_id_q8_gpu: ids count {} < m {m}", ids.count);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let push = push_u32(&[nout as u32, k as u32, per_expert_words as u32, m as u32]);
+        self.dispatch_out(
+            "mul_mat_vec_id_q8",
+            &[bank.buffer, x_flat.buffer, out.buffer, ids.buffer],
+            2,
+            &push,
+            (((m * nout) as u32).div_ceil(WG1D), 1, 1),
         )?;
         Ok(out)
     }
