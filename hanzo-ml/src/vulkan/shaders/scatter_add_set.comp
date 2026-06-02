@@ -12,6 +12,8 @@ void main() {
     uint inner = g % right;
     uint outer = g / (right * dim_src);
     uint id = ids[g];
+    // Bounds-check the index: a stray id (corrupt/model-bug) must not RMW OOB in dst.
+    if (id >= dim_dst) { return; }
     uint idx = outer * (dim_dst * right) + id * right + inner;
     float add = src[g];
     uint old = dst[idx];
