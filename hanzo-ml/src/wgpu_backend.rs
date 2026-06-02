@@ -27,10 +27,67 @@ fn kernel_wgsl(name: &str) -> Result<&'static str> {
         "matmul_nt" => include_str!("wgpu/shaders/matmul_nt.wgsl"),
         "mul_mat_vec_q8_0" => include_str!("wgpu/shaders/mul_mat_vec_q8_0.wgsl"),
         "mul_mat_vec_q4_0" => include_str!("wgpu/shaders/mul_mat_vec_q4_0.wgsl"),
+        "mul_mat_vec_q4k" => include_str!("wgpu/shaders/mul_mat_vec_q4k.wgsl"),
+        "moe_matvec_q4_0" => include_str!("wgpu/shaders/moe_matvec_q4_0.wgsl"),
+        "moe_matvec_q8_0" => include_str!("wgpu/shaders/moe_matvec_q8_0.wgsl"),
+        "moe_matvec_q4k" => include_str!("wgpu/shaders/moe_matvec_q4k.wgsl"),
+        "flash_attn" => include_str!("wgpu/shaders/flash_attn.wgsl"),
         "strided_copy" => include_str!("wgpu/shaders/strided_copy.wgsl"),
         "copy" => include_str!("wgpu/shaders/copy.wgsl"),
         "copy2d" => include_str!("wgpu/shaders/copy2d.wgsl"),
         "const_fill" => include_str!("wgpu/shaders/const_fill.wgsl"),
+        // elementwise unary
+        "exp" => include_str!("wgpu/shaders/exp.wgsl"),
+        "log" => include_str!("wgpu/shaders/log.wgsl"),
+        "sqrt" => include_str!("wgpu/shaders/sqrt.wgsl"),
+        "neg" => include_str!("wgpu/shaders/neg.wgsl"),
+        "abs" => include_str!("wgpu/shaders/abs.wgsl"),
+        "tanh" => include_str!("wgpu/shaders/tanh.wgsl"),
+        "sigmoid" => include_str!("wgpu/shaders/sigmoid.wgsl"),
+        "relu" => include_str!("wgpu/shaders/relu.wgsl"),
+        "gelu" => include_str!("wgpu/shaders/gelu.wgsl"),
+        "gelu_erf" => include_str!("wgpu/shaders/gelu_erf.wgsl"),
+        "erf" => include_str!("wgpu/shaders/erf.wgsl"),
+        "recip" => include_str!("wgpu/shaders/recip.wgsl"),
+        "sign" => include_str!("wgpu/shaders/sign.wgsl"),
+        "cos" => include_str!("wgpu/shaders/cos.wgsl"),
+        "sin" => include_str!("wgpu/shaders/sin.wgsl"),
+        "sqr" => include_str!("wgpu/shaders/sqr.wgsl"),
+        "ceil" => include_str!("wgpu/shaders/ceil.wgsl"),
+        "floor" => include_str!("wgpu/shaders/floor.wgsl"),
+        "round" => include_str!("wgpu/shaders/round.wgsl"),
+        "silu" => include_str!("wgpu/shaders/silu.wgsl"),
+        "elu" => include_str!("wgpu/shaders/elu.wgsl"),
+        "affine" => include_str!("wgpu/shaders/affine.wgsl"),
+        "powf" => include_str!("wgpu/shaders/powf.wgsl"),
+        // elementwise binary
+        "add" => include_str!("wgpu/shaders/add.wgsl"),
+        "sub" => include_str!("wgpu/shaders/sub.wgsl"),
+        "mul" => include_str!("wgpu/shaders/mul.wgsl"),
+        "div" => include_str!("wgpu/shaders/div.wgsl"),
+        "maximum" => include_str!("wgpu/shaders/maximum.wgsl"),
+        "minimum" => include_str!("wgpu/shaders/minimum.wgsl"),
+        "silu_mul" => include_str!("wgpu/shaders/silu_mul.wgsl"),
+        "cmp" => include_str!("wgpu/shaders/cmp.wgsl"),
+        "where_cond" => include_str!("wgpu/shaders/where_cond.wgsl"),
+        // reductions
+        "reduce_sum" => include_str!("wgpu/shaders/reduce_sum.wgsl"),
+        "reduce_max" => include_str!("wgpu/shaders/reduce_max.wgsl"),
+        "reduce_min" => include_str!("wgpu/shaders/reduce_min.wgsl"),
+        "reduce_argmin" => include_str!("wgpu/shaders/reduce_argmin.wgsl"),
+        "reduce_argmax" => include_str!("wgpu/shaders/reduce_argmax.wgsl"),
+        // cast
+        "cast_f2u" => include_str!("wgpu/shaders/cast_f2u.wgsl"),
+        "cast_u2f" => include_str!("wgpu/shaders/cast_u2f.wgsl"),
+        // index ops
+        "gather" => include_str!("wgpu/shaders/gather.wgsl"),
+        "index_select" => include_str!("wgpu/shaders/index_select.wgsl"),
+        "scatter_set" => include_str!("wgpu/shaders/scatter_set.wgsl"),
+        "scatter_add_set" => include_str!("wgpu/shaders/scatter_add_set.wgsl"),
+        // fused transformer ops
+        "softmax_rows" => include_str!("wgpu/shaders/softmax_rows.wgsl"),
+        "rms_norm" => include_str!("wgpu/shaders/rms_norm.wgsl"),
+        "rope" => include_str!("wgpu/shaders/rope.wgsl"),
         _ => crate::bail!("wgpu: no WGSL kernel for `{name}`"),
     };
     Ok(s)
@@ -365,6 +422,141 @@ impl WgpuDevice {
         self.matvec_q8_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
     }
 
+    /// Native-GGML Q4_K matvec with both operands on the GPU: `y[nout] = Wq * x[k]`, `Wq` is the raw
+    /// 144-byte Q4_K super-block bytes from [`upload_qweight`]. `k` must be a multiple of 256.
+    pub fn matvec_q4k_gpu(
+        &self,
+        wq: &WgpuStorage,
+        x: &WgpuStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<WgpuStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_q4k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        self.dispatch(
+            "mul_mat_vec_q4k",
+            &[&wq.buffer, &x.buffer, &out.buffer],
+            &pack_u32(&[nout as u32, k as u32]),
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Host-input convenience: uploads `x` then runs [`matvec_q4k_gpu`]. Returns the f32 result.
+    pub fn matvec_q4k(&self, wq: &WgpuStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q4k: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q4k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Upload a `u32` index/id vector to a GPU buffer (e.g. the MoE router's per-slot expert ids).
+    pub fn upload_ids(&self, ids: &[u32]) -> Result<WgpuStorage> {
+        self.upload_u32(ids)
+    }
+
+    /// Fused MoE grouped quant matvec on the GPU: for each routed slot `s` and output row `r`,
+    /// `y[s, r] = sum_k W[ids[s], r, k] * x[s, k]`, reading the per-expert slice from a single GGML
+    /// weight bank `[E, n, k]` already uploaded via [`upload_qweight`]. The router gather and the
+    /// per-expert GEMM run in one dispatch. `kernel` selects the dtype variant ("moe_matvec_q4_0" /
+    /// "moe_matvec_q8_0" / "moe_matvec_q4k"). Mirrors `VulkanDevice::moe_matvec_gpu`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_matvec_gpu(
+        &self,
+        kernel: &'static str,
+        wbank: &WgpuStorage,
+        x: &WgpuStorage,
+        ids: &WgpuStorage,
+        nrows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<WgpuStorage> {
+        if x.count < nrows * k {
+            crate::bail!("moe_matvec_gpu: x count {} < nrows*k {}", x.count, nrows * k);
+        }
+        if ids.count < nrows {
+            crate::bail!("moe_matvec_gpu: ids count {} < nrows {nrows}", ids.count);
+        }
+        let total = nrows * n;
+        let out = self.alloc_f32(total)?;
+        self.dispatch(
+            kernel,
+            &[&wbank.buffer, &x.buffer, &ids.buffer, &out.buffer],
+            &pack_u32(&[n as u32, k as u32, nrows as u32]),
+            ((total as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Fused scaled-dot-product (flash) attention on the GPU, online-softmax. Q is `[BH, Lq, D]`,
+    /// K/V are `[BH, Lk, D]` (contiguous f32 device buffers, head_dim D <= 256); output is
+    /// `[BH, Lq, D]`. `scale` multiplies the QK^T scores; `causal` applies aligned causal masking.
+    /// Mirrors `VulkanDevice::flash_attn_gpu`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_gpu(
+        &self,
+        q: &WgpuStorage,
+        k: &WgpuStorage,
+        v: &WgpuStorage,
+        bh: usize,
+        lq: usize,
+        lk: usize,
+        d: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Result<WgpuStorage> {
+        if d > 256 {
+            crate::bail!("flash_attn_gpu: head_dim {d} > 256 (kernel limit)");
+        }
+        if q.count < bh * lq * d {
+            crate::bail!("flash_attn_gpu: q count {} < bh*lq*d {}", q.count, bh * lq * d);
+        }
+        if k.count < bh * lk * d || v.count < bh * lk * d {
+            crate::bail!("flash_attn_gpu: k/v count too small for bh*lk*d {}", bh * lk * d);
+        }
+        let out = self.alloc_f32(bh * lq * d)?;
+        // Uniform block matches flash_attn.wgsl: {u32 bh, lq, lk, d; f32 scale; u32 causal}.
+        let mut params = pack_u32(&[bh as u32, lq as u32, lk as u32, d as u32]);
+        params.extend_from_slice(&scale.to_ne_bytes());
+        params.extend_from_slice(&(causal as u32).to_ne_bytes());
+        let total = bh * lq;
+        self.dispatch(
+            "flash_attn",
+            &[&q.buffer, &k.buffer, &v.buffer, &out.buffer],
+            &params,
+            ((total as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Host-input convenience for [`flash_attn_gpu`]: uploads Q/K/V and returns the `[BH*Lq*D]`
+    /// output as an f32 vector. For tests/standalone use.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        bh: usize,
+        lq: usize,
+        lk: usize,
+        d: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Result<Vec<f32>> {
+        let qs = self.upload_f32(q)?;
+        let ks = self.upload_f32(k)?;
+        let vs = self.upload_f32(v)?;
+        self.flash_attn_gpu(&qs, &ks, &vs, bh, lq, lk, d, scale, causal)?
+            .to_vec_f32()
+    }
+
     // Read `count` 4-byte words out of `src` to the host: copy to a MAP_READ staging buffer,
     // map_async, then block on device.poll(Wait). This is the one new mechanism vs the Vulkan
     // backend's direct host map. Returns the raw bytes (caller reinterprets as f32/u32).
@@ -471,6 +663,163 @@ impl WgpuStorage {
             Self::groups_1d(n),
         )?;
         Ok(out)
+    }
+
+    // Materialize a u32 storage (ids / where_cond mask) into a fresh contiguous, offset-0 buffer.
+    // Done on the CPU via the layout's strided index so it's bit-exact for arbitrary u32 values
+    // (reusing the float strided_copy would reinterpret small integers as denormal floats). These
+    // tensors (token/position ids, masks) are tiny so the round-trip is cheap. Mirrors Vulkan.
+    fn contiguous_u32(&self, layout: &Layout) -> Result<WgpuStorage> {
+        debug_assert_eq!(self.dtype, DType::U32);
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            return self.device.upload_u32(&self.to_vec_u32()?);
+        }
+        let src = self.to_vec_u32()?;
+        let gathered: Vec<u32> = layout.strided_index().map(|i| src[i]).collect();
+        self.device.upload_u32(&gathered)
+    }
+
+    // Buffer for a contiguous, offset-0 f32 view of `layout`: no copy when the storage already is
+    // one (returns its own buffer), otherwise materializes a packed copy returned via `keep` (held
+    // alive by the caller until the dispatch is recorded). Mirrors VulkanStorage::contig_buf.
+    fn contig_buf(&self, layout: &Layout, keep: &mut Option<WgpuStorage>) -> Result<Arc<wgpu::Buffer>> {
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            Ok(self.buffer.clone())
+        } else {
+            let s = self.contiguous(layout)?;
+            let b = s.buffer.clone();
+            *keep = Some(s);
+            Ok(b)
+        }
+    }
+
+    // --- native fused ops (mirror VulkanStorage), used by storage.rs dispatch wrappers ---
+
+    /// softmax over the last dim. `self` is the input; `layout` its layout. One row per thread.
+    pub fn softmax_last_dim(&self, layout: &Layout) -> Result<WgpuStorage> {
+        let mut xk = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
+        let dims = layout.dims();
+        let m = *dims.last().unwrap_or(&1);
+        let nrows = layout.shape().elem_count() / m.max(1);
+        let out = self.device.alloc_f32(nrows * m)?;
+        self.device.dispatch(
+            "softmax_rows",
+            &[&xb, &out.buffer],
+            &pack_u32(&[nrows as u32, m as u32]),
+            Self::groups_1d(nrows),
+        )?;
+        Ok(out)
+    }
+
+    /// rms-norm over the last dim. `self`=x, `alpha`=scale [m].
+    pub fn rms_norm(
+        &self,
+        layout: &Layout,
+        alpha: &WgpuStorage,
+        alpha_l: &Layout,
+        eps: f32,
+    ) -> Result<WgpuStorage> {
+        let mut xk = None;
+        let mut ak = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
+        let ab = alpha.contig_buf(alpha_l, &mut ak)?;
+        let dims = layout.dims();
+        let m = *dims.last().unwrap_or(&1);
+        let nrows = layout.shape().elem_count() / m.max(1);
+        let out = self.device.alloc_f32(nrows * m)?;
+        let mut params = pack_u32(&[nrows as u32, m as u32]);
+        params.extend_from_slice(&eps.to_ne_bytes());
+        self.device.dispatch(
+            "rms_norm",
+            &[&xb, &ab, &out.buffer],
+            &params,
+            Self::groups_1d(nrows),
+        )?;
+        Ok(out)
+    }
+
+    /// Fused SwiGLU: out = silu(self) * rhs, elementwise. One dispatch instead of silu + mul.
+    pub fn silu_mul(
+        &self,
+        layout: &Layout,
+        rhs: &WgpuStorage,
+        rhs_l: &Layout,
+    ) -> Result<WgpuStorage> {
+        let mut ak = None;
+        let mut bk = None;
+        let ab = self.contig_buf(layout, &mut ak)?;
+        let bb = rhs.contig_buf(rhs_l, &mut bk)?;
+        let n = layout.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        self.device.dispatch(
+            "silu_mul",
+            &[&ab, &bb, &out.buffer],
+            &pack_u32(&[n as u32]),
+            Self::groups_1d(n),
+        )?;
+        Ok(out)
+    }
+
+    /// GPT-NeoX rotary embedding. `self`=src [b,h,t,d], cos/sin [t,d/2] or [b,t,d/2].
+    pub fn rope(
+        &self,
+        layout: &Layout,
+        cos: &WgpuStorage,
+        cos_l: &Layout,
+        sin: &WgpuStorage,
+        sin_l: &Layout,
+    ) -> Result<WgpuStorage> {
+        let mut srck = None;
+        let mut ck = None;
+        let mut sk = None;
+        let srcb = self.contig_buf(layout, &mut srck)?;
+        let cb = cos.contig_buf(cos_l, &mut ck)?;
+        let sb = sin.contig_buf(sin_l, &mut sk)?;
+        let (b, h, t, d) = layout.shape().dims4()?;
+        let unbatched = (cos_l.dims().len() == 3 && sin_l.dims().len() == 3) as u32;
+        let out = self.device.alloc_f32(b * h * t * d)?;
+        let pairs = b * h * t * (d / 2);
+        self.device.dispatch(
+            "rope",
+            &[&srcb, &cb, &sb, &out.buffer],
+            &pack_u32(&[b as u32, h as u32, t as u32, d as u32, unbatched]),
+            Self::groups_1d(pairs),
+        )?;
+        Ok(out)
+    }
+
+    // Shared scatter: write/accumulate src into dst (self) along `dim` at positions `ids`.
+    // dst is assumed contiguous (its layout `l` gives the dim sizes). ids/src share a shape.
+    #[allow(clippy::too_many_arguments)]
+    fn scatter_impl(
+        &self,
+        kernel: &'static str,
+        l: &Layout,
+        ids: &WgpuStorage,
+        ids_l: &Layout,
+        src: &WgpuStorage,
+        src_l: &Layout,
+        dim: usize,
+    ) -> Result<()> {
+        if ids.dtype != DType::U32 {
+            crate::bail!("wgpu: scatter requires u32 ids, got {:?}", ids.dtype);
+        }
+        let idc = ids.contiguous_u32(ids_l)?;
+        let srcc = src.contiguous(src_l)?;
+        let src_dims = src_l.dims();
+        let dst_dims = l.dims();
+        let right: usize = src_dims[dim + 1..].iter().product();
+        let dim_src = src_dims[dim];
+        let dim_dst = dst_dims[dim];
+        let n = src_l.shape().elem_count();
+        self.device.dispatch(
+            kernel,
+            &[&self.buffer, &srcc.buffer, &idc.buffer],
+            &pack_u32(&[n as u32, right as u32, dim_src as u32, dim_dst as u32]),
+            Self::groups_1d(n),
+        )?;
+        Ok(())
     }
 }
 
@@ -675,30 +1024,129 @@ impl BackendStorage for WgpuStorage {
         }
     }
 
-    fn affine(&self, _: &Layout, _: f64, _: f64) -> Result<Self> {
-        todo_wgpu!("affine")
+    fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
+        let n = layout.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        let mut params = (n as u32).to_ne_bytes().to_vec();
+        params.extend_from_slice(&(mul as f32).to_ne_bytes());
+        params.extend_from_slice(&(add as f32).to_ne_bytes());
+        self.device
+            .dispatch("affine", &[&cb, &out.buffer], &params, Self::groups_1d(n))?;
+        Ok(out)
     }
 
-    fn powf(&self, _: &Layout, _: f64) -> Result<Self> {
-        todo_wgpu!("powf")
+    fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
+        let n = layout.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        let mut params = (n as u32).to_ne_bytes().to_vec();
+        params.extend_from_slice(&(e as f32).to_ne_bytes());
+        self.device
+            .dispatch("powf", &[&cb, &out.buffer], &params, Self::groups_1d(n))?;
+        Ok(out)
     }
 
-    fn elu(&self, _: &Layout, _: f64) -> Result<Self> {
-        todo_wgpu!("elu")
+    fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
+        let n = layout.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        let mut params = (n as u32).to_ne_bytes().to_vec();
+        params.extend_from_slice(&(alpha as f32).to_ne_bytes());
+        self.device
+            .dispatch("elu", &[&cb, &out.buffer], &params, Self::groups_1d(n))?;
+        Ok(out)
     }
 
-    fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
-        todo_wgpu!("reduce_op")
+    fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
+        let (kernel, is_arg) = match op {
+            ReduceOp::Sum => ("reduce_sum", false),
+            ReduceOp::Max => ("reduce_max", false),
+            ReduceOp::Min => ("reduce_min", false),
+            ReduceOp::ArgMin => ("reduce_argmin", true),
+            ReduceOp::ArgMax => ("reduce_argmax", true),
+        };
+        let dims = layout.dims();
+        let rank = dims.len();
+        if rank == 0 {
+            crate::bail!("wgpu: reduce_op on scalar not supported");
+        }
+        if sum_dims != [rank - 1] {
+            crate::bail!(
+                "wgpu: reduce_op only supports the last dim (got dims={sum_dims:?}, rank={rank})"
+            );
+        }
+        let c = self.contiguous(layout)?;
+        let cols = dims[rank - 1];
+        let rows: usize = dims[..rank - 1].iter().product();
+        let out = if is_arg {
+            self.device.alloc_u32(rows)?
+        } else {
+            self.device.alloc_f32(rows)?
+        };
+        self.device.dispatch(
+            kernel,
+            &[&c.buffer, &out.buffer],
+            &pack_u32(&[rows as u32, cols as u32]),
+            Self::groups_1d(rows),
+        )?;
+        Ok(out)
     }
 
-    fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
-        todo_wgpu!("cmp")
+    fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        // Elementwise compare on f32 operands -> u32 {0,1} mask.
+        let lc = self.contiguous(lhs_l)?;
+        let rc = rhs.contiguous(rhs_l)?;
+        let n = lhs_l.shape().elem_count();
+        let out = self.device.alloc_u32(n)?;
+        let code: u32 = match op {
+            CmpOp::Eq => 0,
+            CmpOp::Ne => 1,
+            CmpOp::Le => 2,
+            CmpOp::Ge => 3,
+            CmpOp::Lt => 4,
+            CmpOp::Gt => 5,
+        };
+        self.device.dispatch(
+            "cmp",
+            &[&lc.buffer, &rc.buffer, &out.buffer],
+            &pack_u32(&[n as u32, code]),
+            Self::groups_1d(n),
+        )?;
+        Ok(out)
     }
 
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
-        // Same dtype: just contiguous-ize (respects layout/offset). Cross-dtype: CPU round-trip.
+        let n = layout.shape().elem_count();
         match (self.dtype, dtype) {
+            // Same dtype: just contiguous-ize (respects layout/offset).
             (DType::F32, DType::F32) | (DType::U32, DType::U32) => self.contiguous(layout),
+            (DType::F32, DType::U32) => {
+                let c = self.contiguous(layout)?;
+                let out = self.device.alloc_u32(n)?;
+                self.device.dispatch(
+                    "cast_f2u",
+                    &[&c.buffer, &out.buffer],
+                    &pack_u32(&[n as u32]),
+                    Self::groups_1d(n),
+                )?;
+                Ok(out)
+            }
+            (DType::U32, DType::F32) => {
+                let c = self.contiguous(layout)?;
+                let out = self.device.alloc_f32(n)?;
+                self.device.dispatch(
+                    "cast_u2f",
+                    &[&c.buffer, &out.buffer],
+                    &pack_u32(&[n as u32]),
+                    Self::groups_1d(n),
+                )?;
+                Ok(out)
+            }
+            // Other dtypes aren't held by this backend: CPU-convert then upload.
             _ => {
                 let cpu = self.to_cpu_storage()?;
                 let converted = crate::backend::BackendStorage::to_dtype(&cpu, layout, dtype)?;
@@ -707,16 +1155,108 @@ impl BackendStorage for WgpuStorage {
         }
     }
 
-    fn unary_impl<B: UnaryOpT>(&self, _: &Layout) -> Result<Self> {
-        todo_wgpu!("unary_impl")
+    fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        let kernel: &'static str = match B::NAME {
+            "silu" => "silu",
+            "gelu" => "gelu",
+            "relu" => "relu",
+            "exp" => "exp",
+            "neg" => "neg",
+            "sqr" => "sqr",
+            "sqrt" => "sqrt",
+            "recip" => "recip",
+            "tanh" => "tanh",
+            "sin" => "sin",
+            "cos" => "cos",
+            "log" => "log",
+            "abs" => "abs",
+            "floor" => "floor",
+            "ceil" => "ceil",
+            "round" => "round",
+            "sign" => "sign",
+            "erf" => "erf",
+            "gelu_erf" => "gelu_erf",
+            "sigmoid" => "sigmoid",
+            // Anything still without a WGSL kernel: fall back to CPU (correct, slow).
+            _ => {
+                let cpu = self.to_cpu_storage()?;
+                let r = crate::backend::BackendStorage::unary_impl::<B>(&cpu, layout)?;
+                return self.device.storage_from_cpu_storage(&r);
+            }
+        };
+        let mut ck = None;
+        let cb = self.contig_buf(layout, &mut ck)?;
+        let n = layout.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        self.device
+            .dispatch(kernel, &[&cb, &out.buffer], &pack_u32(&[n as u32]), Self::groups_1d(n))?;
+        Ok(out)
     }
 
-    fn binary_impl<B: BinaryOpT>(&self, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
-        todo_wgpu!("binary_impl")
+    fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        let kernel: &'static str = match B::NAME {
+            "add" => "add",
+            "sub" => "sub",
+            "mul" => "mul",
+            "div" => "div",
+            "maximum" => "maximum",
+            "minimum" => "minimum",
+            // Anything still without a WGSL kernel: fall back to CPU (correct, slow).
+            _ => {
+                let lc = self.to_cpu_storage()?;
+                let rc = rhs.to_cpu_storage()?;
+                let r = crate::backend::BackendStorage::binary_impl::<B>(&lc, &rc, lhs_l, rhs_l)?;
+                return self.device.storage_from_cpu_storage(&r);
+            }
+        };
+        // hanzo-ml pre-broadcasts both layouts to the output shape; broadcast layouts aren't
+        // contiguous so contig_buf still materializes them, but same-shape contiguous operands skip.
+        let mut lk = None;
+        let mut rk = None;
+        let lb = self.contig_buf(lhs_l, &mut lk)?;
+        let rb = rhs.contig_buf(rhs_l, &mut rk)?;
+        let n = lhs_l.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        self.device
+            .dispatch(kernel, &[&lb, &rb, &out.buffer], &pack_u32(&[n as u32]), Self::groups_1d(n))?;
+        Ok(out)
     }
 
-    fn where_cond(&self, _: &Layout, _: &Self, _: &Layout, _: &Self, _: &Layout) -> Result<Self> {
-        todo_wgpu!("where_cond")
+    fn where_cond(
+        &self,
+        l: &Layout,
+        t: &Self,
+        t_l: &Layout,
+        f: &Self,
+        f_l: &Layout,
+    ) -> Result<Self> {
+        // self is the condition mask (u32). The kernel reads it linearly.
+        if self.dtype != DType::U32 {
+            crate::bail!("wgpu: where_cond requires u32 condition, got {:?}", self.dtype);
+        }
+        let mut condk = None;
+        let condb = if l.is_contiguous() && l.start_offset() == 0 {
+            self.buffer.clone()
+        } else {
+            let s = self.contiguous_u32(l)?;
+            let b = s.buffer.clone();
+            condk = Some(s);
+            b
+        };
+        let _ = &condk; // keep the materialized condition alive until the dispatch is recorded
+        let mut tk = None;
+        let mut fk = None;
+        let tb = t.contig_buf(t_l, &mut tk)?;
+        let fb = f.contig_buf(f_l, &mut fk)?;
+        let n = l.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        self.device.dispatch(
+            "where_cond",
+            &[&condb, &tb, &fb, &out.buffer],
+            &pack_u32(&[n as u32]),
+            Self::groups_1d(n),
+        )?;
+        Ok(out)
     }
 
     fn conv1d(
@@ -759,36 +1299,82 @@ impl BackendStorage for WgpuStorage {
         todo_wgpu!("conv_transpose2d")
     }
 
-    fn index_select(&self, _: &Self, _: &Layout, _: &Layout, _: usize) -> Result<Self> {
-        todo_wgpu!("index_select")
+    fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        if ids.dtype != DType::U32 {
+            crate::bail!("wgpu: index_select requires u32 ids, got {:?}", ids.dtype);
+        }
+        // The kernel reads ids linearly (ids[i]), so materialize a contiguous, offset-0 copy.
+        let mut idk = None;
+        let ids_buf = if ids_l.is_contiguous() && ids_l.start_offset() == 0 {
+            ids.buffer.clone()
+        } else {
+            let s = ids.contiguous_u32(ids_l)?;
+            let b = s.buffer.clone();
+            idk = Some(s);
+            b
+        };
+        let _ = &idk; // keep the materialized ids alive until the dispatch is recorded
+        let src_c = self.contiguous(l)?;
+        let dims = l.dims();
+        let left: usize = dims[..dim].iter().product();
+        let dim_size = dims[dim];
+        let right: usize = dims[dim + 1..].iter().product();
+        let n_ids = ids_l.shape().elem_count();
+        let total = left * n_ids * right;
+        let out = self.device.alloc_f32(total)?;
+        self.device.dispatch(
+            "index_select",
+            &[&ids_buf, &src_c.buffer, &out.buffer],
+            &pack_u32(&[left as u32, dim_size as u32, right as u32, n_ids as u32]),
+            Self::groups_1d(total),
+        )?;
+        Ok(out)
     }
 
-    fn gather(&self, _: &Layout, _: &Self, _: &Layout, _: usize) -> Result<Self> {
-        todo_wgpu!("gather")
+    fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
+        if ids.dtype != DType::U32 {
+            crate::bail!("wgpu: gather requires u32 ids, got {:?}", ids.dtype);
+        }
+        let src = self.contiguous(l)?;
+        let idc = ids.contiguous_u32(ids_l)?;
+        let out_dims = ids_l.dims();
+        let src_dims = l.dims();
+        let right: usize = out_dims[dim + 1..].iter().product();
+        let dim_out = out_dims[dim];
+        let dim_src = src_dims[dim];
+        let n = ids_l.shape().elem_count();
+        let out = self.device.alloc_f32(n)?;
+        self.device.dispatch(
+            "gather",
+            &[&src.buffer, &idc.buffer, &out.buffer],
+            &pack_u32(&[n as u32, right as u32, dim_out as u32, dim_src as u32]),
+            Self::groups_1d(n),
+        )?;
+        Ok(out)
     }
 
     fn scatter_set(
         &mut self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        todo_wgpu!("scatter_set")
+        self.scatter_impl("scatter_set", l, ids, ids_l, src, src_l, dim)
     }
 
     fn scatter_add_set(
         &mut self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        todo_wgpu!("scatter_add_set")
+        self.scatter_impl("scatter_add_set", l, ids, ids_l, src, src_l, dim)
     }
 
     fn index_add(
