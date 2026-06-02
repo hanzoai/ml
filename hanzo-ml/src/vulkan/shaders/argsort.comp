@@ -1,0 +1,62 @@
+#version 450
+// Row-wise argsort over the last (contiguous) dim of a row-major [rows, cols] f32 buffer.
+// out[row*cols + .] is the permutation of column indices that sorts that row (asc=1 -> ascending,
+// asc=0 -> descending). Bitonic sort, one workgroup per row, ported 1:1 from the CUDA k_argsort
+// (hanzo-kernels/src/sort.cu) so ties/padding resolve identically across backends.
+// Index scratch lives in shared memory sized to MAX_COLS_PAD; cols_pad (next pow2 of cols) must be
+// <= MAX_COLS_PAD, asserted host-side. Each invocation strides over cols_pad when it exceeds WG.
+#define MAX_COLS_PAD 1024u
+#define WG 256u
+#define ASC 1u
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) readonly  buffer In  { float inp[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { uint o[]; };
+layout(push_constant) uniform Pc { uint rows; uint cols; uint cols_pad; uint asc; };
+
+shared uint dst_row[MAX_COLS_PAD];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= rows) { return; }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * cols;
+
+    for (uint col = tid; col < cols_pad; col += WG) {
+        dst_row[col] = col;
+    }
+    barrier();
+
+    for (uint k = 2u; k <= cols_pad; k *= 2u) {
+        for (uint j = k / 2u; j > 0u; j /= 2u) {
+            for (uint col = tid; col < cols_pad; col += WG) {
+                uint ixj = col ^ j;
+                if (ixj > col) {
+                    // out-of-range padded indices (>= cols) sort to the high end so the real
+                    // indices keep their sorted order in [0, cols); matches the CUDA comparator.
+                    bool swap;
+                    if ((col & k) == 0u) {
+                        swap = dst_row[col] >= cols ||
+                            (dst_row[ixj] < cols && (asc == ASC ?
+                                inp[base + dst_row[col]] > inp[base + dst_row[ixj]] :
+                                inp[base + dst_row[col]] < inp[base + dst_row[ixj]]));
+                    } else {
+                        swap = dst_row[ixj] >= cols ||
+                            (dst_row[col] < cols && (asc == ASC ?
+                                inp[base + dst_row[col]] < inp[base + dst_row[ixj]] :
+                                inp[base + dst_row[col]] > inp[base + dst_row[ixj]]));
+                    }
+                    if (swap) {
+                        uint tmp = dst_row[col];
+                        dst_row[col] = dst_row[ixj];
+                        dst_row[ixj] = tmp;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    for (uint col = tid; col < cols; col += WG) {
+        o[base + col] = dst_row[col];
+    }
+}
