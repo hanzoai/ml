@@ -48,6 +48,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "copy" => spv!("copy"),
+        "copy2d" => spv!("copy2d"),
+        "const_fill" => spv!("const_fill"),
         "reduce_sum" => spv!("reduce_sum"),
         "reduce_max" => spv!("reduce_max"),
         "strided_copy" => spv!("strided_copy"),
@@ -805,6 +807,19 @@ impl VulkanDevice {
         let s = self.alloc_u32(data.len())?;
         unsafe { self.write_u32(s.memory, data)? };
         Ok(s)
+    }
+
+    // Name a CPU-fallback round-trip when HANZO_VK_PROFILE is set. Each fallback op reads its
+    // operand(s) back to the host, computes on the (UNtimed) CPU, and re-uploads -- a hidden
+    // bottleneck the size-only readback log can't attribute to an op. This names the culprit so a
+    // GPU re-run can prioritize which op to port native next. Zero-cost when profiling is off (the
+    // call is behind the `profile` bool and `op`/`extra` are cheap &str / Display formatting only
+    // evaluated on the slow path). `op` is the op name; `extra` is a shape/size descriptor.
+    #[inline]
+    fn profile_fallback(&self, op: &str, extra: std::fmt::Arguments<'_>) {
+        if self.inner.profile {
+            eprintln!("[HANZO_VK_PROFILE] cpu-fallback op={op} {extra} (GPU->CPU->GPU round-trip)");
+        }
     }
 }
 
@@ -1609,6 +1624,10 @@ impl BackendStorage for VulkanStorage {
             }
             // Other dtypes aren't held by this backend: CPU-convert then upload.
             _ => {
+                self.device.profile_fallback(
+                    "to_dtype",
+                    format_args!("{:?}->{:?} elems={n}", self.dtype, dtype),
+                );
                 let cpu = self.to_cpu_storage()?;
                 let converted = crate::backend::BackendStorage::to_dtype(&cpu, layout, dtype)?;
                 self.device.storage_from_cpu_storage(&converted)
@@ -1639,6 +1658,10 @@ impl BackendStorage for VulkanStorage {
             "gelu_erf" => "gelu_erf",
             // Anything still without a SPIR-V kernel: fall back to CPU (correct, slow).
             _ => {
+                self.device.profile_fallback(
+                    B::NAME,
+                    format_args!("unary elems={}", layout.shape().elem_count()),
+                );
                 let cpu = self.to_cpu_storage()?;
                 let r = crate::backend::BackendStorage::unary_impl::<B>(&cpu, layout)?;
                 return self.device.storage_from_cpu_storage(&r);
@@ -1669,6 +1692,10 @@ impl BackendStorage for VulkanStorage {
             "minimum" => "minimum",
             // Anything still without a SPIR-V kernel: fall back to CPU (correct, slow).
             _ => {
+                self.device.profile_fallback(
+                    B::NAME,
+                    format_args!("binary elems={}", lhs_l.shape().elem_count()),
+                );
                 let lc = self.to_cpu_storage()?;
                 let rc = rhs.to_cpu_storage()?;
                 let r = crate::backend::BackendStorage::binary_impl::<B>(&lc, &rc, lhs_l, rhs_l)?;
@@ -2181,24 +2208,67 @@ impl BackendStorage for VulkanStorage {
         src_offset: usize,
         dst_offset: usize,
     ) -> Result<()> {
-        // CPU round-trip (bit-preserving via f32): copy d1 rows of d2 contiguous elems
-        // with per-row src/dst strides. Works for any 4-byte dtype.
-        let src = self.to_vec_f32()?;
-        let mut dstv = dst.to_vec_f32()?;
-        for i in 0..d1 {
-            let so = src_offset + i * src_stride1;
-            let d_o = dst_offset + i * dst_stride1;
-            dstv[d_o..d_o + d2].copy_from_slice(&src[so..so + d2]);
+        // Native on-GPU 2D strided block copy: d1 rows of d2 contiguous elems, per-row
+        // src/dst strides + base offsets. This is the cat / slice_set primitive (KV-cache
+        // append + GQA repeat_kv every layer), previously the single hottest GPU<->CPU
+        // round-trip in the forward (each call read both buffers to the host, copied on CPU,
+        // re-uploaded). The `copy2d` kernel is uint-typed so it's bit-exact for f32 AND u32
+        // storage. The kernel only writes the addressed elements, leaving the rest of `dst`
+        // intact, exactly like the previous read-modify-write, so successive copies compose.
+        let total = d1 * d2;
+        if total == 0 {
+            return Ok(());
         }
-        unsafe { dst.device.write_f32(dst.memory, &dstv) }
+        if self.device.inner.profile {
+            eprintln!(
+                "[HANZO_VK_PROFILE] copy2d(native): d1={d1} d2={d2} elems={total} \
+                 (was a CPU round-trip; now on-GPU)"
+            );
+        }
+        let push = push_u32(&[
+            d1 as u32,
+            d2 as u32,
+            src_stride1 as u32,
+            dst_stride1 as u32,
+            src_offset as u32,
+            dst_offset as u32,
+        ]);
+        self.device.dispatch(
+            "copy2d",
+            &[self.buffer, dst.buffer],
+            &push,
+            Self::groups_1d(total),
+        )
     }
 
     fn const_set(&mut self, s: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
-        // Host-visible memory: read the whole buffer, set every element the layout addresses
-        // (the strided index handles non-contiguous / offset / broadcast-free views as well as
-        // the contiguous fast path), then write it back. Read-modify-write so elements outside
-        // the addressed set are preserved. u32 storage is set as an integer; everything else
-        // (f32, and f16/bf16 which live as f32) as a float.
+        // Fast path: a contiguous, offset-0 view that covers the WHOLE buffer (the
+        // Tensor::full / ones / fill primitive) is filled on-GPU by const_fill, no readback.
+        // The value is passed as raw 32-bit bits so one uint kernel serves f32 and u32 storage
+        // bit-exactly. Every element is written, so nothing outside the addressed set exists to
+        // preserve -- the read-modify-write the slow path needs is unnecessary here.
+        let n = layout.shape().elem_count();
+        if layout.is_contiguous() && layout.start_offset() == 0 && n == self.count {
+            let bits: u32 = if self.dtype == DType::U32 || self.dtype == DType::U8 {
+                s.to_f64() as u32
+            } else {
+                (s.to_f64() as f32).to_bits()
+            };
+            return self.device.dispatch(
+                "const_fill",
+                &[self.buffer],
+                &push_u32(&[n as u32, bits]),
+                Self::groups_1d(n),
+            );
+        }
+        // Slow path (partial / strided / offset view): host-visible read-modify-write so elements
+        // outside the addressed set are preserved. u32 storage is set as an integer; everything
+        // else (f32, and f16/bf16 which live as f32) as a float. Named for the profiler since it
+        // still round-trips.
+        self.device.profile_fallback(
+            "const_set",
+            format_args!("elems={n} buf={} (partial/strided)", self.count),
+        );
         if self.dtype == DType::U32 || self.dtype == DType::U8 {
             let v = s.to_f64() as u32;
             let mut data = self.to_vec_u32()?;
