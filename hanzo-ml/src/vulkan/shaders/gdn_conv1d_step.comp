@@ -1,0 +1,32 @@
+#version 450
+// Causal depthwise conv1d, SINGLE timestep (decode, seq_len==1, batch==1). One invocation per conv
+// channel. Matches QGatedDeltaNet::causal_conv1d_update for seq=1 with a conv_state of width k_size:
+// hidden = [conv_state[0..k] | x]; window = hidden[1..k+1] (drop the oldest column, append x);
+// out[c] = silu(sum_j window[c][j]*weight[c][j]); the new conv_state IS that window. So
+//   window[j] = (j < k-1) ? conv_state[j+1] : x;  conv_state[j] <- window[j].
+// weight is [conv_dim, k_size], conv_state is [conv_dim, k_size], x is [conv_dim]. No bias.
+// MAX_K bounds the per-invocation window; k_size must be <= MAX_K (asserted host-side).
+#define MAX_K 8u
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0)           buffer Cs  { float cs[]; };   // conv_state, in+out
+layout(set = 0, binding = 1) readonly  buffer X   { float x[]; };
+layout(set = 0, binding = 2) readonly  buffer W   { float w[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float outp[]; };
+layout(push_constant) uniform Pc { uint conv_dim; uint k_size; };
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= conv_dim) { return; }
+    uint cs_base = c * k_size;
+    uint w_base = c * k_size;
+
+    float win[MAX_K];
+    for (uint j = 0u; j + 1u < k_size; j++) { win[j] = cs[cs_base + j + 1u]; }
+    win[k_size - 1u] = x[c];
+
+    float acc = 0.0;
+    for (uint j = 0u; j < k_size; j++) { acc += win[j] * w[w_base + j]; }
+    // silu(acc) = acc * sigmoid(acc)
+    outp[c] = acc / (1.0 + exp(-acc));
+
+    for (uint j = 0u; j < k_size; j++) { cs[cs_base + j] = win[j]; }
+}
