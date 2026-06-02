@@ -142,6 +142,15 @@ struct VkInner {
     cm_use: bool,
     // CPU-side RNG seed (kernels are deterministic; randoms are generated on the CPU then uploaded).
     seed: Mutex<u64>,
+    // VK_KHR_push_descriptor device fns, present iff the driver advertises the extension (native
+    // AMD/NV; typically absent on WSL/Dozen). When set, `dispatch` pushes buffer handles inline
+    // into the command buffer via `vkCmdPushDescriptorSetKHR` instead of allocating + updating +
+    // binding a descriptor set per op — three driver calls and two heap Vecs per dispatch collapse
+    // to one recorded command, which is the dominant CPU cost on the decode hot path (the same op
+    // graph, hundreds of dispatches x 28 layers, re-recorded every token). Set HANZO_VK_PUSH_DESC=0
+    // to force the legacy alloc+update path. Pipelines' set layouts are created with the
+    // PUSH_DESCRIPTOR_KHR flag exactly when this is `Some`, so the two paths never mix.
+    push_descriptor: Option<ash::khr::push_descriptor::Device>,
     // kernel name -> built pipeline. &'static str keys: kernel names are compile-time literals.
     pipelines: Mutex<HashMap<&'static str, CachedPipeline>>,
     // Persistent per-dispatch Vulkan objects (command pool/buffer, fence, descriptor pool),
@@ -430,6 +439,15 @@ impl VulkanDevice {
             return Ok(p.clone());
         }
         let dev = self.dev();
+        // A set layout consumed by vkCmdPushDescriptorSetKHR must be created with the
+        // PUSH_DESCRIPTOR_KHR flag; the legacy allocate-from-pool path requires it absent. The
+        // backend commits to one or the other at init (`push_descriptor`), so every layout is built
+        // to match and the two paths can't be crossed for a given device.
+        let layout_flags = if self.inner.push_descriptor.is_some() {
+            vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+        } else {
+            vk::DescriptorSetLayoutCreateFlags::empty()
+        };
         let cached = unsafe {
             let binds: Vec<_> = (0..n_buffers as u32)
                 .map(|i| {
@@ -442,7 +460,9 @@ impl VulkanDevice {
                 .collect();
             let set_layout = dev
                 .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binds),
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .flags(layout_flags)
+                        .bindings(&binds),
                     None,
                 )
                 .map_err(vkerr)?;
@@ -515,7 +535,9 @@ impl VulkanDevice {
         unsafe {
             if !s.recording {
                 // Start a fresh batch: free the previous batch's descriptor sets (its GPU work
-                // already completed at the last flush) and open the command buffer.
+                // already completed at the last flush) and open the command buffer. The pool reset
+                // is a no-op for the push-descriptor path (no sets are allocated from it) but stays
+                // harmless and keeps the legacy path correct.
                 dev.reset_descriptor_pool(s.dpool, vk::DescriptorPoolResetFlags::empty())
                     .map_err(vkerr)?;
                 dev.begin_command_buffer(s.cmd, &vk::CommandBufferBeginInfo::default())
@@ -523,17 +545,8 @@ impl VulkanDevice {
                 s.recording = true;
                 s.n = 0;
             }
-            // Allocate a fresh descriptor set for this dispatch. Sets accumulate within the
-            // batch (each recorded dispatch keeps its own); the pool is reset only when the
-            // next batch begins, after the current one has been submitted and awaited.
-            let set_layouts = [p.set_layout];
-            let set = dev
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(s.dpool)
-                        .set_layouts(&set_layouts),
-                )
-                .map_err(vkerr)?[0];
+            // Buffer infos are needed by both paths; build them once. (WriteDescriptorSet borrows
+            // these, so they must outlive the update/push call below.)
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
                 .iter()
                 .map(|&b| {
@@ -542,27 +555,61 @@ impl VulkanDevice {
                         .range(vk::WHOLE_SIZE)]
                 })
                 .collect();
-            let writes: Vec<_> = (0..bufs.len())
-                .map(|i| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&infos[i])
-                })
-                .collect();
-            dev.update_descriptor_sets(&writes, &[]);
-
             let cmd = s.cmd;
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
-            dev.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                p.layout,
-                0,
-                &[set],
-                &[],
-            );
+
+            if let Some(pd) = &self.inner.push_descriptor {
+                // Fast path: push buffer handles inline into the command buffer. No descriptor-set
+                // object is allocated and nothing is written to pool-backed GPU memory — the driver
+                // records the bindings directly, eliminating the per-op allocate + update + bind
+                // (three driver calls + descriptor-pool traffic) that dominated decode CPU time.
+                let writes: Vec<_> = (0..bufs.len())
+                    .map(|i| {
+                        // dst_set is ignored by vkCmdPushDescriptorSetKHR (left default/null).
+                        vk::WriteDescriptorSet::default()
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&infos[i])
+                    })
+                    .collect();
+                pd.cmd_push_descriptor_set(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    p.layout,
+                    0,
+                    &writes,
+                );
+            } else {
+                // Legacy path: allocate a fresh descriptor set for this dispatch. Sets accumulate
+                // within the batch (each recorded dispatch keeps its own); the pool is reset only
+                // when the next batch begins, after the current one has been submitted and awaited.
+                let set_layouts = [p.set_layout];
+                let set = dev
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(s.dpool)
+                            .set_layouts(&set_layouts),
+                    )
+                    .map_err(vkerr)?[0];
+                let writes: Vec<_> = (0..bufs.len())
+                    .map(|i| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&infos[i])
+                    })
+                    .collect();
+                dev.update_descriptor_sets(&writes, &[]);
+                dev.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    p.layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+            }
             if !push.is_empty() {
                 dev.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
@@ -800,9 +847,34 @@ impl BackendDevice for VulkanDevice {
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
-            // Enable the coopmat extension + the features its SPIR-V needs (cooperative matrix,
-            // Vulkan memory model, fp16 arithmetic, 16-bit storage) only when supported.
-            let cm_ext_names = [ash::khr::cooperative_matrix::NAME.as_ptr()];
+            // VK_KHR_push_descriptor: lets `dispatch` push buffer handles inline into the command
+            // buffer (vkCmdPushDescriptorSetKHR) instead of allocating + updating + binding a
+            // descriptor set per op. That per-op churn is the dominant CPU cost on the decode hot
+            // path (same op graph, hundreds of dispatches x 28 layers, re-recorded every token), so
+            // collapsing it to one recorded command is the lever. Enabled when advertised (native
+            // AMD/NV; typically absent on WSL/Dozen, which keeps the legacy path). HANZO_VK_PUSH_DESC=0
+            // forces the legacy path. The extension's guaranteed maxPushDescriptors >= 32 dwarfs our
+            // widest kernel (4 storage buffers), so no per-pipeline limit check is needed.
+            let has_pd_ext = dev_exts.iter().any(|e| {
+                CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::push_descriptor::NAME
+            });
+            let use_pd = has_pd_ext
+                && std::env::var("HANZO_VK_PUSH_DESC")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+
+            // Build the enabled-extension list dynamically: coopmat and push_descriptor are
+            // independent and either may be present. push_descriptor needs no extra device feature
+            // struct (just the extension + a fn-pointer load), so it's a bare name here.
+            let mut ext_names: Vec<*const std::os::raw::c_char> = Vec::new();
+            if coopmat {
+                ext_names.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+            }
+            if use_pd {
+                ext_names.push(ash::khr::push_descriptor::NAME.as_ptr());
+            }
+            // Coopmat's SPIR-V needs these features (cooperative matrix, Vulkan memory model, fp16
+            // arithmetic, 16-bit storage); push_descriptor needs none.
             let mut cm_feat =
                 vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
             let mut mm_feat =
@@ -812,15 +884,20 @@ impl BackendDevice for VulkanDevice {
             let mut s16_feat =
                 vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
             let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
+            if !ext_names.is_empty() {
+                dci = dci.enabled_extension_names(&ext_names);
+            }
             if coopmat {
                 dci = dci
-                    .enabled_extension_names(&cm_ext_names)
                     .push_next(&mut cm_feat)
                     .push_next(&mut mm_feat)
                     .push_next(&mut f16_feat)
                     .push_next(&mut s16_feat);
             }
             let device = instance.create_device(pdev, &dci, None).map_err(vkerr)?;
+            // Load push_descriptor device fns now that the device exists with the extension enabled.
+            let push_descriptor = use_pd
+                .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
             let queue = device.get_device_queue(qfi, 0);
             let mem_props = instance.get_physical_device_memory_properties(pdev);
 
@@ -877,6 +954,7 @@ impl BackendDevice for VulkanDevice {
                 gpu_id: ordinal,
                 mem_props,
                 seed: Mutex::new(299792458),
+                push_descriptor,
                 pipelines: Mutex::new(HashMap::new()),
                 submitter,
                 bufpool: Mutex::new(BufPool::default()),
