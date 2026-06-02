@@ -123,9 +123,11 @@ struct CachedPipeline {
 
 struct VkInner {
     _entry: ash::Entry,
+    #[allow(dead_code)] // held to keep the Vulkan instance alive for the device's lifetime
     instance: ash::Instance,
     device: ash::Device,
     queue: vk::Queue,
+    #[allow(dead_code)] // queue family index, retained for completeness
     qfi: u32,
     gpu_id: usize,
     mem_props: vk::PhysicalDeviceMemoryProperties,
@@ -156,6 +158,7 @@ struct VkInner {
 // the single `cmd` and submitted together on flush (see `dispatch`/`flush_locked`), so the
 // per-op CPU<->GPU fence stall is paid once per batch instead of once per op.
 struct Submitter {
+    #[allow(dead_code)] // owns the pool that `cmd` is allocated from; freed with the device
     cpool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -239,7 +242,7 @@ impl VulkanDevice {
     /// one fp16 scale + 32 int8, packed into 9 u32. Returns the device buffer to reuse across many
     /// matvecs (weights are constant during decode). `k` must be a multiple of 32.
     pub fn quantize_q8(&self, w: &[f32], nout: usize, k: usize) -> Result<VulkanStorage> {
-        if k % 32 != 0 {
+        if !k.is_multiple_of(32) {
             crate::bail!("quantize_q8: k must be a multiple of 32, got {k}");
         }
         if w.len() != nout * k {
@@ -1187,6 +1190,7 @@ impl VulkanStorage {
 
     // Shared scatter: write/accumulate src into dst (self) along `dim` at positions `ids`.
     // dst is assumed contiguous (its layout `l` gives the dim sizes). ids/src share a shape.
+    #[allow(clippy::too_many_arguments)]
     fn scatter_impl(
         &self,
         kernel: &'static str,
