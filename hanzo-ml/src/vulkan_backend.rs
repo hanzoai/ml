@@ -55,7 +55,9 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
         "mul_mat_vec_id_q4k" => spv!("mul_mat_vec_id_q4k"),
+        "mul_mat_vec_id_q4k_sg" => spv!("mul_mat_vec_id_q4k_sg"),
         "mul_mat_vec_id_q8" => spv!("mul_mat_vec_id_q8"),
+        "mul_mat_vec_id_q8_sg" => spv!("mul_mat_vec_id_q8_sg"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -564,13 +566,42 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// Kernel name + dispatch grid for a fused grouped (MoE) matvec producing `m*nout` outputs. When
+    /// the device supports subgroup arithmetic (`subgroup_matvec`, the same gate q8 uses) this selects
+    /// the `_sg` variant — ONE SUBGROUP per (slot,col) output, lanes striding that row's blocks for
+    /// coalesced reads — and a workgroup of WG1D invocations holds `WG1D/subgroup_size` subgroups, so
+    /// it yields that many outputs; dispatch `ceil(m*nout / rows_per_wg)` workgroups. Otherwise the
+    /// scalar kernel (one invocation per output, `ceil(m*nout / WG1D)` workgroups). `base` is the
+    /// scalar kernel name; the `_sg` literal is matched (not formatted) to keep it `'static`.
+    fn matvec_id_grid(
+        &self,
+        base: &'static str,
+        m: usize,
+        nout: usize,
+    ) -> (&'static str, (u32, u32, u32)) {
+        let total = (m * nout) as u32;
+        if self.inner.subgroup_matvec {
+            let sg = match base {
+                "mul_mat_vec_id_q4k" => "mul_mat_vec_id_q4k_sg",
+                "mul_mat_vec_id_q8" => "mul_mat_vec_id_q8_sg",
+                other => other,
+            };
+            // subgroup_size is >=2 (checked at init) and <=64 in practice, so rows_per_wg is [1, 32].
+            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
+            (sg, (total.div_ceil(rows_per_wg), 1, 1))
+        } else {
+            (base, (total.div_ceil(WG1D), 1, 1))
+        }
+    }
+
     /// Fused grouped Q4_K matvec for resident-bank MoE: ONE dispatch computes `y[m*nout]` where
     /// `y[slot*nout + col] = dequant(bank[ids[slot]])[col, :] . x_flat[slot*k ..]`. `ids` is a GPU u32
     /// buffer of length `m` (the routed expert per slot), `x_flat` is `[m, k]` f32 contiguous, `bank`
     /// is the verbatim [E,n,k] Q4_K bank, `per_expert_words = n * (k/256) * 36`. Replaces the
     /// per-expert index_select/matvec/index_add loop -- and its routing-ids GPU->CPU sync -- with one
     /// kernel reading ids straight from VRAM. Decode is bit-identical to [`matvec_q4k_gpu_off`] (same
-    /// in-shader block decode). One invocation per (slot,col); grid ceil(m*nout / WG1D).
+    /// in-shader block decode). Dispatches the subgroup-reduced `_sg` variant when supported (one
+    /// subgroup per (slot,col)), else the scalar kernel (one invocation per output). See `matvec_id_grid`.
     #[allow(clippy::too_many_arguments)]
     pub fn mul_mat_vec_id_q4k_gpu(
         &self,
@@ -598,13 +629,15 @@ impl VulkanDevice {
         let out = self.alloc_f32(m * nout)?;
         let push = push_u32(&[nout as u32, k as u32, per_expert_words as u32, m as u32]);
         // Y is binding 2, not the last buffer (IDS is 3); name it so the RAW hazard tracker keys on
-        // the buffer the kernel actually writes.
+        // the buffer the kernel actually writes. Subgroup variant when available (one subgroup per
+        // output element, coalesced reads + subgroupAdd); else the scalar fallback.
+        let (kernel, groups) = self.matvec_id_grid("mul_mat_vec_id_q4k", m, nout);
         self.dispatch_out(
-            "mul_mat_vec_id_q4k",
+            kernel,
             &[bank.buffer, x_flat.buffer, out.buffer, ids.buffer],
             2,
             &push,
-            (((m * nout) as u32).div_ceil(WG1D), 1, 1),
+            groups,
         )?;
         Ok(out)
     }
@@ -612,7 +645,8 @@ impl VulkanDevice {
     /// Fused grouped Q8_0 matvec for resident-bank MoE: ONE dispatch computes `y[m*nout]` where
     /// `y[slot*nout + col] = dequant(bank[ids[slot]])[col, :] . x_flat[slot*k ..]`. Q8_0 analog of
     /// [`mul_mat_vec_id_q4k_gpu`]; `per_expert_words = n * (k/32) * 9`. Decode is bit-identical to
-    /// [`matvec_q8_gpu_off`]. One invocation per (slot,col); grid ceil(m*nout / WG1D).
+    /// [`matvec_q8_gpu_off`]. Dispatches the subgroup-reduced `_sg` variant when supported (one
+    /// subgroup per (slot,col)), else the scalar kernel (one invocation per output). See `matvec_id_grid`.
     #[allow(clippy::too_many_arguments)]
     pub fn mul_mat_vec_id_q8_gpu(
         &self,
@@ -639,12 +673,13 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(m * nout)?;
         let push = push_u32(&[nout as u32, k as u32, per_expert_words as u32, m as u32]);
+        let (kernel, groups) = self.matvec_id_grid("mul_mat_vec_id_q8", m, nout);
         self.dispatch_out(
-            "mul_mat_vec_id_q8",
+            kernel,
             &[bank.buffer, x_flat.buffer, out.buffer, ids.buffer],
             2,
             &push,
-            (((m * nout) as u32).div_ceil(WG1D), 1, 1),
+            groups,
         )?;
         Ok(out)
     }
