@@ -1,0 +1,51 @@
+#version 450
+// Activation quantizer for the int8 dp4a prefill matmul. Quantizes f32 activations x[M,k] (row-major)
+// to q8_1-style int8 per 32-block: xq[M,k] int8 packed 4-per-u32 (M*(k/32)*8 u32 total) + one f32
+// scale per block xs[M, k/32]. Run ONCE per prefill; the dp4a matmul reuses the quantized rows across
+// all N output columns, so this O(M*k) pass is amortized over the O(M*N*k) matmul. Per (row m, block
+// b): scale = max(|x|)/127 over the 32 elems (scale=1 and all-zero q if the block is all zero), then
+// q[i] = clamp(round(x[i]/scale), -127, 127). 127 (not 128) matches the symmetric Q8_0 weight range so
+// the dp4a product stays in the exact int8xint8 grid. Packing is little-endian (lane l in byte l), the
+// SAME order the weights use (quantize_q8 packs q<<(l*8)), so OpSDotAccSat pairs matching lanes.
+// One invocation = one 32-block of one row; dispatch M*(k/32) invocations.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer X  { float x[]; };  // activations, row-major [M, k]
+layout(set = 0, binding = 1) writeonly buffer XQ { uint  xq[]; }; // int8, 4 per u32, [M, k/32, 8]
+layout(set = 0, binding = 2) writeonly buffer XS { float xs[]; }; // per-block f32 scale, [M, k/32]
+// m: rows; k: contraction dim (multiple of 32). x row stride is k.
+layout(push_constant) uniform Pc { uint m; uint k; };
+
+const float QMAX = 127.0; // symmetric int8 range, matches Q8_0 weights
+
+void main() {
+    uint nblocks = k / 32u;
+    uint gid = gl_GlobalInvocationID.x; // flat (row, block) index
+    uint total = m * nblocks;
+    if (gid >= total) {
+        return;
+    }
+    uint row = gid / nblocks;
+    uint blk = gid - row * nblocks;
+    uint xbase = row * k + blk * 32u; // first f32 of this block
+
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) {
+        amax = max(amax, abs(x[xbase + i]));
+    }
+    // Zero block: emit scale=1 and all-zero codes so the dp4a contributes exactly 0 (avoids 0/0).
+    float scale = amax > 0.0 ? amax / QMAX : 1.0;
+    float inv = amax > 0.0 ? QMAX / amax : 0.0;
+
+    xs[gid] = scale; // xs is [M, k/32] row-major, same flat index as gid
+    uint obase = gid * 8u; // 8 u32 per block
+    for (uint j = 0u; j < 8u; j++) {
+        uint word = 0u;
+        for (uint l = 0u; l < 4u; l++) {
+            int q = int(round(x[xbase + j * 4u + l] * inv));
+            q = clamp(q, -127, 127);
+            word |= (uint(q) & 0xFFu) << (l * 8u); // little-endian lane packing (matches weights)
+        }
+        xq[obase + j] = word;
+    }
+}
