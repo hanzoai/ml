@@ -235,3 +235,82 @@ fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// MoE: the fused grouped quant matvec. Build a quantized expert bank [E, n, k] on the Vulkan device
+// and call QTensor::indexed_moe_forward (the path Qwen3-MoE uses) -- which now runs one on-GPU
+// dispatch that gathers each routed slot's expert and computes its matvec -- and compare to a host
+// f64 reference over the dequantized per-expert weights.
+fn moe_case(
+    dev: &Device,
+    dtype: GgmlDType,
+    e_cnt: usize,
+    n: usize,
+    k: usize,
+    t: usize,
+    topk: usize,
+) -> hanzo_ml::Result<f32> {
+    let cpu = Device::Cpu;
+    // Expert bank [E, n, k] and its dequantized f32 (the reference weights).
+    let bank_host: Vec<f32> = (0..e_cnt * n * k).map(|i| pseudo(i) * 0.5).collect();
+    let bank_t = Tensor::from_vec(bank_host, (e_cnt, n, k), &cpu)?;
+    let q_bank = QTensor::quantize(&bank_t.reshape((e_cnt * n, k))?, dtype)?; // quantize per row
+    let bank_deq: Vec<f32> = q_bank.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?; // [E*n*k]
+    let bytes = q_bank.data()?.into_owned();
+
+    // Activations [t, topk, k] (per-slot inputs) and router ids [t, topk].
+    let x_host: Vec<f32> = (0..t * topk * k).map(|i| pseudo(i + 11) * 0.7).collect();
+    // Deterministic expert assignment spread across all experts.
+    let ids_host: Vec<u32> = (0..t * topk).map(|i| ((i * 7 + 3) % e_cnt) as u32).collect();
+
+    // Build the Vulkan QTensor bank the loader way and run the fused MoE forward.
+    let qs_vk = QStorage::from_data(std::borrow::Cow::Owned(bytes), dev, dtype)?;
+    let q_vk = QTensor::new(qs_vk, (e_cnt, n, k))?;
+    let x_vk = Tensor::from_vec(x_host.clone(), (t, topk, k), dev)?;
+    let ids_vk = Tensor::from_vec(ids_host.clone(), (t, topk), dev)?;
+    let y_vk = q_vk
+        .indexed_moe_forward(&x_vk, &ids_vk)?
+        .reshape((t * topk, n))?
+        .to_vec2::<f32>()?;
+
+    // Reference: y[slot, r] = sum_k W_deq[ids[slot], r, k] * x[slot, k].
+    let mut max_abs = 0f32;
+    for slot in 0..t * topk {
+        let e = ids_host[slot] as usize;
+        for r in 0..n {
+            let wbase = (e * n + r) * k;
+            let xbase = slot * k;
+            let mut acc = 0f64;
+            for j in 0..k {
+                acc += bank_deq[wbase + j] as f64 * x_host[xbase + j] as f64;
+            }
+            max_abs = max_abs.max((y_vk[slot][r] as f64 - acc).abs() as f32);
+        }
+    }
+    Ok(max_abs)
+}
+
+#[test]
+fn vulkan_moe_forward_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    // Qwen3-MoE-ish: many experts, small expert intermediate n, hidden k, a few tokens, top-k.
+    // (e_cnt, n, k, t, topk). k divisible by 256 so all three dtypes work on the same shapes.
+    let cases = [
+        (8usize, 256usize, 256usize, 2usize, 2usize),
+        (16, 512, 256, 3, 4),
+        (4, 768, 512, 1, 2), // decode-like: single token, top-2
+    ];
+    for &(e_cnt, n, k, t, topk) in &cases {
+        for dt in [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType::Q4K] {
+            let max_abs = moe_case(&dev, dt, e_cnt, n, k, t, topk)?;
+            println!(
+                "MoE {dt:?}  E={e_cnt:3} n={n:4} k={k:4} t={t} topk={topk}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}"
+            );
+            assert!(
+                max_abs < 1e-3,
+                "MoE {dt:?} GPU/ref mismatch too large: {max_abs}"
+            );
+        }
+    }
+    Ok(())
+}
