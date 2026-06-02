@@ -47,6 +47,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm_coopmat_rb_nt" => spv!("bmm_coopmat_rb_nt"),
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
+        "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -123,16 +124,50 @@ struct CachedPipeline {
     n_buffers: usize,
 }
 
+// Device-memory placement strategy for storage buffers, set once at init from
+// HANZO_VK_DEVICE_MEMORY_STRATEGY. On this RDNA3.5 UMA APU the host-visible "VRAM carveout" heap
+// is small (a few hundred MB), while the large unified pool (~GTT, tens of GB of the 128GB system
+// RAM) is exposed as a DEVICE_LOCAL-only heap. A pure host-visible policy therefore OOMs an 18.6GB
+// model even though there is ample memory; we must be able to place big buffers in the large heap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MemStrategy {
+    // Only ever use host-visible memory types (legacy behaviour; correct on classic discrete GPUs
+    // with a single large host-visible heap or where staging is handled elsewhere).
+    HostOnly,
+    // Prefer the largest DEVICE_LOCAL heap for every buffer; fall back to host-visible.
+    DeviceFirst,
+    // Per-allocation: use a host-visible type when its heap is large enough to hold the buffer,
+    // otherwise place it in the largest usable (typically DEVICE_LOCAL) heap. Default.
+    Auto,
+}
+
 struct VkInner {
     _entry: ash::Entry,
     #[allow(dead_code)] // held to keep the Vulkan instance alive for the device's lifetime
     instance: ash::Instance,
+    // Physical device handle, retained so memory budget (free bytes) can be re-queried at runtime
+    // for the scratch-allocation guard (heap `size` is total capacity, not what is currently free).
+    pdev: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
     #[allow(dead_code)] // queue family index, retained for completeness
     qfi: u32,
     gpu_id: usize,
     mem_props: vk::PhysicalDeviceMemoryProperties,
+    // Buffer-placement policy (see MemStrategy).
+    mem_strategy: MemStrategy,
+    // VK_EXT_memory_budget advertised: lets us query per-heap *free* bytes (heapBudget) at runtime
+    // instead of only the static total heap `size`. When absent we fall back to total heap size as
+    // a conservative upper bound for the scratch guard.
+    has_mem_budget: bool,
+    // Subgroup arithmetic support for the COMPUTE stage (queried from PhysicalDeviceSubgroupProperties
+    // at init). When true the q8 mat-vec uses the subgroup-reduced kernel (one subgroup per output
+    // row, fused subgroupAdd) instead of the scalar one-thread-per-row kernel; this raises memory-
+    // level parallelism per row and halves the dispatch count on the decode hot path. Gated because
+    // the subgroup SPIR-V needs GroupNonUniformArithmetic, which not every driver (e.g. some WSL/
+    // Dozen configs) provides. `subgroup_size` is the reported subgroup width.
+    subgroup_matvec: bool,
+    subgroup_size: u32,
     // Cooperative-matrix (matrix-core / WMMA) availability and the chosen MxNxK tile for an
     // fp16xfp16 -> fp32 subgroup config. Present on native AMD/NV drivers (RDNA3.5 8060S),
     // absent on WSL/Dozen.
@@ -220,6 +255,10 @@ pub struct VulkanStorage {
     memory: vk::DeviceMemory,
     count: usize,
     dtype: DType,
+    // Is `memory` HOST_VISIBLE (directly CPU-mappable)? False when the buffer was placed in a
+    // DEVICE_LOCAL-only heap (the large GTT pool on this UMA APU), in which case uploads/readbacks
+    // go through a transient host-visible staging buffer + a GPU copy instead of a direct map.
+    host_visible: bool,
     device: VulkanDevice,
 }
 
@@ -239,10 +278,20 @@ impl std::fmt::Debug for VulkanStorage {
 // on the GPU) `reclaim` moves it to the size-keyed `free` list, where `raw_buffer` reuses it. This
 // bounds device memory to the peak working set and reuses buffers across tokens, instead of leaking
 // every allocation (which OOM'd a full unquantized forward on Dozen's ~8GB heap).
+// Pool entries carry whether their backing memory is HOST_VISIBLE (mappable from the CPU). With the
+// device-memory placement strategy a large buffer may be DEVICE_LOCAL-only, so reuse must preserve
+// this flag — the upload/readback path branches on it (direct map vs staging copy).
+#[derive(Clone, Copy)]
+struct PooledBuf {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    host_visible: bool,
+}
+
 #[derive(Default)]
 struct BufPool {
-    pending: Vec<(u64, vk::Buffer, vk::DeviceMemory)>,
-    free: HashMap<u64, Vec<(vk::Buffer, vk::DeviceMemory)>>,
+    pending: Vec<(u64, PooledBuf)>,
+    free: HashMap<u64, Vec<PooledBuf>>,
 }
 
 // drop: park (size, buffer, memory) for reuse after the next fence. No Vulkan calls here, just
@@ -254,7 +303,14 @@ impl Drop for VulkanStorage {
         }
         let bytes = ((self.count * self.dtype.size_in_bytes()).max(4)) as u64;
         if let Ok(mut pool) = self.device.inner.bufpool.lock() {
-            pool.pending.push((bytes, self.buffer, self.memory));
+            pool.pending.push((
+                bytes,
+                PooledBuf {
+                    buffer: self.buffer,
+                    memory: self.memory,
+                    host_visible: self.host_visible,
+                },
+            ));
         }
     }
 }
@@ -336,20 +392,38 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32]);
-        self.dispatch(
-            "mul_mat_vec_q8",
-            &[wq.buffer, x.buffer, out.buffer],
-            &push,
-            ((nout as u32).div_ceil(WG1D), 1, 1),
-        )?;
+        if self.inner.subgroup_matvec {
+            // Subgroup-reduced kernel: one subgroup per output row, fused subgroupAdd. A workgroup
+            // of WG1D (64) invocations holds WG1D/subgroup_size subgroups, so it produces that many
+            // rows; dispatch ceil(nout / rows_per_wg) workgroups. subgroup_size is >=2 (checked at
+            // init) and <=64 in practice, so rows_per_wg is in [1, 32].
+            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
+            self.dispatch(
+                "mul_mat_vec_q8_sg",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(rows_per_wg), 1, 1),
+            )?;
+        } else {
+            self.dispatch(
+                "mul_mat_vec_q8",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(WG1D), 1, 1),
+            )?;
+        }
         Ok(out)
     }
 
-    // Allocate a host-visible+coherent storage buffer of `bytes` bytes.
-    unsafe fn raw_buffer(&self, bytes: u64) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    // Allocate a storage buffer of `bytes` bytes, returning it plus whether its memory is
+    // HOST_VISIBLE (directly CPU-mappable). Placement follows the configured MemStrategy: on this
+    // UMA APU a large buffer may be placed in a DEVICE_LOCAL-only heap (the big GTT pool) that the
+    // CPU cannot map — callers then upload/read back through a staging buffer. Buffers carry
+    // TRANSFER_SRC|TRANSFER_DST usage so that staging GPU copy is always legal.
+    unsafe fn raw_buffer(&self, bytes: u64) -> Result<(vk::Buffer, vk::DeviceMemory, bool)> {
         let bytes = bytes.max(4); // zero-size buffers are illegal; round up to one f32.
                                   // Reuse a same-size buffer reclaimed from a completed batch before allocating fresh.
-        if let Some(pair) = self
+        if let Some(p) = self
             .inner
             .bufpool
             .lock()
@@ -358,45 +432,344 @@ impl VulkanDevice {
             .get_mut(&bytes)
             .and_then(Vec::pop)
         {
-            return Ok(pair);
+            return Ok((p.buffer, p.memory, p.host_visible));
         }
         let dev = self.dev();
         let info = vk::BufferCreateInfo::default()
             .size(bytes)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buf = dev.create_buffer(&info, None).map_err(vkerr)?;
+        let req = dev.get_buffer_memory_requirements(buf);
+        let idx = self
+            .pick_memory_type(req.memory_type_bits, req.size)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "vulkan: no usable memory type for a {req_size}-byte buffer (type_bits={bits:#x}, strategy={strat:?})",
+                    req_size = req.size,
+                    bits = req.memory_type_bits,
+                    strat = self.inner.mem_strategy,
+                ))
+            })?;
+        let (mem, used_idx) = match dev.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(idx),
+            None,
+        ) {
+            Ok(m) => (m, idx),
+            Err(e) => {
+                // The chosen heap accounting said the type was usable, but the driver still refused
+                // (fragmentation, racing allocations, or a too-optimistic budget). Try every other
+                // usable type, largest heap first, before giving up — this is the concrete OOM
+                // recovery for the 18.6GB-model case where the first pick is the small host-visible
+                // carveout and the real space is in the DEVICE_LOCAL heap.
+                let mut fallback = None;
+                for alt in self.usable_types_by_heap_desc(req.memory_type_bits, req.size) {
+                    if alt == idx {
+                        continue;
+                    }
+                    if let Ok(m) = dev.allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size(req.size)
+                            .memory_type_index(alt),
+                        None,
+                    ) {
+                        fallback = Some((m, alt));
+                        break;
+                    }
+                }
+                match fallback {
+                    Some(p) => p,
+                    None => {
+                        dev.destroy_buffer(buf, None);
+                        return Err(vkerr(e));
+                    }
+                }
+            }
+        };
+        dev.bind_buffer_memory(buf, mem, 0).map_err(vkerr)?;
+        let host_visible = self.inner.mem_props.memory_types[used_idx as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        Ok((buf, mem, host_visible))
+    }
+
+    // Free bytes available in heap `h`. Uses VK_EXT_memory_budget (heapBudget = driver's estimate of
+    // what this process may still allocate from the heap) when advertised; otherwise falls back to
+    // the heap's total `size` as a conservative upper bound. Budget is re-queried each call because
+    // it shifts as buffers are allocated/freed (this is the point of the scratch guard below).
+    fn free_heap_bytes(&self, h: u32) -> u64 {
+        let mp = &self.inner.mem_props;
+        let total = mp.memory_heaps[h as usize].size;
+        if !self.inner.has_mem_budget {
+            return total;
+        }
+        unsafe {
+            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            self.inner
+                .instance
+                .get_physical_device_memory_properties2(self.inner.pdev, &mut props2);
+            // heap_budget is 0 for heaps the driver doesn't report; treat that as "unknown" and use
+            // the static size so we never under-report and wrongly refuse a valid allocation.
+            let b = budget.heap_budget[h as usize];
+            if b == 0 {
+                total
+            } else {
+                b
+            }
+        }
+    }
+
+    // Usable memory types for `type_bits` whose heap can (per free_heap_bytes) hold `bytes`, ordered
+    // largest free-heap first. The placement primitive for both pick_memory_type and the OOM retry.
+    fn usable_types_by_heap_desc(&self, type_bits: u32, bytes: u64) -> Vec<u32> {
+        let mp = &self.inner.mem_props;
+        let mut v: Vec<u32> = (0..mp.memory_type_count)
+            .filter(|&i| (type_bits & (1 << i)) != 0)
+            .filter(|&i| {
+                let h = mp.memory_types[i as usize].heap_index;
+                self.free_heap_bytes(h) >= bytes
+            })
+            .collect();
+        v.sort_by_key(|&i| {
+            let h = mp.memory_types[i as usize].heap_index;
+            std::cmp::Reverse(self.free_heap_bytes(h))
+        });
+        v
+    }
+
+    // Will a transient scratch buffer of `bytes` total bytes fit in the largest usable heap's free
+    // space, keeping a margin so we don't allocate the very last byte (which the driver may need for
+    // command-buffer / descriptor backing)? Used to decide between the fp16 coopmat path (extra
+    // scratch) and the fp32 path (none) without risking an OOM abort.
+    fn scratch_fits(&self, bytes: u64) -> bool {
+        // 64 MiB margin or 1/16 of the request, whichever is larger.
+        let margin = (bytes / 16).max(64 * 1024 * 1024);
+        let need = bytes.saturating_add(margin);
+        let mp = &self.inner.mem_props;
+        (0..mp.memory_heap_count)
+            .map(|h| self.free_heap_bytes(h))
+            .max()
+            .map(|free| free >= need)
+            .unwrap_or(false)
+    }
+
+    // Choose a memory type index for a `bytes`-sized buffer with the given `type_bits`, honouring the
+    // configured MemStrategy. Returns None only when no type's heap can fit the request.
+    //
+    // The shapes we must handle on the AMD 8060S UMA part:
+    //  - a small HOST_VISIBLE|DEVICE_LOCAL "carveout" heap (hundreds of MB), and
+    //  - a large DEVICE_LOCAL-only heap (the GTT pool, tens of GB).
+    // Placing an 18.6GB weight buffer demands the large heap, which may not be host-visible; the
+    // upload/readback path stages through a host-visible buffer for those (see write_/read_).
+    fn pick_memory_type(&self, type_bits: u32, bytes: u64) -> Option<u32> {
+        let mp = &self.inner.mem_props;
+        // host-visible candidates whose heap fits, cached-coherent preferred then plain coherent.
+        let host_cached = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT
+            | vk::MemoryPropertyFlags::HOST_CACHED;
+        let host_base =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let fits = |i: u32| -> bool {
+            let h = mp.memory_types[i as usize].heap_index;
+            self.free_heap_bytes(h) >= bytes
+        };
+        let host_visible_pick = |flags: vk::MemoryPropertyFlags| -> Option<u32> {
+            (0..mp.memory_type_count).find(|&i| {
+                (type_bits & (1 << i)) != 0
+                    && mp.memory_types[i as usize].property_flags.contains(flags)
+                    && fits(i)
+            })
+        };
+        // Largest DEVICE_LOCAL heap that fits (the GTT pool on UMA), then largest heap of any kind.
+        let device_local_pick = || -> Option<u32> {
+            self.usable_types_by_heap_desc(type_bits, bytes)
+                .into_iter()
+                .find(|&i| {
+                    mp.memory_types[i as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                })
+        };
+        let any_largest = || {
+            self.usable_types_by_heap_desc(type_bits, bytes)
+                .into_iter()
+                .next()
+        };
+
+        match self.inner.mem_strategy {
+            MemStrategy::HostOnly => {
+                host_visible_pick(host_cached).or_else(|| host_visible_pick(host_base))
+            }
+            MemStrategy::DeviceFirst => device_local_pick()
+                .or_else(|| host_visible_pick(host_cached))
+                .or_else(|| host_visible_pick(host_base))
+                .or_else(any_largest),
+            // Auto: prefer host-visible when it fits (cheap upload + readback, no staging on UMA),
+            // else spill to the largest DEVICE_LOCAL heap — the path that makes the 18.6GB model load.
+            MemStrategy::Auto => host_visible_pick(host_cached)
+                .or_else(|| host_visible_pick(host_base))
+                .or_else(device_local_pick)
+                .or_else(any_largest),
+        }
+    }
+
+    // Allocate a buffer that is guaranteed HOST_VISIBLE (for staging). Forces the host-visible
+    // policy regardless of the device strategy; staging buffers are transient and always small
+    // relative to the host-visible heap (one tensor's worth at a time). Not pooled.
+    unsafe fn raw_buffer_host_visible(
+        &self,
+        bytes: u64,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+        let bytes = bytes.max(4);
+        let dev = self.dev();
+        let info = vk::BufferCreateInfo::default()
+            .size(bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buf = dev.create_buffer(&info, None).map_err(vkerr)?;
         let req = dev.get_buffer_memory_requirements(buf);
         let mp = &self.inner.mem_props;
-        // On this unified-memory APU every host-visible type is also DEVICE_LOCAL (one 60GB
-        // heap), so buffers are already in fast memory — no staging needed. We do prefer a
-        // HOST_CACHED+COHERENT type when present: cached speeds up CPU readback, coherent
-        // means no manual flush/invalidate. Fall back to plain HOST_VISIBLE|HOST_COHERENT.
-        let base = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let cached = base | vk::MemoryPropertyFlags::HOST_CACHED;
-        let usable = |i: u32, flags: vk::MemoryPropertyFlags| {
+        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let idx = match (0..mp.memory_type_count).find(|&i| {
             (req.memory_type_bits & (1 << i)) != 0
-                && mp.memory_types[i as usize].property_flags.contains(flags)
+                && mp.memory_types[i as usize].property_flags.contains(host)
+        }) {
+            Some(i) => i,
+            None => {
+                dev.destroy_buffer(buf, None);
+                return Err(Error::Msg(
+                    "vulkan: no host-visible memory type for staging buffer".into(),
+                ));
+            }
         };
-        let idx = (0..mp.memory_type_count)
-            .find(|&i| usable(i, cached))
-            .or_else(|| (0..mp.memory_type_count).find(|&i| usable(i, base)))
-            .ok_or_else(|| Error::Msg("vulkan: no host-visible memory type".into()))?;
-        let mem = dev
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(idx),
-                None,
-            )
-            .map_err(vkerr)?;
+        let mem = match dev.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(idx),
+            None,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                dev.destroy_buffer(buf, None);
+                return Err(vkerr(e));
+            }
+        };
         dev.bind_buffer_memory(buf, mem, 0).map_err(vkerr)?;
         Ok((buf, mem))
     }
 
-    unsafe fn write_f32(&self, mem: vk::DeviceMemory, data: &[f32]) -> Result<()> {
+    // Copy `bytes` from `src[src_off..]` to `dst[dst_off..]` on a one-shot command buffer and block
+    // until done. Uses the submitter's command pool + its fence. The submitter lock is held for the
+    // whole copy so it can't interleave with a concurrent batch on the same `cmd`; callers flush
+    // first so `cmd` is idle on entry.
+    unsafe fn copy_buffer_blocking(
+        &self,
+        src: vk::Buffer,
+        src_off: u64,
+        dst: vk::Buffer,
+        dst_off: u64,
+        bytes: u64,
+    ) -> Result<()> {
+        let dev = self.dev();
+        let mut s = self.inner.submitter.lock().unwrap();
+        dev.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty())
+            .map_err(vkerr)?;
+        dev.begin_command_buffer(
+            s.cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .map_err(vkerr)?;
+        let region = [vk::BufferCopy::default()
+            .src_offset(src_off)
+            .dst_offset(dst_off)
+            .size(bytes)];
+        dev.cmd_copy_buffer(s.cmd, src, dst, &region);
+        dev.end_command_buffer(s.cmd).map_err(vkerr)?;
+        dev.reset_fences(&[s.fence]).map_err(vkerr)?;
+        let cmds = [s.cmd];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        dev.queue_submit(self.inner.queue, &submit, s.fence)
+            .map_err(vkerr)?;
+        dev.wait_for_fences(&[s.fence], true, u64::MAX)
+            .map_err(vkerr)?;
+        s.recording = false;
+        s.n = 0;
+        s.written_since_barrier.clear();
+        Ok(())
+    }
+
+    // Bound on a single staging chunk. A non-host-visible buffer can be many GB (the 18.6GB model),
+    // but the host-visible heap on this UMA part is a small carveout — so we stage in chunks of at
+    // most this size, reusing one small staging buffer, instead of needing a full-size host-visible
+    // mirror. 256 MiB is a good balance of per-copy submit overhead vs staging footprint.
+    const STAGE_CHUNK: u64 = 256 * 1024 * 1024;
+
+    // Upload raw `data` into device-local (non-host-visible) `dst` via a transient host-visible
+    // staging buffer + GPU copy. `dst` carries TRANSFER_DST usage (set in raw_buffer). Any recorded
+    // batch is flushed first (the copy mutates `dst`), then the copy runs on its own one-shot submit.
+    unsafe fn staged_upload(&self, dst: vk::Buffer, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
+        }
+        self.flush()?;
+        let dev = self.dev();
+        let bytes = data.len() as u64;
+        let (staging, staging_mem) = self.raw_buffer_host_visible(bytes)?;
+        let ptr = dev
+            .map_memory(staging_mem, 0, bytes, vk::MemoryMapFlags::empty())
+            .map_err(vkerr)? as *mut u8;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        dev.unmap_memory(staging_mem);
+        self.copy_buffer_blocking(staging, dst, bytes)?;
+        dev.destroy_buffer(staging, None);
+        dev.free_memory(staging_mem, None);
+        Ok(())
+    }
+
+    // Read `bytes` out of device-local (non-host-visible) `src` via a transient host-visible staging
+    // buffer + GPU copy. Mirror of staged_upload.
+    unsafe fn staged_readback(&self, src: vk::Buffer, bytes: u64) -> Result<Vec<u8>> {
+        if bytes == 0 {
+            return Ok(Vec::new());
+        }
+        self.flush()?;
+        let dev = self.dev();
+        let (staging, staging_mem) = self.raw_buffer_host_visible(bytes)?;
+        self.copy_buffer_blocking(src, staging, bytes)?;
+        let ptr = dev
+            .map_memory(staging_mem, 0, bytes, vk::MemoryMapFlags::empty())
+            .map_err(vkerr)? as *const u8;
+        let v = std::slice::from_raw_parts(ptr, bytes as usize).to_vec();
+        dev.unmap_memory(staging_mem);
+        dev.destroy_buffer(staging, None);
+        dev.free_memory(staging_mem, None);
+        Ok(v)
+    }
+
+    // Upload f32 `data` into a storage buffer. Host-visible memory takes the direct-map fast path;
+    // DEVICE_LOCAL-only memory (big weight buffers on UMA) goes through a staging copy. `buffer` is
+    // unused on the host-visible path but required to issue the staging GPU copy on the other.
+    unsafe fn write_f32(
+        &self,
+        buffer: vk::Buffer,
+        mem: vk::DeviceMemory,
+        host_visible: bool,
+        data: &[f32],
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if !host_visible {
+            let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4);
+            return self.staged_upload(buffer, bytes);
         }
         let dev = self.dev();
         let ptr = dev
@@ -407,9 +780,21 @@ impl VulkanDevice {
         Ok(())
     }
 
-    unsafe fn read_f32(&self, mem: vk::DeviceMemory, n: usize) -> Result<Vec<f32>> {
+    unsafe fn read_f32(
+        &self,
+        buffer: vk::Buffer,
+        mem: vk::DeviceMemory,
+        host_visible: bool,
+        n: usize,
+    ) -> Result<Vec<f32>> {
         if n == 0 {
             return Ok(Vec::new());
+        }
+        if !host_visible {
+            let raw = self.staged_readback(buffer, (n * 4) as u64)?;
+            let mut v = vec![0f32; n];
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), v.as_mut_ptr() as *mut u8, n * 4);
+            return Ok(v);
         }
         // Ensure all recorded GPU work that may write this buffer has completed.
         self.flush()?;
@@ -432,9 +817,19 @@ impl VulkanDevice {
     }
 
     // u32 mirrors of write_f32/read_f32 (buffers are just bytes; 4 bytes/elem).
-    unsafe fn write_u32(&self, mem: vk::DeviceMemory, data: &[u32]) -> Result<()> {
+    unsafe fn write_u32(
+        &self,
+        buffer: vk::Buffer,
+        mem: vk::DeviceMemory,
+        host_visible: bool,
+        data: &[u32],
+    ) -> Result<()> {
         if data.is_empty() {
             return Ok(());
+        }
+        if !host_visible {
+            let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4);
+            return self.staged_upload(buffer, bytes);
         }
         let dev = self.dev();
         let ptr = dev
@@ -445,9 +840,21 @@ impl VulkanDevice {
         Ok(())
     }
 
-    unsafe fn read_u32(&self, mem: vk::DeviceMemory, n: usize) -> Result<Vec<u32>> {
+    unsafe fn read_u32(
+        &self,
+        buffer: vk::Buffer,
+        mem: vk::DeviceMemory,
+        host_visible: bool,
+        n: usize,
+    ) -> Result<Vec<u32>> {
         if n == 0 {
             return Ok(Vec::new());
+        }
+        if !host_visible {
+            let raw = self.staged_readback(buffer, (n * 4) as u64)?;
+            let mut v = vec![0u32; n];
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), v.as_mut_ptr() as *mut u8, n * 4);
+            return Ok(v);
         }
         // Ensure all recorded GPU work that may write this buffer has completed.
         self.flush()?;
@@ -751,61 +1158,76 @@ impl VulkanDevice {
     fn reclaim(&self) {
         let mut pool = self.inner.bufpool.lock().unwrap();
         let pending = std::mem::take(&mut pool.pending);
-        for (bytes, buf, mem) in pending {
-            pool.free.entry(bytes).or_default().push((buf, mem));
+        for (bytes, p) in pending {
+            pool.free.entry(bytes).or_default().push(p);
         }
     }
 
     // Allocate an f32 storage holding `count` elements (uninitialized device memory).
     fn alloc_f32(&self, count: usize) -> Result<VulkanStorage> {
-        let (buffer, memory) = unsafe { self.raw_buffer((count * 4) as u64)? };
+        let (buffer, memory, host_visible) = unsafe { self.raw_buffer((count * 4) as u64)? };
         Ok(VulkanStorage {
             buffer,
             memory,
             count,
             dtype: DType::F32,
+            host_visible,
             device: self.clone(),
         })
     }
 
-    // fp16 scratch (2 bytes/elem) for coopmat matmul inputs. Returns the buffer plus its memory and
-    // byte size so the caller can return it to the pool via free_scratch once recorded.
-    fn alloc_f16(&self, count: usize) -> Result<(vk::Buffer, vk::DeviceMemory, u64)> {
+    // fp16 scratch (2 bytes/elem) for coopmat matmul inputs. Returns the buffer plus its memory,
+    // host-visibility, and byte size so the caller can return it to the pool via free_scratch.
+    fn alloc_f16(&self, count: usize) -> Result<(vk::Buffer, vk::DeviceMemory, bool, u64)> {
         let bytes = ((count * 2).max(4)) as u64;
-        let (buffer, memory) = unsafe { self.raw_buffer(bytes)? };
-        Ok((buffer, memory, bytes))
+        let (buffer, memory, host_visible) = unsafe { self.raw_buffer(bytes)? };
+        Ok((buffer, memory, host_visible, bytes))
     }
 
     // Return a scratch buffer to the pool. Deferred-safe like VulkanStorage::drop: it parks in
     // `pending` and is reclaimed only after the next flush+fence, by which point the dispatch that
     // referenced it has completed on the GPU.
-    fn free_scratch(&self, bytes: u64, buffer: vk::Buffer, memory: vk::DeviceMemory) {
+    fn free_scratch(
+        &self,
+        bytes: u64,
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+        host_visible: bool,
+    ) {
         if let Ok(mut pool) = self.inner.bufpool.lock() {
-            pool.pending.push((bytes, buffer, memory));
+            pool.pending.push((
+                bytes,
+                PooledBuf {
+                    buffer,
+                    memory,
+                    host_visible,
+                },
+            ));
         }
     }
 
     pub(crate) fn upload_f32(&self, data: &[f32]) -> Result<VulkanStorage> {
         let s = self.alloc_f32(data.len())?;
-        unsafe { self.write_f32(s.memory, data)? };
+        unsafe { self.write_f32(s.buffer, s.memory, s.host_visible, data)? };
         Ok(s)
     }
 
     // u32 storage (ids/cond). 4 bytes/elem, same as f32.
     fn alloc_u32(&self, count: usize) -> Result<VulkanStorage> {
-        let (buffer, memory) = unsafe { self.raw_buffer((count * 4) as u64)? };
+        let (buffer, memory, host_visible) = unsafe { self.raw_buffer((count * 4) as u64)? };
         Ok(VulkanStorage {
             buffer,
             memory,
             count,
             dtype: DType::U32,
+            host_visible,
             device: self.clone(),
         })
     }
 
     fn upload_u32(&self, data: &[u32]) -> Result<VulkanStorage> {
         let s = self.alloc_u32(data.len())?;
-        unsafe { self.write_u32(s.memory, data)? };
+        unsafe { self.write_u32(s.buffer, s.memory, s.host_visible, data)? };
         Ok(s)
     }
 
@@ -991,6 +1413,55 @@ impl BackendDevice for VulkanDevice {
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
+            // Buffer-memory placement policy. Default `auto`: host-visible when it fits, else spill
+            // big buffers (e.g. an 18.6GB model's weights) to the largest DEVICE_LOCAL heap (the GTT
+            // pool on this UMA APU), which is where the real capacity lives. `host_only` restores the
+            // legacy host-visible-only behaviour; `device_first` forces big-heap placement always.
+            let mem_strategy = match std::env::var("HANZO_VK_DEVICE_MEMORY_STRATEGY")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+            {
+                Some("host_only") | Some("host") => MemStrategy::HostOnly,
+                Some("device_first") | Some("device") => MemStrategy::DeviceFirst,
+                Some("auto") | None | Some("") => MemStrategy::Auto,
+                Some(other) => {
+                    eprintln!(
+                        "[vulkan] unknown HANZO_VK_DEVICE_MEMORY_STRATEGY=`{other}` (expected host_only|device_first|auto); using auto"
+                    );
+                    MemStrategy::Auto
+                }
+            };
+
+            // VK_EXT_memory_budget: enables querying per-heap *free* bytes at runtime (the scratch
+            // guard needs this; the static heap `size` is total capacity only). Enable it when the
+            // device advertises it; otherwise the guard conservatively falls back to total size.
+            let has_mem_budget = dev_exts.iter().any(|e| {
+                CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::memory_budget::NAME
+            });
+
+            // Subgroup capability (core in Vulkan 1.1+, which the 1.3 instance guarantees). The q8
+            // mat-vec subgroup kernel uses subgroupAdd (ARITHMETIC) at COMPUTE-stage scope, so we
+            // require both before enabling it. HANZO_VK_SUBGROUP_MATVEC=0 forces the scalar kernel.
+            let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg_props);
+            instance.get_physical_device_properties2(pdev, &mut p2);
+            let sg_compute = sg_props
+                .supported_stages
+                .contains(vk::ShaderStageFlags::COMPUTE);
+            let sg_arith = sg_props
+                .supported_operations
+                .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC);
+            // subgroupElect needs BASIC; subgroupAdd needs ARITHMETIC. Require a sane width (>=2)
+            // so the reduction is actually parallel.
+            let subgroup_size = sg_props.subgroup_size;
+            let subgroup_matvec = sg_compute
+                && sg_arith
+                && subgroup_size >= 2
+                && std::env::var("HANZO_VK_SUBGROUP_MATVEC")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+
             // Build the enabled-extension list dynamically: coopmat and push_descriptor are
             // independent and either may be present. push_descriptor needs no extra device feature
             // struct (just the extension + a fn-pointer load), so it's a bare name here.
@@ -1000,6 +1471,9 @@ impl BackendDevice for VulkanDevice {
             }
             if use_pd {
                 ext_names.push(ash::khr::push_descriptor::NAME.as_ptr());
+            }
+            if has_mem_budget {
+                ext_names.push(ash::ext::memory_budget::NAME.as_ptr());
             }
             // Coopmat's SPIR-V needs these features (cooperative matrix, Vulkan memory model, fp16
             // arithmetic, 16-bit storage); push_descriptor needs none.
@@ -1084,11 +1558,16 @@ impl BackendDevice for VulkanDevice {
             let inner = VkInner {
                 _entry: entry,
                 instance,
+                pdev,
                 device,
                 queue,
                 qfi,
                 gpu_id: ordinal,
                 mem_props,
+                mem_strategy,
+                has_mem_budget,
+                subgroup_matvec,
+                subgroup_size,
                 seed: Mutex::new(299792458),
                 profile,
                 push_descriptor,
@@ -1228,12 +1707,18 @@ impl VulkanStorage {
 
     // Download the whole buffer as f32 (used internally + by to_cpu_storage).
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        unsafe { self.device.read_f32(self.memory, self.count) }
+        unsafe {
+            self.device
+                .read_f32(self.buffer, self.memory, self.host_visible, self.count)
+        }
     }
 
     // Download the whole buffer as u32 (used by to_cpu_storage for U32 storage).
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
-        unsafe { self.device.read_u32(self.memory, self.count) }
+        unsafe {
+            self.device
+                .read_u32(self.buffer, self.memory, self.host_visible, self.count)
+        }
     }
 
     // 1D elementwise dispatch over `n` elements: ceil(n/64) workgroups.
@@ -2117,14 +2602,23 @@ impl BackendStorage for VulkanStorage {
 
         // Matrix-core path: 16x16x16 fp16 coopmat when every tile dim is a multiple of 16. Casts
         // operands to fp16 (as llama.cpp does) and runs the register-blocked WMMA GEMM.
+        //
+        // The fp16 scratch (a16 + b16) is an extra, transient 2 B/elem allocation on top of the
+        // already-resident operands and output. On the UMA part a large model already fills most of
+        // the GTT heap, so a big GEMM's scratch can be the allocation that tips over the edge. Guard
+        // it: if the two scratch buffers won't fit in the largest usable heap's *free* bytes (plus a
+        // margin), fall through to the fp32 tiled GEMM, which needs no extra f16 buffers — correct
+        // result, just slower, instead of an OOM abort.
+        let scratch_bytes = ((b * m * k * 2).max(4) as u64).saturating_add((b * k * n * 2).max(4) as u64);
         if self.device.inner.cm_use
+            && self.device.scratch_fits(scratch_bytes)
             && matches!(self.device.coopmat_info(), Some((16, 16, 16)))
             && m % 16 == 0
             && n % 16 == 0
             && k % 16 == 0
         {
-            let (a16, a16_mem, a16_bytes) = self.device.alloc_f16(b * m * k)?;
-            let (b16, b16_mem, b16_bytes) = self.device.alloc_f16(b * k * n)?;
+            let (a16, a16_mem, a16_hv, a16_bytes) = self.device.alloc_f16(b * m * k)?;
+            let (b16, b16_mem, b16_hv, b16_bytes) = self.device.alloc_f16(b * k * n)?;
             self.device.dispatch(
                 "cast_f2h",
                 &[lc_buf, a16],
@@ -2148,8 +2642,8 @@ impl BackendStorage for VulkanStorage {
             self.device
                 .dispatch(kernel, &[a16, b16, out.buffer], &push, groups)?;
             // Scratch is dead after the kernel reads it; return to the pool (reclaimed post-flush).
-            self.device.free_scratch(a16_bytes, a16, a16_mem);
-            self.device.free_scratch(b16_bytes, b16, b16_mem);
+            self.device.free_scratch(a16_bytes, a16, a16_mem, a16_hv);
+            self.device.free_scratch(b16_bytes, b16, b16_mem, b16_hv);
             return Ok(out);
         }
 
@@ -2278,7 +2772,10 @@ impl BackendStorage for VulkanStorage {
                 }
                 data[i] = v;
             }
-            unsafe { self.device.write_u32(self.memory, &data) }
+            unsafe {
+                self.device
+                    .write_u32(self.buffer, self.memory, self.host_visible, &data)
+            }
         } else {
             let v = s.to_f64() as f32;
             let mut data = self.to_vec_f32()?;
@@ -2288,7 +2785,10 @@ impl BackendStorage for VulkanStorage {
                 }
                 data[i] = v;
             }
-            unsafe { self.device.write_f32(self.memory, &data) }
+            unsafe {
+                self.device
+                    .write_f32(self.buffer, self.memory, self.host_visible, &data)
+            }
         }
     }
 }
