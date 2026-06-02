@@ -4,7 +4,7 @@ use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
 use half::f16;
 
-use cudarc::driver::{CudaSlice, CudaView, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, CudaView, DevicePtr, PushKernelArg, SyncOnDrop};
 
 #[derive(Clone, Debug)]
 struct PaddedCudaSlice {
@@ -19,13 +19,17 @@ pub struct QCudaStorage {
     device: CudaDevice,
 }
 
-static FORCE_DMMV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static FORCE_DMMV: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub const WARP_SIZE: usize = 32;
+// Output rows each indexed-MoE block computes (tile). MUST match
+// INDEXED_MOE_ROWS_PER_BLOCK in hanzo-kernels/src/quantized.cu.
+pub const INDEXED_MOE_ROWS_PER_BLOCK: usize = 4;
 pub const MMQ_X_Q4_0_AMPERE: usize = 4;
 pub const MMQ_Y_Q4_0_AMPERE: usize = 32;
 pub const NWARPS_Q4_0_AMPERE: usize = 4;
@@ -289,7 +293,7 @@ fn mul_mat_vec_via_q8_1(
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
+    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
     quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
 
     let kernel_name = match dtype {
@@ -307,7 +311,7 @@ fn mul_mat_vec_via_q8_1(
     };
     let kernel_name = format!("{kernel_name}{b_size}");
     let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::QUANTIZED)?;
-    let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+    let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
@@ -362,7 +366,7 @@ fn mul_mat_via_q8_1(
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         k_padded * y_cols * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
+    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
     quantize_q8_1(y, &mut y_q8_1, k, y_cols, dev)?;
 
     let (kernel_name, mmq_x, mmq_y) = match dtype {
@@ -379,7 +383,7 @@ fn mul_mat_via_q8_1(
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::QUANTIZED)?;
-    let dst = unsafe { dev.alloc::<f32>(x_rows * y_cols)? };
+    let dst = dev.alloc_zeros::<f32>(x_rows * y_cols)?;
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (
             ceil_div(x_rows, mmq_y) as u32,
@@ -434,14 +438,14 @@ fn indexed_moe_forward_fused_q8_1_input(
     let num_blocks_per_row = k_padded / q8_1_block_size;
     let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
     let y_size_in_bytes = total_rows * dst_row_size_bytes;
-    let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
+    let mut input_quant = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
 
     let input_view = input.slice(0..);
     quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
 
     // output buffer
     let outsize = batch * topk * n;
-    let out = unsafe { dev.alloc::<f32>(outsize)? };
+    let out = dev.alloc_zeros::<f32>(outsize)?;
 
     let kernel_name = match w_dtype {
         GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
@@ -450,10 +454,17 @@ fn indexed_moe_forward_fused_q8_1_input(
         GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
         GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
         GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+        GgmlDType::Q4_0 => "indexed_moe_forward_q4_0_q8_1",
+        GgmlDType::Q4_1 => "indexed_moe_forward_q4_1_q8_1",
+        GgmlDType::Q5_0 => "indexed_moe_forward_q5_0_q8_1",
+        GgmlDType::Q5_1 => "indexed_moe_forward_q5_1_q8_1",
         _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::QUANTIZED)?;
-    let (nblocks, nwarps) = (n as u32, 4);
+    // Each block computes INDEXED_MOE_ROWS_PER_BLOCK output rows (tile), so the
+    // x-grid shrinks by that factor vs. the old 1-row-per-block launch.
+    let nblocks = ceil_div(n, INDEXED_MOE_ROWS_PER_BLOCK) as u32;
+    let nwarps = 4u32;
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (nblocks, batch as u32, topk as u32),
         block_dim: (WARP_SIZE as u32, nwarps, 1),
@@ -499,6 +510,10 @@ impl QCudaStorage {
         if matches!(
             self.dtype(),
             GgmlDType::Q8_0
+                | GgmlDType::Q4_0
+                | GgmlDType::Q4_1
+                | GgmlDType::Q5_0
+                | GgmlDType::Q5_1
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K
                 | GgmlDType::Q4K
@@ -595,8 +610,6 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
-            // No native MXFP4 cuda kernel; dequantize on cpu via BlockMXFP4::to_float.
-            GgmlDType::MXFP4 => deq::<crate::quantized::BlockMXFP4>(&buffer, block_len, &mut out),
         }
 
         self.device
@@ -622,7 +635,7 @@ impl QCudaStorage {
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
-            .memcpy_htod::<u8, [u8], _>(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+            .memcpy_htod(&data[..], &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
             inner,
             len: data.len(),
@@ -650,7 +663,7 @@ impl QCudaStorage {
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
-            .memcpy_htod::<u8, [u8], _>(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+            .memcpy_htod(&data[..], &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
             inner,
             len: data.len(),
@@ -679,7 +692,7 @@ impl QCudaStorage {
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
-            .memcpy_htod::<u8, [u8], _>(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+            .memcpy_htod(&data[..], &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
             inner,
             len: data.len(),
@@ -703,7 +716,7 @@ impl QCudaStorage {
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
-            .memcpy_htod::<u8, [u8], _>(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+            .memcpy_htod(&data[..], &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
             inner,
             len: data.len(),
@@ -721,6 +734,17 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        // Optimized MMVQ and MMQ paths (support most paths: BF16/F16/F32, batch 1-8, all quant types, reuses per-device workspace).
+        if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
+                return Ok(result);
+            }
+            if let Some(result) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
+                return Ok(result);
+            }
+        }
+
+        // Fallback
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
         } else {
@@ -746,8 +770,15 @@ impl QCudaStorage {
     }
 
     pub fn device_ptr(&self) -> Result<*const u8> {
-        use cudarc::driver::DevicePtr;
         Ok(self.data.inner.device_ptr(self.data.inner.stream()).0 as *const u8)
+    }
+
+    pub fn device_ptr_with_guard<'a>(
+        &'a self,
+        stream: &'a CudaStream,
+    ) -> Result<(*const u8, SyncOnDrop<'a>)> {
+        let (ptr, guard) = self.data.inner.device_ptr(stream);
+        Ok((ptr as *const u8, guard))
     }
 }
 
@@ -849,7 +880,7 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     };
     let dtype = T::DTYPE;
     let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
-    let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
+    let mut inner = device.alloc_zeros::<u8>(padded_len)?;
     device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
     Ok(QStorage::Cuda(QCudaStorage {
         data: PaddedCudaSlice {
