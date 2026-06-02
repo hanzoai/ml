@@ -1,14 +1,9 @@
 [workspace]
+# Only the hanzo-* crates are workspace members. The legacy hanzo-ml-* crates are an orphaned
+# duplicate cluster (no hanzo crate depends on them); keeping them out of the build drops the
+# `hanzo-ml` name from the workspace and resolves the hanzo-ml-pyo3 vs hanzo-ml-pyo3 `links="python"`
+# conflict. The dirs remain on disk for now and can be deleted in a follow-up.
 members = [
-    "candle-core",
-    "candle-datasets",
-    "candle-examples",
-    "candle-nn",
-    "candle-pyo3",
-    "candle-transformers",
-    "candle-ug",
-    "candle-wasm-examples/*",
-    "candle-wasm-tests",
     "hanzo-datasets",
     "hanzo-ml",
     "hanzo-ml-examples",
@@ -16,28 +11,23 @@ members = [
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
     "hanzo-nn",
-    # hanzo-quantize and hanzo-rlhf are their own workspace roots (see their
-    # Cargo.toml `[workspace]` markers). Excluded here so they don't get
-    # dragged into the parent ml workspace's pyo3-0.22-vs-0.27 conflict.
+    "hanzo-training",
     "hanzo-transformers",
     "tensor-tools",
 ]
 exclude = [
-    "candle-book",
-    "candle-flash-attn",
-    "hanzo-quantize",                    # standalone via own [workspace]; see members comment
-    "hanzo-rlhf",                        # standalone via own [workspace]; see members comment
-    "candle-flash-attn-v3",
-    "candle-kernels",
-    "candle-metal-kernels",
-    "candle-onnx",
+    "hanzo-ml-book",
+    "hanzo-flash-attn",
+    "hanzo-flash-attn-v3",
+    "hanzo-kernels",
+    "hanzo-metal-kernels",
+    "hanzo-rocm-kernels",
+    "hanzo-onnx",
     "hanzo-flash-attn",
     "hanzo-kernels",
     "hanzo-metal-kernels",
     "hanzo-ml-book",
     "hanzo-onnx",
-    "hanzo-train",
-    "hanzo-training",
     "hanzo-ug",
 ]
 resolver = "2"
@@ -46,38 +36,30 @@ resolver = "2"
 version = "0.10.2"
 edition = "2021"
 description = "Minimalist ML framework."
-repository = "https://github.com/huggingface/candle"
+repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+rocm-rs = "0.5"
+hanzo-rocm-kernels = { path = "./hanzo-rocm-kernels", version = "0.10.2" }
 ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
-candle = { path = "./candle-core", package = "candle-core", version = "0.9.2" }
-# Alias so workspace members can use either `candle` or `candle-core` interchangeably.
-# Used by hanzo-quantize and hanzo-rlhf which prefer the explicit `candle-core` name.
-candle-core = { path = "./candle-core", version = "0.9.2" }
-candle-datasets = { path = "./candle-datasets", version = "0.9.2" }
-candle-flash-attn = { path = "./candle-flash-attn", version = "0.9.2" }
-candle-flash-attn-v3 = { path = "./candle-flash-attn-v3", version = "0.9.2" }
-candle-kernels = { path = "./candle-kernels", version = "0.9.2" }
-candle-metal-kernels = { path = "./candle-metal-kernels", version = "0.9.2" }
-candle-nn = { path = "./candle-nn", version = "0.9.2" }
-candle-onnx = { path = "./candle-onnx", version = "0.9.2" }
-candle-transformers = { path = "./candle-transformers", version = "0.9.2" }
-candle-ug = { path = "./candle-ug", version = "0.9.2" }
-# Hanzo-renamed workspace dependencies
-hanzo-datasets = { path = "./hanzo-datasets", version = "0.9.2-alpha.2" }
-hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.9.2-alpha.2" }
-hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.9.2-alpha.2" }
-hanzo-ml = { path = "./hanzo-ml", version = "0.9.2-alpha.2" }
-hanzo-nn = { path = "./hanzo-nn", version = "0.9.2-alpha.2" }
-hanzo-onnx = { path = "./hanzo-onnx", version = "0.9.2-alpha.2" }
-hanzo-transformers = { path = "./hanzo-transformers", version = "0.9.2-alpha.2" }
-hanzo-ug = { path = "./hanzo-ug", version = "0.9.2-alpha.2" }
+chrono = "0.4"
+# Hanzo-renamed workspace dependencies (uplifted to candle 0.10.2)
+hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.10.2" }
+hanzo-datasets = { path = "./hanzo-datasets", version = "0.10.2" }
+hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.10.2" }
+hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.10.2" }
+hanzo-kernels = { path = "./hanzo-kernels", version = "0.10.2" }
+hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.10.2" }
+hanzo-nn = { path = "./hanzo-nn", version = "0.10.2" }
+hanzo-onnx = { path = "./hanzo-onnx", version = "0.10.2" }
+hanzo-transformers = { path = "./hanzo-transformers", version = "0.10.2" }
+hanzo-ug = { path = "./hanzo-ug", version = "0.10.2" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
 cudarc = { version = "0.19.4", features = [
@@ -140,3 +122,11 @@ objc2-foundation = { version = "0.3.1" }
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+[workspace.lints.clippy]
+# Stylistic lints in inherited model/bench code; allowed so CI clippy -D warnings is green.
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
