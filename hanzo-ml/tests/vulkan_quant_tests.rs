@@ -290,6 +290,85 @@ fn moe_case(
     Ok(max_abs)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Flash-attention: fused QK^T -> softmax -> V (online softmax) vs an eager f64 reference. The GPU
+// kernel never materializes the [Lq, Lk] score matrix; the reference computes it explicitly.
+fn flash_case(
+    dev: &Device,
+    bh: usize,
+    lq: usize,
+    lk: usize,
+    d: usize,
+    causal: bool,
+) -> hanzo_ml::Result<f32> {
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let q: Vec<f32> = (0..bh * lq * d).map(|i| pseudo(i) * 0.5).collect();
+    let k: Vec<f32> = (0..bh * lk * d).map(|i| pseudo(i + 5) * 0.5).collect();
+    let v: Vec<f32> = (0..bh * lk * d).map(|i| pseudo(i + 9) * 0.5).collect();
+
+    let vk = dev.as_vulkan_device()?;
+    let out = vk.flash_attn(&q, &k, &v, bh, lq, lk, d, scale, causal)?;
+    assert_eq!(out.len(), bh * lq * d);
+
+    // Eager f64 reference.
+    let mut max_abs = 0f32;
+    for b in 0..bh {
+        for qi in 0..lq {
+            let last = if causal { qi + (lk - lq) + 1 } else { lk };
+            let last = last.min(lk);
+            // scores
+            let mut sc = vec![0f64; last];
+            let mut mx = f64::NEG_INFINITY;
+            for (j, scj) in sc.iter_mut().enumerate() {
+                let mut s = 0f64;
+                for t in 0..d {
+                    s += q[(b * lq + qi) * d + t] as f64 * k[(b * lk + j) * d + t] as f64;
+                }
+                *scj = s * scale as f64;
+                mx = mx.max(*scj);
+            }
+            let mut denom = 0f64;
+            for scj in sc.iter_mut() {
+                *scj = (*scj - mx).exp();
+                denom += *scj;
+            }
+            for t in 0..d {
+                let mut acc = 0f64;
+                for (j, &p) in sc.iter().enumerate() {
+                    acc += p * v[(b * lk + j) * d + t] as f64;
+                }
+                acc /= denom;
+                let g = out[(b * lq + qi) * d + t] as f64;
+                max_abs = max_abs.max((g - acc).abs() as f32);
+            }
+        }
+    }
+    Ok(max_abs)
+}
+
+#[test]
+fn vulkan_flash_attn_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    // (bh, lq, lk, d, causal). d = 128 is Qwen3's head dim.
+    let cases = [
+        (8usize, 16usize, 16usize, 128usize, false), // prefill, non-causal
+        (8, 16, 16, 128, true),                       // prefill, causal
+        (8, 1, 64, 128, true),                        // decode: single query over a 64-key cache
+        (4, 7, 13, 64, false),                        // ragged Lq != Lk, smaller d
+    ];
+    for &(bh, lq, lk, d, causal) in &cases {
+        let max_abs = flash_case(&dev, bh, lq, lk, d, causal)?;
+        println!(
+            "FlashAttn bh={bh} lq={lq:3} lk={lk:3} d={d:3} causal={causal}  GPU-vs-(eager ref) max_abs={max_abs:.3e}"
+        );
+        assert!(
+            max_abs < 1e-4,
+            "FlashAttn GPU/ref mismatch too large: {max_abs}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn vulkan_moe_forward_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
