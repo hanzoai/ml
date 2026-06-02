@@ -740,6 +740,67 @@ impl QTensor {
                     panic!("Non-cuda indexed_moe_forward is not implemented!");
                 }
             },
+            // Native Vulkan MoE: one fused grouped quant matvec dispatch reads the per-expert slice
+            // out of the GGML weight bank [E, n, k] resident in VRAM and gathers by the router ids --
+            // the whole expert compute runs on the GPU (no CPU expert loop; the CPU fallback below
+            // would also hit the unimplemented Vulkan index_add). Supported for Q4_0/Q8_0/Q4_K; other
+            // quant dtypes fall through to the (CPU-bound) generic path.
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(_, vk_dev)
+                if matches!(
+                    self.storage.dtype(),
+                    GgmlDType::Q4_0 | GgmlDType::Q8_0 | GgmlDType::Q4K
+                ) =>
+            {
+                let out_dtype = x.dtype();
+                let (e_cnt, n, k) = self.shape().dims3()?;
+                let (t, topk) = ids.dims2()?;
+                let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+                let x_exp = if s == topk {
+                    x.clone()
+                } else {
+                    x.broadcast_as((t, topk, k))?
+                };
+                // [S, k] contiguous f32 on the Vulkan device; S = t*topk routed slots.
+                let nrows = t * topk;
+                let x_flat = x_exp
+                    .reshape((nrows, k))?
+                    .to_dtype(crate::DType::F32)?
+                    .contiguous()?;
+                let ids_vec = ids
+                    .reshape((nrows,))?
+                    .to_dtype(crate::DType::U32)?
+                    .to_vec1::<u32>()?;
+                // Defend against a stray id (model bug / corrupt router) reading OOB in the bank.
+                if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
+                    crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
+                }
+
+                let kernel = match self.storage.dtype() {
+                    GgmlDType::Q4_0 => "moe_matvec_q4_0",
+                    GgmlDType::Q8_0 => "moe_matvec_q8_0",
+                    GgmlDType::Q4K => "moe_matvec_q4k",
+                    other => crate::bail!("vulkan MoE: no kernel for {other:?}"),
+                };
+                let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
+                let wbank = vk_dev.upload_qweight(&bank)?;
+                let ids_buf = vk_dev.upload_ids(&ids_vec)?;
+                let y = {
+                    let (store, _) = x_flat.storage_and_layout();
+                    let xv = match &*store {
+                        Storage::Vulkan(v) => v,
+                        _ => crate::bail!("vulkan MoE: x not on vulkan after contiguous()"),
+                    };
+                    vk_dev.moe_matvec_gpu(kernel, &wbank, xv, &ids_buf, nrows, n, k)?
+                };
+                let out = crate::tensor::from_storage(
+                    Storage::Vulkan(y),
+                    (nrows, n),
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                out.reshape((t, topk, n))?.to_dtype(out_dtype)
+            }
             _ => {
                 // CPU / non-CUDA fallback: per-expert quantized matmul. The packed expert bank
                 // [E, n, k] is sliced into equal, contiguous per-expert quantized blocks; for
