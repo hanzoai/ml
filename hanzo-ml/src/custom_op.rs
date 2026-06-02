@@ -7,6 +7,22 @@ use crate::VulkanStorage;
 use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
 use std::sync::Arc;
 
+/// Name a custom/inplace op that has no native Vulkan path when `HANZO_VK_PROFILE` is set, before
+/// it bails. The size-only readback profiler can't attribute a missing op to a name; this surfaces
+/// the exact op (+ its shape) so a GPU re-run knows which `vulkan_fwd` override to add next. The
+/// env read is on the cold bail path only (the op errors out right after), so it's effectively
+/// zero-cost for ops that DO have a native path. Vulkan-only (the default impls it guards are
+/// `#[cfg(feature = "vulkan")]`), so it never touches other backends.
+#[cfg(feature = "vulkan")]
+fn log_vulkan_custom_op_bail(name: &str, l: &Layout) {
+    if std::env::var("HANZO_VK_PROFILE").map(|v| v != "0").unwrap_or(false) {
+        eprintln!(
+            "[HANZO_VK_PROFILE] custom-op bail op={name} shape={:?} (no vulkan_fwd; would round-trip/err)",
+            l.shape().dims()
+        );
+    }
+}
+
 /// Unary ops that can be defined in user-land.
 pub trait CustomOp1 {
     // Box<dyn> does not support const yet, so use a function to get the name.
@@ -37,6 +53,7 @@ pub trait CustomOp1 {
         _storage: &VulkanStorage,
         _layout: &Layout,
     ) -> Result<(VulkanStorage, Shape)> {
+        log_vulkan_custom_op_bail(self.name(), _layout);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
             self.name()
@@ -107,10 +124,11 @@ pub trait CustomOp2 {
     fn vulkan_fwd(
         &self,
         _: &VulkanStorage,
-        _: &Layout,
+        l1: &Layout,
         _: &VulkanStorage,
         _: &Layout,
     ) -> Result<(VulkanStorage, Shape)> {
+        log_vulkan_custom_op_bail(self.name(), l1);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
             self.name()
@@ -192,12 +210,13 @@ pub trait CustomOp3 {
     fn vulkan_fwd(
         &self,
         _: &VulkanStorage,
-        _: &Layout,
+        l1: &Layout,
         _: &VulkanStorage,
         _: &Layout,
         _: &VulkanStorage,
         _: &Layout,
     ) -> Result<(VulkanStorage, Shape)> {
+        log_vulkan_custom_op_bail(self.name(), l1);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
             self.name()
@@ -353,6 +372,7 @@ pub trait InplaceOp1 {
     }
     #[cfg(feature = "vulkan")]
     fn vulkan_fwd(&self, _storage: &mut VulkanStorage, _layout: &Layout) -> Result<()> {
+        log_vulkan_custom_op_bail(self.name(), _layout);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
             self.name()
@@ -395,10 +415,11 @@ pub trait InplaceOp2 {
     fn vulkan_fwd(
         &self,
         _: &mut VulkanStorage,
-        _: &Layout,
+        l1: &Layout,
         _: &VulkanStorage,
         _: &Layout,
     ) -> Result<()> {
+        log_vulkan_custom_op_bail(self.name(), l1);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
             self.name()
@@ -470,12 +491,13 @@ pub trait InplaceOp3 {
     fn vulkan_fwd(
         &self,
         _: &mut VulkanStorage,
-        _: &Layout,
+        l1: &Layout,
         _: &VulkanStorage,
         _: &Layout,
         _: &VulkanStorage,
         _: &Layout,
     ) -> Result<()> {
+        log_vulkan_custom_op_bail(self.name(), l1);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
             self.name()
