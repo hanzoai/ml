@@ -1,9 +1,9 @@
 use crate::{
     Buffer, CommandQueue, ComputePipeline, Function, Library, MTLResourceOptions, MetalKernelError,
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{rc::Retained, runtime::AnyObject, runtime::ProtocolObject};
 use objc2_foundation::NSString;
-use objc2_metal::{MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice};
+use objc2_metal::{MTLCompileOptions, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice};
 use std::{ffi::c_void, ptr};
 
 #[derive(Clone, Debug)]
@@ -20,19 +20,31 @@ impl AsRef<ProtocolObject<dyn MTLDevice>> for Device {
 }
 
 impl Device {
+    pub fn new(raw: Retained<ProtocolObject<dyn MTLDevice>>) -> Self {
+        Device { raw }
+    }
+
     pub fn registry_id(&self) -> u64 {
         self.as_ref().registryID()
     }
 
+    /// Returns all Metal devices in the system.
     pub fn all() -> Vec<Self> {
-        MTLCreateSystemDefaultDevice()
+        MTLCopyAllDevices()
+            .to_vec()
             .into_iter()
             .map(|raw| Device { raw })
             .collect()
     }
 
+    /// Returns the system default Metal device, if available.
+    ///
+    /// Falls back to first device from `all` if `MTLCreateSystemDefaultDevice`
+    /// returns nil.
     pub fn system_default() -> Option<Self> {
-        MTLCreateSystemDefaultDevice().map(|raw| Device { raw })
+        MTLCreateSystemDefaultDevice()
+            .map(|raw| Device { raw })
+            .or_else(|| Device::all().first().cloned())
     }
 
     pub fn new_buffer(
@@ -54,7 +66,8 @@ impl Device {
         length: usize,
         options: MTLResourceOptions,
     ) -> Result<Buffer, MetalKernelError> {
-        let pointer = ptr::NonNull::new(pointer as *mut c_void).unwrap();
+        let pointer = ptr::NonNull::new(pointer as *mut c_void)
+            .ok_or_else(|| MetalKernelError::InvalidInput("Null pointer".to_string()))?;
         unsafe {
             self.as_ref()
                 .newBufferWithBytes_length_options(pointer, length, options)
@@ -73,7 +86,7 @@ impl Device {
         let raw = self
             .as_ref()
             .newLibraryWithSource_options_error(&NSString::from_str(source), options)
-            .unwrap();
+            .map_err(|e| MetalKernelError::LoadLibraryError(e.to_string()))?;
 
         Ok(Library::new(raw))
     }
@@ -85,13 +98,14 @@ impl Device {
         let raw = self
             .as_ref()
             .newComputePipelineStateWithFunction_error(function.as_ref())
-            .unwrap();
+            .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
         Ok(ComputePipeline::new(raw))
     }
 
     pub fn new_command_queue(&self) -> Result<CommandQueue, MetalKernelError> {
-        let raw = self.as_ref().newCommandQueue().unwrap();
-        Ok(raw)
+        self.as_ref()
+            .newCommandQueue()
+            .ok_or_else(|| MetalKernelError::FailedToCreateResource("CommandQueue".to_string()))
     }
 
     pub fn recommended_max_working_set_size(&self) -> usize {
