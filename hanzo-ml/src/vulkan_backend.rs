@@ -3727,7 +3727,9 @@ impl BackendStorage for VulkanStorage {
             crate::bail!("vulkan: gather requires u32 ids, got {:?}", ids.dtype);
         }
         let src = self.contiguous(l)?;
-        let idc = ids.contiguous(ids_l)?;
+        // u32 ids: use contiguous_u32 (bit-exact). The float strided_copy would reinterpret small
+        // ids as denormal floats that load-time flush-to-zero can corrupt (see contiguous_u32).
+        let idc = ids.contiguous_u32(ids_l)?;
         let out_dims = ids_l.dims();
         let src_dims = l.dims();
         let right: usize = out_dims[dim + 1..].iter().product();
