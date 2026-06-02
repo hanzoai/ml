@@ -49,6 +49,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
+        "mul_mat_q8" => spv!("mul_mat_q8"),
+        "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
@@ -373,6 +375,39 @@ impl VulkanDevice {
         self.upload_u32(&packed)
     }
 
+    /// Upload an already-Q8_0-quantized weight to the GPU verbatim. `data` is the GGUF `BlockQ8_0`
+    /// bytes (34 B/block = f16 scale + 32 int8), repacked LOSSLESLY into the kernel's 9-u32 layout
+    /// (scale in u32[0] low half, 32 int8 four-per-word in u32[1..9]) -- the same layout
+    /// [`quantize_q8`] emits, so the matvec/matmul decode is identical and no f32 round-trip is
+    /// needed. This is the MoE-bank path: a Q8_0 [E,n,k] expert bank uploads once with `nout = E*n`
+    /// and stays quantized. `data` must be exactly `nout * (k/32) * 34` bytes; `k` a multiple of 32.
+    pub fn quantize_q8_blocks(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("quantize_q8_blocks: k must be a multiple of 32, got {k}");
+        }
+        let nblocks = k / 32;
+        let want = nout * nblocks * 34;
+        if data.len() != want {
+            crate::bail!(
+                "quantize_q8_blocks: data len {} != {nout}*{nblocks}*34 = {want}",
+                data.len()
+            );
+        }
+        // Source block: bytes [0,2) = f16 scale (LE), bytes [2,34) = 32 int8. Repack each block into
+        // 9 u32: u32[0] low half = the scale bits verbatim; u32[1..9] = the 32 int8, 4 per word.
+        let mut packed = vec![0u32; nout * nblocks * 9];
+        for blk in 0..nout * nblocks {
+            let src = &data[blk * 34..blk * 34 + 34];
+            let o = blk * 9;
+            packed[o] = u16::from_le_bytes([src[0], src[1]]) as u32;
+            for j in 0..8 {
+                let b = 2 + j * 4;
+                packed[o + 1 + j] = u32::from_le_bytes([src[b], src[b + 1], src[b + 2], src[b + 3]]);
+            }
+        }
+        self.upload_u32(&packed)
+    }
+
     /// Q8_0 matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q8`]. The kernel
     /// reads weights at ~1.125 bytes/elem instead of 4 — the bandwidth lever for memory-bound
     /// decode on this APU. Expect ~1e-2 error (fp16-scale int8 quantization).
@@ -400,11 +435,26 @@ impl VulkanDevice {
         nout: usize,
         k: usize,
     ) -> Result<VulkanStorage> {
+        self.matvec_q8_gpu_off(wq, x, nout, k, 0)
+    }
+
+    /// Q8_0 matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
+    /// `woff == 0` is bit-identical to [`matvec_q8_gpu`]; a non-zero offset selects one expert's row
+    /// block of a resident MoE bank (`woff = e * nout * (k/32) * 9`), so the whole [E,n,k] Q8 bank
+    /// stays uploaded once and each routed expert reads only its own slice (no per-token re-upload).
+    pub fn matvec_q8_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
         if x.count < k {
             crate::bail!("matvec_q8_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        let push = push_u32(&[nout as u32, k as u32]);
+        let push = push_u32(&[nout as u32, k as u32, woff as u32]);
         if self.inner.subgroup_matvec {
             // Subgroup-reduced kernel: one subgroup per output row, fused subgroupAdd. A workgroup
             // of WG1D (64) invocations holds WG1D/subgroup_size subgroups, so it produces that many
@@ -480,6 +530,21 @@ impl VulkanDevice {
         nout: usize,
         k: usize,
     ) -> Result<VulkanStorage> {
+        self.matvec_q4k_gpu_off(wq, x, nout, k, 0)
+    }
+
+    /// Q4_K matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
+    /// `woff == 0` is bit-identical to [`matvec_q4k_gpu`]; a non-zero offset selects one expert's row
+    /// block of a resident MoE bank (`woff = e * nout * (k/256) * 36`), so the whole [E,n,k] Q4_K
+    /// bank stays uploaded once and each routed expert reads only its own slice.
+    pub fn matvec_q4k_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
         if !k.is_multiple_of(256) {
             crate::bail!("matvec_q4k_gpu: k must be a multiple of 256, got {k}");
         }
@@ -487,13 +552,117 @@ impl VulkanDevice {
             crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        let push = push_u32(&[nout as u32, k as u32]);
+        let push = push_u32(&[nout as u32, k as u32, woff as u32]);
         self.dispatch(
             "mul_mat_vec_q4k",
             &[wq.buffer, x.buffer, out.buffer],
             &push,
             ((nout as u32).div_ceil(WG1D), 1, 1),
         )?;
+        Ok(out)
+    }
+
+    /// Q8_0 matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
+    /// (same blocks as [`quantize_q8`] / [`matvec_q8_gpu`]). Decodes each weight block once and reuses
+    /// it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so weight memory traffic matches a single
+    /// matvec per output column instead of dequantizing the whole weight to f32 every forward. `x`
+    /// must be a contiguous `[m, k]` device buffer; returns `[m, nout]` row-major.
+    pub fn matmul_q8_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        self.matmul_q8_gpu_off(wq, x, m, nout, k, 0)
+    }
+
+    /// Q8_0 prefill matmul into a slice of `wq` starting at `woff` u32 words. `woff == 0` is
+    /// bit-identical to [`matmul_q8_gpu`]; a non-zero offset selects one expert's weight block of a
+    /// resident MoE bank (`woff = e * nout * (k/32) * 9`) so a prefill expert with M>1 routed rows
+    /// runs one banked matmul without re-uploading the weight.
+    pub fn matmul_q8_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matmul_q8_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q8_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mat_q8",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
+        Ok(out)
+    }
+
+    /// Q4_K matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
+    /// (verbatim GGUF Q4_K super-blocks, same decode as [`matvec_q4k_gpu`]). Decodes each weight value
+    /// once and reuses it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so weight memory traffic
+    /// matches a single matvec per output column instead of dequantizing the whole weight to f32 every
+    /// forward. `x` must be a contiguous `[m, k]` device buffer; returns `[m, nout]` row-major.
+    pub fn matmul_q4k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        self.matmul_q4k_gpu_off(wq, x, m, nout, k, 0)
+    }
+
+    /// Q4_K prefill matmul into a slice of `wq` starting at `woff` u32 words. `woff == 0` is
+    /// bit-identical to [`matmul_q4k_gpu`]; a non-zero offset selects one expert's weight block of a
+    /// resident MoE bank (`woff = e * nout * (k/256) * 36`) so a prefill expert with M>1 routed rows
+    /// runs one banked matmul without re-uploading the weight.
+    pub fn matmul_q4k_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matmul_q4k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q4k_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mat_q4k",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
         Ok(out)
     }
 
@@ -723,6 +892,20 @@ impl VulkanDevice {
         nout: usize,
         k: usize,
     ) -> Result<VulkanStorage> {
+        self.matvec_q5k_gpu_off(wq, x, nout, k, 0)
+    }
+
+    /// Q5_K matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
+    /// `woff == 0` is bit-identical to [`matvec_q5k_gpu`]; a non-zero offset selects one expert's row
+    /// block of a resident MoE bank (`woff = e * nout * (k/256) * 44`).
+    pub fn matvec_q5k_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
         if !k.is_multiple_of(256) {
             crate::bail!("matvec_q5k_gpu: k must be a multiple of 256, got {k}");
         }
@@ -730,7 +913,7 @@ impl VulkanDevice {
             crate::bail!("matvec_q5k_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        let push = push_u32(&[nout as u32, k as u32]);
+        let push = push_u32(&[nout as u32, k as u32, woff as u32]);
         self.dispatch(
             "mul_mat_vec_q5k",
             &[wq.buffer, x.buffer, out.buffer],
@@ -802,6 +985,20 @@ impl VulkanDevice {
         nout: usize,
         k: usize,
     ) -> Result<VulkanStorage> {
+        self.matvec_q6k_gpu_off(wq, x, nout, k, 0)
+    }
+
+    /// Q6_K matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
+    /// `woff == 0` is bit-identical to [`matvec_q6k_gpu`]; a non-zero offset selects one expert's row
+    /// block of a resident MoE bank (`woff = e * nout * (k/256) * 53`, 53 u32 = padded Q6_K block).
+    pub fn matvec_q6k_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
         if !k.is_multiple_of(256) {
             crate::bail!("matvec_q6k_gpu: k must be a multiple of 256, got {k}");
         }
@@ -809,7 +1006,7 @@ impl VulkanDevice {
             crate::bail!("matvec_q6k_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        let push = push_u32(&[nout as u32, k as u32]);
+        let push = push_u32(&[nout as u32, k as u32, woff as u32]);
         self.dispatch(
             "mul_mat_vec_q6k",
             &[wq.buffer, x.buffer, out.buffer],
@@ -1770,6 +1967,12 @@ fn push_u32(v: &[u32]) -> Vec<u8> {
 
 const WG1D: u32 = 64;
 
+// Activation rows decoded per invocation in the quantized prefill matmul kernels (mul_mat_q8 /
+// mul_mat_q4k). MUST equal the MAX_M const in those .comp shaders (their register accumulator array
+// bound). The host tiles the M dimension by this so each weight block is still read once per output
+// column across a tile of up to MATMUL_Q_MAX_M rows.
+const MATMUL_Q_MAX_M: usize = 8;
+
 // Compile-time per-invocation array bounds in gdn_step.comp / gdn_conv1d_step.comp (MAX_K #defines).
 // head_k_dim must be <= GDN_STEP_MAX_K and the conv kernel <= GDN_CONV_MAX_K; both checked host-side.
 const GDN_STEP_MAX_K: usize = 256;
@@ -2174,6 +2377,13 @@ impl BackendDevice for VulkanDevice {
 
 impl VulkanStorage {
     fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Number of u32 words in this buffer. For a quantized weight/bank uploaded via the `quantize_*`
+    /// helpers (all `upload_u32`-backed, dtype U32) this is the block-word count -- used to assert a
+    /// resident MoE bank's per-expert stride covers exactly E experts.
+    pub fn len_words(&self) -> usize {
         self.count
     }
 
