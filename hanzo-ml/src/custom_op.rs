@@ -4,6 +4,8 @@ use crate::tensor::from_storage;
 use crate::RocmStorage;
 #[cfg(feature = "vulkan")]
 use crate::VulkanStorage;
+#[cfg(feature = "wgpu")]
+use crate::WgpuStorage;
 use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
 use std::sync::Arc;
 
@@ -56,6 +58,13 @@ pub trait CustomOp1 {
         log_vulkan_custom_op_bail(self.name(), _layout);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(&self, _storage: &WgpuStorage, _layout: &Layout) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
             self.name()
         )))
     }
@@ -131,6 +140,19 @@ pub trait CustomOp2 {
         log_vulkan_custom_op_bail(self.name(), l1);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _: &WgpuStorage,
+        _l1: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
             self.name()
         )))
     }
@@ -219,6 +241,21 @@ pub trait CustomOp3 {
         log_vulkan_custom_op_bail(self.name(), l1);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _: &WgpuStorage,
+        _l1: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
             self.name()
         )))
     }
@@ -378,6 +415,13 @@ pub trait InplaceOp1 {
             self.name()
         )))
     }
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(&self, _storage: &mut WgpuStorage, _layout: &Layout) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
+            self.name()
+        )))
+    }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
     /// offsets etc so the associated layout should be used to access it.
@@ -422,6 +466,19 @@ pub trait InplaceOp2 {
         log_vulkan_custom_op_bail(self.name(), l1);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _: &mut WgpuStorage,
+        _l1: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
             self.name()
         )))
     }
@@ -500,6 +557,21 @@ pub trait InplaceOp3 {
         log_vulkan_custom_op_bail(self.name(), l1);
         Err(crate::Error::Msg(format!(
             "no vulkan implementation for {}",
+            self.name()
+        )))
+    }
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _: &mut WgpuStorage,
+        _l1: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
             self.name()
         )))
     }
