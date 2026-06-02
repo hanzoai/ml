@@ -548,7 +548,7 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
         ]
     );
 
-    // Replicate the issue from https://github.com/huggingface/hanzo/issues/1212
+    // Replicate the issue from https://github.com/hanzoai/ml/issues/1212
     let res = t.i((.., .., 0..4, 0..4))?.conv2d(&w, 0, 2, 1, 1)?;
     let loss = res.sqr()?.sum_all()?;
     assert_eq!(test_utils::to_vec0_round(&loss, 2)?, 21.12f32);
@@ -817,7 +817,7 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
                 [  31.0,  -88.9,   47.1, -123.5,   -3.8],
                 [ -14.8,  -39.8,  128.2, -110.3,   42.6],
                 // 1st column on next row; torch is -7.2
-                [  -7.1,   95.3,  -21.3,  -58.7,  -13.9], 
+                [  -7.1,   95.3,  -21.3,  -58.7,  -13.9],
                 [  26.9,   21.3,   16.1,   70.3,   32.1]
             ]
         ]
