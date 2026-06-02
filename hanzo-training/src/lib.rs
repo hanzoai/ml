@@ -5,6 +5,7 @@
 pub mod config;
 pub mod dataset;
 pub mod evaluation;
+pub mod grpo;
 pub mod logging;
 pub mod metrics;
 pub mod model;
@@ -18,6 +19,10 @@ pub use config::{
 };
 pub use dataset::{Dataset, JsonlDataset, TrainingSample, ZenAgenticDataset, ZenIdentityDataset};
 pub use evaluation::{AccuracyBenchmark, Benchmark, BenchmarkRunner, PerplexityBenchmark};
+pub use grpo::{
+    Completion, GrpoConfig, GrpoMetrics, GrpoTrainer, Policy, Reward, SampledGroup, Sampler,
+    SamplingMode,
+};
 pub use logging::{ConsoleLogger, Logger, MultiLogger};
 pub use metrics::{EvaluationMetrics, MetricsCollector, TrainingMetrics};
 pub use model::TrainableModel;
