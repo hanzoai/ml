@@ -72,6 +72,7 @@ pub mod layout;
 pub mod metal_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
+pub mod model_delta;
 pub mod npy;
 pub mod op;
 pub mod pickle;
