@@ -134,6 +134,8 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
         #[cfg(feature = "vulkan")]
         Device::Vulkan(d) => QStorage::Vulkan(Box::new(data.to_vec()), d.clone()),
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(d) => QStorage::Wgpu(Box::new(data.to_vec()), d.clone()),
     };
     super::QTensor::new(data, dims)
 }
@@ -188,8 +190,11 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q6K => {
             from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims, device)
         }
-        GgmlDType::MXFP4 => {
-            from_raw_data::<k_quants::BlockMXFP4>(raw_data, size_in_bytes, dims, device)
+        GgmlDType::IQ4_NL => {
+            from_raw_data::<k_quants::BlockIQ4nl>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ4_XS => {
+            from_raw_data::<k_quants::BlockIQ4xs>(raw_data, size_in_bytes, dims, device)
         }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
