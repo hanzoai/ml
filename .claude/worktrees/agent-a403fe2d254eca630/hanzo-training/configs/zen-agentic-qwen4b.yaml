@@ -1,0 +1,82 @@
+# Zen Agentic Dataset Training Configuration
+# Train Qwen3-4B on real-world agentic programming data
+
+model:
+  name: "qwen3-4b"
+  architecture: "qwen"
+  checkpoint: "Qwen/Qwen3-4B-Instruct"
+  max_seq_length: 4096
+  vocab_size: 151936
+  hidden_size: 3584
+  num_layers: 32
+  num_heads: 28
+
+dataset:
+  name: "zen-agentic"
+  path: "/Users/z/work/zen/zen-agentic-dataset-private"
+  format: "jsonl"
+  train_split: "train"
+  validation_split: "valid"
+  max_seq_length: 4096
+  preprocessing:
+    tokenizer: "Qwen/Qwen3-4B-Instruct"
+    add_eos: true
+    add_bos: false
+    truncation: true
+    padding: "right"
+
+training:
+  # Core parameters optimized for Qwen3-4B
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  learning_rate: 0.0002  # 2e-4
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_steps: 10000
+  epochs: 2
+  
+  # Optimization
+  optimizer: "adamw"
+  scheduler: "cosine"
+  gradient_clipping: 1.0
+  
+  # LoRA for parameter-efficient fine-tuning
+  lora:
+    enabled: true
+    r: 64
+    alpha: 128.0
+    dropout: 0.1
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+    bias: "none"
+  
+  # Checkpointing and evaluation
+  save_steps: 1000
+  eval_steps: 500
+  logging_steps: 10
+  
+  # Hardware optimization
+  mixed_precision: "bf16"
+  device: "cuda:0"
+  multi_gpu: false
+  compile: true
+
+evaluation:
+  benchmarks: ["perplexity", "accuracy"]
+  metrics: ["loss", "accuracy", "perplexity"]
+  output_dir: "./eval_results"
+
+logging:
+  wandb:
+    enabled: true
+    project: "hanzo-training"
+    name: "qwen3-4b-zen-agentic"
+    tags: ["qwen", "agentic", "programming"]
+    notes: "Training Qwen3-4B on zen-agentic-dataset for real-world programming tasks"
+  
+  tensorboard: true
+  console_level: "info"
+  
+  file_logging:
+    enabled: true
+    path: "./logs/training.log"
+    level: "debug"
