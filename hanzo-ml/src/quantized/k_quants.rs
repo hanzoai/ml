@@ -19,23 +19,13 @@ pub const QK5_0: usize = 32;
 pub const QK5_1: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
-pub const QK_MXFP4: usize = 32;
+pub const QK4_NL: usize = 32;
 
-// MXFP4 nibble -> value LUT. From llama.cpp ggml-common.h:1117 (kvalues_mxfp4).
-const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
-
-// E8M0 8-bit exponent -> fp32 scale, halved (E0M2 values are doubled in MXFP4).
-// Bit-for-bit replica of llama.cpp ggml-impl.h:477 ggml_e8m0_to_fp32_half.
-fn e8m0_to_fp32_half(x: u8) -> f32 {
-    let bits: u32 = if x < 2 {
-        // 0x00200000 = 2^-128, 0x00400000 = 2^-127
-        0x0020_0000u32 << x
-    } else {
-        // 0.5 * 2^(x-127) = 2^(x-128) = normalized with exponent (x-1)
-        (x as u32 - 1) << 23
-    };
-    f32::from_bits(bits)
-}
+// Non-uniform 4-bit codebook shared by IQ4_NL and IQ4_XS.
+// Bit-for-bit replica of llama.cpp ggml-common.h:1110-1112 (kvalues_iq4nl).
+pub const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
 
 pub trait GgmlType: Sized + Clone + Send + Sync {
     const DTYPE: GgmlDType;
@@ -115,14 +105,29 @@ pub struct BlockQ8_0 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ8_0>() == 34);
 
-// MXFP4 block: E8M0 scale + 16 bytes holding 32 packed 4-bit values (llama.cpp block_mxfp4).
+// IQ4_NL block: f16 scale + 16 bytes holding 32 packed 4-bit codebook indices.
+// Bit-for-bit replica of llama.cpp ggml-common.h:437-442 (block_iq4_nl, QK4_NL=32).
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
-pub struct BlockMXFP4 {
-    pub(crate) e: u8,
-    pub(crate) qs: [u8; QK_MXFP4 / 2],
+pub struct BlockIQ4nl {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; QK4_NL / 2],
 }
-const _: () = assert!(std::mem::size_of::<BlockMXFP4>() == 17);
+const _: () = assert!(std::mem::size_of::<BlockIQ4nl>() == 18);
+
+// IQ4_XS block: f16 super-block scale, 6-bit per-sub-block scales split across
+// scales_h (2 high bits each) and scales_l (4 low bits each), then 128 bytes of
+// packed 4-bit codebook indices (256 elements, 8 sub-blocks of 32).
+// Bit-for-bit replica of llama.cpp ggml-common.h:444-450 (block_iq4_xs, QK_K=256).
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ4xs {
+    pub(crate) d: f16,
+    pub(crate) scales_h: u16,
+    pub(crate) scales_l: [u8; QK_K / 64],
+    pub(crate) qs: [u8; QK_K / 2],
+}
+const _: () = assert!(std::mem::size_of::<BlockIQ4xs>() == 136);
 
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
@@ -722,34 +727,34 @@ impl GgmlType for BlockQ8_0 {
     }
 }
 
-impl GgmlType for BlockMXFP4 {
-    const DTYPE: GgmlDType = GgmlDType::MXFP4;
-    const BLCK_SIZE: usize = QK_MXFP4;
+impl GgmlType for BlockIQ4nl {
+    const DTYPE: GgmlDType = GgmlDType::IQ4_NL;
+    const BLCK_SIZE: usize = QK4_NL;
     // Dequantize-to-f32 then dot against a Q8_0-quantized lhs (both block size 32).
     type VecDotType = BlockQ8_0;
 
-    // dequantize_row_mxfp4 (llama.cpp ggml-quants.c:511): d = e8m0_to_fp32_half(e);
-    // y[j] = d*lut[qs[j]&0xf], y[j+16] = d*lut[qs[j]>>4].
+    // dequantize_row_iq4_nl (llama.cpp ggml-quants.c:2653): d = fp16_to_fp32(d);
+    // y[j] = d*kvalues_iq4nl[qs[j]&0xf], y[j+16] = d*kvalues_iq4nl[qs[j]>>4].
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         let k = ys.len();
         debug_assert!(
-            k.is_multiple_of(QK_MXFP4),
-            "dequantize_row_mxfp4: {k} is not divisible by {QK_MXFP4}"
+            k.is_multiple_of(QK4_NL),
+            "dequantize_row_iq4_nl: {k} is not divisible by {QK4_NL}"
         );
-        let nb = k / QK_MXFP4;
+        let nb = k / QK4_NL;
         for i in 0..nb {
-            let d = e8m0_to_fp32_half(xs[i].e);
-            for j in 0..QK_MXFP4 / 2 {
+            let d = xs[i].d.to_f32();
+            for j in 0..QK4_NL / 2 {
                 let q = xs[i].qs[j];
-                ys[i * QK_MXFP4 + j] = KVALUES_MXFP4[(q & 0x0f) as usize] as f32 * d;
-                ys[i * QK_MXFP4 + j + QK_MXFP4 / 2] = KVALUES_MXFP4[(q >> 4) as usize] as f32 * d;
+                ys[i * QK4_NL + j] = d * KVALUES_IQ4NL[(q & 0x0f) as usize] as f32;
+                ys[i * QK4_NL + j + QK4_NL / 2] = d * KVALUES_IQ4NL[(q >> 4) as usize] as f32;
             }
         }
     }
 
-    // We only decode MXFP4 from gguf; quantization is unused.
+    // We only decode IQ4_NL from gguf; quantization is unused.
     fn from_float(_xs: &[f32], _ys: &mut [Self]) {
-        panic!("MXFP4 quantize (from_float) is not supported")
+        panic!("IQ4_NL quantize (from_float) is not supported")
     }
 
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
@@ -758,17 +763,86 @@ impl GgmlType for BlockMXFP4 {
 
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
         debug_assert!(
-            n.is_multiple_of(QK_MXFP4),
-            "vec_dot_mxfp4_q8_0: {n} is not divisible by {QK_MXFP4}"
+            n.is_multiple_of(QK4_NL),
+            "vec_dot_iq4_nl_q8_0: {n} is not divisible by {QK4_NL}"
         );
-        // Dequantize each MXFP4 block to f32 and dot against the Q8_0 lhs block.
+        // Dequantize each IQ4_NL block to f32 and dot against the Q8_0 lhs block.
         let mut sumf = 0f32;
-        let mut tmp = [0f32; QK_MXFP4];
+        let mut tmp = [0f32; QK4_NL];
         for (x, y) in xs.iter().zip(ys.iter()) {
             Self::to_float(std::slice::from_ref(x), &mut tmp);
             let dy = f16::to_f32(y.d);
-            for j in 0..QK_MXFP4 {
+            for j in 0..QK4_NL {
                 sumf += tmp[j] * (y.qs[j] as f32 * dy);
+            }
+        }
+        sumf
+    }
+}
+
+impl GgmlType for BlockIQ4xs {
+    const DTYPE: GgmlDType = GgmlDType::IQ4_XS;
+    const BLCK_SIZE: usize = QK_K;
+    // Dequantize-to-f32 then dot against a Q8_0-quantized lhs (block size 32).
+    type VecDotType = BlockQ8_0;
+
+    // dequantize_row_iq4_xs (llama.cpp ggml-quants.c:2671): per 256-block, 8 sub-blocks
+    // of 32; 6-bit scale ls = scales_l nibble | (scales_h 2 bits << 4); dl = d*(ls-32);
+    // y[j] = dl*kvalues_iq4nl[qs[j]&0xf], y[j+16] = dl*kvalues_iq4nl[qs[j]>>4].
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK_K),
+            "dequantize_row_iq4_xs: {k} is not divisible by {QK_K}"
+        );
+        let nb = k / QK_K;
+        for i in 0..nb {
+            let d_all = xs[i].d.to_f32();
+            let scales_h = xs[i].scales_h;
+            let mut y_off = i * QK_K;
+            let mut qs_off = 0usize;
+            for ib in 0..QK_K / 32 {
+                let ls = ((xs[i].scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf)
+                    | (((scales_h >> (2 * ib)) & 3) << 4) as u8;
+                let dl = d_all * (ls as i32 - 32) as f32;
+                for j in 0..16 {
+                    let q = xs[i].qs[qs_off + j];
+                    ys[y_off + j] = dl * KVALUES_IQ4NL[(q & 0x0f) as usize] as f32;
+                    ys[y_off + j + 16] = dl * KVALUES_IQ4NL[(q >> 4) as usize] as f32;
+                }
+                y_off += 32;
+                qs_off += 16;
+            }
+        }
+    }
+
+    // We only decode IQ4_XS from gguf; quantization is unused.
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("IQ4_XS quantize (from_float) is not supported")
+    }
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK_K),
+            "vec_dot_iq4_xs_q8_0: {n} is not divisible by {QK_K}"
+        );
+        // Dequantize each IQ4_XS super-block to f32 and dot against the Q8_0 lhs blocks.
+        let mut sumf = 0f32;
+        let mut tmp = [0f32; QK_K];
+        // Each IQ4_XS block (256 elems) spans QK_K/QK8_0 Q8_0 blocks (32 elems each).
+        let q8_per_block = QK_K / QK8_0;
+        for (bx, x) in xs.iter().enumerate() {
+            Self::to_float(std::slice::from_ref(x), &mut tmp);
+            for sub in 0..q8_per_block {
+                let y = &ys[bx * q8_per_block + sub];
+                let dy = f16::to_f32(y.d);
+                for j in 0..QK8_0 {
+                    sumf += tmp[sub * QK8_0 + j] * (y.qs[j] as f32 * dy);
+                }
             }
         }
         sumf
