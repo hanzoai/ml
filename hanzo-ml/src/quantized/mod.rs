@@ -1111,6 +1111,45 @@ impl QMatMul {
             .to_dtype(crate::DType::F32)?
             .contiguous()?;
         let ids_flat = ids.reshape((t * topk,))?.to_dtype(crate::DType::U32)?;
+        // DECODE FAST PATH (single token, t==1): run the WHOLE MoE expert compute in one fused GPU
+        // dispatch instead of reading the routing ids to the host, looping experts on the CPU, and
+        // index_add-scattering per expert (the per-token host round-trips that bottlenecked Vulkan
+        // decode). The fused kernel gathers each slot's expert from `ids` (kept on-GPU) and does the
+        // per-expert matvec reading the resident bank at the SAME `(eid*n + r)` row base the host path
+        // used, so the result is the routed-expert outputs in slot order `[topk, n]` -- exactly what
+        // `out_flat` would hold after the scatter, so the engine's `broadcast_mul(scores).sum` combine
+        // is unchanged. Only Q4K (verbatim 144-B blocks) and Q8_0 (9-u32 repacked blocks) banks reach
+        // this path; both are the only resident-bank dtypes (Q5K/Q6K are requantized to Q8 at load).
+        if t == 1 {
+            let kernel = match dtype {
+                GgmlDType::Q4K => Some("moe_matvec_q4k"),
+                GgmlDType::Q8_0 => Some("moe_matvec_q8_0"),
+                _ => None,
+            };
+            if let Some(kernel) = kernel {
+                let nrows = t * topk; // == topk
+                let (xstore, _) = x_flat.storage_and_layout();
+                let xv = match &*xstore {
+                    crate::Storage::Vulkan(v) => v,
+                    _ => crate::bail!("VulkanQuantBank fused-MoE expected vulkan x storage"),
+                };
+                // ids_flat is u32 + contiguous on the GPU; hand its buffer to the kernel directly.
+                let ids_c = ids_flat.contiguous()?;
+                let (idstore, _) = ids_c.storage_and_layout();
+                let idv = match &*idstore {
+                    crate::Storage::Vulkan(v) => v,
+                    _ => crate::bail!("VulkanQuantBank fused-MoE expected vulkan ids storage"),
+                };
+                let y_store = d.moe_matvec_gpu(kernel, bank, xv, idv, nrows, n, k)?;
+                let out_flat = crate::tensor::from_storage(
+                    crate::Storage::Vulkan(y_store),
+                    (nrows, n),
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                return out_flat.reshape((t, topk, n))?.to_dtype(out_dtype);
+            }
+        }
         let ids_vec = ids_flat.to_vec1::<u32>()?;
         let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
         for (slot, eid) in ids_vec.iter().enumerate() {

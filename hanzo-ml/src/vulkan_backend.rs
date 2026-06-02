@@ -54,6 +54,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
+        "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
+        "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -558,6 +560,47 @@ impl VulkanDevice {
             &[wq.buffer, x.buffer, out.buffer],
             &push,
             ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Fused MoE grouped quant matvec on the GPU: for each routed slot `s` (`0..nrows`) and output
+    /// row `r` (`0..n`), computes `y[s, r] = sum_k W[ids[s], r, k] * x[s, k]`, reading the per-expert
+    /// slice from a single resident GGML weight bank `[E, n, k]` (uploaded via [`quantize_q4k`] /
+    /// [`quantize_q8_blocks`]). The router gather (which expert) and the per-expert GEMM run in ONE
+    /// dispatch -- the whole MoE expert compute stays on the GPU: no CPU expert loop, no routing-id
+    /// readback, no per-token weight upload, no index_add scatter. The output is already in slot order
+    /// `[nrows, n]`, so the engine's `broadcast_mul(scores).sum` combine handles the rest.
+    ///
+    /// `kernel` selects the bank dtype variant ("moe_matvec_q4k" for a verbatim 144-B Q4_K bank, or
+    /// "moe_matvec_q8_0" for the 9-u32/36-B repacked Q8_0 bank from [`quantize_q8_blocks`]). The
+    /// expert-id -> bank-row mapping is `(eid*n + r)` rows of `k/block` blocks each, identical to the
+    /// host path's `woff = eid * per_expert_words`. `wbank`/`x`/`ids` are device buffers; `ids` holds
+    /// one u32 expert id per slot and is consumed on the GPU (never read to host).
+    pub fn moe_matvec_gpu(
+        &self,
+        kernel: &'static str,
+        wbank: &VulkanStorage,
+        x: &VulkanStorage,
+        ids: &VulkanStorage,
+        nrows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if x.count < nrows * k {
+            crate::bail!("moe_matvec_gpu: x count {} < nrows*k {}", x.count, nrows * k);
+        }
+        if ids.count < nrows {
+            crate::bail!("moe_matvec_gpu: ids count {} < nrows {nrows}", ids.count);
+        }
+        let total = nrows * n;
+        let out = self.alloc_f32(total)?;
+        let push = push_u32(&[n as u32, k as u32, nrows as u32]);
+        self.dispatch(
+            kernel,
+            &[wbank.buffer, x.buffer, ids.buffer, out.buffer],
+            &push,
+            ((total as u32).div_ceil(WG1D), 1, 1),
         )?;
         Ok(out)
     }
