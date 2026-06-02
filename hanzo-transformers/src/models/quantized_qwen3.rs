@@ -9,8 +9,11 @@
 use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use hanzo_ml::quantized::{gguf_file, QTensor};
-use hanzo_ml::{DType, Device, Result, Tensor};
-use hanzo_nn::{kv_cache::ConcatKvCache, Activation, Embedding, Module};
+use hanzo_ml::{DType, Device, Result, Storage, Tensor};
+use hanzo_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
+use hanzo_nn::attention::{flash_attn, AttnMask};
+use hanzo_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
+use hanzo_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
@@ -373,12 +376,6 @@ impl AttentionWeights {
             let reshaped_ctx = ctx.transpose(1, 2)?.reshape((b, l, self.hidden_size))?;
             self.o_proj.forward(&reshaped_ctx)
         }
-        let probs = hanzo_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // (B, H, L, D)
-        let reshaped_ctx = ctx
-            .transpose(1, 2)?
-            .reshape((b, l, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&reshaped_ctx)
     }
 
     fn clear_kv_cache(&mut self) {

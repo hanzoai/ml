@@ -5,6 +5,8 @@ use cudarc::driver::CudaFunction;
 use float8::F8E4M3;
 use half::{bf16, f16};
 pub use hanzo_kernels as kernels;
+use std::any::{Any, TypeId};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 

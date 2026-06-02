@@ -308,7 +308,7 @@ fn mul_mat_vec_via_q8_1(
     };
     let kernel_name = format!("{kernel_name}{b_size}");
     let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::QUANTIZED)?;
-    let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+    let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
@@ -380,7 +380,7 @@ fn mul_mat_via_q8_1(
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::QUANTIZED)?;
-    let dst = unsafe { dev.alloc::<f32>(x_rows * y_cols)? };
+    let dst = dev.alloc_zeros::<f32>(x_rows * y_cols)?;
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (
             ceil_div(x_rows, mmq_y) as u32,
@@ -621,7 +621,7 @@ impl QCudaStorage {
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
-            .memcpy_htod(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+            .memcpy_htod(&data[..], &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
             inner,
             len: data.len(),
@@ -649,7 +649,7 @@ impl QCudaStorage {
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
-            .memcpy_htod(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+            .memcpy_htod(&data[..], &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
             inner,
             len: data.len(),
@@ -678,7 +678,7 @@ impl QCudaStorage {
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
-            .memcpy_htod(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+            .memcpy_htod(&data[..], &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
             inner,
             len: data.len(),
@@ -702,7 +702,7 @@ impl QCudaStorage {
             data.len() + MATRIX_ROW_PADDING * self.dtype.type_size() / self.dtype.block_size();
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
-            .memcpy_htod(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+            .memcpy_htod(&data[..], &mut inner.slice_mut(..data.len()))?;
         self.data = PaddedCudaSlice {
             inner,
             len: data.len(),
