@@ -737,16 +737,6 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
-        // Optimized MMVQ and MMQ paths (support most paths: BF16/F16/F32, batch 1-8, all quant types, reuses per-device workspace).
-        if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
-                return Ok(result);
-            }
-            if let Some(result) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
-                return Ok(result);
-            }
-        }
-
         // Fallback
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
