@@ -894,7 +894,7 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
     let t = t.reshape((1, 4, 4, 4))?;
 
     // Use a simple weight: all ones kernel for easy verification
-    let w = Tensor::ones((2, 4, 3, 3), candle_core::DType::F32, dev)?;
+    let w = Tensor::ones((2, 4, 3, 3), hanzo_ml::DType::F32, dev)?;
     let res = t.conv2d(&w, 1, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 2, 4, 4]);
 
