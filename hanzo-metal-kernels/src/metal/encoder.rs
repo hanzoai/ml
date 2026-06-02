@@ -163,6 +163,16 @@ impl ComputeCommandEncoder {
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
 
+    /// Declare that a resource may be accessed through an argument buffer by this encoder.
+    ///
+    /// Wraps `MTLComputeCommandEncoder::useResource:usage:`. In objc2-metal 0.3.x the
+    /// selector is exposed as `useResource_usage` and takes a `&ProtocolObject<dyn MTLResource>`
+    /// (previously this was a `use_resource(&Buffer, MTLResourceUsage)` convenience method).
+    pub fn use_resource(&self, buffer: &Buffer, usage: objc2_metal::MTLResourceUsage) {
+        let resource: &ProtocolObject<dyn objc2_metal::MTLResource> = buffer.into();
+        self.raw.useResource_usage(resource, usage);
+    }
+
     /// Insert a memory barrier at buffers scope.
     pub fn insert_memory_barrier(&self) {
         self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
