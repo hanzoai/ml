@@ -88,6 +88,13 @@ impl Device {
                 let storage = dtype.cpu_zeros(elem_count);
                 Ok(QStorage::Vulkan(storage, d.clone()))
             }
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(d) => {
+                // Same as Vulkan: keep the quantized blocks in a CPU box + the device; QMatMul's
+                // WgpuQuant path uploads them to the GPU on use.
+                let storage = dtype.cpu_zeros(elem_count);
+                Ok(QStorage::Wgpu(storage, d.clone()))
+            }
         }
     }
 }
@@ -101,6 +108,11 @@ pub enum QStorage {
     // a direct quantized matmul (the Q8 kernel) is the bandwidth-win follow-up.
     #[cfg(feature = "vulkan")]
     Vulkan(Box<dyn QuantizedType>, crate::VulkanDevice),
+    // wgpu mirror of the Vulkan path: quantized blocks held in a CPU box + the device. QMatMul's
+    // WgpuQuant path reads the GGML bytes straight in the native quant matvec kernel (decode), or
+    // dequantizes to an f32 wgpu tensor on demand.
+    #[cfg(feature = "wgpu")]
+    Wgpu(Box<dyn QuantizedType>, crate::WgpuDevice),
 }
 
 impl QStorage {
@@ -145,6 +157,8 @@ impl QStorage {
             Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
             #[cfg(feature = "vulkan")]
             Device::Vulkan(d) => Ok(Self::Vulkan(dtype.from_data(data), d.clone())),
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(d) => Ok(Self::Wgpu(dtype.from_data(data), d.clone())),
         }
     }
 
@@ -155,6 +169,8 @@ impl QStorage {
             QStorage::Cuda(storage) => storage.dtype().block_size(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.block_size(),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(storage, _) => storage.block_size(),
         }
     }
 
@@ -165,6 +181,8 @@ impl QStorage {
             QStorage::Cuda(storage) => storage.dtype(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.dtype(),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(storage, _) => storage.dtype(),
         }
     }
 
@@ -175,6 +193,8 @@ impl QStorage {
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(_storage, device) => Device::Vulkan(device.clone()),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(_storage, device) => Device::Wgpu(device.clone()),
         }
     }
 
@@ -185,6 +205,8 @@ impl QStorage {
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.storage_size_in_bytes(),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(storage, _) => storage.storage_size_in_bytes(),
         }
     }
 
@@ -265,6 +287,12 @@ impl QStorage {
                 let cpu = storage.dequantize(elem_count)?;
                 Ok(Storage::Vulkan(device.upload_f32(cpu.as_slice::<f32>()?)?))
             }
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(storage, device) => {
+                // Dequantize on the CPU, then upload the f32 weights to the GPU.
+                let cpu = storage.dequantize(elem_count)?;
+                Ok(Storage::Wgpu(device.upload_f32(cpu.as_slice::<f32>()?)?))
+            }
         }
     }
 
@@ -285,6 +313,13 @@ impl QStorage {
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
                 Ok(Cow::from(data))
             }
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(storage, _) => {
+                let data_ptr = storage.as_ptr();
+                let size_in_bytes = storage.storage_size_in_bytes();
+                let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
+                Ok(Cow::from(data))
+            }
         }
     }
 
@@ -293,6 +328,8 @@ impl QStorage {
             QStorage::Cuda(storage) => storage.device_ptr(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(..) => crate::bail!("not implemented"),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(..) => crate::bail!("not implemented"),
             QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
@@ -860,6 +897,8 @@ impl QTensor {
             QStorage::Cuda(storage) => storage.device_ptr(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(..) => crate::bail!("not implemented"),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(..) => crate::bail!("not implemented"),
             QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
@@ -892,6 +931,17 @@ pub enum QMatMul {
     VulkanQuant {
         qtensor: std::sync::Arc<QTensor>,
         wq: std::sync::Arc<crate::VulkanStorage>,
+        dtype: GgmlDType,
+        n: usize,
+        k: usize,
+    },
+    // wgpu mirror of VulkanQuant: GGML quantized blocks live in VRAM and decode (1 row) runs the
+    // matching native-GGML quant matvec WGSL kernel straight out of the block format. Prefill (>1
+    // row) dequantizes to a temporary f32 weight. `dtype` selects the kernel; `n`/`k` are the dims.
+    #[cfg(feature = "wgpu")]
+    WgpuQuant {
+        qtensor: std::sync::Arc<QTensor>,
+        wq: std::sync::Arc<crate::WgpuStorage>,
         dtype: GgmlDType,
         n: usize,
         k: usize,
@@ -950,11 +1000,36 @@ impl QMatMul {
                 }
             }
         }
+        // Native wgpu quantized path: same idea as Vulkan. Milestone 1 ships the Q4_0/Q8_0 WGSL
+        // matvec kernels; other dtypes (incl. Q4_K) fall through to the dequantize path below.
+        #[cfg(feature = "wgpu")]
+        {
+            let dt = qtensor.dtype();
+            let native_wgpu = matches!(dt, GgmlDType::Q4_0 | GgmlDType::Q8_0);
+            if native_wgpu {
+                if let Device::Wgpu(d) = qtensor.device() {
+                    if let Ok((n, k)) = qtensor.shape().dims2() {
+                        let blk = dt.block_size();
+                        if k % blk == 0 {
+                            let bytes = qtensor.data()?;
+                            let wq = d.upload_qweight(&bytes)?;
+                            return Ok(Self::WgpuQuant {
+                                qtensor,
+                                wq: std::sync::Arc::new(wq),
+                                dtype: dt,
+                                n,
+                                k,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         let dequantize = match qtensor.dtype() {
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            // The Vulkan backend has no native quantized matmul yet, so dequantize to f32 here
-            // (once, at construction) and run the regular f32 GPU matmul.
-            _ => DEQUANTIZE_ALL.with(|b| *b) || qtensor.device().is_vulkan(),
+            // The Vulkan/wgpu backends have no generic native quantized matmul, so dequantize to f32
+            // here (once, at construction) and run the regular f32 GPU matmul.
+            _ => DEQUANTIZE_ALL.with(|b| *b) || qtensor.device().is_vulkan() || qtensor.device().is_wgpu(),
         };
         let t = if dequantize {
             let tensor = qtensor.dequantize(&qtensor.device())?;
@@ -979,6 +1054,8 @@ impl QMatMul {
             Self::TensorF16(t) => Ok(t.clone()),
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
+            #[cfg(feature = "wgpu")]
+            Self::WgpuQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
         }
     }
 
@@ -998,6 +1075,8 @@ impl QMatMul {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
+            #[cfg(feature = "wgpu")]
+            Self::WgpuQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
             _ => {
                 panic!("Not implemented!")
             }
@@ -1036,6 +1115,8 @@ impl crate::CustomOp1 for QTensor {
             QStorage::Cpu(storage) => storage,
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(..) => crate::bail!("Invalid storage"),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(..) => crate::bail!("Invalid storage"),
             QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
         };
         match storage.dtype() {
@@ -1130,6 +1211,55 @@ impl crate::Module for QMatMul {
                     dims[last] = *n;
                     Ok(crate::tensor::from_storage(
                         crate::Storage::Vulkan(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                } else {
+                    // Prefill: dequantize to a temporary f32 weight (reuses the NT matmul path).
+                    let w = qtensor.dequantize(&xs.device())?;
+                    let w = match *xs.dims() {
+                        [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                        [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                        _ => w.t()?,
+                    };
+                    xs.matmul(&w)
+                }
+            }
+            #[cfg(feature = "wgpu")]
+            Self::WgpuQuant {
+                qtensor,
+                wq,
+                dtype,
+                n,
+                k,
+            } => {
+                let rows: usize = xs.elem_count() / *k;
+                if rows == 1 {
+                    // Decode: weights stay quantized in VRAM; the matching native-GGML quant matvec
+                    // WGSL kernel runs straight out of the block format (no dequant, no copy).
+                    let xs = xs.contiguous()?;
+                    let d = match xs.device() {
+                        Device::Wgpu(d) => d,
+                        _ => crate::bail!("WgpuQuant input not on wgpu"),
+                    };
+                    let y = {
+                        let (store, _) = xs.storage_and_layout();
+                        let xv = match &*store {
+                            crate::Storage::Wgpu(v) => v,
+                            _ => crate::bail!("WgpuQuant expected wgpu storage"),
+                        };
+                        match dtype {
+                            GgmlDType::Q4_0 => d.matvec_q4_0_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q8_0 => d.matvec_q8_0_gpu(wq, xv, *n, *k)?,
+                            other => crate::bail!("WgpuQuant: no native matvec for {other:?}"),
+                        }
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Wgpu(y),
                         dims,
                         crate::op::BackpropOp::none(),
                         false,
