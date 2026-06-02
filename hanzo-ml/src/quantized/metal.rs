@@ -387,7 +387,7 @@ impl From<GgmlDType> for hanzo_metal_kernels::GgmlDType {
             GgmlDType::Q8K => hanzo_metal_kernels::GgmlDType::Q8K,
             GgmlDType::F16 => hanzo_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => hanzo_metal_kernels::GgmlDType::F32,
-            GgmlDType::BF16 => hanzo_metal_kernels::GgmlDType::F16,
+            GgmlDType::BF16 => hanzo_metal_kernels::GgmlDType::BF16,
         }
     }
 }
