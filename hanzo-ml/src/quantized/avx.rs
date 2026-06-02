@@ -667,3 +667,311 @@ pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32
         hsum_float_8(acc)
     }
 }
+
+// ---------------------------------------------------------------------------
+// AVX-512 / AVX-512-VNNI kernels.
+//
+// These mirror the AVX2 kernels above but operate on 512-bit registers and, for
+// the q4_0/q4k/q8_0 paths, use the VNNI `vpdpbusd` instruction
+// (`_mm512_dpbusd_epi32`) which fuses an unsigned*signed byte multiply with a
+// horizontal-by-4 i32 accumulation in a single uop.
+//
+// Everything is gated behind `x86_64` + the concrete target features that the
+// intrinsics require (`avx512f` for the float/FMA core, `avx512bw` for the
+// byte/word integer ops, `avx512vnni` for `vpdpbusd`). On a target that does
+// not enable all three (older x86, ARM, wasm, ...) none of this is compiled and
+// the AVX2 / NEON / scalar fallbacks remain the only kernels, so this cannot
+// break those builds. The compile-time dispatch in `k_quants.rs` prefers these
+// kernels over the AVX2 ones when the features are enabled.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vnni"
+))]
+#[inline(always)]
+unsafe fn hsum_float_16(x: __m512) -> f32 {
+    _mm512_reduce_add_ps(x)
+}
+
+/// q4_0 x q8_0 using VNNI.
+///
+/// q4_0 stores 32 weights as 16 packed nibbles in `[0, 15]`; the real signed
+/// weight is `nibble - 8`. We feed the *unsigned* nibbles to `vpdpbusd`
+/// (unsigned * signed) and afterwards subtract `8 * sum(q8)`, computed with a
+/// second `vpdpbusd` against an all-ones byte vector. Two blocks are processed
+/// per iteration so each 512-bit register is fully utilised; an odd trailing
+/// block is handled with a widen-to-i16 `madd` tail.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vnni"
+))]
+#[inline(always)]
+pub(crate) fn vec_dot_q4_0_q8_0_avx512(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> f32 {
+    debug_assert!(
+        n.is_multiple_of(QK8_0),
+        "vec_dot_q4_0_q8_0: {n} is not divisible by {QK8_0}"
+    );
+    unsafe {
+        let low_mask = _mm512_set1_epi8(0xF);
+        let ones = _mm512_set1_epi8(1);
+        let nb = xs.len().min(ys.len());
+        let mut acc = _mm512_setzero_ps();
+        let mut i = 0;
+        // Two 32-element blocks at a time -> 64 nibbles per 512-bit lane.
+        while i + 2 <= nb {
+            let x0 = &xs[i];
+            let x1 = &xs[i + 1];
+            let y0 = &ys[i];
+            let y1 = &ys[i + 1];
+
+            // Expand the two blocks' nibbles into 64 unsigned bytes in [0, 15].
+            // Low nibbles of block0 (16) | low nibbles of block1 (16) | high
+            // nibbles of block0 (16) | high nibbles of block1 (16) — the exact
+            // ordering only has to match the q8 byte ordering we build below.
+            let bx0 = bytes_from_nibbles_32(x0.qs.as_ptr()); // 32 bytes, block0
+            let bx1 = bytes_from_nibbles_32(x1.qs.as_ptr()); // 32 bytes, block1
+            let bx = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(bx0), bx1);
+            let bx = _mm512_and_si512(bx, low_mask);
+
+            let by0 = _mm256_loadu_si256(y0.qs.as_ptr() as *const __m256i);
+            let by1 = _mm256_loadu_si256(y1.qs.as_ptr() as *const __m256i);
+            let by = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(by0), by1);
+
+            // raw = sum(nibble * q8) per i32 lane (4 bytes folded together)
+            let raw = _mm512_dpbusd_epi32(_mm512_setzero_si512(), bx, by);
+            // corr = sum(q8) per i32 lane
+            let corr = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, by);
+            // dot = sum((nibble - 8) * q8) = raw - 8 * corr
+            let prod = _mm512_sub_epi32(raw, _mm512_slli_epi32::<3>(corr));
+
+            // Lanes 0..7 belong to block0, lanes 8..15 to block1. Scale each
+            // half by its own (dx * dy) and accumulate.
+            let prodf = _mm512_cvtepi32_ps(prod);
+            let d0 = f16::to_f32(x0.d) * f16::to_f32(y0.d);
+            let d1 = f16::to_f32(x1.d) * f16::to_f32(y1.d);
+            let mut ds = [d1; 16];
+            ds[0..8].fill(d0);
+            let dv = _mm512_loadu_ps(ds.as_ptr());
+            acc = _mm512_fmadd_ps(dv, prodf, acc);
+
+            i += 2;
+        }
+        let mut sumf = hsum_float_16(acc);
+        // Odd trailing block via widen-to-i16 madd (exact signed*signed).
+        if i < nb {
+            let x = &xs[i];
+            let y = &ys[i];
+            let bx = bytes_from_nibbles_32(x.qs.as_ptr());
+            let off = _mm256_set1_epi8(8);
+            let bx = _mm256_sub_epi8(bx, off);
+            let by = _mm256_loadu_si256(y.qs.as_ptr() as *const __m256i);
+            let xs16 = _mm512_cvtepi8_epi16(bx);
+            let ys16 = _mm512_cvtepi8_epi16(by);
+            let sumi = _mm512_madd_epi16(xs16, ys16);
+            let d = f16::to_f32(x.d) * f16::to_f32(y.d);
+            sumf += d * _mm512_reduce_add_epi32(sumi) as f32;
+        }
+        sumf
+    }
+}
+
+/// q8_0 x q8_0 — both operands are signed bytes, so VNNI's unsigned*signed
+/// `vpdpbusd` cannot be used directly. We widen each 32-byte block to 32 i16
+/// and use a single 512-bit `madd_epi16` (exact signed*signed), accumulating
+/// the per-block i32 sums and scaling by `dx*dy`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vnni"
+))]
+#[inline(always)]
+pub(crate) fn vec_dot_q8_0_q8_0_avx512(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> f32 {
+    debug_assert!(
+        n.is_multiple_of(QK8_0),
+        "vec_dot_q8_0_q8_0: {n} is not divisible by {QK8_0}"
+    );
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            let bx = _mm256_loadu_si256(x.qs.as_ptr() as *const __m256i);
+            let by = _mm256_loadu_si256(y.qs.as_ptr() as *const __m256i);
+            let xs16 = _mm512_cvtepi8_epi16(bx);
+            let ys16 = _mm512_cvtepi8_epi16(by);
+            let sumi = _mm512_madd_epi16(xs16, ys16);
+            let d = _mm512_set1_ps(f16::to_f32(x.d) * f16::to_f32(y.d));
+            acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(sumi), acc);
+        }
+        hsum_float_16(acc)
+    }
+}
+
+/// q4k x q8k.
+///
+/// Q4K packs `QK_K`(=256) 4-bit weights with 8 sub-blocks of 32, each carrying
+/// a 6-bit scale and a 6-bit min (decoded into `utmp`). The q4 nibbles are
+/// already unsigned in `[0, 15]` (no -8 offset), which is exactly what VNNI
+/// wants. We process one 64-byte chunk of q4 (two sub-blocks: low + high
+/// nibbles) per 512-bit step, applying the per-sub-block scale with an i16
+/// `madd` after the `maddubs` widening — mirroring the AVX2 kernel but at
+/// double width. The min term is handled exactly as in AVX2 with the 128-bit
+/// `q8sums` reduction.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vnni"
+))]
+#[inline(always)]
+pub(crate) fn vec_dot_q4k_q8k_avx512(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
+    debug_assert!(
+        n.is_multiple_of(QK_K),
+        "vec_dot_q4k_q8k: {n} is not divisible by {QK_K}"
+    );
+    let mut utmp = [0u32; 4];
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    unsafe {
+        let m4 = _mm256_set1_epi8(0xF);
+
+        let mut acc = _mm512_setzero_ps();
+        let mut acc_m = _mm_setzero_ps();
+
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            let d = y.d * x.d.to_f32();
+            let dmin = -y.d * x.dmin.to_f32();
+
+            LittleEndian::read_u32_into(&x.scales, &mut utmp[0..3]);
+
+            utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+            let uaux = utmp[1] & KMASK1;
+            utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= KMASK1;
+
+            let mut q4 = x.qs.as_ptr();
+            let mut q8 = y.qs.as_ptr();
+
+            // 8 scales then 8 mins, sign-extended to i16 (they are < 64).
+            let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
+                utmp[3] as i32,
+                utmp[2] as i32,
+                utmp[1] as i32,
+                utmp[0] as i32,
+            ));
+
+            // ---- min contribution (identical to AVX2) ----
+            let q8sums = _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i);
+            let q8s = _mm_hadd_epi16(
+                _mm256_extracti128_si256(q8sums, 0),
+                _mm256_extracti128_si256(q8sums, 1),
+            );
+            let prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+            acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+            // The 8 scales live in the low 128 bits of `mins_and_scales`.
+            let sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+            // Duplicate the 8 i16 scales into a 256-bit lane so the existing
+            // 256-bit shuffle table addresses them, then we build 512-bit
+            // scale vectors from two consecutive groups.
+            let scales256 = mm256_set_m128i(sc128, sc128);
+
+            let mut sumi = _mm512_setzero_si512();
+
+            // QK_K/64 == 4 iterations of the AVX2 kernel; each handles 64 q4
+            // values (low+high nibble of a 32-byte load) and two scale groups.
+            // We pack two AVX2 iterations into one 512-bit step (j and j+1).
+            for j in (0..QK_K / 64).step_by(2) {
+                // ---- group j ----
+                let sl_a = _mm256_shuffle_epi8(scales256, get_scale_shuffle_k4(2 * j));
+                let sh_a = _mm256_shuffle_epi8(scales256, get_scale_shuffle_k4(2 * j + 1));
+                let q4b_a = _mm256_loadu_si256(q4 as *const __m256i);
+                q4 = q4.add(32);
+                let q4l_a = _mm256_and_si256(q4b_a, m4);
+                let q4h_a = _mm256_and_si256(_mm256_srli_epi16(q4b_a, 4), m4);
+                let q8l_a = _mm256_loadu_si256(q8 as *const __m256i);
+                q8 = q8.add(32);
+                let q8h_a = _mm256_loadu_si256(q8 as *const __m256i);
+                q8 = q8.add(32);
+
+                // ---- group j+1 ----
+                let sl_b = _mm256_shuffle_epi8(scales256, get_scale_shuffle_k4(2 * (j + 1)));
+                let sh_b = _mm256_shuffle_epi8(scales256, get_scale_shuffle_k4(2 * (j + 1) + 1));
+                let q4b_b = _mm256_loadu_si256(q4 as *const __m256i);
+                q4 = q4.add(32);
+                let q4l_b = _mm256_and_si256(q4b_b, m4);
+                let q4h_b = _mm256_and_si256(_mm256_srli_epi16(q4b_b, 4), m4);
+                let q8l_b = _mm256_loadu_si256(q8 as *const __m256i);
+                q8 = q8.add(32);
+                let q8h_b = _mm256_loadu_si256(q8 as *const __m256i);
+                q8 = q8.add(32);
+
+                // Combine the two groups' low-nibble products into one 512-bit op.
+                let q4l = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q4l_a), q4l_b);
+                let q8l = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8l_a), q8l_b);
+                let scl = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(sl_a), sl_b);
+                let p16l = _mm512_maddubs_epi16(q4l, q8l);
+                let p16l = _mm512_madd_epi16(scl, p16l);
+                sumi = _mm512_add_epi32(sumi, p16l);
+
+                // ... and the two groups' high-nibble products.
+                let q4h = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q4h_a), q4h_b);
+                let q8h = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8h_a), q8h_b);
+                let sch = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(sh_a), sh_b);
+                let p16h = _mm512_maddubs_epi16(q4h, q8h);
+                let p16h = _mm512_madd_epi16(sch, p16h);
+                sumi = _mm512_add_epi32(sumi, p16h);
+            }
+
+            let vd = _mm512_set1_ps(d);
+            acc = _mm512_fmadd_ps(vd, _mm512_cvtepi32_ps(sumi), acc);
+        }
+
+        let acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+        let acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+        hsum_float_16(acc) + _mm_cvtss_f32(acc_m)
+    }
+}
+
+/// q8k x q8k — signed*signed sum over the 256 i8 weights, widened to i16 and
+/// reduced with 512-bit `madd_epi16`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vnni"
+))]
+#[inline(always)]
+pub(crate) fn vec_dot_q8k_q8k_avx512(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32 {
+    debug_assert!(
+        n.is_multiple_of(QK_K),
+        "vec_dot_q8k_8k: {n} is not divisible by {QK_K}"
+    );
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            let mut sumi = _mm512_setzero_si512();
+            let x_qs = x.qs.as_ptr();
+            let y_qs = y.qs.as_ptr();
+            // 256 i8 -> eight 32-byte chunks, each widened to 32 i16.
+            for j in (0..QK_K).step_by(32) {
+                let xv = _mm256_loadu_si256(x_qs.add(j) as *const __m256i);
+                let yv = _mm256_loadu_si256(y_qs.add(j) as *const __m256i);
+                let xv16 = _mm512_cvtepi8_epi16(xv);
+                let yv16 = _mm512_cvtepi8_epi16(yv);
+                sumi = _mm512_add_epi32(sumi, _mm512_madd_epi16(xv16, yv16));
+            }
+            let d = _mm512_set1_ps(x.d * y.d);
+            acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(sumi), acc);
+        }
+        hsum_float_16(acc)
+    }
+}
