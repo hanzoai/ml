@@ -888,6 +888,30 @@ impl QMatMul {
             if is_quantized && qtensor.shape().rank() == 3 {
                 return Ok(Self::QTensor(qtensor));
             }
+            // Any other 2D quantized linear (Q6K down/output, Q5K, Q4_0, Q5_0, ...) has no native
+            // keep-quantized matvec kernel, so the old path dequantized it to a 4 B/elem f32 weight
+            // in VRAM -- 3.5x the decode bandwidth and the f32 VRAM blowup. Instead requantize the
+            // (already-lossy) dequant to Q8_0 on the GPU and run the native Q8 matvec: every decode
+            // linear now reads ~1.125 B/elem. The extra error vs the source quant is tiny (Q8 of an
+            // already-Q5K/Q6K row), and prefill still dequantizes `qtensor` to f32 for the NT matmul.
+            if is_quantized {
+                if let Ok((n, k)) = qtensor.shape().dims2() {
+                    if k % 32 == 0 {
+                        let wf = qtensor
+                            .dequantize(&Device::Cpu)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?;
+                        let wq = d.quantize_q8(&wf, n, k)?;
+                        return Ok(Self::VulkanQuant {
+                            qtensor,
+                            wq: std::sync::Arc::new(wq),
+                            dtype: GgmlDType::Q8_0,
+                            n,
+                            k,
+                        });
+                    }
+                }
+            }
         }
         let dequantize = match qtensor.dtype() {
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
