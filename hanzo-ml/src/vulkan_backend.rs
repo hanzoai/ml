@@ -113,6 +113,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "gdn_conv_full" => spv!("gdn_conv_full"),
         "gdn_conv_state_save" => spv!("gdn_conv_state_save"),
         "gdn_gating" => spv!("gdn_gating"),
+        "paged_attn" => spv!("paged_attn"),
+        "reshape_and_cache" => spv!("reshape_and_cache"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -299,6 +301,46 @@ impl std::fmt::Debug for VulkanStorage {
             self.count, self.dtype
         )
     }
+}
+
+/// Arguments for [`VulkanDevice::paged_attention_vk`]. All tensors are f32 `VulkanStorage`
+/// except `block_tables`/`context_lens` (u32). Strides are in f32 ELEMENTS. Grouped into a
+/// struct because the kernel needs many invariants (see the codebase 6+ arg convention).
+pub struct PagedAttnArgs<'a> {
+    pub q: &'a VulkanStorage,
+    pub key_cache: &'a VulkanStorage,
+    pub value_cache: &'a VulkanStorage,
+    pub block_tables: &'a VulkanStorage,
+    pub context_lens: &'a VulkanStorage,
+    pub num_seqs: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_size: usize,
+    pub block_size: usize,
+    pub max_num_blocks_per_seq: usize,
+    pub q_stride: usize,
+    pub kv_block_stride: usize,
+    pub kv_head_stride: usize,
+    pub x: usize,
+    pub max_context_len: usize,
+    pub scale: f32,
+}
+
+/// Arguments for [`VulkanDevice::reshape_and_cache_vk`]. f32 tensors except `slot_mapping`
+/// (u32, pad = 0xFFFFFFFF). Strides in f32 elements.
+pub struct ReshapeCacheArgs<'a> {
+    pub key: &'a VulkanStorage,
+    pub value: &'a VulkanStorage,
+    pub key_cache: &'a VulkanStorage,
+    pub value_cache: &'a VulkanStorage,
+    pub slot_mapping: &'a VulkanStorage,
+    pub num_tokens: usize,
+    pub num_heads: usize,
+    pub head_size: usize,
+    pub block_size: usize,
+    pub key_stride: usize,
+    pub value_stride: usize,
+    pub x: usize,
 }
 
 // Deferred-safe buffer pool. Buffers are never freed inline: deferred dispatch may still hold a
@@ -1116,6 +1158,86 @@ impl VulkanDevice {
             ((total as u32).div_ceil(WG1D), 1, 1),
         )?;
         Ok((beta, g))
+    }
+
+    /// PagedAttention decode kernel (v1, f32). For each (seq, head) computes
+    /// `softmax(scale * Q.K^T) . V` over the sequence's cached KV, gathered from the
+    /// non-contiguous paged blocks named by `block_tables`. One workgroup per
+    /// (head, seq). See `src/vulkan/shaders/paged_attn.comp` for the layout contract.
+    ///
+    /// Buffers carry f32 (Vulkan upcasts f16/bf16 on upload). `block_tables` and
+    /// `context_lens` are u32 storages. Strides are in ELEMENTS (f32 slots), computed
+    /// host-side from the actual f32 cache layout (NOT the logical dtype). The output is
+    /// a fresh `[num_seqs, num_heads, head_size]` f32 storage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_attention_vk(&self, p: &PagedAttnArgs<'_>) -> Result<VulkanStorage> {
+        if p.head_size as u64 > 256 {
+            crate::bail!("vulkan paged_attn: head_size {} > 256 (shared mem bound)", p.head_size);
+        }
+        let out = self.alloc_f32(p.num_seqs * p.num_heads * p.head_size)?;
+        // push: 10 u32 then 1 f32 (scale). std430 scalar packing, tightly packed.
+        let mut push = push_u32(&[
+            p.num_kv_heads as u32,
+            p.num_heads as u32,
+            p.head_size as u32,
+            p.block_size as u32,
+            p.max_num_blocks_per_seq as u32,
+            p.q_stride as u32,
+            p.kv_block_stride as u32,
+            p.kv_head_stride as u32,
+            p.x as u32,
+            p.max_context_len as u32,
+        ]);
+        push.extend_from_slice(&p.scale.to_ne_bytes());
+        let bufs = [
+            p.q.buffer,
+            p.key_cache.buffer,
+            p.value_cache.buffer,
+            p.block_tables.buffer,
+            p.context_lens.buffer,
+            out.buffer,
+        ];
+        // grid: x = heads, y = seqs (matches gl_WorkGroupID.x/.y in the shader).
+        self.dispatch_out(
+            "paged_attn",
+            &bufs,
+            5,
+            &push,
+            (p.num_heads as u32, p.num_seqs as u32, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Write new per-token K/V into the paged cache at the `slot_mapping` positions
+    /// (f32). `slot_mapping` is a u32 storage; the host maps the engine's i64 slots
+    /// (>=0) to u32 and the -1 pad sentinel to 0xFFFFFFFF (skipped in-shader). Strides
+    /// are in f32 elements. Mutates `key_cache`/`value_cache` in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reshape_and_cache_vk(&self, p: &ReshapeCacheArgs<'_>) -> Result<()> {
+        let push = push_u32(&[
+            p.key_stride as u32,
+            p.value_stride as u32,
+            p.num_heads as u32,
+            p.head_size as u32,
+            p.block_size as u32,
+            p.x as u32,
+        ]);
+        let bufs = [
+            p.key.buffer,
+            p.value.buffer,
+            p.key_cache.buffer,
+            p.value_cache.buffer,
+            p.slot_mapping.buffer,
+        ];
+        // One workgroup per token; kernel writes bindings 2 (key_cache) and 3 (value_cache).
+        self.dispatch_multi_out(
+            "reshape_and_cache",
+            &bufs,
+            &[2, 3],
+            &push,
+            (p.num_tokens as u32, 1, 1),
+        )?;
+        Ok(())
     }
 
     /// Like [`Self::dispatch_out`] but the kernel writes several output bindings (named by
