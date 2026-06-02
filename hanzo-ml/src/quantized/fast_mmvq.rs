@@ -97,7 +97,7 @@ type PlainLauncher = unsafe extern "C" fn(
 );
 
 fn plain_launcher_bf16(dtype: GgmlDType) -> Option<PlainLauncher> {
-    use candle_kernels::ffi;
+    use hanzo_kernels::ffi;
     let f: PlainLauncher = match dtype {
         GgmlDType::Q4_0 => ffi::launch_mmvq_gguf_q4_0_bf16_plain,
         GgmlDType::Q4_1 => ffi::launch_mmvq_gguf_q4_1_bf16_plain,
@@ -115,7 +115,7 @@ fn plain_launcher_bf16(dtype: GgmlDType) -> Option<PlainLauncher> {
 }
 
 fn plain_launcher_f16(dtype: GgmlDType) -> Option<PlainLauncher> {
-    use candle_kernels::ffi;
+    use hanzo_kernels::ffi;
     let f: PlainLauncher = match dtype {
         GgmlDType::Q4_0 => ffi::launch_mmvq_gguf_q4_0_f16_plain,
         GgmlDType::Q4_1 => ffi::launch_mmvq_gguf_q4_1_f16_plain,
@@ -133,7 +133,7 @@ fn plain_launcher_f16(dtype: GgmlDType) -> Option<PlainLauncher> {
 }
 
 fn plain_launcher_f32(dtype: GgmlDType) -> Option<PlainLauncher> {
-    use candle_kernels::ffi;
+    use hanzo_kernels::ffi;
     let f: PlainLauncher = match dtype {
         GgmlDType::Q4_0 => ffi::launch_mmvq_gguf_q4_0_f32_plain,
         GgmlDType::Q4_1 => ffi::launch_mmvq_gguf_q4_1_f32_plain,
@@ -164,7 +164,7 @@ pub fn try_fwd(
     rhs: &CudaStorage,
     rhs_l: &crate::Layout,
 ) -> Result<Option<(CudaStorage, Shape)>> {
-    use candle_kernels::ffi;
+    use hanzo_kernels::ffi;
 
     // Gate checks.
     let w_dtype = qstorage.dtype();
