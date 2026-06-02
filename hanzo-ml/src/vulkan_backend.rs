@@ -49,6 +49,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
+        "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
+        "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -92,6 +94,12 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "upsample_nearest1d" => spv!("upsample_nearest1d"),
         "upsample_nearest2d" => spv!("upsample_nearest2d"),
         "upsample_bilinear2d" => spv!("upsample_bilinear2d"),
+        "gdn_recurrence" => spv!("gdn_recurrence"),
+        "gdn_chunked" => spv!("gdn_chunked"),
+        "gdn_conv_update" => spv!("gdn_conv_update"),
+        "gdn_conv_full" => spv!("gdn_conv_full"),
+        "gdn_conv_state_save" => spv!("gdn_conv_state_save"),
+        "gdn_gating" => spv!("gdn_gating"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -478,6 +486,328 @@ impl VulkanDevice {
         let push = push_u32(&[nout as u32, k as u32]);
         self.dispatch(
             "mul_mat_vec_q4k",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Gated delta-rule recurrence on the GPU (hybrid GDN / Qwen3.6 mixer), mirroring the CUDA
+    /// `gated_delta_rule_recurrence` math. All operands are f32 device buffers laid out exactly as
+    /// the CUDA kernel expects: `q,k` `[BH,S,K]`, `v` `[BH,S,V]`, `g,beta` `[BH,S]`, `state` `[BH,K,V]`
+    /// (updated in place). Returns the output `[BH,S,V]`. `seq_len==1` is the decode path (sequential
+    /// `gdn_recurrence`); a longer prefill uses the chunked kernel when `k_dim<=128`, else the
+    /// sequential one (its private state array bounds `k_dim<=256`, covering shipping GDN configs).
+    /// One workgroup per (V-tile, batch*head); V-tile width is 64 (matches the kernels' BV).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_recurrence_gpu(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        g: &VulkanStorage,
+        beta: &VulkanStorage,
+        state: &VulkanStorage,
+        bh: usize,
+        seq_len: usize,
+        k_dim: usize,
+        v_dim: usize,
+    ) -> Result<VulkanStorage> {
+        if k_dim > 256 {
+            crate::bail!("gdn_recurrence_gpu: k_dim {k_dim} exceeds the kernel bound of 256");
+        }
+        let out = self.alloc_f32(bh * seq_len * v_dim)?;
+        let push = push_u32(&[seq_len as u32, k_dim as u32, v_dim as u32]);
+        let bufs = [
+            q.buffer, k.buffer, v.buffer, g.buffer, beta.buffer, state.buffer, out.buffer,
+        ];
+        let v_tiles = (v_dim as u32).div_ceil(WG1D);
+        // Chunked prefill kernel bounds its shared key array at K<=128; fall back to the sequential
+        // kernel (private array bound K<=256) for the rare wider config. Decode (seq_len==1) always
+        // uses the sequential kernel -- there are no chunks to amortize over a single token.
+        let kernel = if seq_len > 1 && k_dim <= 128 {
+            "gdn_chunked"
+        } else {
+            "gdn_recurrence"
+        };
+        // The kernel writes BOTH `state` (binding 5, in place) and `out` (binding 6). Mark both
+        // live so a later dispatch in this batch that reads either inserts the RAW barrier.
+        self.dispatch_multi_out(kernel, &bufs, &[5, 6], &push, (v_tiles, bh as u32, 1))?;
+        Ok(out)
+    }
+
+    /// Causal conv1d single-step update (GDN decode path), mirroring CUDA `causal_conv1d_update`.
+    /// `x` `[B,conv_dim,1]`, `weight` `[conv_dim,kernel_size]`, `conv_state` `[B,conv_dim,kernel_size]`
+    /// (shifted+updated in place). Returns the SiLU-activated output `[B,conv_dim,1]`. f32 on this
+    /// backend (f16/bf16 GDN tensors are stored as f32). `kernel_size<=8` (the kernel's window bound).
+    pub fn gdn_conv_update_gpu(
+        &self,
+        x: &VulkanStorage,
+        weight: &VulkanStorage,
+        conv_state: &VulkanStorage,
+        batch_size: usize,
+        conv_dim: usize,
+        kernel_size: usize,
+    ) -> Result<VulkanStorage> {
+        if !(1..=8).contains(&kernel_size) {
+            crate::bail!("gdn_conv_update_gpu: kernel_size {kernel_size} out of range 1..=8");
+        }
+        let out = self.alloc_f32(batch_size * conv_dim)?;
+        let push = push_u32(&[batch_size as u32, conv_dim as u32, kernel_size as u32]);
+        let bufs = [x.buffer, weight.buffer, conv_state.buffer, out.buffer];
+        // Writes conv_state (binding 2, in place) and out (binding 3); track both for hazards.
+        self.dispatch_multi_out(
+            "gdn_conv_update",
+            &bufs,
+            &[2, 3],
+            &push,
+            ((conv_dim as u32).div_ceil(WG1D), batch_size as u32, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Causal conv1d over a full sequence (GDN prefill path), mirroring CUDA `causal_conv1d_full`
+    /// plus `save_conv_state`. `x` `[B,conv_dim,S]`, `weight` `[conv_dim,kernel_size]`. Returns the
+    /// SiLU output `[B,conv_dim,S]` and the trailing window saved into a fresh conv_state
+    /// `[B,conv_dim,kernel_size]` (left zero-padded when `S<kernel_size`). f32 throughout.
+    pub fn gdn_conv_full_gpu(
+        &self,
+        x: &VulkanStorage,
+        weight: &VulkanStorage,
+        batch_size: usize,
+        conv_dim: usize,
+        seq_len: usize,
+        kernel_size: usize,
+    ) -> Result<(VulkanStorage, VulkanStorage)> {
+        let out = self.alloc_f32(batch_size * conv_dim * seq_len)?;
+        let cs = self.alloc_f32(batch_size * conv_dim * kernel_size)?;
+        let push_full = push_u32(&[
+            batch_size as u32,
+            conv_dim as u32,
+            seq_len as u32,
+            kernel_size as u32,
+        ]);
+        let total = (batch_size * conv_dim * seq_len) as u32;
+        self.dispatch(
+            "gdn_conv_full",
+            &[x.buffer, weight.buffer, out.buffer],
+            &push_full,
+            (total.div_ceil(WG1D), 1, 1),
+        )?;
+        // Independent of the conv output (reads x, writes a disjoint buffer), so no barrier needed.
+        self.dispatch(
+            "gdn_conv_state_save",
+            &[x.buffer, cs.buffer],
+            &push_full,
+            ((conv_dim as u32).div_ceil(WG1D), batch_size as u32, 1),
+        )?;
+        Ok((out, cs))
+    }
+
+    /// Fused GDN gating, mirroring CUDA `fused_gdn_gating`: `beta=sigmoid(b)`,
+    /// `g=-exp(a_log)*softplus(a+dt_bias)`. `b,a` are `[total]`; `a_log,dt_bias` are per-head
+    /// `[num_heads]` (indexed by `idx % num_heads`). Returns `(beta, g)`, each `[total]`. f32.
+    pub fn gdn_gating_gpu(
+        &self,
+        b: &VulkanStorage,
+        a: &VulkanStorage,
+        a_log: &VulkanStorage,
+        dt_bias: &VulkanStorage,
+        total: usize,
+        num_heads: usize,
+    ) -> Result<(VulkanStorage, VulkanStorage)> {
+        let beta = self.alloc_f32(total)?;
+        let g = self.alloc_f32(total)?;
+        let push = push_u32(&[total as u32, num_heads as u32]);
+        let bufs = [
+            b.buffer,
+            a.buffer,
+            a_log.buffer,
+            dt_bias.buffer,
+            beta.buffer,
+            g.buffer,
+        ];
+        // Writes beta (binding 4) and g (binding 5); both are consumed downstream, track both.
+        self.dispatch_multi_out(
+            "gdn_gating",
+            &bufs,
+            &[4, 5],
+            &push,
+            ((total as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok((beta, g))
+    }
+
+    /// Like [`Self::dispatch_out`] but the kernel writes several output bindings (named by
+    /// `out_idxs`); each is marked live in the in-batch hazard set so a later dispatch reading any of
+    /// them gets the RAW barrier. Used by the GDN kernels (recurrence updates state AND writes output;
+    /// gating writes beta AND g; conv-update updates state AND writes output). Shares `dispatch_out`'s
+    /// recording path by issuing the dispatch with the first output index, then registering the rest.
+    fn dispatch_multi_out(
+        &self,
+        name: &'static str,
+        bufs: &[vk::Buffer],
+        out_idxs: &[usize],
+        push: &[u8],
+        groups: (u32, u32, u32),
+    ) -> Result<()> {
+        let first = out_idxs
+            .first()
+            .copied()
+            .unwrap_or(bufs.len().saturating_sub(1));
+        self.dispatch_out(name, bufs, first, push, groups)?;
+        if out_idxs.len() > 1 {
+            let mut s = self.inner.submitter.lock().unwrap();
+            for &i in &out_idxs[1..] {
+                if let Some(&buf) = bufs.get(i) {
+                    s.written_since_barrier.insert(buf);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Upload Q5_K weights to the GPU once, verbatim in the GGUF super-block layout (176 B = 44 u32
+    /// per 256-weight block, `nout * k/256` blocks total). No requantize: the bytes are the same
+    /// blocks the CPU `k_quants::BlockQ5K` holds (d, dmin, 12 scale bytes, 32 qh bytes, 128 qs
+    /// bytes), so the in-shader decode matches the CPU dequant exactly. `data` must be exactly the
+    /// `nout * (k/256) * 176` packed block bytes; `k` must be a multiple of 256.
+    pub fn quantize_q5k(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("quantize_q5k: k must be a multiple of 256, got {k}");
+        }
+        let nblocks = k / 256;
+        let want = nout * nblocks * 176;
+        if data.len() != want {
+            crate::bail!(
+                "quantize_q5k: data len {} != {nout}*{nblocks}*176 = {want}",
+                data.len()
+            );
+        }
+        // Q5_K blocks are 176 bytes (a multiple of 4), so the buffer is u32-aligned by construction
+        // and can be reinterpreted verbatim for the kernel's `uint w[]` binding.
+        let words: &[u32] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
+        self.upload_u32(words)
+    }
+
+    /// Q5_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q5k`]. Reads weights
+    /// at ~5.5 bits/elem instead of 32 -- the bandwidth lever for memory-bound decode on this APU.
+    /// Decode matches the CPU `BlockQ5K::to_float`.
+    pub fn matvec_q5k(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q5k: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q5k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Q5_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, no host round-trip.
+    /// Weights stay quantized in VRAM (~5.5 bits/elem) instead of dequantizing to f32, so decode
+    /// reads ~6x less weight memory. One invocation per output row (scalar kernel).
+    pub fn matvec_q5k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_q5k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q5k_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q5k",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Upload Q6_K weights to the GPU once. The CPU `k_quants::BlockQ6K` block is 210 bytes
+    /// (ql[128], qh[64], scales[16] i8, d f16) which is NOT u32-aligned, so each block is repacked
+    /// into a PADDED 212-byte (53 u32) stride here (trailing 2 bytes unused); the shader uses the
+    /// same 53 u32 stride and byte-addressed reads, so the in-shader decode matches the CPU dequant
+    /// exactly. `data` must be exactly the `nout * (k/256) * 210` packed block bytes; `k` must be a
+    /// multiple of 256.
+    pub fn quantize_q6k(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("quantize_q6k: k must be a multiple of 256, got {k}");
+        }
+        let nblocks = k / 256;
+        let total = nout * nblocks;
+        let want = total * 210;
+        if data.len() != want {
+            crate::bail!(
+                "quantize_q6k: data len {} != {nout}*{nblocks}*210 = {want}",
+                data.len()
+            );
+        }
+        // Repack 210-byte source blocks into 53-u32 (212-byte) padded blocks so the device buffer is
+        // u32-aligned and every block starts on a u32 boundary. Trailing 2 bytes of each block are
+        // zero pad and never read by the shader.
+        let mut words = vec![0u32; total * 53];
+        for blk in 0..total {
+            let src = &data[blk * 210..blk * 210 + 210];
+            let dst = &mut words[blk * 53..blk * 53 + 53];
+            // Copy the 210 bytes into the low 210 bytes of the 212-byte (53 u32) padded block.
+            let dst_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, 53 * 4)
+            };
+            dst_bytes[..210].copy_from_slice(src);
+        }
+        self.upload_u32(&words)
+    }
+
+    /// Q6_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q6k`]. Reads weights
+    /// at ~6.5 bits/elem (incl. pad) instead of 32 -- the bandwidth lever for memory-bound decode on
+    /// this APU. Decode matches the CPU `BlockQ6K::to_float`.
+    pub fn matvec_q6k(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q6k: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q6k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Q6_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, no host round-trip.
+    /// Weights stay quantized in VRAM (~6.5 bits/elem incl. pad) instead of dequantizing to f32, so
+    /// decode reads ~5x less weight memory. One invocation per output row (scalar kernel).
+    pub fn matvec_q6k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_q6k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q6k_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q6k",
             &[wq.buffer, x.buffer, out.buffer],
             &push,
             ((nout as u32).div_ceil(WG1D), 1, 1),
@@ -1141,15 +1471,27 @@ impl VulkanDevice {
                 s.barriers += 1;
             }
             // Buffer infos are needed by both paths; build them once. (WriteDescriptorSet borrows
-            // these, so they must outlive the update/push call below.)
-            let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
-                .iter()
-                .map(|&b| {
-                    [vk::DescriptorBufferInfo::default()
-                        .buffer(b)
-                        .range(vk::WHOLE_SIZE)]
-                })
-                .collect();
+            // these, so they must outlive the update/push call below.) Built on the stack into a
+            // fixed array — never a heap Vec — because this is the decode hot path: hundreds of
+            // dispatches x N layers re-recorded every token, where a per-dispatch Vec alloc+free for
+            // both `infos` and `writes` was pure CPU churn the GPU then stalled on. MAX_BINDINGS (8)
+            // comfortably covers the widest kernel (4 buffers: where_cond/index_select); only the
+            // first `nb = bufs.len()` entries are populated and passed on, and the debug_assert
+            // above (kernel binding-count drift) plus the one here pin the bound, so it can never be
+            // exceeded in a correct build. The arrays live for the rest of this unsafe block,
+            // satisfying the borrows the push/update calls hold on them.
+            const MAX_BINDINGS: usize = 8;
+            let nb = bufs.len();
+            debug_assert!(
+                nb <= MAX_BINDINGS,
+                "vulkan: kernel `{name}` binds {nb} buffers > MAX_BINDINGS {MAX_BINDINGS}"
+            );
+            let mut infos = [[vk::DescriptorBufferInfo::default(); 1]; MAX_BINDINGS];
+            for (i, &b) in bufs.iter().enumerate() {
+                infos[i] = [vk::DescriptorBufferInfo::default()
+                    .buffer(b)
+                    .range(vk::WHOLE_SIZE)];
+            }
             let cmd = s.cmd;
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
 
@@ -1158,21 +1500,20 @@ impl VulkanDevice {
                 // object is allocated and nothing is written to pool-backed GPU memory — the driver
                 // records the bindings directly, eliminating the per-op allocate + update + bind
                 // (three driver calls + descriptor-pool traffic) that dominated decode CPU time.
-                let writes: Vec<_> = (0..bufs.len())
-                    .map(|i| {
-                        // dst_set is ignored by vkCmdPushDescriptorSetKHR (left default/null).
-                        vk::WriteDescriptorSet::default()
-                            .dst_binding(i as u32)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .buffer_info(&infos[i])
-                    })
-                    .collect();
+                let mut writes = [vk::WriteDescriptorSet::default(); MAX_BINDINGS];
+                for (i, w) in writes.iter_mut().enumerate().take(nb) {
+                    // dst_set is ignored by vkCmdPushDescriptorSetKHR (left default/null).
+                    *w = vk::WriteDescriptorSet::default()
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&infos[i]);
+                }
                 pd.cmd_push_descriptor_set(
                     cmd,
                     vk::PipelineBindPoint::COMPUTE,
                     p.layout,
                     0,
-                    &writes,
+                    &writes[..nb],
                 );
             } else {
                 // Legacy path: allocate a fresh descriptor set for this dispatch. Sets accumulate
@@ -1186,16 +1527,15 @@ impl VulkanDevice {
                             .set_layouts(&set_layouts),
                     )
                     .map_err(vkerr)?[0];
-                let writes: Vec<_> = (0..bufs.len())
-                    .map(|i| {
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(set)
-                            .dst_binding(i as u32)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .buffer_info(&infos[i])
-                    })
-                    .collect();
-                dev.update_descriptor_sets(&writes, &[]);
+                let mut writes = [vk::WriteDescriptorSet::default(); MAX_BINDINGS];
+                for (i, w) in writes.iter_mut().enumerate().take(nb) {
+                    *w = vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&infos[i]);
+                }
+                dev.update_descriptor_sets(&writes[..nb], &[]);
                 dev.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::COMPUTE,

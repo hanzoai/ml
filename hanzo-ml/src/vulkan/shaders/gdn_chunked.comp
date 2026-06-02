@@ -1,0 +1,162 @@
+#version 450
+// Chunked gated delta-rule recurrence (prefill path), mirroring cuda/gdn.cu
+// chunked_gated_delta_rule_kernel (and the Metal BT=32 port). Processes the
+// sequence in BT-token chunks: per chunk it prefix-sums g, builds the lower-
+// triangular kk_dot, forward-substitutes the corrected deltas, computes the
+// output, then advances the recurrent state.
+//
+// One workgroup per (v_tile, bh); one invocation per V-column owns its state
+// column s[k] and the chunk's corrected deltas delta_arr[BT] in registers.
+//
+// BT=32 keeps shared memory within the 32KB floor (k_chunk 32*128*4=16KB +
+// kk_dot 32*32*4=4KB + gcum/beta 256B + q_buf 512B ~= 21KB). MAX_K=128 bounds
+// the per-invocation state/key arrays (shipping GDN K is 64 or 128).
+//
+// Inactive lanes (v_idx >= v_dim) do not early-return: they still reach every
+// barrier() and help cooperative loads, so control flow stays workgroup-uniform.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint BT = 32u;
+const uint MAX_K = 128u;
+const uint BV = 64u;
+
+layout(set = 0, binding = 0) readonly  buffer Q     { float q[]; };
+layout(set = 0, binding = 1) readonly  buffer K     { float k[]; };
+layout(set = 0, binding = 2) readonly  buffer V     { float v[]; };
+layout(set = 0, binding = 3) readonly  buffer G     { float g[]; };
+layout(set = 0, binding = 4) readonly  buffer Beta  { float beta[]; };
+layout(set = 0, binding = 5)          buffer State { float state[]; };
+layout(set = 0, binding = 6) writeonly buffer Out   { float outp[]; };
+layout(push_constant) uniform Pc { uint seq_len; uint k_dim; uint v_dim; };
+
+shared float k_chunk[BT * MAX_K];
+shared float kk_dot[BT * BT];
+shared float gcum[BT];
+shared float beta_s[BT];
+shared float q_buf[MAX_K];
+
+void main() {
+    uint v_tile = gl_WorkGroupID.x;
+    uint bh = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint v_idx = v_tile * BV + tid;
+    bool lane_on = v_idx < v_dim;
+
+    uint num_chunks = (seq_len + BT - 1u) / BT;
+
+    uint qk_bh = bh * seq_len * k_dim;
+    uint v_bh = bh * seq_len * v_dim;
+    uint gb_bh = bh * seq_len;
+    uint state_bh = bh * k_dim * v_dim;
+    uint out_bh = bh * seq_len * v_dim;
+
+    float s[MAX_K];
+    if (lane_on) {
+        for (uint j = 0u; j < k_dim; j++) {
+            s[j] = state[state_bh + j * v_dim + v_idx];
+        }
+    }
+
+    float delta_arr[BT];
+
+    for (uint c = 0u; c < num_chunks; c++) {
+        uint chunk_start = c * BT;
+        uint chunk_len = min(BT, seq_len - chunk_start);
+
+        for (uint t = 0u; t < chunk_len; t++) {
+            for (uint j = tid; j < k_dim; j += BV) {
+                k_chunk[t * k_dim + j] = k[qk_bh + (chunk_start + t) * k_dim + j];
+            }
+        }
+        if (tid < chunk_len) {
+            beta_s[tid] = beta[gb_bh + chunk_start + tid];
+            gcum[tid] = g[gb_bh + chunk_start + tid];
+        }
+        barrier();
+
+        for (uint stride = 1u; stride < BT; stride <<= 1) {
+            float prev = 0.0;
+            if (tid < chunk_len && tid >= stride) {
+                prev = gcum[tid - stride];
+            }
+            barrier();
+            if (tid < chunk_len && tid >= stride) {
+                gcum[tid] += prev;
+            }
+            barrier();
+        }
+
+        for (uint idx = tid; idx < chunk_len * chunk_len; idx += BV) {
+            uint i = idx / chunk_len;
+            uint j = idx % chunk_len;
+            if (j < i) {
+                float dot = 0.0;
+                for (uint d = 0u; d < k_dim; d++) {
+                    dot = fma(k_chunk[i * k_dim + d], k_chunk[j * k_dim + d], dot);
+                }
+                kk_dot[i * BT + j] = dot;
+            }
+        }
+        barrier();
+
+        if (lane_on) {
+            for (uint i = 0u; i < chunk_len; i++) {
+                float v_i = v[v_bh + (chunk_start + i) * v_dim + v_idx];
+                float decay_i = exp(gcum[i]);
+                float beta_i = beta_s[i];
+                float kv_mem = 0.0;
+                for (uint d = 0u; d < k_dim; d++) {
+                    kv_mem = fma(s[d] * decay_i, k_chunk[i * k_dim + d], kv_mem);
+                }
+                float rhs = beta_i * (v_i - kv_mem);
+                for (uint j = 0u; j < i; j++) {
+                    float a_ij = beta_i * kk_dot[i * BT + j] * exp(gcum[i] - gcum[j]);
+                    rhs -= a_ij * delta_arr[j];
+                }
+                delta_arr[i] = rhs;
+            }
+        }
+
+        for (uint i = 0u; i < chunk_len; i++) {
+            for (uint j = tid; j < k_dim; j += BV) {
+                q_buf[j] = q[qk_bh + (chunk_start + i) * k_dim + j];
+            }
+            barrier();
+
+            if (lane_on) {
+                float decay_i = exp(gcum[i]);
+                float o_val = 0.0;
+                for (uint d = 0u; d < k_dim; d++) {
+                    o_val = fma(q_buf[d], s[d] * decay_i, o_val);
+                }
+                for (uint j = 0u; j <= i; j++) {
+                    float qk_dot = 0.0;
+                    for (uint d = 0u; d < k_dim; d++) {
+                        qk_dot = fma(q_buf[d], k_chunk[j * k_dim + d], qk_dot);
+                    }
+                    o_val += qk_dot * delta_arr[j] * exp(gcum[i] - gcum[j]);
+                }
+                outp[out_bh + (chunk_start + i) * v_dim + v_idx] = o_val;
+            }
+            barrier();
+        }
+
+        if (lane_on) {
+            float g_total = gcum[chunk_len - 1u];
+            for (uint d = 0u; d < k_dim; d++) {
+                float s_new = s[d] * exp(g_total);
+                for (uint t = 0u; t < chunk_len; t++) {
+                    s_new += k_chunk[t * k_dim + d] * delta_arr[t] * exp(g_total - gcum[t]);
+                }
+                s[d] = s_new;
+            }
+        }
+        barrier();
+    }
+
+    if (lane_on) {
+        for (uint j = 0u; j < k_dim; j++) {
+            state[state_bh + j * v_dim + v_idx] = s[j];
+        }
+    }
+}
