@@ -6,6 +6,7 @@ pub(crate) mod qmatmul;
 pub(crate) mod random;
 pub(crate) mod reduce;
 pub(crate) mod unary;
+pub(crate) mod vec_dot;
 pub(crate) mod where_cond;
 
 use hanzo_ml::{Device, Result};
