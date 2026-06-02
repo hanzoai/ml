@@ -196,6 +196,9 @@ pub fn qtensor_from_ggml(
         GgmlDType::IQ4_XS => {
             from_raw_data::<k_quants::BlockIQ4xs>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::MXFP4 => {
+            from_raw_data::<k_quants::BlockMXFP4>(raw_data, size_in_bytes, dims, device)
+        }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
 }
