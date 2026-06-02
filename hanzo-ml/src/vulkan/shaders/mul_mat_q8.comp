@@ -13,8 +13,10 @@ layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // quantized we
 layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activations, row-major [M, k]
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, row-major [M, nout]
 // m0: first activation row this dispatch handles; mcount: rows in this tile (1..MAX_M); nout: total
-// columns; k: contraction dim (multiple of 32). x row stride is k, y row stride is nout.
-layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; };
+// columns; k: contraction dim (multiple of 32). x row stride is k, y row stride is nout. woff: u32
+// offset into w[] where this weight matrix starts (0 for a plain 2D weight; e*nout*(k/32)*9 to select
+// expert e of a resident MoE bank).
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
 
 const uint MAX_M = 8u; // register accumulators per invocation; host tiles M by this
 
@@ -24,7 +26,7 @@ void main() {
         return;
     }
     uint nblocks = k / 32u;
-    uint base = n * nblocks * 9u; // u32 offset of weight row n
+    uint base = woff + n * nblocks * 9u; // u32 offset of weight row n within the selected matrix
     float acc[MAX_M];
     for (uint r = 0u; r < MAX_M; r++) {
         acc[r] = 0.0;

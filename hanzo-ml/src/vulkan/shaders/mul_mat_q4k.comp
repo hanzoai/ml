@@ -14,8 +14,10 @@ layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // Q4_K blocks,
 layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activations, row-major [M, k]
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, row-major [M, nout]
 // m0: first activation row this dispatch handles; mcount: rows in this tile (1..MAX_M); nout: total
-// columns; k: contraction dim (multiple of 256). x row stride is k, y row stride is nout.
-layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; };
+// columns; k: contraction dim (multiple of 256). x row stride is k, y row stride is nout. woff: u32
+// offset into w[] where this weight matrix starts (0 for a plain 2D weight; e*nout*(k/256)*36 to
+// select expert e of a resident MoE bank).
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
 
 const uint QK_K = 256u;
 const uint BLK_U32 = 36u; // 144 bytes / 4
@@ -49,7 +51,7 @@ void main() {
         return;
     }
     uint nblocks = k / QK_K;
-    uint rowbase = n * nblocks * BLK_U32; // u32 offset of weight row n
+    uint rowbase = woff + n * nblocks * BLK_U32; // u32 offset of weight row n within the selected matrix
     float acc[MAX_M];
     for (uint r = 0u; r < MAX_M; r++) {
         acc[r] = 0.0;
