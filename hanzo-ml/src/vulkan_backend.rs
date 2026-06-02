@@ -81,6 +81,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "reduce_min" => spv!("reduce_min"),
         "reduce_argmin" => spv!("reduce_argmin"),
         "reduce_argmax" => spv!("reduce_argmax"),
+        "argsort" => spv!("argsort"),
         "gather" => spv!("gather"),
         "scatter_set" => spv!("scatter_set"),
         "scatter_add_set" => spv!("scatter_add_set"),
@@ -1434,6 +1435,11 @@ const WG1D: u32 = 64;
 const GDN_STEP_MAX_K: usize = 256;
 const GDN_CONV_MAX_K: usize = 8;
 
+// Compile-time MAX_COLS_PAD bound on argsort.comp's shared index scratch. cols_pad (next pow2 of the
+// sorted dim) must be <= ARGSORT_MAX_COLS_PAD; wider rows fall back to the CPU argsort (not on the
+// MoE routing hot path, where cols == num_experts ~128).
+const ARGSORT_MAX_COLS_PAD: usize = 1024;
+
 impl BackendDevice for VulkanDevice {
     type Storage = VulkanStorage;
 
@@ -1919,6 +1925,33 @@ impl VulkanStorage {
     }
 
     // --- native fused ops (replace the GPU<->CPU round-trip fallbacks) ---
+
+    // Row-wise argsort over the last (contiguous) dim via the bitonic argsort kernel. Returns the u32
+    // index permutation (shape == input shape) entirely on the GPU. `Ok(None)` when cols_pad exceeds
+    // the shader's shared-scratch bound (ARGSORT_MAX_COLS_PAD); the caller then uses the CPU argsort.
+    // MoE routing (cols == num_experts ~128) always stays on the GPU path.
+    pub fn arg_sort_last_dim(
+        &self,
+        layout: &Layout,
+        asc: bool,
+        last_dim: usize,
+    ) -> Result<Option<VulkanStorage>> {
+        let cols = last_dim;
+        let cols_pad = cols.next_power_of_two();
+        if cols_pad > ARGSORT_MAX_COLS_PAD {
+            return Ok(None);
+        }
+        let mut xk = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
+        let n = layout.shape().elem_count();
+        let rows = n / cols.max(1);
+        let out = self.device.alloc_u32(n)?;
+        let push = push_u32(&[rows as u32, cols as u32, cols_pad as u32, asc as u32]);
+        // One workgroup per row; the shader threads cooperate over cols_pad inside it.
+        self.device
+            .dispatch("argsort", &[xb, out.buffer], &push, (rows as u32, 1, 1))?;
+        Ok(Some(out))
+    }
 
     // softmax over the last dim. `self` is the input; `layout` its layout. One row per thread.
     pub fn softmax_last_dim(&self, layout: &Layout) -> Result<VulkanStorage> {
