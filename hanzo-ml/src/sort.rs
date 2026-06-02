@@ -108,8 +108,9 @@ impl crate::CustomOp1 for ArgSort {
         "argsort"
     }
 
-    // No SPIR-V sort kernel; argsort runs on tiny tensors (e.g. MoE routing logits), so a CPU
-    // roundtrip is correct and cheap.
+    // GPU-native bitonic argsort over the last dim (the MoE routing hot path, cols == num_experts).
+    // Only f32 rows within the kernel's shared-scratch bound run on the GPU; u32 inputs (e.g. sorting
+    // expert ids) and over-wide rows take the CPU roundtrip, which is correct and off the hot path.
     #[cfg(feature = "vulkan")]
     fn vulkan_fwd(
         &self,
@@ -117,6 +118,11 @@ impl crate::CustomOp1 for ArgSort {
         layout: &crate::Layout,
     ) -> Result<(crate::VulkanStorage, crate::Shape)> {
         use crate::backend::{BackendDevice, BackendStorage};
+        if storage.dtype() == crate::DType::F32 {
+            if let Some(out) = storage.arg_sort_last_dim(layout, self.asc, self.last_dim)? {
+                return Ok((out, layout.shape().into()));
+            }
+        }
         let cpu = storage.to_cpu_storage()?;
         let (sorted, shape) = self.cpu_fwd(&cpu, layout)?;
         let out = storage.device().storage_from_cpu_storage(&sorted)?;
@@ -276,6 +282,43 @@ fn next_power_of_2(x: usize) -> usize {
     n
 }
 
+// CPU mirror of argsort.comp / the CUDA k_argsort bitonic network. Lets the unit test below check
+// the exact comparator + padding semantics the GPU kernel implements, with no GPU. `asc` matches the
+// shader's `asc == ASC` branch; out-of-range padded indices (>= cols) sort to the high end.
+#[cfg(test)]
+fn bitonic_argsort_ref(vals: &[f32], asc: bool) -> Vec<u32> {
+    let cols = vals.len();
+    let cols_pad = next_power_of_2(cols);
+    let mut idx: Vec<usize> = (0..cols_pad).collect();
+    // literal transcription of the shader's two comparator branches (a == dst_row[col],
+    // b == dst_row[ixj]); `gt`/`lt` use the same strict tests so ties resolve identically.
+    let gt = |a: usize, b: usize| if asc { vals[a] > vals[b] } else { vals[a] < vals[b] };
+    let lt = |a: usize, b: usize| if asc { vals[a] < vals[b] } else { vals[a] > vals[b] };
+    let mut k = 2;
+    while k <= cols_pad {
+        let mut j = k / 2;
+        while j > 0 {
+            for col in 0..cols_pad {
+                let ixj = col ^ j;
+                if ixj > col {
+                    let (a, b) = (idx[col], idx[ixj]);
+                    let swap = if col & k == 0 {
+                        a >= cols || (b < cols && gt(a, b))
+                    } else {
+                        b >= cols || (a < cols && lt(a, b))
+                    };
+                    if swap {
+                        idx.swap(col, ixj);
+                    }
+                }
+            }
+            j /= 2;
+        }
+        k *= 2;
+    }
+    idx[..cols].iter().map(|&i| i as u32).collect()
+}
+
 impl Tensor {
     /// Returns the indices that sort the tensor along the last dimension.
     ///
@@ -311,5 +354,53 @@ impl Tensor {
         let asort = self.arg_sort_last_dim(asc)?;
         let sorted = self.gather(&asort, crate::D::Minus1)?;
         Ok((sorted, asort))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The bitonic argsort the Vulkan kernel runs must match the CPU reference top-k: descending
+    // values in order, and the first-k indices select the k largest. Ties may pick either index.
+    #[test]
+    fn bitonic_argsort_matches_reference_topk() {
+        let rows: [Vec<f32>; 4] = [
+            (0..128).map(|i| ((i * 37) % 101) as f32 * 0.5).collect(),
+            vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0],
+            vec![2.0, 2.0, 2.0, 1.0, 3.0, 3.0], // ties + non-power-of-2 width
+            vec![-1.0, -5.0, 0.0, 10.0, 10.0],
+        ];
+        for vals in rows {
+            let cols = vals.len();
+            let order = bitonic_argsort_ref(&vals, false);
+            assert_eq!(order.len(), cols);
+            // every column index appears exactly once
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..cols as u32).collect::<Vec<_>>());
+            // gathered values are non-increasing (descending sort)
+            let gathered: Vec<f32> = order.iter().map(|&i| vals[i as usize]).collect();
+            for w in gathered.windows(2) {
+                assert!(w[0] >= w[1], "not descending: {gathered:?}");
+            }
+            // top-k values equal the reference's k largest, for every k
+            let mut ref_sorted = vals.clone();
+            ref_sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            for k in 1..=cols {
+                assert_eq!(&gathered[..k], &ref_sorted[..k], "top-{k} value mismatch");
+            }
+        }
+    }
+
+    // Ascending direction sorts values non-decreasing (used by topk_unsorted's reorder pass).
+    #[test]
+    fn bitonic_argsort_ascending() {
+        let vals = vec![5.0f32, 1.0, 4.0, 2.0, 3.0, 0.0, 6.0];
+        let order = bitonic_argsort_ref(&vals, true);
+        let gathered: Vec<f32> = order.iter().map(|&i| vals[i as usize]).collect();
+        for w in gathered.windows(2) {
+            assert!(w[0] <= w[1], "not ascending: {gathered:?}");
+        }
     }
 }
