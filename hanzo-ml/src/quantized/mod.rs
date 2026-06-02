@@ -56,6 +56,10 @@ fn as_t_slice<T>(data: &[u8]) -> &[T] {
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
+    // Per-expert resident QMatMul cache for indexed_moe_forward: builds each expert's weight
+    // (from_arc -> VRAM upload/dequant) ONCE instead of per token. Arc clones share the cache; an
+    // empty map by default has no effect for non-MoE QTensors.
+    expert_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, QMatMul>>>,
 }
 
 impl Device {
@@ -520,7 +524,11 @@ impl QTensor {
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
         check_shape(&shape, storage.block_size())?;
-        Ok(Self { storage, shape })
+        Ok(Self {
+            storage,
+            shape,
+            expert_cache: Default::default(),
+        })
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
@@ -540,6 +548,7 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
+            expert_cache: Default::default(),
         })
     }
 
@@ -575,6 +584,7 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
+            expert_cache: Default::default(),
         })
     }
 
@@ -618,6 +628,7 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
+            expert_cache: Default::default(),
         })
     }
 
@@ -646,6 +657,7 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
+            expert_cache: Default::default(),
         })
     }
 
@@ -750,19 +762,41 @@ impl QTensor {
                     groups.entry(*eid).or_default().push(slot as u32);
                 }
                 let dtype = self.storage.dtype();
-                let all_bytes = self.data()?;
-                let expert_bytes = all_bytes.len() / e_cnt;
                 let mut out_flat = Tensor::zeros((t * topk, n), crate::DType::F32, device)?;
+                // Only fetch (and copy) the whole bank's bytes on a cache miss; once every routed
+                // expert is resident the bank is never re-read.
+                let mut all_bytes: Option<std::borrow::Cow<[u8]>> = None;
                 for (eid, slots) in groups.into_iter() {
-                    let off = eid as usize * expert_bytes;
-                    let qs = QStorage::from_data(
-                        std::borrow::Cow::Borrowed(&all_bytes[off..off + expert_bytes]),
-                        device,
-                        dtype,
-                    )?;
-                    let shape: crate::Shape = (n, k).into();
-                    let w_e = QTensor { storage: qs, shape };
-                    let qm = QMatMul::from_arc(Arc::new(w_e))?;
+                    // Resident per-expert QMatMul: from_arc (Vulkan upload/dequant) runs ONCE per
+                    // expert instead of per token. Clone the built QMatMul out of the lock before
+                    // forward so the mutex is not held across the matvec.
+                    let qm = {
+                        let mut cache = self.expert_cache.lock().unwrap();
+                        match cache.get(&eid) {
+                            Some(qm) => qm.clone(),
+                            None => {
+                                let bytes = match &all_bytes {
+                                    Some(b) => b,
+                                    None => {
+                                        all_bytes = Some(self.data()?);
+                                        all_bytes.as_ref().unwrap()
+                                    }
+                                };
+                                let expert_bytes = bytes.len() / e_cnt;
+                                let off = eid as usize * expert_bytes;
+                                let qs = QStorage::from_data(
+                                    std::borrow::Cow::Borrowed(&bytes[off..off + expert_bytes]),
+                                    device,
+                                    dtype,
+                                )?;
+                                let shape: crate::Shape = (n, k).into();
+                                let w_e = QTensor::new(qs, shape)?;
+                                let qm = QMatMul::from_arc(Arc::new(w_e))?;
+                                cache.insert(eid, qm.clone());
+                                qm
+                            }
+                        }
+                    };
                     let m = slots.len();
                     let idx = Tensor::from_vec(slots, (m,), device)?;
                     let x_e = x_flat.index_select(&idx, 0)?; // [m, k]
