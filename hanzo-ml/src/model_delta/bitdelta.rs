@@ -73,7 +73,12 @@ pub struct BitDelta {
 
 #[inline]
 fn numel(shape: &[usize]) -> usize {
-    shape.iter().product()
+    // saturate on overflow so a crafted `.bitdelta` shape can't panic/wrap; the
+    // downstream words_len check then rejects the mismatch gracefully.
+    shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .unwrap_or(usize::MAX)
 }
 
 #[inline]
