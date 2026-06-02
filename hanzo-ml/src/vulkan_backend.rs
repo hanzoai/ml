@@ -47,6 +47,9 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm_coopmat_rb_nt" => spv!("bmm_coopmat_rb_nt"),
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
+        "mul_mat_vec_q8_0" => spv!("mul_mat_vec_q8_0"),
+        "mul_mat_vec_q4_0" => spv!("mul_mat_vec_q4_0"),
+        "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -390,6 +393,129 @@ impl VulkanDevice {
             ((nout as u32).div_ceil(WG1D), 1, 1),
         )?;
         Ok(out)
+    }
+
+    /// Upload native GGML quantized weight bytes verbatim to a GPU buffer (reused across decode
+    /// matvecs). The matvec kernels read the GGML block format straight out of this buffer — no CPU
+    /// dequant, no re-pack — so weights stay quantized in VRAM (Q4_0 ~0.56 B/elem, Q4_K ~0.56 B/elem,
+    /// Q8_0 ~1.06 B/elem) instead of being dequantized to 4 B/elem f32. `bytes` is the exact
+    /// `QTensor::data()` slice; it is zero-padded to a u32 multiple for the std430 SSBO.
+    pub fn upload_qweight(&self, bytes: &[u8]) -> Result<VulkanStorage> {
+        let nwords = bytes.len().div_ceil(4);
+        let mut words = vec![0u32; nwords.max(1)];
+        // SAFETY: words is 4-byte aligned and large enough to hold every input byte.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, nwords * 4)
+        };
+        dst[..bytes.len()].copy_from_slice(bytes);
+        self.upload_u32(&words)
+    }
+
+    /// Native-GGML Q4_0 matvec with both operands on the GPU: `y[nout] = Wq * x[k]`, where `Wq` is
+    /// the raw Q4_0 block bytes from [`upload_qweight`]. Byte-exact dequant vs the CPU reference
+    /// (within int4 quantization error). `k` must be a multiple of 32. No host round-trip.
+    pub fn matvec_q4_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matvec_q4_0_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q4_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q4_0",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Native-GGML Q8_0 matvec (reads the 34-byte BlockQ8_0 directly, no re-pack). Both operands on
+    /// the GPU: `y[nout] = Wq * x[k]`, `Wq` from [`upload_qweight`]. `k` multiple of 32.
+    pub fn matvec_q8_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matvec_q8_0_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q8_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q8_0",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Native-GGML Q4_K matvec with both operands on the GPU: `y[nout] = Wq * x[k]`, `Wq` is the raw
+    /// 144-byte Q4_K super-block bytes from [`upload_qweight`]. Byte-exact dequant vs the CPU
+    /// reference. `k` must be a multiple of 256. No host round-trip.
+    pub fn matvec_q4k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_q4k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q4k",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Host-input convenience: uploads `x` then runs [`matvec_q4_0_gpu`]. Returns the f32 result.
+    pub fn matvec_q4_0(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q4_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q4_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Host-input convenience: uploads `x` then runs [`matvec_q8_0_gpu`]. Returns the f32 result.
+    pub fn matvec_q8_0(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q8_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q8_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Host-input convenience: uploads `x` then runs [`matvec_q4k_gpu`]. Returns the f32 result.
+    pub fn matvec_q4k(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q4k: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q4k_gpu(wq, &xs, nout, k)?.to_vec_f32()
     }
 
     // Allocate a storage buffer of `bytes` bytes, returning it plus whether its memory is
@@ -1068,37 +1194,45 @@ impl VulkanDevice {
     fn reclaim(&self) {
         let mut pool = self.inner.bufpool.lock().unwrap();
         let pending = std::mem::take(&mut pool.pending);
-        for (bytes, buf, mem) in pending {
-            pool.free.entry(bytes).or_default().push((buf, mem));
+        for (bytes, pooled) in pending {
+            pool.free.entry(bytes).or_default().push(pooled);
         }
     }
 
     // Allocate an f32 storage holding `count` elements (uninitialized device memory).
     fn alloc_f32(&self, count: usize) -> Result<VulkanStorage> {
-        let (buffer, memory) = unsafe { self.raw_buffer((count * 4) as u64)? };
+        let (buffer, memory, host_visible) = unsafe { self.raw_buffer((count * 4) as u64)? };
         Ok(VulkanStorage {
             buffer,
             memory,
             count,
             dtype: DType::F32,
             device: self.clone(),
+            host_visible,
         })
     }
 
-    // fp16 scratch (2 bytes/elem) for coopmat matmul inputs. Returns the buffer plus its memory and
-    // byte size so the caller can return it to the pool via free_scratch once recorded.
-    fn alloc_f16(&self, count: usize) -> Result<(vk::Buffer, vk::DeviceMemory, u64)> {
+    // fp16 scratch (2 bytes/elem) for coopmat matmul inputs. Returns the buffer plus its memory,
+    // byte size, and host-visibility so the caller can return it to the pool via free_scratch.
+    fn alloc_f16(&self, count: usize) -> Result<(vk::Buffer, vk::DeviceMemory, u64, bool)> {
         let bytes = ((count * 2).max(4)) as u64;
-        let (buffer, memory) = unsafe { self.raw_buffer(bytes)? };
-        Ok((buffer, memory, bytes))
+        let (buffer, memory, host_visible) = unsafe { self.raw_buffer(bytes)? };
+        Ok((buffer, memory, bytes, host_visible))
     }
 
     // Return a scratch buffer to the pool. Deferred-safe like VulkanStorage::drop: it parks in
     // `pending` and is reclaimed only after the next flush+fence, by which point the dispatch that
     // referenced it has completed on the GPU.
-    fn free_scratch(&self, bytes: u64, buffer: vk::Buffer, memory: vk::DeviceMemory) {
+    fn free_scratch(&self, bytes: u64, buffer: vk::Buffer, memory: vk::DeviceMemory, host_visible: bool) {
         if let Ok(mut pool) = self.inner.bufpool.lock() {
-            pool.pending.push((bytes, buffer, memory));
+            pool.pending.push((
+                bytes,
+                PooledBuf {
+                    buffer,
+                    memory,
+                    host_visible,
+                },
+            ));
         }
     }
 
@@ -1110,13 +1244,14 @@ impl VulkanDevice {
 
     // u32 storage (ids/cond). 4 bytes/elem, same as f32.
     fn alloc_u32(&self, count: usize) -> Result<VulkanStorage> {
-        let (buffer, memory) = unsafe { self.raw_buffer((count * 4) as u64)? };
+        let (buffer, memory, host_visible) = unsafe { self.raw_buffer((count * 4) as u64)? };
         Ok(VulkanStorage {
             buffer,
             memory,
             count,
             dtype: DType::U32,
             device: self.clone(),
+            host_visible,
         })
     }
 
@@ -2484,8 +2619,8 @@ impl BackendStorage for VulkanStorage {
             && n % 16 == 0
             && k % 16 == 0
         {
-            let (a16, a16_mem, a16_bytes) = self.device.alloc_f16(b * m * k)?;
-            let (b16, b16_mem, b16_bytes) = self.device.alloc_f16(b * k * n)?;
+            let (a16, a16_mem, a16_bytes, a16_hv) = self.device.alloc_f16(b * m * k)?;
+            let (b16, b16_mem, b16_bytes, b16_hv) = self.device.alloc_f16(b * k * n)?;
             self.device.dispatch(
                 "cast_f2h",
                 &[lc_buf, a16],
@@ -2509,8 +2644,8 @@ impl BackendStorage for VulkanStorage {
             self.device
                 .dispatch(kernel, &[a16, b16, out.buffer], &push, groups)?;
             // Scratch is dead after the kernel reads it; return to the pool (reclaimed post-flush).
-            self.device.free_scratch(a16_bytes, a16, a16_mem);
-            self.device.free_scratch(b16_bytes, b16, b16_mem);
+            self.device.free_scratch(a16_bytes, a16, a16_mem, a16_hv);
+            self.device.free_scratch(b16_bytes, b16, b16_mem, b16_hv);
             return Ok(out);
         }
 
