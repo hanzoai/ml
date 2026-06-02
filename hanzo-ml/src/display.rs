@@ -26,6 +26,10 @@ impl Tensor {
             crate::DeviceLocation::Vulkan { gpu_id } => {
                 format!(", vulkan:{gpu_id}")
             }
+            #[cfg(feature = "wgpu")]
+            crate::DeviceLocation::Wgpu { gpu_id } => {
+                format!(", wgpu:{gpu_id}")
+            }
         };
 
         write!(f, "Tensor[")?;
@@ -560,6 +564,10 @@ impl std::fmt::Display for Tensor {
             #[cfg(feature = "vulkan")]
             crate::DeviceLocation::Vulkan { gpu_id } => {
                 format!(", vulkan:{gpu_id}")
+            }
+            #[cfg(feature = "wgpu")]
+            crate::DeviceLocation::Wgpu { gpu_id } => {
+                format!(", wgpu:{gpu_id}")
             }
         };
 
