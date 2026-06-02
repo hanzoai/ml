@@ -2503,3 +2503,103 @@ verify_block_sizes!(
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ2K, BlockQ3K, BlockQ4K,
     BlockQ5K, BlockQ6K, BlockQ8K, f32, f16, bf16
 );
+
+#[cfg(test)]
+mod q4k_shader_decode_tests {
+    // Mirrors the Vulkan `mul_mat_vec_q4k.comp` decode in Rust against the SAME packed bytes the
+    // host uploads (block bytes reinterpreted as u32 words). The kernel reads weights at ~4.5
+    // bits/elem and decodes in-shader; this test proves that in-shader arithmetic reproduces the
+    // canonical CPU `BlockQ4K::to_float` bit-for-bit (the GPU run only adds dispatch plumbing).
+    use super::*;
+
+    // get_scale_min_k4, transcribed from the shader (reads scale bytes out of u32[1..4]).
+    fn shader_scale_byte(words: &[u32], base: usize, b: usize) -> u32 {
+        let word = words[base + 1 + (b >> 2)];
+        (word >> ((b & 3) * 8)) & 0xFF
+    }
+    fn shader_scale_min(words: &[u32], base: usize, j: usize) -> (u32, u32) {
+        if j < 4 {
+            (
+                shader_scale_byte(words, base, j) & 63,
+                shader_scale_byte(words, base, j + 4) & 63,
+            )
+        } else {
+            let s_j4 = shader_scale_byte(words, base, j + 4);
+            let s_jm4 = shader_scale_byte(words, base, j - 4);
+            let s_j = shader_scale_byte(words, base, j);
+            (
+                (s_j4 & 0x0F) | ((s_jm4 >> 6) << 4),
+                (s_j4 >> 4) | ((s_j >> 6) << 4),
+            )
+        }
+    }
+
+    // Full transcription of mul_mat_vec_q4k.comp's per-block decode: returns the 256 dequantized
+    // weights of super-block `blk` from the u32 words, in output order.
+    fn shader_decode_block(words: &[u32], blk: usize) -> Vec<f32> {
+        const BLK_U32: usize = 36;
+        let base = blk * BLK_U32;
+        let d = f16::from_bits((words[base] & 0xFFFF) as u16).to_f32();
+        let dmin = f16::from_bits((words[base] >> 16) as u16).to_f32();
+        let qbase = base + 4;
+        let mut out = vec![0f32; QK_K];
+        for c in 0..4 {
+            let is = c * 2;
+            let (sc1, m1u) = shader_scale_min(words, base, is);
+            let (sc2, m2u) = shader_scale_min(words, base, is + 1);
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * m1u as f32;
+            let d2 = d * sc2 as f32;
+            let m2 = dmin * m2u as f32;
+            let qoff = c * 32;
+            let xlo = c * 64;
+            let xhi = xlo + 32;
+            for l in 0..32 {
+                let qb = qoff + l;
+                let qword = words[qbase + (qb >> 2)];
+                let q = (qword >> ((qb & 3) * 8)) & 0xFF;
+                out[xlo + l] = d1 * (q & 0x0F) as f32 - m1;
+                out[xhi + l] = d2 * (q >> 4) as f32 - m2;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn shader_decode_matches_cpu_to_float() {
+        let nblocks = 32usize;
+        let n = nblocks * QK_K;
+        // Deterministic pseudo-random f32 weights with a realistic dynamic range.
+        let xs: Vec<f32> = (0..n)
+            .map(|i| (((i.wrapping_mul(2654435761)) % 251) as f32 - 125.0) / 32.0)
+            .collect();
+        let mut blocks = vec![BlockQ4K::zeros(); nblocks];
+        BlockQ4K::from_float(&xs, &mut blocks);
+
+        // CPU canonical dequant.
+        let mut cpu = vec![0f32; n];
+        BlockQ4K::to_float(&blocks, &mut cpu);
+
+        // Reinterpret the block bytes as u32 words, exactly like VulkanDevice::quantize_q4k.
+        let byte_len = std::mem::size_of_val(&blocks[..]);
+        let words: &[u32] = unsafe {
+            std::slice::from_raw_parts(blocks.as_ptr() as *const u32, byte_len / 4)
+        };
+        assert_eq!(words.len(), nblocks * 36);
+
+        let mut max_abs = 0f32;
+        for blk in 0..nblocks {
+            let dec = shader_decode_block(words, blk);
+            for l in 0..QK_K {
+                let a = cpu[blk * QK_K + l];
+                let b = dec[l];
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        // Same blocks, same arithmetic -> exact (allow a hair for f16->f32 rounding identity).
+        assert!(
+            max_abs < 1e-6,
+            "shader Q4_K decode disagrees with BlockQ4K::to_float: max|delta|={max_abs:e}"
+        );
+    }
+}
