@@ -85,7 +85,7 @@ type QuantizeLauncher = unsafe extern "C" fn(
 );
 
 fn quantize_launcher(layout: DsLayout) -> QuantizeLauncher {
-    use candle_kernels::ffi;
+    use hanzo_kernels::ffi;
     match layout {
         DsLayout::D4 => ffi::launch_mmq_quantize_q8_1_D4,
         DsLayout::DS4 => ffi::launch_mmq_quantize_q8_1_DS4,
@@ -111,7 +111,7 @@ type MmqLauncher = unsafe extern "C" fn(
 );
 
 fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
-    use candle_kernels::ffi;
+    use hanzo_kernels::ffi;
     let f: MmqLauncher = match dtype {
         GgmlDType::Q4_0 => ffi::launch_mmq_gguf_q4_0,
         GgmlDType::Q4_1 => ffi::launch_mmq_gguf_q4_1,
