@@ -1172,6 +1172,11 @@ impl QMatMul {
                 } else {
                     match dtype {
                         GgmlDType::Q4K => d.matmul_q4k_gpu_off(bank, xv, m, n, k, woff)?,
+                        // Q8_0 banked prefill: int8 dp4a when the device has hw int8 dot, else
+                        // f32-decode. Both run at the bank's woff with no re-upload.
+                        GgmlDType::Q8_0 if d.int_dot8() => {
+                            d.matmul_q8_dp4a_gpu_off(bank, xv, m, n, k, woff)?
+                        }
                         GgmlDType::Q8_0 => d.matmul_q8_gpu_off(bank, xv, m, n, k, woff)?,
                         // No matmul kernel for this dtype: one banked matvec per routed row.
                         _ => {
@@ -1365,6 +1370,9 @@ impl crate::Module for QMatMul {
                         };
                         match dtype {
                             GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
+                            // Q8_0 prefill: int8 dp4a (compute-bound lever) when the device has hw
+                            // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
+                            _ if d.int_dot8() => d.matmul_q8_dp4a_gpu(wq, xv, m, *n, *k)?,
                             _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
                         }
                     };
