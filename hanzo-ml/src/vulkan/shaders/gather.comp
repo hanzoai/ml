@@ -13,5 +13,6 @@ void main() {
     uint inner = g % right;
     uint outer = g / (right * dim_out);
     uint id = ids[g];
-    o[g] = src[outer * (dim_src * right) + id * right + inner];
+    // Bounds-check the gather index: a stray id (corrupt/model-bug) must not read OOB in src.
+    o[g] = (id < dim_src) ? src[outer * (dim_src * right) + id * right + inner] : 0.0;
 }
