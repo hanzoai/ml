@@ -1171,6 +1171,11 @@ impl QMatMul {
                     }
                 } else {
                     match dtype {
+                        // Q4_K banked prefill: int8 dp4a when the device has hw int8 dot, else
+                        // f32-decode. Both run at the bank's woff with no re-upload.
+                        GgmlDType::Q4K if d.int_dot8() => {
+                            d.matmul_q4k_dp4a_gpu_off(bank, xv, m, n, k, woff)?
+                        }
                         GgmlDType::Q4K => d.matmul_q4k_gpu_off(bank, xv, m, n, k, woff)?,
                         // Q8_0 banked prefill: int8 dp4a when the device has hw int8 dot, else
                         // f32-decode. Both run at the bank's woff with no re-upload.
@@ -1369,6 +1374,9 @@ impl crate::Module for QMatMul {
                             _ => crate::bail!("VulkanQuant expected vulkan storage"),
                         };
                         match dtype {
+                            // Q4_K prefill: int8 dp4a (compute-bound lever) when the device has hw
+                            // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
+                            GgmlDType::Q4K if d.int_dot8() => d.matmul_q4k_dp4a_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
                             // Q8_0 prefill: int8 dp4a (compute-bound lever) when the device has hw
                             // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
