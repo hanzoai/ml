@@ -12,3 +12,4 @@ license = "BSD-3-Clause OR Apache-2.0"
 
 [build-dependencies]
 bindgen_cuda = { package = "hanzo-bindgen-cuda", version = "0.1.7" }
+glob = "0.3"
