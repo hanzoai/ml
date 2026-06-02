@@ -822,13 +822,16 @@ pub enum QMatMul {
     QTensor(std::sync::Arc<QTensor>),
     Tensor(Tensor),
     TensorF16(Tensor),
-    // Native Vulkan quantized weight: Q8_0 blocks resident in VRAM (~1.125 B/elem). Decode (1 row)
-    // runs the GPU Q8 matvec directly (bandwidth-optimal); prefill dequantizes to a temporary f32.
-    // `qtensor` is the original (CPU-side) for the prefill dequant; `n`/`k` are the weight dims.
+    // Native Vulkan quantized weight: the GGML quantized blocks live in VRAM (Q4_0/Q4_K ~0.5 B/elem,
+    // Q8_0 ~1.06 B/elem). Decode (1 row) runs the matching on-GPU quant matvec kernel directly out of
+    // the block format (no CPU dequant, no re-pack) -- the bandwidth lever for memory-bound decode.
+    // Prefill (>1 row) dequantizes the original `qtensor` to a temporary f32 weight. `dtype` selects
+    // the kernel; `n`/`k` are the weight dims.
     #[cfg(feature = "vulkan")]
     VulkanQuant {
         qtensor: std::sync::Arc<QTensor>,
         wq: std::sync::Arc<crate::VulkanStorage>,
+        dtype: GgmlDType,
         n: usize,
         k: usize,
     },
@@ -858,24 +861,30 @@ thread_local! {
 
 impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
-        // Native Vulkan quantized path: keep Q8_0 weights quantized in VRAM and run the GPU matvec
-        // for decode, instead of dequantizing the whole model to f32 (4x the decode bandwidth).
+        // Native Vulkan quantized path: keep the GGML quantized blocks in VRAM and run the matching
+        // on-GPU quant matvec for decode, instead of dequantizing the whole model to f32 (4x the
+        // decode bandwidth). The kernel reads the GGML block format straight from the uploaded bytes
+        // -- no CPU dequant, no re-pack -- so this is exact w.r.t. the CPU reference. Q4_0/Q4_K need
+        // k a multiple of their block (32 / 256); Q8_0 needs a multiple of 32.
         #[cfg(feature = "vulkan")]
-        if qtensor.dtype() == GgmlDType::Q8_0 {
-            if let Device::Vulkan(d) = qtensor.device() {
-                if let Ok((n, k)) = qtensor.shape().dims2() {
-                    if k % 32 == 0 {
-                        let wf = qtensor
-                            .dequantize(&Device::Cpu)?
-                            .flatten_all()?
-                            .to_vec1::<f32>()?;
-                        let wq = d.quantize_q8(&wf, n, k)?;
-                        return Ok(Self::VulkanQuant {
-                            qtensor,
-                            wq: std::sync::Arc::new(wq),
-                            n,
-                            k,
-                        });
+        {
+            let dt = qtensor.dtype();
+            let native_vk = matches!(dt, GgmlDType::Q4_0 | GgmlDType::Q8_0 | GgmlDType::Q4K);
+            if native_vk {
+                if let Device::Vulkan(d) = qtensor.device() {
+                    if let Ok((n, k)) = qtensor.shape().dims2() {
+                        let blk = dt.block_size();
+                        if k % blk == 0 {
+                            let bytes = qtensor.data()?;
+                            let wq = d.upload_qweight(&bytes)?;
+                            return Ok(Self::VulkanQuant {
+                                qtensor,
+                                wq: std::sync::Arc::new(wq),
+                                dtype: dt,
+                                n,
+                                k,
+                            });
+                        }
                     }
                 }
             }
@@ -1026,10 +1035,17 @@ impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             #[cfg(feature = "vulkan")]
-            Self::VulkanQuant { qtensor, wq, n, k } => {
+            Self::VulkanQuant {
+                qtensor,
+                wq,
+                dtype,
+                n,
+                k,
+            } => {
                 let rows: usize = xs.elem_count() / *k;
                 if rows == 1 {
-                    // Decode: weights stay quantized in VRAM, GPU Q8 matvec (no dequant, no copy).
+                    // Decode: weights stay quantized in VRAM; the matching native-GGML quant matvec
+                    // runs straight out of the block format (no dequant, no copy).
                     let xs = xs.contiguous()?;
                     let d = match xs.device() {
                         Device::Vulkan(d) => d,
@@ -1041,7 +1057,12 @@ impl crate::Module for QMatMul {
                             crate::Storage::Vulkan(v) => v,
                             _ => crate::bail!("VulkanQuant expected vulkan storage"),
                         };
-                        d.matvec_q8_gpu(wq, xv, *n, *k)?
+                        match dtype {
+                            GgmlDType::Q4_0 => d.matvec_q4_0_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q8_0 => d.matvec_q8_0_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
+                            other => crate::bail!("VulkanQuant: no native matvec for {other:?}"),
+                        }
                     };
                     let mut dims = xs.dims().to_vec();
                     let last = dims.len() - 1;
