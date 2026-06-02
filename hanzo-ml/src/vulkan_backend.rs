@@ -50,6 +50,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
+        "mul_mat_q8_dp4a" => spv!("mul_mat_q8_dp4a"),
+        "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
@@ -192,6 +194,13 @@ struct VkInner {
     // absent on WSL/Dozen.
     coopmat: bool,
     cm_mnk: (u32, u32, u32),
+    // Hardware int8 4x8-packed-signed dot product (GL_EXT_shader_integer_dot_product / OpSDotAccSat).
+    // True iff the device advertises BOTH shaderIntegerDotProduct (feature) AND the 4x8-bit-packed-
+    // signed-accelerated property (queried at init). Gates the Q8_0 PREFILL path: when set, M>1 Q8
+    // matmuls run mul_mat_q8_dp4a (quantize activations to int8 once, then dp4a vs the int8 weights)
+    // instead of mul_mat_q8 (f32 weight-decode + MACs) -- the compute-bound prefill lever on RDNA3.5.
+    // Decode (M==1) and non-Q8 paths are untouched; devices without the feature fall back to mul_mat_q8.
+    int_dot8: bool,
     // Whether matmul uses the register-blocked coopmat kernel (bmm_coopmat_rb). Default ON when the
     // device advertises coopmat (measured 1.3-2.7x over fp32 bmm_reg on the real AMD driver, full
     // forward argmax matches CPU); HANZO_VK_COOPMAT=0 forces the fp32 path.
@@ -344,6 +353,12 @@ impl VulkanDevice {
     /// fp16xfp16 -> fp32 subgroup config, else `None`. Used to pick the coopmat matmul path.
     pub fn coopmat_info(&self) -> Option<(u32, u32, u32)> {
         self.inner.coopmat.then_some(self.inner.cm_mnk)
+    }
+
+    /// Whether the device has hardware int8 4x8-packed-signed dot product (and it is gated on). When
+    /// true, the Q8_0 prefill (M>1) path should use [`matmul_q8_dp4a_gpu`] instead of [`matmul_q8_gpu`].
+    pub fn int_dot8(&self) -> bool {
+        self.inner.int_dot8
     }
 
     /// Quantize `W[nout x k]` (row-major fp32) to Q8_0 and upload it to the GPU once. Per 32-block:
@@ -728,6 +743,71 @@ impl VulkanDevice {
             self.dispatch(
                 "mul_mat_q8",
                 &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
+        Ok(out)
+    }
+
+    /// Q8_0 prefill matmul via hardware int8 dp4a -- the compute-bound prefill lever. Same result as
+    /// [`matmul_q8_gpu`] (`y[m, nout] = x[m, k] * Wq^T`) but instead of decoding each weight to f32 and
+    /// doing f32 MACs, it quantizes the activation tile to int8 ONCE ([`quantize_act_q8`] -> q8_1-style
+    /// codes + per-block scales) then dispatches [`mul_mat_q8_dp4a`], which uses the accelerated
+    /// `OpSDotAccSat` 4x8-packed signed dot vs the int8 weights. Only valid when [`int_dot8`] is true;
+    /// callers should fall back to [`matmul_q8_gpu`] otherwise (this fn does NOT re-check, so the
+    /// activation quant runs unconditionally -- gate at the call site). Drop-in for [`matmul_q8_gpu`].
+    pub fn matmul_q8_dp4a_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        self.matmul_q8_dp4a_gpu_off(wq, x, m, nout, k, 0)
+    }
+
+    /// [`matmul_q8_dp4a_gpu`] into a slice of `wq` starting at `woff` u32 words (`woff == 0` matches the
+    /// plain form; `woff = e * nout * (k/32) * 9` selects expert `e` of a resident Q8 MoE bank). Mirrors
+    /// [`matmul_q8_gpu_off`] so it is a drop-in on the banked prefill path.
+    pub fn matmul_q8_dp4a_gpu_off(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+        woff: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matmul_q8_dp4a_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q8_dp4a_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let nblocks = k / 32;
+        // Quantize the whole activation tile to int8 once (reused across all nout columns): xq is
+        // m*nblocks*8 u32 (32 int8/block, 4 per word), xs is m*nblocks f32 block scales.
+        let xq = self.alloc_u32(m * nblocks * 8)?;
+        let xs = self.alloc_f32(m * nblocks)?;
+        let qpush = push_u32(&[m as u32, k as u32]);
+        self.dispatch(
+            "quantize_act_q8",
+            &[x.buffer, xq.buffer, xs.buffer],
+            &qpush,
+            (((m * nblocks) as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mat_q8_dp4a",
+                &[wq.buffer, xq.buffer, xs.buffer, out.buffer],
                 &push,
                 (cols, 1, 1),
             )?;
@@ -2259,6 +2339,33 @@ impl BackendDevice for VulkanDevice {
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
+            // Hardware int8 dot product (core in Vulkan 1.3, which the 1.3 instance guarantees, so no
+            // extension to enable -- only the feature must be turned on at device creation to use
+            // OpSDotAccSat). Gate the Q8_0 PREFILL dp4a path on BOTH the feature
+            // (shaderIntegerDotProduct) AND the 4x8-bit-packed-signed accelerated properties: the
+            // kernel uses the accumulating-saturating signed 4x8 op, so we require its acc-sat property
+            // (and the plain 4x8 property) to be hardware-accelerated, else the f32-decode mul_mat_q8 is
+            // as good or better. Two separate queries: properties via PhysicalDeviceProperties2, the
+            // feature via PhysicalDeviceFeatures2.
+            let mut idp_props = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+            {
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut idp_props);
+                instance.get_physical_device_properties2(pdev, &mut p2);
+            }
+            let mut idp_feat = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+            {
+                let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut idp_feat);
+                instance.get_physical_device_features2(pdev, &mut f2);
+            }
+            let int_dot8 = idp_feat.shader_integer_dot_product == vk::TRUE
+                && idp_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE
+                && idp_props
+                    .integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated
+                    == vk::TRUE
+                && std::env::var("HANZO_VK_INT_DOT8")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+
             // Build the enabled-extension list dynamically: coopmat and push_descriptor are
             // independent and either may be present. push_descriptor needs no extra device feature
             // struct (just the extension + a fn-pointer load), so it's a bare name here.
@@ -2282,6 +2389,10 @@ impl BackendDevice for VulkanDevice {
                 vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
             let mut s16_feat =
                 vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
+            // Turn the int8 dot-product feature ON at device creation when gated in; OpSDotAccSat is
+            // illegal otherwise. Reuse a fresh struct (the queried one carries the read-back value).
+            let mut idp_enable = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+                .shader_integer_dot_product(true);
             let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
             if !ext_names.is_empty() {
                 dci = dci.enabled_extension_names(&ext_names);
@@ -2292,6 +2403,9 @@ impl BackendDevice for VulkanDevice {
                     .push_next(&mut mm_feat)
                     .push_next(&mut f16_feat)
                     .push_next(&mut s16_feat);
+            }
+            if int_dot8 {
+                dci = dci.push_next(&mut idp_enable);
             }
             let device = instance.create_device(pdev, &dci, None).map_err(vkerr)?;
             // Load push_descriptor device fns now that the device exists with the extension enabled.
@@ -2374,6 +2488,7 @@ impl BackendDevice for VulkanDevice {
                 coopmat,
                 cm_mnk,
                 cm_use,
+                int_dot8,
             };
             Ok(Self {
                 inner: Arc::new(inner),
