@@ -1,23 +1,27 @@
 #version 450
-// Q4_K matrix-vector product (decode/memory-bound path): y[n] = sum_k W[n,k]*x[k], W stored as
-// GGUF Q4_K super-blocks kept verbatim in VRAM (no host requantize). One Q4_K super-block packs 256
-// weights into 144 bytes = 36 u32: u32[0] = {d(f16 lo), dmin(f16 hi)}; u32[1..4] = 12 scale bytes
-// (6-bit packed scales+mins); u32[4..36] = 128 quant bytes (two 4-bit weights each). Reading
-// ~4.5 bits/weight instead of 32 cuts decode memory traffic ~7x on this ~256 GB/s APU. One
-// invocation computes one output element. Decode MUST match the CPU k_quants BlockQ4K::to_float.
+// Q4_K matrix-matrix product (the prefill/compute path): y[m,n] = sum_k x[m,k]*W[n,k] with W stored
+// as GGUF Q4_K super-blocks kept verbatim in VRAM, SAME layout and decode as mul_mat_vec_q4k (256
+// weights / 144 bytes = 36 u32 per super-block). Prefill has M>1 activation rows sharing one weight
+// matrix, so the old path dequantized the whole weight to f32 every forward (massive VRAM + bandwidth)
+// This kernel keeps W quantized and decodes each weight value ONCE per output column, reusing it
+// across all M rows: weight traffic equals a single matvec while M rows are produced. One invocation
+// computes one output column n for up to MAX_M rows (the host tiles M by MAX_M). Decode MUST match the
+// CPU k_quants BlockQ4K::to_float (identical to mul_mat_vec_q4k).
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // Q4_K blocks, 36 u32 / 256-block
-layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activation vector, length k
-layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
-// woff: u32 offset into w[] where this weight matrix starts. 0 for a plain 2D weight; for a resident
-// MoE expert bank [E,n,k] it selects expert e (woff = e * n * (k/256) * BLK_U32) so each expert's
-// matvec indexes its own slice without re-uploading. k is a multiple of 256.
-layout(push_constant) uniform Pc { uint nout; uint k; uint woff; };
+layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activations, row-major [M, k]
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, row-major [M, nout]
+// m0: first activation row this dispatch handles; mcount: rows in this tile (1..MAX_M); nout: total
+// columns; k: contraction dim (multiple of 256). x row stride is k, y row stride is nout. woff: u32
+// offset into w[] where this weight matrix starts (0 for a plain 2D weight; e*nout*(k/256)*36 to
+// select expert e of a resident MoE bank).
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
 
 const uint QK_K = 256u;
 const uint BLK_U32 = 36u; // 144 bytes / 4
+const uint MAX_M = 8u;    // register accumulators per invocation; host tiles M by this
 
 // Byte `b` (0-based) out of the block's scale region (u32[1..4], i.e. the 12 scale bytes).
 uint scale_byte(uint base, uint b) {
@@ -47,8 +51,11 @@ void main() {
         return;
     }
     uint nblocks = k / QK_K;
-    uint rowbase = woff + n * nblocks * BLK_U32; // u32 offset of row n within the selected matrix
-    float acc = 0.0;
+    uint rowbase = woff + n * nblocks * BLK_U32; // u32 offset of weight row n within the selected matrix
+    float acc[MAX_M];
+    for (uint r = 0u; r < MAX_M; r++) {
+        acc[r] = 0.0;
+    }
     for (uint blk = 0u; blk < nblocks; blk++) {
         uint base = rowbase + blk * BLK_U32;
         float d    = float(unpackHalf2x16(w[base]).x);
@@ -71,12 +78,18 @@ void main() {
                 uint qb = qoff + l;
                 uint qword = w[qbase + (qb >> 2u)];
                 uint q = (qword >> ((qb & 3u) * 8u)) & 0xFFu;
+                // Decode the two weights of this byte ONCE, then reuse across all rows.
                 float wlo = d1 * float(q & 0x0Fu) - m1;
                 float whi = d2 * float(q >> 4u)  - m2;
-                acc += wlo * x[xlo + l];
-                acc += whi * x[xhi + l];
+                for (uint r = 0u; r < mcount; r++) {
+                    uint xrow = (m0 + r) * k;
+                    acc[r] += wlo * x[xrow + xlo + l];
+                    acc[r] += whi * x[xrow + xhi + l];
+                }
             }
         }
     }
-    y[n] = acc;
+    for (uint r = 0u; r < mcount; r++) {
+        y[(m0 + r) * nout + n] = acc[r];
+    }
 }
