@@ -49,6 +49,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "cast_f2h" => spv!("cast_f2h"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
+        "mul_mat_q8" => spv!("mul_mat_q8"),
+        "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
@@ -494,6 +496,78 @@ impl VulkanDevice {
             &push,
             ((nout as u32).div_ceil(WG1D), 1, 1),
         )?;
+        Ok(out)
+    }
+
+    /// Q8_0 matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
+    /// (same blocks as [`quantize_q8`] / [`matvec_q8_gpu`]). Decodes each weight block once and reuses
+    /// it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so weight memory traffic matches a single
+    /// matvec per output column instead of dequantizing the whole weight to f32 every forward. `x`
+    /// must be a contiguous `[m, k]` device buffer; returns `[m, nout]` row-major.
+    pub fn matmul_q8_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matmul_q8_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q8_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_q8",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
+        Ok(out)
+    }
+
+    /// Q4_K matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
+    /// (verbatim GGUF Q4_K super-blocks, same decode as [`matvec_q4k_gpu`]). Decodes each weight value
+    /// once and reuses it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so weight memory traffic
+    /// matches a single matvec per output column instead of dequantizing the whole weight to f32 every
+    /// forward. `x` must be a contiguous `[m, k]` device buffer; returns `[m, nout]` row-major.
+    pub fn matmul_q4k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matmul_q4k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q4k_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_q4k",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
         Ok(out)
     }
 
@@ -1769,6 +1843,12 @@ fn push_u32(v: &[u32]) -> Vec<u8> {
 }
 
 const WG1D: u32 = 64;
+
+// Activation rows decoded per invocation in the quantized prefill matmul kernels (mul_mat_q8 /
+// mul_mat_q4k). MUST equal the MAX_M const in those .comp shaders (their register accumulator array
+// bound). The host tiles the M dimension by this so each weight block is still read once per output
+// column across a tile of up to MATMUL_Q_MAX_M rows.
+const MATMUL_Q_MAX_M: usize = 8;
 
 // Compile-time per-invocation array bounds in gdn_step.comp / gdn_conv1d_step.comp (MAX_K #defines).
 // head_k_dim must be <= GDN_STEP_MAX_K and the conv kernel <= GDN_CONV_MAX_K; both checked host-side.
