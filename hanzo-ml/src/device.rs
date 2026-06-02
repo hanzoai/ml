@@ -21,6 +21,10 @@ pub enum DeviceLocation {
     Vulkan {
         gpu_id: usize,
     },
+    #[cfg(feature = "wgpu")]
+    Wgpu {
+        gpu_id: usize,
+    },
 }
 
 /// Cpu, Cuda, or Metal
@@ -33,6 +37,8 @@ pub enum Device {
     Rocm(crate::RocmDevice),
     #[cfg(feature = "vulkan")]
     Vulkan(crate::VulkanDevice),
+    #[cfg(feature = "wgpu")]
+    Wgpu(crate::WgpuDevice),
 }
 
 pub trait NdArray {
@@ -259,6 +265,10 @@ impl Device {
     pub fn new_vulkan(ordinal: usize) -> Result<Self> {
         Ok(Self::Vulkan(crate::VulkanDevice::new(ordinal)?))
     }
+    #[cfg(feature = "wgpu")]
+    pub fn new_wgpu(ordinal: usize) -> Result<Self> {
+        Ok(Self::Wgpu(crate::WgpuDevice::new(ordinal)?))
+    }
 
     pub fn as_cuda_device(&self) -> Result<&crate::CudaDevice> {
         match self {
@@ -269,6 +279,8 @@ impl Device {
             Self::Rocm(_) => crate::bail!("expected a cuda device, got rocm"),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(_) => crate::bail!("expected a cuda device, got vulkan"),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(_) => crate::bail!("expected a cuda device, got wgpu"),
         }
     }
 
@@ -281,6 +293,8 @@ impl Device {
             Self::Rocm(_) => crate::bail!("expected a metal device, got rocm"),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(_) => crate::bail!("expected a metal device, got vulkan"),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(_) => crate::bail!("expected a metal device, got wgpu"),
         }
     }
 
@@ -300,6 +314,19 @@ impl Device {
             Self::Cpu => crate::bail!("expected a vulkan device, got cpu"),
             Self::Metal(_) => crate::bail!("expected a vulkan device, got Metal"),
             Self::Vulkan(d) => Ok(d),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(_) => crate::bail!("expected a vulkan device, got wgpu"),
+        }
+    }
+    #[cfg(feature = "wgpu")]
+    pub fn as_wgpu_device(&self) -> Result<&crate::WgpuDevice> {
+        match self {
+            Self::Cuda(_) => crate::bail!("expected a wgpu device, got cuda"),
+            Self::Cpu => crate::bail!("expected a wgpu device, got cpu"),
+            Self::Metal(_) => crate::bail!("expected a wgpu device, got Metal"),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(_) => crate::bail!("expected a wgpu device, got vulkan"),
+            Self::Wgpu(d) => Ok(d),
         }
     }
 
@@ -320,6 +347,8 @@ impl Device {
             Self::Rocm(r) => r.set_seed(seed),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(r) => r.set_seed(seed),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(r) => r.set_seed(seed),
         }
     }
 
@@ -332,6 +361,8 @@ impl Device {
             Self::Rocm(r) => r.get_current_seed(),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(r) => r.get_current_seed(),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(r) => r.get_current_seed(),
         }
     }
 
@@ -344,6 +375,8 @@ impl Device {
             (Self::Rocm(lhs), Self::Rocm(rhs)) => lhs.same_device(rhs),
             #[cfg(feature = "vulkan")]
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => lhs.same_device(rhs),
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => lhs.same_device(rhs),
             _ => false,
         }
     }
@@ -357,6 +390,8 @@ impl Device {
             Self::Rocm(device) => device.location(),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(device) => device.location(),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(device) => device.location(),
         }
     }
 
@@ -394,6 +429,17 @@ impl Device {
         }
     }
 
+    pub fn is_wgpu(&self) -> bool {
+        #[cfg(feature = "wgpu")]
+        {
+            matches!(self, Self::Wgpu(_))
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            false
+        }
+    }
+
     pub fn supports_bf16(&self) -> bool {
         match self {
             Self::Cuda(_) | Self::Metal(_) => true,
@@ -404,6 +450,9 @@ impl Device {
             // backend is f32/u32-only, so default away from bf16.
             #[cfg(feature = "vulkan")]
             Self::Vulkan(_) => false,
+            // wgpu/WGSL path on the GB10 computes in f32/u32; no native bf16.
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(_) => false,
         }
     }
 
@@ -468,6 +517,11 @@ impl Device {
                 let storage = device.rand_uniform(shape, dtype, lo, up)?;
                 Ok(Storage::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::Wgpu(storage))
+            }
         }
     }
 
@@ -516,6 +570,11 @@ impl Device {
                 let storage = device.rand_normal(shape, dtype, mean, std)?;
                 Ok(Storage::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::Wgpu(storage))
+            }
         }
     }
 
@@ -552,6 +611,11 @@ impl Device {
                 let storage = device.zeros_impl(shape, dtype)?;
                 Ok(Storage::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(device) => {
+                let storage = device.zeros_impl(shape, dtype)?;
+                Ok(Storage::Wgpu(storage))
+            }
         }
     }
 
@@ -579,6 +643,11 @@ impl Device {
                 let storage = device.alloc_uninit(shape, dtype)?;
                 Ok(Storage::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(device) => {
+                let storage = device.alloc_uninit(shape, dtype)?;
+                Ok(Storage::Wgpu(storage))
+            }
         }
     }
 
@@ -602,6 +671,11 @@ impl Device {
             Device::Vulkan(device) => {
                 let storage = device.storage_from_slice(data)?;
                 Ok(Storage::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(device) => {
+                let storage = device.storage_from_slice(data)?;
+                Ok(Storage::Wgpu(storage))
             }
         }
     }
@@ -631,6 +705,12 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(device) => {
+                let storage = array.to_cpu_storage();
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Wgpu(storage))
+            }
         }
     }
 
@@ -659,6 +739,12 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(device) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Wgpu(storage))
+            }
         }
     }
 
@@ -671,6 +757,8 @@ impl Device {
             Self::Rocm(d) => d.synchronize(),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(d) => d.synchronize(),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(d) => d.synchronize(),
         }
     }
 }
