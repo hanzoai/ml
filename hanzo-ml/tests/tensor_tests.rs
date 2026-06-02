@@ -1,4 +1,5 @@
 use hanzo_ml::{test_device, test_utils, DType, Device, IndexOp, Result, Tensor, D};
+use float8::F8E4M3;
 
 fn zeros(device: &Device) -> Result<()> {
     let tensor = Tensor::zeros((5, 2), DType::F32, device)?;
@@ -61,6 +62,24 @@ fn ones(device: &Device) -> Result<()> {
             ]
         ],
     );
+
+    if !device.is_metal() {
+        assert_eq!(
+            Tensor::ones((2, 3), DType::F8E4M3, device)?.to_vec2::<F8E4M3>()?,
+            [
+                [
+                    F8E4M3::from_f32(1.),
+                    F8E4M3::from_f32(1.),
+                    F8E4M3::from_f32(1.)
+                ],
+                [
+                    F8E4M3::from_f32(1.),
+                    F8E4M3::from_f32(1.),
+                    F8E4M3::from_f32(1.)
+                ]
+            ],
+        );
+    }
     Ok(())
 }
 
@@ -109,6 +128,24 @@ fn arange(device: &Device) -> Result<()> {
         Tensor::arange_step(5i64, 0i64, -1, device)?.to_vec1::<i64>()?,
         [5, 4, 3, 2, 1],
     );
+
+    if !device.is_metal() {
+        assert_eq!(
+            Tensor::arange_step(
+                F8E4M3::from_f32(0.),
+                F8E4M3::from_f32(5.),
+                F8E4M3::from_f32(2.),
+                device
+            )?
+            .to_vec1::<F8E4M3>()?,
+            [
+                F8E4M3::from_f32(0.),
+                F8E4M3::from_f32(2.),
+                F8E4M3::from_f32(4.),
+            ],
+        );
+    }
+
     Ok(())
 }
 
@@ -182,6 +219,26 @@ fn asort(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Test sorting a large tensor that exceeds 1024 elements.
+fn asort_big(device: &Device) -> Result<()> {
+    // Skip on metal for now
+    if device.is_metal() {
+        return Ok(());
+    }
+    const SIZE: usize = 2000;
+    let data: Vec<f32> = (0..SIZE).map(|x| (SIZE - x) as f32).collect();
+    let tensor = Tensor::new(data.as_slice(), device)?;
+
+    let indexes = tensor.arg_sort_last_dim(true)?;
+    let expected_indexes: Vec<u32> = (0..SIZE).rev().map(|x| x as u32).collect();
+    assert_eq!(indexes.to_vec1::<u32>()?, expected_indexes);
+
+    let indexes = tensor.arg_sort_last_dim(false)?;
+    let expected_indexes: Vec<u32> = (0..SIZE).map(|x| x as u32).collect();
+    assert_eq!(indexes.to_vec1::<u32>()?, expected_indexes);
+    Ok(())
+}
+
 fn unary_op(device: &Device) -> Result<()> {
     let data = &[[-3f32, 1., 4., -0.1, 0.5], [2.7, -1.8, -0.28, 1.8, 2.8]];
     let tensor = Tensor::new(data, device)?;
@@ -252,7 +309,7 @@ fn unary_op(device: &Device) -> Result<()> {
         [-1.2642, 0.0000, -1.7293, 3.0000]
     );
     // This test failed on metal prior to the following PR:
-    // https://github.com/huggingface/hanzo/pull/2490
+    // https://github.com/hanzoai/ml/pull/2490
     let y = tensor.reshape((2, 2))?.t()?.elu(2.)?.flatten_all()?;
     assert_eq!(
         test_utils::to_vec1_round(&y, 4)?,
@@ -951,7 +1008,7 @@ fn index_select(device: &Device) -> Result<()> {
             hs.to_vec2::<f32>()?,
             &[[0.0, 1.0, 2.0], [6.0, 7.0, 8.0], [3.0, 4.0, 5.0]]
         );
-        // Prior to https://github.com/huggingface/hanzo/pull/1022
+        // Prior to https://github.com/hanzoai/ml/pull/1022
         // There would be a bug where the last values in the result tensor would be set to 0.
         let ids = Tensor::new(&[0u32, 2u32, 1u32, 0u32, 2u32, 1u32], device)?;
         let hs = t.index_select(&ids, 0)?;
@@ -1662,6 +1719,7 @@ test_device!(argmin, argmin_cpu, argmin_gpu, argmin_metal);
 test_device!(transpose, transpose_cpu, transpose_gpu, transpose_metal);
 test_device!(unary_op, unary_op_cpu, unary_op_gpu, unary_op_metal);
 test_device!(binary_op, binary_op_cpu, binary_op_gpu, binary_op_metal);
+test_device!(ternary_op, ternary_op_cpu, ternary_op_gpu, ternary_op_metal);
 test_device!(embeddings, embeddings_cpu, embeddings_gpu, embeddings_metal);
 test_device!(cmp, cmp_cpu, cmp_gpu, cmp_metal);
 test_device!(
@@ -1688,11 +1746,48 @@ test_device!(
 test_device!(randn, randn_cpu, randn_gpu, randn_metal);
 test_device!(clamp, clamp_cpu, clamp_gpu, clamp_metal);
 test_device!(asort, asort_cpu, asort_gpu, asort_metal);
+test_device!(asort_big, asort_big_cpu, asort_big_gpu, asort_big_metal);
 test_device!(var, var_cpu, var_gpu, var_metal);
 test_device!(zero_dim, zero_dim_cpu, zero_dim_gpu, zero_dim_metal);
 
+fn tensor_send_sync(device: &Device) -> Result<()> {
+    let tensor = Tensor::new(vec![1.0f32, 2.0, 3.0], device)?;
+
+    for _ in 0..10 {
+        let tensor = tensor.clone();
+        std::thread::spawn(move || {
+            let new = tensor.add(&tensor).unwrap();
+            let result: Vec<f32> = new.to_vec1().unwrap();
+            assert_eq!(result, vec![2.0f32, 4.0, 6.0]);
+        });
+    }
+    let result: Vec<f32> = tensor.to_vec1().unwrap();
+    assert_eq!(result, vec![1.0f32, 2.0, 3.0]);
+
+    let tensor = Tensor::new(vec![1.0f32, 2.0, 3.0], device)?;
+    tensor.device().synchronize().unwrap();
+
+    let new = std::thread::spawn(move || {
+        let new = tensor.add(&tensor).unwrap();
+        new.device().synchronize().unwrap();
+        new
+    })
+    .join()
+    .unwrap();
+    let result: Vec<f32> = new.to_vec1().unwrap();
+    assert_eq!(result, vec![2.0f32, 4.0, 6.0]);
+
+    Ok(())
+}
+test_device!(
+    tensor_send_sync,
+    tensor_send_sync_cpu,
+    tensor_send_sync_gpu,
+    tensor_send_sync_metal
+);
+
 // There was originally a bug on the CPU implementation for randn
-// https://github.com/huggingface/hanzo/issues/381
+// https://github.com/hanzoai/ml/issues/381
 #[test]
 fn randn_hasneg() -> Result<()> {
     let t = Tensor::randn(0f32, 1f32, 200, &Device::Cpu)?.to_vec1::<f32>()?;
@@ -1920,5 +2015,67 @@ fn tensor_norm() -> Result<()> {
     let t = Tensor::new(&[[3., 4.], [0., 0.]], &Device::Cpu)?;
     let norm = t.norm()?;
     assert_eq!(norm.to_scalar::<f64>()?, 5.);
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn transfers_cuda_to_device() -> Result<()> {
+    use rand::seq::SliceRandom;
+
+    let devices = cudarc::driver::safe::CudaContext::device_count()
+        .map_err(hanzo_ml::cuda::CudaError::from)?;
+    if devices < 2 {
+        return Ok(());
+    }
+    let first = Device::new_cuda(0)?;
+
+    let mut data: Vec<u32> = (0..262144).collect();
+    let mut rng = rand::rng();
+    data.shuffle(&mut rng);
+
+    let t1 = Tensor::from_vec(data, (512, 512), &first)?;
+    let second = Device::new_cuda(1)?;
+    let t2 = t1.to_device(&second)?;
+
+    assert_ne!(
+        t1.device().as_cuda_device()?.id(),
+        t2.device().as_cuda_device()?.id()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn allocates_twice_when_transferring_to_same_device() -> Result<()> {
+    use std::{ops::Deref, sync::RwLockReadGuard};
+
+    use hanzo_ml::Storage;
+    use rand::seq::SliceRandom;
+
+    let first = Device::new_cuda(0)?;
+    let second = Device::new_cuda(0)?;
+
+    let mut data: Vec<u32> = (0..262144).collect();
+    let mut rng = rand::rng();
+    data.shuffle(&mut rng);
+
+    let t1 = Tensor::from_vec(data, (512, 512), &first)?;
+    let t2 = t1.to_device(&second)?;
+
+    let (storage1, _) = t1.storage_and_layout();
+    let (storage2, _) = t2.storage_and_layout();
+    let extract = |s: RwLockReadGuard<'_, Storage>| match &s.deref() {
+        Storage::Cuda(c) => {
+            use cudarc::driver::DevicePtr;
+            let slice = c.as_cuda_slice::<u32>().unwrap();
+            let ptr = slice.device_ptr(slice.stream()).0;
+            ptr
+        }
+        _ => unimplemented!(),
+    };
+    let id1 = extract(storage1);
+    let id2 = extract(storage2);
+    assert_ne!(id1, id2);
     Ok(())
 }
