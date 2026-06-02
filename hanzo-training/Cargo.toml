@@ -66,3 +66,7 @@ path = "examples/train_llama.rs"
 [[example]]
 name = "train_qwen"
 path = "examples/train_qwen.rs"
+
+[[example]]
+name = "grpo_toy"
+path = "examples/grpo_toy.rs"
