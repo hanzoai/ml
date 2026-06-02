@@ -133,7 +133,7 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         #[cfg(feature = "rocm")]
         Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
         #[cfg(feature = "vulkan")]
-        Device::Vulkan(_) => crate::bail!("quantized tensors on vulkan are not supported yet"),
+        Device::Vulkan(d) => QStorage::Vulkan(Box::new(data.to_vec()), d.clone()),
     };
     super::QTensor::new(data, dims)
 }
