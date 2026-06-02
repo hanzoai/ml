@@ -53,16 +53,6 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
         "sigmoid"
     }
 
-    #[cfg(feature = "vulkan")]
-    fn vulkan_fwd(
-        &self,
-        storage: &hanzo_ml::VulkanStorage,
-        layout: &Layout,
-    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
-        let out = storage.sigmoid(layout)?;
-        Ok((out, layout.shape().clone()))
-    }
-
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
         use hanzo_ml::backend::BackendStorage;
 
@@ -1159,10 +1149,14 @@ impl hanzo_ml::CustomOp3 for Sdpa {
             || q_head == 80
             || q_head == 96
             || q_head == 128
-            || q_head == 256;
+            || q_head == 256
+            || q_head == 512;
 
         let supports_sdpa_full_mask = self.mask.is_none() || q_seq <= k_seq;
-        let supports_sdpa_full = q_seq > 8 && supported_head_dim && supports_sdpa_full_mask;
+        // F32 full attention at head_dim=512 exceeds 32KB Metal threadgroup memory
+        let supports_sdpa_full_dtype = !(q_head == 512 && q.dtype() == DType::F32);
+        let supports_sdpa_full =
+            q_seq > 8 && supported_head_dim && supports_sdpa_full_mask && supports_sdpa_full_dtype;
         let supports_sdpa_vector = q_seq <= 8 && supported_head_dim && q_seq <= k_seq;
 
         implementation_supports_use_case &= supports_sdpa_full || supports_sdpa_vector;
