@@ -923,26 +923,33 @@ impl QMatMul {
             );
             if is_quantized && qtensor.shape().rank() == 3 {
                 let dtype = qtensor.dtype();
-                if let (Ok((e, n, k)), Some(blk_u32)) =
-                    (qtensor.shape().dims3(), gpu_block_u32(dtype))
-                {
-                    let bs = dtype.block_size();
-                    if k % bs == 0 {
-                        // Per-expert u32 stride into the bank buffer: each expert is n rows of
-                        // k/blocksize blocks, each block blk_u32 words on the GPU.
-                        let per_expert_words = n * (k / bs) * blk_u32;
-                        let bytes = qtensor.data()?;
-                        // Treat the [E,n,k] bank as (E*n) rows of k: the verbatim/repacked uploaders
-                        // lay rows out contiguously, so expert e starts at e*per_expert_words.
-                        let bank = match dtype {
-                            GgmlDType::Q4K => d.quantize_q4k(bytes.as_ref(), e * n, k)?,
-                            GgmlDType::Q5K => d.quantize_q5k(bytes.as_ref(), e * n, k)?,
-                            GgmlDType::Q6K => d.quantize_q6k(bytes.as_ref(), e * n, k)?,
-                            GgmlDType::Q8_0 => d.quantize_q8_blocks(bytes.as_ref(), e * n, k)?,
-                            _ => unreachable!("gpu_block_u32 gated the dtype above"),
-                        };
-                        // The uploaded bank must be exactly E per-expert strides; a mismatch means a
-                        // wrong stride (which would silently read the wrong expert at forward).
+                if let Ok((e, n, k)) = qtensor.shape().dims3() {
+                    let bs8 = GgmlDType::Q8_0.block_size();
+                    // Q4K/Q8_0 banks upload verbatim (their woff kernels are proven: Q4K via the 35B
+                    // attention path, Q8 via the dense path). Other quantized dtypes (Q5K/Q6K, e.g. the
+                    // Q4_K_M down-experts) requantize to Q8 at load -- identical numerics to the old
+                    // per-token Q6K->Q8 path, but resident -- since their verbatim matvec kernels are
+                    // unproven. One bank's f32 transient is sub-GB, not the whole-model OOM.
+                    let built = if matches!(dtype, GgmlDType::Q4K) && k % dtype.block_size() == 0 {
+                        Some((d.quantize_q4k(qtensor.data()?.as_ref(), e * n, k)?, GgmlDType::Q4K))
+                    } else if matches!(dtype, GgmlDType::Q8_0) && k % bs8 == 0 {
+                        Some((
+                            d.quantize_q8_blocks(qtensor.data()?.as_ref(), e * n, k)?,
+                            GgmlDType::Q8_0,
+                        ))
+                    } else if k % bs8 == 0 {
+                        let wf = qtensor
+                            .dequantize(&Device::Cpu)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?;
+                        Some((d.quantize_q8(&wf, e * n, k)?, GgmlDType::Q8_0))
+                    } else {
+                        None
+                    };
+                    if let Some((bank, store)) = built {
+                        let blk_u32 = gpu_block_u32(store).expect("Q4K/Q8 have gpu blocks");
+                        let per_expert_words = n * (k / store.block_size()) * blk_u32;
+                        // A stride mismatch means we would silently read the wrong expert at forward.
                         assert_eq!(
                             bank.len_words(),
                             e * per_expert_words,
@@ -952,7 +959,7 @@ impl QMatMul {
                         return Ok(Self::VulkanQuantBank {
                             qtensor,
                             bank: std::sync::Arc::new(bank),
-                            dtype,
+                            dtype: store,
                             e,
                             n,
                             k,
