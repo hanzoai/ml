@@ -108,6 +108,21 @@ impl crate::CustomOp1 for ArgSort {
         "argsort"
     }
 
+    // No SPIR-V sort kernel; argsort runs on tiny tensors (e.g. MoE routing logits), so a CPU
+    // roundtrip is correct and cheap.
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &crate::VulkanStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, crate::Shape)> {
+        use crate::backend::{BackendDevice, BackendStorage};
+        let cpu = storage.to_cpu_storage()?;
+        let (sorted, shape) = self.cpu_fwd(&cpu, layout)?;
+        let out = storage.device().storage_from_cpu_storage(&sorted)?;
+        Ok((out, shape))
+    }
+
     fn cpu_fwd(
         &self,
         storage: &crate::CpuStorage,
