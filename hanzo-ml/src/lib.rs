@@ -139,6 +139,9 @@ pub use dummy_vulkan_backend as vulkan;
 
 pub use vulkan::{VulkanDevice, VulkanStorage};
 
+#[cfg(feature = "vulkan")]
+pub use vulkan::{PagedAttnArgs, ReshapeCacheArgs};
+
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
