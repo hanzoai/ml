@@ -1,77 +1,18 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+//! Backward compatibility shim for CPU flash attention.
+//!
+//! **Deprecated:** Use `candle_nn::attention::{flash_attn, AttnMask}` instead.
 
 use hanzo_ml::{Device, Result, Storage, Tensor, WithDType};
 use std::sync::LazyLock;
 use std::{f32, iter::Sum};
 
-use rayon::prelude::*;
-use rayon::ThreadPool;
-
-#[cfg(target_os = "macos")]
-/// Elevate the thread QoS so macOS prefers running it on Performance (P) cores.
-unsafe fn set_thread_affinity() {
-    // USER_INTERACTIVE has the highest scheduling priority that user code
-    // can request and is most likely to be scheduled on P‑cores.
-    use libc::{pthread_set_qos_class_self_np, qos_class_t::QOS_CLASS_USER_INTERACTIVE};
-    // The second argument is a relative priority within the QoS class (0 = default).
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-}
-
-#[cfg(not(target_os = "macos"))]
-#[inline(always)]
-unsafe fn set_thread_affinity() {
-    // On non‑macOS platforms we currently leave affinity untouched.
-}
-
-/// Rayon pool used by the flash‑attention CPU kernels, with a per‑thread
-/// start handler that applies our affinity hint exactly once.
-static FLASH_ATTN_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
-    rayon::ThreadPoolBuilder::new()
-        .start_handler(|_| unsafe {
-            set_thread_affinity();
-        })
-        .build()
-        .expect("Failed to build custom Rayon thread‑pool for flash‑attention")
-});
-
-const DOT_CHUNK: usize = 4;
-
-/// Size (in KV positions) processed by each inner‑tile job.
-const TILE_KV: usize = 16;
-
-#[inline]
-fn vec_dot<T: WithDType + Sum + Copy + std::ops::Mul<Output = T>>(a: &[T], b: &[T]) -> T {
-    let mut sum = T::zero();
-    let chunks = a.len() / DOT_CHUNK;
-
-    for i in 0..chunks {
-        let i_chunk = i * DOT_CHUNK;
-        sum = sum
-            + a[i_chunk] * b[i_chunk]
-            + a[i_chunk + 1] * b[i_chunk + 1]
-            + a[i_chunk + 2] * b[i_chunk + 2]
-            + a[i_chunk + 3] * b[i_chunk + 3];
-    }
-
-    for i in (chunks * DOT_CHUNK)..a.len() {
-        sum += a[i] * b[i];
-    }
-    sum
-}
-
-/// Fused attention optimized for CPU.
+/// Deprecated: use `candle_nn::attention::flash_attn` with `AttnMask` instead.
 ///
-/// Computes softmax(qk^T*scale)v.
-///
-/// **Inputs shapes:**
-/// - `q`: (bs, seq, qhead, hidden)
-/// - `k`: (bs, kv_seq, v_head, hidden)
-/// - `k`: (bs, kv_seq, kv_head_seq, v_hidden)
-/// - `scale` is applied before softmax.
-///
-/// - This supports ALiBi with `max_bias` as well as softcapping with `softcap`.
-///
-/// **Output shape:** (bs, qhead, seq, v_hidden)
+/// This shim routes through the new dispatcher which handles both B=1 and B>1.
+#[deprecated(
+    since = "0.9.2",
+    note = "Use `candle_nn::attention::{flash_attn, AttnMask}` instead"
+)]
 pub fn run_flash_attn_cpu<T>(
     q: &Tensor,
     k: &Tensor,
@@ -82,7 +23,7 @@ pub fn run_flash_attn_cpu<T>(
     softcap: Option<f32>,
 ) -> Result<Tensor>
 where
-    T: WithDType + Sum + num_traits::real::Real,
+    T: WithDType + Sum + num_traits::real::Real + 'static,
 {
     // Inline CPU slice extraction for q, k, v, and optional mask
     let (q_guard, q_layout) = q.storage_and_layout();
