@@ -1,0 +1,53 @@
+#version 450
+// Fused MoE grouped quant matvec (Q8_0): for each routed slot s and each output row r,
+//   y[s, r] = sum_k W[ ids[s], r, k ] * x[s, k]
+// reading the per-expert weight slice out of a single GGML Q8_0 weight bank [E, n, k] resident in
+// VRAM -- the router gather (which expert) and the per-expert GEMM happen in ONE dispatch, so the
+// whole Qwen3-MoE expert compute runs on the GPU (no CPU expert loop, no index_add scatter, no
+// per-call weight re-upload). Each invocation computes one output element. Q8_0 block = 34 bytes
+// = { f16 d ; i8 qs[32] }, weight = qs*d (byte-exact with BlockQ8_0::to_float).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W   { uint  w[];   };  // expert bank, raw Q8_0 bytes
+layout(set = 0, binding = 1) readonly buffer X   { float x[];   };  // [S, k] activations
+layout(set = 0, binding = 2) readonly buffer Ids { uint  ids[]; };  // [S] expert id per slot
+layout(set = 0, binding = 3) writeonly buffer Y  { float y[];   };  // [S, n] outputs
+// n = rows/expert, k = inner dim (mult of 32), nrows = S (total routed slots).
+layout(push_constant) uniform Pc { uint n; uint k; uint nrows; };
+
+uint rdbyte(uint bo) { return bitfieldExtract(w[bo >> 2u], int((bo & 3u) * 8u), 8); }
+float rdscale(uint bo) {
+    uint lo = rdbyte(bo);
+    uint hi = rdbyte(bo + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = nrows * n;
+    if (gid >= total) {
+        return;
+    }
+    uint s = gid / n;          // routed slot
+    uint r = gid - s * n;      // output row within the expert
+    uint expert = ids[s];
+    uint nblocks = k / 32u;
+    // byte offset of weight row r of `expert` in the bank: ((expert*n + r) blocks-rows) * 34 B/block.
+    uint rowbase = (expert * n + r) * nblocks * 34u;
+    uint xbase = s * k;
+    float acc = 0.0;
+    for (uint b = 0u; b < nblocks; b++) {
+        uint bb = rowbase + b * 34u;
+        float d = rdscale(bb);
+        uint qbase = bb + 2u;
+        uint xb = xbase + b * 32u;
+        float bsum = 0.0;
+        for (uint j = 0u; j < 32u; j++) {
+            int q = bitfieldExtract(int(rdbyte(qbase + j)), 0, 8);
+            bsum += float(q) * x[xb + j];
+        }
+        acc += d * bsum;
+    }
+    y[gid] = acc;
+}
