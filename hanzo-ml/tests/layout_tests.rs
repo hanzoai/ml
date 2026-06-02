@@ -1,4 +1,5 @@
 use hanzo_ml::{test_device, Device, IndexOp, Result, Tensor};
+use hanzo_ml;
 
 fn contiguous(device: &Device) -> Result<()> {
     let tensor = Tensor::arange(0u32, 24u32, device)?.reshape((2, 3, 4))?;
@@ -59,9 +60,7 @@ fn strided_blocks() -> Result<()> {
             assert_eq!(start_offset, 0);
             assert_eq!(len, 24);
         }
-        hanzo_ml::StridedBlocks::MultipleBlocks { .. } => {
-            panic!("unexpected block structure")
-        }
+        other => panic!("unexpected block structure {other:?}"),
     };
     let tensor = Tensor::arange(0u32, 26u32, &Cpu)?
         .i(2..)?
@@ -71,9 +70,7 @@ fn strided_blocks() -> Result<()> {
             assert_eq!(start_offset, 2);
             assert_eq!(len, 24);
         }
-        hanzo_ml::StridedBlocks::MultipleBlocks { .. } => {
-            panic!("unexpected block structure")
-        }
+        other => panic!("unexpected block structure {other:?}"),
     };
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     let tensor = tensor.i(1)?;
@@ -82,9 +79,7 @@ fn strided_blocks() -> Result<()> {
             assert_eq!(start_offset, 12);
             assert_eq!(len, 12);
         }
-        hanzo_ml::StridedBlocks::MultipleBlocks { .. } => {
-            panic!("unexpected block structure")
-        }
+        other => panic!("unexpected block structure {other:?}"),
     };
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     let tensor = tensor.i((.., 1))?.contiguous()?;
@@ -94,17 +89,13 @@ fn strided_blocks() -> Result<()> {
             assert_eq!(len, 8);
             assert_eq!(tensor.to_vec2::<u32>()?, &[[4, 5, 6, 7], [16, 17, 18, 19]]);
         }
-        hanzo_ml::StridedBlocks::MultipleBlocks { .. } => {
-            panic!("unexpected block structure")
-        }
+        other => panic!("unexpected block structure {other:?}"),
     };
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     let tensor = tensor.i((.., 1))?;
     match tensor.strided_blocks() {
-        hanzo_ml::StridedBlocks::SingleBlock { .. } => {
-            panic!("unexpected block structure")
-        }
-        hanzo_ml::StridedBlocks::MultipleBlocks {
+        hanzo_ml::StridedBlocks::UniformBlocks {
+            start_offset,
             block_len,
             count,
             src_stride,
@@ -118,9 +109,6 @@ fn strided_blocks() -> Result<()> {
     };
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     match tensor.t()?.strided_blocks() {
-        hanzo_ml::StridedBlocks::SingleBlock { .. } => {
-            panic!("unexpected block structure")
-        }
         hanzo_ml::StridedBlocks::MultipleBlocks {
             block_start_index,
             block_len,
@@ -138,9 +126,6 @@ fn strided_blocks() -> Result<()> {
     };
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     match tensor.transpose(0, 1)?.strided_blocks() {
-        hanzo_ml::StridedBlocks::SingleBlock { .. } => {
-            panic!("unexpected block structure")
-        }
         hanzo_ml::StridedBlocks::MultipleBlocks {
             block_start_index,
             block_len,

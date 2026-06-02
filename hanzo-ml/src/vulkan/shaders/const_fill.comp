@@ -1,0 +1,22 @@
+#version 450
+// Fill a contiguous run of `n` 4-byte words with a constant bit pattern `val`:
+// out[i] = val for i in [0, n). Powers const_set / Tensor::full / ones on a contiguous,
+// offset-0, whole-buffer view, replacing a GPU->CPU->GPU read-modify-write with one
+// on-GPU dispatch. The value is passed as raw bits (uint) so the SAME kernel serves f32
+// and u32 storage bit-exactly (the host packs f32::to_bits() or the u32 directly), with
+// no float canonicalization. Partial / strided / offset views still use the CPU path,
+// which must preserve unaddressed elements.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out { uint outp[]; };
+layout(push_constant) uniform Pc {
+    uint n;
+    uint val; // raw 32-bit pattern to store
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < n) {
+        outp[i] = val;
+    }
+}
