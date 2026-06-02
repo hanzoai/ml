@@ -274,6 +274,8 @@ impl Tensor {
                     Device::Rocm(_) => crate::bail!("not supported on rocm yet"),
                     #[cfg(feature = "vulkan")]
                     Device::Vulkan(_) => crate::bail!("not supported on vulkan yet"),
+                    #[cfg(feature = "wgpu")]
+                    Device::Wgpu(_) => crate::bail!("not supported on wgpu yet"),
                     #[cfg(not(feature = "metal"))]
                     Device::Metal(_) => {
                         return Err(Error::Msg("Metal support not compiled".to_string()));
@@ -374,6 +376,8 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         Device::Rocm(_) => crate::bail!("not supported on rocm yet"),
         #[cfg(feature = "vulkan")]
         Device::Vulkan(_) => crate::bail!("not supported on vulkan yet"),
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(_) => crate::bail!("not supported on wgpu yet"),
         #[cfg(not(feature = "metal"))]
         Device::Metal(_) => {
             return Err(Error::Msg("Metal support not compiled".to_string()));
