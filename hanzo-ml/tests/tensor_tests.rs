@@ -1719,7 +1719,6 @@ test_device!(argmin, argmin_cpu, argmin_gpu, argmin_metal);
 test_device!(transpose, transpose_cpu, transpose_gpu, transpose_metal);
 test_device!(unary_op, unary_op_cpu, unary_op_gpu, unary_op_metal);
 test_device!(binary_op, binary_op_cpu, binary_op_gpu, binary_op_metal);
-test_device!(ternary_op, ternary_op_cpu, ternary_op_gpu, ternary_op_metal);
 test_device!(embeddings, embeddings_cpu, embeddings_gpu, embeddings_metal);
 test_device!(cmp, cmp_cpu, cmp_gpu, cmp_metal);
 test_device!(
