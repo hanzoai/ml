@@ -511,10 +511,15 @@ impl VulkanDevice {
         }
         unsafe {
             let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-            self.inner
-                .instance
-                .get_physical_device_memory_properties2(self.inner.pdev, &mut props2);
+            {
+                // props2 mutably borrows budget via push_next; scope it so the borrow ends before
+                // we read budget back.
+                let mut props2 =
+                    vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+                self.inner
+                    .instance
+                    .get_physical_device_memory_properties2(self.inner.pdev, &mut props2);
+            }
             // heap_budget is 0 for heaps the driver doesn't report; treat that as "unknown" and use
             // the static size so we never under-report and wrongly refuse a valid allocation.
             let b = budget.heap_budget[h as usize];
@@ -721,37 +726,59 @@ impl VulkanDevice {
         }
         self.flush()?;
         let dev = self.dev();
-        let bytes = data.len() as u64;
-        let (staging, staging_mem) = self.raw_buffer_host_visible(bytes)?;
-        let ptr = dev
-            .map_memory(staging_mem, 0, bytes, vk::MemoryMapFlags::empty())
-            .map_err(vkerr)? as *mut u8;
-        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        dev.unmap_memory(staging_mem);
-        self.copy_buffer_blocking(staging, dst, bytes)?;
+        let total = data.len() as u64;
+        // One small staging buffer (<= STAGE_CHUNK), reused across chunks, so the host-visible heap
+        // never needs the full buffer's worth — the lever that lets an 18.6GB DEVICE_LOCAL buffer
+        // load through a few-hundred-MB host-visible carveout.
+        let chunk = total.min(Self::STAGE_CHUNK);
+        let (staging, staging_mem) = self.raw_buffer_host_visible(chunk)?;
+        let mut off = 0u64;
+        let result = (|| -> Result<()> {
+            while off < total {
+                let n = (total - off).min(chunk);
+                let ptr = dev
+                    .map_memory(staging_mem, 0, n, vk::MemoryMapFlags::empty())
+                    .map_err(vkerr)? as *mut u8;
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(off as usize), ptr, n as usize);
+                dev.unmap_memory(staging_mem);
+                self.copy_buffer_blocking(staging, 0, dst, off, n)?;
+                off += n;
+            }
+            Ok(())
+        })();
         dev.destroy_buffer(staging, None);
         dev.free_memory(staging_mem, None);
-        Ok(())
+        result
     }
 
     // Read `bytes` out of device-local (non-host-visible) `src` via a transient host-visible staging
-    // buffer + GPU copy. Mirror of staged_upload.
+    // buffer + GPU copy, chunked like staged_upload. Mirror of staged_upload.
     unsafe fn staged_readback(&self, src: vk::Buffer, bytes: u64) -> Result<Vec<u8>> {
         if bytes == 0 {
             return Ok(Vec::new());
         }
         self.flush()?;
         let dev = self.dev();
-        let (staging, staging_mem) = self.raw_buffer_host_visible(bytes)?;
-        self.copy_buffer_blocking(src, staging, bytes)?;
-        let ptr = dev
-            .map_memory(staging_mem, 0, bytes, vk::MemoryMapFlags::empty())
-            .map_err(vkerr)? as *const u8;
-        let v = std::slice::from_raw_parts(ptr, bytes as usize).to_vec();
-        dev.unmap_memory(staging_mem);
+        let chunk = bytes.min(Self::STAGE_CHUNK);
+        let (staging, staging_mem) = self.raw_buffer_host_visible(chunk)?;
+        let mut out = vec![0u8; bytes as usize];
+        let mut off = 0u64;
+        let result = (|| -> Result<()> {
+            while off < bytes {
+                let n = (bytes - off).min(chunk);
+                self.copy_buffer_blocking(src, off, staging, 0, n)?;
+                let ptr = dev
+                    .map_memory(staging_mem, 0, n, vk::MemoryMapFlags::empty())
+                    .map_err(vkerr)? as *const u8;
+                std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr().add(off as usize), n as usize);
+                dev.unmap_memory(staging_mem);
+                off += n;
+            }
+            Ok(())
+        })();
         dev.destroy_buffer(staging, None);
         dev.free_memory(staging_mem, None);
-        Ok(v)
+        result.map(|()| out)
     }
 
     // Upload f32 `data` into a storage buffer. Host-visible memory takes the direct-map fast path;
@@ -1444,8 +1471,12 @@ impl BackendDevice for VulkanDevice {
             // mat-vec subgroup kernel uses subgroupAdd (ARITHMETIC) at COMPUTE-stage scope, so we
             // require both before enabling it. HANZO_VK_SUBGROUP_MATVEC=0 forces the scalar kernel.
             let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg_props);
-            instance.get_physical_device_properties2(pdev, &mut p2);
+            {
+                // p2 mutably borrows sg_props via push_next; scope it so the borrow ends before we
+                // read sg_props back below.
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg_props);
+                instance.get_physical_device_properties2(pdev, &mut p2);
+            }
             let sg_compute = sg_props
                 .supported_stages
                 .contains(vk::ShaderStageFlags::COMPUTE);
