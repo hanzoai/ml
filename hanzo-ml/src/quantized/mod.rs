@@ -838,6 +838,62 @@ impl QTensor {
                 );
                 out.reshape((t, topk, n))?.to_dtype(out_dtype)
             }
+            // Native wgpu MoE: mirror of the Vulkan fused grouped quant matvec dispatch. The GGML
+            // weight bank [E, n, k] is uploaded once and the router gather + per-expert GEMM run in
+            // one WGSL dispatch. Supported for Q4_0/Q8_0/Q4_K.
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(_, wgpu_dev)
+                if matches!(
+                    self.storage.dtype(),
+                    GgmlDType::Q4_0 | GgmlDType::Q8_0 | GgmlDType::Q4K
+                ) =>
+            {
+                let out_dtype = x.dtype();
+                let (e_cnt, n, k) = self.shape().dims3()?;
+                let (t, topk) = ids.dims2()?;
+                let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+                let x_exp = if s == topk {
+                    x.clone()
+                } else {
+                    x.broadcast_as((t, topk, k))?
+                };
+                let nrows = t * topk;
+                let x_flat = x_exp
+                    .reshape((nrows, k))?
+                    .to_dtype(crate::DType::F32)?
+                    .contiguous()?;
+                let ids_vec = ids
+                    .reshape((nrows,))?
+                    .to_dtype(crate::DType::U32)?
+                    .to_vec1::<u32>()?;
+                if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
+                    crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
+                }
+                let kernel = match self.storage.dtype() {
+                    GgmlDType::Q4_0 => "moe_matvec_q4_0",
+                    GgmlDType::Q8_0 => "moe_matvec_q8_0",
+                    GgmlDType::Q4K => "moe_matvec_q4k",
+                    other => crate::bail!("wgpu MoE: no kernel for {other:?}"),
+                };
+                let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
+                let wbank = wgpu_dev.upload_qweight(&bank)?;
+                let ids_buf = wgpu_dev.upload_ids(&ids_vec)?;
+                let y = {
+                    let (store, _) = x_flat.storage_and_layout();
+                    let xv = match &*store {
+                        Storage::Wgpu(v) => v,
+                        _ => crate::bail!("wgpu MoE: x not on wgpu after contiguous()"),
+                    };
+                    wgpu_dev.moe_matvec_gpu(kernel, &wbank, xv, &ids_buf, nrows, n, k)?
+                };
+                let out = crate::tensor::from_storage(
+                    Storage::Wgpu(y),
+                    (nrows, n),
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                out.reshape((t, topk, n))?.to_dtype(out_dtype)
+            }
             _ => {
                 // CPU / non-CUDA fallback: per-expert quantized matmul. The packed expert bank
                 // [E, n, k] is sliced into equal, contiguous per-expert quantized blocks; for
@@ -1000,12 +1056,12 @@ impl QMatMul {
                 }
             }
         }
-        // Native wgpu quantized path: same idea as Vulkan. Milestone 1 ships the Q4_0/Q8_0 WGSL
-        // matvec kernels; other dtypes (incl. Q4_K) fall through to the dequantize path below.
+        // Native wgpu quantized path: same idea as Vulkan. Ships the Q4_0/Q8_0/Q4_K WGSL matvec
+        // kernels; other dtypes fall through to the dequantize path below.
         #[cfg(feature = "wgpu")]
         {
             let dt = qtensor.dtype();
-            let native_wgpu = matches!(dt, GgmlDType::Q4_0 | GgmlDType::Q8_0);
+            let native_wgpu = matches!(dt, GgmlDType::Q4_0 | GgmlDType::Q8_0 | GgmlDType::Q4K);
             if native_wgpu {
                 if let Device::Wgpu(d) = qtensor.device() {
                     if let Ok((n, k)) = qtensor.shape().dims2() {
@@ -1252,6 +1308,7 @@ impl crate::Module for QMatMul {
                         match dtype {
                             GgmlDType::Q4_0 => d.matvec_q4_0_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q8_0 => d.matvec_q8_0_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
                             other => crate::bail!("WgpuQuant: no native matvec for {other:?}"),
                         }
                     };

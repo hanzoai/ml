@@ -55,6 +55,7 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
     let y_gpu: Vec<f32> = match dtype {
         GgmlDType::Q4_0 => g.matvec_q4_0(&wq, &x_host, nout, k)?,
         GgmlDType::Q8_0 => g.matvec_q8_0(&wq, &x_host, nout, k)?,
+        GgmlDType::Q4K => g.matvec_q4k(&wq, &x_host, nout, k)?,
         _ => panic!("unsupported dtype in run_case: {dtype:?}"),
     };
     assert_eq!(y_gpu.len(), nout);
@@ -261,10 +262,30 @@ fn end_to_end_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> han
 }
 
 #[test]
+fn wgpu_matvec_q4k_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::Q4K, nout, k)?;
+        println!(
+            "Q4_K  nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "Q4_K GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn wgpu_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
+    // (nout, k); k divisible by 256 so all three dtypes are exercised on the same shapes.
     for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
-        for dt in [GgmlDType::Q4_0, GgmlDType::Q8_0] {
+        for dt in [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType::Q4K] {
             let max_abs = end_to_end_case(&dev, dt, nout, k)?;
             println!("QMatMul::forward {dt:?}  nout={nout:5} k={k:5}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}");
             assert!(
@@ -272,6 +293,156 @@ fn wgpu_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
                 "QMatMul::forward {dt:?} GPU/ref mismatch too large: {max_abs}"
             );
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// MoE: the fused grouped quant matvec. Build a quantized expert bank [E, n, k] on the wgpu device
+// and call QTensor::indexed_moe_forward (the Qwen3-MoE path) -- one on-GPU dispatch gathers each
+// routed slot's expert and computes its matvec -- and compare to a host f64 reference over the
+// dequantized per-expert weights.
+fn moe_case(
+    dev: &Device,
+    dtype: GgmlDType,
+    e_cnt: usize,
+    n: usize,
+    k: usize,
+    t: usize,
+    topk: usize,
+) -> hanzo_ml::Result<f32> {
+    let cpu = Device::Cpu;
+    let bank_host: Vec<f32> = (0..e_cnt * n * k).map(|i| pseudo(i) * 0.5).collect();
+    let bank_t = Tensor::from_vec(bank_host, (e_cnt, n, k), &cpu)?;
+    let q_bank = QTensor::quantize(&bank_t.reshape((e_cnt * n, k))?, dtype)?; // quantize per row
+    let bank_deq: Vec<f32> = q_bank.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?; // [E*n*k]
+    let bytes = q_bank.data()?.into_owned();
+
+    let x_host: Vec<f32> = (0..t * topk * k).map(|i| pseudo(i + 11) * 0.7).collect();
+    let ids_host: Vec<u32> = (0..t * topk).map(|i| ((i * 7 + 3) % e_cnt) as u32).collect();
+
+    let qs = QStorage::from_data(std::borrow::Cow::Owned(bytes), dev, dtype)?;
+    let q = QTensor::new(qs, (e_cnt, n, k))?;
+    let x = Tensor::from_vec(x_host.clone(), (t, topk, k), dev)?;
+    let ids = Tensor::from_vec(ids_host.clone(), (t, topk), dev)?;
+    let y = q
+        .indexed_moe_forward(&x, &ids)?
+        .reshape((t * topk, n))?
+        .to_vec2::<f32>()?;
+
+    let mut max_abs = 0f32;
+    for slot in 0..t * topk {
+        let e = ids_host[slot] as usize;
+        for r in 0..n {
+            let wbase = (e * n + r) * k;
+            let xbase = slot * k;
+            let mut acc = 0f64;
+            for j in 0..k {
+                acc += bank_deq[wbase + j] as f64 * x_host[xbase + j] as f64;
+            }
+            max_abs = max_abs.max((y[slot][r] as f64 - acc).abs() as f32);
+        }
+    }
+    Ok(max_abs)
+}
+
+#[test]
+fn wgpu_moe_forward_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    // (e_cnt, n, k, t, topk). k divisible by 256 so all three dtypes work on the same shapes.
+    let cases = [
+        (8usize, 256usize, 256usize, 2usize, 2usize),
+        (16, 512, 256, 3, 4),
+        (4, 768, 512, 1, 2), // decode-like: single token, top-2
+    ];
+    for &(e_cnt, n, k, t, topk) in &cases {
+        for dt in [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType::Q4K] {
+            let max_abs = moe_case(&dev, dt, e_cnt, n, k, t, topk)?;
+            println!(
+                "MoE {dt:?}  E={e_cnt:3} n={n:4} k={k:4} t={t} topk={topk}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}"
+            );
+            assert!(
+                max_abs < 1e-3,
+                "MoE {dt:?} GPU/ref mismatch too large: {max_abs}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Flash-attention: fused QK^T -> softmax -> V (online softmax) vs an eager f64 reference. The GPU
+// kernel never materializes the [Lq, Lk] score matrix; the reference computes it explicitly.
+fn flash_case(
+    dev: &Device,
+    bh: usize,
+    lq: usize,
+    lk: usize,
+    d: usize,
+    causal: bool,
+) -> hanzo_ml::Result<f32> {
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let q: Vec<f32> = (0..bh * lq * d).map(|i| pseudo(i) * 0.5).collect();
+    let k: Vec<f32> = (0..bh * lk * d).map(|i| pseudo(i + 5) * 0.5).collect();
+    let v: Vec<f32> = (0..bh * lk * d).map(|i| pseudo(i + 9) * 0.5).collect();
+
+    let g = dev.as_wgpu_device()?;
+    let out = g.flash_attn(&q, &k, &v, bh, lq, lk, d, scale, causal)?;
+    assert_eq!(out.len(), bh * lq * d);
+
+    let mut max_abs = 0f32;
+    for b in 0..bh {
+        for qi in 0..lq {
+            let last = if causal { qi + (lk - lq) + 1 } else { lk };
+            let last = last.min(lk);
+            let mut sc = vec![0f64; last];
+            let mut mx = f64::NEG_INFINITY;
+            for (j, scj) in sc.iter_mut().enumerate() {
+                let mut s = 0f64;
+                for t in 0..d {
+                    s += q[(b * lq + qi) * d + t] as f64 * k[(b * lk + j) * d + t] as f64;
+                }
+                *scj = s * scale as f64;
+                mx = mx.max(*scj);
+            }
+            let mut denom = 0f64;
+            for scj in sc.iter_mut() {
+                *scj = (*scj - mx).exp();
+                denom += *scj;
+            }
+            for t in 0..d {
+                let mut acc = 0f64;
+                for (j, &pp) in sc.iter().enumerate() {
+                    acc += pp * v[(b * lk + j) * d + t] as f64;
+                }
+                acc /= denom;
+                let gg = out[(b * lq + qi) * d + t] as f64;
+                max_abs = max_abs.max((gg - acc).abs() as f32);
+            }
+        }
+    }
+    Ok(max_abs)
+}
+
+#[test]
+fn wgpu_flash_attn_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    // (bh, lq, lk, d, causal). d = 128 is Qwen3's head dim.
+    let cases = [
+        (8usize, 16usize, 16usize, 128usize, false),
+        (8, 16, 16, 128, true),
+        (8, 1, 64, 128, true), // decode: single query over a 64-key cache
+        (4, 7, 13, 64, false), // ragged Lq != Lk, smaller d
+    ];
+    for &(bh, lq, lk, d, causal) in &cases {
+        let max_abs = flash_case(&dev, bh, lq, lk, d, causal)?;
+        println!(
+            "FlashAttn bh={bh} lq={lq:3} lk={lk:3} d={d:3} causal={causal}  GPU-vs-(eager ref) max_abs={max_abs:.3e}"
+        );
+        assert!(
+            max_abs < 1e-4,
+            "FlashAttn GPU/ref mismatch too large: {max_abs}"
+        );
     }
     Ok(())
 }
