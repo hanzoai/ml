@@ -1,0 +1,64 @@
+#version 450
+// Q8_0 matrix-matrix product (the prefill/compute path): y[m,n] = sum_k x[m,k]*W[n,k] with W stored
+// quantized, SAME block layout and decode as mul_mat_vec_q8 (1 fp16 scale + 32 int8 per 32-block,
+// 9 u32/block). Prefill has M>1 activation rows sharing one weight matrix, so dequantizing the whole
+// weight to f32 every forward is the dominant cost. This kernel keeps W quantized in VRAM and decodes
+// each weight block ONCE per output column, reusing it across all M rows: weight traffic is identical
+// to a single matvec while M rows are produced, instead of M independent weight re-reads. One
+// invocation computes one output column n for up to MAX_M rows (the host tiles M by MAX_M).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // quantized weights, 9 u32 / 32-block
+layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activations, row-major [M, k]
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, row-major [M, nout]
+// m0: first activation row this dispatch handles; mcount: rows in this tile (1..MAX_M); nout: total
+// columns; k: contraction dim (multiple of 32). x row stride is k, y row stride is nout.
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; };
+
+const uint MAX_M = 8u; // register accumulators per invocation; host tiles M by this
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 32u;
+    uint base = n * nblocks * 9u; // u32 offset of weight row n
+    float acc[MAX_M];
+    for (uint r = 0u; r < MAX_M; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint b = 0u; b < nblocks; b++) {
+        uint off = base + b * 9u;
+        float scale = unpackHalf2x16(w[off]).x;
+        uint xb = b * 32u;
+        float bsum[MAX_M];
+        for (uint r = 0u; r < MAX_M; r++) {
+            bsum[r] = 0.0;
+        }
+        for (uint j = 0u; j < 8u; j++) {
+            uint word = w[off + 1u + j];
+            // Decode the 4 int8 lanes of this word ONCE, then reuse across all rows.
+            // bitfieldExtract on a signed int sign-extends the 8-bit lane.
+            float q0 = float(bitfieldExtract(int(word), 0, 8));
+            float q1 = float(bitfieldExtract(int(word), 8, 8));
+            float q2 = float(bitfieldExtract(int(word), 16, 8));
+            float q3 = float(bitfieldExtract(int(word), 24, 8));
+            uint xo = xb + j * 4u;
+            for (uint r = 0u; r < mcount; r++) {
+                uint xrow = (m0 + r) * k;
+                bsum[r] += q0 * x[xrow + xo + 0u]
+                         + q1 * x[xrow + xo + 1u]
+                         + q2 * x[xrow + xo + 2u]
+                         + q3 * x[xrow + xo + 3u];
+            }
+        }
+        for (uint r = 0u; r < mcount; r++) {
+            acc[r] += scale * bsum[r];
+        }
+    }
+    for (uint r = 0u; r < mcount; r++) {
+        y[(m0 + r) * nout + n] = acc[r];
+    }
+}
