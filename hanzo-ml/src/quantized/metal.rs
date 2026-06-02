@@ -37,10 +37,11 @@ impl QMetalStorage {
         use crate::quantized::k_quants::GgmlType;
 
         let buffer = self.device.allocate_buffer(self.buffer.length())?;
-        let blit = self.device.blit_command_encoder()?;
-        blit.set_label("blit_to_cpu");
-        blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
-        blit.end_encoding();
+        {
+            let mut blit = self.device.blit_command_encoder()?;
+            blit.set_label("blit_to_cpu");
+            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+        }
         self.device.wait_until_completed()?;
         let mut out = vec![0.0; elem_count];
         let block_len = elem_count / self.dtype.block_size();
@@ -104,10 +105,6 @@ impl QMetalStorage {
             GgmlDType::Q8K => {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
-            }
-            GgmlDType::MXFP4 => {
-                let vec: Vec<crate::quantized::BlockMXFP4> = read_to_vec(&buffer, block_len);
-                crate::quantized::BlockMXFP4::to_float(&vec, &mut out);
             }
         }
 
@@ -226,6 +223,7 @@ impl QMetalStorage {
         let device = storage.device().clone();
         let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
         let encoder = device.command_encoder()?;
+        let kdtype: hanzo_metal_kernels::GgmlDType = self.dtype.try_into()?;
         // In some cases it would be better to use the mm variant, though it has its drawbacks
         // around memory alignment.
         for batch_id in 0..m {
@@ -233,7 +231,7 @@ impl QMetalStorage {
                 device.device(),
                 &encoder,
                 device.kernels(),
-                self.dtype.into(),
+                kdtype,
                 (1, 1, n, k),
                 storage.buffer(),
                 (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
@@ -243,7 +241,8 @@ impl QMetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
+        let dst_storage =
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
     }
 
@@ -317,7 +316,7 @@ impl QMetalStorage {
             device.device(),
             &encoder,
             device.kernels(),
-            self.dtype.into(),
+            self.dtype.try_into()?,
             src0_l.dims(),
             &src0_stride,
             &self.buffer,
@@ -335,20 +334,198 @@ impl QMetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
+        let dst_storage =
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
     }
 
     pub fn data(&self) -> Result<Vec<u8>> {
         let buffer = self.device.allocate_buffer(self.buffer.length())?;
         {
-            let blit = self.device.blit_command_encoder()?;
+            let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
             blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
-            blit.end_encoding();
         }
         self.device.wait_until_completed()?;
         Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
+    }
+
+    /// One expert's quantized weights `[n, k]` times `x` `[m, k]` (contiguous f32), read straight out
+    /// of the resident `[E, n, k]` bank at byte offset `weight_offset` -- no dequant, no copy.
+    /// Returns `[m, n]` f32. Decode (m==1) uses the matvec kernel (same as `fwd_mv`); prefill (m>1)
+    /// uses the matmul kernel (same as `fwd`), each just offset into the bank by `weight_offset`.
+    fn moe_expert_matmul(
+        &self,
+        x: &MetalStorage,
+        weight_offset: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<MetalStorage> {
+        use crate::MetalError;
+        let device = self.device.clone();
+        let dst = device.new_buffer(m * n, DType::F32, "moe_expert_matmul")?;
+        let dtype: hanzo_metal_kernels::GgmlDType = self.dtype.try_into()?;
+        let encoder = device.command_encoder()?;
+        if m == 1 {
+            hanzo_metal_kernels::call_quantized_matmul_mv_t_offset(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                dtype,
+                (1, 1, n, k),
+                x.buffer(),
+                0,
+                &self.buffer,
+                weight_offset,
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        } else {
+            // src0 = weight [n, k], src1 = x [m, k] (both 4D-padded, contiguous), as in `fwd`.
+            let bs = self.dtype.block_size() as f32;
+            let ts = self.dtype.type_size() as f32;
+            let w_l = crate::Layout::contiguous(&[1, 1, n, k]);
+            let w_stride = w_l
+                .stride()
+                .iter()
+                .map(|x| (*x as f32 * (ts / bs)) as usize)
+                .collect::<Vec<_>>();
+            let x_l = crate::Layout::contiguous(&[1, 1, m, k]);
+            let x_stride = x_l
+                .stride()
+                .iter()
+                .map(|x| x * DType::F32.size_in_bytes())
+                .collect::<Vec<_>>();
+            hanzo_metal_kernels::call_quantized_matmul_mm_t_offset(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                dtype,
+                w_l.dims(),
+                &w_stride,
+                &self.buffer,
+                weight_offset,
+                x_l.dims(),
+                &x_stride,
+                x.buffer(),
+                0,
+                &[1, 1, m, n],
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(MetalStorage::new(dst, device, m * n, DType::F32))
+    }
+
+    /// Keep-quantized indexed MoE forward, mirroring the CUDA fused path but on Metal's unified
+    /// memory: the `[E, n, k]` GGUF expert bank stays quantized in `self.buffer` (no whole-bank
+    /// dequant, the multi-GB f32 OOM), and each routed expert's matvec reads its slice by byte
+    /// offset via the native quant matvec kernel. Slots are grouped by expert host-side (router ids
+    /// are tiny), gathered, run, and scattered back -- cost scales with active experts, not E.
+    pub fn indexed_moe_forward(
+        &self,
+        self_shape: &Shape,   // [num_experts, n, k]
+        input: &MetalStorage, // [t, topk or 1, k]
+        input_l: &crate::Layout,
+        ids: &MetalStorage, // [t, topk]
+        ids_l: &crate::Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use std::collections::HashMap;
+
+        let device = self.device.clone();
+        let mdev = crate::Device::Metal(device.clone());
+        let (e_cnt, n, k) = self_shape.dims3()?;
+        let (t, topk) = ids_l.shape().dims2()?;
+        let s = input_l.shape().dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+        let nrows = t * topk;
+
+        // Mirrors the CUDA indexed-MoE contract: inputs arrive contiguous at offset 0.
+        if !input_l.is_contiguous() || input_l.start_offset() != 0 {
+            crate::bail!("indexed_moe_forward: input must be contiguous at offset 0");
+        }
+        if !ids_l.is_contiguous() || ids_l.start_offset() != 0 {
+            crate::bail!("indexed_moe_forward: ids must be contiguous at offset 0");
+        }
+        let none = crate::op::BackpropOp::none();
+        let input_t = crate::tensor::from_storage(
+            crate::Storage::Metal(input.clone()),
+            input_l.shape().clone(),
+            none.clone(),
+            false,
+        );
+        let x_exp = if s == topk {
+            input_t.clone()
+        } else {
+            input_t.broadcast_as((t, topk, k))?
+        };
+        // [nrows, k] contiguous f32 routed-slot inputs, resident on the Metal device.
+        let x_flat = x_exp
+            .reshape((nrows, k))?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
+
+        let ids_t = crate::tensor::from_storage(
+            crate::Storage::Metal(ids.clone()),
+            ids_l.shape().clone(),
+            none.clone(),
+            false,
+        );
+        let ids_vec = ids_t
+            .reshape((nrows,))?
+            .to_dtype(DType::U32)?
+            .to_vec1::<u32>()?;
+        if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
+            crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
+        }
+
+        let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (slot, eid) in ids_vec.iter().enumerate() {
+            groups.entry(*eid).or_default().push(slot as u32);
+        }
+
+        let block_size = self.dtype.block_size();
+        let type_size = self.dtype.type_size();
+        if !k.is_multiple_of(block_size) {
+            crate::bail!("indexed_moe_forward: k {k} not a multiple of block size {block_size}");
+        }
+        let expert_bytes = n * (k / block_size) * type_size;
+        // Each expert is bound at byte offset eid*expert_bytes; Metal setBuffer:offset: needs a
+        // 4-byte-aligned offset, so expert_bytes must be a multiple of 4. Holds for every supported
+        // GGML block size when n is even, which it always is for real weight dims. Fail loudly else.
+        if !expert_bytes.is_multiple_of(4) {
+            crate::bail!(
+                "indexed_moe_forward: expert stride {expert_bytes} bytes not 4-byte aligned"
+            );
+        }
+
+        let mut out_flat = crate::Tensor::zeros((nrows, n), DType::F32, &mdev)?;
+        for (eid, slots) in groups.into_iter() {
+            let m = slots.len();
+            let idx = crate::Tensor::from_vec(slots, (m,), &mdev)?;
+            let x_e = x_flat.index_select(&idx, 0)?.contiguous()?; // [m, k]
+            let y_e = {
+                let (store, _) = x_e.storage_and_layout();
+                let xs = match &*store {
+                    crate::Storage::Metal(st) => st,
+                    _ => crate::bail!("indexed_moe_forward: x_e not on metal"),
+                };
+                self.moe_expert_matmul(xs, eid as usize * expert_bytes, m, n, k)?
+            };
+            let y_e =
+                crate::tensor::from_storage(crate::Storage::Metal(y_e), (m, n), none.clone(), false);
+            out_flat = out_flat.index_add(&idx, &y_e, 0)?;
+        }
+
+        let out_flat = out_flat.contiguous()?;
+        let (store, _) = out_flat.storage_and_layout();
+        let out_storage = match &*store {
+            crate::Storage::Metal(st) => st.clone(),
+            _ => crate::bail!("indexed_moe_forward: output not on metal"),
+        };
+        Ok((out_storage, (t, topk, n).into()))
     }
 }
 
@@ -372,9 +549,14 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     slice.to_vec()
 }
 
-impl From<GgmlDType> for hanzo_metal_kernels::GgmlDType {
-    fn from(value: GgmlDType) -> Self {
-        match value {
+// Fallible: any ggml dtype without a Metal kernel returns an error rather than panicking. A
+// panicking `From` is a footgun -- a caller that hits an unmapped quant (e.g. a future MXFP4/IQ4
+// bank, or ISQ with an unexpected type) should surface a clean error, not abort the process.
+impl TryFrom<GgmlDType> for hanzo_metal_kernels::GgmlDType {
+    type Error = crate::Error;
+
+    fn try_from(value: GgmlDType) -> Result<Self> {
+        let dt = match value {
             GgmlDType::Q4_0 => hanzo_metal_kernels::GgmlDType::Q4_0,
             GgmlDType::Q4_1 => hanzo_metal_kernels::GgmlDType::Q4_1,
             GgmlDType::Q5_0 => hanzo_metal_kernels::GgmlDType::Q5_0,
@@ -389,9 +571,10 @@ impl From<GgmlDType> for hanzo_metal_kernels::GgmlDType {
             GgmlDType::Q8K => hanzo_metal_kernels::GgmlDType::Q8K,
             GgmlDType::F16 => hanzo_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => hanzo_metal_kernels::GgmlDType::F32,
-            GgmlDType::BF16 => hanzo_metal_kernels::GgmlDType::F16,
-            // No native MXFP4 metal kernel; MXFP4 takes the dequantize-to-f32 path instead.
-            GgmlDType::MXFP4 => panic!("MXFP4 has no native metal quantized matmul kernel"),
-        }
+            GgmlDType::BF16 => hanzo_metal_kernels::GgmlDType::BF16,
+            #[allow(unreachable_patterns)]
+            other => crate::bail!("no Metal quantized kernel for dtype {other:?}"),
+        };
+        Ok(dt)
     }
 }
