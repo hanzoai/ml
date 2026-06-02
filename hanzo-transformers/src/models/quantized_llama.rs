@@ -180,9 +180,12 @@ impl LayerWeights {
         let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        // The call to contiguous below is only necessary when processing the prompt.
-        // When the seq_len is 1 in the inference loop, this is a no-op.
-        hanzo_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        let x = x.contiguous()?;
+        if self.rope_is_neox {
+            hanzo_nn::rotary_emb::rope(&x, &cos, &sin)
+        } else {
+            hanzo_nn::rotary_emb::rope_i(&x, &cos, &sin)
+        }
     }
 
     fn forward_attn(

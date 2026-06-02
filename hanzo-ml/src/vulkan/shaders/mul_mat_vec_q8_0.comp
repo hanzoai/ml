@@ -1,0 +1,47 @@
+#version 450
+// Q8_0 matrix-vector product reading the *native GGML* Q8_0 block format straight from a GPU buffer
+// (no CPU dequant, no re-pack). One GGML BlockQ8_0 = 34 bytes = { f16 d ; i8 qs[32] }; each weight
+// dequantizes as qs[i] * d (byte-exact with k_quants.rs BlockQ8_0::to_float). 34 B/block is not
+// 4-aligned, so the row is byte-addressed out of a u32-packed buffer. Reading ~1.06 B/weight vs 4
+// cuts decode memory traffic ~3.8x. One invocation = one output element. (The sibling
+// `mul_mat_vec_q8` kernel consumes a re-packed 9-u32 layout; this one consumes GGUF bytes as-is.)
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint  w[]; };  // raw Q8_0 blocks, 34 B each
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };  // activation vector, length k
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
+layout(push_constant) uniform Pc { uint nout; uint k; };        // k is a multiple of 32
+
+uint rdbyte(uint bo) {
+    return bitfieldExtract(w[bo >> 2u], int((bo & 3u) * 8u), 8);
+}
+float rdscale(uint bo) {
+    uint lo = rdbyte(bo);
+    uint hi = rdbyte(bo + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 32u;
+    uint rowbase = n * nblocks * 34u; // byte offset of row n
+    float acc = 0.0;
+    for (uint b = 0u; b < nblocks; b++) {
+        uint bb = rowbase + b * 34u;
+        float d = rdscale(bb);
+        uint qbase = bb + 2u;        // i8 qs[32] after the 2-byte scale
+        uint xb = b * 32u;
+        float bsum = 0.0;
+        for (uint j = 0u; j < 32u; j++) {
+            // sign-extend the 8-bit weight lane.
+            int q = bitfieldExtract(int(rdbyte(qbase + j)), 0, 8);
+            bsum += float(q) * x[xb + j];
+        }
+        acc += d * bsum;
+    }
+    y[n] = acc;
+}
