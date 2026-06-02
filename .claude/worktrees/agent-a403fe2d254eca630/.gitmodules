@@ -1,0 +1,3 @@
+[submodule "hanzo-ml-examples/examples/flash-attn/cutlass"]
+	path = hanzo-ml-flash-attn/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
