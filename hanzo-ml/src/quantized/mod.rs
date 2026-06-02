@@ -1098,8 +1098,44 @@ impl crate::Module for QMatMul {
                         crate::op::BackpropOp::none(),
                         false,
                     ))
+                } else if matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0)
+                    && xs.device().is_vulkan()
+                {
+                    // Prefill: keep weights quantized in VRAM and decode in-shader (M>1 matmul),
+                    // amortizing each decoded weight block across all M rows. This replaces the old
+                    // path that dequantized the ENTIRE weight to f32 every forward (the dominant
+                    // time-to-first-token cost). Flatten xs to [M, k], run the GPU matmul, reshape
+                    // the [M, n] result back to the input's batch dims with last dim = n.
+                    let xs = xs.contiguous()?;
+                    let m = xs.elem_count() / *k;
+                    let xs2 = xs.reshape((m, *k))?;
+                    let d = match xs2.device() {
+                        Device::Vulkan(d) => d,
+                        _ => crate::bail!("VulkanQuant input not on vulkan"),
+                    };
+                    let y = {
+                        let (store, _) = xs2.storage_and_layout();
+                        let xv = match &*store {
+                            crate::Storage::Vulkan(v) => v,
+                            _ => crate::bail!("VulkanQuant expected vulkan storage"),
+                        };
+                        match dtype {
+                            GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
+                            _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
+                        }
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Vulkan(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
                 } else {
-                    // Prefill: dequantize to a temporary f32 weight (reuses the NT matmul path).
+                    // Fallback (non-Q4K/Q8 dtype or non-Vulkan device): dequantize to a temporary f32
+                    // weight and reuse the NT matmul path.
                     let w = qtensor.dequantize(&xs.device())?;
                     let w = match *xs.dims() {
                         [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
