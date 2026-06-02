@@ -53,6 +53,16 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
         "sigmoid"
     }
 
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &hanzo_ml::VulkanStorage,
+        layout: &Layout,
+    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
+        let out = storage.sigmoid(layout)?;
+        Ok((out, layout.shape().clone()))
+    }
+
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
         use hanzo_ml::backend::BackendStorage;
 
