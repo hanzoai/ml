@@ -142,6 +142,12 @@ struct VkInner {
     cm_use: bool,
     // CPU-side RNG seed (kernels are deterministic; randoms are generated on the CPU then uploaded).
     seed: Mutex<u64>,
+    // Per-flush phase profiling, gated on HANZO_VK_PROFILE=1 (read once at init). When set,
+    // `flush_locked` prints, per submitted batch, the time spent recording dispatches, in
+    // queue_submit, in the fence wait, plus the dispatch and emitted-barrier counts; readbacks
+    // print their map+copy time. Lets the 8060S show where the per-token milliseconds actually go.
+    // Strictly zero-overhead when unset: the recording timer and all prints are behind this bool.
+    profile: bool,
     // VK_KHR_push_descriptor device fns, present iff the driver advertises the extension (native
     // AMD/NV; typically absent on WSL/Dozen). When set, `dispatch` pushes buffer handles inline
     // into the command buffer via `vkCmdPushDescriptorSetKHR` instead of allocating + updating +
@@ -176,6 +182,22 @@ struct Submitter {
     recording: bool,
     // Dispatches recorded into `cmd` since it was begun (bounded by BATCH_CAP).
     n: u32,
+    // Hazard tracking for selective barriers. Holds the output buffers written by dispatches
+    // recorded since the last memory barrier in the current command buffer. A new dispatch needs
+    // a barrier only if it READS a buffer in this set (a genuine read-after-write on data produced
+    // earlier in this same batch); independent dispatches (disjoint buffers, or that only read
+    // weights/inputs uploaded in an earlier already-fenced batch) record back-to-back with no
+    // barrier, so the GPU can overlap their fixed launch/drain overhead. Cleared on each emitted
+    // barrier and at the start of every batch. See `dispatch` for the correctness argument (WAW/WAR
+    // can't occur within a batch because the buffer pool only recycles handles across fences).
+    written_since_barrier: std::collections::HashSet<vk::Buffer>,
+    // Per-batch profiling accumulators (HANZO_VK_PROFILE=1). `record_ns` is the wall time spent in
+    // the dispatch recording path (descriptor push/update + cmd_dispatch + barrier bookkeeping)
+    // since the batch began; `barriers` counts memory barriers emitted this batch. Both reset per
+    // batch and are read by `flush_locked` when profiling is on. Zero-overhead otherwise (the
+    // recording timer is only sampled when the device's `profile` flag is set).
+    record_ns: u128,
+    barriers: u32,
 }
 // Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex.
 unsafe impl Send for Submitter {}
@@ -390,11 +412,20 @@ impl VulkanDevice {
         // Ensure all recorded GPU work that may write this buffer has completed.
         self.flush()?;
         let dev = self.dev();
+        // Time just the map+copy (the flush above already reports its own phases). On the decode
+        // hot path the only readback per token is the logits, so this is the per-token readback cost.
+        let t0 = self.inner.profile.then(std::time::Instant::now);
         let ptr = dev
             .map_memory(mem, 0, (n * 4) as u64, vk::MemoryMapFlags::empty())
             .map_err(vkerr)? as *const f32;
         let v = std::slice::from_raw_parts(ptr, n).to_vec();
         dev.unmap_memory(mem);
+        if let Some(t) = t0 {
+            eprintln!(
+                "[HANZO_VK_PROFILE] readback(f32): {n} elems map+copy={:.3}ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(v)
     }
 
@@ -419,11 +450,18 @@ impl VulkanDevice {
         // Ensure all recorded GPU work that may write this buffer has completed.
         self.flush()?;
         let dev = self.dev();
+        let t0 = self.inner.profile.then(std::time::Instant::now);
         let ptr = dev
             .map_memory(mem, 0, (n * 4) as u64, vk::MemoryMapFlags::empty())
             .map_err(vkerr)? as *const u32;
         let v = std::slice::from_raw_parts(ptr, n).to_vec();
         dev.unmap_memory(mem);
+        if let Some(t) = t0 {
+            eprintln!(
+                "[HANZO_VK_PROFILE] readback(u32): {n} elems map+copy={:.3}ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(v)
     }
 
@@ -514,12 +552,29 @@ impl VulkanDevice {
         Ok(cached)
     }
 
-    // Dispatch kernel `name` over `bufs` (bound 0..N) with raw push bytes and group counts.
-    // Blocks on a fence (v1 is synchronous; matches the probe).
+    // Dispatch kernel `name` over `bufs` (bound 0..N) with raw push bytes and group counts. The
+    // dispatch is recorded into the current batch's command buffer (deferred; submitted on flush).
+    // Convention: the LAST buffer is the kernel's output (the one it writes); all others are inputs.
+    // The two scatter kernels write binding 0 instead, so they call `dispatch_out` with out_idx=0.
     fn dispatch(
         &self,
         name: &'static str,
         bufs: &[vk::Buffer],
+        push: &[u8],
+        groups: (u32, u32, u32),
+    ) -> Result<()> {
+        let out_idx = bufs.len().saturating_sub(1);
+        self.dispatch_out(name, bufs, out_idx, push, groups)
+    }
+
+    // Like `dispatch`, but `out_idx` names which binding the kernel writes (its output). Used for
+    // selective hazard barriers: only a dispatch that reads a buffer produced earlier in this same
+    // batch needs a barrier before it (see `written_since_barrier`).
+    fn dispatch_out(
+        &self,
+        name: &'static str,
+        bufs: &[vk::Buffer],
+        out_idx: usize,
         push: &[u8],
         groups: (u32, u32, u32),
     ) -> Result<()> {
@@ -531,6 +586,8 @@ impl VulkanDevice {
         );
         let dev = self.dev();
         let queue = self.inner.queue;
+        let profile = self.inner.profile;
+        let rec_t0 = profile.then(std::time::Instant::now);
         let mut s = self.inner.submitter.lock().unwrap();
         unsafe {
             if !s.recording {
@@ -544,6 +601,38 @@ impl VulkanDevice {
                     .map_err(vkerr)?;
                 s.recording = true;
                 s.n = 0;
+                s.written_since_barrier.clear();
+                s.record_ns = 0;
+                s.barriers = 0;
+            }
+            // RAW hazard: if this dispatch touches a buffer that an earlier dispatch in this same
+            // batch wrote (and we haven't barriered since), insert ONE memory barrier first, then
+            // start a new barrier-free group. Independent dispatches (disjoint buffers, or reading
+            // only weights/inputs from an earlier already-fenced batch) need no barrier and the GPU
+            // can overlap their fixed launch/drain overhead -- the win on the decode hot path, which
+            // is hundreds of tiny dispatches/token where that overhead, not compute, dominates.
+            // We test ALL bindings (not just the inputs): a fresh output handle is never already in
+            // the set (the pool recycles handles only across fences, so live handles are unique
+            // in-batch), so this is exact for normal ops AND also catches the in-place scatter
+            // kernels' read-modify-write of binding 0.
+            let reads_inflight_write = bufs.iter().any(|b| s.written_since_barrier.contains(b));
+            if reads_inflight_write {
+                let bar = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )];
+                dev.cmd_pipeline_barrier(
+                    s.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &bar,
+                    &[],
+                    &[],
+                );
+                s.written_since_barrier.clear();
+                s.barriers += 1;
             }
             // Buffer infos are needed by both paths; build them once. (WriteDescriptorSet borrows
             // these, so they must outlive the update/push call below.)
@@ -614,26 +703,26 @@ impl VulkanDevice {
                 dev.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
             dev.cmd_dispatch(cmd, groups.0, groups.1, groups.2);
-            // Guard RAW/WAW hazards between consecutive dispatches that share a buffer. A single
-            // global memory barrier is conservative (it serializes the batch on the GPU) but
-            // correct for any buffer aliasing; the win here is removing host stalls, not overlap.
-            let bar = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &bar,
-                &[],
-                &[],
-            );
+            // Mark this dispatch's output live in the current barrier-free group so a later
+            // dispatch that READS it triggers the barrier above. WAW/WAR can't arise within a
+            // batch: a buffer is written only as some op's freshly-allocated output, the pool only
+            // recycles a freed buffer's handle into a new allocation AFTER a flush+fence (reclaim
+            // runs post-fence), so no two live allocations in one batch share a handle -- thus the
+            // only intra-batch hazard is RAW, which this set captures. Cross-batch ordering is the
+            // full queue_submit + fence wait in flush_locked.
+            if let Some(&out_buf) = bufs.get(out_idx) {
+                s.written_since_barrier.insert(out_buf);
+            }
             s.n += 1;
+            if profile {
+                if let Some(t0) = rec_t0 {
+                    s.record_ns += t0.elapsed().as_nanos();
+                }
+            }
             // Bound the descriptor-set budget: a forward longer than BATCH_CAP ops just flushes
             // a handful of times instead of once.
             if s.n >= BATCH_CAP {
-                flush_locked(dev, queue, &mut s)?;
+                flush_locked(dev, queue, &mut s, profile)?;
                 drop(s);
                 self.reclaim();
             }
@@ -646,9 +735,10 @@ impl VulkanDevice {
     fn flush(&self) -> Result<()> {
         let dev = self.dev();
         let queue = self.inner.queue;
+        let profile = self.inner.profile;
         {
             let mut s = self.inner.submitter.lock().unwrap();
-            flush_locked(dev, queue, &mut s)?;
+            flush_locked(dev, queue, &mut s, profile)?;
         }
         self.reclaim();
         Ok(())
@@ -728,23 +818,46 @@ fn vkerr(e: vk::Result) -> Error {
 const BATCH_CAP: u32 = 4096;
 
 // End, submit, and block on the current command batch, then mark the submitter idle. A no-op
-// when nothing is recorded. Caller must hold the submitter lock.
-fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter) -> Result<()> {
+// when nothing is recorded. Caller must hold the submitter lock. When `profile` is set, prints the
+// per-batch phase breakdown (recording / submit / fence-wait time, dispatch + barrier counts) so
+// the real GPU shows where per-token milliseconds go; the timers are only sampled when profiling.
+fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter, profile: bool) -> Result<()> {
     if !s.recording {
         return Ok(());
     }
+    let n = s.n;
+    let barriers = s.barriers;
+    let record_ms = s.record_ns as f64 / 1e6;
+    let (mut submit_ms, mut wait_ms) = (0.0f64, 0.0f64);
     unsafe {
         dev.end_command_buffer(s.cmd).map_err(vkerr)?;
         dev.reset_fences(&[s.fence]).map_err(vkerr)?;
         let cmds = [s.cmd];
+        let t_sub = profile.then(std::time::Instant::now);
         dev.queue_submit(
             queue,
             &[vk::SubmitInfo::default().command_buffers(&cmds)],
             s.fence,
         )
         .map_err(vkerr)?;
+        if let Some(t) = t_sub {
+            submit_ms = t.elapsed().as_secs_f64() * 1e3;
+        }
+        let t_wait = profile.then(std::time::Instant::now);
         dev.wait_for_fences(&[s.fence], true, u64::MAX)
             .map_err(vkerr)?;
+        if let Some(t) = t_wait {
+            wait_ms = t.elapsed().as_secs_f64() * 1e3;
+        }
+    }
+    if profile {
+        // One line per submitted batch. On decode this is ~one batch per token, so this is the
+        // per-token GPU breakdown: `dispatch` = ops recorded, `barriers` = memory barriers emitted
+        // (lower is better -- with selective barriers, independent ops in a row emit none).
+        eprintln!(
+            "[HANZO_VK_PROFILE] flush: dispatch={n} barriers={barriers} \
+             record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms",
+        );
     }
     s.recording = false;
     s.n = 0;
@@ -943,7 +1056,15 @@ impl BackendDevice for VulkanDevice {
                 dpool,
                 recording: false,
                 n: 0,
+                written_since_barrier: std::collections::HashSet::new(),
+                record_ns: 0,
+                barriers: 0,
             });
+
+            // Phase profiling: opt-in, read once here so the hot path only checks a bool.
+            let profile = std::env::var("HANZO_VK_PROFILE")
+                .map(|v| v != "0")
+                .unwrap_or(false);
 
             let inner = VkInner {
                 _entry: entry,
@@ -954,6 +1075,7 @@ impl BackendDevice for VulkanDevice {
                 gpu_id: ordinal,
                 mem_props,
                 seed: Mutex::new(299792458),
+                profile,
                 push_descriptor,
                 pipelines: Mutex::new(HashMap::new()),
                 submitter,
@@ -1290,9 +1412,12 @@ impl VulkanStorage {
         let dim_src = src_dims[dim];
         let dim_dst = dst_dims[dim];
         let n = src_l.shape().elem_count();
-        self.device.dispatch(
+        // scatter writes (and scatter_add reads) binding 0 (`self.buffer`), not the last binding,
+        // so name out_idx=0 for the hazard tracker.
+        self.device.dispatch_out(
             kernel,
             &[self.buffer, srcc.buffer, idc.buffer],
+            0,
             &push_u32(&[n as u32, right as u32, dim_src as u32, dim_dst as u32]),
             Self::groups_1d(n),
         )?;
