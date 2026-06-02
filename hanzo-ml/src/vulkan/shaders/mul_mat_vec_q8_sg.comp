@@ -17,7 +17,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // quantized weights, 9 u32 / 32-block
 layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activation vector, length k
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
-layout(push_constant) uniform Pc { uint nout; uint k; };         // k is a multiple of 32
+// woff: u32 offset into w[] where this weight matrix starts (0 for a plain 2D weight; e*n*(k/32)*9
+// to select expert e of a resident MoE bank). k is a multiple of 32.
+layout(push_constant) uniform Pc { uint nout; uint k; uint woff; };
 
 void main() {
     // One subgroup per output row. Row = global subgroup index.
@@ -26,7 +28,7 @@ void main() {
         return;
     }
     uint nblocks = k / 32u;
-    uint base = row * nblocks * 9u; // u32 offset of this row
+    uint base = woff + row * nblocks * 9u; // u32 offset of this row within the selected matrix
     uint lane = gl_SubgroupInvocationID;
     uint lanes = gl_SubgroupSize;
 

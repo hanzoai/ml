@@ -56,10 +56,6 @@ fn as_t_slice<T>(data: &[u8]) -> &[T] {
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
-    // Per-expert resident QMatMul cache for indexed_moe_forward: builds each expert's weight
-    // (from_arc -> VRAM upload/dequant) ONCE instead of per token. Arc clones share the cache; an
-    // empty map by default has no effect for non-MoE QTensors.
-    expert_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, QMatMul>>>,
 }
 
 impl Device {
@@ -524,11 +520,7 @@ impl QTensor {
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
         check_shape(&shape, storage.block_size())?;
-        Ok(Self {
-            storage,
-            shape,
-            expert_cache: Default::default(),
-        })
+        Ok(Self { storage, shape })
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
@@ -548,7 +540,6 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
-            expert_cache: Default::default(),
         })
     }
 
@@ -584,7 +575,6 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
-            expert_cache: Default::default(),
         })
     }
 
@@ -628,7 +618,6 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
-            expert_cache: Default::default(),
         })
     }
 
@@ -657,7 +646,6 @@ impl QTensor {
         Ok(Self {
             storage,
             shape: shape.clone(),
-            expert_cache: Default::default(),
         })
     }
 
@@ -762,41 +750,19 @@ impl QTensor {
                     groups.entry(*eid).or_default().push(slot as u32);
                 }
                 let dtype = self.storage.dtype();
+                let all_bytes = self.data()?;
+                let expert_bytes = all_bytes.len() / e_cnt;
                 let mut out_flat = Tensor::zeros((t * topk, n), crate::DType::F32, device)?;
-                // Only fetch (and copy) the whole bank's bytes on a cache miss; once every routed
-                // expert is resident the bank is never re-read.
-                let mut all_bytes: Option<std::borrow::Cow<[u8]>> = None;
                 for (eid, slots) in groups.into_iter() {
-                    // Resident per-expert QMatMul: from_arc (Vulkan upload/dequant) runs ONCE per
-                    // expert instead of per token. Clone the built QMatMul out of the lock before
-                    // forward so the mutex is not held across the matvec.
-                    let qm = {
-                        let mut cache = self.expert_cache.lock().unwrap();
-                        match cache.get(&eid) {
-                            Some(qm) => qm.clone(),
-                            None => {
-                                let bytes = match &all_bytes {
-                                    Some(b) => b,
-                                    None => {
-                                        all_bytes = Some(self.data()?);
-                                        all_bytes.as_ref().unwrap()
-                                    }
-                                };
-                                let expert_bytes = bytes.len() / e_cnt;
-                                let off = eid as usize * expert_bytes;
-                                let qs = QStorage::from_data(
-                                    std::borrow::Cow::Borrowed(&bytes[off..off + expert_bytes]),
-                                    device,
-                                    dtype,
-                                )?;
-                                let shape: crate::Shape = (n, k).into();
-                                let w_e = QTensor::new(qs, shape)?;
-                                let qm = QMatMul::from_arc(Arc::new(w_e))?;
-                                cache.insert(eid, qm.clone());
-                                qm
-                            }
-                        }
-                    };
+                    let off = eid as usize * expert_bytes;
+                    let qs = QStorage::from_data(
+                        std::borrow::Cow::Borrowed(&all_bytes[off..off + expert_bytes]),
+                        device,
+                        dtype,
+                    )?;
+                    let shape: crate::Shape = (n, k).into();
+                    let w_e = QTensor { storage: qs, shape };
+                    let qm = QMatMul::from_arc(Arc::new(w_e))?;
                     let m = slots.len();
                     let idx = Tensor::from_vec(slots, (m,), device)?;
                     let x_e = x_flat.index_select(&idx, 0)?; // [m, k]
@@ -842,6 +808,21 @@ pub enum QMatMul {
         n: usize,
         k: usize,
     },
+    // Resident MoE expert bank: the WHOLE [e, n, k] quantized weight uploaded to VRAM ONCE at load,
+    // kept quantized (verbatim blocks, never dequantized -- the f32 bank is a ~140GB OOM on the 35B).
+    // indexed_moe_forward indexes per routed expert by its block offset into `bank` instead of
+    // re-uploading that expert every token (the 97x-slower-than-CUDA decode bug). `per_expert_words`
+    // is the u32 stride between experts in `bank` (n * k/blocksize * gpu_block_u32 for `dtype`).
+    #[cfg(feature = "vulkan")]
+    VulkanQuantBank {
+        qtensor: std::sync::Arc<QTensor>,
+        bank: std::sync::Arc<crate::VulkanStorage>,
+        dtype: GgmlDType,
+        e: usize,
+        n: usize,
+        k: usize,
+        per_expert_words: usize,
+    },
 }
 
 thread_local! {
@@ -863,6 +844,22 @@ thread_local! {
             },
             Err(_) => false,
         }
+    }
+}
+
+// u32 words a single quantized block occupies in the GPU bank/weight buffer for `dtype`, i.e. the
+// stride the matvec/matmul shaders step by. This is the GPU (uploaded) block size, which differs
+// from the source block byte size for the padded/repacked dtypes: Q6_K source is 210 B but uploads
+// as 212 B (53 u32) and Q8_0 source is 34 B but uploads as 36 B (9 u32); Q4_K (144 B) and Q5_K
+// (176 B) upload verbatim. Returns None for dtypes with no native GPU quantized kernel.
+#[cfg(feature = "vulkan")]
+fn gpu_block_u32(dtype: GgmlDType) -> Option<usize> {
+    match dtype {
+        GgmlDType::Q8_0 => Some(9),  // 36 B / 4 (repacked from 34 B source)
+        GgmlDType::Q4K => Some(36),  // 144 B / 4 (verbatim)
+        GgmlDType::Q5K => Some(44),  // 176 B / 4 (verbatim)
+        GgmlDType::Q6K => Some(53),  // 212 B / 4 (210 B source padded to 212)
+        _ => None,
     }
 }
 
@@ -913,17 +910,64 @@ impl QMatMul {
                 }
                 _ => {}
             }
-            // 3D quantized expert banks ([E,n,k]): keep the WHOLE bank quantized (QTensor) and let
-            // indexed_moe_forward dequantize only the routed experts per token. Dequantizing all E
-            // experts to f32 here is the 140GB OOM on a 35B MoE (the expert banks are ~all the
-            // weights). This covers every quantized dtype the Q4_K_XL/M mix uses (Q4K/Q5K/Q6K/Q8_0):
-            // the Q4K rows get the in-shader-decode matvec, the rest dequantize per selected expert
-            // (still tiny -- only `topk` experts materialize, never the full bank).
+            // 3D quantized expert banks ([E,n,k]): upload the WHOLE bank to VRAM ONCE here, kept
+            // quantized (verbatim blocks, NEVER dequantized -- the f32 bank is a ~140GB OOM on the
+            // 35B MoE). indexed_moe_forward then runs each routed expert's matvec/matmul by indexing
+            // its block offset into the resident `bank`, with NO per-token re-upload (the prior path
+            // re-uploaded every active expert every token: 97x slower than CUDA). Covers the
+            // Q4_K_XL/M mix dtypes that have a native GPU quantized kernel (Q4K gate/up, Q6K down,
+            // Q5K, Q8_0). A bank dtype with no kernel (e.g. Q4_0/Q2K) keeps the old QTensor path.
             let is_quantized = !matches!(
                 qtensor.dtype(),
                 GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
             );
             if is_quantized && qtensor.shape().rank() == 3 {
+                let dtype = qtensor.dtype();
+                if let Ok((e, n, k)) = qtensor.shape().dims3() {
+                    let bs8 = GgmlDType::Q8_0.block_size();
+                    // Q4K/Q8_0 banks upload verbatim (their woff kernels are proven: Q4K via the 35B
+                    // attention path, Q8 via the dense path). Other quantized dtypes (Q5K/Q6K, e.g. the
+                    // Q4_K_M down-experts) requantize to Q8 at load -- identical numerics to the old
+                    // per-token Q6K->Q8 path, but resident -- since their verbatim matvec kernels are
+                    // unproven. One bank's f32 transient is sub-GB, not the whole-model OOM.
+                    let built = if matches!(dtype, GgmlDType::Q4K) && k % dtype.block_size() == 0 {
+                        Some((d.quantize_q4k(qtensor.data()?.as_ref(), e * n, k)?, GgmlDType::Q4K))
+                    } else if matches!(dtype, GgmlDType::Q8_0) && k % bs8 == 0 {
+                        Some((
+                            d.quantize_q8_blocks(qtensor.data()?.as_ref(), e * n, k)?,
+                            GgmlDType::Q8_0,
+                        ))
+                    } else if k % bs8 == 0 {
+                        let wf = qtensor
+                            .dequantize(&Device::Cpu)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?;
+                        Some((d.quantize_q8(&wf, e * n, k)?, GgmlDType::Q8_0))
+                    } else {
+                        None
+                    };
+                    if let Some((bank, store)) = built {
+                        let blk_u32 = gpu_block_u32(store).expect("Q4K/Q8 have gpu blocks");
+                        let per_expert_words = n * (k / store.block_size()) * blk_u32;
+                        // A stride mismatch means we would silently read the wrong expert at forward.
+                        assert_eq!(
+                            bank.len_words(),
+                            e * per_expert_words,
+                            "vulkan MoE bank stride mismatch: {} words != {e}*{per_expert_words}",
+                            bank.len_words()
+                        );
+                        return Ok(Self::VulkanQuantBank {
+                            qtensor,
+                            bank: std::sync::Arc::new(bank),
+                            dtype: store,
+                            e,
+                            n,
+                            k,
+                            per_expert_words,
+                        });
+                    }
+                }
+                // Unsupported bank dtype/shape: keep the per-expert dequant QTensor path.
                 return Ok(Self::QTensor(qtensor));
             }
             // Any other 2D quantized linear (Q6K down/output, Q5K, Q4_0, Q5_0, ...) has no native
@@ -980,6 +1024,8 @@ impl QMatMul {
             Self::TensorF16(t) => Ok(t.clone()),
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuantBank { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
         }
     }
 
@@ -999,10 +1045,136 @@ impl QMatMul {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuantBank {
+                bank,
+                dtype,
+                e,
+                n,
+                k,
+                per_expert_words,
+                ..
+            } => self.bank_indexed_moe_forward(x, ids, bank, *dtype, *e, *n, *k, *per_expert_words),
             _ => {
                 panic!("Not implemented!")
             }
         }
+    }
+
+    /// Resident-bank MoE forward (Vulkan). The whole [E,n,k] quantized expert bank is already in VRAM
+    /// (`bank`); this routes tokens to experts, groups slots by expert, and for each selected expert
+    /// dispatches a banked matvec (decode: that expert has m==1 routed slot) or banked matmul
+    /// (prefill: m>1) AT the expert's u32 offset (`eid * per_expert_words`) into `bank`, accumulating
+    /// into the output. NO per-expert re-upload, NO whole-bank f32 dequant -- the fix for the 97x
+    /// decode regression. Mirrors the group-by-expert/index_select/index_add structure of the old
+    /// QTensor path so the routing math is unchanged; only the per-expert weight access differs.
+    #[cfg(feature = "vulkan")]
+    #[allow(clippy::too_many_arguments)]
+    fn bank_indexed_moe_forward(
+        &self,
+        x: &Tensor,
+        ids: &Tensor,
+        bank: &crate::VulkanStorage,
+        dtype: GgmlDType,
+        e_cnt: usize,
+        n: usize,
+        k: usize,
+        per_expert_words: usize,
+    ) -> Result<Tensor> {
+        use std::collections::HashMap;
+        let device = x.device();
+        let d = match device {
+            Device::Vulkan(d) => d.clone(),
+            _ => crate::bail!("VulkanQuantBank indexed_moe_forward: input not on vulkan"),
+        };
+        let out_dtype = x.dtype();
+        let (t, topk) = ids.dims2()?;
+        let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+        let x_exp = if s == topk {
+            x.clone()
+        } else {
+            x.broadcast_as((t, topk, k))?
+        };
+        // Flatten activations to [t*topk, k] f32 contiguous (the matvec/matmul kernels read f32 x).
+        let x_flat = x_exp
+            .reshape((t * topk, k))?
+            .to_dtype(crate::DType::F32)?
+            .contiguous()?;
+        let ids_flat = ids.reshape((t * topk,))?.to_dtype(crate::DType::U32)?;
+        let ids_vec = ids_flat.to_vec1::<u32>()?;
+        let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (slot, eid) in ids_vec.iter().enumerate() {
+            groups.entry(*eid).or_default().push(slot as u32);
+        }
+        let mut out_flat = Tensor::zeros((t * topk, n), crate::DType::F32, device)?;
+        for (eid, slots) in groups.into_iter() {
+            if eid as usize >= e_cnt {
+                crate::bail!("VulkanQuantBank: expert id {eid} >= E {e_cnt}");
+            }
+            let woff = eid as usize * per_expert_words;
+            let m = slots.len();
+            let idx = Tensor::from_vec(slots, (m,), device)?;
+            let x_e = x_flat.index_select(&idx, 0)?.contiguous()?; // [m, k]
+            // Run expert `eid` at its block offset in the resident bank. Decode is m==1 (matvec);
+            // prefill m>1 uses the banked matmul where one exists (Q4K/Q8), else loops the matvec per
+            // row (Q5K/Q6K have no matmul kernel) -- still no re-upload, weights stay quantized.
+            let y_store = {
+                let (store, _) = x_e.storage_and_layout();
+                let xv = match &*store {
+                    crate::Storage::Vulkan(v) => v,
+                    _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
+                };
+                if m == 1 {
+                    match dtype {
+                        GgmlDType::Q4K => d.matvec_q4k_gpu_off(bank, xv, n, k, woff)?,
+                        GgmlDType::Q5K => d.matvec_q5k_gpu_off(bank, xv, n, k, woff)?,
+                        GgmlDType::Q6K => d.matvec_q6k_gpu_off(bank, xv, n, k, woff)?,
+                        _ => d.matvec_q8_gpu_off(bank, xv, n, k, woff)?,
+                    }
+                } else {
+                    match dtype {
+                        GgmlDType::Q4K => d.matmul_q4k_gpu_off(bank, xv, m, n, k, woff)?,
+                        GgmlDType::Q8_0 => d.matmul_q8_gpu_off(bank, xv, m, n, k, woff)?,
+                        // No matmul kernel for this dtype: one banked matvec per routed row.
+                        _ => {
+                            let mut rows = Vec::with_capacity(m);
+                            for r in 0..m {
+                                let xr = x_e.narrow(0, r, 1)?.contiguous()?;
+                                let (rstore, _) = xr.storage_and_layout();
+                                let rv = match &*rstore {
+                                    crate::Storage::Vulkan(v) => v,
+                                    _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
+                                };
+                                let yr = match dtype {
+                                    GgmlDType::Q5K => d.matvec_q5k_gpu_off(bank, rv, n, k, woff)?,
+                                    GgmlDType::Q6K => d.matvec_q6k_gpu_off(bank, rv, n, k, woff)?,
+                                    _ => d.matvec_q8_gpu_off(bank, rv, n, k, woff)?,
+                                };
+                                let yr = crate::tensor::from_storage(
+                                    crate::Storage::Vulkan(yr),
+                                    (1usize, n),
+                                    crate::op::BackpropOp::none(),
+                                    false,
+                                );
+                                rows.push(yr);
+                            }
+                            let y = Tensor::cat(&rows, 0)?;
+                            out_flat = out_flat.index_add(&idx, &y, 0)?;
+                            continue;
+                        }
+                    }
+                }
+            };
+            // matvec returns [n]; matmul returns [m*n]. Reshape to [m, n] for index_add.
+            let y_e = crate::tensor::from_storage(
+                crate::Storage::Vulkan(y_store),
+                (m, n),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            out_flat = out_flat.index_add(&idx, &y_e, 0)?;
+        }
+        out_flat.reshape((t, topk, n))?.to_dtype(out_dtype)
     }
 }
 
@@ -1132,8 +1304,44 @@ impl crate::Module for QMatMul {
                         crate::op::BackpropOp::none(),
                         false,
                     ))
+                } else if matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0)
+                    && xs.device().is_vulkan()
+                {
+                    // Prefill: keep weights quantized in VRAM and decode in-shader (M>1 matmul),
+                    // amortizing each decoded weight block across all M rows. This replaces the old
+                    // path that dequantized the ENTIRE weight to f32 every forward (the dominant
+                    // time-to-first-token cost). Flatten xs to [M, k], run the GPU matmul, reshape
+                    // the [M, n] result back to the input's batch dims with last dim = n.
+                    let xs = xs.contiguous()?;
+                    let m = xs.elem_count() / *k;
+                    let xs2 = xs.reshape((m, *k))?;
+                    let d = match xs2.device() {
+                        Device::Vulkan(d) => d,
+                        _ => crate::bail!("VulkanQuant input not on vulkan"),
+                    };
+                    let y = {
+                        let (store, _) = xs2.storage_and_layout();
+                        let xv = match &*store {
+                            crate::Storage::Vulkan(v) => v,
+                            _ => crate::bail!("VulkanQuant expected vulkan storage"),
+                        };
+                        match dtype {
+                            GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
+                            _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
+                        }
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Vulkan(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
                 } else {
-                    // Prefill: dequantize to a temporary f32 weight (reuses the NT matmul path).
+                    // Fallback (non-Q4K/Q8 dtype or non-Vulkan device): dequantize to a temporary f32
+                    // weight and reuse the NT matmul path.
                     let w = qtensor.dequantize(&xs.device())?;
                     let w = match *xs.dims() {
                         [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
@@ -1142,6 +1350,12 @@ impl crate::Module for QMatMul {
                     };
                     xs.matmul(&w)
                 }
+            }
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuantBank { .. } => {
+                // A 3D MoE expert bank has no single-matrix forward; it is only ever driven through
+                // indexed_moe_forward (the engine never calls .forward on an expert bank).
+                crate::bail!("VulkanQuantBank: use indexed_moe_forward, not forward")
             }
             Self::QTensor(t) => {
                 // The `qmatmul` CustomOp1 has no correct Vulkan path for non-VulkanQuant weights
