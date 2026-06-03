@@ -264,6 +264,10 @@ struct Submitter {
     // recording timer is only sampled when the device's `profile` flag is set).
     record_ns: u128,
     barriers: u32,
+    // Per-batch dispatch histogram by kernel name (HANZO_VK_PROFILE=1 only). Lets flush_locked
+    // print which kernels dominate the per-token dispatch/barrier count so fusion targets the
+    // right ops. Reset per batch; empty/untouched when profiling is off.
+    op_counts: std::collections::HashMap<&'static str, u32>,
 }
 // Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex.
 unsafe impl Send for Submitter {}
@@ -2107,6 +2111,7 @@ impl VulkanDevice {
                 if let Some(t0) = rec_t0 {
                     s.record_ns += t0.elapsed().as_nanos();
                 }
+                *s.op_counts.entry(name).or_insert(0) += 1;
             }
             // Bound the descriptor-set budget: a forward longer than BATCH_CAP ops just flushes
             // a handful of times instead of once.
@@ -2303,7 +2308,18 @@ fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter, profile:
             "[HANZO_VK_PROFILE] flush: dispatch={n} barriers={barriers} \
              record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms",
         );
+        // Per-op histogram (top 14 by dispatch count) so fusion targets the dominant kernels.
+        let mut ops: Vec<(&&'static str, &u32)> = s.op_counts.iter().collect();
+        ops.sort_by(|a, b| b.1.cmp(a.1));
+        let hist = ops
+            .iter()
+            .take(14)
+            .map(|(name, c)| format!("{name}={c}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("[HANZO_VK_PROFILE]   ops: {hist}");
     }
+    s.op_counts.clear();
     s.recording = false;
     s.n = 0;
     Ok(())
@@ -2610,6 +2626,7 @@ impl BackendDevice for VulkanDevice {
                 written_since_barrier: std::collections::HashSet::new(),
                 record_ns: 0,
                 barriers: 0,
+                op_counts: std::collections::HashMap::new(),
             });
 
             // Phase profiling: opt-in, read once here so the hot path only checks a bool.
