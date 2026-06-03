@@ -362,12 +362,23 @@ struct PooledBuf {
 // Size-class for the reuse pool. Decode attention allocates transient tensors whose size grows by
 // one token each step (score [b,h,1,cur_len], softmax, att@v); keying `free` by exact byte size
 // means every token requests a never-before-seen size, so nothing is ever reused and each token
-// leaks a fresh buffer -> O(seq^2) device memory -> OOM on long generations. Rounding the physical
-// allocation up to a coarse class collapses those ever-growing sizes onto O(log seq) buckets so a
-// later token's larger request reuses an earlier (now bucket-sized) buffer. Small buffers stay
-// exact (no waste, they already reuse fine); only allocations above the threshold round to the next
-// power of two (<=2x over-allocation, bounded -- which is the point).
-const POOL_EXACT_MAX: u64 = 64 * 1024; // <=64KiB: key by exact size (no rounding, no waste).
+// leaks a fresh buffer -> O(seq^2) device memory -> OOM on long generations. That LEAK is bounded by
+// the idle-pool cap below (reclaim() destroys idle buffers over POOL_FREE_CAP_BYTES); the cap alone
+// is sufficient to prevent the OOM.
+//
+// CORRECTNESS: keys MUST be exact byte size. Power-of-two bucketing (rounding a >64KiB request up to
+// the next pow2 so a later differently-sized request can reuse the buffer) was tried (commit
+// d9b70910) and silently CORRUPTED inference: a reused bucket buffer is physically larger than the
+// current logical tensor, and a consumer reads into the stale tail [logical, physical), producing
+// garbled (non-deterministic) logits on EVERY model (0.6B and 8B both reproduced; CPU + native
+// llama.cpp Vulkan stayed coherent on the same GPU+model, proving it was this pool, not the
+// GPU/driver/model). The invariant the bucketing assumed ("kernels touch only the first n elems via
+// their push-constant count, tail unused") does not hold somewhere on the readback/copy path. Exact
+// keys keep physical == logical so there is never a stale tail. Re-enabling cross-size reuse for the
+// growing attention-score buffers is a PERF follow-up (find the physical-size-reading consumer and
+// make it honor the logical count, or zero reused buffers) -- not a correctness one; the cap below
+// already bounds memory.
+const POOL_EXACT_MAX: u64 = u64::MAX; // always exact: pow2 bucketing corrupts inference (see above).
 
 const fn pool_bucket(bytes: u64) -> u64 {
     let b = if bytes < 4 { 4 } else { bytes };
@@ -869,9 +880,14 @@ impl VulkanDevice {
         let xs = self.alloc_f32(m * nblocks)?;
         let xsum = self.alloc_f32(m * nblocks)?;
         let qpush = push_u32(&[m as u32, k as u32]);
-        self.dispatch(
+        // quantize_act_q8 WRITES xq(1), xs(2), xsum(3); mark all three so a later in-batch reader gets
+        // the RAW barrier. The default dispatch() marks only the last binding (xsum) -- but mul_mat_q8_dp4a
+        // reads xq+xs and NOT xsum, so without this the matmul races the still-running quantizer and reads
+        // unwritten int8 activations (garbage). The Q4_K consumer reads xsum and so was accidentally safe.
+        self.dispatch_outs(
             "quantize_act_q8",
             &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
+            &[1, 2, 3],
             &qpush,
             (((m * nblocks) as u32).div_ceil(WG1D), 1, 1),
         )?;
@@ -991,9 +1007,13 @@ impl VulkanDevice {
         let xs = self.alloc_f32(m * nb32)?;
         let xsum = self.alloc_f32(m * nb32)?;
         let qpush = push_u32(&[m as u32, k as u32]);
-        self.dispatch(
+        // Mark all three outputs (xq, xs, xsum) so an in-batch consumer barriers correctly regardless of
+        // which it reads -- see the matching note in matmul_q8_dp4a_gpu_off (the Q8 consumer reads xq+xs
+        // but not xsum, so relying on the default last-binding-only marking misses the hazard).
+        self.dispatch_outs(
             "quantize_act_q8",
             &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
+            &[1, 2, 3],
             &qpush,
             (((m * nb32) as u32).div_ceil(WG1D), 1, 1),
         )?;
