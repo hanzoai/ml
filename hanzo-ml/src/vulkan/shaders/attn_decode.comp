@@ -1,0 +1,57 @@
+#version 450
+// Fused single-query (decode, seq_len==1) attention with online (flash-style) softmax.
+// One workgroup per (batch, query-head); loops the KV length doing q.k -> online-softmax ->
+// weighted-v accumulation, GQA-aware. Replaces the repeat_kv + bmm(QK^T) + softmax_rows + bmm(*V)
+// + contiguous chain (~10 dispatches/layer) with ONE dispatch. All tensors f32, row-major contiguous:
+//   q:[B,H,1,D]  k,v:[B,Hkv,L,D]  out:[B,H,1,D].  scale = 1/sqrt(D) (or model softmax_scale).
+// Requires D == local_size_x and D a power of two <= 128 (Qwen3 head_dim=128); the caller must check.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly  buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly  buffer K { float k[]; };
+layout(set = 0, binding = 2) readonly  buffer V { float v[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform Pc { uint B; uint H; uint Hkv; uint L; uint D; float scale; };
+
+shared float red[128];   // dot-product reduction scratch
+shared float sh_score;   // broadcast q.k[j] across the workgroup
+
+void main() {
+    uint bh = gl_WorkGroupID.x;       // flat (batch, query-head)
+    uint b = bh / H;
+    if (b >= B) { return; }
+    uint h = bh - b * H;
+    uint kvh = h / (H / Hkv);         // GQA: query-head -> kv-head
+    uint t = gl_LocalInvocationID.x;  // dimension index 0..D-1
+
+    uint q_base = (b * H + h) * D;
+    uint kv_base = (b * Hkv + kvh) * L * D;
+
+    float qd = (t < D) ? q[q_base + t] : 0.0;
+
+    float m = -1e30;  // running max (scalar, identical across threads)
+    float l = 0.0;    // running sum of exp (scalar)
+    float acc = 0.0;  // running weighted-v for this thread's dimension t
+
+    for (uint j = 0u; j < L; j++) {
+        red[t] = (t < D) ? qd * k[kv_base + j * D + t] : 0.0;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1) {
+            if (t < s && t + s < D) { red[t] += red[t + s]; }
+            barrier();
+        }
+        if (t == 0u) { sh_score = red[0] * scale; }
+        barrier();
+        float score = sh_score;
+
+        float m_new = max(m, score);
+        float corr = exp(m - m_new);
+        float p = exp(score - m_new);
+        l = l * corr + p;
+        acc = acc * corr + p * ((t < D) ? v[kv_base + j * D + t] : 0.0);
+        m = m_new;
+        barrier();  // sh_score consumed before the next iteration overwrites red/sh_score
+    }
+
+    if (t < D) { o[q_base + t] = acc / l; }
+}
