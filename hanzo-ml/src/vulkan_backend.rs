@@ -46,6 +46,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm_coopmat_rb" => spv!("bmm_coopmat_rb"),
         "bmm_coopmat_rb_nt" => spv!("bmm_coopmat_rb_nt"),
         "cast_f2h" => spv!("cast_f2h"),
+        "cast_h2f" => spv!("cast_h2f"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_0" => spv!("mul_mat_vec_q8_0"),
         "mul_mat_vec_q4_0" => spv!("mul_mat_vec_q4_0"),
@@ -2215,6 +2216,19 @@ impl BackendStorage for VulkanStorage {
                 )?;
                 Ok(out)
             }
+            // f16/bf16 are REPRESENTED as f32 on this backend (see zeros_impl / alloc_uninit), so any
+            // cast among {f32, f16, bf16} is a representation no-op -- just contiguous-ize (preserves
+            // full f32 precision, same f32-backed result the old CPU path produced). The model casts
+            // q/k/v to the model dtype and the attention output back to f32 every layer; routing those
+            // through the CPU fired ~4200 GPU->CPU->GPU syncs/run -> ~0.6 T/s.
+            (DType::F32, DType::F16)
+            | (DType::F32, DType::BF16)
+            | (DType::F16, DType::F32)
+            | (DType::BF16, DType::F32)
+            | (DType::F16, DType::F16)
+            | (DType::BF16, DType::BF16)
+            | (DType::F16, DType::BF16)
+            | (DType::BF16, DType::F16) => self.contiguous(layout),
             // Other dtypes aren't held by this backend: CPU-convert then upload.
             _ => {
                 self.device.profile_fallback(
