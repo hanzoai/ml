@@ -70,6 +70,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "index_select" => spv!("index_select"),
         "where_cond" => spv!("where_cond"),
         "softmax_rows" => spv!("softmax_rows"),
+        "attn_decode" => spv!("attn_decode"),
         "rms_norm" => spv!("rms_norm"),
         "rope" => spv!("rope"),
         "sin" => spv!("sin"),
@@ -500,6 +501,48 @@ impl VulkanDevice {
         k: usize,
     ) -> Result<VulkanStorage> {
         self.matvec_q8_gpu_off(wq, x, nout, k, 0)
+    }
+
+    /// Fused single-query (decode) attention: `out[B,H,1,D] = softmax(scale * Q.Kᵀ) · V`, GQA-aware,
+    /// in ONE dispatch (online softmax). Collapses the repeat_kv + QKᵀ bmm + softmax + ·V bmm +
+    /// contiguous chain (~10 dispatches/layer) that dominates decode. Inputs row-major contiguous f32:
+    /// q:[B,H,1,D], k/v:[B,Hkv,L,D]. Requires head_dim a power of two <= 128 (matches the kernel's
+    /// 128-wide workgroup + shared-memory dot-product reduction); callers without that shape keep the
+    /// eager bmm path.
+    pub fn attn_decode_gpu(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        b: usize,
+        h: usize,
+        hkv: usize,
+        l: usize,
+        d: usize,
+        scale: f32,
+    ) -> Result<VulkanStorage> {
+        if d == 0 || d > 128 || !d.is_power_of_two() {
+            crate::bail!("attn_decode_gpu: head_dim {d} must be a power of two in 1..=128");
+        }
+        if h % hkv != 0 {
+            crate::bail!("attn_decode_gpu: H {h} not a multiple of Hkv {hkv}");
+        }
+        let out = self.alloc_f32(b * h * d)?;
+        let push = push_u32(&[
+            b as u32,
+            h as u32,
+            hkv as u32,
+            l as u32,
+            d as u32,
+            scale.to_bits(),
+        ]);
+        self.dispatch(
+            "attn_decode",
+            &[q.buffer, k.buffer, v.buffer, out.buffer],
+            &push,
+            ((b * h) as u32, 1, 1),
+        )?;
+        Ok(out)
     }
 
     /// Q8_0 matvec into a slice of `wq` starting at `woff` u32 words: `y[nout] = Wq[woff..] * x[k]`.
