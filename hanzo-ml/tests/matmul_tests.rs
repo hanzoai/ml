@@ -102,7 +102,7 @@ fn tensor_mv() -> Result<()> {
     Ok(())
 }
 
-// https://github.com/huggingface/hanzo/issues/1948
+// https://github.com/hanzoai/ml/issues/1948
 fn squeeze_mm(device: &Device) -> Result<()> {
     let seq_len = 8_usize;
     let a = Tensor::zeros((1, seq_len, 16), DType::F32, device)?;
@@ -113,7 +113,7 @@ fn squeeze_mm(device: &Device) -> Result<()> {
     Ok(())
 }
 
-// https://github.com/huggingface/hanzo/issues/1992
+// https://github.com/hanzoai/ml/issues/1992
 fn mm_layout(device: &Device) -> Result<()> {
     let a = Tensor::arange(0f32, 16f32, device)?.reshape((1, 1, 4, 4))?;
     let b = Tensor::arange(0f32, 8f32, device)?.reshape((1, 1, 4, 2))?;
