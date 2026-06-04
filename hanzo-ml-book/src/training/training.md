@@ -1,7 +1,7 @@
 # Training
 
 
-Training starts with data. We're going to use the huggingface hub and 
+Training starts with data. We're going to use the huggingface hub and
 start with the Hello world dataset of machine learning, MNIST.
 
 Let's start with downloading `MNIST` from [huggingface](https://huggingface.co/datasets/mnist).
