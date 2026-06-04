@@ -15,7 +15,7 @@ struct Args {
 
     /// The input to be processed, in wav format, will default to `jfk.wav`. Alternatively
     /// this can be set to sample:jfk, sample:gb1, ... to fetch a sample from the following
-    /// repo: https://huggingface.co/datasets/Narsil/candle_demo/
+    /// repo: https://huggingface.co/datasets/Narsil/hanzo_demo/
     #[arg(long)]
     input: Option<String>,
 
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
             std::path::PathBuf::from(input)
         }
     } else {
-        println!("No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/candle_demo/blob/main/samples_jfk.wav");
+        println!("No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/hanzo_demo/blob/main/samples_jfk.wav");
         dataset.get("samples_jfk.wav")?
     };
 
