@@ -1053,6 +1053,18 @@ pub enum QMatMul {
         n: usize,
         k: usize,
     },
+    // Resident-bank MoE (Vulkan): the whole [E,n,k] quantized expert bank lives in VRAM; routing
+    // dispatches banked matvec/matmul at each expert offset (no per-token re-upload, no f32 dequant).
+    #[cfg(feature = "vulkan")]
+    VulkanQuantBank {
+        qtensor: std::sync::Arc<QTensor>,
+        bank: std::sync::Arc<crate::VulkanStorage>,
+        dtype: GgmlDType,
+        e: usize,
+        n: usize,
+        k: usize,
+        per_expert_words: usize,
+    },
     // wgpu mirror of VulkanQuant: GGML quantized blocks live in VRAM and decode (1 row) runs the
     // matching native-GGML quant matvec WGSL kernel straight out of the block format. Prefill (>1
     // row) dequantizes to a temporary f32 weight. `dtype` selects the kernel; `n`/`k` are the dims.
@@ -1172,6 +1184,8 @@ impl QMatMul {
             Self::TensorF16(t) => Ok(t.clone()),
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuantBank { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
             #[cfg(feature = "wgpu")]
             Self::WgpuQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
         }
@@ -1193,12 +1207,186 @@ impl QMatMul {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuantBank {
+                bank,
+                dtype,
+                e,
+                n,
+                k,
+                per_expert_words,
+                ..
+            } => self.bank_indexed_moe_forward(x, ids, bank, *dtype, *e, *n, *k, *per_expert_words),
             #[cfg(feature = "wgpu")]
             Self::WgpuQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
             _ => {
                 panic!("Not implemented!")
             }
         }
+    }
+
+    /// Resident-bank MoE forward (Vulkan). The whole [E,n,k] quantized expert bank is already in VRAM
+    /// (`bank`); this routes tokens to experts, groups slots by expert, and for each selected expert
+    /// dispatches a banked matvec (decode: that expert has m==1 routed slot) or banked matmul
+    /// (prefill: m>1) AT the expert's u32 offset (`eid * per_expert_words`) into `bank`, accumulating
+    /// into the output. NO per-expert re-upload, NO whole-bank f32 dequant -- the fix for the 97x
+    /// decode regression. Mirrors the group-by-expert/index_select/index_add structure of the old
+    /// QTensor path so the routing math is unchanged; only the per-expert weight access differs.
+    #[cfg(feature = "vulkan")]
+    #[allow(clippy::too_many_arguments)]
+    fn bank_indexed_moe_forward(
+        &self,
+        x: &Tensor,
+        ids: &Tensor,
+        bank: &crate::VulkanStorage,
+        dtype: GgmlDType,
+        e_cnt: usize,
+        n: usize,
+        k: usize,
+        per_expert_words: usize,
+    ) -> Result<Tensor> {
+        use std::collections::HashMap;
+        let device = x.device();
+        let d = match device {
+            Device::Vulkan(d) => d.clone(),
+            _ => crate::bail!("VulkanQuantBank indexed_moe_forward: input not on vulkan"),
+        };
+        let out_dtype = x.dtype();
+        let (t, topk) = ids.dims2()?;
+        let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+        let x_exp = if s == topk {
+            x.clone()
+        } else {
+            x.broadcast_as((t, topk, k))?
+        };
+        // Flatten activations to [t*topk, k] f32 contiguous (the matvec/matmul kernels read f32 x).
+        let x_flat = x_exp
+            .reshape((t * topk, k))?
+            .to_dtype(crate::DType::F32)?
+            .contiguous()?;
+        let ids_flat = ids
+            .reshape((t * topk,))?
+            .to_dtype(crate::DType::U32)?
+            .contiguous()?;
+        let m_all = t * topk;
+        // Fused grouped matvec: ONE dispatch per projection reads the routed expert id per slot from a
+        // GPU buffer and computes every routed-slot output at once -- NO routing-ids GPU->CPU sync, NO
+        // HashMap, NO Tensor::zeros, NO index_select/index_add. Decode is bit-identical to the
+        // matvec_*_gpu_off kernels. Handles BOTH decode (t==1) and prefill (t>1): slots index
+        // x_flat/ids_flat directly. Banks are only ever stored Q4K (gate/up) or Q8_0 (down, and any
+        // Q5K/Q6K requantized at load); any other dtype falls through to the loop below.
+        if matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0) {
+            let (xstore, _) = x_flat.storage_and_layout();
+            let xv = match &*xstore {
+                crate::Storage::Vulkan(v) => v,
+                _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
+            };
+            let (istore, _) = ids_flat.storage_and_layout();
+            let iv = match &*istore {
+                crate::Storage::Vulkan(v) => v,
+                _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
+            };
+            let y_store = match dtype {
+                GgmlDType::Q4K => {
+                    d.mul_mat_vec_id_q4k_gpu(bank, xv, iv, m_all, n, k, per_expert_words)?
+                }
+                _ => d.mul_mat_vec_id_q8_gpu(bank, xv, iv, m_all, n, k, per_expert_words)?,
+            };
+            let y = crate::tensor::from_storage(
+                crate::Storage::Vulkan(y_store),
+                (m_all, n),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            return y.reshape((t, topk, n))?.to_dtype(out_dtype);
+        }
+        // Fallback (no id-kernel for this bank dtype): group slots by expert on the CPU and run a
+        // banked matvec/matmul per expert. The one-edit revert to this path: replace the
+        // `matches!(dtype, ..)` guard above with `false`.
+        let ids_vec = ids_flat.to_vec1::<u32>()?;
+        let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (slot, eid) in ids_vec.iter().enumerate() {
+            groups.entry(*eid).or_default().push(slot as u32);
+        }
+        let mut out_flat = Tensor::zeros((t * topk, n), crate::DType::F32, device)?;
+        for (eid, slots) in groups.into_iter() {
+            if eid as usize >= e_cnt {
+                crate::bail!("VulkanQuantBank: expert id {eid} >= E {e_cnt}");
+            }
+            let woff = eid as usize * per_expert_words;
+            let m = slots.len();
+            let idx = Tensor::from_vec(slots, (m,), device)?;
+            let x_e = x_flat.index_select(&idx, 0)?.contiguous()?; // [m, k]
+            // Run expert `eid` at its block offset in the resident bank. Decode is m==1 (matvec);
+            // prefill m>1 uses the banked matmul where one exists (Q4K/Q8), else loops the matvec per
+            // row (Q5K/Q6K have no matmul kernel) -- still no re-upload, weights stay quantized.
+            let y_store = {
+                let (store, _) = x_e.storage_and_layout();
+                let xv = match &*store {
+                    crate::Storage::Vulkan(v) => v,
+                    _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
+                };
+                if m == 1 {
+                    match dtype {
+                        GgmlDType::Q4K => d.matvec_q4k_gpu_off(bank, xv, n, k, woff)?,
+                        GgmlDType::Q5K => d.matvec_q5k_gpu_off(bank, xv, n, k, woff)?,
+                        GgmlDType::Q6K => d.matvec_q6k_gpu_off(bank, xv, n, k, woff)?,
+                        _ => d.matvec_q8_gpu_off(bank, xv, n, k, woff)?,
+                    }
+                } else {
+                    match dtype {
+                        // Q4_K banked prefill: int8 dp4a when the device has hw int8 dot, else
+                        // f32-decode. Both run at the bank's woff with no re-upload.
+                        GgmlDType::Q4K if d.int_dot8() => {
+                            d.matmul_q4k_dp4a_gpu_off(bank, xv, m, n, k, woff)?
+                        }
+                        GgmlDType::Q4K => d.matmul_q4k_gpu_off(bank, xv, m, n, k, woff)?,
+                        // Q8_0 banked prefill: int8 dp4a when the device has hw int8 dot, else
+                        // f32-decode. Both run at the bank's woff with no re-upload.
+                        GgmlDType::Q8_0 if d.int_dot8() => {
+                            d.matmul_q8_dp4a_gpu_off(bank, xv, m, n, k, woff)?
+                        }
+                        GgmlDType::Q8_0 => d.matmul_q8_gpu_off(bank, xv, m, n, k, woff)?,
+                        // No matmul kernel for this dtype: one banked matvec per routed row.
+                        _ => {
+                            let mut rows = Vec::with_capacity(m);
+                            for r in 0..m {
+                                let xr = x_e.narrow(0, r, 1)?.contiguous()?;
+                                let (rstore, _) = xr.storage_and_layout();
+                                let rv = match &*rstore {
+                                    crate::Storage::Vulkan(v) => v,
+                                    _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
+                                };
+                                let yr = match dtype {
+                                    GgmlDType::Q5K => d.matvec_q5k_gpu_off(bank, rv, n, k, woff)?,
+                                    GgmlDType::Q6K => d.matvec_q6k_gpu_off(bank, rv, n, k, woff)?,
+                                    _ => d.matvec_q8_gpu_off(bank, rv, n, k, woff)?,
+                                };
+                                let yr = crate::tensor::from_storage(
+                                    crate::Storage::Vulkan(yr),
+                                    (1usize, n),
+                                    crate::op::BackpropOp::none(),
+                                    false,
+                                );
+                                rows.push(yr);
+                            }
+                            let y = Tensor::cat(&rows, 0)?;
+                            out_flat = out_flat.index_add(&idx, &y, 0)?;
+                            continue;
+                        }
+                    }
+                }
+            };
+            // matvec returns [n]; matmul returns [m*n]. Reshape to [m, n] for index_add.
+            let y_e = crate::tensor::from_storage(
+                crate::Storage::Vulkan(y_store),
+                (m, n),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            out_flat = out_flat.index_add(&idx, &y_e, 0)?;
+        }
+        out_flat.reshape((t, topk, n))?.to_dtype(out_dtype)
     }
 }
 
@@ -1321,7 +1509,48 @@ impl crate::Module for QMatMul {
                             GgmlDType::Q4_0 => d.matvec_q4_0_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q8_0 => d.matvec_q8_0_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
-                            other => crate::bail!("VulkanQuant: no native matvec for {other:?}"),
+                            _ => d.matvec_q8_gpu(wq, xv, *n, *k)?,
+                        }
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Vulkan(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                } else if matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0)
+                    && xs.device().is_vulkan()
+                {
+                    // Prefill: keep weights quantized in VRAM and decode in-shader (M>1 matmul),
+                    // amortizing each decoded weight block across all M rows. This replaces the old
+                    // path that dequantized the ENTIRE weight to f32 every forward (the dominant
+                    // time-to-first-token cost). Flatten xs to [M, k], run the GPU matmul, reshape
+                    // the [M, n] result back to the input's batch dims with last dim = n.
+                    let xs = xs.contiguous()?;
+                    let m = xs.elem_count() / *k;
+                    let xs2 = xs.reshape((m, *k))?;
+                    let d = match xs2.device() {
+                        Device::Vulkan(d) => d,
+                        _ => crate::bail!("VulkanQuant input not on vulkan"),
+                    };
+                    let y = {
+                        let (store, _) = xs2.storage_and_layout();
+                        let xv = match &*store {
+                            crate::Storage::Vulkan(v) => v,
+                            _ => crate::bail!("VulkanQuant expected vulkan storage"),
+                        };
+                        match dtype {
+                            // Q4_K prefill: int8 dp4a (compute-bound lever) when the device has hw
+                            // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
+                            GgmlDType::Q4K if d.int_dot8() => d.matmul_q4k_dp4a_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
+                            // Q8_0 prefill: int8 dp4a (compute-bound lever) when the device has hw
+                            // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
+                            _ if d.int_dot8() => d.matmul_q8_dp4a_gpu(wq, xv, m, *n, *k)?,
+                            _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
                         }
                     };
                     let mut dims = xs.dims().to_vec();
@@ -1343,6 +1572,12 @@ impl crate::Module for QMatMul {
                     };
                     xs.matmul(&w)
                 }
+            }
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuantBank { .. } => {
+                // A resident MoE expert bank has no single-matrix forward; it is only driven through
+                // indexed_moe_forward (the engine never calls .forward on an expert bank).
+                crate::bail!("VulkanQuantBank: use indexed_moe_forward, not forward")
             }
             #[cfg(feature = "wgpu")]
             Self::WgpuQuant {
