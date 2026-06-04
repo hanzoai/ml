@@ -48,3 +48,5 @@ bria.mp3
 bria.safetensors
 bria.wav
 hanzo-ml-inference
+
+.claude/
