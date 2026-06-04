@@ -23,15 +23,15 @@ const uint ROWS_PER_SG = 4u;
 // Dequantized dot of one 32-block: 8 u32 words (4 int8 each) against the 32 staged activations.
 // `off` points at the block's scale word; the 8 payload words follow. Returns sum_i q_i * xr_i
 // (the per-block fp16 scale is applied by the caller).
-float blockdot(uint off, float xr[32]) {
+float blockdot(uint off, uint xb) {
     float s = 0.0;
     for (uint j = 0u; j < 8u; j++) {
         uint word = w[off + 1u + j];
-        uint xo = j * 4u;
-        s += float(bitfieldExtract(int(word), 0, 8))  * xr[xo + 0u];
-        s += float(bitfieldExtract(int(word), 8, 8))  * xr[xo + 1u];
-        s += float(bitfieldExtract(int(word), 16, 8)) * xr[xo + 2u];
-        s += float(bitfieldExtract(int(word), 24, 8)) * xr[xo + 3u];
+        uint xo = xb + j * 4u;
+        s += float(bitfieldExtract(int(word), 0, 8))  * x[xo + 0u];
+        s += float(bitfieldExtract(int(word), 8, 8))  * x[xo + 1u];
+        s += float(bitfieldExtract(int(word), 16, 8)) * x[xo + 2u];
+        s += float(bitfieldExtract(int(word), 24, 8)) * x[xo + 3u];
     }
     return s;
 }
@@ -55,16 +55,12 @@ void main() {
 
     float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
     for (uint blk = lane; blk < nblocks; blk += lanes) {
-        float xr[32];
         uint xb = blk * 32u;
-        for (uint i = 0u; i < 32u; i++) {
-            xr[i] = x[xb + i];
-        }
         uint d = blk * 9u;
-        acc0 += unpackHalf2x16(w[b0 + d]).x * blockdot(b0 + d, xr);
-        if (h1) { acc1 += unpackHalf2x16(w[b1 + d]).x * blockdot(b1 + d, xr); }
-        if (h2) { acc2 += unpackHalf2x16(w[b2 + d]).x * blockdot(b2 + d, xr); }
-        if (h3) { acc3 += unpackHalf2x16(w[b3 + d]).x * blockdot(b3 + d, xr); }
+        acc0 += unpackHalf2x16(w[b0 + d]).x * blockdot(b0 + d, xb);
+        if (h1) { acc1 += unpackHalf2x16(w[b1 + d]).x * blockdot(b1 + d, xb); }
+        if (h2) { acc2 += unpackHalf2x16(w[b2 + d]).x * blockdot(b2 + d, xb); }
+        if (h3) { acc3 += unpackHalf2x16(w[b3 + d]).x * blockdot(b3 + d, xb); }
     }
 
     float t0 = subgroupAdd(acc0);
