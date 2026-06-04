@@ -680,6 +680,8 @@ impl Tensor {
             Storage::Rocm(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             #[cfg(feature = "vulkan")]
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -1956,6 +1958,8 @@ impl Tensor {
             Storage::Rocm(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             #[cfg(feature = "vulkan")]
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -1991,6 +1995,8 @@ impl Tensor {
             Storage::Rocm(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             #[cfg(feature = "vulkan")]
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2036,6 +2042,8 @@ impl Tensor {
             Storage::Rocm(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             #[cfg(feature = "vulkan")]
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2398,6 +2406,8 @@ impl Tensor {
                 (Storage::Rocm(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 #[cfg(feature = "vulkan")]
                 (Storage::Vulkan(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+                #[cfg(feature = "wgpu")]
+                (Storage::Wgpu(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 #[cfg(feature = "rocm")]
                 (Storage::Cpu(storage), Device::Rocm(rocm)) => {
                     Storage::Rocm(rocm.storage_from_cpu_storage(storage)?)
@@ -2405,6 +2415,10 @@ impl Tensor {
                 #[cfg(feature = "vulkan")]
                 (Storage::Cpu(storage), Device::Vulkan(vulkan)) => {
                     Storage::Vulkan(vulkan.storage_from_cpu_storage(storage)?)
+                }
+                #[cfg(feature = "wgpu")]
+                (Storage::Cpu(storage), Device::Wgpu(wgpu)) => {
+                    Storage::Wgpu(wgpu.storage_from_cpu_storage(storage)?)
                 }
                 #[cfg(feature = "rocm")]
                 (Storage::Rocm(storage), Device::Rocm(rocm)) => {
@@ -2415,6 +2429,11 @@ impl Tensor {
                 (Storage::Vulkan(storage), Device::Vulkan(vulkan)) => {
                     let cpu_storage = storage.to_cpu_storage()?;
                     Storage::Vulkan(vulkan.storage_from_cpu_storage(&cpu_storage)?)
+                }
+                #[cfg(feature = "wgpu")]
+                (Storage::Wgpu(storage), Device::Wgpu(wgpu)) => {
+                    let cpu_storage = storage.to_cpu_storage()?;
+                    Storage::Wgpu(wgpu.storage_from_cpu_storage(&cpu_storage)?)
                 }
                 (Storage::Cuda(storage), Device::Cuda(cuda)) => {
                     // TODO: Avoid passing through the cpu storage here, especially if the gpu ids
