@@ -166,7 +166,7 @@ impl KernelCache {
 /// Detect the GPU architecture (e.g., "gfx908", "gfx90a", "gfx942")
 fn detect_gpu_arch(_device: &Device) -> Result<String, KernelError> {
     // First try to get from environment variable (useful for testing/build machines)
-    if let Ok(arch) = std::env::var("HANZO_ROCM_ARCH") {
+    if let Ok(arch) = std::env::var("ROCM_ARCH") {
         return Ok(arch);
     }
 
@@ -200,7 +200,7 @@ fn detect_gpu_arch(_device: &Device) -> Result<String, KernelError> {
             Ok("gfx908".to_string())
         }
         Err(e) => Err(KernelError::Compilation(format!(
-            "hipcc not found: {}. Please install ROCm or set HANZO_ROCM_ARCH environment variable",
+            "hipcc not found: {}. Please install ROCm or set ROCM_ARCH environment variable",
             e
         ))),
     }
@@ -209,7 +209,7 @@ fn detect_gpu_arch(_device: &Device) -> Result<String, KernelError> {
 /// Detect ROCm version
 fn detect_rocm_version() -> Result<String, KernelError> {
     // Try to get from environment variable first
-    if let Ok(version) = std::env::var("HANZO_ROCM_VERSION") {
+    if let Ok(version) = std::env::var("ROCM_VERSION") {
         return Ok(version);
     }
 
@@ -230,7 +230,7 @@ fn detect_rocm_version() -> Result<String, KernelError> {
             Ok("6.0".to_string())
         }
         Err(e) => Err(KernelError::Compilation(format!(
-            "hipcc not found: {}. Please install ROCm or set HANZO_ROCM_VERSION environment variable",
+            "hipcc not found: {}. Please install ROCm or set ROCM_VERSION environment variable",
             e
         ))),
     }
