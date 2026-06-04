@@ -151,7 +151,7 @@ struct CachedPipeline {
 }
 
 // Device-memory placement strategy for storage buffers, set once at init from
-// HANZO_VK_DEVICE_MEMORY_STRATEGY. On this RDNA3.5 UMA APU the host-visible "VRAM carveout" heap
+// VK_DEVICE_MEMORY_STRATEGY. On this RDNA3.5 UMA APU the host-visible "VRAM carveout" heap
 // is small (a few hundred MB), while the large unified pool (~GTT, tens of GB of the 128GB system
 // RAM) is exposed as a DEVICE_LOCAL-only heap. A pure host-visible policy therefore OOMs an 18.6GB
 // model even though there is ample memory; we must be able to place big buffers in the large heap.
@@ -201,11 +201,11 @@ struct VkInner {
     cm_mnk: (u32, u32, u32),
     // Whether matmul uses the register-blocked coopmat kernel (bmm_coopmat_rb). Default ON when the
     // device advertises coopmat (measured 1.3-2.7x over fp32 bmm_reg on the real AMD driver, full
-    // forward argmax matches CPU); HANZO_VK_COOPMAT=0 forces the fp32 path.
+    // forward argmax matches CPU); VK_COOPMAT=0 forces the fp32 path.
     cm_use: bool,
     // CPU-side RNG seed (kernels are deterministic; randoms are generated on the CPU then uploaded).
     seed: Mutex<u64>,
-    // Per-flush phase profiling, gated on HANZO_VK_PROFILE=1 (read once at init). When set,
+    // Per-flush phase profiling, gated on VK_PROFILE=1 (read once at init). When set,
     // `flush_locked` prints, per submitted batch, the time spent recording dispatches, in
     // queue_submit, in the fence wait, plus the dispatch and emitted-barrier counts; readbacks
     // print their map+copy time. Lets the 8060S show where the per-token milliseconds actually go.
@@ -216,7 +216,7 @@ struct VkInner {
     // into the command buffer via `vkCmdPushDescriptorSetKHR` instead of allocating + updating +
     // binding a descriptor set per op — three driver calls and two heap Vecs per dispatch collapse
     // to one recorded command, which is the dominant CPU cost on the decode hot path (the same op
-    // graph, hundreds of dispatches x 28 layers, re-recorded every token). Set HANZO_VK_PUSH_DESC=0
+    // graph, hundreds of dispatches x 28 layers, re-recorded every token). Set VK_PUSH_DESC=0
     // to force the legacy alloc+update path. Pipelines' set layouts are created with the
     // PUSH_DESCRIPTOR_KHR flag exactly when this is `Some`, so the two paths never mix.
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
@@ -254,7 +254,7 @@ struct Submitter {
     // barrier and at the start of every batch. See `dispatch` for the correctness argument (WAW/WAR
     // can't occur within a batch because the buffer pool only recycles handles across fences).
     written_since_barrier: std::collections::HashSet<vk::Buffer>,
-    // Per-batch profiling accumulators (HANZO_VK_PROFILE=1). `record_ns` is the wall time spent in
+    // Per-batch profiling accumulators (VK_PROFILE=1). `record_ns` is the wall time spent in
     // the dispatch recording path (descriptor push/update + cmd_dispatch + barrier bookkeeping)
     // since the batch began; `barriers` counts memory barriers emitted this batch. Both reset per
     // batch and are read by `flush_locked` when profiling is on. Zero-overhead otherwise (the
@@ -1755,7 +1755,7 @@ impl VulkanDevice {
         dev.unmap_memory(mem);
         if let Some(t) = t0 {
             eprintln!(
-                "[HANZO_VK_PROFILE] readback(f32): {n} elems map+copy={:.3}ms",
+                "[VK_PROFILE] readback(f32): {n} elems map+copy={:.3}ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -1813,7 +1813,7 @@ impl VulkanDevice {
         dev.unmap_memory(mem);
         if let Some(t) = t0 {
             eprintln!(
-                "[HANZO_VK_PROFILE] readback(u32): {n} elems map+copy={:.3}ms",
+                "[VK_PROFILE] readback(u32): {n} elems map+copy={:.3}ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -2228,7 +2228,7 @@ impl VulkanDevice {
         self.upload_u32(ids)
     }
 
-    // Name a CPU-fallback round-trip when HANZO_VK_PROFILE is set. Each fallback op reads its
+    // Name a CPU-fallback round-trip when VK_PROFILE is set. Each fallback op reads its
     // operand(s) back to the host, computes on the (UNtimed) CPU, and re-uploads -- a hidden
     // bottleneck the size-only readback log can't attribute to an op. This names the culprit so a
     // GPU re-run can prioritize which op to port native next. Zero-cost when profiling is off (the
@@ -2237,7 +2237,7 @@ impl VulkanDevice {
     #[inline]
     fn profile_fallback(&self, op: &str, extra: std::fmt::Arguments<'_>) {
         if self.inner.profile {
-            eprintln!("[HANZO_VK_PROFILE] cpu-fallback op={op} {extra} (GPU->CPU->GPU round-trip)");
+            eprintln!("[VK_PROFILE] cpu-fallback op={op} {extra} (GPU->CPU->GPU round-trip)");
         }
     }
 }
@@ -2289,7 +2289,7 @@ fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter, profile:
         // per-token GPU breakdown: `dispatch` = ops recorded, `barriers` = memory barriers emitted
         // (lower is better -- with selective barriers, independent ops in a row emit none).
         eprintln!(
-            "[HANZO_VK_PROFILE] flush: dispatch={n} barriers={barriers} \
+            "[VK_PROFILE] flush: dispatch={n} barriers={barriers} \
              record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms",
         );
     }
@@ -2404,9 +2404,9 @@ impl BackendDevice for VulkanDevice {
             // Default ON when the device advertises coopmat: the register-blocked kernel
             // (bmm_coopmat_rb) measured 1.3-2.7x over the fp32 bmm_reg on the real AMD driver and a
             // full Qwen3-0.6B forward's argmax matched CPU exactly (fp16 inputs, fp32 accumulate).
-            // Set HANZO_VK_COOPMAT=0 to force the fp32 path (e.g. if precision matters).
+            // Set VK_COOPMAT=0 to force the fp32 path (e.g. if precision matters).
             let cm_use = coopmat
-                && std::env::var("HANZO_VK_COOPMAT")
+                && std::env::var("VK_COOPMAT")
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
@@ -2415,14 +2415,14 @@ impl BackendDevice for VulkanDevice {
             // descriptor set per op. That per-op churn is the dominant CPU cost on the decode hot
             // path (same op graph, hundreds of dispatches x 28 layers, re-recorded every token), so
             // collapsing it to one recorded command is the lever. Enabled when advertised (native
-            // AMD/NV; typically absent on WSL/Dozen, which keeps the legacy path). HANZO_VK_PUSH_DESC=0
+            // AMD/NV; typically absent on WSL/Dozen, which keeps the legacy path). VK_PUSH_DESC=0
             // forces the legacy path. The extension's guaranteed maxPushDescriptors >= 32 dwarfs our
             // widest kernel (4 storage buffers), so no per-pipeline limit check is needed.
             let has_pd_ext = dev_exts.iter().any(|e| {
                 CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::push_descriptor::NAME
             });
             let use_pd = has_pd_ext
-                && std::env::var("HANZO_VK_PUSH_DESC")
+                && std::env::var("VK_PUSH_DESC")
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
@@ -2430,7 +2430,7 @@ impl BackendDevice for VulkanDevice {
             // big buffers (e.g. an 18.6GB model's weights) to the largest DEVICE_LOCAL heap (the GTT
             // pool on this UMA APU), which is where the real capacity lives. `host_only` restores the
             // legacy host-visible-only behaviour; `device_first` forces big-heap placement always.
-            let mem_strategy = match std::env::var("HANZO_VK_DEVICE_MEMORY_STRATEGY")
+            let mem_strategy = match std::env::var("VK_DEVICE_MEMORY_STRATEGY")
                 .ok()
                 .as_deref()
                 .map(str::trim)
@@ -2440,7 +2440,7 @@ impl BackendDevice for VulkanDevice {
                 Some("auto") | None | Some("") => MemStrategy::Auto,
                 Some(other) => {
                     eprintln!(
-                        "[vulkan] unknown HANZO_VK_DEVICE_MEMORY_STRATEGY=`{other}` (expected host_only|device_first|auto); using auto"
+                        "[vulkan] unknown VK_DEVICE_MEMORY_STRATEGY=`{other}` (expected host_only|device_first|auto); using auto"
                     );
                     MemStrategy::Auto
                 }
@@ -2455,7 +2455,7 @@ impl BackendDevice for VulkanDevice {
 
             // Subgroup capability (core in Vulkan 1.1+, which the 1.3 instance guarantees). The q8
             // mat-vec subgroup kernel uses subgroupAdd (ARITHMETIC) at COMPUTE-stage scope, so we
-            // require both before enabling it. HANZO_VK_SUBGROUP_MATVEC=0 forces the scalar kernel.
+            // require both before enabling it. VK_SUBGROUP_MATVEC=0 forces the scalar kernel.
             let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
             {
                 // p2 mutably borrows sg_props via push_next; scope it so the borrow ends before we
@@ -2475,7 +2475,7 @@ impl BackendDevice for VulkanDevice {
             let subgroup_matvec = sg_compute
                 && sg_arith
                 && subgroup_size >= 2
-                && std::env::var("HANZO_VK_SUBGROUP_MATVEC")
+                && std::env::var("VK_SUBGROUP_MATVEC")
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
@@ -2573,7 +2573,7 @@ impl BackendDevice for VulkanDevice {
             });
 
             // Phase profiling: opt-in, read once here so the hot path only checks a bool.
-            let profile = std::env::var("HANZO_VK_PROFILE")
+            let profile = std::env::var("VK_PROFILE")
                 .map(|v| v != "0")
                 .unwrap_or(false);
 
@@ -3929,7 +3929,7 @@ impl BackendStorage for VulkanStorage {
         }
         if self.device.inner.profile {
             eprintln!(
-                "[HANZO_VK_PROFILE] copy2d(native): d1={d1} d2={d2} elems={total} \
+                "[VK_PROFILE] copy2d(native): d1={d1} d2={d2} elems={total} \
                  (was a CPU round-trip; now on-GPU)"
             );
         }
