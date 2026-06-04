@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-ml"
-version = "0.9.2"
+version = "0.10.3"
 edition = "2021"
 description = "Minimalist ML framework."
 repository = "https://github.com/hanzoai/ml"
@@ -20,6 +20,8 @@ cudarc = { workspace = true, optional = true }
 rocm-rs = { workspace = true, optional = true }
 hanzo-rocm-kernels = { workspace = true, optional = true }
 ash = { version = "0.38", optional = true }
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }
 gemm = { workspace = true }
 half = { workspace = true }
 float8 = { workspace = true }
@@ -36,6 +38,8 @@ safetensors = { workspace = true }
 thiserror = { workspace = true }
 yoke = { workspace = true }
 zip = { workspace = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { workspace = true, features = ["onig"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
 hanzo-ug = { workspace = true, optional = true }
@@ -52,6 +56,7 @@ cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 rocm = ["dep:rocm-rs", "dep:hanzo-rocm-kernels"]
 vulkan = ["dep:ash"]
+wgpu = ["dep:wgpu", "dep:pollster"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = [

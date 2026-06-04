@@ -6,6 +6,8 @@ use crate::RocmStorage;
 #[cfg(feature = "vulkan")]
 use crate::VulkanStorage;
 use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape};
+#[cfg(feature = "wgpu")]
+use crate::WgpuStorage;
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
 // We do not want to implement Clone on Storage as cloning may fail because of
@@ -19,6 +21,8 @@ pub enum Storage {
     Rocm(RocmStorage),
     #[cfg(feature = "vulkan")]
     Vulkan(VulkanStorage),
+    #[cfg(feature = "wgpu")]
+    Wgpu(WgpuStorage),
 }
 
 impl Storage {
@@ -43,6 +47,11 @@ impl Storage {
                 let storage = storage.try_clone(layout)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.try_clone(layout)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -55,6 +64,8 @@ impl Storage {
             Self::Rocm(storage) => Device::Rocm(storage.device().clone()),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(storage) => Device::Vulkan(storage.device().clone()),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => Device::Wgpu(storage.device().clone()),
         }
     }
 
@@ -67,6 +78,8 @@ impl Storage {
             Self::Rocm(storage) => storage.dtype(),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(storage) => storage.dtype(),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => storage.dtype(),
         }
     }
 
@@ -109,6 +122,8 @@ impl Storage {
             Storage::Rocm(storage) => storage.const_set(v, l),
             #[cfg(feature = "vulkan")]
             Storage::Vulkan(storage) => storage.const_set(v, l),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(storage) => storage.const_set(v, l),
         }
     }
 
@@ -135,6 +150,11 @@ impl Storage {
             Self::Vulkan(storage) => {
                 let storage = storage.affine(layout, mul, add)?;
                 Ok(Self::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.affine(layout, mul, add)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -163,6 +183,11 @@ impl Storage {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.powf(layout, alpha)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -189,6 +214,11 @@ impl Storage {
             Self::Vulkan(storage) => {
                 let storage = storage.elu(layout, alpha)?;
                 Ok(Self::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.elu(layout, alpha)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -224,6 +254,11 @@ impl Storage {
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
+                let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::Wgpu(storage))
             }
             (lhs, rhs) => {
                 // Should not happen because of the same device check above but we're defensive
@@ -262,6 +297,11 @@ impl Storage {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.reduce_op(op, layout, s)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -289,6 +329,11 @@ impl Storage {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.to_dtype(layout, dtype)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -315,6 +360,11 @@ impl Storage {
             Self::Vulkan(storage) => {
                 let (storage, shape) = c.vulkan_fwd(storage, l)?;
                 Ok((Self::Vulkan(storage), shape))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let (storage, shape) = c.wgpu_fwd(storage, l)?;
+                Ok((Self::Wgpu(storage), shape))
             }
         }
     }
@@ -349,6 +399,11 @@ impl Storage {
             (Self::Vulkan(s1), Self::Vulkan(s2)) => {
                 let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Vulkan(s), shape))
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s1), Self::Wgpu(s2)) => {
+                let (s, shape) = c.wgpu_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Wgpu(s), shape))
             }
             _ => unreachable!(),
         }
@@ -388,6 +443,11 @@ impl Storage {
                 let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::Vulkan(s), shape))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => {
+                let (s, shape) = c.wgpu_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Wgpu(s), shape))
+            }
             _ => unreachable!(),
         }
     }
@@ -401,6 +461,8 @@ impl Storage {
             Self::Rocm(storage) => c.rocm_fwd(storage, l),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(storage) => c.vulkan_fwd(storage, l),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => c.wgpu_fwd(storage, l),
         }
     }
 
@@ -420,6 +482,8 @@ impl Storage {
             (Self::Rocm(s1), Self::Rocm(s2)) => c.rocm_fwd(s1, l1, s2, l2),
             #[cfg(feature = "vulkan")]
             (Self::Vulkan(s1), Self::Vulkan(s2)) => c.vulkan_fwd(s1, l1, s2, l2),
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s1), Self::Wgpu(s2)) => c.wgpu_fwd(s1, l1, s2, l2),
             _ => unreachable!(),
         }
     }
@@ -446,6 +510,10 @@ impl Storage {
             #[cfg(feature = "vulkan")]
             (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
                 c.vulkan_fwd(s1, l1, s2, l2, s3, l3)
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => {
+                c.wgpu_fwd(s1, l1, s2, l2, s3, l3)
             }
             _ => unreachable!(),
         }
@@ -474,6 +542,11 @@ impl Storage {
             Self::Vulkan(storage) => {
                 let storage = storage.unary_impl::<B>(layout)?;
                 Ok(Self::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.unary_impl::<B>(layout)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -508,6 +581,11 @@ impl Storage {
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
+                let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::Wgpu(storage))
             }
             (lhs, rhs) => {
                 // Should not happen because of the same device check above but we're defensive
@@ -554,6 +632,11 @@ impl Storage {
                 let s = inp.conv1d(l, kernel, kernel_l, params)?;
                 Ok(Self::Vulkan(s))
             }
+            #[cfg(feature = "wgpu")]
+            (Storage::Wgpu(inp), Storage::Wgpu(kernel)) => {
+                let s = inp.conv1d(l, kernel, kernel_l, params)?;
+                Ok(Self::Wgpu(s))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -594,6 +677,11 @@ impl Storage {
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
                 Ok(Self::Vulkan(s))
+            }
+            #[cfg(feature = "wgpu")]
+            (Storage::Wgpu(inp), Storage::Wgpu(kernel)) => {
+                let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
+                Ok(Self::Wgpu(s))
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
@@ -636,6 +724,11 @@ impl Storage {
                 let s = inp.conv2d(l, kernel, kernel_l, params)?;
                 Ok(Self::Vulkan(s))
             }
+            #[cfg(feature = "wgpu")]
+            (Storage::Wgpu(inp), Storage::Wgpu(kernel)) => {
+                let s = inp.conv2d(l, kernel, kernel_l, params)?;
+                Ok(Self::Wgpu(s))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -677,6 +770,11 @@ impl Storage {
                 let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;
                 Ok(Self::Vulkan(s))
             }
+            #[cfg(feature = "wgpu")]
+            (Storage::Wgpu(inp), Storage::Wgpu(kernel)) => {
+                let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;
+                Ok(Self::Wgpu(s))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -715,6 +813,11 @@ impl Storage {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -747,6 +850,11 @@ impl Storage {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.max_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -774,6 +882,11 @@ impl Storage {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.upsample_nearest1d(layout, sz)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -800,6 +913,11 @@ impl Storage {
             Self::Vulkan(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
                 Ok(Self::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -841,6 +959,12 @@ impl Storage {
                     storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -877,6 +1001,11 @@ impl Storage {
             (Self::Vulkan(cond), Self::Vulkan(t), Self::Vulkan(f)) => {
                 let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
                 Ok(Self::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(cond), Self::Wgpu(t), Self::Wgpu(f)) => {
+                let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
+                Ok(Self::Wgpu(storage))
             }
             (_, lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
@@ -918,6 +1047,11 @@ impl Storage {
                 let storage = s.gather(l, indexes, indexes_l, d)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s), Self::Wgpu(indexes)) => {
+                let storage = s.gather(l, indexes, indexes_l, d)?;
+                Ok(Self::Wgpu(storage))
+            }
             _ => unreachable!(),
         }
     }
@@ -949,6 +1083,10 @@ impl Storage {
             }
             #[cfg(feature = "vulkan")]
             (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s), Self::Wgpu(indexes), Self::Wgpu(source)) => {
                 s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             _ => unreachable!(),
@@ -983,6 +1121,10 @@ impl Storage {
             }
             #[cfg(feature = "vulkan")]
             (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s), Self::Wgpu(indexes), Self::Wgpu(source)) => {
                 s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             _ => unreachable!(),
@@ -1024,6 +1166,11 @@ impl Storage {
                 let storage = s.index_add(l, indexes, indexes_l, source, source_l, d)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s), Self::Wgpu(indexes), Self::Wgpu(source)) => {
+                let storage = s.index_add(l, indexes, indexes_l, source, source_l, d)?;
+                Ok(Self::Wgpu(storage))
+            }
             _ => unreachable!(),
         }
     }
@@ -1058,6 +1205,11 @@ impl Storage {
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
                 Ok(Self::Vulkan(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
+                let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
+                Ok(Self::Wgpu(storage))
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
@@ -1100,6 +1252,11 @@ impl Storage {
                 let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
                 Ok(Self::Vulkan(storage))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
+                let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
+                Ok(Self::Wgpu(storage))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -1126,6 +1283,10 @@ impl Storage {
             (Self::Rocm(src), Self::Rocm(dst)) => Ok(src.copy_strided_src(dst, dst_offset, src_l)?),
             #[cfg(feature = "vulkan")]
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
+                Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(src), Self::Wgpu(dst)) => {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
@@ -1162,6 +1323,10 @@ impl Storage {
             }
             #[cfg(feature = "vulkan")]
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
+                Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(src), Self::Wgpu(dst)) => {
                 Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
