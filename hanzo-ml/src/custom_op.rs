@@ -9,7 +9,7 @@ use crate::WgpuStorage;
 use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
 use std::sync::Arc;
 
-/// Name a custom/inplace op that has no native Vulkan path when `HANZO_VK_PROFILE` is set, before
+/// Name a custom/inplace op that has no native Vulkan path when `VK_PROFILE` is set, before
 /// it bails. The size-only readback profiler can't attribute a missing op to a name; this surfaces
 /// the exact op (+ its shape) so a GPU re-run knows which `vulkan_fwd` override to add next. The
 /// env read is on the cold bail path only (the op errors out right after), so it's effectively
@@ -17,9 +17,9 @@ use std::sync::Arc;
 /// `#[cfg(feature = "vulkan")]`), so it never touches other backends.
 #[cfg(feature = "vulkan")]
 fn log_vulkan_custom_op_bail(name: &str, l: &Layout) {
-    if std::env::var("HANZO_VK_PROFILE").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("VK_PROFILE").map(|v| v != "0").unwrap_or(false) {
         eprintln!(
-            "[HANZO_VK_PROFILE] custom-op bail op={name} shape={:?} (no vulkan_fwd; would round-trip/err)",
+            "[VK_PROFILE] custom-op bail op={name} shape={:?} (no vulkan_fwd; would round-trip/err)",
             l.shape().dims()
         );
     }
