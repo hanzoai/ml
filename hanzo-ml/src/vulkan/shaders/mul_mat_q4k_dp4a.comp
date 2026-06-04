@@ -1,0 +1,132 @@
+#version 450
+// Q4_K prefill matmul via hardware int8 dot product (the compute-bound prefill lever for Q4_K weights:
+// attention projections + MoE gate/up experts in Q4_K_M/XL). Same result as mul_mat_q4k -- y[m,n] =
+// sum_k x[m,k]*W[n,k], W stored as verbatim GGUF Q4_K super-blocks -- but instead of decoding each
+// weight to f32 and doing f32 MACs vs f32 activations, it dp4a's the 4-bit codes against PRE-QUANTIZED
+// int8 activations (quantize_act_q8, reused across all N columns). A Q4_K super-block is 256 weights /
+// 144 bytes = 36 u32; per 32-weight sub-block weight = d1*q4 - m1 with q4 in 0..15, d1 = d*sc6,
+// m1 = dmin*min6 (d,m,q decode IDENTICAL to mul_mat_vec_q4k / mul_mat_q4k -- a wrong nibble/scale/min
+// is a systematic bias that garbles output). The 8 sub-blocks of a super-block align 1:1 with the 8
+// contiguous 32-element activation blocks (sub-block 2c = lower nibbles of qs chunk c -> act block
+// blk*8+2c; sub-block 2c+1 = upper nibbles -> act block blk*8+2c+1), so each uses that block's int8
+// codes xq + f32 scale xs + dequantized block sum xsum.
+//
+// Affine per sub-block: x_i ~= xs*xq_i, so
+//   sum_i x_i*w_i = sum_i x_i*(d1*q4_i - m1) = d1*sum_i(x_i*q4_i) - m1*sum_i(x_i)
+//                 ~= d1*xs*dot(q4, xq) - m1*xsum   (xsum = xs*sum_i(xq_i), the dequantized block sum).
+// The +d1*xs*dot term is the dp4a; the -m1*xsum term is the zero-point/min correction (its sign and
+// the xsum it multiplies must be exact, else systematic bias). dot(q4, xq): q4 in 0..15 zero-extends
+// to a byte whose high bit is 0, i.e. a NON-NEGATIVE signed int8 with the identical value, so the
+// plain signed OpSDotAccSat (q4 as signed 0..15) x (xq signed -127..127) is exact -- no mixed-sign
+// dot needed. Worst-case |acc| over a block is 32*15*127 = 60960, far inside int32 and below the
+// saturation threshold, so AccSat == plain accumulate here.
+//
+// One invocation computes one output column n for up to MAX_M rows; the host tiles M by MAX_M and
+// passes woff (0 for a plain weight; e*nout*(k/256)*36 to select expert e of a resident MoE bank).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// glslang 14.0 lacks the GL_EXT_shader_integer_dot_product builtins, so declare OpSDotAccSat (opcode
+// 4453) directly: int32 saturating acc += dot(unpack_s8x4(a), unpack_s8x4(b)). The trailing
+// PackedVectorFormat is a literal (4x8Bit == 0). Capabilities 6018 (DotProduct) + 6019
+// (DotProductInput4x8BitPacked) and SPV_KHR_integer_dot_product are attached so the module validates.
+// The device gate (int_dot8) guarantees this is only dispatched where the feature/property are present.
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4453)
+  int sdot_accsat(int a, int b, int acc, spirv_literal int fmt);
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W    { uint  w[];    }; // Q4_K blocks, 36 u32 / 256-block
+layout(set = 0, binding = 1) readonly buffer XQ   { uint  xq[];   }; // int8 acts, 4/u32, [M, k/32, 8]
+layout(set = 0, binding = 2) readonly buffer XS   { float xs[];   }; // act block scales, [M, k/32]
+layout(set = 0, binding = 3) readonly buffer XSUM { float xsum[]; }; // act block sums (xs*sum xq), [M, k/32]
+layout(set = 0, binding = 4) writeonly buffer Y   { float y[];    }; // output, row-major [M, nout]
+// m0: first activation row this dispatch handles; mcount: rows in this tile (1..MAX_M); nout: total
+// columns; k: contraction dim (multiple of 256). xq block stride is 8 u32; xs/xsum row strides are
+// k/32; y row stride is nout. woff: u32 offset into w[] where this weight matrix starts.
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
+
+const uint QK_K = 256u;
+const uint BLK_U32 = 36u; // 144 bytes / 4
+const uint MAX_M = 8u;    // register accumulators per invocation; host tiles M by this
+const int  FMT4x8 = 0;    // PackedVectorFormat4x8Bit
+
+// Byte `b` (0-based) out of the block's scale region (u32[1..4], i.e. the 12 scale bytes).
+uint scale_byte(uint base, uint b) {
+    uint word = w[base + 1u + (b >> 2u)];
+    return (word >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+// get_scale_min_k4 from k_quants/utils.rs: returns packed (sc<<8 | m), each 6-bit. Bit-for-bit
+// identical to mul_mat_vec_q4k / mul_mat_q4k.
+uint get_scale_min_k4(uint base, uint j) {
+    uint sc, m;
+    if (j < 4u) {
+        sc = scale_byte(base, j) & 63u;
+        m  = scale_byte(base, j + 4u) & 63u;
+    } else {
+        uint s_j4 = scale_byte(base, j + 4u);
+        uint s_jm4 = scale_byte(base, j - 4u);
+        uint s_j = scale_byte(base, j);
+        sc = (s_j4 & 0x0Fu) | ((s_jm4 >> 6u) << 4u);
+        m  = (s_j4 >> 4u)   | ((s_j   >> 6u) << 4u);
+    }
+    return (sc << 8u) | m;
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / QK_K;
+    uint rowbase = woff + n * nblocks * BLK_U32; // u32 offset of weight row n within the selected matrix
+    float acc[MAX_M];
+    for (uint r = 0u; r < MAX_M; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint blk = 0u; blk < nblocks; blk++) {
+        uint base = rowbase + blk * BLK_U32;
+        float d    = float(unpackHalf2x16(w[base]).x);
+        float dmin = float(unpackHalf2x16(w[base]).y);
+        uint qbase = base + 4u;     // u32 index where the 128 quant bytes start
+        uint ablk  = blk * 8u;      // first activation 32-block of this super-block (xs/xsum index)
+        // 4 chunks of 64 weights; chunk c packs sub-block 2c (low nibbles) + 2c+1 (high nibbles).
+        for (uint c = 0u; c < 4u; c++) {
+            uint is = c * 2u;
+            uint sm1 = get_scale_min_k4(base, is);
+            uint sm2 = get_scale_min_k4(base, is + 1u);
+            float d1 = d * float(sm1 >> 8u);   // sub-block 2c   scale
+            float m1 = dmin * float(sm1 & 0xFFu); // sub-block 2c   min
+            float d2 = d * float(sm2 >> 8u);   // sub-block 2c+1 scale
+            float m2 = dmin * float(sm2 & 0xFFu); // sub-block 2c+1 min
+            uint qcw = qbase + c * 8u;          // 8 u32 = the 32 qs bytes of this chunk
+            // Unpack this chunk's 32 bytes into two 4-per-u32 int8-code packs matching the activation
+            // lane order (element i in word i/4, byte i%4): plo = low nibbles, phi = high nibbles.
+            uint plo[8];
+            uint phi[8];
+            for (uint j = 0u; j < 8u; j++) {
+                uint qw = w[qcw + j];                // 4 qs bytes
+                plo[j] =  qw        & 0x0F0F0F0Fu;   // low nibble of each byte (0..15, positive int8)
+                phi[j] = (qw >> 4u) & 0x0F0F0F0Fu;   // high nibble of each byte
+            }
+            uint blo = ablk + is;        // activation 32-block for the low-nibble sub-block (hi = blo+1)
+            for (uint r = 0u; r < mcount; r++) {
+                uint xrlo = ((m0 + r) * nblocks * 8u) + blo; // flat (row, block) index into xs/xsum
+                uint xrhi = xrlo + 1u;                       // high-nibble sub-block's activation block
+                uint xqlo = xrlo * 8u;       // 8 u32 of int8 codes for the low sub-block
+                uint xqhi = xrhi * 8u;
+                int dlo = 0;
+                int dhi = 0;
+                for (uint j = 0u; j < 8u; j++) {
+                    dlo = sdot_accsat(int(plo[j]), int(xq[xqlo + j]), dlo, FMT4x8);
+                    dhi = sdot_accsat(int(phi[j]), int(xq[xqhi + j]), dhi, FMT4x8);
+                }
+                acc[r] += d1 * xs[xrlo] * float(dlo) - m1 * xsum[xrlo];
+                acc[r] += d2 * xs[xrhi] * float(dhi) - m2 * xsum[xrhi];
+            }
+        }
+    }
+    for (uint r = 0u; r < mcount; r++) {
+        y[(m0 + r) * nout + n] = acc[r];
+    }
+}
