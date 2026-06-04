@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
-const DEFAULT_HANZO_METAL_COMPUTE_PER_BUFFER: usize = 50;
-const DEFAULT_HANZO_METAL_COMMAND_POOL_SIZE: usize = 5;
+const DEFAULT_METAL_COMPUTE_PER_BUFFER: usize = 50;
+const DEFAULT_METAL_COMMAND_POOL_SIZE: usize = 5;
 
 /// Creates a new command buffer from the queue with an attached semaphore for tracking its state.
 pub fn create_command_buffer(
@@ -57,18 +57,18 @@ unsafe impl Sync for Commands {}
 
 impl Commands {
     pub fn new(command_queue: CommandQueue) -> Result<Self, MetalKernelError> {
-        let compute_per_buffer = match std::env::var("HANZO_METAL_COMPUTE_PER_BUFFER") {
+        let compute_per_buffer = match std::env::var("METAL_COMPUTE_PER_BUFFER") {
             Ok(val) => val
                 .parse()
-                .unwrap_or(DEFAULT_HANZO_METAL_COMPUTE_PER_BUFFER),
-            _ => DEFAULT_HANZO_METAL_COMPUTE_PER_BUFFER,
+                .unwrap_or(DEFAULT_METAL_COMPUTE_PER_BUFFER),
+            _ => DEFAULT_METAL_COMPUTE_PER_BUFFER,
         };
 
-        let pool_size = match std::env::var("HANZO_METAL_COMMAND_POOL_SIZE") {
+        let pool_size = match std::env::var("METAL_COMMAND_POOL_SIZE") {
             Ok(val) => val
                 .parse()
-                .unwrap_or(DEFAULT_HANZO_METAL_COMMAND_POOL_SIZE),
-            _ => DEFAULT_HANZO_METAL_COMMAND_POOL_SIZE,
+                .unwrap_or(DEFAULT_METAL_COMMAND_POOL_SIZE),
+            _ => DEFAULT_METAL_COMMAND_POOL_SIZE,
         };
 
         let pool = (0..pool_size)

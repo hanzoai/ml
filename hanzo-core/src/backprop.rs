@@ -17,8 +17,8 @@ fn broadcast_back(arg: &Tensor, node: &Tensor, reduced_dims: &[usize]) -> Result
 }
 
 thread_local! {
-    static HANZO_GRAD_DO_NOT_DETACH: bool = {
-        match std::env::var("HANZO_GRAD_DO_NOT_DETACH") {
+    static GRAD_DO_NOT_DETACH: bool = {
+        match std::env::var("GRAD_DO_NOT_DETACH") {
             Ok(s) => {
                 !s.is_empty() && s != "0"
             },
@@ -178,7 +178,7 @@ impl Tensor {
             // do not have to allocate too often. Here we just call `.detach` to avoid computing
             // the backprop graph of the backprop itself. This would be an issue for second order
             // derivatives but these are out of scope at the moment.
-            let do_not_detach = HANZO_GRAD_DO_NOT_DETACH.with(|b| *b);
+            let do_not_detach = GRAD_DO_NOT_DETACH.with(|b| *b);
             let grad = if do_not_detach { grad } else { grad.detach() };
             if let Some(op) = node.op() {
                 match op {

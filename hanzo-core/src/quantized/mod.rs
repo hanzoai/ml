@@ -705,7 +705,7 @@ pub enum QMatMul {
 
 thread_local! {
     static DEQUANTIZE_ALL: bool = {
-        match std::env::var("HANZO_DEQUANTIZE_ALL") {
+        match std::env::var("DEQUANTIZE_ALL") {
             Ok(s) => {
                 !s.is_empty() && s != "0"
             },
@@ -716,7 +716,7 @@ thread_local! {
 
 thread_local! {
     static DEQUANTIZE_ALL_F16: bool = {
-        match std::env::var("HANZO_DEQUANTIZE_ALL_F16") {
+        match std::env::var("DEQUANTIZE_ALL_F16") {
             Ok(s) => {
                 !s.is_empty() && s != "0"
             },
