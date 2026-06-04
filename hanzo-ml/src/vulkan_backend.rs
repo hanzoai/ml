@@ -64,6 +64,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
         "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
         "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
+        "flash_attn" => spv!("flash_attn"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
@@ -568,6 +569,68 @@ impl VulkanDevice {
         let words: &[u32] =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
         self.upload_u32(words)
+    }
+
+    /// Flash-attention over Q/K/V already in VRAM; output `[BH, Lq, D]`. `scale` multiplies QK^T
+    /// scores, `causal` applies aligned causal masking (query qi attends to keys <= qi + (Lk - Lq)).
+    /// One dispatch per (bh, query) output row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_gpu(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        bh: usize,
+        lq: usize,
+        lk: usize,
+        d: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Result<VulkanStorage> {
+        if d > 256 {
+            crate::bail!("flash_attn_gpu: head_dim {d} > 256 (kernel limit)");
+        }
+        if q.count < bh * lq * d {
+            crate::bail!("flash_attn_gpu: q count {} < bh*lq*d {}", q.count, bh * lq * d);
+        }
+        if k.count < bh * lk * d || v.count < bh * lk * d {
+            crate::bail!("flash_attn_gpu: k/v count too small for bh*lk*d {}", bh * lk * d);
+        }
+        let out = self.alloc_f32(bh * lq * d)?;
+        // Push block matches flash_attn.comp: {u32 bh, lq, lk, d; f32 scale; u32 causal}.
+        let mut push = push_u32(&[bh as u32, lq as u32, lk as u32, d as u32]);
+        push.extend_from_slice(&scale.to_ne_bytes());
+        push.extend_from_slice(&(causal as u32).to_ne_bytes());
+        let total = bh * lq;
+        self.dispatch(
+            "flash_attn",
+            &[q.buffer, k.buffer, v.buffer, out.buffer],
+            &push,
+            ((total as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Host-input convenience for [`flash_attn_gpu`]: uploads Q/K/V and returns the `[BH*Lq*D]`
+    /// output as an f32 vector. For tests/standalone use.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        bh: usize,
+        lq: usize,
+        lk: usize,
+        d: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Result<Vec<f32>> {
+        let qs = self.upload_f32(q)?;
+        let ks = self.upload_f32(k)?;
+        let vs = self.upload_f32(v)?;
+        self.flash_attn_gpu(&qs, &ks, &vs, bh, lq, lk, d, scale, causal)?
+            .to_vec_f32()
     }
 
     /// Q4_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q4k`]. Reads weights
