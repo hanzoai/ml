@@ -1,0 +1,15 @@
+[package]
+name = "hanzo-kernels"
+version = "0.10.2"
+edition = "2021"
+
+description = "CUDA kernels for Hanzo"
+repository = "https://github.com/huggingface/hanzo"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[build-dependencies]
+cudaforge = "0.1.2"

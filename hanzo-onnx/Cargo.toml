@@ -1,0 +1,22 @@
+[package]
+name = "hanzo-onnx"
+version = "0.10.2"
+edition = "2021"
+
+description = "ONNX support for Hanzo"
+repository = "https://github.com/huggingface/hanzo"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+hanzo = { path = "../hanzo-core", package = "hanzo-core", version = "0.10.2" }
+hanzo-nn = { path = "../hanzo-nn", version = "0.10.2" }
+prost = "0.14.1"
+
+[build-dependencies]
+prost-build = "0.14.1"
+
+[dev-dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+clap = { version = "4.5.49", features = ["derive"] }
