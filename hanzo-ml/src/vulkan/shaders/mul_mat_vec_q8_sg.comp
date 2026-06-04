@@ -1,58 +1,80 @@
 #version 450
 // Subgroup-reduced Q8_0 matrix-vector product: y[n] = sum_k W[n,k]*x[k], W stored quantized
 // (1 fp16 scale + 32 int8 per 32-block, 9 u32/block). Decode is memory-bandwidth bound on this
-// ~256 GB/s APU; reading ~1.125 B/weight is the lever. This variant fuses the per-row reduction
-// into a single subgroup arithmetic reduce (subgroupAdd) instead of one thread per row, so a whole
-// subgroup streams one row's blocks in parallel — more memory-level parallelism per row and no
-// shared-memory barrier. It is dispatched ONLY when the device advertises subgroup ARITHMETIC
-// support (gated host-side in vulkan_backend.rs); the scalar mul_mat_vec_q8 kernel is the fallback.
+// ~256 GB/s APU; reading ~1.125 B/weight is the lever. One subgroup streams ROWS_PER_SG output rows
+// at once, loading each 32-block of x ONCE into registers and reusing it across all ROWS_PER_SG
+// rows' weights -- this raises arithmetic intensity and keeps ROWS_PER_SG independent weight loads
+// in flight per lane (memory-level parallelism), the win over 1-row-per-subgroup. Dispatched only
+// when the device advertises subgroup ARITHMETIC support (gated host-side); scalar mul_mat_vec_q8 is
+// the fallback. Host dispatches ceil(nout / (rows_per_wg * ROWS_PER_SG)) workgroups.
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// 64 invocations/workgroup: on RDNA (subgroup size 32 or 64) that is 1-2 subgroups, each handling
-// one output row. gl_NumSubgroups rows are produced per workgroup.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // quantized weights, 9 u32 / 32-block
 layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activation vector, length k
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
-// woff: u32 offset into w[] where this weight matrix starts (0 for a plain 2D weight; e*n*(k/32)*9
-// to select expert e of a resident MoE bank). k is a multiple of 32.
 layout(push_constant) uniform Pc { uint nout; uint k; uint woff; };
 
+const uint ROWS_PER_SG = 4u;
+
+// Dequantized dot of one 32-block: 8 u32 words (4 int8 each) against the 32 staged activations.
+// `off` points at the block's scale word; the 8 payload words follow. Returns sum_i q_i * xr_i
+// (the per-block fp16 scale is applied by the caller).
+float blockdot(uint off, float xr[32]) {
+    float s = 0.0;
+    for (uint j = 0u; j < 8u; j++) {
+        uint word = w[off + 1u + j];
+        uint xo = j * 4u;
+        s += float(bitfieldExtract(int(word), 0, 8))  * xr[xo + 0u];
+        s += float(bitfieldExtract(int(word), 8, 8))  * xr[xo + 1u];
+        s += float(bitfieldExtract(int(word), 16, 8)) * xr[xo + 2u];
+        s += float(bitfieldExtract(int(word), 24, 8)) * xr[xo + 3u];
+    }
+    return s;
+}
+
 void main() {
-    // One subgroup per output row. Row = global subgroup index.
-    uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
-    if (row >= nout) {
+    uint sg = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint row0 = sg * ROWS_PER_SG;
+    if (row0 >= nout) {
         return;
     }
     uint nblocks = k / 32u;
-    uint base = woff + row * nblocks * 9u; // u32 offset of this row within the selected matrix
     uint lane = gl_SubgroupInvocationID;
     uint lanes = gl_SubgroupSize;
 
-    // Each lane sums a strided subset of the 32-blocks; partials reduced across the subgroup.
-    float acc = 0.0;
-    for (uint b = lane; b < nblocks; b += lanes) {
-        uint off = base + b * 9u;
-        float scale = unpackHalf2x16(w[off]).x;
-        float bsum = 0.0;
-        uint xb = b * 32u;
-        for (uint j = 0u; j < 8u; j++) {
-            uint word = w[off + 1u + j];
-            uint xo = xb + j * 4u;
-            // bitfieldExtract on a signed int sign-extends the 8-bit lane.
-            bsum += float(bitfieldExtract(int(word), 0, 8))  * x[xo + 0u];
-            bsum += float(bitfieldExtract(int(word), 8, 8))  * x[xo + 1u];
-            bsum += float(bitfieldExtract(int(word), 16, 8)) * x[xo + 2u];
-            bsum += float(bitfieldExtract(int(word), 24, 8)) * x[xo + 3u];
+    uint r1 = row0 + 1u, r2 = row0 + 2u, r3 = row0 + 3u;
+    bool h1 = r1 < nout, h2 = r2 < nout, h3 = r3 < nout;
+    uint b0 = woff + row0 * nblocks * 9u;
+    uint b1 = woff + r1 * nblocks * 9u;
+    uint b2 = woff + r2 * nblocks * 9u;
+    uint b3 = woff + r3 * nblocks * 9u;
+
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    for (uint blk = lane; blk < nblocks; blk += lanes) {
+        float xr[32];
+        uint xb = blk * 32u;
+        for (uint i = 0u; i < 32u; i++) {
+            xr[i] = x[xb + i];
         }
-        acc += scale * bsum;
+        uint d = blk * 9u;
+        acc0 += unpackHalf2x16(w[b0 + d]).x * blockdot(b0 + d, xr);
+        if (h1) { acc1 += unpackHalf2x16(w[b1 + d]).x * blockdot(b1 + d, xr); }
+        if (h2) { acc2 += unpackHalf2x16(w[b2 + d]).x * blockdot(b2 + d, xr); }
+        if (h3) { acc3 += unpackHalf2x16(w[b3 + d]).x * blockdot(b3 + d, xr); }
     }
-    // Single subgroup reduction over all lanes' partials; lane 0 writes the row.
-    float total = subgroupAdd(acc);
+
+    float t0 = subgroupAdd(acc0);
+    float t1 = h1 ? subgroupAdd(acc1) : 0.0;
+    float t2 = h2 ? subgroupAdd(acc2) : 0.0;
+    float t3 = h3 ? subgroupAdd(acc3) : 0.0;
     if (subgroupElect()) {
-        y[row] = total;
+        y[row0] = t0;
+        if (h1) { y[r1] = t1; }
+        if (h2) { y[r2] = t2; }
+        if (h3) { y[r3] = t3; }
     }
 }

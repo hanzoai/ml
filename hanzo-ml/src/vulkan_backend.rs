@@ -563,11 +563,12 @@ impl VulkanDevice {
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32, woff as u32]);
         if self.inner.subgroup_matvec {
-            // Subgroup-reduced kernel: one subgroup per output row, fused subgroupAdd. A workgroup
-            // of WG1D (64) invocations holds WG1D/subgroup_size subgroups, so it produces that many
-            // rows; dispatch ceil(nout / rows_per_wg) workgroups. subgroup_size is >=2 (checked at
-            // init) and <=64 in practice, so rows_per_wg is in [1, 32].
-            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
+            // Subgroup-reduced kernel: each subgroup streams ROWS_PER_SG (=4, must match the shader)
+            // output rows, reusing each staged x-block across them. A workgroup of WG1D (64)
+            // invocations holds WG1D/subgroup_size subgroups, so it produces (subgroups * 4) rows;
+            // dispatch ceil(nout / rows_per_wg) workgroups.
+            const ROWS_PER_SG: u32 = 4;
+            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1) * ROWS_PER_SG;
             self.dispatch(
                 "mul_mat_vec_q8_sg",
                 &[wq.buffer, x.buffer, out.buffer],
