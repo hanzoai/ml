@@ -559,7 +559,7 @@ impl QuantizedAttention {
                 None => attn_weights,
             };
 
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = hanzo_nn::ops::softmax_last_dim(&attn_weights)?;
             let attn_output = attn_weights.matmul(&v)?;
 
             attn_output
