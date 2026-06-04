@@ -38,7 +38,7 @@ rayon = { workspace = true }
 safetensors = { workspace = true }
 
 # Progress and metrics
-indicatif = "0.17"
+indicatif = "0.18"
 # wandb = { version = "0.1", optional = true }  # Commented out for now
 
 [dev-dependencies]
