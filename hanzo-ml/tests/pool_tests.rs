@@ -1,6 +1,6 @@
 use hanzo_ml::{test_device, test_utils, Device, IndexOp, Result, Tensor};
 
-// https://github.com/huggingface/hanzo/issues/364
+// https://github.com/hanzoai/ml/issues/364
 fn avg_pool2d(dev: &Device) -> Result<()> {
     let data: Vec<f32> = vec![
         1., 1., 1., 1., 0., 0., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.,

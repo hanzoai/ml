@@ -65,6 +65,7 @@ pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
 pub mod dummy_vulkan_backend;
+pub mod dummy_wgpu_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
@@ -93,6 +94,8 @@ pub mod utils;
 mod variable;
 #[cfg(feature = "vulkan")]
 pub mod vulkan_backend;
+#[cfg(feature = "wgpu")]
+pub mod wgpu_backend;
 
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;
@@ -138,6 +141,15 @@ pub use vulkan_backend as vulkan;
 pub use dummy_vulkan_backend as vulkan;
 
 pub use vulkan::{VulkanDevice, VulkanStorage};
+
+// `wgpu_be` alias to avoid clashing with the `wgpu` crate name.
+#[cfg(feature = "wgpu")]
+pub use wgpu_backend as wgpu_be;
+
+#[cfg(not(feature = "wgpu"))]
+pub use dummy_wgpu_backend as wgpu_be;
+
+pub use wgpu_be::{WgpuDevice, WgpuStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
