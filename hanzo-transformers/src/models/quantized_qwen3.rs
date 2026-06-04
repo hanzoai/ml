@@ -371,7 +371,7 @@ impl AttentionWeights {
                 };
                 scores = scores.broadcast_add(&mask)?;
             }
-            let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+            let probs = hanzo_nn::ops::softmax_last_dim(&scores)?;
             let ctx = probs.matmul(&v)?;
             let reshaped_ctx = ctx.transpose(1, 2)?.reshape((b, l, self.hidden_size))?;
             self.o_proj.forward(&reshaped_ctx)
