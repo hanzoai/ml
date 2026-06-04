@@ -1,6 +1,8 @@
 use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
-use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
+use crate::{
+    set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Output, Source,
+};
 use objc2_metal::{MTLResourceUsage, MTLSize};
 
 #[allow(clippy::too_many_arguments)]
@@ -31,7 +33,7 @@ pub fn call_reduce_contiguous(
             shape,
             work_per_threadgroup,
             &input,
-            output
+            Output::new(output)
         )
     );
 
@@ -88,7 +90,7 @@ pub fn call_reduce_strided(
             strides,
             work_per_threadgroup,
             &input,
-            output
+            Output::new(output)
         )
     );
 
@@ -135,7 +137,12 @@ pub fn call_last_softmax(
 
     set_params!(
         encoder,
-        (length, work_per_threadgroup, (input, input_offset), output)
+        (
+            length,
+            work_per_threadgroup,
+            (input, input_offset),
+            Output::new(output)
+        )
     );
 
     let out_length = length / work_per_threadgroup;
@@ -156,8 +163,6 @@ pub fn call_last_softmax(
         height: 1,
         depth: 1,
     };
-    encoder.use_resource(input, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -188,7 +193,7 @@ pub fn call_rms_norm(
             length,
             elements_to_sum,
             (input, input_offset),
-            output,
+            Output::new(output),
             (alpha, alpha_offset),
             eps
         )
@@ -213,9 +218,6 @@ pub fn call_rms_norm(
         height: 1,
         depth: 1,
     };
-    encoder.use_resource(input, MTLResourceUsage::Read);
-    encoder.use_resource(alpha, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -248,7 +250,7 @@ pub fn call_layer_norm(
             length,
             elements_to_sum,
             (input, input_offset),
-            output,
+            Output::new(output),
             (alpha, alpha_offset),
             (beta, beta_offset),
             eps
@@ -275,10 +277,6 @@ pub fn call_layer_norm(
         height: 1,
         depth: 1,
     };
-    encoder.use_resource(input, MTLResourceUsage::Read);
-    encoder.use_resource(alpha, MTLResourceUsage::Read);
-    encoder.use_resource(beta, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -314,14 +312,10 @@ pub fn call_rope_i(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            Output::new(output)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (bh * td) / 2);
-    encoder.use_resource(src, MTLResourceUsage::Read);
-    encoder.use_resource(cos, MTLResourceUsage::Read);
-    encoder.use_resource(sin, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -361,14 +355,10 @@ pub fn call_rope_thd(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            Output::new(output)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (b * t * h * d) / 2);
-    encoder.use_resource(src, MTLResourceUsage::Read);
-    encoder.use_resource(cos, MTLResourceUsage::Read);
-    encoder.use_resource(sin, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -406,14 +396,10 @@ pub fn call_rope(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            Output::new(output)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (bh * td) / 2);
-    encoder.use_resource(src, MTLResourceUsage::Read);
-    encoder.use_resource(cos, MTLResourceUsage::Read);
-    encoder.use_resource(sin, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
