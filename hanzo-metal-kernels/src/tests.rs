@@ -2395,7 +2395,7 @@ fn commands_creation_and_encoder() {
 
 #[test]
 fn commands_concurrent_acquisition() {
-    std::env::set_var("CANDLE_METAL_COMPUTE_PER_BUFFER", "2");
+    std::env::set_var("HANZO_METAL_COMPUTE_PER_BUFFER", "2");
 
     let device = Device::system_default().unwrap();
     let queue = device.new_command_queue().unwrap();

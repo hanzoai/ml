@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
-const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
+const DEFAULT_HANZO_METAL_COMPUTE_PER_BUFFER: usize = 50;
 
 fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, MetalKernelError> {
     command_queue.commandBuffer().map(CommandBuffer::new).ok_or(
@@ -127,11 +127,11 @@ impl Commands {
         command_queue: CommandQueue,
         residency_set: &ResidencySet,
     ) -> Result<Self, MetalKernelError> {
-        let compute_per_buffer = match std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER") {
+        let compute_per_buffer = match std::env::var("HANZO_METAL_COMPUTE_PER_BUFFER") {
             Ok(val) => val
                 .parse()
-                .unwrap_or(DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER),
-            _ => DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
+                .unwrap_or(DEFAULT_HANZO_METAL_COMPUTE_PER_BUFFER),
+            _ => DEFAULT_HANZO_METAL_COMPUTE_PER_BUFFER,
         };
 
         if let Some(raw) = residency_set.raw() {

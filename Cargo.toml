@@ -49,7 +49,7 @@ accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 chrono = "0.4"
-# Hanzo-renamed workspace dependencies (uplifted to candle 0.10.2)
+# Hanzo-renamed workspace dependencies (at version 0.10.x)
 hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.10.2" }
 hanzo-datasets = { path = "./hanzo-datasets", version = "0.10.2" }
 hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.10.2" }
