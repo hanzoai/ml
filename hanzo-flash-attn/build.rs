@@ -1,5 +1,5 @@
 // Build script to run nvcc and generate the C glue code for launching the flash-attention kernel.
-// The cuda build time is very long so one can set the HANZO_FLASH_ATTN_BUILD_DIR environment
+// The cuda build time is very long so one can set the FLASH_ATTN_BUILD_DIR environment
 // variable in order to cache the compiled artifacts and avoid recompiling too often.
 use cudaforge::{KernelBuilder, Result};
 use std::path::PathBuf;
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=kernels/static_switch.h");
     println!("cargo::rerun-if-changed=kernels/hardware_info.h");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let build_dir = match std::env::var("HANZO_FLASH_ATTN_BUILD_DIR") {
+    let build_dir = match std::env::var("FLASH_ATTN_BUILD_DIR") {
         Err(_) =>
         {
             #[allow(clippy::redundant_clone)]
