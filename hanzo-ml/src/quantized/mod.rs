@@ -137,6 +137,7 @@ impl QStorage {
                 GgmlDType::IQ4_NL => metal::load_quantized(d, as_t_slice::<BlockIQ4nl>(&data)),
                 GgmlDType::IQ4_XS => metal::load_quantized(d, as_t_slice::<BlockIQ4xs>(&data)),
                 GgmlDType::MXFP4 => metal::load_quantized(d, as_t_slice::<BlockMXFP4>(&data)),
+                GgmlDType::TQ2_0 => crate::bail!("TQ2_0 is CPU/Vulkan-only for now (no Metal kernel)"),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(&data)),
             },
             Device::Cuda(d) => match dtype {
@@ -157,6 +158,7 @@ impl QStorage {
                 GgmlDType::IQ4_NL => cuda::load_quantized(d, as_t_slice::<BlockIQ4nl>(&data)),
                 GgmlDType::IQ4_XS => cuda::load_quantized(d, as_t_slice::<BlockIQ4xs>(&data)),
                 GgmlDType::MXFP4 => cuda::load_quantized(d, as_t_slice::<BlockMXFP4>(&data)),
+                GgmlDType::TQ2_0 => crate::bail!("TQ2_0 is CPU/Vulkan-only for now (no CUDA kernel)"),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(&data)),
             },
             #[cfg(feature = "rocm")]
@@ -380,6 +382,9 @@ pub enum GgmlDType {
     IQ4_NL,
     #[allow(non_camel_case_types)]
     IQ4_XS,
+    // Ternary TQ2_0 (BitNet), ggml type 35: 256 elems / block, 2-bit {-1,0,1} codes + f16 scale.
+    #[allow(non_camel_case_types)]
+    TQ2_0,
     // 4-bit microscaling float (MXFP4), ggml type 39: 32 elems / block, E8M0 scale + 16 nibble-pairs.
     MXFP4,
 }
@@ -406,6 +411,8 @@ impl GgmlDType {
             23 => Self::IQ4_XS,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
+            // Ternary TQ2_0: ggml type 35 (llama.cpp ggml.h GGML_TYPE_TQ2_0=35).
+            35 => Self::TQ2_0,
             39 => Self::MXFP4,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
@@ -432,6 +439,7 @@ impl GgmlDType {
             Self::IQ4_XS => 23,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
+            Self::TQ2_0 => 35,
             Self::MXFP4 => 39,
         }
     }
@@ -459,6 +467,9 @@ impl GgmlDType {
             Self::IQ4_XS => {
                 Box::new(vec![BlockIQ4xs::zeros(); elem_count / BlockIQ4xs::BLCK_SIZE])
             }
+            Self::TQ2_0 => {
+                Box::new(vec![BlockTQ2_0::zeros(); elem_count / BlockTQ2_0::BLCK_SIZE])
+            }
             Self::MXFP4 => Box::new(vec![BlockMXFP4::zeros(); elem_count / BlockMXFP4::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
         }
@@ -482,6 +493,7 @@ impl GgmlDType {
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(&data).to_vec()),
             Self::IQ4_NL => Box::new(as_t_slice::<BlockIQ4nl>(&data).to_vec()),
             Self::IQ4_XS => Box::new(as_t_slice::<BlockIQ4xs>(&data).to_vec()),
+            Self::TQ2_0 => Box::new(as_t_slice::<BlockTQ2_0>(&data).to_vec()),
             Self::MXFP4 => Box::new(as_t_slice::<BlockMXFP4>(&data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(&data).to_vec()),
         }
@@ -508,6 +520,7 @@ impl GgmlDType {
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
             Self::IQ4_NL => std::mem::size_of::<BlockIQ4nl>(),
             Self::IQ4_XS => std::mem::size_of::<BlockIQ4xs>(),
+            Self::TQ2_0 => std::mem::size_of::<BlockTQ2_0>(),
             Self::MXFP4 => std::mem::size_of::<BlockMXFP4>(),
         }
     }
@@ -525,9 +538,8 @@ impl GgmlDType {
             Self::Q8_1 => k_quants::QK8_1,
             Self::IQ4_NL => k_quants::QK4_NL,
             Self::MXFP4 => k_quants::QK_MXFP4,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::IQ4_XS => {
-                k_quants::QK_K
-            }
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::IQ4_XS
+            | Self::TQ2_0 => k_quants::QK_K,
         }
     }
 }
