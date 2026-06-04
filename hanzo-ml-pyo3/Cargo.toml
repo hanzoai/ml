@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-ml-pyo3"
-version = "0.9.2"
+version = "0.10.2"
 edition = "2021"
 description = "Minimalist ML framework."
 repository = "https://github.com/hanzoai/ml"
@@ -20,11 +20,11 @@ hanzo-nn = { workspace = true }
 hanzo-onnx = { workspace = true, optional = true }
 half = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+pyo3 = { version = "0.24.1", features = ["extension-module", "abi3-py38"] }
 float8 = { workspace = true }
 
 [build-dependencies]
-pyo3-build-config = "0.22"
+pyo3-build-config = "0.24.1"
 
 [features]
 default = []
