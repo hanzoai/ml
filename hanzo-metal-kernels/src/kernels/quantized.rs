@@ -36,31 +36,6 @@ pub fn call_quantized_matmul_mv_t(
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_quantized_matmul_mv_t_offset(
-        device, ep, kernels, dtype, (b, m, n, k), lhs, lhs_offset, rhs, 0, dst_offset, dst,
-    )
-}
-
-/// Native-GGML quantized matvec where the quantized weight (`rhs`, src0) is read starting at
-/// `rhs_offset` bytes into its buffer. The offset lets a single resident `[E, n, k]` GGUF expert
-/// bank serve per-expert matvecs without re-uploading or dequantizing: bind the whole bank and pass
-/// `expert_idx * n * (k/block) * type_size`. `rhs_offset` must be a multiple of 4 bytes (Metal
-/// `setBuffer:offset:` requirement on Apple GPUs); for these GGML block sizes that holds whenever
-/// `n` is even, which it always is for real model weight dims.
-#[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mv_t_offset(
-    device: &Device,
-    ep: impl EncoderProvider,
-    kernels: &Kernels,
-    dtype: GgmlDType,
-    (b, m, n, k): (usize, usize, usize, usize),
-    lhs: &Buffer,
-    lhs_offset: usize,
-    rhs: &Buffer,
-    rhs_offset: usize,
-    dst_offset: usize,
-    dst: &Buffer,
-) -> Result<(), MetalKernelError> {
     // Everything is in reverse
     let ne00 = k as i64;
     let ne01 = n as i64;
@@ -173,7 +148,7 @@ pub fn call_quantized_matmul_mv_t_offset(
     set_params!(
         encoder,
         (
-            (rhs, rhs_offset),
+            rhs,
             (lhs, lhs_offset),
             Output::with_offset(dst, dst_offset),
             ne00,
@@ -210,35 +185,6 @@ pub fn call_quantized_matmul_mm_t(
     src0_shape: &[usize],
     src0_stride: &[usize],
     src0: &Buffer,
-    src1_shape: &[usize],
-    src1_stride: &[usize],
-    src1: &Buffer,
-    src1_offset: usize,
-    dst_shape: &[usize],
-    dst_offset: usize,
-    dst: &Buffer,
-) -> Result<(), MetalKernelError> {
-    call_quantized_matmul_mm_t_offset(
-        device, ep, kernels, dtype, src0_shape, src0_stride, src0, 0, src1_shape, src1_stride, src1,
-        src1_offset, dst_shape, dst_offset, dst,
-    )
-}
-
-/// Native-GGML quantized matmul where the quantized weight (`src0`) is read starting at
-/// `src0_offset` bytes into its buffer. Lets a single resident `[E, n, k]` GGUF expert bank serve a
-/// per-expert GEMM (prefill, m>1) without re-uploading or dequantizing -- bind the whole bank and
-/// pass `expert_idx * n * (k/block) * type_size`. `src0_offset` must be 4-byte aligned (true for
-/// all GGML block sizes when n is even).
-#[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mm_t_offset(
-    device: &Device,
-    ep: impl EncoderProvider,
-    kernels: &Kernels,
-    dtype: GgmlDType,
-    src0_shape: &[usize],
-    src0_stride: &[usize],
-    src0: &Buffer,
-    src0_offset: usize,
     src1_shape: &[usize],
     src1_stride: &[usize],
     src1: &Buffer,
@@ -307,7 +253,7 @@ pub fn call_quantized_matmul_mm_t_offset(
     set_params!(
         encoder,
         (
-            (src0, src0_offset),
+            src0,
             (src1, src1_offset),
             Output::with_offset(dst, dst_offset),
             ne00,
