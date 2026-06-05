@@ -47,16 +47,28 @@ void main() {
     for (uint b = 0u; b < nblocks; b++) {
         uint woffb = wbase + b * 9u;
         float wscale = unpackHalf2x16(w[woffb]).x;
-        // dp4a accumulates over the block's 8 u32-pairs into an exact int32, per row. Worst-case
-        // magnitude is 32 * 127 * 127 = 516128, well within int32 and below the saturation threshold,
-        // so AccSat behaves identically to a plain accumulate here (sat only guards pathological inputs).
+        // Hoist the 8 weight words ONCE per block (they don't depend on the row r) -- the old loop
+        // re-read each from the W buffer mcount times. Reused across all mcount rows below.
+        int w0 = int(w[woffb + 1u]); int w1 = int(w[woffb + 2u]);
+        int w2 = int(w[woffb + 3u]); int w3 = int(w[woffb + 4u]);
+        int w4 = int(w[woffb + 5u]); int w5 = int(w[woffb + 6u]);
+        int w6 = int(w[woffb + 7u]); int w7 = int(w[woffb + 8u]);
+        // dp4a accumulates the block's 8 u32-pairs into an exact int32, per row. Worst-case magnitude
+        // is 32*127*127 = 516128, well within int32 and below saturation, so AccSat == plain add here.
+        // Eight INDEPENDENT sdots (each acc=0) + a balanced tree-sum break the old 8-deep serial dot
+        // dependency chain -> 8-way ILP per block (latency-hiding on the dp4a units).
         for (uint r = 0u; r < mcount; r++) {
             uint xb = (m0 + r) * nblocks + b; // flat (row, block) index into xq/xs
             uint xqbase = xb * 8u;
-            int dot = 0;
-            for (uint j = 0u; j < 8u; j++) {
-                dot = sdot_accsat(int(w[woffb + 1u + j]), int(xq[xqbase + j]), dot, FMT4x8);
-            }
+            int d0 = sdot_accsat(w0, int(xq[xqbase + 0u]), 0, FMT4x8);
+            int d1 = sdot_accsat(w1, int(xq[xqbase + 1u]), 0, FMT4x8);
+            int d2 = sdot_accsat(w2, int(xq[xqbase + 2u]), 0, FMT4x8);
+            int d3 = sdot_accsat(w3, int(xq[xqbase + 3u]), 0, FMT4x8);
+            int d4 = sdot_accsat(w4, int(xq[xqbase + 4u]), 0, FMT4x8);
+            int d5 = sdot_accsat(w5, int(xq[xqbase + 5u]), 0, FMT4x8);
+            int d6 = sdot_accsat(w6, int(xq[xqbase + 6u]), 0, FMT4x8);
+            int d7 = sdot_accsat(w7, int(xq[xqbase + 7u]), 0, FMT4x8);
+            int dot = ((d0 + d1) + (d2 + d3)) + ((d4 + d5) + (d6 + d7));
             acc[r] += wscale * xs[xb] * float(dot);
         }
     }
