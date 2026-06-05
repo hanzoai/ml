@@ -53,6 +53,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q8_dp4a" => spv!("mul_mat_q8_dp4a"),
         "mul_mm_q8" => spv!("mul_mm_q8"),
+        "mul_mm_q8_dp4a" => spv!("mul_mm_q8_dp4a"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
@@ -1021,6 +1022,51 @@ impl VulkanDevice {
         let push = push_u32(&[m as u32, k as u32, nout as u32, 0u32]); // woff = 0 (plain 2D weight)
         let groups = ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1u32);
         self.dispatch("mul_mm_q8", &[wq.buffer, x.buffer, out.buffer], &push, groups)?;
+        Ok(out)
+    }
+
+    /// Q8_0 prefill via the shared-memory-tiled int8-dot GEMM (`mul_mm_q8_dp4a`): `y[m, nout] =
+    /// x[m, k] * Wq^T`. Quantizes the activation tile to int8 once, then a single dispatch where each
+    /// 64x64 output tile stages its weight + activation sub-tiles in shared memory (Q8 read ONCE,
+    /// reused across all 64 rows) and 256 threads each compute a 4x4 register tile. Unlike the
+    /// per-column [`matmul_q8_dp4a_gpu`] this gets weight reuse AND occupancy together. m,n % 16, k % 32.
+    pub fn matmul_q8_mm_dp4a_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matmul_q8_mm_dp4a_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q8_mm_dp4a_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let nblocks = k / 32;
+        let xq = self.alloc_u32(m * nblocks * 8)?;
+        let xs = self.alloc_f32(m * nblocks)?;
+        let xsum = self.alloc_f32(m * nblocks)?;
+        let qpush = push_u32(&[m as u32, k as u32]);
+        // quantize_act_q8 writes xq(1),xs(2),xsum(3); mark 1+2 so the GEMM gets the RAW barrier on the
+        // int8 acts + scales it actually reads (xsum unused for symmetric Q8).
+        self.dispatch_outs(
+            "quantize_act_q8",
+            &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
+            &[1, 2],
+            &qpush,
+            (((m * nblocks) as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        let out = self.alloc_f32(m * nout)?;
+        let push = push_u32(&[m as u32, k as u32, nout as u32, 0u32]); // woff = 0
+        let groups = ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1u32);
+        self.dispatch(
+            "mul_mm_q8_dp4a",
+            &[wq.buffer, xq.buffer, xs.buffer, out.buffer],
+            &push,
+            groups,
+        )?;
         Ok(out)
     }
 
