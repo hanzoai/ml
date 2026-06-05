@@ -1,13 +1,14 @@
 #version 450
-// Shared-memory-tiled int8-dot (dp4a) Q8_0 GEMM (the prefill lever): C[m,n] = A[m,k] * W[n,k]^T.
-// Breaks the reuse-vs-occupancy tradeoff of the per-column mul_mat_q8_dp4a (which balances at
-// MAX_M=16): a workgroup stages a 64-row x NBK-block activation tile and a 64-col x NBK-block weight
-// tile in shared memory (each Q8/int8 value loaded ONCE per workgroup, reused across the whole 64x64
-// output tile), and 256 threads each compute a 4x4 register sub-tile -> high weight reuse AND high
-// occupancy at once. Staging NBK=4 Q8 blocks (128 k) per shared load amortizes the workgroup barrier
-// over 4x more compute than a 1-block tile. Activations are pre-quantized to int8 (xq) + per-block f32
-// scale (xs) by quantize_act_q8; weights are Q8_0 (1 fp16 scale + 32 int8 = 9 u32/block). k % 32 == 0;
-// m,n arbitrary (edge rows/cols and the tail K-blocks are zero-padded on load, bound-checked on store).
+// Shared-memory-tiled, DOUBLE-BUFFERED int8-dot (dp4a) Q8_0 GEMM (the prefill lever):
+//   C[m,n] = A[m,k] * W[n,k]^T
+// A 64x64 output tile per workgroup; 256 threads each own a 4x4 register sub-tile. Each K-step stages
+// NBK=2 Q8 blocks (64 k) of weights+int8-acts into shared so every Q8 weight is read ONCE per
+// workgroup and reused across all 64 rows (weight reuse AND occupancy together, vs the per-column
+// dp4a's tradeoff). Two shared buffers are ping-ponged: while the dp4a compute consumes tile k, the
+// global loads for tile k+1 are in flight into the other buffer -> the memory latency is hidden behind
+// compute, lifting dp4a-unit utilization (the ~5%-of-peak ceiling of the single-buffered tile).
+// Activations are pre-quantized int8 (xq) + per-block f32 scale (xs); weights Q8_0 (9 u32/block).
+// k % 32 == 0; m,n arbitrary (edge rows/cols and tail K-blocks zero-padded on load, bound-checked on store).
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_spirv_intrinsics : require
@@ -24,14 +25,40 @@ layout(push_constant) uniform Pc { uint m; uint k; uint n; uint woff; };
 
 const uint BM  = 64u, BN = 64u;
 const uint TM  = 4u,  TN = 4u;        // per-thread register sub-tile; (BM/TM)*(BN/TN) = 16*16 = 256 threads
-const uint NBK = 4u;                  // Q8 blocks staged per K-step (128 k); 4x fewer barriers than 1-block
-const uint BKU = NBK * 8u;            // u32 per row staged in shared (= 32)
+const uint NBK = 2u;                  // Q8 blocks staged per K-step (64 k); 2 buffers => fits LDS
+const uint BKU = NBK * 8u;            // u32 per row staged in shared (= 16)
 const int  FMT4x8 = 0;
 
-shared uint  sXq[BM * BKU];           // [64 rows][32 u32]  int8 activations for this K-step
-shared uint  sWq[BN * BKU];           // [64 cols][32 u32]  Q8 weight payload for this K-step
-shared float sXs[BM * NBK];           // [64 rows][4]  activation block scales
-shared float sWs[BN * NBK];           // [64 cols][4]  weight block scales
+shared uint  sXq[2][BM * BKU];        // double-buffered int8 activations
+shared uint  sWq[2][BN * BKU];        // double-buffered Q8 weight payload
+shared float sXs[2][BM * NBK];        // activation block scales
+shared float sWs[2][BN * NBK];        // weight block scales
+
+// Stage K-step `kb0`'s tile (NBK blocks) into shared buffer `bi`. Reads gl_ builtins directly.
+void load_tile(uint bi, uint kb0) {
+    uint tid  = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.y * BM;
+    uint col0 = gl_WorkGroupID.x * BN;
+    uint nblocks = k / 32u;
+    for (uint i = tid; i < BM * BKU; i += 256u) {
+        uint rr = i / BKU, idx = i % BKU, sub = idx / 8u, ww = idx % 8u; uint gr = row0 + rr;
+        sXq[bi][i] = (gr < m && kb0 + sub < nblocks) ? xq[(gr * nblocks + kb0 + sub) * 8u + ww] : 0u;
+    }
+    for (uint i = tid; i < BM * NBK; i += 256u) {
+        uint rr = i / NBK, sub = i % NBK; uint gr = row0 + rr;
+        sXs[bi][i] = (gr < m && kb0 + sub < nblocks) ? xs[gr * nblocks + kb0 + sub] : 0.0;
+    }
+    for (uint i = tid; i < BN * BKU; i += 256u) {
+        uint cc = i / BKU, idx = i % BKU, sub = idx / 8u, ww = idx % 8u; uint gc = col0 + cc;
+        sWq[bi][i] = (gc < n && kb0 + sub < nblocks)
+            ? w[woff + gc * nblocks * 9u + (kb0 + sub) * 9u + 1u + ww] : 0u;
+    }
+    for (uint i = tid; i < BN * NBK; i += 256u) {
+        uint cc = i / NBK, sub = i % NBK; uint gc = col0 + cc;
+        sWs[bi][i] = (gc < n && kb0 + sub < nblocks)
+            ? unpackHalf2x16(w[woff + gc * nblocks * 9u + (kb0 + sub) * 9u]).x : 0.0;
+    }
+}
 
 void main() {
     uint tid  = gl_LocalInvocationID.x;        // 0..255
@@ -46,31 +73,13 @@ void main() {
     [[unroll]] for (uint i = 0u; i < TM; i++)
         [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
 
-    for (uint kstep = 0u; kstep < ksteps; kstep++) {
-        uint kb0 = kstep * NBK;
-        // stage activation int8 payload (64 rows x NBK blocks)
-        for (uint i = tid; i < BM * BKU; i += 256u) {
-            uint rr = i / BKU, idx = i % BKU, sub = idx / 8u, ww = idx % 8u; uint gr = row0 + rr;
-            sXq[i] = (gr < m && kb0 + sub < nblocks) ? xq[(gr * nblocks + kb0 + sub) * 8u + ww] : 0u;
-        }
-        for (uint i = tid; i < BM * NBK; i += 256u) {
-            uint rr = i / NBK, sub = i % NBK; uint gr = row0 + rr;
-            sXs[i] = (gr < m && kb0 + sub < nblocks) ? xs[gr * nblocks + kb0 + sub] : 0.0;
-        }
-        // stage weight Q8 payload + scale (64 cols x NBK blocks)
-        for (uint i = tid; i < BN * BKU; i += 256u) {
-            uint cc = i / BKU, idx = i % BKU, sub = idx / 8u, ww = idx % 8u; uint gc = col0 + cc;
-            sWq[i] = (gc < n && kb0 + sub < nblocks)
-                ? w[woff + gc * nblocks * 9u + (kb0 + sub) * 9u + 1u + ww] : 0u;
-        }
-        for (uint i = tid; i < BN * NBK; i += 256u) {
-            uint cc = i / NBK, sub = i % NBK; uint gc = col0 + cc;
-            sWs[i] = (gc < n && kb0 + sub < nblocks)
-                ? unpackHalf2x16(w[woff + gc * nblocks * 9u + (kb0 + sub) * 9u]).x : 0.0;
-        }
-        barrier();
+    load_tile(0u, 0u);                         // prologue: first tile into buffer 0
+    barrier();
 
-        // each thread accumulates its TM x TN outputs over the NBK staged blocks
+    for (uint kstep = 0u; kstep < ksteps; kstep++) {
+        uint cur = kstep & 1u;
+        if (kstep + 1u < ksteps) load_tile((kstep + 1u) & 1u, (kstep + 1u) * NBK); // prefetch next
+        // compute current tile (overlaps with the in-flight prefetch loads above)
         [[unroll]] for (uint ti = 0u; ti < TM; ti++) {
             uint rr = tr * TM + ti;
             [[unroll]] for (uint tj = 0u; tj < TN; tj++) {
@@ -78,13 +87,13 @@ void main() {
                 [[unroll]] for (uint sub = 0u; sub < NBK; sub++) {
                     int dot = 0;
                     [[unroll]] for (uint ww = 0u; ww < 8u; ww++)
-                        dot = sdot_accsat(int(sWq[cc * BKU + sub * 8u + ww]),
-                                          int(sXq[rr * BKU + sub * 8u + ww]), dot, FMT4x8);
-                    acc[ti][tj] += sWs[cc * NBK + sub] * sXs[rr * NBK + sub] * float(dot);
+                        dot = sdot_accsat(int(sWq[cur][cc * BKU + sub * 8u + ww]),
+                                          int(sXq[cur][rr * BKU + sub * 8u + ww]), dot, FMT4x8);
+                    acc[ti][tj] += sWs[cur][cc * NBK + sub] * sXs[cur][rr * NBK + sub] * float(dot);
                 }
             }
         }
-        barrier();
+        barrier();                             // prefetch done + compute done before next swap
     }
 
     [[unroll]] for (uint ti = 0u; ti < TM; ti++) {
