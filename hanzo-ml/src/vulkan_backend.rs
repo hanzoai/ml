@@ -50,6 +50,9 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "dequant_q8_f16" => spv!("dequant_q8_f16"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
+        "mul_mat_vec_q8_sg_rps2" => spv!("mul_mat_vec_q8_sg_rps2"),
+        "mul_mat_vec_q8_sg_rps8" => spv!("mul_mat_vec_q8_sg_rps8"),
+        "mul_mat_vec_q8_sg_rps16" => spv!("mul_mat_vec_q8_sg_rps16"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q8_dp4a" => spv!("mul_mat_q8_dp4a"),
         "mul_mm_q8" => spv!("mul_mm_q8"),
@@ -597,10 +600,18 @@ impl VulkanDevice {
             // output rows, reusing each staged x-block across them. A workgroup of WG1D (64)
             // invocations holds WG1D/subgroup_size subgroups, so it produces (subgroups * 4) rows;
             // dispatch ceil(nout / rows_per_wg) workgroups.
-            const ROWS_PER_SG: u32 = 4;
-            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1) * ROWS_PER_SG;
+            // ROWS_PER_SG sweep: default 4 (shader default); HANZO_VK_MV_RPS picks a variant. The host
+            // divisor MUST match the shader's CFG_RPS, so they are chosen together here.
+            let (mv_kern, rows_per_sg): (&str, u32) =
+                match std::env::var("HANZO_VK_MV_RPS").as_deref() {
+                    Ok("2") => ("mul_mat_vec_q8_sg_rps2", 2),
+                    Ok("8") => ("mul_mat_vec_q8_sg_rps8", 8),
+                    Ok("16") => ("mul_mat_vec_q8_sg_rps16", 16),
+                    _ => ("mul_mat_vec_q8_sg", 4),
+                };
+            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1) * rows_per_sg;
             self.dispatch(
-                "mul_mat_vec_q8_sg",
+                mv_kern,
                 &[wq.buffer, x.buffer, out.buffer],
                 &push,
                 ((nout as u32).div_ceil(rows_per_wg), 1, 1),
