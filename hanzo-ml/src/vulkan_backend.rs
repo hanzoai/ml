@@ -2124,20 +2124,39 @@ impl VulkanDevice {
             // the set (the pool recycles handles only across fences, so live handles are unique
             // in-batch), so this is exact for normal ops AND also catches the in-place scatter
             // kernels' read-modify-write of binding 0.
-            let reads_inflight_write = bufs.iter().any(|b| s.written_since_barrier.contains(b));
-            if reads_inflight_write {
-                let bar = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                    )];
+            // Buffer-scoped RAW barrier: emit one vk::BufferMemoryBarrier per read buffer that an
+            // earlier in-batch dispatch wrote, instead of a single global vk::MemoryBarrier. A global
+            // barrier drains the whole compute pipeline (no op overlaps), which on the decode hot path
+            // (~1k tiny dispatches/token, GPU-execution-bound) is the dominant cost; scoping to the
+            // actual hazard buffers lets the driver keep disjoint-buffer dispatches in flight (e.g. the
+            // next matvec prefetching its weight while the current op's output is still draining). Same
+            // src/dst access masks => strict refinement, no hazard lost (we still test ALL bufs, incl
+            // the in-place-scatter RMW of binding 0).
+            let mut bufbars = [vk::BufferMemoryBarrier::default(); 8];
+            let mut nbar = 0usize;
+            for &b in bufs {
+                if s.written_since_barrier.contains(&b)
+                    && !bufbars[..nbar].iter().any(|x| x.buffer == b)
+                {
+                    bufbars[nbar] = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(b)
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE);
+                    nbar += 1;
+                }
+            }
+            if nbar > 0 {
                 dev.cmd_pipeline_barrier(
                     s.cmd,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
-                    &bar,
                     &[],
+                    &bufbars[..nbar],
                     &[],
                 );
                 s.written_since_barrier.clear();
