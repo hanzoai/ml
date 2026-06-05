@@ -1357,6 +1357,9 @@ impl crate::Module for QMatMul {
                         };
                         match dtype {
                             GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
+                            // Subgroup matvec is the best decode kernel here: decode is HBM-bandwidth-
+                            // bound, and the dp4a matmul (great for prefill's M-row reuse) is slower at
+                            // M=1 (no reuse + an extra activation-quantize dispatch). Measured 9.3 vs 6.1.
                             _ => d.matvec_q8_gpu(wq, xv, *n, *k)?,
                         }
                     };

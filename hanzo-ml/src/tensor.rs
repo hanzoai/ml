@@ -2491,13 +2491,24 @@ impl Tensor {
     /// ```
     pub fn to_dtype(&self, dtype: DType) -> Result<Self> {
         if self.dtype() == dtype {
-            Ok(self.clone())
-        } else {
-            let shape = self.shape();
-            let storage = self.storage().to_dtype(self.layout(), dtype)?;
-            let op = BackpropOp::new1(self, Op::ToDType);
-            Ok(from_storage(storage, shape.clone(), op, false))
+            return Ok(self.clone());
         }
+        // Vulkan stores f16/bf16 as f32 and computes entirely in f32 (the backend zeros/upload
+        // invariant), so a float->float cast is a representation no-op. Return a cheap storage-sharing
+        // clone (keeps the f32 label, which every Vulkan kernel treats identically) instead of
+        // dispatching a strided copy per cast -- the per-layer q/k/v to_dtype casts plus assorted
+        // intermediate casts are a large share of the decode hot-path dispatches.
+        #[cfg(feature = "vulkan")]
+        if self.device().is_vulkan()
+            && matches!(self.dtype(), DType::F32 | DType::F16 | DType::BF16)
+            && matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+        {
+            return Ok(self.clone());
+        }
+        let shape = self.shape();
+        let storage = self.storage().to_dtype(self.layout(), dtype)?;
+        let op = BackpropOp::new1(self, Op::ToDType);
+        Ok(from_storage(storage, shape.clone(), op, false))
     }
 
     /// Returns a tensor that is in row major order. This is the same as the original tensor if it

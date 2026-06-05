@@ -14,7 +14,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // quantized weights, 9 u32 / 32-block
-layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activation vector, length k
+layout(set = 0, binding = 1) readonly buffer X { vec4   xv[]; }; // activation vector (vec4 view), length k/4
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
 layout(push_constant) uniform Pc { uint nout; uint k; uint woff; };
 
@@ -22,16 +22,19 @@ const uint ROWS_PER_SG = 4u;
 
 // Dequantized dot of one 32-block: 8 u32 words (4 int8 each) against the 32 staged activations.
 // `off` points at the block's scale word; the 8 payload words follow. Returns sum_i q_i * xr_i
-// (the per-block fp16 scale is applied by the caller).
+// (the per-block fp16 scale is applied by the caller). Activations load as vec4 (xb is a multiple of
+// 32, so xb/4 is 4-aligned): one vec4 fetch + one dot() per word replaces 4 scalar loads + 4 muls.
 float blockdot(uint off, uint xb) {
     float s = 0.0;
+    uint xv0 = xb >> 2u; // xb % 4 == 0 (xb = blk*32) -> vec4-aligned index into xv
     for (uint j = 0u; j < 8u; j++) {
         uint word = w[off + 1u + j];
-        uint xo = xb + j * 4u;
-        s += float(bitfieldExtract(int(word), 0, 8))  * x[xo + 0u];
-        s += float(bitfieldExtract(int(word), 8, 8))  * x[xo + 1u];
-        s += float(bitfieldExtract(int(word), 16, 8)) * x[xo + 2u];
-        s += float(bitfieldExtract(int(word), 24, 8)) * x[xo + 3u];
+        vec4 q = vec4(
+            float(bitfieldExtract(int(word), 0, 8)),
+            float(bitfieldExtract(int(word), 8, 8)),
+            float(bitfieldExtract(int(word), 16, 8)),
+            float(bitfieldExtract(int(word), 24, 8)));
+        s += dot(q, xv[xv0 + j]);
     }
     return s;
 }
