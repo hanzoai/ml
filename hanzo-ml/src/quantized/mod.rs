@@ -1406,9 +1406,18 @@ impl crate::Module for QMatMul {
                                 let _ = &w16;
                                 d.matmul_q8_mm_gpu(wq, xv, m, *n, *k)?
                             }
-                            // Q8_0 prefill: int8 dp4a (compute-bound lever) when the device has hw
-                            // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
-                            _ if d.int_dot8() => d.matmul_q8_dp4a_gpu(wq, xv, m, *n, *k)?,
+                            // Q8_0 prefill fallback (HANZO_VK_Q8_MM=0): the per-column dp4a, kept for
+                            // A/B and tiny-m cases.
+                            _ if d.int_dot8()
+                                && std::env::var("HANZO_VK_Q8_MM").map(|v| v == "0").unwrap_or(false) =>
+                            {
+                                d.matmul_q8_dp4a_gpu(wq, xv, m, *n, *k)?
+                            }
+                            // Q8_0 prefill DEFAULT: shared-memory-tiled int8 GEMM — weight reuse (Q8 read
+                            // once per workgroup, reused across 64 rows) AND occupancy (256 threads x 4x4
+                            // register tiles) together, vs the per-column dp4a's reuse/occupancy tradeoff.
+                            // Measured 112 vs 94 T/s prefill. Falls back to the f32-decode matmul w/o dp4a.
+                            _ if d.int_dot8() => d.matmul_q8_mm_dp4a_gpu(wq, xv, m, *n, *k)?,
                             _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
                         }
                     };
