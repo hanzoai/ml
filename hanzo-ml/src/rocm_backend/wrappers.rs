@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use rocm_rs::hip::error::Error as HipError;
 use rocm_rs::hip::{bindings, DeviceMemory, Stream};
+#[cfg(feature = "miopen")]
 use rocm_rs::miopen::Handle;
 use rocm_rs::rocrand::PseudoRng;
 
@@ -259,11 +260,15 @@ impl DerefMut for SendSyncPseudoRng {
     }
 }
 
+#[cfg(feature = "miopen")]
 pub struct SendSyncMIOpenHandle(pub Handle);
 
+#[cfg(feature = "miopen")]
 unsafe impl Send for SendSyncMIOpenHandle {}
+#[cfg(feature = "miopen")]
 unsafe impl Sync for SendSyncMIOpenHandle {}
 
+#[cfg(feature = "miopen")]
 impl SendSyncMIOpenHandle {
     pub fn new(stream: &Stream) -> Result<Self, rocm_rs::miopen::error::Error> {
         let handle = Handle::with_stream(stream)?;
@@ -271,6 +276,7 @@ impl SendSyncMIOpenHandle {
     }
 }
 
+#[cfg(feature = "miopen")]
 impl Deref for SendSyncMIOpenHandle {
     type Target = Handle;
     fn deref(&self) -> &Self::Target {
