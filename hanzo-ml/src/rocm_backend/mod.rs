@@ -12,6 +12,7 @@ use rocm_rs::rocblas::{self, level3::GemmStridedBatchedType, types::Operation};
 
 mod device;
 mod error;
+#[cfg(feature = "miopen")]
 mod miopen;
 mod wrappers;
 pub use device::{DeviceId, RocmDevice};
@@ -396,6 +397,7 @@ macro_rules! dispatch_matmul {
     }};
 }
 
+#[cfg(feature = "miopen")]
 macro_rules! dispatch_miopen_conv {
     ($self:expr, $kernel:expr, $l:expr, $kernel_l:expr, $dst_el:expr, $device:expr, $handle:expr, $func:ident, $($arg:expr),* $(,)?) => {{
         let device = $device.clone();
@@ -1640,6 +1642,20 @@ impl BackendStorage for RocmStorage {
         Ok(Self { slice, device })
     }
 
+    #[cfg(not(feature = "miopen"))]
+    fn conv1d(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConv1D,
+    ) -> Result<Self> {
+        Err(crate::Error::Msg(
+            "conv1d requires the `miopen` feature (MIOpen unavailable in this ROCm build)".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "miopen")]
     fn conv1d(
         &self,
         l: &Layout,
@@ -1680,6 +1696,21 @@ impl BackendStorage for RocmStorage {
         )
     }
 
+    #[cfg(not(feature = "miopen"))]
+    fn conv_transpose1d(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConvTranspose1D,
+    ) -> Result<Self> {
+        Err(crate::Error::Msg(
+            "conv_transpose1d requires the `miopen` feature (MIOpen unavailable in this ROCm build)"
+                .to_string(),
+        ))
+    }
+
+    #[cfg(feature = "miopen")]
     fn conv_transpose1d(
         &self,
         l: &Layout,
@@ -1715,6 +1746,20 @@ impl BackendStorage for RocmStorage {
         )
     }
 
+    #[cfg(not(feature = "miopen"))]
+    fn conv2d(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConv2D,
+    ) -> Result<Self> {
+        Err(crate::Error::Msg(
+            "conv2d requires the `miopen` feature (MIOpen unavailable in this ROCm build)".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "miopen")]
     fn conv2d(
         &self,
         l: &Layout,

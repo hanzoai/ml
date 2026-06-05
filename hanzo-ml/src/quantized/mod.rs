@@ -817,6 +817,9 @@ pub enum QMatMul {
         dtype: GgmlDType,
         n: usize,
         k: usize,
+        // Lazily-filled f16 dequant of `wq` (row-major [n,k]) for the coopmat prefill GEMM. Built
+        // once on the first M>1 forward and reused; None until then (decode never needs it).
+        w16: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::VulkanStorage>>>>,
     },
     // Resident MoE expert bank: the WHOLE [e, n, k] quantized weight uploaded to VRAM ONCE at load,
     // kept quantized (verbatim blocks, never dequantized -- the f32 bank is a ~140GB OOM on the 35B).
@@ -897,6 +900,7 @@ impl QMatMul {
                                 dtype: GgmlDType::Q8_0,
                                 n,
                                 k,
+                                w16: std::sync::Arc::new(std::sync::Mutex::new(None)),
                             });
                         }
                     }
@@ -914,6 +918,7 @@ impl QMatMul {
                                 dtype: GgmlDType::Q4K,
                                 n,
                                 k,
+                                w16: std::sync::Arc::new(std::sync::Mutex::new(None)),
                             });
                         }
                     }
@@ -1000,6 +1005,7 @@ impl QMatMul {
                             dtype: GgmlDType::Q8_0,
                             n,
                             k,
+                            w16: std::sync::Arc::new(std::sync::Mutex::new(None)),
                         });
                     }
                 }
@@ -1333,6 +1339,7 @@ impl crate::Module for QMatMul {
                 dtype,
                 n,
                 k,
+                w16,
             } => {
                 let rows: usize = xs.elem_count() / *k;
                 if rows == 1 {
@@ -1388,6 +1395,20 @@ impl crate::Module for QMatMul {
                             // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
                             GgmlDType::Q4K if d.int_dot8() => d.matmul_q4k_dp4a_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
+                            // Q8_0 prefill, fast path: fp16 matrix-core (coopmat) GEMM. Reuses each
+                            // loaded fragment across the whole tile grid (vs 8-row reuse of the
+                            // quantized matmul) -- the prefill/TTFT lever toward llama.cpp parity.
+                            // The f16 weight is dequantized once and cached on `w16`.
+                            _ if d.coopmat_q8_ok(m, *n, *k) => {
+                                let cached = {
+                                    let mut g = w16.lock().unwrap();
+                                    if g.is_none() {
+                                        *g = Some(std::sync::Arc::new(d.dequant_q8_to_f16(wq, *n, *k)?));
+                                    }
+                                    g.as_ref().unwrap().clone()
+                                };
+                                d.matmul_q8_coopmat_gpu(&cached, xv, m, *n, *k)?
+                            }
                             // Q8_0 prefill: int8 dp4a (compute-bound lever) when the device has hw
                             // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
                             _ if d.int_dot8() => d.matmul_q8_dp4a_gpu(wq, xv, m, *n, *k)?,

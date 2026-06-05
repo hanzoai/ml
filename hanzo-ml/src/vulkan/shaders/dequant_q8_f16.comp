@@ -1,0 +1,32 @@
+#version 450
+// Q8_0 -> f16 dequant. Emits the weight in natural row-major [n,k] f16 so the coopmat GEMM
+// (bmm_coopmat_rb_nt) can consume it directly. One invocation decodes one 32-element block;
+// blocks are laid out row-major (row n's blocks contiguous), so block b maps to flat elements
+// [b*32 .. b*32+32). Lets prefill reuse the matrix-core path instead of the bandwidth-bound
+// per-8-row quantized matmul.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer W   { uint      w[]; };  // quantized, 9 u32 / 32-block
+layout(set = 0, binding = 1) writeonly buffer Out { float16_t o[]; };  // f16 [n*k], row-major
+
+layout(push_constant) uniform Pc { uint nblocks_total; };
+
+void main() {
+    uint blk = gl_GlobalInvocationID.x;
+    if (blk >= nblocks_total) return;
+
+    uint off = blk * 9u;
+    float scale = unpackHalf2x16(w[off]).x;
+    uint obase = blk * 32u;
+
+    for (uint j = 0u; j < 8u; j++) {
+        uint word = w[off + 1u + j];
+        uint xo = obase + j * 4u;
+        o[xo + 0u] = float16_t(scale * float(bitfieldExtract(int(word), 0, 8)));
+        o[xo + 1u] = float16_t(scale * float(bitfieldExtract(int(word), 8, 8)));
+        o[xo + 2u] = float16_t(scale * float(bitfieldExtract(int(word), 16, 8)));
+        o[xo + 3u] = float16_t(scale * float(bitfieldExtract(int(word), 24, 8)));
+    }
+}

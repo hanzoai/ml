@@ -9,6 +9,7 @@ pub enum RocmError {
     #[error("rocBLAS error: {0}")]
     Rocblas(String),
 
+    #[cfg(feature = "miopen")]
     #[error("MIOpen error: {0}")]
     MIOpen(String),
 
