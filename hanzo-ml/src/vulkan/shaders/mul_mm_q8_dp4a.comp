@@ -1,0 +1,85 @@
+#version 450
+// Shared-memory-tiled int8-dot (dp4a) Q8_0 GEMM (the prefill lever): C[m,n] = A[m,k] * W[n,k]^T.
+// Breaks the reuse-vs-occupancy tradeoff of the per-column mul_mat_q8_dp4a (which balances at
+// MAX_M=16): a workgroup stages a 64x32 activation tile and a 64x32 weight tile in shared memory
+// (each Q8/int8 value loaded ONCE per workgroup, reused across the whole 64x64 output tile), and
+// 256 threads each compute a 4x4 register sub-tile -> high weight reuse AND high occupancy at once.
+// Activations are pre-quantized to int8 (xq) + per-block f32 scale (xs) by quantize_act_q8; weights
+// are Q8_0 (1 fp16 scale + 32 int8 = 9 u32/block). BK=32 == one block. m,n multiples of 16, k of 32.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4453)
+  int sdot_accsat(int a, int b, int acc, spirv_literal int fmt);
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W  { uint  w[];  };  // Q8_0 weights, 9 u32 / 32-block, [n,k]
+layout(set = 0, binding = 1) readonly buffer XQ { uint  xq[]; };  // int8 acts, 4/u32, [m, k/32, 8]
+layout(set = 0, binding = 2) readonly buffer XS { float xs[]; };  // act block scales, [m, k/32]
+layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };   // output f32, row-major [m, n]
+layout(push_constant) uniform Pc { uint m; uint k; uint n; uint woff; };
+
+const uint BM = 64u, BN = 64u, BK = 32u;
+const uint TM = 4u,  TN = 4u;        // per-thread register sub-tile; (BM/TM)*(BN/TN) = 16*16 = 256 threads
+const int  FMT4x8 = 0;
+
+shared uint  sXq[BM * 8u];           // [64 rows][8 u32]  int8 activations for this block
+shared uint  sWq[BN * 8u];           // [64 cols][8 u32]  Q8 weight payload for this block
+shared float sXs[BM];                // activation block scale per row
+shared float sWs[BN];                // weight block scale per col
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;        // 0..255
+    uint tr   = tid / 16u;                     // thread-row 0..15
+    uint tc   = tid % 16u;                     // thread-col 0..15
+    uint row0 = gl_WorkGroupID.y * BM;
+    uint col0 = gl_WorkGroupID.x * BN;
+    uint nblocks = k / 32u;
+
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0u; i < TM; i++)
+        [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
+
+    for (uint kb = 0u; kb < nblocks; kb++) {
+        // stage activation tile (int8 + scale)
+        for (uint i = tid; i < BM * 8u; i += 256u) {
+            uint rr = i / 8u, ww = i % 8u; uint gr = row0 + rr;
+            sXq[i] = (gr < m) ? xq[(gr * nblocks + kb) * 8u + ww] : 0u;
+        }
+        for (uint i = tid; i < BM; i += 256u) {
+            uint gr = row0 + i; sXs[i] = (gr < m) ? xs[gr * nblocks + kb] : 0.0;
+        }
+        // stage weight tile (Q8 payload + scale)
+        for (uint i = tid; i < BN * 8u; i += 256u) {
+            uint cc = i / 8u, ww = i % 8u; uint gc = col0 + cc;
+            sWq[i] = (gc < n) ? w[woff + gc * nblocks * 9u + kb * 9u + 1u + ww] : 0u;
+        }
+        for (uint i = tid; i < BN; i += 256u) {
+            uint gc = col0 + i;
+            sWs[i] = (gc < n) ? unpackHalf2x16(w[woff + gc * nblocks * 9u + kb * 9u]).x : 0.0;
+        }
+        barrier();
+
+        // each thread accumulates its TM x TN outputs from the shared tiles
+        [[unroll]] for (uint ti = 0u; ti < TM; ti++) {
+            uint rr = tr * TM + ti;
+            [[unroll]] for (uint tj = 0u; tj < TN; tj++) {
+                uint cc = tc * TN + tj;
+                int dot = 0;
+                [[unroll]] for (uint ww = 0u; ww < 8u; ww++)
+                    dot = sdot_accsat(int(sWq[cc * 8u + ww]), int(sXq[rr * 8u + ww]), dot, FMT4x8);
+                acc[ti][tj] += sWs[cc] * sXs[rr] * float(dot);
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint ti = 0u; ti < TM; ti++) {
+        uint gr = row0 + tr * TM + ti;
+        [[unroll]] for (uint tj = 0u; tj < TN; tj++) {
+            uint gc = col0 + tc * TN + tj;
+            if (gr < m && gc < n) y[gr * n + gc] = acc[ti][tj];
+        }
+    }
+}
