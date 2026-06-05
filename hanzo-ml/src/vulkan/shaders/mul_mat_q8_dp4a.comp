@@ -30,7 +30,7 @@ layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };   // output, row
 // and nout. woff: u32 offset into w[] where this weight matrix starts (0 for a plain 2D weight).
 layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
 
-const uint MAX_M = 8u; // register accumulators per invocation; host tiles M by this
+const uint MAX_M = 16u; // register accumulators per invocation; host tiles M by this
 const int  FMT4x8 = 0; // PackedVectorFormat4x8Bit
 
 void main() {
