@@ -52,6 +52,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q8_dp4a" => spv!("mul_mat_q8_dp4a"),
+        "mul_mm_q8" => spv!("mul_mm_q8"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
@@ -995,6 +996,31 @@ impl VulkanDevice {
         let groups = (nt_tiles.div_ceil(4), mt.div_ceil(4), 1u32);
         self.dispatch("bmm_coopmat_rb_nt", &[a16, w16.buffer, out.buffer], &push, groups)?;
         self.free_scratch(a16_bytes, a16, a16_mem, a16_hv);
+        Ok(out)
+    }
+
+    /// Q8_0 prefill via the quant-aware coopmat GEMM (`mul_mm_q8`): `y[m, nout] = x[m, k] * Wq^T`.
+    /// Reads the Q8 weight ONCE, dequantizing each block to f16 in shared memory before the matrix-
+    /// core MulAdd -- no whole-weight f16 materialization and no per-matmul activation cast pass (vs
+    /// [`matmul_q8_coopmat_gpu`]). 64x64 output tile per workgroup; caller guarantees m,n,k % 16 == 0.
+    pub fn matmul_q8_mm_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if x.count < m * k {
+            crate::bail!("matmul_q8_mm_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        if !k.is_multiple_of(32) {
+            crate::bail!("matmul_q8_mm_gpu: k must be a multiple of 32, got {k}");
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let push = push_u32(&[m as u32, k as u32, nout as u32, 0u32]); // woff = 0 (plain 2D weight)
+        let groups = ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1u32);
+        self.dispatch("mul_mm_q8", &[wq.buffer, x.buffer, out.buffer], &push, groups)?;
         Ok(out)
     }
 
