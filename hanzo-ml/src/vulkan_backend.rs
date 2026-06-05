@@ -2487,7 +2487,7 @@ const WG1D: u32 = 64;
 // mul_mat_q4k). MUST equal the MAX_M const in those .comp shaders (their register accumulator array
 // bound). The host tiles the M dimension by this so each weight block is still read once per output
 // column across a tile of up to MATMUL_Q_MAX_M rows.
-const MATMUL_Q_MAX_M: usize = 8;
+const MATMUL_Q_MAX_M: usize = 16;
 
 // Compile-time per-invocation array bounds in gdn_step.comp / gdn_conv1d_step.comp (MAX_K #defines).
 // head_k_dim must be <= GDN_STEP_MAX_K and the conv kernel <= GDN_CONV_MAX_K; both checked host-side.

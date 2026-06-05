@@ -18,7 +18,7 @@ layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, row-
 // expert e of a resident MoE bank).
 layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
 
-const uint MAX_M = 8u; // register accumulators per invocation; host tiles M by this
+const uint MAX_M = 16u; // register accumulators per invocation; host tiles M by this
 
 void main() {
     uint n = gl_GlobalInvocationID.x;
