@@ -21,7 +21,7 @@ layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint
 
 const uint QK_K = 256u;
 const uint BLK_U32 = 36u; // 144 bytes / 4
-const uint MAX_M = 8u;    // register accumulators per invocation; host tiles M by this
+const uint MAX_M = 16u;    // register accumulators per invocation; host tiles M by this
 
 // Byte `b` (0-based) out of the block's scale region (u32[1..4], i.e. the 12 scale bytes).
 uint scale_byte(uint base, uint b) {
