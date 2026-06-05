@@ -1,3 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#define CFG_TM 4u
+#define CFG_TN 4u
+#define CFG_NBK 4u
 #include "mul_mm_q8_dp4a_body.glsl"
