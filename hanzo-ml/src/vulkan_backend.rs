@@ -2785,6 +2785,25 @@ impl BackendDevice for VulkanDevice {
                 vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
             let mut s16_feat =
                 vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
+            // Hardware int8 4x8 dp4a detection: gates the Q8/Q4_K dp4a prefill path. Require both the
+            // plain and acc-sat signed 4x8 properties hw-accelerated, else f32-decode is as good.
+            // VK_INT_DOT8=0 forces off.
+            let mut idp_props = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+            {
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut idp_props);
+                instance.get_physical_device_properties2(pdev, &mut p2);
+            }
+            let mut idp_feat = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+            {
+                let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut idp_feat);
+                instance.get_physical_device_features2(pdev, &mut f2);
+            }
+            let int_dot8 = idp_feat.shader_integer_dot_product == vk::TRUE
+                && idp_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE
+                && idp_props
+                    .integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated
+                    == vk::TRUE
+                && std::env::var("VK_INT_DOT8").map(|v| v != "0").unwrap_or(true);
             let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
             if !ext_names.is_empty() {
                 dci = dci.enabled_extension_names(&ext_names);
@@ -2795,6 +2814,11 @@ impl BackendDevice for VulkanDevice {
                     .push_next(&mut mm_feat)
                     .push_next(&mut f16_feat)
                     .push_next(&mut s16_feat);
+            }
+            let mut idp_enable = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+                .shader_integer_dot_product(true);
+            if int_dot8 {
+                dci = dci.push_next(&mut idp_enable);
             }
             let device = instance.create_device(pdev, &dci, None).map_err(vkerr)?;
             // Load push_descriptor device fns now that the device exists with the extension enabled.
@@ -2882,7 +2906,7 @@ impl BackendDevice for VulkanDevice {
                 coopmat,
                 cm_mnk,
                 cm_use,
-                int_dot8: false,
+                int_dot8,
             };
             Ok(Self {
                 inner: Arc::new(inner),
