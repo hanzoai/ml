@@ -47,6 +47,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm_coopmat_rb" => spv!("bmm_coopmat_rb"),
         "bmm_coopmat_rb_nt" => spv!("bmm_coopmat_rb_nt"),
         "cast_f2h" => spv!("cast_f2h"),
+        "dequant_q8_f16" => spv!("dequant_q8_f16"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
@@ -405,6 +406,23 @@ impl VulkanDevice {
     /// true, the Q8_0 prefill (M>1) path should use [`matmul_q8_dp4a_gpu`] instead of [`matmul_q8_gpu`].
     pub fn int_dot8(&self) -> bool {
         self.inner.int_dot8
+    }
+
+    /// Whether a Q8 prefill GEMM of these dims should take the fp16 matrix-core (coopmat) path:
+    /// device has a 16x16x16 coopmat config, it is enabled, every tile dim is a multiple of 16, and
+    /// the f16 weight + activation scratch fits. Far higher arithmetic intensity than the quantized
+    /// matmul (which only reuses each weight over 8 rows), closing the prefill gap to llama.cpp.
+    pub fn coopmat_q8_ok(&self, m: usize, nout: usize, k: usize) -> bool {
+        // Opt-in (HANZO_VK_Q8_COOPMAT=1): the f16 weight cache doubles resident weight VRAM (Q8 +
+        // f16), which on this UMA part can push the decode matvec onto slower memory. Off by default
+        // until the prefill win outweighs that; the path itself is correct (coherent output).
+        std::env::var("HANZO_VK_Q8_COOPMAT").map(|v| v != "0").unwrap_or(false)
+            && self.inner.cm_use
+            && matches!(self.coopmat_info(), Some((16, 16, 16)))
+            && m % 16 == 0
+            && nout % 16 == 0
+            && k % 16 == 0
+            && self.scratch_fits(((m * k * 2) as u64).saturating_add((nout * k * 2) as u64))
     }
 
     /// Quantize `W[nout x k]` (row-major fp32) to Q8_0 and upload it to the GPU once. Per 32-block:
@@ -911,6 +929,72 @@ impl VulkanDevice {
             )?;
             m0 += mcount;
         }
+        Ok(out)
+    }
+
+    /// Persistent f16 device buffer (2 B/elem), owned like [`alloc_f32`] so it survives across
+    /// forwards (the dequantized-weight cache for the coopmat prefill path), unlike the transient
+    /// scratch from [`alloc_f16`].
+    fn alloc_f16_storage(&self, count: usize) -> Result<VulkanStorage> {
+        let (buffer, memory, host_visible) = unsafe { self.raw_buffer((count * 2).max(4) as u64)? };
+        Ok(VulkanStorage {
+            buffer,
+            memory,
+            count,
+            dtype: DType::F16,
+            host_visible,
+            device: self.clone(),
+        })
+    }
+
+    /// Dequantize a resident Q8_0 weight (9 u32 / 32-block, row-major `[nout, k]`) to a fresh f16
+    /// `[nout, k]` device buffer. Done once and cached so prefill can run the matrix-core GEMM
+    /// instead of the bandwidth-bound quantized matmul that only reuses each weight over 8 rows.
+    pub fn dequant_q8_to_f16(&self, wq: &VulkanStorage, nout: usize, k: usize) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("dequant_q8_to_f16: k must be a multiple of 32, got {k}");
+        }
+        let nblocks_total = nout * k / 32;
+        let out = self.alloc_f16_storage(nout * k)?;
+        self.dispatch(
+            "dequant_q8_f16",
+            &[wq.buffer, out.buffer],
+            &push_u32(&[nblocks_total as u32]),
+            ((nblocks_total as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Q8_0 prefill via the fp16 matrix-core (coopmat) GEMM: `y[m, nout] = x[m, k] * W[nout, k]^T`,
+    /// `w16` the cached f16 weight from [`dequant_q8_to_f16`]. Casts the activations to f16 and runs
+    /// `bmm_coopmat_rb_nt`, reusing each loaded fragment across the whole tile grid (vs the 8-row
+    /// reuse of the quantized matmul). Caller guarantees `m % 16 == 0 && nout % 16 == 0 && k % 16 == 0`
+    /// and that coopmat is available.
+    pub fn matmul_q8_coopmat_gpu(
+        &self,
+        w16: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if x.count < m * k {
+            crate::bail!("matmul_q8_coopmat_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let (a16, a16_mem, a16_hv, a16_bytes) = self.alloc_f16(m * k)?;
+        self.dispatch(
+            "cast_f2h",
+            &[x.buffer, a16],
+            &push_u32(&[(m * k) as u32]),
+            (((m * k) as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        let out = self.alloc_f32(m * nout)?;
+        let push = push_u32(&[1u32, m as u32, k as u32, nout as u32]);
+        let mt = (m / 16) as u32;
+        let nt_tiles = (nout / 16) as u32;
+        let groups = (nt_tiles.div_ceil(4), mt.div_ceil(4), 1u32);
+        self.dispatch("bmm_coopmat_rb_nt", &[a16, w16.buffer, out.buffer], &push, groups)?;
+        self.free_scratch(a16_bytes, a16, a16_mem, a16_hv);
         Ok(out)
     }
 
@@ -3356,8 +3440,15 @@ impl BackendStorage for VulkanStorage {
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         let n = layout.shape().elem_count();
         match (self.dtype, dtype) {
-            // Same dtype: just contiguous-ize (respects layout/offset).
-            (DType::F32, DType::F32) | (DType::U32, DType::U32) => self.contiguous(layout),
+            // f16/bf16 are represented as f32 in this backend (see zeros_impl/upload invariant), so any
+            // conversion among the float dtypes is a representation no-op -- the f32 buffer already holds
+            // full-precision values. Just contiguous-ize. This eliminates the GPU->CPU->GPU round-trip
+            // that `to_dtype F32<->BF16` otherwise incurs on every layer (the dominant decode/prefill cost).
+            (
+                DType::F32 | DType::F16 | DType::BF16,
+                DType::F32 | DType::F16 | DType::BF16,
+            ) => self.contiguous(layout),
+            (DType::U32, DType::U32) => self.contiguous(layout),
             (DType::F32, DType::U32) => {
                 let c = self.contiguous(layout)?;
                 let out = self.device.alloc_u32(n)?;

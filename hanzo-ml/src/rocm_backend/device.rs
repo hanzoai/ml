@@ -5,9 +5,10 @@ use hanzo_rocm_kernels::compile::KernelCache;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+#[cfg(feature = "miopen")]
+use super::wrappers::SendSyncMIOpenHandle;
 use super::wrappers::{
-    DevicePool, SendSyncDeviceMemory, SendSyncMIOpenHandle, SendSyncPseudoRng,
-    SendSyncRocblasHandle, SendSyncStream,
+    DevicePool, SendSyncDeviceMemory, SendSyncPseudoRng, SendSyncRocblasHandle, SendSyncStream,
 };
 use super::{Affine, RocmError, RocmStorage, RocmStorageSlice};
 use rocm_rs::hip::Device as HipDevice;
@@ -31,6 +32,7 @@ pub struct RocmDevice {
     rocrand: Arc<Mutex<SendSyncPseudoRng>>,
     seed_value: Arc<RwLock<u64>>,
     pub(crate) blas: Arc<SendSyncRocblasHandle>,
+    #[cfg(feature = "miopen")]
     pub(crate) miopen: Arc<SendSyncMIOpenHandle>,
     kernel_manager: Arc<Mutex<KernelCache>>,
     /// Caching allocator pool (avoids the synchronizing per-op hipMalloc).
@@ -60,6 +62,7 @@ impl RocmDevice {
         blas.set_stream(&stream)
             .map_err(|e| RocmError::Rocblas(e.to_string()))?;
 
+        #[cfg(feature = "miopen")]
         let miopen =
             SendSyncMIOpenHandle::new(&stream).map_err(|e| RocmError::MIOpen(e.to_string()))?;
 
@@ -75,6 +78,7 @@ impl RocmDevice {
             rocrand: Arc::new(Mutex::new(rocrand)),
             seed_value: Arc::new(RwLock::new(seed)),
             blas: Arc::new(blas),
+            #[cfg(feature = "miopen")]
             miopen: Arc::new(miopen),
             kernel_manager,
             pool: Arc::new(Mutex::new(HashMap::new())),
@@ -125,6 +129,7 @@ impl RocmDevice {
         &self.kernel_manager
     }
 
+    #[cfg(feature = "miopen")]
     pub(crate) fn miopen(&self) -> &Arc<SendSyncMIOpenHandle> {
         &self.miopen
     }
