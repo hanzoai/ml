@@ -1398,19 +1398,13 @@ impl crate::Module for QMatMul {
                             // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
                             GgmlDType::Q4K if d.int_dot8() => d.matmul_q4k_dp4a_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
-                            // Q8_0 prefill, fast path: fp16 matrix-core (coopmat) GEMM. Reuses each
-                            // loaded fragment across the whole tile grid (vs 8-row reuse of the
-                            // quantized matmul) -- the prefill/TTFT lever toward llama.cpp parity.
-                            // The f16 weight is dequantized once and cached on `w16`.
+                            // Q8_0 prefill fast path: quant-aware matrix-core (coopmat) GEMM that reads
+                            // the Q8 weight once and dequantizes it in shared memory (no whole-weight
+                            // f16 materialization, no per-matmul activation cast) -- the prefill/TTFT
+                            // lever toward llama.cpp parity. `w16` is no longer used here.
                             _ if d.coopmat_q8_ok(m, *n, *k) => {
-                                let cached = {
-                                    let mut g = w16.lock().unwrap();
-                                    if g.is_none() {
-                                        *g = Some(std::sync::Arc::new(d.dequant_q8_to_f16(wq, *n, *k)?));
-                                    }
-                                    g.as_ref().unwrap().clone()
-                                };
-                                d.matmul_q8_coopmat_gpu(&cached, xv, m, *n, *k)?
+                                let _ = &w16;
+                                d.matmul_q8_mm_gpu(wq, xv, m, *n, *k)?
                             }
                             // Q8_0 prefill: int8 dp4a (compute-bound lever) when the device has hw
                             // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
