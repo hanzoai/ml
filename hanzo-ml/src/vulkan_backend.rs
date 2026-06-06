@@ -50,6 +50,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "dequant_q8_f16" => spv!("dequant_q8_f16"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
+        "mul_mat_vec_q8_llama" => spv!("mul_mat_vec_q8_llama"),
         "qk_norm_rope" => spv!("qk_norm_rope"),
         "mul_mat_vec_q8_sg_rps2" => spv!("mul_mat_vec_q8_sg_rps2"),
         "mul_mat_vec_q8_sg_rps8" => spv!("mul_mat_vec_q8_sg_rps8"),
@@ -604,26 +605,17 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32, woff as u32]);
-        if self.inner.subgroup_matvec {
-            // Subgroup-reduced kernel: each subgroup streams ROWS_PER_SG (=4, must match the shader)
-            // output rows, reusing each staged x-block across them. A workgroup of WG1D (64)
-            // invocations holds WG1D/subgroup_size subgroups, so it produces (subgroups * 4) rows;
-            // dispatch ceil(nout / rows_per_wg) workgroups.
-            // ROWS_PER_SG sweep: default 4 (shader default); HANZO_VK_MV_RPS picks a variant. The host
-            // divisor MUST match the shader's CFG_RPS, so they are chosen together here.
-            let (mv_kern, rows_per_sg): (&str, u32) =
-                match std::env::var("HANZO_VK_MV_RPS").as_deref() {
-                    Ok("2") => ("mul_mat_vec_q8_sg_rps2", 2),
-                    Ok("8") => ("mul_mat_vec_q8_sg_rps8", 8),
-                    Ok("16") => ("mul_mat_vec_q8_sg_rps16", 16),
-                    _ => ("mul_mat_vec_q8_sg", 4),
-                };
-            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1) * rows_per_sg;
+        // Faithful llama.cpp Q8 matvec when the device has subgroup arithmetic + f16: 128 threads
+        // sweep K (consecutive threads -> consecutive memory = coalesced, 128 in-flight streams),
+        // NUM_ROWS=2 output rows/workgroup reusing each activation vec4 load, f16 dequant/accum,
+        // 4x-unrolled K loop, subgroup-reduce. Scalar kernel is the fallback for devices without it.
+        if self.inner.subgroup_matvec && k.is_multiple_of(32) {
+            const NUM_ROWS: u32 = 2;
             self.dispatch(
-                mv_kern,
+                "mul_mat_vec_q8_llama",
                 &[wq.buffer, x.buffer, out.buffer],
                 &push,
-                ((nout as u32).div_ceil(rows_per_wg), 1, 1),
+                ((nout as u32).div_ceil(NUM_ROWS), 1, 1),
             )?;
         } else {
             self.dispatch(
