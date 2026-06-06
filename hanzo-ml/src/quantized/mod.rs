@@ -1398,25 +1398,20 @@ impl crate::Module for QMatMul {
                             // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
                             GgmlDType::Q4K if d.int_dot8() => d.matmul_q4k_dp4a_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
-                            // Q8_0 prefill fast path: quant-aware matrix-core (coopmat) GEMM that reads
-                            // the Q8 weight once and dequantizes it in shared memory (no whole-weight
-                            // f16 materialization, no per-matmul activation cast) -- the prefill/TTFT
-                            // lever toward llama.cpp parity. `w16` is no longer used here.
-                            _ if d.coopmat_q8_ok(m, *n, *k) => {
+                            // Q8_0 prefill A/B override: force the dp4a tiled GEMM on a coopmat device.
+                            _ if d.int_dot8() && std::env::var("HANZO_VK_Q8_DP4A").is_ok() => {
                                 let _ = &w16;
-                                d.matmul_q8_mm_gpu(wq, xv, m, *n, *k)?
+                                d.matmul_q8_mm_dp4a_gpu(wq, xv, m, *n, *k)?
                             }
-                            // Q8_0 prefill fallback (HANZO_VK_Q8_MM=0): the per-column dp4a, kept for
-                            // A/B and tiny-m cases.
-                            _ if d.int_dot8()
-                                && std::env::var("HANZO_VK_Q8_MM").map(|v| v == "0").unwrap_or(false) =>
-                            {
-                                d.matmul_q8_dp4a_gpu(wq, xv, m, *n, *k)?
+                            // Q8_0 prefill DEFAULT (coopmat devices): multi-warp matrix-core (WMMA) GEMM,
+                            // dequant Q8 in shared + reuse across the tile -- the prefill parity lever.
+                            // ~140 vs dp4a ~135 T/s on the 8060S; HANZO_VK_Q8_CM selects the tile config.
+                            _ if d.coopmat_info().is_some() && k.is_multiple_of(32) => {
+                                let _ = &w16;
+                                d.matmul_q8_cm_gpu(wq, xv, m, *n, *k)?
                             }
-                            // Q8_0 prefill DEFAULT: shared-memory-tiled int8 GEMM — weight reuse (Q8 read
-                            // once per workgroup, reused across 64 rows) AND occupancy (256 threads x 4x4
-                            // register tiles) together, vs the per-column dp4a's reuse/occupancy tradeoff.
-                            // Measured 112 vs 94 T/s prefill. Falls back to the f32-decode matmul w/o dp4a.
+                            // Q8_0 prefill (int8-dot, no coopmat): shared-memory-tiled dp4a GEMM —
+                            // weight reuse + occupancy together (vs the per-column dp4a tradeoff).
                             _ if d.int_dot8() => d.matmul_q8_mm_dp4a_gpu(wq, xv, m, *n, *k)?,
                             _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
                         }
