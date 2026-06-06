@@ -1,0 +1,101 @@
+#version 450
+// Faithful port of llama.cpp's Vulkan mul_mat_vec for Q8_0. y[row] = sum_k W[row,k]*x[k],
+// W = Q8_0 (1 f16 scale + 32 int8 = 9 u32/block, [nout,k]). Structure copied from llama (the parts
+// that set its ~81%-of-peak decode bandwidth on RADV):
+//   - BLOCK_SIZE=128 threads sweep K; each owns K_PER_ITER=8 contiguous elements per iter
+//     (col = base + K_PER_ITER*tid) -> consecutive threads read consecutive memory (coalesced) with
+//     128 independent memory streams in flight (memory-level parallelism).
+//   - NUM_ROWS=2 output rows per workgroup, reusing each activation vec4 load across both rows.
+//   - manual 4x unroll of the K loop (independent loads -> compiler overlaps them).
+//   - reduction via subgroupAdd within each subgroup, then combine the per-subgroup partials in shared.
+// Accumulation is f32 (llama's ACC_TYPE): the dot operands can be f16 for ALU rate but the running sum
+// MUST be f32 -- an f16 accumulator overflows across the FFN's k=12288 reductions and yields NaN
+// logits. Decode is weight-bandwidth-bound (int8 weights), so the accumulator dtype costs nothing.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint  w[]; };   // Q8_0, 9 u32/block
+layout(set = 0, binding = 1) readonly buffer X { vec4  xv[]; };  // activations, k/4 vec4
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, nout
+layout(push_constant) uniform Pc { uint nout; uint k; uint woff; };
+
+const uint BLOCK_SIZE = 128u;
+const uint NUM_ROWS = 2u;
+const uint K_PER_ITER = 8u;
+const uint MAX_SG = 8u; // BLOCK_SIZE / min-subgroup(16) upper bound
+
+shared float tmpsh[NUM_ROWS][MAX_SG];
+
+vec4 unpack_q8(uint word) {
+    return vec4(
+        float(bitfieldExtract(int(word), 0, 8)),
+        float(bitfieldExtract(int(word), 8, 8)),
+        float(bitfieldExtract(int(word), 16, 8)),
+        float(bitfieldExtract(int(word), 24, 8)));
+}
+
+// One K_PER_ITER=8 chunk at column `col` accumulated into temp[0],temp[1] (the two output rows).
+void accK(inout float temp[NUM_ROWS], uint col, uint br0, uint br1) {
+    uint c4 = col >> 2u;
+    vec4 b0 = xv[c4];
+    vec4 b1 = xv[c4 + 1u];
+    uint blk = col >> 5u;
+    uint wq = (col & 31u) >> 2u;        // payload word offset within block: {0,2,4,6}
+    uint o0 = br0 + blk * 9u;
+    uint o1 = br1 + blk * 9u;
+    float s0 = unpackHalf2x16(w[o0]).x;
+    float s1 = unpackHalf2x16(w[o1]).x;
+    temp[0] += s0 * (dot(unpack_q8(w[o0 + 1u + wq]), b0) + dot(unpack_q8(w[o0 + 2u + wq]), b1));
+    temp[1] += s1 * (dot(unpack_q8(w[o1 + 1u + wq]), b0) + dot(unpack_q8(w[o1 + 2u + wq]), b1));
+}
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * NUM_ROWS;
+    if (row0 >= nout) {
+        return;
+    }
+    uint nblocks = k / 32u;
+    uint r1 = min(row0 + 1u, nout - 1u);   // dup last row if nout odd (harmless; guarded on store)
+    uint br0 = woff + row0 * nblocks * 9u;
+    uint br1 = woff + r1 * nblocks * 9u;
+
+    float temp[NUM_ROWS];
+    temp[0] = 0.0;
+    temp[1] = 0.0;
+
+    uint stride = BLOCK_SIZE * K_PER_ITER;  // 1024
+    uint col = K_PER_ITER * tid;
+    for (; col + 3u * stride < k; col += 4u * stride) {  // manual 4x unroll: overlapped loads
+        accK(temp, col,             br0, br1);
+        accK(temp, col + stride,    br0, br1);
+        accK(temp, col + 2u*stride, br0, br1);
+        accK(temp, col + 3u*stride, br0, br1);
+    }
+    for (; col < k; col += stride) {
+        accK(temp, col, br0, br1);
+    }
+
+    temp[0] = subgroupAdd(temp[0]);
+    temp[1] = subgroupAdd(temp[1]);
+    uint nsg = gl_NumSubgroups;
+    if (nsg > 1u) {
+        if (subgroupElect()) {
+            tmpsh[0][gl_SubgroupID] = temp[0];
+            tmpsh[1][gl_SubgroupID] = temp[1];
+        }
+        barrier();
+        if (tid == 0u) {
+            float a0 = 0.0, a1 = 0.0;
+            [[unroll]] for (uint s = 0u; s < nsg; s++) { a0 += tmpsh[0][s]; a1 += tmpsh[1][s]; }
+            y[row0] = a0;
+            if (row0 + 1u < nout) y[row0 + 1u] = a1;
+        }
+    } else if (subgroupElect()) {
+        y[row0] = temp[0];
+        if (row0 + 1u < nout) y[row0 + 1u] = temp[1];
+    }
+}
