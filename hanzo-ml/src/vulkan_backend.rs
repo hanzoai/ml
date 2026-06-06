@@ -50,6 +50,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "dequant_q8_f16" => spv!("dequant_q8_f16"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
+        "qk_norm_rope" => spv!("qk_norm_rope"),
         "mul_mat_vec_q8_sg_rps2" => spv!("mul_mat_vec_q8_sg_rps2"),
         "mul_mat_vec_q8_sg_rps8" => spv!("mul_mat_vec_q8_sg_rps8"),
         "mul_mat_vec_q8_sg_rps16" => spv!("mul_mat_vec_q8_sg_rps16"),
@@ -1138,6 +1139,33 @@ impl VulkanDevice {
         };
         let groups = ((nout as u32).div_ceil(bn), (m as u32).div_ceil(bm), 1u32);
         self.dispatch(kern, &[wq.buffer, x.buffer, out.buffer], &push, groups)?;
+        Ok(out)
+    }
+
+    /// Fused per-head RMSNorm + NeoX RoPE for q/k (decode attention-prep). `x` is [nrows, d] (q or k
+    /// flattened over [b,h,s], row-major [b,h,s,d]); `weight` is the [d] norm weight; `cos`/`sin` are
+    /// the position-sliced [s, d/2] cache. Replaces the generic contiguous+rms_norm+transpose+rope+
+    /// reshape chain with one dispatch. Returns rotated+normed [nrows, d].
+    pub fn qk_norm_rope_gpu(
+        &self,
+        x: &VulkanStorage,
+        weight: &VulkanStorage,
+        cos: &VulkanStorage,
+        sin: &VulkanStorage,
+        nrows: usize,
+        d: usize,
+        s: usize,
+        eps: f32,
+    ) -> Result<VulkanStorage> {
+        let out = self.alloc_f32(nrows * d)?;
+        let mut push = push_u32(&[nrows as u32, d as u32, s as u32]);
+        push.extend_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            "qk_norm_rope",
+            &[x.buffer, weight.buffer, cos.buffer, sin.buffer, out.buffer],
+            &push,
+            ((nrows as u32).div_ceil(WG1D), 1, 1),
+        )?;
         Ok(out)
     }
 
