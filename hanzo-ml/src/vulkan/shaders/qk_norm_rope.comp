@@ -1,0 +1,43 @@
+#version 450
+// Fused per-head RMSNorm + GPT-NeoX RoPE (the decode attention-prep lever): replaces the generic
+// path's q.contiguous + rms_norm + transpose.flatten + rope + reshape.transpose chain (the per-layer
+// strided_copy storm) with one dispatch. x is [nrows, d] = q or k flattened over [b,h,s] (row-major
+// [b,h,s,d]); per row: RMSNorm over the head_dim d (matches rms_norm.comp: y = x*rsqrt(mean(x^2)+eps)
+// *weight), then NeoX rotation of (i, i+d/2) pairs using cos/sin[position] (cos/sin are [s, d/2], the
+// position-sliced cache; row's position index = row % s). Output rotated+normed, same [nrows, d] layout.
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer X  { float x[]; };       // [nrows, d]
+layout(set = 0, binding = 1) readonly  buffer WT { float weight[]; };  // [d] norm weight
+layout(set = 0, binding = 2) readonly  buffer CO { float cosb[]; };    // [s, d/2]
+layout(set = 0, binding = 3) readonly  buffer SI { float sinb[]; };    // [s, d/2]
+layout(set = 0, binding = 4) writeonly buffer Y  { float y[]; };       // [nrows, d]
+layout(push_constant) uniform Pc { uint nrows; uint d; uint s; float eps; };
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= nrows) {
+        return;
+    }
+    uint base = row * d;
+    uint hd = d / 2u;
+    uint cbase = (row % s) * hd;            // position within the cos/sin slice
+
+    float ss = 0.0;
+    for (uint i = 0u; i < d; i++) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    float denom = inversesqrt(ss / float(d) + eps);
+
+    for (uint i = 0u; i < hd; i++) {
+        float n1 = x[base + i]      * denom * weight[i];
+        float n2 = x[base + hd + i] * denom * weight[hd + i];
+        float c  = cosb[cbase + i];
+        float sn = sinb[cbase + i];
+        y[base + i]      = n1 * c - n2 * sn;
+        y[base + hd + i] = n1 * sn + n2 * c;
+    }
+}
