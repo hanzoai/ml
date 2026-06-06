@@ -67,6 +67,14 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mm_q8_dp4a_12x4" => spv!("mul_mm_q8_dp4a_12x4"),
         "mul_mm_q8_dp4a_16x2" => spv!("mul_mm_q8_dp4a_16x2"),
         "mul_mm_q8_dp4a_16x4" => spv!("mul_mm_q8_dp4a_16x4"),
+        "mul_mm_q8_cm" => spv!("mul_mm_q8_cm"),
+        "mul_mm_q8_cm_8x2" => spv!("mul_mm_q8_cm_8x2"),
+        "mul_mm_q8_cm_4x4" => spv!("mul_mm_q8_cm_4x4"),
+        "mul_mm_q8_cm_2x4" => spv!("mul_mm_q8_cm_2x4"),
+        "mul_mm_q8_cm_8x1" => spv!("mul_mm_q8_cm_8x1"),
+        "mul_mm_q8_cm_6x2" => spv!("mul_mm_q8_cm_6x2"),
+        "mul_mm_q8_cm_12x2" => spv!("mul_mm_q8_cm_12x2"),
+        "mul_mm_q8_cm_16x2" => spv!("mul_mm_q8_cm_16x2"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
@@ -1099,6 +1107,37 @@ impl VulkanDevice {
             };
         let groups = ((nout as u32).div_ceil(bn), (m as u32).div_ceil(bm), 1u32);
         self.dispatch(kern, &[wq.buffer, xq.buffer, xs.buffer, out.buffer], &push, groups)?;
+        Ok(out)
+    }
+
+    /// Q8_0 prefill via the multi-warp coopmat (WMMA) GEMM (`mul_mm_q8_cm`): dequant Q8 -> f16 in
+    /// shared, matrix-core MulAdd, 4 subgroups/workgroup. Experimental A/B vs the dp4a tiled GEMM
+    /// (HANZO_VK_Q8_CM selects a tile config); answers whether RDNA3.5 WMMA beats int8 dp4a here.
+    pub fn matmul_q8_cm_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if x.count < m * k {
+            crate::bail!("matmul_q8_cm_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let push = push_u32(&[m as u32, k as u32, nout as u32, 0u32]);
+        let (kern, bm, bn): (&str, u32, u32) = match std::env::var("HANZO_VK_Q8_CM").as_deref() {
+            Ok("4x2") => ("mul_mm_q8_cm", 64, 128),
+            Ok("4x4") => ("mul_mm_q8_cm_4x4", 64, 256),
+            Ok("2x4") => ("mul_mm_q8_cm_2x4", 32, 256),
+            Ok("8x1") => ("mul_mm_q8_cm_8x1", 128, 64),
+            Ok("6x2") => ("mul_mm_q8_cm_6x2", 96, 128),
+            Ok("12x2") => ("mul_mm_q8_cm_12x2", 192, 128),
+            Ok("16x2") => ("mul_mm_q8_cm_16x2", 256, 128),
+            _ => ("mul_mm_q8_cm_8x2", 128, 128), // sweep winner (~140 T/s)
+        };
+        let groups = ((nout as u32).div_ceil(bn), (m as u32).div_ceil(bm), 1u32);
+        self.dispatch(kern, &[wq.buffer, x.buffer, out.buffer], &push, groups)?;
         Ok(out)
     }
 
