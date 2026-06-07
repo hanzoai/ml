@@ -1449,6 +1449,17 @@ impl crate::Module for QMatMul {
                     };
                     return xs.matmul(&w);
                 }
+                // CUDA prefill (batched, rows > 8): dequantize the weight to f16 and run cuBLAS hgemm
+                // (Blackwell tensor cores) instead of candle's Ampere-tiled MMQ -- and it stays in
+                // f16/in_dtype (no f32 cast round-trip). Decode (rows <= 8) keeps the mmvq kernel, which
+                // is already at llama parity. Mirrors the mmvq/mmq batch threshold in cuda.rs::fwd.
+                #[cfg(feature = "cuda")]
+                if xs.device().is_cuda() {
+                    let kdim = xs.dim(xs.rank() - 1)?;
+                    if xs.elem_count() / kdim.max(1) > 8 {
+                        return self.forward_via_f16(xs);
+                    }
+                }
                 xs.apply_op1_no_bwd(t.as_ref())
             }
             Self::Tensor(w) => {
