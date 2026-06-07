@@ -3164,11 +3164,13 @@ impl VulkanStorage {
         let out = self.device.alloc_f32(nrows * m)?;
         let mut push = push_u32(&[nrows as u32, m as u32]);
         push.extend_from_slice(&eps.to_ne_bytes());
+        // One workgroup per row (the kernel cooperatively reduces m across its 256 threads), NOT
+        // groups_1d (which would pack 64 rows/workgroup and serialize each row on one lane).
         self.device.dispatch(
             "rms_norm",
             &[xb, ab, out.buffer],
             &push,
-            Self::groups_1d(nrows),
+            (nrows as u32, 1, 1),
         )?;
         Ok(out)
     }
