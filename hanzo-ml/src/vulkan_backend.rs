@@ -272,6 +272,14 @@ struct Submitter {
     // print which kernels dominate the per-token dispatch/barrier count so fusion targets the
     // right ops. Reset per batch; empty/untouched when profiling is off.
     op_counts: std::collections::HashMap<&'static str, u32>,
+    // GPU timestamp profiling (VK_PROFILE=1): a TIMESTAMP query pool (BATCH_CAP+1 slots) takes one
+    // completion stamp per dispatch (+ a batch-start stamp); flush_locked diffs consecutive stamps
+    // and sums them by op name => a per-op GPU-time breakdown of the batch (decode = per token), which
+    // separates real kernel time from inter-op stalls. ts_period = ns/tick (0 => timestamps
+    // unsupported, instrumentation skipped). ts_names = op name per recorded dispatch, in order.
+    query_pool: vk::QueryPool,
+    ts_period: f32,
+    ts_names: Vec<&'static str>,
 }
 // Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex.
 unsafe impl Send for Submitter {}
@@ -2125,6 +2133,17 @@ impl VulkanDevice {
                 s.written_since_barrier.clear();
                 s.record_ns = 0;
                 s.barriers = 0;
+                if profile && s.ts_period > 0.0 {
+                    // Reset the pool and stamp the batch start; each dispatch stamps its completion.
+                    dev.cmd_reset_query_pool(s.cmd, s.query_pool, 0, BATCH_CAP + 1);
+                    dev.cmd_write_timestamp(
+                        s.cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        s.query_pool,
+                        0,
+                    );
+                    s.ts_names.clear();
+                }
             }
             // RAW hazard: if this dispatch touches a buffer that an earlier dispatch in this same
             // batch wrote (and we haven't barriered since), insert ONE memory barrier first, then
@@ -2271,6 +2290,17 @@ impl VulkanDevice {
                     s.record_ns += t0.elapsed().as_nanos();
                 }
                 *s.op_counts.entry(name).or_insert(0) += 1;
+                if s.ts_period > 0.0 {
+                    // s.n is post-increment: stamp[s.n] = completion of this (the s.n-th) dispatch;
+                    // stamp[0] was the batch start, so diff(stamp[i], stamp[i-1]) = op i's GPU span.
+                    dev.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        s.query_pool,
+                        s.n,
+                    );
+                    s.ts_names.push(name);
+                }
             }
             // Bound the descriptor-set budget: a forward longer than BATCH_CAP ops just flushes
             // a handful of times instead of once.
@@ -2477,6 +2507,43 @@ fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter, profile:
             .collect::<Vec<_>>()
             .join(" ");
         eprintln!("[VK_PROFILE]   ops: {hist}");
+        // Per-op GPU time from the timestamps (fence already waited, so results are ready). Diff
+        // consecutive completion stamps and sum by op name -> shows which kernels actually own the
+        // GPU's wall time (vs the dispatch-count histogram above), and the SUM vs fence_wait reveals
+        // inter-op stall time (the serial dependency drains).
+        let nts = s.ts_names.len();
+        if s.ts_period > 0.0 && nts > 0 {
+            let mut stamps = vec![0u64; nts + 1];
+            if unsafe {
+                dev.get_query_pool_results(
+                    s.query_pool,
+                    0,
+                    &mut stamps,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+            }
+            .is_ok()
+            {
+                let mut gpu: std::collections::HashMap<&'static str, f64> =
+                    std::collections::HashMap::new();
+                let mut total = 0.0f64;
+                for i in 0..nts {
+                    let dt = stamps[i + 1].wrapping_sub(stamps[i]) as f64 * s.ts_period as f64 / 1e6;
+                    *gpu.entry(s.ts_names[i]).or_insert(0.0) += dt;
+                    total += dt;
+                }
+                let mut g: Vec<(&&'static str, &f64)> = gpu.iter().collect();
+                g.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let gstr = g
+                    .iter()
+                    .take(12)
+                    .map(|(k, v)| format!("{k}={v:.2}ms"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("[VK_PROFILE]   gpu-busy {total:.2}ms by-op: {gstr}");
+            }
+        }
+        s.ts_names.clear();
     }
     s.op_counts.clear();
     s.recording = false;
@@ -2739,6 +2806,21 @@ impl BackendDevice for VulkanDevice {
             let fence = device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(vkerr)?;
+            // Timestamp query pool for per-op GPU-time profiling (VK_PROFILE). One slot per dispatch
+            // plus the batch-start stamp. ts_period (ns/tick) is 0 if the device reports no timestamp
+            // support, in which case the recording path skips the writes.
+            let ts_period = instance
+                .get_physical_device_properties(pdev)
+                .limits
+                .timestamp_period;
+            let query_pool = device
+                .create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(BATCH_CAP + 1),
+                    None,
+                )
+                .map_err(vkerr)?;
             // Sized for a whole batch: one descriptor set per recorded dispatch (up to
             // BATCH_CAP), each binding up to 4 storage buffers (the widest kernel).
             let dpool_sizes = [vk::DescriptorPoolSize::default()
@@ -2763,6 +2845,9 @@ impl BackendDevice for VulkanDevice {
                 record_ns: 0,
                 barriers: 0,
                 op_counts: std::collections::HashMap::new(),
+                query_pool,
+                ts_period,
+                ts_names: Vec::new(),
             });
 
             // Phase profiling: opt-in, read once here so the hot path only checks a bool.
