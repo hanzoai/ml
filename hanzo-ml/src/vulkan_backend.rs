@@ -70,6 +70,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "reduce_sum" => spv!("reduce_sum"),
         "reduce_max" => spv!("reduce_max"),
         "strided_copy" => spv!("strided_copy"),
+        "kv_append" => spv!("strided_copy"),
         "index_select" => spv!("index_select"),
         "where_cond" => spv!("where_cond"),
         "softmax_rows" => spv!("softmax_rows"),
@@ -3982,7 +3983,11 @@ impl BackendStorage for VulkanStorage {
             b
         };
         let _ = &idk; // keep the materialized ids alive until the dispatch is recorded
-        let src_c = self.contiguous(l)?;
+        // Source (e.g. the [vocab, hidden] embedding table) is normally already contiguous: use its
+        // buffer directly instead of a full copy. The old unconditional self.contiguous(l) re-copied
+        // the entire 2.5GB f32 embedding table EVERY decode token (~28ms, the #2 decode cost).
+        let mut srck = None;
+        let src_buf = self.contig_buf(l, &mut srck)?;
         let dims = l.dims();
         let left: usize = dims[..dim].iter().product();
         let dim_size = dims[dim];
@@ -3993,10 +3998,11 @@ impl BackendStorage for VulkanStorage {
         let push = push_u32(&[left as u32, dim_size as u32, right as u32, n_ids as u32]);
         self.device.dispatch(
             "index_select",
-            &[ids_buf, src_c.buffer, out.buffer],
+            &[ids_buf, src_buf, out.buffer],
             &push,
             Self::groups_1d(total),
         )?;
+        let _ = &srck;
         Ok(out)
     }
 
@@ -4187,7 +4193,7 @@ impl BackendStorage for VulkanStorage {
         p.extend_from_slice(&shape6);
         p.extend_from_slice(&stride6);
         self.device.dispatch(
-            "strided_copy",
+            "kv_append",
             &[self.buffer, dst.buffer],
             &push_u32(&p),
             Self::groups_1d(n),
