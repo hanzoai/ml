@@ -47,36 +47,13 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm_coopmat_rb" => spv!("bmm_coopmat_rb"),
         "bmm_coopmat_rb_nt" => spv!("bmm_coopmat_rb_nt"),
         "cast_f2h" => spv!("cast_f2h"),
-        "dequant_q8_f16" => spv!("dequant_q8_f16"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
-        "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
         "mul_mat_vec_q8_llama" => spv!("mul_mat_vec_q8_llama"),
         "qk_norm_rope" => spv!("qk_norm_rope"),
-        "mul_mat_vec_q8_sg_rps2" => spv!("mul_mat_vec_q8_sg_rps2"),
-        "mul_mat_vec_q8_sg_rps8" => spv!("mul_mat_vec_q8_sg_rps8"),
-        "mul_mat_vec_q8_sg_rps16" => spv!("mul_mat_vec_q8_sg_rps16"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q8_dp4a" => spv!("mul_mat_q8_dp4a"),
-        "mul_mm_q8" => spv!("mul_mm_q8"),
         "mul_mm_q8_dp4a" => spv!("mul_mm_q8_dp4a"),
-        "mul_mm_q8_dp4a_8x4" => spv!("mul_mm_q8_dp4a_8x4"),
-        "mul_mm_q8_dp4a_4x8" => spv!("mul_mm_q8_dp4a_4x8"),
-        "mul_mm_q8_dp4a_8x8" => spv!("mul_mm_q8_dp4a_8x8"),
-        "mul_mm_q8_dp4a_2x2" => spv!("mul_mm_q8_dp4a_2x2"),
-        "mul_mm_q8_dp4a_6x6" => spv!("mul_mm_q8_dp4a_6x6"),
-        "mul_mm_q8_dp4a_4x4n4" => spv!("mul_mm_q8_dp4a_4x4n4"),
-        "mul_mm_q8_dp4a_8x2" => spv!("mul_mm_q8_dp4a_8x2"),
-        "mul_mm_q8_dp4a_12x4" => spv!("mul_mm_q8_dp4a_12x4"),
-        "mul_mm_q8_dp4a_16x2" => spv!("mul_mm_q8_dp4a_16x2"),
-        "mul_mm_q8_dp4a_16x4" => spv!("mul_mm_q8_dp4a_16x4"),
         "mul_mm_q8_cm" => spv!("mul_mm_q8_cm"),
-        "mul_mm_q8_cm_8x2" => spv!("mul_mm_q8_cm_8x2"),
-        "mul_mm_q8_cm_4x4" => spv!("mul_mm_q8_cm_4x4"),
-        "mul_mm_q8_cm_2x4" => spv!("mul_mm_q8_cm_2x4"),
-        "mul_mm_q8_cm_8x1" => spv!("mul_mm_q8_cm_8x1"),
-        "mul_mm_q8_cm_6x2" => spv!("mul_mm_q8_cm_6x2"),
-        "mul_mm_q8_cm_12x2" => spv!("mul_mm_q8_cm_12x2"),
-        "mul_mm_q8_cm_16x2" => spv!("mul_mm_q8_cm_16x2"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
@@ -235,7 +212,7 @@ struct VkInner {
     cm_use: bool,
     // CPU-side RNG seed (kernels are deterministic; randoms are generated on the CPU then uploaded).
     seed: Mutex<u64>,
-    // Per-flush phase profiling, gated on HANZO_VK_PROFILE=1 (read once at init). When set,
+    // Per-flush phase profiling, gated on VK_PROFILE=1 (read once at init). When set,
     // `flush_locked` prints, per submitted batch, the time spent recording dispatches, in
     // queue_submit, in the fence wait, plus the dispatch and emitted-barrier counts; readbacks
     // print their map+copy time. Lets the 8060S show where the per-token milliseconds actually go.
@@ -284,14 +261,14 @@ struct Submitter {
     // barrier and at the start of every batch. See `dispatch` for the correctness argument (WAW/WAR
     // can't occur within a batch because the buffer pool only recycles handles across fences).
     written_since_barrier: std::collections::HashSet<vk::Buffer>,
-    // Per-batch profiling accumulators (HANZO_VK_PROFILE=1). `record_ns` is the wall time spent in
+    // Per-batch profiling accumulators (VK_PROFILE=1). `record_ns` is the wall time spent in
     // the dispatch recording path (descriptor push/update + cmd_dispatch + barrier bookkeeping)
     // since the batch began; `barriers` counts memory barriers emitted this batch. Both reset per
     // batch and are read by `flush_locked` when profiling is on. Zero-overhead otherwise (the
     // recording timer is only sampled when the device's `profile` flag is set).
     record_ns: u128,
     barriers: u32,
-    // Per-batch dispatch histogram by kernel name (HANZO_VK_PROFILE=1 only). Lets flush_locked
+    // Per-batch dispatch histogram by kernel name (VK_PROFILE=1 only). Lets flush_locked
     // print which kernels dominate the per-token dispatch/barrier count so fusion targets the
     // right ops. Reset per batch; empty/untouched when profiling is off.
     op_counts: std::collections::HashMap<&'static str, u32>,
@@ -433,22 +410,6 @@ impl VulkanDevice {
         self.inner.int_dot8
     }
 
-    /// Whether a Q8 prefill GEMM of these dims should take the fp16 matrix-core (coopmat) path:
-    /// device has a 16x16x16 coopmat config, it is enabled, every tile dim is a multiple of 16, and
-    /// the f16 weight + activation scratch fits. Far higher arithmetic intensity than the quantized
-    /// matmul (which only reuses each weight over 8 rows), closing the prefill gap to llama.cpp.
-    pub fn coopmat_q8_ok(&self, m: usize, nout: usize, k: usize) -> bool {
-        // Opt-in (HANZO_VK_Q8_COOPMAT=1): the f16 weight cache doubles resident weight VRAM (Q8 +
-        // f16), which on this UMA part can push the decode matvec onto slower memory. Off by default
-        // until the prefill win outweighs that; the path itself is correct (coherent output).
-        std::env::var("HANZO_VK_Q8_COOPMAT").map(|v| v != "0").unwrap_or(false)
-            && self.inner.cm_use
-            && matches!(self.coopmat_info(), Some((16, 16, 16)))
-            && m % 16 == 0
-            && nout % 16 == 0
-            && k % 16 == 0
-            && self.scratch_fits(((m * k * 2) as u64).saturating_add((nout * k * 2) as u64))
-    }
 
     /// Quantize `W[nout x k]` (row-major fp32) to Q8_0 and upload it to the GPU once. Per 32-block:
     /// one fp16 scale + 32 int8, packed into 9 u32. Returns the device buffer to reuse across many
@@ -956,97 +917,6 @@ impl VulkanDevice {
         Ok(out)
     }
 
-    /// Persistent f16 device buffer (2 B/elem), owned like [`alloc_f32`] so it survives across
-    /// forwards (the dequantized-weight cache for the coopmat prefill path), unlike the transient
-    /// scratch from [`alloc_f16`].
-    fn alloc_f16_storage(&self, count: usize) -> Result<VulkanStorage> {
-        let (buffer, memory, host_visible) = unsafe { self.raw_buffer((count * 2).max(4) as u64)? };
-        Ok(VulkanStorage {
-            buffer,
-            memory,
-            count,
-            dtype: DType::F16,
-            host_visible,
-            device: self.clone(),
-        })
-    }
-
-    /// Dequantize a resident Q8_0 weight (9 u32 / 32-block, row-major `[nout, k]`) to a fresh f16
-    /// `[nout, k]` device buffer. Done once and cached so prefill can run the matrix-core GEMM
-    /// instead of the bandwidth-bound quantized matmul that only reuses each weight over 8 rows.
-    pub fn dequant_q8_to_f16(&self, wq: &VulkanStorage, nout: usize, k: usize) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(32) {
-            crate::bail!("dequant_q8_to_f16: k must be a multiple of 32, got {k}");
-        }
-        let nblocks_total = nout * k / 32;
-        let out = self.alloc_f16_storage(nout * k)?;
-        self.dispatch(
-            "dequant_q8_f16",
-            &[wq.buffer, out.buffer],
-            &push_u32(&[nblocks_total as u32]),
-            ((nblocks_total as u32).div_ceil(WG1D), 1, 1),
-        )?;
-        Ok(out)
-    }
-
-    /// Q8_0 prefill via the fp16 matrix-core (coopmat) GEMM: `y[m, nout] = x[m, k] * W[nout, k]^T`,
-    /// `w16` the cached f16 weight from [`dequant_q8_to_f16`]. Casts the activations to f16 and runs
-    /// `bmm_coopmat_rb_nt`, reusing each loaded fragment across the whole tile grid (vs the 8-row
-    /// reuse of the quantized matmul). Caller guarantees `m % 16 == 0 && nout % 16 == 0 && k % 16 == 0`
-    /// and that coopmat is available.
-    pub fn matmul_q8_coopmat_gpu(
-        &self,
-        w16: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-    ) -> Result<VulkanStorage> {
-        if x.count < m * k {
-            crate::bail!("matmul_q8_coopmat_gpu: x count {} < m*k {}", x.count, m * k);
-        }
-        let (a16, a16_mem, a16_hv, a16_bytes) = self.alloc_f16(m * k)?;
-        self.dispatch(
-            "cast_f2h",
-            &[x.buffer, a16],
-            &push_u32(&[(m * k) as u32]),
-            (((m * k) as u32).div_ceil(WG1D), 1, 1),
-        )?;
-        let out = self.alloc_f32(m * nout)?;
-        let push = push_u32(&[1u32, m as u32, k as u32, nout as u32]);
-        let mt = (m / 16) as u32;
-        let nt_tiles = (nout / 16) as u32;
-        let groups = (nt_tiles.div_ceil(4), mt.div_ceil(4), 1u32);
-        self.dispatch("bmm_coopmat_rb_nt", &[a16, w16.buffer, out.buffer], &push, groups)?;
-        self.free_scratch(a16_bytes, a16, a16_mem, a16_hv);
-        Ok(out)
-    }
-
-    /// Q8_0 prefill via the quant-aware coopmat GEMM (`mul_mm_q8`): `y[m, nout] = x[m, k] * Wq^T`.
-    /// Reads the Q8 weight ONCE, dequantizing each block to f16 in shared memory before the matrix-
-    /// core MulAdd -- no whole-weight f16 materialization and no per-matmul activation cast pass (vs
-    /// [`matmul_q8_coopmat_gpu`]). 64x64 output tile per workgroup; caller guarantees m,n,k % 16 == 0.
-    pub fn matmul_q8_mm_gpu(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-    ) -> Result<VulkanStorage> {
-        if x.count < m * k {
-            crate::bail!("matmul_q8_mm_gpu: x count {} < m*k {}", x.count, m * k);
-        }
-        if !k.is_multiple_of(32) {
-            crate::bail!("matmul_q8_mm_gpu: k must be a multiple of 32, got {k}");
-        }
-        let out = self.alloc_f32(m * nout)?;
-        let push = push_u32(&[m as u32, k as u32, nout as u32, 0u32]); // woff = 0 (plain 2D weight)
-        let groups = ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1u32);
-        self.dispatch("mul_mm_q8", &[wq.buffer, x.buffer, out.buffer], &push, groups)?;
-        Ok(out)
-    }
-
     /// Q8_0 prefill via the shared-memory-tiled int8-dot GEMM (`mul_mm_q8_dp4a`): `y[m, nout] =
     /// x[m, k] * Wq^T`. Quantizes the activation tile to int8 once, then a single dispatch where each
     /// 64x64 output tile stages its weight + activation sub-tiles in shared memory (Q8 read ONCE,
@@ -1082,30 +952,19 @@ impl VulkanDevice {
         )?;
         let out = self.alloc_f32(m * nout)?;
         let push = push_u32(&[m as u32, k as u32, nout as u32, 0u32]); // woff = 0
-        // Tile-config sweep: one build, many spv variants selected at runtime (BM=16*TM, BN=16*TN).
-        // Default = 8x4 (128x64), the sweep winner. HANZO_VK_MM_CFG picks another for A/B.
-        let (kern, bm, bn): (&str, u32, u32) =
-            match std::env::var("HANZO_VK_MM_CFG").as_deref() {
-                Ok("4x4") => ("mul_mm_q8_dp4a", 64, 64),
-                Ok("4x8") => ("mul_mm_q8_dp4a_4x8", 64, 128),
-                Ok("8x8") => ("mul_mm_q8_dp4a_8x8", 128, 128),
-                Ok("2x2") => ("mul_mm_q8_dp4a_2x2", 32, 32),
-                Ok("6x6") => ("mul_mm_q8_dp4a_6x6", 96, 96),
-                Ok("4x4n4") => ("mul_mm_q8_dp4a_4x4n4", 64, 64),
-                Ok("8x2") => ("mul_mm_q8_dp4a_8x2", 128, 32),
-                Ok("12x4") => ("mul_mm_q8_dp4a_12x4", 192, 64),
-                Ok("16x2") => ("mul_mm_q8_dp4a_16x2", 256, 32),
-                Ok("16x4") => ("mul_mm_q8_dp4a_16x4", 256, 64),
-                _ => ("mul_mm_q8_dp4a_8x4", 128, 64),
-            };
-        let groups = ((nout as u32).div_ceil(bn), (m as u32).div_ceil(bm), 1u32);
-        self.dispatch(kern, &[wq.buffer, xq.buffer, xs.buffer, out.buffer], &push, groups)?;
+        // 8x4 tile (BM=128, BN=64): the tile-sweep winner for the dp4a prefill GEMM.
+        let groups = ((nout as u32).div_ceil(64), (m as u32).div_ceil(128), 1u32);
+        self.dispatch(
+            "mul_mm_q8_dp4a",
+            &[wq.buffer, xq.buffer, xs.buffer, out.buffer],
+            &push,
+            groups,
+        )?;
         Ok(out)
     }
 
-    /// Q8_0 prefill via the multi-warp coopmat (WMMA) GEMM (`mul_mm_q8_cm`): dequant Q8 -> f16 in
-    /// shared, matrix-core MulAdd, 4 subgroups/workgroup. Experimental A/B vs the dp4a tiled GEMM
-    /// (HANZO_VK_Q8_CM selects a tile config); answers whether RDNA3.5 WMMA beats int8 dp4a here.
+    /// Q8_0 prefill via the multi-warp coopmat (WMMA) GEMM: dequant Q8 -> f16 in shared, matrix-core
+    /// MulAdd, 4 subgroups/workgroup, 8x2 tile (128x128). The prefill GEMM on coopmat devices.
     pub fn matmul_q8_cm_gpu(
         &self,
         wq: &VulkanStorage,
@@ -1119,18 +978,8 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(m * nout)?;
         let push = push_u32(&[m as u32, k as u32, nout as u32, 0u32]);
-        let (kern, bm, bn): (&str, u32, u32) = match std::env::var("HANZO_VK_Q8_CM").as_deref() {
-            Ok("4x2") => ("mul_mm_q8_cm", 64, 128),
-            Ok("4x4") => ("mul_mm_q8_cm_4x4", 64, 256),
-            Ok("2x4") => ("mul_mm_q8_cm_2x4", 32, 256),
-            Ok("8x1") => ("mul_mm_q8_cm_8x1", 128, 64),
-            Ok("6x2") => ("mul_mm_q8_cm_6x2", 96, 128),
-            Ok("12x2") => ("mul_mm_q8_cm_12x2", 192, 128),
-            Ok("16x2") => ("mul_mm_q8_cm_16x2", 256, 128),
-            _ => ("mul_mm_q8_cm_8x2", 128, 128), // sweep winner (~140 T/s)
-        };
-        let groups = ((nout as u32).div_ceil(bn), (m as u32).div_ceil(bm), 1u32);
-        self.dispatch(kern, &[wq.buffer, x.buffer, out.buffer], &push, groups)?;
+        let groups = ((nout as u32).div_ceil(128), (m as u32).div_ceil(128), 1u32);
+        self.dispatch("mul_mm_q8_cm", &[wq.buffer, x.buffer, out.buffer], &push, groups)?;
         Ok(out)
     }
 
@@ -2057,7 +1906,7 @@ impl VulkanDevice {
         dev.unmap_memory(mem);
         if let Some(t) = t0 {
             eprintln!(
-                "[HANZO_VK_PROFILE] readback(f32): {n} elems map+copy={:.3}ms",
+                "[VK_PROFILE] readback(f32): {n} elems map+copy={:.3}ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -2115,7 +1964,7 @@ impl VulkanDevice {
         dev.unmap_memory(mem);
         if let Some(t) = t0 {
             eprintln!(
-                "[HANZO_VK_PROFILE] readback(u32): {n} elems map+copy={:.3}ms",
+                "[VK_PROFILE] readback(u32): {n} elems map+copy={:.3}ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -2554,7 +2403,7 @@ impl VulkanDevice {
         Ok(s)
     }
 
-    // Name a CPU-fallback round-trip when HANZO_VK_PROFILE is set. Each fallback op reads its
+    // Name a CPU-fallback round-trip when VK_PROFILE is set. Each fallback op reads its
     // operand(s) back to the host, computes on the (UNtimed) CPU, and re-uploads -- a hidden
     // bottleneck the size-only readback log can't attribute to an op. This names the culprit so a
     // GPU re-run can prioritize which op to port native next. Zero-cost when profiling is off (the
@@ -2563,7 +2412,7 @@ impl VulkanDevice {
     #[inline]
     fn profile_fallback(&self, op: &str, extra: std::fmt::Arguments<'_>) {
         if self.inner.profile {
-            eprintln!("[HANZO_VK_PROFILE] cpu-fallback op={op} {extra} (GPU->CPU->GPU round-trip)");
+            eprintln!("[VK_PROFILE] cpu-fallback op={op} {extra} (GPU->CPU->GPU round-trip)");
         }
     }
 }
@@ -2615,7 +2464,7 @@ fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter, profile:
         // per-token GPU breakdown: `dispatch` = ops recorded, `barriers` = memory barriers emitted
         // (lower is better -- with selective barriers, independent ops in a row emit none).
         eprintln!(
-            "[HANZO_VK_PROFILE] flush: dispatch={n} barriers={barriers} \
+            "[VK_PROFILE] flush: dispatch={n} barriers={barriers} \
              record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms",
         );
         // Per-op histogram (top 14 by dispatch count) so fusion targets the dominant kernels.
@@ -2627,7 +2476,7 @@ fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter, profile:
             .map(|(name, c)| format!("{name}={c}"))
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!("[HANZO_VK_PROFILE]   ops: {hist}");
+        eprintln!("[VK_PROFILE]   ops: {hist}");
     }
     s.op_counts.clear();
     s.recording = false;
@@ -2742,10 +2591,7 @@ impl BackendDevice for VulkanDevice {
             // (bmm_coopmat_rb) measured 1.3-2.7x over the fp32 bmm_reg on the real AMD driver and a
             // full Qwen3-0.6B forward's argmax matched CPU exactly (fp16 inputs, fp32 accumulate).
             // Set HANZO_VK_COOPMAT=0 to force the fp32 path (e.g. if precision matters).
-            let cm_use = coopmat
-                && std::env::var("HANZO_VK_COOPMAT")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+            let cm_use = coopmat;
 
             // VK_KHR_push_descriptor: lets `dispatch` push buffer handles inline into the command
             // buffer (vkCmdPushDescriptorSetKHR) instead of allocating + updating + binding a
@@ -2758,30 +2604,16 @@ impl BackendDevice for VulkanDevice {
             let has_pd_ext = dev_exts.iter().any(|e| {
                 CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::push_descriptor::NAME
             });
-            let use_pd = has_pd_ext
-                && std::env::var("HANZO_VK_PUSH_DESC")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+            let use_pd = has_pd_ext;
 
             // Buffer-memory placement policy. Default `auto`: host-visible when it fits, else spill
             // big buffers (e.g. an 18.6GB model's weights) to the largest DEVICE_LOCAL heap (the GTT
             // pool on this UMA APU), which is where the real capacity lives. `host_only` restores the
             // legacy host-visible-only behaviour; `device_first` forces big-heap placement always.
-            let mem_strategy = match std::env::var("HANZO_VK_DEVICE_MEMORY_STRATEGY")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-            {
-                Some("host_only") | Some("host") => MemStrategy::HostOnly,
-                Some("device_first") | Some("device") => MemStrategy::DeviceFirst,
-                Some("auto") | None | Some("") => MemStrategy::Auto,
-                Some(other) => {
-                    eprintln!(
-                        "[vulkan] unknown HANZO_VK_DEVICE_MEMORY_STRATEGY=`{other}` (expected host_only|device_first|auto); using auto"
-                    );
-                    MemStrategy::Auto
-                }
-            };
+            // Per-allocation placement: host-visible when its heap fits the buffer, else the largest
+            // DEVICE_LOCAL heap. The only correct policy on this UMA APU (small host-visible carveout,
+            // huge DEVICE_LOCAL GTT pool); the other strategies existed only for A/B and are dropped.
+            let mem_strategy = MemStrategy::Auto;
 
             // VK_EXT_memory_budget: enables querying per-heap *free* bytes at runtime (the scratch
             // guard needs this; the static heap `size` is total capacity only). Enable it when the
@@ -2811,10 +2643,7 @@ impl BackendDevice for VulkanDevice {
             let subgroup_size = sg_props.subgroup_size;
             let subgroup_matvec = sg_compute
                 && sg_arith
-                && subgroup_size >= 2
-                && std::env::var("HANZO_VK_SUBGROUP_MATVEC")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+                && subgroup_size >= 2;
 
             // Hardware int8 dot product (core in Vulkan 1.3, which the 1.3 instance guarantees, so no
             // extension to enable -- only the feature must be turned on at device creation to use
@@ -2838,10 +2667,7 @@ impl BackendDevice for VulkanDevice {
                 && idp_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE
                 && idp_props
                     .integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated
-                    == vk::TRUE
-                && std::env::var("HANZO_VK_INT_DOT8")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+                    == vk::TRUE;
 
             // Build the enabled-extension list dynamically: coopmat and push_descriptor are
             // independent and either may be present. push_descriptor needs no extra device feature
@@ -2940,7 +2766,7 @@ impl BackendDevice for VulkanDevice {
             });
 
             // Phase profiling: opt-in, read once here so the hot path only checks a bool.
-            let profile = std::env::var("HANZO_VK_PROFILE")
+            let profile = std::env::var("VK_PROFILE")
                 .map(|v| v != "0")
                 .unwrap_or(false);
 
@@ -4304,7 +4130,7 @@ impl BackendStorage for VulkanStorage {
         }
         if self.device.inner.profile {
             eprintln!(
-                "[HANZO_VK_PROFILE] copy2d(native): d1={d1} d2={d2} elems={total} \
+                "[VK_PROFILE] copy2d(native): d1={d1} d2={d2} elems={total} \
                  (was a CPU round-trip; now on-GPU)"
             );
         }

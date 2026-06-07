@@ -1398,20 +1398,13 @@ impl crate::Module for QMatMul {
                             // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
                             GgmlDType::Q4K if d.int_dot8() => d.matmul_q4k_dp4a_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
-                            // Q8_0 prefill A/B override: force the dp4a tiled GEMM on a coopmat device.
-                            _ if d.int_dot8() && std::env::var("HANZO_VK_Q8_DP4A").is_ok() => {
-                                let _ = &w16;
-                                d.matmul_q8_mm_dp4a_gpu(wq, xv, m, *n, *k)?
-                            }
-                            // Q8_0 prefill DEFAULT (coopmat devices): multi-warp matrix-core (WMMA) GEMM,
-                            // dequant Q8 in shared + reuse across the tile -- the prefill parity lever.
-                            // ~140 vs dp4a ~135 T/s on the 8060S; HANZO_VK_Q8_CM selects the tile config.
+                            // Q8_0 prefill on coopmat devices: multi-warp matrix-core (WMMA) GEMM,
+                            // dequant Q8 in shared + reuse across the 128x128 tile (~140 T/s, 8060S).
                             _ if d.coopmat_info().is_some() && k.is_multiple_of(32) => {
                                 let _ = &w16;
                                 d.matmul_q8_cm_gpu(wq, xv, m, *n, *k)?
                             }
-                            // Q8_0 prefill (int8-dot, no coopmat): shared-memory-tiled dp4a GEMM —
-                            // weight reuse + occupancy together (vs the per-column dp4a tradeoff).
+                            // Q8_0 prefill (int8-dot, no coopmat): shared-memory-tiled dp4a GEMM.
                             _ if d.int_dot8() => d.matmul_q8_mm_dp4a_gpu(wq, xv, m, *n, *k)?,
                             _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
                         }

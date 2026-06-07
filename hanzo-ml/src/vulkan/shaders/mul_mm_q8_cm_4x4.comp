@@ -1,5 +1,0 @@
-#version 450
-#extension GL_GOOGLE_include_directive : require
-#define CFG_RM 4u
-#define CFG_RN 4u
-#include "mul_mm_q8_cm_body.glsl"
