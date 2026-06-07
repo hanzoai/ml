@@ -81,6 +81,12 @@ impl CommandBuffer {
             .unwrap()
     }
 
+    // Alias the engine's metal kernels expect. This encoder wrapper does no explicit MTLFence work
+    // (Metal tracks hazards on tracked resources), so the "no_fence" variant is the same encoder.
+    pub fn compute_command_encoder_no_fence(&self) -> ComputeCommandEncoder {
+        self.compute_command_encoder()
+    }
+
     pub fn blit_command_encoder(&self) -> BlitCommandEncoder {
         self.as_ref()
             .blitCommandEncoder()

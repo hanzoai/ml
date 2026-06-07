@@ -11,6 +11,36 @@ use std::sync::{Arc, Mutex};
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
+/// RAII guard that owns a `ComputeCommandEncoder` for the lifetime of a command-recording scope.
+/// The hanzo-quant/paged-attn metal kernels accept `&CommandsGuard` as an `EncoderProvider`; it
+/// derefs to the inner encoder so all `set_*`/`dispatch_*` calls forward transparently.
+pub struct CommandsGuard<'a> {
+    encoder: ComputeCommandEncoder,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> CommandsGuard<'a> {
+    pub fn new(encoder: ComputeCommandEncoder) -> Self {
+        Self {
+            encoder,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl std::ops::Deref for CommandsGuard<'_> {
+    type Target = ComputeCommandEncoder;
+    fn deref(&self) -> &ComputeCommandEncoder {
+        &self.encoder
+    }
+}
+
+impl AsRef<ComputeCommandEncoder> for CommandsGuard<'_> {
+    fn as_ref(&self) -> &ComputeCommandEncoder {
+        &self.encoder
+    }
+}
+
 const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
 const DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE: usize = 5;
 
