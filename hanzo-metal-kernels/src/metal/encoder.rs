@@ -55,6 +55,17 @@ impl ComputeCommandEncoder {
         }
     }
 
+    // Semantic aliases the hanzo-quant metal kernels use to bind read (input) and write (output)
+    // buffers at a binding index. Metal tracks hazards on tracked resources automatically, so both
+    // are just `set_buffer`; the input/output naming documents intent at the call site.
+    pub fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        self.set_buffer(index, buffer, offset);
+    }
+
+    pub fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        self.set_buffer(index, buffer, offset);
+    }
+
     pub fn set_bytes_directly(&self, index: usize, length: usize, bytes: *const c_void) {
         let pointer = ptr::NonNull::new(bytes as *mut c_void).unwrap();
         unsafe { self.raw.setBytes_length_atIndex(pointer, length, index) }

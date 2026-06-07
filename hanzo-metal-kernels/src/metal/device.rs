@@ -13,6 +13,17 @@ pub struct Device {
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
+/// Apple-silicon chip class, used by the quant kernels to pick threadgroup tunings. Detected from the
+/// MTLDevice name (e.g. "Apple M4 Max"). Only `Ultra` is special-cased downstream; the rest share the
+/// default path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetalDeviceType {
+    Ultra,
+    Max,
+    Pro,
+    Other,
+}
+
 impl AsRef<ProtocolObject<dyn MTLDevice>> for Device {
     fn as_ref(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.raw
@@ -22,6 +33,20 @@ impl AsRef<ProtocolObject<dyn MTLDevice>> for Device {
 impl Device {
     pub fn registry_id(&self) -> u64 {
         self.as_ref().registryID()
+    }
+
+    /// Chip class from the device name ("Apple M4 Max" -> Max). Drives kernel threadgroup tuning.
+    pub fn device_type(&self) -> MetalDeviceType {
+        let name = self.as_ref().name().to_string();
+        if name.contains("Ultra") {
+            MetalDeviceType::Ultra
+        } else if name.contains("Max") {
+            MetalDeviceType::Max
+        } else if name.contains("Pro") {
+            MetalDeviceType::Pro
+        } else {
+            MetalDeviceType::Other
+        }
     }
 
     pub fn all() -> Vec<Self> {
