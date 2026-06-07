@@ -1,4 +1,0 @@
-#version 450
-#extension GL_GOOGLE_include_directive : require
-#define CFG_RPS 16u
-#include "mul_mat_vec_q8_sg_body.glsl"

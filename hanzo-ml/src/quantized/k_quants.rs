@@ -2419,18 +2419,7 @@ pub fn matmul<T: GgmlType>(
     // while still keeping chunks large enough to amortize task overhead. For
     // prefill / batched matmul (m > 1) we keep the conservative 128, which
     // already has plenty of work to spread.
-    //
-    // `HANZO_MIN_LEN` overrides the heuristic entirely (must be >= 1).
-    let min_len = match std::env::var("HANZO_MIN_LEN").ok().and_then(|s| s.parse::<usize>().ok()) {
-        Some(v) if v >= 1 => v,
-        _ => {
-            if m == 1 {
-                8
-            } else {
-                128
-            }
-        }
-    };
+    let min_len = if m == 1 { 8 } else { 128 };
 
     for row_idx in 0..m {
         let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
