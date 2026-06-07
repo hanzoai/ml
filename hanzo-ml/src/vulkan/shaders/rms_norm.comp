@@ -1,17 +1,32 @@
 #version 450
-// RMS norm over the last dim: y = x / sqrt(mean(x^2) + eps) * alpha. One invocation per row.
-// Matches hanzo-ml CPU rms-norm: m = sqrt(sum(x^2)/dim + eps); y = x / m * alpha.
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// RMS norm over the last dim: y = x / sqrt(mean(x^2) + eps) * alpha.
+// ONE WORKGROUP PER ROW: all 256 threads cooperate on the m-reduction (strided partial sums -> shared
+// tree reduce) and the normalized write. The old kernel was one *thread* per row with a serial m-loop,
+// so a decode row [1,m] ran on a single lane while the rest of the GPU sat idle (~0.36ms/call, the
+// dominant decode overhead). Matches hanzo-ml CPU rms-norm: d = sqrt(sum(x^2)/m + eps); y = x/d*alpha.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
 layout(set = 0, binding = 1) readonly  buffer A { float alpha[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform Pc { uint nrows; uint m; float eps; };
+shared float red[256];
+shared float denom_sh;
 void main() {
-    uint row = gl_GlobalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
     if (row >= nrows) { return; }
     uint base = row * m;
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupSize.x;
     float ss = 0.0;
-    for (uint i = 0u; i < m; i++) { float v = x[base + i]; ss += v * v; }
-    float denom = sqrt(ss / float(m) + eps);
-    for (uint i = 0u; i < m; i++) { y[base + i] = x[base + i] / denom * alpha[i]; }
+    for (uint i = tid; i < m; i += wg) { float v = x[base + i]; ss += v * v; }
+    red[tid] = ss;
+    barrier();
+    for (uint s = wg / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) { red[tid] += red[tid + s]; }
+        barrier();
+    }
+    if (tid == 0u) { denom_sh = sqrt(red[0] / float(m) + eps); }
+    barrier();
+    float denom = denom_sh;
+    for (uint i = tid; i < m; i += wg) { y[base + i] = x[base + i] / denom * alpha[i]; }
 }
