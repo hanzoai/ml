@@ -313,27 +313,61 @@ impl QMetalStorage {
             [vec![1; 4 - src_shape.rank()], src_shape.dims().to_vec()].concat(),
         );
 
-        hanzo_metal_kernels::call_quantized_matmul_mm_t(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            self.dtype.into(),
-            src0_l.dims(),
-            &src0_stride,
-            &self.buffer,
-            src1_l.dims(),
-            &src1_l
-                .stride()
-                .iter()
-                .map(|x| x * DType::F32.size_in_bytes())
-                .collect::<Vec<_>>(),
-            storage.buffer(),
-            src1_l.start_offset() * storage.dtype().size_in_bytes(),
-            dst_shape.dims(),
-            0,
-            &dst,
-        )
-        .map_err(MetalError::from)?;
+        let src1_stride_bytes = src1_l
+            .stride()
+            .iter()
+            .map(|x| x * DType::F32.size_in_bytes())
+            .collect::<Vec<_>>();
+        let src1_offset = src1_l.start_offset() * storage.dtype().size_in_bytes();
+
+        // Prefill (m > 1; m == 1 already routed to fwd_mv above) is the
+        // compute-bound GEMM. The cooperative tensor-ops (matmul2d) Q8_0 kernel
+        // is correct and Metal-4-gated, but on the M4 Max it benches slower than
+        // the simdgroup-matrix kernel (the runtime-compiled cooperative-tensor
+        // path doesn't match an AOT metallib), so it stays opt-in. Default keeps
+        // the faster simdgroup kernel. Set CANDLE_METAL_ENABLE_MM2D=1 to try it.
+        let mm2d_enabled = std::env::var("CANDLE_METAL_ENABLE_MM2D")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let use_mm2d = mm2d_enabled
+            && matches!(self.dtype, GgmlDType::Q8_0)
+            && device.device().supports_metal4();
+        if use_mm2d {
+            hanzo_metal_kernels::call_quantized_matmul_mm_q8_0_mm2d(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                src0_l.dims(),
+                &src0_stride,
+                &self.buffer,
+                src1_l.dims(),
+                &src1_stride_bytes,
+                storage.buffer(),
+                src1_offset,
+                dst_shape.dims(),
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        } else {
+            hanzo_metal_kernels::call_quantized_matmul_mm_t(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                src0_l.dims(),
+                &src0_stride,
+                &self.buffer,
+                src1_l.dims(),
+                &src1_stride_bytes,
+                storage.buffer(),
+                src1_offset,
+                dst_shape.dims(),
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        }
 
         let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
