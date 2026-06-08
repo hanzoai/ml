@@ -1,6 +1,6 @@
 use crate::source::{
-    AFFINE, BINARY, CAST, CONV, FILL, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE,
-    SDPA, SORT, TERNARY, UNARY,
+    AFFINE, BINARY, CAST, CONV, FILL, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, QUANTIZED_MM2D,
+    RANDOM, REDUCE, SDPA, SORT, TERNARY, UNARY,
 };
 use crate::utils::get_env_bool;
 use crate::{
@@ -94,6 +94,7 @@ impl Kernels {
             Source::Indexing => INDEXING,
             Source::MlxSort => MLX_SORT,
             Source::Quantized => QUANTIZED,
+            Source::QuantizedMM2d => QUANTIZED_MM2D,
             Source::Random => RANDOM,
             Source::Reduce => REDUCE,
             Source::Sort => SORT,
@@ -116,7 +117,12 @@ impl Kernels {
         } else {
             let lib = {
                 let source_content = self.get_library_source(source);
-                let compile_options = get_compile_options();
+                // The matmul2d (cooperative tensor-ops) path requires the Metal 4
+                // language; everything else uses the broadly-compatible default.
+                let compile_options = match source {
+                    Source::QuantizedMM2d => get_compile_options_metal4(),
+                    _ => get_compile_options(),
+                };
                 device
                     .new_library_with_source(source_content, Some(&compile_options))
                     .map_err(|e| MetalKernelError::LoadLibraryError(e.to_string()))?
@@ -198,5 +204,14 @@ fn get_compile_options() -> Retained<MTLCompileOptions> {
         #[allow(deprecated)]
         compile_options.setFastMathEnabled(fast_math_enabled);
     }
+    compile_options
+}
+
+/// Compile options for the Metal 4 cooperative tensor-ops (matmul2d) kernels.
+/// These require the Metal 4 language version; callers must only request this
+/// source on a Metal-4-capable Apple GPU (see `Device::supports_metal4`).
+fn get_compile_options_metal4() -> Retained<MTLCompileOptions> {
+    let compile_options = get_compile_options();
+    compile_options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
     compile_options
 }

@@ -283,6 +283,110 @@ pub fn call_quantized_matmul_mm_t(
     Ok(())
 }
 
+/// Metal 4 matmul2d-based Q8_0 mul_mm (prefill GEMM).
+///
+/// Same semantics and argument layout as `call_quantized_matmul_mm_t`, but
+/// dispatches the cooperative tensor-ops kernel in `Source::QuantizedMM2d`
+/// (tile: 64 rows of weights x 128 rows of activations, K step 32, 128 threads,
+/// 4 simdgroups). The caller MUST verify the device supports Metal 4
+/// (`Device::supports_metal4`) before invoking; otherwise the library will fail
+/// to compile. Restricted to Q8_0; all other dtypes use the simdgroup path.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm_q8_0_mm2d(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    src0_shape: &[usize],
+    src0_stride: &[usize],
+    src0: &Buffer,
+    src1_shape: &[usize],
+    src1_stride: &[usize],
+    src1: &Buffer,
+    src1_offset: usize,
+    dst_shape: &[usize],
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    // Everything is in reverse (matches call_quantized_matmul_mm_t).
+    let ne00 = src0_shape[src0_shape.len() - 1] as i64;
+    let ne01 = src0_shape[src0_shape.len() - 2] as i64;
+    let ne02 = src0_shape[src0_shape.len() - 3] as i64;
+    let ne03 = src0_shape[src0_shape.len() - 4] as i64;
+
+    let nb01 = src0_stride[src0_stride.len() - 2] as i64;
+    let nb02 = src0_stride[src0_stride.len() - 3] as i64;
+    let nb03 = src0_stride[src0_stride.len() - 4] as i64;
+
+    let ne11 = src1_shape[src1_shape.len() - 2] as i64;
+    let ne12 = src1_shape[src1_shape.len() - 3] as i64;
+    let ne13 = src1_shape[src1_shape.len() - 4] as i64;
+
+    let nb10 = src1_stride[src1_stride.len() - 1] as i64;
+    let nb11 = src1_stride[src1_stride.len() - 2] as i64;
+    let nb12 = src1_stride[src1_stride.len() - 3] as i64;
+    let nb13 = src1_stride[src1_stride.len() - 4] as i64;
+
+    let ne0 = dst_shape[dst_shape.len() - 1] as i64;
+    let ne1 = dst_shape[dst_shape.len() - 2] as i64;
+    let r2 = (ne12 / ne02) as u32;
+    let r3 = (ne13 / ne03) as u32;
+
+    // Tile geometry from quantized_mm2d.metal: NRB(N)=128, NRA(M)=64.
+    const NRA: usize = 64; // weight-row tile (M = ne0)
+    const NRB: usize = 128; // activation-row tile (N = ne1)
+    let thread_groups_count = MTLSize {
+        width: divide(ne11 as usize, NRB),
+        height: divide(ne01 as usize, NRA),
+        depth: (ne12 * ne13) as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+
+    let pipeline = kernels.load_pipeline(
+        device,
+        Source::QuantizedMM2d,
+        "kernel_mul_mm_q8_0_f32_mm2d",
+    )?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            src0,
+            (src1, src1_offset),
+            (dst, dst_offset),
+            ne00,
+            ne02,
+            nb01,
+            nb02,
+            nb03,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            nb13,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(src0, MTLResourceUsage::Read);
+    encoder.use_resource(src1, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+
+    // Threadgroup memory: NRA rows x NK(=32) cols of half = 64*32*2 = 4096 bytes.
+    encoder.set_threadgroup_memory_length(0, 4096);
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }

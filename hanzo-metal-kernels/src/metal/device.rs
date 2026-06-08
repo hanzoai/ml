@@ -49,6 +49,15 @@ impl Device {
         }
     }
 
+    /// Whether this GPU supports the Metal 4 feature set, i.e. the cooperative
+    /// tensor-ops (mpp::tensor_ops::matmul2d) used by the matmul2d mul_mm path.
+    /// Gates loading of the `Source::QuantizedMM2d` library, which only compiles
+    /// at MTLLanguageVersion 4.0. Falls back to `false` on older OS/GPUs.
+    pub fn supports_metal4(&self) -> bool {
+        self.as_ref()
+            .supportsFamily(objc2_metal::MTLGPUFamily::Metal4)
+    }
+
     pub fn all() -> Vec<Self> {
         MTLCreateSystemDefaultDevice()
             .into_iter()
