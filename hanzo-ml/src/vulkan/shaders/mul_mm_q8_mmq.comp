@@ -1,0 +1,17 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// RDNA3 MMQ-int tiling for Q8_0 prefill (llama l_warptile_mmq_int on RDNA3, mapped to our layout):
+// BLOCK_SIZE=256 threads, 128x128 output tile, 4 warps of WARP=64 each owning a 64x64 region via
+// WMITER=2 x WNITER=2 sub-tiles of TM=4 x TN=4 registers. BK_STEP=1 Q8 block staged per K iter.
+#define CFG_BM 128u
+#define CFG_BN 128u
+#define CFG_BK_STEP 1u
+#define CFG_WM 64u
+#define CFG_WN 64u
+#define CFG_WMITER 2u
+#define CFG_TM 4u
+#define CFG_TN 4u
+#define CFG_WARP 64u
+#define CFG_BLOCK_SIZE 256u
+#define CFG_DBUF 1u
+#include "mul_mm_q8_mmq_body.glsl"
