@@ -359,13 +359,16 @@ __device__ void rmsnorm(const T * x, T * dst, const T * alpha, const int ncols, 
     tmp = warp_reduce_sum(tmp);
     if (block_size > WARP_SIZE) {
         __shared__ float s_sum[32];
+        const int n_warps = (block_size + WARP_SIZE - 1) / WARP_SIZE;
         int warp_id = threadIdx.x / WARP_SIZE;
         int lane_id = threadIdx.x % WARP_SIZE;
         if (lane_id == 0) {
             s_sum[warp_id] = tmp;
         }
         __syncthreads();
-        tmp = s_sum[lane_id];
+        // Only the first n_warps slots are valid; lanes beyond that read 0 so a
+        // non-multiple-of-WARP_SIZE block_size cannot pick up garbage shmem.
+        tmp = (lane_id < n_warps) ? s_sum[lane_id] : 0.0f;
         tmp = warp_reduce_sum(tmp);
     }
 
@@ -447,6 +450,43 @@ __device__ void layernorm(const T * x, T * dst, const T * alpha, const T * beta,
     }
 }
 
+// Fused rotary embedding (GPT-NeoX / "rope" half-rotation, matches hanzo_nn rope_slow and the
+// CUDA `rope` kernel). One thread handles one (i1,i2) pair: dst[i1]=x1*c-x2*s, dst[i2]=x1*s+x2*c.
+// cos/sin are [t, d/2] (or [b,t,d/2] when stride_b>0). All math in float so f16/bf16 stay accurate.
+template <typename T>
+__device__ void rope(const T * src, const T * cos, const T * sin, T * dst,
+                     const unsigned int bh, const unsigned int td, const unsigned int d,
+                     const unsigned int stride_b) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (2 * idx >= bh * td) return;
+
+    unsigned int i_bh = idx / (td / 2);
+    unsigned int i_td = idx - (td / 2) * i_bh;
+    unsigned int i_t = i_td / (d / 2);
+    unsigned int i_d = i_td - (d / 2) * i_t;
+    unsigned int i1 = i_bh * td + i_t * d + i_d;
+    unsigned int i2 = i1 + d / 2;
+    unsigned int i_cs = i_t * (d / 2) + i_d;
+    if (stride_b > 0) {
+      unsigned int b_idx = (2 * idx) / stride_b;
+      i_cs += b_idx * (td / 2);
+    }
+    const float c = (float)cos[i_cs];
+    const float s = (float)sin[i_cs];
+    const float x1 = (float)src[i1];
+    const float x2 = (float)src[i2];
+    dst[i1] = (T)(x1 * c - x2 * s);
+    dst[i2] = (T)(x1 * s + x2 * c);
+}
+
+#define ROPE_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME( \
+      const TYPENAME *src, const TYPENAME *cos, const TYPENAME *sin, TYPENAME *dst, \
+      const unsigned int bh, const unsigned int td, const unsigned int d, \
+      const unsigned int stride_b) { \
+    rope<TYPENAME>(src, cos, sin, dst, bh, td, d, stride_b); \
+  }
+
 #define FAST_OP(TYPENAME, MIN_NAME, MAX_NAME, ARGMIN_NAME, ARGMAX_NAME, SUM_NAME) \
   extern "C" __global__ void ARGMIN_NAME( \
       const size_t src_numel, const size_t el_to_sum_per_block, \
@@ -509,6 +549,10 @@ FAST_OP(uint8_t, fast_min_u8, fast_max_u8, fast_argmin_u8, fast_argmax_u8, fast_
 // Softmax kernels
 SOFTMAX_OP(float, float, softmax_f32)
 SOFTMAX_OP(double, double, softmax_f64)
+
+// Rope (rotary embedding) kernels
+ROPE_OP(float, rope_f32)
+ROPE_OP(double, rope_f64)
 
 // RmsNorm kernels
 RMSNORM_OP(float, rmsnorm_f32)
@@ -590,13 +634,16 @@ __device__ void rmsnorm<__half>(const __half * x, __half * dst, const __half * a
     tmp = warp_reduce_sum(tmp);
     if (block_size > WARP_SIZE) {
         __shared__ float s_sum[32];
+        const int n_warps = (block_size + WARP_SIZE - 1) / WARP_SIZE;
         int warp_id = threadIdx.x / WARP_SIZE;
         int lane_id = threadIdx.x % WARP_SIZE;
         if (lane_id == 0) {
             s_sum[warp_id] = tmp;
         }
         __syncthreads();
-        tmp = s_sum[lane_id];
+        // Only the first n_warps slots are valid; lanes beyond that read 0 so a
+        // non-multiple-of-WARP_SIZE block_size cannot pick up garbage shmem.
+        tmp = (lane_id < n_warps) ? s_sum[lane_id] : 0.0f;
         tmp = warp_reduce_sum(tmp);
     }
 
@@ -624,6 +671,9 @@ extern "C" __global__ void softmax_f16(const __half *src, __half *dst, const int
 extern "C" __global__ void rmsnorm_f16(const __half *src, __half *dst, const __half *alpha, const int n_cols, const int block_size, const float eps) {
     rmsnorm<__half>(src, dst, alpha, n_cols, block_size, eps);
 }
+
+// Rope for F16 (the `rope` template is dtype-generic via float casts; __half qualifies).
+ROPE_OP(__half, rope_f16)
 
 // LayerNorm for F16
 template <>
@@ -838,5 +888,41 @@ __device__ void fast_argmin_f(const size_t src_numel, const size_t el_to_sum_per
 
 FAST_OP_F(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
 FAST_OP_F(hip_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argmax_bf16, fast_sum_bf16)
+
+// Rope for BF16 (the `rope` template only does float casts + (T)float assignment).
+ROPE_OP(hip_bfloat16, rope_bf16)
+
+// Softmax for BF16 (accumulate in float). Standalone (not a template specialization) since the
+// generic `softmax` template was already instantiated above for f32/f64.
+extern "C" __global__ void softmax_bf16(const hip_bfloat16 *x, hip_bfloat16 *dst, const int ncols) {
+    const int row = blockDim.x*blockIdx.x + threadIdx.x;
+    const int block_size = blockDim.y;
+    const int tid = threadIdx.y;
+
+    float max_val = -INFINITY;
+    for (int col = tid; col < ncols; col += block_size) {
+        max_val = fmaxf(max_val, (float)x[row*ncols + col]);
+    }
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        max_val = fmaxf(max_val, __shfl_xor(max_val, mask, 32));
+    }
+
+    float tmp = 0.;
+    for (int col = tid; col < ncols; col += block_size) {
+        const int i = row*ncols + col;
+        const float val = expf((float)x[i] - max_val);
+        tmp += val;
+        dst[i] = hip_bfloat16(val);
+    }
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp += __shfl_xor(tmp, mask, 32);
+    }
+
+    const float inv_tmp = 1.f / tmp;
+    for (int col = tid; col < ncols; col += block_size) {
+        const int i = row*ncols + col;
+        dst[i] = hip_bfloat16((float)dst[i] * inv_tmp);
+    }
+}
 
 #endif // __HIPCC__

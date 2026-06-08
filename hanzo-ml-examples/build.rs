@@ -43,8 +43,8 @@ fn main() {
     // Download config, tokenizer, and model files from hf at build time.
     // option_env! automatically detects changes in the env var and trigger rebuilds correctly.
     // Example value:
-    // BUILDTIME_MODEL_REVISION="sentence-transformers/all-MiniLM-L6-v2:c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
-    if let Some(model_rev) = core::option_env!("BUILDTIME_MODEL_REVISION") {
+    // CANDLE_BUILDTIME_MODEL_REVISION="sentence-transformers/all-MiniLM-L6-v2:c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+    if let Some(model_rev) = core::option_env!("CANDLE_BUILDTIME_MODEL_REVISION") {
         buildtime_downloader::download_model(model_rev).expect("Model download failed!");
     }
 }
