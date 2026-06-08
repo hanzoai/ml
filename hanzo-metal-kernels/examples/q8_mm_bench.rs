@@ -106,7 +106,7 @@ fn run_case(device: &Device, kernels: &Kernels, n_w: usize, n_act: usize, k: usi
 
     // Argument shapes/strides matching call_quantized_matmul_mm_t's callers.
     let src0_shape = [1usize, 1, n_w, k];
-    // src0_stride: candle scales element strides by type_size/block_size (=34/32 for Q8_0).
+    // src0_stride: hanzo_ml scales element strides by type_size/block_size (=34/32 for Q8_0).
     let ts_over_bs = 34f32 / 32f32;
     let src0_stride = [
         (n_w * k) as f32 * ts_over_bs,

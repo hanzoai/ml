@@ -1,7 +1,7 @@
 //! The trainer-free GRPO loop.
 //!
 //! "Trainer-free" = no external trainer framework (no HF `Trainer`, no
-//! `accelerate`); just pure `candle` autograd + `hanzo_nn::AdamW`. One
+//! `accelerate`); just pure `hanzo_ml` autograd + `hanzo_nn::AdamW`. One
 //! [`GrpoTrainer::step`] performs the full GRPO update for a batch of prompts:
 //!
 //! 1. **Rollout**: sample `group_size` completions per prompt from the current

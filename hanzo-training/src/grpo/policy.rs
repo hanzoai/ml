@@ -28,7 +28,7 @@ pub struct SampledGroup {
 
 /// Trait implemented by anything trainable with GRPO.
 ///
-/// Implementors own their parameters as `candle` [`Var`]s and expose them via
+/// Implementors own their parameters as `hanzo_ml` [`Var`]s and expose them via
 /// [`Policy::trainable_vars`] so the trainer can build an optimizer over them.
 pub trait Policy {
     /// The trainable parameters of this policy, handed to the optimizer.

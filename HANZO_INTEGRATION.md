@@ -10,7 +10,7 @@ Hanzo ML is the official ML framework for the Hanzo ecosystem, based on Hanzo fr
 ```
 ~/work/hanzo/
 ├── ml/                 # hanzoai/ml - ML framework (based on HF hanzo-ml)
-├── engine/             # hanzoai/engine - Inference engine (based on mistral-rs)
+├── engine/             # hanzoai/engine - Hanzo Engine (inference engine)
 ├── jin/                # Jin multimodal models
 └── llm/                # LLM Gateway proxy
 ```
@@ -41,7 +41,7 @@ accelerate = ["hanzo-ml/accelerate"]
 
 ## Model Loading Integration
 
-### In Hanzo Engine (mistral-rs fork)
+### In Hanzo Engine
 
 ```rust
 use hanzo_ml_core::{Device, Tensor};
@@ -51,7 +51,7 @@ use hanzo_ml_transformers::models::llama::LlamaConfig;
 let device = Device::new_metal(0)?;
 let model = LlamaConfig::load(&device, &config_path)?;
 
-// Use with mistral-rs pipeline
+// Use with Hanzo Engine pipeline
 let pipeline = Pipeline::new(model, tokenizer)?;
 ```
 

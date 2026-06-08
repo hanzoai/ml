@@ -5,7 +5,27 @@ This documents the main changes to the `hanzo-ml` crate.
 
 ### Added
 
+- **Vulkan backend** for `hanzo-ml`: GPU acceleration on Vulkan-capable
+  hardware (notably AMD RDNA / Radeon iGPUs such as the 8060S) without CUDA or
+  Metal. Pins subgroup width to wave64 via `VK_EXT_subgroup_size_control` so the
+  cooperative reductions (rms_norm, matvec) run with the wave size the kernels
+  assume.
+- **`mul_mv_ext` small-batch matvec** (Metal): a multi-column matrix-vector
+  kernel for the `m > 1` path (speculative / multi-token-prediction verify),
+  the keystone that keeps the verify step matvec-fast instead of falling back to
+  a general matmul.
+
 ### Modified
+
+- **Non-square-mask SDPA fix**: scaled-dot-product attention now handles the
+  multi-query / non-square attention-mask case correctly (q_len != kv_len), so
+  speculative verify and MTP produce correct attention.
+- Vulkan decode throughput work: stop re-copying the multi-GB embedding table
+  every token, and a parallel cooperative `rms_norm`, materially raising
+  Vulkan decode tokens/sec.
+- Enables a **sync-free speculative draft loop** in the inference engine: the
+  attention/matvec fixes above let the draft-then-verify decode path run without
+  per-token host<->device synchronization.
 
 ## v0.3.0 - 2023-10-01
 

@@ -5,21 +5,33 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/hanzoai/ml/blob/main/LICENSE-APACHE)
 
 Hanzo ML is a minimalist ML framework for Rust with a focus on performance (including GPU support) 
-and ease of use. Based on Hanzo from Hugging Face, Hanzo ML provides optimizations for Edge AI, 
+and ease of use. Hanzo ML provides optimizations for Edge AI, 
 quantization, and multimodal workloads.
 
 ## Key Features
 
-- **High Performance**: GPU acceleration via CUDA, Metal (Apple Silicon), and CPU optimizations
+- **High Performance**: GPU acceleration via CUDA, Metal (Apple Silicon), Vulkan (AMD/cross-vendor), and CPU optimizations
 - **Edge AI Optimized**: Quantization support (GGUF, GGML, AFQ, GPTQ, AWQ)  
 - **Multimodal**: Text, vision, audio, and 3D model support
 - **WebAssembly**: Run models in the browser with WASM support
 - **Rust Native**: Memory-safe, zero-cost abstractions
 - **Hanzo Integration**: Works seamlessly with Hanzo Engine for inference
 
+### Native acceleration
+
+- **Vulkan backend** for AMD RDNA / Radeon iGPUs (e.g. the 8060S) and other
+  Vulkan hardware, with subgroup width pinned to wave64 via
+  `VK_EXT_subgroup_size_control` for correct cooperative reductions.
+- **`mul_mv_ext` small-batch matvec** (Metal) for the `m > 1` speculative /
+  multi-token-prediction verify path, keeping the verify step matvec-fast.
+- **Non-square-mask SDPA**: scaled-dot-product attention handles the
+  multi-query case (`q_len != kv_len`) used by speculative decoding and MTP.
+- Enables a **sync-free speculative draft loop** in Hanzo Engine — draft-then-
+  verify decode without per-token host/device synchronization.
+
 ## Get started
 
-Make sure that you have [`hanzo-ml`](https://github.com/huggingface/hanzo/tree/main/hanzo-ml) correctly installed as described in [**Installation**](https://huggingface.github.io/hanzo/guide/installation.html).
+Make sure that you have [`hanzo-ml`](https://github.com/hanzoai/ml/tree/main/hanzo-ml) correctly installed as described in the [**Installation**](https://github.com/hanzoai/ml#installation) guide.
 
 Let's see how to run a simple matrix multiplication.
 Write the following to your `myapp/src/main.rs` file:
