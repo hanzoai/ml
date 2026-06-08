@@ -41,7 +41,7 @@ struct Args {
 
 // Remember to set env variable before running.
 // Use specific commit vs main to reduce chance of URL breaking later from directory layout changes, etc.
-// SINGLE_FILE_BINARY_BUILDER_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+// CANDLE_SINGLE_FILE_BINARY_BUILDER_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
 // cargo run --example bert_single_file_binary
 fn main() -> Result<()> {
     use tracing_chrome::ChromeLayerBuilder;
@@ -175,9 +175,9 @@ fn main() -> Result<()> {
 }
 
 pub fn build_model_and_tokenizer_from_bytes(device: &Device) -> Result<(BertModel, Tokenizer)> {
-    let config_data = include_bytes!(env!("BUILDTIME_MODEL_CONFIG"));
-    let tokenizer_data = include_bytes!(env!("BUILDTIME_MODEL_TOKENIZER"));
-    let weights_data = include_bytes!(env!("BUILDTIME_MODEL_WEIGHTS"));
+    let config_data = include_bytes!(env!("CANDLE_BUILDTIME_MODEL_CONFIG"));
+    let tokenizer_data = include_bytes!(env!("CANDLE_BUILDTIME_MODEL_TOKENIZER"));
+    let weights_data = include_bytes!(env!("CANDLE_BUILDTIME_MODEL_WEIGHTS"));
 
     let config_string = std::str::from_utf8(config_data)?;
     let config: BertConfig = serde_json::from_str(config_string)?;

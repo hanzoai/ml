@@ -875,82 +875,6 @@ impl GgmlType for BlockIQ4xs {
     }
 }
 
-// Ternary TQ2_0 (BitNet), ggml type 35, 2.0625 bpw. 256 elems/block: QK_K/4 bytes of 2-bit
-// codes (4 lanes of 32 per 32-byte group) then an f16 scale. Bit-for-bit replica of
-// llama.cpp ggml-common.h block_tq2_0.
-#[derive(Debug, Clone, PartialEq)]
-#[repr(C)]
-pub struct BlockTQ2_0 {
-    pub(crate) qs: [u8; QK_K / 4],
-    pub(crate) d: f16,
-}
-const _: () = assert!(std::mem::size_of::<BlockTQ2_0>() == QK_K / 4 + 2);
-
-impl GgmlType for BlockTQ2_0 {
-    const DTYPE: GgmlDType = GgmlDType::TQ2_0;
-    const BLCK_SIZE: usize = QK_K;
-    // Dequantize-to-f32 then dot against a Q8_0-quantized lhs (block size 32).
-    type VecDotType = BlockQ8_0;
-
-    // dequantize_row_tq2_0 (llama.cpp ggml-quants.c): d = fp16_to_fp32(d); per 32-byte group,
-    // lanes l in 0..4, m in 0..32: q = (qs[j+m] >> (l*2)) & 3, y = (q - 1) * d.
-    fn to_float(xs: &[Self], ys: &mut [f32]) {
-        let k = ys.len();
-        debug_assert!(
-            k.is_multiple_of(QK_K),
-            "dequantize_row_tq2_0: {k} is not divisible by {QK_K}"
-        );
-        let nb = k / QK_K;
-        for i in 0..nb {
-            let d = xs[i].d.to_f32();
-            let qs = &xs[i].qs;
-            let mut out = i * QK_K;
-            let mut j = 0;
-            while j < qs.len() {
-                for l in 0..4 {
-                    for m in 0..32 {
-                        let q = ((qs[j + m] >> (l * 2)) & 3) as i8;
-                        ys[out] = (q - 1) as f32 * d;
-                        out += 1;
-                    }
-                }
-                j += 32;
-            }
-        }
-    }
-
-    // We only decode TQ2_0 from gguf; quantization is unused.
-    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
-        panic!("TQ2_0 quantize (from_float) is not supported")
-    }
-
-    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
-        Self::vec_dot_unopt(n, xs, ys)
-    }
-
-    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
-        debug_assert!(
-            n.is_multiple_of(QK_K),
-            "vec_dot_tq2_0_q8: {n} is not divisible by {QK_K}"
-        );
-        // Dequantize each TQ2_0 super-block (256) and dot against the QK_K/QK8_0 Q8_0 lhs blocks.
-        let mut sumf = 0f32;
-        let mut tmp = [0f32; QK_K];
-        let q8_per_block = QK_K / QK8_0;
-        for (bx, x) in xs.iter().enumerate() {
-            Self::to_float(std::slice::from_ref(x), &mut tmp);
-            for sub in 0..q8_per_block {
-                let y = &ys[bx * q8_per_block + sub];
-                let dy = f16::to_f32(y.d);
-                for j in 0..QK8_0 {
-                    sumf += tmp[sub * QK8_0 + j] * (y.qs[j] as f32 * dy);
-                }
-            }
-        }
-        sumf
-    }
-}
-
 impl GgmlType for BlockMXFP4 {
     const DTYPE: GgmlDType = GgmlDType::MXFP4;
     const BLCK_SIZE: usize = QK_MXFP4;
@@ -2649,8 +2573,8 @@ pub fn matmul<T: GgmlType>(
     // prefill / batched matmul (m > 1) we keep the conservative 128, which
     // already has plenty of work to spread.
     //
-    // `MIN_LEN` overrides the heuristic entirely (must be >= 1).
-    let min_len = match std::env::var("MIN_LEN").ok().and_then(|s| s.parse::<usize>().ok()) {
+    // `HANZO_MIN_LEN` overrides the heuristic entirely (must be >= 1).
+    let min_len = match std::env::var("HANZO_MIN_LEN").ok().and_then(|s| s.parse::<usize>().ok()) {
         Some(v) if v >= 1 => v,
         _ => {
             if m == 1 {

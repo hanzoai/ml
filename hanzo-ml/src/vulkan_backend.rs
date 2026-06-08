@@ -66,14 +66,6 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
         "flash_attn" => spv!("flash_attn"),
         "copy" => spv!("copy"),
-        "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
-        "mul_mat_q8_dp4a" => spv!("mul_mat_q8_dp4a"),
-        "quantize_act_q8" => spv!("quantize_act_q8"),
-        "mul_mat_vec_id_q4k" => spv!("mul_mat_vec_id_q4k"),
-        "mul_mat_vec_id_q4k_sg" => spv!("mul_mat_vec_id_q4k_sg"),
-        "mul_mat_vec_id_q8" => spv!("mul_mat_vec_id_q8"),
-        "mul_mat_vec_id_q8_sg" => spv!("mul_mat_vec_id_q8_sg"),
-        "attn_decode" => spv!("attn_decode"),
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
         "reduce_sum" => spv!("reduce_sum"),
@@ -159,7 +151,7 @@ struct CachedPipeline {
 }
 
 // Device-memory placement strategy for storage buffers, set once at init from
-// VK_DEVICE_MEMORY_STRATEGY. On this RDNA3.5 UMA APU the host-visible "VRAM carveout" heap
+// HANZO_VK_DEVICE_MEMORY_STRATEGY. On this RDNA3.5 UMA APU the host-visible "VRAM carveout" heap
 // is small (a few hundred MB), while the large unified pool (~GTT, tens of GB of the 128GB system
 // RAM) is exposed as a DEVICE_LOCAL-only heap. A pure host-visible policy therefore OOMs an 18.6GB
 // model even though there is ample memory; we must be able to place big buffers in the large heap.
@@ -209,13 +201,11 @@ struct VkInner {
     cm_mnk: (u32, u32, u32),
     // Whether matmul uses the register-blocked coopmat kernel (bmm_coopmat_rb). Default ON when the
     // device advertises coopmat (measured 1.3-2.7x over fp32 bmm_reg on the real AMD driver, full
-    // forward argmax matches CPU); VK_COOPMAT=0 forces the fp32 path.
+    // forward argmax matches CPU); HANZO_VK_COOPMAT=0 forces the fp32 path.
     cm_use: bool,
-    // True iff the device has hw int8 4x8 dp4a; gates the dp4a prefill path.
-    int_dot8: bool,
     // CPU-side RNG seed (kernels are deterministic; randoms are generated on the CPU then uploaded).
     seed: Mutex<u64>,
-    // Per-flush phase profiling, gated on VK_PROFILE=1 (read once at init). When set,
+    // Per-flush phase profiling, gated on HANZO_VK_PROFILE=1 (read once at init). When set,
     // `flush_locked` prints, per submitted batch, the time spent recording dispatches, in
     // queue_submit, in the fence wait, plus the dispatch and emitted-barrier counts; readbacks
     // print their map+copy time. Lets the 8060S show where the per-token milliseconds actually go.
@@ -226,7 +216,7 @@ struct VkInner {
     // into the command buffer via `vkCmdPushDescriptorSetKHR` instead of allocating + updating +
     // binding a descriptor set per op — three driver calls and two heap Vecs per dispatch collapse
     // to one recorded command, which is the dominant CPU cost on the decode hot path (the same op
-    // graph, hundreds of dispatches x 28 layers, re-recorded every token). Set VK_PUSH_DESC=0
+    // graph, hundreds of dispatches x 28 layers, re-recorded every token). Set HANZO_VK_PUSH_DESC=0
     // to force the legacy alloc+update path. Pipelines' set layouts are created with the
     // PUSH_DESCRIPTOR_KHR flag exactly when this is `Some`, so the two paths never mix.
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
@@ -264,7 +254,7 @@ struct Submitter {
     // barrier and at the start of every batch. See `dispatch` for the correctness argument (WAW/WAR
     // can't occur within a batch because the buffer pool only recycles handles across fences).
     written_since_barrier: std::collections::HashSet<vk::Buffer>,
-    // Per-batch profiling accumulators (VK_PROFILE=1). `record_ns` is the wall time spent in
+    // Per-batch profiling accumulators (HANZO_VK_PROFILE=1). `record_ns` is the wall time spent in
     // the dispatch recording path (descriptor push/update + cmd_dispatch + barrier bookkeeping)
     // since the batch began; `barriers` counts memory barriers emitted this batch. Both reset per
     // batch and are read by `flush_locked` when profiling is on. Zero-overhead otherwise (the
@@ -976,279 +966,6 @@ impl VulkanDevice {
     /// (updated in place). Returns the output `[BH,S,V]`. `seq_len==1` is the decode path (sequential
     /// `gdn_recurrence`); a longer prefill uses the chunked kernel when `k_dim<=128`, else the
     /// sequential one (its private state array bounds `k_dim<=256`, covering shipping GDN configs).
-    /// true, the Q8_0 prefill (M>1) path should use [`matmul_q8_dp4a_gpu`] instead of [`matmul_q8_gpu`].
-    pub fn int_dot8(&self) -> bool {
-        self.inner.int_dot8
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn mul_mat_vec_id_q4k_gpu(
-        &self,
-        bank: &VulkanStorage,
-        x_flat: &VulkanStorage,
-        ids: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-        per_expert_words: usize,
-    ) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(256) {
-            crate::bail!("mul_mat_vec_id_q4k_gpu: k must be a multiple of 256, got {k}");
-        }
-        if x_flat.count < m * k {
-            crate::bail!(
-                "mul_mat_vec_id_q4k_gpu: x_flat count {} < m*k {}",
-                x_flat.count,
-                m * k
-            );
-        }
-        if ids.count < m {
-            crate::bail!("mul_mat_vec_id_q4k_gpu: ids count {} < m {m}", ids.count);
-        }
-        let out = self.alloc_f32(m * nout)?;
-        let push = push_u32(&[nout as u32, k as u32, per_expert_words as u32, m as u32]);
-        // Y is binding 2, not the last buffer (IDS is 3); name it so the RAW hazard tracker keys on
-        // the buffer the kernel actually writes. Subgroup variant when available (one subgroup per
-        // output element, coalesced reads + subgroupAdd); else the scalar fallback.
-        let (kernel, groups) = self.matvec_id_grid("mul_mat_vec_id_q4k", m, nout);
-        self.dispatch_out(
-            kernel,
-            &[bank.buffer, x_flat.buffer, out.buffer, ids.buffer],
-            2,
-            &push,
-            groups,
-        )?;
-        Ok(out)
-    }
-
-    /// Fused grouped Q8_0 matvec for resident-bank MoE: ONE dispatch computes `y[m*nout]` where
-    /// `y[slot*nout + col] = dequant(bank[ids[slot]])[col, :] . x_flat[slot*k ..]`. Q8_0 analog of
-    /// [`mul_mat_vec_id_q4k_gpu`]; `per_expert_words = n * (k/32) * 9`. Decode is bit-identical to
-    /// [`matvec_q8_gpu_off`]. Dispatches the subgroup-reduced `_sg` variant when supported (one
-    /// subgroup per (slot,col)), else the scalar kernel (one invocation per output). See `matvec_id_grid`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn mul_mat_vec_id_q8_gpu(
-        &self,
-        bank: &VulkanStorage,
-        x_flat: &VulkanStorage,
-        ids: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-        per_expert_words: usize,
-    ) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(32) {
-            crate::bail!("mul_mat_vec_id_q8_gpu: k must be a multiple of 32, got {k}");
-        }
-        if x_flat.count < m * k {
-            crate::bail!(
-                "mul_mat_vec_id_q8_gpu: x_flat count {} < m*k {}",
-                x_flat.count,
-                m * k
-            );
-        }
-        if ids.count < m {
-            crate::bail!("mul_mat_vec_id_q8_gpu: ids count {} < m {m}", ids.count);
-        }
-        let out = self.alloc_f32(m * nout)?;
-        let push = push_u32(&[nout as u32, k as u32, per_expert_words as u32, m as u32]);
-        let (kernel, groups) = self.matvec_id_grid("mul_mat_vec_id_q8", m, nout);
-        self.dispatch_out(
-            kernel,
-            &[bank.buffer, x_flat.buffer, out.buffer, ids.buffer],
-            2,
-            &push,
-            groups,
-        )?;
-        Ok(out)
-    }
-
-    /// Q8_0 prefill matmul via hardware int8 dp4a -- the compute-bound prefill lever. Same result as
-    /// [`matmul_q8_gpu`] (`y[m, nout] = x[m, k] * Wq^T`) but instead of decoding each weight to f32 and
-    /// doing f32 MACs, it quantizes the activation tile to int8 ONCE ([`quantize_act_q8`] -> q8_1-style
-    /// codes + per-block scales) then dispatches [`mul_mat_q8_dp4a`], which uses the accelerated
-    /// `OpSDotAccSat` 4x8-packed signed dot vs the int8 weights. Only valid when [`int_dot8`] is true;
-    /// callers should fall back to [`matmul_q8_gpu`] otherwise (this fn does NOT re-check, so the
-    /// activation quant runs unconditionally -- gate at the call site). Drop-in for [`matmul_q8_gpu`].
-    pub fn matmul_q8_dp4a_gpu(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-    ) -> Result<VulkanStorage> {
-        self.matmul_q8_dp4a_gpu_off(wq, x, m, nout, k, 0)
-    }
-
-    /// [`matmul_q8_dp4a_gpu`] into a slice of `wq` starting at `woff` u32 words (`woff == 0` matches the
-    /// plain form; `woff = e * nout * (k/32) * 9` selects expert `e` of a resident Q8 MoE bank). Mirrors
-    /// [`matmul_q8_gpu_off`] so it is a drop-in on the banked prefill path.
-    pub fn matmul_q8_dp4a_gpu_off(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-        woff: usize,
-    ) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(32) {
-            crate::bail!("matmul_q8_dp4a_gpu: k must be a multiple of 32, got {k}");
-        }
-        if x.count < m * k {
-            crate::bail!("matmul_q8_dp4a_gpu: x count {} < m*k {}", x.count, m * k);
-        }
-        let nblocks = k / 32;
-        // Quantize the whole activation tile to int8 once (reused across all nout columns): xq is
-        // m*nblocks*8 u32 (32 int8/block, 4 per word), xs is m*nblocks f32 block scales. quantize_act_q8
-        // also writes xsum (dequant block sums) for the Q4_K dp4a min correction; the Q8_0 weight is
-        // symmetric (no min term) so xsum is unused here, but the kernel declares 4 bindings, so bind a
-        // throwaway xsum to keep the binding count consistent with the Q4_K dp4a caller.
-        let xq = self.alloc_u32(m * nblocks * 8)?;
-        let xs = self.alloc_f32(m * nblocks)?;
-        let xsum = self.alloc_f32(m * nblocks)?;
-        let qpush = push_u32(&[m as u32, k as u32]);
-        // quantize_act_q8 WRITES xq(1), xs(2), xsum(3); mark all three so a later in-batch reader gets
-        // the RAW barrier. The default dispatch() marks only the last binding (xsum) -- but mul_mat_q8_dp4a
-        // reads xq+xs and NOT xsum, so without this the matmul races the still-running quantizer and reads
-        // unwritten int8 activations (garbage). The Q4_K consumer reads xsum and so was accidentally safe.
-        self.dispatch_outs(
-            "quantize_act_q8",
-            &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
-            &[1, 2, 3],
-            &qpush,
-            (((m * nblocks) as u32).div_ceil(WG1D), 1, 1),
-        )?;
-        let out = self.alloc_f32(m * nout)?;
-        let cols = (nout as u32).div_ceil(WG1D);
-        let mut m0 = 0usize;
-        while m0 < m {
-            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
-            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
-            self.dispatch(
-                "mul_mat_q8_dp4a",
-                &[wq.buffer, xq.buffer, xs.buffer, out.buffer],
-                &push,
-                (cols, 1, 1),
-            )?;
-            m0 += mcount;
-        }
-        Ok(out)
-    }
-
-    /// Q4_K prefill matmul via hardware int8 dp4a -- the compute-bound prefill lever for Q4_K weights
-    /// (attention projections + MoE gate/up experts in Q4_K_M/XL). Same result as [`matmul_q4k_gpu`]
-    /// (`y[m, nout] = x[m, k] * Wq^T`) but instead of decoding each weight to f32 and doing f32 MACs,
-    /// it quantizes the activation tile to int8 ONCE ([`quantize_act_q8`] -> codes + per-block scales +
-    /// dequant block sums) then dispatches [`mul_mat_q4k_dp4a`], which dp4a's the 4-bit codes vs the
-    /// int8 activations (`d1*xs*dot - m1*xsum` per 32-sub-block). Only valid when [`int_dot8`] is true;
-    /// callers fall back to [`matmul_q4k_gpu`] otherwise (this fn does NOT re-check, so the activation
-    /// quant runs unconditionally -- gate at the call site). Drop-in for [`matmul_q4k_gpu`].
-    pub fn matmul_q4k_dp4a_gpu(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-    ) -> Result<VulkanStorage> {
-        self.matmul_q4k_dp4a_gpu_off(wq, x, m, nout, k, 0)
-    }
-
-    /// [`matmul_q4k_dp4a_gpu`] into a slice of `wq` starting at `woff` u32 words (`woff == 0` matches
-    /// the plain form; `woff = e * nout * (k/256) * 36` selects expert `e` of a resident Q4_K MoE bank).
-    /// Mirrors [`matmul_q4k_gpu_off`] so it is a drop-in on the banked prefill path.
-    pub fn matmul_q4k_dp4a_gpu_off(
-        &self,
-        wq: &VulkanStorage,
-        x: &VulkanStorage,
-        m: usize,
-        nout: usize,
-        k: usize,
-        woff: usize,
-    ) -> Result<VulkanStorage> {
-        if !k.is_multiple_of(256) {
-            crate::bail!("matmul_q4k_dp4a_gpu: k must be a multiple of 256, got {k}");
-        }
-        if x.count < m * k {
-            crate::bail!("matmul_q4k_dp4a_gpu: x count {} < m*k {}", x.count, m * k);
-        }
-        // Activation 32-blocks (the dp4a contraction granularity), k/32 per row. The Q4_K 32-weight
-        // sub-blocks align 1:1 with these, so the same quantize_act_q8 output feeds both dp4a matmuls.
-        let nb32 = k / 32;
-        // Quantize the whole activation tile to int8 once (reused across all nout columns): xq is
-        // m*nb32*8 u32 (32 int8/block, 4 per word), xs is m*nb32 f32 block scales, xsum is m*nb32 f32
-        // dequant block sums (xs*sum(codes)) for the -m*xsum min correction.
-        let xq = self.alloc_u32(m * nb32 * 8)?;
-        let xs = self.alloc_f32(m * nb32)?;
-        let xsum = self.alloc_f32(m * nb32)?;
-        let qpush = push_u32(&[m as u32, k as u32]);
-        // Mark all three outputs (xq, xs, xsum) so an in-batch consumer barriers correctly regardless of
-        // which it reads -- see the matching note in matmul_q8_dp4a_gpu_off (the Q8 consumer reads xq+xs
-        // but not xsum, so relying on the default last-binding-only marking misses the hazard).
-        self.dispatch_outs(
-            "quantize_act_q8",
-            &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
-            &[1, 2, 3],
-            &qpush,
-            (((m * nb32) as u32).div_ceil(WG1D), 1, 1),
-        )?;
-        let out = self.alloc_f32(m * nout)?;
-        let cols = (nout as u32).div_ceil(WG1D);
-        let mut m0 = 0usize;
-        while m0 < m {
-            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
-            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, woff as u32]);
-            self.dispatch(
-                "mul_mat_q4k_dp4a",
-                &[wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer],
-                &push,
-                (cols, 1, 1),
-            )?;
-            m0 += mcount;
-        }
-        Ok(out)
-    }
-
-    /// Kernel name + dispatch grid for a fused grouped (MoE) matvec producing `m*nout` outputs. When
-    /// the device supports subgroup arithmetic (`subgroup_matvec`, the same gate q8 uses) this selects
-    /// the `_sg` variant — ONE SUBGROUP per (slot,col) output, lanes striding that row's blocks for
-    /// coalesced reads — and a workgroup of WG1D invocations holds `WG1D/subgroup_size` subgroups, so
-    /// it yields that many outputs; dispatch `ceil(m*nout / rows_per_wg)` workgroups. Otherwise the
-    /// scalar kernel (one invocation per output, `ceil(m*nout / WG1D)` workgroups). `base` is the
-    /// scalar kernel name; the `_sg` literal is matched (not formatted) to keep it `'static`.
-    fn matvec_id_grid(
-        &self,
-        base: &'static str,
-        m: usize,
-        nout: usize,
-    ) -> (&'static str, (u32, u32, u32)) {
-        let total = (m * nout) as u32;
-        if self.inner.subgroup_matvec {
-            let sg = match base {
-                "mul_mat_vec_id_q4k" => "mul_mat_vec_id_q4k_sg",
-                "mul_mat_vec_id_q8" => "mul_mat_vec_id_q8_sg",
-                other => other,
-            };
-            // subgroup_size is >=2 (checked at init) and <=64 in practice, so rows_per_wg is [1, 32].
-            let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
-            (sg, (total.div_ceil(rows_per_wg), 1, 1))
-        } else {
-            (base, (total.div_ceil(WG1D), 1, 1))
-        }
-    }
-
-    /// Fused grouped Q4_K matvec for resident-bank MoE: ONE dispatch computes `y[m*nout]` where
-    /// `y[slot*nout + col] = dequant(bank[ids[slot]])[col, :] . x_flat[slot*k ..]`. `ids` is a GPU u32
-    /// buffer of length `m` (the routed expert per slot), `x_flat` is `[m, k]` f32 contiguous, `bank`
-    /// is the verbatim [E,n,k] Q4_K bank, `per_expert_words = n * (k/256) * 36`. Replaces the
-    /// per-expert index_select/matvec/index_add loop -- and its routing-ids GPU->CPU sync -- with one
-    /// kernel reading ids straight from VRAM. Decode is bit-identical to [`matvec_q4k_gpu_off`] (same
-    /// in-shader block decode). Dispatches the subgroup-reduced `_sg` variant when supported (one
-    /// subgroup per (slot,col)), else the scalar kernel (one invocation per output). See `matvec_id_grid`.
-    #[allow(clippy::too_many_arguments)]
-
     /// One workgroup per (V-tile, batch*head); V-tile width is 64 (matches the kernels' BV).
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_recurrence_gpu(
@@ -2038,7 +1755,7 @@ impl VulkanDevice {
         dev.unmap_memory(mem);
         if let Some(t) = t0 {
             eprintln!(
-                "[VK_PROFILE] readback(f32): {n} elems map+copy={:.3}ms",
+                "[HANZO_VK_PROFILE] readback(f32): {n} elems map+copy={:.3}ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -2096,7 +1813,7 @@ impl VulkanDevice {
         dev.unmap_memory(mem);
         if let Some(t) = t0 {
             eprintln!(
-                "[VK_PROFILE] readback(u32): {n} elems map+copy={:.3}ms",
+                "[HANZO_VK_PROFILE] readback(u32): {n} elems map+copy={:.3}ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -2511,7 +2228,7 @@ impl VulkanDevice {
         self.upload_u32(ids)
     }
 
-    // Name a CPU-fallback round-trip when VK_PROFILE is set. Each fallback op reads its
+    // Name a CPU-fallback round-trip when HANZO_VK_PROFILE is set. Each fallback op reads its
     // operand(s) back to the host, computes on the (UNtimed) CPU, and re-uploads -- a hidden
     // bottleneck the size-only readback log can't attribute to an op. This names the culprit so a
     // GPU re-run can prioritize which op to port native next. Zero-cost when profiling is off (the
@@ -2520,7 +2237,7 @@ impl VulkanDevice {
     #[inline]
     fn profile_fallback(&self, op: &str, extra: std::fmt::Arguments<'_>) {
         if self.inner.profile {
-            eprintln!("[VK_PROFILE] cpu-fallback op={op} {extra} (GPU->CPU->GPU round-trip)");
+            eprintln!("[HANZO_VK_PROFILE] cpu-fallback op={op} {extra} (GPU->CPU->GPU round-trip)");
         }
     }
 }
@@ -2572,7 +2289,7 @@ fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter, profile:
         // per-token GPU breakdown: `dispatch` = ops recorded, `barriers` = memory barriers emitted
         // (lower is better -- with selective barriers, independent ops in a row emit none).
         eprintln!(
-            "[VK_PROFILE] flush: dispatch={n} barriers={barriers} \
+            "[HANZO_VK_PROFILE] flush: dispatch={n} barriers={barriers} \
              record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms",
         );
     }
@@ -2687,9 +2404,9 @@ impl BackendDevice for VulkanDevice {
             // Default ON when the device advertises coopmat: the register-blocked kernel
             // (bmm_coopmat_rb) measured 1.3-2.7x over the fp32 bmm_reg on the real AMD driver and a
             // full Qwen3-0.6B forward's argmax matched CPU exactly (fp16 inputs, fp32 accumulate).
-            // Set VK_COOPMAT=0 to force the fp32 path (e.g. if precision matters).
+            // Set HANZO_VK_COOPMAT=0 to force the fp32 path (e.g. if precision matters).
             let cm_use = coopmat
-                && std::env::var("VK_COOPMAT")
+                && std::env::var("HANZO_VK_COOPMAT")
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
@@ -2698,14 +2415,14 @@ impl BackendDevice for VulkanDevice {
             // descriptor set per op. That per-op churn is the dominant CPU cost on the decode hot
             // path (same op graph, hundreds of dispatches x 28 layers, re-recorded every token), so
             // collapsing it to one recorded command is the lever. Enabled when advertised (native
-            // AMD/NV; typically absent on WSL/Dozen, which keeps the legacy path). VK_PUSH_DESC=0
+            // AMD/NV; typically absent on WSL/Dozen, which keeps the legacy path). HANZO_VK_PUSH_DESC=0
             // forces the legacy path. The extension's guaranteed maxPushDescriptors >= 32 dwarfs our
             // widest kernel (4 storage buffers), so no per-pipeline limit check is needed.
             let has_pd_ext = dev_exts.iter().any(|e| {
                 CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::push_descriptor::NAME
             });
             let use_pd = has_pd_ext
-                && std::env::var("VK_PUSH_DESC")
+                && std::env::var("HANZO_VK_PUSH_DESC")
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
@@ -2713,7 +2430,7 @@ impl BackendDevice for VulkanDevice {
             // big buffers (e.g. an 18.6GB model's weights) to the largest DEVICE_LOCAL heap (the GTT
             // pool on this UMA APU), which is where the real capacity lives. `host_only` restores the
             // legacy host-visible-only behaviour; `device_first` forces big-heap placement always.
-            let mem_strategy = match std::env::var("VK_DEVICE_MEMORY_STRATEGY")
+            let mem_strategy = match std::env::var("HANZO_VK_DEVICE_MEMORY_STRATEGY")
                 .ok()
                 .as_deref()
                 .map(str::trim)
@@ -2723,7 +2440,7 @@ impl BackendDevice for VulkanDevice {
                 Some("auto") | None | Some("") => MemStrategy::Auto,
                 Some(other) => {
                     eprintln!(
-                        "[vulkan] unknown VK_DEVICE_MEMORY_STRATEGY=`{other}` (expected host_only|device_first|auto); using auto"
+                        "[vulkan] unknown HANZO_VK_DEVICE_MEMORY_STRATEGY=`{other}` (expected host_only|device_first|auto); using auto"
                     );
                     MemStrategy::Auto
                 }
@@ -2738,7 +2455,7 @@ impl BackendDevice for VulkanDevice {
 
             // Subgroup capability (core in Vulkan 1.1+, which the 1.3 instance guarantees). The q8
             // mat-vec subgroup kernel uses subgroupAdd (ARITHMETIC) at COMPUTE-stage scope, so we
-            // require both before enabling it. VK_SUBGROUP_MATVEC=0 forces the scalar kernel.
+            // require both before enabling it. HANZO_VK_SUBGROUP_MATVEC=0 forces the scalar kernel.
             let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
             {
                 // p2 mutably borrows sg_props via push_next; scope it so the borrow ends before we
@@ -2758,7 +2475,7 @@ impl BackendDevice for VulkanDevice {
             let subgroup_matvec = sg_compute
                 && sg_arith
                 && subgroup_size >= 2
-                && std::env::var("VK_SUBGROUP_MATVEC")
+                && std::env::var("HANZO_VK_SUBGROUP_MATVEC")
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
@@ -2785,25 +2502,6 @@ impl BackendDevice for VulkanDevice {
                 vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
             let mut s16_feat =
                 vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
-            // Hardware int8 4x8 dp4a detection: gates the Q8/Q4_K dp4a prefill path. Require both the
-            // plain and acc-sat signed 4x8 properties hw-accelerated, else f32-decode is as good.
-            // VK_INT_DOT8=0 forces off.
-            let mut idp_props = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
-            {
-                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut idp_props);
-                instance.get_physical_device_properties2(pdev, &mut p2);
-            }
-            let mut idp_feat = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
-            {
-                let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut idp_feat);
-                instance.get_physical_device_features2(pdev, &mut f2);
-            }
-            let int_dot8 = idp_feat.shader_integer_dot_product == vk::TRUE
-                && idp_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE
-                && idp_props
-                    .integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated
-                    == vk::TRUE
-                && std::env::var("VK_INT_DOT8").map(|v| v != "0").unwrap_or(true);
             let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
             if !ext_names.is_empty() {
                 dci = dci.enabled_extension_names(&ext_names);
@@ -2814,11 +2512,6 @@ impl BackendDevice for VulkanDevice {
                     .push_next(&mut mm_feat)
                     .push_next(&mut f16_feat)
                     .push_next(&mut s16_feat);
-            }
-            let mut idp_enable = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
-                .shader_integer_dot_product(true);
-            if int_dot8 {
-                dci = dci.push_next(&mut idp_enable);
             }
             let device = instance.create_device(pdev, &dci, None).map_err(vkerr)?;
             // Load push_descriptor device fns now that the device exists with the extension enabled.
@@ -2880,7 +2573,7 @@ impl BackendDevice for VulkanDevice {
             });
 
             // Phase profiling: opt-in, read once here so the hot path only checks a bool.
-            let profile = std::env::var("VK_PROFILE")
+            let profile = std::env::var("HANZO_VK_PROFILE")
                 .map(|v| v != "0")
                 .unwrap_or(false);
 
@@ -2906,7 +2599,6 @@ impl BackendDevice for VulkanDevice {
                 coopmat,
                 cm_mnk,
                 cm_use,
-                int_dot8,
             };
             Ok(Self {
                 inner: Arc::new(inner),
@@ -4237,7 +3929,7 @@ impl BackendStorage for VulkanStorage {
         }
         if self.device.inner.profile {
             eprintln!(
-                "[VK_PROFILE] copy2d(native): d1={d1} d2={d2} elems={total} \
+                "[HANZO_VK_PROFILE] copy2d(native): d1={d1} d2={d2} elems={total} \
                  (was a CPU round-trip; now on-GPU)"
             );
         }
