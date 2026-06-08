@@ -1,6 +1,6 @@
 use crate::source::{
     AFFINE, BINARY, CAST, CONV, FILL, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, QUANTIZED_MM2D,
-    RANDOM, REDUCE, SDPA, SORT, TERNARY, UNARY,
+    QUANTIZED_MV_EXT, RANDOM, REDUCE, SDPA, SORT, TERNARY, UNARY,
 };
 use crate::utils::get_env_bool;
 use crate::{
@@ -95,6 +95,7 @@ impl Kernels {
             Source::MlxSort => MLX_SORT,
             Source::Quantized => QUANTIZED,
             Source::QuantizedMM2d => QUANTIZED_MM2D,
+            Source::QuantizedMvExt => QUANTIZED_MV_EXT,
             Source::Random => RANDOM,
             Source::Reduce => REDUCE,
             Source::Sort => SORT,

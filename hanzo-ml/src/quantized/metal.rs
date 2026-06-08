@@ -320,6 +320,22 @@ impl QMetalStorage {
             .collect::<Vec<_>>();
         let src1_offset = src1_l.start_offset() * storage.dtype().size_in_bytes();
 
+        // Small-batch (m in 2..=8) is the speculative-decode / MTP verify range.
+        // The simdgroup-matrix GEMM is compute-bound there; ggml-metal's
+        // `mul_mv_ext` reads each weight once and dots it against all m activation
+        // columns (memory-bound, like the m==1 mat-vec). For Q8_0 with K%128==0 we
+        // route this range to the ported kernel; larger m (prefill) stays on the
+        // GEMM. ne11 == m after the rank-4 left-pad below. Opt out with
+        // CANDLE_METAL_DISABLE_MV_EXT=1.
+        let ne11_m = src1_l.dims()[src1_l.dims().len() - 2];
+        let mv_ext_disabled = std::env::var("CANDLE_METAL_DISABLE_MV_EXT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let use_mv_ext = !mv_ext_disabled
+            && matches!(self.dtype, GgmlDType::Q8_0)
+            && (2..=8).contains(&ne11_m)
+            && k % 128 == 0;
+
         // Prefill (m > 1; m == 1 already routed to fwd_mv above) is the
         // compute-bound GEMM. The cooperative tensor-ops (matmul2d) Q8_0 kernel
         // is correct and Metal-4-gated, but on the M4 Max it benches slower than
@@ -332,7 +348,24 @@ impl QMetalStorage {
         let use_mm2d = mm2d_enabled
             && matches!(self.dtype, GgmlDType::Q8_0)
             && device.device().supports_metal4();
-        if use_mm2d {
+        if use_mv_ext {
+            hanzo_metal_kernels::call_quantized_matmul_mv_ext_q8_0(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                src0_l.dims(),
+                &src0_stride,
+                &self.buffer,
+                src1_l.dims(),
+                &src1_stride_bytes,
+                storage.buffer(),
+                src1_offset,
+                dst_shape.dims(),
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        } else if use_mm2d {
             hanzo_metal_kernels::call_quantized_matmul_mm_q8_0_mm2d(
                 device.device(),
                 &encoder,
