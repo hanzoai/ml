@@ -1,6 +1,6 @@
 //! Trainer-free GRPO (Group Relative Policy Optimization).
 //!
-//! A pure-`candle`-autograd implementation of GRPO — no external trainer
+//! A pure-`hanzo_ml`-autograd implementation of GRPO — no external trainer
 //! framework. The algorithm is ported from the `zooai-gym` GRPO trainer
 //! (`trainers/grpo/{args,sampler,trainer}.py`); see [`math`] for the exact
 //! formula correspondence.
@@ -18,7 +18,7 @@
 //!
 //! # Plugging in a real model
 //! Implement [`Policy`] for your model:
-//! - `trainable_vars()` returns the model's `candle` [`Var`](hanzo_ml::Var)s.
+//! - `trainable_vars()` returns the model's `hanzo_ml` [`Var`](hanzo_ml::Var)s.
 //! - `sample_group()` is your autoregressive `generate` loop (uses the provided
 //!   [`Sampler`], which wraps the real `LogitsProcessor`).
 //! - `sequence_logprob()` is a differentiable teacher-forced forward pass that
