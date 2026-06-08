@@ -387,6 +387,138 @@ pub fn call_quantized_matmul_mm_q8_0_mm2d(
     Ok(())
 }
 
+/// Small-batch Q8_0 mat-vec (port of ggml-metal's `mul_mv_ext`), for activation
+/// batch sizes `2 <= ne11 <= 8` (the speculative-decode / MTP verify range).
+///
+/// Same argument layout as `call_quantized_matmul_mm_t` (src0 = Q8_0 weights,
+/// src1 = f32 activations). Unlike the simdgroup-matrix GEMM, each weight chunk
+/// is read once and dotted against all `r1ptg` activation columns, so the cost
+/// is memory-bound (streaming the weights) instead of compute-bound.
+///
+/// Requires `ne00 % 128 == 0` and `2 <= ne11 <= 8`; the caller must check this
+/// and fall back to the GEMM otherwise. Q8_0 only.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_ext_q8_0(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    src0_shape: &[usize],
+    src0_stride: &[usize],
+    src0: &Buffer,
+    src1_shape: &[usize],
+    src1_stride: &[usize],
+    src1: &Buffer,
+    src1_offset: usize,
+    dst_shape: &[usize],
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    // Everything is in reverse (matches call_quantized_matmul_mm_t).
+    let ne00 = src0_shape[src0_shape.len() - 1] as i64; // K
+    let ne01 = src0_shape[src0_shape.len() - 2] as i64; // weight rows (output cols)
+    let ne02 = src0_shape[src0_shape.len() - 3] as i64;
+    let ne03 = src0_shape[src0_shape.len() - 4] as i64;
+
+    let nb01 = src0_stride[src0_stride.len() - 2] as i64;
+    let nb02 = src0_stride[src0_stride.len() - 3] as i64;
+    let nb03 = src0_stride[src0_stride.len() - 4] as i64;
+
+    let ne11 = src1_shape[src1_shape.len() - 2] as i64; // activation rows (m)
+    let ne12 = src1_shape[src1_shape.len() - 3] as i64;
+    let ne13 = src1_shape[src1_shape.len() - 4] as i64;
+
+    let nb11 = src1_stride[src1_stride.len() - 2] as i64;
+    let nb12 = src1_stride[src1_stride.len() - 3] as i64;
+    let nb13 = src1_stride[src1_stride.len() - 4] as i64;
+
+    let ne0 = dst_shape[dst_shape.len() - 1] as i64; // == ne01
+    let ne1 = dst_shape[dst_shape.len() - 2] as i64; // == ne11
+    let r2 = (ne12 / ne02) as u32;
+    let r3 = (ne13 / ne03) as u32;
+
+    if ne00 % 128 != 0 {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "Q8_0", // ne00 not a multiple of 128
+            "qmatmul_mv_ext",
+        ));
+    }
+    if !(2..=8).contains(&ne11) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "Q8_0",
+            "qmatmul_mv_ext",
+        ));
+    }
+
+    // Tuning copied from ggml-metal-ops.cpp (the mul_mv_ext dispatch):
+    //   nsg = 2; nxpsg by ne00/ne11; r1ptg by ne11.
+    let nsg: i32 = 2;
+    let nxpsg: usize = if ne00 % 256 == 0 && ne11 < 3 {
+        16
+    } else if ne00 % 128 == 0 {
+        8
+    } else {
+        4
+    };
+    let nypsg = 32 / nxpsg; // weight rows per simdgroup
+    let r0ptg = nypsg * nsg as usize; // weight rows per threadgroup
+    let r1ptg: usize = match ne11 {
+        2 => 2,
+        3 | 6 => 3,
+        4 | 7 | 8 => 4,
+        5 => 5,
+        _ => unreachable!("ne11 range checked above"),
+    };
+
+    let name = format!("kernel_mul_mv_ext_q8_0_f32_r1_{r1ptg}_nx{nxpsg}");
+
+    let thread_groups_count = MTLSize {
+        width: divide(ne01 as usize, r0ptg),
+        height: divide(ne11 as usize, r1ptg),
+        depth: (ne12 * ne13) as usize,
+    };
+    // 32 threads per simdgroup, nsg simdgroups => threadgroup is (32, nsg, 1).
+    let threads_per_threadgroup = MTLSize {
+        width: 32,
+        height: nsg as usize,
+        depth: 1,
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::QuantizedMvExt, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            src0,
+            (src1, src1_offset),
+            (dst, dst_offset),
+            ne00,
+            ne01,
+            nb01,
+            nb02,
+            nb03,
+            ne11,
+            nb11,
+            nb12,
+            nb13,
+            ne0,
+            ne1,
+            nsg,
+            ne12 as i32,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(src0, MTLResourceUsage::Read);
+    encoder.use_resource(src1, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
