@@ -26,6 +26,21 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
+// Opt-in switch for the modern llama-style mmq/mmvq path (int8 MMA matrix-core + stream-K) ported
+// in fast_mmq.rs / fast_mmvq.rs. Off by default until validated on NVIDIA hardware; enable with
+// CANDLE_CUDA_FAST_MMQ=1. When on, QCudaStorage::fwd tries it first and falls back to the legacy
+// on-GPU q8_1 kernels for any dtype/shape it doesn't support.
+pub(crate) fn fast_mmq_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        matches!(
+            std::env::var("CANDLE_CUDA_FAST_MMQ").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    })
+}
+
 pub const WARP_SIZE: usize = 32;
 // Output rows each indexed-MoE block computes (tile). MUST match
 // INDEXED_MOE_ROWS_PER_BLOCK in hanzo-kernels/src/quantized.cu.
@@ -748,6 +763,18 @@ impl QCudaStorage {
             [b, _k] => *b <= max_bm,
             _ => false,
         };
+        // Modern llama mmq/mmvq path (int8 MMA matrix-core + stream-K). Opt-in via
+        // CANDLE_CUDA_FAST_MMQ=1; try_fwd returns Ok(None) for unsupported dtype/shape, falling
+        // through to the legacy on-GPU q8_1 kernels below. Skipped under FORCE_DMMV.
+        if fast_mmq_enabled() && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+            if use_vec_kernel {
+                if let Some(out) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
+                    return Ok(out);
+                }
+            } else if let Some(out) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
+                return Ok(out);
+            }
+        }
         if use_vec_kernel {
             self.dequantize_matmul_vec(self_shape, storage, layout)
         } else {

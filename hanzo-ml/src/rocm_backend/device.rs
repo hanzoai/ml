@@ -2,13 +2,14 @@ use crate::backend::BackendDevice;
 use crate::{CpuStorage, DType, Layout, Result, Shape};
 use half::{bf16, f16};
 use hanzo_rocm_kernels::compile::KernelCache;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::wrappers::{
-    DevicePool, SendSyncDeviceMemory, SendSyncMIOpenHandle, SendSyncPseudoRng,
+    DevicePool, SendSyncDeviceMemory, SendSyncPseudoRng,
     SendSyncRocblasHandle, SendSyncStream,
 };
+#[cfg(feature = "rocm-miopen")]
+use super::wrappers::SendSyncMIOpenHandle;
 use super::{Affine, RocmError, RocmStorage, RocmStorageSlice};
 use rocm_rs::hip::Device as HipDevice;
 
@@ -31,6 +32,7 @@ pub struct RocmDevice {
     rocrand: Arc<Mutex<SendSyncPseudoRng>>,
     seed_value: Arc<RwLock<u64>>,
     pub(crate) blas: Arc<SendSyncRocblasHandle>,
+    #[cfg(feature = "rocm-miopen")]
     pub(crate) miopen: Arc<SendSyncMIOpenHandle>,
     kernel_manager: Arc<Mutex<KernelCache>>,
     /// Caching allocator pool (avoids the synchronizing per-op hipMalloc).
@@ -60,6 +62,7 @@ impl RocmDevice {
         blas.set_stream(&stream)
             .map_err(|e| RocmError::Rocblas(e.to_string()))?;
 
+        #[cfg(feature = "rocm-miopen")]
         let miopen =
             SendSyncMIOpenHandle::new(&stream).map_err(|e| RocmError::MIOpen(e.to_string()))?;
 
@@ -75,9 +78,10 @@ impl RocmDevice {
             rocrand: Arc::new(Mutex::new(rocrand)),
             seed_value: Arc::new(RwLock::new(seed)),
             blas: Arc::new(blas),
+            #[cfg(feature = "rocm-miopen")]
             miopen: Arc::new(miopen),
             kernel_manager,
-            pool: Arc::new(Mutex::new(HashMap::new())),
+            pool: Arc::new(Mutex::new(super::wrappers::PoolInner::default())),
         })
     }
 
@@ -93,7 +97,11 @@ impl RocmDevice {
     pub fn alloc_zeros<T: Default + Clone>(&self, len: usize) -> Result<SendSyncDeviceMemory<T>> {
         let mut mem = SendSyncDeviceMemory::new_pooled(len, Some(self.pool.clone()))
             .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))?;
-        mem.memset(0)
+        // Capture-safe: enqueue the zero-fill asynchronously on the device's single
+        // stream. The synchronizing `hipMemset` trips hipGraph capture (HIP 906);
+        // `hipMemsetAsync` is recordable, and single-stream ordering keeps the math
+        // identical to the prior blocking version.
+        mem.memset_async(0, self.stream.0.as_raw())
             .map_err(|e| crate::Error::Msg(format!("Failed to memset: {}", e)))?;
         Ok(mem)
     }
@@ -121,10 +129,30 @@ impl RocmDevice {
             .map_err(|e| crate::Error::Msg(format!("Synchronize failed: {}", e)))
     }
 
+    /// Open a hipGraph-capture reservation scope on the caching pool. Buffers
+    /// allocated while the scope is open are reserved (never recycled) on Drop so
+    /// the captured graph's device pointers can never be handed to a later
+    /// allocation — preventing the stale-replay corruption. Must be paired with
+    /// [`Self::end_graph_capture_scope`]. See `wrappers::PoolInner`.
+    pub fn begin_graph_capture_scope(&self) {
+        if let Ok(mut inner) = self.pool.lock() {
+            inner.begin_capture();
+        }
+    }
+
+    /// Close a hipGraph-capture reservation scope opened by
+    /// [`Self::begin_graph_capture_scope`].
+    pub fn end_graph_capture_scope(&self) {
+        if let Ok(mut inner) = self.pool.lock() {
+            inner.end_capture();
+        }
+    }
+
     pub(crate) fn kernel_manager(&self) -> &std::sync::Mutex<KernelCache> {
         &self.kernel_manager
     }
 
+    #[cfg(feature = "rocm-miopen")]
     pub(crate) fn miopen(&self) -> &Arc<SendSyncMIOpenHandle> {
         &self.miopen
     }
