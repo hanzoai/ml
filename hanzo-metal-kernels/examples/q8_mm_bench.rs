@@ -236,10 +236,155 @@ fn run_case(device: &Device, kernels: &Kernels, n_w: usize, n_act: usize, k: usi
     );
 }
 
+// Small-batch (2..=8 activation cols) verify + timing for the mul_mv_ext Q8_0
+// kernel vs the simdgroup GEMM. Compares both against the f32 reference and
+// reports the per-call ms (this is the spec-decode / MTP verify step).
+fn run_case_mv_ext(device: &Device, kernels: &Kernels, n_w: usize, n_act: usize, k: usize) {
+    assert!(k % 128 == 0, "mv_ext requires k % 128 == 0");
+    assert!((2..=8).contains(&n_act));
+    let queue = device.new_command_queue().unwrap();
+    let opts = RESOURCE_OPTIONS;
+
+    let mut seed = 0x9E37_79B9u32;
+    let mut rng = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+    };
+    let weights_f32: Vec<f32> = (0..n_w * k).map(|_| rng()).collect();
+    let acts_f32: Vec<f32> = (0..n_act * k).map(|_| rng()).collect();
+
+    let wq = quantize_q8_0(&weights_f32, n_w, k);
+    let weights_deq = dequantize_q8_0(&wq, n_w, k);
+
+    let w_buf = device
+        .new_buffer_with_data(wq.as_ptr() as *const _, wq.len(), opts)
+        .unwrap();
+    let a_buf = device
+        .new_buffer_with_data(
+            acts_f32.as_ptr() as *const _,
+            std::mem::size_of_val(&acts_f32[..]),
+            opts,
+        )
+        .unwrap();
+    let dst_ext = device.new_buffer(n_act * n_w * 4, opts).unwrap();
+    let dst_simd = device.new_buffer(n_act * n_w * 4, opts).unwrap();
+
+    let src0_shape = [1usize, 1, n_w, k];
+    let ts_over_bs = 34f32 / 32f32;
+    let src0_stride = [
+        (n_w * k) as f32 * ts_over_bs,
+        (n_w * k) as f32 * ts_over_bs,
+        (k as f32 * ts_over_bs) as usize as f32,
+        ts_over_bs,
+    ]
+    .map(|x| x as usize);
+    let src1_shape = [1usize, 1, n_act, k];
+    let src1_stride = [n_act * k * 4, n_act * k * 4, k * 4, 4]; // bytes
+    let dst_shape = [1usize, n_act, n_w];
+
+    let launch_ext = |cb: &hanzo_metal_kernels::metal::CommandBuffer| {
+        hanzo_metal_kernels::call_quantized_matmul_mv_ext_q8_0(
+            device, cb, kernels, &src0_shape, &src0_stride, &w_buf, &src1_shape, &src1_stride,
+            &a_buf, 0, &dst_shape, 0, &dst_ext,
+        )
+        .unwrap();
+    };
+    let launch_simd = |cb: &hanzo_metal_kernels::metal::CommandBuffer| {
+        hanzo_metal_kernels::call_quantized_matmul_mm_t(
+            device, cb, kernels, GgmlDType::Q8_0, &src0_shape, &src0_stride, &w_buf, &src1_shape,
+            &src1_stride, &a_buf, 0, &dst_shape, 0, &dst_simd,
+        )
+        .unwrap();
+    };
+
+    // correctness
+    {
+        let sem = Arc::new(CommandSemaphore::new());
+        let cb = create_command_buffer(&queue, sem).unwrap();
+        launch_ext(&cb);
+        cb.commit();
+        cb.wait_until_completed();
+        let sem = Arc::new(CommandSemaphore::new());
+        let cb = create_command_buffer(&queue, sem).unwrap();
+        launch_simd(&cb);
+        cb.commit();
+        cb.wait_until_completed();
+        let reference = cpu_ref(&weights_deq, &acts_f32, n_w, n_act, k);
+        let read = |buf: &hanzo_metal_kernels::metal::Buffer| -> Vec<f32> {
+            let ptr = buf.contents() as *const f32;
+            unsafe { std::slice::from_raw_parts(ptr, n_act * n_w).to_vec() }
+        };
+        let e = read(&dst_ext);
+        let s = read(&dst_simd);
+        let scale = reference.iter().fold(0f32, |a, &b| a.max(b.abs())).max(1e-6);
+        let mut max_ext = 0f32;
+        let mut max_simd = 0f32;
+        let mut max_es = 0f32;
+        for i in 0..n_act * n_w {
+            max_ext = max_ext.max((e[i] - reference[i]).abs());
+            max_simd = max_simd.max((s[i] - reference[i]).abs());
+            max_es = max_es.max((e[i] - s[i]).abs());
+        }
+        println!(
+            "  verify n_w={n_w} n_act={n_act} k={k}: rel ext={:.2e} simd={:.2e} (ext-vs-simd {:.2e})",
+            max_ext / scale,
+            max_simd / scale,
+            max_es / scale
+        );
+    }
+
+    // timing (ms per call). Batch BATCH dispatches into one command buffer so the
+    // per-submit overhead (~0.05-0.15ms) is amortized and we see kernel-execution
+    // time, which is what compounds across the ~36-layer engine forward.
+    let time = |which: u8| -> f64 {
+        const WARMUP: usize = 3;
+        const REPS: usize = 30;
+        const BATCH: usize = 64;
+        let mut sum = 0f64;
+        for idx in 0..(WARMUP + REPS) {
+            let sem = Arc::new(CommandSemaphore::new());
+            let cb = create_command_buffer(&queue, sem).unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..BATCH {
+                if which == 0 {
+                    launch_ext(&cb);
+                } else {
+                    launch_simd(&cb);
+                }
+            }
+            cb.commit();
+            cb.wait_until_completed();
+            let dt = t0.elapsed().as_secs_f64();
+            if idx >= WARMUP {
+                sum += dt;
+            }
+        }
+        sum / (REPS * BATCH) as f64 * 1e3
+    };
+    let ms_ext = time(0);
+    let ms_simd = time(1);
+    println!(
+        "  n_w={n_w:6} n_act={n_act:3} k={k:5}  ext {ms_ext:7.4} ms  simd {ms_simd:7.4} ms ({:.2}x faster)",
+        ms_simd / ms_ext
+    );
+}
+
 fn main() {
     let device = Device::system_default().unwrap();
     println!("device supports metal4: {}", device.supports_metal4());
     let kernels = Kernels::new();
+
+    // mul_mv_ext (small-batch / spec-decode verify) correctness + timing.
+    println!("== mul_mv_ext correctness + timing (small batch) ==");
+    for &n_act in &[2usize, 3, 4, 5, 6, 8] {
+        // attn proj shape; k=128 multiple required.
+        run_case_mv_ext(&device, &kernels, 256, n_act, 128);
+    }
+    // Qwen3-8B-ish projection shapes at the verify batch (gamma+1 = 5).
+    println!("== mul_mv_ext on Qwen3-8B shapes (n_act=5) ==");
+    for &(n_w, k) in &[(4096usize, 4096usize), (12288, 4096), (4096, 12288), (1024, 4096)] {
+        run_case_mv_ext(&device, &kernels, n_w, 5, k);
+    }
 
     // Verify correctness on a few shapes first.
     println!("== correctness ==");

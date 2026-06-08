@@ -8,6 +8,7 @@ pub const MLX_GEMM: &str = include_str!("metal_src/mlx_gemm.metal");
 pub const MLX_SORT: &str = include_str!("metal_src/mlx_sort.metal");
 pub const QUANTIZED: &str = include_str!("metal_src/quantized.metal");
 pub const QUANTIZED_MM2D: &str = include_str!("metal_src/quantized_mm2d.metal");
+pub const QUANTIZED_MV_EXT: &str = include_str!("metal_src/quantized_mv_ext.metal");
 pub const RANDOM: &str = include_str!("metal_src/random.metal");
 pub const REDUCE: &str = include_str!("metal_src/reduce.metal");
 pub const SORT: &str = include_str!("metal_src/sort.metal");
@@ -27,6 +28,7 @@ pub enum Source {
     MlxSort,
     Quantized,
     QuantizedMM2d,
+    QuantizedMvExt,
     Random,
     Reduce,
     Sort,
