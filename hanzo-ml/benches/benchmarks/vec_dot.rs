@@ -1,4 +1,4 @@
-use hanzo_ml::cpu::kernels::VecOps;
+use candle_core::cpu::kernels::VecOps;
 use criterion::{criterion_group, BatchSize, Criterion, Throughput};
 use half::{bf16, f16};
 

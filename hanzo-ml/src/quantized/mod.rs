@@ -1,6 +1,7 @@
 use crate::{
     backend::BackendStorage, CpuStorage, DType, Device, Result, Shape, Storage, Tensor, D,
 };
+use iq_quants::*;
 use k_quants::*;
 use std::borrow::Cow;
 
@@ -10,6 +11,8 @@ mod dummy_cuda;
 mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
+mod iq_grids;
+pub mod iq_quants;
 pub mod imatrix_file;
 pub mod k_quants;
 #[cfg(feature = "metal")]
@@ -36,6 +39,9 @@ pub mod neon;
 #[cfg(target_feature = "simd128")]
 pub mod simd128;
 pub mod utils;
+// Declarative GGUF quant-type formatter (Cut 2). Additive: defines `quant_format!` and a
+// `#[cfg(test)]` equivalence proof; does not alter any existing type or wiring.
+pub mod quant_format;
 use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
@@ -80,7 +86,12 @@ impl Device {
                 Ok(QStorage::Cuda(storage))
             }
             #[cfg(feature = "rocm")]
-            Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
+            Device::Rocm(d) => {
+                // Mirror Vulkan: keep quantized blocks in a CPU box + the device; QMatMul
+                // dequantizes them to a dense ROCm tensor on use.
+                let storage = dtype.cpu_zeros(elem_count);
+                Ok(QStorage::Rocm(storage, d.clone()))
+            }
             #[cfg(feature = "vulkan")]
             Device::Vulkan(d) => {
                 // Keep quantized blocks in a CPU box + the device (same as from_data); QMatMul's
@@ -103,6 +114,11 @@ pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
+    // ROCm mirrors the Vulkan path: quantized blocks held in a CPU box + the device; QMatMul
+    // dequantizes them to a dense f32 ROCm tensor on demand (rocBLAS matmul). A native HIP quant
+    // matmul is the bandwidth-win follow-up.
+    #[cfg(feature = "rocm")]
+    Rocm(Box<dyn QuantizedType>, crate::RocmDevice),
     // Vulkan keeps the quantized blocks in a CPU box and dequantizes to an f32 Vulkan tensor on
     // demand (QMatMul forces dequantize for Vulkan). Lets GGUF-quantized models run on the GPU;
     // a direct quantized matmul (the Q8 kernel) is the bandwidth-win follow-up.
@@ -137,8 +153,9 @@ impl QStorage {
                 GgmlDType::IQ4_NL => metal::load_quantized(d, as_t_slice::<BlockIQ4nl>(&data)),
                 GgmlDType::IQ4_XS => metal::load_quantized(d, as_t_slice::<BlockIQ4xs>(&data)),
                 GgmlDType::MXFP4 => metal::load_quantized(d, as_t_slice::<BlockMXFP4>(&data)),
-                GgmlDType::TQ2_0 => crate::bail!("TQ2_0 is CPU/Vulkan-only for now (no Metal kernel)"),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(&data)),
+                // IQ / ternary / 1-bit / NVFP4 codec types have no native Metal loader (CPU-decode only).
+                other => crate::bail!("{other:?} is not supported on the Metal backend"),
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(&data)),
@@ -158,11 +175,12 @@ impl QStorage {
                 GgmlDType::IQ4_NL => cuda::load_quantized(d, as_t_slice::<BlockIQ4nl>(&data)),
                 GgmlDType::IQ4_XS => cuda::load_quantized(d, as_t_slice::<BlockIQ4xs>(&data)),
                 GgmlDType::MXFP4 => cuda::load_quantized(d, as_t_slice::<BlockMXFP4>(&data)),
-                GgmlDType::TQ2_0 => crate::bail!("TQ2_0 is CPU/Vulkan-only for now (no CUDA kernel)"),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(&data)),
+                // IQ / ternary / 1-bit / NVFP4 codec types have no native CUDA loader (CPU-decode only).
+                other => crate::bail!("{other:?} is not supported on the CUDA backend"),
             },
             #[cfg(feature = "rocm")]
-            Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
+            Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(data), d.clone())),
             #[cfg(feature = "vulkan")]
             Device::Vulkan(d) => Ok(Self::Vulkan(dtype.from_data(data), d.clone())),
             #[cfg(feature = "wgpu")]
@@ -175,6 +193,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.block_size(),
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(storage, _) => storage.block_size(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.block_size(),
             #[cfg(feature = "wgpu")]
@@ -187,6 +207,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.dtype(),
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(storage, _) => storage.dtype(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.dtype(),
             #[cfg(feature = "wgpu")]
@@ -199,6 +221,8 @@ impl QStorage {
             QStorage::Cpu(_storage) => Device::Cpu,
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(_storage, device) => Device::Rocm(device.clone()),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(_storage, device) => Device::Vulkan(device.clone()),
             #[cfg(feature = "wgpu")]
@@ -211,6 +235,8 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.storage_size_in_bytes(),
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(storage, _) => storage.storage_size_in_bytes(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.storage_size_in_bytes(),
             #[cfg(feature = "wgpu")]
@@ -289,6 +315,13 @@ impl QStorage {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(storage, device) => {
+                // Dequantize on the CPU, then upload the dense f32 weights to the ROCm device.
+                use crate::backend::BackendDevice;
+                let cpu = storage.dequantize(elem_count)?;
+                Ok(Storage::Rocm(device.storage_from_cpu_storage(&cpu)?))
+            }
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, device) => {
                 // Dequantize on the CPU, then upload the f32 weights to the GPU.
@@ -314,6 +347,13 @@ impl QStorage {
             }
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(storage, _) => {
+                let data_ptr = storage.as_ptr();
+                let size_in_bytes = storage.storage_size_in_bytes();
+                let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
+                Ok(Cow::from(data))
+            }
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => {
                 let data_ptr = storage.as_ptr();
@@ -334,6 +374,8 @@ impl QStorage {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(..) => crate::bail!("not implemented"),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(..) => crate::bail!("not implemented"),
             #[cfg(feature = "wgpu")]
@@ -382,148 +424,117 @@ pub enum GgmlDType {
     IQ4_NL,
     #[allow(non_camel_case_types)]
     IQ4_XS,
-    // Ternary TQ2_0 (BitNet), ggml type 35: 256 elems / block, 2-bit {-1,0,1} codes + f16 scale.
-    #[allow(non_camel_case_types)]
-    TQ2_0,
     // 4-bit microscaling float (MXFP4), ggml type 39: 32 elems / block, E8M0 scale + 16 nibble-pairs.
     MXFP4,
+    // IQ / ternary / 1-bit / NVFP4 codec types (decode-only; dequant->matmul on every backend).
+    #[allow(non_camel_case_types)]
+    IQ2_XXS,
+    #[allow(non_camel_case_types)]
+    IQ2_XS,
+    #[allow(non_camel_case_types)]
+    IQ3_XXS,
+    #[allow(non_camel_case_types)]
+    IQ1_S,
+    #[allow(non_camel_case_types)]
+    IQ3_S,
+    #[allow(non_camel_case_types)]
+    IQ2_S,
+    #[allow(non_camel_case_types)]
+    IQ1_M,
+    TQ1_0,
+    TQ2_0,
+    NVFP4,
+    Q1_0,
+}
+
+// --- Single-source-of-truth wiring (Cut 2) -----------------------------------------
+//
+// The five purely 1:1-per-block `GgmlDType` methods (`from_u32`, `to_u32`, `cpu_zeros`,
+// `from_data`, `type_size`) are generated from the ONE `for_each_quant!` table in
+// `quant_format.rs` instead of six hand-maintained match blocks. Each generator below is
+// handed the whole `Variant => Block @ ggml_id` list and emits the block arms; the three
+// non-block pseudo-types (F32/F16/BF16) that the table intentionally omits keep their
+// bespoke arms inline. Behavior is byte-identical to the previous hand-written matches —
+// the table's ids/blocks were verified equal to them. (`block_size` is left hand-written:
+// the table carries no block-size data and its grouped form — F32=1, Q1_0/NVFP4 special,
+// the big QK_K group — is already minimal.)
+use crate::for_each_quant;
+
+macro_rules! gen_from_u32 {
+    ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
+        pub(crate) fn from_u32(u: u32) -> Result<Self> {
+            let dtype = match u {
+                0 => Self::F32,
+                1 => Self::F16,
+                30 => Self::BF16,
+                $( $id => Self::$v, )+
+                _ => crate::bail!("unknown dtype for tensor {u}"),
+            };
+            Ok(dtype)
+        }
+    };
+}
+
+macro_rules! gen_to_u32 {
+    ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
+        pub(crate) fn to_u32(self) -> u32 {
+            match self {
+                Self::F32 => 0,
+                Self::F16 => 1,
+                Self::BF16 => 30,
+                $( Self::$v => $id, )+
+            }
+        }
+    };
+}
+
+macro_rules! gen_cpu_zeros {
+    ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
+        /// The block dtype
+        pub fn cpu_zeros(&self, elem_count: usize) -> Box<dyn QuantizedType> {
+            match self {
+                Self::F32 => Box::new(vec![f32::zeros(); elem_count]),
+                Self::F16 => Box::new(vec![f16::zeros(); elem_count]),
+                Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
+                $( Self::$v => Box::new(vec![<$b>::zeros(); elem_count / <$b>::BLCK_SIZE]), )+
+            }
+        }
+    };
+}
+
+macro_rules! gen_from_data {
+    ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
+        pub fn from_data(&self, data: Cow<'_, [u8]>) -> Box<dyn QuantizedType> {
+            match self {
+                Self::F32 => Box::new(as_t_slice::<f32>(&data).to_vec()),
+                Self::F16 => Box::new(as_t_slice::<f16>(&data).to_vec()),
+                Self::BF16 => Box::new(as_t_slice::<bf16>(&data).to_vec()),
+                $( Self::$v => Box::new(as_t_slice::<$b>(&data).to_vec()), )+
+            }
+        }
+    };
+}
+
+macro_rules! gen_type_size {
+    ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
+        /// The type size for blocks in bytes.
+        pub fn type_size(&self) -> usize {
+            use k_quants::*;
+            match self {
+                Self::F32 => 4,
+                Self::F16 | Self::BF16 => 2,
+                $( Self::$v => std::mem::size_of::<$b>(), )+
+            }
+        }
+    };
 }
 
 impl GgmlDType {
-    pub(crate) fn from_u32(u: u32) -> Result<Self> {
-        let dtype = match u {
-            0 => Self::F32,
-            1 => Self::F16,
-            2 => Self::Q4_0,
-            3 => Self::Q4_1,
-            6 => Self::Q5_0,
-            7 => Self::Q5_1,
-            8 => Self::Q8_0,
-            9 => Self::Q8_1,
-            10 => Self::Q2K,
-            11 => Self::Q3K,
-            12 => Self::Q4K,
-            13 => Self::Q5K,
-            14 => Self::Q6K,
-            15 => Self::Q8K,
-            // IQ4_NL / IQ4_XS: ggml type ids 20 / 23 (llama.cpp ggml.h GGML_TYPE_IQ4_NL=20, _XS=23).
-            20 => Self::IQ4_NL,
-            23 => Self::IQ4_XS,
-            // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
-            30 => Self::BF16,
-            // Ternary TQ2_0: ggml type 35 (llama.cpp ggml.h GGML_TYPE_TQ2_0=35).
-            35 => Self::TQ2_0,
-            39 => Self::MXFP4,
-            _ => crate::bail!("unknown dtype for tensor {u}"),
-        };
-        Ok(dtype)
-    }
-
-    pub(crate) fn to_u32(self) -> u32 {
-        match self {
-            Self::F32 => 0,
-            Self::F16 => 1,
-            Self::Q4_0 => 2,
-            Self::Q4_1 => 3,
-            Self::Q5_0 => 6,
-            Self::Q5_1 => 7,
-            Self::Q8_0 => 8,
-            Self::Q8_1 => 9,
-            Self::Q2K => 10,
-            Self::Q3K => 11,
-            Self::Q4K => 12,
-            Self::Q5K => 13,
-            Self::Q6K => 14,
-            Self::Q8K => 15,
-            Self::IQ4_NL => 20,
-            Self::IQ4_XS => 23,
-            // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
-            Self::BF16 => 30,
-            Self::TQ2_0 => 35,
-            Self::MXFP4 => 39,
-        }
-    }
-
-    /// The block dtype
-    pub fn cpu_zeros(&self, elem_count: usize) -> Box<dyn QuantizedType> {
-        match self {
-            Self::F32 => Box::new(vec![f32::zeros(); elem_count]),
-            Self::F16 => Box::new(vec![f16::zeros(); elem_count]),
-            Self::Q4_0 => Box::new(vec![BlockQ4_0::zeros(); elem_count / BlockQ4_0::BLCK_SIZE]),
-            Self::Q4_1 => Box::new(vec![BlockQ4_1::zeros(); elem_count / BlockQ4_1::BLCK_SIZE]),
-            Self::Q5_0 => Box::new(vec![BlockQ5_0::zeros(); elem_count / BlockQ5_0::BLCK_SIZE]),
-            Self::Q5_1 => Box::new(vec![BlockQ5_1::zeros(); elem_count / BlockQ5_1::BLCK_SIZE]),
-            Self::Q8_0 => Box::new(vec![BlockQ8_0::zeros(); elem_count / BlockQ8_0::BLCK_SIZE]),
-            Self::Q8_1 => Box::new(vec![BlockQ8_1::zeros(); elem_count / BlockQ8_1::BLCK_SIZE]),
-            Self::Q2K => Box::new(vec![BlockQ2K::zeros(); elem_count / BlockQ2K::BLCK_SIZE]),
-            Self::Q3K => Box::new(vec![BlockQ3K::zeros(); elem_count / BlockQ3K::BLCK_SIZE]),
-            Self::Q4K => Box::new(vec![BlockQ4K::zeros(); elem_count / BlockQ4K::BLCK_SIZE]),
-            Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
-            Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
-            Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
-            Self::IQ4_NL => {
-                Box::new(vec![BlockIQ4nl::zeros(); elem_count / BlockIQ4nl::BLCK_SIZE])
-            }
-            Self::IQ4_XS => {
-                Box::new(vec![BlockIQ4xs::zeros(); elem_count / BlockIQ4xs::BLCK_SIZE])
-            }
-            Self::TQ2_0 => {
-                Box::new(vec![BlockTQ2_0::zeros(); elem_count / BlockTQ2_0::BLCK_SIZE])
-            }
-            Self::MXFP4 => Box::new(vec![BlockMXFP4::zeros(); elem_count / BlockMXFP4::BLCK_SIZE]),
-            Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
-        }
-    }
-
-    pub fn from_data(&self, data: Cow<'_, [u8]>) -> Box<dyn QuantizedType> {
-        match self {
-            Self::F32 => Box::new(as_t_slice::<f32>(&data).to_vec()),
-            Self::F16 => Box::new(as_t_slice::<f16>(&data).to_vec()),
-            Self::Q4_0 => Box::new(as_t_slice::<BlockQ4_0>(&data).to_vec()),
-            Self::Q4_1 => Box::new(as_t_slice::<BlockQ4_1>(&data).to_vec()),
-            Self::Q5_0 => Box::new(as_t_slice::<BlockQ5_0>(&data).to_vec()),
-            Self::Q5_1 => Box::new(as_t_slice::<BlockQ5_1>(&data).to_vec()),
-            Self::Q8_0 => Box::new(as_t_slice::<BlockQ8_0>(&data).to_vec()),
-            Self::Q8_1 => Box::new(as_t_slice::<BlockQ8_1>(&data).to_vec()),
-            Self::Q2K => Box::new(as_t_slice::<BlockQ2K>(&data).to_vec()),
-            Self::Q3K => Box::new(as_t_slice::<BlockQ3K>(&data).to_vec()),
-            Self::Q4K => Box::new(as_t_slice::<BlockQ4K>(&data).to_vec()),
-            Self::Q5K => Box::new(as_t_slice::<BlockQ5K>(&data).to_vec()),
-            Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(&data).to_vec()),
-            Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(&data).to_vec()),
-            Self::IQ4_NL => Box::new(as_t_slice::<BlockIQ4nl>(&data).to_vec()),
-            Self::IQ4_XS => Box::new(as_t_slice::<BlockIQ4xs>(&data).to_vec()),
-            Self::TQ2_0 => Box::new(as_t_slice::<BlockTQ2_0>(&data).to_vec()),
-            Self::MXFP4 => Box::new(as_t_slice::<BlockMXFP4>(&data).to_vec()),
-            Self::BF16 => Box::new(as_t_slice::<bf16>(&data).to_vec()),
-        }
-    }
-
-    /// The type size for blocks in bytes.
-    pub fn type_size(&self) -> usize {
-        use k_quants::*;
-        match self {
-            Self::F32 => 4,
-            Self::F16 | Self::BF16 => 2,
-            Self::Q4_0 => std::mem::size_of::<BlockQ4_0>(),
-            Self::Q4_1 => std::mem::size_of::<BlockQ4_1>(),
-            Self::Q5_0 => std::mem::size_of::<BlockQ5_0>(),
-            Self::Q5_1 => std::mem::size_of::<BlockQ5_1>(),
-            // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/ggml.c#L932
-            Self::Q8_0 => std::mem::size_of::<BlockQ8_0>(),
-            Self::Q8_1 => std::mem::size_of::<BlockQ8_1>(),
-            Self::Q2K => std::mem::size_of::<BlockQ2K>(),
-            Self::Q3K => std::mem::size_of::<BlockQ3K>(),
-            Self::Q4K => std::mem::size_of::<BlockQ4K>(),
-            Self::Q5K => std::mem::size_of::<BlockQ5K>(),
-            Self::Q6K => std::mem::size_of::<BlockQ6K>(),
-            Self::Q8K => std::mem::size_of::<BlockQ8K>(),
-            Self::IQ4_NL => std::mem::size_of::<BlockIQ4nl>(),
-            Self::IQ4_XS => std::mem::size_of::<BlockIQ4xs>(),
-            Self::TQ2_0 => std::mem::size_of::<BlockTQ2_0>(),
-            Self::MXFP4 => std::mem::size_of::<BlockMXFP4>(),
-        }
-    }
+    for_each_quant!(gen_from_u32);
+    for_each_quant!(gen_to_u32);
+    for_each_quant!(gen_cpu_zeros);
+    for_each_quant!(gen_from_data);
+    for_each_quant!(gen_type_size);
 
     /// The block size, i.e. the number of elements stored in each block.
     pub fn block_size(&self) -> usize {
@@ -538,7 +549,23 @@ impl GgmlDType {
             Self::Q8_1 => k_quants::QK8_1,
             Self::IQ4_NL => k_quants::QK4_NL,
             Self::MXFP4 => k_quants::QK_MXFP4,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::IQ4_XS
+            Self::Q1_0 => iq_quants::QK1_0,
+            Self::NVFP4 => iq_quants::QK_NVFP4,
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::IQ4_XS
+            | Self::IQ2_XXS
+            | Self::IQ2_XS
+            | Self::IQ3_XXS
+            | Self::IQ1_S
+            | Self::IQ3_S
+            | Self::IQ2_S
+            | Self::IQ1_M
+            | Self::TQ1_0
             | Self::TQ2_0 => k_quants::QK_K,
         }
     }
@@ -956,6 +983,72 @@ impl QTensor {
                 );
                 out.reshape((t, topk, n))?.to_dtype(out_dtype)
             }
+            // Native ROCm MoE: the GGML expert bank [E,n,k] is uploaded once and each routed slot
+            // is dispatched through the SAME unified qmatvec_core<WTYPE> as ordinary decode (no
+            // MoE-per-quant kernel; works for every wired quant). Avoids ROCm's missing index_add:
+            // each routed slot writes exactly one output row, placed directly by slot index.
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(_, rocm_dev)
+                if crate::RocmQuantType::from_ggml(self.storage.dtype()).is_some() =>
+            {
+                let qt = crate::RocmQuantType::from_ggml(self.storage.dtype()).unwrap();
+                let out_dtype = x.dtype();
+                let (e_cnt, n, k) = self.shape().dims3()?;
+                let (t, topk) = ids.dims2()?;
+                let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+                let x_exp = if s == topk {
+                    x.clone()
+                } else {
+                    x.broadcast_as((t, topk, k))?
+                };
+                let nrows = t * topk;
+                // Keep the model's working dtype (bf16/f16) so the matvec runs native; cast exotic
+                // dtypes to f16. The unified core reads f16/bf16 activations directly.
+                let x_flat = match x_exp.dtype() {
+                    DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
+                    _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
+                };
+                let ids_vec = ids
+                    .reshape((nrows,))?
+                    .to_dtype(crate::DType::U32)?
+                    .to_vec1::<u32>()?;
+                if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
+                    crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
+                }
+                use crate::backend::BackendDevice;
+                let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
+                // Upload the expert bank to VRAM ONCE and keep it resident: the bank's CPU bytes are
+                // owned by this QTensor for the model's lifetime, so (ptr,len) is a stable key. Re-
+                // uploading the (multi-GB) bank on every token/layer would dominate decode; caching
+                // makes the MoE bandwidth-bound on the quant decode, not the host->device copy.
+                let wbank = {
+                    let key = (bank.as_ref().as_ptr() as usize, bank.as_ref().len());
+                    let cache = rocm_moe_bank_cache();
+                    let mut guard = cache.lock().expect("moe bank cache lock");
+                    if let Some(w) = guard.get(&key) {
+                        w.clone()
+                    } else {
+                        let w = std::sync::Arc::new(rocm_dev.storage_from_slice(bank.as_ref())?);
+                        guard.insert(key, w.clone());
+                        w
+                    }
+                };
+                let y = {
+                    let (store, _) = x_flat.storage_and_layout();
+                    let xr = match &*store {
+                        crate::Storage::Rocm(r) => r,
+                        _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
+                    };
+                    rocm_dev.moe_matvec_quant(qt, wbank.as_ref(), xr, &ids_vec, nrows, n, k)?
+                };
+                let out = crate::tensor::from_storage(
+                    crate::Storage::Rocm(y),
+                    (nrows, n),
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                out.reshape((t, topk, n))?.to_dtype(out_dtype)
+            }
             _ => {
                 // CPU / non-CUDA fallback: per-expert quantized matmul. The packed expert bank
                 // [E, n, k] is sliced into equal, contiguous per-expert quantized blocks; for
@@ -1013,6 +1106,8 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(..) => crate::bail!("not implemented"),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(..) => crate::bail!("not implemented"),
             #[cfg(feature = "wgpu")]
@@ -1053,18 +1148,6 @@ pub enum QMatMul {
         n: usize,
         k: usize,
     },
-    // Resident-bank MoE (Vulkan): the whole [E,n,k] quantized expert bank lives in VRAM; routing
-    // dispatches banked matvec/matmul at each expert offset (no per-token re-upload, no f32 dequant).
-    #[cfg(feature = "vulkan")]
-    VulkanQuantBank {
-        qtensor: std::sync::Arc<QTensor>,
-        bank: std::sync::Arc<crate::VulkanStorage>,
-        dtype: GgmlDType,
-        e: usize,
-        n: usize,
-        k: usize,
-        per_expert_words: usize,
-    },
     // wgpu mirror of VulkanQuant: GGML quantized blocks live in VRAM and decode (1 row) runs the
     // matching native-GGML quant matvec WGSL kernel straight out of the block format. Prefill (>1
     // row) dequantizes to a temporary f32 weight. `dtype` selects the kernel; `n`/`k` are the dims.
@@ -1076,11 +1159,38 @@ pub enum QMatMul {
         n: usize,
         k: usize,
     },
+    // Native ROCm quantized weight: the GGML blocks live in VRAM. Decode (1 row) runs the ONE
+    // unified on-GPU quant matvec (qmatvec_core<WTYPE>) straight out of the block format; prefill
+    // (>1 row) runs the ONE unified int8 WMMA GEMM (qmmq_core<WTYPE>) -- both for the full wired
+    // spread (Q8_0/Q4_0/Q4_K/Q6_K/IQ4_XS/TQ2_0). Unwired types dequantize to a temporary f16
+    // weight (RDNA matrix-core matmul). `n`/`k` are the weight dims.
+    #[cfg(feature = "rocm")]
+    RocmQuant {
+        qtensor: std::sync::Arc<QTensor>,
+        wq: std::sync::Arc<crate::RocmStorage>,
+        dtype: GgmlDType,
+        n: usize,
+        k: usize,
+    },
+}
+
+// Resident ROCm MoE expert-bank cache: maps a (CPU bank ptr, len) to its uploaded VRAM copy so
+// the multi-GB GGML expert bank is host->device copied ONCE, not per token/layer. The CPU bytes
+// are owned by the model's QTensor for its lifetime, so the pointer is a stable key. Keyed by
+// usize (raw ptr) to stay Send+Sync; the RocmStorage is reference-counted and reused.
+#[cfg(feature = "rocm")]
+fn rocm_moe_bank_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 thread_local! {
     static DEQUANTIZE_ALL: bool = {
-        match std::env::var("DEQUANTIZE_ALL") {
+        match std::env::var("CANDLE_DEQUANTIZE_ALL") {
             Ok(s) => {
                 !s.is_empty() && s != "0"
             },
@@ -1091,7 +1201,7 @@ thread_local! {
 
 thread_local! {
     static DEQUANTIZE_ALL_F16: bool = {
-        match std::env::var("DEQUANTIZE_ALL_F16") {
+        match std::env::var("CANDLE_DEQUANTIZE_ALL_F16") {
             Ok(s) => {
                 !s.is_empty() && s != "0"
             },
@@ -1155,15 +1265,73 @@ impl QMatMul {
                 }
             }
         }
+        // Native ROCm quantized path: keep the GGML blocks in VRAM and run the ONE unified on-GPU
+        // quant decode core (qmatvec_core<WTYPE>; Q8_0+Q4_0 also have the int8 WMMA prefill gemm),
+        // instead of dequantizing the whole model to dense f16 (2x+ the decode bandwidth). Reads the
+        // block format straight from the uploaded bytes -- exact w.r.t. the CPU reference. The wired
+        // set is exactly RocmQuantType::from_ggml; k must be a multiple of that type's block size.
+        #[cfg(feature = "rocm")]
+        {
+            let dt = qtensor.dtype();
+            // Decode AND prefill native iff the unified core has this type wired (one enum row in
+            // RocmQuantType): decode rides qmatvec_core<WTYPE>, prefill (rows>1) rides the int8 WMMA
+            // qmmq_core<WTYPE>. Both cover the SAME wired spread; adding a type is one enum row + the
+            // in-kernel decode, no per-quant kernel. Unwired types dequantize-to-f16 in forward().
+            if let Some(qt) = crate::RocmQuantType::from_ggml(dt) {
+                if let Device::Rocm(d) = qtensor.device() {
+                    if let Ok((n, k)) = qtensor.shape().dims2() {
+                        let blk_ok = k % qt.block_elems() == 0;
+                        if blk_ok {
+                            use crate::backend::BackendDevice;
+                            let bytes = qtensor.data()?;
+                            let wq = d.storage_from_slice(bytes.as_ref())?;
+                            return Ok(Self::RocmQuant {
+                                qtensor,
+                                wq: std::sync::Arc::new(wq),
+                                dtype: dt,
+                                n,
+                                k,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // ROCm MoE bank: a 3D [E,n,k] expert bank of a wired quant type stays QUANTIZED (kept as
+        // QTensor), so `indexed_moe_forward` runs each routed expert through the ONE unified
+        // qmatvec_core (no per-expert kernel) instead of dequantizing the whole bank to dense f16
+        // (which for a 30B-A3B model is many GB of resident f16 AND has no indexed_moe path). The 2D
+        // RocmQuant decode/prefill path above already handles ordinary weights; this is the MoE case.
+        #[cfg(feature = "rocm")]
+        {
+            if qtensor.device().is_rocm()
+                && qtensor.shape().dims().len() == 3
+                && crate::RocmQuantType::from_ggml(qtensor.dtype()).is_some()
+                && !DEQUANTIZE_ALL.with(|b| *b)
+            {
+                return Ok(Self::QTensor(qtensor));
+            }
+        }
         let dequantize = match qtensor.dtype() {
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            // The Vulkan/wgpu backends have no generic native quantized matmul, so dequantize to f32
-            // here (once, at construction) and run the regular f32 GPU matmul.
-            _ => DEQUANTIZE_ALL.with(|b| *b) || qtensor.device().is_vulkan() || qtensor.device().is_wgpu(),
+            // The Vulkan/wgpu/ROCm backends have no generic native quantized matmul, so dequantize
+            // to f32 here (once, at construction) and run the regular f32 GPU matmul.
+            _ => {
+                DEQUANTIZE_ALL.with(|b| *b)
+                    || qtensor.device().is_vulkan()
+                    || qtensor.device().is_wgpu()
+                    || qtensor.device().is_rocm()
+            }
         };
         let t = if dequantize {
-            let tensor = qtensor.dequantize(&qtensor.device())?;
-            Self::Tensor(tensor)
+            // ROCm: dequantize to f16 so the matmul hits RDNA3.5 matrix cores (WMMA). Dense f32
+            // (sgemm) has no matrix-core path on RDNA and runs ~an order of magnitude slower, and
+            // f16 also halves the resident weight memory.
+            if qtensor.device().is_rocm() {
+                Self::TensorF16(qtensor.dequantize_f16(&qtensor.device())?)
+            } else {
+                Self::Tensor(qtensor.dequantize(&qtensor.device())?)
+            }
         } else if DEQUANTIZE_ALL_F16.with(|b| *b) {
             let tensor = qtensor.dequantize_f16(&qtensor.device())?;
             Self::TensorF16(tensor)
@@ -1182,10 +1350,10 @@ impl QMatMul {
             Self::QTensor(t) => t.dequantize_f16(&t.device()),
             Self::Tensor(t) => t.to_dtype(DType::F16),
             Self::TensorF16(t) => Ok(t.clone()),
+            #[cfg(feature = "rocm")]
+            Self::RocmQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
-            #[cfg(feature = "vulkan")]
-            Self::VulkanQuantBank { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
             #[cfg(feature = "wgpu")]
             Self::WgpuQuant { qtensor, .. } => qtensor.dequantize_f16(&qtensor.device()),
         }
@@ -1205,188 +1373,16 @@ impl QMatMul {
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
+            #[cfg(feature = "rocm")]
+            Self::RocmQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
-            #[cfg(feature = "vulkan")]
-            Self::VulkanQuantBank {
-                bank,
-                dtype,
-                e,
-                n,
-                k,
-                per_expert_words,
-                ..
-            } => self.bank_indexed_moe_forward(x, ids, bank, *dtype, *e, *n, *k, *per_expert_words),
             #[cfg(feature = "wgpu")]
             Self::WgpuQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
             _ => {
                 panic!("Not implemented!")
             }
         }
-    }
-
-    /// Resident-bank MoE forward (Vulkan). The whole [E,n,k] quantized expert bank is already in VRAM
-    /// (`bank`); this routes tokens to experts, groups slots by expert, and for each selected expert
-    /// dispatches a banked matvec (decode: that expert has m==1 routed slot) or banked matmul
-    /// (prefill: m>1) AT the expert's u32 offset (`eid * per_expert_words`) into `bank`, accumulating
-    /// into the output. NO per-expert re-upload, NO whole-bank f32 dequant -- the fix for the 97x
-    /// decode regression. Mirrors the group-by-expert/index_select/index_add structure of the old
-    /// QTensor path so the routing math is unchanged; only the per-expert weight access differs.
-    #[cfg(feature = "vulkan")]
-    #[allow(clippy::too_many_arguments)]
-    fn bank_indexed_moe_forward(
-        &self,
-        x: &Tensor,
-        ids: &Tensor,
-        bank: &crate::VulkanStorage,
-        dtype: GgmlDType,
-        e_cnt: usize,
-        n: usize,
-        k: usize,
-        per_expert_words: usize,
-    ) -> Result<Tensor> {
-        use std::collections::HashMap;
-        let device = x.device();
-        let d = match device {
-            Device::Vulkan(d) => d.clone(),
-            _ => crate::bail!("VulkanQuantBank indexed_moe_forward: input not on vulkan"),
-        };
-        let out_dtype = x.dtype();
-        let (t, topk) = ids.dims2()?;
-        let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
-        let x_exp = if s == topk {
-            x.clone()
-        } else {
-            x.broadcast_as((t, topk, k))?
-        };
-        // Flatten activations to [t*topk, k] f32 contiguous (the matvec/matmul kernels read f32 x).
-        let x_flat = x_exp
-            .reshape((t * topk, k))?
-            .to_dtype(crate::DType::F32)?
-            .contiguous()?;
-        let ids_flat = ids
-            .reshape((t * topk,))?
-            .to_dtype(crate::DType::U32)?
-            .contiguous()?;
-        let m_all = t * topk;
-        // Fused grouped matvec: ONE dispatch per projection reads the routed expert id per slot from a
-        // GPU buffer and computes every routed-slot output at once -- NO routing-ids GPU->CPU sync, NO
-        // HashMap, NO Tensor::zeros, NO index_select/index_add. Decode is bit-identical to the
-        // matvec_*_gpu_off kernels. Handles BOTH decode (t==1) and prefill (t>1): slots index
-        // x_flat/ids_flat directly. Banks are only ever stored Q4K (gate/up) or Q8_0 (down, and any
-        // Q5K/Q6K requantized at load); any other dtype falls through to the loop below.
-        if matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0) {
-            let (xstore, _) = x_flat.storage_and_layout();
-            let xv = match &*xstore {
-                crate::Storage::Vulkan(v) => v,
-                _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
-            };
-            let (istore, _) = ids_flat.storage_and_layout();
-            let iv = match &*istore {
-                crate::Storage::Vulkan(v) => v,
-                _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
-            };
-            let y_store = match dtype {
-                GgmlDType::Q4K => {
-                    d.mul_mat_vec_id_q4k_gpu(bank, xv, iv, m_all, n, k, per_expert_words)?
-                }
-                _ => d.mul_mat_vec_id_q8_gpu(bank, xv, iv, m_all, n, k, per_expert_words)?,
-            };
-            let y = crate::tensor::from_storage(
-                crate::Storage::Vulkan(y_store),
-                (m_all, n),
-                crate::op::BackpropOp::none(),
-                false,
-            );
-            return y.reshape((t, topk, n))?.to_dtype(out_dtype);
-        }
-        // Fallback (no id-kernel for this bank dtype): group slots by expert on the CPU and run a
-        // banked matvec/matmul per expert. The one-edit revert to this path: replace the
-        // `matches!(dtype, ..)` guard above with `false`.
-        let ids_vec = ids_flat.to_vec1::<u32>()?;
-        let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (slot, eid) in ids_vec.iter().enumerate() {
-            groups.entry(*eid).or_default().push(slot as u32);
-        }
-        let mut out_flat = Tensor::zeros((t * topk, n), crate::DType::F32, device)?;
-        for (eid, slots) in groups.into_iter() {
-            if eid as usize >= e_cnt {
-                crate::bail!("VulkanQuantBank: expert id {eid} >= E {e_cnt}");
-            }
-            let woff = eid as usize * per_expert_words;
-            let m = slots.len();
-            let idx = Tensor::from_vec(slots, (m,), device)?;
-            let x_e = x_flat.index_select(&idx, 0)?.contiguous()?; // [m, k]
-            // Run expert `eid` at its block offset in the resident bank. Decode is m==1 (matvec);
-            // prefill m>1 uses the banked matmul where one exists (Q4K/Q8), else loops the matvec per
-            // row (Q5K/Q6K have no matmul kernel) -- still no re-upload, weights stay quantized.
-            let y_store = {
-                let (store, _) = x_e.storage_and_layout();
-                let xv = match &*store {
-                    crate::Storage::Vulkan(v) => v,
-                    _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
-                };
-                if m == 1 {
-                    match dtype {
-                        GgmlDType::Q4K => d.matvec_q4k_gpu_off(bank, xv, n, k, woff)?,
-                        GgmlDType::Q5K => d.matvec_q5k_gpu_off(bank, xv, n, k, woff)?,
-                        GgmlDType::Q6K => d.matvec_q6k_gpu_off(bank, xv, n, k, woff)?,
-                        _ => d.matvec_q8_gpu_off(bank, xv, n, k, woff)?,
-                    }
-                } else {
-                    match dtype {
-                        // Q4_K banked prefill: int8 dp4a when the device has hw int8 dot, else
-                        // f32-decode. Both run at the bank's woff with no re-upload.
-                        GgmlDType::Q4K if d.int_dot8() => {
-                            d.matmul_q4k_dp4a_gpu_off(bank, xv, m, n, k, woff)?
-                        }
-                        GgmlDType::Q4K => d.matmul_q4k_gpu_off(bank, xv, m, n, k, woff)?,
-                        // Q8_0 banked prefill: int8 dp4a when the device has hw int8 dot, else
-                        // f32-decode. Both run at the bank's woff with no re-upload.
-                        GgmlDType::Q8_0 if d.int_dot8() => {
-                            d.matmul_q8_dp4a_gpu_off(bank, xv, m, n, k, woff)?
-                        }
-                        GgmlDType::Q8_0 => d.matmul_q8_gpu_off(bank, xv, m, n, k, woff)?,
-                        // No matmul kernel for this dtype: one banked matvec per routed row.
-                        _ => {
-                            let mut rows = Vec::with_capacity(m);
-                            for r in 0..m {
-                                let xr = x_e.narrow(0, r, 1)?.contiguous()?;
-                                let (rstore, _) = xr.storage_and_layout();
-                                let rv = match &*rstore {
-                                    crate::Storage::Vulkan(v) => v,
-                                    _ => crate::bail!("VulkanQuantBank expected vulkan storage"),
-                                };
-                                let yr = match dtype {
-                                    GgmlDType::Q5K => d.matvec_q5k_gpu_off(bank, rv, n, k, woff)?,
-                                    GgmlDType::Q6K => d.matvec_q6k_gpu_off(bank, rv, n, k, woff)?,
-                                    _ => d.matvec_q8_gpu_off(bank, rv, n, k, woff)?,
-                                };
-                                let yr = crate::tensor::from_storage(
-                                    crate::Storage::Vulkan(yr),
-                                    (1usize, n),
-                                    crate::op::BackpropOp::none(),
-                                    false,
-                                );
-                                rows.push(yr);
-                            }
-                            let y = Tensor::cat(&rows, 0)?;
-                            out_flat = out_flat.index_add(&idx, &y, 0)?;
-                            continue;
-                        }
-                    }
-                }
-            };
-            // matvec returns [n]; matmul returns [m*n]. Reshape to [m, n] for index_add.
-            let y_e = crate::tensor::from_storage(
-                crate::Storage::Vulkan(y_store),
-                (m, n),
-                crate::op::BackpropOp::none(),
-                false,
-            );
-            out_flat = out_flat.index_add(&idx, &y_e, 0)?;
-        }
-        out_flat.reshape((t, topk, n))?.to_dtype(out_dtype)
     }
 }
 
@@ -1419,6 +1415,8 @@ impl crate::CustomOp1 for QTensor {
         #[allow(clippy::infallible_destructuring_match)]
         let self_storage = match &self.storage {
             QStorage::Cpu(storage) => storage,
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(..) => crate::bail!("Invalid storage"),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(..) => crate::bail!("Invalid storage"),
             #[cfg(feature = "wgpu")]
@@ -1482,6 +1480,157 @@ impl crate::CustomOp1 for QTensor {
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
+            #[cfg(feature = "rocm")]
+            Self::RocmQuant {
+                qtensor,
+                wq,
+                dtype,
+                n,
+                k,
+            } => {
+                let rows: usize = xs.elem_count() / *k;
+                #[cfg(feature = "rocm")]
+                {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static DBG_DECODE: AtomicUsize = AtomicUsize::new(0);
+                    static DBG_PREFILL: AtomicUsize = AtomicUsize::new(0);
+                    static DBG_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+                    if std::env::var("HANZO_DBG_PATH").is_ok() {
+                        // Buckets MATCH the real dispatch below: decode = rows==1 wired; prefill =
+                        // rows>1 wired (native qmmq_core<WTYPE>); fallback = unwired OR forced.
+                        let wired = crate::RocmQuantType::from_ggml(*dtype).is_some();
+                        let forced_fb = (matches!(dtype, GgmlDType::Q4K)
+                            && std::env::var("HANZO_Q4K_FALLBACK").is_ok())
+                            || std::env::var("HANZO_QMMQ_FALLBACK").is_ok();
+                        if rows == 1 && wired && !forced_fb {
+                            DBG_DECODE.fetch_add(1, Ordering::Relaxed);
+                        } else if rows > 1 && wired && !forced_fb {
+                            DBG_PREFILL.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            DBG_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Print on EVERY rows>1 (prefill is rare vs decode) + every 200 total, so the
+                        // native-prefill path is always visible the moment it is taken.
+                        let tot = DBG_DECODE.load(Ordering::Relaxed)
+                            + DBG_PREFILL.load(Ordering::Relaxed)
+                            + DBG_FALLBACK.load(Ordering::Relaxed);
+                        if rows > 1 || tot % 200 == 0 {
+                            eprintln!(
+                                "[DBG_PATH] decode={} prefill(native)={} fallback={} (dt={:?} rows={} n={} k={})",
+                                DBG_DECODE.load(Ordering::Relaxed),
+                                DBG_PREFILL.load(Ordering::Relaxed),
+                                DBG_FALLBACK.load(Ordering::Relaxed),
+                                dtype, rows, *n, *k
+                            );
+                        }
+                    }
+                }
+                // Table-driven unified decode: a type is decode-native iff the single
+                // `qmatvec_core<WTYPE>` has a `decode_block` wired for it (RocmQuantType::from_ggml).
+                // Q8_0/Q4_0/Q4_K/Q6_K/IQ4_XS/TQ2_0 today; adding a type is one enum row, no kernel.
+                // HANZO_Q4K_FALLBACK=1 forces Q4_K back through the dequantize path (A/B diagnostic).
+                #[cfg(feature = "rocm")]
+                let unified_qt = crate::RocmQuantType::from_ggml(*dtype).filter(|_| {
+                    !(matches!(dtype, GgmlDType::Q4K) && std::env::var("HANZO_Q4K_FALLBACK").is_ok())
+                });
+                #[cfg(not(feature = "rocm"))]
+                let unified_qt: Option<()> = None;
+                if rows == 1 && unified_qt.is_some() {
+                    // Decode: weights stay quantized in VRAM; the ONE native on-GPU quant matvec core
+                    // dequantizes per-block on-the-fly (no dense f16 copy). The matvec consumes
+                    // bf16/f16 activations directly and returns the same dtype, so the model's working
+                    // dtype (bf16) is kept end-to-end -- no bf16->f32->f16->bf16 cast detour. Only fall
+                    // back to an f16 cast for exotic input dtypes. Every wired type (symmetric 8-bit
+                    // through asymmetric super-block through sub-4-bit ternary) rides the same core.
+                    let xs = match xs.dtype() {
+                        DType::BF16 | DType::F16 => xs.contiguous()?,
+                        _ => xs.to_dtype(DType::F16)?.contiguous()?,
+                    };
+                    let d = match xs.device() {
+                        Device::Rocm(d) => d,
+                        _ => crate::bail!("RocmQuant input not on rocm"),
+                    };
+                    let y = {
+                        let (store, _) = xs.storage_and_layout();
+                        let xr = match &*store {
+                            crate::Storage::Rocm(r) => r,
+                            _ => crate::bail!("RocmQuant expected rocm storage"),
+                        };
+                        #[cfg(feature = "rocm")]
+                        {
+                            d.matvec_quant(unified_qt.unwrap(), wq, xr, *n, *k)?
+                        }
+                        #[cfg(not(feature = "rocm"))]
+                        {
+                            crate::bail!("rocm feature disabled")
+                        }
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Rocm(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                } else if let Some(qt) =
+                    unified_qt.filter(|_| std::env::var("HANZO_QMMQ_FALLBACK").is_err())
+                {
+                    // Prefill (rows>1): native int8 WMMA gemm through the ONE unified core
+                    // (`qmmq_core<WTYPE>` in quant.hip). Weights stay quantized in VRAM (no resident
+                    // dense f16, which would slow the memory-bound decode) and the MAC runs on the
+                    // RDNA3 int8 matrix cores instead of rocBLAS. The SAME core covers the whole wired
+                    // spread: Q8_0/Q4_0 (symmetric, proven), Q4_K (asymmetric -- min bias via the
+                    // q8_1 block-sum), and the symmetric super-block / IQ / ternary types (Q6_K,
+                    // IQ4_XS, TQ2_0). Selecting the type is one `RocmQuantType` row + the in-kernel
+                    // decode; there is NO per-quant prefill kernel. HANZO_QMMQ_FALLBACK=1 forces the
+                    // dequant-f16 matmul below (the prefill before/after A/B benchmark lever).
+                    let xs = xs.to_dtype(DType::F16)?.contiguous()?;
+                    let d = match xs.device() {
+                        Device::Rocm(d) => d,
+                        _ => crate::bail!("RocmQuant input not on rocm"),
+                    };
+                    let m = xs.elem_count() / *k;
+                    let y = {
+                        let (store, _) = xs.storage_and_layout();
+                        let xr = match &*store {
+                            crate::Storage::Rocm(r) => r,
+                            _ => crate::bail!("RocmQuant expected rocm storage"),
+                        };
+                        #[cfg(feature = "rocm")]
+                        {
+                            d.qmmq_quant(qt, xr, wq, m, *n, *k)?
+                        }
+                        #[cfg(not(feature = "rocm"))]
+                        {
+                            let _ = qt;
+                            crate::bail!("rocm feature disabled")
+                        }
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Rocm(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                } else {
+                    // Unwired-type / forced-fallback prefill: dequantize to a temporary f16 weight
+                    // (freed after; a persistent f16 copy would slow the memory-bound decode). Only
+                    // reached for quants with no `qmmq_core<WTYPE>` wired (e.g. Q5_K/MXFP4) or when
+                    // HANZO_QMMQ_FALLBACK forces it for the prefill A/B measurement.
+                    let w = qtensor.dequantize_f16(&xs.device())?;
+                    let w = match *xs.dims() {
+                        [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                        [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                        _ => w.t()?,
+                    };
+                    xs.to_dtype(DType::F16)?.matmul(&w)
+                }
+            }
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant {
                 qtensor,
@@ -1509,48 +1658,7 @@ impl crate::Module for QMatMul {
                             GgmlDType::Q4_0 => d.matvec_q4_0_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q8_0 => d.matvec_q8_0_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
-                            _ => d.matvec_q8_gpu(wq, xv, *n, *k)?,
-                        }
-                    };
-                    let mut dims = xs.dims().to_vec();
-                    let last = dims.len() - 1;
-                    dims[last] = *n;
-                    Ok(crate::tensor::from_storage(
-                        crate::Storage::Vulkan(y),
-                        dims,
-                        crate::op::BackpropOp::none(),
-                        false,
-                    ))
-                } else if matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0)
-                    && xs.device().is_vulkan()
-                {
-                    // Prefill: keep weights quantized in VRAM and decode in-shader (M>1 matmul),
-                    // amortizing each decoded weight block across all M rows. This replaces the old
-                    // path that dequantized the ENTIRE weight to f32 every forward (the dominant
-                    // time-to-first-token cost). Flatten xs to [M, k], run the GPU matmul, reshape
-                    // the [M, n] result back to the input's batch dims with last dim = n.
-                    let xs = xs.contiguous()?;
-                    let m = xs.elem_count() / *k;
-                    let xs2 = xs.reshape((m, *k))?;
-                    let d = match xs2.device() {
-                        Device::Vulkan(d) => d,
-                        _ => crate::bail!("VulkanQuant input not on vulkan"),
-                    };
-                    let y = {
-                        let (store, _) = xs2.storage_and_layout();
-                        let xv = match &*store {
-                            crate::Storage::Vulkan(v) => v,
-                            _ => crate::bail!("VulkanQuant expected vulkan storage"),
-                        };
-                        match dtype {
-                            // Q4_K prefill: int8 dp4a (compute-bound lever) when the device has hw
-                            // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
-                            GgmlDType::Q4K if d.int_dot8() => d.matmul_q4k_dp4a_gpu(wq, xv, m, *n, *k)?,
-                            GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
-                            // Q8_0 prefill: int8 dp4a (compute-bound lever) when the device has hw
-                            // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
-                            _ if d.int_dot8() => d.matmul_q8_dp4a_gpu(wq, xv, m, *n, *k)?,
-                            _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
+                            other => crate::bail!("VulkanQuant: no native matvec for {other:?}"),
                         }
                     };
                     let mut dims = xs.dims().to_vec();
@@ -1572,12 +1680,6 @@ impl crate::Module for QMatMul {
                     };
                     xs.matmul(&w)
                 }
-            }
-            #[cfg(feature = "vulkan")]
-            Self::VulkanQuantBank { .. } => {
-                // A resident MoE expert bank has no single-matrix forward; it is only driven through
-                // indexed_moe_forward (the engine never calls .forward on an expert bank).
-                crate::bail!("VulkanQuantBank: use indexed_moe_forward, not forward")
             }
             #[cfg(feature = "wgpu")]
             Self::WgpuQuant {
