@@ -195,6 +195,12 @@ struct VkInner {
     // Dozen configs) provides. `subgroup_size` is the reported subgroup width.
     subgroup_matvec: bool,
     subgroup_size: u32,
+    // VK_EXT_subgroup_size_control: the subgroup width (in invocations) to PIN on the subgroup-
+    // reduction mat-vec pipelines, or 0 if unsupported. ggml-vulkan's RADV fast path requires this
+    // extension and pins the q8 mat-vec to the device's widest wave (wave64 on RDNA), which widens
+    // each coalesced weight read vs RADV's default wave32 pick on the decode hot path. Applied in
+    // `pipeline` to kernels whose name ends in `_llama` or contains `_sg`.
+    subgroup_pin: u32,
     // Cooperative-matrix (matrix-core / WMMA) availability and the chosen MxNxK tile for an
     // fp16xfp16 -> fp32 subgroup config. Present on native AMD/NV drivers (RDNA3.5 8060S),
     // absent on WSL/Dozen.
@@ -2038,10 +2044,17 @@ impl VulkanDevice {
             let module = dev
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)
                 .map_err(vkerr)?;
-            let stage = vk::PipelineShaderStageCreateInfo::default()
+            let mut rss = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(self.inner.subgroup_pin);
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
                 .name(c"main");
+            // Pin the wave width on the subgroup-reduction mat-vec kernels (see `subgroup_pin`); the
+            // coopmat (`_cm`) kernels manage their own subgroup tile and are left untouched.
+            if self.inner.subgroup_pin > 0 && (name.ends_with("_llama") || name.contains("_sg")) {
+                stage = stage.push_next(&mut rss);
+            }
             let pipeline = dev
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
@@ -2713,6 +2726,33 @@ impl BackendDevice for VulkanDevice {
                 && sg_arith
                 && subgroup_size >= 2;
 
+            // VK_EXT_subgroup_size_control: pin the compute subgroup width on the mat-vec pipelines.
+            // ggml-vulkan gets ~81% of peak decode bandwidth on RADV by forcing the widest wave for
+            // the q8 mat-vec (RADV otherwise picks wave32, halving the coalesced read width). We pin
+            // to maxSubgroupSize (wave64 on RDNA3) when the COMPUTE stage supports it; 0 = off. The
+            // mat-vec shaders reduce via subgroupAdd + a shared combine over up to 8 subgroups, so
+            // they stay correct at any pinned width.
+            let has_sg_size_control = dev_exts.iter().any(|e| {
+                CStr::from_ptr(e.extension_name.as_ptr())
+                    == ash::ext::subgroup_size_control::NAME
+            });
+            let mut sgsc_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+            if has_sg_size_control {
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sgsc_props);
+                instance.get_physical_device_properties2(pdev, &mut p2);
+            }
+            let subgroup_pin = if has_sg_size_control
+                && subgroup_matvec
+                && sgsc_props
+                    .required_subgroup_size_stages
+                    .contains(vk::ShaderStageFlags::COMPUTE)
+                && sgsc_props.max_subgroup_size >= sgsc_props.min_subgroup_size.max(1)
+            {
+                sgsc_props.max_subgroup_size
+            } else {
+                0
+            };
+
             // Hardware int8 dot product (core in Vulkan 1.3, which the 1.3 instance guarantees, so no
             // extension to enable -- only the feature must be turned on at device creation to use
             // OpSDotAccSat). Gate the Q8_0 PREFILL dp4a path on BOTH the feature
@@ -2750,6 +2790,9 @@ impl BackendDevice for VulkanDevice {
             if has_mem_budget {
                 ext_names.push(ash::ext::memory_budget::NAME.as_ptr());
             }
+            if subgroup_pin > 0 {
+                ext_names.push(ash::ext::subgroup_size_control::NAME.as_ptr());
+            }
             // Coopmat's SPIR-V needs these features (cooperative matrix, Vulkan memory model, fp16
             // arithmetic, 16-bit storage); push_descriptor needs none.
             let mut cm_feat =
@@ -2764,6 +2807,8 @@ impl BackendDevice for VulkanDevice {
             // illegal otherwise. Reuse a fresh struct (the queried one carries the read-back value).
             let mut idp_enable = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
                 .shader_integer_dot_product(true);
+            let mut sgsc_enable = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+                .subgroup_size_control(true);
             let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
             if !ext_names.is_empty() {
                 dci = dci.enabled_extension_names(&ext_names);
@@ -2777,6 +2822,9 @@ impl BackendDevice for VulkanDevice {
             }
             if int_dot8 {
                 dci = dci.push_next(&mut idp_enable);
+            }
+            if subgroup_pin > 0 {
+                dci = dci.push_next(&mut sgsc_enable);
             }
             let device = instance.create_device(pdev, &dci, None).map_err(vkerr)?;
             // Load push_descriptor device fns now that the device exists with the extension enabled.
@@ -2869,6 +2917,7 @@ impl BackendDevice for VulkanDevice {
                 has_mem_budget,
                 subgroup_matvec,
                 subgroup_size,
+                subgroup_pin,
                 seed: Mutex::new(299792458),
                 profile,
                 push_descriptor,

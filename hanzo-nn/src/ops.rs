@@ -1161,9 +1161,13 @@ impl hanzo_ml::CustomOp3 for Sdpa {
             || q_head == 128
             || q_head == 256;
 
+        // The sdpa_vector kernel is single-query only (it reads one query row and the grid has no
+        // q_seq dimension), so it is correct exclusively for q_seq == 1. Multi-query forwards
+        // (e.g. speculative-decode verify, gamma+1 queries vs a longer cache) must use the full
+        // steel kernel, which handles q_seq != kv_seq via qL_off and reads the explicit mask.
         let supports_sdpa_full_mask = self.mask.is_none() || q_seq <= k_seq;
-        let supports_sdpa_full = q_seq > 8 && supported_head_dim && supports_sdpa_full_mask;
-        let supports_sdpa_vector = q_seq <= 8 && supported_head_dim && q_seq <= k_seq;
+        let supports_sdpa_full = q_seq > 1 && supported_head_dim && supports_sdpa_full_mask;
+        let supports_sdpa_vector = q_seq == 1 && supported_head_dim && q_seq <= k_seq;
 
         implementation_supports_use_case &= supports_sdpa_full || supports_sdpa_vector;
 
