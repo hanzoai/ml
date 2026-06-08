@@ -1398,14 +1398,25 @@ impl crate::Module for QMatMul {
                             // int8 dot, else the f32-decode matmul. Both produce [m, n] identically.
                             GgmlDType::Q4K if d.int_dot8() => d.matmul_q4k_dp4a_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
-                            // Q8_0 prefill on coopmat devices: multi-warp matrix-core (WMMA) GEMM,
-                            // dequant Q8 in shared + reuse across the 128x128 tile (~140 T/s, 8060S).
+                            // Q8_0 prefill GEMM selection. The RDNA3 warp-tiled int8-dp4a kernel
+                            // (mul_mm_q8_mmq, llama MMQ tiling) is the default when the device has hw
+                            // int8 dot; it A/B'd ahead of the coopmat (WMMA) GEMM on the 8060S. Override
+                            // for benchmarking via HANZO_VK_Q8_PREFILL = mmq | dp4a | coopmat.
+                            _ if d.int_dot8() && k.is_multiple_of(32) => {
+                                let _ = &w16;
+                                match std::env::var("HANZO_VK_Q8_PREFILL").as_deref() {
+                                    Ok("coopmat") if d.coopmat_info().is_some() => {
+                                        d.matmul_q8_cm_gpu(wq, xv, m, *n, *k)?
+                                    }
+                                    Ok("dp4a") => d.matmul_q8_mm_dp4a_gpu(wq, xv, m, *n, *k)?,
+                                    _ => d.matmul_q8_mmq_gpu(wq, xv, m, *n, *k)?,
+                                }
+                            }
+                            // Q8_0 prefill on coopmat devices without int8 dot: WMMA GEMM.
                             _ if d.coopmat_info().is_some() && k.is_multiple_of(32) => {
                                 let _ = &w16;
                                 d.matmul_q8_cm_gpu(wq, xv, m, *n, *k)?
                             }
-                            // Q8_0 prefill (int8-dot, no coopmat): shared-memory-tiled dp4a GEMM.
-                            _ if d.int_dot8() => d.matmul_q8_mm_dp4a_gpu(wq, xv, m, *n, *k)?,
                             _ => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
                         }
                     };
