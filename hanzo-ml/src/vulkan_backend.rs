@@ -53,6 +53,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q8_dp4a" => spv!("mul_mat_q8_dp4a"),
         "mul_mm_q8_dp4a" => spv!("mul_mm_q8_dp4a"),
+        "mul_mm_q8_mmq" => spv!("mul_mm_q8_mmq"),
         "mul_mm_q8_cm" => spv!("mul_mm_q8_cm"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
@@ -971,6 +972,51 @@ impl VulkanDevice {
         let groups = ((nout as u32).div_ceil(64), (m as u32).div_ceil(128), 1u32);
         self.dispatch(
             "mul_mm_q8_dp4a",
+            &[wq.buffer, xq.buffer, xs.buffer, out.buffer],
+            &push,
+            groups,
+        )?;
+        Ok(out)
+    }
+
+    /// Q8_0 prefill via the RDNA3 warp-tiled int8-dot GEMM (`mul_mm_q8_mmq`): same result as
+    /// [`matmul_q8_mm_dp4a_gpu`] (`y[m, nout] = x[m, k] * Wq^T`) but the GEMM uses llama.cpp's MMQ-int
+    /// tiling -- 256 threads as 4 warps (WARP=64) each owning a 64x64 sub-region of a 128x128 output
+    /// tile via WMITER/WNITER strided TMxTN register sub-tiles, with the B (weight) column pulled into a
+    /// register once and reused across all A rows. Keeps our Q8_0 weight layout (9 u32/block, f16 scale)
+    /// + the per-block int8 activation quant + `sdot_accsat`. m,n bound-checked; k % 32.
+    pub fn matmul_q8_mmq_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matmul_q8_mmq_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q8_mmq_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let nblocks = k / 32;
+        let xq = self.alloc_u32(m * nblocks * 8)?;
+        let xs = self.alloc_f32(m * nblocks)?;
+        let xsum = self.alloc_f32(m * nblocks)?;
+        let qpush = push_u32(&[m as u32, k as u32]);
+        self.dispatch_outs(
+            "quantize_act_q8",
+            &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
+            &[1, 2],
+            &qpush,
+            (((m * nblocks) as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        let out = self.alloc_f32(m * nout)?;
+        let push = push_u32(&[m as u32, k as u32, nout as u32, 0u32]); // woff = 0
+        // 128x128 output tile: .x sweeps M-tiles, .y sweeps N-tiles (matches the body's ir/ic).
+        let groups = ((m as u32).div_ceil(128), (nout as u32).div_ceil(128), 1u32);
+        self.dispatch(
+            "mul_mm_q8_mmq",
             &[wq.buffer, xq.buffer, xs.buffer, out.buffer],
             &push,
             groups,
@@ -2741,7 +2787,14 @@ impl BackendDevice for VulkanDevice {
                 let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sgsc_props);
                 instance.get_physical_device_properties2(pdev, &mut p2);
             }
-            let subgroup_pin = if has_sg_size_control
+            // A/B lever (benchmark only): VK_NO_SUBGROUP_PIN=1 disables the wave-width pin so the
+            // mat-vec pipelines compile with the driver's default subgroup pick (RADV wave32 on
+            // RDNA3). Lets us measure the wave64-pin delta against an otherwise identical binary.
+            let subgroup_pin_disabled = std::env::var("VK_NO_SUBGROUP_PIN")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let subgroup_pin = if !subgroup_pin_disabled
+                && has_sg_size_control
                 && subgroup_matvec
                 && sgsc_props
                     .required_subgroup_size_stages
@@ -2752,6 +2805,12 @@ impl BackendDevice for VulkanDevice {
             } else {
                 0
             };
+            eprintln!(
+                "[VK_INIT] subgroup_size={subgroup_size} subgroup_matvec={subgroup_matvec} \
+                 sg_size_control={has_sg_size_control} sgsc_range=[{},{}] subgroup_pin={subgroup_pin} \
+                 (pin_disabled={subgroup_pin_disabled})",
+                sgsc_props.min_subgroup_size, sgsc_props.max_subgroup_size,
+            );
 
             // Hardware int8 dot product (core in Vulkan 1.3, which the 1.3 instance guarantees, so no
             // extension to enable -- only the feature must be turned on at device creation to use
