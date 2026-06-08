@@ -7,10 +7,10 @@ use hanzo_nn::{kv_cache::ConcatKvCache, Activation, VarBuilder};
 use std::sync::Arc;
 
 #[cfg(feature = "flash-attn")]
-use hanzo_flash_attn;
+use candle_flash_attn;
 
 #[cfg(not(feature = "flash-attn"))]
-use hanzo_nn::attention::{flash_attn, AttnMask};
+use candle_nn::attention::{flash_attn, AttnMask};
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -264,7 +264,7 @@ impl Qwen3Attention {
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let causal = l > 1;
-        let ctx = hanzo_flash_attn::flash_attn(&q, &k, &v, scale, causal)?;
+        let ctx = candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)?;
 
         // Output: (B, S, H, D) -> (B, L, hidden_size)
         ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
@@ -272,7 +272,7 @@ impl Qwen3Attention {
 
     /// CPU flash attention - optimized fused kernel for CPU
     ///
-    /// The `flash_attn` dispatcher in hanzo-nn automatically selects:
+    /// The `flash_attn` dispatcher in candle-nn automatically selects:
     /// - B=1: single-batch optimized kernels (direct slice access)
     /// - B>1: packed varlen path (avoids batch-dim stride overhead)
     #[cfg(not(feature = "flash-attn"))]

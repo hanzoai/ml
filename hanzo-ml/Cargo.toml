@@ -55,6 +55,10 @@ cuda = ["cudarc", "dep:hanzo-kernels", "hanzo-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 rocm = ["dep:rocm-rs", "dep:hanzo-rocm-kernels"]
+# MIOpen-backed conv ops (conv1d/conv2d/conv_transpose1d). Off by default: MIOpen
+# ships in the Linux ROCm SDK but NOT the Windows ROCm 7.x SDK. Enable on a ROCm
+# install that includes MIOpen to get GPU conv; LLM inference does not need it.
+rocm-miopen = ["rocm-rs/miopen"]
 vulkan = ["dep:ash"]
 wgpu = ["dep:wgpu", "dep:pollster"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]

@@ -6,8 +6,8 @@
 //! Ported from <https://github.com/huggingface/candle/pull/3250>.
 
 use candle::Result;
-use hanzo_nn::attention::flash_attn_varlen_cpu;
-use hanzo_nn::varlen_attention::flash_attn_varlen_unfused;
+use candle_nn::attention::flash_attn_varlen_cpu;
+use candle_nn::varlen_attention::flash_attn_varlen_unfused;
 
 #[cfg(test)]
 mod tests {
@@ -385,7 +385,7 @@ mod tests {
         .to_dtype(scores.dtype())?;
         scores = scores.add(&bias)?;
 
-        let probs = hanzo_nn::ops::softmax_last_dim(&scores)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?.transpose(1, 2)?; // [B,max_q,H,D]
 
         let mut outs = Vec::with_capacity(bsz);

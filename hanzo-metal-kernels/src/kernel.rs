@@ -183,7 +183,7 @@ fn get_compile_options() -> Retained<MTLCompileOptions> {
     let compile_options = MTLCompileOptions::new();
     //unsafe { compile_options.setEnableLogging(true) };
 
-    let fast_math_enabled = get_env_bool("METAL_ENABLE_FAST_MATH", true);
+    let fast_math_enabled = get_env_bool("CANDLE_METAL_ENABLE_FAST_MATH", true);
     // Ref availability:
     // https://developer.apple.com/documentation/metal/mtlcompileoptions/mathmode
     if available!(macos = 15, ios = 18) {

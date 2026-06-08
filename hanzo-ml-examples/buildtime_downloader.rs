@@ -15,9 +15,9 @@ pub fn download_model(model_and_revision: &str) -> Result<()> {
         let weights = api.get("model.safetensors")?.to_string_lossy().to_string();
         (config, tokenizer, weights)
     };
-    println!("cargo::rustc-env=BUILDTIME_MODEL_CONFIG={config_filename}");
-    println!("cargo::rustc-env=BUILDTIME_MODEL_TOKENIZER={tokenizer_filename}");
-    println!("cargo::rustc-env=BUILDTIME_MODEL_WEIGHTS={weights_filename}");
+    println!("cargo::rustc-env=CANDLE_BUILDTIME_MODEL_CONFIG={config_filename}");
+    println!("cargo::rustc-env=CANDLE_BUILDTIME_MODEL_TOKENIZER={tokenizer_filename}");
+    println!("cargo::rustc-env=CANDLE_BUILDTIME_MODEL_WEIGHTS={weights_filename}");
 
     Ok(())
 }
