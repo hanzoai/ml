@@ -306,3 +306,49 @@ pub fn iou(a: (i64, i64, i64, i64), b: (i64, i64, i64, i64)) -> f64 {
         inter / union
     }
 }
+
+// ---- structural CI tests (no GPU): bbox / IoU geometry the SFD+FAN stage relies on.
+// Compiled + run by the face-detect-run standalone example via `cargo test`.
+#[cfg(test)]
+mod struct_tests {
+    use super::*;
+
+    #[test]
+    fn iou_identity_and_disjoint() {
+        let a = (0, 0, 10, 10);
+        assert!((iou(a, a) - 1.0).abs() < 1e-12);
+        assert_eq!(iou(a, (100, 100, 110, 110)), 0.0);
+    }
+
+    #[test]
+    fn iou_half_overlap() {
+        // two 10x10 boxes overlapping in a 10x5 strip: inter=50, union=150 -> 1/3
+        assert!((iou((0, 0, 10, 10), (0, 5, 10, 15)) - (50.0 / 150.0)).abs() < 1e-9);
+    }
+
+    fn synth_landmarks(nose_y: f32, chin_y: f32, xmin: f32, xmax: f32) -> Vec<[f32; 2]> {
+        let mut lm = vec![[(xmin + xmax) / 2.0, nose_y]; 68];
+        lm[29] = [(xmin + xmax) / 2.0, nose_y]; // nose bridge -> half_y
+        lm[0] = [xmin, chin_y];
+        lm[16] = [xmax, chin_y];
+        lm
+    }
+
+    #[test]
+    fn musetalk_bbox_matches_python_formula() {
+        // nose y=100, chin y=150 -> half_dist=50, upper=max(0,100-50)=50.
+        let bb = musetalk_bbox(&synth_landmarks(100.0, 150.0, 40.0, 160.0), 768).expect("bbox");
+        assert_eq!(bb, (40, 50, 160, 150));
+    }
+
+    #[test]
+    fn musetalk_bbox_clamps_upper_at_zero() {
+        let bb = musetalk_bbox(&synth_landmarks(20.0, 150.0, 40.0, 160.0), 768).expect("bbox");
+        assert_eq!(bb.1, 0);
+    }
+
+    #[test]
+    fn musetalk_bbox_rejects_too_few_landmarks() {
+        assert!(musetalk_bbox(&vec![[0f32; 2]; 10], 768).is_none());
+    }
+}
