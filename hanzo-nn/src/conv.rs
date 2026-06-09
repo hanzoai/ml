@@ -216,6 +216,18 @@ impl Conv2d {
 
 impl crate::Module for Conv2d {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(bias) = &self.bias {
+            if self.config.cudnn_fwd_algo.is_none() {
+                return x.conv2d_with_bias(
+                    &self.weight,
+                    bias,
+                    self.config.padding,
+                    self.config.stride,
+                    self.config.dilation,
+                    self.config.groups,
+                );
+            }
+        }
         let x = x.conv2d_with_algo(
             &self.weight,
             self.config.padding,

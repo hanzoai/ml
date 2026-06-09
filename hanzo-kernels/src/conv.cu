@@ -51,6 +51,29 @@ __device__ void conv1d(
   dst[dst_i] = static_cast<T>(d);
 }
 
+// Fused conv2d epilogue: transpose the im2col-GEMM output from NHWC (b, h, w, c) contiguous to
+// NCHW (b, c, h, w) contiguous while adding the per-channel bias. Replaces a strided ucopy plus a
+// separate broadcast-add. One thread per output element, indexed in NCHW order.
+template <typename T>
+__device__ void conv2d_bias_nchw(
+    const size_t numel,
+    const size_t c_out,
+    const size_t hw,
+    const T *src_nhwc,
+    const T *bias,
+    T *dst_nchw
+) {
+  const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= numel) {
+    return;
+  }
+  const size_t c = (i / hw) % c_out;
+  const size_t b = i / (hw * c_out);
+  const size_t hw_i = i % hw;
+  const size_t src_i = (b * hw + hw_i) * c_out + c;
+  dst_nchw[i] = src_nhwc[src_i] + bias[c];
+}
+
 template <typename T>
 __device__ void im2col1d(
     const size_t numel,
@@ -693,6 +716,18 @@ extern "C" __global__ void FN_NAME(  \
   col2im1d<TYPENAME>(dst_el, l_out, l_in, c_out, k_size, stride, src, dst); \
 } \
 
+#define CONV2D_BIAS_NCHW_OP(TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME(  \
+    const size_t numel, \
+    const size_t c_out, \
+    const size_t hw, \
+    const TYPENAME *src_nhwc, \
+    const TYPENAME *bias, \
+    TYPENAME *dst_nchw \
+) {  \
+  conv2d_bias_nchw<TYPENAME>(numel, c_out, hw, src_nhwc, bias, dst_nchw); \
+}  \
+
 #define IM2COL_OP(TYPENAME, FN_NAME) \
 extern "C" __global__ void FN_NAME(  \
     const size_t dst_numel, \
@@ -810,6 +845,7 @@ MAX_POOL2D_OP(__nv_bfloat16, max_pool2d_bf16)
 UPSAMPLE_NEAREST2D_OP(__nv_bfloat16, upsample_nearest2d_bf16)
 UPSAMPLE_BILINEAR2D_OP(__nv_bfloat16, upsample_bilinear2d_bf16)
 IM2COL_OP(__nv_bfloat16, im2col_bf16)
+CONV2D_BIAS_NCHW_OP(__nv_bfloat16, conv2d_bias_nchw_bf16)
 IM2COL1D_OP(__nv_bfloat16, im2col1d_bf16)
 COL2IM1D_OP(__nv_bfloat16, col2im1d_bf16)
 
@@ -836,6 +872,7 @@ MAX_POOL2D_OP(__half, max_pool2d_f16)
 UPSAMPLE_NEAREST2D_OP(__half, upsample_nearest2d_f16)
 UPSAMPLE_BILINEAR2D_OP(__half, upsample_bilinear2d_f16)
 IM2COL_OP(__half, im2col_f16)
+CONV2D_BIAS_NCHW_OP(__half, conv2d_bias_nchw_f16)
 IM2COL1D_OP(__half, im2col1d_f16)
 COL2IM1D_OP(__half, col2im1d_f16)
 #endif
@@ -881,7 +918,9 @@ UPSAMPLE_BILINEAR2D_OP(uint8_t, upsample_bilinear2d_u8)
 UPSAMPLE_BILINEAR2D_OP(uint32_t, upsample_bilinear2d_u32)
 
 IM2COL_OP(float, im2col_f32)
+CONV2D_BIAS_NCHW_OP(float, conv2d_bias_nchw_f32)
 IM2COL_OP(double, im2col_f64)
+CONV2D_BIAS_NCHW_OP(double, conv2d_bias_nchw_f64)
 IM2COL_OP(uint8_t, im2col_u8)
 IM2COL_OP(uint32_t, im2col_u32)
 
