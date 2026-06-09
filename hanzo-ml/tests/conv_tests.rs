@@ -932,12 +932,125 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+/* Regression for the MuseTalk VAE divergence investigation (fix/cpu-conv2d).
+
+The e2e suite reported MuseTalk CPU-f32 VAE-decode diverging (cosine ~0.099). A prior agent
+attributed it to the CPU conv2d on the VAE 128->256 3x3 stride-1 pad-1 conv. This test pins
+that exact shape (and a few neighbours) against a self-contained f64 ground-truth convolution,
+covering the multi-tile tiled-im2col path (out_h*out_w > TILE_SIZE) and a non-contiguous input.
+All cases match to high precision, demonstrating the CPU conv2d kernel itself is correct; the
+real divergence lives upstream of the kernel (model wiring / dtype), not here.
+*/
+fn conv2d_vae_shapes(dev: &Device) -> Result<()> {
+    // deterministic LCG, approx-normal via central limit
+    fn gen(n: usize, mut s: u64) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                let mut acc = 0f32;
+                for _ in 0..12 {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    acc += ((s >> 33) as u32 as f32) / (u32::MAX as f32 + 1.0);
+                }
+                acc - 6.0
+            })
+            .collect()
+    }
+    fn naive(
+        inp: &[f32],
+        wgt: &[f32],
+        c_in: usize,
+        c_out: usize,
+        h: usize,
+        w: usize,
+        k: usize,
+        pad: usize,
+    ) -> Vec<f32> {
+        let (oh, ow) = (h + 2 * pad - (k - 1), w + 2 * pad - (k - 1));
+        let mut out = vec![0f32; c_out * oh * ow];
+        for co in 0..c_out {
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut acc = 0f64;
+                    for ci in 0..c_in {
+                        for ky in 0..k {
+                            for kx in 0..k {
+                                let iy = (oy + ky) as isize - pad as isize;
+                                let ix = (ox + kx) as isize - pad as isize;
+                                if iy < 0 || iy >= h as isize || ix < 0 || ix >= w as isize {
+                                    continue;
+                                }
+                                let ii = (ci * h + iy as usize) * w + ix as usize;
+                                let wi = ((co * c_in + ci) * k + ky) * k + kx;
+                                acc += inp[ii] as f64 * wgt[wi] as f64;
+                            }
+                        }
+                    }
+                    out[(co * oh + oy) * ow + ox] = acc as f32;
+                }
+            }
+        }
+        out
+    }
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for i in 0..a.len() {
+            d += a[i] as f64 * b[i] as f64;
+            na += a[i] as f64 * a[i] as f64;
+            nb += b[i] as f64 * b[i] as f64;
+        }
+        d / (na.sqrt() * nb.sqrt() + 1e-30)
+    }
+
+    let cases = [
+        (128usize, 256usize, 32usize, 32usize), // the flagged VAE conv (1024 px > 512 tile)
+        (256, 256, 32, 32),
+        (64, 128, 16, 16),
+        (128, 3, 64, 64),
+    ];
+    for (c_in, c_out, h, w) in cases {
+        let inp = gen(c_in * h * w, 0x1234_5678 ^ ((c_in as u64) << 8));
+        let wgt = gen(c_out * c_in * 9, 0x9abc_def0 ^ ((c_out as u64) << 8));
+        let t = Tensor::from_vec(inp.clone(), (1, c_in, h, w), dev)?;
+        let k = Tensor::from_vec(wgt.clone(), (c_out, c_in, 3, 3), dev)?;
+        let res = t.conv2d(&k, 1, 1, 1, 1)?.flatten_all()?.to_vec1::<f32>()?;
+        let refv = naive(&inp, &wgt, c_in, c_out, h, w, 3, 1);
+        let c = cosine(&res, &refv);
+        assert!(
+            c > 0.9999,
+            "conv2d {c_in}->{c_out} {h}x{w}: cosine vs f64 ref = {c} (expected >0.9999)"
+        );
+    }
+
+    // non-contiguous input (narrow) must still match (mimics a sliced activation)
+    let (c_in, c_out, h, w) = (128usize, 256usize, 32usize, 32usize);
+    let big = gen(c_in * (h + 4) * (w + 4), 0xfeed_face);
+    let tb = Tensor::from_vec(big, (1, c_in, h + 4, w + 4), dev)?;
+    let t = tb.narrow(2, 2, h)?.narrow(3, 2, w)?;
+    assert!(!t.is_contiguous());
+    let wgt = gen(c_out * c_in * 9, 0x9abc_def0 ^ ((c_out as u64) << 8));
+    let k = Tensor::from_vec(wgt.clone(), (c_out, c_in, 3, 3), dev)?;
+    let res = t.conv2d(&k, 1, 1, 1, 1)?.flatten_all()?.to_vec1::<f32>()?;
+    let inp_c = t.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let refv = naive(&inp_c, &wgt, c_in, c_out, h, w, 3, 1);
+    let c = cosine(&res, &refv);
+    assert!(c > 0.9999, "conv2d non-contiguous input: cosine = {c}");
+    Ok(())
+}
+
 test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
 test_device!(
     conv1d_small,
     conv1d_small_cpu,
     conv1d_small_gpu,
     conv1d_small_metal
+);
+test_device!(
+    conv2d_vae_shapes,
+    conv2d_vae_shapes_cpu,
+    conv2d_vae_shapes_gpu,
+    conv2d_vae_shapes_metal
 );
 test_device!(conv2d, conv2d_cpu, conv2d_gpu, conv2d_metal);
 test_device!(
