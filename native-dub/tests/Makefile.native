@@ -1,0 +1,41 @@
+# PURE-NATIVE-RUST zen-dub e2e runner. NO bash orchestration of Python; every target invokes only
+# `cargo test`. The suite spans BOTH repos: hanzo-ml (kernels/framework/face-detect) AND hanzo-engine
+# (speech models + the full-pipeline integration test). No python process is spawned at test time.
+#
+#   make e2e          everything below (ml + engine, structural + integration)
+#   make ml           cargo test -p hanzo-ml + -p hanzo-transformers   (kernels, conv, face-detect)
+#   make engine       cargo test -p hanzo-engine deterministic + structural (committed fixtures)
+#   make integration  cargo test -p hanzo-engine --test dub_e2e        (the full dub, env-gated)
+#
+# Weights/audio for the integration + codec_validation tests are env-gated; absent => clean skip:
+#   ZEN3_ASR_DIR  ZEN3_TTS_DIR  DUB_SUN_WAV   (defaults = spark layout, baked into the tests)
+# Add CUDA with:  CARGO_FEATURES="--features cuda"   (default: CPU, portable + deterministic)
+#
+# Repo locations (override if your checkout differs):
+HANZO_ML     ?= $(HOME)/work/hanzo/ml
+HANZO_ENGINE ?= $(HOME)/work/hanzo/engine
+CARGO_FEATURES ?=
+
+SHELL := /usr/bin/env bash
+.PHONY: e2e ml engine integration
+
+e2e: ml engine integration
+	@echo "##### native-rust e2e: ml + engine + integration all invoked via cargo (no python) #####"
+
+# ---- hanzo-ml: kernels / framework / face-detect (task item 4) ----
+ml:
+	@echo "== hanzo-ml: conv/kernel/framework tests =="
+	cd "$(HANZO_ML)" && cargo test -p hanzo-ml $(CARGO_FEATURES)
+	@echo "== hanzo-transformers: face_detection struct_tests + whisper feats =="
+	cd "$(HANZO_ML)" && cargo test -p hanzo-transformers $(CARGO_FEATURES)
+
+# ---- hanzo-engine: deterministic (committed PyTorch fixtures) + structural ----
+engine:
+	@echo "== hanzo-engine: codec_validation (committed fixtures) + zen3_struct =="
+	cd "$(HANZO_ENGINE)" && cargo test -p hanzo-engine --lib codec_validation $(CARGO_FEATURES) -- --nocapture --test-threads=1
+	cd "$(HANZO_ENGINE)" && cargo test -p hanzo-engine --lib zen3_struct $(CARGO_FEATURES) -- --nocapture --test-threads=1
+
+# ---- hanzo-engine: full-pipeline native integration test (replaces the bash orchestrator) ----
+integration:
+	@echo "== hanzo-engine: dub_e2e (ASR -> golden translate -> TTS -> ASR round-trip -> MuseTalk) =="
+	cd "$(HANZO_ENGINE)" && cargo test -p hanzo-engine --test dub_e2e $(CARGO_FEATURES) -- --nocapture --test-threads=1
