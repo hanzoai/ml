@@ -183,6 +183,65 @@ __device__ void layernorm(const T * x, T * dst, const T * alpha, const T * beta,
     }
 }
 
+// GroupNorm with f32 accumulation. One block per (batch, group); each block normalizes
+// `ncols = channels_per_group * spatial` contiguous elements, then applies per-channel
+// affine (alpha/beta indexed by global channel = group*channels_per_group + chan_in_group).
+// Matches hanzo-nn GroupNorm: mean/var reduced in f32, output rounded to T.
+// Two-pass (mean, then sum of squared deviations about that mean) to match the decomposed
+// reference's E[(x-mean)^2] rounding rather than the less-stable E[x^2]-mean^2.
+template <typename T>
+__device__ __forceinline__ float groupnorm_block_reduce(float v, const int block_size,
+                                                        float2 *s_scratch) {
+    v = warp_reduce_sum(v);
+    if (block_size > WARP_SIZE) {
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_scratch[warp_id].x = v;
+        }
+        __syncthreads();
+        const int n_warps = (block_size + WARP_SIZE - 1) / WARP_SIZE;
+        v = lane_id < n_warps ? s_scratch[lane_id].x : 0.f;
+        v = warp_reduce_sum(v);
+        __syncthreads();
+    }
+    return v;
+}
+
+template <typename T>
+__device__ void groupnorm(const T * x, T * dst, const T * alpha, const T * beta,
+                          const int ncols, const int num_groups, const int channels_per_group,
+                          const int spatial, const int block_size, const float eps) {
+    const int row = blockIdx.x;
+    const int group = row % num_groups;
+    const int tid = threadIdx.x;
+    __shared__ float2 s_scratch[32];
+
+    float sum = 0.f;
+    for (int col = tid; col < ncols; col += block_size) {
+        sum += static_cast<float>(x[row*ncols + col]);
+    }
+    sum = groupnorm_block_reduce<T>(sum, block_size, s_scratch);
+    const float mean = sum / ncols;
+
+    float sq = 0.f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float d = static_cast<float>(x[row*ncols + col]) - mean;
+        sq += d * d;
+    }
+    sq = groupnorm_block_reduce<T>(sq, block_size, s_scratch);
+    const float inv_std = rsqrtf(sq / ncols + eps);
+
+    // Match the decomposed reference's rounding: normalize in f32, round to T, then apply the
+    // per-channel affine in native-T arithmetic (broadcast_mul/broadcast_add are T*T -> T).
+    for (int col = tid; col < ncols; col += block_size) {
+        const int chan = group * channels_per_group + col / spatial;
+        const float lhs = (static_cast<float>(x[row*ncols + col]) - mean) * inv_std;
+        const T n = static_cast<T>(lhs);
+        dst[row*ncols + col] = n * alpha[chan] + beta[chan];
+    }
+}
+
 // RmsNorm implementation adapted from ggml, accumulation is made using f32.
 // https://github.com/ggerganov/llama.cpp/blob/d59bd97065cd7ded6c4ecab54b1d5e0b1b11e318/ggml-cuda.cu#L523
 template <typename T>
@@ -612,6 +671,16 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
     layernorm<TYPENAME>(src, dst, alpha, beta, n_cols, block_size, eps);       \
   }                                                                            \
 
+#define GROUPNORM_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME(                                          \
+      const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha,               \
+      const TYPENAME *beta, const int n_cols, const int num_groups,            \
+      const int channels_per_group, const int spatial,                        \
+      const int block_size, const float eps) {                                \
+    groupnorm<TYPENAME>(src, dst, alpha, beta, n_cols, num_groups,            \
+                        channels_per_group, spatial, block_size, eps);         \
+  }                                                                            \
+
 #define ROPE_OP(TYPENAME, FN_NAME, FN_NAME_I, FN_NAME_THD) \
   extern "C" __global__ void FN_NAME_I( \
       const TYPENAME *src, \
@@ -651,6 +720,7 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
 SOFTMAX_OP(__nv_bfloat16, float, softmax_bf16)
 RMSNORM_OP(__nv_bfloat16, rmsnorm_bf16)
 LAYERNORM_OP(__nv_bfloat16, layernorm_bf16)
+GROUPNORM_OP(__nv_bfloat16, groupnorm_bf16)
 ROPE_OP(__nv_bfloat16, rope_bf16, rope_i_bf16, rope_thd_bf16)
 SUM_OP(__nv_bfloat16, sum_bf16)
 FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argmax_bf16, fast_sum_bf16)
@@ -668,6 +738,7 @@ FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argm
 SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
+GROUPNORM_OP(__half, groupnorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
 SUM_OP(__half, sum_f16)
 FAST_OP(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
@@ -681,7 +752,9 @@ SOFTMAX_OP(double, double, softmax_f64)
 RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
 LAYERNORM_OP(float, layernorm_f32)
+GROUPNORM_OP(float, groupnorm_f32)
 LAYERNORM_OP(double, layernorm_f64)
+GROUPNORM_OP(double, groupnorm_f64)
 ROPE_OP(float, rope_f32, rope_i_f32, rope_thd_f32)
 ROPE_OP(double, rope_f64, rope_i_f64, rope_thd_f64)
 
