@@ -1,0 +1,21 @@
+[package]
+name = "whisper-feats-verify"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "whisper-feats-verify"
+path = "src/main.rs"
+
+[dependencies]
+hanzo-ml = { path = "../ml/hanzo-ml" }
+hanzo-nn = { path = "../ml/hanzo-nn" }
+hanzo-quant = { path = "../engine/hanzo-quant" }
+half = "2"
+
+[features]
+cuda = ["hanzo-ml/cuda", "hanzo-nn/cuda", "hanzo-quant/cuda"]
+cudnn = ["cuda", "hanzo-ml/cudnn", "hanzo-nn/cudnn"]
+
+[profile.release]
+opt-level = 3
