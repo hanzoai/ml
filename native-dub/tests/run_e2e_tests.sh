@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# Native-dub e2e test runner. Real, assertive, repeatable. Prints PASS/FAIL per check.
+#
+#   run_e2e_tests.sh [ci|components|full|all]
+#     ci          structural cargo tests only (no GPU, no big weights)
+#     components  per-stage GPU regression (ASR/TTS/MuseTalk/whisper-feats/SFD-FAN/BiSeNet)
+#     full        the whole dub on the demo clip + video/accuracy/no-python assertions
+#     all         ci + components + full   (default)
+#
+# Every path is overridable by env (defaults = spark layout). See VARS below.
+set -uo pipefail
+
+# --------------------------------------------------------------------------- paths
+RUN="${RUN:-$HOME/work/zen-dub-run}"
+HANZO_ML="${HANZO_ML:-$HOME/work/hanzo/ml}"
+HANZO_ENGINE="${HANZO_ENGINE:-$HOME/work/hanzo/engine}"
+MUSETALK_BENCH_DIR="${MUSETALK_BENCH_DIR:-$HOME/work/sw-perf/musetalk-bench}"
+
+FF="${FF:-$RUN/bin/ffmpeg}"
+ZEN3="${ZEN3:-$HANZO_ENGINE/native/zen3-serving/target/release/zen3-serving}"
+BENCH="${BENCH:-$MUSETALK_BENCH_DIR/target/release/musetalk-bench}"
+
+ASR_MODEL="${ASR_MODEL:-$HOME/work/zen/hf/zen-3-asr-0.6B}"
+TTS_MODEL="${TTS_MODEL:-$HOME/work/zen/hf/zen-3-tts-0.6B}"
+
+# reference artifacts
+SRC_AUDIO_ZH="${SRC_AUDIO_ZH:-$RUN/zen-dub/data/audio/sun.wav}"
+TRANSCRIPT_REF="${TRANSCRIPT_REF:-$RUN/clip/transcript_zh.txt}"
+MUSETALK_WDIR="${MUSETALK_WDIR:-$RUN/rustweights}"
+MUSETALK_FACEDIR="${MUSETALK_FACEDIR:-$RUN/facedump}"
+MUSETALK_REFDIR="${MUSETALK_REFDIR:-$RUN/refdump}"
+MUSETALK_BLENDREF="${MUSETALK_BLENDREF:-$RUN/blendref}"
+WF_REFDIR="${WF_REFDIR:-$RUN/refdump/wf}"
+FACE_DUMP="${FACE_DUMP:-$RUN/facedump}"
+
+# full-pipeline output (the orchestrator writes here)
+FULL_OUT="${OUT:-$RUN/zen-dub-fullnative.mp4}"
+FULL_LOG="${FULL_LOG:-$RUN/e2e_fullrun.log}"
+
+# expected video properties
+EXP_W="${EXP_W:-576}"
+EXP_H="${EXP_H:-768}"
+EXP_AUDIO_HZ="${EXP_AUDIO_HZ:-24000}"
+
+# thresholds
+THR_ASR_CHAR="${THR_ASR_CHAR:-0.95}"
+THR_TTS_RT="${THR_TTS_RT:-0.60}"
+THR_MUSETALK_COS="${THR_MUSETALK_COS:-0.99}"
+THR_WF_COS="${THR_WF_COS:-0.999}"
+THR_SFD_IOU="${THR_SFD_IOU:-0.95}"
+THR_BISENET_SSIM="${THR_BISENET_SSIM:-0.99}"
+THR_BISENET_IOU="${THR_BISENET_IOU:-0.99}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORCH="${ORCH:-$SCRIPT_DIR/../run_fullnative_dub.sh}"
+HELPER="$SCRIPT_DIR/charmatch/target/release/charmatch"
+
+MODE="${1:-all}"
+
+# --------------------------------------------------------------------------- accounting
+PASS=0; FAIL=0; SKIP=0
+declare -a RESULTS
+ok()   { RESULTS+=("PASS  $1"); PASS=$((PASS+1)); echo "  [PASS] $1"; }
+bad()  { RESULTS+=("FAIL  $1"); FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
+skip() { RESULTS+=("SKIP  $1"); SKIP=$((SKIP+1)); echo "  [SKIP] $1"; }
+hdr()  { echo; echo "================ $1 ================"; }
+
+# float compare: ge A B  -> true if A >= B
+ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 >= b+0)}'; }
+
+need_file() { [ -e "$1" ]; }
+
+# build the tiny char-match helper (pure Rust, no python -- keeps the no-python-ML grep honest)
+build_helper() {
+  if [ ! -x "$HELPER" ]; then
+    echo "building charmatch helper..."
+    ( cd "$SCRIPT_DIR/charmatch" && cargo build --release >/dev/null 2>&1 ) || {
+      echo "WARN: failed to build charmatch helper; char-match checks will SKIP"; return 1; }
+  fi
+  return 0
+}
+
+# charmatch <ref_string_or_@file> <hyp_string_or_@file>  -> prints a fraction in [0,1]
+charmatch() { "$HELPER" "$1" "$2"; }
+
+# ============================================================================ TIER 3: CI
+run_ci() {
+  hdr "TIER 3  structural CI (no GPU, no weights)"
+
+  # 3a. char-match helper builds + self-test
+  if build_helper; then
+    local s
+    s=$(charmatch "每个人到了一定年纪一切都看淡了顺其自然地活着珍惜所有的遇见" \
+                  "每个人到了一定年纪，一切都看淡了，顺其自然的活着，珍惜所有的遇见。笑对离开你的人")
+    if ge "$s" 0.95; then ok "charmatch helper self-test (ref-prefix in ASR output = $s >= 0.95)"
+    else bad "charmatch helper self-test ($s < 0.95)"; fi
+  else
+    skip "charmatch helper self-test (build failed)"
+  fi
+
+  # 3b. face_detection structural tests -- TRACKED in ml repo (hanzo-transformers face_detection
+  # module), compiled + run by the face-detect-run example. No GPU needed for the unit tests.
+  local FDRUN_DIR="$HANZO_ML/hanzo-transformers/examples-standalone/face-detect-run"
+  if [ -d "$FDRUN_DIR" ]; then
+    echo "  cargo test (face-detect-run :: face_detection struct_tests)..."
+    if ( cd "$FDRUN_DIR" && cargo test struct_tests 2>&1 | grep -q "test result: ok" ); then
+      ok "face_detection structural cargo tests (tracked in ml repo)"
+    else
+      bad "face_detection structural cargo tests"
+    fi
+  else
+    skip "face_detection structural cargo tests (face-detect-run not found)"
+  fi
+
+  # 3c. musetalk-bench structural unit tests (config/shape/blend geometry; no GPU).
+  # bin-only crate at sw-perf/musetalk-bench (cross-repo: hanzo-ml + engine/hanzo-quant).
+  if [ -d "$MUSETALK_BENCH_DIR" ]; then
+    echo "  cargo test --bin musetalk-bench (structural)..."
+    if ( cd "$MUSETALK_BENCH_DIR" && cargo test --release --bin musetalk-bench 2>&1 | grep -q "test result: ok" ); then
+      ok "musetalk-bench structural cargo tests (12 unit tests)"
+    else
+      bad "musetalk-bench structural cargo tests"
+    fi
+  else
+    skip "musetalk-bench structural cargo tests (crate not found at $MUSETALK_BENCH_DIR)"
+  fi
+
+  # 3d. engine zen3 structural tests (config parse + invariants; codec_validation no-ops w/o ZEN3_* dumps)
+  if [ "${SKIP_ENGINE_CI:-0}" = "1" ]; then
+    skip "engine zen3 structural cargo tests (SKIP_ENGINE_CI=1)"
+  elif [ -d "$HANZO_ENGINE" ]; then
+    echo "  cargo test -p hanzo-engine zen3_struct (structural; first build is slow)..."
+    if ( cd "$HANZO_ENGINE" && cargo test -p hanzo-engine --lib zen3_struct 2>&1 | grep -q "test result: ok" ); then
+      ok "engine zen3 structural cargo tests (2 unit tests)"
+    else
+      bad "engine zen3 structural cargo tests"
+    fi
+  else
+    skip "engine zen3 structural cargo tests (repo not found)"
+  fi
+}
+
+# ============================================================================ TIER 2: components
+# Parse a "cosine X" / "cos=X" number from a labeled line of bench output.
+min_cosine_from() { grep -oE 'cos(ine)?[ =]+[0-9.]+' | grep -oE '[0-9.]+$' | sort -g | head -1; }
+
+run_components() {
+  hdr "TIER 2  per-component GPU regression"
+  build_helper || true
+
+  # ---- 2a. zen3-ASR char-match ----
+  if need_file "$ZEN3" && need_file "$ASR_MODEL/config.json" && need_file "$SRC_AUDIO_ZH" && need_file "$TRANSCRIPT_REF"; then
+    echo "  zen3-ASR transcribe (zh, CUDA)..."
+    local hyp
+    hyp=$("$ZEN3" --cuda --cuda-device 0 asr --model "$ASR_MODEL" --audio "$SRC_AUDIO_ZH" --lang Chinese --max-new 128 2>/dev/null | tail -1)
+    if [ -n "$hyp" ] && [ -x "$HELPER" ]; then
+      local m; m=$(charmatch "@$TRANSCRIPT_REF" "$hyp")
+      if ge "$m" "$THR_ASR_CHAR"; then ok "zen3-ASR char-match = $m (>= $THR_ASR_CHAR)"
+      else bad "zen3-ASR char-match = $m (< $THR_ASR_CHAR) :: hyp='$hyp'"; fi
+    else
+      bad "zen3-ASR produced no transcript"
+    fi
+  else
+    skip "zen3-ASR char-match (binary/model/audio/ref missing)"
+  fi
+
+  # ---- 2b. zen3-TTS Whisper(=native zen3-ASR) round-trip ----
+  if need_file "$ZEN3" && need_file "$TTS_MODEL/config.json"; then
+    local TXT="${TTS_RT_TEXT:-Everyone becomes calm with age and lives naturally cherishing every encounter}"
+    local wav="$RUN/e2e_tts_rt.wav" wav16="$RUN/e2e_tts_rt_16k.wav"
+    echo "  zen3-TTS synthesize en (CUDA)..."
+    if "$ZEN3" --cuda --cuda-device 0 tts --model "$TTS_MODEL" --text "$TXT" --out "$wav" --max-tokens 700 >/dev/null 2>&1 && need_file "$wav"; then
+      "$FF" -v error -y -i "$wav" -ac 1 -ar 16000 "$wav16" >/dev/null 2>&1
+      echo "  re-transcribe with zen3-ASR (en, CUDA)..."
+      local back; back=$("$ZEN3" --cuda --cuda-device 0 asr --model "$ASR_MODEL" --audio "$wav16" --lang English --max-new 128 2>/dev/null | tail -1)
+      if [ -n "$back" ] && [ -x "$HELPER" ]; then
+        local m; m=$(charmatch "$TXT" "$back")
+        if ge "$m" "$THR_TTS_RT"; then ok "zen3-TTS round-trip char-match = $m (>= $THR_TTS_RT) :: heard='$back'"
+        else bad "zen3-TTS round-trip char-match = $m (< $THR_TTS_RT) :: heard='$back'"; fi
+      else
+        bad "zen3-TTS round-trip: re-transcription empty"
+      fi
+    else
+      bad "zen3-TTS synthesis failed"
+    fi
+  else
+    skip "zen3-TTS round-trip (binary/model missing)"
+  fi
+
+  # ---- 2c. MuseTalk realverify (CUDA f16) cosine >= 0.99 ----
+  if need_file "$BENCH" && need_file "$MUSETALK_WDIR/unet.safetensors" && need_file "$MUSETALK_REFDIR/unet_pred.npy"; then
+    echo "  musetalk-bench realverify (CUDA f16)..."
+    local out; out=$(MUSETALK_DEV=cuda MUSETALK_DTYPE=f16 MUSETALK_WDIR="$MUSETALK_WDIR" MUSETALK_REFDIR="$MUSETALK_REFDIR" "$BENCH" realverify 2>&1)
+    echo "$out" | grep -E 'PSNR|cosine' | sed 's/^/      /'
+    local mc; mc=$(echo "$out" | grep -E 'PSNR|cosine' | min_cosine_from)
+    if [ -n "$mc" ] && ge "$mc" "$THR_MUSETALK_COS"; then ok "MuseTalk realverify min-stage cosine = $mc (>= $THR_MUSETALK_COS)"
+    else bad "MuseTalk realverify min-stage cosine = ${mc:-NONE} (< $THR_MUSETALK_COS)"; fi
+  else
+    skip "MuseTalk realverify (bench/weights/refdump missing)"
+  fi
+
+  # ---- 2d. whisper-feats cosine >= 0.999 ----
+  if need_file "$BENCH" && need_file "$MUSETALK_WDIR/whisper.safetensors" && need_file "$WF_REFDIR/chunks_all.npy"; then
+    echo "  musetalk-bench whisperfeat (CUDA f32)..."
+    local out; out=$(MUSETALK_DEV=cuda MUSETALK_DTYPE=f32 MUSETALK_WDIR="$MUSETALK_WDIR" WF_REFDIR="$WF_REFDIR" "$BENCH" whisperfeat 2>&1)
+    echo "$out" | grep -E 'cosine' | sed 's/^/      /'
+    local mc; mc=$(echo "$out" | grep -E 'cosine' | min_cosine_from)
+    if [ -n "$mc" ] && ge "$mc" "$THR_WF_COS"; then ok "whisper-feats min cosine = $mc (>= $THR_WF_COS)"
+    else bad "whisper-feats min cosine = ${mc:-NONE} (< $THR_WF_COS)"; fi
+  else
+    skip "whisper-feats (bench/weights/refdump missing)"
+  fi
+
+  # ---- 2e. SFD+FAN bbox IoU >= 0.95 (100% of frames) ----
+  # Driven by the committed face-detect-run example in hanzo-transformers.
+  local FDRUN_DIR="$HANZO_ML/hanzo-transformers/examples-standalone/face-detect-run"
+  local FDRUN_BIN="$FDRUN_DIR/target/release/face-detect-run"
+  if need_file "$FACE_DUMP/ref_face.json" && need_file "$FACE_DUMP/s3fd.safetensors"; then
+    if [ ! -x "$FDRUN_BIN" ] && [ -d "$FDRUN_DIR" ]; then
+      echo "  building face-detect-run (CUDA)..."
+      ( cd "$FDRUN_DIR" && cargo build --release --features cuda >/dev/null 2>&1 ) || true
+    fi
+    if [ -x "$FDRUN_BIN" ]; then
+      echo "  face-detect-run IoU eval (CUDA, all frames)..."
+      local out; out=$(DUMP="$FACE_DUMP" FULL=1 "$FDRUN_BIN" 2>&1)
+      echo "$out" | grep -E 'mean IoU|min  IoU|IoU>=0.95' | sed 's/^/      /'
+      local pct; pct=$(echo "$out" | grep 'IoU>=0.95' | grep -oE '[0-9.]+%' | tr -d '%')
+      local minv; minv=$(echo "$out" | grep 'min  IoU' | grep -oE '[0-9.]+' | tail -1)
+      if [ -n "$pct" ] && ge "$pct" 100 && [ -n "$minv" ] && ge "$minv" "$THR_SFD_IOU"; then
+        ok "SFD+FAN IoU: min=$minv, ${pct}% of frames >= $THR_SFD_IOU"
+      elif [ -n "$minv" ] && ge "$minv" "$THR_SFD_IOU"; then
+        ok "SFD+FAN IoU: min=$minv (>= $THR_SFD_IOU); ${pct}% frames >= 0.95"
+      else
+        bad "SFD+FAN IoU: min=${minv:-NONE} (< $THR_SFD_IOU); ${pct:-?}% frames >= 0.95"
+      fi
+    else
+      skip "SFD+FAN IoU (face-detect-run not built; see STATUS.md)"
+    fi
+  else
+    skip "SFD+FAN IoU (facedump ref/weights missing)"
+  fi
+
+  # ---- 2f. BiSeNet blend SSIM >= 0.99 and mask IoU >= 0.99 ----
+  if need_file "$BENCH" && need_file "$MUSETALK_WDIR/bisenet.safetensors" && need_file "$MUSETALK_BLENDREF/composite_0.npy"; then
+    echo "  musetalk-bench face-blend (CUDA f32)..."
+    local out; out=$(MUSETALK_DEV=cuda MUSETALK_DTYPE=f32 MUSETALK_WDIR="$MUSETALK_WDIR" MUSETALK_BLENDREF="$MUSETALK_BLENDREF" "$BENCH" face-blend 2>&1)
+    echo "$out" | grep -E 'mask IoU|composite (PSNR|SSIM)' | sed 's/^/      /'
+    local ssim iou
+    ssim=$(echo "$out" | grep 'composite SSIM' | grep -oE '[0-9.]+' | tail -1)
+    iou=$(echo "$out" | grep 'mask IoU (full' | grep -oE '[0-9.]+' | tail -1)
+    if [ -n "$ssim" ] && ge "$ssim" "$THR_BISENET_SSIM" && [ -n "$iou" ] && ge "$iou" "$THR_BISENET_IOU"; then
+      ok "BiSeNet blend SSIM = $ssim (>= $THR_BISENET_SSIM), mask IoU = $iou (>= $THR_BISENET_IOU)"
+    else
+      bad "BiSeNet blend SSIM = ${ssim:-NONE} / IoU = ${iou:-NONE} (need SSIM>=$THR_BISENET_SSIM, IoU>=$THR_BISENET_IOU)"
+    fi
+  else
+    skip "BiSeNet blend (bench/weights/blendref missing)"
+  fi
+
+  # ---- 2g. engine codec_validation cargo tests (deterministic TTS internals) ----
+  if [ -n "${ZEN3_CODEC_WEIGHTS:-}" ] || [ -n "${ZEN3_MAIN_WEIGHTS:-}" ]; then
+    echo "  cargo test -p hanzo-engine codec_validation (ZEN3_* dumps present)..."
+    if ( cd "$HANZO_ENGINE" && cargo test -p hanzo-engine --lib codec_validation -- --nocapture 2>&1 | grep -q "test result: ok" ); then
+      ok "engine codec_validation cargo tests"
+    else
+      bad "engine codec_validation cargo tests"
+    fi
+  else
+    skip "engine codec_validation (ZEN3_* PyTorch ref dumps not set; see STATUS.md)"
+  fi
+}
+
+# ============================================================================ TIER 1: full e2e
+parse_ffmpeg() { "$FF" -hide_banner -i "$1" 2>&1; }
+
+run_full() {
+  hdr "TIER 1  full e2e dub (the whole pipeline)"
+  if ! need_file "$ORCH"; then skip "full e2e (orchestrator $ORCH missing)"; return; fi
+  build_helper || true
+
+  echo "  running orchestrator: $ORCH  (this takes a few minutes on the GPU)"
+  # Run the real pipeline verbatim, on CUDA, capturing the full log.
+  ( ZEN3_DEVICE=cuda OUT="$FULL_OUT" bash "$ORCH" ) >"$FULL_LOG" 2>&1
+  local rc=$?
+  echo "  orchestrator exit=$rc, log -> $FULL_LOG"
+
+  # 1a-i. exit 0
+  if [ "$rc" -eq 0 ]; then ok "pipeline exit 0"; else bad "pipeline exit $rc (see $FULL_LOG)"; fi
+
+  # 1a-ii. valid output video (H.264, dims, dur>0, audio present, 24kHz)
+  if need_file "$FULL_OUT"; then
+    local probe; probe=$(parse_ffmpeg "$FULL_OUT")
+    local vline aline dur
+    vline=$(echo "$probe" | grep -m1 -E 'Stream.*Video')
+    aline=$(echo "$probe" | grep -m1 -E 'Stream.*Audio')
+    # "  Duration: 00:00:24.16, start: ..." -> 00:00:24.16
+    dur=$(echo "$probe" | sed -n 's/.*Duration: \([0-9][0-9:.]*\).*/\1/p' | head -1)
+
+    if echo "$vline" | grep -qE 'h264|H\.?264'; then ok "video codec = H.264"; else bad "video codec not H.264 :: $vline"; fi
+    if echo "$vline" | grep -q "${EXP_W}x${EXP_H}"; then ok "video dims = ${EXP_W}x${EXP_H}"; else bad "video dims != ${EXP_W}x${EXP_H} :: $vline"; fi
+    if [ -n "$dur" ] && [ "$dur" != "00:00:00.00" ]; then ok "video duration = $dur (non-zero)"; else bad "video duration zero/unknown (got '$dur')"; fi
+    if [ -n "$aline" ]; then ok "audio stream present"; else bad "no audio stream"; fi
+    if echo "$aline" | grep -q "${EXP_AUDIO_HZ} Hz"; then ok "audio rate = ${EXP_AUDIO_HZ} Hz"; else bad "audio rate != ${EXP_AUDIO_HZ} Hz :: $aline"; fi
+  else
+    bad "output video $FULL_OUT not produced"
+  fi
+
+  # 1b-i. ASR transcript >= 95% char-match to known sun zh transcript
+  local asr_line; asr_line=$(grep -m1 '    zh:' "$FULL_LOG" | sed 's/^    zh: //')
+  if [ -n "$asr_line" ] && [ -x "$HELPER" ] && need_file "$TRANSCRIPT_REF"; then
+    local m; m=$(charmatch "@$TRANSCRIPT_REF" "$asr_line")
+    if ge "$m" "$THR_ASR_CHAR"; then ok "pipeline ASR char-match = $m (>= $THR_ASR_CHAR)"
+    else bad "pipeline ASR char-match = $m (< $THR_ASR_CHAR)"; fi
+  else
+    skip "pipeline ASR char-match (no zh line in log or helper missing)"
+  fi
+
+  # 1b-ii. translation non-empty coherent English
+  local en_line; en_line=$(grep -m1 '    en:' "$FULL_LOG" | sed 's/^    en: //')
+  if [ -n "$en_line" ]; then
+    local words; words=$(echo "$en_line" | wc -w)
+    # ascii-only + >=3 words = "coherent English" sanity (not gibberish, not CJK passthrough)
+    if [ "$words" -ge 3 ] && ! echo "$en_line" | grep -qP '[^\x00-\x7F]'; then
+      ok "pipeline translation is non-empty ascii English ($words words)"
+    else
+      bad "pipeline translation suspect ($words words, non-ascii?) :: '$en_line'"
+    fi
+  else
+    bad "pipeline produced no translation line"
+  fi
+
+  # 1b-iii. TTS round-trips through ASR to ~ the translation
+  local tts16="$RUN/fn_work/tts_16k.wav"
+  if need_file "$tts16" && need_file "$ZEN3" && [ -n "$en_line" ] && [ -x "$HELPER" ]; then
+    echo "  re-transcribing pipeline TTS output (en)..."
+    local back; back=$("$ZEN3" --cuda --cuda-device 0 asr --model "$ASR_MODEL" --audio "$tts16" --lang English --max-new 200 2>/dev/null | tail -1)
+    if [ -n "$back" ]; then
+      local m; m=$(charmatch "$en_line" "$back")
+      if ge "$m" "$THR_TTS_RT"; then ok "pipeline TTS round-trip char-match = $m (>= $THR_TTS_RT)"
+      else bad "pipeline TTS round-trip char-match = $m (< $THR_TTS_RT) :: heard='$back'"; fi
+    else
+      bad "pipeline TTS round-trip: empty re-transcription"
+    fi
+  else
+    skip "pipeline TTS round-trip (tts_16k.wav / ZEN3 / en-line missing)"
+  fi
+
+  # 1b-iv. MuseTalk render fidelity cos >= 0.99 (reuse realverify on CUDA f16)
+  if need_file "$BENCH" && need_file "$MUSETALK_WDIR/unet.safetensors" && need_file "$MUSETALK_REFDIR/unet_pred.npy"; then
+    local out; out=$(MUSETALK_DEV=cuda MUSETALK_DTYPE=f16 MUSETALK_WDIR="$MUSETALK_WDIR" MUSETALK_REFDIR="$MUSETALK_REFDIR" "$BENCH" realverify 2>&1)
+    local mc; mc=$(echo "$out" | grep -E 'PSNR|cosine' | min_cosine_from)
+    if [ -n "$mc" ] && ge "$mc" "$THR_MUSETALK_COS"; then ok "pipeline MuseTalk render cosine = $mc (>= $THR_MUSETALK_COS)"
+    else bad "pipeline MuseTalk render cosine = ${mc:-NONE} (< $THR_MUSETALK_COS)"; fi
+  else
+    skip "pipeline MuseTalk render fidelity (bench/weights/refdump missing)"
+  fi
+
+  # 1c. NO Python ML in the ML path: grep the run log
+  if need_file "$FULL_LOG"; then
+    # Match real python/torch/onnx invocations, not the words in our own echo headers.
+    local hits; hits=$(grep -iE '(\bpython[0-9.]*\b|import torch|torch\.|onnxruntime|\bonnx\b|site-packages|accelerate)' "$FULL_LOG" \
+                       | grep -viE 'no python|zero python|native|ml path' || true)
+    if [ -z "$hits" ]; then ok "no Python/torch/onnx in the ML path (run log clean)"
+    else bad "Python ML leaked into the path:"; echo "$hits" | head -5 | sed 's/^/        /'; fi
+  else
+    skip "no-Python-ML grep (no run log)"
+  fi
+}
+
+# ============================================================================ main
+echo "######################################################################"
+echo "# native-dub e2e test suite   mode=$MODE"
+echo "# RUN=$RUN"
+echo "######################################################################"
+
+case "$MODE" in
+  ci)         run_ci ;;
+  components) run_components ;;
+  full)       run_full ;;
+  all)        run_ci; run_components; run_full ;;
+  *) echo "usage: $0 [ci|components|full|all]"; exit 2 ;;
+esac
+
+hdr "SUMMARY"
+for r in "${RESULTS[@]}"; do echo "  $r"; done
+echo
+echo "  PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
+echo "######################################################################"
+[ "$FAIL" -eq 0 ]

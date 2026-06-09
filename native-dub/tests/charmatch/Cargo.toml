@@ -1,0 +1,14 @@
+[package]
+name = "charmatch"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust char-match metric for native-dub e2e tests (no python in the test path)."
+
+[[bin]]
+name = "charmatch"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+
+[workspace]
