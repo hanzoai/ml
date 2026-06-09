@@ -854,6 +854,20 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
         }
     }
 
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &hanzo_ml::VulkanStorage,
+        l1: &Layout,
+        s2: &hanzo_ml::VulkanStorage,
+        l2: &Layout,
+        s3: &hanzo_ml::VulkanStorage,
+        l3: &Layout,
+    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
+        let out = s1.layer_norm(l1, s2, l2, s3, l3, self.eps)?;
+        Ok((out, l1.shape().clone()))
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,

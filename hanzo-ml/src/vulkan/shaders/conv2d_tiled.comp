@@ -1,0 +1,82 @@
+#version 450
+// Tiled conv2d for the common stride=1, dilation=1 case (SD VAE/UNet 3x3 convs dominate MuseTalk).
+// One workgroup computes a TILE_H x TILE_W output tile for ONE (batch, out_channel). Per input
+// channel the workgroup cooperatively stages the (TILE_H+kh-1) x (TILE_W+kw-1) input halo into
+// shared memory ONCE, so each input pixel is read from global ~1x per (out-tile, in-channel)
+// instead of kh*kw times per output pixel as the naive kernel did. Weights for the current
+// (oc, ic) are tiny (kh*kw) and stay hot in L1. This raises arithmetic intensity ~kh*kw-fold,
+// moving the dominant cost off the memory bus toward the ALU on the bandwidth-bound APU.
+// Layout matches the naive conv2d: in[b,c_in,ih,iw], w[c_out,c_in,kh,kw], out[b,c_out,oh,ow],
+// all contiguous f32. Caller dispatches grid = (ceil(ow/TILE_W), ceil(oh/TILE_H), b*c_out).
+layout(local_size_x = 16, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly  buffer In  { float inp[]; };
+layout(set = 0, binding = 1) readonly  buffer W   { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform Pc {
+    uint b_size; uint c_in; uint c_out; uint ih; uint iw; uint oh; uint ow;
+    uint kh; uint kw; uint padding; uint stride; uint dilation;
+};
+
+const uint TILE_W = 16u;
+const uint TILE_H = 8u;
+// Halo tile bound: TILE + (kmax-1). kmax kernel side supported here is 3 (SD convs are 1x1/3x3),
+// so halo is at most TILE+2. Sized generously; only (TILE_H+kh-1)*(TILE_W+kw-1) is used.
+const uint SH_W = TILE_W + 2u;
+const uint SH_H = TILE_H + 2u;
+shared float tile[SH_H * SH_W];
+
+void main() {
+    uint tile_x0 = gl_WorkGroupID.x * TILE_W;
+    uint tile_y0 = gl_WorkGroupID.y * TILE_H;
+    uint bc = gl_WorkGroupID.z;          // flattened (batch, out_channel)
+    uint oc = bc % c_out;
+    uint bb = bc / c_out;
+
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint oxw = tile_x0 + lx;
+    uint oxh = tile_y0 + ly;
+    bool in_bounds = (oxw < ow) && (oxh < oh);
+
+    // Halo dims for this (kh,kw) under stride=1,dil=1: the tile of input feeding TILE_HxTILE_W outs.
+    uint halo_w = TILE_W + kw - 1u;
+    uint halo_h = TILE_H + kh - 1u;
+    // Top-left input coord (signed; padding shifts the window left/up). stride=1 assumed.
+    int in_x0 = int(tile_x0) - int(padding);
+    int in_y0 = int(tile_y0) - int(padding);
+
+    float acc = 0.0;
+    uint wbase_oc = oc * c_in * kh * kw;
+
+    for (uint ic = 0u; ic < c_in; ic++) {
+        uint in_c = (bb * c_in + ic) * ih * iw;
+        // Cooperative halo load: the workgroup's TILE_W*TILE_H threads stride over halo_h*halo_w.
+        uint halo_n = halo_h * halo_w;
+        for (uint idx = ly * TILE_W + lx; idx < halo_n; idx += TILE_W * TILE_H) {
+            uint hy = idx / halo_w;
+            uint hx = idx % halo_w;
+            int iy = in_y0 + int(hy);
+            int ix = in_x0 + int(hx);
+            float v = 0.0;
+            if (iy >= 0 && iy < int(ih) && ix >= 0 && ix < int(iw)) {
+                v = inp[in_c + uint(iy) * iw + uint(ix)];
+            }
+            tile[hy * SH_W + hx] = v;
+        }
+        barrier();
+        if (in_bounds) {
+            uint wbase = wbase_oc + ic * kh * kw;
+            for (uint r = 0u; r < kh; r++) {
+                for (uint c = 0u; c < kw; c++) {
+                    // Output (ly,lx) consumes input (ly+r, lx+c) of the staged halo.
+                    acc += tile[(ly + r) * SH_W + (lx + c)] * w[wbase + r * kw + c];
+                }
+            }
+        }
+        barrier();
+    }
+    if (in_bounds) {
+        o[((bb * c_out + oc) * oh + oxh) * ow + oxw] = acc;
+    }
+}
