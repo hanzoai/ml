@@ -69,14 +69,17 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "copy2d" => spv!("copy2d"),
         "const_fill" => spv!("const_fill"),
         "reduce_sum" => spv!("reduce_sum"),
+        "reduce_sum_rows" => spv!("reduce_sum_rows"),
         "reduce_max" => spv!("reduce_max"),
         "strided_copy" => spv!("strided_copy"),
         "kv_append" => spv!("strided_copy"),
         "index_select" => spv!("index_select"),
         "where_cond" => spv!("where_cond"),
         "softmax_rows" => spv!("softmax_rows"),
+        "softmax_rows_sg" => spv!("softmax_rows_sg"),
         "attn_decode" => spv!("attn_decode"),
         "rms_norm" => spv!("rms_norm"),
+        "layer_norm" => spv!("layer_norm"),
         "rope" => spv!("rope"),
         "sin" => spv!("sin"),
         "cos" => spv!("cos"),
@@ -106,6 +109,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "gdn_step" => spv!("gdn_step"),
         "gdn_conv1d_step" => spv!("gdn_conv1d_step"),
         "conv2d" => spv!("conv2d"),
+        "conv2d_tiled" => spv!("conv2d_tiled"),
         "conv_transpose1d" => spv!("conv_transpose1d"),
         "conv_transpose2d" => spv!("conv_transpose2d"),
         "avg_pool2d" => spv!("avg_pool2d"),
@@ -3238,7 +3242,7 @@ impl VulkanStorage {
         Ok(Some(out))
     }
 
-    // softmax over the last dim. `self` is the input; `layout` its layout. One row per thread.
+    // softmax over the last dim. `self` is the input; `layout` its layout. One workgroup per row.
     pub fn softmax_last_dim(&self, layout: &Layout) -> Result<VulkanStorage> {
         let mut xk = None;
         let xb = self.contig_buf(layout, &mut xk)?;
@@ -3246,11 +3250,21 @@ impl VulkanStorage {
         let m = *dims.last().unwrap_or(&1);
         let nrows = layout.shape().elem_count() / m.max(1);
         let out = self.device.alloc_f32(nrows * m)?;
+        // One workgroup per row. When the device pins subgroup width (VK_EXT_subgroup_size_control,
+        // RDNA), use the subgroup variant: a single wave owns the row and reduces with subgroupMax/
+        // subgroupAdd -- no shared memory, no barriers, coalesced lane->column. The portable variant
+        // (256-thread shared tree reduce) is the fallback. The old one-thread-per-row kernel (groups_1d)
+        // serialized each 1024-wide SD-attention row on one lane (~2s of softmax/frame in the UNet).
+        let kernel = if self.device.inner.subgroup_pin > 0 {
+            "softmax_rows_sg"
+        } else {
+            "softmax_rows"
+        };
         self.device.dispatch(
-            "softmax_rows",
+            kernel,
             &[xb, out.buffer],
             &push_u32(&[nrows as u32, m as u32]),
-            Self::groups_1d(nrows),
+            (nrows as u32, 1, 1),
         )?;
         Ok(out)
     }
@@ -3278,6 +3292,38 @@ impl VulkanStorage {
         self.device.dispatch(
             "rms_norm",
             &[xb, ab, out.buffer],
+            &push,
+            (nrows as u32, 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    // LayerNorm over the last dim: y = (x-mean)/sqrt(var+eps)*alpha + beta. alpha/beta are length-m
+    // vectors. One workgroup per row (cooperative two-reduction), matching the rms_norm dispatch shape.
+    pub fn layer_norm(
+        &self,
+        layout: &Layout,
+        alpha: &VulkanStorage,
+        alpha_l: &Layout,
+        beta: &VulkanStorage,
+        beta_l: &Layout,
+        eps: f32,
+    ) -> Result<VulkanStorage> {
+        let mut xk = None;
+        let mut ak = None;
+        let mut bk = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
+        let ab = alpha.contig_buf(alpha_l, &mut ak)?;
+        let bb = beta.contig_buf(beta_l, &mut bk)?;
+        let dims = layout.dims();
+        let m = *dims.last().unwrap_or(&1);
+        let nrows = layout.shape().elem_count() / m.max(1);
+        let out = self.device.alloc_f32(nrows * m)?;
+        let mut push = push_u32(&[nrows as u32, m as u32]);
+        push.extend_from_slice(&eps.to_ne_bytes());
+        self.device.dispatch(
+            "layer_norm",
+            &[xb, ab, bb, out.buffer],
             &push,
             (nrows as u32, 1, 1),
         )?;
@@ -3607,13 +3653,28 @@ impl BackendStorage for VulkanStorage {
             self.device.alloc_f32(rows)?
         };
         let push = push_u32(&[rows as u32, cols as u32]);
-        // one invocation per row
-        self.device.dispatch(
-            kernel,
-            &[c.buffer, out.buffer],
-            &push,
-            Self::groups_1d(rows),
-        )?;
+        // Wide-row sum (GroupNorm: few rows, ~1M cols each) is starved by the one-thread-per-row
+        // kernel; route it to the cooperative one-workgroup-per-row reducer (256 lanes/row, shared
+        // tree reduce). Threshold keeps the cheap kernel for the common many-rows/short-cols case
+        // where per-row parallelism isn't the bottleneck and the extra workgroups would just add
+        // launch overhead. Only Sum has a cooperative variant; arg/min/max keep the scalar kernel.
+        const COOP_REDUCE_MIN_COLS: usize = 4096;
+        if op == ReduceOp::Sum && cols >= COOP_REDUCE_MIN_COLS {
+            self.device.dispatch(
+                "reduce_sum_rows",
+                &[c.buffer, out.buffer],
+                &push,
+                (rows as u32, 1, 1),
+            )?;
+        } else {
+            // one invocation per row
+            self.device.dispatch(
+                kernel,
+                &[c.buffer, out.buffer],
+                &push,
+                Self::groups_1d(rows),
+            )?;
+        }
         Ok(out)
     }
 
@@ -3899,12 +3960,39 @@ impl BackendStorage for VulkanStorage {
             p.stride as u32,
             p.dilation as u32,
         ]);
-        self.device.dispatch(
-            "conv2d",
-            &[inp.buffer, w.buffer, out.buffer],
-            &push,
-            Self::groups_1d(p.b_size * p.c_out * oh * ow),
-        )?;
+        // Tiled, shared-memory-staged kernel for the dominant stride=1 / dilation=1 / kernel<=3
+        // case (every SD VAE+UNet 3x3 and 1x1 conv): each input pixel is read ~once per (out-tile,
+        // in-channel) instead of k*k times, the bandwidth lever on this UMA part. Anything else
+        // (stride=2 downsamplers, dilated, k>3) keeps the naive one-thread-per-output kernel, whose
+        // result it must match bit-for-bit (same accumulation order: ic-major, then r, then c).
+        // HANZO_VK_CONV2D=naive forces the old kernel for A/B benchmarking the baseline.
+        const CONV_TILE_W: u32 = 16;
+        const CONV_TILE_H: u32 = 8;
+        let use_tiled = std::env::var("HANZO_VK_CONV2D").as_deref() != Ok("naive")
+            && p.stride == 1
+            && p.dilation == 1
+            && p.k_h <= 3
+            && p.k_w <= 3;
+        if use_tiled {
+            let groups = (
+                (ow as u32).div_ceil(CONV_TILE_W),
+                (oh as u32).div_ceil(CONV_TILE_H),
+                (p.b_size * p.c_out) as u32,
+            );
+            self.device.dispatch(
+                "conv2d_tiled",
+                &[inp.buffer, w.buffer, out.buffer],
+                &push,
+                groups,
+            )?;
+        } else {
+            self.device.dispatch(
+                "conv2d",
+                &[inp.buffer, w.buffer, out.buffer],
+                &push,
+                Self::groups_1d(p.b_size * p.c_out * oh * ow),
+            )?;
+        }
         Ok(out)
     }
 

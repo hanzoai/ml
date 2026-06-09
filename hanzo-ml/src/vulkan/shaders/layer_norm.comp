@@ -1,0 +1,53 @@
+#version 450
+// LayerNorm over the last dim: y = (x - mean) / sqrt(var + eps) * alpha + beta. var is computed the
+// NUMERICALLY-STABLE two-pass way -- mean first, then mean of (x-mean)^2 -- to match hanzo-ml's CPU
+// layer-norm bit-for-bit. The one-pass E[x^2]-E[x]^2 form catastrophically cancels in f32 when the
+// activations are large and similar (SD UNet proj_in/attn outputs), which silently distorts the whole
+// forward (cosine ~0.94 vs CPU) without ever NaN-ing. ONE WORKGROUP PER ROW: 256 threads cooperate on
+// each reduction (strided partials -> shared tree reduce). alpha/beta are length-m vectors, broadcast.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly  buffer A { float alpha[]; };
+layout(set = 0, binding = 2) readonly  buffer B { float beta[]; };
+layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Pc { uint nrows; uint m; float eps; };
+shared float red[256];
+shared float mean_sh;
+shared float inv_std_sh;
+
+float reduce_sum_shared(float v, uint tid, uint wg) {
+    red[tid] = v;
+    barrier();
+    for (uint d = wg / 2u; d > 0u; d >>= 1u) {
+        if (tid < d) { red[tid] += red[tid + d]; }
+        barrier();
+    }
+    return red[0];
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= nrows) { return; }
+    uint base = row * m;
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupSize.x;
+
+    float s = 0.0;
+    for (uint i = tid; i < m; i += wg) { s += x[base + i]; }
+    float total = reduce_sum_shared(s, tid, wg);
+    if (tid == 0u) { mean_sh = total / float(m); }
+    barrier();
+    float mean = mean_sh;
+
+    float s2 = 0.0;
+    for (uint i = tid; i < m; i += wg) { float d = x[base + i] - mean; s2 += d * d; }
+    barrier();                       // reuse red[] for the second reduction
+    float var_sum = reduce_sum_shared(s2, tid, wg);
+    if (tid == 0u) { inv_std_sh = inversesqrt(var_sum / float(m) + eps); }
+    barrier();
+    float inv_std = inv_std_sh;
+
+    for (uint i = tid; i < m; i += wg) {
+        y[base + i] = (x[base + i] - mean) * inv_std * alpha[i] + beta[i];
+    }
+}

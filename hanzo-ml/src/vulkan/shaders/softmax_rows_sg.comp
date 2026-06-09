@@ -1,0 +1,32 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Numerically-stable softmax over the last dim, ONE SUBGROUP PER ROW: a single wave (gl_SubgroupSize
+// lanes, 64 on RDNA) owns a row and reduces row-max and exp-sum with subgroupMax/subgroupAdd -- NO
+// shared memory and NO barriers, with consecutive lanes touching consecutive columns (coalesced). The
+// prior one-thread-per-row kernel serialized each 1024-wide SD-attention row on a single lane (~2 s of
+// softmax/frame); the shared-mem tree-reduce variant traded that for 16 barriers x ~41k tiny rows and
+// was no faster. Subgroup reduction removes both. local_size_x must equal the device subgroup size;
+// the dispatch uses (nrows,1,1) so workgroup == row == one subgroup. y = softmax(x).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Pc { uint nrows; uint m; };
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= nrows) { return; }
+    uint base = row * m;
+    uint lane = gl_SubgroupInvocationID;
+    uint w = gl_SubgroupSize;
+
+    float mx = -3.402823466e38;
+    for (uint i = lane; i < m; i += w) { mx = max(mx, x[base + i]); }
+    mx = subgroupMax(mx);
+
+    float ssum = 0.0;
+    for (uint i = lane; i < m; i += w) { float e = exp(x[base + i] - mx); y[base + i] = e; ssum += e; }
+    ssum = subgroupAdd(ssum);
+    float inv = 1.0 / ssum;
+
+    for (uint i = lane; i < m; i += w) { y[base + i] *= inv; }
+}

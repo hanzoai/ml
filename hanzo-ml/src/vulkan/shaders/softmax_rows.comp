@@ -1,18 +1,45 @@
 #version 450
-// Numerically-stable softmax over the last dim. One invocation per row (row = all but
-// the last dim flattened). Eliminates the GPU->CPU->GPU round-trip the fallback used.
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// Numerically-stable softmax over the last dim. ONE WORKGROUP PER ROW: the workgroup's 256 threads
+// cooperatively reduce the row max and the exp-sum (strided partials -> shared tree reduce). Portable
+// fallback for devices without pinned-subgroup-size control; on RDNA the softmax_rows_sg subgroup
+// variant (no shared mem / no barriers) is used instead. Caller dispatches grid = (nrows, 1, 1).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
 layout(set = 0, binding = 1) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform Pc { uint nrows; uint m; };
+shared float red[256];
+shared float bcast;
 void main() {
-    uint row = gl_GlobalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
     if (row >= nrows) { return; }
     uint base = row * m;
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupSize.x;
+
     float mx = -3.402823466e38;
-    for (uint i = 0u; i < m; i++) { mx = max(mx, x[base + i]); }
-    float s = 0.0;
-    for (uint i = 0u; i < m; i++) { float e = exp(x[base + i] - mx); y[base + i] = e; s += e; }
-    float inv = 1.0 / s;
-    for (uint i = 0u; i < m; i++) { y[base + i] *= inv; }
+    for (uint i = tid; i < m; i += wg) { mx = max(mx, x[base + i]); }
+    red[tid] = mx;
+    barrier();
+    for (uint s = wg / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) { red[tid] = max(red[tid], red[tid + s]); }
+        barrier();
+    }
+    if (tid == 0u) { bcast = red[0]; }
+    barrier();
+    float row_max = bcast;
+    barrier();
+
+    float ssum = 0.0;
+    for (uint i = tid; i < m; i += wg) { float e = exp(x[base + i] - row_max); y[base + i] = e; ssum += e; }
+    red[tid] = ssum;
+    barrier();
+    for (uint s = wg / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) { red[tid] += red[tid + s]; }
+        barrier();
+    }
+    if (tid == 0u) { bcast = red[0]; }
+    barrier();
+    float inv = 1.0 / bcast;
+
+    for (uint i = tid; i < m; i += wg) { y[base + i] *= inv; }
 }
