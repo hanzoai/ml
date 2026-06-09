@@ -749,6 +749,15 @@ impl QCudaStorage {
         use cudarc::driver::DevicePtr;
         Ok(self.data.inner.device_ptr(self.data.inner.stream()).0 as *const u8)
     }
+
+    pub fn device_ptr_with_guard<'a>(
+        &'a self,
+        stream: &'a cudarc::driver::CudaStream,
+    ) -> Result<(*const u8, cudarc::driver::SyncOnDrop<'a>)> {
+        use cudarc::driver::DevicePtr;
+        let (ptr, guard) = self.data.inner.device_ptr(stream);
+        Ok((ptr as *const u8, guard))
+    }
 }
 
 impl QCudaStorage {
