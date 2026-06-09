@@ -40,6 +40,7 @@ pub mod efficientvit;
 pub mod encodec;
 pub mod eva2;
 pub mod falcon;
+pub mod face_detection;
 pub mod fastvit;
 pub mod flux;
 pub mod gemma;
