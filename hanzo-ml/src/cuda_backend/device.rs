@@ -249,9 +249,31 @@ impl CudaDevice {
     }
 }
 
+// MuseTalk-style eager forwards do ~4500 stream-ordered allocs/frame; the per-frame device sync
+// otherwise lets the async mempool hand pages back to the OS and re-fault them next frame. Pinning
+// the release threshold to "never" keeps the pool resident so reuse is free. Best-effort.
+fn pin_mempool_threshold(ordinal: usize) {
+    use cudarc::driver::sys;
+    unsafe {
+        let Ok(cu_device) = cudarc::driver::result::device::get(ordinal as i32) else {
+            return;
+        };
+        let Ok(pool) = cudarc::driver::result::device::get_default_mem_pool(cu_device) else {
+            return;
+        };
+        let mut threshold: u64 = u64::MAX;
+        let _ = cudarc::driver::result::mem_pool::set_attribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &mut threshold as *mut u64 as *mut core::ffi::c_void,
+        );
+    }
+}
+
 impl CudaDevice {
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        pin_mempool_threshold(ordinal);
         let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
@@ -276,6 +298,7 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        pin_mempool_threshold(ordinal);
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
