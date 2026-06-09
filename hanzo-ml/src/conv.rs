@@ -340,6 +340,72 @@ impl Tensor {
         }
     }
 
+    /// 2D convolution with a per-output-channel bias folded into the result. On the CUDA im2col
+    /// path the bias-add is fused into the NHWC->NCHW transpose epilogue (one kernel instead of a
+    /// strided copy + a broadcast-add); every other backend/dtype falls back to conv2d + add.
+    pub fn conv2d_with_bias(
+        &self,
+        kernel: &Self,
+        bias: &Self,
+        padding: usize,
+        stride: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        #[cfg(all(feature = "cuda", not(feature = "cudnn")))]
+        {
+            let (b_size, c_in, i_h, i_w) = self.dims4()?;
+            let (c_out, c_in_k, k_h, k_w) = kernel.dims4()?;
+            let fused_ok = groups == 1
+                && self.device().is_cuda()
+                && self.is_contiguous()
+                && kernel.is_contiguous()
+                && matches!(
+                    self.dtype(),
+                    crate::DType::F16 | crate::DType::BF16 | crate::DType::F32 | crate::DType::F64
+                )
+                && self.dtype() == kernel.dtype()
+                && self.dtype() == bias.dtype()
+                && c_in == c_in_k;
+            if fused_ok {
+                let params = ParamsConv2D {
+                    b_size,
+                    i_h,
+                    i_w,
+                    k_h,
+                    k_w,
+                    c_out,
+                    c_in,
+                    padding,
+                    stride,
+                    dilation,
+                    cudnn_fwd_algo: None,
+                };
+                let (inp_s, inp_l) = self.storage_and_layout();
+                let (k_s, k_l) = kernel.storage_and_layout();
+                let (b_s, _) = bias.storage_and_layout();
+                if let (
+                    crate::Storage::Cuda(inp),
+                    crate::Storage::Cuda(ks),
+                    crate::Storage::Cuda(bs),
+                ) = (&*inp_s, &*k_s, &*b_s)
+                {
+                    let out = inp.conv2d_with_bias(&inp_l, ks, &k_l, bs, &params)?;
+                    let op = crate::op::BackpropOp::none();
+                    return Ok(crate::tensor::from_storage(
+                        crate::Storage::Cuda(out),
+                        params.out_dims(),
+                        op,
+                        false,
+                    ));
+                }
+            }
+        }
+        let out = self.conv2d(kernel, padding, stride, dilation, groups)?;
+        let c_out = bias.dims1()?;
+        out.broadcast_add(&bias.reshape((1, c_out, 1, 1))?)
+    }
+
     /// Applies a 2D transposed convolution over the input tensor.
     pub fn conv_transpose2d(
         &self,

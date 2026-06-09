@@ -1246,6 +1246,78 @@ cuda_dtype!(f64, F64);
 cuda_dtype!(float8::F8E4M3, F8E4M3);
 
 impl CudaStorage {
+    // im2col-GEMM conv2d with the bias-add fused into the NHWC->NCHW transpose epilogue: one
+    // `conv2d_bias_nchw` kernel replaces the strided ucopy + a separate broadcast-add. Only the
+    // non-cudnn im2col path; bias has c_out elements. Output is contiguous NCHW.
+    #[cfg(not(feature = "cudnn"))]
+    pub fn conv2d_with_bias(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        bias: &Self,
+        params: &crate::conv::ParamsConv2D,
+    ) -> Result<Self> {
+        use crate::backend::BackendStorage;
+        let device = self.device().clone();
+        let col = Im2Col {
+            h_k: params.k_h,
+            w_k: params.k_w,
+            stride: params.stride,
+            dilation: params.dilation,
+            padding: params.padding,
+        }
+        .map(&self.slice, &device, l)?;
+        let col = Self { slice: col, device: device.clone() };
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_h * params.k_w * params.c_in;
+        let m = h_out * w_out;
+        let col_l = Layout::contiguous((b * m, k));
+        let res = if kernel_l.is_contiguous() {
+            let kl = Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+            col.matmul(kernel, (1, b * m, n, k), &col_l, &kl)?
+        } else {
+            let mut kernel_c =
+                unsafe { self.device().alloc_uninit(kernel_l.shape(), kernel.dtype())? };
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            let kl = Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+            col.matmul(kernel, (1, b * m, n, k), &col_l, &kl)?
+        };
+        // res is NHWC-contiguous [b, h_out*w_out, n]; fuse transpose-to-NCHW + per-channel bias.
+        let numel = b * n * m;
+        let out_shape = crate::Shape::from((b, n, h_out, w_out));
+        let mut out = unsafe { device.alloc_uninit(&out_shape, res.dtype())? };
+        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        macro_rules! launch_bias {
+            ($variant:ident, $fname:literal) => {{
+                let (CudaStorageSlice::$variant(src), CudaStorageSlice::$variant(bs)) =
+                    (&res.slice, &bias.slice)
+                else {
+                    crate::bail!("conv2d_with_bias: dtype mismatch between conv output and bias")
+                };
+                let CudaStorageSlice::$variant(dst) = &mut out.slice else { unreachable!() };
+                let func = device.get_or_load_func($fname, &kernels::CONV)?;
+                let mut builder = func.builder();
+                barg!(builder, numel, n, m);
+                builder.arg(src);
+                builder.arg(bs);
+                builder.arg(dst);
+                unsafe { builder.launch(cfg) }.w()?;
+            }};
+        }
+        match res.dtype() {
+            DType::F16 => launch_bias!(F16, "conv2d_bias_nchw_f16"),
+            DType::BF16 => launch_bias!(BF16, "conv2d_bias_nchw_bf16"),
+            DType::F32 => launch_bias!(F32, "conv2d_bias_nchw_f32"),
+            DType::F64 => launch_bias!(F64, "conv2d_bias_nchw_f64"),
+            dt => crate::bail!("conv2d_with_bias unsupported dtype {dt:?}"),
+        }
+        Ok(out)
+    }
+
     pub fn wrap_cuda_slice<T: CudaDType>(slice: CudaSlice<T>, device: CudaDevice) -> CudaStorage {
         T::wrap_cuda_slice(slice, device)
     }
