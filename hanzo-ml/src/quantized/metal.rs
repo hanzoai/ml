@@ -106,6 +106,18 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+            GgmlDType::IQ4_NL => {
+                let vec: Vec<crate::quantized::BlockIQ4nl> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ4nl::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ4_XS => {
+                let vec: Vec<crate::quantized::BlockIQ4xs> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ4xs::to_float(&vec, &mut out);
+            }
+            GgmlDType::MXFP4 => {
+                let vec: Vec<crate::quantized::BlockMXFP4> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockMXFP4::to_float(&vec, &mut out);
+            }
         }
 
         let buffer = self.device.new_buffer_with_data(&out)?;
@@ -388,6 +400,11 @@ impl From<GgmlDType> for hanzo_metal_kernels::GgmlDType {
             GgmlDType::F16 => hanzo_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => hanzo_metal_kernels::GgmlDType::F32,
             GgmlDType::BF16 => hanzo_metal_kernels::GgmlDType::BF16,
+            // No native MXFP4 metal kernel; MXFP4 takes the dequantize-to-f32 path instead.
+            GgmlDType::MXFP4 => panic!("MXFP4 has no native metal quantized matmul kernel"),
+            // No native IQ4_NL/IQ4_XS metal kernel; they take the dequantize-to-f32 path instead.
+            GgmlDType::IQ4_NL => panic!("IQ4_NL has no native metal quantized matmul kernel"),
+            GgmlDType::IQ4_XS => panic!("IQ4_XS has no native metal quantized matmul kernel"),
         }
     }
 }
