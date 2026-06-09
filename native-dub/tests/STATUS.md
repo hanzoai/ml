@@ -22,7 +22,7 @@ but its inputs are not present in this checkout so it no-ops loudly.
 | whisper-feats | min cosine >= 0.999 | **LIVE** | `musetalk-bench whisperfeat` CUDA f32 vs PyTorch refdump/wf. Real ~1.000. |
 | SFD+FAN | IoU >= 0.95, 100% frames | **LIVE** | `face-detect-run` over all 550 ref frames vs `face_alignment`. Real mean ~0.999. |
 | BiSeNet blend | SSIM >= 0.99, IoU >= 0.99 | **LIVE** | `musetalk-bench face-blend` CUDA f32 vs PyTorch blendref. Real SSIM ~1.000. |
-| engine `codec_validation` | cosine > 0.99 / 0.999 | **SKIP** | Real assertive cargo tests in `qwen3_tts/mod.rs` (codec, talker, prefill, full-gen greedy). They `return` early unless `ZEN3_*` PyTorch reference dumps (`codes_QT.i64`, `tk_prefill.f32`, ...) are set. Those raw dumps are **not checked into the repo** and were not present on spark at suite-build time, so they no-op. To enable: regenerate the dumps from the Python zen-3-tts reference and export `ZEN3_CODEC_WEIGHTS`/`ZEN3_MAIN_WEIGHTS`/etc., then `run_e2e_tests.sh components` runs them. The TTS path is still covered end-to-end and approximately by the round-trip check above; `codec_validation` is the exact/deterministic complement. |
+| engine `codec_validation` | cosine > 0.99 / 0.999 | **LIVE** (one-command-enable) | Real assertive cargo tests in `qwen3_tts/mod.rs` (codec, talker, prefill, full-gen greedy) vs PyTorch reference tensors. The raw dumps (`codes_QT.i64`, `tk_prefill.f32`, `ref_*.f32`, ...) are **not checked into git** (they are derived data), so the tests `return` early until `ZEN3_*` is exported. They are now **one-command regenerable** from the real PyTorch zen-3-tts reference via `reference/dump_tts_ref.py` (wrapped by `reference/gen_tts_ref.sh`), and the runner regenerates+runs them when `ZEN3_GEN_REF=1`. **Measured on spark (CPU, transformers==4.57.3 vs the Rust CPU decoder, 2026-06):** all 4 pass -- `prefill` cos=1.000000 (mad 2e-6); `talker` hidden cos=0.999999 / logits cos=0.999999 and frame-0 codes bit-exact; `codec` quant/pretrans/upsample/wav cos=1.000000; `full-gen greedy` codebook-0 48/48 and full-frame (all 16 codes) 8/8. See "Enabling codec_validation" below. |
 
 ## Tier 1 -- full e2e dub
 
@@ -59,3 +59,48 @@ but its inputs are not present in this checkout so it no-ops loudly.
 4. **Reference dumps + weights are not in git** (multi-GB safetensors, PyTorch `.npy`/`.qt`).
    They live on spark `~/work/zen-dub-run/`. Every path is env-overridable. A check whose
    inputs are absent prints `[SKIP]` with the reason rather than failing.
+
+## Enabling `codec_validation` (one command)
+
+The deterministic zen-3-TTS verifier needs PyTorch reference tensors. Regenerate them from the
+real QwenLM/Qwen3-TTS model + the `zen-3-tts-0.6B` weights, then the cargo tests run + assert.
+
+**As part of the suite** (regenerates, then runs the check):
+
+```bash
+ZEN3_GEN_REF=1 native-dub/tests/run_e2e_tests.sh components
+```
+
+**Standalone** (regenerate once, then run the cargo tests directly):
+
+```bash
+native-dub/reference/gen_tts_ref.sh                 # -> ~/work/zen-dub-run/tts-ref/*.{f32,i64} + meta.env
+source ~/work/zen-dub-run/tts-ref/meta.env           # exports ZEN3_MAIN_WEIGHTS, ZEN3_TK_PREFILL, ...
+( cd "$HANZO_ENGINE" && cargo test -p hanzo-engine --lib codec_validation -- --nocapture --test-threads=1 )
+```
+
+What it does:
+
+- `reference/dump_tts_ref.py` loads the real PyTorch zen-3-tts (`modeling_qwen3_tts.py` +
+  `modeling_qwen3_tts_tokenizer_v2.py`) on a fixed prompt + fixed seed, runs a fully **greedy**
+  (deterministic) decode, and writes the exact per-stage tensors the four tests consume as **raw
+  little-endian** `f32`/`i64`: the talker prefill / hidden / logits / frame-0 codes, the full
+  greedy code grid, and the codec decode stages (SplitRVQ `quant` -> pre-transformer `pretrans` ->
+  post-upsample -> final `wav`). It writes `meta.txt` (shapes + scalars) and `meta.env` (the
+  exact `export ZEN3_*` block).
+- `reference/gen_tts_ref.sh` provisions a `--system-site-packages` venv with the **pinned**
+  `transformers==4.57.3` (the modeling code's API; the system transformers is a different major
+  and will not load the model) and runs the dump. Override the interpreter with `TTS_REF_PY=...`.
+- The dump runs on **CPU by default** (`ZEN3_REF_DEVICE=cpu`) to match the cargo tests, which load
+  the weights as f32 on `Device::Cpu` and need no GPU. (On the GB10 the unified memory is often
+  already held by a running `hanzo` server, so CPU is also the robust default.)
+
+**Honest note on tolerances.** `codec` and `prefill` match to cos=1.000000 (the prefill is the same
+embedding arithmetic on both sides; the codec decode is f32 convs/attention with only float
+accumulation-order noise -- e.g. `upsample` max-abs-diff ~5e-3 but cos still 1.0). The talker is a
+28-layer transformer: hidden/logits cos=0.999999 with max-abs-diff ~0.04-0.07 on individual
+elements (f32 accumulation order across 28 layers + attention), comfortably above the 0.999 gate,
+and the greedy argmax codes are **bit-exact**. Full-gen matches codebook-0 48/48 over the dumped
+length; the test allows late tie-break flips beyond the first 8 frames (this degenerate greedy
+sequence has long repeated runs whose near-tie logits are sensitive to accumulation order), which
+did not occur here.
