@@ -1,0 +1,27 @@
+#version 450
+// Row-wise sum reduction, ONE WORKGROUP PER ROW: the workgroup's 256 threads cooperatively reduce
+// the row (strided partial sums -> shared tree reduce). For the GroupNorm reduction in SD VAE/UNet a
+// "row" is a whole group (e.g. 1,048,576 elems at 256x256x512/32groups) and there are only ~32 rows,
+// so the one-thread-per-row reduce_sum kernel ran 32 lanes on a 2560-lane GPU with a 1M serial loop.
+// This spreads each row across 256 lanes. out[row] = sum_c in[row*cols + c]; output length = rows.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly  buffer In  { float inp[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform Pc { uint rows; uint cols; };
+shared float red[256];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= rows) { return; }
+    uint base = row * cols;
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupSize.x;
+    float acc = 0.0;
+    for (uint c = tid; c < cols; c += wg) { acc += inp[base + c]; }
+    red[tid] = acc;
+    barrier();
+    for (uint s = wg / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) { red[tid] += red[tid + s]; }
+        barrier();
+    }
+    if (tid == 0u) { o[row] = red[0]; }
+}
