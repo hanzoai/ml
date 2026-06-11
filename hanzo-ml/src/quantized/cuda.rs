@@ -628,6 +628,39 @@ impl QCudaStorage {
             GgmlDType::IQ4_NL => deq::<crate::quantized::BlockIQ4nl>(&buffer, block_len, &mut out),
             GgmlDType::IQ4_XS => deq::<crate::quantized::BlockIQ4xs>(&buffer, block_len, &mut out),
             GgmlDType::MXFP4 => deq::<crate::quantized::BlockMXFP4>(&buffer, block_len, &mut out),
+            GgmlDType::IQ2_XXS => {
+                deq::<crate::quantized::iq_quants::BlockIQ2xxs>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ2_XS => {
+                deq::<crate::quantized::iq_quants::BlockIQ2xs>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ3_XXS => {
+                deq::<crate::quantized::iq_quants::BlockIQ3xxs>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ1_S => {
+                deq::<crate::quantized::iq_quants::BlockIQ1s>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ3_S => {
+                deq::<crate::quantized::iq_quants::BlockIQ3s>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ2_S => {
+                deq::<crate::quantized::iq_quants::BlockIQ2s>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ1_M => {
+                deq::<crate::quantized::iq_quants::BlockIQ1m>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::TQ1_0 => {
+                deq::<crate::quantized::iq_quants::BlockTQ1_0>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::TQ2_0 => {
+                deq::<crate::quantized::iq_quants::BlockTQ2_0>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::NVFP4 => {
+                deq::<crate::quantized::iq_quants::BlockNVFP4>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::Q1_0 => {
+                deq::<crate::quantized::iq_quants::BlockQ1_0>(&buffer, block_len, &mut out)
+            }
         }
 
         self.device

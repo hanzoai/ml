@@ -1366,6 +1366,153 @@ impl RocmStorage {
         }
     }
 
+    /// Positions-aware fused rotary embedding for q and k, computing per-token cache rows
+    /// IN-KERNEL from a device `positions` tensor (u32, length == batch). Matches the engine
+    /// CPU reference `apply_rotary_cpu_inner`: cache_row = positions[batch_idx] + seq_idx,
+    /// neox pairs (i, i+d/2), gpt-j pairs (2i, 2i+1). `cos`/`sin` are the full [max_pos, d/2]
+    /// cache tables. `self`=q and `k` are `[b, h, t, d]` / `[b, kh, t, d]` contiguous; no host
+    /// round-trip. Returns (q_out, k_out). Supports F32/F16/BF16 (q/k/cos/sin same dtype).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_positions(
+        &self,
+        q_layout: &Layout,
+        k: &RocmStorage,
+        k_layout: &Layout,
+        cos: &RocmStorage,
+        cos_layout: &Layout,
+        sin: &RocmStorage,
+        sin_layout: &Layout,
+        positions: &RocmStorage,
+        positions_layout: &Layout,
+        is_neox: bool,
+    ) -> Result<(Self, Self)> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, RopeKernel};
+        let q = self;
+        if !q_layout.is_contiguous()
+            || !k_layout.is_contiguous()
+            || !cos_layout.is_contiguous()
+            || !sin_layout.is_contiguous()
+            || !positions_layout.is_contiguous()
+        {
+            crate::bail!("rope_positions on rocm requires contiguous inputs");
+        }
+        let (b, h, t, d) = q_layout.shape().dims4()?;
+        let (kb, kh, kt, kd) = k_layout.shape().dims4()?;
+        if (kb, kt, kd) != (b, t, d) {
+            crate::bail!("rope_positions q/k shape mismatch {q_layout:?} {k_layout:?}");
+        }
+        if d % 2 != 0 {
+            crate::bail!("rope_positions on rocm requires even head dim, got {d}");
+        }
+        let pos_mem = match &positions.slice {
+            RocmStorageSlice::U32(m) => m,
+            other => crate::bail!("rope_positions positions must be u32, got {:?}", other.dtype()),
+        };
+        let device = self.device.clone();
+        let q_el = b * h * t * d;
+        let k_el = b * kh * t * d;
+        let b_u = b as u32;
+        let h_u = h as u32;
+        let kh_u = kh as u32;
+        let t_u = t as u32;
+        let d_u = d as u32;
+        let neox: u32 = if is_neox { 1 } else { 0 };
+        let max_heads = h.max(kh);
+        let total = b * max_heads * t * (d / 2);
+        let grid = rocm_rs::hip::Dim3::from((total.div_ceil(256)).max(1) as u32);
+        let block = rocm_rs::hip::Dim3::from(256u32);
+
+        let q_off = q_layout.start_offset();
+        let k_off = k_layout.start_offset();
+        let cos_off = cos_layout.start_offset();
+        let sin_off = sin_layout.start_offset();
+        let pos_off = positions_layout.start_offset();
+
+        macro_rules! launch_rope_pos {
+            ($variant:ident, $ty:ty, $func:literal) => {{
+                let q_mem = match &q.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => unreachable!(),
+                };
+                let k_mem = match &k.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => crate::bail!(
+                        "rope_positions: k dtype {:?} must match q dtype {:?}",
+                        k.slice.dtype(),
+                        q.slice.dtype()
+                    ),
+                };
+                let cos_mem = match &cos.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => crate::bail!(
+                        "rope_positions: cos dtype {:?} must match q dtype {:?}",
+                        cos.slice.dtype(),
+                        q.slice.dtype()
+                    ),
+                };
+                let sin_mem = match &sin.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => crate::bail!(
+                        "rope_positions: sin dtype {:?} must match q dtype {:?}",
+                        sin.slice.dtype(),
+                        q.slice.dtype()
+                    ),
+                };
+                let q_out = device.alloc::<$ty>(q_el)?;
+                let k_out = device.alloc::<$ty>(k_el)?;
+                let q_ptr = unsafe { q_mem.offset_ptr(q_off) };
+                let k_ptr = unsafe { k_mem.offset_ptr(k_off) };
+                let cos_ptr = unsafe { cos_mem.offset_ptr(cos_off) };
+                let sin_ptr = unsafe { sin_mem.offset_ptr(sin_off) };
+                let pos_ptr = unsafe { pos_mem.offset_ptr(pos_off) };
+                let q_out_ptr = q_out.as_ptr();
+                let k_out_ptr = k_out.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        &device,
+                        RopeKernel::NAME,
+                        RopeKernel::CODE,
+                        $func,
+                        grid,
+                        block,
+                        &mut [
+                            (&q_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&k_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&cos_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&sin_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&pos_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&q_out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&k_out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            &b_u as *const u32 as *mut std::ffi::c_void,
+                            &h_u as *const u32 as *mut std::ffi::c_void,
+                            &kh_u as *const u32 as *mut std::ffi::c_void,
+                            &t_u as *const u32 as *mut std::ffi::c_void,
+                            &d_u as *const u32 as *mut std::ffi::c_void,
+                            &neox as *const u32 as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+                Ok((
+                    Self {
+                        slice: RocmStorageSlice::$variant(q_out),
+                        device: device.clone(),
+                    },
+                    Self {
+                        slice: RocmStorageSlice::$variant(k_out),
+                        device: device.clone(),
+                    },
+                ))
+            }};
+        }
+
+        match &q.slice {
+            RocmStorageSlice::F32(_) => launch_rope_pos!(F32, f32, "rope_positions_f32"),
+            RocmStorageSlice::F16(_) => launch_rope_pos!(F16, f16, "rope_positions_f16"),
+            RocmStorageSlice::BF16(_) => launch_rope_pos!(BF16, bf16, "rope_positions_bf16"),
+            other => crate::bail!("rope_positions on rocm unsupported dtype {:?}", other.dtype()),
+        }
+    }
+
     /// Fused softmax over the last dim (max-subtract-exp-sum-div, f32 accumulation), replacing the
     /// composite that ran 5 ops + 2 casts. One warp per row (32 lanes along threadIdx.y); the
     /// reduction is a warp shuffle (no shared memory). Reuses the ReduceKernel `softmax_{...}`.
