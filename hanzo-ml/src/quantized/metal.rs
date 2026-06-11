@@ -118,6 +118,13 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockMXFP4> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockMXFP4::to_float(&vec, &mut out);
             }
+            // dbc-validation: dequant-to-float not wired for these newer IQ/ternary/FP4
+            // codecs on the Metal readback path (GAP in source). Bail honestly rather
+            // than silently mis-decode. Q8_0/Q4_K (the validated models) have arms above.
+            other => crate::bail!(
+                "dequantize-to-float on Metal not implemented for {:?}",
+                other
+            ),
         }
 
         let buffer = self.device.new_buffer_with_data(&out)?;
@@ -429,6 +436,7 @@ impl QMetalStorage {
             )
             .map_err(MetalError::from)?;
         }
+        drop(encoder); // dbc-validation: release CommandsGuard borrow of `device` before move
         Ok(MetalStorage::new(dst, device, m * n, DType::F32))
     }
 
