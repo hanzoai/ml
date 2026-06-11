@@ -132,7 +132,7 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(feature = "rocm")]
-pub use rocm_backend::{RocmDevice, RocmError, RocmStorage};
+pub use rocm_backend::{RocmDevice, RocmError, RocmQuantType, RocmStorage};
 
 #[cfg(feature = "vulkan")]
 pub use vulkan_backend as vulkan;
