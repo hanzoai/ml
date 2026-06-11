@@ -2,13 +2,14 @@ use crate::backend::BackendDevice;
 use crate::{CpuStorage, DType, Layout, Result, Shape};
 use half::{bf16, f16};
 use hanzo_rocm_kernels::compile::KernelCache;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::wrappers::{
-    DevicePool, SendSyncDeviceMemory, SendSyncMIOpenHandle, SendSyncPseudoRng,
+    DevicePool, SendSyncDeviceMemory, SendSyncPseudoRng,
     SendSyncRocblasHandle, SendSyncStream,
 };
+#[cfg(feature = "rocm-miopen")]
+use super::wrappers::SendSyncMIOpenHandle;
 use super::{Affine, RocmError, RocmStorage, RocmStorageSlice};
 use rocm_rs::hip::Device as HipDevice;
 
@@ -28,9 +29,10 @@ pub struct RocmDevice {
     id: DeviceId,
     device: Arc<HipDevice>,
     pub(crate) stream: Arc<SendSyncStream>,
-    rocrand: Arc<Mutex<SendSyncPseudoRng>>,
+    rocrand: Arc<Mutex<Option<SendSyncPseudoRng>>>,
     seed_value: Arc<RwLock<u64>>,
     pub(crate) blas: Arc<SendSyncRocblasHandle>,
+    #[cfg(feature = "rocm-miopen")]
     pub(crate) miopen: Arc<SendSyncMIOpenHandle>,
     kernel_manager: Arc<Mutex<KernelCache>>,
     /// Caching allocator pool (avoids the synchronizing per-op hipMalloc).
@@ -49,17 +51,16 @@ impl RocmDevice {
         device.set_current()?;
         let stream = device.get_stream()?;
 
-        let mut rocrand = SendSyncPseudoRng::new(rocm_rs::rocrand::rng_type::PSEUDO_DEFAULT)
-            .map_err(|e| crate::Error::Msg(format!("Failed to create rocrand generator: {}", e)))?;
+        // rocrand's generator destructor SIGSEGVs under WSL (rocRAND poisson manager teardown).
+        // Inference samples on the host, so create the generator lazily and only if a device RNG
+        // op actually runs; left unused it stays None and never hits the broken destructor.
         let seed = 299792458u64;
-        rocrand
-            .set_seed(seed)
-            .map_err(|e| crate::Error::Msg(format!("Failed to set rocrand seed: {}", e)))?;
 
         let blas = SendSyncRocblasHandle::new().map_err(|e| RocmError::Rocblas(e.to_string()))?;
         blas.set_stream(&stream)
             .map_err(|e| RocmError::Rocblas(e.to_string()))?;
 
+        #[cfg(feature = "rocm-miopen")]
         let miopen =
             SendSyncMIOpenHandle::new(&stream).map_err(|e| RocmError::MIOpen(e.to_string()))?;
 
@@ -68,17 +69,42 @@ impl RocmDevice {
                 crate::Error::Msg(format!("Failed to create kernel cache: {}", e))
             })?));
 
+        // rocBLAS (and MIOpen) handle destructors SIGSEGV under WSL at process teardown. They are
+        // process-lifetime handles, so leak one Arc ref to skip the broken destructor; the OS
+        // reclaims the device on exit anyway.
+        let blas = Arc::new(blas);
+        std::mem::forget(blas.clone());
+        #[cfg(feature = "rocm-miopen")]
+        let miopen = {
+            let miopen = Arc::new(miopen);
+            std::mem::forget(miopen.clone());
+            miopen
+        };
+
         Ok(Self {
             id: DeviceId::new(),
             device: Arc::new(device),
             stream: Arc::new(SendSyncStream(stream)),
-            rocrand: Arc::new(Mutex::new(rocrand)),
+            rocrand: Arc::new(Mutex::new(None)),
             seed_value: Arc::new(RwLock::new(seed)),
-            blas: Arc::new(blas),
-            miopen: Arc::new(miopen),
+            blas,
+            #[cfg(feature = "rocm-miopen")]
+            miopen,
             kernel_manager,
-            pool: Arc::new(Mutex::new(HashMap::new())),
+            pool: Arc::new(Mutex::new(super::wrappers::PoolInner::default())),
         })
+    }
+
+    fn lock_rng(&self) -> Result<std::sync::MutexGuard<'_, Option<SendSyncPseudoRng>>> {
+        let mut guard = self.rocrand.lock().unwrap();
+        if guard.is_none() {
+            let mut rng = SendSyncPseudoRng::new(rocm_rs::rocrand::rng_type::PSEUDO_DEFAULT)
+                .map_err(|e| crate::Error::Msg(format!("Failed to create rocrand generator: {}", e)))?;
+            rng.set_seed(*self.seed_value.read().unwrap())
+                .map_err(|e| crate::Error::Msg(format!("Failed to set rocrand seed: {}", e)))?;
+            *guard = Some(rng);
+        }
+        Ok(guard)
     }
 
     pub fn id(&self) -> DeviceId {
@@ -93,7 +119,11 @@ impl RocmDevice {
     pub fn alloc_zeros<T: Default + Clone>(&self, len: usize) -> Result<SendSyncDeviceMemory<T>> {
         let mut mem = SendSyncDeviceMemory::new_pooled(len, Some(self.pool.clone()))
             .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))?;
-        mem.memset(0)
+        // Capture-safe: enqueue the zero-fill asynchronously on the device's single
+        // stream. The synchronizing `hipMemset` trips hipGraph capture (HIP 906);
+        // `hipMemsetAsync` is recordable, and single-stream ordering keeps the math
+        // identical to the prior blocking version.
+        mem.memset_async(0, self.stream.0.as_raw())
             .map_err(|e| crate::Error::Msg(format!("Failed to memset: {}", e)))?;
         Ok(mem)
     }
@@ -121,10 +151,30 @@ impl RocmDevice {
             .map_err(|e| crate::Error::Msg(format!("Synchronize failed: {}", e)))
     }
 
+    /// Open a hipGraph-capture reservation scope on the caching pool. Buffers
+    /// allocated while the scope is open are reserved (never recycled) on Drop so
+    /// the captured graph's device pointers can never be handed to a later
+    /// allocation — preventing the stale-replay corruption. Must be paired with
+    /// [`Self::end_graph_capture_scope`]. See `wrappers::PoolInner`.
+    pub fn begin_graph_capture_scope(&self) {
+        if let Ok(mut inner) = self.pool.lock() {
+            inner.begin_capture();
+        }
+    }
+
+    /// Close a hipGraph-capture reservation scope opened by
+    /// [`Self::begin_graph_capture_scope`].
+    pub fn end_graph_capture_scope(&self) {
+        if let Ok(mut inner) = self.pool.lock() {
+            inner.end_capture();
+        }
+    }
+
     pub(crate) fn kernel_manager(&self) -> &std::sync::Mutex<KernelCache> {
         &self.kernel_manager
     }
 
+    #[cfg(feature = "rocm-miopen")]
     pub(crate) fn miopen(&self) -> &Arc<SendSyncMIOpenHandle> {
         &self.miopen
     }
@@ -346,7 +396,8 @@ impl BackendDevice for RocmDevice {
 
     fn rand_uniform(&self, shape: &Shape, dtype: DType, lo: f64, hi: f64) -> Result<Self::Storage> {
         let elem_count = shape.elem_count();
-        let mut rocrand = self.rocrand.lock().unwrap();
+        let mut guard = self.lock_rng()?;
+        let rocrand = guard.as_mut().unwrap();
         let slice = match dtype {
             DType::U8
             | DType::U32
@@ -402,7 +453,8 @@ impl BackendDevice for RocmDevice {
         std: f64,
     ) -> Result<Self::Storage> {
         let elem_count = shape.elem_count();
-        let mut rocrand = self.rocrand.lock().unwrap();
+        let mut guard = self.lock_rng()?;
+        let rocrand = guard.as_mut().unwrap();
         // rocrand can only generate an even number of normal values.
         let elem_count_round = if elem_count % 2 == 1 {
             elem_count + 1
@@ -455,10 +507,11 @@ impl BackendDevice for RocmDevice {
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
-        let mut rocrand = self.rocrand.lock().unwrap();
-        rocrand
-            .set_seed(seed)
-            .map_err(|e| crate::Error::Msg(format!("Failed to set rocrand seed: {}", e)))?;
+        if let Some(rocrand) = self.rocrand.lock().unwrap().as_mut() {
+            rocrand
+                .set_seed(seed)
+                .map_err(|e| crate::Error::Msg(format!("Failed to set rocrand seed: {}", e)))?;
+        }
         *self.seed_value.write().unwrap() = seed;
         Ok(())
     }
