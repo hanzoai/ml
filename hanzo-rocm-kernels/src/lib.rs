@@ -9,7 +9,7 @@ pub use compile::KernelCache;
 pub use error::KernelError;
 pub use kernel::{
     AffineKernel, BinaryKernel, BinaryOp, CastKernel, DType, FillKernel, IndexingKernel,
-    KernelSource, ReduceKernel, UnaryKernel, UnaryOp,
+    KernelSource, ReduceKernel, RopeKernel, UnaryKernel, UnaryOp,
 };
 pub use ops::OpLauncher;
 pub use utils::BufferOffset;
