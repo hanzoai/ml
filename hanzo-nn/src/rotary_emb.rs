@@ -384,6 +384,19 @@ impl hanzo_ml::CustomOp3 for RotaryEmb {
         let out = s1.rope(l1, s2, l2, s3, l3)?;
         Ok((out, l1.shape().clone()))
     }
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        s1: &hanzo_ml::RocmStorage,
+        l1: &Layout,
+        s2: &hanzo_ml::RocmStorage,
+        l2: &Layout,
+        s3: &hanzo_ml::RocmStorage,
+        l3: &Layout,
+    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
+        let out = s1.rope(l1, s2, l2, s3, l3)?;
+        Ok((out, l1.shape().clone()))
+    }
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
@@ -550,8 +563,19 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         hanzo_ml::bail!("sin has to be contiguous in rope")
     }
+    // The fused rocm rope kernel handles contiguous F16/F32/BF16 with an even head dim; fall back
+    // to the unfused composite (rope_slow) for anything else so we never feed it a bad shape/dtype.
     if xs.device().is_rocm() {
-        return rope_slow(xs, cos, sin);
+        let n_embd = xs.dim(D::Minus1)?;
+        let supported = matches!(
+            xs.dtype(),
+            hanzo_ml::DType::F16 | hanzo_ml::DType::F32 | hanzo_ml::DType::BF16
+        ) && cos.dtype() == xs.dtype()
+            && sin.dtype() == xs.dtype()
+            && n_embd % 2 == 0;
+        if !supported {
+            return rope_slow(xs, cos, sin);
+        }
     }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
 }
