@@ -80,6 +80,20 @@ impl KernelSource for SortKernel {
     const CODE: &'static str = include_str!("kernels/sort.hip");
 }
 
+/// Native quantized matvec kernels (Q8_0, decode path)
+pub struct QuantKernel;
+impl KernelSource for QuantKernel {
+    const NAME: &'static str = "quant";
+    const CODE: &'static str = include_str!("kernels/quant.hip");
+}
+
+/// Native positions-aware rotary embedding (neox and gpt-j) kernel source
+pub struct RopeKernel;
+impl KernelSource for RopeKernel {
+    const NAME: &'static str = "rope";
+    const CODE: &'static str = include_str!("kernels/rope.hip");
+}
+
 /// Binary operation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {

@@ -5,10 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use rocm_rs::hip::error::Error as HipError;
 use rocm_rs::hip::{bindings, DeviceMemory, Stream};
+#[cfg(feature = "rocm-miopen")]
 use rocm_rs::miopen::Handle;
 use rocm_rs::rocrand::PseudoRng;
 
-/// Caching device-memory pool: byte-size -> free device pointers (as usize).
+/// Caching device-memory pool: byte-size -> free device pointers (as usize),
+/// plus a hipGraph-capture reservation depth.
 ///
 /// Reusing freed buffers avoids per-op `hipMalloc`, which is a *synchronizing*
 /// call on HIP — it blocks the CPU until all pending GPU work completes. Without
@@ -16,7 +18,47 @@ use rocm_rs::rocrand::PseudoRng;
 /// stream, so the GPU sits ~95% idle waiting on the CPU: the WSL-bridge ~1 tok/s
 /// killer. This mirrors hanzo-ml-cuda's caching allocator. Buffers are returned to
 /// the pool on Drop instead of being freed.
-pub type DevicePool = Arc<Mutex<HashMap<usize, Vec<usize>>>>;
+///
+/// # hipGraph capture reservation (`capture_depth`)
+///
+/// A captured decode forward bakes the *device pointer* of every output buffer
+/// into the graph's kernel nodes. After capture those buffers are normally
+/// dropped back into the freelist and handed out to later eager allocations —
+/// but the graph still writes to / reads from those exact pointers on every
+/// replay. That aliases the graph's captured storage with unrelated live
+/// tensors, so each replay clobbers (and recomputes against) corrupted scratch
+/// and the logits never advance: the fluent-but-stale single-token loop.
+///
+/// CUDA dodges this because its caching allocator is graph-capture aware and
+/// keeps captured buffers reserved. The ROCm plain-`hipMalloc` pool was not.
+/// While `capture_depth > 0`, every buffer allocated from the pool is *leaked*
+/// out of the pool on Drop (its pointer is recorded in `reserved`, neither freed
+/// nor recycled) so no later allocation can ever reuse a pointer the in-flight
+/// graph captured. The reservation is permanent for the process — acceptable
+/// because the decode graph cache is bounded and each bucket's working set is
+/// captured exactly once.
+pub struct PoolInner {
+    /// byte-size -> free device pointers (as usize).
+    free: HashMap<usize, Vec<usize>>,
+    /// Number of nested in-flight hipGraph captures. While > 0, buffers
+    /// allocated from this pool are reserved (leaked) on Drop instead of
+    /// recycled, so a captured graph's pointers are never reused.
+    capture_depth: usize,
+    /// Device pointers reserved by captures (kept out of the freelist forever).
+    reserved: Vec<usize>,
+}
+
+impl Default for PoolInner {
+    fn default() -> Self {
+        Self {
+            free: HashMap::new(),
+            capture_depth: 0,
+            reserved: Vec::new(),
+        }
+    }
+}
+
+pub type DevicePool = Arc<Mutex<PoolInner>>;
 
 const MAX_POOLED_PER_SIZE: usize = 64;
 
@@ -25,6 +67,10 @@ pub struct SendSyncDeviceMemory<T> {
     ptr: *mut std::ffi::c_void,
     size: usize, // bytes
     pool: Option<DevicePool>,
+    /// True when this buffer was allocated while a hipGraph capture was in
+    /// flight: on Drop it is reserved (leaked) rather than recycled so the
+    /// captured graph's pointer is never handed to another tensor.
+    capture_reserved: bool,
     phantom: PhantomData<T>,
 }
 
@@ -45,17 +91,23 @@ impl<T> SendSyncDeviceMemory<T> {
                 ptr: std::ptr::null_mut(),
                 size: 0,
                 pool,
+                capture_reserved: false,
                 phantom: PhantomData,
             });
         }
+        // Whether a hipGraph capture is in flight. Read under the same lock we use
+        // to pop a free buffer so the decision is consistent with the pool state.
+        let mut capture_reserved = false;
         if let Some(p) = &pool {
-            if let Ok(mut map) = p.lock() {
-                if let Some(v) = map.get_mut(&size) {
+            if let Ok(mut inner) = p.lock() {
+                capture_reserved = inner.capture_depth > 0;
+                if let Some(v) = inner.free.get_mut(&size) {
                     if let Some(raw) = v.pop() {
                         return Ok(Self {
                             ptr: raw as *mut std::ffi::c_void,
                             size,
                             pool: pool.clone(),
+                            capture_reserved,
                             phantom: PhantomData,
                         });
                     }
@@ -71,6 +123,7 @@ impl<T> SendSyncDeviceMemory<T> {
             ptr,
             size,
             pool,
+            capture_reserved,
             phantom: PhantomData,
         })
     }
@@ -86,6 +139,7 @@ impl<T> SendSyncDeviceMemory<T> {
             ptr,
             size,
             pool: None,
+            capture_reserved: false,
             phantom: PhantomData,
         }
     }
@@ -183,6 +237,26 @@ impl<T> SendSyncDeviceMemory<T> {
         }
         Ok(())
     }
+
+    /// Capture-safe memset: enqueues `hipMemsetAsync` on `stream` instead of the
+    /// synchronizing `hipMemset`. The destination is device memory, so this op is
+    /// fully recordable inside a hipGraph capture (no host-side sync). `stream` is
+    /// the raw `hipStream_t` from `device.stream().as_raw()`. Ordering on the
+    /// backend's single stream preserves correctness.
+    pub fn memset_async(
+        &mut self,
+        value: i32,
+        stream: bindings::hipStream_t,
+    ) -> Result<(), HipError> {
+        if self.ptr.is_null() {
+            return Ok(());
+        }
+        let err = unsafe { bindings::hipMemsetAsync(self.ptr, value, self.size, stream) };
+        if err != bindings::hipError_t_hipSuccess {
+            return Err(HipError::new(err));
+        }
+        Ok(())
+    }
 }
 
 impl<T> Drop for SendSyncDeviceMemory<T> {
@@ -191,8 +265,16 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
             return;
         }
         if let Some(p) = &self.pool {
-            if let Ok(mut map) = p.lock() {
-                let v = map.entry(self.size).or_default();
+            if let Ok(mut inner) = p.lock() {
+                if self.capture_reserved {
+                    // This pointer was baked into an in-flight hipGraph capture.
+                    // Reserve it permanently (never freed, never recycled) so no
+                    // later allocation can alias the graph's captured storage and
+                    // corrupt a replay. See [`PoolInner`].
+                    inner.reserved.push(self.ptr as usize);
+                    return;
+                }
+                let v = inner.free.entry(self.size).or_default();
                 if v.len() < MAX_POOLED_PER_SIZE {
                     v.push(self.ptr as usize);
                     return;
@@ -202,6 +284,20 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
         unsafe {
             let _ = bindings::hipFree(self.ptr);
         }
+    }
+}
+
+impl PoolInner {
+    /// Enter a hipGraph capture scope: every buffer allocated from this pool
+    /// while the scope is open is reserved (leaked) on Drop instead of being
+    /// recycled, so the captured graph's device pointers are never reused.
+    pub fn begin_capture(&mut self) {
+        self.capture_depth += 1;
+    }
+
+    /// Leave a hipGraph capture scope.
+    pub fn end_capture(&mut self) {
+        self.capture_depth = self.capture_depth.saturating_sub(1);
     }
 }
 
@@ -259,11 +355,15 @@ impl DerefMut for SendSyncPseudoRng {
     }
 }
 
+#[cfg(feature = "rocm-miopen")]
 pub struct SendSyncMIOpenHandle(pub Handle);
 
+#[cfg(feature = "rocm-miopen")]
 unsafe impl Send for SendSyncMIOpenHandle {}
+#[cfg(feature = "rocm-miopen")]
 unsafe impl Sync for SendSyncMIOpenHandle {}
 
+#[cfg(feature = "rocm-miopen")]
 impl SendSyncMIOpenHandle {
     pub fn new(stream: &Stream) -> Result<Self, rocm_rs::miopen::error::Error> {
         let handle = Handle::with_stream(stream)?;
@@ -271,6 +371,7 @@ impl SendSyncMIOpenHandle {
     }
 }
 
+#[cfg(feature = "rocm-miopen")]
 impl Deref for SendSyncMIOpenHandle {
     type Target = Handle;
     fn deref(&self) -> &Self::Target {
