@@ -136,6 +136,10 @@ BINARY_OP(uint8_t, bmaximum_u8, (x > y ? x : y))
 BINARY_OP(uint32_t, bmaximum_u32, (x > y ? x : y))
 BINARY_OP(int64_t, bmaximum_i64, (x > y ? x : y))
 
+// Fused SwiGLU: out = silu(x) * y = (x / (1 + exp(-x))) * y. One launch instead of silu + mul.
+BINARY_OP(float, silu_mul_f32, ((x / (1.0f + expf(-x))) * y))
+BINARY_OP(double, silu_mul_f64, ((x / (1.0 + exp(-x))) * y))
+
 // 16-bit float variants. hip_bfloat16/__half lack reliable arithmetic
 // operators, so load+compute in float and cast the result back.
 #if defined(__HIPCC__)
@@ -219,4 +223,8 @@ BINARY_OP_F(hip_bfloat16, bmul_bf16, x * y)
 BINARY_OP_F(hip_bfloat16, bsub_bf16, x - y)
 BINARY_OP_F(hip_bfloat16, bminimum_bf16, (x < y ? x : y))
 BINARY_OP_F(hip_bfloat16, bmaximum_bf16, (x > y ? x : y))
+
+// Fused SwiGLU (x, y already loaded as float in BINARY_OP_F; silu accum in f32).
+BINARY_OP_F(__half, silu_mul_f16, ((x / (1.0f + expf(-x))) * y))
+BINARY_OP_F(hip_bfloat16, silu_mul_bf16, ((x / (1.0f + expf(-x))) * y))
 #endif

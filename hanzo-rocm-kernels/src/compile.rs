@@ -165,9 +165,15 @@ impl KernelCache {
 
 /// Detect the GPU architecture (e.g., "gfx908", "gfx90a", "gfx942")
 fn detect_gpu_arch(_device: &Device) -> Result<String, KernelError> {
-    // First try to get from environment variable (useful for testing/build machines)
-    if let Ok(arch) = std::env::var("ROCM_ARCH") {
-        return Ok(arch);
+    // First try environment variables (useful for build machines and for Windows, where
+    // rocminfo is typically absent). ROCM_GFX_ARCH matches hanzo-engine's build.rs.
+    for var in ["CANDLE_ROCM_ARCH", "ROCM_GFX_ARCH"] {
+        if let Ok(arch) = std::env::var(var) {
+            let arch = arch.trim();
+            if !arch.is_empty() {
+                return Ok(arch.to_string());
+            }
+        }
     }
 
     // Try to use rocminfo to detect the architecture
@@ -196,11 +202,11 @@ fn detect_gpu_arch(_device: &Device) -> Result<String, KernelError> {
     // Try hipcc to get default arch
     match Command::new("hipcc").args(&["--version"]).output() {
         Ok(_) => {
-            eprintln!("Warning: Could not detect GPU architecture, defaulting to gfx908");
-            Ok("gfx908".to_string())
+            eprintln!("Warning: Could not detect GPU architecture, defaulting to gfx1151 (set ROCM_GFX_ARCH to override)");
+            Ok("gfx1151".to_string())
         }
         Err(e) => Err(KernelError::Compilation(format!(
-            "hipcc not found: {}. Please install ROCm or set ROCM_ARCH environment variable",
+            "hipcc not found: {}. Please install ROCm or set CANDLE_ROCM_ARCH environment variable",
             e
         ))),
     }
@@ -209,7 +215,7 @@ fn detect_gpu_arch(_device: &Device) -> Result<String, KernelError> {
 /// Detect ROCm version
 fn detect_rocm_version() -> Result<String, KernelError> {
     // Try to get from environment variable first
-    if let Ok(version) = std::env::var("ROCM_VERSION") {
+    if let Ok(version) = std::env::var("CANDLE_ROCM_VERSION") {
         return Ok(version);
     }
 
@@ -230,7 +236,7 @@ fn detect_rocm_version() -> Result<String, KernelError> {
             Ok("6.0".to_string())
         }
         Err(e) => Err(KernelError::Compilation(format!(
-            "hipcc not found: {}. Please install ROCm or set ROCM_VERSION environment variable",
+            "hipcc not found: {}. Please install ROCm or set CANDLE_ROCM_VERSION environment variable",
             e
         ))),
     }
@@ -286,17 +292,22 @@ fn compile_kernel(
         ))
     })?;
 
-    // Step 1: Compile HIP to object file
+    // Compile HIP straight to a code-object bundle with `hipcc --genco`. This avoids the
+    // Linux-only `objcopy -j .hip_fatbin` extraction (Windows COFF objects don't yield a
+    // bundler-parseable section); --genco emits a __CLANG_OFFLOAD_BUNDLE__ that the
+    // offload-bundler below unbundles for the gfx target. `-fPIC` is omitted (the
+    // windows-msvc clang target rejects it; code is position-independent there by default).
+    let _ = &obj_file; // no longer needed (was the `-c` object output)
+    let offload_arg = format!("--offload-arch={}", arch);
+    let fatbin_str = fatbin_file.to_str().unwrap();
+    let src_str = source_file.to_str().unwrap();
+    let mut hipcc_args: Vec<&str> = vec![offload_arg.as_str(), "-O3", "--genco"];
+    if !cfg!(target_os = "windows") {
+        hipcc_args.push("-fPIC");
+    }
+    hipcc_args.extend_from_slice(&["-o", fatbin_str, src_str]);
     let output = Command::new("hipcc")
-        .args(&[
-            &format!("--offload-arch={}", arch),
-            "-O3",
-            "-fPIC",
-            "-c",
-            "-o",
-            obj_file.to_str().unwrap(),
-            source_file.to_str().unwrap(),
-        ])
+        .args(&hipcc_args)
         .output()
         .map_err(|e| {
             KernelError::Compilation(format!("Failed to execute hipcc: {}. Is hipcc in PATH?", e))
@@ -305,33 +316,7 @@ fn compile_kernel(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(KernelError::Compilation(format!(
-            "hipcc compilation failed for {}:\n{}",
-            name, stderr
-        )));
-    }
-
-    // Step 2: Extract fat binary from object
-    let extract_output = Command::new("objcopy")
-        .args(&[
-            "-O",
-            "binary",
-            "-j",
-            ".hip_fatbin",
-            obj_file.to_str().unwrap(),
-            fatbin_file.to_str().unwrap(),
-        ])
-        .output()
-        .map_err(|e| {
-            KernelError::Compilation(format!(
-                "Failed to execute objcopy: {}. Is binutils in PATH?",
-                e
-            ))
-        })?;
-
-    if !extract_output.status.success() {
-        let stderr = String::from_utf8_lossy(&extract_output.stderr);
-        return Err(KernelError::Compilation(format!(
-            "objcopy extraction failed for {}:\n{}",
+            "hipcc --genco failed for {}:\n{}",
             name, stderr
         )));
     }
@@ -389,6 +374,18 @@ fn compile_kernel(
 
 /// Find an ROCm tool using hipcc
 fn find_rocm_tool(tool_name: &str) -> Result<String, KernelError> {
+    // ROCm tools live in ROCM_PATH/bin; hipcc's --print-prog-name does not resolve all of
+    // them (especially on Windows). Prefer the explicit path, then hipcc, then PATH.
+    if let Ok(rocm) = std::env::var("ROCM_PATH") {
+        for cand in [
+            format!("{rocm}/bin/{tool_name}.exe"),
+            format!("{rocm}/bin/{tool_name}"),
+        ] {
+            if PathBuf::from(&cand).exists() {
+                return Ok(cand);
+            }
+        }
+    }
     let output = Command::new("hipcc")
         .args(&["--print-prog-name", tool_name])
         .output()
@@ -399,10 +396,8 @@ fn find_rocm_tool(tool_name: &str) -> Result<String, KernelError> {
             return Ok(path);
         }
     }
-    Err(KernelError::Compilation(format!(
-        "{} not found via hipcc. Is ROCm installed?",
-        tool_name
-    )))
+    // Last resort: rely on PATH (ROCm bin is typically on PATH).
+    Ok(tool_name.to_string())
 }
 
 /// Helper struct to clean up temporary files
