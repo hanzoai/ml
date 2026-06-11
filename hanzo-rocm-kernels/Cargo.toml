@@ -13,7 +13,7 @@ half = { version = "2.5.0", features = [
     "use-intrinsics",
     "rand_distr",
 ] }
-rocm-rs = "0.5"
+rocm-rs = { version = "0.5", default-features = false, features = ["macros"] }
 sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1.41"
