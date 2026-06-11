@@ -335,6 +335,16 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
         Ok((out, layout.shape().clone()))
     }
 
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        storage: &hanzo_ml::RocmStorage,
+        layout: &Layout,
+    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
+        let out = storage.softmax_last_dim(layout)?;
+        Ok((out, layout.shape().clone()))
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
@@ -437,8 +447,14 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
+    // The fused rocm softmax kernel handles contiguous F16/F32/BF16; fall back to the unfused
+    // composite for anything else so we never feed the kernel a shape/dtype it can't handle.
     if xs.device().is_rocm() {
-        return softmax(xs, D::Minus1);
+        let supported =
+            matches!(xs.dtype(), DType::F16 | DType::F32 | DType::BF16) && xs.is_contiguous();
+        if !supported {
+            return softmax(xs, D::Minus1);
+        }
     }
     xs.apply_op1_no_bwd(&SoftmaxLastDim)
 }
@@ -597,6 +613,18 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
         Ok((dst, l1.shape().clone()))
     }
 
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        s1: &hanzo_ml::RocmStorage,
+        l1: &Layout,
+        s2: &hanzo_ml::RocmStorage,
+        l2: &Layout,
+    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
+        let out = s1.rms_norm(l1, s2, l2, self.eps)?;
+        Ok((out, l1.shape().clone()))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
@@ -668,12 +696,32 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             alpha.shape()
         )
     }
-    // ROCm has no fused rms-norm kernel; use the unfused tensor-op path
-    // (real HIP kernels for each sub-op).
+    // The fused CustomOp2 (cpu/cuda/metal/rocm) expects alpha to live on the same device
+    // (and, for the gpu kernels, the same dtype) as xs. RmsNorm weights are frequently held
+    // on CPU / in a different dtype, which used to surface as the intermittent
+    // "device mismatch in rms-norm Cpu vs Rocm" flake. Normalize alpha up front.
+    let alpha = if alpha.device().same_device(xs.device()) {
+        alpha.clone()
+    } else {
+        alpha.to_device(xs.device())?
+    };
+    let alpha = if alpha.dtype() == xs.dtype() {
+        alpha
+    } else {
+        alpha.to_dtype(xs.dtype())?
+    };
+    // The fused rocm kernel only handles contiguous F16/F32; fall back to the unfused
+    // composite (rms_norm_slow) for anything else so we never feed the kernel a shape/dtype
+    // it can't handle.
     if xs.device().is_rocm() {
-        return rms_norm_slow(xs, alpha, eps);
+        let supported = matches!(xs.dtype(), DType::F16 | DType::F32)
+            && xs.is_contiguous()
+            && alpha.is_contiguous();
+        if !supported {
+            return rms_norm_slow(xs, &alpha, eps);
+        }
     }
-    xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
+    xs.apply_op2_no_bwd(&alpha, &RmsNorm { eps })
 }
 
 // Fused SwiGLU: silu(a) * b, elementwise (both same shape). One op instead of silu + mul.
@@ -744,6 +792,18 @@ impl hanzo_ml::CustomOp2 for SiluMul {
         let out = s1.silu_mul(l1, s2, l2)?;
         Ok((out, l1.shape().clone()))
     }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        s1: &hanzo_ml::RocmStorage,
+        l1: &Layout,
+        s2: &hanzo_ml::RocmStorage,
+        l2: &Layout,
+    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
+        let out = s1.silu_mul(l1, s2, l2)?;
+        Ok((out, l1.shape().clone()))
+    }
 }
 
 /// Fused SwiGLU: `silu(gate) * up`. Falls back to the unfused tensor ops where there's no kernel.
@@ -751,6 +811,18 @@ pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     if gate.device().is_cuda() || gate.device().is_metal() {
         // No fused kernel on these yet; compose (silu then mul).
         return silu(gate)?.mul(up);
+    }
+    // The fused rocm kernel only handles contiguous F16/F32/BF16 of identical shape; fall back to
+    // the unfused composite otherwise so we never feed it a shape/dtype it can't handle.
+    if gate.device().is_rocm() {
+        let supported = matches!(gate.dtype(), DType::F16 | DType::F32 | DType::BF16)
+            && gate.dtype() == up.dtype()
+            && gate.is_contiguous()
+            && up.is_contiguous()
+            && gate.shape() == up.shape();
+        if !supported {
+            return silu(gate)?.mul(up);
+        }
     }
     gate.apply_op2_no_bwd(up, &SiluMul)
 }

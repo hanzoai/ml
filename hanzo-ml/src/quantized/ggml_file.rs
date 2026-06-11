@@ -1,6 +1,6 @@
 //! Support for the GGML file format.
 
-use super::{k_quants, GgmlDType, QStorage};
+use super::{iq_quants, k_quants, GgmlDType, QStorage};
 use crate::{Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
@@ -131,7 +131,7 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
         #[cfg(feature = "rocm")]
-        Device::Rocm(_) => crate::bail!("quantized tensors on rocm are not supported yet"),
+        Device::Rocm(d) => QStorage::Rocm(Box::new(data.to_vec()), d.clone()),
         #[cfg(feature = "vulkan")]
         Device::Vulkan(d) => QStorage::Vulkan(Box::new(data.to_vec()), d.clone()),
         #[cfg(feature = "wgpu")]
@@ -198,6 +198,39 @@ pub fn qtensor_from_ggml(
         }
         GgmlDType::MXFP4 => {
             from_raw_data::<k_quants::BlockMXFP4>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ2_XXS => {
+            from_raw_data::<iq_quants::BlockIQ2xxs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ2_XS => {
+            from_raw_data::<iq_quants::BlockIQ2xs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ3_XXS => {
+            from_raw_data::<iq_quants::BlockIQ3xxs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ1_S => {
+            from_raw_data::<iq_quants::BlockIQ1s>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ3_S => {
+            from_raw_data::<iq_quants::BlockIQ3s>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ2_S => {
+            from_raw_data::<iq_quants::BlockIQ2s>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ1_M => {
+            from_raw_data::<iq_quants::BlockIQ1m>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::TQ1_0 => {
+            from_raw_data::<iq_quants::BlockTQ1_0>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::TQ2_0 => {
+            from_raw_data::<iq_quants::BlockTQ2_0>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::NVFP4 => {
+            from_raw_data::<iq_quants::BlockNVFP4>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q1_0 => {
+            from_raw_data::<iq_quants::BlockQ1_0>(raw_data, size_in_bytes, dims, device)
         }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
