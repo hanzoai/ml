@@ -26,7 +26,25 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
+// Opt-in switch for the modern llama-style mmq/mmvq path (int8 MMA matrix-core + stream-K) ported
+// in fast_mmq.rs / fast_mmvq.rs. Off by default until validated on NVIDIA hardware; enable with
+// CANDLE_CUDA_FAST_MMQ=1. When on, QCudaStorage::fwd tries it first and falls back to the legacy
+// on-GPU q8_1 kernels for any dtype/shape it doesn't support.
+pub(crate) fn fast_mmq_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        matches!(
+            std::env::var("CANDLE_CUDA_FAST_MMQ").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    })
+}
+
 pub const WARP_SIZE: usize = 32;
+// Output rows each indexed-MoE block computes (tile). MUST match
+// INDEXED_MOE_ROWS_PER_BLOCK in hanzo-kernels/src/quantized.cu.
+pub const INDEXED_MOE_ROWS_PER_BLOCK: usize = 4;
 pub const MMQ_X_Q4_0_AMPERE: usize = 4;
 pub const MMQ_Y_Q4_0_AMPERE: usize = 32;
 pub const NWARPS_Q4_0_AMPERE: usize = 4;
@@ -451,10 +469,17 @@ fn indexed_moe_forward_fused_q8_1_input(
         GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
         GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
         GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+        GgmlDType::Q4_0 => "indexed_moe_forward_q4_0_q8_1",
+        GgmlDType::Q4_1 => "indexed_moe_forward_q4_1_q8_1",
+        GgmlDType::Q5_0 => "indexed_moe_forward_q5_0_q8_1",
+        GgmlDType::Q5_1 => "indexed_moe_forward_q5_1_q8_1",
         _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::QUANTIZED)?;
-    let (nblocks, nwarps) = (n as u32, 4);
+    // Each block computes INDEXED_MOE_ROWS_PER_BLOCK output rows (tile), so the
+    // x-grid shrinks by that factor vs. the old 1-row-per-block launch.
+    let nblocks = ceil_div(n, INDEXED_MOE_ROWS_PER_BLOCK) as u32;
+    let nwarps = 4u32;
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (nblocks, batch as u32, topk as u32),
         block_dim: (WARP_SIZE as u32, nwarps, 1),
@@ -500,6 +525,10 @@ impl QCudaStorage {
         if matches!(
             self.dtype(),
             GgmlDType::Q8_0
+                | GgmlDType::Q4_0
+                | GgmlDType::Q4_1
+                | GgmlDType::Q5_0
+                | GgmlDType::Q5_1
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K
                 | GgmlDType::Q4K
@@ -596,6 +625,42 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
+            GgmlDType::IQ4_NL => deq::<crate::quantized::BlockIQ4nl>(&buffer, block_len, &mut out),
+            GgmlDType::IQ4_XS => deq::<crate::quantized::BlockIQ4xs>(&buffer, block_len, &mut out),
+            GgmlDType::MXFP4 => deq::<crate::quantized::BlockMXFP4>(&buffer, block_len, &mut out),
+            GgmlDType::IQ2_XXS => {
+                deq::<crate::quantized::iq_quants::BlockIQ2xxs>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ2_XS => {
+                deq::<crate::quantized::iq_quants::BlockIQ2xs>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ3_XXS => {
+                deq::<crate::quantized::iq_quants::BlockIQ3xxs>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ1_S => {
+                deq::<crate::quantized::iq_quants::BlockIQ1s>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ3_S => {
+                deq::<crate::quantized::iq_quants::BlockIQ3s>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ2_S => {
+                deq::<crate::quantized::iq_quants::BlockIQ2s>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::IQ1_M => {
+                deq::<crate::quantized::iq_quants::BlockIQ1m>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::TQ1_0 => {
+                deq::<crate::quantized::iq_quants::BlockTQ1_0>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::TQ2_0 => {
+                deq::<crate::quantized::iq_quants::BlockTQ2_0>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::NVFP4 => {
+                deq::<crate::quantized::iq_quants::BlockNVFP4>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::Q1_0 => {
+                deq::<crate::quantized::iq_quants::BlockQ1_0>(&buffer, block_len, &mut out)
+            }
         }
 
         self.device
@@ -720,16 +785,6 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
-        // Optimized MMVQ and MMQ paths (support most paths: BF16/F16/F32, batch 1-8, all quant types, reuses per-device workspace).
-        if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
-                return Ok(result);
-            }
-            if let Some(result) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
-                return Ok(result);
-            }
-        }
-
         // Fallback
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
@@ -741,6 +796,18 @@ impl QCudaStorage {
             [b, _k] => *b <= max_bm,
             _ => false,
         };
+        // Modern llama mmq/mmvq path (int8 MMA matrix-core + stream-K). Opt-in via
+        // CANDLE_CUDA_FAST_MMQ=1; try_fwd returns Ok(None) for unsupported dtype/shape, falling
+        // through to the legacy on-GPU q8_1 kernels below. Skipped under FORCE_DMMV.
+        if fast_mmq_enabled() && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+            if use_vec_kernel {
+                if let Some(out) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
+                    return Ok(out);
+                }
+            } else if let Some(out) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
+                return Ok(out);
+            }
+        }
         if use_vec_kernel {
             self.dequantize_matmul_vec(self_shape, storage, layout)
         } else {

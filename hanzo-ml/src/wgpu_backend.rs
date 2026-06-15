@@ -837,17 +837,24 @@ impl BackendDevice for WgpuDevice {
     type Storage = WgpuStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
-        // Instance restricted to Vulkan: on the GB10 box that is the NVIDIA driver (the spark target).
-        // GL is excluded so we never silently land on a software rasterizer through the GL backend.
+        // Backend selection by platform. On the GB10 box the real GPU driver is Vulkan (NVIDIA, the
+        // spark target); on Apple Silicon (macOS) there is no Vulkan ICD, the native GPU API is
+        // Metal, so target Metal there. GL is excluded either way so we never silently land on a
+        // software rasterizer through the GL backend.
+        #[cfg(target_os = "macos")]
+        const WGPU_BACKENDS: wgpu::Backends = wgpu::Backends::METAL;
+        #[cfg(not(target_os = "macos"))]
+        const WGPU_BACKENDS: wgpu::Backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
+            backends: WGPU_BACKENDS,
             ..Default::default()
         });
-        // Enumerate Vulkan adapters and pick the `ordinal`-th NON-CPU one (skip llvmpipe / software),
-        // mirroring the raw-Vulkan backend's adapter filter. The GB10 enumerates as an integrated
-        // GPU; llvmpipe enumerates as Cpu.
+        // Enumerate adapters on the selected backend and pick the `ordinal`-th NON-CPU one (skip
+        // llvmpipe / software), mirroring the raw-Vulkan backend's adapter filter. The GB10
+        // enumerates as an integrated GPU; Apple Silicon also enumerates as integrated (unified
+        // memory); llvmpipe enumerates as Cpu.
         let mut gpus: Vec<wgpu::Adapter> = Vec::new();
-        for ad in instance.enumerate_adapters(wgpu::Backends::VULKAN) {
+        for ad in instance.enumerate_adapters(WGPU_BACKENDS) {
             let info = ad.get_info();
             let is_cpu = info.device_type == wgpu::DeviceType::Cpu
                 || info.name.to_lowercase().contains("llvmpipe");
@@ -856,7 +863,7 @@ impl BackendDevice for WgpuDevice {
             }
         }
         if gpus.is_empty() {
-            return Err(Error::Msg("wgpu: no non-CPU Vulkan adapter".into()));
+            return Err(Error::Msg("wgpu: no non-CPU GPU adapter".into()));
         }
         // Prefer a discrete/integrated GPU at the requested ordinal; the GB10 is integrated.
         let adapter = if ordinal < gpus.len() {

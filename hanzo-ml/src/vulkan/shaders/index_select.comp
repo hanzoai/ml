@@ -16,6 +16,8 @@ void main() {
         uint r = gid % right;
         uint i = (gid / right) % n_ids;
         uint l = gid / (right * n_ids);
-        outp[gid] = inp[(l * dim_size + ids[i]) * right + r];
+        // Bounds-check the selected index: a stray id (corrupt/model-bug) must not read OOB in inp.
+        uint id = ids[i];
+        outp[gid] = (id < dim_size) ? inp[(l * dim_size + id) * right + r] : 0.0;
     }
 }
