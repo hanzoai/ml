@@ -13,5 +13,8 @@ void main() {
     uint inner = g % right;
     uint outer = g / (right * dim_src);
     uint id = ids[g];
-    dst[outer * (dim_dst * right) + id * right + inner] = src[g];
+    // Bounds-check the index: a stray id (corrupt/model-bug) must not write OOB in dst.
+    if (id < dim_dst) {
+        dst[outer * (dim_dst * right) + id * right + inner] = src[g];
+    }
 }

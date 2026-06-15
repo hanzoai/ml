@@ -1,0 +1,65 @@
+#version 450
+// Fused single-query (decode, seq_len==1) attention with online (flash-style) softmax.
+// One workgroup (= one subgroup of 32) per (batch, query-head); loops the KV length doing
+// q.k -> online-softmax -> weighted-v accumulation, GQA-aware. Replaces the repeat_kv + bmm(QK^T)
+// + softmax_rows + bmm(*V) + contiguous chain (~10 dispatches/layer) with ONE dispatch.
+// The dot product reduces via subgroupAdd (no shared memory, no barriers) so the per-key cost is a
+// single subgroup op instead of a log2(D) barrier tree. All tensors f32, row-major contiguous:
+//   q:[B,H,1,D]  k,v:[B,Hkv,L,D]  out:[B,H,1,D].  scale = softmax_scale (e.g. 1/sqrt(D)).
+// Each of the 32 lanes owns dims {t, t+32, t+64, t+96}; supports head_dim D in 1..=128.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) readonly  buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly  buffer K { float k[]; };
+layout(set = 0, binding = 2) readonly  buffer V { float v[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform Pc { uint B; uint H; uint Hkv; uint L; uint D; float scale; };
+
+void main() {
+    uint bh = gl_WorkGroupID.x;
+    uint b = bh / H;
+    if (b >= B) { return; }
+    uint h = bh - b * H;
+    uint kvh = h / (H / Hkv);
+    uint t = gl_LocalInvocationID.x;  // lane 0..31
+
+    uint q_base = (b * H + h) * D;
+    uint kv_base = (b * Hkv + kvh) * L * D;
+
+    uint d0 = t, d1 = t + 32u, d2 = t + 64u, d3 = t + 96u;
+    bool h0 = d0 < D, h1 = d1 < D, h2 = d2 < D, h3 = d3 < D;
+    float q0 = h0 ? q[q_base + d0] : 0.0;
+    float q1 = h1 ? q[q_base + d1] : 0.0;
+    float q2 = h2 ? q[q_base + d2] : 0.0;
+    float q3 = h3 ? q[q_base + d3] : 0.0;
+
+    float m = -1e30;  // running max
+    float l = 0.0;    // running sum of exp
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;  // weighted-v per owned dim
+
+    for (uint j = 0u; j < L; j++) {
+        uint kb = kv_base + j * D;
+        float part = q0 * (h0 ? k[kb + d0] : 0.0)
+                   + q1 * (h1 ? k[kb + d1] : 0.0)
+                   + q2 * (h2 ? k[kb + d2] : 0.0)
+                   + q3 * (h3 ? k[kb + d3] : 0.0);
+        float score = subgroupAdd(part) * scale;
+
+        float m_new = max(m, score);
+        float corr = exp(m - m_new);
+        float p = exp(score - m_new);
+        l = l * corr + p;
+        a0 = a0 * corr + p * (h0 ? v[kb + d0] : 0.0);
+        a1 = a1 * corr + p * (h1 ? v[kb + d1] : 0.0);
+        a2 = a2 * corr + p * (h2 ? v[kb + d2] : 0.0);
+        a3 = a3 * corr + p * (h3 ? v[kb + d3] : 0.0);
+        m = m_new;
+    }
+
+    float inv = 1.0 / l;
+    if (h0) { o[q_base + d0] = a0 * inv; }
+    if (h1) { o[q_base + d1] = a1 * inv; }
+    if (h2) { o[q_base + d2] = a2 * inv; }
+    if (h3) { o[q_base + d3] = a3 * inv; }
+}

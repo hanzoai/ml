@@ -12,7 +12,6 @@
 //!
 pub mod audio;
 pub mod model;
-pub mod musetalk_audio;
 pub mod quantized_model;
 
 use serde::Deserialize;

@@ -8,7 +8,7 @@ fn run_sqrt(a: &Tensor) {
     a.sqrt().unwrap();
 }
 
-fn run_binary_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
+fn run_unary_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
     let b = 1;
     let m = 1024;
     let k = 1024;

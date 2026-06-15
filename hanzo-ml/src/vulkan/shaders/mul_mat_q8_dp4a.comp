@@ -1,0 +1,66 @@
+#version 450
+// Q8_0 prefill matmul via hardware int8 dot product (the compute-bound prefill lever). Same result as
+// mul_mat_q8 -- y[m,n] = sum_k x[m,k]*W[n,k], W stored Q8_0 -- but instead of decoding each weight to
+// f32 and doing f32 MACs vs f32 activations, it uses OpSDotAccSat (4x8-packed signed dot, hardware-
+// accelerated on RDNA3.5) over int8 weights and PRE-QUANTIZED int8 activations. The activation tile is
+// quantized once (quantize_act_q8) and reused across all N columns. Per 32-block both operands are 8
+// u32 (4 int8 each); the int32 accumulator over the block is exact, then scaled by w_scale[n,b] *
+// xs[m,b] to f32. Weight layout is identical to mul_mat_q8 (1 fp16 scale + 32 int8 = 9 u32/block);
+// activations are xq (int8, 4/u32, [M,k/32,8]) + xs (f32 scale, [M,k/32]) from quantize_act_q8.
+// One invocation computes one output column n for up to MAX_M rows; the host tiles M by MAX_M and
+// passes woff (0 for a plain weight; e*nout*(k/32)*9 to select expert e of a resident MoE bank).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// glslang 14.0 lacks the GL_EXT_shader_integer_dot_product builtins, so declare OpSDotAccSat (opcode
+// 4453) directly: int32 saturating acc += dot(unpack_s8x4(a), unpack_s8x4(b)). The trailing
+// PackedVectorFormat is a literal (4x8Bit == 0). Capabilities 6018 (DotProduct) + 6019
+// (DotProductInput4x8BitPacked) and SPV_KHR_integer_dot_product are attached so the module validates.
+// The device gate (int_dot8) guarantees this is only dispatched where the feature/property are present.
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4453)
+  int sdot_accsat(int a, int b, int acc, spirv_literal int fmt);
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W  { uint  w[];  };  // Q8_0 weights, 9 u32 / 32-block
+layout(set = 0, binding = 1) readonly buffer XQ { uint  xq[]; };  // int8 acts, 4/u32, [M, k/32, 8]
+layout(set = 0, binding = 2) readonly buffer XS { float xs[]; };  // act block scales, [M, k/32]
+layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };   // output, row-major [M, nout]
+// m0: first activation row this dispatch handles; mcount: rows in this tile (1..MAX_M); nout: total
+// columns; k: contraction dim (multiple of 32). xq block stride is 8 u32, xs/y row strides are k/32
+// and nout. woff: u32 offset into w[] where this weight matrix starts (0 for a plain 2D weight).
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
+
+const uint MAX_M = 8u; // register accumulators per invocation; host tiles M by this
+const int  FMT4x8 = 0; // PackedVectorFormat4x8Bit
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 32u;
+    uint wbase = woff + n * nblocks * 9u; // u32 offset of weight row n within the selected matrix
+    float acc[MAX_M];
+    for (uint r = 0u; r < MAX_M; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint b = 0u; b < nblocks; b++) {
+        uint woffb = wbase + b * 9u;
+        float wscale = unpackHalf2x16(w[woffb]).x;
+        // dp4a accumulates over the block's 8 u32-pairs into an exact int32, per row. Worst-case
+        // magnitude is 32 * 127 * 127 = 516128, well within int32 and below the saturation threshold,
+        // so AccSat behaves identically to a plain accumulate here (sat only guards pathological inputs).
+        for (uint r = 0u; r < mcount; r++) {
+            uint xb = (m0 + r) * nblocks + b; // flat (row, block) index into xq/xs
+            uint xqbase = xb * 8u;
+            int dot = 0;
+            for (uint j = 0u; j < 8u; j++) {
+                dot = sdot_accsat(int(w[woffb + 1u + j]), int(xq[xqbase + j]), dot, FMT4x8);
+            }
+            acc[r] += wscale * xs[xb] * float(dot);
+        }
+    }
+    for (uint r = 0u; r < mcount; r++) {
+        y[(m0 + r) * nout + n] = acc[r];
+    }
+}
