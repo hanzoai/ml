@@ -33,7 +33,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.10.2"
+version = "0.11.0"
 edition = "2021"
 description = "Minimalist ML framework."
 repository = "https://github.com/hanzoai/ml"
@@ -43,23 +43,23 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 rocm-rs = "0.5"
-hanzo-rocm-kernels = { path = "./hanzo-rocm-kernels", version = "0.10.2" }
+hanzo-rocm-kernels = { path = "./hanzo-rocm-kernels", version = "0.11.0" }
 ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 chrono = "0.4"
 # Hanzo-renamed workspace dependencies (at version 0.10.x)
-hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.10.2" }
-hanzo-datasets = { path = "./hanzo-datasets", version = "0.10.2" }
-hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.10.2" }
-hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.10.2" }
-hanzo-kernels = { path = "./hanzo-kernels", version = "0.10.2" }
-hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.10.2" }
-hanzo-nn = { path = "./hanzo-nn", version = "0.10.2" }
-hanzo-onnx = { path = "./hanzo-onnx", version = "0.10.2" }
-hanzo-transformers = { path = "./hanzo-transformers", version = "0.10.2" }
-hanzo-ug = { path = "./hanzo-ug", version = "0.10.2" }
+hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.0" }
+hanzo-datasets = { path = "./hanzo-datasets", version = "0.11.0" }
+hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.11.0" }
+hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.11.0" }
+hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.0" }
+hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.0" }
+hanzo-nn = { path = "./hanzo-nn", version = "0.11.0" }
+hanzo-onnx = { path = "./hanzo-onnx", version = "0.11.0" }
+hanzo-transformers = { path = "./hanzo-transformers", version = "0.11.0" }
+hanzo-ug = { path = "./hanzo-ug", version = "0.11.0" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
 cudarc = { version = "0.19.4", features = [
