@@ -1488,6 +1488,22 @@ impl crate::Module for QMatMul {
                 n,
                 k,
             } => {
+                // Device-residency guard: multi-token attention prefill can leave the activation
+                // off-device (an upstream op leaked to host); recover instead of bailing so prefill
+                // stays correct. The leak is the bug to fix for speed; this keeps us correct meanwhile.
+                let xs_recovered = if xs.device().is_rocm() {
+                    None
+                } else {
+                    if std::env::var("HANZO_DBG_PATH").is_ok() {
+                        eprintln!(
+                            "[ROCm-RECOVER] activation off-device {:?} dims {:?}",
+                            xs.device().location(),
+                            xs.dims()
+                        );
+                    }
+                    Some(xs.to_device(&qtensor.device())?)
+                };
+                let xs = xs_recovered.as_ref().unwrap_or(xs);
                 let rows: usize = xs.elem_count() / *k;
                 #[cfg(feature = "rocm")]
                 {

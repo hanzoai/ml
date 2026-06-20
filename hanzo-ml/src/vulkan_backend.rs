@@ -637,6 +637,40 @@ impl VulkanDevice {
     /// at ~4.5 bits/elem instead of 32 -- the bandwidth lever for memory-bound decode on this APU.
     /// Decode matches the CPU `BlockQ4K::to_float` so expect ~1e-3 relative error vs CPU f32 (the
     /// quantization error is already baked into the stored blocks).
+    /// Q4_0 matvec with the activation supplied as a host f32 slice (`x.len() == k`): uploads `x`
+    /// to the GPU then dispatches [`matvec_q4_0_gpu`], reading the result back to host. Mirrors the
+    /// [`matvec_q4k`] host wrapper so the backend-parametric bench can call one method per dtype.
+    pub fn matvec_q4_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q4_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q4_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Q8_0 matvec with the activation supplied as a host f32 slice (`x.len() == k`): uploads `x`
+    /// to the GPU then dispatches [`matvec_q8_0_gpu`], reading the result back to host. Mirrors the
+    /// [`matvec_q4k`] host wrapper so the backend-parametric bench can call one method per dtype.
+    pub fn matvec_q8_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q8_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q8_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
     pub fn matvec_q4k(
         &self,
         wq: &VulkanStorage,
