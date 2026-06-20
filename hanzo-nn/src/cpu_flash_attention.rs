@@ -1,16 +1,16 @@
 //! Backward compatibility shim for CPU flash attention.
 //!
-//! **Deprecated:** Use `candle_nn::attention::{flash_attn, AttnMask}` instead.
+//! **Deprecated:** Use `hanzo_nn::attention::{flash_attn, AttnMask}` instead.
 
 use hanzo_ml::{Result, Tensor, WithDType};
 use std::iter::Sum;
 
-/// Deprecated: use `candle_nn::attention::flash_attn` with `AttnMask` instead.
+/// Deprecated: use `hanzo_nn::attention::flash_attn` with `AttnMask` instead.
 ///
 /// This shim routes through the new dispatcher which handles both B=1 and B>1.
 #[deprecated(
     since = "0.9.2",
-    note = "Use `candle_nn::attention::{flash_attn, AttnMask}` instead"
+    note = "Use `hanzo_nn::attention::{flash_attn, AttnMask}` instead"
 )]
 pub fn run_flash_attn_cpu<T>(
     q: &Tensor,
