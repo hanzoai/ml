@@ -5,7 +5,7 @@ struct TmpFile(std::path::PathBuf);
 impl TmpFile {
     fn create(base: &str) -> TmpFile {
         let filename = std::env::temp_dir().join(format!(
-            "candle-{}-{}-{:?}",
+            "hanzo-{}-{}-{:?}",
             base,
             std::process::id(),
             std::thread::current().id(),
