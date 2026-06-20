@@ -430,7 +430,7 @@ pub const CLASSES: [&str; 1000] = [
     "colobus, colobus monkey",
     "proboscis monkey, Nasalis larvatus",
     "marmoset",
-    "capuchin, ringtail, Cebus capucinus",
+    "capuchin, corona, Cebus capucinus",
     "howler monkey, howler",
     "titi, titi monkey",
     "spider monkey, Ateles geoffroyi",

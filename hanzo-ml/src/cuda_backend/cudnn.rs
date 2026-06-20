@@ -94,7 +94,7 @@ pub(crate) fn launch_conv2d<
         w: &w,
         y: &y,
     };
-    let alg = match params.cudnn_fwd_algo {
+    let mut alg = match params.cudnn_fwd_algo {
         None => conv2d.pick_algorithm()?,
         Some(HanzoAlgo::ImplicitGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
         Some(HanzoAlgo::ImplicitPrecompGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
@@ -106,7 +106,10 @@ pub(crate) fn launch_conv2d<
         Some(HanzoAlgo::WinogradNonFused) => A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED,
         Some(HanzoAlgo::Count) => A::CUDNN_CONVOLUTION_FWD_ALGO_COUNT,
     };
-    let workspace_size = conv2d.get_workspace_size(alg)?;
+    let workspace_size = match conv2d.get_workspace_size(alg) {
+        Ok(ws) => ws,
+        Err(_) => { alg = conv2d.pick_algorithm()?; conv2d.get_workspace_size(alg)? }
+    };
     let mut workspace = dev.cuda_stream().alloc_zeros::<u8>(workspace_size)?;
     unsafe {
         conv2d.launch::<CudaSlice<u8>, _, _, _>(
