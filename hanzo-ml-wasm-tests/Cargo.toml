@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-ml-wasm-tests"
-version = "0.10.2"
+version = "0.11.0"
 edition = "2021"
 description = "WASM tests for hanzo"
 keywords = ["blas", "tensor", "machine-learning"]
