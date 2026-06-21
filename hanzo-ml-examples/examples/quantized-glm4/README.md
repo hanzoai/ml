@@ -1,6 +1,6 @@
-# candle-quantized-glm4
+# hanzo-ml-quantized-glm4
 
-Candle implementation of various quantized GLM4-0414 models.
+Hanzo implementation of various quantized GLM4-0414 models.
 
 ## Running an example
 

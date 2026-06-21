@@ -1,4 +1,4 @@
-from candle import Tensor, QTensor, DType
+from hanzo-ml import Tensor, QTensor, DType
 from typing import (
     Dict,
     Tuple,
@@ -237,7 +237,7 @@ class Module:
                 Default: ``None``.
             prefix (str, optional): a prefix added to parameter and buffer
                 names to compose the keys in state_dict. Default: ``''``.
-            keep_vars (bool, optional): by default the :class:`~candle.Tensor` s
+            keep_vars (bool, optional): by default the :class:`~hanzo-ml.Tensor` s
                 returned in the state dict are detached from autograd. If it's
                 set to ``True``, detaching will not be performed.
                 Default: ``False``.
@@ -283,7 +283,7 @@ class Module:
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         r"""Saves module state to `destination` dictionary, containing a state
         of the module, but not its descendants. This is called on every
-        submodule in :meth:`~candle.nn.Module.state_dict`.
+        submodule in :meth:`~hanzo-ml.nn.Module.state_dict`.
 
         In rare cases, subclasses can achieve class-specific behavior by
         overriding this method with custom logic.
@@ -304,7 +304,7 @@ class Module:
         r"""Copies parameters and buffers from :attr:`state_dict` into
         this module and its descendants. If :attr:`strict` is ``True``, then
         the keys of :attr:`state_dict` must exactly match the keys returned
-        by this module's :meth:`~candle.nn.Module.state_dict` function.
+        by this module's :meth:`~hanzo-ml.nn.Module.state_dict` function.
 
         .. warning::
             If :attr:`assign` is ``True`` the optimizer must be created after
@@ -315,7 +315,7 @@ class Module:
                 persistent buffers.
             strict (bool, optional): whether to strictly enforce that the keys
                 in :attr:`state_dict` match the keys returned by this module's
-                :meth:`~candle.nn.Module.state_dict` function. Default: ``True``
+                :meth:`~hanzo-ml.nn.Module.state_dict` function. Default: ``True``
             assign (bool, optional): whether to assign items in the state
                 dictionary to their corresponding keys in the module instead
                 of copying them inplace into the module's current parameters and buffers.
@@ -400,7 +400,7 @@ class Module:
     ):
         r"""Copies parameters and buffers from :attr:`state_dict` into only
         this module, but not its descendants. This is called on every submodule
-        in :meth:`~candle.nn.Module.load_state_dict`. Metadata saved for this
+        in :meth:`~hanzo-ml.nn.Module.load_state_dict`. Metadata saved for this
         module in input :attr:`state_dict` is provided as :attr:`local_metadata`.
         For state dicts without metadata, :attr:`local_metadata` is empty.
         Subclasses can achieve class-specific backward compatible loading using
@@ -411,7 +411,7 @@ class Module:
 
         .. note::
             :attr:`state_dict` is not the same object as the input
-            :attr:`state_dict` to :meth:`~candle.nn.Module.load_state_dict`. So
+            :attr:`state_dict` to :meth:`~hanzo-ml.nn.Module.load_state_dict`. So
             it can be modified.
 
         Args:
@@ -430,7 +430,7 @@ class Module:
                 keys to this list
             error_msgs (list of str): error messages should be added to this
                 list, and will be reported together in
-                :meth:`~candle.nn.Module.load_state_dict`
+                :meth:`~hanzo-ml.nn.Module.load_state_dict`
         """
         persistent_buffers = {k: v for k, v in self._buffers.items() if k not in self._non_persistent_buffers_set}
         local_name_params = persistent_buffers.items()
@@ -559,7 +559,7 @@ class Module:
         if isinstance(tensor, Tensor):
             return tensor.to_dtype(dtype)
         else:
-            raise TypeError("candle.Module.to only accepts Tensor dtypes, but got desired dtype={}".format(dtype))
+            raise TypeError("hanzo-ml.Module.to only accepts Tensor dtypes, but got desired dtype={}".format(dtype))
 
     def type(self: T, dst_type: Union[DType, str]) -> T:
         r"""Casts all parameters and buffers to :attr:`dst_type`.
@@ -606,9 +606,9 @@ class Module:
             This method modifies the module in-place.
 
         Args:
-            device (:class:`candle.device`): the desired device of the parameters
+            device (:class:`hanzo-ml.device`): the desired device of the parameters
                 and buffers in this module
-            dtype (:class:`candle.dtype`): the desired floating point dtype of
+            dtype (:class:`hanzo-ml.dtype`): the desired floating point dtype of
                 the parameters and buffers in this module
 
         Returns:
@@ -644,7 +644,7 @@ class Module:
             dtype = dtype.lower()
             if dtype not in ["f32", "f16", "f64"]:
                 raise TypeError(
-                    "candle.Module.to only accepts floating point" "dtypes, but got desired dtype={}".format(dtype)
+                    "hanzo-ml.Module.to only accepts floating point" "dtypes, but got desired dtype={}".format(dtype)
                 )
 
         def convert(t):

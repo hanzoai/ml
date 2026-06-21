@@ -1,4 +1,4 @@
-# candle-z-image: Text-to-Image Generation with Flow Matching
+# hanzo-ml-z-image: Text-to-Image Generation with Flow Matching
 
 Z-Image is a ~24B parameter text-to-image generation model developed by Alibaba,
 using flow matching for high-quality image synthesis.
@@ -97,7 +97,7 @@ cargo run --features metal --example z_image -r -- \
 # Square (1:1)
 cargo run --features metal --example z_image -r -- \
     --model turbo \
-    --prompt "A cute robot holding a candle, digital art" \
+    --prompt "A cute robot holding a hanzo-ml, digital art" \
     --width 1024 --height 1024 --num-steps 8
 ```
 
