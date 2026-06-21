@@ -13,7 +13,7 @@
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
-// Matches candle's MATRIX_ROW_PADDING.
+// Matches hanzo-ml's MATRIX_ROW_PADDING.
 #define MATRIX_ROW_PADDING 512
 
 typedef uint16_t ggml_fp16_t;
@@ -910,7 +910,7 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x,
   reinterpret_cast<half &>(y[ib].ds.y) = (half)sum;
 }
 
-// Host-side launchers used by `candle-kernels/src/ffi.rs`.
+// Host-side launchers used by `hanzo-kernels/src/ffi.rs`.
 
 #define MMVQ_LAUNCHER_PLAIN(tag, dst_tag, dst_c_type)                          \
   extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_plain(                  \

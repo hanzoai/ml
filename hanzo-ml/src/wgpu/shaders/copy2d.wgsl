@@ -1,5 +1,5 @@
 // 2D strided block copy: copy `d1` rows of `d2` contiguous 4-byte words from `inp` to `outp`, with
-// independent per-row source/dest strides and base offsets (candle's copy2d: cat/slice_set, the
+// independent per-row source/dest strides and base offsets (hanzo-ml's copy2d: cat/slice_set, the
 // KV-cache append + GQA repeat_kv path). Typed u32 so it is bit-exact for BOTH f32 and u32 storage.
 // Output keeps any element this copy does not address (never zeroed) so successive writes compose.
 // WGSL port of copy2d.comp; params in a UNIFORM at binding 0.

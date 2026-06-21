@@ -1,7 +1,7 @@
-import candle
-from candle import Tensor
+import hanzo-ml
+from hanzo-ml import Tensor
 
-_UNSIGNED_DTYPES = set([str(candle.u8), str(candle.u32)])
+_UNSIGNED_DTYPES = set([str(hanzo-ml.u8), str(hanzo-ml.u32)])
 
 
 def _assert_tensor_metadata(
@@ -59,11 +59,11 @@ def assert_almost_equal(
 
     # Secure against overflow of u32 and u8 tensors
     if str(actual.dtype) in _UNSIGNED_DTYPES or str(expected.dtype) in _UNSIGNED_DTYPES:
-        actual = actual.to(candle.i64)
-        expected = expected.to(candle.i64)
+        actual = actual.to(hanzo-ml.i64)
+        expected = expected.to(hanzo-ml.i64)
 
     diff = (actual - expected).abs()
 
-    threshold = (expected.abs().to_dtype(candle.f32) * rtol + atol).to(expected)
+    threshold = (expected.abs().to_dtype(hanzo-ml.f32) * rtol + atol).to(expected)
 
     assert (diff <= threshold).sum_all().values() == actual.nelement, f"Difference between tensors was to great"

@@ -521,7 +521,7 @@ pub fn call_mlx_gemm(
     let (bm, bn, bk, wm, wn) = (tile.bm, tile.bn, tile.bk, tile.wm, tile.wn);
 
     // https://github.com/ml-explore/mlx/blob/02efb310cac667bc547d1b96f21596c221f84fe7/mlx/backend/metal/matmul.cpp#L422
-    // has_batch should be true when b > 1, matching the original candle behavior.
+    // has_batch should be true when b > 1, matching the original hanzo-ml behavior.
     let has_batch = b > 1;
 
     let constants = Some(ConstantValues::new(vec![

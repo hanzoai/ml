@@ -14,7 +14,7 @@ fn main() -> Result<()> {
         Device::Metal(m) => m,
         _ => anyhow::bail!("unexpected device"),
     };
-    metal_device.capture("/tmp/candle.gputrace")?;
+    metal_device.capture("/tmp/hanzo-ml.gputrace")?;
     // This first synchronize ensures that a new command buffer gets created after setting up the
     // capture scope.
     device.synchronize()?;

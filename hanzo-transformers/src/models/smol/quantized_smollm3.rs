@@ -329,7 +329,7 @@ impl QuantizedAttention {
             (q_proj, k_proj)
         } else {
             // Standard path: dequantize, reconstruct, requantize.
-            use candle::quantized::{GgmlDType, QTensor};
+            use hanzo_ml::quantized::{GgmlDType, QTensor};
             let q_weight_qtensor = vb.get_no_shape("attn_q.weight")?;
             let q_weight_raw = q_weight_qtensor.dequantize(&cpu)?;
             let q_weight = reconstruct_qk_weights(&q_weight_raw, num_heads)?;
@@ -407,17 +407,17 @@ impl QuantizedAttention {
             let (q_g, q_l) = q_proj_out.storage_and_layout();
             let q_flat: &[f32] = match &*q_g {
                 Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[q_l.start_offset()..],
-                _ => candle::bail!("Expected CPU storage"),
+                _ => hanzo_ml::bail!("Expected CPU storage"),
             };
             let (k_g, k_l) = k_proj_out.storage_and_layout();
             let k_flat: &[f32] = match &*k_g {
                 Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[k_l.start_offset()..],
-                _ => candle::bail!("Expected CPU storage"),
+                _ => hanzo_ml::bail!("Expected CPU storage"),
             };
             let (v_g, v_l) = v_proj_out.storage_and_layout();
             let v_flat: &[f32] = match &*v_g {
                 Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[v_l.start_offset()..],
-                _ => candle::bail!("Expected CPU storage"),
+                _ => hanzo_ml::bail!("Expected CPU storage"),
             };
 
             // 2. Copy Q and K into pre-allocated buffers for in-place RoPE (no allocation)

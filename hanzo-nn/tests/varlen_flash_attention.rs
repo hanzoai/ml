@@ -3,16 +3,16 @@
 //! Validates both fused (`flash_attn_varlen_cpu`) and unfused (`flash_attn_varlen_unfused`)
 //! implementations against a padded reference attention.
 //!
-//! Ported from <https://github.com/huggingface/candle/pull/3250>.
+//! Ported from <https://github.com/hanzoai/ml/pull/3250>.
 
-use candle::Result;
+use hanzo_ml::Result;
 use hanzo_nn::attention::flash_attn_varlen_cpu;
 use hanzo_nn::varlen_attention::flash_attn_varlen_unfused;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle::{DType, Device, IndexOp, Tensor};
+    use hanzo_ml::{DType, Device, IndexOp, Tensor};
     use rand::prelude::*;
 
     // Implementation dispatch
@@ -88,7 +88,7 @@ mod tests {
                 k.to_dtype(DType::F16)?,
                 v.to_dtype(DType::F16)?,
             )),
-            _ => candle::bail!("Unsupported precision: {:?}", precision),
+            _ => hanzo_ml::bail!("Unsupported precision: {:?}", precision),
         }
     }
 
@@ -131,7 +131,7 @@ mod tests {
             return Ok((k.clone(), v.clone()));
         }
         if !num_heads.is_multiple_of(num_kv_heads) {
-            candle::bail!(
+            hanzo_ml::bail!(
                 "Invalid GQA config: num_heads={} not divisible by num_kv_heads={}",
                 num_heads,
                 num_kv_heads
@@ -212,7 +212,7 @@ mod tests {
         let slopes = if let Some(s) = alibi_slopes {
             let v = s.to_vec1::<f32>()?;
             if v.len() != num_heads {
-                candle::bail!("alibi_slopes has len {}, expected {}", v.len(), num_heads);
+                hanzo_ml::bail!("alibi_slopes has len {}, expected {}", v.len(), num_heads);
             }
             Some(v)
         } else {
@@ -273,7 +273,7 @@ mod tests {
                                 }
                                 (None, None) => {}
                                 (None, Some(_)) => {
-                                    candle::bail!("window_right without window_left")
+                                    hanzo_ml::bail!("window_right without window_left")
                                 }
                             }
                         }

@@ -1,8 +1,8 @@
 import math
 from typing import Any
 
-import candle
-from candle import Tensor
+import hanzo-ml
+from hanzo-ml import Tensor
 from .module import Module
 
 # See https://github.com/pytorch/pytorch/blob/main/torch/nn/modules/linear.py
@@ -22,7 +22,7 @@ class Identity(Module):
     Examples::
 
         >>> m = nn.Identity(54, unused_argument1=0.1, unused_argument2=False)
-        >>> input = candle.randn(128, 20)
+        >>> input = hanzo-ml.randn(128, 20)
         >>> output = m(input)
         >>> print(output.shape)
     """
@@ -80,9 +80,9 @@ class Linear(Module):
         self.in_features = in_features
         self.out_features = out_features
         # TODO: Do actual initialization here: e.g. kaiming_uniform or xavier_uniform
-        self.weight = candle.ones((out_features, in_features), **factory_kwargs)
+        self.weight = hanzo-ml.ones((out_features, in_features), **factory_kwargs)
         if bias:
-            self.bias = candle.zeros((out_features,), **factory_kwargs)
+            self.bias = hanzo-ml.zeros((out_features,), **factory_kwargs)
         else:
             self.bias = None
 
@@ -90,7 +90,7 @@ class Linear(Module):
         dims = x.shape
         last_dim = dims[-1]
 
-        if isinstance(self.weight, candle.QTensor):
+        if isinstance(self.weight, hanzo-ml.QTensor):
             if len(dims) < 3:
                 matmul_result = self.weight.matmul_t(x).broadcast_add(self.bias)
             elif len(dims) == 3:
