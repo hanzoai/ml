@@ -599,7 +599,7 @@ impl ModelWeights {
 #[cfg(test)]
 mod tests {
     use crate::utils::build_causal_mask;
-    use candle::{Device, Result};
+    use hanzo_ml::{Device, Result};
 
     // ── Mask shape tests ──────────────────────────────────────────────────────
 

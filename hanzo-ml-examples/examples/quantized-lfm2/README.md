@@ -1,6 +1,6 @@
-# candle-quantized-lfm2
+# hanzo-ml-quantized-lfm2
 
-Candle implementation of various quantized lfm2 models.
+Hanzo implementation of various quantized lfm2 models.
 
 ## Running an example
 

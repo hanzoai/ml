@@ -1,4 +1,4 @@
-# candle-nomic-bert
+# hanzo-ml-nomic-bert
 
 [nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) is
 a text embedding model based on the NomicBert architecture. It produces 768-dimensional

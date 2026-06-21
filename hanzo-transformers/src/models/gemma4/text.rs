@@ -1,6 +1,6 @@
 //! Gemma 4 text decoder.
 //!
-//! and following the candle gemma3.rs patterns.
+//! and following the hanzo-ml gemma3.rs patterns.
 
 use std::sync::Arc;
 

@@ -860,7 +860,7 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
     Ok(())
 }
 
-/* Regression test for https://github.com/huggingface/candle/issues/3404
+/* Regression test for https://github.com/hanzoai/ml/issues/3404
 
 When C_in == H == W, NCHW and NHWC strides are numerically identical:
   NCHW [B, C, H, W] strides: [C*H*W, H*W, W, 1]

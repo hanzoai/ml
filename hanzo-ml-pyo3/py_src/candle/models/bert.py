@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from typing import Optional
-from candle.nn import Module, Embedding, LayerNorm, Linear, ModuleList
-from candle import Tensor
-import candle
-import candle.functional as F
+from hanzo-ml.nn import Module, Embedding, LayerNorm, Linear, ModuleList
+from hanzo-ml import Tensor
+import hanzo-ml
+import hanzo-ml.functional as F
 from typing import Tuple, Optional
 
 
@@ -150,7 +150,7 @@ class BertEmbeddings(Module):
         self.position_embeddings = Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = Embedding(config.type_vocab_size, config.hidden_size)
         self.LayerNorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.position_ids = candle.Tensor(list(range(config.max_position_embeddings))).reshape(
+        self.position_ids = hanzo-ml.Tensor(list(range(config.max_position_embeddings))).reshape(
             (1, config.max_position_embeddings)
         )
 
@@ -183,8 +183,8 @@ class BertPooler(Module):
 
 def masked_fill(on_false: float, mask: Tensor, on_true: float):
     shape = mask.shape
-    on_true = candle.tensor(on_true).broadcast_as(shape)
-    on_false = candle.tensor(on_false).broadcast_as(shape)
+    on_true = hanzo-ml.tensor(on_true).broadcast_as(shape)
+    on_false = hanzo-ml.tensor(on_false).broadcast_as(shape)
     return mask.where_cond(on_true, on_false)
 
 
