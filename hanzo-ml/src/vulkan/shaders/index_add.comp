@@ -1,0 +1,27 @@
+#version 450
+// index_add along `dim`: dst already holds a copy of `self`; add each src element into the row
+// selected by the 1D `ids` (ids has src_dim_sz entries). For src flat index g = (pre_i, j, inner)
+// with inner < post_dim and j < src_dim_sz, do dst[(pre_i*max_idx + ids[j])*post_dim + inner] += src[g].
+// Atomic via atomicCompSwap on a uint view of dst (Dozen/D3D12 lacks the float-atomic extension),
+// matching scatter_add_set; needed because duplicate ids would alias the same dst slab.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Dst { uint dst[]; };
+layout(set = 0, binding = 1) readonly buffer Src { float src[]; };
+layout(set = 0, binding = 2) readonly buffer Ids { uint ids[]; };
+layout(push_constant) uniform Pc { uint n; uint post_dim; uint src_dim_sz; uint max_idx; };
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= n) { return; }
+    uint inner = g % post_dim;
+    uint j = (g / post_dim) % src_dim_sz;
+    uint pre_i = g / (post_dim * src_dim_sz);
+    uint idx = (pre_i * max_idx + ids[j]) * post_dim + inner;
+    float add = src[g];
+    uint old = dst[idx];
+    uint assumed;
+    do {
+        assumed = old;
+        float nv = uintBitsToFloat(assumed) + add;
+        old = atomicCompSwap(dst[idx], assumed, floatBitsToUint(nv));
+    } while (old != assumed);
+}
