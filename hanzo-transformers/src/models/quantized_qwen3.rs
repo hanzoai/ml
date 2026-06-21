@@ -275,21 +275,21 @@ impl AttentionWeights {
                 let (q_g, q_l) = q_cont.storage_and_layout();
                 let q_data: &[f32] = match &*q_g {
                     Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[q_l.start_offset()..],
-                    _ => candle::bail!("Expected CPU storage"),
+                    _ => hanzo_ml::bail!("Expected CPU storage"),
                 };
 
                 let k_cont = k.squeeze(0)?.squeeze(1)?.contiguous()?;
                 let (k_g, k_l) = k_cont.storage_and_layout();
                 let k_data: &[f32] = match &*k_g {
                     Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[k_l.start_offset()..],
-                    _ => candle::bail!("Expected CPU storage"),
+                    _ => hanzo_ml::bail!("Expected CPU storage"),
                 };
 
                 let v_cont = v.squeeze(0)?.squeeze(1)?.contiguous()?;
                 let (v_g, v_l) = v_cont.storage_and_layout();
                 let v_data: &[f32] = match &*v_g {
                     Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[v_l.start_offset()..],
-                    _ => candle::bail!("Expected CPU storage"),
+                    _ => hanzo_ml::bail!("Expected CPU storage"),
                 };
 
                 // Write K, V into raw cache (no tensor allocation)
@@ -324,12 +324,12 @@ impl AttentionWeights {
                     let (kg, kl) = k_cont.storage_and_layout();
                     let k_d: &[f32] = match &*kg {
                         Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
-                        _ => candle::bail!("Expected CPU"),
+                        _ => hanzo_ml::bail!("Expected CPU"),
                     };
                     let (vg, vl) = v_cont.storage_and_layout();
                     let v_d: &[f32] = match &*vg {
                         Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
-                        _ => candle::bail!("Expected CPU"),
+                        _ => hanzo_ml::bail!("Expected CPU"),
                     };
                     self.raw_cache.as_mut().unwrap().write_kv_batch(k_d, v_d, l);
                 }

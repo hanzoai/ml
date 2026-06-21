@@ -1,7 +1,7 @@
 import logging
 
 try:
-    from .candle import *
+    from .hanzo-ml import *
 except ImportError as e:
     # If we are in development mode, or we did not bundle the DLLs, we try to locate them here
     # PyO3 wont give us any information about what DLLs are missing, so we can only try to load
@@ -46,10 +46,10 @@ except ImportError as e:
     locate_mkl_dlls()
 
     try:
-        from .candle import *
+        from .hanzo-ml import *
     except ImportError as inner_e:
         raise ImportError("Could not locate DLLs. Please check the documentation for more information.")
 
-__doc__ = candle.__doc__
-if hasattr(candle, "__all__"):
-    __all__ = candle.__all__
+__doc__ = hanzo-ml.__doc__
+if hasattr(hanzo-ml, "__all__"):
+    __all__ = hanzo-ml.__all__

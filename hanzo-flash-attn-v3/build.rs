@@ -2,8 +2,8 @@
 
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2024 Michael Feil
-// adapted from https://github.com/huggingface/candle-flash-attn-v1 , Oliver Dehaene
-// adapted further in 2025 by Eric Buehler for candle repo.
+// adapted from https://github.com/huggingface/hanzo-flash-attn-v1 , Oliver Dehaene
+// adapted further in 2025 by Eric Buehler for hanzo-ml repo.
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 // http://www.apache.org/licenses/LICENSE-2.0> or the MIT license

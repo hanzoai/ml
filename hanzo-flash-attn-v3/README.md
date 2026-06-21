@@ -19,5 +19,5 @@ To make it a workspace member, either:
    build-verify on a Hopper (sm90) GPU, or
 2. author the missing hdim 64/128/256 sm90 kernels.
 
-Preserved here (debranded from the orphaned upstream `candle-flash-attn-v3`) so the
+Preserved here (debranded from the orphaned upstream `hanzo-flash-attn-v3`) so the
 Hopper hdim512 work is not lost. Requires CUDA + `compute_cap >= 90` (`cudaforge` build).
