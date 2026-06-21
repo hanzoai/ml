@@ -1,4 +1,4 @@
-## candle-rwkv
+## hanzo-ml-rwkv
 
 The [RWKV model](https://wiki.rwkv.com/) is a recurrent neural network model with performance on par with transformer architectures. This example supports RWKV v5, v6, and v7 (including v7a and v7b variants).
 

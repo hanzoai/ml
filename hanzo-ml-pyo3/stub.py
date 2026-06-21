@@ -12,8 +12,8 @@ GENERATED_COMMENT = "# Generated content DO NOT EDIT\n"
 TYPING = """from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Sequence
 from os import PathLike
 """
-CANDLE_SPECIFIC_TYPING = "from hanzo.typing import _ArrayLike, Device, Scalar, Index, Shape\n"
-CANDLE_TENSOR_IMPORTS = "from hanzo import Tensor,DType,QTensor\n"
+HANZO_SPECIFIC_TYPING = "from hanzo.typing import _ArrayLike, Device, Scalar, Index, Shape\n"
+HANZO_TENSOR_IMPORTS = "from hanzo import Tensor,DType,QTensor\n"
 RETURN_TYPE_MARKER = "&RETURNS&: "
 ADDITIONAL_TYPEHINTS = {}
 FORWARD_REF_PATTERN = re.compile(r"ForwardRef\('([^']+)'\)")
@@ -89,9 +89,9 @@ def pyi_file(obj, indent=""):
     if inspect.ismodule(obj):
         string += GENERATED_COMMENT
         string += TYPING
-        string += CANDLE_SPECIFIC_TYPING
+        string += HANZO_SPECIFIC_TYPING
         if obj.__name__ != "hanzo.hanzo":
-            string += CANDLE_TENSOR_IMPORTS
+            string += HANZO_TENSOR_IMPORTS
         members = get_module_members(obj)
         for member in members:
             string += pyi_file(member, indent)

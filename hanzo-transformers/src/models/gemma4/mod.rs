@@ -185,7 +185,7 @@ fn broadcast_embed_to_mask(embeds: &Tensor, mask: &Tensor) -> Result<Tensor> {
     // Count masked positions per batch, fill them in sequence from embeds
     let mask_f32 = mask.to_dtype(DType::F32)?;
     // cumsum along seq dimension to assign embed indices
-    // Since candle doesn't have cumsum, we use a broadcast approach:
+    // Since hanzo-ml doesn't have cumsum, we use a broadcast approach:
     // Create output tensor of zeros, then use where_cond
     let zeros = Tensor::zeros((b_sz, seq_len, hidden), embeds.dtype(), embeds.device())?;
 

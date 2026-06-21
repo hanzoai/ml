@@ -1,6 +1,6 @@
-# candle-voxtral: speech recognition
+# hanzo-ml-voxtral: speech recognition
 
-An implementation of Voxtral speech recognition using candle.
+An implementation of Voxtral speech recognition using hanzo-ml.
 
 ## Running the example
 

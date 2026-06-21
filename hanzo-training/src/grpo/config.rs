@@ -4,7 +4,7 @@
 //! `args.py`). Only the knobs that matter for the *algorithm* are kept; the
 //! distributed / sequence-parallel machinery from the reference is intentionally
 //! dropped (it is orthogonal to the math and out of scope for a single-process,
-//! pure-`candle`-autograd trainer).
+//! pure-`hanzo-ml`-autograd trainer).
 
 use serde::{Deserialize, Serialize};
 

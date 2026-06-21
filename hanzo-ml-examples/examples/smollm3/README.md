@@ -1,6 +1,6 @@
 # SmolLM3 Unified Inference
 
-A unified Rust implementation for running SmolLM3 models using the Candle ML framework. Supports both quantized (GGUF) and full precision (safetensors) models with a single codebase.
+A unified Rust implementation for running SmolLM3 models using the Hanzo ML framework. Supports both quantized (GGUF) and full precision (safetensors) models with a single codebase.
 
 ## Features
 
@@ -113,8 +113,8 @@ GPU acceleration supported via CUDA (with `cuda` feature) or Metal (macOS).
 
 **Out of memory**: Try a smaller quantization level or use `--sample-len` to reduce generation length
 
-**Compilation errors**: Ensure you're using the latest version of the Candle crate
+**Compilation errors**: Ensure you're using the latest version of the Hanzo crate
 
 ## License
 
-This implementation follows the Candle framework license. SmolLM3 models are available under Apache 2.0.
+This implementation follows the Hanzo framework license. SmolLM3 models are available under Apache 2.0.

@@ -49,7 +49,7 @@ class Sequential(Module):
     each a registered submodule of the ``Sequential``).
 
     What's the difference between a ``Sequential`` and a
-    :class:`candle.nn.ModuleList`? A ``ModuleList`` is exactly what it
+    :class:`hanzo-ml.nn.ModuleList`? A ``ModuleList`` is exactly what it
     sounds like--a list for storing ``Module`` s! On the other hand,
     the layers in a ``Sequential`` are connected in a cascading way.
     """
@@ -212,9 +212,9 @@ class Sequential(Module):
 class ModuleList(Module):
     r"""Holds submodules in a list.
 
-    :class:`~candle.nn.ModuleList` can be indexed like a regular Python list, but
+    :class:`~hanzo-ml.nn.ModuleList` can be indexed like a regular Python list, but
     modules it contains are properly registered, and will be visible by all
-    :class:`~candle.nn.Module` methods.
+    :class:`~hanzo-ml.nn.Module` methods.
 
     Args:
         modules (iterable, optional): an iterable of modules to add
@@ -367,20 +367,20 @@ class ModuleList(Module):
 class ModuleDict(Module):
     r"""Holds submodules in a dictionary.
 
-    :class:`~candle.nn.ModuleDict` can be indexed like a regular Python dictionary,
+    :class:`~hanzo-ml.nn.ModuleDict` can be indexed like a regular Python dictionary,
     but modules it contains are properly registered, and will be visible by all
-    :class:`~candle.nn.Module` methods.
+    :class:`~hanzo-ml.nn.Module` methods.
 
-    :class:`~candle.nn.ModuleDict` is an **ordered** dictionary that respects
+    :class:`~hanzo-ml.nn.ModuleDict` is an **ordered** dictionary that respects
 
     * the order of insertion, and
 
-    * in :meth:`~candle.nn.ModuleDict.update`, the order of the merged
+    * in :meth:`~hanzo-ml.nn.ModuleDict.update`, the order of the merged
       ``OrderedDict``, ``dict`` (started from Python 3.6) or another
-      :class:`~candle.nn.ModuleDict` (the argument to
-      :meth:`~candle.nn.ModuleDict.update`).
+      :class:`~hanzo-ml.nn.ModuleDict` (the argument to
+      :meth:`~hanzo-ml.nn.ModuleDict.update`).
 
-    Note that :meth:`~candle.nn.ModuleDict.update` with other unordered mapping
+    Note that :meth:`~hanzo-ml.nn.ModuleDict.update` with other unordered mapping
     types (e.g., Python's plain ``dict`` before Python version 3.6) does not
     preserve the order of the merged mapping.
 
@@ -441,16 +441,16 @@ class ModuleDict(Module):
         return self._modules.values()
 
     def update(self, modules: Mapping[str, Module]) -> None:
-        r"""Update the :class:`~candle.nn.ModuleDict` with the key-value pairs from a
+        r"""Update the :class:`~hanzo-ml.nn.ModuleDict` with the key-value pairs from a
         mapping or an iterable, overwriting existing keys.
 
         .. note::
-            If :attr:`modules` is an ``OrderedDict``, a :class:`~candle.nn.ModuleDict`, or
+            If :attr:`modules` is an ``OrderedDict``, a :class:`~hanzo-ml.nn.ModuleDict`, or
             an iterable of key-value pairs, the order of new elements in it is preserved.
 
         Args:
-            modules (iterable): a mapping (dictionary) from string to :class:`~candle.nn.Module`,
-                or an iterable of key-value pairs of type (string, :class:`~candle.nn.Module`)
+            modules (iterable): a mapping (dictionary) from string to :class:`~hanzo-ml.nn.Module`,
+                or an iterable of key-value pairs of type (string, :class:`~hanzo-ml.nn.Module`)
         """
         if not isinstance(modules, container_abcs.Iterable):
             raise TypeError(
