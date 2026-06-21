@@ -314,10 +314,37 @@ struct PooledBuf {
     host_visible: bool,
 }
 
+// Size-class for the reuse pool. Decode attention allocates transient tensors whose size grows by
+// one token each step (score [b,h,1,cur_len], softmax, att@v); keying `free` by exact byte size
+// means every token requests a never-before-seen size, so nothing is ever reused and each token
+// leaks a fresh buffer -> O(seq^2) device memory -> OOM on long generations. Rounding the physical
+// allocation up to a coarse class collapses those ever-growing sizes onto O(log seq) buckets so a
+// later token's larger request reuses an earlier (now bucket-sized) buffer. Small buffers stay
+// exact (no waste, they already reuse fine); only allocations above the threshold round to the next
+// power of two (<=2x over-allocation, bounded -- which is the point).
+const POOL_EXACT_MAX: u64 = 64 * 1024; // <=64KiB: key by exact size (no rounding, no waste).
+
+const fn pool_bucket(bytes: u64) -> u64 {
+    let b = if bytes < 4 { 4 } else { bytes };
+    if b <= POOL_EXACT_MAX {
+        b
+    } else {
+        b.next_power_of_two()
+    }
+}
+
+// Cap the idle (free, unreferenced) pool so a workload that touches many distinct large size-classes
+// can't retain them all forever. reclaim() destroys real device buffers once free exceeds this. The
+// peak working set of a forward fits well under this; it only bounds the long tail. ~12 GiB.
+const POOL_FREE_CAP_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+
 #[derive(Default)]
 struct BufPool {
     pending: Vec<(u64, PooledBuf)>,
     free: HashMap<u64, Vec<PooledBuf>>,
+    // Sum of bucket sizes currently held in `free` (idle, reusable). Tracked so reclaim can enforce
+    // POOL_FREE_CAP_BYTES without walking the whole map.
+    free_bytes: u64,
 }
 
 // drop: park (size, buffer, memory) for reuse after the next fence. No Vulkan calls here, just
@@ -327,7 +354,9 @@ impl Drop for VulkanStorage {
         if self.buffer == vk::Buffer::null() {
             return;
         }
-        let bytes = ((self.count * self.dtype.size_in_bytes()).max(4)) as u64;
+        // Park under the bucket key (raw_buffer allocated this buffer at its bucket size), so the
+        // physical buffer matches the key a later same-bucket request looks up.
+        let bytes = pool_bucket((self.count * self.dtype.size_in_bytes()) as u64);
         if let Ok(mut pool) = self.device.inner.bufpool.lock() {
             pool.pending.push((
                 bytes,
@@ -1374,18 +1403,17 @@ impl VulkanDevice {
     // CPU cannot map — callers then upload/read back through a staging buffer. Buffers carry
     // TRANSFER_SRC|TRANSFER_DST usage so that staging GPU copy is always legal.
     unsafe fn raw_buffer(&self, bytes: u64) -> Result<(vk::Buffer, vk::DeviceMemory, bool)> {
-        let bytes = bytes.max(4); // zero-size buffers are illegal; round up to one f32.
-                                  // Reuse a same-size buffer reclaimed from a completed batch before allocating fresh.
-        if let Some(p) = self
-            .inner
-            .bufpool
-            .lock()
-            .unwrap()
-            .free
-            .get_mut(&bytes)
-            .and_then(Vec::pop)
+        // Allocate at the bucket size so every pooled buffer matches its `free` key exactly; a reused
+        // buffer is then always physically >= the request (kernels touch only the first `n` elems via
+        // their push-constant count, and descriptors bind WHOLE_SIZE, so the extra tail is unused).
+        let bytes = pool_bucket(bytes);
+        // Reuse a same-bucket buffer reclaimed from a completed batch before allocating fresh.
         {
-            return Ok((p.buffer, p.memory, p.host_visible));
+            let mut pool = self.inner.bufpool.lock().unwrap();
+            if let Some(p) = pool.free.get_mut(&bytes).and_then(Vec::pop) {
+                pool.free_bytes = pool.free_bytes.saturating_sub(bytes);
+                return Ok((p.buffer, p.memory, p.host_visible));
+            }
         }
         let dev = self.dev();
         let info = vk::BufferCreateInfo::default()
@@ -2161,12 +2189,38 @@ impl VulkanDevice {
     }
 
     // Move buffers dropped before this point into the reuse pool. Sound only right after a
-    // flush+fence: the awaited batch (the last that could reference them) is done on the GPU.
+    // flush+fence: the awaited batch (the last that could reference them) is done on the GPU -- which
+    // is also why it's safe to actually destroy buffers here when over the cap (no in-flight work can
+    // still reference a free-list entry).
     fn reclaim(&self) {
+        let dev = self.dev();
         let mut pool = self.inner.bufpool.lock().unwrap();
         let pending = std::mem::take(&mut pool.pending);
         for (bytes, p) in pending {
             pool.free.entry(bytes).or_default().push(p);
+            pool.free_bytes += bytes;
+        }
+        // Enforce the idle-pool cap: destroy real device buffers (largest buckets first, since those
+        // dominate the bytes and are the least likely to be reused) until back under the cap.
+        while pool.free_bytes > POOL_FREE_CAP_BYTES {
+            let Some(&bucket) = pool.free.keys().max() else {
+                break;
+            };
+            let Some(bufs) = pool.free.get_mut(&bucket) else {
+                break;
+            };
+            let Some(p) = bufs.pop() else {
+                pool.free.remove(&bucket);
+                continue;
+            };
+            if bufs.is_empty() {
+                pool.free.remove(&bucket);
+            }
+            pool.free_bytes = pool.free_bytes.saturating_sub(bucket);
+            unsafe {
+                dev.destroy_buffer(p.buffer, None);
+                dev.free_memory(p.memory, None);
+            }
         }
     }
 
@@ -2201,6 +2255,8 @@ impl VulkanDevice {
         memory: vk::DeviceMemory,
         host_visible: bool,
     ) {
+        // Park under the bucket key, matching the size raw_buffer allocated and looks up.
+        let bytes = pool_bucket(bytes);
         if let Ok(mut pool) = self.inner.bufpool.lock() {
             pool.pending.push((
                 bytes,
