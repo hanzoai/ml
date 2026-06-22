@@ -111,6 +111,18 @@ impl RocmDevice {
         self.id
     }
 
+    pub fn ordinal(&self) -> i32 {
+        self.device.id()
+    }
+
+    /// True for APUs (gfx1151 Strix Halo etc.) where GPU and CPU share physical RAM. The device
+    /// mapper uses this to treat total VRAM as unified instead of slicing it per-layer.
+    pub fn is_integrated(&self) -> bool {
+        rocm_rs::hip::get_device_properties(self.device.id())
+            .map(|p| p.integrated != 0)
+            .unwrap_or(false)
+    }
+
     pub fn alloc<T>(&self, len: usize) -> Result<SendSyncDeviceMemory<T>> {
         SendSyncDeviceMemory::new_pooled(len, Some(self.pool.clone()))
             .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))
