@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-flash-attn-v3"
-version = "0.11.2"
+version = "0.11.3"
 edition = "2021"
 
 description = "FlashAttention-3 (Hopper/sm90) layer for the Hanzo ML framework."
@@ -12,7 +12,7 @@ readme = "README.md"
 exclude = ["cutlass/docs/**", "cutlass/test/**", "cutlass/examples/**", "cutlass/tools/**", "cutlass/media/**"]
 
 [dependencies]
-hanzo-ml = { path = "../hanzo-ml", features = ["cuda"], package = "hanzo-ml", version = "0.11.2" }
+hanzo-ml = { path = "../hanzo-ml", features = ["cuda"], package = "hanzo-ml", version = "0.11.3" }
 half = { version = "2.3.1", features = ["num-traits"] }
 
 [build-dependencies]
