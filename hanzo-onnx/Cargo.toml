@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-onnx"
-version = "0.11.2"
+version = "0.11.3"
 edition = "2021"
 description = "Minimalist ML framework."
 repository = "https://github.com/hanzoai/ml"
@@ -9,8 +9,8 @@ categories = ["science"]
 license = "BSD-3-Clause OR Apache-2.0"
 
 [dependencies]
-hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.2" }
-hanzo-nn = { path = "../hanzo-nn", version = "0.11.2" }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.3" }
+hanzo-nn = { path = "../hanzo-nn", version = "0.11.3" }
 prost = "0.14.1"
 
 [build-dependencies]
