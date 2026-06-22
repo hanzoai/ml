@@ -996,7 +996,9 @@ impl QTensor {
             {
                 let qt = crate::RocmQuantType::from_ggml(self.storage.dtype()).unwrap();
                 let out_dtype = x.dtype();
-                let (e_cnt, n, k) = self.shape().dims3()?;
+                // e_cnt is not read: ids stay on-device and the router guarantees the bound, so the
+                // old host bounds check (and its DtoH `to_vec1`) is gone.
+                let (_e_cnt, n, k) = self.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
                 let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
                 let x_exp = if s == topk {
@@ -1029,45 +1031,30 @@ impl QTensor {
                         w
                     }
                 };
-                // Q4_K: keep router ids ON the GPU and run the ONE batched dp4a launch (experts on
-                // grid.y, ids read on-device). No `to_vec1` DtoH sync -- that host round-trip (3 per
-                // layer x 48 layers per token) was both the dominant WSL decode stall AND what made HIP
-                // stream capture illegal (hipErrorStreamCaptureImplicit -> the graph-path SIGSEGV).
-                // The router emits a top-k over the e_cnt expert logits, so 0 <= id < e_cnt by
-                // construction; the prior host bounds check is dropped here to stay capture-clean.
+                // Keep router ids ON the GPU for EVERY wired quant type and run ONE batched launch
+                // (experts on grid.y, ids read on-device). No `to_vec1` DtoH sync -- that host round-
+                // trip (3 per layer x 48 layers per token) was both the dominant WSL decode stall AND
+                // what made HIP stream capture illegal (hipErrorStreamCaptureImplicit -> the graph-path
+                // SIGSEGV). The router emits a top-k over the e_cnt expert logits, so 0 <= id < e_cnt
+                // by construction; the prior host bounds check is dropped to stay capture-clean.
+                let ids_u32 = ids
+                    .reshape((nrows,))?
+                    .to_dtype(crate::DType::U32)?
+                    .contiguous()?;
+                let (store, _) = x_flat.storage_and_layout();
+                let xr = match &*store {
+                    crate::Storage::Rocm(r) => r,
+                    _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
+                };
+                let (idstore, _) = ids_u32.storage_and_layout();
+                let idr = match &*idstore {
+                    crate::Storage::Rocm(r) => r,
+                    _ => crate::bail!("rocm MoE: ids not on rocm"),
+                };
                 let y = if matches!(qt, crate::RocmQuantType::Q4K) {
-                    let ids_u32 = ids
-                        .reshape((nrows,))?
-                        .to_dtype(crate::DType::U32)?
-                        .contiguous()?;
-                    let (store, _) = x_flat.storage_and_layout();
-                    let xr = match &*store {
-                        crate::Storage::Rocm(r) => r,
-                        _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
-                    };
-                    let (idstore, _) = ids_u32.storage_and_layout();
-                    let idr = match &*idstore {
-                        crate::Storage::Rocm(r) => r,
-                        _ => crate::bail!("rocm MoE: ids not on rocm"),
-                    };
                     rocm_dev.moe_matvec_q4k_dp4a(wbank.as_ref(), xr, idr, nrows, n, k)?
                 } else {
-                    // Other wired quant types use the per-expert scalar launch loop, which offsets the
-                    // bank by `eid` on the host -> needs ids materialized on the host (not capture-clean,
-                    // but those types have no batched on-device-ids kernel yet).
-                    let ids_vec = ids
-                        .reshape((nrows,))?
-                        .to_dtype(crate::DType::U32)?
-                        .to_vec1::<u32>()?;
-                    if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
-                        crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
-                    }
-                    let (store, _) = x_flat.storage_and_layout();
-                    let xr = match &*store {
-                        crate::Storage::Rocm(r) => r,
-                        _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
-                    };
-                    rocm_dev.moe_matvec_quant(qt, wbank.as_ref(), xr, &ids_vec, nrows, n, k)?
+                    rocm_dev.moe_matvec_quant(qt, wbank.as_ref(), xr, idr, nrows, n, k)?
                 };
                 let out = crate::tensor::from_storage(
                     crate::Storage::Rocm(y),
@@ -1411,7 +1398,8 @@ impl QMatMul {
             } if crate::RocmQuantType::from_ggml(*dtype).is_some() => {
                 let qt = crate::RocmQuantType::from_ggml(*dtype).unwrap();
                 let wbank = wq.as_ref();
-                let (e_cnt, n, k) = qtensor.shape().dims3()?;
+                // e_cnt unused: ids stay on-device, router guarantees the bound (no host check).
+                let (_e_cnt, n, k) = qtensor.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
                 let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
                 let x_exp = if s == topk {
@@ -1425,41 +1413,30 @@ impl QMatMul {
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                 };
                 let out_dtype = x.dtype();
-                // Keep router ids ON the GPU: the batched dp4a kernel indexes experts on-device, so
-                // there is no per-call `to_vec1` host round-trip. That DtoH sync (3 per layer x 48
-                // layers per token) was the dominant decode stall on WSL, not the expert matmul.
+                // Keep router ids ON the GPU for EVERY wired quant type: the batched kernels index
+                // experts on-device, so there is no per-call `to_vec1` host round-trip. That DtoH
+                // sync (3 per layer x 48 layers per token) was both the dominant decode stall on WSL
+                // AND the HIP-graph capture breaker. Router top-k guarantees 0 <= id < e_cnt.
+                let ids_u32 = ids
+                    .reshape((nrows,))?
+                    .to_dtype(crate::DType::U32)?
+                    .contiguous()?;
+                let (xstore, _) = x_flat.storage_and_layout();
+                let xr = match &*xstore {
+                    crate::Storage::Rocm(r) => r,
+                    _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
+                };
+                let (idstore, _) = ids_u32.storage_and_layout();
+                let idr = match &*idstore {
+                    crate::Storage::Rocm(r) => r,
+                    _ => crate::bail!("rocm MoE: ids not on rocm"),
+                };
                 let y = if matches!(qt, crate::RocmQuantType::Q4K) {
-                    let ids_u32 = ids
-                        .reshape((nrows,))?
-                        .to_dtype(crate::DType::U32)?
-                        .contiguous()?;
-                    let (xstore, _) = x_flat.storage_and_layout();
-                    let xr = match &*xstore {
-                        crate::Storage::Rocm(r) => r,
-                        _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
-                    };
-                    let (idstore, _) = ids_u32.storage_and_layout();
-                    let idr = match &*idstore {
-                        crate::Storage::Rocm(r) => r,
-                        _ => crate::bail!("rocm MoE: ids not on rocm"),
-                    };
                     wbank.device.moe_matvec_q4k_dp4a(wbank, xr, idr, nrows, n, k)?
                 } else {
-                    let ids_vec = ids
-                        .reshape((nrows,))?
-                        .to_dtype(crate::DType::U32)?
-                        .to_vec1::<u32>()?;
-                    if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
-                        crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
-                    }
-                    let (xstore, _) = x_flat.storage_and_layout();
-                    let xr = match &*xstore {
-                        crate::Storage::Rocm(r) => r,
-                        _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
-                    };
                     wbank
                         .device
-                        .moe_matvec_quant(qt, wbank, xr, &ids_vec, nrows, n, k)?
+                        .moe_matvec_quant(qt, wbank, xr, idr, nrows, n, k)?
                 };
                 let out = crate::tensor::from_storage(
                     crate::Storage::Rocm(y),

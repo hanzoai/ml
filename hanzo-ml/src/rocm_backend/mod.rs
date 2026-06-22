@@ -593,6 +593,27 @@ impl RocmQuantType {
             (Self::TQ2_0, false) => "qmatvecu_tq2_0_bf16",
         }
     }
+
+    /// The unified indexed-MoE decode entry point for this (type, activation-dtype) pair. Twin of
+    /// `decode_kernel`: every symbol is `moe_qmatvec_core<WTYPE,XT>` with a different WTYPE -- one
+    /// batched on-device-ids launch over all routed slots (experts on grid.y), capture-clean. This
+    /// REPLACES the per-expert host launch loop for the non-Q4_K types.
+    fn moe_decode_kernel(self, f16: bool) -> &'static str {
+        match (self, f16) {
+            (Self::Q8_0, true) => "moe_qmatvecu_q8_0_f16",
+            (Self::Q8_0, false) => "moe_qmatvecu_q8_0_bf16",
+            (Self::Q4_0, true) => "moe_qmatvecu_q4_0_f16",
+            (Self::Q4_0, false) => "moe_qmatvecu_q4_0_bf16",
+            (Self::Q4K, true) => "moe_qmatvecu_q4k_f16",
+            (Self::Q4K, false) => "moe_qmatvecu_q4k_bf16",
+            (Self::Q6K, true) => "moe_qmatvecu_q6k_f16",
+            (Self::Q6K, false) => "moe_qmatvecu_q6k_bf16",
+            (Self::IQ4_XS, true) => "moe_qmatvecu_iq4xs_f16",
+            (Self::IQ4_XS, false) => "moe_qmatvecu_iq4xs_bf16",
+            (Self::TQ2_0, true) => "moe_qmatvecu_tq2_0_f16",
+            (Self::TQ2_0, false) => "moe_qmatvecu_tq2_0_bf16",
+        }
+    }
 }
 
 impl RocmDevice {
@@ -877,7 +898,7 @@ impl RocmDevice {
         qt: RocmQuantType,
         wbank: &RocmStorage,
         x: &RocmStorage,
-        ids: &[u32],
+        ids: &RocmStorage,
         nrows: usize,
         n: usize,
         k: usize,
@@ -887,12 +908,13 @@ impl RocmDevice {
         if k % elems != 0 {
             crate::bail!("moe_matvec_quant({qt:?}): k={k} not a multiple of block size {elems}");
         }
-        if ids.len() != nrows {
-            crate::bail!("moe_matvec_quant: ids.len()={} != nrows={nrows}", ids.len());
-        }
         let wbank_mem = match &wbank.slice {
             RocmStorageSlice::U8(m) => m,
             _ => crate::bail!("moe_matvec_quant: weight bank must be u8 (raw GGML block bytes)"),
+        };
+        let ids_ptr = match &ids.slice {
+            RocmStorageSlice::U32(m) => m.as_ptr(),
+            _ => crate::bail!("moe_matvec_quant: ids must be u32 on device"),
         };
         // Per-expert byte stride in the bank: one expert is an [n,k] weight = n*(k/elems) blocks,
         // each block `block_bytes` on disk. Validate the bank is an exact multiple of that.
@@ -908,59 +930,48 @@ impl RocmDevice {
         // quantized to q8_1 once -- collapses the per-expert scalar launch loop into the same dp4a
         // roofline as non-MoE decode (mirrors CUDA indexed_moe_forward_q4k_q8_1).
         if matches!(qt, RocmQuantType::Q4K) {
-            let mut idmem = self.alloc::<u32>(nrows)?;
-            idmem
-                .copy_from_host(ids)
-                .map_err(|e| crate::Error::Msg(format!("moe ids upload: {e}")))?;
-            let ids_store = RocmStorage {
-                slice: RocmStorageSlice::U32(idmem),
-                device: self.clone(),
-            };
-            return self.moe_matvec_q4k_dp4a(wbank, x, &ids_store, nrows, n, k);
+            return self.moe_matvec_q4k_dp4a(wbank, x, ids, nrows, n, k);
         }
 
-        // Other wired quant types: per-expert scalar core, one launch per routed slot.
-        // The kernel's first param is the WEIGHT output dimension (it computes one output row per
-        // warp over [0,n)); each routed slot produces a full [n] output vector. `n_i` = n, NOT the
-        // number of slots. The grid covers n output rows; per slot we offset the weight (to its
-        // expert), the activation (to slot s's row), and the output (to slot s's row).
+        // Other wired quant types: ONE batched `moe_qmatvec_core<WTYPE>` launch over all routed
+        // slots. Experts on grid.y (slot s = blockIdx.y), expert id read ON-DEVICE (ids_ptr) and the
+        // bank offset by ids[s] IN-KERNEL -- no per-slot host loop, no host ids round-trip, so the
+        // forward stays HIP-graph-capture-clean. grid.x covers the n output rows (one warp per row,
+        // one full [n] output vector per slot). This is the non-Q4_K twin of moe_matvec_q4k_dp4a.
         let n_i = n as i32;
         let ncols = k as i32;
-        let grid = rocm_rs::hip::Dim3::from((n.div_ceil(8)) as u32);
+        let nslots = nrows as i32;
+        let grid = rocm_rs::hip::Dim3::from(((n.div_ceil(8)) as u32, nrows as u32, 1u32));
         let block = rocm_rs::hip::Dim3::from(256u32);
+        let wbank_ptr = wbank_mem.as_ptr();
 
         macro_rules! launch_moe {
             ($variant:ident, $ty:ty, $f16:expr) => {{
-                let func = qt.decode_kernel($f16);
-                let x_mem = match &x.slice {
-                    RocmStorageSlice::$variant(m) => m,
+                let func = qt.moe_decode_kernel($f16);
+                let x_ptr = match &x.slice {
+                    RocmStorageSlice::$variant(m) => m.as_ptr(),
                     _ => unreachable!(),
                 };
                 let out = self.alloc::<$ty>(nrows * n)?;
-                for (s, &eid) in ids.iter().enumerate() {
-                    // SAFETY: eid bounds checked by the caller; offsets stay within the resident
-                    // bank / activation / output allocations (expert_bytes*E, nrows*k, nrows*n).
-                    let wq_ptr =
-                        unsafe { wbank_mem.offset_ptr((eid as usize) * expert_bytes) };
-                    let x_ptr = unsafe { x_mem.offset_ptr(s * k) };
-                    let out_ptr = unsafe { out.offset_ptr(s * n) };
-                    unsafe {
-                        launch_kernel(
-                            self,
-                            QuantKernel::NAME,
-                            QuantKernel::CODE,
-                            func,
-                            grid,
-                            block,
-                            &mut [
-                                &n_i as *const i32 as *mut std::ffi::c_void,
-                                &ncols as *const i32 as *mut std::ffi::c_void,
-                                (&wq_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                                (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                                (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                            ],
-                        )?;
-                    }
+                let out_ptr = out.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        self,
+                        QuantKernel::NAME,
+                        QuantKernel::CODE,
+                        func,
+                        grid,
+                        block,
+                        &mut [
+                            &n_i as *const i32 as *mut std::ffi::c_void,
+                            &ncols as *const i32 as *mut std::ffi::c_void,
+                            &nslots as *const i32 as *mut std::ffi::c_void,
+                            (&wbank_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&ids_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        ],
+                    )?;
                 }
                 Ok(RocmStorage {
                     slice: RocmStorageSlice::$variant(out),
