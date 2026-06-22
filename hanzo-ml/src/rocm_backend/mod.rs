@@ -439,7 +439,7 @@ macro_rules! dispatch_miopen_conv {
 }
 
 macro_rules! cast_launch {
-    ($dev:expr, $grid:expr, $block:expr, $el:expr, $dims_len:expr, $ds_ptr:expr, $src_ptr:expr, $src_dtype:expr, $rust_type:ty, $variant:ident) => {{
+    ($dev:expr, $grid:expr, $block:expr, $el:expr, $num_dims:expr, $ds:expr, $src_ptr:expr, $src_dtype:expr, $rust_type:ty, $variant:ident) => {{
         let out = $dev.alloc::<$rust_type>($el)?;
         let out_ptr = out.as_ptr() as *mut std::ffi::c_void;
         let func_name = format!("cast_{}_{}", $src_dtype.as_str(), stringify!($rust_type));
@@ -453,8 +453,8 @@ macro_rules! cast_launch {
                 $block,
                 &mut [
                     &$el as *const usize as *mut std::ffi::c_void,
-                    &$dims_len as *const usize as *mut std::ffi::c_void,
-                    (&$ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                    &$num_dims as *const usize as *mut std::ffi::c_void,
+                    $ds.as_arg(),
                     (&$src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                 ],
@@ -1979,48 +1979,66 @@ impl RocmStorage {
     }
 }
 
-fn dims_and_strides(
-    dev: &RocmDevice,
-    layout: &Layout,
-    n_strides: usize,
-) -> Result<Option<SendSyncDeviceMemory<usize>>> {
-    if layout.is_contiguous() {
-        return Ok(None);
-    }
-    let dims = layout.shape().dims();
-    let strides = layout.stride();
-    let mut data = Vec::with_capacity(dims.len() + n_strides * dims.len());
-    for &d in dims {
-        data.push(d as usize);
-    }
-    for _ in 0..n_strides {
-        for &s in strides {
-            data.push(s as usize);
-        }
-    }
-    Ok(Some(dev.clone_htod(&data)?))
+/// Max tensor rank the inline dims/strides payload supports. Mirrors `ROCM_DS_MAX`
+/// in every strided HIP kernel (see e.g. unary.hip). Decode/prefill tensors are all
+/// <= 4D; 8 is a comfortable ceiling. A higher rank bails rather than truncating.
+pub(crate) const ROCM_DS_MAX: usize = 8;
+
+/// Number of stride-sets the payload reserves room for: dims + up to 3 stride
+/// vectors (the ternary/where_cond op has 3). `[dims, s0, s1, s2]`.
+const ROCM_DS_SETS: usize = 4;
+
+/// Inline dims/strides metadata passed BY VALUE in the kernel param block instead
+/// of via a device buffer. Eliminates the per-op `clone_htod` H2D copy that trips
+/// hipGraph capture (HIP 906 hipErrorStreamCaptureImplicit) on every strided op
+/// every layer every token. Layout is `[dims (ROCM_DS_MAX), strides_0, strides_1,
+/// strides_2]`, each block of `ROCM_DS_MAX` `usize`s; the kernel reads only the
+/// first `num_dims` of each block. `#[repr(C)]` so it matches the HIP `DimsStrides`
+/// struct byte-for-byte. The kernel still runs its own `is_contiguous` check on the
+/// inline values, so the contiguous fast path needs no special-casing here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DimsStrides {
+    v: [usize; ROCM_DS_MAX * ROCM_DS_SETS],
 }
 
-fn dims_and_strides_pair(
-    dev: &RocmDevice,
-    l1: &Layout,
-    l2: &Layout,
-) -> Result<Option<SendSyncDeviceMemory<usize>>> {
-    if l1.is_contiguous() && l2.is_contiguous() {
-        return Ok(None);
+impl DimsStrides {
+    /// Build the inline payload from `dims` and `n_strides` stride vectors. Returns
+    /// the payload plus `num_dims` (the rank the kernel iterates). Bails for rank >
+    /// `ROCM_DS_MAX` rather than silently truncating.
+    fn build(dims: &[usize], strides: &[&[usize]]) -> Result<(Self, usize)> {
+        let num_dims = dims.len();
+        if num_dims > ROCM_DS_MAX {
+            crate::bail!(
+                "ROCm strided op rank {num_dims} exceeds ROCM_DS_MAX {ROCM_DS_MAX}; raise the cap"
+            );
+        }
+        debug_assert!(strides.len() <= ROCM_DS_SETS - 1);
+        let mut v = [0usize; ROCM_DS_MAX * ROCM_DS_SETS];
+        v[..num_dims].copy_from_slice(dims);
+        for (set, stride) in strides.iter().enumerate() {
+            let base = (set + 1) * ROCM_DS_MAX;
+            v[base..base + num_dims].copy_from_slice(stride);
+        }
+        Ok((Self { v }, num_dims))
     }
-    let dims = l1.shape().dims();
-    let mut data = Vec::with_capacity(dims.len() * 3);
-    for &d in dims {
-        data.push(d as usize);
+
+    /// Pointer to the payload for the kernel param block (HIP copies it by value).
+    fn as_arg(&self) -> *mut std::ffi::c_void {
+        &self.v as *const _ as *mut std::ffi::c_void
     }
-    for &s in l1.stride() {
-        data.push(s as usize);
-    }
-    for &s in l2.stride() {
-        data.push(s as usize);
-    }
-    Ok(Some(dev.clone_htod(&data)?))
+}
+
+/// Inline dims + single stride-set for a one-input strided op (Map1, copy, cast,
+/// affine, fill, to_dtype).
+fn dims_and_strides(layout: &Layout) -> Result<(DimsStrides, usize)> {
+    DimsStrides::build(layout.shape().dims(), &[layout.stride()])
+}
+
+/// Inline dims + two stride-sets for a broadcast binary op (Map2). Both layouts
+/// share `l1`'s dims (the broadcast output shape).
+fn dims_and_strides_pair(l1: &Layout, l2: &Layout) -> Result<(DimsStrides, usize)> {
+    DimsStrides::build(l1.shape().dims(), &[l1.stride(), l2.stride()])
 }
 
 /// Trait for applying unary operations to ROCm storage.
@@ -2117,21 +2135,16 @@ impl<U: crate::op::UnaryOpT> Map1 for U {
     ) -> Result<SendSyncDeviceMemory<T>> {
         use hanzo_rocm_kernels::kernel::UnaryKernel;
         let shape = layout.shape();
-        let dims = shape.dims();
         let elem_count = shape.elem_count();
 
         let func_name = kernel_name::<T>(U::KERNEL);
-        let ds = dims_and_strides(dev, layout, 1)?;
+        let (ds, num_dims) = dims_and_strides(layout)?;
         let output = dev.alloc::<T>(elem_count)?;
         let (grid, block) = launch_config(elem_count);
 
         unsafe {
             let src_ptr = src.offset_ptr(layout.start_offset());
             let out_ptr = output.as_ptr();
-            let ds_ptr: *const usize = ds
-                .as_ref()
-                .map(|d| d.as_ptr() as *const usize)
-                .unwrap_or(std::ptr::null());
 
             launch_kernel(
                 dev,
@@ -2142,8 +2155,8 @@ impl<U: crate::op::UnaryOpT> Map1 for U {
                 block,
                 &mut [
                     &elem_count as *const usize as *mut std::ffi::c_void,
-                    &dims.len() as *const usize as *mut std::ffi::c_void,
-                    (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                    &num_dims as *const usize as *mut std::ffi::c_void,
+                    ds.as_arg(),
                     (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                 ],
@@ -2165,11 +2178,10 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
     ) -> Result<SendSyncDeviceMemory<T>> {
         use hanzo_rocm_kernels::kernel::BinaryKernel;
         let shape = lhs_l.shape();
-        let dims = shape.dims();
         let elem_count = shape.elem_count();
 
         let func_name = kernel_name::<T>(U::KERNEL);
-        let ds = dims_and_strides_pair(dev, lhs_l, rhs_l)?;
+        let (ds, num_dims) = dims_and_strides_pair(lhs_l, rhs_l)?;
         let output = dev.alloc::<T>(elem_count)?;
         let (grid, block) = launch_config(elem_count);
 
@@ -2177,10 +2189,6 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
             let lhs_ptr = lhs.offset_ptr(lhs_l.start_offset());
             let rhs_ptr = rhs.offset_ptr(rhs_l.start_offset());
             let out_ptr = output.as_ptr();
-            let ds_ptr: *const usize = ds
-                .as_ref()
-                .map(|d| d.as_ptr() as *const usize)
-                .unwrap_or(std::ptr::null());
 
             launch_kernel(
                 dev,
@@ -2191,8 +2199,8 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
                 block,
                 &mut [
                     &elem_count as *const usize as *mut std::ffi::c_void,
-                    &dims.len() as *const usize as *mut std::ffi::c_void,
-                    (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                    &num_dims as *const usize as *mut std::ffi::c_void,
+                    ds.as_arg(),
                     (&lhs_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&rhs_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
@@ -2233,11 +2241,10 @@ impl Affine {
     ) -> Result<SendSyncDeviceMemory<T>> {
         use hanzo_rocm_kernels::kernel::AffineKernel;
         let shape = layout.shape();
-        let dims = shape.dims();
         let elem_count = shape.elem_count();
 
         let func_name = kernel_name::<T>("affine");
-        let ds = dims_and_strides(dev, layout, 1)?;
+        let (ds, num_dims) = dims_and_strides(layout)?;
         let output = dev.alloc::<T>(elem_count)?;
         let (grid, block) = launch_config(elem_count);
 
@@ -2247,10 +2254,6 @@ impl Affine {
         unsafe {
             let src_ptr = src.offset_ptr(layout.start_offset());
             let out_ptr = output.as_ptr();
-            let ds_ptr: *const usize = ds
-                .as_ref()
-                .map(|d| d.as_ptr() as *const usize)
-                .unwrap_or(std::ptr::null());
 
             launch_kernel(
                 dev,
@@ -2261,8 +2264,8 @@ impl Affine {
                 block,
                 &mut [
                     &elem_count as *const usize as *mut std::ffi::c_void,
-                    &dims.len() as *const usize as *mut std::ffi::c_void,
-                    (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                    &num_dims as *const usize as *mut std::ffi::c_void,
+                    ds.as_arg(),
                     (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     &mul_val as *const T as *mut std::ffi::c_void,
@@ -2304,11 +2307,10 @@ impl Powf {
     ) -> Result<SendSyncDeviceMemory<T>> {
         use hanzo_rocm_kernels::kernel::UnaryKernel;
         let shape = layout.shape();
-        let dims = shape.dims();
         let elem_count = shape.elem_count();
 
         let func_name = kernel_name::<T>("upowf");
-        let ds = dims_and_strides(dev, layout, 1)?;
+        let (ds, num_dims) = dims_and_strides(layout)?;
         let output = dev.alloc::<T>(elem_count)?;
         let (grid, block) = launch_config(elem_count);
 
@@ -2317,10 +2319,6 @@ impl Powf {
         unsafe {
             let src_ptr = src.offset_ptr(layout.start_offset());
             let out_ptr = output.as_ptr();
-            let ds_ptr: *const usize = ds
-                .as_ref()
-                .map(|d| d.as_ptr() as *const usize)
-                .unwrap_or(std::ptr::null());
 
             launch_kernel(
                 dev,
@@ -2331,8 +2329,8 @@ impl Powf {
                 block,
                 &mut [
                     &elem_count as *const usize as *mut std::ffi::c_void,
-                    &dims.len() as *const usize as *mut std::ffi::c_void,
-                    (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                    &num_dims as *const usize as *mut std::ffi::c_void,
+                    ds.as_arg(),
                     (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     &scalar_val as *const T as *mut std::ffi::c_void,
@@ -2373,11 +2371,10 @@ impl Elu {
     ) -> Result<SendSyncDeviceMemory<T>> {
         use hanzo_rocm_kernels::kernel::UnaryKernel;
         let shape = layout.shape();
-        let dims = shape.dims();
         let elem_count = shape.elem_count();
 
         let func_name = kernel_name::<T>("uelu");
-        let ds = dims_and_strides(dev, layout, 1)?;
+        let (ds, num_dims) = dims_and_strides(layout)?;
         let output = dev.alloc::<T>(elem_count)?;
         let (grid, block) = launch_config(elem_count);
 
@@ -2386,10 +2383,6 @@ impl Elu {
         unsafe {
             let src_ptr = src.offset_ptr(layout.start_offset());
             let out_ptr = output.as_ptr();
-            let ds_ptr: *const usize = ds
-                .as_ref()
-                .map(|d| d.as_ptr() as *const usize)
-                .unwrap_or(std::ptr::null());
 
             launch_kernel(
                 dev,
@@ -2400,8 +2393,8 @@ impl Elu {
                 block,
                 &mut [
                     &elem_count as *const usize as *mut std::ffi::c_void,
-                    &dims.len() as *const usize as *mut std::ffi::c_void,
-                    (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                    &num_dims as *const usize as *mut std::ffi::c_void,
+                    ds.as_arg(),
                     (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     &alpha_val as *const T as *mut std::ffi::c_void,
@@ -2502,8 +2495,10 @@ impl FastReduce<'_> {
 
         let func_name = kernel_name::<T>(name);
 
-        let ds_data: Vec<usize> = [dims.as_slice(), stride.as_slice()].concat();
-        let ds = dev.clone_htod(&ds_data)?;
+        // Reduce reorders to [kept dims..., reduced dims...]; the kernel iterates the
+        // full src rank over this reordered (dims, stride) pair, so the payload carries
+        // those exact arrays (NOT the raw layout) inline by value.
+        let (ds, num_dims) = DimsStrides::build(&dims, &[stride.as_slice()])?;
 
         let output = dev.alloc::<T>(dst_el)?;
         let grid = rocm_rs::hip::Dim3::from(dst_el as u32);
@@ -2512,7 +2507,6 @@ impl FastReduce<'_> {
         unsafe {
             let src_ptr = src.offset_ptr(layout.start_offset());
             let out_ptr = output.as_ptr();
-            let ds_ptr = ds.as_ptr() as *const usize;
 
             launch_kernel(
                 dev,
@@ -2524,8 +2518,8 @@ impl FastReduce<'_> {
                 &mut [
                     &src_el as *const usize as *mut std::ffi::c_void,
                     &el_to_sum_per_block as *const usize as *mut std::ffi::c_void,
-                    &src_dims.len() as *const usize as *mut std::ffi::c_void,
-                    (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                    &num_dims as *const usize as *mut std::ffi::c_void,
+                    ds.as_arg(),
                     (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                 ],
@@ -2551,7 +2545,7 @@ fn where_cond_typed<T: Copy + Send + Sync + WithDType + 'static>(
     cond_ptr: *mut std::ffi::c_void,
     t_ptr: *mut std::ffi::c_void,
     f_ptr: *mut std::ffi::c_void,
-    ds: &SendSyncDeviceMemory<usize>,
+    ds: &DimsStrides,
     numel: usize,
     num_dims: usize,
     device: &RocmDevice,
@@ -2562,7 +2556,6 @@ fn where_cond_typed<T: Copy + Send + Sync + WithDType + 'static>(
     let (grid, block) = launch_config(numel);
     unsafe {
         let out_ptr = output.as_ptr();
-        let ds_ptr = ds.as_ptr() as *const usize;
         launch_kernel(
             device,
             TernaryKernel::NAME,
@@ -2573,7 +2566,7 @@ fn where_cond_typed<T: Copy + Send + Sync + WithDType + 'static>(
             &mut [
                 &numel as *const usize as *mut std::ffi::c_void,
                 &num_dims as *const usize as *mut std::ffi::c_void,
-                (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                ds.as_arg(),
                 (&cond_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                 (&t_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                 (&f_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
@@ -2588,10 +2581,11 @@ fn where_cond_typed<T: Copy + Send + Sync + WithDType + 'static>(
 fn index_select_typed<T: Copy + Send + Sync + WithDType + 'static>(
     ids_prefix: &str,
     ids_ptr: *mut std::ffi::c_void,
-    // `Some(ds)`: general path, the shape/stride metadata buffer (an H2D clone_htod
-    // upstream). `None`: capture-safe contiguous fast path — the kernel never reads
-    // `info`, so no clone_htod fires (the op that trips hipGraph capture HIP 906).
-    ds: Option<&SendSyncDeviceMemory<usize>>,
+    // Inline dims/strides payload (by value in the param block, no device buffer ->
+    // capture-clean). `num_dims == 0` is the contiguous `isc_*` fast path (the kernel
+    // ignores `info`); otherwise the `is_*` kernel reads the inline metadata.
+    ds: &DimsStrides,
+    num_dims: usize,
     src_ptr: *mut std::ffi::c_void,
     left_size: usize,
     src_dim_size: usize,
@@ -2606,14 +2600,10 @@ fn index_select_typed<T: Copy + Send + Sync + WithDType + 'static>(
     // `is_*` kernels. `ids_prefix` already carries the right base ("isc_u32"/"is_u32").
     let func_name = kernel_name::<T>(ids_prefix);
     let output = device.alloc::<T>(dst_el)?;
-    let num_dims = ds.map(|d| d.count() / 2).unwrap_or(0);
     let (grid, block) = launch_config(dst_el);
 
     unsafe {
         let out_ptr = output.as_ptr();
-        let ds_ptr = ds
-            .map(|d| d.as_ptr() as *const usize)
-            .unwrap_or(std::ptr::null());
 
         launch_kernel(
             device,
@@ -2625,7 +2615,7 @@ fn index_select_typed<T: Copy + Send + Sync + WithDType + 'static>(
             &mut [
                 &dst_el as *const usize as *mut std::ffi::c_void,
                 &num_dims as *const usize as *mut std::ffi::c_void,
-                (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                ds.as_arg(),
                 (&ids_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                 (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                 (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
@@ -2801,19 +2791,14 @@ impl BackendStorage for RocmStorage {
 
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         let shape = layout.shape();
-        let dims = shape.dims();
         let el = shape.elem_count();
         let dev = self.device.clone();
 
-        let ds = dims_and_strides(&dev, layout, 1)?;
+        let (ds, num_dims) = dims_and_strides(layout)?;
         let start_o = layout.start_offset();
         let src_ptr = unsafe { self.slice.offset_ptr(start_o) };
 
         let (grid, block) = launch_config(el);
-        let ds_ptr: *const usize = ds
-            .as_ref()
-            .map(|d| d.as_ptr() as *const usize)
-            .unwrap_or(std::ptr::null());
 
         let src_dtype = self.slice.dtype();
         let slice = match dtype {
@@ -2822,8 +2807,8 @@ impl BackendStorage for RocmStorage {
                 grid,
                 block,
                 el,
-                dims.len(),
-                ds_ptr,
+                num_dims,
+                ds,
                 src_ptr,
                 src_dtype,
                 u8,
@@ -2834,8 +2819,8 @@ impl BackendStorage for RocmStorage {
                 grid,
                 block,
                 el,
-                dims.len(),
-                ds_ptr,
+                num_dims,
+                ds,
                 src_ptr,
                 src_dtype,
                 u32,
@@ -2846,8 +2831,8 @@ impl BackendStorage for RocmStorage {
                 grid,
                 block,
                 el,
-                dims.len(),
-                ds_ptr,
+                num_dims,
+                ds,
                 src_ptr,
                 src_dtype,
                 i64,
@@ -2858,8 +2843,8 @@ impl BackendStorage for RocmStorage {
                 grid,
                 block,
                 el,
-                dims.len(),
-                ds_ptr,
+                num_dims,
+                ds,
                 src_ptr,
                 src_dtype,
                 bf16,
@@ -2870,8 +2855,8 @@ impl BackendStorage for RocmStorage {
                 grid,
                 block,
                 el,
-                dims.len(),
-                ds_ptr,
+                num_dims,
+                ds,
                 src_ptr,
                 src_dtype,
                 f16,
@@ -2882,8 +2867,8 @@ impl BackendStorage for RocmStorage {
                 grid,
                 block,
                 el,
-                dims.len(),
-                ds_ptr,
+                num_dims,
+                ds,
                 src_ptr,
                 src_dtype,
                 f32,
@@ -2894,8 +2879,8 @@ impl BackendStorage for RocmStorage {
                 grid,
                 block,
                 el,
-                dims.len(),
-                ds_ptr,
+                num_dims,
+                ds,
                 src_ptr,
                 src_dtype,
                 f64,
@@ -2932,8 +2917,8 @@ impl BackendStorage for RocmStorage {
     fn where_cond(&self, l: &Layout, a: &Self, la: &Layout, b: &Self, lb: &Layout) -> Result<Self> {
         let device = self.device.clone();
         let numel = l.shape().elem_count();
-        let num_dims = l.dims().len();
-        let ds = device.clone_htod(&[l.dims(), l.stride(), la.stride(), lb.stride()].concat())?;
+        let (ds, num_dims) =
+            DimsStrides::build(l.dims(), &[l.stride(), la.stride(), lb.stride()])?;
         let (cond_prefix, cond_ptr) = match &self.slice {
             RocmStorageSlice::U8(s) => ("where_u8", unsafe { s.offset_ptr(l.start_offset()) }
                 as *mut std::ffi::c_void),
@@ -3296,21 +3281,17 @@ impl BackendStorage for RocmStorage {
         let ids_dim_size = ids_l.shape().elem_count();
         let dst_el = ids_dim_size * left_size * right_size;
 
-        // Capture-safe fast path: when the ids layout is contiguous, the index_select
-        // kernel's `b = is_contiguous(...)` is always true, so `info` (dims/strides) is
-        // never dereferenced. We can then skip the `clone_htod` of the shape metadata —
-        // that H2D copy is the FIRST op to trip hipGraph capture (HIP 906) on the
-        // embedding gather and the RoPE cos/sin gather (both use contiguous 1-D ids).
-        // The `isc_*` kernels are byte-for-byte identical math to `is_*` with b=true.
-        // Non-contiguous ids (general / prefill, not captured) keep the original path.
+        // Capture-clean metadata: dims/strides ride INLINE in the kernel param block
+        // (no device buffer, no clone_htod -- the H2D copy that trips hipGraph capture
+        // with HIP 906). Contiguous ids use the `isc_*` kernels (which ignore `info`
+        // entirely), so they pass an empty payload; non-contiguous ids use `is_*` with
+        // the filled inline payload. Both are byte-identical math.
         let ids_contig = ids_l.is_contiguous();
-        let ds = if ids_contig {
-            None
+        let (ds, num_dims) = if ids_contig {
+            (DimsStrides { v: [0; ROCM_DS_MAX * ROCM_DS_SETS] }, 0)
         } else {
-            let ids_dims = ids_l.shape().dims();
-            Some(device.clone_htod(&[ids_dims, ids_l.stride()].concat())?)
+            DimsStrides::build(ids_l.shape().dims(), &[ids_l.stride()])?
         };
-        let ds_ref = ds.as_ref();
 
         let src_ptr = match src_l.contiguous_offsets() {
             Some((o1, _)) => unsafe { self.slice.offset_ptr(o1) },
@@ -3336,7 +3317,8 @@ impl BackendStorage for RocmStorage {
             RocmStorageSlice::F32(_) => RocmStorageSlice::F32(index_select_typed::<f32>(
                 ids_prefix,
                 ids_ptr,
-                ds_ref,
+                &ds,
+                num_dims,
                 src_ptr,
                 left_size,
                 src_dim_size,
@@ -3348,7 +3330,8 @@ impl BackendStorage for RocmStorage {
             RocmStorageSlice::F64(_) => RocmStorageSlice::F64(index_select_typed::<f64>(
                 ids_prefix,
                 ids_ptr,
-                ds_ref,
+                &ds,
+                num_dims,
                 src_ptr,
                 left_size,
                 src_dim_size,
@@ -3360,7 +3343,8 @@ impl BackendStorage for RocmStorage {
             RocmStorageSlice::U8(_) => RocmStorageSlice::U8(index_select_typed::<u8>(
                 ids_prefix,
                 ids_ptr,
-                ds_ref,
+                &ds,
+                num_dims,
                 src_ptr,
                 left_size,
                 src_dim_size,
@@ -3372,7 +3356,8 @@ impl BackendStorage for RocmStorage {
             RocmStorageSlice::U32(_) => RocmStorageSlice::U32(index_select_typed::<u32>(
                 ids_prefix,
                 ids_ptr,
-                ds_ref,
+                &ds,
+                num_dims,
                 src_ptr,
                 left_size,
                 src_dim_size,
@@ -3384,7 +3369,8 @@ impl BackendStorage for RocmStorage {
             RocmStorageSlice::I64(_) => RocmStorageSlice::I64(index_select_typed::<i64>(
                 ids_prefix,
                 ids_ptr,
-                ds_ref,
+                &ds,
+                num_dims,
                 src_ptr,
                 left_size,
                 src_dim_size,
@@ -3396,7 +3382,8 @@ impl BackendStorage for RocmStorage {
             RocmStorageSlice::BF16(_) => RocmStorageSlice::BF16(index_select_typed::<half::bf16>(
                 ids_prefix,
                 ids_ptr,
-                ds_ref,
+                &ds,
+                num_dims,
                 src_ptr,
                 left_size,
                 src_dim_size,
@@ -3408,7 +3395,8 @@ impl BackendStorage for RocmStorage {
             RocmStorageSlice::F16(_) => RocmStorageSlice::F16(index_select_typed::<half::f16>(
                 ids_prefix,
                 ids_ptr,
-                ds_ref,
+                &ds,
+                num_dims,
                 src_ptr,
                 left_size,
                 src_dim_size,
@@ -3481,7 +3469,6 @@ impl BackendStorage for RocmStorage {
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
         let src_shape = src_l.shape();
-        let dims = src_shape.dims();
         let el_count = src_shape.elem_count();
         if el_count == 0 {
             return Ok(());
@@ -3535,7 +3522,7 @@ impl BackendStorage for RocmStorage {
         }
 
         let (grid, block) = launch_config(el_count);
-        let ds = dims_and_strides(&self.device, src_l, 1)?;
+        let (ds, num_dims) = dims_and_strides(src_l)?;
 
         macro_rules! copy_strided {
             ($variant:ident, $suffix:expr, $ty:ty) => {{
@@ -3553,10 +3540,6 @@ impl BackendStorage for RocmStorage {
                         (dst_mem.as_ptr() as *mut $ty).add(dst_offset) as *mut std::ffi::c_void,
                     )
                 };
-                let ds_ptr: *const usize = ds
-                    .as_ref()
-                    .map(|d| d.as_ptr() as *const usize)
-                    .unwrap_or(std::ptr::null());
                 unsafe {
                     launch_kernel(
                         &self.device,
@@ -3567,8 +3550,8 @@ impl BackendStorage for RocmStorage {
                         block,
                         &mut [
                             &el_count as *const usize as *mut std::ffi::c_void,
-                            &dims.len() as *const usize as *mut std::ffi::c_void,
-                            (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                            &num_dims as *const usize as *mut std::ffi::c_void,
+                            ds.as_arg(),
                             (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                             (&dst_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                         ],
@@ -3649,14 +3632,13 @@ impl BackendStorage for RocmStorage {
 
     fn const_set(&mut self, val: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
         let shape = layout.shape();
-        let dims = shape.dims();
         let el_count = shape.elem_count();
         if el_count == 0 {
             return Ok(());
         }
 
         let (grid, block) = launch_config(el_count);
-        let ds = dims_and_strides(&self.device, layout, 1)?;
+        let (ds, num_dims) = dims_and_strides(layout)?;
 
         macro_rules! const_set {
             ($variant:ident, $suffix:expr, $ty:ty, $val:expr) => {{
@@ -3667,10 +3649,6 @@ impl BackendStorage for RocmStorage {
                 let func_name = format!("const_set_{}", $suffix);
                 let out_ptr = unsafe { mem.offset_ptr(layout.start_offset()) };
                 let scalar_val: $ty = $val;
-                let ds_ptr: *const usize = ds
-                    .as_ref()
-                    .map(|d| d.as_ptr() as *const usize)
-                    .unwrap_or(std::ptr::null());
                 unsafe {
                     launch_kernel(
                         &self.device,
@@ -3681,8 +3659,8 @@ impl BackendStorage for RocmStorage {
                         block,
                         &mut [
                             &el_count as *const usize as *mut std::ffi::c_void,
-                            &dims.len() as *const usize as *mut std::ffi::c_void,
-                            (&ds_ptr) as *const *const usize as *mut std::ffi::c_void,
+                            &num_dims as *const usize as *mut std::ffi::c_void,
+                            ds.as_arg(),
                             &scalar_val as *const $ty as *mut std::ffi::c_void,
                             (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                         ],

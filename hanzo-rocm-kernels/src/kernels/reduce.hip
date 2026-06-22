@@ -11,6 +11,14 @@
 #include <limits>
 #include <math.h>
 
+// Inline dims/strides metadata passed BY VALUE (no device buffer -> hipGraph-capture
+// clean). Must match Rust `DimsStrides`: ROCM_DS_MAX(8) * ROCM_DS_SETS(4) = 32 size_t.
+// `info` (the reduce device-fn arg) points at `ds.v`; the single stride-set sits at
+// offset ROCM_DS_MAX, NOT num_dims.
+#define ROCM_DS_MAX 8
+#define ROCM_DS_SETS 4
+typedef struct { size_t v[ROCM_DS_MAX * ROCM_DS_SETS]; } DimsStrides;
+
 const int BLOCK_SIZE = 1024;
 const int WARP_SIZE = 32;
 
@@ -128,7 +136,7 @@ __device__ void
 fast_sum(const size_t src_numel, const size_t el_to_sum_per_block,
          const size_t num_dims, const size_t *info, const T *src, T *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
 
     __shared__ T shr[BLOCK_SIZE];
     size_t tid = threadIdx.x;
@@ -160,7 +168,7 @@ __device__ void
 fast_max(const size_t src_numel, const size_t el_to_sum_per_block,
          const size_t num_dims, const size_t *info, const T *src, T *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
 
     __shared__ T shr[BLOCK_SIZE];
     size_t tid = threadIdx.x;
@@ -192,7 +200,7 @@ __device__ void
 fast_min(const size_t src_numel, const size_t el_to_sum_per_block,
          const size_t num_dims, const size_t *info, const T *src, T *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
 
     __shared__ T shr[BLOCK_SIZE];
     size_t tid = threadIdx.x;
@@ -224,7 +232,7 @@ __device__ void
 fast_argmin(const size_t src_numel, const size_t el_to_sum_per_block,
             const size_t num_dims, const size_t *info, const T *src, uint32_t *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
 
     __shared__ T shr[BLOCK_SIZE];
     __shared__ uint32_t shr_index[BLOCK_SIZE];
@@ -265,7 +273,7 @@ __device__ void
 fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
             const size_t num_dims, const size_t *info, const T *src, uint32_t *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
 
     __shared__ T shr[BLOCK_SIZE];
     __shared__ uint32_t shr_index[BLOCK_SIZE];
@@ -490,33 +498,33 @@ __device__ void rope(const T * src, const T * cos, const T * sin, T * dst,
 #define FAST_OP(TYPENAME, MIN_NAME, MAX_NAME, ARGMIN_NAME, ARGMAX_NAME, SUM_NAME) \
   extern "C" __global__ void ARGMIN_NAME( \
       const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, \
       uint32_t *dst) { \
-    fast_argmin(src_numel, el_to_sum_per_block, num_dims, info, src, dst); \
+    fast_argmin(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);\
   } \
   extern "C" __global__ void ARGMAX_NAME( \
       const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, \
       uint32_t *dst) { \
-    fast_argmax(src_numel, el_to_sum_per_block, num_dims, info, src, dst); \
+    fast_argmax(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);\
   } \
   extern "C" __global__ void MIN_NAME( \
       const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, \
       TYPENAME *dst) { \
-    fast_min(src_numel, el_to_sum_per_block, num_dims, info, src, dst); \
+    fast_min(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);\
   } \
   extern "C" __global__ void MAX_NAME( \
       const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, \
       TYPENAME *dst) { \
-    fast_max(src_numel, el_to_sum_per_block, num_dims, info, src, dst); \
+    fast_max(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);\
   } \
   extern "C" __global__ void SUM_NAME( \
       const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, \
       TYPENAME *dst) { \
-    fast_sum(src_numel, el_to_sum_per_block, num_dims, info, src, dst); \
+    fast_sum(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);\
   }
 
 #define SOFTMAX_OP(TYPENAME, ACC_TYPENAME, FN_NAME) \
@@ -750,7 +758,7 @@ template <typename T>
 __device__ void fast_sum_f(const size_t src_numel, const size_t el_to_sum_per_block,
          const size_t num_dims, const size_t *info, const T *src, T *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
     __shared__ float shr[BLOCK_SIZE];
     size_t tid = threadIdx.x;
     size_t dst_id = blockIdx.x;
@@ -773,7 +781,7 @@ template <typename T>
 __device__ void fast_max_f(const size_t src_numel, const size_t el_to_sum_per_block,
          const size_t num_dims, const size_t *info, const T *src, T *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
     __shared__ float shr[BLOCK_SIZE];
     size_t tid = threadIdx.x;
     size_t dst_id = blockIdx.x;
@@ -796,7 +804,7 @@ template <typename T>
 __device__ void fast_min_f(const size_t src_numel, const size_t el_to_sum_per_block,
          const size_t num_dims, const size_t *info, const T *src, T *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
     __shared__ float shr[BLOCK_SIZE];
     size_t tid = threadIdx.x;
     size_t dst_id = blockIdx.x;
@@ -819,7 +827,7 @@ template <typename T>
 __device__ void fast_argmax_f(const size_t src_numel, const size_t el_to_sum_per_block,
             const size_t num_dims, const size_t *info, const T *src, uint32_t *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
     __shared__ float shr[BLOCK_SIZE];
     __shared__ uint32_t shr_index[BLOCK_SIZE];
     size_t tid = threadIdx.x;
@@ -846,7 +854,7 @@ template <typename T>
 __device__ void fast_argmin_f(const size_t src_numel, const size_t el_to_sum_per_block,
             const size_t num_dims, const size_t *info, const T *src, uint32_t *dst) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
+    const size_t *strides = info + ROCM_DS_MAX;
     __shared__ float shr[BLOCK_SIZE];
     __shared__ uint32_t shr_index[BLOCK_SIZE];
     size_t tid = threadIdx.x;
@@ -871,20 +879,20 @@ __device__ void fast_argmin_f(const size_t src_numel, const size_t el_to_sum_per
 
 #define FAST_OP_F(TYPENAME, MIN_NAME, MAX_NAME, ARGMIN_NAME, ARGMAX_NAME, SUM_NAME) \
   extern "C" __global__ void ARGMIN_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, uint32_t *dst) { \
-    fast_argmin_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); } \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, uint32_t *dst) { \
+    fast_argmin_f(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);} \
   extern "C" __global__ void ARGMAX_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, uint32_t *dst) { \
-    fast_argmax_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); } \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, uint32_t *dst) { \
+    fast_argmax_f(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);} \
   extern "C" __global__ void MIN_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, TYPENAME *dst) { \
-    fast_min_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); } \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, TYPENAME *dst) { \
+    fast_min_f(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);} \
   extern "C" __global__ void MAX_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, TYPENAME *dst) { \
-    fast_max_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); } \
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, TYPENAME *dst) { \
+    fast_max_f(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);} \
   extern "C" __global__ void SUM_NAME(const size_t src_numel, const size_t el_to_sum_per_block, \
-      const size_t num_dims, const size_t *info, const TYPENAME *src, TYPENAME *dst) { \
-    fast_sum_f(src_numel, el_to_sum_per_block, num_dims, info, src, dst); }
+      const size_t num_dims, const DimsStrides ds, const TYPENAME *src, TYPENAME *dst) { \
+    fast_sum_f(src_numel, el_to_sum_per_block, num_dims, ds.v, src, dst);}
 
 FAST_OP_F(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
 FAST_OP_F(hip_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argmax_bf16, fast_sum_bf16)
