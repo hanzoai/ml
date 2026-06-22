@@ -1,8 +1,8 @@
 # Generated content DO NOT EDIT
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Sequence
 from os import PathLike
-from candle.typing import _ArrayLike, Device, Scalar, Index, Shape
-from candle import Tensor, DType, QTensor
+from hanzo-ml.typing import _ArrayLike, Device, Scalar, Index, Shape
+from hanzo-ml import Tensor, DType, QTensor
 
 @staticmethod
 def silu(tensor: Tensor) -> Tensor:

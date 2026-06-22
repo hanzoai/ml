@@ -326,7 +326,7 @@ impl Qwen3Attention {
                 )?;
                 ctx_f32.to_dtype(DType::BF16)?
             }
-            dtype => candle::bail!("Unsupported dtype for CPU flash attention: {:?}", dtype),
+            dtype => hanzo_ml::bail!("Unsupported dtype for CPU flash attention: {:?}", dtype),
         };
 
         // Output from CPU flash attention is (B, H, S, D), transpose to (B, S, H, D)

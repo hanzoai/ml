@@ -1,7 +1,7 @@
 from .module import Module
 from typing import Optional, Tuple, Any
-from candle import Tensor
-import candle
+from hanzo-ml import Tensor
+import hanzo-ml
 
 
 class Embedding(Module):
@@ -29,7 +29,7 @@ class Embedding(Module):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.weight = candle.randn((num_embeddings, embedding_dim), **factory_kwargs)
+        self.weight = hanzo-ml.randn((num_embeddings, embedding_dim), **factory_kwargs)
 
     def forward(self, indexes: Tensor) -> Tensor:
         final_dims = list(indexes.shape)

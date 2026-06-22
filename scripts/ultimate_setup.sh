@@ -5,7 +5,7 @@
 set -e
 
 HANZO_ML_DIR="/Users/z/work/hanzo/ml"
-UPSTREAM_CANDLE="/Users/z/work/hf/hanzo-ml"
+UPSTREAM_HANZO_ML="/Users/z/work/hf/hanzo-ml"
 ZEN_DATASET="/Users/z/work/zen/zen-agentic-dataset"
 HANZO_ENGINE="/Users/z/work/hanzo/engine"
 
@@ -13,8 +13,8 @@ cd "$HANZO_ML_DIR"
 
 # Pull latest upstream changes
 echo "Pulling latest Hanzo upstream changes..."
-if [ -d "$UPSTREAM_CANDLE" ]; then
-    cd "$UPSTREAM_CANDLE"
+if [ -d "$UPSTREAM_HANZO_ML" ]; then
+    cd "$UPSTREAM_HANZO_ML"
     git pull origin main || true
     LATEST_COMMIT=$(git rev-parse HEAD)
     echo "Latest upstream: $LATEST_COMMIT"

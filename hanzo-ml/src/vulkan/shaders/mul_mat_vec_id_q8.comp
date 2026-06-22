@@ -1,0 +1,47 @@
+#version 450
+// Fused grouped Q8_0 matvec for MoE decode/prefill: ONE dispatch computes every routed slot's output
+// y[m, nout] where y[slot][col] = dequant(bank[ids[slot]])[col, :] . x_flat[slot, :]. Replaces the
+// per-expert index_select + matvec + index_add loop (and its routing-ids GPU->CPU sync) with a single
+// kernel that reads the per-slot expert id from a GPU SSBO. One invocation per (slot,col). The Q8_0
+// block decode below is COPIED VERBATIM from mul_mat_vec_q8.comp and MUST stay bit-identical (a wrong
+// decode silently garbles all MoE output). Bank is [E,n,k] Q8_0 blocks (9 u32 / 32-block); expert e
+// starts at woff = ids[slot] * per_expert_words u32 words. k is a multiple of 32.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W   { uint   w[]; };   // Q8_0 bank, 9 u32 / 32-block
+layout(set = 0, binding = 1) readonly buffer X   { float  x[]; };   // x_flat [m, k] row-major
+layout(set = 0, binding = 2) writeonly buffer Y  { float  y[]; };   // out [m, nout] row-major
+layout(set = 0, binding = 3) readonly buffer IDS { uint  ids[]; };  // per-slot expert id, length m
+layout(push_constant) uniform Pc { uint nout; uint k; uint per_expert_words; uint m; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint slot = gid / nout;
+    uint col  = gid % nout;
+    if (slot >= m) {
+        return;
+    }
+    uint nblocks = k / 32u;
+    uint woff = ids[slot] * per_expert_words;    // expert id[slot]'s block base in the bank
+    uint base = woff + col * nblocks * 9u;        // u32 offset of row col within that expert
+    uint xbase = slot * k;                        // this slot's activation row in x_flat
+    float acc = 0.0;
+    for (uint b = 0u; b < nblocks; b++) {
+        uint off = base + b * 9u;
+        float scale = unpackHalf2x16(w[off]).x;
+        float bsum = 0.0;
+        uint xb = xbase + b * 32u;
+        for (uint j = 0u; j < 8u; j++) {
+            uint word = w[off + 1u + j];
+            uint xo = xb + j * 4u;
+            // bitfieldExtract on a signed int sign-extends the 8-bit lane.
+            bsum += float(bitfieldExtract(int(word), 0, 8))  * x[xo + 0u];
+            bsum += float(bitfieldExtract(int(word), 8, 8))  * x[xo + 1u];
+            bsum += float(bitfieldExtract(int(word), 16, 8)) * x[xo + 2u];
+            bsum += float(bitfieldExtract(int(word), 24, 8)) * x[xo + 3u];
+        }
+        acc += scale * bsum;
+    }
+    y[slot * nout + col] = acc;
+}

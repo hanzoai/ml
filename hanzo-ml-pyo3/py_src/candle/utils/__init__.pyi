@@ -1,8 +1,8 @@
 # Generated content DO NOT EDIT
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Sequence
 from os import PathLike
-from candle.typing import _ArrayLike, Device, Scalar, Index, Shape
-from candle import Tensor, DType, QTensor
+from hanzo-ml.typing import _ArrayLike, Device, Scalar, Index, Shape
+from hanzo-ml import Tensor, DType, QTensor
 
 @staticmethod
 def cuda_is_available() -> bool:
@@ -14,21 +14,21 @@ def cuda_is_available() -> bool:
 @staticmethod
 def get_num_threads() -> int:
     """
-    Returns the number of threads used by the candle.
+    Returns the number of threads used by the hanzo-ml.
     """
     pass
 
 @staticmethod
 def has_accelerate() -> bool:
     """
-    Returns true if candle was compiled with 'accelerate' support.
+    Returns true if hanzo-ml was compiled with 'accelerate' support.
     """
     pass
 
 @staticmethod
 def has_mkl() -> bool:
     """
-    Returns true if candle was compiled with MKL support.
+    Returns true if hanzo-ml was compiled with MKL support.
     """
     pass
 

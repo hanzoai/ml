@@ -1,6 +1,6 @@
-# candle-granite 4.0 Micro (GraniteMoeHybrid)
+# hanzo-ml-granite 4.0 Micro (GraniteMoeHybrid)
 
-This example runs IBM's [Granite 4.0 Micro](https://huggingface.co/ibm-granite/granite-4.0-micro) hybrid Mixture-of-Experts model with Candle's `GraniteMoeHybrid` implementation. It mirrors the Granite example workflow while showcasing the embedding/logit scaling and hybrid attention stack specific to the 4.0 release.
+This example runs IBM's [Granite 4.0 Micro](https://huggingface.co/ibm-granite/granite-4.0-micro) hybrid Mixture-of-Experts model with Hanzo's `GraniteMoeHybrid` implementation. It mirrors the Granite example workflow while showcasing the embedding/logit scaling and hybrid attention stack specific to the 4.0 release.
 
 ## Running the example
 
@@ -13,7 +13,7 @@ Key flags:
 - `--model-id` selects a Hugging Face repo or a local directory containing `config.json`, `tokenizer.json`, and the `model.safetensors` shards (defaults to `ibm-granite/granite-4.0-micro`).
 - `--cpu` forces CPU execution; omit to use CUDA/Metal when available. Combine with `--dtype bf16|f16|f32` to override the default precision.
 - `--no_kv_cache` disables reuse of attention key/value tensors. Leave it off for faster decoding.
-- `--use_flash_attn` turns on Flash Attention kernels when Candle is built with the feature.
+- `--use_flash_attn` turns on Flash Attention kernels when Hanzo is built with the feature.
 - Sampling controls such as `--temperature`, `--top-p`, `--top-k`, `--repeat-penalty`, and `--repeat-last-n` match the Granite example.
 
 The inline prompt builder wraps your text in the chat template expected by Granite 4.0 Micro (`<|start_of_role|>user ...`). Generation stops when the EOS token (`100257`) is produced or after `sample_len` tokens.

@@ -3,7 +3,7 @@
 //! Thin wrapper over the real [`hanzo_transformers::generation::LogitsProcessor`]
 //! so rollouts use the same battle-tested arg-max / temperature / top-p sampling
 //! path as inference. The reference trainer samples via HF `generate`; this is
-//! the `candle` equivalent.
+//! the `hanzo-ml` equivalent.
 
 use crate::grpo::config::{GrpoConfig, SamplingMode};
 use crate::grpo::policy::Sampler;
