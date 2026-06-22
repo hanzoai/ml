@@ -302,6 +302,101 @@ extern "C" __global__ void qmatvec_q4k_dp4a_bf16(
     }
 }
 
+// Batched indexed-MoE Q4_K decode matvec via int8 dp4a. Same per-row math as qmatvec_q4k_dp4a_*
+// above, but ALL routed slots run in ONE launch with experts on grid.y: for slot s = blockIdx.y,
+// expert = ids[s], and the warp computes output row `row` of that expert's [n,k] weight against
+// slot s's pre-quantized q8_1 activation (xq + s*ncols, xd + s*ncols/32) into y[s*n + row]. This
+// collapses the host per-expert launch loop (topk tiny launches) into one well-occupied grid AND
+// uses the dp4a int8 core instead of scalar-float dequant -- the two levers that bring MoE decode
+// to the same roofline as the non-MoE dp4a matvec. `wbank` = [E,n,k] resident GGML Q4_K bytes.
+extern "C" __global__ void moe_qmatvec_q4k_dp4a_f16(
+    const int n,                        // output rows per expert (weight rows)
+    const int ncols,                    // k, multiple of 256
+    const int nslots,                   // routed slots (= nrows)
+    const uint8_t* __restrict__ wbank,  // [E, n, k] Q4_K blocks
+    const int* __restrict__ ids,        // [nslots] expert id per slot
+    const int8_t* __restrict__ xq,      // [nslots, ncols] q8_1 int8 quants
+    const __half* __restrict__ xd,      // [nslots, ncols/32] q8_1 f16 scales
+    __half* __restrict__ y              // [nslots, n]
+) {
+    const int s = blockIdx.y;
+    if (s >= nslots) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    if (row >= n) {
+        return;
+    }
+    const int nblocks = ncols >> 8; // ncols / 256
+    const int expert = ids[s];
+    const uint8_t* row_ptr =
+        wbank + ((size_t)expert * n + row) * (size_t)nblocks * Q4K_BLOCK_BYTES_DP4A;
+    const int8_t* xq_row = xq + (size_t)s * ncols;
+    const __half* xd_row = xd + (size_t)s * (ncols >> 5);
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const uint8_t* blk = row_ptr + (size_t)b * Q4K_BLOCK_BYTES_DP4A;
+        const int8_t* xq8  = xq_row + (size_t)b * 256;
+        const __half* xd8  = xd_row + (size_t)b * 8;
+        acc += q4k_dp4a_block(blk, xq8, xd8);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        y[(size_t)s * n + row] = __float2half(acc);
+    }
+}
+
+// bf16 activation/output mirror of moe_qmatvec_q4k_dp4a_f16 (model working dtype). Identical int8
+// math; only the output store type differs (the q8_1 activation is dtype-independent).
+extern "C" __global__ void moe_qmatvec_q4k_dp4a_bf16(
+    const int n,
+    const int ncols,
+    const int nslots,
+    const uint8_t* __restrict__ wbank,
+    const int* __restrict__ ids,
+    const int8_t* __restrict__ xq,
+    const __half* __restrict__ xd,
+    hip_bfloat16* __restrict__ y
+) {
+    const int s = blockIdx.y;
+    if (s >= nslots) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    if (row >= n) {
+        return;
+    }
+    const int nblocks = ncols >> 8;
+    const int expert = ids[s];
+    const uint8_t* row_ptr =
+        wbank + ((size_t)expert * n + row) * (size_t)nblocks * Q4K_BLOCK_BYTES_DP4A;
+    const int8_t* xq_row = xq + (size_t)s * ncols;
+    const __half* xd_row = xd + (size_t)s * (ncols >> 5);
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const uint8_t* blk = row_ptr + (size_t)b * Q4K_BLOCK_BYTES_DP4A;
+        const int8_t* xq8  = xq_row + (size_t)b * 256;
+        const __half* xd8  = xd_row + (size_t)b * 8;
+        acc += q4k_dp4a_block(blk, xq8, xd8);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        y[(size_t)s * n + row] = hip_bfloat16(acc);
+    }
+}
+
 // Q8_0 block layout (GGML): 2-byte f16 scale `d`, then 32 int8 quants. 34 bytes, 32 weights.
 // Weight matrix W is [nrows, ncols] row-major; row r holds ncols/32 consecutive Q8_0 blocks.
 //   y[r] = sum_k dequant(W[r,k]) * x[k],   dequant(W[r,k]) = d_block * qs[k_in_block]
