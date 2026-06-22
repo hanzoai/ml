@@ -1551,6 +1551,33 @@ impl crate::CustomOp1 for QTensor {
     }
 }
 
+/// Dense (non-quantized) matmul `xs @ w^T` for the `Tensor`/`TensorF16` `QMatMul` variants, where
+/// the stored weight `w` is `[n, k]` and `xs` is `[.., k]`. On ROCm at decode (a single-row matvec)
+/// this computes the result as `sum_k(xs[k] * w[n, k])` via pooled broadcast-mul + reduce instead of
+/// rocBLAS `gemm_ex`. rocBLAS's GEMM dispatch records a vendor-specific PM4 indirect-buffer packet
+/// that WSL's HSA thunk rejects on hipGraph replay (`VendorSpecificAqlToPm4` assert), so a captured
+/// decode forward containing one (e.g. the MoE F32 router gate) corrupts/aborts on replay. The
+/// reduce path uses only ops already exercised under capture (RMSNorm etc.), so it replays cleanly,
+/// and at M=1 a GEMV-as-reduce is as cheap as the GEMM (it materializes only the `[n, k]` weight).
+/// Prefill (rows > 1, never graph-captured) keeps the rocBLAS GEMM. Non-ROCm devices are unchanged.
+fn dense_matmul(xs: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let k = *w.dims().last().unwrap();
+    let rows = xs.elem_count() / k;
+    if rows == 1 && xs.device().is_rocm() {
+        let n = w.dim(0)?;
+        let out = xs.reshape((1, k))?.broadcast_mul(w)?.sum(D::Minus1)?;
+        let mut dims = xs.dims().to_vec();
+        *dims.last_mut().unwrap() = n;
+        return out.reshape(dims);
+    }
+    let w = match *xs.dims() {
+        [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+        [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+        _ => w.t()?,
+    };
+    xs.matmul(&w)
+}
+
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
@@ -1822,22 +1849,10 @@ impl crate::Module for QMatMul {
                 }
             }
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
-            Self::Tensor(w) => {
-                let w = match *xs.dims() {
-                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
-                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
-                    _ => w.t()?,
-                };
-                xs.matmul(&w)
-            }
+            Self::Tensor(w) => dense_matmul(xs, w),
             Self::TensorF16(w) => {
                 let in_dtype = xs.dtype();
-                let w = match *xs.dims() {
-                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
-                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
-                    _ => w.t()?,
-                };
-                xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
+                dense_matmul(&xs.to_dtype(DType::F16)?, w)?.to_dtype(in_dtype)
             }
         }
     }

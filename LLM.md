@@ -68,11 +68,26 @@ ml/
   NEVER the stream-level `device.synchronize()` which returns `hipErrorStreamCaptureUnsupported` on a
   still-capturing stream and leaves the 901->SIGSEGV poison). DENSE Qwen3-0.6B-Q8_0 graphs-ON = exit 0,
   fully COHERENT, 105 T/s -- proves the metadata fix + position-invariant decode replay are correct.
-- REMAINING (MoE-specific, NOT the metadata fix): Qwen3-30B-A3B (MoE) graphs-ON captures+launches but
-  the REPLAY drifts (correct for ~9 tokens then loops) and eventually hits a WSL HSA assert
-  (`librocdxg/.../queue.cpp:841 VendorSpecificAqlToPm4 packet->ven_hdr == AMD_AQL_FORMAT_PM4_IB`, exit
-  134). Dense is perfect, so this is the on-device-ids batched-MoE expert dispatch under graph replay
-  (the indexed-MoE scratch/scale/routing path), a separate workstream from the (now-fixed) metadata
-  capture-breaker. rocm graphs stay DEFAULT-OFF; eager MoE is the coherent default (and 1.5-2.7x faster
-  now). NEXT: bisect the MoE replay divergence (suspect: a routing/scale buffer recycled across replays
-  not reserved by `begin_graph_capture_scope`, or a moe scratch alloc inside the captured forward).
+- MoE graphs (Qwen3-30B-A3B) ROOT-CAUSED + RESOLVED via a model-level gate (NOT a buffer fix). Two
+  distinct issues were found and the prior "recycled routing/scale buffer" hypothesis was DISPROVEN:
+  (1) The MoE F32 ROUTER GATE (`ffn_gate_inp.weight` is F32 dense, [hidden->128 experts]) was the ONE
+  dense rocBLAS matmul in the captured forward (experts/attn/lm_head are all quantized -> pooled
+  matvec, no rocBLAS). rocBLAS's `gemm_ex` dispatch records a vendor-specific PM4 indirect-buffer
+  packet that WSL's HSA thunk rejects on graph replay -> the `VendorSpecificAqlToPm4` assert. FIX:
+  `dense_matmul` (quantized/mod.rs) now computes a dense rocm matvec (rows==1) as pooled
+  `broadcast_mul + sum` instead of rocBLAS -- capture-clean, numerically identical, GEMV-cheap at M=1.
+  This removed the assert source and is a general dense-decode improvement. ALSO pinned a fixed
+  process-lifetime rocBLAS workspace (`pin_rocblas_workspace`, device.rs) so rocBLAS never lazily
+  `hipMalloc`s GEMM scratch outside our pool (eager prefill win + belt-and-suspenders).
+  (2) The DEEPER blocker (the real reason MoE graphs can't replay): even with rocBLAS gone, replay
+  still drifts. AMD_LOG_LEVEL=3 proves `GraphExec::UpdateStreams failed` (hip_graph_internal.cpp:1981)
+  on EVERY `hipGraphLaunch` (30/30), with ZERO hipMalloc/hipFree during replay (so NOT a recycled
+  pointer -- the capture reservation works). This is ROCm/hip#3887: HIP-graph replay reads stale
+  device state for graphs with ~200+ kernel nodes on RDNA, no upstream fix, no env/flag workaround
+  (GPU_MAX_HW_QUEUES=1 doesn't help). The MoE decode forward (per-layer router sort/top-k + on-device
+  expert gather x48 layers) blows past that node count; dense Qwen3-0.6B (no MoE ops, fewer layers)
+  stays under it and replays byte-coherent at ~104-106 T/s. RESOLUTION: `model_supports_rocm_decode_graph`
+  (engine gguf.rs) now EXCLUDES the MoE variants (Qwen3MoE, Qwen35), so MoE always decodes eager
+  (coherent, 30-55 T/s -- faster here than the broken graph path anyway) while dense keeps its working
+  graph path. Verified: MoE eager + MoE graphs-ON(=eager fallback, no assert, 340-token coherent
+  haiku+count) + dense graphs-ON (105.98 T/s) all clean.
