@@ -45,6 +45,39 @@ impl std::fmt::Debug for RocmDevice {
     }
 }
 
+/// Fixed rocBLAS device workspace (bytes). By default rocBLAS manages its own GEMM scratch and
+/// `hipMalloc`s it lazily on first use; that allocation lands OUTSIDE our caching pool and, when it
+/// happens during a hipGraph capture, gets baked into a graph node yet is freed/reused across
+/// replays -> corrupted decode (the MoE F32 router-gate matmul is the one dense rocBLAS op in the
+/// captured forward). Pinning a single process-lifetime workspace makes rocBLAS reuse it for every
+/// GEMM, so no per-call `hipMalloc` ever escapes into a captured graph. 64 MiB comfortably covers
+/// gemm_ex Standard on every shape this engine issues.
+const ROCBLAS_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Pin a fixed, process-lifetime rocBLAS workspace on `blas` (see [`ROCBLAS_WORKSPACE_BYTES`]). The
+/// buffer is a raw `hipMalloc` deliberately leaked for the process lifetime, mirroring the leaked
+/// rocBLAS handle: rocBLAS frees any prior managed workspace when we set ours, so it must outlive
+/// the handle, and the OS reclaims it at exit anyway.
+fn pin_rocblas_workspace(blas: &SendSyncRocblasHandle) -> Result<()> {
+    use rocm_rs::hip::bindings;
+    use rocm_rs::rocblas::ffi;
+    let mut ptr = std::ptr::null_mut();
+    let err = unsafe { bindings::hipMalloc(&mut ptr, ROCBLAS_WORKSPACE_BYTES) };
+    if err != bindings::hipError_t_hipSuccess {
+        return Err(crate::Error::Msg(format!(
+            "Failed to allocate rocBLAS workspace: {err:?}"
+        )));
+    }
+    let status = unsafe { ffi::rocblas_set_workspace(blas.as_raw(), ptr, ROCBLAS_WORKSPACE_BYTES) };
+    if status != ffi::rocblas_status__rocblas_status_success {
+        unsafe {
+            let _ = bindings::hipFree(ptr);
+        }
+        return Err(RocmError::Rocblas(format!("rocblas_set_workspace failed: {status}")).into());
+    }
+    Ok(())
+}
+
 impl RocmDevice {
     pub fn new(device_id: usize) -> Result<Self> {
         let device = HipDevice::new(device_id as i32)?;
@@ -59,6 +92,7 @@ impl RocmDevice {
         let blas = SendSyncRocblasHandle::new().map_err(|e| RocmError::Rocblas(e.to_string()))?;
         blas.set_stream(&stream)
             .map_err(|e| RocmError::Rocblas(e.to_string()))?;
+        pin_rocblas_workspace(&blas)?;
 
         #[cfg(feature = "rocm-miopen")]
         let miopen =
