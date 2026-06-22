@@ -79,15 +79,27 @@ ml/
   This removed the assert source and is a general dense-decode improvement. ALSO pinned a fixed
   process-lifetime rocBLAS workspace (`pin_rocblas_workspace`, device.rs) so rocBLAS never lazily
   `hipMalloc`s GEMM scratch outside our pool (eager prefill win + belt-and-suspenders).
-  (2) The DEEPER blocker (the real reason MoE graphs can't replay): even with rocBLAS gone, replay
-  still drifts. AMD_LOG_LEVEL=3 proves `GraphExec::UpdateStreams failed` (hip_graph_internal.cpp:1981)
-  on EVERY `hipGraphLaunch` (30/30), with ZERO hipMalloc/hipFree during replay (so NOT a recycled
-  pointer -- the capture reservation works). This is ROCm/hip#3887: HIP-graph replay reads stale
-  device state for graphs with ~200+ kernel nodes on RDNA, no upstream fix, no env/flag workaround
-  (GPU_MAX_HW_QUEUES=1 doesn't help). The MoE decode forward (per-layer router sort/top-k + on-device
-  expert gather x48 layers) blows past that node count; dense Qwen3-0.6B (no MoE ops, fewer layers)
-  stays under it and replays byte-coherent at ~104-106 T/s. RESOLUTION: `model_supports_rocm_decode_graph`
-  (engine gguf.rs) now EXCLUDES the MoE variants (Qwen3MoE, Qwen35), so MoE always decodes eager
-  (coherent, 30-55 T/s -- faster here than the broken graph path anyway) while dense keeps its working
-  graph path. Verified: MoE eager + MoE graphs-ON(=eager fallback, no assert, 340-token coherent
-  haiku+count) + dense graphs-ON (105.98 T/s) all clean.
+  (2) The DEEPER blocker, RE-ROOT-CAUSED (the prior "#3887 / ~200-node UpdateStreams" label was WRONG):
+  the failure is the closed WSL/WDDM thunk's AQL->PM4 queue ring, NOT a hanzo capture bug and NOT a
+  kernel-node-count limit. EVIDENCE (rocgdb + AMD_LOG_LEVEL=4): the abort is in
+  `wsl::thunk::ComputeQueue::VendorSpecificAqlToPm4` (librocdxg queue.cpp:841) on the thunk's async
+  `AqlToPm4Thread` -- it reads a queue slot whose `ven_hdr` is stale/garbage (ring desync), asserting
+  `ven_hdr == AMD_AQL_FORMAT_PM4_IB`. `GraphExec::UpdateStreams failed` is BENIGN: it logs `max_streams:
+  1`, `hipGraphLaunch` still returns hipSuccess, and DENSE Qwen3-0.6B logs the SAME failure 42x yet
+  replays 325 coherent tokens at ~105 T/s. So replay is numerically correct -- the captured MoE forward
+  is single-stream (verified: no stream fork, no host-sync, no memset/copyRect graph nodes during
+  replay -- 0 fillBuffer/0 copyRect after instantiate), and the per-token input refresh DOES reach the
+  buffers (in_tok advances and the first replay tokens are the correct next tokens). The real mechanism:
+  a `hipGraphLaunch` injects ONE `PM4_IB` packet whose indirect buffer scales with graph size; the MoE
+  graph (router sort/top-k + on-device expert gather x48 layers, ~33ms to instantiate) is large enough
+  that repeated PM4-IB submissions interleaved with the eager sampler packets overrun the WDDM ring --
+  output drifts into stale repetition ("count to count to... e e e") then aborts after only ~9-132
+  launches (NONDETERMINISTIC, timing-dependent -> a race, the corruption signature). Dense's tiny IB
+  overruns the same ring only after ~325 launches (so dense ALSO eventually asserts -- this is not
+  MoE-specific in mechanism, only in rate). NOT FIXABLE in-repo: `device.synchronize()` after every
+  launch (drains the stream) does NOT help (MoE still drifts+aborts at ~85 tok), `AMD_DIRECT_DISPATCH=1`
+  does NOT help, and `hipGraphInstantiateWithFlags` ignores all flags on ROCm (documented). RESOLUTION
+  (unchanged): `model_supports_rocm_decode_graph` (engine gguf.rs) EXCLUDES the MoE variants so MoE
+  decodes eager -- correct AND fast (377 coherent tokens, 31-55 T/s, exit 0) -- while dense keeps the
+  working graph path. Verified: MoE eager (377-tok coherent haiku+count, no assert) + dense graphs-ON
+  (105 T/s, 325-tok coherent) clean.
