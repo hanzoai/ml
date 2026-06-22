@@ -1,21 +1,21 @@
-import candle
+import hanzo-ml
 from typing import Dict, Tuple, Any
-from candle import Tensor, QTensor, utils, nn
-from candle.nn import Module, ModuleList
+from hanzo-ml import Tensor, QTensor, utils, nn
+from hanzo-ml.nn import Module, ModuleList
 
 
 def masked_fill(on_false: Tensor, mask: Tensor, on_true: Tensor):
     shape = mask.shape
-    on_true = candle.tensor(on_true).broadcast_as(shape)
+    on_true = hanzo-ml.tensor(on_true).broadcast_as(shape)
     return mask.where_cond(on_true, on_false)
 
 
 def precompute_freqs_cis(hparams: Dict[str, Any], freq_base: float, max_seq_len: int):
     head_dim = hparams["n_embd"] // hparams["n_head"]
     theta = [1.0 / freq_base ** (i / head_dim) for i in range(0, head_dim, 2)]
-    theta = candle.tensor(theta)
+    theta = hanzo-ml.tensor(theta)
     idx_theta = [float(i) for i in range(max_seq_len)]
-    idx_theta = candle.tensor(idx_theta).reshape((max_seq_len, 1))
+    idx_theta = hanzo-ml.tensor(idx_theta).reshape((max_seq_len, 1))
     m = idx_theta.matmul(theta.unsqueeze(0))
     return (m.cos(), m.sin())
 
@@ -91,8 +91,8 @@ class QuantizedLayer(Module):
 
         if self.kv_cache is not None and index_pos > 0:
             prev_k, prev_v = self.kv_cache
-            k = candle.cat([prev_k, k], 2).contiguous()
-            v = candle.cat([prev_v, v], 2).contiguous()
+            k = hanzo-ml.cat([prev_k, k], 2).contiguous()
+            v = hanzo-ml.cat([prev_v, v], 2).contiguous()
 
         self.kv_cache = (k, v)
 
@@ -115,7 +115,7 @@ class QuantizedLayer(Module):
         x1 = x.narrow(-1, 1, 1)
         y0 = x0.broadcast_mul(cos) - x1.broadcast_mul(sin)
         y1 = x0.broadcast_mul(sin) + x1.broadcast_mul(cos)
-        rope = candle.cat([y0, y1], -1)
+        rope = hanzo-ml.cat([y0, y1], -1)
         return rope.flatten_from(-2)
 
 
@@ -140,7 +140,7 @@ class QuantizedLlama(Module):
         x = x.reshape((b_size, seq_len, hidden_size))
 
         mask = [int(j > i) for j in range(seq_len) for i in range(seq_len)]
-        mask = candle.tensor(mask).reshape((seq_len, seq_len))
+        mask = hanzo-ml.tensor(mask).reshape((seq_len, seq_len))
 
         for layer in self.layers:
             x = layer(x, mask, index_pos)

@@ -97,6 +97,306 @@ extern "C" __global__ void quantize_q8_1(
     }
 }
 
+// bf16 activation variant of quantize_q8_1: byte-identical q8_1 quant (int8 xq + per-32-block f16
+// scale xd + int sum xs), reading bf16 instead of f16. The decode path keeps the model's working
+// bf16 dtype, so the dp4a Q4_K matvec needs a bf16-input q8_1 quant (the f16 one above rejects bf16);
+// the only difference is the activation load (hip_bfloat16 -> float), the quant math is the same.
+extern "C" __global__ void quantize_q8_1_bf16(
+    const int M,
+    const int K,
+    const hip_bfloat16* __restrict__ x,
+    int8_t* __restrict__ xq,
+    __half* __restrict__ xd,
+    int* __restrict__ xs
+) {
+    const int nblk = K >> 5;
+    const int wid = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (wid >= M * nblk) {
+        return;
+    }
+    const int m = wid / nblk;
+    const int blk = wid % nblk;
+    const int lane = threadIdx.x & 31;
+    const size_t idx = (size_t)m * K + (size_t)blk * 32 + lane;
+    const float v = (float)x[idx];
+    float a = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor(a, off));
+    }
+    const float inv = (a > 0.0f) ? (127.0f / a) : 0.0f;
+    int q = (int)roundf(v * inv);
+    q = max(-127, min(127, q));
+    xq[idx] = (int8_t)q;
+    int qsum = q;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        qsum += __shfl_xor(qsum, off);
+    }
+    if (lane == 0) {
+        xd[(size_t)m * nblk + blk] = __float2half(a / 127.0f);
+        xs[(size_t)m * nblk + blk] = qsum;
+    }
+}
+
+// get_scale_min_k4 scale/min unpack -- DEFINED below (reused by the scalar Q4_K path + the unified
+// core); forward-declared here so the dp4a Q4_K kernel can call the SAME unpack (one source of
+// truth for the 6-bit scale layout).
+__device__ __forceinline__ void q4k_scale_min(const uint8_t* __restrict__ s, int j, int* sc, int* m);
+
+// ----------------------------------------------------------------------------------------------
+// dp4a (4-element signed int8 dot-accumulate) for the int8 decode path. FAITHFUL to llama.cpp's
+// ggml_cuda_dp4a (common.cuh): on RDNA3/RDNA3.5/RDNA4 the signed-int8 v_dot4 is exposed as
+// __builtin_amdgcn_sudot4(neg_a_unsigned=?, a, neg_b_unsigned=?, b, c, clamp); llama passes
+// (true, a, true, b, c, false) -- the two `true`s select SIGNED operands (NOT unsigned), giving a
+// signed*signed 4xint8 dot accumulated into c. gfx1151 (RDNA3.5) does NOT have the `dot1-insts`
+// feature that `__builtin_amdgcn_sdot4` needs (verified: sdot4 fails to compile here), so sudot4 is
+// the correct builtin -- exactly llama's RDNA3 path. Returns c + sum_{k=0..3} a8[k]*b8[k].
+__device__ __forceinline__ int hip_dp4a(int a, int b, int c) {
+#if defined(__HIPCC__)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    const int8_t* a8 = reinterpret_cast<const int8_t*>(&a);
+    const int8_t* b8 = reinterpret_cast<const int8_t*>(&b);
+    return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
+#endif
+}
+
+// ----------------------------------------------------------------------------------------------
+// Native Q4_K decode matvec via int8 dp4a -- FAITHFUL port of llama.cpp's vec_dot_q4_K_q8_1 +
+// vec_dot_q4_K_q8_1_impl_vmmq (ggml-cuda/vecdotq.cuh). This REPLACES the scalar-float qmatvec_q4k_*
+// path (which dequantized to f32 and did float MACs) with the same int8 SIMD dot llama.cpp runs:
+// the activation row is pre-quantized to q8_1 (int8 qs + per-32-block f16 scale d8), and each weight
+// nibble is dotted against the q8_1 int8 directly via v_dot4 (4x int8 MAC/instruction), then scaled.
+//
+// MATH (per Q4_K super-block: 256 weights = 8 sub-blocks of 32; block_q4_K = {d, dmin, 12 scale
+// bytes, 128 qs bytes}). For sub-block j in [0,8): (sc[j], m[j]) = get_scale_min_k4(scales, j);
+// the 32 weights are nibbles of qs -- chunk c = j/2 covers qs[c*32, c*32+32); sub-block 2c uses the
+// LOW nibble of each byte, sub-block 2c+1 the HIGH nibble (exactly llama's v0i=(v>>0)&0x0F0F0F0F /
+// v1i=(v>>4)&0x0F0F0F0F split and the to_float chunk layout). The matching q8_1 block j has int8
+// quants u[j][0..31] (as 8 ints) and scale d8[j]. Then, identical to impl_vmmq:
+//     dot1 = sum_k nibble_k * u_k        (8x dp4a over the 32 elems)
+//     dot2 = sum_k u_k                   (8x dp4a of 0x01010101 vs u  -- sum of q8_1 quants)
+//     sumf_d += d8[j] * (dot1 * sc[j])
+//     sumf_m += d8[j] * (dot2 * m[j])
+//     result += d * sumf_d - dmin * sumf_m
+// llama tiles the 8 sub-blocks across the mmvq thread grid via the iqs/bq8_offset machinery and 4
+// vec_dot calls of QR4_K=2 each; summing all 8 sub-blocks in one loop is algebraically identical
+// (same per-element products, same f32 accumulation of the d*sc*dot1 - dmin*m*dot2 terms).
+//
+// WARP-per-row, LANE-STRIDED over super-blocks (matches the proven unified decode core): lane L
+// streams whole super-blocks b = L, L+32, ... so 32 independent super-block loads are in flight
+// (hides LPDDR5X latency on the m=1 FFN shapes), each lane fully int8-decodes its super-blocks, then
+// a warp-shuffle reduces the per-lane partials. The q8_1 activation (xq int8 + xd f16 scale) is laid
+// out [k] contiguous: super-block b, sub-block j -> q8 ints at xq + (b*8 + j)*32, scale xd[b*8 + j].
+
+#define Q4K_BLOCK_BYTES_DP4A 144
+
+// Lane's full int8 dot of ONE Q4_K super-block against its 8 q8_1 activation blocks. `blk` -> the
+// 144-byte Q4_K super-block; `xq8` -> the 256 int8 q8_1 quants for this super-block (8 blocks of 32,
+// contiguous); `xd8` -> the 8 per-32-block f16 q8_1 scales for this super-block.
+__device__ __forceinline__ float q4k_dp4a_block(
+        const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+    const float d    = __half2float(*reinterpret_cast<const __half*>(blk));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+    const uint8_t* scales = blk + 4;        // 12 packed 6-bit scale bytes
+    const int* q4 = reinterpret_cast<const int*>(blk + 16);  // 128 qs bytes = 32 ints
+    const int* u  = reinterpret_cast<const int*>(xq8);       // 256 int8 = 64 ints (8 blocks * 8 ints)
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {        // 4 chunks, each = qs[c*32, c*32+32) = 8 ints
+        // Sub-block 2c (low nibbles) and 2c+1 (high nibbles) share the same 8 weight ints.
+        int sc_lo, m_lo, sc_hi, m_hi;
+        q4k_scale_min(scales, 2 * c,     &sc_lo, &m_lo);
+        q4k_scale_min(scales, 2 * c + 1, &sc_hi, &m_hi);
+        const int* q4c   = q4 + c * 8;          // 8 ints of this chunk's nibble-packed weights
+        const int* u_lo  = u + (2 * c)     * 8; // q8_1 block 2c   (8 ints)
+        const int* u_hi  = u + (2 * c + 1) * 8; // q8_1 block 2c+1 (8 ints)
+        const float d8_lo = __half2float(xd8[2 * c]);
+        const float d8_hi = __half2float(xd8[2 * c + 1]);
+        int dot1_lo = 0, dot2_lo = 0, dot1_hi = 0, dot2_hi = 0;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int w   = q4c[t];
+            const int wlo = (w >> 0) & 0x0F0F0F0F;   // low  nibble of each byte
+            const int whi = (w >> 4) & 0x0F0F0F0F;   // high nibble of each byte
+            dot1_lo = hip_dp4a(wlo, u_lo[t], dot1_lo);
+            dot2_lo = hip_dp4a(0x01010101, u_lo[t], dot2_lo);
+            dot1_hi = hip_dp4a(whi, u_hi[t], dot1_hi);
+            dot2_hi = hip_dp4a(0x01010101, u_hi[t], dot2_hi);
+        }
+        sumf_d += d8_lo * (dot1_lo * sc_lo) + d8_hi * (dot1_hi * sc_hi);
+        sumf_m += d8_lo * (dot2_lo * m_lo)  + d8_hi * (dot2_hi * m_hi);
+    }
+    return d * sumf_d - dmin * sumf_m;
+}
+
+// f16 activation/output. wq = raw Q4_K weight bytes; xq/xd = the pre-quantized q8_1 activation row.
+extern "C" __global__ void qmatvec_q4k_dp4a_f16(
+    const int nrows,
+    const int ncols,            // multiple of 256
+    const uint8_t* __restrict__ wq,
+    const int8_t*  __restrict__ xq,   // [ncols] q8_1 int8 quants
+    const __half*  __restrict__ xd,   // [ncols/32] q8_1 f16 scales
+    __half* __restrict__ y
+) {
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    if (row >= nrows) {
+        return;
+    }
+    const int nblocks = ncols >> 8; // ncols / 256
+    const uint8_t* row_ptr = wq + (size_t)row * (size_t)nblocks * Q4K_BLOCK_BYTES_DP4A;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const uint8_t* blk = row_ptr + (size_t)b * Q4K_BLOCK_BYTES_DP4A;
+        const int8_t* xq8  = xq + (size_t)b * 256;
+        const __half* xd8  = xd + (size_t)b * 8;
+        acc += q4k_dp4a_block(blk, xq8, xd8);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        y[row] = __float2half(acc);
+    }
+}
+
+// bf16 activation/output (model working dtype). Identical int8 math; only the output store differs
+// (the q8_1 activation is already int8 + f16 scale, dtype-independent, produced by quantize_q8_1).
+extern "C" __global__ void qmatvec_q4k_dp4a_bf16(
+    const int nrows,
+    const int ncols,            // multiple of 256
+    const uint8_t* __restrict__ wq,
+    const int8_t*  __restrict__ xq,
+    const __half*  __restrict__ xd,
+    hip_bfloat16* __restrict__ y
+) {
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    if (row >= nrows) {
+        return;
+    }
+    const int nblocks = ncols >> 8; // ncols / 256
+    const uint8_t* row_ptr = wq + (size_t)row * (size_t)nblocks * Q4K_BLOCK_BYTES_DP4A;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const uint8_t* blk = row_ptr + (size_t)b * Q4K_BLOCK_BYTES_DP4A;
+        const int8_t* xq8  = xq + (size_t)b * 256;
+        const __half* xd8  = xd + (size_t)b * 8;
+        acc += q4k_dp4a_block(blk, xq8, xd8);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        y[row] = hip_bfloat16(acc);
+    }
+}
+
+// Batched indexed-MoE Q4_K decode matvec via int8 dp4a. Same per-row math as qmatvec_q4k_dp4a_*
+// above, but ALL routed slots run in ONE launch with experts on grid.y: for slot s = blockIdx.y,
+// expert = ids[s], and the warp computes output row `row` of that expert's [n,k] weight against
+// slot s's pre-quantized q8_1 activation (xq + s*ncols, xd + s*ncols/32) into y[s*n + row]. This
+// collapses the host per-expert launch loop (topk tiny launches) into one well-occupied grid AND
+// uses the dp4a int8 core instead of scalar-float dequant -- the two levers that bring MoE decode
+// to the same roofline as the non-MoE dp4a matvec. `wbank` = [E,n,k] resident GGML Q4_K bytes.
+extern "C" __global__ void moe_qmatvec_q4k_dp4a_f16(
+    const int n,                        // output rows per expert (weight rows)
+    const int ncols,                    // k, multiple of 256
+    const int nslots,                   // routed slots (= nrows)
+    const uint8_t* __restrict__ wbank,  // [E, n, k] Q4_K blocks
+    const int* __restrict__ ids,        // [nslots] expert id per slot
+    const int8_t* __restrict__ xq,      // [nslots, ncols] q8_1 int8 quants
+    const __half* __restrict__ xd,      // [nslots, ncols/32] q8_1 f16 scales
+    __half* __restrict__ y              // [nslots, n]
+) {
+    const int s = blockIdx.y;
+    if (s >= nslots) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    if (row >= n) {
+        return;
+    }
+    const int nblocks = ncols >> 8; // ncols / 256
+    const int expert = ids[s];
+    const uint8_t* row_ptr =
+        wbank + ((size_t)expert * n + row) * (size_t)nblocks * Q4K_BLOCK_BYTES_DP4A;
+    const int8_t* xq_row = xq + (size_t)s * ncols;
+    const __half* xd_row = xd + (size_t)s * (ncols >> 5);
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const uint8_t* blk = row_ptr + (size_t)b * Q4K_BLOCK_BYTES_DP4A;
+        const int8_t* xq8  = xq_row + (size_t)b * 256;
+        const __half* xd8  = xd_row + (size_t)b * 8;
+        acc += q4k_dp4a_block(blk, xq8, xd8);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        y[(size_t)s * n + row] = __float2half(acc);
+    }
+}
+
+// bf16 activation/output mirror of moe_qmatvec_q4k_dp4a_f16 (model working dtype). Identical int8
+// math; only the output store type differs (the q8_1 activation is dtype-independent).
+extern "C" __global__ void moe_qmatvec_q4k_dp4a_bf16(
+    const int n,
+    const int ncols,
+    const int nslots,
+    const uint8_t* __restrict__ wbank,
+    const int* __restrict__ ids,
+    const int8_t* __restrict__ xq,
+    const __half* __restrict__ xd,
+    hip_bfloat16* __restrict__ y
+) {
+    const int s = blockIdx.y;
+    if (s >= nslots) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    if (row >= n) {
+        return;
+    }
+    const int nblocks = ncols >> 8;
+    const int expert = ids[s];
+    const uint8_t* row_ptr =
+        wbank + ((size_t)expert * n + row) * (size_t)nblocks * Q4K_BLOCK_BYTES_DP4A;
+    const int8_t* xq_row = xq + (size_t)s * ncols;
+    const __half* xd_row = xd + (size_t)s * (ncols >> 5);
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const uint8_t* blk = row_ptr + (size_t)b * Q4K_BLOCK_BYTES_DP4A;
+        const int8_t* xq8  = xq_row + (size_t)b * 256;
+        const __half* xd8  = xd_row + (size_t)b * 8;
+        acc += q4k_dp4a_block(blk, xq8, xd8);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        y[(size_t)s * n + row] = hip_bfloat16(acc);
+    }
+}
+
 // Q8_0 block layout (GGML): 2-byte f16 scale `d`, then 32 int8 quants. 34 bytes, 32 weights.
 // Weight matrix W is [nrows, ncols] row-major; row r holds ncols/32 consecutive Q8_0 blocks.
 //   y[r] = sum_k dequant(W[r,k]) * x[k],   dequant(W[r,k]) = d_block * qs[k_in_block]

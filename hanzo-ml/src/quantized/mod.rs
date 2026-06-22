@@ -1011,13 +1011,6 @@ impl QTensor {
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                 };
-                let ids_vec = ids
-                    .reshape((nrows,))?
-                    .to_dtype(crate::DType::U32)?
-                    .to_vec1::<u32>()?;
-                if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
-                    crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
-                }
                 use crate::backend::BackendDevice;
                 let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
                 // Upload the expert bank to VRAM ONCE and keep it resident: the bank's CPU bytes are
@@ -1036,7 +1029,39 @@ impl QTensor {
                         w
                     }
                 };
-                let y = {
+                // Q4_K: keep router ids ON the GPU and run the ONE batched dp4a launch (experts on
+                // grid.y, ids read on-device). No `to_vec1` DtoH sync -- that host round-trip (3 per
+                // layer x 48 layers per token) was both the dominant WSL decode stall AND what made HIP
+                // stream capture illegal (hipErrorStreamCaptureImplicit -> the graph-path SIGSEGV).
+                // The router emits a top-k over the e_cnt expert logits, so 0 <= id < e_cnt by
+                // construction; the prior host bounds check is dropped here to stay capture-clean.
+                let y = if matches!(qt, crate::RocmQuantType::Q4K) {
+                    let ids_u32 = ids
+                        .reshape((nrows,))?
+                        .to_dtype(crate::DType::U32)?
+                        .contiguous()?;
+                    let (store, _) = x_flat.storage_and_layout();
+                    let xr = match &*store {
+                        crate::Storage::Rocm(r) => r,
+                        _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
+                    };
+                    let (idstore, _) = ids_u32.storage_and_layout();
+                    let idr = match &*idstore {
+                        crate::Storage::Rocm(r) => r,
+                        _ => crate::bail!("rocm MoE: ids not on rocm"),
+                    };
+                    rocm_dev.moe_matvec_q4k_dp4a(wbank.as_ref(), xr, idr, nrows, n, k)?
+                } else {
+                    // Other wired quant types use the per-expert scalar launch loop, which offsets the
+                    // bank by `eid` on the host -> needs ids materialized on the host (not capture-clean,
+                    // but those types have no batched on-device-ids kernel yet).
+                    let ids_vec = ids
+                        .reshape((nrows,))?
+                        .to_dtype(crate::DType::U32)?
+                        .to_vec1::<u32>()?;
+                    if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
+                        crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
+                    }
                     let (store, _) = x_flat.storage_and_layout();
                     let xr = match &*store {
                         crate::Storage::Rocm(r) => r,
@@ -1193,7 +1218,7 @@ fn rocm_moe_bank_cache(
 
 thread_local! {
     static DEQUANTIZE_ALL: bool = {
-        match std::env::var("CANDLE_DEQUANTIZE_ALL") {
+        match std::env::var("DEQUANTIZE_ALL") {
             Ok(s) => {
                 !s.is_empty() && s != "0"
             },
@@ -1204,7 +1229,7 @@ thread_local! {
 
 thread_local! {
     static DEQUANTIZE_ALL_F16: bool = {
-        match std::env::var("CANDLE_DEQUANTIZE_ALL_F16") {
+        match std::env::var("DEQUANTIZE_ALL_F16") {
             Ok(s) => {
                 !s.is_empty() && s != "0"
             },
@@ -1376,6 +1401,75 @@ impl QMatMul {
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
+            // Resident-bank MoE: `wq` already holds the [E,n,k] GGML blocks in VRAM (uploaded at
+            // load), so route straight to the batched on-GPU quant matvec. Delegating to `qtensor`
+            // (CPU-side) instead drops to the generic fallback that re-uploads every routed expert
+            // every token -- the 20-50x decode cliff. `qtensor` is read only for its shape.
+            #[cfg(feature = "rocm")]
+            Self::RocmQuant {
+                qtensor, wq, dtype, ..
+            } if crate::RocmQuantType::from_ggml(*dtype).is_some() => {
+                let qt = crate::RocmQuantType::from_ggml(*dtype).unwrap();
+                let wbank = wq.as_ref();
+                let (e_cnt, n, k) = qtensor.shape().dims3()?;
+                let (t, topk) = ids.dims2()?;
+                let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+                let x_exp = if s == topk {
+                    x.clone()
+                } else {
+                    x.broadcast_as((t, topk, k))?
+                };
+                let nrows = t * topk;
+                let x_flat = match x_exp.dtype() {
+                    DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
+                    _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
+                };
+                let out_dtype = x.dtype();
+                // Keep router ids ON the GPU: the batched dp4a kernel indexes experts on-device, so
+                // there is no per-call `to_vec1` host round-trip. That DtoH sync (3 per layer x 48
+                // layers per token) was the dominant decode stall on WSL, not the expert matmul.
+                let y = if matches!(qt, crate::RocmQuantType::Q4K) {
+                    let ids_u32 = ids
+                        .reshape((nrows,))?
+                        .to_dtype(crate::DType::U32)?
+                        .contiguous()?;
+                    let (xstore, _) = x_flat.storage_and_layout();
+                    let xr = match &*xstore {
+                        crate::Storage::Rocm(r) => r,
+                        _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
+                    };
+                    let (idstore, _) = ids_u32.storage_and_layout();
+                    let idr = match &*idstore {
+                        crate::Storage::Rocm(r) => r,
+                        _ => crate::bail!("rocm MoE: ids not on rocm"),
+                    };
+                    wbank.device.moe_matvec_q4k_dp4a(wbank, xr, idr, nrows, n, k)?
+                } else {
+                    let ids_vec = ids
+                        .reshape((nrows,))?
+                        .to_dtype(crate::DType::U32)?
+                        .to_vec1::<u32>()?;
+                    if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
+                        crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
+                    }
+                    let (xstore, _) = x_flat.storage_and_layout();
+                    let xr = match &*xstore {
+                        crate::Storage::Rocm(r) => r,
+                        _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
+                    };
+                    wbank
+                        .device
+                        .moe_matvec_quant(qt, wbank, xr, &ids_vec, nrows, n, k)?
+                };
+                let out = crate::tensor::from_storage(
+                    crate::Storage::Rocm(y),
+                    (nrows, n),
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                out.reshape((t, topk, n))?.to_dtype(out_dtype)
+            }
+            // Unwired ROCm quant dtypes (no on-GPU quant matvec): CPU per-expert fallback.
             #[cfg(feature = "rocm")]
             Self::RocmQuant { qtensor, .. } => qtensor.indexed_moe_forward(x, ids),
             #[cfg(feature = "vulkan")]
@@ -1491,6 +1585,22 @@ impl crate::Module for QMatMul {
                 n,
                 k,
             } => {
+                // Device-residency guard: multi-token attention prefill can leave the activation
+                // off-device (an upstream op leaked to host); recover instead of bailing so prefill
+                // stays correct. The leak is the bug to fix for speed; this keeps us correct meanwhile.
+                let xs_recovered = if xs.device().is_rocm() {
+                    None
+                } else {
+                    if std::env::var("HANZO_DBG_PATH").is_ok() {
+                        eprintln!(
+                            "[ROCm-RECOVER] activation off-device {:?} dims {:?}",
+                            xs.device().location(),
+                            xs.dims()
+                        );
+                    }
+                    Some(xs.to_device(&qtensor.device())?)
+                };
+                let xs = xs_recovered.as_ref().unwrap_or(xs);
                 let rows: usize = xs.elem_count() / *k;
                 #[cfg(feature = "rocm")]
                 {
