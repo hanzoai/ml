@@ -10,6 +10,12 @@
 #include <stdint.h>
 #include <math.h>
 
+// Inline dims/strides metadata passed BY VALUE (no device buffer -> hipGraph-capture
+// clean). Must match Rust `DimsStrides`: ROCM_DS_MAX(8) * ROCM_DS_SETS(4) = 32 size_t.
+#define ROCM_DS_MAX 8
+#define ROCM_DS_SETS 4
+typedef struct { size_t v[ROCM_DS_MAX * ROCM_DS_SETS]; } DimsStrides;
+
 __device__ bool is_contiguous(
     const size_t num_dims,
     const size_t *dims,
@@ -46,20 +52,21 @@ __device__ unsigned int get_strided_index(
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *info, \
+    const DimsStrides ds, \
     const TYPENAME *inp, \
     TYPENAME *out, \
     const TYPENAME mul, \
     const TYPENAME add \
 ) { \
-    if (info == nullptr || is_contiguous(num_dims, info, info + num_dims)) { \
+    const size_t *dims = ds.v; \
+    const size_t *strides = ds.v + ROCM_DS_MAX; \
+    if (num_dims == 0 || is_contiguous(num_dims, dims, strides)) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             out[i] = inp[i] * mul + add; \
         } \
     } else { \
-        const size_t *strides = info + num_dims; \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
-            unsigned int src_i = get_strided_index(i, num_dims, info, strides); \
+            unsigned int src_i = get_strided_index(i, num_dims, dims, strides); \
             out[i] = inp[src_i] * mul + add; \
         } \
     } \
@@ -80,7 +87,7 @@ AFFINE_OP(int64_t, affine_i64)
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *info, \
+    const DimsStrides ds, \
     const TYPENAME *inp, \
     TYPENAME *out, \
     const TYPENAME mul, \
@@ -88,14 +95,15 @@ extern "C" __global__ void FN_NAME( \
 ) { \
     float mulf = (float)mul; \
     float addf = (float)add; \
-    if (info == nullptr || is_contiguous(num_dims, info, info + num_dims)) { \
+    const size_t *dims = ds.v; \
+    const size_t *strides = ds.v + ROCM_DS_MAX; \
+    if (num_dims == 0 || is_contiguous(num_dims, dims, strides)) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             out[i] = (TYPENAME)((float)inp[i] * mulf + addf); \
         } \
     } else { \
-        const size_t *strides = info + num_dims; \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
-            unsigned int src_i = get_strided_index(i, num_dims, info, strides); \
+            unsigned int src_i = get_strided_index(i, num_dims, dims, strides); \
             out[i] = (TYPENAME)((float)inp[src_i] * mulf + addf); \
         } \
     } \
