@@ -1,7 +1,7 @@
 #version 450
 // 2D strided block copy: copy `d1` rows of `d2` contiguous f32 elements from `inp`
 // to `outp`, with independent per-row source/dest strides and base offsets. This is
-// candle's copy2d primitive, which powers `Tensor::cat` along the inner dims and
+// hanzo-ml's copy2d primitive, which powers `Tensor::cat` along the inner dims and
 // `slice_set` (the KV-cache append + GQA repeat_kv path in a transformer forward).
 // Replaces the previous GPU->CPU->GPU round-trip with one on-GPU dispatch.
 //

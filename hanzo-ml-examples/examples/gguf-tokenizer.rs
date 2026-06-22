@@ -20,7 +20,7 @@ struct Args {
     #[arg(long)]
     revision: Option<String>,
     /// Text prompt to tokenize with the GGUF tokenizer.
-    #[arg(long, default_value = "Hello Candle!")]
+    #[arg(long, default_value = "Hello Hanzo!")]
     prompt: String,
 }
 

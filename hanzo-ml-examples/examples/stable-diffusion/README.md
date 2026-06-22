@@ -54,7 +54,7 @@ The default scheduler for the XL Turbo version is the Euler Ancestral scheduler.
 
 Using flash attention makes image generation a lot faster and uses less memory.
 The downside is some long compilation time. You can set the
-`CANDLE_FLASH_ATTN_BUILD_DIR` environment variable to something like
+`HANZO_FLASH_ATTN_BUILD_DIR` environment variable to something like
 `/home/user/.hanzo` to ensures that the compilation artifacts are properly
 cached.
 

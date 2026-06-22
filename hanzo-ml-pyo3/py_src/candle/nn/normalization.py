@@ -1,5 +1,5 @@
-import candle
-from candle import Tensor
+import hanzo-ml
+from hanzo-ml import Tensor
 from .module import Module
 from typing import Union, List, Tuple, Optional, Any
 
@@ -34,9 +34,9 @@ class LayerNorm(Module):
         self.normalized_shape = tuple(normalized_shape)
         self.eps = eps
 
-        self.weight = candle.ones(normalized_shape, **factory_kwargs)
+        self.weight = hanzo-ml.ones(normalized_shape, **factory_kwargs)
         if bias:
-            self.bias = candle.zeros(normalized_shape, **factory_kwargs)
+            self.bias = hanzo-ml.zeros(normalized_shape, **factory_kwargs)
         else:
             self.bias = None
 

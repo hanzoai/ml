@@ -42,7 +42,7 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-rocm-rs = "0.5"
+rocm-rs = { version = "0.5", default-features = false, features = ["macros"] }
 hanzo-rocm-kernels = { path = "./hanzo-rocm-kernels", version = "0.11.0" }
 ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }

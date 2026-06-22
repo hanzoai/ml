@@ -40,8 +40,8 @@ Where:
 
 Manages the AOT compilation cache:
 
-- **GPU Detection**: Automatically detects GPU architecture using `rocminfo` or falls back to environment variable `CANDLE_ROCM_ARCH`
-- **Version Detection**: Detects ROCm version using `hipcc --version` or environment variable `CANDLE_ROCM_VERSION`
+- **GPU Detection**: Automatically detects GPU architecture using `rocminfo` or falls back to environment variable `HANZO_ROCM_ARCH`
+- **Version Detection**: Detects ROCm version using `hipcc --version` or environment variable `HANZO_ROCM_VERSION`
 - **Compilation**: Invokes `hipcc` with appropriate flags:
   ```bash
   hipcc --offload-arch={arch} -O3 -fPIC -c -o output.o input.hip
@@ -79,8 +79,8 @@ let module = manager.get_or_compile_module(Source::Binary)?;
 
 ### Environment Variables
 
-- `CANDLE_ROCM_ARCH` - Override GPU architecture detection (e.g., "gfx908")
-- `CANDLE_ROCM_VERSION` - Override ROCm version detection (e.g., "6.1")
+- `HANZO_ROCM_ARCH` - Override GPU architecture detection (e.g., "gfx908")
+- `HANZO_ROCM_VERSION` - Override ROCm version detection (e.g., "6.1")
 
 ## Requirements
 
@@ -124,7 +124,7 @@ Common AMD GPU architectures:
 - CDNA3: gfx942 (MI300 series)
 - RDNA3: gfx1100, gfx1101, gfx1102 (RX 7000 series)
 
-The system will try to auto-detect, but you can override with `CANDLE_ROCM_ARCH`.
+The system will try to auto-detect, but you can override with `HANZO_ROCM_ARCH`.
 
 ## License
 
