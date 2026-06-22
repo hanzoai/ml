@@ -9,6 +9,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Inline dims/strides metadata passed BY VALUE (no device buffer -> hipGraph-capture
+// clean). Must match Rust `DimsStrides`: ROCM_DS_MAX(8) * ROCM_DS_SETS(4) = 32 size_t.
+#define ROCM_DS_MAX 8
+#define ROCM_DS_SETS 4
+typedef struct { size_t v[ROCM_DS_MAX * ROCM_DS_SETS]; } DimsStrides;
+
 __device__ bool is_contiguous(
     const size_t num_dims,
     const size_t *dims,
@@ -75,8 +81,8 @@ __device__ void index_select(
     const size_t right_size
 ) {
     const size_t *dims = info;
-    const size_t *strides = info + num_dims;
-    bool b = is_contiguous(num_dims, dims, strides);
+    const size_t *strides = info + ROCM_DS_MAX;
+    bool b = num_dims == 0 || is_contiguous(num_dims, dims, strides);
     for (unsigned int dst_i = blockIdx.x * blockDim.x + threadIdx.x; dst_i < numel; dst_i += blockDim.x * gridDim.x) {
           unsigned int left_i = dst_i / (ids_dim_size * right_size);
           unsigned int id_i = dst_i / right_size % ids_dim_size;
@@ -95,7 +101,7 @@ __device__ void index_select(
 extern "C" __global__ void FN_NAME(  \
     const size_t numel,  \
     const size_t num_dims, \
-    const size_t *info, \
+    const DimsStrides ds, \
     const INDEX_TYPENAME *ids, \
     const TYPENAME *inp, \
     TYPENAME *out, \
@@ -103,7 +109,7 @@ extern "C" __global__ void FN_NAME(  \
     const size_t src_dim_size, \
     const size_t ids_dim_size, \
     const size_t right_size \
-) { index_select(numel, num_dims, info, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size); }
+) { index_select(numel, num_dims, ds.v, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size); }
 
 IS_OP(float, int64_t, is_i64_f32)
 IS_OP(double, int64_t, is_i64_f64)
@@ -156,7 +162,7 @@ __device__ void index_select_contig(
 extern "C" __global__ void FN_NAME(  \
     const size_t numel,  \
     const size_t num_dims, \
-    const size_t *info, \
+    const DimsStrides ds, \
     const INDEX_TYPENAME *ids, \
     const TYPENAME *inp, \
     TYPENAME *out, \
@@ -164,7 +170,7 @@ extern "C" __global__ void FN_NAME(  \
     const size_t src_dim_size, \
     const size_t ids_dim_size, \
     const size_t right_size \
-) { (void)num_dims; (void)info; index_select_contig(numel, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size); }
+) { (void)num_dims; (void)ds; index_select_contig(numel, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size); }
 
 ISC_OP(float, int64_t, isc_i64_f32)
 ISC_OP(double, int64_t, isc_i64_f64)
