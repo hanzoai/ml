@@ -873,6 +873,80 @@ DEFINE_QMATVECU(q6k,   DW_Q6_K)
 DEFINE_QMATVECU(iq4xs, DW_IQ4_XS)
 DEFINE_QMATVECU(tq2_0, DW_TQ2_0)
 
+// THE unified indexed-MoE decode core. Same warp-per-row + lane-strided-block math as
+// `qmatvec_core`, but ALL routed slots run in ONE launch with the routed expert on grid.y:
+//   slot s = blockIdx.y, expert = ids[s] (read ON-DEVICE -- no host ids round-trip), and the warp
+//   computes output row `row` of THAT expert's [n,k] byte-slice of the resident `[E,n,k]` bank
+//   against slot s's activation row (x + s*ncols) into y[s*n + row].
+// This is the non-Q4_K twin of `moe_qmatvec_q4k_dp4a_*`: it collapses the per-expert host launch
+// loop (which had to materialize ids on the host -> hipErrorStreamCaptureImplicit, breaking HIP
+// graph capture) into one well-occupied capture-clean grid, while reusing the proven per-type
+// `qdec_block_full<WTYPE,XT>` decode verbatim -- only the expert-offset + slot indexing change.
+template <int WTYPE, typename XT>
+__device__ __forceinline__ void moe_qmatvec_core(
+    const int n,                       // output rows per expert (weight rows)
+    const int ncols,                   // k, multiple of ELEMS
+    const int nslots,                  // routed slots (= nrows)
+    const uint8_t* __restrict__ wbank, // [E, n, k] resident GGML blocks
+    const int* __restrict__ ids,       // [nslots] expert id per slot
+    const XT* __restrict__ x,          // [nslots, ncols] routed activations
+    XT* __restrict__ y                 // [nslots, n]
+) {
+    constexpr int WBYTES = qdw_traits<WTYPE>::BYTES;
+    constexpr int ELEMS  = qdw_traits<WTYPE>::ELEMS;
+    const int s = blockIdx.y;
+    if (s >= nslots) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    if (row >= n) {
+        return;
+    }
+    const int nblocks = ncols / ELEMS;
+    const int expert = ids[s];
+    // Offset the bank to expert `ids[s]`, row `row`, IN-KERNEL (the host loop used to do this).
+    const uint8_t* row_ptr =
+        wbank + ((size_t)expert * (size_t)n + (size_t)row) * (size_t)nblocks * WBYTES;
+    const XT* x_row = x + (size_t)s * (size_t)ncols;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        acc += qdec_block_full<WTYPE, XT>(row_ptr + (size_t)b * WBYTES, x_row + (size_t)b * ELEMS);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        qstore(&y[(size_t)s * (size_t)n + (size_t)row], acc);
+    }
+}
+
+// Unified per-type indexed-MoE entry points (f16 + bf16). Twin of DEFINE_QMATVECU: every symbol is
+// the SAME `moe_qmatvec_core` with a different WTYPE -- one core, one launcher table on the Rust
+// side. The Rust `moe_matvec_quant` selects the symbol by RocmQuantType + activation dtype.
+#define DEFINE_MOE_QMATVECU(NAME, WTYPE)                                                             \
+    extern "C" __global__ void moe_qmatvecu_##NAME##_f16(                                            \
+        const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,          \
+        const int* __restrict__ ids, const __half* __restrict__ x, __half* __restrict__ y) {        \
+        moe_qmatvec_core<WTYPE, __half>(n, ncols, nslots, wbank, ids, x, y);                         \
+    }                                                                                                \
+    extern "C" __global__ void moe_qmatvecu_##NAME##_bf16(                                           \
+        const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,          \
+        const int* __restrict__ ids, const hip_bfloat16* __restrict__ x, hip_bfloat16* __restrict__ y) { \
+        moe_qmatvec_core<WTYPE, hip_bfloat16>(n, ncols, nslots, wbank, ids, x, y);                   \
+    }
+
+DEFINE_MOE_QMATVECU(q8_0,  DW_Q8_0)
+DEFINE_MOE_QMATVECU(q4_0,  DW_Q4_0)
+DEFINE_MOE_QMATVECU(q4k,   DW_Q4_K)
+DEFINE_MOE_QMATVECU(q6k,   DW_Q6_K)
+DEFINE_MOE_QMATVECU(iq4xs, DW_IQ4_XS)
+DEFINE_MOE_QMATVECU(tq2_0, DW_TQ2_0)
+
+#undef DEFINE_MOE_QMATVECU
 #undef DEFINE_QMATVECU
 #undef DW_Q8_0
 #undef DW_Q4_0
