@@ -1,7 +1,7 @@
 # Generated content DO NOT EDIT
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Sequence
 from os import PathLike
-from candle.typing import _ArrayLike, Device, Scalar, Index, Shape
+from hanzo-ml.typing import _ArrayLike, Device, Scalar, Index, Shape
 
 class bf16(DType):
     pass
@@ -75,7 +75,7 @@ def zeros(*shape: Shape, dtype: Optional[DType] = None, device: Optional[Device]
 
 class DType:
     """
-    A `candle` dtype.
+    A `hanzo-ml` dtype.
     """
 
 class QTensor:
@@ -118,7 +118,7 @@ class QTensor:
 
 class Tensor:
     """
-    A `candle` tensor.
+    A `hanzo-ml` tensor.
     """
 
     def __init__(self, data: _ArrayLike):
@@ -511,7 +511,7 @@ class Tensor:
 
     def to_torch(self) -> torch.Tensor:
         """
-        Converts candle's tensor to pytorch's tensor
+        Converts hanzo-ml's tensor to pytorch's tensor
         """
         pass
 

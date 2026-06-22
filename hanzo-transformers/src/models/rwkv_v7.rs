@@ -684,7 +684,7 @@ impl DeaAttention {
             (&k_full + (&k_shifted - &k_full)?.broadcast_mul(&self.x_k)?)?
         } else {
             // Single token: shifted is zeros, so k = k + (0 - k) * x_k = k * (1 - x_k)
-            // Note: Candle doesn't support scalar - tensor directly, use neg + scalar
+            // Note: Hanzo doesn't support scalar - tensor directly, use neg + scalar
             let scale = (self.x_k.neg()? + 1.0)?;
 
             k_full.broadcast_mul(&scale)?
