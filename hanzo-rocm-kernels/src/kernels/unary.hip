@@ -10,6 +10,14 @@
 #include <stdint.h>
 #include <math.h>
 
+// Inline dims/strides metadata passed BY VALUE in the kernel param block (no device
+// buffer, no host->device copy -> hipGraph-capture clean). Must match the Rust
+// `DimsStrides` (rocm_backend/mod.rs): ROCM_DS_MAX(8) * ROCM_DS_SETS(4) = 32 size_t.
+// Layout: [dims, strides_0, strides_1, strides_2], each block ROCM_DS_MAX wide.
+#define ROCM_DS_MAX 8
+#define ROCM_DS_SETS 4
+typedef struct { size_t v[ROCM_DS_MAX * ROCM_DS_SETS]; } DimsStrides;
+
 __device__ bool is_contiguous(
     const size_t num_dims,
     const size_t *dims,
@@ -30,13 +38,13 @@ __device__ bool is_contiguous(
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *dims_and_strides, \
+    const DimsStrides ds, \
     const TYPENAME *input, \
     TYPENAME *out \
 ) { \
-    const size_t *dims = dims_and_strides; \
-    const size_t *strides = dims_and_strides + num_dims; \
-    bool contiguous = dims_and_strides == nullptr || is_contiguous(num_dims, dims, strides); \
+    const size_t *dims = ds.v; \
+    const size_t *strides = ds.v + ROCM_DS_MAX; \
+    bool contiguous = num_dims == 0 || is_contiguous(num_dims, dims, strides); \
     if (contiguous) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             TYPENAME x = input[i]; \
@@ -61,14 +69,14 @@ extern "C" __global__ void FN_NAME( \
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *dims_and_strides, \
+    const DimsStrides ds, \
     const TYPENAME *input, \
     TYPENAME *out, \
     TYPENAME scalar \
 ) { \
-    const size_t *dims = dims_and_strides; \
-    const size_t *strides = dims_and_strides + num_dims; \
-    bool contiguous = dims_and_strides == nullptr || is_contiguous(num_dims, dims, strides); \
+    const size_t *dims = ds.v; \
+    const size_t *strides = ds.v + ROCM_DS_MAX; \
+    bool contiguous = num_dims == 0 || is_contiguous(num_dims, dims, strides); \
     if (contiguous) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             TYPENAME x = input[i]; \
@@ -172,13 +180,13 @@ UNARY_OP_SCALAR(double, upowf_f64, pow(x, scalar))
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *dims_and_strides, \
+    const DimsStrides ds, \
     const TYPENAME *input, \
     TYPENAME *out \
 ) { \
-    const size_t *dims = dims_and_strides; \
-    const size_t *strides = dims_and_strides + num_dims; \
-    bool contiguous = dims_and_strides == nullptr || is_contiguous(num_dims, dims, strides); \
+    const size_t *dims = ds.v; \
+    const size_t *strides = ds.v + ROCM_DS_MAX; \
+    bool contiguous = num_dims == 0 || is_contiguous(num_dims, dims, strides); \
     if (contiguous) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             float x = (float)input[i]; \
@@ -203,15 +211,15 @@ extern "C" __global__ void FN_NAME( \
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *dims_and_strides, \
+    const DimsStrides ds, \
     const TYPENAME *input, \
     TYPENAME *out, \
     TYPENAME scalar_in \
 ) { \
-    const size_t *dims = dims_and_strides; \
-    const size_t *strides = dims_and_strides + num_dims; \
+    const size_t *dims = ds.v; \
+    const size_t *strides = ds.v + ROCM_DS_MAX; \
     float scalar = (float)scalar_in; \
-    bool contiguous = dims_and_strides == nullptr || is_contiguous(num_dims, dims, strides); \
+    bool contiguous = num_dims == 0 || is_contiguous(num_dims, dims, strides); \
     if (contiguous) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             float x = (float)input[i]; \
