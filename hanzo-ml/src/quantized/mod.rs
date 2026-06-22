@@ -477,7 +477,10 @@ macro_rules! gen_from_u32 {
 
 macro_rules! gen_to_u32 {
     ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
-        pub(crate) fn to_u32(self) -> u32 {
+        /// GGML type id for this dtype. Single source of truth (generated from the
+        /// `for_each_quant!` table); cross-crate callers (e.g. hanzo-quant UQFF
+        /// serialization) use this instead of hand-rolled id maps that drift.
+        pub fn to_u32(self) -> u32 {
             match self {
                 Self::F32 => 0,
                 Self::F16 => 1,
