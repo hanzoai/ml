@@ -12,6 +12,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Inline dims/strides metadata passed BY VALUE (no device buffer -> hipGraph-capture
+// clean). Must match Rust `DimsStrides`: ROCM_DS_MAX(8) * ROCM_DS_SETS(4) = 32 size_t,
+// layout [dims, lhs_strides, rhs_strides, _].
+#define ROCM_DS_MAX 8
+#define ROCM_DS_SETS 4
+typedef struct { size_t v[ROCM_DS_MAX * ROCM_DS_SETS]; } DimsStrides;
+
 // Helper to check if tensor is contiguous
 __device__ bool is_contiguous(
     const size_t num_dims,
@@ -34,16 +41,16 @@ __device__ bool is_contiguous(
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *dims_and_strides, \
+    const DimsStrides ds, \
     const TYPENAME *lhs, \
     const TYPENAME *rhs, \
     TYPENAME *out \
 ) { \
-    const size_t *dims = dims_and_strides; \
-    const size_t *lhs_strides = dims_and_strides + 1 * num_dims; \
-    const size_t *rhs_strides = dims_and_strides + 2 * num_dims; \
-    bool lhs_cont = dims_and_strides == nullptr || is_contiguous(num_dims, dims, lhs_strides); \
-    bool rhs_cont = dims_and_strides == nullptr || is_contiguous(num_dims, dims, rhs_strides); \
+    const size_t *dims = ds.v; \
+    const size_t *lhs_strides = ds.v + 1 * ROCM_DS_MAX; \
+    const size_t *rhs_strides = ds.v + 2 * ROCM_DS_MAX; \
+    bool lhs_cont = num_dims == 0 || is_contiguous(num_dims, dims, lhs_strides); \
+    bool rhs_cont = num_dims == 0 || is_contiguous(num_dims, dims, rhs_strides); \
     if (lhs_cont && rhs_cont) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             TYPENAME x = lhs[i]; \
@@ -150,16 +157,16 @@ BINARY_OP(double, silu_mul_f64, ((x / (1.0 + exp(-x))) * y))
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *dims_and_strides, \
+    const DimsStrides ds, \
     const TYPENAME *lhs, \
     const TYPENAME *rhs, \
     TYPENAME *out \
 ) { \
-    const size_t *dims = dims_and_strides; \
-    const size_t *lhs_strides = dims_and_strides + 1 * num_dims; \
-    const size_t *rhs_strides = dims_and_strides + 2 * num_dims; \
-    bool lhs_cont = dims_and_strides == nullptr || is_contiguous(num_dims, dims, lhs_strides); \
-    bool rhs_cont = dims_and_strides == nullptr || is_contiguous(num_dims, dims, rhs_strides); \
+    const size_t *dims = ds.v; \
+    const size_t *lhs_strides = ds.v + 1 * ROCM_DS_MAX; \
+    const size_t *rhs_strides = ds.v + 2 * ROCM_DS_MAX; \
+    bool lhs_cont = num_dims == 0 || is_contiguous(num_dims, dims, lhs_strides); \
+    bool rhs_cont = num_dims == 0 || is_contiguous(num_dims, dims, rhs_strides); \
     if (lhs_cont && rhs_cont) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
             float x = (float)lhs[i]; \

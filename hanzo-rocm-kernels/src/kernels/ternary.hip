@@ -10,6 +10,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Inline dims/strides metadata passed BY VALUE (no device buffer -> hipGraph-capture
+// clean). Must match Rust `DimsStrides`: ROCM_DS_MAX(8) * ROCM_DS_SETS(4) = 32 size_t,
+// layout [dims, cond_strides, t_strides, f_strides].
+#define ROCM_DS_MAX 8
+#define ROCM_DS_SETS 4
+typedef struct { size_t v[ROCM_DS_MAX * ROCM_DS_SETS]; } DimsStrides;
+
 __device__ unsigned int wc_strided_index(
     unsigned int idx,
     const size_t num_dims,
@@ -30,16 +37,16 @@ __device__ unsigned int wc_strided_index(
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
-    const size_t *dims_and_strides, \
+    const DimsStrides ds, \
     const ID_TYPENAME *cond, \
     const TYPENAME *t, \
     const TYPENAME *f, \
     TYPENAME *out \
 ) { \
-    const size_t *dims = dims_and_strides; \
-    const size_t *cond_s = dims_and_strides + 1 * num_dims; \
-    const size_t *t_s = dims_and_strides + 2 * num_dims; \
-    const size_t *f_s = dims_and_strides + 3 * num_dims; \
+    const size_t *dims = ds.v; \
+    const size_t *cond_s = ds.v + 1 * ROCM_DS_MAX; \
+    const size_t *t_s = ds.v + 2 * ROCM_DS_MAX; \
+    const size_t *f_s = ds.v + 3 * ROCM_DS_MAX; \
     for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
         unsigned int ci = wc_strided_index(i, num_dims, dims, cond_s); \
         unsigned int ti = wc_strided_index(i, num_dims, dims, t_s); \
