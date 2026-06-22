@@ -29,10 +29,33 @@ pub fn call_quantized_matmul_mv_t(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GgmlDType,
+    dims: (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    call_quantized_matmul_mv_t_offset(
+        device, ep, kernels, dtype, dims, lhs, lhs_offset, rhs, 0, dst_offset, dst,
+    )
+}
+
+/// As [`call_quantized_matmul_mv_t`], but the quantized weight (`rhs`) is read
+/// starting `rhs_offset` bytes into its buffer -- the keep-quantized MoE path,
+/// where each routed expert's `[n, k]` block sits at a byte offset inside one
+/// packed `[E, n, k]` GGUF bank.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_t_offset(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
     (b, m, n, k): (usize, usize, usize, usize),
     lhs: &Buffer,
     lhs_offset: usize,
     rhs: &Buffer,
+    rhs_offset: usize,
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
@@ -148,7 +171,7 @@ pub fn call_quantized_matmul_mv_t(
     set_params!(
         encoder,
         (
-            rhs,
+            (rhs, rhs_offset),
             (lhs, lhs_offset),
             Output::with_offset(dst, dst_offset),
             ne00,
@@ -185,6 +208,32 @@ pub fn call_quantized_matmul_mm_t(
     src0_shape: &[usize],
     src0_stride: &[usize],
     src0: &Buffer,
+    src1_shape: &[usize],
+    src1_stride: &[usize],
+    src1: &Buffer,
+    src1_offset: usize,
+    dst_shape: &[usize],
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    call_quantized_matmul_mm_t_offset(
+        device, ep, kernels, dtype, src0_shape, src0_stride, src0, 0, src1_shape,
+        src1_stride, src1, src1_offset, dst_shape, dst_offset, dst,
+    )
+}
+
+/// As [`call_quantized_matmul_mm_t`], but the quantized weight (`src0`) is read
+/// starting `src0_offset` bytes into its buffer -- the keep-quantized MoE path.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm_t_offset(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    src0_shape: &[usize],
+    src0_stride: &[usize],
+    src0: &Buffer,
+    src0_offset: usize,
     src1_shape: &[usize],
     src1_stride: &[usize],
     src1: &Buffer,
@@ -253,7 +302,7 @@ pub fn call_quantized_matmul_mm_t(
     set_params!(
         encoder,
         (
-            src0,
+            (src0, src0_offset),
             (src1, src1_offset),
             Output::with_offset(dst, dst_offset),
             ne00,
