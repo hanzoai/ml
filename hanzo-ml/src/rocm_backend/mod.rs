@@ -614,6 +614,57 @@ impl RocmQuantType {
             (Self::TQ2_0, false) => "moe_qmatvecu_tq2_0_bf16",
         }
     }
+
+    /// Whether this type has a faithful int8-dp4a decode (`qdp4a<WTYPE>` in quant.hip). The K-quants
+    /// whose 256-element super-block decodes to (int quant)*(per-block scale)[+min] dot a once-
+    /// quantized q8_1 int8 activation via `v_dot4` -- ~4x the scalar-float dequant on this APU.
+    /// Q4_K + Q6_K today (Q5_K is one `qdp4a<DW_Q5_K>` + one row away). This is the ONE predicate that
+    /// routes decode/MoE to the dp4a core; every other type falls to the scalar `qmatvec_core`. The
+    /// per-type `HANZO_<T>_FALLBACK` env var forces the scalar path for A/B + as the numeric oracle.
+    fn dp4a_capable(self) -> bool {
+        matches!(self, Self::Q4K | Self::Q6K)
+    }
+
+    /// Env var that forces this dp4a-capable type back to the scalar `qmatvec_core` (A/B + the
+    /// correctness reference the dp4a output is gated against). `None` for non-dp4a types.
+    fn dp4a_fallback_env(self) -> Option<&'static str> {
+        match self {
+            Self::Q4K => Some("HANZO_Q4K_FALLBACK"),
+            Self::Q6K => Some("HANZO_Q6K_FALLBACK"),
+            _ => None,
+        }
+    }
+
+    /// Whether the dp4a path is selected NOW: dp4a-capable AND its fallback env is unset. The single
+    /// gate `matvec_quant` and `moe_matvec_quant` read to choose the dp4a core vs the scalar core.
+    pub fn dp4a_active(self) -> bool {
+        self.dp4a_capable()
+            && self
+                .dp4a_fallback_env()
+                .is_none_or(|e| std::env::var_os(e).is_none())
+    }
+
+    /// The unified dp4a decode entry point (`qmatvec_dp4a_core<WTYPE,XT>`). One core, one table.
+    fn dp4a_decode_kernel(self, f16: bool) -> &'static str {
+        match (self, f16) {
+            (Self::Q4K, true) => "qmatvec_dp4a_q4k_f16",
+            (Self::Q4K, false) => "qmatvec_dp4a_q4k_bf16",
+            (Self::Q6K, true) => "qmatvec_dp4a_q6k_f16",
+            (Self::Q6K, false) => "qmatvec_dp4a_q6k_bf16",
+            _ => unreachable!("dp4a_decode_kernel: {self:?} is not dp4a-capable"),
+        }
+    }
+
+    /// The unified indexed-MoE dp4a decode entry point (`moe_qmatvec_dp4a_core<WTYPE,XT>`).
+    fn dp4a_moe_kernel(self, f16: bool) -> &'static str {
+        match (self, f16) {
+            (Self::Q4K, true) => "moe_qmatvec_dp4a_q4k_f16",
+            (Self::Q4K, false) => "moe_qmatvec_dp4a_q4k_bf16",
+            (Self::Q6K, true) => "moe_qmatvec_dp4a_q6k_f16",
+            (Self::Q6K, false) => "moe_qmatvec_dp4a_q6k_bf16",
+            _ => unreachable!("dp4a_moe_kernel: {self:?} is not dp4a-capable"),
+        }
+    }
 }
 
 impl RocmDevice {
@@ -644,14 +695,13 @@ impl RocmDevice {
             RocmStorageSlice::U8(m) => m.as_ptr(),
             _ => crate::bail!("matvec_quant: weights must be u8 (raw GGML block bytes)"),
         };
-        // Q4_K FAST PATH: int8 dp4a decode (faithful port of llama.cpp vec_dot_q4_K_q8_1). Pre-
-        // quantize the activation row to q8_1 (int8 + per-32-block f16 scale), then run v_dot4 against
-        // the weight nibbles -- ~2x the scalar-float dequant path. Set HANZO_Q4K_FALLBACK=1 to force
-        // the proven scalar `qmatvecu_q4k_*` core instead (A/B + correctness reference).
-        if qt == RocmQuantType::Q4K
-            && std::env::var_os("HANZO_Q4K_FALLBACK").is_none()
-        {
-            return self.matvec_q4k_dp4a(wq_ptr, x, n, k);
+        // dp4a FAST PATH (trait-selected, NOT a per-quant special-case): for any dp4a-capable type
+        // (Q4_K/Q6_K now, Q5_K-ready) pre-quantize the activation row to q8_1 once and run v_dot4
+        // against the weight blocks -- ~4x the scalar-float dequant on this APU. Every other type, and
+        // any type with its `HANZO_<T>_FALLBACK` set, falls through to the scalar `qmatvec_core`
+        // below. ONE dp4a path + ONE scalar fallback, chosen by `dp4a_active`.
+        if qt.dp4a_active() {
+            return self.matvec_dp4a(qt, wq_ptr, x, n, k);
         }
         let nrows = n as i32;
         let ncols = k as i32;
@@ -702,14 +752,17 @@ impl RocmDevice {
         }
     }
 
-    /// Q4_K decode via int8 dp4a -- faithful port of llama.cpp `vec_dot_q4_K_q8_1` (+ `_impl_vmmq`).
-    /// Two launches: (1) `quantize_q8_1[_bf16]` quantizes the activation row `x[k]` to q8_1 (int8 `xq`
-    /// + per-32-block f16 scale `xd`; the q8_1 `s`/sum is recomputed in-kernel by the dp4a so `xs` is
-    /// discarded here), (2) `qmatvec_q4k_dp4a_{f16,bf16}` dots each weight nibble against the q8_1
-    /// int8 via `v_dot4` and scales. `xq`/`xd` own their VRAM until the end of this fn (past the
-    /// stream-ordered launches). Output dtype = `x`'s dtype.
-    fn matvec_q4k_dp4a(
+    /// Decode matvec via int8 dp4a for any dp4a-capable type (`qt.dp4a_capable`), the int8-SIMD twin
+    /// of `matvec_quant`'s scalar path -- a faithful port of llama.cpp's `vec_dot_<T>_q8_1`. Two
+    /// launches: (1) `quantize_q8_1[_bf16]` quantizes the activation row `x[k]` to q8_1 (int8 `xq` +
+    /// per-32-block f16 scale `xd`; the unused `xs` block-sum is recomputed in-kernel), (2)
+    /// `qmatvec_dp4a_<t>_{f16,bf16}` dots each weight block against the q8_1 int8 via `v_dot4` and
+    /// scales. `qt` selects the per-type packed-int decode (`qdp4a<WTYPE>`) -- the ONLY thing that
+    /// varies, so Q4_K/Q6_K/Q5_K ride the SAME launcher. `xq`/`xd` own their VRAM past the
+    /// stream-ordered launches. Output dtype = `x`'s dtype.
+    fn matvec_dp4a(
         &self,
+        qt: RocmQuantType,
         wq_ptr: *mut std::ffi::c_void,
         x: &RocmStorage,
         n: usize,
@@ -717,57 +770,6 @@ impl RocmDevice {
     ) -> Result<RocmStorage> {
         use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
         let nblk = k / 32;
-        // FUSED single-launch path (HANZO_Q4K_FUSED=1): quantize the activation to q8_1 in shared
-        // memory AND dp4a in ONE kernel, skipping the separate quantize_q8_1 launch + xq/xd/xs
-        // scratch allocs + inter-launch sync. Wins on the small overhead-bound matvecs (k/v proj).
-        // Shared = k bytes int8 (16B-padded) + k/32 f16 scales.
-        if std::env::var_os("HANZO_Q4K_FUSED").is_some() {
-            let nrows = n as i32;
-            let ncols = k as i32;
-            let grid = rocm_rs::hip::Dim3::from((n.div_ceil(8)) as u32);
-            let block = rocm_rs::hip::Dim3::from(256u32);
-            let shmem = ((((k + 15) & !15) + nblk * std::mem::size_of::<f16>()) as u32 + 15) & !15;
-            macro_rules! launch_fused {
-                ($variant:ident, $ty:ty, $func:expr) => {{
-                    let x_ptr = match &x.slice {
-                        RocmStorageSlice::$variant(s) => s.as_ptr(),
-                        _ => unreachable!(),
-                    };
-                    let out = self.alloc::<$ty>(n)?;
-                    let out_ptr = out.as_ptr();
-                    unsafe {
-                        launch_kernel_shmem(
-                            self,
-                            QuantKernel::NAME,
-                            QuantKernel::CODE,
-                            $func,
-                            grid,
-                            block,
-                            shmem,
-                            &mut [
-                                &nrows as *const i32 as *mut std::ffi::c_void,
-                                &ncols as *const i32 as *mut std::ffi::c_void,
-                                (&wq_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                                (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                                (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                            ],
-                        )?;
-                    }
-                    Ok(RocmStorage {
-                        slice: RocmStorageSlice::$variant(out),
-                        device: self.clone(),
-                    })
-                }};
-            }
-            return match &x.slice {
-                RocmStorageSlice::F16(_) => launch_fused!(F16, f16, "qmatvec_q4k_dp4a_fused_f16"),
-                RocmStorageSlice::BF16(_) => launch_fused!(BF16, bf16, "qmatvec_q4k_dp4a_fused_bf16"),
-                other => crate::bail!(
-                    "matvec_q4k_dp4a fused: activations must be f16 or bf16, got {:?}",
-                    other.dtype()
-                ),
-            };
-        }
         // Quantize the single activation row (m=1) to q8_1. Dispatch the quant kernel on x's dtype so
         // bf16 activations stay bf16 end-to-end (no bf16->f16 cast detour); both emit the SAME int8
         // xq + f16 xd. xs (the int block-sum) is allocated but unused -- the dp4a recomputes the sum.
@@ -785,7 +787,7 @@ impl RocmDevice {
             RocmStorageSlice::F16(s) => ("quantize_q8_1", s.as_ptr()),
             RocmStorageSlice::BF16(s) => ("quantize_q8_1_bf16", s.as_ptr()),
             other => crate::bail!(
-                "matvec_q4k_dp4a: activations must be f16 or bf16, got {:?}",
+                "matvec_dp4a: activations must be f16 or bf16, got {:?}",
                 other.dtype()
             ),
         };
@@ -808,44 +810,17 @@ impl RocmDevice {
             )?;
         }
 
-        // dp4a matvec: FAITHFUL port of llama.cpp mul_mat_vec_q launch tiling (mmvq.cu) for the
-        // decode (ncols_dst=1) case. The tiled kernel makes 16 lanes cooperate per Q4_K super-block
-        // (qi/vdr = QI4_K/VDR = 32/2 = 16), so all 32 lanes stay busy even for the small-nblocks
-        // decode shapes here (k=2048 -> nblocks=8; the old whole-super-block-per-lane kernel left
-        // 24/32 lanes idle). Each warp computes ROWS output rows (Q4K_TILED_ROWS in quant.hip,
-        // default 2), reusing the loaded q8_1 activation across rows; `nwarps` warps per block stack
-        // the warp's row-groups. block = (32, nwarps, 1); grid.x = ceil(nrows / (nwarps*ROWS)).
-        // ROWS is compiled into the kernel; nwarps is tuned here (HANZO_Q4K_NWARPS for A/B sweeps).
-        const Q4K_TILED_ROWS: usize = 2; // must match Q4K_TILED_ROWS in quant.hip
-        // Kernel choice. The original whole-super-block-per-lane kernel (each lane reads one
-        // contiguous 144-byte super-block, fully unrolled) is the DEFAULT: on gfx1151 it sustains
-        // up to ~460 GB/s via L1/L2 reuse of the small q8_1 activation and is 15-55% FASTER than the
-        // llama.cpp-style 16-lanes-per-super-block tiling (which adds strided activation reads +
-        // multi-row register pressure that this APU's cache already obviates). HANZO_Q4K_TILED=1
-        // opts into the faithful llama tiling (kept for reference / larger-GPU portability).
-        let tiled = std::env::var_os("HANZO_Q4K_TILED").is_some();
-        let nwarps: usize = std::env::var("HANZO_Q4K_NWARPS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&w| w >= 1 && w <= 16)
-            .unwrap_or(1);
-        let rows_per_block_total = nwarps * Q4K_TILED_ROWS;
+        // dp4a matvec: warp per output row, lane-strided over the row's 256-elem super-blocks (each
+        // lane fully int8-decodes its super-blocks via qdp4a<WTYPE>, then a warp-shuffle reduces). On
+        // gfx1151 this sustains up to ~460 GB/s via L1/L2 reuse of the small q8_1 activation. 256
+        // threads = 8 warps = 8 rows/block.
         let nrows = n as i32;
         let ncols = k as i32;
-        let (grid, block) = if tiled {
-            (
-                rocm_rs::hip::Dim3::from((n.div_ceil(rows_per_block_total)) as u32),
-                rocm_rs::hip::Dim3::from((32u32, nwarps as u32, 1u32)),
-            )
-        } else {
-            // Original: 256 threads = 8 warps = 8 rows/block, one warp per row, lane-strided blocks.
-            (
-                rocm_rs::hip::Dim3::from((n.div_ceil(8)) as u32),
-                rocm_rs::hip::Dim3::from(256u32),
-            )
-        };
+        let grid = rocm_rs::hip::Dim3::from((n.div_ceil(8)) as u32);
+        let block = rocm_rs::hip::Dim3::from(256u32);
         macro_rules! launch_dp4a {
-            ($variant:ident, $ty:ty, $func:expr) => {{
+            ($variant:ident, $ty:ty, $f16:expr) => {{
+                let func = qt.dp4a_decode_kernel($f16);
                 let out = self.alloc::<$ty>(n)?;
                 let out_ptr = out.as_ptr();
                 unsafe {
@@ -853,7 +828,7 @@ impl RocmDevice {
                         self,
                         QuantKernel::NAME,
                         QuantKernel::CODE,
-                        $func,
+                        func,
                         grid,
                         block,
                         &mut [
@@ -872,13 +847,11 @@ impl RocmDevice {
                 })
             }};
         }
-        // Keep xq/xd/xs alive across the second launch (stream-ordered): bind after the macro so the
-        // borrow checker sees them used past the kernel that reads them.
-        let result = match (&x.slice, tiled) {
-            (RocmStorageSlice::F16(_), true) => launch_dp4a!(F16, f16, "qmatvec_q4k_dp4a_tiled_f16"),
-            (RocmStorageSlice::BF16(_), true) => launch_dp4a!(BF16, bf16, "qmatvec_q4k_dp4a_tiled_bf16"),
-            (RocmStorageSlice::F16(_), false) => launch_dp4a!(F16, f16, "qmatvec_q4k_dp4a_f16"),
-            (RocmStorageSlice::BF16(_), false) => launch_dp4a!(BF16, bf16, "qmatvec_q4k_dp4a_bf16"),
+        // Bind result after the macro so the borrow checker sees xq/xd/xs used past the (stream-
+        // ordered) dp4a launch that reads them.
+        let result = match &x.slice {
+            RocmStorageSlice::F16(_) => launch_dp4a!(F16, f16, true),
+            RocmStorageSlice::BF16(_) => launch_dp4a!(BF16, bf16, false),
             _ => unreachable!(),
         };
         drop((xq, xd, xs));
@@ -926,18 +899,20 @@ impl RocmDevice {
                 wbank_mem.size()
             );
         }
-        // Q4_K: ONE batched int8 dp4a launch over all routed slots (experts on grid.y), activation
-        // quantized to q8_1 once -- collapses the per-expert scalar launch loop into the same dp4a
-        // roofline as non-MoE decode (mirrors CUDA indexed_moe_forward_q4k_q8_1).
-        if matches!(qt, RocmQuantType::Q4K) {
-            return self.moe_matvec_q4k_dp4a(wbank, x, ids, nrows, n, k);
+        // dp4a-capable types (Q4_K/Q6_K now): ONE batched int8 dp4a launch over all routed slots
+        // (experts on grid.y), activation quantized to q8_1 once -- collapses the per-expert scalar
+        // launch loop into the same dp4a roofline as non-MoE decode (mirrors CUDA indexed_moe_forward
+        // _q4k_q8_1). Trait-selected like the non-MoE decode, so there is ONE dp4a MoE path + ONE
+        // scalar MoE fallback (the `qmatvec_core` branch below).
+        if qt.dp4a_active() {
+            return self.moe_matvec_dp4a(qt, wbank, x, ids, nrows, n, k);
         }
 
         // Other wired quant types: ONE batched `moe_qmatvec_core<WTYPE>` launch over all routed
         // slots. Experts on grid.y (slot s = blockIdx.y), expert id read ON-DEVICE (ids_ptr) and the
         // bank offset by ids[s] IN-KERNEL -- no per-slot host loop, no host ids round-trip, so the
         // forward stays HIP-graph-capture-clean. grid.x covers the n output rows (one warp per row,
-        // one full [n] output vector per slot). This is the non-Q4_K twin of moe_matvec_q4k_dp4a.
+        // one full [n] output vector per slot). This is the scalar twin of moe_matvec_dp4a.
         let n_i = n as i32;
         let ncols = k as i32;
         let nslots = nrows as i32;
@@ -990,12 +965,15 @@ impl RocmDevice {
         }
     }
 
-    /// Q4_K batched indexed-MoE decode: quantize the [nrows,k] routed activations to q8_1 ONCE, then
-    /// one `moe_qmatvec_q4k_dp4a_*` launch with the routed experts on grid.y (expert = ids[s] per
-    /// slot). One well-occupied grid + int8 dp4a, vs the per-expert scalar launch loop. Returns
-    /// [nrows,n] in x's dtype; routing + bank-residency are the caller's job.
-    pub(crate) fn moe_matvec_q4k_dp4a(
+    /// Batched indexed-MoE decode via int8 dp4a for any dp4a-capable type (`qt`): quantize the
+    /// [nrows,k] routed activations to q8_1 ONCE, then one `moe_qmatvec_dp4a_<t>_*` launch with the
+    /// routed experts on grid.y (expert = ids[s] per slot). One well-occupied grid + int8 dp4a, vs the
+    /// per-expert scalar launch loop. `qt` selects the per-type packed-int decode -- Q4_K/Q6_K/Q5_K
+    /// ride the SAME launcher. Returns [nrows,n] in x's dtype; routing + bank-residency are the
+    /// caller's job.
+    pub(crate) fn moe_matvec_dp4a(
         &self,
+        qt: RocmQuantType,
         wbank: &RocmStorage,
         x: &RocmStorage,
         ids_dev: &RocmStorage,
@@ -1006,11 +984,11 @@ impl RocmDevice {
         use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
         let wbank_mem = match &wbank.slice {
             RocmStorageSlice::U8(m) => m,
-            _ => crate::bail!("moe_matvec_q4k_dp4a: weight bank must be u8 (raw GGML blocks)"),
+            _ => crate::bail!("moe_matvec_dp4a: weight bank must be u8 (raw GGML blocks)"),
         };
         let ids_ptr = match &ids_dev.slice {
             RocmStorageSlice::U32(m) => m.as_ptr(),
-            _ => crate::bail!("moe_matvec_q4k_dp4a: ids must be u32 on device"),
+            _ => crate::bail!("moe_matvec_dp4a: ids must be u32 on device"),
         };
         let nblk32 = k / 32;
         // (1) Quantize the [nrows,k] activations to q8_1 (int8 xq + per-32-block f16 xd). `xs` is the
@@ -1029,7 +1007,7 @@ impl RocmDevice {
             RocmStorageSlice::F16(s) => ("quantize_q8_1", s.as_ptr()),
             RocmStorageSlice::BF16(s) => ("quantize_q8_1_bf16", s.as_ptr()),
             other => crate::bail!(
-                "moe_matvec_q4k_dp4a: activations must be f16 or bf16, got {:?}",
+                "moe_matvec_dp4a: activations must be f16 or bf16, got {:?}",
                 other.dtype()
             ),
         };
@@ -1060,7 +1038,8 @@ impl RocmDevice {
         let block = rocm_rs::hip::Dim3::from(256u32);
         let wbank_ptr = wbank_mem.as_ptr();
         macro_rules! launch_moe_dp4a {
-            ($variant:ident, $ty:ty, $func:expr) => {{
+            ($variant:ident, $ty:ty, $f16:expr) => {{
+                let func = qt.dp4a_moe_kernel($f16);
                 let out = self.alloc::<$ty>(nrows * n)?;
                 let out_ptr = out.as_ptr();
                 unsafe {
@@ -1068,7 +1047,7 @@ impl RocmDevice {
                         self,
                         QuantKernel::NAME,
                         QuantKernel::CODE,
-                        $func,
+                        func,
                         grid,
                         block,
                         &mut [
@@ -1090,8 +1069,8 @@ impl RocmDevice {
             }};
         }
         let result = match &x.slice {
-            RocmStorageSlice::F16(_) => launch_moe_dp4a!(F16, f16, "moe_qmatvec_q4k_dp4a_f16"),
-            RocmStorageSlice::BF16(_) => launch_moe_dp4a!(BF16, bf16, "moe_qmatvec_q4k_dp4a_bf16"),
+            RocmStorageSlice::F16(_) => launch_moe_dp4a!(F16, f16, true),
+            RocmStorageSlice::BF16(_) => launch_moe_dp4a!(BF16, bf16, false),
             _ => unreachable!(),
         };
         // Keep q8_1 scratch alive past the (stream-ordered) dp4a launch that reads it.
