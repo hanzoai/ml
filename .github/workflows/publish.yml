@@ -21,13 +21,25 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -u
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is empty -- set it (from KMS) as a repo/org secret"; exit 1
+          fi
           # bottom-up: leaf kernels + ug + flash-attn-build, then hanzo-ml, then nn, then flash-attn
+          fail=0
           for c in hanzo-kernels hanzo-metal-kernels hanzo-rocm-kernels hanzo-ug \
                    hanzo-flash-attn-build hanzo-ml hanzo-nn hanzo-flash-attn; do
             if [ -d "$c" ]; then
               echo "::group::publish $c"
-              ( cd "$c" && cargo publish --no-verify ) \
-                || echo "::warning::$c not published (already at this version, or error) — continuing"
+              out=$( cd "$c" && cargo publish --no-verify 2>&1 ); rc=$?
+              echo "$out"
+              if [ "$rc" -ne 0 ]; then
+                if echo "$out" | grep -qiE 'already (uploaded|exists)|is already uploaded'; then
+                  echo "::warning::$c already at this version -- skipping"
+                else
+                  echo "::error::$c publish FAILED"; fail=1
+                fi
+              fi
               echo "::endgroup::"
             fi
           done
+          exit "$fail"
