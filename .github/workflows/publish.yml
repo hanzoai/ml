@@ -1,0 +1,33 @@
+name: Publish crates
+
+# Publishes the hanzo-* candle-fork crates to crates.io in dependency order on a
+# version tag (e.g. `0.11.4`). GPU build scripts can't run on crates.io builders,
+# so we publish with --no-verify (downstream consumers build with their own SDK).
+# Requires repo secret CARGO_REGISTRY_TOKEN (a crates.io API token).
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish hanzo-* crates (dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -u
+          # bottom-up: leaf kernels + ug + flash-attn-build, then hanzo-ml, then nn, then flash-attn
+          for c in hanzo-kernels hanzo-metal-kernels hanzo-rocm-kernels hanzo-ug \
+                   hanzo-flash-attn-build hanzo-ml hanzo-nn hanzo-flash-attn; do
+            if [ -d "$c" ]; then
+              echo "::group::publish $c"
+              ( cd "$c" && cargo publish --no-verify ) \
+                || echo "::warning::$c not published (already at this version, or error) — continuing"
+              echo "::endgroup::"
+            fi
+          done
