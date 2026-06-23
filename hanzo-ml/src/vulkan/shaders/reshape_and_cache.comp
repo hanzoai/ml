@@ -1,0 +1,70 @@
+#version 450
+// reshape_and_cache (Vulkan compute), f32 storage. Writes new per-token K/V vectors
+// into the paged KV cache at the positions named by slot_mapping. Mirrors the
+// CUDA/Metal reshape_and_cache kernels.
+//
+// key   : [num_tokens, num_heads, head_size]   (contiguous rows, stride key_stride)
+// value : [num_tokens, num_heads, head_size]   (stride value_stride)
+// key_cache  : [num_blocks, num_heads, head_size/x, block_size, x]
+// value_cache: [num_blocks, num_heads, head_size, block_size]
+// slot_mapping: [num_tokens] (i64 in CUDA/Metal; here passed as u32 with PAD = 0xFFFFFFFF
+//               meaning "skip"). The host maps the engine's i64 slots (>=0) to u32 and
+//               the -1 pad sentinel to 0xFFFFFFFF.
+//
+// One workgroup per token; threads stripe over the num_heads*head_size elements.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer K  { float key[]; };
+layout(set = 0, binding = 1) readonly  buffer V  { float value[]; };
+layout(set = 0, binding = 2) buffer KC { float key_cache[]; };
+layout(set = 0, binding = 3) buffer VC { float value_cache[]; };
+layout(set = 0, binding = 4) readonly  buffer SM { uint slot_mapping[]; };
+
+layout(push_constant) uniform Pc {
+    uint key_stride;
+    uint value_stride;
+    uint num_heads;
+    uint head_size;
+    uint block_size;
+    uint x;
+};
+
+const uint PAD_SLOT = 0xFFFFFFFFu;
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint nthreads = gl_WorkGroupSize.x;
+
+    uint slot = slot_mapping[token_idx];
+    if (slot == PAD_SLOT) { return; }
+
+    uint block_idx = slot / block_size;
+    uint block_offset = slot % block_size;
+
+    uint n = num_heads * head_size;
+    for (uint i = tid; i < n; i += nthreads) {
+        uint head_idx = i / head_size;
+        uint head_offset = i % head_size;
+        uint x_idx = head_offset / x;
+        uint x_offset = head_offset % x;
+
+        uint src_key_idx = token_idx * key_stride + i;
+        uint src_value_idx = token_idx * value_stride + i;
+
+        uint tgt_key_idx =
+            block_idx * num_heads * (head_size / x) * block_size * x +
+            head_idx * (head_size / x) * block_size * x +
+            x_idx * block_size * x +
+            block_offset * x + x_offset;
+        uint tgt_value_idx =
+            block_idx * num_heads * head_size * block_size +
+            head_idx * head_size * block_size +
+            head_offset * block_size +
+            block_offset;
+
+        key_cache[tgt_key_idx] = key[src_key_idx];
+        value_cache[tgt_value_idx] = value[src_value_idx];
+    }
+}

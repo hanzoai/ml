@@ -1,0 +1,193 @@
+#version 450
+// PagedAttention decode kernel (Vulkan compute), f32 storage.
+// Mirrors the CUDA/Metal v1 (non-partitioned) paged-attention math: for one query
+// (one decode token per sequence) and one attention head, attend over all cached KV
+// positions for that sequence, where the KV lives in non-contiguous VRAM blocks
+// addressed through a per-sequence block table. Output = softmax(scale*Q.K^T) . V.
+//
+// One workgroup == one (seq, head) pair. Threads in the workgroup cooperate over the
+// HEAD_SIZE reduction (dot products) and over the context length (KV positions).
+//
+// Cache layout (matches hanzo-engine cache_engine + the CUDA/Metal kernels):
+//   key_cache  : [num_blocks, num_kv_heads, head_size/x, block_size, x]
+//   value_cache: [num_blocks, num_kv_heads, head_size, block_size]
+// with x = 16/elem_size. NOTE: on the Vulkan backend every elem is stored as f32
+// (4 bytes), so the HOST must build strides/x consistent with that 4-byte element
+// (the engine's `x` is computed from the logical dtype size; the dispatch wrapper
+// passes the *actual* f32-based strides via push constants). See dispatch wrapper.
+//
+// Limitations of this scaffold:
+//   - f32 only (Vulkan backend upcasts f16/bf16 -> f32 on upload).
+//   - No fp8 cache, no alibi, no softcapping, no attention sinks (TODO: add as the
+//     CUDA/Metal kernels have, gated by push-constant flags).
+//   - Single-partition (v1) only: correct for any context length but not split across
+//     workgroups for very long contexts (a v2 split-K reduce is future work).
+//   - block tables / context lens are u32 (the engine stores them as u32; the CUDA
+//     code casts u32->i32, values are small positive indices).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// q: [num_seqs, num_heads, head_size]  (the single decode query per seq/head)
+layout(set = 0, binding = 0) readonly  buffer Q  { float q[]; };
+// key cache, flattened f32: see layout above.
+layout(set = 0, binding = 1) readonly  buffer KC { float kc[]; };
+// value cache, flattened f32.
+layout(set = 0, binding = 2) readonly  buffer VC { float vc[]; };
+// block_tables: [num_seqs, max_num_blocks_per_seq] (u32 physical block ids).
+layout(set = 0, binding = 3) readonly  buffer BT { uint block_tables[]; };
+// context_lens: [num_seqs] (u32).
+layout(set = 0, binding = 4) readonly  buffer CL { uint context_lens[]; };
+// out: [num_seqs, num_heads, head_size].
+layout(set = 0, binding = 5) writeonly buffer O  { float o[]; };
+
+layout(push_constant) uniform Pc {
+    uint num_kv_heads;          // KV heads (<= num_heads for GQA/MQA)
+    uint num_heads;             // query heads
+    uint head_size;             // per-head dim (e.g. 128)
+    uint block_size;            // tokens per KV block (e.g. 16/32)
+    uint max_num_blocks_per_seq;// stride (cols) of block_tables
+    uint q_stride;              // elems between consecutive seqs in q (= num_heads*head_size)
+    uint kv_block_stride;       // elems between consecutive blocks in the cache
+    uint kv_head_stride;        // elems between consecutive kv heads within a block
+    uint x;                     // packing factor of the key cache inner dim (16/elem_size_host)
+    uint max_context_len;       // clamp for context_len (effective)
+    float scale;                // softmax scale (1/sqrt(head_size) folded by caller)
+};
+
+// Shared reductions across the workgroup.
+const uint MAX_HEAD_SIZE = 256u;
+const uint WG = 128u;                 // == local_size_x
+shared float s_q[MAX_HEAD_SIZE];      // the query vector for this (seq,head)
+shared float s_red[WG];               // generic reduction scratch (>= local_size_x)
+shared float s_acc[MAX_HEAD_SIZE];    // output accumulator (sum_t softmax_t * V_t)
+shared float s_w[WG];                 // per-tile softmax weights (one per position in tile)
+shared uint  s_pb[WG];                // per-tile physical block id (cached, one per position)
+shared uint  s_bo[WG];                // per-tile block offset within block
+
+void main() {
+    uint head_idx = gl_WorkGroupID.x;
+    uint seq_idx  = gl_WorkGroupID.y;
+    uint tid      = gl_LocalInvocationID.x;
+    uint nthreads = gl_WorkGroupSize.x;
+
+    uint context_len = context_lens[seq_idx];
+    if (context_len > max_context_len) { context_len = max_context_len; }
+
+    uint num_queries_per_kv = num_heads / num_kv_heads;
+    uint kv_head_idx = head_idx / num_queries_per_kv;
+
+    // Load query for this (seq, head) into shared memory.
+    uint q_base = seq_idx * q_stride + head_idx * head_size;
+    for (uint i = tid; i < head_size; i += nthreads) {
+        s_q[i] = q[q_base + i];
+    }
+    for (uint i = tid; i < head_size; i += nthreads) {
+        s_acc[i] = 0.0;
+    }
+    barrier();
+
+    uint bt_base = seq_idx * max_num_blocks_per_seq;
+
+    // Pass 1: max logit (numerical stability). Each thread handles a strided set of
+    // context positions, computing qk = scale * dot(Q, K_t).
+    float local_max = -3.402823466e38;
+    for (uint t = tid; t < context_len; t += nthreads) {
+        uint block_row = t / block_size;
+        uint block_off = t % block_size;
+        uint phys_block = block_tables[bt_base + block_row];
+        // key element index: kc[phys_block*kv_block_stride + kv_head_idx*kv_head_stride
+        //                       + (d/x)*block_size*x + block_off*x + (d%x)]
+        float qk = 0.0;
+        uint kbase = phys_block * kv_block_stride + kv_head_idx * kv_head_stride;
+        for (uint d = 0u; d < head_size; d++) {
+            uint d_outer = d / x;
+            uint d_inner = d % x;
+            uint kidx = kbase + d_outer * block_size * x + block_off * x + d_inner;
+            qk += s_q[d] * kc[kidx];
+        }
+        qk *= scale;
+        local_max = max(local_max, qk);
+    }
+    // Reduce max across the workgroup.
+    s_red[tid] = local_max;
+    barrier();
+    for (uint stride = nthreads / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) { s_red[tid] = max(s_red[tid], s_red[tid + stride]); }
+        barrier();
+    }
+    float qk_max = s_red[0];
+    barrier();
+
+    // Passes 2+3 fused, tiled over context positions in chunks of WG. For each tile:
+    //   (a) thread `tid` computes the weight w_t = exp(scale*Q.K_t - qk_max) for its
+    //       position and stashes (w, phys_block, block_off) in shared memory,
+    //   (b) the workgroup reduces the tile's weights into the running exp_sum, and
+    //   (c) all threads cooperate to add this tile's weighted-V into s_acc, striped
+    //       over the head dims (each thread owns dims d = tid, tid+WG, ...).
+    // This is O(context_len * head_size) total work (no head_size^2 recompute) and keeps
+    // shared memory bounded by WG (independent of context_len). Denominator deferred:
+    // we accumulate unnormalized sum_t exp(.)*V_t and the running exp_sum, then divide
+    // once at the end (algebraically identical to normalizing per term).
+    float exp_sum = 0.0;
+    for (uint i = tid; i < head_size; i += nthreads) { s_acc[i] = 0.0; }
+    barrier();
+
+    for (uint base = 0u; base < context_len; base += WG) {
+        uint t = base + tid;
+        float w = 0.0;
+        uint phys_block = 0u;
+        uint block_off = 0u;
+        if (t < context_len) {
+            uint block_row = t / block_size;
+            block_off = t % block_size;
+            phys_block = block_tables[bt_base + block_row];
+            float qk = 0.0;
+            uint kbase = phys_block * kv_block_stride + kv_head_idx * kv_head_stride;
+            for (uint d = 0u; d < head_size; d++) {
+                uint d_outer = d / x;
+                uint d_inner = d % x;
+                uint kidx = kbase + d_outer * block_size * x + block_off * x + d_inner;
+                qk += s_q[d] * kc[kidx];
+            }
+            qk *= scale;
+            w = exp(qk - qk_max);
+        }
+        s_w[tid] = w;
+        s_pb[tid] = phys_block;
+        s_bo[tid] = block_off;
+        // running denominator (reduce this tile's weights, add to exp_sum).
+        s_red[tid] = w;
+        barrier();
+        for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+            if (tid < stride) { s_red[tid] += s_red[tid + stride]; }
+            barrier();
+        }
+        if (tid == 0u) { exp_sum += s_red[0]; }
+        barrier();
+        // accumulate this tile's weighted V into s_acc, striped over head dims.
+        uint tile = min(WG, context_len - base);
+        for (uint d = tid; d < head_size; d += nthreads) {
+            float acc = 0.0;
+            for (uint j = 0u; j < tile; j++) {
+                uint vidx = s_pb[j] * kv_block_stride + kv_head_idx * kv_head_stride
+                            + d * block_size + s_bo[j];
+                acc += s_w[j] * vc[vidx];
+            }
+            s_acc[d] += acc;
+        }
+        barrier();
+    }
+
+    // Broadcast exp_sum (only tid 0 accumulated it) and normalize.
+    if (tid == 0u) { s_red[0] = 1.0 / (exp_sum + 1e-6); }
+    barrier();
+    float inv_sum = s_red[0];
+    for (uint i = tid; i < head_size; i += nthreads) { s_acc[i] *= inv_sum; }
+    barrier();
+
+    // Write output: o[seq, head, :] = s_acc.
+    uint o_base = seq_idx * num_heads * head_size + head_idx * head_size;
+    for (uint i = tid; i < head_size; i += nthreads) {
+        o[o_base + i] = s_acc[i];
+    }
+}
