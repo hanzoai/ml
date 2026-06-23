@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-training"
-version = "0.11.4"
+version = "0.11.5"
 edition = "2021"
 description = "Training framework for Hanzo ML models on zen-agentic-dataset"
 repository = "https://github.com/hanzoai/ml"

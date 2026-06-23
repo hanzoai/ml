@@ -7,7 +7,7 @@
 
 [package]
 name = "hanzo-flash-attn-build"
-version = "0.11.4"
+version = "0.11.5"
 edition = "2021"
 description = "Build-time helper that fetches and resolves the pinned NVIDIA CUTLASS include directory for the hanzo flash-attention CUDA kernels."
 repository = "https://github.com/hanzoai/ml"
