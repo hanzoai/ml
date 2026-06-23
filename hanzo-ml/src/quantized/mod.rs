@@ -1051,11 +1051,7 @@ impl QTensor {
                     crate::Storage::Rocm(r) => r,
                     _ => crate::bail!("rocm MoE: ids not on rocm"),
                 };
-                let y = if matches!(qt, crate::RocmQuantType::Q4K) {
-                    rocm_dev.moe_matvec_q4k_dp4a(wbank.as_ref(), xr, idr, nrows, n, k)?
-                } else {
-                    rocm_dev.moe_matvec_quant(qt, wbank.as_ref(), xr, idr, nrows, n, k)?
-                };
+                let y = rocm_dev.moe_matvec_quant(qt, wbank.as_ref(), xr, idr, nrows, n, k)?;
                 let out = crate::tensor::from_storage(
                     crate::Storage::Rocm(y),
                     (nrows, n),
@@ -1431,13 +1427,9 @@ impl QMatMul {
                     crate::Storage::Rocm(r) => r,
                     _ => crate::bail!("rocm MoE: ids not on rocm"),
                 };
-                let y = if matches!(qt, crate::RocmQuantType::Q4K) {
-                    wbank.device.moe_matvec_q4k_dp4a(wbank, xr, idr, nrows, n, k)?
-                } else {
-                    wbank
-                        .device
-                        .moe_matvec_quant(qt, wbank, xr, idr, nrows, n, k)?
-                };
+                let y = wbank
+                    .device
+                    .moe_matvec_quant(qt, wbank, xr, idr, nrows, n, k)?;
                 let out = crate::tensor::from_storage(
                     crate::Storage::Rocm(y),
                     (nrows, n),
@@ -1613,15 +1605,14 @@ impl crate::Module for QMatMul {
                     static DBG_PREFILL: AtomicUsize = AtomicUsize::new(0);
                     static DBG_FALLBACK: AtomicUsize = AtomicUsize::new(0);
                     if std::env::var("HANZO_DBG_PATH").is_ok() {
-                        // Buckets MATCH the real dispatch below: decode = rows==1 wired; prefill =
-                        // rows>1 wired (native qmmq_core<WTYPE>); fallback = unwired OR forced.
+                        // Buckets MATCH the real dispatch below: decode = rows==1 wired (the dp4a-vs-
+                        // scalar A/B is internal to matvec_quant, still native); prefill = rows>1 wired
+                        // native qmmq_core<WTYPE>; fallback = unwired OR HANZO_QMMQ_FALLBACK dequantize.
                         let wired = crate::RocmQuantType::from_ggml(*dtype).is_some();
-                        let forced_fb = (matches!(dtype, GgmlDType::Q4K)
-                            && std::env::var("HANZO_Q4K_FALLBACK").is_ok())
-                            || std::env::var("HANZO_QMMQ_FALLBACK").is_ok();
-                        if rows == 1 && wired && !forced_fb {
+                        let prefill_fb = std::env::var("HANZO_QMMQ_FALLBACK").is_ok();
+                        if rows == 1 && wired {
                             DBG_DECODE.fetch_add(1, Ordering::Relaxed);
-                        } else if rows > 1 && wired && !forced_fb {
+                        } else if rows > 1 && wired && !prefill_fb {
                             DBG_PREFILL.fetch_add(1, Ordering::Relaxed);
                         } else {
                             DBG_FALLBACK.fetch_add(1, Ordering::Relaxed);
@@ -1645,11 +1636,11 @@ impl crate::Module for QMatMul {
                 // Table-driven unified decode: a type is decode-native iff the single
                 // `qmatvec_core<WTYPE>` has a `decode_block` wired for it (RocmQuantType::from_ggml).
                 // Q8_0/Q4_0/Q4_K/Q6_K/IQ4_XS/TQ2_0 today; adding a type is one enum row, no kernel.
-                // HANZO_Q4K_FALLBACK=1 forces Q4_K back through the dequantize path (A/B diagnostic).
+                // The dp4a-vs-scalar A/B for dp4a-capable types (HANZO_Q4K_FALLBACK / HANZO_Q6K_FALLBACK)
+                // lives entirely inside `matvec_quant` (dp4a_active) -- ONE fallback, one place; it
+                // switches the decode core, the type stays on the native path either way.
                 #[cfg(feature = "rocm")]
-                let unified_qt = crate::RocmQuantType::from_ggml(*dtype).filter(|_| {
-                    !(matches!(dtype, GgmlDType::Q4K) && std::env::var("HANZO_Q4K_FALLBACK").is_ok())
-                });
+                let unified_qt = crate::RocmQuantType::from_ggml(*dtype);
                 #[cfg(not(feature = "rocm"))]
                 let unified_qt: Option<()> = None;
                 if rows == 1 && unified_qt.is_some() {
