@@ -51,10 +51,34 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   selected by `RocmQuantType::moe_decode_kernel`. ONE batched launch over all routed slots: slot s on
   grid.y, expert = ids[s] read ON-DEVICE, bank offset by ids[s] in-kernel. `moe_matvec_quant` takes
   GPU `ids: &RocmStorage` (NOT `&[u32]`) so NO `copy_from_host`/`to_vec1` host round-trip fires.
-  Q4_K keeps its dp4a path (`moe_matvec_q4k_dp4a`); every other wired type uses the new core. This
+  dp4a-capable types take the dp4a core (below); every other wired type uses this scalar core. This
   eliminated the per-expert host launch loop for mixed-precision GGUF (Qwen3-30B-A3B-Q4_K_M has Q6_K
   ffn_down experts). Eager decode 10.22 -> 12.07 T/s. Correctness gate: `moe_matvec_unified_numeric`
   (hanzo-cli) now covers Q4_K + Q8_0 + Q6_K MoE, nbad=0 vs the CPU `to_float` oracle.
+- UNIFIED int8-dp4a DECODE core `qmatvec_dp4a_core<WTYPE,XT>` + MoE twin `moe_qmatvec_dp4a_core<WTYPE,XT>`
+  (quant.hip) -> per-type entry points `qmatvec_dp4a_<t>_{f16,bf16}` / `moe_qmatvec_dp4a_<t>_{f16,bf16}`
+  (DEFINE_QMATVEC_DP4A), one per-type packed-int decode `qdp4a<WTYPE>::block` (mirrors the scalar
+  `qdec<WTYPE>::partial` bit layout). This REPLACED the hand-written Q4_K-only dp4a kernels: there is
+  now ONE dp4a core + ONE scalar fallback, trait-selected by `RocmQuantType::dp4a_active()` (dp4a_capable
+  AND `HANZO_<T>_FALLBACK` unset). Wired: Q4_K (ASYM) + Q6_K (SYM 6-bit) -- Q5_K is one `qdp4a<DW_Q5_K>`
+  + one row away. The `if Q4K {dp4a} else {scalar}` braid is GONE from `matvec_quant` / `moe_matvec_quant`
+  / the two `indexed_moe_forward` sites; the dp4a-vs-scalar A/B lives ONLY in `matvec_quant` (the
+  forward-level `unified_qt` filter no longer forces a Q4_K dequantize -- the fallback now switches the
+  decode CORE, the type stays native either way). Q6_K dp4a = the #1 decode lever (Q6_K = output.weight
+  lm_head + attn_v + ffn_down experts = 37.7% of GPU work, was SCALAR ~80 GB/s vs Q4_K dp4a 460 GB/s).
+  gfx1151 has NO `__vsubss4` (ROCm 7.13) so Q6_K reconstructs the centered (q-32) weight directly into
+  signed int8 [-32,31] and `sudot4`s it -- no branchless subtract needed. Correctness: `qmatvec_dp4a_vs
+  _scalar` (hanzo-cli) asserts dp4a == scalar core bit-faithfully (nbad=0, Q4_K+Q6_K, matvec+MoE) AND
+  the existing oracle gates stay nbad=0. PERF: eager decode Qwen3-30B-A3B-Q4_K_M (GRAPHS=0, -n 0:48,
+  3 sustained 560-tok runs) = 33.71 T/s mean (33.74/33.90/33.50) vs 33.8 baseline = FLAT; A/B
+  HANZO_Q6K_FALLBACK=1 (scalar Q6_K) = 32.1 T/s -> dp4a is marginally faster but within thermal/run-
+  length noise. The Q6_K kernel-level 4x (80->~460 GB/s) does NOT surface at the model level because
+  EAGER MoE decode is LAUNCH-bound, not Q6_K-bandwidth-bound: ~1500-1900 tiny hipLaunchKernel/token
+  over 48 layers (each matvec is its own launch; dp4a even ADDS the quantize_q8_1 launch), so the wall
+  clock is dispatch-latency-dominated (~30 ms/tok / ~16-20 us per op) and shrinking Q6_K GPU-time
+  barely moves it. The lever is real but is gated behind HIP-graph capture (where per-launch overhead
+  vanishes) -- MoE graphs now replay clean, so the Q6_K dp4a win should surface with GRAPHS=1; revisit
+  there. Correct + bit-faithful + zero-regression either way, so it ships as the default decode core.
 - INLINE DIMS/STRIDES (capture-clean strided ops) -- DONE. The per-op `clone_htod` of the tiny
   dims/strides metadata array was the capture-breaker: every strided op (Map1, Map2/broadcast,
   FastReduce/RMS-sum, copy_strided, cast/to_dtype, where_cond, const_set, index_select non-contig)
