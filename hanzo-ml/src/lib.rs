@@ -142,6 +142,9 @@ pub use dummy_vulkan_backend as vulkan;
 
 pub use vulkan::{VulkanDevice, VulkanStorage};
 
+#[cfg(feature = "vulkan")]
+pub use vulkan::{PagedAttnArgs, ReshapeCacheArgs};
+
 // `wgpu_be` alias to avoid clashing with the `wgpu` crate name.
 #[cfg(feature = "wgpu")]
 pub use wgpu_backend as wgpu_be;
