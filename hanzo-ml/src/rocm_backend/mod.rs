@@ -1820,6 +1820,129 @@ impl RocmStorage {
         }
     }
 
+    /// Matrix-core (WMMA) flash-attention forward. `self`=Q `[B,Hq,Lq,D]`, `k`/`v` `[B,Hkv,Lk,D]`
+    /// (GQA: `Hq % Hkv == 0`), head dim D must be 128. Returns O `[B,Hq,Lq,D]`. f16/bf16 only.
+    /// `causal` enables the per-query upper-triangle skip. Inputs must be contiguous.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn(
+        &self,
+        q_layout: &Layout,
+        k: &RocmStorage,
+        k_layout: &Layout,
+        v: &RocmStorage,
+        v_layout: &Layout,
+        scale: f32,
+        causal: bool,
+    ) -> Result<Self> {
+        use hanzo_rocm_kernels::kernel::{FlashKernel, KernelSource};
+        const FA_DH: usize = 128;
+        let q = self;
+        if !q_layout.is_contiguous() || !k_layout.is_contiguous() || !v_layout.is_contiguous() {
+            crate::bail!("flash_attn on rocm requires contiguous q/k/v");
+        }
+        let (b, hq, lq, d) = q_layout.shape().dims4()?;
+        let (kb, hkv, lk, kd) = k_layout.shape().dims4()?;
+        let (vb, vhkv, vlk, vd) = v_layout.shape().dims4()?;
+        if d != FA_DH || kd != FA_DH || vd != FA_DH {
+            crate::bail!("flash_attn on rocm requires head_dim == {FA_DH}, got q={d} k={kd} v={vd}");
+        }
+        if (kb, vb, vhkv, vlk) != (b, b, hkv, lk) {
+            crate::bail!("flash_attn q/k/v batch/kv-head/kv-len mismatch {q_layout:?} {k_layout:?} {v_layout:?}");
+        }
+        if hkv == 0 || hq % hkv != 0 {
+            crate::bail!("flash_attn requires Hq % Hkv == 0, got Hq={hq} Hkv={hkv}");
+        }
+        if std::env::var("HANZO_ROCM_FLASH_DEBUG").as_deref() == Ok("1") {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SEEN: AtomicBool = AtomicBool::new(false);
+            if !SEEN.swap(true, Ordering::Relaxed) {
+                eprintln!("[rocm-flash-attn] WMMA kernel active: B={b} Hq={hq} Hkv={hkv} Lq={lq} Lk={lk} D={d} causal={causal}");
+            }
+        }
+        let device = self.device.clone();
+        let o_el = b * hq * lq * d;
+        let b_i = b as i32;
+        let hq_i = hq as i32;
+        let hkv_i = hkv as i32;
+        let lq_i = lq as i32;
+        let lk_i = lk as i32;
+        let causal_i: i32 = i32::from(causal);
+        const BR: usize = 64;
+        const BLOCK: u32 = 128;
+        let grid = rocm_rs::hip::Dim3 {
+            x: lq.div_ceil(BR) as u32,
+            y: hq as u32,
+            z: b as u32,
+        };
+        let block = rocm_rs::hip::Dim3::from(BLOCK);
+        let q_off = q_layout.start_offset();
+        let k_off = k_layout.start_offset();
+        let v_off = v_layout.start_offset();
+
+        macro_rules! launch_flash {
+            ($variant:ident, $ty:ty, $func:literal) => {{
+                let q_mem = match &q.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => unreachable!(),
+                };
+                let k_mem = match &k.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => crate::bail!(
+                        "flash_attn: k dtype {:?} must match q dtype {:?}",
+                        k.slice.dtype(),
+                        q.slice.dtype()
+                    ),
+                };
+                let v_mem = match &v.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => crate::bail!(
+                        "flash_attn: v dtype {:?} must match q dtype {:?}",
+                        v.slice.dtype(),
+                        q.slice.dtype()
+                    ),
+                };
+                let o_out = device.alloc::<$ty>(o_el)?;
+                let q_ptr = unsafe { q_mem.offset_ptr(q_off) };
+                let k_ptr = unsafe { k_mem.offset_ptr(k_off) };
+                let v_ptr = unsafe { v_mem.offset_ptr(v_off) };
+                let o_ptr = o_out.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        &device,
+                        FlashKernel::NAME,
+                        FlashKernel::CODE,
+                        $func,
+                        grid,
+                        block,
+                        &mut [
+                            &b_i as *const i32 as *mut std::ffi::c_void,
+                            &hq_i as *const i32 as *mut std::ffi::c_void,
+                            &hkv_i as *const i32 as *mut std::ffi::c_void,
+                            &lq_i as *const i32 as *mut std::ffi::c_void,
+                            &lk_i as *const i32 as *mut std::ffi::c_void,
+                            &scale as *const f32 as *mut std::ffi::c_void,
+                            &causal_i as *const i32 as *mut std::ffi::c_void,
+                            (&q_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&k_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&v_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&o_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+                Ok(Self {
+                    slice: RocmStorageSlice::$variant(o_out),
+                    device: device.clone(),
+                })
+            }};
+        }
+
+        match &q.slice {
+            RocmStorageSlice::F16(_) => launch_flash!(F16, f16, "flash_attn_f16"),
+            RocmStorageSlice::BF16(_) => launch_flash!(BF16, bf16, "flash_attn_bf16"),
+            other => crate::bail!("flash_attn on rocm unsupported dtype {:?} (f16/bf16 only)", other.dtype()),
+        }
+    }
+
     /// Fused softmax over the last dim (max-subtract-exp-sum-div, f32 accumulation), replacing the
     /// composite that ran 5 ops + 2 casts. One warp per row (32 lanes along threadIdx.y); the
     /// reduction is a warp shuffle (no shared memory). Reuses the ReduceKernel `softmax_{...}`.
