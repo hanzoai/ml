@@ -28,17 +28,31 @@ Correctness: **Q4_K and Q6_K both nbad=0** across all shapes incl. the productio
 correct (`true,true`).
 
 Occupancy (`-Rpass-analysis=kernel-resource-usage`): zero VGPR/SGPR spills on all four prefill kernels.
-Q4_K 129 VGPR / 10 waves / 22528 B LDS; Q6_K 159 VGPR / 9 waves / 21504 B LDS; Q8_0 127 VGPR / 10 waves.
+Q4_K 129 VGPR / 10 waves / 22528 B LDS; Q6_K (SWAR) 147 VGPR / 9 waves / 21504 B LDS (was 159 VGPR
+pre-SWAR); Q8_0 127 VGPR / 10 waves.
 
-Performance (the honest result): the prefill is **weight-decode-bound, not WMMA-bound**. At a fixed
-512x5120x8192 GEMM the throughput falls monotonically with decode cost --
-Q8_0 (memcpy) ~23 TF/s, Q4_K (nibble) ~19.6 TF/s, Q6_K (6-bit reassemble) ~11 TF/s -- while rocBLAS
-f16 `hgemm` does 28-41 TF/s. So `qmmq` is **0.5-0.7x** the hgemm GEMM rate (Q4_K) / **0.3-0.4x** (Q6_K).
-The end-to-end FFN win (Q4_K ~1.0-1.16x vs the *shipped* dequant-f16 fallback) comes from avoiding the
-dequant cost, not from a faster GEMM -- and the shipped ROCm fallback dequantizes on the **CPU** + H2D
-every call, which is what makes keeping weights quantized worthwhile. The lever to actually beat hgemm
-is to hoist/vectorize the per-block weight decode (esp. Q6_K's branchy quad loop) so the matrix cores
-stop starving; that work is NOT done here.
+Performance: the prefill was **weight-decode-bound, not WMMA-bound** -- at a fixed 512x5120x8192 GEMM
+throughput fell monotonically with decode cost. The decode front-end is now **SWAR-vectorized** (one
+128-bit load + lane-parallel 32-bit nibble/6-bit extract, replacing per-byte 16-bit bitops):
+
+- **Q6_K SWAR win: 1.70-1.74x** (10.4 -> 18.2 TF/s at 512x5120x8192; 1.71x gate/up 512x4096x12288;
+  1.70x down 512x12288x4096). The branchy per-byte 6-bit reassembly is gone -- ISA `v_and_b16`/
+  `v_lshrrev_b16`/`v_lshlrev_b16` count **208 -> 0**, kernel body 2492 -> 1278 lines, VGPR 159 -> 147,
+  still 0 spills. Q6_K now hits the SAME ~18 TF/s as Q4_K (decode is no longer its bottleneck).
+- **Q4_K SWAR: ~1.00x (neutral)**. Q4_K's byte loads were ALREADY vectorized by the compiler (simple
+  nibble mask), so SWAR is a wash -- no gain, no regression, nbad=0 preserved.
+
+Both signed-center borrow-free via `((e|0x80808080) - 0x20202020) ^ 0x80808080` (gfx1151 has no
+`__vsubss4`); the `iu8` WMMA `is_signed` flags stay `true,true`; the oracle re-runs nbad=0.
+
+**Honest ceiling -- the native path does NOT beat rocBLAS f16 hgemm, and decode is no longer why.**
+Even Q8_0 with a trivial memcpy decode tops out at ~18-21 TF/s while hgemm does ~28-41 TF/s. The inner
+loop is 8 WMMA + 32 LDS ops (4:1 LDS:MMA) at 10 waves / 0 spills, so the shared MMA machine is **LDS-
+bandwidth / scheduling bound at ~40-50% of the iu8 WMMA peak**, not decode-bound. Beating hgemm would
+require restructuring that shared tile/MMA machine (wider LDS loads, larger register tiling, async
+copies) -- deliberately out of scope (kept byte-identical). Net: the native path's value is (1) keeping
+weights quantized (the shipped fallback dequantizes on the **CPU** + H2D every prefill) and (2) Q6_K
+prefill is now 1.7x faster. It is fallback-competitive, not a raw-GEMM-rate win over hgemm.
 
 `k%256` guard: the only divisibility constraint is on **K** (`k % block_elems() == 0`). **N is
 unconstrained** (the kernel tiles N by 128 with `gn < N` guards). Standard FFN widths are multiples of
