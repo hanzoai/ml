@@ -29,3 +29,18 @@ echo ">> NUMERIC ORACLE (must report ALL PASS / nbad=0)"
 
 echo ">> MICROBENCH (native int8-WMMA prefill vs dequant-f16 + rocBLAS hgemm)"
 ./qmmq_bench
+
+echo ">> A/B DECODE: pre-SWAR (byte loop) vs shipped SWAR decode, thermally interleaved"
+GITROOT=$(git -C . rev-parse --show-toplevel 2>/dev/null || echo ..)
+BASE_REV=$(git -C "$GITROOT" log -1 --format=%H --skip=1 -- hanzo-rocm-kernels/src/kernels/quant.hip 2>/dev/null || true)
+if [ -n "$BASE_REV" ]; then
+  git -C "$GITROOT" show "$BASE_REV:hanzo-rocm-kernels/src/kernels/quant.hip" > /tmp/qmmq_quant_base.hip
+  hipcc --genco -O3 --offload-arch="$ARCH" /tmp/qmmq_quant_base.hip -o k_old.hsaco
+  hipcc --genco -O3 --offload-arch="$ARCH" ../src/kernels/quant.hip      -o k_new.hsaco
+  hipcc -O3 --offload-arch="$ARCH" qmmq_ab_decode.hip -o qmmq_ab_decode
+  ./qmmq_ab_decode 512 5120 8192
+  ./qmmq_ab_decode 512 4096 12288   # FFN gate/up
+  ./qmmq_ab_decode 512 12288 4096   # FFN down
+else
+  echo "  (skipped: could not resolve baseline quant.hip revision from git)"
+fi
