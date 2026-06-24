@@ -214,40 +214,47 @@ template <int WTYPE> struct qdp4a;
 //   dot1 = sum_k nibble_k * u_k (8 dp4a); dot2 = sum_k u_k (8 dp4a of 0x01010101 = q8_1 sum)
 //   sumf_d += d8[j]*(dot1*sc[j]);  sumf_m += d8[j]*(dot2*m[j]);  result = d*sumf_d - dmin*sumf_m
 template <> struct qdp4a<DW_Q4_K> {
-    static __device__ __forceinline__ float block(
-            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+    static constexpr int NSUB = 4;           // 4 chunks per super-block, each independently summable
+    // Chunk `sub` (0..3) of one super-block: qs[sub*32, sub*32+32) = sub-blocks 2*sub (low) + 2*sub+1
+    // (high). Returns the chunk's COMPLETE f32 contribution (already folded into d/dmin units) so
+    // chunk partials sum directly to `block()`. This is the per-sub-unit work item the MoE core
+    // strides across lanes -- 4 chunks * nblocks fills the warp on the narrow-k expert shapes.
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int sub) {
         const float d    = __half2float(*reinterpret_cast<const __half*>(blk));
         const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
-        const uint8_t* scales = blk + 4;                          // 12 packed 6-bit scale bytes
-        const int* q4 = reinterpret_cast<const int*>(blk + 16);   // 128 qs bytes = 32 ints
-        const int* u  = reinterpret_cast<const int*>(xq8);        // 256 int8 = 64 ints (8 blocks * 8)
-        float sumf_d = 0.0f;
-        float sumf_m = 0.0f;
+        const uint8_t* scales = blk + 4;
+        const int* q4 = reinterpret_cast<const int*>(blk + 16);
+        const int* u  = reinterpret_cast<const int*>(xq8);
+        int sc_lo, m_lo, sc_hi, m_hi;
+        q4k_scale_min(scales, 2 * sub,     &sc_lo, &m_lo);
+        q4k_scale_min(scales, 2 * sub + 1, &sc_hi, &m_hi);
+        const int* q4c   = q4 + sub * 8;
+        const int* u_lo  = u + (2 * sub)     * 8;
+        const int* u_hi  = u + (2 * sub + 1) * 8;
+        const float d8_lo = __half2float(xd8[2 * sub]);
+        const float d8_hi = __half2float(xd8[2 * sub + 1]);
+        int dot1_lo = 0, dot2_lo = 0, dot1_hi = 0, dot2_hi = 0;
         #pragma unroll
-        for (int c = 0; c < 4; ++c) {        // 4 chunks, each = qs[c*32, c*32+32) = 8 ints
-            int sc_lo, m_lo, sc_hi, m_hi;
-            q4k_scale_min(scales, 2 * c,     &sc_lo, &m_lo);
-            q4k_scale_min(scales, 2 * c + 1, &sc_hi, &m_hi);
-            const int* q4c   = q4 + c * 8;
-            const int* u_lo  = u + (2 * c)     * 8;
-            const int* u_hi  = u + (2 * c + 1) * 8;
-            const float d8_lo = __half2float(xd8[2 * c]);
-            const float d8_hi = __half2float(xd8[2 * c + 1]);
-            int dot1_lo = 0, dot2_lo = 0, dot1_hi = 0, dot2_hi = 0;
-            #pragma unroll
-            for (int t = 0; t < 8; ++t) {
-                const int w   = q4c[t];
-                const int wlo = (w >> 0) & 0x0F0F0F0F;   // low  nibble of each byte
-                const int whi = (w >> 4) & 0x0F0F0F0F;   // high nibble of each byte
-                dot1_lo = hip_dp4a(wlo, u_lo[t], dot1_lo);
-                dot2_lo = hip_dp4a(0x01010101, u_lo[t], dot2_lo);
-                dot1_hi = hip_dp4a(whi, u_hi[t], dot1_hi);
-                dot2_hi = hip_dp4a(0x01010101, u_hi[t], dot2_hi);
-            }
-            sumf_d += d8_lo * (dot1_lo * sc_lo) + d8_hi * (dot1_hi * sc_hi);
-            sumf_m += d8_lo * (dot2_lo * m_lo)  + d8_hi * (dot2_hi * m_hi);
+        for (int t = 0; t < 8; ++t) {
+            const int w   = q4c[t];
+            const int wlo = (w >> 0) & 0x0F0F0F0F;
+            const int whi = (w >> 4) & 0x0F0F0F0F;
+            dot1_lo = hip_dp4a(wlo, u_lo[t], dot1_lo);
+            dot2_lo = hip_dp4a(0x01010101, u_lo[t], dot2_lo);
+            dot1_hi = hip_dp4a(whi, u_hi[t], dot1_hi);
+            dot2_hi = hip_dp4a(0x01010101, u_hi[t], dot2_hi);
         }
+        const float sumf_d = d8_lo * (dot1_lo * sc_lo) + d8_hi * (dot1_hi * sc_hi);
+        const float sumf_m = d8_lo * (dot2_lo * m_lo)  + d8_hi * (dot2_hi * m_hi);
         return d * sumf_d - dmin * sumf_m;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int sub = 0; sub < NSUB; ++sub) s += partial(blk, xq8, xd8, sub);
+        return s;
     }
 };
 
@@ -263,45 +270,54 @@ template <> struct qdp4a<DW_Q4_K> {
 // of 4 per 16-group. d8 (q8_1 32-block scale) for p is xd8[p/32]. result = d * sum_{16-grp g}
 // scales[g] * d8[g/2] * (sum of the group's 4 dp4a). Bit-faithful to the oracle (f32 reorder only).
 template <> struct qdp4a<DW_Q6_K> {
-    static __device__ __forceinline__ float block(
-            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+    static constexpr int NSUB = 16;          // 16 scale-groups per super-block, each summable
+    // Scale-group `sub` (0..15) of one super-block: positions p = sub*16 .. sub*16+15. Returns the
+    // group's COMPLETE f32 contribution (d folded in) so group partials sum directly to `block()`.
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int sub) {
         const uint8_t* ql_b = blk;                                       // 128
         const uint8_t* qh_b = blk + 128;                                 // 64
         const int8_t*  sc_b = reinterpret_cast<const int8_t*>(blk + 192);// 16 signed
         const float d = __half2float(*reinterpret_cast<const __half*>(blk + 208));
-        float sumf = 0.0f;
+        const int g     = sub;
+        const int sc    = sc_b[g];
+        const float d8  = __half2float(xd8[g >> 1]);   // q8_1 32-block scale: 2 16-groups per block
+        // A 16-element scale-group lies wholly inside ONE 32-quad, so half/quad/l0 are constant for
+        // all 16 positions (p0>>7, (p0>>5)&3, p0&31 with p0=g*16 const within the group). Load the
+        // group's 16 ql + 16 qh bytes as four packed ints each (vectorized, vs 16 byte loads) and
+        // reconstruct 4 weights per int with packed nibble/2-bit ops -- no per-element branch, no
+        // byte-granular gathers. The quad/half selection is the ONE branch, now per-group not per-elem.
+        const int base = g * 16;
+        const int half = base >> 7;
+        const int quad = (base >> 5) & 3;
+        const int l0   = base & 31;                      // 0 or 16
+        const int* ql4 = reinterpret_cast<const int*>(ql_b + 64 * half + l0 + ((quad & 1) ? 32 : 0));
+        const int* qh4 = reinterpret_cast<const int*>(qh_b + 32 * half + l0);
+        const int hsh  = quad * 2;                        // qh shift: 0,2,4,6 for quad 0,1,2,3
+        const bool loNib = (quad < 2);                    // quad 0/1 = low nibble, 2/3 = high
+        // Handle the q6-32 centering as a bias term (like Q4_K's dot2): the raw 6-bit code q in [0,63]
+        // is a valid signed int8, so dp4a(q_packed, u) is exact; sum_p (q_p-32)*u_p = dot_q - 32*sum_u.
+        // sum_u via dp4a(0x01010101, u) avoids the cross-byte-borrow that a packed (q-32) subtract has.
+        int dot_q = 0, sum_u = 0;
         #pragma unroll
-        for (int g = 0; g < 16; ++g) {       // 16 scale-groups of 16 elems each (p = g*16 .. g*16+15)
-            const int sc   = sc_b[g];
-            const float d8 = __half2float(xd8[g >> 1]);   // q8_1 32-block scale: 2 16-groups per block
-            int dot = 0;
-            #pragma unroll
-            for (int q = 0; q < 4; ++q) {    // 4 dp4a of 4 contiguous positions p0 = g*16 + q*4
-                const int p0   = g * 16 + q * 4;
-                const int half = p0 >> 7;             // 0,1   (which 128-half)
-                const int quad = (p0 >> 5) & 3;       // 0..3  (quadrant within half)
-                const int l0   = p0 & 31;             // 0..28 (offset within the 32-quad, step 4)
-                const uint8_t* ql = ql_b + 64 * half;
-                const uint8_t* qh = qh_b + 32 * half;
-                int8_t w[4];
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int l = l0 + j;             // l in [0,31]
-                    int wq;
-                    if (quad == 0)      wq = ((ql[l]      & 0xF) | ((qh[l] & 3) << 4)) - 32;
-                    else if (quad == 1) wq = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                    else if (quad == 2) wq = ((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
-                    else                wq = ((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
-                    w[j] = (int8_t)wq;                // in [-32,31], fits signed int8
-                }
-                int wpacked;
-                __builtin_memcpy(&wpacked, w, 4);
-                const int u = *reinterpret_cast<const int*>(xq8 + p0);  // 4 contiguous q8_1 int8
-                dot = hip_dp4a(wpacked, u, dot);
-            }
-            sumf += d8 * (float)(dot * sc);
+        for (int q = 0; q < 4; ++q) {        // 4 dp4a of 4 contiguous positions p0 = base + q*4
+            const int lv = ql4[q];
+            const int hv = qh4[q];
+            const int nib = loNib ? ((lv >> 0) & 0x0F0F0F0F) : ((lv >> 4) & 0x0F0F0F0F);
+            const int hi  = ((hv >> hsh) & 0x03030303) << 4;
+            const int wpk = nib | hi;                     // raw q6 in [0,63] per byte = valid int8
+            const int u = *reinterpret_cast<const int*>(xq8 + base + q * 4);
+            dot_q = hip_dp4a(wpk, u, dot_q);
+            sum_u = hip_dp4a(0x01010101, u, sum_u);
         }
-        return d * sumf;
+        return d * d8 * (float)((dot_q - 32 * sum_u) * sc);
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int sub = 0; sub < NSUB; ++sub) s += partial(blk, xq8, xd8, sub);
+        return s;
     }
 };
 
@@ -380,9 +396,19 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     const int8_t* xq_row = xq + (size_t)s * ncols;
     const __half* xd_row = xd + (size_t)s * (ncols >> 5);
 
+    // Stride lanes over (super-block x sub-unit) work items, NOT whole super-blocks. The expert
+    // shapes are narrow-k (gate/up k=2048 -> 8 super-blocks, down k=768 -> 3), so whole-super-block
+    // striding leaves 24/32 (gate/up) or 29/32 (down) lanes idle. NSUB sub-units per super-block
+    // (Q4_K=4 chunks, Q6_K=16 groups) lifts the parallel unit count to nblocks*NSUB (>=32 here), so
+    // every lane carries dp4a work; sub-unit partials sum identically to qdp4a<WTYPE>::block.
+    constexpr int NSUB = qdp4a<WTYPE>::NSUB;
+    const int nunits = nblocks * NSUB;
     float acc = 0.0f;
-    for (int b = lane; b < nblocks; b += 32) {
-        acc += qdp4a<WTYPE>::block(row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * 256, xd_row + (size_t)b * 8);
+    for (int u = lane; u < nunits; u += 32) {
+        const int b = u / NSUB;
+        const int sub = u - b * NSUB;
+        acc += qdp4a<WTYPE>::partial(
+            row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * 256, xd_row + (size_t)b * 8, sub);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -1225,10 +1251,14 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_Q4_K>(const uint8_t* sb, int 
     const int c = g >> 1;            // chunk 0..3
     const int shift = (g & 1) ? 4 : 0;
     const uint8_t* qc = qs + c * 32 + half; // k=half..half+15 of this sub-block
-    int8_t tmp[16];
+    // SWAR nibble extract: one 128-bit load of the 16 packed bytes, then  (w >> shift) & 0x0F0F0F0F
+    // across all 4 dwords -- 4 lane-parallel ANDs replace 16 per-byte v_and_b16 ops. q_w is the
+    // UNSIGNED nibble 0..15 (the min term carries the offset), so no sign-extend is needed.
+    uint32_t w[4]; __builtin_memcpy(w, qc, 16);
+    v4i_ld v;
     #pragma unroll
-    for (int i = 0; i < 16; ++i) tmp[i] = (int8_t)((qc[i] >> shift) & 0x0F);
-    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+    for (int j = 0; j < 4; ++j) v[j] = (int)((w[j] >> shift) & 0x0F0F0F0Fu);
+    return v;
 }
 
 // Q6_K: super-block = ql[128], qh[64], scales[16] (signed i8), d (f16). 32-sub-block g covers the
@@ -1236,24 +1266,28 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_Q4_K>(const uint8_t* sb, int 
 // [-32,31]). k=half..half+15 within the sub-block (this routine returns one 16-half).
 template <>
 __device__ __forceinline__ v4i_ld decode_w_half<WT_Q6_K>(const uint8_t* sb, int g, int half) {
-    const uint8_t* ql_b = sb;
     const uint8_t* qh_b = sb + 128;
     const int hf = g >> 2;           // 0,1  (which 128-half)
     const int quad = g & 3;          // 0..3
-    const uint8_t* ql = ql_b + 64 * hf;
-    const uint8_t* qh = qh_b + 32 * hf;
-    int8_t tmp[16];
+    // ql[kk] for quad 0/2, ql[kk+32] for quad 1/3 -- both 16 contiguous bytes (kk=half..half+15).
+    const uint8_t* ql = sb + 64 * hf + ((quad & 1) ? 32 : 0) + half;
+    const uint8_t* qh = qh_b + 32 * hf + half;
+    const int lshift = (quad >> 1) ? 4 : 0;     // low nibble (q0/q1) vs high nibble (q2/q3)
+    const int hshift = quad * 2;                 // qh 2-bit field: bits 0,2,4,6 for quad 0..3
+    // SWAR over 4 dwords: load the 16 ql + 16 qh bytes as two 128-bit vectors, extract the 6-bit
+    // weight lane-parallel (nibble | (2-bit<<4)) -- 8 dword ops replace 16x{and_b16,lshr_b16,or}.
+    // Then center to signed [-32,31] borrow-free: ((e|0x80808080) - 0x20202020) ^ 0x80808080
+    // (e in [0,63]; OR sets bit7 so the per-byte subtract never borrows; final XOR yields (int8)e-32).
+    uint32_t lw[4], hw[4]; __builtin_memcpy(lw, ql, 16); __builtin_memcpy(hw, qh, 16);
+    v4i_ld v;
     #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const int kk = half + i;     // 0..31 within the sub-block (= ll in to_float)
-        int q;
-        if (quad == 0)      q = ((ql[kk]      & 0xF) | ((qh[kk] & 3) << 4)) - 32;
-        else if (quad == 1) q = ((ql[kk + 32] & 0xF) | (((qh[kk] >> 2) & 3) << 4)) - 32;
-        else if (quad == 2) q = ((ql[kk]      >> 4)  | (((qh[kk] >> 4) & 3) << 4)) - 32;
-        else                q = ((ql[kk + 32] >> 4)  | (((qh[kk] >> 6) & 3) << 4)) - 32;
-        tmp[i] = (int8_t)q;
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t lo = (lw[j] >> lshift) & 0x0F0F0F0Fu;
+        const uint32_t hi = ((hw[j] >> hshift) & 0x03030303u) << 4;
+        const uint32_t e  = lo | hi;                              // unsigned 6-bit, per byte [0,63]
+        v[j] = (int)((((e | 0x80808080u) - 0x20202020u) ^ 0x80808080u)); // signed (e-32) per byte
     }
-    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+    return v;
 }
 
 // IQ4_XS: super-block = d (f16), scales_h (u16), scales_l[4], qs[128]. Sub-block ib=g covers
@@ -1351,11 +1385,13 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_Q6_K>(const ui
 template <> __device__ __forceinline__ float decode_w_secscale<WT_IQ4_XS>(const uint8_t*, int) { return 0.0f; }
 template <> __device__ __forceinline__ float decode_w_secscale<WT_TQ2_0>(const uint8_t*, int) { return 0.0f; }
 
-// Shared int8 tile row stride: 32 data bytes + 4 pad bytes (llama's MMQ_MMA_TILE_X_K_Q8_0 padding,
-// which keeps row*stride % 8 == 4). With 16B (b128) fragment loads on 32B rows, consecutive rows
-// otherwise land on the same 32 LDS banks; +4B shifts each row by one bank-group so the 16-lane
-// fragment loads spread across banks. 20480 B LDS total (2*128*36 + 2*128*4) -> still 3 blocks/CU.
-#define SROW 36
+// Shared int8 tile row stride: 32 data bytes + 16 pad bytes = 48. The pad is 16-ALIGNED so the 32-byte
+// fragment loads (`__builtin_memcpy(&frag, &sXi[row*SROW], 32)`) lower to `ds_load_b128` (two 16-byte
+// LDS reads) instead of byte-strided `ds_load_2addr_b32` -- a 36-byte stride is not 16-aligned so the
+// per-lane base broke b128 vectorization. Measured +11% on Q4_K prefill (gfx1151, oracle nbad=0). The
+// 16-byte pad also keeps consecutive rows off the same LDS bank-group (bank-conflict-free, profiled
+// LDSBankConflict ~0.03%). 26624 B LDS total (2*128*48 + scales) -> still fits occupancy (10 waves).
+#define SROW 48
 // Stage the X (activation) int8 tile + the weight int8 tile (per-type decode) + the per-block
 // scales for 32-block BLK into shared buffer BUF. Identical X-half staging to the proven path; the
 // WEIGHT tile uses decode_w_half<WTYPE>(super-block, g, half) with g = the sub-block index. Scales
