@@ -158,3 +158,26 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   (Qwen3-VL mRoPE + non-paged Sdpa decode) has the SAME class of bug (fresh per-forward cos/sin) and is
   deliberately LEFT OUT of the gate (decodes eager, correct) until its mRoPE is threaded through
   rope_positions too -- do that before enabling its graph path.
+- Q6_K dp4a decode kernel ~5x SPEEDUP (quant.hip `qdp4a<DW_Q6_K>::partial`, branch perf/moe-fused-decode).
+  rocprofv3 on Qwen3-30B-A3B-Q4_K_M decode proved the EAGER MoE wall is COMPUTE (not pure dispatch):
+  Q6_K kernels (output.weight lm_head + attn_v + ffn_down experts) were ~40% of GPU time at 260/249 us
+  per call -- 5-12x slower than the Q4_K kernels (45/21 us) -- because the OLD Q6_K decode did, per
+  16-elem scale-group, 16 byte-granular ql/qh gathers + a branchy per-element (if quad==0..3) 6-bit
+  reconstruct. FIX: a 16-elem scale-group lies wholly inside ONE 32-quad so half/quad/l0 are CONSTANT
+  across its 16 positions -> load the 16 ql + 16 qh bytes as four packed `int` reads each, reconstruct
+  4 weights/int with packed nibble (`>>0|>>4 & 0x0F0F0F0F`) + 2-bit-high (`(hv>>(quad*2))&0x03030303<<4`)
+  ops, ONE branch per group not per elem. The q6-32 centering is a BIAS TERM (sum_p(q-32)u = dp4a(q,u)
+  - 32*dp4a(0x01010101,u)) -- raw q in [0,63] is a valid signed int8, and the bias-sum avoids the
+  cross-byte-borrow a packed `int - 0x20202020` would suffer (gfx1151 has no per-byte `__vsubss4`).
+  RESULT (rocprofv3, same workload): qmatvec_dp4a_q6k 260->53 us (4.9x), moe_qmatvec_dp4a_q6k 249->51 us
+  (4.9x); total GPU kernel time 4622->2410 ms (-48%). Model-level eager decode 28.2 -> 33.0 T/s (+17%,
+  3 runs 33.74/32.96/32.28) + prefill ~108->157 T/s; the model gain < the -48% GPU drop because eager
+  carries fixed per-launch dispatch overhead that doesn't shrink with kernel time (the GRAPHS lever).
+  Correctness: `qmatvec_unified_numeric` Q6_K dp4a-vs-scalar + MoE dp4a-vs-scalar all nbad=0 (bit-
+  faithful to the CPU to_float oracle, f32 reorder only). ALSO in the same branch: the MoE dp4a core
+  (`moe_qmatvec_dp4a_core`) now strides lanes over (super-block x sub-unit) work items, not whole
+  super-blocks -- the expert shapes are narrow-k (gate/up k=2048->8 super-blocks, down k=768->3) so
+  whole-block striding idled 24-29/32 lanes; NSUB sub-units/super-block (Q4_K=4 chunks, Q6_K=16 groups)
+  via the new `qdp4a<WTYPE>::partial(blk,xq8,xd8,sub)` (block() = sum over sub, so non-MoE core is
+  byte-unchanged) fills the warp. Occupancy fix alone was model-flat (Q4_K MoE was already 45 us);
+  the Q6_K decode rewrite was the real lever.
