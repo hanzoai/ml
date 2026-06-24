@@ -1225,10 +1225,14 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_Q4_K>(const uint8_t* sb, int 
     const int c = g >> 1;            // chunk 0..3
     const int shift = (g & 1) ? 4 : 0;
     const uint8_t* qc = qs + c * 32 + half; // k=half..half+15 of this sub-block
-    int8_t tmp[16];
+    // SWAR nibble extract: one 128-bit load of the 16 packed bytes, then  (w >> shift) & 0x0F0F0F0F
+    // across all 4 dwords -- 4 lane-parallel ANDs replace 16 per-byte v_and_b16 ops. q_w is the
+    // UNSIGNED nibble 0..15 (the min term carries the offset), so no sign-extend is needed.
+    uint32_t w[4]; __builtin_memcpy(w, qc, 16);
+    v4i_ld v;
     #pragma unroll
-    for (int i = 0; i < 16; ++i) tmp[i] = (int8_t)((qc[i] >> shift) & 0x0F);
-    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+    for (int j = 0; j < 4; ++j) v[j] = (int)((w[j] >> shift) & 0x0F0F0F0Fu);
+    return v;
 }
 
 // Q6_K: super-block = ql[128], qh[64], scales[16] (signed i8), d (f16). 32-sub-block g covers the
@@ -1236,24 +1240,28 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_Q4_K>(const uint8_t* sb, int 
 // [-32,31]). k=half..half+15 within the sub-block (this routine returns one 16-half).
 template <>
 __device__ __forceinline__ v4i_ld decode_w_half<WT_Q6_K>(const uint8_t* sb, int g, int half) {
-    const uint8_t* ql_b = sb;
     const uint8_t* qh_b = sb + 128;
     const int hf = g >> 2;           // 0,1  (which 128-half)
     const int quad = g & 3;          // 0..3
-    const uint8_t* ql = ql_b + 64 * hf;
-    const uint8_t* qh = qh_b + 32 * hf;
-    int8_t tmp[16];
+    // ql[kk] for quad 0/2, ql[kk+32] for quad 1/3 -- both 16 contiguous bytes (kk=half..half+15).
+    const uint8_t* ql = sb + 64 * hf + ((quad & 1) ? 32 : 0) + half;
+    const uint8_t* qh = qh_b + 32 * hf + half;
+    const int lshift = (quad >> 1) ? 4 : 0;     // low nibble (q0/q1) vs high nibble (q2/q3)
+    const int hshift = quad * 2;                 // qh 2-bit field: bits 0,2,4,6 for quad 0..3
+    // SWAR over 4 dwords: load the 16 ql + 16 qh bytes as two 128-bit vectors, extract the 6-bit
+    // weight lane-parallel (nibble | (2-bit<<4)) -- 8 dword ops replace 16x{and_b16,lshr_b16,or}.
+    // Then center to signed [-32,31] borrow-free: ((e|0x80808080) - 0x20202020) ^ 0x80808080
+    // (e in [0,63]; OR sets bit7 so the per-byte subtract never borrows; final XOR yields (int8)e-32).
+    uint32_t lw[4], hw[4]; __builtin_memcpy(lw, ql, 16); __builtin_memcpy(hw, qh, 16);
+    v4i_ld v;
     #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const int kk = half + i;     // 0..31 within the sub-block (= ll in to_float)
-        int q;
-        if (quad == 0)      q = ((ql[kk]      & 0xF) | ((qh[kk] & 3) << 4)) - 32;
-        else if (quad == 1) q = ((ql[kk + 32] & 0xF) | (((qh[kk] >> 2) & 3) << 4)) - 32;
-        else if (quad == 2) q = ((ql[kk]      >> 4)  | (((qh[kk] >> 4) & 3) << 4)) - 32;
-        else                q = ((ql[kk + 32] >> 4)  | (((qh[kk] >> 6) & 3) << 4)) - 32;
-        tmp[i] = (int8_t)q;
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t lo = (lw[j] >> lshift) & 0x0F0F0F0Fu;
+        const uint32_t hi = ((hw[j] >> hshift) & 0x03030303u) << 4;
+        const uint32_t e  = lo | hi;                              // unsigned 6-bit, per byte [0,63]
+        v[j] = (int)((((e | 0x80808080u) - 0x20202020u) ^ 0x80808080u)); // signed (e-32) per byte
     }
-    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+    return v;
 }
 
 // IQ4_XS: super-block = d (f16), scales_h (u16), scales_l[4], qs[128]. Sub-block ib=g covers
