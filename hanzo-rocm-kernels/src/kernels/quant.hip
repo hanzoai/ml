@@ -1359,11 +1359,13 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_Q6_K>(const ui
 template <> __device__ __forceinline__ float decode_w_secscale<WT_IQ4_XS>(const uint8_t*, int) { return 0.0f; }
 template <> __device__ __forceinline__ float decode_w_secscale<WT_TQ2_0>(const uint8_t*, int) { return 0.0f; }
 
-// Shared int8 tile row stride: 32 data bytes + 4 pad bytes (llama's MMQ_MMA_TILE_X_K_Q8_0 padding,
-// which keeps row*stride % 8 == 4). With 16B (b128) fragment loads on 32B rows, consecutive rows
-// otherwise land on the same 32 LDS banks; +4B shifts each row by one bank-group so the 16-lane
-// fragment loads spread across banks. 20480 B LDS total (2*128*36 + 2*128*4) -> still 3 blocks/CU.
-#define SROW 36
+// Shared int8 tile row stride: 32 data bytes + 16 pad bytes = 48. The pad is 16-ALIGNED so the 32-byte
+// fragment loads (`__builtin_memcpy(&frag, &sXi[row*SROW], 32)`) lower to `ds_load_b128` (two 16-byte
+// LDS reads) instead of byte-strided `ds_load_2addr_b32` -- a 36-byte stride is not 16-aligned so the
+// per-lane base broke b128 vectorization. Measured +11% on Q4_K prefill (gfx1151, oracle nbad=0). The
+// 16-byte pad also keeps consecutive rows off the same LDS bank-group (bank-conflict-free, profiled
+// LDSBankConflict ~0.03%). 26624 B LDS total (2*128*48 + scales) -> still fits occupancy (10 waves).
+#define SROW 48
 // Stage the X (activation) int8 tile + the weight int8 tile (per-type decode) + the per-block
 // scales for 32-block BLK into shared buffer BUF. Identical X-half staging to the proven path; the
 // WEIGHT tile uses decode_w_half<WTYPE>(super-block, g, half) with g = the sub-block index. Scales
