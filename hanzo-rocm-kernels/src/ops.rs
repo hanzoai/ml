@@ -58,20 +58,24 @@ impl OpLauncher {
 
         let (grid, block) = grid_block_config(numel);
 
+        // hipModuleLaunchKernel reads each kernel_params[i] as a pointer TO arg i's value.
+        // Device pointers are themselves values, so we pass the ADDRESS of a local slot holding
+        // each pointer/scalar, and keep those slots alive until after `launch` returns.
+        let info_ptr: *mut std::ffi::c_void = dims_and_strides
+            .map(|m| m.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let lhs_ptr = lhs.as_ptr();
+        let rhs_ptr = rhs.as_ptr();
+        let out_ptr = output.as_ptr();
+
         let mut args: Vec<*mut std::ffi::c_void> = vec![
             (&numel) as *const usize as *mut std::ffi::c_void,
             (&num_dims) as *const usize as *mut std::ffi::c_void,
+            (&info_ptr) as *const _ as *mut std::ffi::c_void,
+            (&lhs_ptr) as *const _ as *mut std::ffi::c_void,
+            (&rhs_ptr) as *const _ as *mut std::ffi::c_void,
+            (&out_ptr) as *const _ as *mut std::ffi::c_void,
         ];
-
-        if let Some(info) = dims_and_strides {
-            args.push(info.as_ptr() as *mut std::ffi::c_void);
-        } else {
-            args.push(std::ptr::null_mut());
-        }
-
-        args.push(lhs.as_ptr() as *mut std::ffi::c_void);
-        args.push(rhs.as_ptr() as *mut std::ffi::c_void);
-        args.push(output.as_ptr() as *mut std::ffi::c_void);
 
         function
             .launch(grid, block, 0, Some(stream), &mut args)
@@ -114,19 +118,21 @@ impl OpLauncher {
 
         let (grid, block) = grid_block_config(numel);
 
+        // hipModuleLaunchKernel reads each kernel_params[i] as a pointer TO arg i's value.
+        // Pass the ADDRESS of a local slot holding each pointer/scalar (slots outlive `launch`).
+        let info_ptr: *mut std::ffi::c_void = dims_and_strides
+            .map(|m| m.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let in_ptr = input.as_ptr();
+        let out_ptr = output.as_ptr();
+
         let mut args: Vec<*mut std::ffi::c_void> = vec![
             (&numel) as *const usize as *mut std::ffi::c_void,
             (&num_dims) as *const usize as *mut std::ffi::c_void,
+            (&info_ptr) as *const _ as *mut std::ffi::c_void,
+            (&in_ptr) as *const _ as *mut std::ffi::c_void,
+            (&out_ptr) as *const _ as *mut std::ffi::c_void,
         ];
-
-        if let Some(info) = dims_and_strides {
-            args.push(info.as_ptr() as *mut std::ffi::c_void);
-        } else {
-            args.push(std::ptr::null_mut());
-        }
-
-        args.push(input.as_ptr() as *mut std::ffi::c_void);
-        args.push(output.as_ptr() as *mut std::ffi::c_void);
 
         function
             .launch(grid, block, 0, Some(stream), &mut args)
@@ -169,22 +175,23 @@ impl OpLauncher {
 
         let (grid, block) = grid_block_config(numel);
 
-        let exp_ptr: *const T = &exp_val;
+        // hipModuleLaunchKernel reads each kernel_params[i] as a pointer TO arg i's value.
+        // Pass the ADDRESS of a local slot holding each pointer/scalar (slots outlive `launch`).
+        // `exp_val` is a by-value scalar arg: its address is the slot, the value rides inline.
+        let info_ptr: *mut std::ffi::c_void = dims_and_strides
+            .map(|m| m.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let in_ptr = input.as_ptr();
+        let out_ptr = output.as_ptr();
 
         let mut args: Vec<*mut std::ffi::c_void> = vec![
             (&numel) as *const usize as *mut std::ffi::c_void,
             (&num_dims) as *const usize as *mut std::ffi::c_void,
+            (&info_ptr) as *const _ as *mut std::ffi::c_void,
+            (&in_ptr) as *const _ as *mut std::ffi::c_void,
+            (&exp_val) as *const T as *mut std::ffi::c_void,
+            (&out_ptr) as *const _ as *mut std::ffi::c_void,
         ];
-
-        if let Some(info) = dims_and_strides {
-            args.push(info.as_ptr() as *mut std::ffi::c_void);
-        } else {
-            args.push(std::ptr::null_mut());
-        }
-
-        args.push(input.as_ptr() as *mut std::ffi::c_void);
-        args.push(exp_ptr as *mut std::ffi::c_void);
-        args.push(output.as_ptr() as *mut std::ffi::c_void);
 
         function
             .launch(grid, block, 0, Some(stream), &mut args)
