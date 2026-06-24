@@ -94,6 +94,13 @@ impl KernelSource for RopeKernel {
     const CODE: &'static str = include_str!("kernels/rope.hip");
 }
 
+/// Matrix-core (WMMA) flash-attention forward kernel source
+pub struct FlashKernel;
+impl KernelSource for FlashKernel {
+    const NAME: &'static str = "flash";
+    const CODE: &'static str = include_str!("kernels/flash.hip");
+}
+
 /// Binary operation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
