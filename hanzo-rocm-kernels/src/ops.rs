@@ -4,8 +4,22 @@ use crate::compile::KernelCache;
 use crate::error::KernelError;
 use crate::kernel::{dtype_suffix, BinaryOp, UnaryOp};
 use crate::utils::grid_block_config;
-use rocm_rs::hip::{DeviceMemory, Stream};
+use rocm_rs::hip::{DeviceMemory, Dim3, Stream};
 use std::sync::Arc;
+
+/// Q/K/V/O shape for a flash-attention launch. Q,O are `[B, Hq, Lq, head_dim]`; K,V are
+/// `[B, Hkv, Lk, head_dim]` (GQA: `Hq % Hkv == 0`). `head_dim` must be 128.
+#[derive(Clone, Copy, Debug)]
+pub struct FlashAttnShape {
+    pub batch: i32,
+    pub q_heads: i32,
+    pub kv_heads: i32,
+    pub q_len: i32,
+    pub kv_len: i32,
+    pub head_dim: i32,
+    pub scale: f32,
+    pub causal: bool,
+}
 
 /// Launcher for kernel operations.
 ///
@@ -191,6 +205,73 @@ impl OpLauncher {
             (&in_ptr) as *const _ as *mut std::ffi::c_void,
             (&exp_val) as *const T as *mut std::ffi::c_void,
             (&out_ptr) as *const _ as *mut std::ffi::c_void,
+        ];
+
+        function
+            .launch(grid, block, 0, Some(stream), &mut args)
+            .map_err(|e| KernelError::Launch(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Launch the matrix-core (WMMA) flash-attention forward kernel.
+    ///
+    /// `dtype` selects the entry point: `"f16"` or `"bf16"`. Q/K/V/O are raw device pointers of the
+    /// matching element type (head_dim must be 128). Output `o` is `[B, Hq, Lq, head_dim]`.
+    pub fn launch_flash_attn<T: Copy + Send + Sync + 'static>(
+        &self,
+        stream: &Stream,
+        dtype: &str,
+        shape: FlashAttnShape,
+        q: &DeviceMemory<T>,
+        k: &DeviceMemory<T>,
+        v: &DeviceMemory<T>,
+        o: &mut DeviceMemory<T>,
+    ) -> Result<(), KernelError> {
+        use crate::kernel::FlashKernel;
+        use crate::kernel::KernelSource;
+
+        const BR: i32 = 64;
+        const BLOCK: u32 = 128;
+
+        let module = self
+            .cache
+            .get_or_load(FlashKernel::NAME, FlashKernel::CODE)?;
+        let kernel_name = format!("flash_attn_{}", dtype);
+        let function = module
+            .get_function(&kernel_name)
+            .map_err(|e| KernelError::Launch(format!("Kernel {} not found: {}", kernel_name, e)))?;
+
+        let grid = Dim3 {
+            x: ((shape.q_len + BR - 1) / BR) as u32,
+            y: shape.q_heads as u32,
+            z: shape.batch as u32,
+        };
+        let block = Dim3 {
+            x: BLOCK,
+            y: 1,
+            z: 1,
+        };
+
+        let causal: i32 = i32::from(shape.causal);
+        // hipModuleLaunchKernel reads each kernel_params[i] as a pointer TO arg i's value. Pointer
+        // args are themselves values, so we pass the ADDRESS of each device pointer, not the pointer.
+        let qp = q.as_ptr();
+        let kp = k.as_ptr();
+        let vp = v.as_ptr();
+        let op = o.as_ptr();
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&shape.batch) as *const i32 as *mut std::ffi::c_void,
+            (&shape.q_heads) as *const i32 as *mut std::ffi::c_void,
+            (&shape.kv_heads) as *const i32 as *mut std::ffi::c_void,
+            (&shape.q_len) as *const i32 as *mut std::ffi::c_void,
+            (&shape.kv_len) as *const i32 as *mut std::ffi::c_void,
+            (&shape.scale) as *const f32 as *mut std::ffi::c_void,
+            (&causal) as *const i32 as *mut std::ffi::c_void,
+            (&qp) as *const _ as *mut std::ffi::c_void,
+            (&kp) as *const _ as *mut std::ffi::c_void,
+            (&vp) as *const _ as *mut std::ffi::c_void,
+            (&op) as *const _ as *mut std::ffi::c_void,
         ];
 
         function
