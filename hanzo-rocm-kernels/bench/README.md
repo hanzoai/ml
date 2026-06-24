@@ -45,14 +45,35 @@ throughput fell monotonically with decode cost. The decode front-end is now **SW
 Both signed-center borrow-free via `((e|0x80808080) - 0x20202020) ^ 0x80808080` (gfx1151 has no
 `__vsubss4`); the `iu8` WMMA `is_signed` flags stay `true,true`; the oracle re-runs nbad=0.
 
-**Honest ceiling -- the native path does NOT beat rocBLAS f16 hgemm, and decode is no longer why.**
-Even Q8_0 with a trivial memcpy decode tops out at ~18-21 TF/s while hgemm does ~28-41 TF/s. The inner
-loop is 8 WMMA + 32 LDS ops (4:1 LDS:MMA) at 10 waves / 0 spills, so the shared MMA machine is **LDS-
-bandwidth / scheduling bound at ~40-50% of the iu8 WMMA peak**, not decode-bound. Beating hgemm would
-require restructuring that shared tile/MMA machine (wider LDS loads, larger register tiling, async
-copies) -- deliberately out of scope (kept byte-identical). Net: the native path's value is (1) keeping
-weights quantized (the shipped fallback dequantizes on the **CPU** + H2D every prefill) and (2) Q6_K
-prefill is now 1.7x faster. It is fallback-competitive, not a raw-GEMM-rate win over hgemm.
+### MMA-machine tuning (Carmack pass: profile-driven, not blind)
+
+`ds_load_b128` LDS reads (lever a): the int8 fragment staging stride was `SROW=36` (32 data + 4 pad),
+not 16-aligned, so the 32-byte fragment `memcpy` lowered to byte-paired `ds_load_2addr_b32`. Repadding
+to **`SROW=48` (32 + 16, 16-aligned)** makes it `ds_load_b128` -- profiled `SQ_INSTS_LDS` 1.74e7 ->
+1.21e7, GRBM_GUI_ACTIVE 5.16e6 -> 4.72e6 cyc. **Q4_K +10-11%, Q8_0 24 -> 26.4 TF/s**, Q6_K +1-2%
+(thermally-interleaved A/B, all 3 FFN shapes, oracle nbad=0). Banked.
+
+**Why it still does NOT beat rocBLAS f16 hgemm -- the hard hardware ceiling, proved with counters.**
+
+1. **iu8 WMMA is NOT faster than f16 WMMA on gfx1151.** A register-only WMMA-issue microbench
+   (`wmma_peak.hip`, 4 independent accumulator chains over all 320 workgroups) measures **iu8 = 57.1
+   TOP/s, f16 = 56.8 TF/s -> ratio 1.01x**. Unlike CDNA int8 MFMA (2x fp16), RDNA3.5 runs both at the
+   same matrix-core rate. So the quant GEMM has ZERO instruction-rate advantage over f16 hgemm; both
+   share one ~57 T/s ceiling.
+2. **The kernel is latency / occupancy bound, not decode- or LDS-bound.** rocprofv3 on Q8_0 (clean MMA
+   test): `LDSBankConflict` ~0.03-7% (negligible), `OccupancyPercent` ~45%, `SQ_INSTS_VALU:LDS` ~5.5:1.
+   A ceiling probe that STRIPS the entire per-block convert+scale (numerically wrong) gains only **+5%**
+   -- so the ~70 scalar VALU/8 WMMA of int32->f32 rescale is hidden under WMMA latency, not the wall.
+   `__launch_bounds__(512,2)` is neutral (already 10-wave; the stall is runtime dependency latency).
+3. Net: Q8_0 now ~26 TF/s (at hgemm's floor), Q4_K ~22, Q6_K ~20 = ~40-46% of the 57 ceiling; hgemm's
+   28-41 = ~49-72% of the SAME ceiling. hgemm wins purely by **better amortization** (assembly-pipelined
+   larger register tile). Closing that needs a rocBLAS-class tile rewrite (bigger C-fragment tile +
+   software-pipelined global->LDS->reg), which RAISES VGPR and fights the already-45% occupancy -- a
+   multi-day rewrite with real regression risk, and it still could not exceed hgemm because the matrix
+   core itself is the shared ~57 T/s ceiling. **Honest verdict: on gfx1151 the int8 quant prefill
+   GEMM cannot beat f16 hgemm on raw rate** (no int8 WMMA advantage); its value is (1) keeping weights
+   quantized (the shipped fallback dequantizes on the **CPU** + H2D every prefill -> 8x there) and
+   (2) the Q6_K SWAR 1.7x + Q4_K b128 1.1x decode/LDS wins. Fallback-competitive, not a GEMM-rate win.
 
 `k%256` guard: the only divisibility constraint is on **K** (`k % block_elems() == 0`). **N is
 unconstrained** (the kernel tiles N by 128 with `gn < N` guards). Standard FFN widths are multiples of
