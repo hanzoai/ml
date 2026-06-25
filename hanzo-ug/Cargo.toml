@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-ug"
-version = "0.11.6"
+version = "0.11.7"
 edition = "2021"
 description = "Minimalist ML framework."
 repository = "https://github.com/hanzoai/ml"
