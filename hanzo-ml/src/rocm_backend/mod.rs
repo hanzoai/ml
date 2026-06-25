@@ -658,24 +658,52 @@ impl RocmQuantType {
     }
 
     /// The unified dp4a decode entry point (`qmatvec_dp4a_core<WTYPE,XT>`). One core, one table.
-    fn dp4a_decode_kernel(self, f16: bool) -> &'static str {
-        match (self, f16) {
-            (Self::Q4K, true) => "qmatvec_dp4a_q4k_f16",
-            (Self::Q4K, false) => "qmatvec_dp4a_q4k_bf16",
-            (Self::Q6K, true) => "qmatvec_dp4a_q6k_f16",
-            (Self::Q6K, false) => "qmatvec_dp4a_q6k_bf16",
+    /// `act` is the activation dtype: it picks the q8_1 quantize source AND the output store type, so
+    /// an F32 residual stream stays F32 end-to-end (no f16 bounce) -- the decode store dtype mirrors
+    /// the input dtype, just as the q8_1 dot is dtype-independent.
+    fn dp4a_decode_kernel(self, act: Act) -> &'static str {
+        match (self, act) {
+            (Self::Q4K, Act::F16) => "qmatvec_dp4a_q4k_f16",
+            (Self::Q4K, Act::Bf16) => "qmatvec_dp4a_q4k_bf16",
+            (Self::Q4K, Act::F32) => "qmatvec_dp4a_q4k_f32",
+            (Self::Q6K, Act::F16) => "qmatvec_dp4a_q6k_f16",
+            (Self::Q6K, Act::Bf16) => "qmatvec_dp4a_q6k_bf16",
+            (Self::Q6K, Act::F32) => "qmatvec_dp4a_q6k_f32",
             _ => unreachable!("dp4a_decode_kernel: {self:?} is not dp4a-capable"),
         }
     }
 
     /// The unified indexed-MoE dp4a decode entry point (`moe_qmatvec_dp4a_core<WTYPE,XT>`).
-    fn dp4a_moe_kernel(self, f16: bool) -> &'static str {
-        match (self, f16) {
-            (Self::Q4K, true) => "moe_qmatvec_dp4a_q4k_f16",
-            (Self::Q4K, false) => "moe_qmatvec_dp4a_q4k_bf16",
-            (Self::Q6K, true) => "moe_qmatvec_dp4a_q6k_f16",
-            (Self::Q6K, false) => "moe_qmatvec_dp4a_q6k_bf16",
+    fn dp4a_moe_kernel(self, act: Act) -> &'static str {
+        match (self, act) {
+            (Self::Q4K, Act::F16) => "moe_qmatvec_dp4a_q4k_f16",
+            (Self::Q4K, Act::Bf16) => "moe_qmatvec_dp4a_q4k_bf16",
+            (Self::Q4K, Act::F32) => "moe_qmatvec_dp4a_q4k_f32",
+            (Self::Q6K, Act::F16) => "moe_qmatvec_dp4a_q6k_f16",
+            (Self::Q6K, Act::Bf16) => "moe_qmatvec_dp4a_q6k_bf16",
+            (Self::Q6K, Act::F32) => "moe_qmatvec_dp4a_q6k_f32",
             _ => unreachable!("dp4a_moe_kernel: {self:?} is not dp4a-capable"),
+        }
+    }
+}
+
+/// Activation dtype for the dp4a decode path: selects the q8_1 quantize source kernel and the matvec
+/// output store dtype. F32 keeps an F32 residual stream cast-free through the matvec (the q8_1 int8
+/// dot is the same; only the load source and store type differ).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Act {
+    F16,
+    Bf16,
+    F32,
+}
+
+impl Act {
+    /// The `quantize_q8_1*` kernel that produces the q8_1 (int8 xq + f16 xd) activation from this dtype.
+    fn quantize_kernel(self) -> &'static str {
+        match self {
+            Act::F16 => "quantize_q8_1",
+            Act::Bf16 => "quantize_q8_1_bf16",
+            Act::F32 => "quantize_q8_1_f32",
         }
     }
 }
@@ -796,14 +824,16 @@ impl RocmDevice {
         let ki = k as i32;
         let qgrid = rocm_rs::hip::Dim3::from((nblk.div_ceil(8)) as u32);
         let qblock = rocm_rs::hip::Dim3::from(256u32);
-        let (quant_func, x_ptr) = match &x.slice {
-            RocmStorageSlice::F16(s) => ("quantize_q8_1", s.as_ptr()),
-            RocmStorageSlice::BF16(s) => ("quantize_q8_1_bf16", s.as_ptr()),
+        let (act, x_ptr) = match &x.slice {
+            RocmStorageSlice::F16(s) => (Act::F16, s.as_ptr()),
+            RocmStorageSlice::BF16(s) => (Act::Bf16, s.as_ptr()),
+            RocmStorageSlice::F32(s) => (Act::F32, s.as_ptr()),
             other => crate::bail!(
-                "matvec_dp4a: activations must be f16 or bf16, got {:?}",
+                "matvec_dp4a: activations must be f16, bf16, or f32, got {:?}",
                 other.dtype()
             ),
         };
+        let quant_func = act.quantize_kernel();
         unsafe {
             launch_kernel(
                 self,
@@ -832,8 +862,8 @@ impl RocmDevice {
         let grid = rocm_rs::hip::Dim3::from((n.div_ceil(8)) as u32);
         let block = rocm_rs::hip::Dim3::from(256u32);
         macro_rules! launch_dp4a {
-            ($variant:ident, $ty:ty, $f16:expr) => {{
-                let func = qt.dp4a_decode_kernel($f16);
+            ($variant:ident, $ty:ty) => {{
+                let func = qt.dp4a_decode_kernel(act);
                 let out = self.alloc::<$ty>(n)?;
                 let out_ptr = out.as_ptr();
                 unsafe {
@@ -863,8 +893,9 @@ impl RocmDevice {
         // Bind result after the macro so the borrow checker sees xq/xd/xs used past the (stream-
         // ordered) dp4a launch that reads them.
         let result = match &x.slice {
-            RocmStorageSlice::F16(_) => launch_dp4a!(F16, f16, true),
-            RocmStorageSlice::BF16(_) => launch_dp4a!(BF16, bf16, false),
+            RocmStorageSlice::F16(_) => launch_dp4a!(F16, f16),
+            RocmStorageSlice::BF16(_) => launch_dp4a!(BF16, bf16),
+            RocmStorageSlice::F32(_) => launch_dp4a!(F32, f32),
             _ => unreachable!(),
         };
         drop((xq, xd, xs));
@@ -1016,14 +1047,16 @@ impl RocmDevice {
         let ki = k as i32;
         let qgrid = rocm_rs::hip::Dim3::from(((nrows * nblk32).div_ceil(8)) as u32);
         let qblock = rocm_rs::hip::Dim3::from(256u32);
-        let (quant_func, x_ptr) = match &x.slice {
-            RocmStorageSlice::F16(s) => ("quantize_q8_1", s.as_ptr()),
-            RocmStorageSlice::BF16(s) => ("quantize_q8_1_bf16", s.as_ptr()),
+        let (act, x_ptr) = match &x.slice {
+            RocmStorageSlice::F16(s) => (Act::F16, s.as_ptr()),
+            RocmStorageSlice::BF16(s) => (Act::Bf16, s.as_ptr()),
+            RocmStorageSlice::F32(s) => (Act::F32, s.as_ptr()),
             other => crate::bail!(
-                "moe_matvec_dp4a: activations must be f16 or bf16, got {:?}",
+                "moe_matvec_dp4a: activations must be f16, bf16, or f32, got {:?}",
                 other.dtype()
             ),
         };
+        let quant_func = act.quantize_kernel();
         unsafe {
             launch_kernel(
                 self,
@@ -1051,8 +1084,8 @@ impl RocmDevice {
         let block = rocm_rs::hip::Dim3::from(256u32);
         let wbank_ptr = wbank_mem.as_ptr();
         macro_rules! launch_moe_dp4a {
-            ($variant:ident, $ty:ty, $f16:expr) => {{
-                let func = qt.dp4a_moe_kernel($f16);
+            ($variant:ident, $ty:ty) => {{
+                let func = qt.dp4a_moe_kernel(act);
                 let out = self.alloc::<$ty>(nrows * n)?;
                 let out_ptr = out.as_ptr();
                 unsafe {
@@ -1082,13 +1115,73 @@ impl RocmDevice {
             }};
         }
         let result = match &x.slice {
-            RocmStorageSlice::F16(_) => launch_moe_dp4a!(F16, f16, true),
-            RocmStorageSlice::BF16(_) => launch_moe_dp4a!(BF16, bf16, false),
+            RocmStorageSlice::F16(_) => launch_moe_dp4a!(F16, f16),
+            RocmStorageSlice::BF16(_) => launch_moe_dp4a!(BF16, bf16),
+            RocmStorageSlice::F32(_) => launch_moe_dp4a!(F32, f32),
             _ => unreachable!(),
         };
         // Keep q8_1 scratch alive past the (stream-ordered) dp4a launch that reads it.
         drop((xq, xd, xs));
         result
+    }
+
+    /// Dense (non-quantized) decode GEMV: `y[n] = W[n,k] . x[k]` for an f16/f32 dense weight, the
+    /// direct twin of the quant `matvec_quant`. Replaces the `broadcast_mul + sum` reduce (which
+    /// materialized and re-read the whole [n,k] product) for the one dense decode matvec per MoE layer
+    /// (the F32 router gate). One warp per output row, lane-strided dot, f32 accumulate. Capture-clean.
+    pub fn dense_gemv(
+        &self,
+        w: &RocmStorage,
+        x: &RocmStorage,
+        n: usize,
+        k: usize,
+    ) -> Result<RocmStorage> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
+        let n_i = n as i32;
+        let k_i = k as i32;
+        // One block per output row (DGBLK=256 threads split the k-dot); see dense_gemv_core.
+        let grid = rocm_rs::hip::Dim3::from(n as u32);
+        let block = rocm_rs::hip::Dim3::from(256u32);
+        macro_rules! launch_gemv {
+            ($variant:ident, $ty:ty, $func:expr) => {{
+                let w_ptr = match &w.slice {
+                    RocmStorageSlice::$variant(m) => m.as_ptr(),
+                    _ => unreachable!(),
+                };
+                let x_ptr = match &x.slice {
+                    RocmStorageSlice::$variant(m) => m.as_ptr(),
+                    other => crate::bail!("dense_gemv: x dtype {:?} != w dtype", other.dtype()),
+                };
+                let out = self.alloc::<$ty>(n)?;
+                let out_ptr = out.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        self,
+                        QuantKernel::NAME,
+                        QuantKernel::CODE,
+                        $func,
+                        grid,
+                        block,
+                        &mut [
+                            &n_i as *const i32 as *mut std::ffi::c_void,
+                            &k_i as *const i32 as *mut std::ffi::c_void,
+                            (&w_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+                Ok(RocmStorage {
+                    slice: RocmStorageSlice::$variant(out),
+                    device: self.clone(),
+                })
+            }};
+        }
+        match &w.slice {
+            RocmStorageSlice::F16(_) => launch_gemv!(F16, f16, "dense_gemv_f16"),
+            RocmStorageSlice::F32(_) => launch_gemv!(F32, f32, "dense_gemv_f32"),
+            other => crate::bail!("dense_gemv: weight dtype {:?} unsupported (f16/f32 only)", other.dtype()),
+        }
     }
 
     /// Back-compat thin wrapper: Q8_0 decode via the unified core. Kept so existing callers/tests
