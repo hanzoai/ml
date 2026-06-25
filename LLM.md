@@ -204,3 +204,23 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   REMAINING gap to llama (0.89x): avg ~64 tokens/expert vs TILE_M=128 = ~50% M-tile fill (the next
   lever = smaller M-tile / stream-k, needs the 4x4 warp layout reworked), plus the now-relatively-larger
   non-MoE overhead (fast_sum 11%, casts 10%, quantize_q8_1 4%) llama fuses.
+- DYNAMIC M-TILE (LEVER 1, branch perf/moe-fused-gemm on 0.11.8). The fused MoE GEMM staged a 128-row
+  WMMA M-tile regardless of how many tokens an expert routed; at ~64 tok/expert that left HALF the WMMA
+  M-segments empty (measured fill 49.9% over the 432 full-prefill dispatches), and the few-token decode
+  micro-batches (t=4 -> nslots=32, ~1 tok/expert) were ~1-6% full. FIX: `qmmq_core<WTYPE,MOE,NWAVE_M>`
+  is now parametrized on the M-wave count -> TILE_M 128/64/32 (NWAVE_M 4/2/1) with THREADS=NWAVE_M*128.
+  The hardcoded 512-thread STGI staging split was rewritten as THREAD-COUNT-AGNOSTIC strided loops
+  (`for i=t; i<256+TM*2; i+=THREADS` for the int8 tiles, `128+TM` for scales) so ONE core covers every
+  block size; the NWAVE_M=4 case codegens byte-identical (dense path untouched). The launcher
+  (`moe_qmmq_quant`) picks TILE_M by routed fill (avg tok/active-expert: >=160->128, >=24->64, else 32;
+  HANZO_MOE_TILE_M overrides) and sets block=TILE_M*4 + the matching `moe_qmmq_<t>[_tm64|_tm32]_f16`
+  entry. RESULT (gfx1151, on the 0.11.8 combine+f32-quantize baseline): full-prefill M-fill 49.9% ->
+  68.2% (all dispatches now TILE_M=64), prefill 1172.8 -> 1200.5 T/s (+2.4%, tight +-1 over 3 thermally-
+  interleaved passes), decode ~51 flat. The +36% relative fill yields only +2.4% throughput because the
+  full-prefill MoE GEMM is largely WEIGHT-BANDWIDTH-bound, not WMMA-compute-bound -- PROVEN by the A/B:
+  TILE_M=32 (even less empty WMMA work) is SLOWER (~885 vs 952 on 0.11.7) because it re-reads each
+  expert weight in 2 tiles; TILE_M=64 (one tile per ~64-tok expert, minimal weight re-reads + good fill)
+  is the bandwidth/compute balance point. So M-fill is largely exhausted at TILE_M=64; the residual gap
+  is irreducible expert-weight fetch. Bit-exact: `moe_qmmq_numeric` extended to gate all 3 TILE_M
+  (128/64/32) x Q4_K/Q6_K/Q8_0, nbad=0; moe_combine_numeric + moe_matvec_unified_numeric + dense
+  qmmq_unified_numeric all nbad=0; coherent 30B output ("The capital of France is Paris.").
