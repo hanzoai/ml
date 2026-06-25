@@ -1596,58 +1596,69 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_TQ2_0>(const u
 // scales for 32-block BLK into shared buffer BUF. Identical X-half staging to the proven path; the
 // WEIGHT tile uses decode_w_half<WTYPE>(super-block, g, half) with g = the sub-block index. Scales
 // staged once/block: sWd (main, indexed by 16-group via SROW-free 2-slot rows), sWm (secondary).
+// THREAD-COUNT-AGNOSTIC staging: strided loops over the staging work-items so the SAME macro covers
+// any block size (TILE_M=128 -> 512 thr, 64 -> 256, 32 -> 128). The TN=128 weight tile is always 256
+// int8 items (128 cols x 2 halves) + 128 scale cols; the X tile is TM rows. For the TILE_M=128/512-thread
+// case the loops run exactly once with i==t (weight i<256, X i>=256), byte-identical to the proven
+// hardcoded split -- the dense path codegen is unchanged.
 #define STGI(BUF, BLK)                                                                          \
     do {                                                                                        \
         const int sb_ = (BLK) / SUBS;            /* on-disk super-block index */                \
         const int g_  = (BLK) % SUBS;            /* sub-block within the super-block */          \
-        {                                                                                        \
-            const int c = t;                                                                     \
-            const int rc = c & 255;                                                              \
-            const int r = rc >> 1;                                                               \
-            const int half = (rc & 1) * 16;                                                      \
-            if (c < 256) {                                                                       \
-                const int gn = col_tile + r;                                                     \
-                v4i_ld v = {0,0,0,0};                                                            \
+        for (int i = t; i < 256 + TM * 2; i += THREADS) {                                       \
+            if (i < 256) {                                                                       \
+                const int r = i >> 1; const int half = (i & 1) * 16;                            \
+                const int gn = col_tile + r;                                                    \
+                v4i_ld v = {0,0,0,0};                                                           \
                 if (gn < N) {                                                                    \
                     v = decode_w_half<WTYPE>(wq_eff + ((size_t)gn * nsblk + sb_) * WBYTES, g_, half);\
-                }                                                                                \
+                }                                                                               \
                 __builtin_memcpy(&sWi[(BUF)][r * SROW + half], &v, 16);                          \
-            } else {                                                                             \
-                MROW(r, gm, mvalid);                                                              \
-                v4i_ld v = {0,0,0,0};                                                            \
-                if (mvalid) {                                                                    \
-                    v = *reinterpret_cast<const v4i_ld*>(                                        \
-                            &xq[(size_t)gm * K + (BLK) * 32 + half]);                            \
-                }                                                                                \
+            } else {                                                                            \
+                const int j = i - 256; const int r = j >> 1; const int half = (j & 1) * 16;     \
+                MROW(r, gm, mvalid);                                                            \
+                v4i_ld v = {0,0,0,0};                                                           \
+                if (mvalid) {                                                                   \
+                    v = *reinterpret_cast<const v4i_ld*>(                                       \
+                            &xq[(size_t)gm * K + (BLK) * 32 + half]);                           \
+                }                                                                               \
                 __builtin_memcpy(&sXi[(BUF)][r * SROW + half], &v, 16);                          \
-            }                                                                                    \
+            }                                                                                   \
         }                                                                                        \
-        /* Scales staged to shared ONCE per block (like llama's x_df/y_df), single slot per col so   \
-           the LDS footprint matches the proven Q8_0 path exactly. sWd = MAIN scale (the only scale  \
-           for STEP=32; the 1st-16 scale for Q6_K). sWm = SECONDARY scalar, allocated only when      \
-           needed (dmin*m for ASYM; the 2nd-16 scale for Q6_K) -- otherwise a 1-slot dummy. sxs = the\
-           q8_1 per-block activation sum (ASYM only). */                                            \
-        if (t < 128) {                                                                           \
-            const int gn = col_tile + t;                                                        \
-            if (gn < N) {                                                                        \
-                const uint8_t* wb = wq_eff + ((size_t)gn * nsblk + sb_) * WBYTES;                \
-                sWd[(BUF)][t] = decode_w_mainscale<WTYPE>(wb, g_ * 2 + 0);                        \
-                if constexpr (HAS_SEC) sWm[(BUF)][t] = decode_w_secscale<WTYPE>(wb, g_);          \
-            } else {                                                                             \
-                sWd[(BUF)][t] = 0.0f; if constexpr (HAS_SEC) sWm[(BUF)][t] = 0.0f;                \
-            }                                                                                    \
-            MROW(t, gm, mvalid);                                                                  \
-            sxd[(BUF)][t] = mvalid ? __half2float(xd[(size_t)gm * nsblk32 + (BLK)]) : 0.0f;       \
-            if constexpr (!SYMM) {                                                                \
-                sxs[(BUF)][t] = mvalid ? (float)xs[(size_t)gm * nsblk32 + (BLK)] : 0.0f;          \
-            }                                                                                    \
-        }                                                                                        \
+        /* Scales staged to shared ONCE per block (like llama's x_df/y_df): 128 weight cols + TM      \
+           X rows. sWd = MAIN scale (the only scale for STEP=32; the 1st-16 scale for Q6_K). sWm =     \
+           SECONDARY scalar (dmin*m for ASYM; the 2nd-16 scale for Q6_K) -- else a 1-slot dummy. sxs = \
+           the q8_1 per-block activation sum (ASYM only). */                                          \
+        for (int i = t; i < 128 + TM; i += THREADS) {                                           \
+            if (i < 128) {                                                                       \
+                const int gn = col_tile + i;                                                    \
+                if (gn < N) {                                                                    \
+                    const uint8_t* wb = wq_eff + ((size_t)gn * nsblk + sb_) * WBYTES;           \
+                    sWd[(BUF)][i] = decode_w_mainscale<WTYPE>(wb, g_ * 2 + 0);                   \
+                    if constexpr (HAS_SEC) sWm[(BUF)][i] = decode_w_secscale<WTYPE>(wb, g_);     \
+                } else {                                                                        \
+                    sWd[(BUF)][i] = 0.0f; if constexpr (HAS_SEC) sWm[(BUF)][i] = 0.0f;          \
+                }                                                                               \
+            } else {                                                                            \
+                const int r = i - 128;                                                          \
+                MROW(r, gm, mvalid);                                                            \
+                sxd[(BUF)][r] = mvalid ? __half2float(xd[(size_t)gm * nsblk32 + (BLK)]) : 0.0f;  \
+                if constexpr (!SYMM) {                                                           \
+                    sxs[(BUF)][r] = mvalid ? (float)xs[(size_t)gm * nsblk32 + (BLK)] : 0.0f;     \
+                }                                                                               \
+            }                                                                                   \
+        }                                                                                       \
     } while (0)
 
 // Templated device core: identical for every weight type except the WTYPE-selected decode + the
 // compile-time accumulation shape (SYMMETRIC / SCALE_STEP). `xs` is read iff !SYMMETRIC (the q8_1
 // per-block activation sum from quantize_q8_1); symmetric types pass any pointer (never derefed).
-template <int WTYPE, bool MOE = false>
+// NWAVE_M = number of 32-row M-waves (TILE_M = NWAVE_M*32). The N tile is fixed at 128 (4 waves).
+// NWAVE_M=4 -> the proven 128x128/512-thread tile (default; dense path). MoE picks NWAVE_M=2 (64-row)
+// or 1 (32-row) when experts route few tokens, so the WMMA M-rows are filled instead of half/mostly
+// empty (the routed avg is ~64 tok/expert at full prefill, far fewer per micro-batch). One block stays
+// one expert's slice; smaller blocks co-reside more per CU (less LDS), recovering SIMD occupancy.
+template <int WTYPE, bool MOE = false, int NWAVE_M = 4>
 __device__ __forceinline__ void qmmq_core(
     const int M,
     const int N,
@@ -1672,12 +1683,14 @@ __device__ __forceinline__ void qmmq_core(
     // (Q6_K). Otherwise the dummy 1-slot arrays keep the LDS footprint identical to the proven path.
     constexpr bool HAS_SEC   = (!SYMM) || (NSC16 == 2);
     constexpr int SECN       = HAS_SEC ? 128 : 1;  // sWm slots/col
-    constexpr int XSN        = SYMM ? 1 : 128;     // sxs slots/col (ASYM only)
-    const int t = threadIdx.x;       // 0..511
+    constexpr int TM         = NWAVE_M * 32;       // M-tile rows
+    constexpr int THREADS    = NWAVE_M * 128;      // 4 N-waves * 32 lanes * NWAVE_M M-waves
+    constexpr int XSN        = SYMM ? 1 : TM;      // sxs slots/row (ASYM only)
+    const int t = threadIdx.x;       // 0..THREADS-1
     const int lane = t & 31;
-    const int warp = t >> 5;         // 0..15
-    const int wave_m = warp & 3;     // 0..3 (M sub-tile, x32)
-    const int wave_n = warp >> 2;    // 0..3 (N sub-tile, x32)
+    const int warp = t >> 5;         // 0..(4*NWAVE_M-1)
+    const int wave_m = warp % NWAVE_M;   // 0..NWAVE_M-1 (M sub-tile, x32)
+    const int wave_n = warp / NWAVE_M;   // 0..3 (N sub-tile, x32)
     const int nsblk32 = K >> 5;          // # of 32-blocks along K (for xq/xd/xs indexing)
     const int nsblk   = K / SBLK_ELEMS;  // # of on-disk super-blocks along K (for wq indexing)
     const int nblk    = nsblk32;         // K-loop is over 32-blocks (WMMA granularity)
@@ -1695,14 +1708,14 @@ __device__ __forceinline__ void qmmq_core(
         nrows_tile = tile_nrows[rt];
         wq_eff = wq + (size_t)tile_expert[rt] * N * nsblk * WBYTES;
     } else {
-        row_tile = (blockIdx.x / ncol_tiles) * 128;
+        row_tile = (blockIdx.x / ncol_tiles) * TM;
         col_tile = (blockIdx.x % ncol_tiles) * 128;
         wq_eff = wq;
     }
 
-    __shared__ __attribute__((aligned(16))) int8_t sXi[2][128 * SROW];
+    __shared__ __attribute__((aligned(16))) int8_t sXi[2][TM * SROW];
     __shared__ __attribute__((aligned(16))) int8_t sWi[2][128 * SROW];
-    __shared__ float sxd[2][128];     // per-row activation scale (proven Q8_0 layout)
+    __shared__ float sxd[2][TM];      // per-row activation scale (proven Q8_0 layout)
     __shared__ float sWd[2][128];     // per-col MAIN weight scale (proven Q8_0 layout)
     __shared__ float sWm[2][SECN];    // per-col secondary scalar (dmin*m ASYM | 2nd-16 scale Q6_K)
     __shared__ float sxs[2][XSN];     // per-row activation block-sum (ASYM only)
@@ -1848,17 +1861,24 @@ DEFINE_QMMQ(tq2_0, WT_TQ2_0)
 // This REPLACES the per-slot `moe_qmatvec_*` matvec (which re-read an expert's weight once per token,
 // no matrix cores) on the prefill path. Decode (1 row) stays on the dp4a matvec. One WTYPE row adds a
 // fused-MoE prefill type, exactly like the dense DEFINE_QMMQ above -- no new kernel body.
-#define DEFINE_MOE_QMMQ(NAME, WTYPE)                                                             \
-    extern "C" __global__ void moe_qmmq_##NAME##_f16(                                            \
+// Per (type, M-tile) entry. The launcher picks the M-tile by routed fill: `_f16` = TILE_M 128 (full
+// prefill), `_tm64`/`_tm32` = NWAVE_M 2/1 for the few-token-per-expert micro-batches where a 128-row
+// tile would leave most WMMA M-rows empty. The block dim (NWAVE_M*128) is set to match on the host side.
+#define DEFINE_MOE_QMMQ_NW(NAME, WTYPE, SUF, NW)                                                 \
+    extern "C" __global__ void moe_qmmq_##NAME##SUF(                                             \
         const int M, const int N, const int K, const int ncol_tiles,                             \
         const int8_t* __restrict__ xq, const __half* __restrict__ xd,                            \
         const uint8_t* __restrict__ wq, __half* __restrict__ y,                                  \
         const int* __restrict__ xs, const int* __restrict__ slot_map,                            \
         const int* __restrict__ tile_expert, const int* __restrict__ tile_pos0,                  \
         const int* __restrict__ tile_nrows) {                                                    \
-        qmmq_core<WTYPE, true>(M, N, K, ncol_tiles, xq, xd, wq, y, xs,                            \
+        qmmq_core<WTYPE, true, NW>(M, N, K, ncol_tiles, xq, xd, wq, y, xs,                        \
             slot_map, tile_expert, tile_pos0, tile_nrows);                                       \
     }
+#define DEFINE_MOE_QMMQ(NAME, WTYPE)                                                             \
+    DEFINE_MOE_QMMQ_NW(NAME, WTYPE, _f16,      4)                                                 \
+    DEFINE_MOE_QMMQ_NW(NAME, WTYPE, _tm64_f16, 2)                                                 \
+    DEFINE_MOE_QMMQ_NW(NAME, WTYPE, _tm32_f16, 1)
 
 DEFINE_MOE_QMMQ(q8_0,  WT_Q8_0)
 DEFINE_MOE_QMMQ(q4_0,  WT_Q4_0)
@@ -1868,6 +1888,7 @@ DEFINE_MOE_QMMQ(iq4xs, WT_IQ4_XS)
 DEFINE_MOE_QMMQ(tq2_0, WT_TQ2_0)
 
 #undef DEFINE_MOE_QMMQ
+#undef DEFINE_MOE_QMMQ_NW
 #undef MROW
 #undef STGI
 #undef SROW
