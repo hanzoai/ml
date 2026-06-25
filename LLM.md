@@ -224,3 +224,17 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   is irreducible expert-weight fetch. Bit-exact: `moe_qmmq_numeric` extended to gate all 3 TILE_M
   (128/64/32) x Q4_K/Q6_K/Q8_0, nbad=0; moe_combine_numeric + moe_matvec_unified_numeric + dense
   qmmq_unified_numeric all nbad=0; coherent 30B output ("The capital of France is Paris.").
+- 0.11.9 SHIPPED -- LEVER-1 prefill M-tile (real) + f32-native decode core (bit-exact, NO decode
+  speedup, honest). MoE prefill 1177 T/s = 1.09x llama-HIP (1062) / 1.23x Vulkan (957), bit-exact;
+  M-fill exhausted at TILE_M=64 (weight-bandwidth-bound). Decode core (f32-native dp4a matvec via
+  Act::F32 / *_f32 instantiations keeping the residual stream F32 = casts -63%, a dense_gemv block-
+  per-row router gate replacing a materialized broadcast_mul+sum, dense-matvec NSUB lane-coalescing):
+  ALL oracles nbad=0 (qmatvec_unified/bf16/q4k + moe_combine + qmmq_unified) but device-map-controlled
+  A/B (-n 0:48 BOTH binaries, graphs ON) = real run-loop decode 42.06 -> 42.61 T/s = +1.3% FLAT. The
+  agent's headline "+28% (46.8->59.8)" was a MEASUREMENT ARTIFACT: 46.8 = auto-mapper offloading ~1/3
+  layers to CPU, 59.8 = forced-all-GPU; +28% was the -n device fix, not the kernel. The matvec is at
+  88-99% of the 212 GB/s memory roofline (rocprofv3 FETCH_SIZE; Q6_K does more compute yet higher BW
+  than Q4_K = bandwidth-bound proof), so cast/ALU changes cannot move it. The real remaining decode
+  lever is OP-FUSION (fused softmax+topk routing = 6 kernels/layer -> 1; fused gate+up+silu; fused
+  rope+cache) to cut the ~2725 kernels/token, NOT a matvec change. Decode merge kept for the kernel-
+  count reduction + decomplect, not a perf claim. ALWAYS pass -n "0:48" for 30B-A3B decode A/B.
