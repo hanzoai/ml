@@ -1018,6 +1018,10 @@ impl QTensor {
                     DType::F16 | DType::F32 if use_qmmq => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ if use_qmmq => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
+                    // DECODE f32-native: dp4a experts quantize q8_1 from f32 and store f32, so an F32
+                    // routed activation stays F32 (the matvec returns F32 -> the .to_dtype(out_dtype)
+                    // below is a no-op), removing the cast pair that wrapped each gate/up/down matvec.
+                    DType::F32 if qt.dp4a_active() => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                 };
                 use crate::backend::BackendDevice;
@@ -1462,6 +1466,9 @@ impl QMatMul {
                     DType::F16 | DType::F32 if use_qmmq => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ if use_qmmq => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
+                    // DECODE f32-native dp4a: keep F32 routed activation F32 end-to-end (matvec stores
+                    // F32), eliding the cast pair around each expert matvec. See QStorage twin above.
+                    DType::F32 if qt.dp4a_active() => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                 };
                 let out_dtype = x.dtype();
@@ -1615,10 +1622,45 @@ fn dense_matmul(xs: &Tensor, w: &Tensor) -> Result<Tensor> {
     let rows = xs.elem_count() / k;
     if rows == 1 && xs.device().is_rocm() {
         let n = w.dim(0)?;
-        let out = xs.reshape((1, k))?.broadcast_mul(w)?.sum(D::Minus1)?;
-        let mut dims = xs.dims().to_vec();
-        *dims.last_mut().unwrap() = n;
-        return out.reshape(dims);
+        #[cfg(feature = "rocm")]
+        {
+            // Dense decode GEMV: read the [n,k] weight ONCE (warp/row dot) instead of materializing
+            // and re-reading the broadcast_mul product. The activation is matched to the weight dtype
+            // (a [k] cast, negligible); the GEMV stays capture-clean (no rocBLAS).
+            let d = match xs.device() {
+                Device::Rocm(d) => d.clone(),
+                _ => unreachable!(),
+            };
+            let xs1 = xs.reshape((k,))?.to_dtype(w.dtype())?.contiguous()?;
+            let w = w.contiguous()?;
+            let (wstore, _) = w.storage_and_layout();
+            let wr = match &*wstore {
+                crate::Storage::Rocm(r) => r,
+                _ => crate::bail!("dense_matmul: weight not on rocm"),
+            };
+            let (xstore, _) = xs1.storage_and_layout();
+            let xr = match &*xstore {
+                crate::Storage::Rocm(r) => r,
+                _ => crate::bail!("dense_matmul: x not on rocm"),
+            };
+            let y = d.dense_gemv(wr, xr, n, k)?;
+            let mut dims = xs.dims().to_vec();
+            *dims.last_mut().unwrap() = n;
+            return crate::tensor::from_storage(
+                crate::Storage::Rocm(y),
+                dims,
+                crate::op::BackpropOp::none(),
+                false,
+            )
+            .to_dtype(xs.dtype());
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let out = xs.reshape((1, k))?.broadcast_mul(w)?.sum(D::Minus1)?;
+            let mut dims = xs.dims().to_vec();
+            *dims.last_mut().unwrap() = n;
+            return out.reshape(dims);
+        }
     }
     let w = match *xs.dims() {
         [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
@@ -1708,8 +1750,17 @@ impl crate::Module for QMatMul {
                     // dtype (bf16) is kept end-to-end -- no bf16->f32->f16->bf16 cast detour. Only fall
                     // back to an f16 cast for exotic input dtypes. Every wired type (symmetric 8-bit
                     // through asymmetric super-block through sub-4-bit ternary) rides the same core.
+                    // dp4a-capable types accept the F32 residual/norm stream DIRECTLY (q8_1 quantize
+                    // from f32 + f32-store matvec), so an F32 activation stays F32 end-to-end with no
+                    // f16 bounce -- this removes the cast_f32_f16-before / cast_f16_f32-after pair that
+                    // wrapped every decode matvec. Non-dp4a (scalar) types keep the f16 cast.
+                    #[cfg(feature = "rocm")]
+                    let keep_f32 = unified_qt.map(|qt| qt.dp4a_active()).unwrap_or(false);
+                    #[cfg(not(feature = "rocm"))]
+                    let keep_f32 = false;
                     let xs = match xs.dtype() {
                         DType::BF16 | DType::F16 => xs.contiguous()?,
+                        DType::F32 if keep_f32 => xs.contiguous()?,
                         _ => xs.to_dtype(DType::F16)?.contiguous()?,
                     };
                     let d = match xs.device() {
