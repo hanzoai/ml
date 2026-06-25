@@ -1392,6 +1392,15 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_TQ2_0>(const u
 // 16-byte pad also keeps consecutive rows off the same LDS bank-group (bank-conflict-free, profiled
 // LDSBankConflict ~0.03%). 26624 B LDS total (2*128*48 + scales) -> still fits occupancy (10 waves).
 #define SROW 48
+// Map a LOCAL tile row LR (0..127) to the M-index GM into xq/xd/xs and validity VALID. DENSE: GM is
+// the absolute row (row_tile + LR), valid while in [0,M). MOE: the tile is one expert's slice, so LR
+// indexes the expert-sorted positions [pos0, pos0+nrows_tile); GM = slot_map[pos0+LR] gathers/scatters
+// the ORIGINAL routed slot (xq read AND y write share it). `if constexpr (MOE)` elides one branch, so
+// the dense path codegens byte-identical (GM == row_tile+LR, no slot_map load).
+#define MROW(LR, GM, VALID)                                                                          \
+    int GM; bool VALID;                                                                              \
+    if constexpr (MOE) { (VALID) = ((LR) < nrows_tile); (GM) = (VALID) ? slot_map[pos0 + (LR)] : 0; }\
+    else { (GM) = row_tile + (LR); (VALID) = ((GM) < M); }
 // Stage the X (activation) int8 tile + the weight int8 tile (per-type decode) + the per-block
 // scales for 32-block BLK into shared buffer BUF. Identical X-half staging to the proven path; the
 // WEIGHT tile uses decode_w_half<WTYPE>(super-block, g, half) with g = the sub-block index. Scales
@@ -1409,13 +1418,13 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_TQ2_0>(const u
                 const int gn = col_tile + r;                                                     \
                 v4i_ld v = {0,0,0,0};                                                            \
                 if (gn < N) {                                                                    \
-                    v = decode_w_half<WTYPE>(wq + ((size_t)gn * nsblk + sb_) * WBYTES, g_, half);\
+                    v = decode_w_half<WTYPE>(wq_eff + ((size_t)gn * nsblk + sb_) * WBYTES, g_, half);\
                 }                                                                                \
                 __builtin_memcpy(&sWi[(BUF)][r * SROW + half], &v, 16);                          \
             } else {                                                                             \
-                const int gm = row_tile + r;                                                     \
+                MROW(r, gm, mvalid);                                                              \
                 v4i_ld v = {0,0,0,0};                                                            \
-                if (gm < M) {                                                                    \
+                if (mvalid) {                                                                    \
                     v = *reinterpret_cast<const v4i_ld*>(                                        \
                             &xq[(size_t)gm * K + (BLK) * 32 + half]);                            \
                 }                                                                                \
@@ -1430,16 +1439,16 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_TQ2_0>(const u
         if (t < 128) {                                                                           \
             const int gn = col_tile + t;                                                        \
             if (gn < N) {                                                                        \
-                const uint8_t* wb = wq + ((size_t)gn * nsblk + sb_) * WBYTES;                    \
+                const uint8_t* wb = wq_eff + ((size_t)gn * nsblk + sb_) * WBYTES;                \
                 sWd[(BUF)][t] = decode_w_mainscale<WTYPE>(wb, g_ * 2 + 0);                        \
                 if constexpr (HAS_SEC) sWm[(BUF)][t] = decode_w_secscale<WTYPE>(wb, g_);          \
             } else {                                                                             \
                 sWd[(BUF)][t] = 0.0f; if constexpr (HAS_SEC) sWm[(BUF)][t] = 0.0f;                \
             }                                                                                    \
-            const int gm = row_tile + t;                                                        \
-            sxd[(BUF)][t] = (gm < M) ? __half2float(xd[(size_t)gm * nsblk32 + (BLK)]) : 0.0f;    \
+            MROW(t, gm, mvalid);                                                                  \
+            sxd[(BUF)][t] = mvalid ? __half2float(xd[(size_t)gm * nsblk32 + (BLK)]) : 0.0f;       \
             if constexpr (!SYMM) {                                                                \
-                sxs[(BUF)][t] = (gm < M) ? (float)xs[(size_t)gm * nsblk32 + (BLK)] : 0.0f;        \
+                sxs[(BUF)][t] = mvalid ? (float)xs[(size_t)gm * nsblk32 + (BLK)] : 0.0f;          \
             }                                                                                    \
         }                                                                                        \
     } while (0)
@@ -1447,17 +1456,21 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_TQ2_0>(const u
 // Templated device core: identical for every weight type except the WTYPE-selected decode + the
 // compile-time accumulation shape (SYMMETRIC / SCALE_STEP). `xs` is read iff !SYMMETRIC (the q8_1
 // per-block activation sum from quantize_q8_1); symmetric types pass any pointer (never derefed).
-template <int WTYPE>
+template <int WTYPE, bool MOE = false>
 __device__ __forceinline__ void qmmq_core(
     const int M,
     const int N,
     const int K,            // multiple of 32
     const int ncol_tiles,   // ceil(N/128)
-    const int8_t* __restrict__ xq,   // [M, K] int8 pre-quantized activations
+    const int8_t* __restrict__ xq,   // [M, K] int8 pre-quantized activations (MOE: [nslots, K])
     const __half* __restrict__ xd,   // [M, K/32] f16 per-32-block activation scales
-    const uint8_t* __restrict__ wq,  // [N, K] quantized weight super-blocks (WTYPE format)
-    __half* __restrict__ y,          // [M, N]
-    const int* __restrict__ xs       // [M, K/32] i32 per-32-block activation sum (ASYM only)
+    const uint8_t* __restrict__ wq,  // [N, K] weight super-blocks (MOE: [E,N,K] bank, expert-offset)
+    __half* __restrict__ y,          // [M, N] (MOE: [nslots, N])
+    const int* __restrict__ xs,      // [M, K/32] i32 per-32-block activation sum (ASYM only)
+    const int* __restrict__ slot_map = nullptr,    // MOE: [nslots] expert-sorted pos -> original slot
+    const int* __restrict__ tile_expert = nullptr, // MOE: [num_row_tiles] expert id per row-tile
+    const int* __restrict__ tile_pos0 = nullptr,   // MOE: [num_row_tiles] first sorted pos in tile
+    const int* __restrict__ tile_nrows = nullptr   // MOE: [num_row_tiles] valid rows in tile (<=128)
 ) {
     constexpr int WBYTES     = wt_traits<WTYPE>::BYTES;       // on-disk super-block stride
     constexpr int SBLK_ELEMS = wt_traits<WTYPE>::SBLK_ELEMS;  // elems per super-block (32 or 256)
@@ -1469,9 +1482,6 @@ __device__ __forceinline__ void qmmq_core(
     constexpr bool HAS_SEC   = (!SYMM) || (NSC16 == 2);
     constexpr int SECN       = HAS_SEC ? 128 : 1;  // sWm slots/col
     constexpr int XSN        = SYMM ? 1 : 128;     // sxs slots/col (ASYM only)
-    const int tile = blockIdx.x;
-    const int row_tile = (tile / ncol_tiles) * 128;
-    const int col_tile = (tile % ncol_tiles) * 128;
     const int t = threadIdx.x;       // 0..511
     const int lane = t & 31;
     const int warp = t >> 5;         // 0..15
@@ -1480,6 +1490,24 @@ __device__ __forceinline__ void qmmq_core(
     const int nsblk32 = K >> 5;          // # of 32-blocks along K (for xq/xd/xs indexing)
     const int nsblk   = K / SBLK_ELEMS;  // # of on-disk super-blocks along K (for wq indexing)
     const int nblk    = nsblk32;         // K-loop is over 32-blocks (WMMA granularity)
+    // Tile -> output window. DENSE: blockIdx.x enumerates (row-tile x col-tile) over the one weight.
+    // MOE: blockIdx.x enumerates (expert-row-tile x col-tile); each row-tile is one expert's <=128-token
+    // slice (built host-side, never straddling an expert), so the weight base is offset to that expert
+    // and rows are gathered/scattered via MROW. row_tile stays 0 for MOE (the slice offset is pos0).
+    int row_tile, col_tile, pos0 = 0, nrows_tile = 0;
+    const uint8_t* wq_eff;
+    if constexpr (MOE) {
+        const int rt = blockIdx.x / ncol_tiles;
+        col_tile = (blockIdx.x % ncol_tiles) * 128;
+        row_tile = 0;
+        pos0 = tile_pos0[rt];
+        nrows_tile = tile_nrows[rt];
+        wq_eff = wq + (size_t)tile_expert[rt] * N * nsblk * WBYTES;
+    } else {
+        row_tile = (blockIdx.x / ncol_tiles) * 128;
+        col_tile = (blockIdx.x % ncol_tiles) * 128;
+        wq_eff = wq;
+    }
 
     __shared__ __attribute__((aligned(16))) int8_t sXi[2][128 * SROW];
     __shared__ __attribute__((aligned(16))) int8_t sWi[2][128 * SROW];
@@ -1580,21 +1608,23 @@ __device__ __forceinline__ void qmmq_core(
 
     const int lcol = lane & 15;
     const int lrow = lane >> 4;
-    const int rbase = row_tile + wave_m * 32;
+    const int rbase = wave_m * 32;   // LOCAL tile-row base (row_tile folded into MROW for DENSE)
     const int cbase = col_tile + wave_n * 32;
     const int c0 = cbase + lcol;
     const int c1 = cbase + 16 + lcol;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const int r0 = rbase + i * 2 + lrow;
-        const int r1 = rbase + 16 + i * 2 + lrow;
+        const int lr0 = rbase + i * 2 + lrow;
+        const int lr1 = rbase + 16 + i * 2 + lrow;
+        MROW(lr0, d0, v0);
+        MROW(lr1, d1, v1);
         if (c0 < N) {
-            if (r0 < M) y[(size_t)r0 * N + c0] = __float2half(acc00[i]);
-            if (r1 < M) y[(size_t)r1 * N + c0] = __float2half(acc10[i]);
+            if (v0) y[(size_t)d0 * N + c0] = __float2half(acc00[i]);
+            if (v1) y[(size_t)d1 * N + c0] = __float2half(acc10[i]);
         }
         if (c1 < N) {
-            if (r0 < M) y[(size_t)r0 * N + c1] = __float2half(acc01[i]);
-            if (r1 < M) y[(size_t)r1 * N + c1] = __float2half(acc11[i]);
+            if (v0) y[(size_t)d0 * N + c1] = __float2half(acc01[i]);
+            if (v1) y[(size_t)d1 * N + c1] = __float2half(acc11[i]);
         }
     }
 }
@@ -1620,6 +1650,34 @@ DEFINE_QMMQ(iq4xs, WT_IQ4_XS)
 DEFINE_QMMQ(tq2_0, WT_TQ2_0)
 
 #undef DEFINE_QMMQ
+
+// FUSED indexed-MoE PREFILL GEMM: the SAME `qmmq_core<WTYPE,true>` tiled iu8 WMMA machine, but the
+// routed tokens are grouped BY EXPERT host-side (slot_map/tile_* work-items) so each expert's weight
+// is staged ONCE and amortized over all its tokens via the matrix cores -- llama's mul_mat_id strategy.
+// This REPLACES the per-slot `moe_qmatvec_*` matvec (which re-read an expert's weight once per token,
+// no matrix cores) on the prefill path. Decode (1 row) stays on the dp4a matvec. One WTYPE row adds a
+// fused-MoE prefill type, exactly like the dense DEFINE_QMMQ above -- no new kernel body.
+#define DEFINE_MOE_QMMQ(NAME, WTYPE)                                                             \
+    extern "C" __global__ void moe_qmmq_##NAME##_f16(                                            \
+        const int M, const int N, const int K, const int ncol_tiles,                             \
+        const int8_t* __restrict__ xq, const __half* __restrict__ xd,                            \
+        const uint8_t* __restrict__ wq, __half* __restrict__ y,                                  \
+        const int* __restrict__ xs, const int* __restrict__ slot_map,                            \
+        const int* __restrict__ tile_expert, const int* __restrict__ tile_pos0,                  \
+        const int* __restrict__ tile_nrows) {                                                    \
+        qmmq_core<WTYPE, true>(M, N, K, ncol_tiles, xq, xd, wq, y, xs,                            \
+            slot_map, tile_expert, tile_pos0, tile_nrows);                                       \
+    }
+
+DEFINE_MOE_QMMQ(q8_0,  WT_Q8_0)
+DEFINE_MOE_QMMQ(q4_0,  WT_Q4_0)
+DEFINE_MOE_QMMQ(q4k,   WT_Q4_K)
+DEFINE_MOE_QMMQ(q6k,   WT_Q6_K)
+DEFINE_MOE_QMMQ(iq4xs, WT_IQ4_XS)
+DEFINE_MOE_QMMQ(tq2_0, WT_TQ2_0)
+
+#undef DEFINE_MOE_QMMQ
+#undef MROW
 #undef STGI
 #undef SROW
 #undef STG
