@@ -1007,9 +1007,12 @@ impl QTensor {
                     x.broadcast_as((t, topk, k))?
                 };
                 let nrows = t * topk;
-                // Keep the model's working dtype (bf16/f16) so the matvec runs native; cast exotic
-                // dtypes to f16. The unified core reads f16/bf16 activations directly.
+                // PREFILL (t>1) routes to the fused expert-grouped WMMA GEMM (f16 activations); DECODE
+                // (t==1) keeps the model's native bf16/f16 on the capture-clean matvec. See the twin in
+                // QStorage::indexed_moe_forward. HANZO_MOE_QMMQ_FALLBACK forces matvec for the A/B.
+                let use_qmmq = t > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
                 let x_flat = match x_exp.dtype() {
+                    _ if use_qmmq => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                 };
@@ -1051,7 +1054,11 @@ impl QTensor {
                     crate::Storage::Rocm(r) => r,
                     _ => crate::bail!("rocm MoE: ids not on rocm"),
                 };
-                let y = rocm_dev.moe_matvec_quant(qt, wbank.as_ref(), xr, idr, nrows, n, k)?;
+                let y = if use_qmmq {
+                    rocm_dev.moe_qmmq_quant(qt, wbank.as_ref(), xr, idr, nrows, n, k)?
+                } else {
+                    rocm_dev.moe_matvec_quant(qt, wbank.as_ref(), xr, idr, nrows, n, k)?
+                };
                 let out = crate::tensor::from_storage(
                     crate::Storage::Rocm(y),
                     (nrows, n),
@@ -1404,7 +1411,13 @@ impl QMatMul {
                     x.broadcast_as((t, topk, k))?
                 };
                 let nrows = t * topk;
+                // PREFILL (t>1, never graph-captured) routes to the FUSED expert-grouped WMMA GEMM
+                // (`moe_qmmq_quant`), which needs f16 activations; DECODE (t==1) stays on the
+                // capture-clean dp4a/scalar matvec, which takes bf16/f16 natively. HANZO_MOE_QMMQ_FALLBACK
+                // forces the matvec on prefill too (the before/after A/B + oracle-equivalence lever).
+                let use_qmmq = t > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
                 let x_flat = match x_exp.dtype() {
+                    _ if use_qmmq => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                 };
@@ -1427,9 +1440,11 @@ impl QMatMul {
                     crate::Storage::Rocm(r) => r,
                     _ => crate::bail!("rocm MoE: ids not on rocm"),
                 };
-                let y = wbank
-                    .device
-                    .moe_matvec_quant(qt, wbank, xr, idr, nrows, n, k)?;
+                let y = if use_qmmq {
+                    wbank.device.moe_qmmq_quant(qt, wbank, xr, idr, nrows, n, k)?
+                } else {
+                    wbank.device.moe_matvec_quant(qt, wbank, xr, idr, nrows, n, k)?
+                };
                 let out = crate::tensor::from_storage(
                     crate::Storage::Rocm(y),
                     (nrows, n),
