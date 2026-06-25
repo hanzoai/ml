@@ -1012,6 +1012,10 @@ impl QTensor {
                 // QStorage::indexed_moe_forward. HANZO_MOE_QMMQ_FALLBACK forces matvec for the A/B.
                 let use_qmmq = t > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
                 let x_flat = match x_exp.dtype() {
+                    // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
+                    // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
+                    // a symmetric expert type) still cast to f16.
+                    DType::F16 | DType::F32 if use_qmmq => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ if use_qmmq => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
@@ -1204,6 +1208,41 @@ fn rocm_moe_bank_cache(
         std::sync::Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// FUSED MoE expert-combine: `out[i,j] = sum_e scores[i,e] * ys[i,e,j]`, reducing the per-expert
+/// outputs `ys` [t, topk, n] by the router weights `scores` [t, topk] into [t, n]. On ROCm this is
+/// ONE fused kernel (`RocmDevice::moe_combine`) instead of `ys.broadcast_mul(scores).sum(Minus2)`,
+/// which cast ys -> f32, wrote a [t,topk,n] f32 product temp, and ran an 8-wide strided reduce.
+/// Other backends keep the generic broadcast-mul + sum.
+pub fn moe_combine(ys: &Tensor, scores: &Tensor) -> Result<Tensor> {
+    let (t, topk, n) = ys.dims3()?;
+    #[cfg(feature = "rocm")]
+    if let Device::Rocm(dev) = ys.device() {
+        if std::env::var("HANZO_MOE_COMBINE_FALLBACK").is_ok() {
+            return ys.broadcast_mul(&scores.unsqueeze(D::Minus1)?)?.sum(D::Minus2);
+        }
+        let ys_c = ys.contiguous()?;
+        let scores_c = scores.to_dtype(DType::F32)?.contiguous()?;
+        let (ys_store, _) = ys_c.storage_and_layout();
+        let yr = match &*ys_store {
+            Storage::Rocm(r) => r,
+            _ => crate::bail!("moe_combine: ys not on rocm after contiguous()"),
+        };
+        let (sc_store, _) = scores_c.storage_and_layout();
+        let sr = match &*sc_store {
+            Storage::Rocm(r) => r,
+            _ => crate::bail!("moe_combine: scores not on rocm after contiguous()"),
+        };
+        let out = dev.moe_combine(yr, sr, t, topk, n)?;
+        return Ok(crate::tensor::from_storage(
+            Storage::Rocm(out),
+            (t, n),
+            crate::op::BackpropOp::none(),
+            false,
+        ));
+    }
+    ys.broadcast_mul(&scores.unsqueeze(D::Minus1)?)?.sum(D::Minus2)
 }
 
 thread_local! {
@@ -1417,6 +1456,10 @@ impl QMatMul {
                 // forces the matvec on prefill too (the before/after A/B + oracle-equivalence lever).
                 let use_qmmq = t > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
                 let x_flat = match x_exp.dtype() {
+                    // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
+                    // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
+                    // a symmetric expert type) still cast to f16.
+                    DType::F16 | DType::F32 if use_qmmq => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ if use_qmmq => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
