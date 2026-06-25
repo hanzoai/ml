@@ -575,6 +575,19 @@ impl RocmQuantType {
         }
     }
 
+    /// The FUSED indexed-MoE prefill GEMM entry point (`qmmq_core<WTYPE,true>`): same WMMA core as
+    /// `prefill_kernel`, but routed tokens are expert-grouped so each expert's weight is staged once.
+    fn moe_prefill_kernel(self) -> &'static str {
+        match self {
+            Self::Q8_0 => "moe_qmmq_q8_0_f16",
+            Self::Q4_0 => "moe_qmmq_q4_0_f16",
+            Self::Q4K => "moe_qmmq_q4k_f16",
+            Self::Q6K => "moe_qmmq_q6k_f16",
+            Self::IQ4_XS => "moe_qmmq_iq4xs_f16",
+            Self::TQ2_0 => "moe_qmmq_tq2_0_f16",
+        }
+    }
+
     /// The unified-core entry point name for this (type, activation-dtype) pair. EVERY one of these
     /// is `qmatvec_core<WTYPE,XT>` with a different WTYPE -- there is exactly one core.
     fn decode_kernel(self, f16: bool) -> &'static str {
@@ -1370,6 +1383,153 @@ impl RocmDevice {
                     (&wq_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
                     (&xs_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(RocmStorage { slice: RocmStorageSlice::F16(out), device: self.clone() })
+    }
+
+    /// FUSED indexed-MoE PREFILL GEMM. Groups the routed slots by expert (host-side counting sort over
+    /// the GPU `ids`), then runs the ONE tiled iu8 WMMA core (`qmmq_core<WTYPE,true>`) per expert-row-
+    /// tile so each expert's weight is staged ONCE and amortized over all its tokens via the matrix
+    /// cores -- llama's mul_mat_id. Replaces the per-slot `moe_matvec_quant` matvec on the prefill
+    /// (rows>1) path, which re-read an expert's weight once per routed token (no matrix cores). `ids` is
+    /// GPU u32 [nslots]; prefill is never graph-captured, so the small ids DtoH + metadata HtoD here are
+    /// free (decode keeps the capture-clean matvec). Returns [nslots, n] f16.
+    pub fn moe_qmmq_quant(
+        &self,
+        qt: RocmQuantType,
+        wbank: &RocmStorage,
+        x: &RocmStorage,
+        ids: &RocmStorage,
+        nslots: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<RocmStorage> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
+        use std::ffi::c_void;
+        if k % qt.block_elems() != 0 {
+            crate::bail!("moe_qmmq_quant({qt:?}): k={k} not a multiple of block size {}", qt.block_elems());
+        }
+        let wbank_mem = match &wbank.slice {
+            RocmStorageSlice::U8(m) => m,
+            _ => crate::bail!("moe_qmmq_quant: weight bank must be u8 (raw GGML block bytes)"),
+        };
+        let nblk = k / qt.block_elems();
+        let expert_bytes = n * nblk * qt.block_bytes();
+        if expert_bytes == 0 || wbank_mem.size() % expert_bytes != 0 {
+            crate::bail!(
+                "moe_qmmq_quant: bank size {} not a multiple of expert bytes {expert_bytes}",
+                wbank_mem.size()
+            );
+        }
+        let e_cnt = wbank_mem.size() / expert_bytes;
+
+        let ids_host: Vec<u32> = match &ids.slice {
+            RocmStorageSlice::U32(m) => self.clone_dtoh(m)?,
+            _ => crate::bail!("moe_qmmq_quant: ids must be u32 on device"),
+        };
+        let mut counts = vec![0i32; e_cnt];
+        for &e in &ids_host {
+            counts[e as usize] += 1;
+        }
+        let mut offsets = vec![0i32; e_cnt + 1];
+        for e in 0..e_cnt {
+            offsets[e + 1] = offsets[e] + counts[e];
+        }
+        let mut slot_map = vec![0i32; nslots];
+        let mut cursor = offsets.clone();
+        for (s, &e) in ids_host.iter().enumerate() {
+            let e = e as usize;
+            slot_map[cursor[e] as usize] = s as i32;
+            cursor[e] += 1;
+        }
+        const TILE_M: i32 = 128;
+        let mut tile_expert: Vec<i32> = Vec::new();
+        let mut tile_pos0: Vec<i32> = Vec::new();
+        let mut tile_nrows: Vec<i32> = Vec::new();
+        for e in 0..e_cnt {
+            let c = counts[e];
+            let mut done = 0i32;
+            while done < c {
+                tile_expert.push(e as i32);
+                tile_pos0.push(offsets[e] + done);
+                tile_nrows.push((c - done).min(TILE_M));
+                done += TILE_M;
+            }
+        }
+        let num_row_tiles = tile_expert.len();
+        if num_row_tiles == 0 {
+            let out = self.alloc::<f16>(nslots * n)?;
+            return Ok(RocmStorage { slice: RocmStorageSlice::F16(out), device: self.clone() });
+        }
+
+        let (xq, xd, xs_opt) = if qt.symmetric() {
+            let (xq, xd) = self.quantize_q8(x, nslots, k)?;
+            (xq, xd, None)
+        } else {
+            let (xq, xd, xs) = self.quantize_q8_1(x, nslots, k)?;
+            (xq, xd, Some(xs))
+        };
+        let xs_dummy = if xs_opt.is_none() { Some(self.alloc::<i32>(1)?) } else { None };
+        let xq_ptr = match &xq.slice {
+            RocmStorageSlice::U8(s) => s.as_ptr(),
+            _ => crate::bail!("moe_qmmq_quant: xq must be u8"),
+        };
+        let xd_ptr = match &xd.slice {
+            RocmStorageSlice::F16(s) => s.as_ptr(),
+            _ => crate::bail!("moe_qmmq_quant: xd must be f16"),
+        };
+        let xs_ptr = match (&xs_opt, &xs_dummy) {
+            (Some(xs), _) => match &xs.slice {
+                RocmStorageSlice::I32(s) => s.as_ptr(),
+                _ => crate::bail!("moe_qmmq_quant: xs must be i32"),
+            },
+            (None, Some(d)) => d.as_ptr(),
+            _ => unreachable!(),
+        };
+
+        let slot_dev = self.clone_htod(&slot_map)?;
+        let te_dev = self.clone_htod(&tile_expert)?;
+        let tp_dev = self.clone_htod(&tile_pos0)?;
+        let tn_dev = self.clone_htod(&tile_nrows)?;
+        let slot_ptr = slot_dev.as_ptr();
+        let te_ptr = te_dev.as_ptr();
+        let tp_ptr = tp_dev.as_ptr();
+        let tn_ptr = tn_dev.as_ptr();
+
+        let out = self.alloc::<f16>(nslots * n)?;
+        let out_ptr = out.as_ptr();
+        let wbank_ptr = wbank_mem.as_ptr();
+        let mi = nslots as i32;
+        let ni = n as i32;
+        let ki = k as i32;
+        let ncol_tiles = n.div_ceil(128);
+        let ncol_tiles_i = ncol_tiles as i32;
+        let grid = rocm_rs::hip::Dim3::from((ncol_tiles * num_row_tiles) as u32);
+        let block = rocm_rs::hip::Dim3::from(512u32);
+        unsafe {
+            launch_kernel(
+                self,
+                QuantKernel::NAME,
+                QuantKernel::CODE,
+                qt.moe_prefill_kernel(),
+                grid,
+                block,
+                &mut [
+                    &mi as *const i32 as *mut c_void,
+                    &ni as *const i32 as *mut c_void,
+                    &ki as *const i32 as *mut c_void,
+                    &ncol_tiles_i as *const i32 as *mut c_void,
+                    (&xq_ptr) as *const *mut c_void as *mut c_void,
+                    (&xd_ptr) as *const *mut c_void as *mut c_void,
+                    (&wbank_ptr) as *const *mut c_void as *mut c_void,
+                    (&out_ptr) as *const *mut c_void as *mut c_void,
+                    (&xs_ptr) as *const *mut c_void as *mut c_void,
+                    (&slot_ptr) as *const *mut c_void as *mut c_void,
+                    (&te_ptr) as *const *mut c_void as *mut c_void,
+                    (&tp_ptr) as *const *mut c_void as *mut c_void,
+                    (&tn_ptr) as *const *mut c_void as *mut c_void,
                 ],
             )?;
         }
