@@ -139,6 +139,122 @@ extern "C" __global__ void quantize_q8_1_bf16(
     }
 }
 
+// f32 activation variant of quantize_q8 (symmetric): reads float instead of __half. MoE prefill
+// activations arrive in f32 (the model's compute dtype); quantizing f32 directly skips the f32->f16
+// to_dtype cast (a 16.7M-elem read+write per gate/up) the GEMM glue used to pay before this kernel.
+extern "C" __global__ void quantize_q8_f32(
+    const int M,
+    const int K,
+    const float* __restrict__ x,
+    int8_t* __restrict__ xq,
+    __half* __restrict__ xd
+) {
+    const int nblk = K >> 5;
+    const int wid = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (wid >= M * nblk) {
+        return;
+    }
+    const int m = wid / nblk;
+    const int blk = wid % nblk;
+    const int lane = threadIdx.x & 31;
+    const size_t idx = (size_t)m * K + (size_t)blk * 32 + lane;
+    const float v = x[idx];
+    float a = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor(a, off));
+    }
+    const float inv = (a > 0.0f) ? (127.0f / a) : 0.0f;
+    int q = (int)roundf(v * inv);
+    q = max(-127, min(127, q));
+    xq[idx] = (int8_t)q;
+    if (lane == 0) {
+        xd[(size_t)m * nblk + blk] = __float2half(a / 127.0f);
+    }
+}
+
+// f32 activation variant of quantize_q8_1 (asymmetric: also emits the per-block int8 sum xs).
+extern "C" __global__ void quantize_q8_1_f32(
+    const int M,
+    const int K,
+    const float* __restrict__ x,
+    int8_t* __restrict__ xq,
+    __half* __restrict__ xd,
+    int* __restrict__ xs
+) {
+    const int nblk = K >> 5;
+    const int wid = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (wid >= M * nblk) {
+        return;
+    }
+    const int m = wid / nblk;
+    const int blk = wid % nblk;
+    const int lane = threadIdx.x & 31;
+    const size_t idx = (size_t)m * K + (size_t)blk * 32 + lane;
+    const float v = x[idx];
+    float a = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor(a, off));
+    }
+    const float inv = (a > 0.0f) ? (127.0f / a) : 0.0f;
+    int q = (int)roundf(v * inv);
+    q = max(-127, min(127, q));
+    xq[idx] = (int8_t)q;
+    int qsum = q;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        qsum += __shfl_xor(qsum, off);
+    }
+    if (lane == 0) {
+        xd[(size_t)m * nblk + blk] = __float2half(a / 127.0f);
+        xs[(size_t)m * nblk + blk] = qsum;
+    }
+}
+
+// Fused MoE expert-combine: out[i, j] = sum_{e<topk} scores[i, e] * ys[i, e, j].
+// Replaces the engine's broadcast_mul + sum(Minus2): that path cast ys -> f32 (a 16.7M-elem
+// cast), wrote a 16.7M-elem f32 product temp, then ran an 8-wide reduce at 2M blocks x 8 threads
+// (24/32 lanes idle, dst-strided). This reads ys ONCE (coalesced over j), accumulates topk in f32,
+// and writes out[i, j] -- one launch, one pass, no temp. NOT a qmmq_core variant (no matrix cores,
+// no weight decode) -- a standalone glue-reduction kernel.
+template <typename T>
+__device__ __forceinline__ void moe_combine_core(
+    const int ntok, const int topk, const int N,
+    const T* __restrict__ ys,         // [ntok, topk, N]
+    const float* __restrict__ scores, // [ntok, topk]
+    T* __restrict__ out               // [ntok, N]
+) {
+    const size_t total = (size_t)ntok * N;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x; gid < total; gid += stride) {
+        const int i = (int)(gid / N);
+        const int j = (int)(gid - (size_t)i * N);
+        const float* __restrict__ sc = scores + (size_t)i * topk;
+        const T* __restrict__ yp = ys + ((size_t)i * topk) * N + j;
+        float acc = 0.0f;
+        for (int e = 0; e < topk; ++e) {
+            acc += sc[e] * (float)yp[(size_t)e * N];
+        }
+        out[gid] = (T)acc;
+    }
+}
+
+extern "C" __global__ void moe_combine_f16(
+    const int ntok, const int topk, const int N,
+    const __half* __restrict__ ys, const float* __restrict__ scores, __half* __restrict__ out
+) { moe_combine_core<__half>(ntok, topk, N, ys, scores, out); }
+
+extern "C" __global__ void moe_combine_bf16(
+    const int ntok, const int topk, const int N,
+    const hip_bfloat16* __restrict__ ys, const float* __restrict__ scores, hip_bfloat16* __restrict__ out
+) { moe_combine_core<hip_bfloat16>(ntok, topk, N, ys, scores, out); }
+
+extern "C" __global__ void moe_combine_f32(
+    const int ntok, const int topk, const int N,
+    const float* __restrict__ ys, const float* __restrict__ scores, float* __restrict__ out
+) { moe_combine_core<float>(ntok, topk, N, ys, scores, out); }
+
 // get_scale_min_k4 scale/min unpack -- DEFINED below (reused by the scalar Q4_K path + the unified
 // core); forward-declared here so the dp4a Q4_K kernel can call the SAME unpack (one source of
 // truth for the 6-bit scale layout).
