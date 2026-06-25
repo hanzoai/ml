@@ -181,3 +181,26 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   via the new `qdp4a<WTYPE>::partial(blk,xq8,xd8,sub)` (block() = sum over sub, so non-MoE core is
   byte-unchanged) fills the warp. Occupancy fix alone was model-flat (Q4_K MoE was already 45 us);
   the Q6_K decode rewrite was the real lever.
+- FUSED indexed-MoE PREFILL GEMM = the 2.58x prefill lever (branch perf/moe-fused-gemm). The MoE prefill
+  was the ENTIRE deficit vs llama.cpp-HIP on gfx1151 (Qwen3-30B-A3B-Q4_K_M, pp1024/tg128): hanzo
+  prefill 366 vs llama 1056 (0.34x) while dense 0.6B was already 1.12x. ROOT CAUSE (rocprofv3, matvec
+  baseline): `indexed_moe_forward` routed prefill (rows>1) through the per-SLOT `moe_matvec_quant`
+  (grid.y=nslots matvec) EXACTLY like decode, so every routed token re-read its expert's whole Q4_K/Q6_K
+  weight and ran NO matrix cores -- moe_qmatvec_dp4a_q4k 4857 ms (53.1%) + _q6k 1607 ms (17.6%) = 70.7%
+  of GPU time on the MoE matvecs. FIX: a fused expert-grouped WMMA GEMM `qmmq_core<WTYPE,true>` (the
+  SAME proven 16-warp/128x128 iu8 WMMA prefill machine, +`if constexpr (MOE)` gather/scatter -- the
+  dense path codegens byte-identical). Tokens are grouped BY EXPERT host-side (counting sort over the
+  GPU ids; prefill is never graph-captured so the ids DtoH is free) into per-expert <=128-row tiles
+  (slot_map/tile_expert/tile_pos0/tile_nrows work-items); each block stages ONE expert's weight and
+  amortizes it over all its tokens via MROW gather (xq read) + scatter (y write) -- llama's mul_mat_id.
+  `moe_qmmq_quant` (rocm_backend) + `moe_prefill_kernel` table + the two `indexed_moe_forward` sites
+  (`use_qmmq = t>1`, HANZO_MOE_QMMQ_FALLBACK forces matvec for the A/B). DECODE (t==1) keeps the
+  capture-clean dp4a matvec untouched. RESULT (model-level, same bench): prefill 366 -> 944.7 T/s
+  (2.58x, now 0.89x of llama's 1056; A/B HANZO_MOE_QMMQ_FALLBACK=1 = 365.8 confirms the kernel is the
+  sole lever), decode 41 -> ~51 (thermal, untargeted), coherent 30B output. rocprofv3: MoE matmul GPU
+  time 6464 ms (matvec) -> 1452 ms (moe_qmmq_q4k 1242 + _q6k 210), -78%; total GPU 9147 -> 4357 ms (-52%).
+  Bit-exact: new `moe_qmmq_numeric` gate (hanzo-cli, E=8/300-slot Q4_K+Q6_K+Q8_0, multi-tile + empty
+  experts) nbad=0 vs the CPU to_float oracle; dense qmmq_unified_numeric still nbad=0 (MOE=false elides).
+  REMAINING gap to llama (0.89x): avg ~64 tokens/expert vs TILE_M=128 = ~50% M-tile fill (the next
+  lever = smaller M-tile / stream-k, needs the 4x4 warp layout reworked), plus the now-relatively-larger
+  non-MoE overhead (fast_sum 11%, casts 10%, quantize_q8_1 4%) llama fuses.
