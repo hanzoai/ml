@@ -277,6 +277,7 @@ __device__ __forceinline__ void q4k_scale_min(const uint8_t* __restrict__ s, int
 // __float2half, hip_bfloat16 takes float in its ctor. Keeps both cores' epilogue type-agnostic.
 __device__ __forceinline__ void qstore(__half* p, float v)        { *p = __float2half(v); }
 __device__ __forceinline__ void qstore(hip_bfloat16* p, float v)  { *p = hip_bfloat16(v); }
+__device__ __forceinline__ void qstore(float* p, float v)         { *p = v; }
 
 // ----------------------------------------------------------------------------------------------
 // dp4a (4-element signed int8 dot-accumulate) for the int8 decode path. FAITHFUL to llama.cpp's
@@ -466,9 +467,19 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
     const int nblocks = ncols >> 8; // ncols / 256
     const uint8_t* row_ptr = wq + (size_t)row * (size_t)nblocks * WBYTES;
 
+    // Stride lanes over (super-block x sub-unit) work items, NOT whole super-blocks -- the SAME fix the
+    // MoE twin already carries. Narrow-k decode shapes (attn q/k/v/o k=2048 -> 8 super-blocks) left
+    // 24/32 lanes idle under whole-super-block striding; NSUB sub-units (Q4_K=4 chunks, Q6_K=16 groups)
+    // lift the work-item count to nblocks*NSUB so every lane carries a coalesced dp4a. block() = sum
+    // over sub, so this is byte-identical math (f32 reorder only) -- the one lane-coalesced core.
+    constexpr int NSUB = qdp4a<WTYPE>::NSUB;
+    const int nunits = nblocks * NSUB;
     float acc = 0.0f;
-    for (int b = lane; b < nblocks; b += 32) {
-        acc += qdp4a<WTYPE>::block(row_ptr + (size_t)b * WBYTES, xq + (size_t)b * 256, xd + (size_t)b * 8);
+    for (int u = lane; u < nunits; u += 32) {
+        const int b = u / NSUB;
+        const int sub = u - b * NSUB;
+        acc += qdp4a<WTYPE>::partial(
+            row_ptr + (size_t)b * WBYTES, xq + (size_t)b * 256, xd + (size_t)b * 8, sub);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -562,12 +573,76 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
         const int* __restrict__ ids, const int8_t* __restrict__ xq, const __half* __restrict__ xd,   \
         hip_bfloat16* __restrict__ y) {                                                              \
         moe_qmatvec_dp4a_core<WTYPE, hip_bfloat16>(n, ncols, nslots, wbank, ids, xq, xd, y);          \
+    }                                                                                                \
+    extern "C" __global__ void qmatvec_dp4a_##NAME##_f32(                                            \
+        const int nrows, const int ncols, const uint8_t* __restrict__ wq,                            \
+        const int8_t* __restrict__ xq, const __half* __restrict__ xd, float* __restrict__ y) {       \
+        qmatvec_dp4a_core<WTYPE, float>(nrows, ncols, wq, xq, xd, y);                                 \
+    }                                                                                                \
+    extern "C" __global__ void moe_qmatvec_dp4a_##NAME##_f32(                                        \
+        const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,           \
+        const int* __restrict__ ids, const int8_t* __restrict__ xq, const __half* __restrict__ xd,   \
+        float* __restrict__ y) {                                                                     \
+        moe_qmatvec_dp4a_core<WTYPE, float>(n, ncols, nslots, wbank, ids, xq, xd, y);                 \
     }
 
 DEFINE_QMATVEC_DP4A(q4k, DW_Q4_K)
 DEFINE_QMATVEC_DP4A(q6k, DW_Q6_K)
 
 #undef DEFINE_QMATVEC_DP4A
+
+// Dense (non-quantized) GEMV for the decode rows==1 case: y[row] = sum_k w[row,k]*x[k]. Replaces the
+// `broadcast_mul + sum` reduce that materialized the whole [n,k] product just to reduce it (e.g. the
+// MoE F32 router gate [128,2048]: the broadcast_mul wrote + the sum re-read a 1MB intermediate every
+// layer). One warp per output row, lanes strided over k, f32 accumulate, shuffle-reduce -- reads the
+// weight row ONCE, no intermediate. Capture-clean (no rocBLAS). Same store-dispatch as the quant cores.
+__device__ __forceinline__ float dgload(const __half* p) { return __half2float(*p); }
+__device__ __forceinline__ float dgload(const float* p)  { return *p; }
+// ONE block per output row, all DGBLK threads split the k-dot (n is small here -- the [128,2048]
+// router gate -- so warp-per-row left only 16 blocks = latency-bound at ~13% BW). Block-per-row gives
+// nrows blocks * DGBLK threads of memory-level parallelism + a fully coalesced row sweep (thread t
+// reads w[row,t], t+DGBLK, ...), then a warp + shared reduce. Mirrors llama's RDNA nwarps>1 split-k.
+#define DGBLK 256
+template <typename T>
+__device__ __forceinline__ void dense_gemv_core(
+    const int nrows, const int ncols, const T* __restrict__ w, const T* __restrict__ x, T* __restrict__ y
+) {
+    const int row = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+    const int t = threadIdx.x;
+    const T* wr = w + (size_t)row * (size_t)ncols;
+    float acc = 0.0f;
+    for (int j = t; j < ncols; j += DGBLK) {
+        acc += dgload(wr + j) * dgload(x + j);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    __shared__ float warp_sums[DGBLK / 32];
+    if ((t & 31) == 0) {
+        warp_sums[t >> 5] = acc;
+    }
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int w_ = 0; w_ < DGBLK / 32; ++w_) {
+            s += warp_sums[w_];
+        }
+        qstore(&y[row], s);
+    }
+}
+extern "C" __global__ void dense_gemv_f16(
+    const int nrows, const int ncols, const __half* __restrict__ w, const __half* __restrict__ x, __half* __restrict__ y) {
+    dense_gemv_core<__half>(nrows, ncols, w, x, y);
+}
+extern "C" __global__ void dense_gemv_f32(
+    const int nrows, const int ncols, const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y) {
+    dense_gemv_core<float>(nrows, ncols, w, x, y);
+}
 
 // Q8_0 block layout (GGML): 2-byte f16 scale `d`, then 32 int8 quants. 34 bytes, 32 weights.
 // Weight matrix W is [nrows, ncols] row-major; row r holds ncols/32 consecutive Q8_0 blocks.
