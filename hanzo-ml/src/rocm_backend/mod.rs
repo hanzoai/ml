@@ -1178,9 +1178,12 @@ impl RocmDevice {
         k: usize,
     ) -> Result<(RocmStorage, RocmStorage)> {
         use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
-        let x_ptr = match &x.slice {
-            RocmStorageSlice::F16(s) => s.as_ptr(),
-            _ => crate::bail!("quantize_q8: x must be f16"),
+        // Activations arrive f16 (dense prefill) or f32 (the MoE compute dtype); quantize each in its
+        // native dtype so the MoE glue need not pay an f32->f16 cast before this kernel.
+        let (kname, x_ptr) = match &x.slice {
+            RocmStorageSlice::F16(s) => ("quantize_q8", s.as_ptr()),
+            RocmStorageSlice::F32(s) => ("quantize_q8_f32", s.as_ptr()),
+            other => crate::bail!("quantize_q8: x must be f16 or f32, got {:?}", other.dtype()),
         };
         let nblk = k / 32;
         let xq = self.alloc::<u8>(m * k)?;
@@ -1197,7 +1200,7 @@ impl RocmDevice {
                 self,
                 QuantKernel::NAME,
                 QuantKernel::CODE,
-                "quantize_q8",
+                kname,
                 grid,
                 block,
                 &mut [
@@ -1259,9 +1262,13 @@ impl RocmDevice {
         k: usize,
     ) -> Result<(RocmStorage, RocmStorage, RocmStorage)> {
         use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
-        let x_ptr = match &x.slice {
-            RocmStorageSlice::F16(s) => s.as_ptr(),
-            _ => crate::bail!("quantize_q8_1: x must be f16"),
+        // f16 (dense prefill), f32 (MoE compute dtype), or bf16 (decode) -- quantize in the native
+        // dtype, no f32->f16 cast in the MoE glue.
+        let (kname, x_ptr) = match &x.slice {
+            RocmStorageSlice::F16(s) => ("quantize_q8_1", s.as_ptr()),
+            RocmStorageSlice::F32(s) => ("quantize_q8_1_f32", s.as_ptr()),
+            RocmStorageSlice::BF16(s) => ("quantize_q8_1_bf16", s.as_ptr()),
+            other => crate::bail!("quantize_q8_1: x must be f16/f32/bf16, got {:?}", other.dtype()),
         };
         let nblk = k / 32;
         let xq = self.alloc::<u8>(m * k)?;
@@ -1280,7 +1287,7 @@ impl RocmDevice {
                 self,
                 QuantKernel::NAME,
                 QuantKernel::CODE,
-                "quantize_q8_1",
+                kname,
                 grid,
                 block,
                 &mut [
@@ -1534,6 +1541,67 @@ impl RocmDevice {
             )?;
         }
         Ok(RocmStorage { slice: RocmStorageSlice::F16(out), device: self.clone() })
+    }
+
+    /// FUSED MoE expert-combine: `out[i,j] = sum_e scores[i,e] * ys[i,e,j]` in ONE launch. Replaces
+    /// the engine's `ys.broadcast_mul(scores).sum(Minus2)` (a 16.7M-elem ys->f32 cast + a 16.7M-elem
+    /// product temp + an 8-wide reduce at 2M blocks x 8 threads). `ys` is [ntok, topk, n] (f16/bf16/
+    /// f32, contiguous), `scores` is [ntok, topk] f32 contiguous; `out` is [ntok, n] in ys's dtype.
+    pub fn moe_combine(
+        &self,
+        ys: &RocmStorage,
+        scores: &RocmStorage,
+        ntok: usize,
+        topk: usize,
+        n: usize,
+    ) -> Result<RocmStorage> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
+        use std::ffi::c_void;
+        let sc_ptr = match &scores.slice {
+            RocmStorageSlice::F32(s) => s.as_ptr(),
+            other => crate::bail!("moe_combine: scores must be f32, got {:?}", other.dtype()),
+        };
+        let total = ntok * n;
+        let nt = ntok as i32;
+        let tk = topk as i32;
+        let ni = n as i32;
+        let (grid, block) = launch_config(total);
+        macro_rules! launch_combine {
+            ($variant:ident, $rty:ty, $kernel:literal) => {{
+                let ys_ptr = match &ys.slice {
+                    RocmStorageSlice::$variant(s) => s.as_ptr(),
+                    _ => unreachable!(),
+                };
+                let out = self.alloc::<$rty>(total)?;
+                let out_ptr = out.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        self,
+                        QuantKernel::NAME,
+                        QuantKernel::CODE,
+                        $kernel,
+                        grid,
+                        block,
+                        &mut [
+                            &nt as *const i32 as *mut c_void,
+                            &tk as *const i32 as *mut c_void,
+                            &ni as *const i32 as *mut c_void,
+                            (&ys_ptr) as *const *mut c_void as *mut c_void,
+                            (&sc_ptr) as *const *mut c_void as *mut c_void,
+                            (&out_ptr) as *const *mut c_void as *mut c_void,
+                        ],
+                    )?;
+                }
+                RocmStorage { slice: RocmStorageSlice::$variant(out), device: self.clone() }
+            }};
+        }
+        let out = match &ys.slice {
+            RocmStorageSlice::F16(_) => launch_combine!(F16, f16, "moe_combine_f16"),
+            RocmStorageSlice::BF16(_) => launch_combine!(BF16, bf16, "moe_combine_bf16"),
+            RocmStorageSlice::F32(_) => launch_combine!(F32, f32, "moe_combine_f32"),
+            other => crate::bail!("moe_combine: ys dtype {:?} unsupported", other.dtype()),
+        };
+        Ok(out)
     }
 }
 
