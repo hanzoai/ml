@@ -575,16 +575,29 @@ impl RocmQuantType {
         }
     }
 
-    /// The FUSED indexed-MoE prefill GEMM entry point (`qmmq_core<WTYPE,true>`): same WMMA core as
-    /// `prefill_kernel`, but routed tokens are expert-grouped so each expert's weight is staged once.
-    fn moe_prefill_kernel(self) -> &'static str {
-        match self {
-            Self::Q8_0 => "moe_qmmq_q8_0_f16",
-            Self::Q4_0 => "moe_qmmq_q4_0_f16",
-            Self::Q4K => "moe_qmmq_q4k_f16",
-            Self::Q6K => "moe_qmmq_q6k_f16",
-            Self::IQ4_XS => "moe_qmmq_iq4xs_f16",
-            Self::TQ2_0 => "moe_qmmq_tq2_0_f16",
+    /// The FUSED indexed-MoE prefill GEMM entry point (`qmmq_core<WTYPE,true,NWAVE_M>`) for a given
+    /// M-tile size: 128 (full prefill), 64, or 32 (few-token-per-expert micro-batches). Same WMMA core,
+    /// the M-tile shrinks so the routed rows fill the WMMA M-segments instead of leaving them empty.
+    fn moe_prefill_kernel(self, tile_m: usize) -> &'static str {
+        match (self, tile_m) {
+            (Self::Q8_0, 128) => "moe_qmmq_q8_0_f16",
+            (Self::Q8_0, 64) => "moe_qmmq_q8_0_tm64_f16",
+            (Self::Q8_0, _) => "moe_qmmq_q8_0_tm32_f16",
+            (Self::Q4_0, 128) => "moe_qmmq_q4_0_f16",
+            (Self::Q4_0, 64) => "moe_qmmq_q4_0_tm64_f16",
+            (Self::Q4_0, _) => "moe_qmmq_q4_0_tm32_f16",
+            (Self::Q4K, 128) => "moe_qmmq_q4k_f16",
+            (Self::Q4K, 64) => "moe_qmmq_q4k_tm64_f16",
+            (Self::Q4K, _) => "moe_qmmq_q4k_tm32_f16",
+            (Self::Q6K, 128) => "moe_qmmq_q6k_f16",
+            (Self::Q6K, 64) => "moe_qmmq_q6k_tm64_f16",
+            (Self::Q6K, _) => "moe_qmmq_q6k_tm32_f16",
+            (Self::IQ4_XS, 128) => "moe_qmmq_iq4xs_f16",
+            (Self::IQ4_XS, 64) => "moe_qmmq_iq4xs_tm64_f16",
+            (Self::IQ4_XS, _) => "moe_qmmq_iq4xs_tm32_f16",
+            (Self::TQ2_0, 128) => "moe_qmmq_tq2_0_f16",
+            (Self::TQ2_0, 64) => "moe_qmmq_tq2_0_tm64_f16",
+            (Self::TQ2_0, _) => "moe_qmmq_tq2_0_tm32_f16",
         }
     }
 
@@ -1451,7 +1464,25 @@ impl RocmDevice {
             slot_map[cursor[e] as usize] = s as i32;
             cursor[e] += 1;
         }
-        const TILE_M: i32 = 128;
+        // M-tile fill selection (LEVER 1): a 128-row WMMA tile wastes its empty M-rows when an expert
+        // routes few tokens. Pick TILE_M so the AVERAGE active expert ~fills one tile -- 128 for the
+        // full prefill (~64 tok/expert -> ~50% fill at 128, the headline), 64/32 for the micro-batches
+        // (~1-8 tok/expert -> a 128-tile would be ~1-6% full). Capacity-rounding only: tile count and
+        // weight reads scale with ceil(c/TILE_M), so a smaller tile trades a little weight re-read for
+        // far less empty WMMA work. HANZO_MOE_TILE_M overrides for the A/B. The dense path is untouched.
+        let active_experts = counts.iter().filter(|&&c| c > 0).count().max(1);
+        let avg_tok = nslots / active_experts;
+        // Thresholds from the gfx1151 A/B (Qwen3-30B-A3B): TILE_M=64 wins the full prefill (~64 tok/
+        // expert, ~50% fill at 128 -> ~75% at 64, +5%) AND is robust to the per-expert spread, so it
+        // beats 128 across the whole prefill range; TILE_M=32 wins the few-token decode micro-batches
+        // (~1-8 tok/expert, where a 128-tile is ~1-6% full); 128 only pays off for very dense routing
+        // (avg >> 64), which needs a very long prompt. HANZO_MOE_TILE_M overrides for the A/B.
+        let tile_m: i32 = match std::env::var("HANZO_MOE_TILE_M").ok().and_then(|s| s.parse().ok()) {
+            Some(v @ (32 | 64 | 128)) => v,
+            _ if avg_tok >= 160 => 128,
+            _ if avg_tok >= 24 => 64,
+            _ => 32,
+        };
         let mut tile_expert: Vec<i32> = Vec::new();
         let mut tile_pos0: Vec<i32> = Vec::new();
         let mut tile_nrows: Vec<i32> = Vec::new();
@@ -1461,14 +1492,24 @@ impl RocmDevice {
             while done < c {
                 tile_expert.push(e as i32);
                 tile_pos0.push(offsets[e] + done);
-                tile_nrows.push((c - done).min(TILE_M));
-                done += TILE_M;
+                tile_nrows.push((c - done).min(tile_m));
+                done += tile_m;
             }
         }
         let num_row_tiles = tile_expert.len();
         if num_row_tiles == 0 {
             let out = self.alloc::<f16>(nslots * n)?;
             return Ok(RocmStorage { slice: RocmStorageSlice::F16(out), device: self.clone() });
+        }
+        // M-tile fill telemetry (LEVER-1 measurement): valid rows vs WMMA tile capacity. The wasted
+        // fraction = empty WMMA M-rows = the directly-recoverable matrix-core work. Env-gated.
+        if std::env::var("HANZO_MOE_STATS").is_ok() {
+            let cap = (num_row_tiles as i32) * tile_m;
+            let valid: i32 = tile_nrows.iter().sum();
+            eprintln!(
+                "[MOE_FILL] nslots={nslots} n={n} k={k} experts_active={active_experts}/{e_cnt} tiles={num_row_tiles} valid={valid} cap={cap} fill={:.1}% TILE_M={tile_m}",
+                100.0 * valid as f32 / cap as f32
+            );
         }
 
         let (xq, xd, xs_opt) = if qt.symmetric() {
@@ -1514,13 +1555,14 @@ impl RocmDevice {
         let ncol_tiles = n.div_ceil(128);
         let ncol_tiles_i = ncol_tiles as i32;
         let grid = rocm_rs::hip::Dim3::from((ncol_tiles * num_row_tiles) as u32);
-        let block = rocm_rs::hip::Dim3::from(512u32);
+        // Block dim MUST match the kernel's NWAVE_M (4 N-waves * 32 lanes * NWAVE_M M-waves = TILE_M*4).
+        let block = rocm_rs::hip::Dim3::from((tile_m as u32) * 4);
         unsafe {
             launch_kernel(
                 self,
                 QuantKernel::NAME,
                 QuantKernel::CODE,
-                qt.moe_prefill_kernel(),
+                qt.moe_prefill_kernel(tile_m as usize),
                 grid,
                 block,
                 &mut [
