@@ -336,3 +336,38 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   Past llama-HIP 66; the residual gap to Vulkan 82 is STRUCTURAL (faster matvec/attn kernels, not fewer
   launches -- the matvec is already 88-99% roofline). Bit-exact: new `moe_matvec_pair` byte-equality
   (qmatvec_unified_numeric) + `add_rmsnorm_numeric` oracles nbad=0; all prior oracles unchanged.
+
+## Decode matvec launch-geometry (rows-per-wave) + lever-2 (drop quantize_q8_1): BOTH DISPROVEN, bit-exact
+- DIRECTLY tested the "decode matvec has ~32% memory headroom (68% MemUnitBusy -> raise occupancy to
+  ~90% -> 95-110 T/s, beat Vulkan)" hypothesis with a rows-per-wave (RPW) template on `qmatvec_dp4a_core`
+  + `moe_qmatvec_dp4a_core` (`HANZO_DP4A_RPW` / `HANZO_MOE_RPW` / `HANZO_DP4A_WPB`; default (1,8) =
+  shipped; branch occ/matvec-geom). RPW>1 has each wave compute RPW consecutive rows sharing one q8_1
+  activation slice. CONFIRMS the 0.11.9 bandwidth-bound finding with per-config rocprofv3 + T/s:
+  - rocprofv3 (real 30B-A3B-Q4_K decode, gfx1151, EAGER): RPW=2 moved non-MoE q4k MemUnitBusy
+    57.6->62.5% (aggregate 69.2->73.1%) but occupancy DROPPED 15.2->12.6 occ/CU (RPW shrinks the grid,
+    it does NOT lengthen residency) and achieved BW rose only 196->199 GB/s (+1.4%). q6k ALREADY sustains
+    233 GB/s = ~91% of the 256 theoretical -> the "256 / 32% headroom" is illusory; the REALISTIC LPDDR5X
+    ceiling is ~234 and the matvec is AT it. MemUnitBusy% (TA-busy, 57-90% per kernel) and achieved-BW%
+    (~90%) DECOUPLE -- the TA can read <100% busy while DRAM is saturated. The "under-occupied" non-MoE
+    q4k (57%/13.9occ) STILL delivers 181-192 GB/s.
+  - decode T/s (pp1024/tg128, GRAPHS=1, -n 0:48, 3 thermally-interleaved rounds, same binary env-only
+    A/B): base 59.8, RPW=2 59.9, RPW=4 58.5, MOE_RPW=2 59.8, MOE_RPW=4 58.0, WPB=16 55.4 -> FLAT-to-
+    negative. RPW=4 / WPB=16 HURT (register pressure / coarser grid). NO geometry beat base.
+  - decode GPU-time split: matvec 65% (BW-bound), non-matvec overhead 35% (cast 5.9%, paged-attn 4.5%,
+    quantize_q8_1 4.4%, copy 4.3%, rms 3.7%, router gemv 3.2%). The path to Vulkan 83 is the 35%
+    overhead (op-fusion), NOT matvec geometry -- Vulkan's edge is lower overhead at the SAME ~200 GB/s
+    weight BW (re-measured this box/session: llama-Vulkan tg128 83.2+-0.13, llama-HIP 66.1+-1.5, hanzo
+    57-63 thermal-variable), confirming the "structural" call.
+- LEVER-2 (drop the batch=1 quantize_q8_1; route decode to the scalar dequant-MAC core): MEASURED A BIG
+  LOSS, disproving "dp4a's int8 throughput is dead weight at batch=1". Q4_K scalar (HANZO_Q4K_FALLBACK)
+  57.4 -> 44.1 (-23%); all-scalar (+HANZO_Q6K_FALLBACK) -> 33.4 (-42%). The K-quant superblock dequant
+  is COMPUTE-bound (per-weight float MACs), NOT bandwidth-hidden -> dp4a is ESSENTIAL for Q4_K/Q6_K and
+  quantize_q8_1 is cheap necessary overhead. (Consistent with the IQ4_XS/IQ4_NL-stay-scalar note: only
+  CHEAP-LUT-dequant types can win from scalar; expensive K-quant superblocks must stay dp4a.)
+- Bit-exact: `qmatvec_unified` (3 tests) + `qmatvec_q4k` oracles nbad=0 at RPW=1/2/4 (--test-threads=1);
+  RPW=1 byte-identical to shipped; coherent 30B output under RPW=2. RPW template ships DEFAULT-OFF as a
+  measurement harness. The residual q4k gap (181 vs q6k's 233 GB/s) is an ACCESS-PATTERN inefficiency
+  (Q4_K's 144B superblock loads less coalesced than Q6_K's 210B), addressable in
+  `qdp4a<DW_Q4_K>::partial` load vectorization, NOT by launch geometry. VERDICT: the decode matvec is
+  bandwidth-bound at the realistic LPDDR5X ceiling -- decode T/s is won by cutting the 35% non-matvec
+  overhead, not the matvec.
