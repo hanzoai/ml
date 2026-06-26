@@ -999,6 +999,29 @@ impl Act {
     }
 }
 
+// DEV-ONLY dp4a launch-geometry experiment knobs (rows-per-wave + warps-per-block). Default (1, 8)
+// reproduces the shipped launch exactly. RPW>1 kernels are instantiated only for Q4_K/Q6_K.
+fn dp4a_rpw_supported(qt: RocmQuantType) -> bool {
+    matches!(qt, RocmQuantType::Q4K | RocmQuantType::Q6K)
+}
+fn dp4a_geom(rpw_var: &str) -> (u32, u32) {
+    let rpw = std::env::var(rpw_var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1u32)
+        .clamp(1, 8);
+    let wpb = std::env::var("HANZO_DP4A_WPB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8u32)
+        .clamp(1, 16);
+    (rpw, wpb)
+}
+fn dp4a_rpw_sym(base: &str, rpw: u32) -> String {
+    let i = base.rfind('_').expect("dp4a kernel name has an act suffix");
+    format!("{}_rpw{}{}", &base[..i], rpw, &base[i..])
+}
+
 impl RocmDevice {
     /// UNIFIED native quant matvec (decode): `y[n] = W_q[n,k] · x[k]`, reading the GGML block
     /// format straight from VRAM for ANY wired quant type via the SINGLE `qmatvec_core<WTYPE>`.
@@ -1150,11 +1173,16 @@ impl RocmDevice {
         // threads = 8 warps = 8 rows/block.
         let nrows = n as i32;
         let ncols = k as i32;
-        let grid = rocm_rs::hip::Dim3::from((n.div_ceil(8)) as u32);
-        let block = rocm_rs::hip::Dim3::from(256u32);
+        let (rpw, wpb) = dp4a_geom("HANZO_DP4A_RPW");
+        let use_rpw = rpw > 1 && dp4a_rpw_supported(qt);
+        let eff_rpw = if use_rpw { rpw } else { 1 };
+        let base_func = qt.dp4a_decode_kernel(act);
+        let rpw_func = dp4a_rpw_sym(base_func, rpw);
+        let func: &str = if use_rpw { rpw_func.as_str() } else { base_func };
+        let grid = rocm_rs::hip::Dim3::from(n.div_ceil((wpb * eff_rpw) as usize) as u32);
+        let block = rocm_rs::hip::Dim3::from(wpb * 32);
         macro_rules! launch_dp4a {
             ($variant:ident, $ty:ty) => {{
-                let func = qt.dp4a_decode_kernel(act);
                 let out = self.alloc::<$ty>(n)?;
                 let out_ptr = out.as_ptr();
                 unsafe {
@@ -1358,12 +1386,21 @@ impl RocmDevice {
         let n_i = n as i32;
         let ncols = k as i32;
         let nslots = nrows as i32;
-        let grid = rocm_rs::hip::Dim3::from(((n.div_ceil(8)) as u32, nrows as u32, 1u32));
-        let block = rocm_rs::hip::Dim3::from(256u32);
+        let (rpw, wpb) = dp4a_geom("HANZO_MOE_RPW");
+        let use_rpw = rpw > 1 && dp4a_rpw_supported(qt);
+        let eff_rpw = if use_rpw { rpw } else { 1 };
+        let base_func = qt.dp4a_moe_kernel(act);
+        let rpw_func = dp4a_rpw_sym(base_func, rpw);
+        let func: &str = if use_rpw { rpw_func.as_str() } else { base_func };
+        let grid = rocm_rs::hip::Dim3::from((
+            n.div_ceil((wpb * eff_rpw) as usize) as u32,
+            nrows as u32,
+            1u32,
+        ));
+        let block = rocm_rs::hip::Dim3::from(wpb * 32);
         let wbank_ptr = wbank_mem.as_ptr();
         macro_rules! launch_moe_dp4a {
             ($variant:ident, $ty:ty) => {{
-                let func = qt.dp4a_moe_kernel(act);
                 let out = self.alloc::<$ty>(nrows * n)?;
                 let out_ptr = out.as_ptr();
                 unsafe {

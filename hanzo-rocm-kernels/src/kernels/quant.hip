@@ -719,7 +719,14 @@ template <> struct qdp4a_traits<DW_Q5_K> { static constexpr int BYTES = 176; };
 // super-blocks; per-type `qdp4a<WTYPE>::block` does the int8 dot of one super-block against its
 // pre-quantized q8_1 activation slice; warp-shuffle reduces. XT is only the output store type (the
 // q8_1 activation is already int8 + f16 scale, dtype-independent).
-template <int WTYPE, typename XT>
+// RPW = output rows per wave. RPW=1 is the shipped path (byte-identical). RPW>1 has each wave compute
+// RPW consecutive rows: it loads each (super-block x sub-unit) q8_1 activation slice ONCE and dp4a's it
+// against RPW independent weight rows, accumulating RPW partials. This is the under-occupancy lever for
+// the narrow-k non-MoE matvec (attn q/k/v/o k=2048 -> nunits=32 = 1 unit/lane = short waves that retire
+// before LPDDR5X latency is hidden): RPW lengthens each wave RPW-fold (more in-flight weight loads per
+// wave, fewer launch/retire churns) at the cost of an RPW-smaller grid. Per-row accumulation order is
+// identical to RPW=1, so every row is byte-identical -- the numeric oracle passes unchanged.
+template <int WTYPE, typename XT, int RPW = 1>
 __device__ __forceinline__ void qmatvec_dp4a_core(
     const int nrows,
     const int ncols,                  // multiple of 256
@@ -731,33 +738,40 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
     constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
     const int lane = threadIdx.x & 31;
     const int rows_per_block = blockDim.x >> 5;
-    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
-    if (row >= nrows) {
+    const int row0 = (blockIdx.x * rows_per_block + (threadIdx.x >> 5)) * RPW;
+    if (row0 >= nrows) {
         return;
     }
     const int nblocks = ncols >> 8; // ncols / 256
-    const uint8_t* row_ptr = wq + (size_t)row * (size_t)nblocks * WBYTES;
-
-    // Stride lanes over (super-block x sub-unit) work items, NOT whole super-blocks -- the SAME fix the
-    // MoE twin already carries. Narrow-k decode shapes (attn q/k/v/o k=2048 -> 8 super-blocks) left
-    // 24/32 lanes idle under whole-super-block striding; NSUB sub-units (Q4_K=4 chunks, Q6_K=16 groups)
-    // lift the work-item count to nblocks*NSUB so every lane carries a coalesced dp4a. block() = sum
-    // over sub, so this is byte-identical math (f32 reorder only) -- the one lane-coalesced core.
+    const size_t rowstride = (size_t)nblocks * WBYTES;
+    const uint8_t* row_ptr = wq + (size_t)row0 * rowstride;
     constexpr int NSUB = qdp4a<WTYPE>::NSUB;
     const int nunits = nblocks * NSUB;
-    float acc = 0.0f;
+    float acc[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; ++r) acc[r] = 0.0f;
     for (int u = lane; u < nunits; u += 32) {
         const int b = u / NSUB;
         const int sub = u - b * NSUB;
-        acc += qdp4a<WTYPE>::partial(
-            row_ptr + (size_t)b * WBYTES, xq + (size_t)b * 256, xd + (size_t)b * 8, sub);
+        const int8_t* xq8 = xq + (size_t)b * 256;
+        const __half* xd8 = xd + (size_t)b * 8;
+        const uint8_t* wb = row_ptr + (size_t)b * WBYTES;
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            if (RPW == 1 || row0 + r < nrows)
+                acc[r] += qdp4a<WTYPE>::partial(wb + (size_t)r * rowstride, xq8, xd8, sub);
+        }
     }
     #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down(acc, off);
-    }
-    if (lane == 0) {
-        qstore(&y[row], acc);
+    for (int r = 0; r < RPW; ++r) {
+        float a = acc[r];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a += __shfl_down(a, off);
+        }
+        if (lane == 0 && (RPW == 1 || row0 + r < nrows)) {
+            qstore(&y[row0 + r], a);
+        }
     }
 }
 
@@ -766,7 +780,7 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
 // ON-DEVICE), bank offset by ids[s] IN-KERNEL, output row `row` of that expert against slot s's
 // pre-quantized q8_1 activation (xq + s*ncols, xd + s*ncols/32) into y[s*n + row]. Collapses the host
 // per-expert launch loop into one well-occupied capture-clean grid + int8 dp4a.
-template <int WTYPE, typename XT>
+template <int WTYPE, typename XT, int RPW = 1>
 __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     const int n,                        // output rows per expert (weight rows)
     const int ncols,                    // k, multiple of 256
@@ -784,36 +798,43 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     }
     const int lane = threadIdx.x & 31;
     const int rows_per_block = blockDim.x >> 5;
-    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
-    if (row >= n) {
+    const int row0 = (blockIdx.x * rows_per_block + (threadIdx.x >> 5)) * RPW;
+    if (row0 >= n) {
         return;
     }
     const int nblocks = ncols >> 8; // ncols / 256
     const int expert = ids[s];
-    const uint8_t* row_ptr = wbank + ((size_t)expert * n + row) * (size_t)nblocks * WBYTES;
+    const size_t rowstride = (size_t)nblocks * WBYTES;
+    const uint8_t* row_ptr = wbank + ((size_t)expert * n + row0) * rowstride;
     const int8_t* xq_row = xq + (size_t)s * ncols;
     const __half* xd_row = xd + (size_t)s * (ncols >> 5);
-
-    // Stride lanes over (super-block x sub-unit) work items, NOT whole super-blocks. The expert
-    // shapes are narrow-k (gate/up k=2048 -> 8 super-blocks, down k=768 -> 3), so whole-super-block
-    // striding leaves 24/32 (gate/up) or 29/32 (down) lanes idle. NSUB sub-units per super-block
-    // (Q4_K=4 chunks, Q6_K=16 groups) lifts the parallel unit count to nblocks*NSUB (>=32 here), so
-    // every lane carries dp4a work; sub-unit partials sum identically to qdp4a<WTYPE>::block.
     constexpr int NSUB = qdp4a<WTYPE>::NSUB;
     const int nunits = nblocks * NSUB;
-    float acc = 0.0f;
+    float acc[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; ++r) acc[r] = 0.0f;
     for (int u = lane; u < nunits; u += 32) {
         const int b = u / NSUB;
         const int sub = u - b * NSUB;
-        acc += qdp4a<WTYPE>::partial(
-            row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * 256, xd_row + (size_t)b * 8, sub);
+        const int8_t* xq8 = xq_row + (size_t)b * 256;
+        const __half* xd8 = xd_row + (size_t)b * 8;
+        const uint8_t* wb = row_ptr + (size_t)b * WBYTES;
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            if (RPW == 1 || row0 + r < n)
+                acc[r] += qdp4a<WTYPE>::partial(wb + (size_t)r * rowstride, xq8, xd8, sub);
+        }
     }
     #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down(acc, off);
-    }
-    if (lane == 0) {
-        qstore(&y[(size_t)s * n + row], acc);
+    for (int r = 0; r < RPW; ++r) {
+        float a = acc[r];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a += __shfl_down(a, off);
+        }
+        if (lane == 0 && (RPW == 1 || row0 + r < n)) {
+            qstore(&y[(size_t)s * n + row0 + r], a);
+        }
     }
 }
 
@@ -856,6 +877,49 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
         float* __restrict__ y) {                                                                     \
         moe_qmatvec_dp4a_core<WTYPE, float>(n, ncols, nslots, wbank, ids, xq, xd, y);                 \
     }
+
+// EXPERIMENT (rows-per-wave launch-geometry sweep, DEV-ONLY -- Rust selects via HANZO_DP4A_RPW /
+// HANZO_MOE_RPW). RPW>1 instantiations of the SAME cores for the 30B decode types (Q4_K, Q6_K), all
+// three store dtypes. Per-row math is identical to RPW=1, so these are byte-exact vs the shipped path.
+#define DEFINE_QMATVEC_DP4A_RPW(NAME, WTYPE, R)                                                       \
+    extern "C" __global__ void qmatvec_dp4a_##NAME##_rpw##R##_f16(                                    \
+        const int nrows, const int ncols, const uint8_t* __restrict__ wq,                             \
+        const int8_t* __restrict__ xq, const __half* __restrict__ xd, __half* __restrict__ y) {       \
+        qmatvec_dp4a_core<WTYPE, __half, R>(nrows, ncols, wq, xq, xd, y);                             \
+    }                                                                                                \
+    extern "C" __global__ void qmatvec_dp4a_##NAME##_rpw##R##_bf16(                                   \
+        const int nrows, const int ncols, const uint8_t* __restrict__ wq,                             \
+        const int8_t* __restrict__ xq, const __half* __restrict__ xd, hip_bfloat16* __restrict__ y) { \
+        qmatvec_dp4a_core<WTYPE, hip_bfloat16, R>(nrows, ncols, wq, xq, xd, y);                       \
+    }                                                                                                \
+    extern "C" __global__ void qmatvec_dp4a_##NAME##_rpw##R##_f32(                                    \
+        const int nrows, const int ncols, const uint8_t* __restrict__ wq,                             \
+        const int8_t* __restrict__ xq, const __half* __restrict__ xd, float* __restrict__ y) {        \
+        qmatvec_dp4a_core<WTYPE, float, R>(nrows, ncols, wq, xq, xd, y);                              \
+    }                                                                                                \
+    extern "C" __global__ void moe_qmatvec_dp4a_##NAME##_rpw##R##_f16(                                \
+        const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,           \
+        const int* __restrict__ ids, const int8_t* __restrict__ xq, const __half* __restrict__ xd,   \
+        __half* __restrict__ y) {                                                                    \
+        moe_qmatvec_dp4a_core<WTYPE, __half, R>(n, ncols, nslots, wbank, ids, xq, xd, y);            \
+    }                                                                                                \
+    extern "C" __global__ void moe_qmatvec_dp4a_##NAME##_rpw##R##_bf16(                               \
+        const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,           \
+        const int* __restrict__ ids, const int8_t* __restrict__ xq, const __half* __restrict__ xd,   \
+        hip_bfloat16* __restrict__ y) {                                                              \
+        moe_qmatvec_dp4a_core<WTYPE, hip_bfloat16, R>(n, ncols, nslots, wbank, ids, xq, xd, y);      \
+    }                                                                                                \
+    extern "C" __global__ void moe_qmatvec_dp4a_##NAME##_rpw##R##_f32(                                \
+        const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,           \
+        const int* __restrict__ ids, const int8_t* __restrict__ xq, const __half* __restrict__ xd,   \
+        float* __restrict__ y) {                                                                     \
+        moe_qmatvec_dp4a_core<WTYPE, float, R>(n, ncols, nslots, wbank, ids, xq, xd, y);             \
+    }
+DEFINE_QMATVEC_DP4A_RPW(q4k, DW_Q4_K, 2)
+DEFINE_QMATVEC_DP4A_RPW(q4k, DW_Q4_K, 4)
+DEFINE_QMATVEC_DP4A_RPW(q6k, DW_Q6_K, 2)
+DEFINE_QMATVEC_DP4A_RPW(q6k, DW_Q6_K, 4)
+#undef DEFINE_QMATVEC_DP4A_RPW
 
 DEFINE_QMATVEC_DP4A(q4k, DW_Q4_K)
 DEFINE_QMATVEC_DP4A(q6k, DW_Q6_K)
