@@ -275,3 +275,39 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   iq1/iq4nl), all 11 prefill types `nbad=0` (qmmq_unified), MoE decode + moe_combine + moe_route
   `nbad=0`, and the 6 pre-existing types unchanged (zero regression). bit-exact vs the CPU `to_float`
   oracle. `BlockQ8_1::to_float` (k_quants.rs) implemented so the Q8_1 weight type has a CPU reference.
+
+## IQ codebook dp4a decode -- the 2.27x i-quant decode lever (compute-bound, NOT launch-bound)
+- The IQ codebook quants (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M) decoded ONLY through the scalar
+  `qdec<DW_IQ*>` core (a grid-table lookup + float MACs per element) = PATHOLOGICALLY slow because the
+  decode is COMPUTE-bound (the per-element f32 dequant + MAC), not bandwidth-bound. Qwen3-30B-A3B
+  IQ3_XXS decoded 30.4 T/s vs Q4_K's 63 (Q4_K rides dp4a) and llama-HIP 67.6 / Vulkan 91.8.
+- FIX: `qdp4a<DW_IQ*>` specializations of the SAME unified `qmatvec_dp4a_core` / `moe_qmatvec_dp4a_core`
+  the K-quants use (quant.hip). The grid coords land in int8 and `hip_dp4a` (sudot4) dots them against
+  the once-q8_1-quantized activation -- llama.cpp `vec_dot_iq*_q8_1`. Purely ADDITIVE: 7 `qdp4a<>` +
+  7 `qdp4a_traits<>` + 7 `DEFINE_QMATVEC_DP4A` rows + 4 `RocmQuantType` selector rows (dp4a_capable /
+  fallback_env / dp4a_decode_kernel / dp4a_moe_kernel). NO new core, NO dispatch change -- `matvec_quant`
+  / `moe_matvec_quant` / `indexed_moe_forward` already route by `dp4a_active()`. NSUB=8 (the 32-elem
+  sub-block = the q8_1 32-scale unit). They live next to the scalar `qdec<DW_IQ*>` (after the grids)
+  because they index the `__constant__` grid tables, so DEFINE_QMATVEC_DP4A is #undef'd there not at 866.
+- SIGNS without CUDA `__vsub4`/`__vcmpne4` (ABSENT on ROCm 7.13 -- only `__byte_perm` exists): the IQ2/3
+  grids store POSITIVE magnitudes (verified <=62, valid int8) + per-coord sign bits. By linearity
+  `sum (-1)^s g u = dp4a(g,u) - 2*dp4a(g & bytemask(s), u)` -- `dp4a_signed` helper, `iq_bytemask4`
+  spreads a 4-bit sign nibble to 0xFF-per-byte. NO per-byte subtract. Cheaper than the SWAR-vsub4
+  alternative (2 dp4a + 6 ALU vs 1 dp4a + 10 ALU). IQ1 grids are PRE-SIGNED int8 -> direct dp4a + a
+  `sum(u)` term (dp4a vs 0x01010101) for the fractional `+delta` bias.
+- BIT-EXACT (gate leg 1): the f32 IQ scale (`db`) is applied in FLOAT exactly like the scalar `qdec`
+  (NOT llama's integer `sumi*ls/8` folding, which would diverge from the f32 to_float oracle); only the
+  integer grid*activation dot is dp4a. All 7 types nbad=0 vs the scalar core (`qmatvec_iq{2,3,1}_dp4a_
+  vs_scalar`) AND vs to_float-on-q8_1_recon (`check`/`moe_check`); scalar weight decode still bit-exact
+  (`decode_exact` forced-scalar via HANZO_IQ*_FALLBACK); all prior oracles + iq4nl unchanged.
+- FASTER (gate leg 2): Qwen3-30B-A3B-IQ3_XXS decode (eager, -n 0:48, pp1024/tg128, in-binary A/B via
+  the HANZO_IQ*_FALLBACK toggle): 30.4 -> 67.7-69.0 T/s = 2.27x, BEATING llama-HIP 67.6 (shipped v1.3.8
+  = 31.5, matches). Prefill 75.3 -> 301.5 = 4.0x (IQ3 is NOT qmmq-capable, so MoE prefill rides the
+  per-slot matvec core, which is now dp4a too). UNLIKE the launch-bound Q6_K case, the i-quant kernel
+  win FULLY surfaces at the model level because i-quant decode was COMPUTE-bound: HANZO_ROCM_GRAPHS=1
+  is FLAT/slightly lower (66.6) -- decode is no longer launch-bound. Weight BW at 68 T/s is only ~87
+  GB/s (well under the 212 roofline) = the kernel is now grid/VALU-bound, not weight-fetch-bound; 68 is
+  the practical wall (== llama-HIP). Tried `__device__` global grids (vs `__constant__`): SLOWER (65.4)
+  -- the small grids fit the broadcast constant cache and global adds L1 pressure vs weight streaming,
+  so `__constant__` is kept. IQ4_NL stays SCALAR (32-elem legacy block, not the 256-elem super-block
+  the dp4a core strides; would need a separate core, and it is 4.5bpw = less bandwidth-critical).
