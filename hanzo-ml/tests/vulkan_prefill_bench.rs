@@ -7,7 +7,7 @@
 //!
 //!   * BEFORE = `qtensor.dequantize(dev)` + `x.matmul(w^T)` + readback   (the old prefill `else` arm)
 //!   * AFTER  = `QMatMul::forward(x)`                       + readback   (the SHIPPED VulkanQuant path:
-//!             the native GEMM for M <= VULKAN_PREFILL_GEMM_MAX_ROWS(128), the dequant path beyond)
+//!             the native GEMM for M <= the per-dtype gate (Q5_K/Q6_K: 64, else 128), dequant beyond)
 //!
 //! Both produce [M, N] and read it back to host, so the readback cancels in the ratio. The crossover
 //! grid sweeps M past the gate so you see BOTH the native-GEMM win (M <= 128: 1-27x) and the gate
