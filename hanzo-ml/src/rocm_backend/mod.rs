@@ -1738,6 +1738,63 @@ impl RocmDevice {
         };
         Ok(out)
     }
+
+    /// FUSED MoE router: one `moe_route` launch (one block per token) over the F32 router logits
+    /// [ntok, n_experts] -> selected expert ids [ntok, topk] (u32, descending logit) + softmax
+    /// weights [ntok, topk] (f32). Replaces the softmax->sort->narrow->sum->div chain (~6 launches
+    /// /layer). `norm` renormalizes the topk weights to sum 1 (norm_topk_prob). Logits must be f32.
+    pub fn moe_route(
+        &self,
+        logits: &RocmStorage,
+        ntok: usize,
+        n_experts: usize,
+        topk: usize,
+        norm: bool,
+    ) -> Result<(RocmStorage, RocmStorage)> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
+        use std::ffi::c_void;
+        const MOE_ROUTE_MAX_E: usize = 256;
+        if n_experts > MOE_ROUTE_MAX_E {
+            crate::bail!("moe_route: n_experts {n_experts} exceeds kernel max {MOE_ROUTE_MAX_E}");
+        }
+        let lg_ptr = match &logits.slice {
+            RocmStorageSlice::F32(s) => s.as_ptr(),
+            other => crate::bail!("moe_route: logits must be f32, got {:?}", other.dtype()),
+        };
+        let ids = self.alloc::<u32>(ntok * topk)?;
+        let w = self.alloc::<f32>(ntok * topk)?;
+        let ids_ptr = ids.as_ptr();
+        let w_ptr = w.as_ptr();
+        let nt = ntok as i32;
+        let ne = n_experts as i32;
+        let tk = topk as i32;
+        let nm = i32::from(norm);
+        let grid = rocm_rs::hip::Dim3::from(ntok as u32);
+        let block = rocm_rs::hip::Dim3::from(64u32);
+        unsafe {
+            launch_kernel(
+                self,
+                QuantKernel::NAME,
+                QuantKernel::CODE,
+                "moe_route",
+                grid,
+                block,
+                &mut [
+                    &nt as *const i32 as *mut c_void,
+                    &ne as *const i32 as *mut c_void,
+                    &tk as *const i32 as *mut c_void,
+                    &nm as *const i32 as *mut c_void,
+                    (&lg_ptr) as *const *mut c_void as *mut c_void,
+                    (&ids_ptr) as *const *mut c_void as *mut c_void,
+                    (&w_ptr) as *const *mut c_void as *mut c_void,
+                ],
+            )?;
+        }
+        Ok((
+            RocmStorage { slice: RocmStorageSlice::U32(ids), device: self.clone() },
+            RocmStorage { slice: RocmStorageSlice::F32(w), device: self.clone() },
+        ))
+    }
 }
 
 unsafe fn launch_kernel(
