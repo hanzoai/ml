@@ -829,9 +829,12 @@ impl RocmQuantType {
     /// the 256-element IQ codebook quants (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M): the grid coords land in
     /// int8 (magnitudes + sign, or pre-signed for IQ1) and dp4a against the q8_1 activation, killing
     /// the COMPUTE-bound scalar grid-table float MACs. IQ4_NL stays scalar (32-elem legacy block, not
-    /// the 256-elem super-block the dp4a core strides). This is the ONE predicate that routes
-    /// decode/MoE to the dp4a core; every other type falls to the scalar `qmatvec_core`. The per-type
-    /// `HANZO_<T>_FALLBACK` env var forces the scalar path for A/B + as the numeric oracle.
+    /// the 256-elem super-block the dp4a core strides). IQ4_XS is a 256-elem super-block but ALSO stays
+    /// scalar: its dequant is a cheap 16-entry codebook LUT, so scalar decode is already memory-bound --
+    /// dp4a buys nothing and its per-matvec q8_1 quantize is pure overhead (measured neutral on MoE,
+    /// ~7% regression on dense IQ4_XS this APU). This is the ONE predicate that routes decode/MoE to the
+    /// dp4a core; every other type falls to the scalar `qmatvec_core`. The per-type `HANZO_<T>_FALLBACK`
+    /// env var forces the scalar path for A/B + as the numeric oracle.
     fn dp4a_capable(self) -> bool {
         matches!(
             self,
