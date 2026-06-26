@@ -275,3 +275,29 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   iq1/iq4nl), all 11 prefill types `nbad=0` (qmmq_unified), MoE decode + moe_combine + moe_route
   `nbad=0`, and the 6 pre-existing types unchanged (zero regression). bit-exact vs the CPU `to_float`
   oracle. `BlockQ8_1::to_float` (k_quants.rs) implemented so the Q8_1 weight type has a CPU reference.
+
+## Decode op-fusion: gate+up shared-quantize + fused residual-add rmsnorm (+2.8%, bit-exact)
+- rocprofv3 of the SHIPPED v1.3.8 decode (Qwen3-30B-A3B-Q4_K_M, GRAPHS=1) was the start: 1702
+  kernels/token, GPU-busy 13.2ms = 98% of the 13.46ms wall (graphs already hide host-launch latency),
+  matmul+attn 83% (roofline, untouched). Overhead histogram: quantize_q8_1 337/tok (7.02/layer),
+  rmsnorm 193 (4.02/layer = Qwen3 QK-norm), cast 288 (DEAD -- the 0.11.9 f32-native cast cut was
+  FLAT), badd 96, ucopy 96. The prior "40ms copies" hypothesis was wrong: those copies are MODEL-LOAD
+  weight uploads, ~0.2% of decode. So the lever is removing overhead-kernel GPU-TIME, not dispatch
+  latency -- and on gfx1151 each removed small kernel is worth ~2.7us, so kernel-count DOES surface.
+- **moe_gate_up (gate+up shared quantize): +1.1-1.4 T/s.** gate_exps and up_exps consume the SAME
+  routed token, so broadcast + q8_1-quantize it ONCE and dp4a both banks (`moe_matvec_pair`) instead of
+  per bank. Decomplected `moe_matvec_dp4a` into `quantize_q8_1` + `moe_matvec_dp4a_act`; extracted the
+  shared `QTensor::rocm_moe_bank` VRAM cache. CAVEAT (root-caused via a path probe): the experts load
+  as `QMatMul::QTensor` (3D banks), NOT `RocmQuant` (2D) -- the first cut matched RocmQuant and silently
+  fell back (FLAT). -48 quantize -48 ucopy/tok (337->289, 96->48). HANZO_MOE_GATEUP_FALLBACK A/B.
+- **add_rmsnorm (fused residual-add + rmsnorm): +0.4-0.7 T/s.** `s=x+residual` (new residual stream) +
+  `rmsnorm(s)*alpha` in ONE reduce.hip launch, vs a separate `badd` then `rmsnorm`. Wired QRmsNorm::
+  forward_of_sum -> ops::rocm_rms_norm_of_sum (f32) -> RocmStorage::add_rms_norm. Only badd1
+  (attn+residual -> ffn_norm) fuses; badd2 (moe+residual -> NEXT attn_norm) CANNOT -- it would span the
+  per-layer device-map boundary (norm weight on the next layer's device). -48 badd/tok (96->48).
+  HANZO_ADD_RMSNORM_FALLBACK A/B.
+- STACKED: 1702 -> 1558 kernels/tok (-144, -8.5%); device-map-controlled decode A/B (-n 0:48,
+  GRAPHS=1, clean rounds, vs shipped v1.3.8): 74.1 -> 76.0-76.2 T/s (+2.8%), coherent (17x4 / "Paris").
+  Past llama-HIP 66; the residual gap to Vulkan 82 is STRUCTURAL (faster matvec/attn kernels, not fewer
+  launches -- the matvec is already 88-99% roofline). Bit-exact: new `moe_matvec_pair` byte-equality
+  (qmatvec_unified_numeric) + `add_rmsnorm_numeric` oracles nbad=0; all prior oracles unchanged.
