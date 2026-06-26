@@ -376,6 +376,11 @@ __device__ __forceinline__ void q4k_scale_min(const uint8_t* __restrict__ s, int
 #define DW_Q6_K   3   // 210 B, 256 elems, symmetric K-quant (6-bit). val = d*sc*(q-32)
 #define DW_IQ4_XS 4   // 136 B, 256 elems, symmetric codebook (LUT).  val = d*(ls-32)*KVALUES[idx]
 #define DW_TQ2_0  5   // 66 B,  256 elems, symmetric ternary (2-bit). val = d*((q&3)-1)
+#define DW_Q5_K   6   // 176 B, 256 elems, ASYMMETRIC super-block.    val = d*sc*(nib|hi<<4) - dmin*m
+#define DW_Q4_1   7   // 20 B,  32 elems,  ASYMMETRIC legacy.         val = d*nib + m
+#define DW_Q5_0   8   // 22 B,  32 elems,  symmetric legacy 5-bit.    val = d*((nib|hi<<4)-16)
+#define DW_Q5_1   9   // 24 B,  32 elems,  ASYMMETRIC legacy 5-bit.   val = d*(nib|hi<<4) + m
+#define DW_Q8_1   10  // 36 B,  32 elems,  symmetric 8-bit (+sum).    val = d*qs[p]
 
 // Type-dispatched f32 -> output store (the only place the element type leaks): __half needs
 // __float2half, hip_bfloat16 takes float in its ctor. Keeps both cores' epilogue type-agnostic.
@@ -479,6 +484,58 @@ template <> struct qdp4a<DW_Q4_K> {
     }
 };
 
+// Q5_K (ASYMMETRIC, 5-bit). block_q5_K = {d, dmin, 12 scale bytes, qh[32], qs[128]} = 176 B. The
+// 5th bit of each weight rides qh: for sub-block e (0..8), position l (0..32), the high bit is
+// qh[l] bit e (low sub-block 2*c uses bit 2*c, high sub-block 2*c+1 uses bit 2*c+1 -- exactly the
+// to_float u1/u2<<2 walk). So Q5_K = Q4_K with q in [0,31] instead of [0,15]: chunk c (=sub) covers
+// qs[c*32, c*32+32), low nibble + qh bit 2c -> sub-block 2c, high nibble + qh bit 2c+1 -> sub-block
+// 2c+1. The 5-bit code (nib | bit<<4) in [0,31] is a valid signed int8, so dp4a(q5, u) is exact;
+// the asymmetric min term (dot2 = sum_k u, scaled by m) is identical to Q4_K's.
+template <> struct qdp4a<DW_Q5_K> {
+    static constexpr int NSUB = 4;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int sub) {
+        const float d    = __half2float(*reinterpret_cast<const __half*>(blk));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+        const uint8_t* scales = blk + 4;
+        const int* qh = reinterpret_cast<const int*>(blk + 16);  // 8 ints = 32 high-bit bytes
+        const int* q4 = reinterpret_cast<const int*>(blk + 48);  // 128 quant bytes
+        const int* u  = reinterpret_cast<const int*>(xq8);
+        int sc_lo, m_lo, sc_hi, m_hi;
+        q4k_scale_min(scales, 2 * sub,     &sc_lo, &m_lo);
+        q4k_scale_min(scales, 2 * sub + 1, &sc_hi, &m_hi);
+        const int* q4c   = q4 + sub * 8;
+        const int* u_lo  = u + (2 * sub)     * 8;
+        const int* u_hi  = u + (2 * sub + 1) * 8;
+        const float d8_lo = __half2float(xd8[2 * sub]);
+        const float d8_hi = __half2float(xd8[2 * sub + 1]);
+        const int blo = 2 * sub;        // qh bit for the low sub-block
+        const int bhi = 2 * sub + 1;    // qh bit for the high sub-block
+        int dot1_lo = 0, dot2_lo = 0, dot1_hi = 0, dot2_hi = 0;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int w  = q4c[t];
+            const int qv = qh[t];       // 4 qh bytes for positions l=t*4..t*4+4
+            const int wlo = ((w >> 0) & 0x0F0F0F0F) | (((qv >> blo) & 0x01010101) << 4);
+            const int whi = ((w >> 4) & 0x0F0F0F0F) | (((qv >> bhi) & 0x01010101) << 4);
+            dot1_lo = hip_dp4a(wlo, u_lo[t], dot1_lo);
+            dot2_lo = hip_dp4a(0x01010101, u_lo[t], dot2_lo);
+            dot1_hi = hip_dp4a(whi, u_hi[t], dot1_hi);
+            dot2_hi = hip_dp4a(0x01010101, u_hi[t], dot2_hi);
+        }
+        const float sumf_d = d8_lo * (dot1_lo * sc_lo) + d8_hi * (dot1_hi * sc_hi);
+        const float sumf_m = d8_lo * (dot2_lo * m_lo)  + d8_hi * (dot2_hi * m_hi);
+        return d * sumf_d - dmin * sumf_m;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int sub = 0; sub < NSUB; ++sub) s += partial(blk, xq8, xd8, sub);
+        return s;
+    }
+};
+
 // Q6_K (SYMMETRIC 6-bit). block_q6_K = {ql[128], qh[64], scales[16] signed i8, d (f16)} = 210 B.
 // The CPU oracle (k_quants BlockQ6K::vec_dot / qdec<DW_Q6_K>) dequantizes to aux8[256] then dots
 // scales[p/16] * aux8[p] * q8[p] for p in [0,256): aux8 position p = half*128 + quad*32 + l
@@ -547,6 +604,7 @@ template <> struct qdp4a<DW_Q6_K> {
 template <int WTYPE> struct qdp4a_traits;
 template <> struct qdp4a_traits<DW_Q4_K> { static constexpr int BYTES = 144; };
 template <> struct qdp4a_traits<DW_Q6_K> { static constexpr int BYTES = 210; };
+template <> struct qdp4a_traits<DW_Q5_K> { static constexpr int BYTES = 176; };
 
 // THE unified dp4a decode core. Warp per output row; lane-strided over the row's 256-elem
 // super-blocks; per-type `qdp4a<WTYPE>::block` does the int8 dot of one super-block against its
@@ -692,6 +750,7 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
 
 DEFINE_QMATVEC_DP4A(q4k, DW_Q4_K)
 DEFINE_QMATVEC_DP4A(q6k, DW_Q6_K)
+DEFINE_QMATVEC_DP4A(q5k, DW_Q5_K)
 
 #undef DEFINE_QMATVEC_DP4A
 
@@ -1018,6 +1077,11 @@ template <> struct qdw_traits<DW_Q4_K>   { static constexpr int BYTES = 144; sta
 template <> struct qdw_traits<DW_Q6_K>   { static constexpr int BYTES = 210; static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 16; };
 template <> struct qdw_traits<DW_IQ4_XS> { static constexpr int BYTES = 136; static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 8; };
 template <> struct qdw_traits<DW_TQ2_0>  { static constexpr int BYTES = 66;  static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_Q5_K>   { static constexpr int BYTES = 176; static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = false; static constexpr int NSC = 8; };
+template <> struct qdw_traits<DW_Q4_1>   { static constexpr int BYTES = 20;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = false; static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_Q5_0>   { static constexpr int BYTES = 22;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_Q5_1>   { static constexpr int BYTES = 24;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = false; static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_Q8_1>   { static constexpr int BYTES = 36;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
 
 // Per-type decode. `partial<XT>(blk, xb, lane)` returns lane L's partial dot over its owned
 // positions { e*32 + L } of ONE block, mirroring the CPU `to_float` for that type bit-for-bit.
@@ -1135,6 +1199,91 @@ template <> struct qdec<DW_TQ2_0> {
     }
 };
 
+// Q5_K: ASYMMETRIC 5-bit super-block. block = {d, dmin, 12 scale bytes, qh[32], qs[128]} = 176 B.
+// Mirrors Q4_K (val = d*sc*q - dmin*m) but q is 5-bit: for sub-block e (0..8), position l=lane, the
+// qs byte is qs[(e>>1)*32 + l] (low nibble for even e, high for odd e), the 5th bit is qh[l] bit e,
+// and (sc,m) = get_scale_min_k4(e). Lane L owns positions { e*32 + L }. (BlockQ5K::to_float.)
+template <> struct qdec<DW_Q5_K> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const float d    = __half2float(*reinterpret_cast<const __half*>(blk));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+        const uint8_t* scales = blk + 4;       // 12 packed scale bytes (same layout as Q4_K)
+        const uint8_t* qh = blk + 16;          // 32 high-bit bytes
+        const uint8_t* qs = blk + 48;          // 128 quant bytes
+        const uint8_t hbit = qh[lane];
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            int sc, m;
+            q4k_scale_min(scales, e, &sc, &m);
+            const uint8_t qb = qs[(e >> 1) * 32 + lane];
+            const int nib = (e & 1) ? (qb >> 4) : (qb & 0xF);
+            const int hi  = ((hbit >> e) & 1) << 4;
+            const float val = d * (float)sc * (float)(nib | hi) - dmin * (float)m;
+            s += val * (float)xb[e * 32 + lane];
+        }
+        return s;
+    }
+};
+
+// Q4_1: ASYMMETRIC legacy. d (f16) at 0, m (f16) at 2, 16 nibble-pairs at +4. pos p (=lane): p<16 ->
+// low nibble qs[p], p>=16 -> high nibble qs[p-16]; val = nib*d + m. (BlockQ4_1::to_float.)
+template <> struct qdec<DW_Q4_1> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const float m = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+        const uint8_t* qs = blk + 4;
+        const int nib = (lane < 16) ? (qs[lane] & 0x0F) : (qs[lane - 16] >> 4);
+        return ((float)nib * d + m) * (float)xb[lane];
+    }
+};
+
+// Q5_0: symmetric legacy 5-bit. d (f16) at 0, qh[4] (u32 LE) at +2, 16 nibble-pairs at +6. pos p
+// (=lane): nib = p<16 ? qs[p]&0xF : qs[p-16]>>4; the 5th bit is qh-bit p (low p<16 and high p>=16
+// BOTH index bit p -- the to_float xh_0=bit j / xh_1=bit j+16 walk); val = ((nib|bit<<4)-16)*d. qh
+// is read byte-wise (the 22 B stride leaves blk+2 only 2-aligned, so a u32 load could misalign).
+template <> struct qdec<DW_Q5_0> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint8_t* qhb = blk + 2;
+        const uint32_t qh = (uint32_t)qhb[0] | ((uint32_t)qhb[1] << 8) | ((uint32_t)qhb[2] << 16) | ((uint32_t)qhb[3] << 24);
+        const uint8_t* qs = blk + 6;
+        const int nib = (lane < 16) ? (qs[lane] & 0x0F) : (qs[lane - 16] >> 4);
+        const int hi  = (int)((qh >> lane) & 1u) << 4;
+        return (float)((nib | hi) - 16) * d * (float)xb[lane];
+    }
+};
+
+// Q5_1: ASYMMETRIC legacy 5-bit. d (f16) at 0, m (f16) at 2, qh[4] (u32 LE) at +4, 16 nibble-pairs
+// at +8. Like Q5_0 (5th bit = qh-bit p) but NOT centered and with a min: val = (nib|bit<<4)*d + m.
+template <> struct qdec<DW_Q5_1> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const float m = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+        const uint8_t* qhb = blk + 4;
+        const uint32_t qh = (uint32_t)qhb[0] | ((uint32_t)qhb[1] << 8) | ((uint32_t)qhb[2] << 16) | ((uint32_t)qhb[3] << 24);
+        const uint8_t* qs = blk + 8;
+        const int nib = (lane < 16) ? (qs[lane] & 0x0F) : (qs[lane - 16] >> 4);
+        const int hi  = (int)((qh >> lane) & 1u) << 4;
+        return ((float)(nib | hi) * d + m) * (float)xb[lane];
+    }
+};
+
+// Q8_1: symmetric 8-bit (Q8_0 + a per-block sum field). d (f16) at 0, s (f16, the sum -- unused for
+// dequant) at +2, 32 int8 quants at +4. pos p (=lane): val = d * qs[p]. (BlockQ8_1::to_float.)
+template <> struct qdec<DW_Q8_1> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 4);
+        return d * (float)qs[lane] * (float)xb[lane];
+    }
+};
+
 // Whole-block decode: lane L computes the COMPLETE dot of ONE block over ALL its ELEMS positions,
 // reusing the per-type `qdec<WTYPE>::partial` per-position math. Because `partial(blk,xb,p)` returns
 // the dot over the position-set { e*32 + p } owned by "lane" p, summing it over p = 0..31 covers
@@ -1210,6 +1359,11 @@ DEFINE_QMATVECU(q4k,   DW_Q4_K)
 DEFINE_QMATVECU(q6k,   DW_Q6_K)
 DEFINE_QMATVECU(iq4xs, DW_IQ4_XS)
 DEFINE_QMATVECU(tq2_0, DW_TQ2_0)
+DEFINE_QMATVECU(q5k,   DW_Q5_K)
+DEFINE_QMATVECU(q4_1,  DW_Q4_1)
+DEFINE_QMATVECU(q5_0,  DW_Q5_0)
+DEFINE_QMATVECU(q5_1,  DW_Q5_1)
+DEFINE_QMATVECU(q8_1,  DW_Q8_1)
 
 // THE unified indexed-MoE decode core. Same warp-per-row + lane-strided-block math as
 // `qmatvec_core`, but ALL routed slots run in ONE launch with the routed expert on grid.y:
@@ -1283,6 +1437,11 @@ DEFINE_MOE_QMATVECU(q4k,   DW_Q4_K)
 DEFINE_MOE_QMATVECU(q6k,   DW_Q6_K)
 DEFINE_MOE_QMATVECU(iq4xs, DW_IQ4_XS)
 DEFINE_MOE_QMATVECU(tq2_0, DW_TQ2_0)
+DEFINE_MOE_QMATVECU(q5k,   DW_Q5_K)
+DEFINE_MOE_QMATVECU(q4_1,  DW_Q4_1)
+DEFINE_MOE_QMATVECU(q5_0,  DW_Q5_0)
+DEFINE_MOE_QMATVECU(q5_1,  DW_Q5_1)
+DEFINE_MOE_QMATVECU(q8_1,  DW_Q8_1)
 
 #undef DEFINE_MOE_QMATVECU
 #undef DEFINE_QMATVECU
@@ -1292,6 +1451,11 @@ DEFINE_MOE_QMATVECU(tq2_0, DW_TQ2_0)
 #undef DW_Q6_K
 #undef DW_IQ4_XS
 #undef DW_TQ2_0
+#undef DW_Q5_K
+#undef DW_Q4_1
+#undef DW_Q5_0
+#undef DW_Q5_1
+#undef DW_Q8_1
 
 // ----------------------------------------------------------------------------------------------
 // Native Q8_0 quant GEMM (prefill path) using RDNA3 WMMA (matrix cores).
@@ -1494,6 +1658,11 @@ typedef int v4i_ld __attribute__((ext_vector_type(4)));
 #define WT_Q6_K   3   // 210 B, 256 elems, SYM K-quant 6-bit.   q_w = q-32;         scale d*sc (per-16)
 #define WT_IQ4_XS 4   // 136 B, 256 elems, SYM codebook (LUT).  q_w = KVALUES[idx]; scale d*(ls-32)
 #define WT_TQ2_0  5   // 66 B,  256 elems, SYM ternary 2-bit.   q_w = q-1;          scale d
+#define WT_Q5_K   6   // 176 B, 256 elems, ASYM super-block.    q_w = nib|hi<<4(0..31); scale d*sc, min dmin*m
+#define WT_Q4_1   7   // 20 B,  32 elems,  ASYM legacy.         q_w = nib(0..15);   scale d, min -m
+#define WT_Q5_0   8   // 22 B,  32 elems,  SYM legacy 5-bit.    q_w = (nib|hi<<4)-16;   scale d
+#define WT_Q5_1   9   // 24 B,  32 elems,  ASYM legacy 5-bit.   q_w = nib|hi<<4(0..31); scale d, min -m
+#define WT_Q8_1   10  // 36 B,  32 elems,  SYM 8-bit (+sum).    q_w = qs[k];        scale d
 // Per-type traits: BYTES = on-disk super-block stride; SBLK_ELEMS = elems/super-block (32 or 256);
 // SYMMETRIC = no min bias; SCALE_STEP = elems per distinct weight scale (16 for Q6_K else 32).
 // Derived: SUBS = 32-blocks per super-block; NSC16 = distinct scales per 32-block (2 iff SCALE_STEP=16).
@@ -1504,6 +1673,11 @@ template <> struct wt_traits<WT_Q4_K>   { static constexpr int BYTES = 144; stat
 template <> struct wt_traits<WT_Q6_K>   { static constexpr int BYTES = 210; static constexpr int SBLK_ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 16; };
 template <> struct wt_traits<WT_IQ4_XS> { static constexpr int BYTES = 136; static constexpr int SBLK_ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
 template <> struct wt_traits<WT_TQ2_0>  { static constexpr int BYTES = 66;  static constexpr int SBLK_ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_Q5_K>   { static constexpr int BYTES = 176; static constexpr int SBLK_ELEMS = 256; static constexpr bool SYMMETRIC = false; static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_Q4_1>   { static constexpr int BYTES = 20;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = false; static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_Q5_0>   { static constexpr int BYTES = 22;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_Q5_1>   { static constexpr int BYTES = 24;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = false; static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_Q8_1>   { static constexpr int BYTES = 36;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
 
 // q4k_scale_min / KVALUES_IQ4NL_D are defined above for the decode core and reused verbatim here --
 // ONE decode source per format (the prefill decode below mirrors the same bit layout as qdec<WTYPE>).
@@ -1618,6 +1792,85 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_TQ2_0>(const uint8_t* sb, int
     v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
 }
 
+// Q5_K: super-block = f16 d, f16 dmin, 12 scale bytes, qh[32], qs[128]. Sub-block g (0..8): chunk
+// c=g/2 of qs (byte c*32+k), even g = LOW nibble / odd g = HIGH nibble, 5th bit = qh[k] bit g. q_w =
+// the UNSIGNED 5-bit code nib|hi<<4 in [0,31] (the min term carries the offset). Mirrors Q4_K + qh.
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_Q5_K>(const uint8_t* sb, int g, int half) {
+    const uint8_t* qh = sb + 16;
+    const uint8_t* qs = sb + 48;
+    const int chunk = g >> 1;
+    const int shift = (g & 1) ? 4 : 0;
+    const uint8_t* qc = qs + chunk * 32 + half;  // k=half..half+15 of this sub-block
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int l   = half + i;
+        const int nib = (qc[i] >> shift) & 0x0F;
+        const int bit = (qh[l] >> g) & 1;
+        tmp[i] = (int8_t)(nib | (bit << 4));     // 0..31
+    }
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
+// Q4_1: f16 d, f16 m, 16 nibble-pairs at +4 (SUBS=1, g==0). half=0 -> k 0..15 = LOW nibbles, half=16
+// -> HIGH. q_w = the UNSIGNED nibble 0..15 (the +m bias rides decode_w_secscale).
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_Q4_1>(const uint8_t* sb, int, int half) {
+    const uint8_t* qs = sb + 4;
+    const int shift = (half == 0) ? 0 : 4;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) tmp[i] = (int8_t)((qs[i] >> shift) & 0x0F);
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
+// Q5_0: f16 d, qh[4] (u32 LE) at +2, 16 nibble-pairs at +6 (SUBS=1). half=0 -> k 0..15 (low nibbles,
+// qh bits 0..15), half=16 -> k 16..31 (high nibbles, qh bits 16..31). q_w = (nib|bit<<4)-16 (signed
+// [-16,15]). qh read byte-wise (22 B stride leaves sb+2 only 2-aligned).
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_Q5_0>(const uint8_t* sb, int, int half) {
+    const uint8_t* qhb = sb + 2;
+    const uint32_t qh = (uint32_t)qhb[0] | ((uint32_t)qhb[1] << 8) | ((uint32_t)qhb[2] << 16) | ((uint32_t)qhb[3] << 24);
+    const uint8_t* qs = sb + 6;
+    const int shift = (half == 0) ? 0 : 4;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int nib = (qs[i] >> shift) & 0x0F;
+        const int bit = (int)((qh >> (half + i)) & 1u);
+        tmp[i] = (int8_t)((nib | (bit << 4)) - 16);
+    }
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
+// Q5_1: f16 d, f16 m, qh[4] (u32 LE) at +4, 16 nibble-pairs at +8 (SUBS=1). Like Q5_0 but q_w = the
+// UNSIGNED 5-bit code nib|bit<<4 in [0,31] (NOT centered; the +m bias rides decode_w_secscale).
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_Q5_1>(const uint8_t* sb, int, int half) {
+    const uint8_t* qhb = sb + 4;
+    const uint32_t qh = (uint32_t)qhb[0] | ((uint32_t)qhb[1] << 8) | ((uint32_t)qhb[2] << 16) | ((uint32_t)qhb[3] << 24);
+    const uint8_t* qs = sb + 8;
+    const int shift = (half == 0) ? 0 : 4;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int nib = (qs[i] >> shift) & 0x0F;
+        const int bit = (int)((qh >> (half + i)) & 1u);
+        tmp[i] = (int8_t)(nib | (bit << 4));
+    }
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
+// Q8_1: 32 int8 quants at +4 (SUBS=1, g==0); the 16B half is a straight load (Q8_0 with the qs
+// shifted past the extra f16 sum field). q_w = qs[k].
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_Q8_1>(const uint8_t* sb, int, int half) {
+    v4i_ld v;
+    __builtin_memcpy(&v, sb + 4 + half, 16);
+    return v;
+}
+
 // MAIN per-(32-block, 16-group) weight scale. `sub16` = the 16-group index within the super-block
 // (= g*2 + (half==16)). For SCALE_STEP=32 types both halves of a 32-sub-block return the same value
 // (so the merged-accumulate path scales once); for Q6_K (SCALE_STEP=16) each 16-group differs.
@@ -1658,6 +1911,25 @@ template <> __device__ __forceinline__ float decode_w_mainscale<WT_IQ4_XS>(const
 template <> __device__ __forceinline__ float decode_w_mainscale<WT_TQ2_0>(const uint8_t* sb, int) {
     return __half2float(*reinterpret_cast<const __half*>(sb + 64));
 }
+// Q5_K: d * sc_g (sc from get_scale_min_k4 for sub-block g = sub16/2) -- same scale layout as Q4_K.
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q5_K>(const uint8_t* sb, int sub16) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(sb));
+    int sc, m; q4k_scale_min(sb + 4, sub16 >> 1, &sc, &m);
+    return d * (float)sc;
+}
+// Q4_1/Q5_0/Q5_1/Q8_1: single per-block f16 scale `d` at byte 0.
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q4_1>(const uint8_t* sb, int) {
+    return __half2float(*reinterpret_cast<const __half*>(sb));
+}
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q5_0>(const uint8_t* sb, int) {
+    return __half2float(*reinterpret_cast<const __half*>(sb));
+}
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q5_1>(const uint8_t* sb, int) {
+    return __half2float(*reinterpret_cast<const __half*>(sb));
+}
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q8_1>(const uint8_t* sb, int) {
+    return __half2float(*reinterpret_cast<const __half*>(sb));
+}
 
 // SECONDARY per-32-sub-block weight scalar. ASYMMETRIC: dmin * m_g (the min bias scale). SYMMETRIC
 // SCALE_STEP=16 (Q6_K): the 2nd-16-group main scale of sub-block g (so the high half scales by it).
@@ -1679,6 +1951,22 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_Q6_K>(const ui
 }
 template <> __device__ __forceinline__ float decode_w_secscale<WT_IQ4_XS>(const uint8_t*, int) { return 0.0f; }
 template <> __device__ __forceinline__ float decode_w_secscale<WT_TQ2_0>(const uint8_t*, int) { return 0.0f; }
+// Q5_K: dmin * m_g (same min layout as Q4_K).
+template <> __device__ __forceinline__ float decode_w_secscale<WT_Q5_K>(const uint8_t* sb, int g) {
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(sb + 2));
+    int sc, m; q4k_scale_min(sb + 4, g, &sc, &m);
+    return dmin * (float)m;
+}
+// Q4_1/Q5_1: the legacy +m bias. qmmq accumulates out -= d_x*ix*secscale and the true value adds
+// +m*d_x*ix, so secscale = -m (m = the f16 at sb+2).
+template <> __device__ __forceinline__ float decode_w_secscale<WT_Q4_1>(const uint8_t* sb, int) {
+    return -__half2float(*reinterpret_cast<const __half*>(sb + 2));
+}
+template <> __device__ __forceinline__ float decode_w_secscale<WT_Q5_1>(const uint8_t* sb, int) {
+    return -__half2float(*reinterpret_cast<const __half*>(sb + 2));
+}
+template <> __device__ __forceinline__ float decode_w_secscale<WT_Q5_0>(const uint8_t*, int) { return 0.0f; }
+template <> __device__ __forceinline__ float decode_w_secscale<WT_Q8_1>(const uint8_t*, int) { return 0.0f; }
 
 // Shared int8 tile row stride: 32 data bytes + 16 pad bytes = 48. The pad is 16-ALIGNED so the 32-byte
 // fragment loads (`__builtin_memcpy(&frag, &sXi[row*SROW], 32)`) lower to `ds_load_b128` (two 16-byte
@@ -1956,6 +2244,11 @@ DEFINE_QMMQ(q4k,   WT_Q4_K)
 DEFINE_QMMQ(q6k,   WT_Q6_K)
 DEFINE_QMMQ(iq4xs, WT_IQ4_XS)
 DEFINE_QMMQ(tq2_0, WT_TQ2_0)
+DEFINE_QMMQ(q5k,   WT_Q5_K)
+DEFINE_QMMQ(q4_1,  WT_Q4_1)
+DEFINE_QMMQ(q5_0,  WT_Q5_0)
+DEFINE_QMMQ(q5_1,  WT_Q5_1)
+DEFINE_QMMQ(q8_1,  WT_Q8_1)
 
 #undef DEFINE_QMMQ
 
@@ -1990,6 +2283,11 @@ DEFINE_MOE_QMMQ(q4k,   WT_Q4_K)
 DEFINE_MOE_QMMQ(q6k,   WT_Q6_K)
 DEFINE_MOE_QMMQ(iq4xs, WT_IQ4_XS)
 DEFINE_MOE_QMMQ(tq2_0, WT_TQ2_0)
+DEFINE_MOE_QMMQ(q5k,   WT_Q5_K)
+DEFINE_MOE_QMMQ(q4_1,  WT_Q4_1)
+DEFINE_MOE_QMMQ(q5_0,  WT_Q5_0)
+DEFINE_MOE_QMMQ(q5_1,  WT_Q5_1)
+DEFINE_MOE_QMMQ(q8_1,  WT_Q8_1)
 
 #undef DEFINE_MOE_QMMQ
 #undef DEFINE_MOE_QMMQ_NW
@@ -2004,4 +2302,9 @@ DEFINE_MOE_QMMQ(tq2_0, WT_TQ2_0)
 #undef WT_Q6_K
 #undef WT_IQ4_XS
 #undef WT_TQ2_0
+#undef WT_Q5_K
+#undef WT_Q4_1
+#undef WT_Q5_0
+#undef WT_Q5_1
+#undef WT_Q8_1
 #endif
