@@ -1836,6 +1836,17 @@ fn dense_matmul(xs: &Tensor, w: &Tensor) -> Result<Tensor> {
     xs.matmul(&w)
 }
 
+// Prefill row-count gate for the native Vulkan quantized GEMM. The column-per-invocation `mul_mat_q*`
+// kernel re-reads the weight ceil(M / MATMUL_Q_MAX_M(8)) times; the dequant path materializes the f32
+// weight once. So the GEMM wins at small/moderate M and goes weight-bandwidth-bound at large M.
+// Measured crossover on RADV gfx1151 (Radeon 8060S), K=4096, N in {4096, 11008}, all five wired
+// dtypes: the GEMM is faster for every case at M <= 128 (1.0x at the heaviest Q6_K/large-N point, up
+// to 27x at M=16), and the heaviest case crosses below 1.0 by M=256. 128 = 16 weight passes is the
+// strict-non-regression gate; larger dense prefill keeps the dequant path until a shared-memory-tiled
+// int8 GEMM (which reads the weight once and removes this gate) lands.
+#[cfg(feature = "vulkan")]
+const VULKAN_PREFILL_GEMM_MAX_ROWS: usize = 128;
+
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
@@ -2026,7 +2037,11 @@ impl crate::Module for QMatMul {
             }
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant {
-                wq, dtype, n, k, ..
+                qtensor,
+                wq,
+                dtype,
+                n,
+                k,
             } => {
                 let rows: usize = xs.elem_count() / *k;
                 if rows == 1 {
@@ -2063,13 +2078,15 @@ impl crate::Module for QMatMul {
                         crate::op::BackpropOp::none(),
                         false,
                     ))
-                } else {
-                    // Prefill (M>1): native quantized GEMM. Weights stay quantized in VRAM and each
-                    // weight block is decoded ONCE per output column then reused across all M rows --
-                    // weight traffic equals a single matvec while M rows are produced, instead of
-                    // dequantizing the whole weight to f32 every forward (the prefill bandwidth lever
-                    // vs llama.cpp). Same block layout + decode as the matching decode matvec above;
-                    // one matmul_q*_gpu per native dtype. Leading batch dims flatten into M.
+                } else if rows <= VULKAN_PREFILL_GEMM_MAX_ROWS {
+                    // Prefill (small/moderate M): native quantized GEMM. Weights stay quantized in
+                    // VRAM and each weight block is decoded ONCE per output column then reused across
+                    // a tile of up to MATMUL_Q_MAX_M(=8) rows -- so the weight is re-read ceil(M/8)
+                    // times, vs the dequant path's one-time f32 materialization. The GEMM therefore
+                    // wins decisively while M is small (short / chunked prefill, batched decode) and
+                    // would go weight-bandwidth-bound at large M, which the `rows` gate routes to the
+                    // dequant path below. Same block layout + decode as the decode matvec above; one
+                    // matmul_q*_gpu per native dtype. Leading batch dims flatten into M.
                     let m = rows;
                     let xs = xs.contiguous()?;
                     let d = match xs.device() {
@@ -2100,6 +2117,18 @@ impl crate::Module for QMatMul {
                         crate::op::BackpropOp::none(),
                         false,
                     ))
+                } else {
+                    // Large dense prefill (M > the crossover): the column-per-invocation GEMM would
+                    // re-read the weight ceil(M/8) times and lose to materializing the f32 weight once
+                    // and running a dense matmul. Keep the dequant path here -- a strict non-regression
+                    // until a shared-memory-tiled int8 GEMM (reads the weight once) removes the gate.
+                    let w = qtensor.dequantize(&xs.device())?;
+                    let w = match *xs.dims() {
+                        [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                        [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                        _ => w.t()?,
+                    };
+                    xs.matmul(&w)
                 }
             }
             #[cfg(feature = "wgpu")]
