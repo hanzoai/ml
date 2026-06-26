@@ -1442,10 +1442,14 @@ impl QMatMul {
                         if k % blk == 0 {
                             let bytes = qtensor.data()?;
                             // Q6_K's 210-byte block is not u32-aligned; its shader reads a padded
-                            // 53-u32 stride, so repack on upload. Every other native type's matvec
-                            // shader reads the raw GGML bytes directly.
+                            // 53-u32 stride, so repack on upload. Q8_0 repacks to the 9-u32/block
+                            // layout that BOTH its decode (mul_mat_vec_q8) and prefill GEMM
+                            // (mul_mat_q8) read -- ONE layout, so decode + prefill + MoE all agree
+                            // (mirrors how the MoE bank repacks Q8_0). Every other native type's
+                            // shaders byte-address the raw GGML bytes directly.
                             let wq = match dt {
                                 GgmlDType::Q6K => d.quantize_q6k(&bytes, n, k)?,
+                                GgmlDType::Q8_0 => d.quantize_q8_blocks(&bytes, n, k)?,
                                 _ => d.upload_qweight(&bytes)?,
                             };
                             return Ok(Self::VulkanQuant {
@@ -2022,11 +2026,7 @@ impl crate::Module for QMatMul {
             }
             #[cfg(feature = "vulkan")]
             Self::VulkanQuant {
-                qtensor,
-                wq,
-                dtype,
-                n,
-                k,
+                wq, dtype, n, k, ..
             } => {
                 let rows: usize = xs.elem_count() / *k;
                 if rows == 1 {
@@ -2045,7 +2045,9 @@ impl crate::Module for QMatMul {
                         };
                         match dtype {
                             GgmlDType::Q4_0 => d.matvec_q4_0_gpu(wq, xv, *n, *k)?,
-                            GgmlDType::Q8_0 => d.matvec_q8_0_gpu(wq, xv, *n, *k)?,
+                            // Q8_0 rides the 9-u32 repacked layout (mul_mat_vec_q8), the SAME blocks
+                            // the prefill GEMM (mul_mat_q8) reads -- one layout for decode + prefill.
+                            GgmlDType::Q8_0 => d.matvec_q8_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q5K => d.matvec_q5k_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q6K => d.matvec_q6k_gpu(wq, xv, *n, *k)?,
@@ -2062,14 +2064,42 @@ impl crate::Module for QMatMul {
                         false,
                     ))
                 } else {
-                    // Prefill: dequantize to a temporary f32 weight (reuses the NT matmul path).
-                    let w = qtensor.dequantize(&xs.device())?;
-                    let w = match *xs.dims() {
-                        [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
-                        [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
-                        _ => w.t()?,
+                    // Prefill (M>1): native quantized GEMM. Weights stay quantized in VRAM and each
+                    // weight block is decoded ONCE per output column then reused across all M rows --
+                    // weight traffic equals a single matvec while M rows are produced, instead of
+                    // dequantizing the whole weight to f32 every forward (the prefill bandwidth lever
+                    // vs llama.cpp). Same block layout + decode as the matching decode matvec above;
+                    // one matmul_q*_gpu per native dtype. Leading batch dims flatten into M.
+                    let m = rows;
+                    let xs = xs.contiguous()?;
+                    let d = match xs.device() {
+                        Device::Vulkan(d) => d,
+                        _ => crate::bail!("VulkanQuant input not on vulkan"),
                     };
-                    xs.matmul(&w)
+                    let y = {
+                        let (store, _) = xs.storage_and_layout();
+                        let xv = match &*store {
+                            crate::Storage::Vulkan(v) => v,
+                            _ => crate::bail!("VulkanQuant expected vulkan storage"),
+                        };
+                        match dtype {
+                            GgmlDType::Q4_0 => d.matmul_q4_0_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q8_0 => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q5K => d.matmul_q5k_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q6K => d.matmul_q6k_gpu(wq, xv, m, *n, *k)?,
+                            other => crate::bail!("VulkanQuant: no native matmul for {other:?}"),
+                        }
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Vulkan(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
                 }
             }
             #[cfg(feature = "wgpu")]
