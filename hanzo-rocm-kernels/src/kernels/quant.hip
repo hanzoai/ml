@@ -364,6 +364,12 @@ extern "C" __global__ __launch_bounds__(MOE_ROUTE_THREADS) void moe_route(
 // truth for the 6-bit scale layout).
 __device__ __forceinline__ void q4k_scale_min(const uint8_t* __restrict__ s, int j, int* sc, int* m);
 
+// get_scale_min_k4 over the 12 scale bytes held in 3 PACKED WORDS (not DRAM) -- forward-declared so the
+// dp4a Q4_K kernel reads the whole 16-byte header (d/dmin + 12 scales) in ONE 128-bit load and unpacks
+// the scales from registers instead of byte-granular gathers. DEFINED next to q4k_scale_min (one source
+// of truth for the 6-bit scale layout); BIT-IDENTICAL to it, only the byte source changes.
+__device__ __forceinline__ void q4k_scale_min_words(uint32_t w0, uint32_t w1, uint32_t w2, int j, int* sc, int* m);
+
 // q3k_scales unpack -- DEFINED below (reused by the scalar Q3_K path + the dp4a Q3_K kernel);
 // forward-declared here so both call the SAME 16-scale reconstruction (one source of truth).
 __device__ __forceinline__ void q3k_scales(const uint8_t* __restrict__ s, int8_t* __restrict__ out);
@@ -462,14 +468,19 @@ template <> struct qdp4a<DW_Q4_K> {
     // strides across lanes -- 4 chunks * nblocks fills the warp on the narrow-k expert shapes.
     static __device__ __forceinline__ float partial(
             const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int sub) {
-        const float d    = __half2float(*reinterpret_cast<const __half*>(blk));
-        const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
-        const uint8_t* scales = blk + 4;
+        // ONE 128-bit header load: blk[0,16) = d(2) + dmin(2) + 12 scale bytes -> registers. blk is
+        // 16-byte aligned (144 = 16*9, weight base >=256 B aligned), so this is a single coalesced
+        // global_load_b128 instead of two f16 loads + 10 byte-granular scale gathers -- the load-side
+        // gap vs Q6_K. hdr.x = {d, dmin}; hdr.y/z/w = scale bytes 0-3/4-7/8-11. The scale unpack then
+        // runs on the packed words (q4k_scale_min_words), BIT-IDENTICAL to the byte-pointer unpack.
+        const uint4 hdr = *reinterpret_cast<const uint4*>(blk);
+        const float d    = __half2float(__ushort_as_half((unsigned short)(hdr.x & 0xFFFFu)));
+        const float dmin = __half2float(__ushort_as_half((unsigned short)(hdr.x >> 16)));
         const int* q4 = reinterpret_cast<const int*>(blk + 16);
         const int* u  = reinterpret_cast<const int*>(xq8);
         int sc_lo, m_lo, sc_hi, m_hi;
-        q4k_scale_min(scales, 2 * sub,     &sc_lo, &m_lo);
-        q4k_scale_min(scales, 2 * sub + 1, &sc_hi, &m_hi);
+        q4k_scale_min_words(hdr.y, hdr.z, hdr.w, 2 * sub,     &sc_lo, &m_lo);
+        q4k_scale_min_words(hdr.y, hdr.z, hdr.w, 2 * sub + 1, &sc_hi, &m_hi);
         const int* q4c   = q4 + sub * 8;
         const int* u_lo  = u + (2 * sub)     * 8;
         const int* u_hi  = u + (2 * sub + 1) * 8;
@@ -1044,6 +1055,29 @@ __device__ __forceinline__ void q4k_scale_min(const uint8_t* __restrict__ s, int
     } else {
         *sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4);
         *m  = (s[j + 4] >> 4) | ((s[j] >> 6) << 4);
+    }
+}
+
+// Byte k (0..11) of the 12 Q4_K scale bytes packed into 3 little-endian words (w0 = s[0..3],
+// w1 = s[4..7], w2 = s[8..11]) -- the register-resident twin of `s[k]` so the dp4a path sources the
+// scales from the one 128-bit header load, not byte gathers. Pure ALU (select + shift + mask).
+__device__ __forceinline__ uint32_t q4k_sbyte(uint32_t w0, uint32_t w1, uint32_t w2, int k) {
+    const uint32_t w = (k < 4) ? w0 : ((k < 8) ? w1 : w2);
+    return (w >> (8 * (k & 3))) & 0xFFu;
+}
+
+// get_scale_min_k4 over the packed scale words -- BIT-IDENTICAL to q4k_scale_min(blk+4, j, ...): same
+// bytes (via q4k_sbyte), same 6-bit arithmetic. Only the byte source is registers, not DRAM.
+__device__ __forceinline__ void q4k_scale_min_words(uint32_t w0, uint32_t w1, uint32_t w2, int j, int* sc, int* m) {
+    if (j < 4) {
+        *sc = (int)(q4k_sbyte(w0, w1, w2, j)     & 63u);
+        *m  = (int)(q4k_sbyte(w0, w1, w2, j + 4) & 63u);
+    } else {
+        const uint32_t a = q4k_sbyte(w0, w1, w2, j + 4);
+        const uint32_t b = q4k_sbyte(w0, w1, w2, j - 4);
+        const uint32_t c = q4k_sbyte(w0, w1, w2, j);
+        *sc = (int)((a & 0xFu) | ((b >> 6) << 4));
+        *m  = (int)((a >> 4)   | ((c >> 6) << 4));
     }
 }
 
