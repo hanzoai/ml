@@ -340,9 +340,11 @@ fn prefill_case(
 #[test]
 fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
-    // M straddles the host MAX_M=8 tiling: 5 (partial tile), 8 (exact tile), 17 (2 tiles + remainder).
+    // M straddles the host MAX_M=8 tiling AND the M<=128 GEMM gate: 5 (partial tile), 8 (exact tile),
+    // 17 (2 tiles + remainder) all hit the native GEMM; 200 (> the gate) exercises the dequant
+    // fallback so BOTH prefill paths are validated against the same f64 reference.
     // (nout, k) with k divisible by 256 so all five dtypes share the same shapes.
-    for &m in &[5usize, 8, 17] {
+    for &m in &[5usize, 8, 17, 200] {
         for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
             for dt in [
                 GgmlDType::Q4_0,
