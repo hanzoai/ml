@@ -75,6 +75,10 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    pub fn supports_indexed_moe(_dtype: GgmlDType) -> bool {
+        false
+    }
+
     pub fn indexed_moe_forward(
         &self,
         _: &crate::Shape,
