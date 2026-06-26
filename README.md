@@ -10,8 +10,8 @@ quantization, and multimodal workloads.
 
 ## Key Features
 
-- **High Performance**: GPU acceleration via CUDA, Metal (Apple Silicon), and CPU optimizations
-- **Edge AI Optimized**: Quantization support (GGUF, GGML, AFQ, GPTQ, AWQ)  
+- **High Performance**: GPU acceleration via CUDA, Metal (Apple Silicon), ROCm (AMD RDNA3.5 APUs), Vulkan, and CPU optimizations
+- **Edge AI Optimized**: Quantization support (GGUF, GGML, AFQ, GPTQ, AWQ). On AMD `gfx1151` the full GGUF quant zoo (22 types: Q/K, legacy, IQ1-4, TQ) decodes resident + bit-exact through one unified compute core -- prefill beats llama.cpp (1.1-1.26x), decode at HIP parity.
 - **Multimodal**: Text, vision, audio, and 3D model support
 - **WebAssembly**: Run models in the browser with WASM support
 - **Rust Native**: Memory-safe, zero-cost abstractions
