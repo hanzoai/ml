@@ -238,3 +238,15 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   lever is OP-FUSION (fused softmax+topk routing = 6 kernels/layer -> 1; fused gate+up+silu; fused
   rope+cache) to cut the ~2725 kernels/token, NOT a matvec change. Decode merge kept for the kernel-
   count reduction + decomplect, not a perf claim. ALWAYS pass -n "0:48" for 30B-A3B decode A/B.
+
+## 0.11.10 -- fused MoE routing kernel (the REAL decode lever: +13-15%, bit-exact)
+- **`moe_route` (REAL decode win):** ONE ROCm kernel (one block/token, shared-mem softmax + top-k +
+  normalize) replaces the softmax->sort->narrow->sum->div chain (~6 launches/layer x48 = ~240 fewer
+  kernels/token). `hanzo_ml::quantized::moe_route(logits, topk, norm)` -> (indices, weights); rocm
+  fast path + ml-op fallback elsewhere. THIS is the kernel-count lever the bandwidth-wall analysis
+  pointed to (NOT the matvec). Device-map-controlled A/B (-n 0:48, graphs ON): 30B-A3B decode @d4
+  52.9 -> **59.9 T/s (+13%)** = 0.90x llama-HIP (was 0.80x); run-loop long-context 40.4 -> 46.7
+  (+15%); prefill 1177 -> 1192 = 1.12x llama-HIP. Bit-exact: new `moe_route_numeric` oracle nbad=0
+  (max_w_err ~1e-8 vs the ml-op reference) across ntok 1..1024, experts 60..256, topk 4..8, norm
+  on/off; all prior oracles still nbad=0. Next kernel-count levers: fused gate+up+silu, fused
+  rope+cache.
