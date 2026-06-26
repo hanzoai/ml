@@ -825,14 +825,28 @@ impl RocmQuantType {
 
     /// Whether this type has a faithful int8-dp4a decode (`qdp4a<WTYPE>` in quant.hip). The K-quants
     /// whose 256-element super-block decodes to (int quant)*(per-block scale)[+min] dot a once-
-    /// quantized q8_1 int8 activation via `v_dot4` -- ~4x the scalar-float dequant on this APU.
-    /// Q4_K + Q6_K today (Q5_K is one `qdp4a<DW_Q5_K>` + one row away). This is the ONE predicate that
-    /// routes decode/MoE to the dp4a core; every other type falls to the scalar `qmatvec_core`. The
-    /// per-type `HANZO_<T>_FALLBACK` env var forces the scalar path for A/B + as the numeric oracle.
+    /// quantized q8_1 int8 activation via `v_dot4` -- ~4x the scalar-float dequant on this APU. Plus
+    /// the 256-element IQ codebook quants (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M): the grid coords land in
+    /// int8 (magnitudes + sign, or pre-signed for IQ1) and dp4a against the q8_1 activation, killing
+    /// the COMPUTE-bound scalar grid-table float MACs. IQ4_NL stays scalar (32-elem legacy block, not
+    /// the 256-elem super-block the dp4a core strides). This is the ONE predicate that routes
+    /// decode/MoE to the dp4a core; every other type falls to the scalar `qmatvec_core`. The per-type
+    /// `HANZO_<T>_FALLBACK` env var forces the scalar path for A/B + as the numeric oracle.
     fn dp4a_capable(self) -> bool {
         matches!(
             self,
-            Self::Q4K | Self::Q6K | Self::Q2K | Self::Q3K | Self::Q5K
+            Self::Q4K
+                | Self::Q6K
+                | Self::Q2K
+                | Self::Q3K
+                | Self::Q5K
+                | Self::IQ2_XXS
+                | Self::IQ2_XS
+                | Self::IQ2_S
+                | Self::IQ3_XXS
+                | Self::IQ3_S
+                | Self::IQ1_S
+                | Self::IQ1_M
         )
     }
 
@@ -845,6 +859,13 @@ impl RocmQuantType {
             Self::Q2K => Some("HANZO_Q2K_FALLBACK"),
             Self::Q3K => Some("HANZO_Q3K_FALLBACK"),
             Self::Q5K => Some("HANZO_Q5K_FALLBACK"),
+            Self::IQ2_XXS => Some("HANZO_IQ2XXS_FALLBACK"),
+            Self::IQ2_XS => Some("HANZO_IQ2XS_FALLBACK"),
+            Self::IQ2_S => Some("HANZO_IQ2S_FALLBACK"),
+            Self::IQ3_XXS => Some("HANZO_IQ3XXS_FALLBACK"),
+            Self::IQ3_S => Some("HANZO_IQ3S_FALLBACK"),
+            Self::IQ1_S => Some("HANZO_IQ1S_FALLBACK"),
+            Self::IQ1_M => Some("HANZO_IQ1M_FALLBACK"),
             _ => None,
         }
     }
@@ -879,6 +900,27 @@ impl RocmQuantType {
             (Self::Q5K, Act::F16) => "qmatvec_dp4a_q5k_f16",
             (Self::Q5K, Act::Bf16) => "qmatvec_dp4a_q5k_bf16",
             (Self::Q5K, Act::F32) => "qmatvec_dp4a_q5k_f32",
+            (Self::IQ2_XXS, Act::F16) => "qmatvec_dp4a_iq2xxs_f16",
+            (Self::IQ2_XXS, Act::Bf16) => "qmatvec_dp4a_iq2xxs_bf16",
+            (Self::IQ2_XXS, Act::F32) => "qmatvec_dp4a_iq2xxs_f32",
+            (Self::IQ2_XS, Act::F16) => "qmatvec_dp4a_iq2xs_f16",
+            (Self::IQ2_XS, Act::Bf16) => "qmatvec_dp4a_iq2xs_bf16",
+            (Self::IQ2_XS, Act::F32) => "qmatvec_dp4a_iq2xs_f32",
+            (Self::IQ2_S, Act::F16) => "qmatvec_dp4a_iq2s_f16",
+            (Self::IQ2_S, Act::Bf16) => "qmatvec_dp4a_iq2s_bf16",
+            (Self::IQ2_S, Act::F32) => "qmatvec_dp4a_iq2s_f32",
+            (Self::IQ3_XXS, Act::F16) => "qmatvec_dp4a_iq3xxs_f16",
+            (Self::IQ3_XXS, Act::Bf16) => "qmatvec_dp4a_iq3xxs_bf16",
+            (Self::IQ3_XXS, Act::F32) => "qmatvec_dp4a_iq3xxs_f32",
+            (Self::IQ3_S, Act::F16) => "qmatvec_dp4a_iq3s_f16",
+            (Self::IQ3_S, Act::Bf16) => "qmatvec_dp4a_iq3s_bf16",
+            (Self::IQ3_S, Act::F32) => "qmatvec_dp4a_iq3s_f32",
+            (Self::IQ1_S, Act::F16) => "qmatvec_dp4a_iq1_s_f16",
+            (Self::IQ1_S, Act::Bf16) => "qmatvec_dp4a_iq1_s_bf16",
+            (Self::IQ1_S, Act::F32) => "qmatvec_dp4a_iq1_s_f32",
+            (Self::IQ1_M, Act::F16) => "qmatvec_dp4a_iq1_m_f16",
+            (Self::IQ1_M, Act::Bf16) => "qmatvec_dp4a_iq1_m_bf16",
+            (Self::IQ1_M, Act::F32) => "qmatvec_dp4a_iq1_m_f32",
             _ => unreachable!("dp4a_decode_kernel: {self:?} is not dp4a-capable"),
         }
     }
@@ -901,6 +943,27 @@ impl RocmQuantType {
             (Self::Q5K, Act::F16) => "moe_qmatvec_dp4a_q5k_f16",
             (Self::Q5K, Act::Bf16) => "moe_qmatvec_dp4a_q5k_bf16",
             (Self::Q5K, Act::F32) => "moe_qmatvec_dp4a_q5k_f32",
+            (Self::IQ2_XXS, Act::F16) => "moe_qmatvec_dp4a_iq2xxs_f16",
+            (Self::IQ2_XXS, Act::Bf16) => "moe_qmatvec_dp4a_iq2xxs_bf16",
+            (Self::IQ2_XXS, Act::F32) => "moe_qmatvec_dp4a_iq2xxs_f32",
+            (Self::IQ2_XS, Act::F16) => "moe_qmatvec_dp4a_iq2xs_f16",
+            (Self::IQ2_XS, Act::Bf16) => "moe_qmatvec_dp4a_iq2xs_bf16",
+            (Self::IQ2_XS, Act::F32) => "moe_qmatvec_dp4a_iq2xs_f32",
+            (Self::IQ2_S, Act::F16) => "moe_qmatvec_dp4a_iq2s_f16",
+            (Self::IQ2_S, Act::Bf16) => "moe_qmatvec_dp4a_iq2s_bf16",
+            (Self::IQ2_S, Act::F32) => "moe_qmatvec_dp4a_iq2s_f32",
+            (Self::IQ3_XXS, Act::F16) => "moe_qmatvec_dp4a_iq3xxs_f16",
+            (Self::IQ3_XXS, Act::Bf16) => "moe_qmatvec_dp4a_iq3xxs_bf16",
+            (Self::IQ3_XXS, Act::F32) => "moe_qmatvec_dp4a_iq3xxs_f32",
+            (Self::IQ3_S, Act::F16) => "moe_qmatvec_dp4a_iq3s_f16",
+            (Self::IQ3_S, Act::Bf16) => "moe_qmatvec_dp4a_iq3s_bf16",
+            (Self::IQ3_S, Act::F32) => "moe_qmatvec_dp4a_iq3s_f32",
+            (Self::IQ1_S, Act::F16) => "moe_qmatvec_dp4a_iq1_s_f16",
+            (Self::IQ1_S, Act::Bf16) => "moe_qmatvec_dp4a_iq1_s_bf16",
+            (Self::IQ1_S, Act::F32) => "moe_qmatvec_dp4a_iq1_s_f32",
+            (Self::IQ1_M, Act::F16) => "moe_qmatvec_dp4a_iq1_m_f16",
+            (Self::IQ1_M, Act::Bf16) => "moe_qmatvec_dp4a_iq1_m_bf16",
+            (Self::IQ1_M, Act::F32) => "moe_qmatvec_dp4a_iq1_m_f32",
             _ => unreachable!("dp4a_moe_kernel: {self:?} is not dp4a-capable"),
         }
     }
