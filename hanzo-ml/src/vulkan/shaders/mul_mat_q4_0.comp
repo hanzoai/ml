@@ -1,0 +1,76 @@
+#version 450
+// Q4_0 matrix-matrix product (the prefill/compute path): y[m,n] = sum_k x[m,k]*W[n,k] with W stored
+// in the *native GGML* Q4_0 block format read straight from a GPU buffer -- NO CPU dequant round trip.
+// One GGML BlockQ4_0 = 18 bytes = { f16 d ; u8 qs[16] }: the low nibble of qs[j] -> weight j, the high
+// nibble -> weight j+16, each dequantized as (nibble - 8) * d (byte-exact with k_quants.rs
+// BlockQ4_0::to_float). SAME byte layout and decode as mul_mat_vec_q4_0. Prefill has M>1 activation
+// rows sharing one weight matrix, so the old path dequantized the whole weight to f32 every forward
+// (massive VRAM + bandwidth). This kernel keeps W quantized and decodes each weight value ONCE per
+// output column, reusing it across all M rows: weight traffic equals a single matvec while M rows are
+// produced, instead of M independent weight re-reads. One invocation computes one output column n for
+// up to MAX_M rows (the host tiles M by MAX_M).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Weights as raw GGML bytes, packed into u32 words (18 bytes/block is not 4-aligned, so blocks
+// straddle word boundaries -- everything is byte-addressed out of this array).
+layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // raw Q4_0 blocks, 18 B each
+layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activations, row-major [M, k]
+layout(set = 0, binding = 2) writeonly buffer Y { float  y[]; };  // output, row-major [M, nout]
+// m0: first activation row this dispatch handles; mcount: rows in this tile (1..MAX_M); nout: total
+// columns; k: contraction dim (multiple of 32). x row stride is k, y row stride is nout. woff: u32
+// WORD offset into w[] where this weight matrix starts (0 for a plain 2D weight).
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
+
+const uint MAX_M = 8u; // register accumulators per invocation; host tiles M by this
+
+// Read one byte at absolute byte-offset `bo` from the u32-packed weight buffer.
+uint rdbyte(uint bo) {
+    return bitfieldExtract(w[bo >> 2u], int((bo & 3u) * 8u), 8);
+}
+// Read the f16 block scale `d` (2 little-endian bytes at `bo`) as f32.
+float rdscale(uint bo) {
+    uint lo = rdbyte(bo);
+    uint hi = rdbyte(bo + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 32u;
+    uint rowbase = woff * 4u + n * nblocks * 18u; // byte offset of weight row n
+    float acc[MAX_M];
+    for (uint r = 0u; r < MAX_M; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint b = 0u; b < nblocks; b++) {
+        uint bb = rowbase + b * 18u;  // byte offset of this block
+        float d = rdscale(bb);
+        uint qbase = bb + 2u;         // qs[] starts after the 2-byte scale
+        uint xb = b * 32u;            // activation base for this block
+        float bsum[MAX_M];
+        for (uint r = 0u; r < MAX_M; r++) {
+            bsum[r] = 0.0;
+        }
+        for (uint j = 0u; j < 16u; j++) {
+            uint q = rdbyte(qbase + j);
+            // Decode the two weights of this byte ONCE, then reuse across all rows.
+            float x0 = float(int(q & 0x0Fu) - 8);  // low nibble -> weight j
+            float x1 = float(int(q >> 4u) - 8);     // high nibble -> weight j+16
+            for (uint r = 0u; r < mcount; r++) {
+                uint xrow = (m0 + r) * k + xb;
+                bsum[r] += x0 * x[xrow + j];
+                bsum[r] += x1 * x[xrow + j + 16u];
+            }
+        }
+        for (uint r = 0u; r < mcount; r++) {
+            acc[r] += d * bsum[r];
+        }
+    }
+    for (uint r = 0u; r < mcount; r++) {
+        y[(m0 + r) * nout + n] = acc[r];
+    }
+}
