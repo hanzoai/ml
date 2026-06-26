@@ -250,3 +250,28 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   (max_w_err ~1e-8 vs the ml-op reference) across ntok 1..1024, experts 60..256, topk 4..8, norm
   on/off; all prior oracles still nbad=0. Next kernel-count levers: fused gate+up+silu, fused
   rope+cache.
+
+## ROCm quant-zoo -- 16 new GGUF decode families merged to ONE wired set (22 types, all bit-exact)
+- Four sibling branches each added native ROCm decode for a different quant family, all editing the
+  SAME three files (`quant.hip`, `rocm_backend/mod.rs`, `quantized/mod.rs`); hand-merged into ONE
+  wired set. Now `RocmQuantType` has 22 variants: the 6 base (Q8_0/Q4_0/Q4_K/Q6_K/IQ4_XS/TQ2_0) +
+  Q2_K/Q3_K + Q5_K/Q4_1/Q5_0/Q5_1/Q8_1 + IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S + IQ4_NL/TQ1_0/IQ1_S/IQ1_M.
+  Every type decodes through the SAME `qmatvec_core<WTYPE>` (+ `moe_qmatvec_core` MoE twin); the
+  five K-quants Q4_K/Q6_K/Q2_K/Q3_K/Q5_K also ride the int8-dp4a `qdp4a<WTYPE>` core. IQ2/IQ3 carry
+  embedded `__constant__` codebook grids (IQ2XXS/IQ2XS/IQ2S/IQ3XXS/IQ3S + KSIGNS); IQ1_S/IQ1_M carry
+  IQ1S_GRID; IQ4_NL reuses the existing KVALUES_IQ4NL codebook.
+- **Decomplected the prefill predicate to ONE `RocmQuantType::qmmq_capable(&self)`** (the branches had
+  invented three names: `prefill_capable`, two `qmmq_capable`s). It is the int8-WMMA-prefill ALLOWLIST
+  == exactly the types with a `DEFINE_QMMQ`/`wt_traits<WTYPE>` kernel: {Q8_0, Q4_0, Q4_K, Q6_K, IQ4_XS,
+  TQ2_0, Q5_K, Q4_1, Q5_0, Q5_1, Q8_1} (11 true). The 11 decode-only types (Q2_K/Q3_K + all IQ*/TQ*
+  codebook/fractional) are false -> dense prefill dequantizes-to-f16, MoE prefill rides the per-slot
+  matvec core (correct at any token count). ONE gate, read at the dense `forward` filter + both MoE
+  `use_qmmq` sites; an allowlist so a future decode-only type defaults to the safe dequant path.
+- `DW_*` ids renumbered contiguous 0..21 (base 0-5 unchanged; the merge appends b1->b2->b3->b4). Ids
+  are arbitrary tags -- every trait/macro selects by symbolic name and dispatch is by kernel-name
+  string, so renumbering is free. `WT_*` stays 0..10 (only the qmmq-capable types). Verified block
+  bytes against the structs: Q2_K=84, Q3_K=110, Q5_K=176, Q4_1=20, Q5_0=22, Q5_1=24, Q8_1=36.
+- Oracle gate (engine hanzo-cli, gfx1151): all 22 types decode `nbad=0` (qmatvec_unified + iq2/iq3/
+  iq1/iq4nl), all 11 prefill types `nbad=0` (qmmq_unified), MoE decode + moe_combine + moe_route
+  `nbad=0`, and the 6 pre-existing types unchanged (zero regression). bit-exact vs the CPU `to_float`
+  oracle. `BlockQ8_1::to_float` (k_quants.rs) implemented so the Q8_1 weight type has a CPU reference.
