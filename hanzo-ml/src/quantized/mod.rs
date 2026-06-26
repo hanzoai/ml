@@ -1249,6 +1249,51 @@ pub fn moe_combine(ys: &Tensor, scores: &Tensor) -> Result<Tensor> {
     ys.broadcast_mul(&scores.unsqueeze(D::Minus1)?)?.sum(D::Minus2)
 }
 
+/// Fused MoE router. Reduces the F32 router logits [ntok, n_experts] to the topk selected expert
+/// ids [ntok, topk] (descending logit) and their softmax weights [ntok, topk]; `norm` renormalizes
+/// the topk weights to sum 1 (norm_topk_prob). On ROCm this is ONE `moe_route` kernel replacing the
+/// softmax->sort->narrow->sum->div chain (~6 launches/layer); elsewhere it is that chain via ml ops.
+pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Tensor)> {
+    let (ntok, n_experts) = logits.dims2()?;
+    #[cfg(feature = "rocm")]
+    if let Device::Rocm(dev) = logits.device() {
+        if std::env::var("HANZO_MOE_ROUTE_FALLBACK").is_err() {
+            let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
+            let (lg_store, _) = logits_c.storage_and_layout();
+            let lr = match &*lg_store {
+                Storage::Rocm(r) => r,
+                _ => crate::bail!("moe_route: logits not on rocm after contiguous()"),
+            };
+            let (ids, w) = dev.moe_route(lr, ntok, n_experts, topk, norm)?;
+            let ids_t = crate::tensor::from_storage(
+                Storage::Rocm(ids),
+                (ntok, topk),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            let w_t = crate::tensor::from_storage(
+                Storage::Rocm(w),
+                (ntok, topk),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            return Ok((ids_t, w_t));
+        }
+    }
+    let lf = logits.to_dtype(DType::F32)?;
+    let mx = lf.max_keepdim(D::Minus1)?;
+    let e = lf.broadcast_sub(&mx)?.exp()?;
+    let z = e.sum_keepdim(D::Minus1)?;
+    let p = e.broadcast_div(&z)?;
+    let (sv, si) = p.sort_last_dim(false)?;
+    let ids = si.narrow(D::Minus1, 0, topk)?.contiguous()?;
+    let mut w = sv.narrow(D::Minus1, 0, topk)?.contiguous()?;
+    if norm {
+        w = w.broadcast_div(&w.sum_keepdim(D::Minus1)?)?;
+    }
+    Ok((ids, w))
+}
+
 thread_local! {
     static DEQUANTIZE_ALL: bool = {
         match std::env::var("DEQUANTIZE_ALL") {
