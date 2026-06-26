@@ -364,6 +364,10 @@ extern "C" __global__ __launch_bounds__(MOE_ROUTE_THREADS) void moe_route(
 // truth for the 6-bit scale layout).
 __device__ __forceinline__ void q4k_scale_min(const uint8_t* __restrict__ s, int j, int* sc, int* m);
 
+// q3k_scales unpack -- DEFINED below (reused by the scalar Q3_K path + the dp4a Q3_K kernel);
+// forward-declared here so both call the SAME 16-scale reconstruction (one source of truth).
+__device__ __forceinline__ void q3k_scales(const uint8_t* __restrict__ s, int8_t* __restrict__ out);
+
 // Decode-side weight type ids -- the SINGLE shared id space for BOTH the int8-dp4a core
 // (`qdp4a<WTYPE>` / `qmatvec_dp4a_core`) and the scalar core (`qdec<WTYPE>` / `qmatvec_core`); the
 // Rust `RocmQuantType` selects the dp4a vs scalar entry point per type. Distinct from the prefill
@@ -376,6 +380,8 @@ __device__ __forceinline__ void q4k_scale_min(const uint8_t* __restrict__ s, int
 #define DW_Q6_K   3   // 210 B, 256 elems, symmetric K-quant (6-bit). val = d*sc*(q-32)
 #define DW_IQ4_XS 4   // 136 B, 256 elems, symmetric codebook (LUT).  val = d*(ls-32)*KVALUES[idx]
 #define DW_TQ2_0  5   // 66 B,  256 elems, symmetric ternary (2-bit). val = d*((q&3)-1)
+#define DW_Q2_K   6   // 84 B,  256 elems, ASYMMETRIC k-quant (2-bit). val = d*sc*q - dmin*m (q 0..3)
+#define DW_Q3_K   7   // 110 B, 256 elems, symmetric k-quant (3-bit). val = d*sc*(q-4) (q 0..7, sc signed)
 
 // Type-dispatched f32 -> output store (the only place the element type leaks): __half needs
 // __float2half, hip_bfloat16 takes float in its ctor. Keeps both cores' epilogue type-agnostic.
@@ -542,11 +548,105 @@ template <> struct qdp4a<DW_Q6_K> {
     }
 };
 
+// Q2_K (ASYMMETRIC 2-bit). block_q2_K = {scales[16], qs[64], d (f16), dmin (f16)} = 84 B. The 256
+// elems are 8 32-blocks J; 32-block J holds TWO 16-elem sub-blocks: lo (scale 2J) + hi (scale 2J+1),
+// each scales[is] packing a 4-bit scale (&0xF) + 4-bit min (>>4). qs byte (J>>2)*32 + r packs the
+// 2-bit quant of element r of 32-block J at bit (2*(J&3)). q in [0,3] is a valid int8 so dp4a runs it
+// directly; the per-sub-block min rides the dp4a(0x01010101,u) sum (like Q4_K's dot2). NSUB=8: one
+// 32-block (lo+hi) per sub-unit = one q8_1 32-scale d8[J], so the warp fills on narrow-k expert shapes.
+template <> struct qdp4a<DW_Q2_K> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int sub) {
+        const uint8_t* scales = blk;                                        // 16
+        const int* qs = reinterpret_cast<const int*>(blk + 16);            // 64 B = 16 ints
+        const float d    = __half2float(*reinterpret_cast<const __half*>(blk + 80));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 82));
+        const int J = sub;                                                  // 32-block index 0..7
+        const int shift = 2 * (J & 3);
+        const int* qint = qs + (J >> 2) * 8;                               // 8 ints for this 32-block
+        const int* u    = reinterpret_cast<const int*>(xq8) + J * 8;       // 8 q8_1 ints
+        const float d8  = __half2float(xd8[J]);
+        const uint8_t sc_lo = scales[2 * J];
+        const uint8_t sc_hi = scales[2 * J + 1];
+        int dlo = 0, mlo = 0, dhi = 0, mhi = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {                                       // lo 16: ints 0..3 (scale 2J)
+            const int q = (qint[i] >> shift) & 0x03030303;
+            dlo = hip_dp4a(q, u[i], dlo);
+            mlo = hip_dp4a(0x01010101, u[i], mlo);
+        }
+        #pragma unroll
+        for (int i = 4; i < 8; ++i) {                                       // hi 16: ints 4..7 (scale 2J+1)
+            const int q = (qint[i] >> shift) & 0x03030303;
+            dhi = hip_dp4a(q, u[i], dhi);
+            mhi = hip_dp4a(0x01010101, u[i], mhi);
+        }
+        const float sumf_d = d8 * (float)(dlo * (sc_lo & 0xF) + dhi * (sc_hi & 0xF));
+        const float sumf_m = d8 * (float)(mlo * (sc_lo >> 4)  + mhi * (sc_hi >> 4));
+        return d * sumf_d - dmin * sumf_m;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int sub = 0; sub < NSUB; ++sub) s += partial(blk, xq8, xd8, sub);
+        return s;
+    }
+};
+
+// Q3_K (SYMMETRIC 3-bit, signed per-16 scale). block_q3_K = {hmask[32], qs[64], scales[12], d (f16)}
+// = 110 B. Element r of 32-block J: low2 = (qs[(J>>2)*32 + r] >> (2*(J&3))) & 3; hbit = (hmask[r]>>J)&1;
+// q = (low2 | hbit<<2) - 4 in [-4,3]. raw = low2|hbit<<2 in [0,7] is a valid int8 so dp4a runs it; the
+// -4 centering rides the dp4a(0x01010101,u) sum (sum_p (raw-4)u = dot_raw - 4*sum_u, like Q6_K's -32).
+// The signed 6-bit sub-scale (scales[is]-32, per 16 elems) is the q3k_scales reconstruction. NSUB=8.
+template <> struct qdp4a<DW_Q3_K> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int sub) {
+        const int* hmask = reinterpret_cast<const int*>(blk);             // 32 B = 8 ints
+        const int* qs    = reinterpret_cast<const int*>(blk + 32);        // 64 B = 16 ints
+        int8_t sc[16];
+        q3k_scales(blk + 96, sc);                                          // 12 bytes -> 16 i8
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk + 108));
+        const int J = sub;                                                 // 32-block index 0..7
+        const int shift = 2 * (J & 3);
+        const int* qint = qs + (J >> 2) * 8;
+        const int* u    = reinterpret_cast<const int*>(xq8) + J * 8;
+        const float d8  = __half2float(xd8[J]);
+        const int sc_lo = (int)sc[2 * J]     - 32;
+        const int sc_hi = (int)sc[2 * J + 1] - 32;
+        int dlo = 0, slo = 0, dhi = 0, shi = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {                                       // lo 16: ints 0..3
+            const int raw = ((qint[i] >> shift) & 0x03030303) | (((hmask[i] >> J) & 0x01010101) << 2);
+            dlo = hip_dp4a(raw, u[i], dlo);
+            slo = hip_dp4a(0x01010101, u[i], slo);
+        }
+        #pragma unroll
+        for (int i = 4; i < 8; ++i) {                                       // hi 16: ints 4..7
+            const int raw = ((qint[i] >> shift) & 0x03030303) | (((hmask[i] >> J) & 0x01010101) << 2);
+            dhi = hip_dp4a(raw, u[i], dhi);
+            shi = hip_dp4a(0x01010101, u[i], shi);
+        }
+        return d * d8 * (float)(sc_lo * (dlo - 4 * slo) + sc_hi * (dhi - 4 * shi));
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int sub = 0; sub < NSUB; ++sub) s += partial(blk, xq8, xd8, sub);
+        return s;
+    }
+};
+
 // Per-type byte stride for the q8_1-paired dp4a path (= on-disk super-block bytes; mirrors
 // qdw_traits::BYTES). All wired dp4a types are 256-element super-blocks.
 template <int WTYPE> struct qdp4a_traits;
 template <> struct qdp4a_traits<DW_Q4_K> { static constexpr int BYTES = 144; };
 template <> struct qdp4a_traits<DW_Q6_K> { static constexpr int BYTES = 210; };
+template <> struct qdp4a_traits<DW_Q2_K> { static constexpr int BYTES = 84;  };
+template <> struct qdp4a_traits<DW_Q3_K> { static constexpr int BYTES = 110; };
 
 // THE unified dp4a decode core. Warp per output row; lane-strided over the row's 256-elem
 // super-blocks; per-type `qdp4a<WTYPE>::block` does the int8 dot of one super-block against its
@@ -692,6 +792,8 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
 
 DEFINE_QMATVEC_DP4A(q4k, DW_Q4_K)
 DEFINE_QMATVEC_DP4A(q6k, DW_Q6_K)
+DEFINE_QMATVEC_DP4A(q2k, DW_Q2_K)
+DEFINE_QMATVEC_DP4A(q3k, DW_Q3_K)
 
 #undef DEFINE_QMATVEC_DP4A
 
@@ -875,6 +977,30 @@ __device__ __forceinline__ void q4k_scale_min(const uint8_t* __restrict__ s, int
     }
 }
 
+// q3k_scales (BlockQ3K::to_float scale unpack): the 12 packed scale bytes encode 16 6-bit sub-block
+// scales -- the low 4 bits of each live in 2 u32, the high 2 bits are packed into the 3rd. Reconstructs
+// 4 u32 from the 3 (the Rust `aux[]` transform bit-for-bit), then writes them out as 16 i8 (still
+// biased: subtract 32 at use). Warp-uniform input (the 12 bytes are shared) so the ALU is amortized.
+__device__ __forceinline__ void q3k_scales(const uint8_t* __restrict__ s, int8_t* __restrict__ out) {
+    const uint32_t KMASK1 = 0x03030303u, KMASK2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    aux[0] = (uint32_t)s[0] | ((uint32_t)s[1] << 8) | ((uint32_t)s[2] << 16) | ((uint32_t)s[3] << 24);
+    aux[1] = (uint32_t)s[4] | ((uint32_t)s[5] << 8) | ((uint32_t)s[6] << 16) | ((uint32_t)s[7] << 24);
+    aux[2] = (uint32_t)s[8] | ((uint32_t)s[9] << 8) | ((uint32_t)s[10] << 16) | ((uint32_t)s[11] << 24);
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+    aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+    aux[0] = (aux[0] & KMASK2) | (((tmp) & KMASK1) << 4);
+    aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        out[g * 4 + 0] = (int8_t)(aux[g] & 0xFF);
+        out[g * 4 + 1] = (int8_t)((aux[g] >> 8) & 0xFF);
+        out[g * 4 + 2] = (int8_t)((aux[g] >> 16) & 0xFF);
+        out[g * 4 + 3] = (int8_t)((aux[g] >> 24) & 0xFF);
+    }
+}
+
 // Lane `lane` (0..31)'s partial dot over one super-block: sums its weight-position across all 8
 // sub-blocks. Templated on activation type so f16/bf16 share the exact f32 math. `blk` -> 144-byte
 // block, `xb` -> the 256 activations for this super-block.
@@ -1018,6 +1144,8 @@ template <> struct qdw_traits<DW_Q4_K>   { static constexpr int BYTES = 144; sta
 template <> struct qdw_traits<DW_Q6_K>   { static constexpr int BYTES = 210; static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 16; };
 template <> struct qdw_traits<DW_IQ4_XS> { static constexpr int BYTES = 136; static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 8; };
 template <> struct qdw_traits<DW_TQ2_0>  { static constexpr int BYTES = 66;  static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_Q2_K>   { static constexpr int BYTES = 84;  static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = false; static constexpr int NSC = 16; };
+template <> struct qdw_traits<DW_Q3_K>   { static constexpr int BYTES = 110; static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 16; };
 
 // Per-type decode. `partial<XT>(blk, xb, lane)` returns lane L's partial dot over its owned
 // positions { e*32 + L } of ONE block, mirroring the CPU `to_float` for that type bit-for-bit.
@@ -1135,6 +1263,58 @@ template <> struct qdec<DW_TQ2_0> {
     }
 };
 
+// Q2_K: ASYMMETRIC 2-bit. Block = scales[16], qs[64], d (f16), dmin (f16) = 84 B. Lane L owns
+// positions { e*32 + L }, e in 0..8 = 32-block J=e. scale index is = 2*e + (L>=16); dl = d*(sc&0xF),
+// ml = dmin*(sc>>4); q = (qs[(e>>2)*32 + L] >> (2*(e&3))) & 3; val = dl*q - ml. (BlockQ2K::to_float.)
+template <> struct qdec<DW_Q2_K> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const uint8_t* scales = blk;          // 16
+        const uint8_t* qs     = blk + 16;     // 64
+        const float d    = __half2float(*reinterpret_cast<const __half*>(blk + 80));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 82));
+        const int half = lane >> 4;           // 0/1 -> low/high 16 of the 32-block
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int shift = 2 * (e & 3);
+            const uint8_t sc = scales[e * 2 + half];
+            const float dl = d    * (float)(sc & 0xF);
+            const float ml = dmin * (float)(sc >> 4);
+            const int q = (qs[(e >> 2) * 32 + lane] >> shift) & 3;
+            s += (dl * (float)q - ml) * (float)xb[e * 32 + lane];
+        }
+        return s;
+    }
+};
+
+// Q3_K: symmetric 3-bit, signed per-16 scale. Block = hmask[32], qs[64], scales[12], d (f16) = 110 B.
+// Lane L owns { e*32 + L }, e = 32-block J. scale index is = 2*e + (L>=16); 3-bit q = (low2 | hbit<<2)
+// - 4, low2 = (qs[(e>>2)*32 + L] >> (2*(e&3)))&3, hbit = (hmask[L]>>e)&1; val = d*(sc[is]-32)*q.
+template <> struct qdec<DW_Q3_K> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const uint8_t* hmask = blk;           // 32
+        const uint8_t* qs    = blk + 32;      // 64
+        int8_t sc[16];
+        q3k_scales(blk + 96, sc);             // 12 scale bytes -> 16 i8
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk + 108));
+        const int half = lane >> 4;
+        const uint8_t hm = hmask[lane];       // hmask byte index = position within 32-block = lane
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int shift = 2 * (e & 3);
+            const float dl = d * (float)((int)sc[e * 2 + half] - 32);
+            const int low2 = (qs[(e >> 2) * 32 + lane] >> shift) & 3;
+            const int hbit = (hm >> e) & 1;
+            const int q = (low2 | (hbit << 2)) - 4;
+            s += dl * (float)q * (float)xb[e * 32 + lane];
+        }
+        return s;
+    }
+};
+
 // Whole-block decode: lane L computes the COMPLETE dot of ONE block over ALL its ELEMS positions,
 // reusing the per-type `qdec<WTYPE>::partial` per-position math. Because `partial(blk,xb,p)` returns
 // the dot over the position-set { e*32 + p } owned by "lane" p, summing it over p = 0..31 covers
@@ -1210,6 +1390,8 @@ DEFINE_QMATVECU(q4k,   DW_Q4_K)
 DEFINE_QMATVECU(q6k,   DW_Q6_K)
 DEFINE_QMATVECU(iq4xs, DW_IQ4_XS)
 DEFINE_QMATVECU(tq2_0, DW_TQ2_0)
+DEFINE_QMATVECU(q2k,   DW_Q2_K)
+DEFINE_QMATVECU(q3k,   DW_Q3_K)
 
 // THE unified indexed-MoE decode core. Same warp-per-row + lane-strided-block math as
 // `qmatvec_core`, but ALL routed slots run in ONE launch with the routed expert on grid.y:
@@ -1283,6 +1465,8 @@ DEFINE_MOE_QMATVECU(q4k,   DW_Q4_K)
 DEFINE_MOE_QMATVECU(q6k,   DW_Q6_K)
 DEFINE_MOE_QMATVECU(iq4xs, DW_IQ4_XS)
 DEFINE_MOE_QMATVECU(tq2_0, DW_TQ2_0)
+DEFINE_MOE_QMATVECU(q2k,   DW_Q2_K)
+DEFINE_MOE_QMATVECU(q3k,   DW_Q3_K)
 
 #undef DEFINE_MOE_QMATVECU
 #undef DEFINE_QMATVECU
@@ -1292,6 +1476,8 @@ DEFINE_MOE_QMATVECU(tq2_0, DW_TQ2_0)
 #undef DW_Q6_K
 #undef DW_IQ4_XS
 #undef DW_TQ2_0
+#undef DW_Q2_K
+#undef DW_Q3_K
 
 // ----------------------------------------------------------------------------------------------
 // Native Q8_0 quant GEMM (prefill path) using RDNA3 WMMA (matrix cores).

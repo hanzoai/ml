@@ -514,6 +514,8 @@ pub enum RocmQuantType {
     Q6K,
     IQ4_XS,
     TQ2_0,
+    Q2K,
+    Q3K,
 }
 
 impl RocmQuantType {
@@ -528,6 +530,8 @@ impl RocmQuantType {
             G::Q6K => Self::Q6K,
             G::IQ4_XS => Self::IQ4_XS,
             G::TQ2_0 => Self::TQ2_0,
+            G::Q2K => Self::Q2K,
+            G::Q3K => Self::Q3K,
             _ => return None,
         })
     }
@@ -536,7 +540,7 @@ impl RocmQuantType {
     pub fn block_elems(self) -> usize {
         match self {
             Self::Q8_0 | Self::Q4_0 => 32,
-            Self::Q4K | Self::Q6K | Self::IQ4_XS | Self::TQ2_0 => 256,
+            Self::Q4K | Self::Q6K | Self::IQ4_XS | Self::TQ2_0 | Self::Q2K | Self::Q3K => 256,
         }
     }
 
@@ -550,6 +554,8 @@ impl RocmQuantType {
             Self::Q6K => 210,
             Self::IQ4_XS => 136,
             Self::TQ2_0 => 66,
+            Self::Q2K => 84,
+            Self::Q3K => 110,
         }
     }
 
@@ -558,7 +564,15 @@ impl RocmQuantType {
     /// carry a per-sub-block min, so their prefill GEMM also reads the q8_1 activation block-sum
     /// (`quantize_q8_1`) for the `-dmin*m*d_x*sum` bias term; symmetric types never need it.
     pub fn symmetric(self) -> bool {
-        !matches!(self, Self::Q4K)
+        !matches!(self, Self::Q4K | Self::Q2K)
+    }
+
+    /// Whether this type has a native int8-WMMA prefill GEMM (`qmmq_core<WTYPE>`). Q2_K/Q3_K are
+    /// DECODE-native only (the per-16 asym/signed-scale super-block has no qmmq path yet), so their
+    /// prefill (rows>1) routes to the dequant-f16 matmul (dense) / the matvec core (MoE) -- correct
+    /// and memory-native, just not WMMA-accelerated. Every other wired type has the fused prefill GEMM.
+    pub fn qmmq_capable(self) -> bool {
+        !matches!(self, Self::Q2K | Self::Q3K)
     }
 
     /// The UNIFIED prefill GEMM entry point for this type (int8 WMMA, `qmmq_core<WTYPE>` in
@@ -572,6 +586,7 @@ impl RocmQuantType {
             Self::Q6K => "qmmq_q6k_f16",
             Self::IQ4_XS => "qmmq_iq4xs_f16",
             Self::TQ2_0 => "qmmq_tq2_0_f16",
+            Self::Q2K | Self::Q3K => unreachable!("{self:?} has no qmmq prefill (gated by qmmq_capable)"),
         }
     }
 
@@ -598,6 +613,7 @@ impl RocmQuantType {
             (Self::TQ2_0, 128) => "moe_qmmq_tq2_0_f16",
             (Self::TQ2_0, 64) => "moe_qmmq_tq2_0_tm64_f16",
             (Self::TQ2_0, _) => "moe_qmmq_tq2_0_tm32_f16",
+            (Self::Q2K | Self::Q3K, _) => unreachable!("{self:?} has no qmmq prefill (gated by qmmq_capable)"),
         }
     }
 
@@ -617,6 +633,10 @@ impl RocmQuantType {
             (Self::IQ4_XS, false) => "qmatvecu_iq4xs_bf16",
             (Self::TQ2_0, true) => "qmatvecu_tq2_0_f16",
             (Self::TQ2_0, false) => "qmatvecu_tq2_0_bf16",
+            (Self::Q2K, true) => "qmatvecu_q2k_f16",
+            (Self::Q2K, false) => "qmatvecu_q2k_bf16",
+            (Self::Q3K, true) => "qmatvecu_q3k_f16",
+            (Self::Q3K, false) => "qmatvecu_q3k_bf16",
         }
     }
 
@@ -638,6 +658,10 @@ impl RocmQuantType {
             (Self::IQ4_XS, false) => "moe_qmatvecu_iq4xs_bf16",
             (Self::TQ2_0, true) => "moe_qmatvecu_tq2_0_f16",
             (Self::TQ2_0, false) => "moe_qmatvecu_tq2_0_bf16",
+            (Self::Q2K, true) => "moe_qmatvecu_q2k_f16",
+            (Self::Q2K, false) => "moe_qmatvecu_q2k_bf16",
+            (Self::Q3K, true) => "moe_qmatvecu_q3k_f16",
+            (Self::Q3K, false) => "moe_qmatvecu_q3k_bf16",
         }
     }
 
@@ -648,7 +672,7 @@ impl RocmQuantType {
     /// routes decode/MoE to the dp4a core; every other type falls to the scalar `qmatvec_core`. The
     /// per-type `HANZO_<T>_FALLBACK` env var forces the scalar path for A/B + as the numeric oracle.
     fn dp4a_capable(self) -> bool {
-        matches!(self, Self::Q4K | Self::Q6K)
+        matches!(self, Self::Q4K | Self::Q6K | Self::Q2K | Self::Q3K)
     }
 
     /// Env var that forces this dp4a-capable type back to the scalar `qmatvec_core` (A/B + the
@@ -657,6 +681,8 @@ impl RocmQuantType {
         match self {
             Self::Q4K => Some("HANZO_Q4K_FALLBACK"),
             Self::Q6K => Some("HANZO_Q6K_FALLBACK"),
+            Self::Q2K => Some("HANZO_Q2K_FALLBACK"),
+            Self::Q3K => Some("HANZO_Q3K_FALLBACK"),
             _ => None,
         }
     }
@@ -682,6 +708,12 @@ impl RocmQuantType {
             (Self::Q6K, Act::F16) => "qmatvec_dp4a_q6k_f16",
             (Self::Q6K, Act::Bf16) => "qmatvec_dp4a_q6k_bf16",
             (Self::Q6K, Act::F32) => "qmatvec_dp4a_q6k_f32",
+            (Self::Q2K, Act::F16) => "qmatvec_dp4a_q2k_f16",
+            (Self::Q2K, Act::Bf16) => "qmatvec_dp4a_q2k_bf16",
+            (Self::Q2K, Act::F32) => "qmatvec_dp4a_q2k_f32",
+            (Self::Q3K, Act::F16) => "qmatvec_dp4a_q3k_f16",
+            (Self::Q3K, Act::Bf16) => "qmatvec_dp4a_q3k_bf16",
+            (Self::Q3K, Act::F32) => "qmatvec_dp4a_q3k_f32",
             _ => unreachable!("dp4a_decode_kernel: {self:?} is not dp4a-capable"),
         }
     }
@@ -695,6 +727,12 @@ impl RocmQuantType {
             (Self::Q6K, Act::F16) => "moe_qmatvec_dp4a_q6k_f16",
             (Self::Q6K, Act::Bf16) => "moe_qmatvec_dp4a_q6k_bf16",
             (Self::Q6K, Act::F32) => "moe_qmatvec_dp4a_q6k_f32",
+            (Self::Q2K, Act::F16) => "moe_qmatvec_dp4a_q2k_f16",
+            (Self::Q2K, Act::Bf16) => "moe_qmatvec_dp4a_q2k_bf16",
+            (Self::Q2K, Act::F32) => "moe_qmatvec_dp4a_q2k_f32",
+            (Self::Q3K, Act::F16) => "moe_qmatvec_dp4a_q3k_f16",
+            (Self::Q3K, Act::Bf16) => "moe_qmatvec_dp4a_q3k_bf16",
+            (Self::Q3K, Act::F32) => "moe_qmatvec_dp4a_q3k_f32",
             _ => unreachable!("dp4a_moe_kernel: {self:?} is not dp4a-capable"),
         }
     }
