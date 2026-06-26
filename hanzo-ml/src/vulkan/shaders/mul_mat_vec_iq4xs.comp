@@ -1,0 +1,57 @@
+#version 450
+// IQ4_XS matrix-vector product (decode / memory-bound path): y[n] = sum_k W[n,k]*x[k], W stored as
+// GGUF IQ4_XS super-blocks kept verbatim in VRAM (no host requantize). One block packs 256 weights
+// into 136 bytes = 34 u32: d (f16 byte 0..2), scales_h (u16 byte 2..4), scales_l[4] (byte 4..8),
+// qs[128] (byte 8..136, two non-uniform 4-bit codebook indices per byte). Per 32-weight sub-block the
+// 6-bit scale ls = scales_l-nibble | (scales_h 2 bits << 4); dl = d*(ls-32); weight = dl*kvalues[idx]
+// (byte-exact with k_quants.rs BlockIQ4xs::to_float). 136 is a multiple of 4, so the block is
+// word-indexed. One invocation computes one output element.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // IQ4_XS blocks, 34 u32 / 256-block
+layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activation vector, length k
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
+layout(push_constant) uniform Pc { uint nout; uint k; };         // k is a multiple of 256
+
+const uint BLK_U32 = 34u;   // 136 bytes / 4
+const uint SL_BYTE = 4u;    // byte offset of scales_l[4]
+const uint QS_BYTE = 8u;    // byte offset of qs[128]
+
+// Non-uniform 4-bit codebook (llama.cpp kvalues_iq4nl; shared by IQ4_NL and IQ4_XS).
+const int KV[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+// Unsigned byte `b` (0-based) within the block at u32 index `base`.
+uint byte_u(uint base, uint b) {
+    return (w[base + (b >> 2u)] >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 256u;
+    uint rowbase = n * nblocks * BLK_U32; // u32 offset of row n
+    float acc = 0.0;
+    for (uint blk = 0u; blk < nblocks; blk++) {
+        uint base = rowbase + blk * BLK_U32;
+        float d_all = float(unpackHalf2x16(w[base]).x);   // d in low half of u32[0]
+        uint scales_h = w[base] >> 16u;                   // scales_h in high half of u32[0]
+        uint xblk = blk * 256u;
+        // 8 sub-blocks of 32 weights. Sub-block ib uses qs[ib*16..], outputs [ib*32..].
+        for (uint ib = 0u; ib < 8u; ib++) {
+            uint sl = byte_u(base, SL_BYTE + (ib >> 1u));
+            uint ls = ((sl >> (4u * (ib & 1u))) & 0x0Fu) | (((scales_h >> (2u * ib)) & 3u) << 4u);
+            float dl = d_all * float(int(ls) - 32);
+            uint qoff = QS_BYTE + ib * 16u;
+            uint xoff = xblk + ib * 32u;
+            for (uint j = 0u; j < 16u; j++) {
+                uint q = byte_u(base, qoff + j);
+                acc += dl * float(KV[q & 0x0Fu]) * x[xoff + j];
+                acc += dl * float(KV[q >> 4u])   * x[xoff + j + 16u];
+            }
+        }
+    }
+    y[n] = acc;
+}
