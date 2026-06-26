@@ -1,0 +1,55 @@
+#version 450
+// TQ2_0 matrix-vector product (decode / memory-bound path): y[n] = sum_k W[n,k]*x[k] with W stored
+// in the *native GGML* TQ2_0 ternary block format read straight from a GPU buffer -- NO CPU dequant
+// round trip. Each row is K/256 blocks; one GGML block_tq2_0 = 66 bytes = { u8 qs[64] ; f16 d }
+// (qs FIRST, then d). Each qs byte packs four 2-bit ternary values; weight = (q - 1) * d with q in
+// {0,1,2} (byte-exact with iq_quants.rs BlockTQ2_0::to_float). 66 B is not 4-aligned, so the block
+// run is byte-addressed out of the u32 buffer (like Q4_0/Q8_0). One invocation = one output element.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint  w[]; };  // raw TQ2_0 blocks, 66 B each
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };  // activation vector, length k
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
+layout(push_constant) uniform Pc { uint nout; uint k; };        // k is a multiple of 256
+
+// Read one byte at absolute byte-offset `bo` from the u32-packed weight buffer.
+uint rdbyte(uint bo) {
+    return bitfieldExtract(w[bo >> 2u], int((bo & 3u) * 8u), 8);
+}
+// Read the f16 block scale `d` (2 little-endian bytes at `bo`) as f32.
+float rdscale(uint bo) {
+    uint lo = rdbyte(bo);
+    uint hi = rdbyte(bo + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 256u;
+    uint rowbase = n * nblocks * 66u; // byte offset of row n
+    float acc = 0.0;
+    for (uint b = 0u; b < nblocks; b++) {
+        uint bb = rowbase + b * 66u;      // byte offset of this block
+        float d = rdscale(bb + 64u);      // qs[64] then d
+        uint xblk = b * 256u;
+        // qs (64 bytes) processed in two 32-byte chunks; chunk jc holds 4 ternary lanes (shift 2*l)
+        // mapping to outputs jc*128 + l*32 + m.
+        for (uint jc = 0u; jc < 2u; jc++) {
+            uint qbase = bb + jc * 32u;
+            for (uint l = 0u; l < 4u; l++) {
+                uint shift = 2u * l;
+                uint xbase = xblk + jc * 128u + l * 32u;
+                for (uint m = 0u; m < 32u; m++) {
+                    uint q = rdbyte(qbase + m);
+                    float val = float(int((q >> shift) & 3u) - 1);
+                    acc += val * d * x[xbase + m];
+                }
+            }
+        }
+    }
+    y[n] = acc;
+}

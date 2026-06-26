@@ -1,0 +1,77 @@
+#version 450
+// Q3_K matrix-vector product (decode / memory-bound path): y[n] = sum_k W[n,k]*x[k], W stored as
+// GGUF Q3_K super-blocks. One Q3_K super-block packs 256 weights into 110 bytes:
+//   hmask[0..32]   = high (3rd) bit, one bit/weight (subtracted: bit clear -> -4)
+//   qs[32..96]     = low 2 bits, four weights/byte
+//   scales[96..108]= 12 bytes holding 16 packed 6-bit scales (KMASK reconstruction)
+//   d[108..110]    = f16 super-block scale
+// 110 is not u32-aligned, so the host repacks each block into a PADDED 112-byte (28 u32) stride
+// (`BLK_U32` below); the trailing 2 bytes are unused. The 6-bit scales are reconstructed from three
+// u32 scale words exactly as the CPU does. One invocation computes one output element. Decode MUST
+// match the CPU k_quants BlockQ3K::to_float.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // Q3_K blocks, 28 u32 (padded) / 256-block
+layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activation vector, length k
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
+layout(push_constant) uniform Pc { uint nout; uint k; };         // k is a multiple of 256
+
+const uint BLK_U32 = 28u;   // 112 bytes (110 padded to a u32 multiple) / 4
+const uint HM_BYTE = 0u;    // byte offset of hmask[32]
+const uint QS_BYTE = 32u;   // byte offset of qs[64]
+const uint SC_U32  = 24u;   // u32 index of the 12 scale bytes (byte 96..108 -> u32[24..27])
+const uint D_U32   = 27u;   // u32 index of d (f16, byte 108..110 -> low half of u32[27])
+const uint KMASK1  = 0x03030303u;
+const uint KMASK2  = 0x0f0f0f0fu;
+
+// Unsigned byte `b` (0-based) within the block at u32 index `base`.
+uint byte_u(uint base, uint b) {
+    return (w[base + (b >> 2u)] >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 256u;
+    uint rowbase = n * nblocks * BLK_U32; // u32 offset of row n
+    float acc = 0.0;
+    for (uint blk = 0u; blk < nblocks; blk++) {
+        uint base = rowbase + blk * BLK_U32;
+        float d_all = float(unpackHalf2x16(w[base + D_U32]).x);
+        // Reconstruct the 16 signed 6-bit scales into four u32 words scw[0..4] (each = 4 i8 scales),
+        // bit-for-bit with k_quants.rs BlockQ3K::to_float.
+        uint a0 = w[base + SC_U32];      // scale bytes 0..4
+        uint a1 = w[base + SC_U32 + 1u]; // scale bytes 4..8
+        uint tmp = w[base + SC_U32 + 2u];// scale bytes 8..12
+        uint scw[4];
+        scw[2] = ((a0 >> 4u) & KMASK2) | (((tmp >> 4u) & KMASK1) << 4u);
+        scw[3] = ((a1 >> 4u) & KMASK2) | (((tmp >> 6u) & KMASK1) << 4u);
+        scw[0] = (a0 & KMASK2) | ((tmp & KMASK1) << 4u);
+        scw[1] = (a1 & KMASK2) | (((tmp >> 2u) & KMASK1) << 4u);
+        uint xblk = blk * 256u;
+        // Two 128-weight halves (c); within each, 4 shift groups (sj) x 2 scale sub-groups (si) of 16.
+        for (uint c = 0u; c < 2u; c++) {
+            for (uint sj = 0u; sj < 4u; sj++) {
+                uint shift = 2u * sj;
+                uint mbit = 1u << (4u * c + sj);   // hmask bit selecting this (half, shift)
+                for (uint si = 0u; si < 2u; si++) {
+                    uint is = 8u * c + 2u * sj + si;
+                    int sc = bitfieldExtract(int(scw[is >> 2u]), int((is & 3u) * 8u), 8);
+                    float dl = d_all * (float(sc) - 32.0);
+                    uint qbase = QS_BYTE + c * 32u + 16u * si;
+                    uint hbase = HM_BYTE + 16u * si;
+                    uint xbase = xblk + c * 128u + sj * 32u + si * 16u;
+                    for (uint i = 0u; i < 16u; i++) {
+                        int qv = int((byte_u(base, qbase + i) >> shift) & 3u);
+                        int hs = ((byte_u(base, hbase + i) & mbit) == 0u) ? 4 : 0;
+                        acc += dl * float(qv - hs) * x[xbase + i];
+                    }
+                }
+            }
+        }
+    }
+    y[n] = acc;
+}
