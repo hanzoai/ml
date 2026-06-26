@@ -988,8 +988,19 @@ impl GgmlType for BlockQ8_1 {
         }
     }
 
-    fn to_float(_xs: &[Self], _ys: &mut [f32]) {
-        unimplemented!("no support for vec-dot on Q8_1")
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK8_1),
+            "dequantize_row_q8_1: {k} is not divisible by {QK8_1}"
+        );
+        let nb = k / QK8_1;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            for j in 0..QK8_1 {
+                ys[i * QK8_1 + j] = xs[i].qs[j] as f32 * d;
+            }
+        }
     }
 }
 

@@ -1010,7 +1010,10 @@ impl QTensor {
                 // PREFILL (t>1) routes to the fused expert-grouped WMMA GEMM (f16 activations); DECODE
                 // (t==1) keeps the model's native bf16/f16 on the capture-clean matvec. See the twin in
                 // QStorage::indexed_moe_forward. HANZO_MOE_QMMQ_FALLBACK forces matvec for the A/B.
-                let use_qmmq = t > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
+                // Decode-only types (no qmmq kernel) ride the per-slot matvec core for prefill too
+                // (correct at any token count). ONE predicate gates every prefill site.
+                let use_qmmq =
+                    t > 1 && qt.qmmq_capable() && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
                 let x_flat = match x_exp.dtype() {
                     // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
                     // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
@@ -1503,7 +1506,10 @@ impl QMatMul {
                 // (`moe_qmmq_quant`), which needs f16 activations; DECODE (t==1) stays on the
                 // capture-clean dp4a/scalar matvec, which takes bf16/f16 natively. HANZO_MOE_QMMQ_FALLBACK
                 // forces the matvec on prefill too (the before/after A/B + oracle-equivalence lever).
-                let use_qmmq = t > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
+                // Decode-only types (no qmmq kernel) ride the per-slot matvec core for prefill too
+                // (correct at any token count). ONE predicate gates every prefill site.
+                let use_qmmq =
+                    t > 1 && qt.qmmq_capable() && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
                 let x_flat = match x_exp.dtype() {
                     // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
                     // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
@@ -1753,11 +1759,13 @@ impl crate::Module for QMatMul {
                         // Buckets MATCH the real dispatch below: decode = rows==1 wired (the dp4a-vs-
                         // scalar A/B is internal to matvec_quant, still native); prefill = rows>1 wired
                         // native qmmq_core<WTYPE>; fallback = unwired OR HANZO_QMMQ_FALLBACK dequantize.
-                        let wired = crate::RocmQuantType::from_ggml(*dtype).is_some();
+                        let qt = crate::RocmQuantType::from_ggml(*dtype);
+                        let decode_wired = qt.is_some();
+                        let prefill_wired = qt.is_some_and(|qt| qt.qmmq_capable());
                         let prefill_fb = std::env::var("HANZO_QMMQ_FALLBACK").is_ok();
-                        if rows == 1 && wired {
+                        if rows == 1 && decode_wired {
                             DBG_DECODE.fetch_add(1, Ordering::Relaxed);
-                        } else if rows > 1 && wired && !prefill_fb {
+                        } else if rows > 1 && prefill_wired && !prefill_fb {
                             DBG_PREFILL.fetch_add(1, Ordering::Relaxed);
                         } else {
                             DBG_FALLBACK.fetch_add(1, Ordering::Relaxed);
@@ -1788,6 +1796,14 @@ impl crate::Module for QMatMul {
                 let unified_qt = crate::RocmQuantType::from_ggml(*dtype);
                 #[cfg(not(feature = "rocm"))]
                 let unified_qt: Option<()> = None;
+                // Native int8-WMMA prefill exists only for `qmmq_capable` types; the decode-only types
+                // (Q2_K/Q3_K + every IQ*/TQ* codebook/fractional type) dequantize-to-f16 for rows>1 via
+                // the `else` branch below -- correct, just not WMMA-accelerated. ONE predicate, read here
+                // and at the two MoE `use_qmmq` sites.
+                #[cfg(feature = "rocm")]
+                let qmmq_ok = unified_qt.map(|qt| qt.qmmq_capable()).unwrap_or(false);
+                #[cfg(not(feature = "rocm"))]
+                let qmmq_ok = false;
                 if rows == 1 && unified_qt.is_some() {
                     // Decode: weights stay quantized in VRAM; the ONE native on-GPU quant matvec core
                     // dequantizes per-block on-the-fly (no dense f16 copy). The matvec consumes
@@ -1837,7 +1853,7 @@ impl crate::Module for QMatMul {
                         false,
                     ))
                 } else if let Some(qt) =
-                    unified_qt.filter(|_| std::env::var("HANZO_QMMQ_FALLBACK").is_err())
+                    unified_qt.filter(|_| qmmq_ok && std::env::var("HANZO_QMMQ_FALLBACK").is_err())
                 {
                     // Prefill (rows>1): native int8 WMMA gemm through the ONE unified core
                     // (`qmmq_core<WTYPE>` in quant.hip). Weights stay quantized in VRAM (no resident
