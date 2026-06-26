@@ -92,3 +92,80 @@ ROPE_POS_OP(float, rope_positions_f32)
 ROPE_POS_OP(__half, rope_positions_f16)
 ROPE_POS_OP(hip_bfloat16, rope_positions_bf16)
 #endif
+
+// Fused per-head RMSNorm + positions-RoPE for q and k: ONE block per (which, batch, head, token)
+// normalizes that head's `d`-vector (rms over d, scale = rsqrt(mean(x^2)+eps), *weight) IN f32 then
+// rotates it, in a single launch -- replaces two standalone rms_norm kernels + the rope kernel (and
+// the q/k intermediate write+read). The rms math is faithful to reduce.hip `rmsnorm` (f32 accum,
+// mean+eps under rsqrt, *alpha); only the f32 sum ORDER differs (within the decode numeric gate).
+// Output dtype TO lets the decode store f16 directly (the cast that wrapped the old rope folds in).
+#if defined(__HIPCC__)
+template <typename TI, typename TO>
+__device__ __forceinline__ void rope_norm_positions(
+    const TI* q, const TI* k, const TI* q_weight, const TI* k_weight,
+    const TI* cos, const TI* sin, const uint32_t* positions,
+    TO* q_out, TO* k_out, const float q_eps, const float k_eps,
+    const unsigned int b, const unsigned int h, const unsigned int kh,
+    const unsigned int t, const unsigned int d, const unsigned int is_neox) {
+    extern __shared__ float rn_smem[];          // [d] normed vector + [ceil(blockDim/32)] warp partials
+    float* normed = rn_smem;
+    float* s_sum = rn_smem + d;
+
+    const unsigned int qheads = b * h * t;
+    unsigned int gid = blockIdx.x;
+    const bool isq = gid < qheads;
+    const TI* xin; const TI* w; TO* xout; float eps; unsigned int heads;
+    if (isq) { xin = q; w = q_weight; xout = q_out; eps = q_eps; heads = h; }
+    else { gid -= qheads; xin = k; w = k_weight; xout = k_out; eps = k_eps; heads = kh; }
+    const unsigned int i_t = gid % t; gid /= t;
+    const unsigned int head = gid % heads; gid /= heads;
+    const unsigned int i_b = gid;
+    const size_t base = ((size_t)(i_b * heads + head) * t + i_t) * d;
+
+    const int tid = threadIdx.x;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    const float xi = (float)xin[base + tid];
+    float tmp = xi * xi;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) tmp += __shfl_xor(tmp, off);
+    if ((tid & 31) == 0) s_sum[tid >> 5] = tmp;
+    __syncthreads();
+    float ss = 0.0f;
+    for (int w_i = 0; w_i < nwarps; ++w_i) ss += s_sum[w_i];   // sum the per-warp partials (f32)
+    const float scale = rsqrtf(ss / (float)d + eps);
+    normed[tid] = scale * xi * (float)w[tid];
+    __syncthreads();
+
+    const unsigned int half = d >> 1;
+    const unsigned int cache_row = positions[i_b] + i_t;
+    unsigned int p, partner; bool is_x;
+    if (is_neox) {
+        if ((unsigned)tid < half) { p = tid; partner = tid + half; is_x = true; }
+        else { p = tid - half; partner = tid - half; is_x = false; }
+    } else {
+        p = tid >> 1; is_x = (tid & 1) == 0; partner = is_x ? (tid + 1) : (tid - 1);
+    }
+    const float c = (float)cos[(size_t)cache_row * half + p];
+    const float s = (float)sin[(size_t)cache_row * half + p];
+    const float self_v = normed[tid];
+    const float part_v = normed[partner];
+    const float out = is_x ? (self_v * c - part_v * s) : (self_v * c + part_v * s);
+    xout[base + tid] = (TO)out;
+}
+
+#define ROPE_NORM_OP(TI, TO, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const TI *q, const TI *k, const TI *q_weight, const TI *k_weight, \
+    const TI *cos, const TI *sin, const uint32_t *positions, TO *q_out, TO *k_out, \
+    const float q_eps, const float k_eps, \
+    const unsigned int b, const unsigned int h, const unsigned int kh, \
+    const unsigned int t, const unsigned int d, const unsigned int is_neox) { \
+    rope_norm_positions<TI, TO>(q, k, q_weight, k_weight, cos, sin, positions, q_out, k_out, \
+                                q_eps, k_eps, b, h, kh, t, d, is_neox); \
+}
+
+ROPE_NORM_OP(float, float, rope_norm_positions_f32)
+ROPE_NORM_OP(float, __half, rope_norm_positions_f32_f16)
+ROPE_NORM_OP(__half, __half, rope_norm_positions_f16)
+ROPE_NORM_OP(hip_bfloat16, hip_bfloat16, rope_norm_positions_bf16)
+#endif
