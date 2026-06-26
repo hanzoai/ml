@@ -176,8 +176,24 @@ impl QStorage {
                 GgmlDType::IQ4_XS => cuda::load_quantized(d, as_t_slice::<BlockIQ4xs>(&data)),
                 GgmlDType::MXFP4 => cuda::load_quantized(d, as_t_slice::<BlockMXFP4>(&data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(&data)),
-                // IQ / ternary / 1-bit / NVFP4 codec types have no native CUDA loader (CPU-decode only).
-                other => crate::bail!("{other:?} is not supported on the CUDA backend"),
+                // IQ / ternary / 1-bit / NVFP4 codec types: no native on-GPU quant-matmul kernel, but the
+                // GGML blocks upload to VRAM byte-for-byte like any other quant. QCudaStorage::fwd then
+                // dequantizes them to f32 (CPU codebook decode + upload) for a dense matmul -- see
+                // `has_native_q8_1_matmul`. So an i-quant GGUF that used to bail here now LOADS and DECODES
+                // on CUDA, exact w.r.t. the CPU reference; a native mmvq kernel is the bandwidth follow-up.
+                // Exhaustive on purpose: a future GgmlDType must be wired here (fail-closed at compile) rather
+                // than silently bailing at load.
+                GgmlDType::IQ2_XXS => cuda::load_quantized(d, as_t_slice::<BlockIQ2xxs>(&data)),
+                GgmlDType::IQ2_XS => cuda::load_quantized(d, as_t_slice::<BlockIQ2xs>(&data)),
+                GgmlDType::IQ2_S => cuda::load_quantized(d, as_t_slice::<BlockIQ2s>(&data)),
+                GgmlDType::IQ3_XXS => cuda::load_quantized(d, as_t_slice::<BlockIQ3xxs>(&data)),
+                GgmlDType::IQ3_S => cuda::load_quantized(d, as_t_slice::<BlockIQ3s>(&data)),
+                GgmlDType::IQ1_S => cuda::load_quantized(d, as_t_slice::<BlockIQ1s>(&data)),
+                GgmlDType::IQ1_M => cuda::load_quantized(d, as_t_slice::<BlockIQ1m>(&data)),
+                GgmlDType::TQ1_0 => cuda::load_quantized(d, as_t_slice::<BlockTQ1_0>(&data)),
+                GgmlDType::TQ2_0 => cuda::load_quantized(d, as_t_slice::<BlockTQ2_0>(&data)),
+                GgmlDType::NVFP4 => cuda::load_quantized(d, as_t_slice::<BlockNVFP4>(&data)),
+                GgmlDType::Q1_0 => cuda::load_quantized(d, as_t_slice::<BlockQ1_0>(&data)),
             },
             #[cfg(feature = "rocm")]
             Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(data), d.clone())),
@@ -857,18 +873,12 @@ impl QTensor {
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match &self.storage {
-            // Only dtypes with a fused CUDA indexed-MoE kernel take the fast path; others (e.g. MXFP4)
-            // fall through to the generic per-expert path below, which dequantizes via QMatMul.
-            QStorage::Cuda(s)
-                if matches!(
-                    s.dtype(),
-                    GgmlDType::Q8_0
-                        | GgmlDType::Q2K
-                        | GgmlDType::Q3K
-                        | GgmlDType::Q4K
-                        | GgmlDType::Q5K
-                        | GgmlDType::Q6K
-                ) =>
+            // Only dtypes with a fused CUDA indexed-MoE kernel take the fast path; others (e.g. MXFP4,
+            // i-quant/ternary) fall through to the generic per-expert path below, which dequantizes via
+            // QMatMul. The supported set is derived from the ONE kernel-name table (cuda.rs), so this gate
+            // can't drift from the kernels that actually exist -- which is exactly what had stranded
+            // Q4_0/Q4_1/Q5_0/Q5_1 on the CPU even though their fused kernels are now compiled.
+            QStorage::Cuda(s) if cuda::QCudaStorage::supports_indexed_moe(s.dtype()) =>
             {
                 match (&*x.storage(), &*ids.storage()) {
                 (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
