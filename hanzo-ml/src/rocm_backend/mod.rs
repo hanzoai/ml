@@ -2618,6 +2618,138 @@ impl RocmStorage {
         }
     }
 
+    /// Fused per-head RMSNorm + positions-RoPE for q and k in ONE launch (one block per head-vector):
+    /// `rms_norm(q)*q_weight` + RoPE and the same for k, replacing two standalone `rms_norm` launches +
+    /// `rope_positions`. Output dtype == q's dtype (the q/k cast still wraps it; the f32->f16 fold is a
+    /// separate entry). Bit-faithful to the unfused chain modulo f32 sum order (decode numeric gate).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_norm_positions(
+        &self,
+        q_layout: &Layout,
+        k: &RocmStorage,
+        k_layout: &Layout,
+        q_weight: &RocmStorage,
+        k_weight: &RocmStorage,
+        q_eps: f32,
+        k_eps: f32,
+        cos: &RocmStorage,
+        cos_layout: &Layout,
+        sin: &RocmStorage,
+        sin_layout: &Layout,
+        positions: &RocmStorage,
+        positions_layout: &Layout,
+        is_neox: bool,
+    ) -> Result<(Self, Self)> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, RopeKernel};
+        let q = self;
+        if !q_layout.is_contiguous()
+            || !k_layout.is_contiguous()
+            || !cos_layout.is_contiguous()
+            || !sin_layout.is_contiguous()
+            || !positions_layout.is_contiguous()
+        {
+            crate::bail!("rope_norm_positions on rocm requires contiguous inputs");
+        }
+        let (b, h, t, d) = q_layout.shape().dims4()?;
+        let (kb, kh, kt, kd) = k_layout.shape().dims4()?;
+        if (kb, kt, kd) != (b, t, d) {
+            crate::bail!("rope_norm_positions q/k shape mismatch {q_layout:?} {k_layout:?}");
+        }
+        if d % 2 != 0 || d > 1024 {
+            crate::bail!("rope_norm_positions requires even head dim <= 1024, got {d}");
+        }
+        let pos_mem = match &positions.slice {
+            RocmStorageSlice::U32(m) => m,
+            other => crate::bail!("rope_norm_positions positions must be u32, got {:?}", other.dtype()),
+        };
+        let device = self.device.clone();
+        let q_el = b * h * t * d;
+        let k_el = b * kh * t * d;
+        let (b_u, h_u, kh_u, t_u, d_u) = (b as u32, h as u32, kh as u32, t as u32, d as u32);
+        let neox: u32 = if is_neox { 1 } else { 0 };
+        let nblocks = b * (h + kh) * t;
+        let grid = rocm_rs::hip::Dim3::from(nblocks.max(1) as u32);
+        let block = rocm_rs::hip::Dim3::from(d as u32);
+        let nwarps = d.div_ceil(32);
+        let shmem = ((d + nwarps) * std::mem::size_of::<f32>()) as u32;
+
+        let q_off = q_layout.start_offset();
+        let k_off = k_layout.start_offset();
+        let cos_off = cos_layout.start_offset();
+        let sin_off = sin_layout.start_offset();
+        let pos_off = positions_layout.start_offset();
+
+        macro_rules! launch_rope_norm {
+            ($variant:ident, $ty:ty, $func:literal) => {{
+                let (q_mem, k_mem, qw_mem, kw_mem, cos_mem, sin_mem) = match (
+                    &q.slice, &k.slice, &q_weight.slice, &k_weight.slice, &cos.slice, &sin.slice,
+                ) {
+                    (
+                        RocmStorageSlice::$variant(a),
+                        RocmStorageSlice::$variant(b),
+                        RocmStorageSlice::$variant(c),
+                        RocmStorageSlice::$variant(d),
+                        RocmStorageSlice::$variant(e),
+                        RocmStorageSlice::$variant(f),
+                    ) => (a, b, c, d, e, f),
+                    _ => crate::bail!("rope_norm_positions: q/k/weights/cos/sin must share q's dtype"),
+                };
+                let q_out = device.alloc::<$ty>(q_el)?;
+                let k_out = device.alloc::<$ty>(k_el)?;
+                let q_ptr = unsafe { q_mem.offset_ptr(q_off) };
+                let k_ptr = unsafe { k_mem.offset_ptr(k_off) };
+                let qw_ptr = qw_mem.as_ptr();
+                let kw_ptr = kw_mem.as_ptr();
+                let cos_ptr = unsafe { cos_mem.offset_ptr(cos_off) };
+                let sin_ptr = unsafe { sin_mem.offset_ptr(sin_off) };
+                let pos_ptr = unsafe { pos_mem.offset_ptr(pos_off) };
+                let q_out_ptr = q_out.as_ptr();
+                let k_out_ptr = k_out.as_ptr();
+                unsafe {
+                    launch_kernel_shmem(
+                        &device,
+                        RopeKernel::NAME,
+                        RopeKernel::CODE,
+                        $func,
+                        grid,
+                        block,
+                        shmem,
+                        &mut [
+                            (&q_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&k_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&qw_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&kw_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&cos_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&sin_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&pos_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&q_out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&k_out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            &q_eps as *const f32 as *mut std::ffi::c_void,
+                            &k_eps as *const f32 as *mut std::ffi::c_void,
+                            &b_u as *const u32 as *mut std::ffi::c_void,
+                            &h_u as *const u32 as *mut std::ffi::c_void,
+                            &kh_u as *const u32 as *mut std::ffi::c_void,
+                            &t_u as *const u32 as *mut std::ffi::c_void,
+                            &d_u as *const u32 as *mut std::ffi::c_void,
+                            &neox as *const u32 as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+                Ok((
+                    Self { slice: RocmStorageSlice::$variant(q_out), device: device.clone() },
+                    Self { slice: RocmStorageSlice::$variant(k_out), device: device.clone() },
+                ))
+            }};
+        }
+
+        match &q.slice {
+            RocmStorageSlice::F32(_) => launch_rope_norm!(F32, f32, "rope_norm_positions_f32"),
+            RocmStorageSlice::F16(_) => launch_rope_norm!(F16, f16, "rope_norm_positions_f16"),
+            RocmStorageSlice::BF16(_) => launch_rope_norm!(BF16, bf16, "rope_norm_positions_bf16"),
+            other => crate::bail!("rope_norm_positions on rocm unsupported dtype {:?}", other.dtype()),
+        }
+    }
+
     /// Matrix-core (WMMA) flash-attention forward. `self`=Q `[B,Hq,Lq,D]`, `k`/`v` `[B,Hkv,Lk,D]`
     /// (GQA: `Hq % Hkv == 0`), head dim D must be 128. Returns O `[B,Hq,Lq,D]`. f16/bf16 only.
     /// `causal` enables the per-query upper-triangle skip. Inputs must be contiguous.
