@@ -833,6 +833,28 @@ impl QTensor {
         self.storage.data()
     }
 
+    // Upload this expert bank's GGML bytes to VRAM ONCE and keep it resident, keyed by the stable
+    // (ptr,len) of the QTensor's CPU bytes. Re-uploading the multi-GB bank per token/layer would
+    // dominate decode, so the cache makes MoE bandwidth-bound on the quant matvec, not the H2D copy.
+    #[cfg(feature = "rocm")]
+    fn rocm_moe_bank(
+        &self,
+        dev: &crate::RocmDevice,
+    ) -> Result<std::sync::Arc<crate::RocmStorage>> {
+        use crate::backend::BackendDevice;
+        let bank = self.data()?;
+        let key = (bank.as_ref().as_ptr() as usize, bank.as_ref().len());
+        let cache = rocm_moe_bank_cache();
+        let mut guard = cache.lock().expect("moe bank cache lock");
+        if let Some(w) = guard.get(&key) {
+            Ok(w.clone())
+        } else {
+            let w = std::sync::Arc::new(dev.storage_from_slice(bank.as_ref())?);
+            guard.insert(key, w.clone());
+            Ok(w)
+        }
+    }
+
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match &self.storage {
             // Only dtypes with a fused CUDA indexed-MoE kernel take the fast path; others (e.g. MXFP4)
@@ -1027,24 +1049,7 @@ impl QTensor {
                     DType::F32 if qt.dp4a_active() => x_exp.reshape((nrows, k))?.contiguous()?,
                     _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
                 };
-                use crate::backend::BackendDevice;
-                let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
-                // Upload the expert bank to VRAM ONCE and keep it resident: the bank's CPU bytes are
-                // owned by this QTensor for the model's lifetime, so (ptr,len) is a stable key. Re-
-                // uploading the (multi-GB) bank on every token/layer would dominate decode; caching
-                // makes the MoE bandwidth-bound on the quant decode, not the host->device copy.
-                let wbank = {
-                    let key = (bank.as_ref().as_ptr() as usize, bank.as_ref().len());
-                    let cache = rocm_moe_bank_cache();
-                    let mut guard = cache.lock().expect("moe bank cache lock");
-                    if let Some(w) = guard.get(&key) {
-                        w.clone()
-                    } else {
-                        let w = std::sync::Arc::new(rocm_dev.storage_from_slice(bank.as_ref())?);
-                        guard.insert(key, w.clone());
-                        w
-                    }
-                };
+                let wbank = self.rocm_moe_bank(rocm_dev)?;
                 // Keep router ids ON the GPU for EVERY wired quant type and run ONE batched launch
                 // (experts on grid.y, ids read on-device). No `to_vec1` DtoH sync -- that host round-
                 // trip (3 per layer x 48 layers per token) was both the dominant WSL decode stall AND
@@ -1295,6 +1300,94 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
         w = w.broadcast_div(&w.sum_keepdim(D::Minus1)?)?;
     }
     Ok((ids, w))
+}
+
+/// Fused MoE gate+up projections. Both expert banks consume the SAME routed token `x` [t,1,k], so the
+/// shared input is broadcast + quantized ONCE and matvec'd against both banks (vs once per bank,
+/// re-materializing + re-quantizing the identical activation). Returns the raw (gate_out, up_out)
+/// [t,topk,n]; the caller applies silu(gate)*up. Each output is bit-identical to the unfused
+/// `indexed_moe_forward` because the q8_1 activation is deterministic in `x`. ROCm decode/matvec path
+/// only (the prefill qmmq path keeps its own per-bank quantize); every other case runs the two
+/// unfused forwards. HANZO_MOE_GATEUP_FALLBACK forces the unfused path (the A/B + equivalence lever).
+pub fn moe_gate_up(
+    x: &Tensor,
+    ids: &Tensor,
+    gate: &QMatMul,
+    up: &QMatMul,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "rocm")]
+    if std::env::var("HANZO_MOE_GATEUP_FALLBACK").is_err() {
+        if let (QMatMul::QTensor(gq), QMatMul::QTensor(uq)) = (gate, up) {
+            if let (QStorage::Rocm(_, dev), QStorage::Rocm(..)) = (&gq.storage, &uq.storage) {
+                let dt = gq.storage.dtype();
+                if dt == uq.storage.dtype() {
+                    if let Some(qt) = crate::RocmQuantType::from_ggml(dt) {
+                        let (_e, n, k) = gq.shape().dims3()?;
+                        let (t, topk) = ids.dims2()?;
+                        let use_qmmq = t > 1
+                            && qt.qmmq_capable()
+                            && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
+                        if x.dim(1)? == 1 && !use_qmmq {
+                            let nrows = t * topk;
+                            let x_exp = x.broadcast_as((t, topk, k))?;
+                            let x_flat = match x_exp.dtype() {
+                                DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
+                                DType::F32 if qt.dp4a_active() => {
+                                    x_exp.reshape((nrows, k))?.contiguous()?
+                                }
+                                _ => {
+                                    x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?
+                                }
+                            };
+                            let out_dtype = x.dtype();
+                            let ids_u32 =
+                                ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
+                            let gwb = gq.rocm_moe_bank(dev)?;
+                            let uwb = uq.rocm_moe_bank(dev)?;
+                            let (xstore, _) = x_flat.storage_and_layout();
+                            let xr = match &*xstore {
+                                Storage::Rocm(r) => r,
+                                _ => crate::bail!("moe_gate_up: x not on rocm after contiguous()"),
+                            };
+                            let (idstore, _) = ids_u32.storage_and_layout();
+                            let idr = match &*idstore {
+                                Storage::Rocm(r) => r,
+                                _ => crate::bail!("moe_gate_up: ids not on rocm"),
+                            };
+                            let (gy, uy) = dev.moe_matvec_pair(
+                                qt,
+                                gwb.as_ref(),
+                                uwb.as_ref(),
+                                xr,
+                                idr,
+                                nrows,
+                                n,
+                                k,
+                            )?;
+                            let g = crate::tensor::from_storage(
+                                Storage::Rocm(gy),
+                                (nrows, n),
+                                crate::op::BackpropOp::none(),
+                                false,
+                            )
+                            .reshape((t, topk, n))?
+                            .to_dtype(out_dtype)?;
+                            let u = crate::tensor::from_storage(
+                                Storage::Rocm(uy),
+                                (nrows, n),
+                                crate::op::BackpropOp::none(),
+                                false,
+                            )
+                            .reshape((t, topk, n))?
+                            .to_dtype(out_dtype)?;
+                            return Ok((g, u));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((gate.indexed_moe_forward(x, ids)?, up.indexed_moe_forward(x, ids)?))
 }
 
 thread_local! {

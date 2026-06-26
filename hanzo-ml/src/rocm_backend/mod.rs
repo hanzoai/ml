@@ -917,6 +917,15 @@ enum Act {
 }
 
 impl Act {
+    fn of(x: &RocmStorage) -> Result<Self> {
+        match &x.slice {
+            RocmStorageSlice::F16(_) => Ok(Act::F16),
+            RocmStorageSlice::BF16(_) => Ok(Act::Bf16),
+            RocmStorageSlice::F32(_) => Ok(Act::F32),
+            other => crate::bail!("dp4a activation must be f16/bf16/f32, got {:?}", other.dtype()),
+        }
+    }
+
     /// The `quantize_q8_1*` kernel that produces the q8_1 (int8 xq + f16 xd) activation from this dtype.
     fn quantize_kernel(self) -> &'static str {
         match self {
@@ -1233,7 +1242,8 @@ impl RocmDevice {
     /// routed experts on grid.y (expert = ids[s] per slot). One well-occupied grid + int8 dp4a, vs the
     /// per-expert scalar launch loop. `qt` selects the per-type packed-int decode -- Q4_K/Q6_K/Q5_K
     /// ride the SAME launcher. Returns [nrows,n] in x's dtype; routing + bank-residency are the
-    /// caller's job.
+    /// caller's job. The quantize and dp4a-launch halves are split (`quantize_q8_1` +
+    /// `moe_matvec_dp4a_act`) so a shared routed activation (gate+up) can quantize once, matvec twice.
     pub(crate) fn moe_matvec_dp4a(
         &self,
         qt: RocmQuantType,
@@ -1244,6 +1254,27 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<RocmStorage> {
+        let act = Act::of(x)?;
+        // xs (the q8_1 block-sum) is recomputed in the dp4a kernel, so it stays unused here.
+        let (xq, xd, _xs) = self.quantize_q8_1(x, nrows, k)?;
+        self.moe_matvec_dp4a_act(qt, wbank, &xq, &xd, ids_dev, nrows, n, k, act)
+    }
+
+    /// The dp4a-launch half of `moe_matvec_dp4a`: one batched launch (grid.x = expert output rows,
+    /// grid.y = routed slot, expert ids read on-device) dotting the pre-quantized q8_1 activation
+    /// (`xq` int8 + `xd` f16 scale) against the routed expert blocks. `act` is the output store dtype.
+    fn moe_matvec_dp4a_act(
+        &self,
+        qt: RocmQuantType,
+        wbank: &RocmStorage,
+        xq: &RocmStorage,
+        xd: &RocmStorage,
+        ids_dev: &RocmStorage,
+        nrows: usize,
+        n: usize,
+        k: usize,
+        act: Act,
+    ) -> Result<RocmStorage> {
         use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
         let wbank_mem = match &wbank.slice {
             RocmStorageSlice::U8(m) => m,
@@ -1253,49 +1284,14 @@ impl RocmDevice {
             RocmStorageSlice::U32(m) => m.as_ptr(),
             _ => crate::bail!("moe_matvec_dp4a: ids must be u32 on device"),
         };
-        let nblk32 = k / 32;
-        // (1) Quantize the [nrows,k] activations to q8_1 (int8 xq + per-32-block f16 xd). `xs` is the
-        // block-sum the quant kernel writes; the dp4a recomputes it in-kernel, so it stays unused.
-        let xq = self.alloc::<u8>(nrows * k)?;
-        let xd = self.alloc::<f16>(nrows * nblk32)?;
-        let xs = self.alloc::<i32>(nrows * nblk32)?;
-        let xq_ptr = xq.as_ptr();
-        let xd_ptr = xd.as_ptr();
-        let xs_ptr = xs.as_ptr();
-        let mrows = nrows as i32;
-        let ki = k as i32;
-        let qgrid = rocm_rs::hip::Dim3::from(((nrows * nblk32).div_ceil(8)) as u32);
-        let qblock = rocm_rs::hip::Dim3::from(256u32);
-        let (act, x_ptr) = match &x.slice {
-            RocmStorageSlice::F16(s) => (Act::F16, s.as_ptr()),
-            RocmStorageSlice::BF16(s) => (Act::Bf16, s.as_ptr()),
-            RocmStorageSlice::F32(s) => (Act::F32, s.as_ptr()),
-            other => crate::bail!(
-                "moe_matvec_dp4a: activations must be f16, bf16, or f32, got {:?}",
-                other.dtype()
-            ),
+        let xq_ptr = match &xq.slice {
+            RocmStorageSlice::U8(m) => m.as_ptr(),
+            _ => crate::bail!("moe_matvec_dp4a: xq must be u8 (q8_1 int8)"),
         };
-        let quant_func = act.quantize_kernel();
-        unsafe {
-            launch_kernel(
-                self,
-                QuantKernel::NAME,
-                QuantKernel::CODE,
-                quant_func,
-                qgrid,
-                qblock,
-                &mut [
-                    &mrows as *const i32 as *mut std::ffi::c_void,
-                    &ki as *const i32 as *mut std::ffi::c_void,
-                    (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    (&xq_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    (&xd_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    (&xs_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-        // (2) ONE batched dp4a launch: grid.x = expert output rows, grid.y = routed slot. Expert ids
-        // are read on-device (ids_ptr) -- no per-call host round-trip, which is the decode hot path.
+        let xd_ptr = match &xd.slice {
+            RocmStorageSlice::F16(m) => m.as_ptr(),
+            _ => crate::bail!("moe_matvec_dp4a: xd must be f16 (q8_1 scale)"),
+        };
         let n_i = n as i32;
         let ncols = k as i32;
         let nslots = nrows as i32;
@@ -1333,15 +1329,40 @@ impl RocmDevice {
                 })
             }};
         }
-        let result = match &x.slice {
-            RocmStorageSlice::F16(_) => launch_moe_dp4a!(F16, f16),
-            RocmStorageSlice::BF16(_) => launch_moe_dp4a!(BF16, bf16),
-            RocmStorageSlice::F32(_) => launch_moe_dp4a!(F32, f32),
-            _ => unreachable!(),
-        };
-        // Keep q8_1 scratch alive past the (stream-ordered) dp4a launch that reads it.
-        drop((xq, xd, xs));
-        result
+        match act {
+            Act::F16 => launch_moe_dp4a!(F16, f16),
+            Act::Bf16 => launch_moe_dp4a!(BF16, bf16),
+            Act::F32 => launch_moe_dp4a!(F32, f32),
+        }
+    }
+
+    /// Fused gate+up indexed-MoE matvec: both expert banks consume the SAME routed activation `x`
+    /// [nrows,k], so quantize it to q8_1 ONCE and dp4a-matvec both banks (vs a quantize per bank). The
+    /// q8_1 activation is deterministic in `x`, so each output is bit-identical to the unfused
+    /// `moe_matvec_dp4a`. Scalar (non-dp4a) types have no shared pre-quantize and run the two unfused
+    /// matvecs. Returns (gate_out, up_out), each [nrows,n] in x's dtype.
+    pub fn moe_matvec_pair(
+        &self,
+        qt: RocmQuantType,
+        gate_bank: &RocmStorage,
+        up_bank: &RocmStorage,
+        x: &RocmStorage,
+        ids_dev: &RocmStorage,
+        nrows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(RocmStorage, RocmStorage)> {
+        if qt.dp4a_active() {
+            let act = Act::of(x)?;
+            let (xq, xd, _xs) = self.quantize_q8_1(x, nrows, k)?;
+            let g = self.moe_matvec_dp4a_act(qt, gate_bank, &xq, &xd, ids_dev, nrows, n, k, act)?;
+            let u = self.moe_matvec_dp4a_act(qt, up_bank, &xq, &xd, ids_dev, nrows, n, k, act)?;
+            Ok((g, u))
+        } else {
+            let g = self.moe_matvec_quant(qt, gate_bank, x, ids_dev, nrows, n, k)?;
+            let u = self.moe_matvec_quant(qt, up_bank, x, ids_dev, nrows, n, k)?;
+            Ok((g, u))
+        }
     }
 
     /// Dense (non-quantized) decode GEMV: `y[n] = W[n,k] . x[k]` for an f16/f32 dense weight, the
@@ -2194,6 +2215,94 @@ impl RocmStorage {
             RocmStorageSlice::F16(_) => launch_rmsnorm!(F16, f16, "rmsnorm_f16"),
             other => crate::bail!("rms_norm on rocm unsupported dtype {:?}", other.dtype()),
         }
+    }
+
+    /// Fused residual-add + rmsnorm: returns (sum = x + residual, normed = rmsnorm(sum) * alpha) in
+    /// ONE launch (vs a separate add then rmsnorm). f32 only -- the F32 residual/norm stream this
+    /// targets; other dtypes fall back to add + `rms_norm` at the op layer. Bit-identical to that
+    /// fallback (same f32 add, same sum-of-squares reduction order).
+    pub fn add_rms_norm(
+        &self,
+        x_layout: &Layout,
+        residual: &RocmStorage,
+        residual_layout: &Layout,
+        alpha: &RocmStorage,
+        alpha_layout: &Layout,
+        eps: f32,
+    ) -> Result<(Self, Self)> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, ReduceKernel};
+        let x = self;
+        if !x_layout.is_contiguous()
+            || !residual_layout.is_contiguous()
+            || !alpha_layout.is_contiguous()
+        {
+            crate::bail!("add_rms_norm on rocm requires contiguous inputs");
+        }
+        let device = self.device.clone();
+        let dims = x_layout.shape().dims();
+        let elem_count = x_layout.shape().elem_count();
+        let last_dim = dims[dims.len() - 1];
+        if last_dim == 0 {
+            crate::bail!("add_rms_norm: last dim must be non-zero");
+        }
+        let n_rows = (elem_count / last_dim) as u32;
+        let n_cols = last_dim as i32;
+        let block_size: i32 = if last_dim < 1024 { 32 } else { 1024 };
+        let x_off = x_layout.start_offset();
+        let r_off = residual_layout.start_offset();
+        let alpha_off = alpha_layout.start_offset();
+        let (x_mem, r_mem, alpha_mem) = match (&x.slice, &residual.slice, &alpha.slice) {
+            (
+                RocmStorageSlice::F32(xm),
+                RocmStorageSlice::F32(rm),
+                RocmStorageSlice::F32(am),
+            ) => (xm, rm, am),
+            _ => crate::bail!(
+                "add_rms_norm: f32 inputs required (x={:?} residual={:?} alpha={:?})",
+                x.slice.dtype(),
+                residual.slice.dtype(),
+                alpha.slice.dtype()
+            ),
+        };
+        let sum = device.alloc::<f32>(elem_count)?;
+        let out = device.alloc::<f32>(elem_count)?;
+        let x_ptr = unsafe { x_mem.offset_ptr(x_off) };
+        let r_ptr = unsafe { r_mem.offset_ptr(r_off) };
+        let alpha_ptr = unsafe { alpha_mem.offset_ptr(alpha_off) };
+        let sum_ptr = sum.as_ptr();
+        let out_ptr = out.as_ptr();
+        let grid = rocm_rs::hip::Dim3::from(n_rows);
+        let block = rocm_rs::hip::Dim3::from(block_size as u32);
+        unsafe {
+            launch_kernel(
+                &device,
+                ReduceKernel::NAME,
+                ReduceKernel::CODE,
+                "add_rmsnorm_f32",
+                grid,
+                block,
+                &mut [
+                    (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                    (&r_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                    (&sum_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                    (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                    (&alpha_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                    &n_cols as *const i32 as *mut std::ffi::c_void,
+                    &block_size as *const i32 as *mut std::ffi::c_void,
+                    &eps as *const f32 as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok((
+            Self {
+                slice: RocmStorageSlice::F32(sum),
+                device: device.clone(),
+            },
+            Self {
+                slice: RocmStorageSlice::F32(out),
+                device,
+            },
+        ))
     }
 
     /// Fused rotary embedding (GPT-NeoX half-rotation), replacing the ~7-op `rope_slow` composite.
