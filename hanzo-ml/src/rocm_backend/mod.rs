@@ -514,6 +514,11 @@ pub enum RocmQuantType {
     Q6K,
     IQ4_XS,
     TQ2_0,
+    IQ2_XXS,
+    IQ2_XS,
+    IQ2_S,
+    IQ3_XXS,
+    IQ3_S,
 }
 
 impl RocmQuantType {
@@ -528,6 +533,11 @@ impl RocmQuantType {
             G::Q6K => Self::Q6K,
             G::IQ4_XS => Self::IQ4_XS,
             G::TQ2_0 => Self::TQ2_0,
+            G::IQ2_XXS => Self::IQ2_XXS,
+            G::IQ2_XS => Self::IQ2_XS,
+            G::IQ2_S => Self::IQ2_S,
+            G::IQ3_XXS => Self::IQ3_XXS,
+            G::IQ3_S => Self::IQ3_S,
             _ => return None,
         })
     }
@@ -537,6 +547,7 @@ impl RocmQuantType {
         match self {
             Self::Q8_0 | Self::Q4_0 => 32,
             Self::Q4K | Self::Q6K | Self::IQ4_XS | Self::TQ2_0 => 256,
+            Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS | Self::IQ3_S => 256,
         }
     }
 
@@ -550,6 +561,11 @@ impl RocmQuantType {
             Self::Q6K => 210,
             Self::IQ4_XS => 136,
             Self::TQ2_0 => 66,
+            Self::IQ2_XXS => 66,
+            Self::IQ2_XS => 74,
+            Self::IQ2_S => 82,
+            Self::IQ3_XXS => 98,
+            Self::IQ3_S => 110,
         }
     }
 
@@ -559,6 +575,18 @@ impl RocmQuantType {
     /// (`quantize_q8_1`) for the `-dmin*m*d_x*sum` bias term; symmetric types never need it.
     pub fn symmetric(self) -> bool {
         !matches!(self, Self::Q4K)
+    }
+
+    /// Whether this type has the int8-WMMA prefill GEMM (`qmmq_core<WTYPE>`) wired. The codebook
+    /// i-quants (IQ2_*/IQ3_*) are DECODE-only today: their grid+sign reconstruction is not in the
+    /// WMMA `decode_w_half` path, so prefill (rows>1) dequantizes-to-f16 instead. This is the ONE
+    /// predicate the forward prefill sites + the MoE `use_qmmq` gate read; decode/MoE-decode (the
+    /// bandwidth-bound lever) ride `qmatvec_core`/`moe_qmatvec_core` for every `from_ggml` type.
+    pub fn qmmq_capable(self) -> bool {
+        !matches!(
+            self,
+            Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS | Self::IQ3_S
+        )
     }
 
     /// The UNIFIED prefill GEMM entry point for this type (int8 WMMA, `qmmq_core<WTYPE>` in
@@ -572,6 +600,9 @@ impl RocmQuantType {
             Self::Q6K => "qmmq_q6k_f16",
             Self::IQ4_XS => "qmmq_iq4xs_f16",
             Self::TQ2_0 => "qmmq_tq2_0_f16",
+            Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS | Self::IQ3_S => {
+                unreachable!("prefill_kernel: {self:?} is decode-only (qmmq_capable() is false)")
+            }
         }
     }
 
@@ -598,6 +629,9 @@ impl RocmQuantType {
             (Self::TQ2_0, 128) => "moe_qmmq_tq2_0_f16",
             (Self::TQ2_0, 64) => "moe_qmmq_tq2_0_tm64_f16",
             (Self::TQ2_0, _) => "moe_qmmq_tq2_0_tm32_f16",
+            (Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS | Self::IQ3_S, _) => {
+                unreachable!("moe_prefill_kernel: {self:?} is decode-only (qmmq_capable() is false)")
+            }
         }
     }
 
@@ -617,6 +651,16 @@ impl RocmQuantType {
             (Self::IQ4_XS, false) => "qmatvecu_iq4xs_bf16",
             (Self::TQ2_0, true) => "qmatvecu_tq2_0_f16",
             (Self::TQ2_0, false) => "qmatvecu_tq2_0_bf16",
+            (Self::IQ2_XXS, true) => "qmatvecu_iq2xxs_f16",
+            (Self::IQ2_XXS, false) => "qmatvecu_iq2xxs_bf16",
+            (Self::IQ2_XS, true) => "qmatvecu_iq2xs_f16",
+            (Self::IQ2_XS, false) => "qmatvecu_iq2xs_bf16",
+            (Self::IQ2_S, true) => "qmatvecu_iq2s_f16",
+            (Self::IQ2_S, false) => "qmatvecu_iq2s_bf16",
+            (Self::IQ3_XXS, true) => "qmatvecu_iq3xxs_f16",
+            (Self::IQ3_XXS, false) => "qmatvecu_iq3xxs_bf16",
+            (Self::IQ3_S, true) => "qmatvecu_iq3s_f16",
+            (Self::IQ3_S, false) => "qmatvecu_iq3s_bf16",
         }
     }
 
@@ -638,6 +682,16 @@ impl RocmQuantType {
             (Self::IQ4_XS, false) => "moe_qmatvecu_iq4xs_bf16",
             (Self::TQ2_0, true) => "moe_qmatvecu_tq2_0_f16",
             (Self::TQ2_0, false) => "moe_qmatvecu_tq2_0_bf16",
+            (Self::IQ2_XXS, true) => "moe_qmatvecu_iq2xxs_f16",
+            (Self::IQ2_XXS, false) => "moe_qmatvecu_iq2xxs_bf16",
+            (Self::IQ2_XS, true) => "moe_qmatvecu_iq2xs_f16",
+            (Self::IQ2_XS, false) => "moe_qmatvecu_iq2xs_bf16",
+            (Self::IQ2_S, true) => "moe_qmatvecu_iq2s_f16",
+            (Self::IQ2_S, false) => "moe_qmatvecu_iq2s_bf16",
+            (Self::IQ3_XXS, true) => "moe_qmatvecu_iq3xxs_f16",
+            (Self::IQ3_XXS, false) => "moe_qmatvecu_iq3xxs_bf16",
+            (Self::IQ3_S, true) => "moe_qmatvecu_iq3s_f16",
+            (Self::IQ3_S, false) => "moe_qmatvecu_iq3s_bf16",
         }
     }
 
