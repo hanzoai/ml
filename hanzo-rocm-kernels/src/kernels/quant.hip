@@ -862,8 +862,10 @@ DEFINE_QMATVEC_DP4A(q6k, DW_Q6_K)
 DEFINE_QMATVEC_DP4A(q2k, DW_Q2_K)
 DEFINE_QMATVEC_DP4A(q3k, DW_Q3_K)
 DEFINE_QMATVEC_DP4A(q5k, DW_Q5_K)
-
-#undef DEFINE_QMATVEC_DP4A
+// NOTE: DEFINE_QMATVEC_DP4A is NOT #undef'd here -- the IQ codebook dp4a specializations below reuse
+// the SAME macro (one launcher generator). They live after the __constant__ grid tables they index
+// (IQ2XXS_GRID_D / IQ3XXS_GRID_D / IQ1S_GRID_D / KSIGNS_IQ2XS_D), so their qdp4a<> specializations +
+// DEFINE rows + the #undef are emitted there, next to the scalar qdec<> IQ twins.
 
 // Dense (non-quantized) GEMV for the decode rows==1 case: y[row] = sum_k w[row,k]*x[k]. Replaces the
 // `broadcast_mul + sum` reduce that materialized the whole [n,k] product just to reduce it (e.g. the
@@ -2349,6 +2351,318 @@ template <> struct qdec<DW_IQ1_M> {
         return s;
     }
 };
+
+// ----------------------------------------------------------------------------------------------
+// int8-dp4a DECODE for the IQ codebook quants (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M). The int8-SIMD twin
+// of the scalar `qdec<DW_IQ*>` above: instead of decoding each grid coordinate to f32 and doing float
+// MACs (COMPUTE-bound on this APU), the grid coords land in int8 and `v_dot4` (hip_dp4a) dots them
+// against the once-q8_1-quantized activation -- llama.cpp's `vec_dot_iq*_q8_1` technique. These
+// specialize the SAME `qdp4a<WTYPE>` / `qdp4a_traits<WTYPE>` the K-quants use, so they ride the SAME
+// `qmatvec_dp4a_core` / `moe_qmatvec_dp4a_core` + the SAME DEFINE_QMATVEC_DP4A launcher -- NO new core,
+// NO new kernel. They sit HERE (not with the K-quant qdp4a<> at the top) because they index the
+// __constant__ grid tables defined just above, exactly like the scalar qdec<DW_IQ*> twins.
+//
+// NSUB = 8: the work-unit is the 32-elem sub-block (sub = e in [0,8)), matching the q8_1 32-block
+// scale `xd8[e]` -- so `partial(blk,xq8,xd8,e)` returns sub-block e's COMPLETE f32 contribution and
+// block() = sum over e. Each sub-block has 4 groups l in [0,4) of 8 coords; the 8 coords split into a
+// low int (coords 0..3) and high int (coords 4..7), each dotted against its q8_1 int (u[l*2], u[l*2+1]).
+//
+// SIGNS without CUDA's __vsub4/__vcmpne4 (absent on ROCm 7.13): the IQ2/IQ3 grids store POSITIVE
+// magnitudes (verified <=62, valid signed int8) + a per-coord sign bit. By linearity
+//   sum_i (-1)^s_i * g_i * u_i = sum_i g_i u_i - 2 * sum_{s_i set} g_i u_i
+// so `dp4a_signed` = dp4a(g,u) - 2*dp4a(g & bytemask(s), u), where `bytemask` expands a 4-bit sign
+// nibble to 0xFF per signed byte. No per-byte subtract needed. IQ1 grids store SIGNED coords already
+// (no sign field) -> direct dp4a + a `sum(u)` term for the fractional `+delta` bias.
+
+// Expand the low 4 bits of `sgn` to a per-byte mask: byte i = 0xFF if bit i set, else 0x00. Spread
+// bits {0,1,2,3} to byte LSBs {0,8,16,24} (each 0 or 1), then *0xFF to fill the byte (no carry: 1*255).
+__device__ __forceinline__ unsigned iq_bytemask4(unsigned sgn) {
+    const unsigned s = (sgn & 1u) | ((sgn & 2u) << 7) | ((sgn & 4u) << 14) | ((sgn & 8u) << 21);
+    return s * 0xFFu;
+}
+
+// Signed-grid 4-wide int8 dot: sum_i (-1)^sgn_i * g_i * u_i for the 4 magnitude bytes packed in `grid`
+// (each in [0,127]) against the q8_1 int `u`, signs from the low 4 bits of `sgn`. dp4a-only (above).
+__device__ __forceinline__ int dp4a_signed(int grid, int u, unsigned sgn) {
+    const int gm = (int)((unsigned)grid & iq_bytemask4(sgn));
+    return hip_dp4a(grid, u, 0) - 2 * hip_dp4a(gm, u, 0);
+}
+
+// IQ2_XXS (SYM 2.06bpw). Mirrors qdec<DW_IQ2_XXS>: per sub-block e, db = d*(0.5+(aux32_1>>28))*0.25
+// is constant across all 32 coords; grid byte j of IQ2XXS_GRID_D[gi] is the magnitude, ksigns the sign.
+template <> struct qdp4a<DW_IQ2_XXS> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint16_t* qs = reinterpret_cast<const uint16_t*>(blk + 2);
+        const uint32_t aux32_0 = (uint32_t)qs[4 * e] | ((uint32_t)qs[4 * e + 1] << 16);
+        const uint32_t aux32_1 = (uint32_t)qs[4 * e + 2] | ((uint32_t)qs[4 * e + 3] << 16);
+        const float db = d * (0.5f + (float)(aux32_1 >> 28)) * 0.25f;
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int gi = (int)((aux32_0 >> (8 * l)) & 0xFF);
+            const uint64_t entry = IQ2XXS_GRID_D[gi];
+            const uint32_t signs = KSIGNS_IQ2XS_D[(aux32_1 >> (7 * l)) & 127];
+            idot += dp4a_signed((int)(uint32_t)entry, u[2 * l], signs & 0xF);
+            idot += dp4a_signed((int)(uint32_t)(entry >> 32), u[2 * l + 1], (signs >> 4) & 0xF);
+        }
+        return db * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ2_XS (SYM 2.31bpw). Mirrors qdec<DW_IQ2_XS>: scale nibble per sub-block e is sc&0xF for groups
+// 0,1 (db_lo) and sc>>4 for groups 2,3 (db_hi) -- two partial dots scaled separately (llama ls0/ls1).
+template <> struct qdp4a<DW_IQ2_XS> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint16_t* qs = reinterpret_cast<const uint16_t*>(blk + 2);
+        const uint8_t sc = blk[66 + e];
+        const float db_lo = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+        const float db_hi = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot_lo = 0, idot_hi = 0;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint16_t qv = qs[4 * e + l];
+            const uint64_t entry = IQ2XS_GRID_D[qv & 511];
+            const uint32_t signs = KSIGNS_IQ2XS_D[qv >> 9];
+            const int part = dp4a_signed((int)(uint32_t)entry, u[2 * l], signs & 0xF)
+                           + dp4a_signed((int)(uint32_t)(entry >> 32), u[2 * l + 1], (signs >> 4) & 0xF);
+            if (l < 2) idot_lo += part; else idot_hi += part;
+        }
+        return d8 * (db_lo * (float)idot_lo + db_hi * (float)idot_hi);
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ2_S (SYM 2.56bpw). Mirrors qdec<DW_IQ2_S>: idx = qs[4e+l] | ((qh[e]<<(8-2l))&0x300), signs are a
+// raw byte qs[32+4e+l] (NOT ksigns), scale nibble per sub-block like IQ2_XS (db_lo / db_hi).
+template <> struct qdp4a<DW_IQ2_S> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint8_t* qs = blk + 2;
+        const uint8_t* qh = blk + 66;
+        const uint8_t sc = blk[74 + e];
+        const float db_lo = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+        const float db_hi = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot_lo = 0, idot_hi = 0;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int idx = (int)qs[4 * e + l] | (((int)qh[e] << (8 - 2 * l)) & 0x300);
+            const uint64_t entry = IQ2S_GRID_D[idx];
+            const uint32_t signs = qs[32 + 4 * e + l];
+            const int part = dp4a_signed((int)(uint32_t)entry, u[2 * l], signs & 0xF)
+                           + dp4a_signed((int)(uint32_t)(entry >> 32), u[2 * l + 1], (signs >> 4) & 0xF);
+            if (l < 2) idot_lo += part; else idot_hi += part;
+        }
+        return d8 * (db_lo * (float)idot_lo + db_hi * (float)idot_hi);
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ3_XXS (SYM 3.06bpw). Mirrors qdec<DW_IQ3_XXS>: db = d*(0.5+(aux32>>28))*0.5 const per sub-block;
+// each group l has TWO u32 grid entries (coords 0..3 from qs[8e+2l], 4..7 from qs[8e+2l+1]), ksigns.
+template <> struct qdp4a<DW_IQ3_XXS> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint8_t* qs = blk + 2;
+        const uint8_t* ss = blk + 2 + 64;
+        const uint32_t aux32 = (uint32_t)ss[4 * e] | ((uint32_t)ss[4 * e + 1] << 8)
+                             | ((uint32_t)ss[4 * e + 2] << 16) | ((uint32_t)ss[4 * e + 3] << 24);
+        const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t signs = KSIGNS_IQ2XS_D[(aux32 >> (7 * l)) & 127];
+            idot += dp4a_signed((int)IQ3XXS_GRID_D[qs[8 * e + 2 * l]], u[2 * l], signs & 0xF);
+            idot += dp4a_signed((int)IQ3XXS_GRID_D[qs[8 * e + 2 * l + 1]], u[2 * l + 1], (signs >> 4) & 0xF);
+        }
+        return db * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ3_S (SYM 3.31bpw). Mirrors qdec<DW_IQ3_S>: db = d*(1+2*nib) const per sub-block (nib from
+// scales[e>>1]); idx high bit from qh with shift 8-2l (coords 0..3) / 7-2l (coords 4..7); raw sign byte.
+template <> struct qdp4a<DW_IQ3_S> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint8_t* qs = blk + 2;
+        const uint8_t* qh = blk + 66;
+        const uint8_t* signs_b = blk + 74;
+        const uint8_t* scales = blk + 106;
+        const uint8_t sc = scales[e >> 1];
+        const int nib = (e & 1) ? (sc >> 4) : (sc & 0xF);
+        const float db = d * (1.0f + 2.0f * (float)nib);
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int idx0 = (int)qs[8 * e + 2 * l] | (((int)qh[e] << (8 - 2 * l)) & 256);
+            const int idx1 = (int)qs[8 * e + 2 * l + 1] | (((int)qh[e] << (7 - 2 * l)) & 256);
+            const uint32_t signs = signs_b[4 * e + l];
+            idot += dp4a_signed((int)IQ3S_GRID_D[idx0], u[2 * l], signs & 0xF);
+            idot += dp4a_signed((int)IQ3S_GRID_D[idx1], u[2 * l + 1], (signs >> 4) & 0xF);
+        }
+        return db * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ1_S (1.56bpw). Mirrors qdec<DW_IQ1_S>: grid coords are SIGNED int8 already (no sign field) -> direct
+// dp4a; dl = d*(2*((qh>>12)&7)+1), delta = +/-IQ1S_DELTA per sub-block. val = dl*(g+delta), so the
+// fractional bias rides a sum_u term: result = dl*d8*(sum g*u + delta*sum u).
+template <> struct qdp4a<DW_IQ1_S> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint8_t* qs = blk + 2;
+        const uint16_t* qh = reinterpret_cast<const uint16_t*>(blk + 34);
+        const uint16_t qhv = qh[e];
+        const float dl = d * (2.0f * (float)((qhv >> 12) & 7) + 1.0f);
+        const float delta = (qhv & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0, isum = 0;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int idx = (int)qs[e * 4 + l] | ((((int)(qhv >> (3 * l))) & 7) << 8);
+            const uint64_t entry = IQ1S_GRID_D[idx];
+            idot = hip_dp4a((int)(uint32_t)entry, u[2 * l], idot);
+            idot = hip_dp4a((int)(uint32_t)(entry >> 32), u[2 * l + 1], idot);
+            isum = hip_dp4a(0x01010101, u[2 * l], isum);
+            isum = hip_dp4a(0x01010101, u[2 * l + 1], isum);
+        }
+        return dl * d8 * ((float)idot + delta * (float)isum);
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ1_M (1.75bpw). Mirrors qdec<DW_IQ1_M>: signed grid (direct dp4a); super-scale d from 4 scale-nibble
+// tops; dl1 (groups 0,1) / dl2 (groups 2,3) from 3-bit fields; idx high bits + delta sign per group from
+// qh. delta varies PER group -> accumulate dl*(sum g*u + delta*sum u) in f32 per group.
+template <> struct qdp4a<DW_IQ1_M> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint8_t* qs = blk;
+        const uint8_t* qh = blk + 32;
+        const uint8_t* scales = blk + 48;
+        const uint16_t sc0 = (uint16_t)scales[0] | ((uint16_t)scales[1] << 8);
+        const uint16_t sc1 = (uint16_t)scales[2] | ((uint16_t)scales[3] << 8);
+        const uint16_t sc2 = (uint16_t)scales[4] | ((uint16_t)scales[5] << 8);
+        const uint16_t sc3 = (uint16_t)scales[6] | ((uint16_t)scales[7] << 8);
+        const uint16_t scale_u16 = (uint16_t)((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+        const float d = __half2float(__ushort_as_half(scale_u16));
+        const uint16_t sc[4] = {sc0, sc1, sc2, sc3};
+        const uint16_t scv = sc[e >> 1];
+        const float dl1 = d * (2.0f * (float)((scv >> (6 * (e & 1)))     & 0x7) + 1.0f);
+        const float dl2 = d * (2.0f * (float)((scv >> (6 * (e & 1) + 3)) & 0x7) + 1.0f);
+        const uint8_t qh0 = qh[e * 2];
+        const uint8_t qh1 = qh[e * 2 + 1];
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        float fs = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            int idx; float delta; float dl;
+            if (l == 0)      { idx = (int)qs[e * 4]     | (((int)qh0 << 8) & 0x700); delta = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA; dl = dl1; }
+            else if (l == 1) { idx = (int)qs[e * 4 + 1] | (((int)qh0 << 4) & 0x700); delta = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA; dl = dl1; }
+            else if (l == 2) { idx = (int)qs[e * 4 + 2] | (((int)qh1 << 8) & 0x700); delta = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA; dl = dl2; }
+            else             { idx = (int)qs[e * 4 + 3] | (((int)qh1 << 4) & 0x700); delta = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA; dl = dl2; }
+            const uint64_t entry = IQ1S_GRID_D[idx];
+            int idot = hip_dp4a((int)(uint32_t)entry, u[2 * l], 0);
+            idot = hip_dp4a((int)(uint32_t)(entry >> 32), u[2 * l + 1], idot);
+            int isum = hip_dp4a(0x01010101, u[2 * l], 0);
+            isum = hip_dp4a(0x01010101, u[2 * l + 1], isum);
+            fs += dl * ((float)idot + delta * (float)isum);
+        }
+        return d8 * fs;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ dp4a byte strides (= on-disk super-block bytes; mirror qdw_traits::BYTES). All 256-elem.
+template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  };
+template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  };
+template <> struct qdp4a_traits<DW_IQ2_S>   { static constexpr int BYTES = 82;  };
+template <> struct qdp4a_traits<DW_IQ3_XXS> { static constexpr int BYTES = 98;  };
+template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; };
+template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  };
+template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  };
+
+// IQ dp4a entry points (decode + MoE, f16/bf16/f32) via the SAME launcher generator as the K-quants.
+DEFINE_QMATVEC_DP4A(iq2xxs, DW_IQ2_XXS)
+DEFINE_QMATVEC_DP4A(iq2xs,  DW_IQ2_XS)
+DEFINE_QMATVEC_DP4A(iq2s,   DW_IQ2_S)
+DEFINE_QMATVEC_DP4A(iq3xxs, DW_IQ3_XXS)
+DEFINE_QMATVEC_DP4A(iq3s,   DW_IQ3_S)
+DEFINE_QMATVEC_DP4A(iq1_s,  DW_IQ1_S)
+DEFINE_QMATVEC_DP4A(iq1_m,  DW_IQ1_M)
+
+#undef DEFINE_QMATVEC_DP4A
 
 // Whole-block decode: lane L computes the COMPLETE dot of ONE block over ALL its ELEMS positions,
 // reusing the per-type `qdec<WTYPE>::partial` per-position math. Because `partial(blk,xb,p)` returns
