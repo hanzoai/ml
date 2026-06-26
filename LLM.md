@@ -336,3 +336,35 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   Past llama-HIP 66; the residual gap to Vulkan 82 is STRUCTURAL (faster matvec/attn kernels, not fewer
   launches -- the matvec is already 88-99% roofline). Bit-exact: new `moe_matvec_pair` byte-equality
   (qmatvec_unified_numeric) + `add_rmsnorm_numeric` oracles nbad=0; all prior oracles unchanged.
+
+## Fused q/k RMSNorm+RoPE (+2.8%) AND the quantize_q8_1-fold DEAD END (-22%) -- decode is busy-bound
+- FRESH rocprofv3 (v1.3.11, GRAPHS=1, -n 0:48) RESOLVED the "where's the overhead" question that
+  earlier agents disagreed on: decode = 12.17 ms GPU-busy/tok = **94.5%** of the 12.87 ms wall (the
+  inter-kernel gap is only ~0.7 ms un-profiled; rocprof INSTRUMENTATION inflates it to ~1.87 ms, which
+  is what the prior "5.3 ms overhead" estimate over-counted). matvec = 10.1 ms (bandwidth roofline,
+  Q4_K+Q6_K dp4a). NON-matvec busy = 2.06 ms (quantize_q8_1 378us, rmsnorm 330, route 297, casts
+  f32->f16 251 + f16->f32 126, add_rmsnorm 113, combine 108, reshape_cache 94, badd 93, ucopy 80,
+  rope 76, silu 69). So decode is GPU-BUSY-bound, NOT launch-bound -- a fusion helps ONLY if it
+  ELIMINATES work; one that ADDS redundant work loses even though it cuts launches.
+- **DEAD END: folding quantize_q8_1 INTO the dp4a matvec (the "obvious" launch-cut) = -22% LOSS.** A
+  fused `qmatvec_dp4a_q_core` that quantizes the activation to q8_1 in LDS then dp4a's (one launch
+  instead of quantize + matvec) was bit-exact (nbad=0, fused vs 2-launch, Q4_K/Q6_K decode+MoE,
+  f16/bf16/f32) but decode 77.4 -> 59 T/s. ROOT CAUSE: each matvec BLOCK re-quantizes the full
+  activation into its own LDS (256 blocks for a 2048-row proj) + a `__syncthreads` before the dp4a --
+  redundant serialized work injected into the bandwidth-bound matvec. Under HIP graphs the SEPARATE
+  quantize_q8_1 launch is already ~free (graphs hide dispatch), so removing it buys nothing and the
+  in-kernel quant costs. REVERTED. Lesson: do not fold a shared-once op into a many-block consumer.
+- **WIN: fused q/k RMSNorm + positions-RoPE = +2.8% (77.4 -> 79.5 T/s), the true-elimination twin of
+  moe_route.** ONE kernel (`rope.hip rope_norm_positions<TI,TO>`, one block per head-vector: f32
+  rms-reduce -> scale -> *weight -> rope) replaces two standalone `rms_norm` launches + `rope_positions`
+  AND the q/k intermediate write+read. SAME f32 math, NO redundant work -> rmsnorm 145 -> 49/tok,
+  GPU-busy 12.175 -> 11.996 ms. `RocmDevice::rope_norm_positions` + engine
+  `layers::rocm_qk_rms_norm_rope_positions` (fast path of `qk_rms_norm_rope_positions`, per-seq-offset
+  shapes only; HANZO_QK_NORM_ROPE_FALLBACK forces the unfused chain). Bit-exact: `qk_rms_norm_rope_
+  numeric` oracle fused-vs-fallback = 0.000000 (F32, bit-identical) / <f16-tol; coherent 30B. Interleaved
+  A/B (5 rounds, GRAPHS=1): 77.36 -> 79.52 T/s, tight (79.2-79.7).
+- RESIDUAL gap to Vulkan 83 (~3.5 T/s) is the casts (379us, f32<->f16 around the keep_f32 decode
+  boundary) + quantize_q8_1 (377us) -- both resist clean fusion: the casts are dtype-tangled (removing
+  one shifts cost across the F32-residual/F16-KV boundary; the f32-native cast cut was historically
+  FLAT) and the quantize-fold loses (above). Closing it = the Vulkan strategy of fusing the WHOLE
+  attention epilogue (norm+rope+cache, no casts), a multi-kernel rewrite, not a single lever.
