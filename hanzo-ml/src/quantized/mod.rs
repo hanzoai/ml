@@ -1837,15 +1837,22 @@ fn dense_matmul(xs: &Tensor, w: &Tensor) -> Result<Tensor> {
 }
 
 // Prefill row-count gate for the native Vulkan quantized GEMM. The column-per-invocation `mul_mat_q*`
-// kernel re-reads the weight ceil(M / MATMUL_Q_MAX_M(8)) times; the dequant path materializes the f32
-// weight once. So the GEMM wins at small/moderate M and goes weight-bandwidth-bound at large M.
-// Measured crossover on RADV gfx1151 (Radeon 8060S), K=4096, N in {4096, 11008}, all five wired
-// dtypes: the GEMM is faster for every case at M <= 128 (1.0x at the heaviest Q6_K/large-N point, up
-// to 27x at M=16), and the heaviest case crosses below 1.0 by M=256. 128 = 16 weight passes is the
-// strict-non-regression gate; larger dense prefill keeps the dequant path until a shared-memory-tiled
-// int8 GEMM (which reads the weight once and removes this gate) lands.
+// kernel re-reads AND re-decodes the weight ceil(M / MATMUL_Q_MAX_M(8)) times; the dequant path
+// decodes the weight to f32 once then runs a dense matmul. So the GEMM wins at small/moderate M and
+// loses once the re-decode dominates. The crossover is dtype-dependent: cheap-decode quants
+// (Q4_0/Q8_0/Q4_K -- nibble or single-byte unpack) stay ahead through M=128, while the expensive
+// high-bit super-blocks (Q5_K/Q6_K -- 5/6-bit reconstruction with a qh high-bit gather, compute-bound
+// at large N) cross earlier and are only safe through M=64. Measured on RADV gfx1151 (Radeon 8060S),
+// K=4096, N in {4096, 11008}: the chosen rows are the strict-non-regression floor for each family
+// (worst case ~2.1x at the threshold, up to 25x at M=16). Larger dense prefill keeps the dequant path
+// until a shared-memory-tiled int8 GEMM (reads + decodes the weight once, removing this gate) lands.
 #[cfg(feature = "vulkan")]
-const VULKAN_PREFILL_GEMM_MAX_ROWS: usize = 128;
+fn vulkan_prefill_gemm_max_rows(dtype: GgmlDType) -> usize {
+    match dtype {
+        GgmlDType::Q5K | GgmlDType::Q6K => 64,
+        _ => 128,
+    }
+}
 
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -2078,15 +2085,15 @@ impl crate::Module for QMatMul {
                         crate::op::BackpropOp::none(),
                         false,
                     ))
-                } else if rows <= VULKAN_PREFILL_GEMM_MAX_ROWS {
+                } else if rows <= vulkan_prefill_gemm_max_rows(*dtype) {
                     // Prefill (small/moderate M): native quantized GEMM. Weights stay quantized in
                     // VRAM and each weight block is decoded ONCE per output column then reused across
-                    // a tile of up to MATMUL_Q_MAX_M(=8) rows -- so the weight is re-read ceil(M/8)
-                    // times, vs the dequant path's one-time f32 materialization. The GEMM therefore
-                    // wins decisively while M is small (short / chunked prefill, batched decode) and
-                    // would go weight-bandwidth-bound at large M, which the `rows` gate routes to the
-                    // dequant path below. Same block layout + decode as the decode matvec above; one
-                    // matmul_q*_gpu per native dtype. Leading batch dims flatten into M.
+                    // a tile of up to MATMUL_Q_MAX_M(=8) rows -- so the weight is re-read+re-decoded
+                    // ceil(M/8) times, vs the dequant path's one-time f32 materialization. The GEMM
+                    // therefore wins decisively while M is small (short / chunked prefill, batched
+                    // decode) and would lose at large M, which the dtype-aware `rows` gate routes to
+                    // the dequant path below. Same block layout + decode as the decode matvec above;
+                    // one matmul_q*_gpu per native dtype. Leading batch dims flatten into M.
                     let m = rows;
                     let xs = xs.contiguous()?;
                     let d = match xs.device() {
