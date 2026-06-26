@@ -514,6 +514,10 @@ pub enum RocmQuantType {
     Q6K,
     IQ4_XS,
     TQ2_0,
+    IQ4_NL,
+    TQ1_0,
+    IQ1_S,
+    IQ1_M,
 }
 
 impl RocmQuantType {
@@ -528,6 +532,10 @@ impl RocmQuantType {
             G::Q6K => Self::Q6K,
             G::IQ4_XS => Self::IQ4_XS,
             G::TQ2_0 => Self::TQ2_0,
+            G::IQ4_NL => Self::IQ4_NL,
+            G::TQ1_0 => Self::TQ1_0,
+            G::IQ1_S => Self::IQ1_S,
+            G::IQ1_M => Self::IQ1_M,
             _ => return None,
         })
     }
@@ -535,8 +543,9 @@ impl RocmQuantType {
     /// Elements per block (must divide `k`). Matches `qdw_traits<WTYPE>::ELEMS` in quant.hip.
     pub fn block_elems(self) -> usize {
         match self {
-            Self::Q8_0 | Self::Q4_0 => 32,
-            Self::Q4K | Self::Q6K | Self::IQ4_XS | Self::TQ2_0 => 256,
+            Self::Q8_0 | Self::Q4_0 | Self::IQ4_NL => 32,
+            Self::Q4K | Self::Q6K | Self::IQ4_XS | Self::TQ2_0 | Self::TQ1_0 | Self::IQ1_S
+            | Self::IQ1_M => 256,
         }
     }
 
@@ -550,6 +559,10 @@ impl RocmQuantType {
             Self::Q6K => 210,
             Self::IQ4_XS => 136,
             Self::TQ2_0 => 66,
+            Self::IQ4_NL => 18,
+            Self::TQ1_0 => 54,
+            Self::IQ1_S => 50,
+            Self::IQ1_M => 56,
         }
     }
 
@@ -559,6 +572,19 @@ impl RocmQuantType {
     /// (`quantize_q8_1`) for the `-dmin*m*d_x*sum` bias term; symmetric types never need it.
     pub fn symmetric(self) -> bool {
         !matches!(self, Self::Q4K)
+    }
+
+    /// Whether this type has a native int8-WMMA prefill GEMM (`qmmq_core<WTYPE>`). Decode-capability
+    /// (`from_ggml`) and prefill-capability are ORTHOGONAL: the codebook/ternary-base-3/1-bit types
+    /// (IQ4_NL/TQ1_0/IQ1_S/IQ1_M) are decode-only -- IQ1's fractional +/-delta bias does not fit the
+    /// int8 matrix-core path. Dense prefill of a decode-only type dequantizes to f16; MoE prefill rides
+    /// the per-slot matvec core (correct at any token count). `prefill_kernel`/`moe_prefill_kernel` are
+    /// only ever called when this is true, so their decode-only arms are unreachable.
+    pub fn prefill_capable(self) -> bool {
+        matches!(
+            self,
+            Self::Q8_0 | Self::Q4_0 | Self::Q4K | Self::Q6K | Self::IQ4_XS | Self::TQ2_0
+        )
     }
 
     /// The UNIFIED prefill GEMM entry point for this type (int8 WMMA, `qmmq_core<WTYPE>` in
@@ -572,6 +598,9 @@ impl RocmQuantType {
             Self::Q6K => "qmmq_q6k_f16",
             Self::IQ4_XS => "qmmq_iq4xs_f16",
             Self::TQ2_0 => "qmmq_tq2_0_f16",
+            Self::IQ4_NL | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M => {
+                unreachable!("prefill_kernel: {self:?} is decode-only (no qmmq), gated by prefill_capable")
+            }
         }
     }
 
@@ -598,6 +627,9 @@ impl RocmQuantType {
             (Self::TQ2_0, 128) => "moe_qmmq_tq2_0_f16",
             (Self::TQ2_0, 64) => "moe_qmmq_tq2_0_tm64_f16",
             (Self::TQ2_0, _) => "moe_qmmq_tq2_0_tm32_f16",
+            (Self::IQ4_NL | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M, _) => {
+                unreachable!("moe_prefill_kernel: {self:?} is decode-only (no qmmq), gated by prefill_capable")
+            }
         }
     }
 
@@ -617,6 +649,14 @@ impl RocmQuantType {
             (Self::IQ4_XS, false) => "qmatvecu_iq4xs_bf16",
             (Self::TQ2_0, true) => "qmatvecu_tq2_0_f16",
             (Self::TQ2_0, false) => "qmatvecu_tq2_0_bf16",
+            (Self::IQ4_NL, true) => "qmatvecu_iq4nl_f16",
+            (Self::IQ4_NL, false) => "qmatvecu_iq4nl_bf16",
+            (Self::TQ1_0, true) => "qmatvecu_tq1_0_f16",
+            (Self::TQ1_0, false) => "qmatvecu_tq1_0_bf16",
+            (Self::IQ1_S, true) => "qmatvecu_iq1_s_f16",
+            (Self::IQ1_S, false) => "qmatvecu_iq1_s_bf16",
+            (Self::IQ1_M, true) => "qmatvecu_iq1_m_f16",
+            (Self::IQ1_M, false) => "qmatvecu_iq1_m_bf16",
         }
     }
 
@@ -638,6 +678,14 @@ impl RocmQuantType {
             (Self::IQ4_XS, false) => "moe_qmatvecu_iq4xs_bf16",
             (Self::TQ2_0, true) => "moe_qmatvecu_tq2_0_f16",
             (Self::TQ2_0, false) => "moe_qmatvecu_tq2_0_bf16",
+            (Self::IQ4_NL, true) => "moe_qmatvecu_iq4nl_f16",
+            (Self::IQ4_NL, false) => "moe_qmatvecu_iq4nl_bf16",
+            (Self::TQ1_0, true) => "moe_qmatvecu_tq1_0_f16",
+            (Self::TQ1_0, false) => "moe_qmatvecu_tq1_0_bf16",
+            (Self::IQ1_S, true) => "moe_qmatvecu_iq1_s_f16",
+            (Self::IQ1_S, false) => "moe_qmatvecu_iq1_s_bf16",
+            (Self::IQ1_M, true) => "moe_qmatvecu_iq1_m_f16",
+            (Self::IQ1_M, false) => "moe_qmatvecu_iq1_m_bf16",
         }
     }
 
