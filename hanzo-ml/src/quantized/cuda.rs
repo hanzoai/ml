@@ -42,9 +42,6 @@ pub(crate) fn fast_mmq_enabled() -> bool {
 }
 
 pub const WARP_SIZE: usize = 32;
-// Output rows each indexed-MoE block computes (tile). MUST match
-// INDEXED_MOE_ROWS_PER_BLOCK in hanzo-kernels/src/quantized.cu.
-pub const INDEXED_MOE_ROWS_PER_BLOCK: usize = 4;
 pub const MMQ_X_Q4_0_AMPERE: usize = 4;
 pub const MMQ_Y_Q4_0_AMPERE: usize = 32;
 pub const NWARPS_Q4_0_AMPERE: usize = 4;
@@ -425,6 +422,28 @@ fn mul_mat_via_q8_1(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// The compiled fused indexed-MoE q8_1 kernel name for `dtype`, or None when none exists (those types
+/// take the CPU per-expert fallback). This Option is the SINGLE source of truth for "does CUDA have a
+/// fused MoE kernel for this type": `QCudaStorage::supports_indexed_moe` (used by both the inner gate
+/// here and the `QTensor::indexed_moe_forward` fast-path gate in mod.rs) derives from it, so a gate can
+/// never claim support the compiled kernels don't have -- the exact drift that stranded Q4_0/Q4_1/Q5_0/
+/// Q5_1 on the CPU while the kernel-name table already referenced them.
+fn indexed_moe_kernel_name(dtype: GgmlDType) -> Option<&'static str> {
+    Some(match dtype {
+        GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
+        GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
+        GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
+        GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
+        GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
+        GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+        GgmlDType::Q4_0 => "indexed_moe_forward_q4_0_q8_1",
+        GgmlDType::Q4_1 => "indexed_moe_forward_q4_1_q8_1",
+        GgmlDType::Q5_0 => "indexed_moe_forward_q5_0_q8_1",
+        GgmlDType::Q5_1 => "indexed_moe_forward_q5_1_q8_1",
+        _ => return None,
+    })
+}
+
 fn indexed_moe_forward_fused_q8_1_input(
     weight: &CudaView<u8>,
     w_shape: &crate::Shape, //[num_experts, n, k]
@@ -462,23 +481,16 @@ fn indexed_moe_forward_fused_q8_1_input(
     let outsize = batch * topk * n;
     let out = dev.alloc_zeros::<f32>(outsize)?;
 
-    let kernel_name = match w_dtype {
-        GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
-        GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
-        GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
-        GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
-        GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
-        GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
-        GgmlDType::Q4_0 => "indexed_moe_forward_q4_0_q8_1",
-        GgmlDType::Q4_1 => "indexed_moe_forward_q4_1_q8_1",
-        GgmlDType::Q5_0 => "indexed_moe_forward_q5_0_q8_1",
-        GgmlDType::Q5_1 => "indexed_moe_forward_q5_1_q8_1",
-        _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
+    let kernel_name = match indexed_moe_kernel_name(w_dtype) {
+        Some(name) => name,
+        None => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::QUANTIZED)?;
-    // Each block computes INDEXED_MOE_ROWS_PER_BLOCK output rows (tile), so the
-    // x-grid shrinks by that factor vs. the old 1-row-per-block launch.
-    let nblocks = ceil_div(n, INDEXED_MOE_ROWS_PER_BLOCK) as u32;
+    // ONE block per output row: the kernel computes exactly current_output_ptr[blockIdx.x] (its
+    // rows_per_cuda_block is 1). A prior "tile 4 rows/block" change shrank this to ceil(n/4) blocks
+    // without making the kernel tile, so 3/4 of every expert's output rows were left at zero -- the
+    // grid must cover all n rows. (gridDim.y = batch, gridDim.z = topk select the routed slot.)
+    let nblocks = n as u32;
     let nwarps = 4u32;
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (nblocks, batch as u32, topk as u32),
@@ -514,6 +526,14 @@ fn indexed_moe_forward_fused_q8_1_input(
 }
 
 impl QCudaStorage {
+    /// True iff a fused on-GPU indexed-MoE q8_1 kernel exists for `dtype` (derives from the ONE
+    /// kernel-name table). The `QTensor::indexed_moe_forward` fast-path gate consults this so it routes
+    /// to the fused path exactly for the types that have a kernel and to the CPU per-expert fallback for
+    /// the rest -- no second hand-maintained type list to drift.
+    pub fn supports_indexed_moe(dtype: GgmlDType) -> bool {
+        indexed_moe_kernel_name(dtype).is_some()
+    }
+
     pub fn indexed_moe_forward(
         &self,
         self_shape: &crate::Shape, //[num_experts, n, k]
@@ -522,19 +542,7 @@ impl QCudaStorage {
         ids: &CudaStorage, //[batch, topk]
         ids_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
-        if matches!(
-            self.dtype(),
-            GgmlDType::Q8_0
-                | GgmlDType::Q4_0
-                | GgmlDType::Q4_1
-                | GgmlDType::Q5_0
-                | GgmlDType::Q5_1
-                | GgmlDType::Q2K
-                | GgmlDType::Q3K
-                | GgmlDType::Q4K
-                | GgmlDType::Q5K
-                | GgmlDType::Q6K
-        ) {
+        if Self::supports_indexed_moe(self.dtype()) {
             let input_storage = input.as_cuda_slice::<f32>()?;
             let ids_storage = ids.as_cuda_slice::<u32>()?;
             indexed_moe_forward_fused_q8_1_input(
@@ -808,6 +816,14 @@ impl QCudaStorage {
                 return Ok(out);
             }
         }
+        // i-quant / ternary / NVFP4 weights have no native on-GPU q8_1 matvec/mmq kernel (the kernel-name
+        // tables in mul_mat_vec_via_q8_1 / mul_mat_via_q8_1 / dequantize_mul_mat_vec cover only the 10
+        // q8_1 types). Dequantize the weight to f32 once and run a dense matmul -- correct for any shape
+        // (decode m=1 and prefill m>1), exact w.r.t. the CPU reference, and the only way these types
+        // matmul on CUDA until a native mmvq kernel lands. ONE predicate, gated here, one fallback path.
+        if !Self::has_native_q8_1_matmul(self.dtype) {
+            return self.dequantize_matmul_dense(self_shape, storage, layout);
+        }
         if use_vec_kernel {
             self.dequantize_matmul_vec(self_shape, storage, layout)
         } else {
@@ -876,7 +892,31 @@ impl QCudaStorage {
         Ok((out, out_shape.into()))
     }
 
-    fn dequantize_matmul(
+    // dtypes with a native on-GPU q8_1 matmul kernel (the mmvq decode, mmq prefill, and dmmv kernels in
+    // mul_mat_vec_via_q8_1 / mul_mat_via_q8_1 / dequantize_mul_mat_vec -- the same 10-type spread in all
+    // three). Everything else (i-quant codebooks, ternary TQ*, NVFP4, Q1_0) has no such kernel and is
+    // matmul'd by dequantizing the weight to f32 then running a dense matmul (`dequantize_matmul_dense`).
+    fn has_native_q8_1_matmul(dtype: GgmlDType) -> bool {
+        matches!(
+            dtype,
+            GgmlDType::Q4_0
+                | GgmlDType::Q4_1
+                | GgmlDType::Q5_0
+                | GgmlDType::Q5_1
+                | GgmlDType::Q8_0
+                | GgmlDType::Q2K
+                | GgmlDType::Q3K
+                | GgmlDType::Q4K
+                | GgmlDType::Q5K
+                | GgmlDType::Q6K
+        )
+    }
+
+    // Dequantize the quantized weight to a dense f32 tensor, then `input @ weight^T` as a regular matmul.
+    // Backs both the FORCE_DMMV path and `fwd`'s fallback for dtypes without a native q8_1 kernel. Correct
+    // for any input rank/shape that reaches `fwd` (2D [m,k] or 3D [b,m,k]); `dequantize` decodes every
+    // GgmlDType via the CPU `to_float` reference, so the result is exact w.r.t. that reference.
+    fn dequantize_matmul_dense(
         &self,
         self_shape: &crate::Shape,
         storage: &CudaStorage,
@@ -892,31 +932,51 @@ impl QCudaStorage {
         if k2 != k {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
+        let data_f32 = self.dequantize(n * k)?;
+        let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
+        let out = storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?;
+        let mut out_shape = layout.shape().dims().to_vec();
+        out_shape.pop();
+        out_shape.push(n);
+        Ok((out, out_shape.into()))
+    }
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            let data_f32 = self.dequantize(n * k)?;
-            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
-            storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
-        } else {
-            let storage = storage.as_cuda_slice::<f32>()?;
-            let storage = match layout.contiguous_offsets() {
-                Some((o1, o2)) => storage.slice(o1..o2),
-                None => Err(crate::Error::RequiresContiguous {
-                    op: "quantized-matmul",
-                }
-                .bt())?,
-            };
-            mul_mat_via_q8_1(
-                &self.data,
-                &storage,
-                self.dtype,
-                /* x_rows */ n,
-                /* x_cols */ k,
-                /* y_rows */ k,
-                /* y_cols */ b * m,
-                self.device(),
-            )?
+    fn dequantize_matmul(
+        &self,
+        self_shape: &crate::Shape,
+        storage: &CudaStorage,
+        layout: &crate::Layout,
+    ) -> Result<(CudaStorage, crate::Shape)> {
+        if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.dequantize_matmul_dense(self_shape, storage, layout);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let (b, m, k2) = match layout.shape().dims() {
+            &[b, m, k2] => (b, m, k2),
+            &[m, k2] => (1, m, k2),
+            s => crate::bail!("unexpected shape for input {s:?}"),
         };
+        if k2 != k {
+            crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
+        }
+        let storage = storage.as_cuda_slice::<f32>()?;
+        let storage = match layout.contiguous_offsets() {
+            Some((o1, o2)) => storage.slice(o1..o2),
+            None => Err(crate::Error::RequiresContiguous {
+                op: "quantized-matmul",
+            }
+            .bt())?,
+        };
+        let out = mul_mat_via_q8_1(
+            &self.data,
+            &storage,
+            self.dtype,
+            /* x_rows */ n,
+            /* x_cols */ k,
+            /* y_rows */ k,
+            /* y_cols */ b * m,
+            self.device(),
+        )?;
         let mut out_shape = layout.shape().dims().to_vec();
         out_shape.pop();
         out_shape.push(n);
@@ -1063,6 +1123,170 @@ mod test {
         )?;
         let vs = cuda_storage.as_cuda_slice::<f32>()?;
         let _vs = dev.clone_dtoh(&vs.as_view())?;
+        Ok(())
+    }
+
+    // Fused indexed-MoE for the 32-element block types, MULTI-EXPERT. ids select experts {0,1,2,0}, so
+    // slots route to expert_id > 0 -- a wrong per-expert weight stride (the QK_K-vs-`qk` bug) reads the
+    // wrong bank and yields garbage, so this is the stride-fix gate. Q4_0/Q4_1/Q5_0/Q5_1 are the newly
+    // added kernels; Q8_0 re-checks the pre-existing one whose stride this fix corrects (no regression).
+    // Oracle = the SAME stored quant weights dequantized (zero weight error) matmul'd against the raw f32
+    // input; the only delta is the kernel's internal q8_1 input quant (~1/256 per element).
+    #[test]
+    fn cuda_indexed_moe_legacy_32block() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        // k=256 is a multiple of BOTH the 32-element legacy block and the 256-element K-quant block, so
+        // ONE test covers every fused type. n=8 > nblocks-if-broken (ceil(8/4)=2), so the row-coverage
+        // bug leaves rows 2..8 at zero -> caught here.
+        let (e, n, k) = (3usize, 8usize, 256usize);
+        let (batch, topk) = (2usize, 2usize);
+        let ids: Vec<u32> = vec![0, 1, 2, 0]; // [batch, topk] row-major; covers expert_id > 0
+
+        // Deterministic varied small weights/input (LCG) so distinct experts have distinct weights.
+        let mut st: u32 = 0x1234_5678;
+        let mut nextf = || -> f32 {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 8) as f32 / (1u32 << 24) as f32) - 0.5 // [-0.5, 0.5)
+        };
+        let w: Vec<f32> = (0..e * n * k).map(|_| nextf() * 0.5).collect();
+        let inp: Vec<f32> = (0..batch * k).map(|_| nextf()).collect();
+
+        // The 5 newly-added legacy 32-block kernels + the 5 pre-existing K-quant kernels: the launch-row
+        // and stride fixes are shared, so all 10 must agree with the oracle.
+        for dtype in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            // Quantized [e, n, k] expert bank.
+            let mut bank = QCudaStorage::zeros(&dev, e * n * k, dtype)?;
+            let w_cuda = CudaStorage::wrap_cuda_slice(dev.clone_htod(&w)?, dev.clone());
+            bank.quantize(&w_cuda)?;
+            // The dequantized bank IS the weights the kernel reads -> exact-weight oracle.
+            let deq = bank.dequantize(e * n * k)?;
+            let w_deq = dev.clone_dtoh(&deq.as_cuda_slice::<f32>()?.as_view())?;
+
+            // input [batch, 1, k] (input_dim1 == 1: shared input vector per batch), ids [batch, topk].
+            let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+            let input_l = crate::Layout::contiguous((batch, 1usize, k));
+            let ids_storage = CudaStorage::wrap_cuda_slice(dev.clone_htod(&ids)?, dev.clone());
+            let ids_l = crate::Layout::contiguous((batch, topk));
+            let self_shape: crate::Shape = (e, n, k).into();
+
+            let (out_storage, out_shape) =
+                bank.indexed_moe_forward(&self_shape, &input, &input_l, &ids_storage, &ids_l)?;
+            assert_eq!(out_shape.dims().to_vec(), vec![batch, topk, n]);
+            let got = dev.clone_dtoh(&out_storage.as_cuda_slice::<f32>()?.as_view())?;
+
+            // Oracle: out[b,t,j] = sum_i w_deq[expert][j][i] * inp[b][i].
+            let mut max_abs = 0f32;
+            let mut max_err = 0f32;
+            for b in 0..batch {
+                for t in 0..topk {
+                    let expert = ids[b * topk + t] as usize;
+                    for j in 0..n {
+                        let mut acc = 0f32;
+                        for i in 0..k {
+                            acc += w_deq[expert * n * k + j * k + i] * inp[b * k + i];
+                        }
+                        let g = got[(b * topk + t) * n + j];
+                        max_abs = max_abs.max(acc.abs());
+                        max_err = max_err.max((g - acc).abs());
+                    }
+                }
+            }
+            // Correct result tracks the oracle to within the q8_1 input-quant error (~1/256); the stride
+            // bug instead reads the wrong expert bank (garbage, ~100% off). 5% of the output scale cleanly
+            // separates the two.
+            let tol = 0.05 * max_abs + 1e-3;
+            assert!(
+                max_err <= tol,
+                "{dtype:?}: indexed-MoE max_err {max_err} > tol {tol} (max_abs {max_abs})"
+            );
+        }
+        Ok(())
+    }
+
+    // i-quant / ternary / NVFP4 weights have no native CUDA matmul kernel, so QStorage::from_data used to
+    // BAIL when loading them onto CUDA -- an i-quant GGUF could not run on CUDA at all. They now upload
+    // like any quant and QCudaStorage::fwd dequantizes-to-f32 for a dense matmul. This loads a
+    // deterministic block pattern for EACH formerly-bailing type onto CUDA, runs fwd, and checks it
+    // against the matmul of the SAME dequantized weights computed on the host -> proves each type LOADS
+    // and DECODES (matmuls) coherently on CUDA, exact w.r.t. the dequantize reference.
+    #[test]
+    fn cuda_iquant_load_and_dense_matmul() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let cuda_dev = crate::Device::Cuda(dev.clone());
+        let (m, n, k) = (2usize, 4usize, 256usize); // m tokens; [n,k] weight; k spans 256- and 32-elem blocks
+        let inp: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.05 - 0.4).collect();
+
+        for dtype in [
+            GgmlDType::IQ2_XXS,
+            GgmlDType::IQ2_XS,
+            GgmlDType::IQ2_S,
+            GgmlDType::IQ3_XXS,
+            GgmlDType::IQ3_S,
+            GgmlDType::IQ1_S,
+            GgmlDType::IQ1_M,
+            GgmlDType::TQ1_0,
+            GgmlDType::TQ2_0,
+            GgmlDType::NVFP4,
+            GgmlDType::Q1_0,
+        ] {
+            // Bounded byte pattern (<= 0x3F) so every embedded f16 scale decodes finite (no NaN/Inf), yet
+            // varied. Sizing comes from the dtype so it is correct for both 256- and 32-element blocks.
+            let nbytes = (n * k / dtype.block_size()) * dtype.type_size();
+            let bytes: Vec<u8> = (0..nbytes)
+                .map(|i| (i.wrapping_mul(37).wrapping_add(11) & 0x3F) as u8)
+                .collect();
+
+            // LOAD onto CUDA (this is the call that used to bail for these dtypes).
+            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)? {
+                QStorage::Cuda(s) => s,
+                _ => unreachable!("from_data on a CUDA device must yield CUDA storage"),
+            };
+
+            // Dequantized weights [n,k] (the exact values the dense matmul consumes) -> host oracle.
+            let w_dev = qcuda.dequantize(n * k)?;
+            let w_host = dev.clone_dtoh(&w_dev.as_cuda_slice::<f32>()?.as_view())?;
+
+            // CUDA forward: input [m,k] @ weight^T via the dequant-dense fallback (no native kernel).
+            let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+            let input_l = crate::Layout::contiguous((m, k));
+            let self_shape: crate::Shape = (n, k).into();
+            let (out, out_shape) = qcuda.fwd(&self_shape, &input, &input_l)?;
+            assert_eq!(out_shape.dims().to_vec(), vec![m, n]);
+            let got = dev.clone_dtoh(&out.as_cuda_slice::<f32>()?.as_view())?;
+
+            // Host oracle with the SAME dequantized weights: out[r,j] = sum_i w[j,i] * inp[r,i].
+            let mut max_abs = 0f32;
+            let mut max_err = 0f32;
+            for r in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f32;
+                    for i in 0..k {
+                        acc += w_host[j * k + i] * inp[r * k + i];
+                    }
+                    let g = got[r * n + j];
+                    assert!(g.is_finite(), "{dtype:?}: non-finite CUDA output {g}");
+                    max_abs = max_abs.max(acc.abs());
+                    max_err = max_err.max((g - acc).abs());
+                }
+            }
+            // Same weights + same input on GPU vs host -> only f32 accumulation-order noise remains.
+            let tol = 1e-3 * max_abs + 1e-4;
+            assert!(
+                max_err <= tol,
+                "{dtype:?}: i-quant CUDA dense matmul max_err {max_err} > tol {tol} (max_abs {max_abs})"
+            );
+        }
         Ok(())
     }
 }
