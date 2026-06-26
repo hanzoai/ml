@@ -396,6 +396,56 @@ __device__ void rmsnorm(const T * x, T * dst, const T * alpha, const int ncols, 
     }
 }
 
+// Fused residual-add + rmsnorm: s = x + residual (written to sum_out, the new residual stream),
+// dst = rmsnorm(s) * alpha. Bit-identical to a separate add then rmsnorm because s is recomputed in
+// f32 the same way and the sum-of-squares reduction order matches `rmsnorm`. One launch instead of two
+// + one fewer HBM round-trip of the hidden vector.
+template <typename T>
+__device__ void add_rmsnorm(const T * x, const T * residual, T * sum_out, T * dst,
+                            const T * alpha, const int ncols, const int block_size, const float eps) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const int i = row*ncols + col;
+        const float s = (float)(x[i]) + (float)(residual[i]);
+        sum_out[i] = (T)s;
+        tmp += s * s;
+    }
+
+    tmp = warp_reduce_sum(tmp);
+    if (block_size > WARP_SIZE) {
+        __shared__ float s_sum[32];
+        const int n_warps = (block_size + WARP_SIZE - 1) / WARP_SIZE;
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = tmp;
+        }
+        __syncthreads();
+        tmp = (lane_id < n_warps) ? s_sum[lane_id] : 0.0f;
+        tmp = warp_reduce_sum(tmp);
+    }
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    if (alpha == nullptr) {
+        for (int col = tid; col < ncols; col += block_size) {
+            const int i = row*ncols + col;
+            const float s = (float)(x[i]) + (float)(residual[i]);
+            dst[i] = (T)(scale * s);
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const int i = row*ncols + col;
+            const float s = (float)(x[i]) + (float)(residual[i]);
+            dst[i] = (T)(scale * s * (float)(alpha[col]));
+        }
+    }
+}
+
 // TODO: Replace with MIOpen implementation once rocm-rs exposes miopenLayerNorm
 template <typename T>
 __device__ void layernorm(const T * x, T * dst, const T * alpha, const T * beta,
@@ -541,6 +591,13 @@ __device__ void rope(const T * src, const T * cos, const T * sin, T * dst,
     rmsnorm<TYPENAME>(src, dst, alpha, n_cols, block_size, eps); \
   }
 
+#define ADD_RMSNORM_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME( \
+      const TYPENAME *src, const TYPENAME *residual, TYPENAME *sum_out, TYPENAME *dst, \
+      const TYPENAME *alpha, const int n_cols, const int block_size, const float eps) { \
+    add_rmsnorm<TYPENAME>(src, residual, sum_out, dst, alpha, n_cols, block_size, eps); \
+  }
+
 #define LAYERNORM_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME( \
       const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha, \
@@ -565,6 +622,9 @@ ROPE_OP(double, rope_f64)
 // RmsNorm kernels
 RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
+
+// Fused residual-add + rmsnorm (f32 residual stream; other dtypes fall back to add + rmsnorm)
+ADD_RMSNORM_OP(float, add_rmsnorm_f32)
 
 // LayerNorm kernels
 LAYERNORM_OP(float, layernorm_f32)
