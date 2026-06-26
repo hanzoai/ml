@@ -1434,6 +1434,11 @@ impl QMatMul {
                     | GgmlDType::Q4K
                     | GgmlDType::Q5K
                     | GgmlDType::Q6K
+                    | GgmlDType::Q2K
+                    | GgmlDType::Q3K
+                    | GgmlDType::IQ4_XS
+                    | GgmlDType::IQ4_NL
+                    | GgmlDType::TQ2_0
             );
             if native_vk {
                 if let Device::Vulkan(d) = qtensor.device() {
@@ -1441,11 +1446,12 @@ impl QMatMul {
                         let blk = dt.block_size();
                         if k % blk == 0 {
                             let bytes = qtensor.data()?;
-                            // Q6_K's 210-byte block is not u32-aligned; its shader reads a padded
-                            // 53-u32 stride, so repack on upload. Every other native type's matvec
-                            // shader reads the raw GGML bytes directly.
+                            // Q6_K (210 B) and Q3_K (110 B) blocks are not u32-aligned; their shaders
+                            // read a padded u32 stride, so repack on upload. Every other native type's
+                            // matvec shader reads the raw GGML bytes directly (word- or byte-addressed).
                             let wq = match dt {
                                 GgmlDType::Q6K => d.quantize_q6k(&bytes, n, k)?,
+                                GgmlDType::Q3K => d.quantize_q3k(&bytes, n, k)?,
                                 _ => d.upload_qweight(&bytes)?,
                             };
                             return Ok(Self::VulkanQuant {
@@ -2049,6 +2055,11 @@ impl crate::Module for QMatMul {
                             GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q5K => d.matvec_q5k_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q6K => d.matvec_q6k_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q2K => d.matvec_q2k_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q3K => d.matvec_q3k_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::IQ4_XS => d.matvec_iq4xs_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::IQ4_NL => d.matvec_iq4nl_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::TQ2_0 => d.matvec_tq2_0_gpu(wq, xv, *n, *k)?,
                             other => crate::bail!("VulkanQuant: no native matvec for {other:?}"),
                         }
                     };

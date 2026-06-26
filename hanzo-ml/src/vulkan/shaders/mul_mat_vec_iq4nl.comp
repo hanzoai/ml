@@ -1,0 +1,53 @@
+#version 450
+// IQ4_NL matrix-vector product (decode / memory-bound path): y[n] = sum_k W[n,k]*x[k] with W stored
+// in the *native GGML* IQ4_NL block format read straight from a GPU buffer -- NO CPU dequant round
+// trip. Each row is K/32 blocks; one GGML block_iq4_nl = 18 bytes = { f16 d ; u8 qs[16] }. The 32
+// weights are non-uniform 4-bit codebook indices: low nibble of qs[j] -> weight j, high nibble ->
+// weight j+16, dequantized as d * kvalues_iq4nl[idx] (byte-exact with k_quants.rs BlockIQ4nl::to_float).
+// 18 B is not 4-aligned, so the block run is byte-addressed out of the u32 buffer (like Q4_0/Q8_0).
+// One invocation computes one output element (one row dot the activation).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint  w[]; };  // raw IQ4_NL blocks, 18 B each
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };  // activation vector, length k
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
+layout(push_constant) uniform Pc { uint nout; uint k; };        // k is a multiple of 32
+
+// Non-uniform 4-bit codebook (llama.cpp kvalues_iq4nl; same as k_quants.rs KVALUES_IQ4NL).
+const int KV[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+// Read one byte at absolute byte-offset `bo` from the u32-packed weight buffer.
+uint rdbyte(uint bo) {
+    return bitfieldExtract(w[bo >> 2u], int((bo & 3u) * 8u), 8);
+}
+// Read the f16 block scale `d` (2 little-endian bytes at `bo`) as f32.
+float rdscale(uint bo) {
+    uint lo = rdbyte(bo);
+    uint hi = rdbyte(bo + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 32u;
+    uint rowbase = n * nblocks * 18u; // byte offset of row n
+    float acc = 0.0;
+    for (uint b = 0u; b < nblocks; b++) {
+        uint bb = rowbase + b * 18u;      // byte offset of this block
+        float d = rdscale(bb);
+        uint qbase = bb + 2u;             // qs[] starts after the 2-byte scale
+        uint xb = b * 32u;                // activation base for this block
+        float bsum = 0.0;
+        for (uint j = 0u; j < 16u; j++) {
+            uint q = rdbyte(qbase + j);
+            bsum += float(KV[q & 0x0Fu]) * x[xb + j];        // low nibble -> weight j
+            bsum += float(KV[q >> 4u])   * x[xb + j + 16u];  // high nibble -> weight j+16
+        }
+        acc += d * bsum;
+    }
+    y[n] = acc;
+}
