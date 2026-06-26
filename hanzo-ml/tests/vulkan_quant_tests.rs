@@ -286,6 +286,88 @@ fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// End-to-end PREFILL (M>1): the prompt-processing GEMM path. Build a quantized QTensor on the Vulkan
+// device, wrap it in a QMatMul, and run forward on an [M, k] activation -- which now dispatches the
+// native quantized GEMM (`mul_mat_q*`: weights stay quantized in VRAM, each weight block decoded ONCE
+// per output column and reused across all M rows) instead of dequantizing the whole weight to f32.
+// Compare every output row to a host f64 matmul over the dequantized weights. M straddles the host's
+// MAX_M=8 row-tiling (partial tile / exact tile / multi-tile + remainder) so the tiling is exercised.
+fn prefill_case(
+    dev: &Device,
+    dtype: GgmlDType,
+    m: usize,
+    nout: usize,
+    k: usize,
+) -> hanzo_ml::Result<f32> {
+    let cpu = Device::Cpu;
+    let w_host: Vec<f32> = (0..nout * k).map(|i| pseudo(i) * 0.5).collect();
+    let x_host: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
+
+    // CPU quantized weight; reuse it for both the GPU upload bytes and the dequant reference.
+    let w_t = Tensor::from_vec(w_host, (nout, k), &cpu)?;
+    let q_cpu = Arc::new(QTensor::quantize(&w_t, dtype)?);
+    let bytes = q_cpu.data()?.into_owned();
+    let w_deq: Vec<f32> = q_cpu.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
+
+    // Reference: y[mi, n] = sum_k W_deq[n, k] * x[mi, k] in f64 (dequantize-then-dot ground truth).
+    let mut y_ref = vec![0f64; m * nout];
+    for mi in 0..m {
+        for n in 0..nout {
+            let mut acc = 0f64;
+            for j in 0..k {
+                acc += w_deq[n * k + j] as f64 * x_host[mi * k + j] as f64;
+            }
+            y_ref[mi * nout + n] = acc;
+        }
+    }
+
+    // Vulkan quantized weight built the loader way, then QMatMul (native VulkanQuant prefill GEMM).
+    let qs_vk = QStorage::from_data(std::borrow::Cow::Owned(bytes), dev, dtype)?;
+    let q_vk = QTensor::new(qs_vk, (nout, k))?;
+    let qm_vk = QMatMul::from_qtensor(q_vk)?;
+    // A multi-row [M, k] input on the Vulkan device triggers the native prefill GEMM.
+    let x_vk = Tensor::from_vec(x_host, (m, k), dev)?;
+    let y_vk = qm_vk.forward(&x_vk)?.flatten_all()?.to_vec1::<f32>()?;
+
+    assert_eq!(y_vk.len(), m * nout);
+    let mut max_abs = 0f32;
+    for i in 0..m * nout {
+        max_abs = max_abs.max((y_vk[i] as f64 - y_ref[i]).abs() as f32);
+    }
+    Ok(max_abs)
+}
+
+#[test]
+fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    // M straddles the host MAX_M=8 tiling: 5 (partial tile), 8 (exact tile), 17 (2 tiles + remainder).
+    // (nout, k) with k divisible by 256 so all five dtypes share the same shapes.
+    for &m in &[5usize, 8, 17] {
+        for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
+            for dt in [
+                GgmlDType::Q4_0,
+                GgmlDType::Q8_0,
+                GgmlDType::Q4K,
+                GgmlDType::Q5K,
+                GgmlDType::Q6K,
+            ] {
+                let max_abs = prefill_case(&dev, dt, m, nout, k)?;
+                println!(
+                    "QMatMul::prefill {dt:?}  M={m:3} nout={nout:5} k={k:5}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}"
+                );
+                // The GEMM decodes the SAME quantized bytes as the reference dequant and accumulates
+                // per row exactly like the decode matvec; only fp32-vs-f64 accumulation order differs.
+                assert!(
+                    max_abs < 1e-3,
+                    "QMatMul::prefill {dt:?} M={m} GPU/ref mismatch too large: {max_abs}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // MoE: the fused grouped quant matvec. Build a quantized expert bank [E, n, k] on the Vulkan device
 // and call QTensor::indexed_moe_forward (the path Qwen3-MoE uses) -- which now runs one on-GPU
 // dispatch that gathers each routed slot's expert and computes its matvec -- and compare to a host

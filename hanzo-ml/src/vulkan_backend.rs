@@ -52,6 +52,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
         "mul_mat_vec_q8_0" => spv!("mul_mat_vec_q8_0"),
         "mul_mat_vec_q4_0" => spv!("mul_mat_vec_q4_0"),
+        "mul_mat_q4_0" => spv!("mul_mat_q4_0"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
@@ -852,6 +853,46 @@ impl VulkanDevice {
             &push,
             ((total as u32).div_ceil(WG1D), 1, 1),
         )?;
+        Ok(out)
+    }
+
+    /// Q4_0 matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
+    /// (verbatim native GGML Q4_0 18-byte blocks from [`upload_qweight`], same decode as
+    /// [`matvec_q4_0_gpu`]). Decodes each weight value once and reuses it across a tile of up to
+    /// [`MATMUL_Q_MAX_M`] rows, so weight memory traffic matches a single matvec per output column
+    /// instead of dequantizing the whole weight to f32 every forward -- the prefill bandwidth lever.
+    /// `x` must be a contiguous `[m, k]` device buffer; returns `[m, nout]` row-major. `k` a multiple
+    /// of 32.
+    pub fn matmul_q4_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matmul_q4_0_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < m * k {
+            crate::bail!("matmul_q4_0_gpu: x count {} < m*k {}", x.count, m * k);
+        }
+        let out = self.alloc_f32(m * nout)?;
+        let cols = (nout as u32).div_ceil(WG1D);
+        let mut m0 = 0usize;
+        while m0 < m {
+            let mcount = (m - m0).min(MATMUL_Q_MAX_M);
+            // woff = 0: a plain 2D weight starts at word 0 (Q4_0 MoE banks ride the per-slot matvec,
+            // not this GEMM, so no bank offset is ever needed here).
+            let push = push_u32(&[m0 as u32, mcount as u32, nout as u32, k as u32, 0u32]);
+            self.dispatch(
+                "mul_mat_q4_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (cols, 1, 1),
+            )?;
+            m0 += mcount;
+        }
         Ok(out)
     }
 
