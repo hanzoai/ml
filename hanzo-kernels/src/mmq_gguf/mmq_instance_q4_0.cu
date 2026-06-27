@@ -114,7 +114,10 @@ static void launch_mmq_case_q4_0(float * tmp_fixup, const mmq_args & args, cudaS
     }
 }
 
-extern "C" void launch_mmq_gguf_q4_0(
+// weak: hanzo-quant (engine) compiles the same llama MMQ and exports identical C symbols. When both
+// crates are co-linked the dense launchers would otherwise multiply-define; weak defers to whichever
+// is strong (identical code) while keeping hanzo-kernels self-contained for standalone ml builds.
+extern "C" __attribute__((weak)) void launch_mmq_gguf_q4_0(
     void *tmp_fixup_ptr,
     const void *x, const void *y_q8_1_mmq, void *dst,
     int64_t ncols_x, int64_t nrows_x, int64_t ncols_y,
@@ -134,3 +137,5 @@ extern "C" void launch_mmq_gguf_q4_0(
 
     launch_mmq_case_q4_0((float *)tmp_fixup_ptr, args, (cudaStream_t)stream, cc, nsm, smpbo, warp_size_host);
 }
+
+DEFINE_MMQ_GGUF_MOE_LAUNCHER(q4_0, GGML_TYPE_Q4_0, launch_mmq_case_q4_0)

@@ -468,6 +468,20 @@ fn indexed_moe_forward_fused_q8_1_input(
     );
     let topk = n_slots / batch;
 
+    // Prefill (rows>1) -> expert-grouped int8 MMQ GEMM (llama mul_mat_id): group the routed tokens by
+    // expert and stage each expert's weight ONCE, amortizing it over all its tokens via the tensor
+    // cores. The per-slot matvec below instead re-streams the whole expert weight for EVERY routed token
+    // (no matrix cores) -- fine at decode (one token), the 10x deficit at prefill. Decode (batch==1)
+    // keeps the per-slot matvec (bandwidth-bound, capture-clean). HANZO_MOE_QMMQ_FALLBACK forces the
+    // per-slot path for the A/B; unsupported weight dtypes return None and fall through to per-slot.
+    if batch > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err() {
+        if let Some(res) = super::fast_mmq::indexed_moe_grouped(
+            weight, w_shape, w_dtype, input, in_shape, ids, idx_shape, dev,
+        )? {
+            return Ok(res);
+        }
+    }
+
     // Quantize input into q8_1.
     let total_rows = batch * input_dim1;
     let k_padded = pad(k, MATRIX_ROW_PADDING);
@@ -1292,6 +1306,110 @@ mod test {
             assert!(
                 max_err <= tol,
                 "{dtype:?}: i-quant CUDA dense matmul max_err {max_err} > tol {tol} (max_abs {max_abs})"
+            );
+        }
+        Ok(())
+    }
+
+    // Expert-grouped MoE PREFILL GEMM (llama mul_mat_id) numeric gate. batch>1 routes
+    // indexed_moe_forward through fast_mmq::indexed_moe_grouped (the new int8 MMQ path); batch==1 keeps
+    // the per-slot matvec (decode). This exercises a multi-tile, multi-expert prefill (160 routed slots
+    // over 8 experts, with expert 5 deliberately EMPTY to test the expert_bounds zero-range path) and
+    // checks BOTH paths against the exact-weight f32 oracle (dequantized bank @ raw input; only the
+    // kernel's internal q8_1 activation quant ~1/256 differs). A wrong grouping (bad expert offset,
+    // dropped tail columns, scatter collision) reads/writes the wrong place -> ~100% off, far past tol.
+    #[test]
+    fn cuda_indexed_moe_grouped_prefill_vs_oracle() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let (e, n, k) = (8usize, 64usize, 512usize);
+        let (batch, topk) = (40usize, 4usize); // nslots=160, ~20 tok/expert -> real multi-column tiling
+
+        // Deterministic routing leaving expert 5 with ZERO tokens (empty-expert bounds coverage).
+        let mut sr: u32 = 0xC0FF_EE11;
+        let ids: Vec<u32> = (0..batch * topk)
+            .map(|_| {
+                sr = sr.wrapping_mul(1664525).wrapping_add(1013904223);
+                let ex = (sr >> 9) % (e as u32);
+                if ex == 5 {
+                    4
+                } else {
+                    ex
+                }
+            })
+            .collect();
+
+        // Deterministic varied weights/input (LCG), distinct per expert.
+        let mut st: u32 = 0x1234_5678;
+        let mut nextf = || -> f32 {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        let w: Vec<f32> = (0..e * n * k).map(|_| nextf() * 0.5).collect();
+        let inp: Vec<f32> = (0..batch * k).map(|_| nextf()).collect();
+        // One-token input for the decode (per-slot) leg: reuse the first token's k values.
+        let inp1: Vec<f32> = inp[0..k].to_vec();
+        let ids1: Vec<u32> = ids[0..topk].to_vec();
+
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0] {
+            let mut bank = QCudaStorage::zeros(&dev, e * n * k, dtype)?;
+            bank.quantize(&CudaStorage::wrap_cuda_slice(dev.clone_htod(&w)?, dev.clone()))?;
+            let deq = bank.dequantize(e * n * k)?;
+            let w_deq = dev.clone_dtoh(&deq.as_cuda_slice::<f32>()?.as_view())?;
+            let self_shape: crate::Shape = (e, n, k).into();
+
+            // GROUPED prefill (batch>1 -> int8 MMQ).
+            let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+            let input_l = crate::Layout::contiguous((batch, 1usize, k));
+            let ids_storage = CudaStorage::wrap_cuda_slice(dev.clone_htod(&ids)?, dev.clone());
+            let ids_l = crate::Layout::contiguous((batch, topk));
+            let (g_st, g_sh) =
+                bank.indexed_moe_forward(&self_shape, &input, &input_l, &ids_storage, &ids_l)?;
+            assert_eq!(g_sh.dims().to_vec(), vec![batch, topk, n]);
+            let got_g = dev.clone_dtoh(&g_st.as_cuda_slice::<f32>()?.as_view())?;
+
+            let mut max_abs = 0f32;
+            let mut err_g = 0f32;
+            for b in 0..batch {
+                for t in 0..topk {
+                    let ex = ids[b * topk + t] as usize;
+                    for j in 0..n {
+                        let mut acc = 0f32;
+                        for i in 0..k {
+                            acc += w_deq[ex * n * k + j * k + i] * inp[b * k + i];
+                        }
+                        max_abs = max_abs.max(acc.abs());
+                        err_g = err_g.max((got_g[(b * topk + t) * n + j] - acc).abs());
+                    }
+                }
+            }
+            let tol = 0.05 * max_abs + 1e-3;
+            assert!(
+                err_g <= tol,
+                "{dtype:?}: GROUPED prefill vs oracle err {err_g} > tol {tol} (max_abs {max_abs})"
+            );
+
+            // PER-SLOT decode (batch==1) on the same weights -> still tracks the oracle.
+            let input1 = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp1)?, dev.clone());
+            let input1_l = crate::Layout::contiguous((1usize, 1usize, k));
+            let ids1_storage = CudaStorage::wrap_cuda_slice(dev.clone_htod(&ids1)?, dev.clone());
+            let ids1_l = crate::Layout::contiguous((1usize, topk));
+            let (p_st, _) =
+                bank.indexed_moe_forward(&self_shape, &input1, &input1_l, &ids1_storage, &ids1_l)?;
+            let got_p = dev.clone_dtoh(&p_st.as_cuda_slice::<f32>()?.as_view())?;
+            let mut err_p = 0f32;
+            for t in 0..topk {
+                let ex = ids1[t] as usize;
+                for j in 0..n {
+                    let mut acc = 0f32;
+                    for i in 0..k {
+                        acc += w_deq[ex * n * k + j * k + i] * inp1[i];
+                    }
+                    err_p = err_p.max((got_p[t * n + j] - acc).abs());
+                }
+            }
+            assert!(
+                err_p <= tol,
+                "{dtype:?}: PER-SLOT decode vs oracle err {err_p} > tol {tol}"
             );
         }
         Ok(())

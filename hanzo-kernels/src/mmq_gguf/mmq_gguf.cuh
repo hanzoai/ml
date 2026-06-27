@@ -3955,3 +3955,36 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
+
+// -------------------------------------------------------------------------------------------------------------------------------------
+// Expert-grouped MoE prefill launcher (llama's mul_mat_id), defined per quant type next to the dense
+// launch_mmq_gguf_<type>. It is the SAME int8 mul_mat_q core and the SAME static launch_mmq_case_<type>;
+// the ONLY difference is that experts ride the CHANNEL dim. The host groups the routed tokens by expert
+// (counting sort over the router ids -- prefill is never graph-captured, so the ids DtoH is free) and
+// passes:
+//   * ids_dst[col]       -- the ORIGINAL output row for sorted column `col` (write_back scatters there),
+//   * expert_bounds[e]   -- prefix sums [num_experts+1]; expert `zt` owns sorted columns [eb[zt],eb[zt+1]),
+//   * stride_channel_x    -- one expert's weight stride (= nrows_x*stride_row_x), so each expert's weight
+//                            is staged ONCE and amortized over all its tokens via the matrix cores.
+// `dst` is [ncols_dst, nrows_x] row-major over the original token rows (stride_col_dst == nrows_dst ==
+// nrows_x). ncols_max is the largest per-expert token count (bounds the j-tile grid). Decode (one token)
+// keeps the per-slot matvec; only prefill (rows>1) routes here.
+#define DEFINE_MMQ_GGUF_MOE_LAUNCHER(SUFFIX, GTYPE, CASEFN)                                            \
+extern "C" void launch_mmq_gguf_moe_##SUFFIX(                                                          \
+        void *tmp_fixup_ptr,                                                                           \
+        const void *x, const void *y_q8_1_mmq,                                                         \
+        const void *ids_dst, const void *expert_bounds, void *dst,                                     \
+        int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t ncols_max,                        \
+        int64_t stride_row_x, int64_t stride_channel_x, int64_t n_experts,                             \
+        int cc, int nsm, int64_t smpbo, int warp_size_host, void *stream) {                            \
+    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) &&                                           \
+        ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA);                                    \
+    const mmq_args args = {                                                                            \
+        (const char *)x, GTYPE, (const int *)y_q8_1_mmq,                                               \
+        (const int32_t *)ids_dst, (const int32_t *)expert_bounds, (float *)dst,                        \
+        ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_dst, nrows_x,                                 \
+        n_experts, n_experts, stride_channel_x, 0, 0,                                                  \
+        1, 1, 0, 0, 0,                                                                                  \
+        use_stream_k, ncols_max };                                                                     \
+    CASEFN((float *)tmp_fixup_ptr, args, (cudaStream_t)stream, cc, nsm, smpbo, warp_size_host);        \
+}
