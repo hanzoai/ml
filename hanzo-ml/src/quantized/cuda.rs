@@ -693,6 +693,79 @@ impl QCudaStorage {
         }
     }
 
+    /// True for the i-quant codebook types, which have a native dp4a indexed-MoE DECODE kernel
+    /// (moe_qmatvec_dp4a_<iq*>) but NO Blue-C fused q8_1 MoE kernel. Distinct from `supports_indexed_moe`
+    /// (the Blue-C set) -- the dispatch in mod.rs tries that first, then this, then the generic fallback.
+    pub fn supports_iquant_moe(dtype: GgmlDType) -> bool {
+        iquant_dp4a_suffix(dtype).is_some()
+    }
+
+    /// Fused i-quant indexed-MoE DECODE. The [E,n,k] expert bank stays RESIDENT in VRAM and the router
+    /// gather runs on-device (slot s on grid.y, expert = ids[s] read in-kernel) -- the dp4a twin of the
+    /// ROCm moe_matvec_quant. This REPLACES the generic per-expert fallback, which DtoH'd the whole
+    /// expert bank to host (`self.data()`) and re-uploaded each selected expert EVERY token. `x_flat`
+    /// is the already-per-slot-broadcast routed activation [nrows, k] f32 (nrows = batch*topk).
+    pub fn moe_iquant_dp4a(
+        &self,
+        x_flat: &CudaView<f32>,
+        ids: &CudaView<u32>,
+        nrows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<CudaStorage> {
+        let suffix = iquant_dp4a_suffix(self.dtype)
+            .ok_or_else(|| crate::Error::Msg(format!("no i-quant MoE kernel for {:?}", self.dtype)).bt())?;
+        if k % 256 != 0 {
+            crate::bail!("i-quant MoE ncols {k} must be a multiple of 256");
+        }
+        if x_flat.len() != nrows * k {
+            crate::bail!("unexpected x_flat size {}, nrows {nrows} k {k}", x_flat.len());
+        }
+        let dev = self.device();
+        let nblk32 = k / 32;
+
+        // Quantize the nrows routed activations -> separated (int8 xq [nrows,k], f16 scale xd [nrows,k/32]).
+        let mut xq = dev.alloc_zeros::<u8>(nrows * k)?;
+        let mut xd = dev.alloc_zeros::<f16>(nrows * nblk32)?;
+        {
+            let func = dev.get_or_load_func("iq_quantize_q8_f32", &hanzo_kernels::IQUANT_MMVQ)?;
+            let nwarp = (nrows * nblk32) as u32;
+            let threads = 256u32;
+            let blocks = nwarp.div_ceil(threads / WARP_SIZE as u32);
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            barg!(builder, nrows as i32, k as i32);
+            builder.arg(x_flat);
+            builder.arg(&xq);
+            builder.arg(&xd);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+
+        // Fused decode: one batched launch, slots on grid.y, expert gathered on-device from `ids`.
+        let kernel_name = format!("moe_qmatvec_dp4a_{suffix}_f32");
+        let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+        let out = dev.alloc_zeros::<f32>(nrows * n)?;
+        const ROWS_PER_BLOCK: u32 = 8;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(ROWS_PER_BLOCK), nrows as u32, 1),
+            block_dim: (ROWS_PER_BLOCK * WARP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        barg!(builder, n as i32, k as i32, nrows as i32);
+        builder.arg(&self.data.inner);
+        builder.arg(ids);
+        builder.arg(&xq);
+        builder.arg(&xd);
+        builder.arg(&out);
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
+    }
+
     pub fn zeros(device: &CudaDevice, el_count: usize, dtype: GgmlDType) -> Result<Self> {
         let size_in_bytes = ceil_div(el_count, dtype.block_size()) * dtype.type_size();
         let padded_size_in_bytes =
