@@ -11,7 +11,7 @@ Download assets:
 
 ```bash
 # mel filters
-wget -c https://huggingface.co/spaces/lmz/hanzo-ml-whisper/resolve/main/mel_filters.safetensors
+wget -c https://huggingface.co/spaces/lmz/candle-whisper/resolve/main/mel_filters.safetensors
 # Model and tokenizer tiny.en
 wget -c https://huggingface.co/openai/whisper-tiny.en/resolve/main/model.safetensors -P whisper-tiny.en 
 wget -c https://huggingface.co/openai/whisper-tiny.en/raw/main/tokenizer.json -P whisper-tiny.en
@@ -22,19 +22,19 @@ wget -c https://huggingface.co/openai/whisper-tiny/raw/main/tokenizer.json -P wh
 wget -c https://huggingface.co/openai/whisper-tiny/raw/main/config.json -P whisper-tiny
 
 #quantized 
-wget -c https://huggingface.co/lmz/hanzo-ml-whisper/resolve/main/model-tiny-en-q80.gguf -P quantized
-wget -c https://huggingface.co/lmz/hanzo-ml-whisper/raw/main/tokenizer-tiny-en.json -P quantized
-wget -c https://huggingface.co/lmz/hanzo-ml-whisper/raw/main/config-tiny-en.json -P quantized
+wget -c https://huggingface.co/lmz/candle-whisper/resolve/main/model-tiny-en-q80.gguf -P quantized
+wget -c https://huggingface.co/lmz/candle-whisper/raw/main/tokenizer-tiny-en.json -P quantized
+wget -c https://huggingface.co/lmz/candle-whisper/raw/main/config-tiny-en.json -P quantized
 
 
 
 # Audio samples
-wget -c https://huggingface.co/datasets/Narsil/hanzo-ml-examples/resolve/main/samples_gb0.wav -P audios
-wget -c https://huggingface.co/datasets/Narsil/hanzo-ml-examples/resolve/main/samples_a13.wav -P audios
-wget -c https://huggingface.co/datasets/Narsil/hanzo-ml-examples/resolve/main/samples_gb1.wav -P audios
-wget -c https://huggingface.co/datasets/Narsil/hanzo-ml-examples/resolve/main/samples_hp0.wav -P audios
-wget -c https://huggingface.co/datasets/Narsil/hanzo-ml-examples/resolve/main/samples_jfk.wav -P audios
-wget -c https://huggingface.co/datasets/Narsil/hanzo-ml-examples/resolve/main/samples_mm0.wav -P audios
+wget -c https://huggingface.co/datasets/Narsil/candle-examples/resolve/main/samples_gb0.wav -P audios
+wget -c https://huggingface.co/datasets/Narsil/candle-examples/resolve/main/samples_a13.wav -P audios
+wget -c https://huggingface.co/datasets/Narsil/candle-examples/resolve/main/samples_gb1.wav -P audios
+wget -c https://huggingface.co/datasets/Narsil/candle-examples/resolve/main/samples_hp0.wav -P audios
+wget -c https://huggingface.co/datasets/Narsil/candle-examples/resolve/main/samples_jfk.wav -P audios
+wget -c https://huggingface.co/datasets/Narsil/candle-examples/resolve/main/samples_mm0.wav -P audios
 
 ```
 

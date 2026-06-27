@@ -10,8 +10,8 @@ From the `hanzo-ml-wasm-examples/yolo` directory run:
 Download assets:
 
 ```bash
-wget -c https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hanzo/examples/bike.jpeg
-wget -c https://huggingface.co/lmz/hanzo-ml-yolo-v8/resolve/main/yolov8s.safetensors
+wget -c https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/candle/examples/bike.jpeg
+wget -c https://huggingface.co/lmz/candle-yolo-v8/resolve/main/yolov8s.safetensors
 ```
 
 Run hot reload server:
