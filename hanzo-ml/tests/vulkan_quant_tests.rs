@@ -50,6 +50,7 @@ fn quantizable(dtype: GgmlDType) -> bool {
             | GgmlDType::IQ3_XXS
             | GgmlDType::IQ3_S
             | GgmlDType::IQ1_S
+            | GgmlDType::IQ1_M
             | GgmlDType::IQ2_XS
     )
 }
@@ -177,6 +178,19 @@ fn synth_decode_only(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
                 }
             }
         }
+        // block_iq1m (56 B): qs[32] + qh[16] + scales[8]. NO leading d -- d is reconstructed from
+        // the high nibbles of the 4 scale u16. Set scales so scale_u16 = 0x2C00 (f16 = 0.0625) and the
+        // per-sub-block 3-bit scale fields are 0 (dl = d); qs/qh stay random (valid indices + signs).
+        GgmlDType::IQ1_M => {
+            for _ in 0..nout * (k / 256) {
+                for _ in 0..48 {
+                    out.push(pbyte(c)); // qs[32] + qh[16]
+                    c += 1;
+                }
+                // scales[8] = sc0=0, sc1=0, sc2=0xC000, sc3=0x2000 -> scale_u16=0x2C00, dl fields 0.
+                out.extend_from_slice(&[0u8, 0u8, 0u8, 0u8, 0u8, 0xC0u8, 0u8, 0x20u8]);
+            }
+        }
         _ => panic!("synth_decode_only: {dtype:?} is not a decode-only type"),
     }
     out
@@ -218,6 +232,7 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
         GgmlDType::Q3K => vk.quantize_q3k(&raw, nout, k)?,
         GgmlDType::IQ2_XXS => vk.quantize_iq2xxs(&raw, nout, k)?,
         GgmlDType::IQ2_XS => vk.quantize_iq2xs(&raw, nout, k)?,
+        GgmlDType::IQ1_M => vk.quantize_iq1m(&raw, nout, k)?,
         GgmlDType::IQ1_S => vk.quantize_iq1s(&raw, nout, k)?,
         GgmlDType::IQ3_S => vk.quantize_iq3s(&raw, nout, k)?,
         GgmlDType::IQ3_XXS => vk.quantize_iq3xxs(&raw, nout, k)?,
@@ -236,6 +251,7 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
         GgmlDType::IQ4_NL => vk.matvec_iq4nl(&wq, &x_host, nout, k)?,
         GgmlDType::IQ2_XXS => vk.matvec_iq2xxs(&wq, &x_host, nout, k)?,
         GgmlDType::IQ2_XS => vk.matvec_iq2xs(&wq, &x_host, nout, k)?,
+        GgmlDType::IQ1_M => vk.matvec_iq1m(&wq, &x_host, nout, k)?,
         GgmlDType::IQ1_S => vk.matvec_iq1s(&wq, &x_host, nout, k)?,
         GgmlDType::IQ3_S => vk.matvec_iq3s(&wq, &x_host, nout, k)?,
         GgmlDType::IQ3_XXS => vk.matvec_iq3xxs(&wq, &x_host, nout, k)?,
@@ -594,7 +610,25 @@ fn vulkan_matvec_iq1s_matches_cpu() -> hanzo_ml::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn vulkan_matvec_iq1m_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::IQ1_M, nout, k)?;
+        println!(
+            "IQ1_M nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}",
+            s.max_abs, s.max_rel, s.rms
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "IQ1_M GPU/CPU mismatch: max_abs={} max_rel={}", s.max_abs, s.max_rel
+        );
+    }
+    Ok(())
+}
 // ---------------------------------------------------------------------------------------------
+// End-to-end// ---------------------------------------------------------------------------------------------
 // End-to-end// ---------------------------------------------------------------------------------------------
 // End-to-end// ---------------------------------------------------------------------------------------------
 // End-to-end// ---------------------------------------------------------------------------------------------
