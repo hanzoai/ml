@@ -1,0 +1,60 @@
+#version 450
+// Q2_K matrix-vector product (decode / memory-bound path): y[n] = sum_k W[n,k]*x[k], W stored as
+// GGUF Q2_K super-blocks kept verbatim in VRAM (no host requantize). One Q2_K super-block packs 256
+// weights into 84 bytes = 21 u32: scales[16] (byte 0..16, each = d-nibble | min-nibble<<4), qs[64]
+// (byte 16..80, four 2-bit weights per byte), d (f16 byte 80..82), dmin (f16 byte 82..84). Reading
+// ~2.6 bits/weight instead of 32 cuts decode memory traffic ~12x on this ~256 GB/s APU. 84 is a
+// multiple of 4, so the block is word-indexed. One invocation computes one output element. Decode
+// MUST match the CPU k_quants BlockQ2K::to_float.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // Q2_K blocks, 21 u32 / 256-block
+layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activation vector, length k
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
+layout(push_constant) uniform Pc { uint nout; uint k; };         // k is a multiple of 256
+
+const uint BLK_U32 = 21u;   // 84 bytes / 4
+const uint SC_BYTE = 0u;    // byte offset of scales[16]
+const uint QS_BYTE = 16u;   // byte offset of qs[64]
+const uint D_U32   = 20u;   // u32 index of {d (f16 lo), dmin (f16 hi)} (bytes 80..84)
+
+// Unsigned byte `b` (0-based) within the block at u32 index `base`.
+uint byte_u(uint base, uint b) {
+    return (w[base + (b >> 2u)] >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= nout) {
+        return;
+    }
+    uint nblocks = k / 256u;
+    uint rowbase = n * nblocks * BLK_U32; // u32 offset of row n
+    float acc = 0.0;
+    for (uint blk = 0u; blk < nblocks; blk++) {
+        uint base = rowbase + blk * BLK_U32;
+        float d    = float(unpackHalf2x16(w[base + D_U32]).x);
+        float dmin = float(unpackHalf2x16(w[base + D_U32]).y);
+        uint xblk = blk * 256u;
+        // 2 chunks of 128 weights; chunk c uses scales[c*8..], qs[c*32..], outputs [c*128..].
+        for (uint c = 0u; c < 2u; c++) {
+            uint xc = xblk + c * 128u;
+            // 8 scale-groups of 16; group g = 2*j+h with shift 2*j and qs half h.
+            for (uint g = 0u; g < 8u; g++) {
+                uint shift = 2u * (g >> 1u);
+                uint sc = byte_u(base, SC_BYTE + c * 8u + g);
+                float dl = d * float(sc & 0x0Fu);
+                float ml = dmin * float(sc >> 4u);
+                uint qoff = QS_BYTE + c * 32u + (g & 1u) * 16u;
+                uint xg = xc + g * 16u;
+                for (uint l = 0u; l < 16u; l++) {
+                    uint q = byte_u(base, qoff + l);
+                    float val = float((q >> shift) & 3u);
+                    acc += (dl * val - ml) * x[xg + l];
+                }
+            }
+        }
+    }
+    y[n] = acc;
+}
