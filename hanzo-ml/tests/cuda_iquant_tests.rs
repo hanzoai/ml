@@ -268,6 +268,89 @@ fn cuda_matvec_iq2xxs_batched_matches_cpu() {
     }
 }
 
+// ---- dense i-quant PREFILL (m>8 -> the int8-WMMA qmmq GEMM, not the mmvq decode path). Compared to
+// the GPU dequantized-weight matmul over the SAME q8_1-pre-quantized activation, isolating the int8
+// tile decode (the qmmq twin of the decode gate). ----
+fn run_prefill(dev: &Device, dtype: GgmlDType, nout: usize, k: usize, m: usize) -> Err {
+    let cpu = Device::Cpu;
+    let raw = synth(dtype, nout, k);
+    let w_deq: Vec<f32> = QTensor::new(
+        QStorage::from_data(Cow::Owned(raw.clone()), &cpu, dtype).unwrap(),
+        (nout, k),
+    )
+    .unwrap()
+    .dequantize(&cpu)
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+    let matmul = QMatMul::from_qtensor(
+        QTensor::new(QStorage::from_data(Cow::Owned(raw), dev, dtype).unwrap(), (nout, k)).unwrap(),
+    )
+    .unwrap();
+    // m>8 activation, pre-quantized to q8_1 levels per row (idempotent re-quant -> bit-identical inputs).
+    let x_host: Vec<f32> = (0..m * k)
+        .map(|i| pseudo(i + 555))
+        .collect::<Vec<_>>()
+        .chunks(k)
+        .flat_map(q8_1_roundtrip)
+        .collect();
+    let x = Tensor::from_vec(x_host.clone(), (m, k), dev).unwrap();
+    let y: Vec<f32> = matmul.forward(&x).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    // Reference: GPU dense matmul of the exact f32 codebook weights x the same activation.
+    let w_gpu = Tensor::from_vec(w_deq, (nout, k), dev).unwrap();
+    let y_ref: Vec<f32> = x
+        .matmul(&w_gpu.t().unwrap())
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let mut max_abs = 0f32;
+    let mut sse = 0f64;
+    let mut rs = 0f64;
+    for (g, r) in y.iter().zip(&y_ref) {
+        let (g, r) = (*g as f64, *r as f64);
+        max_abs = max_abs.max((g - r).abs() as f32);
+        sse += (g - r) * (g - r);
+        rs += r * r;
+    }
+    let max_rel = ((sse / y.len() as f64).sqrt() / (rs / y.len() as f64).sqrt().max(1e-9)) as f32;
+    Err { max_abs, max_rel }
+}
+
+#[test]
+fn cuda_qmmq_iquant_prefill_matches_dequant() {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no CUDA device ({e})");
+            return;
+        }
+    };
+    // The 5 i-quant types with an int8-WMMA MMQ kernel reading the standard codebook grids (IQ1_S/IQ1_M
+    // use a distinct GPU-packed grid / have no kernel -> dequant prefill, not tested here).
+    for dtype in [
+        GgmlDType::IQ2_XXS,
+        GgmlDType::IQ2_XS,
+        GgmlDType::IQ2_S,
+        GgmlDType::IQ3_XXS,
+        GgmlDType::IQ3_S,
+    ] {
+        for &m in &[16usize, 32] {
+            let s = run_prefill(&dev, dtype, 512, 2048, m);
+            println!("qmmq {dtype:?} prefill m={m}: max_abs={:.3e} max_rel={:.3e}", s.max_abs, s.max_rel);
+            assert!(
+                s.max_rel < 1e-3 && s.max_abs < 1e-1,
+                "{dtype:?} qmmq prefill m={m} diverged: max_abs={:.3e} max_rel={:.3e}",
+                s.max_abs,
+                s.max_rel
+            );
+        }
+    }
+}
+
 // ---- fused i-quant MoE decode: the native dp4a MoE path (bank resident in VRAM, on-device gather)
 // vs the CPU per-expert reference, both fed the same q8_1-level activation + router ids. Exercises the
 // mod.rs CUDA i-quant MoE arm + moe_iquant_dp4a (quantize + the moe_qmatvec_dp4a_<iq*> launch). ----

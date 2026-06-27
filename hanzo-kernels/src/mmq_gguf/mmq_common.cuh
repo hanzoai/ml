@@ -499,14 +499,14 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 
 // IQ/MXFP4 lookup table stubs (needed for compilation even though we only instantiate standard quant types)
 // These are device constants from ggml-common.h. We provide minimal stubs.
-// The functions referencing them are only called for IQ/MXFP4 types which we never instantiate.
 static const __device__ int8_t  kvalues_mxfp4[16] = {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15};
 static const __device__ int8_t  kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-static const __device__ uint64_t iq2xxs_grid[256] = {0};
-static const __device__ uint64_t iq2xs_grid[512] = {0};
-static const __device__ uint64_t iq2s_grid[1024] = {0};
-static const __device__ uint32_t iq3xxs_grid[256] = {0};
-static const __device__ uint32_t iq3s_grid[512] = {0};
+// REAL IQ2/IQ3 codebooks (generated from iq_grids.rs by tools/gen_iquant_grids.py) -- the int8-WMMA
+// MMQ load_tiles_iq2_xxs/xs/s + iq3_xxs/s read these. iq2xxs_grid/iq2xs_grid/iq2s_grid (u64) +
+// iq3xxs_grid/iq3s_grid (u32). NOT hand-edited; regenerate from the Rust source of truth.
+#include "iquant_grids_mmq.cuh"
+// IQ1 uses a distinct ggml-cuda GPU-packed table (iq1s_grid_gpu, a different [2048] nibble encoding,
+// not the iq_grids.rs codebook) -- left stubbed; IQ1_S/IQ1_M are MMQ-excluded (dequant prefill).
 static const __device__ uint32_t iq1s_grid_gpu[512] = {0};
 #define IQ1S_DELTA 0.125f
 #define IQ1M_DELTA 0.125f
