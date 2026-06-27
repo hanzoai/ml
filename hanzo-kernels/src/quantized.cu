@@ -4392,7 +4392,11 @@ __device__ void indexed_moe_forward(
     // Calculate strides
     const size_t weight_block_size = sizeof(block_q_t);
     const size_t input_block_size = sizeof(block_q8_1);
-    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * weight_block_size;
+    // Blocks per expert = (n*k weights) / (qk weights-per-block of THIS type). Must use the template
+    // `qk`, NOT the hardcoded QK_K (256): they coincide only for the K-quants (qk==QK_K). For any
+    // 32-element block type (Q8_0 and the legacy Q4_0/Q4_1/Q5_0/Q5_1) QK_K made the stride 8x too
+    // small, so expert e>0 read the wrong bank -> garbage. `qk` is correct for every wired type.
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
     const size_t output_task_stride_elems = n;
 
@@ -4519,6 +4523,69 @@ extern "C" __global__ void indexed_moe_forward_q6k_q8_1(
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
         (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+}
+
+// Legacy 32-element block types (Q4_0/Q4_1/Q5_0/Q5_1): same generic template, same vec_dot_*_q8_1 the
+// working mul_mat_vec_q*_0_q8_1 decode kernels use. Correct now that weight_expert_stride_bytes divides
+// by the template `qk` (32 here), not the hardcoded QK_K. Reuses QK*/QI*/VDR_* already defined above.
+extern "C" __global__ void indexed_moe_forward_q4_0_q8_1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q4_1_q8_1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward<QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q5_0_q8_1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward<QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q5_1_q8_1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward<QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
 }
 
 extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
