@@ -12,7 +12,7 @@ cd myapp
 ### Standard
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml
+cargo add --git https://github.com/hanzoai/ml.git hanzo-ml
 ```
 
 ### CUDA
@@ -35,7 +35,7 @@ If any of the above commands errors out, please make sure to update your Cuda ve
 Add the `hanzo-ml` crate with the cuda feature:
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml --features "cuda"
+cargo add --git https://github.com/hanzoai/ml.git hanzo-ml --features "cuda"
 ```
 
 ### MKL
@@ -45,7 +45,7 @@ You can also see the `mkl` feature which can get faster inference on CPU.
 Add the `hanzo-ml` crate with the mkl feature:
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml --features "mkl"
+cargo add --git https://github.com/hanzoai/ml.git hanzo-ml --features "mkl"
 ```
 
 ### Metal
@@ -55,7 +55,7 @@ Metal is exclusive to MacOS.
 Add the `hanzo-ml` crate with the metal feature:
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-ml --features "metal"
+cargo add --git https://github.com/hanzoai/ml.git hanzo-ml --features "metal"
 ```
 
 ## 3. Building
