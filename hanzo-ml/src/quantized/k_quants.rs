@@ -2546,10 +2546,18 @@ pub fn matmul<T: GgmlType>(
     rhs_t: &[T],
     dst: &mut [f32],
 ) -> Result<()> {
+    // A row has TWO distinct block counts: the weight `rhs_t` is stored in `T` super-blocks of
+    // `T::BLCK_SIZE` elements, while the activation `lhs` is quantized to `T::VecDotType` blocks of
+    // `T::VecDotType::BLCK_SIZE` elements. For most types these block sizes are equal, but the
+    // i-quant types use a 256-elem super-block with a 32-elem Q8_0 vec-dot block, so a row spans 8x
+    // more activation blocks than weight blocks. Conflating the two counts under-sizes the quantized
+    // activation and `vec_dot` indexes past the end of it (quant_format::vec_dot_dequant_q8_0).
     debug_assert_eq!(
+        T::BLCK_SIZE % T::VecDotType::BLCK_SIZE,
+        0,
+        "weight block size {} is not a multiple of vec-dot block size {}",
         T::BLCK_SIZE,
-        T::VecDotType::BLCK_SIZE,
-        "Mismatched block sizes"
+        T::VecDotType::BLCK_SIZE
     );
     debug_assert_eq!(
         m * k,
@@ -2557,16 +2565,18 @@ pub fn matmul<T: GgmlType>(
         "unexpected lhs length {} ({m},{k},{n})",
         lhs.len()
     );
-    let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
+    let weight_blocks_per_row = k.div_ceil(T::BLCK_SIZE);
+    let act_blocks_per_row = k.div_ceil(T::VecDotType::BLCK_SIZE);
 
     // TODO: Pre-allocate this.
-    let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_blocks];
+    let mut lhs_b = vec![T::VecDotType::zeros(); m * act_blocks_per_row];
     // f32, f16, and bf16 support direct copy
     if T::DIRECT_COPY {
         T::VecDotType::direct_copy(lhs, &mut lhs_b);
     } else {
         for row_idx in 0..m {
-            let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+            let lhs_b_mut =
+                &mut lhs_b[row_idx * act_blocks_per_row..(row_idx + 1) * act_blocks_per_row];
             let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
             T::VecDotType::from_float(lhs, lhs_b_mut)
         }
@@ -2597,7 +2607,7 @@ pub fn matmul<T: GgmlType>(
     };
 
     for row_idx in 0..m {
-        let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+        let lhs_row = &lhs_b[row_idx * act_blocks_per_row..(row_idx + 1) * act_blocks_per_row];
         let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
 
         dst_row
@@ -2606,7 +2616,8 @@ pub fn matmul<T: GgmlType>(
             .with_min_len(min_len)
             .with_max_len(512)
             .for_each(|(col_idx, dst)| {
-                let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+                let rhs_col = &rhs_t
+                    [col_idx * weight_blocks_per_row..(col_idx + 1) * weight_blocks_per_row];
                 *dst = T::vec_dot(k, rhs_col, lhs_row);
             });
     }
@@ -2624,11 +2635,15 @@ pub fn matmul_f16<T: GgmlType>(
         crate::bail!("unexpected lhs length {} {mkn:?}", lhs.len());
     }
 
-    let k_in_lhs_blocks = k.div_ceil(T::BLCK_SIZE);
-    let k_in_rhs_blocks = k.div_ceil(T::VecDotType::BLCK_SIZE);
-    let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_lhs_blocks];
+    // Same two-count split as `matmul`: the weight `rhs_t` is in `T::BLCK_SIZE` super-blocks, the
+    // quantized activation in `T::VecDotType::BLCK_SIZE` blocks (8x as many for the i-quants). Each
+    // must slice with its OWN count -- sizing the activation by the weight count (or vice versa)
+    // overruns `vec_dot`'s `ys` for any type whose two block sizes differ.
+    let weight_blocks_per_row = k.div_ceil(T::BLCK_SIZE);
+    let act_blocks_per_row = k.div_ceil(T::VecDotType::BLCK_SIZE);
+    let mut lhs_b = vec![T::VecDotType::zeros(); m * act_blocks_per_row];
     for row_idx in 0..m {
-        let lhs_b = &mut lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
+        let lhs_b = &mut lhs_b[row_idx * act_blocks_per_row..(row_idx + 1) * act_blocks_per_row];
         let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
         let lhs_f32: Vec<_> = lhs.iter().map(|&x| x.to_f32()).collect();
         T::VecDotType::from_float(&lhs_f32, lhs_b);
@@ -2636,11 +2651,12 @@ pub fn matmul_f16<T: GgmlType>(
     let lhs_b = lhs_b.as_slice();
 
     for row_idx in 0..m {
-        let lhs_row = &lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
+        let lhs_row = &lhs_b[row_idx * act_blocks_per_row..(row_idx + 1) * act_blocks_per_row];
         let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
 
         for (col_idx, dst) in dst_row.iter_mut().enumerate() {
-            let rhs_col = &rhs_t[col_idx * k_in_rhs_blocks..(col_idx + 1) * k_in_rhs_blocks];
+            let rhs_col =
+                &rhs_t[col_idx * weight_blocks_per_row..(col_idx + 1) * weight_blocks_per_row];
             let value = T::vec_dot(k, rhs_col, lhs_row);
             *dst = f16::from_f32(value);
         }
