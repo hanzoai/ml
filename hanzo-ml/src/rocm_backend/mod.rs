@@ -534,6 +534,8 @@ pub enum RocmQuantType {
     TQ1_0,
     IQ1_S,
     IQ1_M,
+    // MXFP4 (gpt-oss): E8M0 1-byte scale + FP4 codebook, 32-elem block (decode + MoE-decode only).
+    MXFP4,
 }
 
 impl RocmQuantType {
@@ -564,6 +566,7 @@ impl RocmQuantType {
             G::TQ1_0 => Self::TQ1_0,
             G::IQ1_S => Self::IQ1_S,
             G::IQ1_M => Self::IQ1_M,
+            G::MXFP4 => Self::MXFP4,
             _ => return None,
         })
     }
@@ -572,7 +575,7 @@ impl RocmQuantType {
     pub fn block_elems(self) -> usize {
         match self {
             Self::Q8_0 | Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_1
-            | Self::IQ4_NL => 32,
+            | Self::IQ4_NL | Self::MXFP4 => 32,
             Self::Q4K | Self::Q6K | Self::IQ4_XS | Self::TQ2_0 | Self::Q2K | Self::Q3K | Self::Q5K
             | Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS | Self::IQ3_S
             | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M => 256,
@@ -605,6 +608,7 @@ impl RocmQuantType {
             Self::TQ1_0 => 54,
             Self::IQ1_S => 50,
             Self::IQ1_M => 56,
+            Self::MXFP4 => 17,
         }
     }
 
@@ -667,7 +671,8 @@ impl RocmQuantType {
             Self::Q5_1 => "qmmq_q5_1_f16",
             Self::Q8_1 => "qmmq_q8_1_f16",
             Self::Q2K | Self::Q3K | Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS
-            | Self::IQ3_S | Self::IQ4_NL | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M => {
+            | Self::IQ3_S | Self::IQ4_NL | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M
+            | Self::MXFP4 => {
                 unreachable!("prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
             }
         }
@@ -713,7 +718,8 @@ impl RocmQuantType {
             (Self::Q8_1, _) => "moe_qmmq_q8_1_tm32_f16",
             (
                 Self::Q2K | Self::Q3K | Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS
-                | Self::IQ3_S | Self::IQ4_NL | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M,
+                | Self::IQ3_S | Self::IQ4_NL | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M
+                | Self::MXFP4,
                 _,
             ) => unreachable!("moe_prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)"),
         }
@@ -767,6 +773,8 @@ impl RocmQuantType {
             (Self::IQ1_S, false) => "qmatvecu_iq1_s_bf16",
             (Self::IQ1_M, true) => "qmatvecu_iq1_m_f16",
             (Self::IQ1_M, false) => "qmatvecu_iq1_m_bf16",
+            (Self::MXFP4, true) => "qmatvecu_mxfp4_f16",
+            (Self::MXFP4, false) => "qmatvecu_mxfp4_bf16",
         }
     }
 
@@ -820,6 +828,8 @@ impl RocmQuantType {
             (Self::IQ1_S, false) => "moe_qmatvecu_iq1_s_bf16",
             (Self::IQ1_M, true) => "moe_qmatvecu_iq1_m_f16",
             (Self::IQ1_M, false) => "moe_qmatvecu_iq1_m_bf16",
+            (Self::MXFP4, true) => "moe_qmatvecu_mxfp4_f16",
+            (Self::MXFP4, false) => "moe_qmatvecu_mxfp4_bf16",
         }
     }
 
