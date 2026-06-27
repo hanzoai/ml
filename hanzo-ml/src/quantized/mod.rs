@@ -934,7 +934,12 @@ impl QTensor {
                     other => crate::bail!("vulkan MoE: no kernel for {other:?}"),
                 };
                 let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
-                let wbank = vk_dev.upload_qweight(&bank)?;
+                // moe_matvec_q8_0's shader reads the repacked 9-u32/block layout (same as the decode
+                // matvec_q8 path); Q4_0/Q4_K shaders read the raw GGML bytes directly.
+                let wbank = match self.storage.dtype() {
+                    GgmlDType::Q8_0 => vk_dev.quantize_q8_blocks(&bank, e_cnt * n, k)?,
+                    _ => vk_dev.upload_qweight(&bank)?,
+                };
                 let ids_buf = vk_dev.upload_ids(&ids_vec)?;
                 let y = {
                     let (store, _) = x_flat.storage_and_layout();
@@ -1422,14 +1427,31 @@ impl QMatMul {
         #[cfg(feature = "vulkan")]
         {
             let dt = qtensor.dtype();
-            let native_vk = matches!(dt, GgmlDType::Q4_0 | GgmlDType::Q8_0 | GgmlDType::Q4K);
+            let native_vk = matches!(
+                dt,
+                GgmlDType::Q4_0
+                    | GgmlDType::Q8_0
+                    | GgmlDType::Q4K
+                    | GgmlDType::Q5K
+                    | GgmlDType::Q6K
+            );
             if native_vk {
                 if let Device::Vulkan(d) = qtensor.device() {
                     if let Ok((n, k)) = qtensor.shape().dims2() {
                         let blk = dt.block_size();
                         if k % blk == 0 {
                             let bytes = qtensor.data()?;
-                            let wq = d.upload_qweight(&bytes)?;
+                            // Q6_K's 210-byte block is not u32-aligned; its shader reads a padded
+                            // 53-u32 stride, so repack on upload. Q8_0 repacks to the 9-u32/block
+                            // layout that BOTH its decode (mul_mat_vec_q8) and prefill GEMM
+                            // (mul_mat_q8) read -- ONE layout, so decode + prefill + MoE all agree
+                            // (mirrors how the MoE bank repacks Q8_0). Every other native type's
+                            // shaders byte-address the raw GGML bytes directly.
+                            let wq = match dt {
+                                GgmlDType::Q6K => d.quantize_q6k(&bytes, n, k)?,
+                                GgmlDType::Q8_0 => d.quantize_q8_blocks(&bytes, n, k)?,
+                                _ => d.upload_qweight(&bytes)?,
+                            };
                             return Ok(Self::VulkanQuant {
                                 qtensor,
                                 wq: std::sync::Arc::new(wq),
@@ -1814,6 +1836,24 @@ fn dense_matmul(xs: &Tensor, w: &Tensor) -> Result<Tensor> {
     xs.matmul(&w)
 }
 
+// Prefill row-count gate for the native Vulkan quantized GEMM. The column-per-invocation `mul_mat_q*`
+// kernel re-reads AND re-decodes the weight ceil(M / MATMUL_Q_MAX_M(8)) times; the dequant path
+// decodes the weight to f32 once then runs a dense matmul. So the GEMM wins at small/moderate M and
+// loses once the re-decode dominates. The crossover is dtype-dependent: cheap-decode quants
+// (Q4_0/Q8_0/Q4_K -- nibble or single-byte unpack) stay ahead through M=128, while the expensive
+// high-bit super-blocks (Q5_K/Q6_K -- 5/6-bit reconstruction with a qh high-bit gather, compute-bound
+// at large N) cross earlier and are only safe through M=64. Measured on RADV gfx1151 (Radeon 8060S),
+// K=4096, N in {4096, 11008}: the chosen rows are the strict-non-regression floor for each family
+// (worst case ~2.1x at the threshold, up to 25x at M=16). Larger dense prefill keeps the dequant path
+// until a shared-memory-tiled int8 GEMM (reads + decodes the weight once, removing this gate) lands.
+#[cfg(feature = "vulkan")]
+fn vulkan_prefill_gemm_max_rows(dtype: GgmlDType) -> usize {
+    match dtype {
+        GgmlDType::Q5K | GgmlDType::Q6K => 64,
+        _ => 128,
+    }
+}
+
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
@@ -2027,8 +2067,12 @@ impl crate::Module for QMatMul {
                         };
                         match dtype {
                             GgmlDType::Q4_0 => d.matvec_q4_0_gpu(wq, xv, *n, *k)?,
-                            GgmlDType::Q8_0 => d.matvec_q8_0_gpu(wq, xv, *n, *k)?,
+                            // Q8_0 rides the 9-u32 repacked layout (mul_mat_vec_q8), the SAME blocks
+                            // the prefill GEMM (mul_mat_q8) reads -- one layout for decode + prefill.
+                            GgmlDType::Q8_0 => d.matvec_q8_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q5K => d.matvec_q5k_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q6K => d.matvec_q6k_gpu(wq, xv, *n, *k)?,
                             other => crate::bail!("VulkanQuant: no native matvec for {other:?}"),
                         }
                     };
@@ -2041,8 +2085,50 @@ impl crate::Module for QMatMul {
                         crate::op::BackpropOp::none(),
                         false,
                     ))
+                } else if rows <= vulkan_prefill_gemm_max_rows(*dtype) {
+                    // Prefill (small/moderate M): native quantized GEMM. Weights stay quantized in
+                    // VRAM and each weight block is decoded ONCE per output column then reused across
+                    // a tile of up to MATMUL_Q_MAX_M(=8) rows -- so the weight is re-read+re-decoded
+                    // ceil(M/8) times, vs the dequant path's one-time f32 materialization. The GEMM
+                    // therefore wins decisively while M is small (short / chunked prefill, batched
+                    // decode) and would lose at large M, which the dtype-aware `rows` gate routes to
+                    // the dequant path below. Same block layout + decode as the decode matvec above;
+                    // one matmul_q*_gpu per native dtype. Leading batch dims flatten into M.
+                    let m = rows;
+                    let xs = xs.contiguous()?;
+                    let d = match xs.device() {
+                        Device::Vulkan(d) => d,
+                        _ => crate::bail!("VulkanQuant input not on vulkan"),
+                    };
+                    let y = {
+                        let (store, _) = xs.storage_and_layout();
+                        let xv = match &*store {
+                            crate::Storage::Vulkan(v) => v,
+                            _ => crate::bail!("VulkanQuant expected vulkan storage"),
+                        };
+                        match dtype {
+                            GgmlDType::Q4_0 => d.matmul_q4_0_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q8_0 => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q5K => d.matmul_q5k_gpu(wq, xv, m, *n, *k)?,
+                            GgmlDType::Q6K => d.matmul_q6k_gpu(wq, xv, m, *n, *k)?,
+                            other => crate::bail!("VulkanQuant: no native matmul for {other:?}"),
+                        }
+                    };
+                    let mut dims = xs.dims().to_vec();
+                    let last = dims.len() - 1;
+                    dims[last] = *n;
+                    Ok(crate::tensor::from_storage(
+                        crate::Storage::Vulkan(y),
+                        dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
                 } else {
-                    // Prefill: dequantize to a temporary f32 weight (reuses the NT matmul path).
+                    // Large dense prefill (M > the crossover): the column-per-invocation GEMM would
+                    // re-read the weight ceil(M/8) times and lose to materializing the f32 weight once
+                    // and running a dense matmul. Keep the dequant path here -- a strict non-regression
+                    // until a shared-memory-tiled int8 GEMM (reads the weight once) removes the gate.
                     let w = qtensor.dequantize(&xs.device())?;
                     let w = match *xs.dims() {
                         [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
