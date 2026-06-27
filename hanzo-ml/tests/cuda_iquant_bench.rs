@@ -32,36 +32,42 @@ fn synth_iq2xxs(nout: usize, k: usize) -> Vec<u8> {
     out
 }
 
-fn bench_shape(dev: &Device, nout: usize, k: usize) -> hanzo_ml::Result<()> {
+// m == 1 -> decode (mmvq dp4a); m > 8 -> prefill (qmmq int8-WMMA GEMM). The fallback path (set via
+// HANZO_IQ_DEQUANT_FALLBACK=1) is the dequant-to-f32 round-trip for both.
+fn bench_shape(dev: &Device, nout: usize, k: usize, m: usize) -> hanzo_ml::Result<()> {
     let raw = synth_iq2xxs(nout, k);
     let bytes = raw.len();
     let qs = QStorage::from_data(Cow::Owned(raw), dev, GgmlDType::IQ2_XXS)?;
     let q = QTensor::new(qs, (nout, k))?;
     let matmul = QMatMul::from_qtensor(q)?;
-    let x = Tensor::from_vec((0..k).map(|i| (pbyte(i) as f32 / 128.0) - 1.0).collect(), (1, k), dev)?;
+    let x = Tensor::from_vec(
+        (0..m * k).map(|i| (pbyte(i) as f32 / 128.0) - 1.0).collect(),
+        (m, k),
+        dev,
+    )?;
 
     // Warmup + sync.
-    for _ in 0..20 {
+    for _ in 0..10 {
         let _ = matmul.forward(&x)?;
     }
     dev.synchronize()?;
 
-    let iters = 300;
+    let iters = if m > 8 { 100 } else { 300 };
     let t0 = Instant::now();
     for _ in 0..iters {
         let _ = matmul.forward(&x)?;
     }
     dev.synchronize()?;
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-    let gbps = bytes as f64 / (us * 1e-6) / 1e9;
-    let path = if std::env::var("HANZO_IQ_DEQUANT_FALLBACK").is_ok() {
-        "dequant-fallback"
-    } else {
-        "native-dp4a"
+    let fallback = std::env::var("HANZO_IQ_DEQUANT_FALLBACK").is_ok();
+    let path = match (fallback, m) {
+        (true, _) => "dequant-fallback",
+        (false, 1) => "native-dp4a",
+        (false, _) => "native-qmmq",
     };
+    let kind = if m == 1 { "decode" } else { "prefill" };
     println!(
-        "[{path:>16}] IQ2_XXS [{nout:>5} x {k:>5}]  {us:8.2} us/matvec   {gbps:7.1} GB/s   ({:.2} MB weight)",
-        bytes as f64 / 1e6
+        "[{path:>16}] {kind} IQ2_XXS [n={nout:>5} k={k:>5} m={m:>4}]  {us:9.2} us/call",
     );
     Ok(())
 }
@@ -76,8 +82,14 @@ fn bench_iq2xxs_decode() {
             return;
         }
     };
-    // Realistic decode-proj shapes (attn k=2048; FFN k=4096; large lm_head-ish).
-    for &(n, k) in &[(2048usize, 2048usize), (4096, 4096), (8192, 4096)] {
-        bench_shape(&dev, n, k).unwrap();
+    // Decode (m=1, mmvq) + prefill (m=128, qmmq) on realistic proj shapes (attn k=2048; FFN k=4096).
+    for &(n, k, m) in &[
+        (2048usize, 2048usize, 1usize),
+        (4096, 4096, 1),
+        (8192, 4096, 1),
+        (4096, 4096, 128),
+        (8192, 4096, 128),
+    ] {
+        bench_shape(&dev, n, k, m).unwrap();
     }
 }
