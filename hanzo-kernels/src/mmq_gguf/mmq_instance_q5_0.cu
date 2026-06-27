@@ -114,7 +114,8 @@ static void launch_mmq_case_q5_0(float * tmp_fixup, const mmq_args & args, cudaS
     }
 }
 
-extern "C" void launch_mmq_gguf_q5_0(
+// weak: see mmq_instance_q4_0.cu -- defer to hanzo-quant's identical strong symbol when co-linked.
+extern "C" __attribute__((weak)) void launch_mmq_gguf_q5_0(
     void *tmp_fixup_ptr,
     const void *x, const void *y_q8_1_mmq, void *dst,
     int64_t ncols_x, int64_t nrows_x, int64_t ncols_y,
@@ -134,3 +135,5 @@ extern "C" void launch_mmq_gguf_q5_0(
 
     launch_mmq_case_q5_0((float *)tmp_fixup_ptr, args, (cudaStream_t)stream, cc, nsm, smpbo, warp_size_host);
 }
+
+DEFINE_MMQ_GGUF_MOE_LAUNCHER(q5_0, GGML_TYPE_Q5_0, launch_mmq_case_q5_0)
