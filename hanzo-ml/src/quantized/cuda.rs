@@ -766,6 +766,31 @@ impl QCudaStorage {
         Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
     }
 
+    /// Expert-grouped int8-WMMA MMQ MoE PREFILL (qmmq) for i-quants -- the prefill twin of
+    /// `moe_iquant_dp4a`. Stages each expert's weight ONCE and amortizes it over all its routed tokens
+    /// via the tensor cores (llama mul_mat_id), vs the per-slot dp4a re-streaming the weight per token.
+    /// Wraps `fast_mmq::indexed_moe_grouped` with the resident [E,n,k] bank; returns None for IQ1_M
+    /// (no MMQ kernel) or unsupported shapes -> caller falls back to the per-slot dp4a path.
+    pub fn moe_iquant_qmmq(
+        &self,
+        w_shape: &crate::Shape,
+        input: &CudaSlice<f32>,
+        in_shape: &crate::Shape,
+        ids: &CudaView<u32>,
+        idx_shape: &crate::Shape,
+    ) -> Result<Option<(CudaStorage, crate::Shape)>> {
+        super::fast_mmq::indexed_moe_grouped(
+            &self.data.inner.slice(0..),
+            w_shape,
+            self.dtype,
+            input,
+            in_shape,
+            ids,
+            idx_shape,
+            self.device(),
+        )
+    }
+
     pub fn zeros(device: &CudaDevice, el_count: usize, dtype: GgmlDType) -> Result<Self> {
         let size_in_bytes = ceil_div(el_count, dtype.block_size()) * dtype.type_size();
         let padded_size_in_bytes =
@@ -1030,8 +1055,17 @@ impl QCudaStorage {
             // twin of the ROCm `qdp4a<IQ*>` 2.27x lever. Only the decode/vec shape (small b*m) takes
             // it; prefill (m>1) keeps the dequant->dense matmul (i-quant qmmq prefill is a separate
             // lever). ONE predicate (`iquant_dp4a_suffix`), gated here next to the fallback.
-            if use_vec_kernel && iquant_dp4a_suffix(self.dtype).is_some() && !iq_dequant_fallback() {
-                return self.mul_mat_vec_iquant(self_shape, storage, layout);
+            if iquant_dp4a_suffix(self.dtype).is_some() && !iq_dequant_fallback() {
+                if use_vec_kernel {
+                    // DECODE: native dp4a mmvq.
+                    return self.mul_mat_vec_iquant(self_shape, storage, layout);
+                }
+                // PREFILL: native int8-WMMA MMQ GEMM (qmmq) for the 6 i-quants with an MMQ kernel
+                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S). IQ1_M (no MMQ kernel) + any unsupported shape
+                // return None and fall through to the dequant dense matmul.
+                if let Some(out) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
+                    return Ok(out);
+                }
             }
             return self.dequantize_matmul_dense(self_shape, storage, layout);
         }
