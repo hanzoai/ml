@@ -1452,6 +1452,7 @@ impl QMatMul {
                     | GgmlDType::IQ4_XS
                     | GgmlDType::IQ4_NL
                     | GgmlDType::TQ2_0
+                    | GgmlDType::IQ2_XXS
             );
             if native_vk {
                 if let Device::Vulkan(d) = qtensor.device() {
@@ -1469,6 +1470,7 @@ impl QMatMul {
                                 GgmlDType::Q6K => d.quantize_q6k(&bytes, n, k)?,
                                 GgmlDType::Q3K => d.quantize_q3k(&bytes, n, k)?,
                                 GgmlDType::Q8_0 => d.quantize_q8_blocks(&bytes, n, k)?,
+                                GgmlDType::IQ2_XXS => d.quantize_iq2xxs(&bytes, n, k)?,
                                 _ => d.upload_qweight(&bytes)?,
                             };
                             return Ok(Self::VulkanQuant {
@@ -2096,6 +2098,7 @@ impl crate::Module for QMatMul {
                             GgmlDType::Q3K => d.matvec_q3k_gpu(wq, xv, *n, *k)?,
                             GgmlDType::IQ4_XS => d.matvec_iq4xs_gpu(wq, xv, *n, *k)?,
                             GgmlDType::IQ4_NL => d.matvec_iq4nl_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::IQ2_XXS => d.matvec_iq2xxs_gpu(wq, xv, *n, *k)?,
                             GgmlDType::TQ2_0 => d.matvec_tq2_0_gpu(wq, xv, *n, *k)?,
                             other => crate::bail!("VulkanQuant: no native matvec for {other:?}"),
                         }
