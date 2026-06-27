@@ -1457,6 +1457,7 @@ impl QMatMul {
                     | GgmlDType::IQ3_XXS
                     | GgmlDType::IQ3_S
                     | GgmlDType::IQ1_S
+                    | GgmlDType::IQ1_M
                     | GgmlDType::IQ2_XS
             );
             if native_vk {
@@ -1477,6 +1478,7 @@ impl QMatMul {
                                 GgmlDType::Q8_0 => d.quantize_q8_blocks(&bytes, n, k)?,
                                 GgmlDType::IQ2_XXS => d.quantize_iq2xxs(&bytes, n, k)?,
                                 GgmlDType::IQ2_XS => d.quantize_iq2xs(&bytes, n, k)?,
+                                GgmlDType::IQ1_M => d.quantize_iq1m(&bytes, n, k)?,
                                 GgmlDType::IQ1_S => d.quantize_iq1s(&bytes, n, k)?,
                                 GgmlDType::IQ3_S => d.quantize_iq3s(&bytes, n, k)?,
                                 GgmlDType::IQ3_XXS => d.quantize_iq3xxs(&bytes, n, k)?,
@@ -2110,6 +2112,7 @@ impl crate::Module for QMatMul {
                             GgmlDType::IQ4_NL => d.matvec_iq4nl_gpu(wq, xv, *n, *k)?,
                             GgmlDType::IQ2_XXS => d.matvec_iq2xxs_gpu(wq, xv, *n, *k)?,
                             GgmlDType::IQ2_XS => d.matvec_iq2xs_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::IQ1_M => d.matvec_iq1m_gpu(wq, xv, *n, *k)?,
                             GgmlDType::IQ1_S => d.matvec_iq1s_gpu(wq, xv, *n, *k)?,
                             GgmlDType::IQ3_S => d.matvec_iq3s_gpu(wq, xv, *n, *k)?,
                             GgmlDType::IQ3_XXS => d.matvec_iq3xxs_gpu(wq, xv, *n, *k)?,
