@@ -41,6 +41,20 @@ pub(crate) fn fast_mmq_enabled() -> bool {
     })
 }
 
+// Force i-quant codebook weights back to the dequantize-to-f32 dense matmul instead of the native
+// dp4a decode -- the A/B knob (mirrors ROCm's HANZO_IQ*_FALLBACK) and a production safety fallback.
+// Read once. Set HANZO_IQ_DEQUANT_FALLBACK=1 to disable the native i-quant mmvq decode path.
+pub(crate) fn iq_dequant_fallback() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        matches!(
+            std::env::var("HANZO_IQ_DEQUANT_FALLBACK").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    })
+}
+
 pub const WARP_SIZE: usize = 32;
 pub const MMQ_X_Q4_0_AMPERE: usize = 4;
 pub const MMQ_Y_Q4_0_AMPERE: usize = 32;
@@ -349,6 +363,101 @@ fn mul_mat_vec_via_q8_1(
         /* nrows_dst */ nrows as i32
     );
     unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// i-quant codebook kernel suffix for the native dp4a decode (qmatvec_dp4a_<suffix>_f32 in
+/// iquant_mmvq.cu). `Some` iff this dtype has a native i-quant decode path; `None` routes to the
+/// dequantize-to-f32 dense fallback. This is the ONE predicate that selects the SotA decode path --
+/// the CUDA twin of `RocmQuantType::dp4a_capable` (the i-quant subset).
+fn iquant_dp4a_suffix(dtype: GgmlDType) -> Option<&'static str> {
+    Some(match dtype {
+        GgmlDType::IQ2_XXS => "iq2xxs",
+        GgmlDType::IQ2_XS => "iq2xs",
+        GgmlDType::IQ2_S => "iq2s",
+        GgmlDType::IQ3_XXS => "iq3xxs",
+        GgmlDType::IQ3_S => "iq3s",
+        GgmlDType::IQ1_S => "iq1_s",
+        GgmlDType::IQ1_M => "iq1_m",
+        _ => return None,
+    })
+}
+
+/// Native i-quant mmvq DECODE: codebook-decode the weight to int8 grid magnitudes (+sign, or
+/// pre-signed for IQ1) and dp4a against the once-q8_1-quantized activation -- NO dequant->f32
+/// round-trip. The SotA decode twin of the ROCm `qdp4a<IQ*>` path (bit-exact, 2.27x). The activation
+/// `y` arrives f32; it is quantized once to the separated (int8 `xq`, f16 scale `xd`) layout the
+/// `qmatvec_dp4a_core` consumes, then each of the (small) `b_size` activation rows is decoded.
+#[allow(clippy::too_many_arguments)]
+fn mul_mat_vec_iquant_dp4a(
+    data: &PaddedCudaSlice,
+    y: &CudaView<f32>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    b_size: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let suffix = iquant_dp4a_suffix(dtype)
+        .ok_or_else(|| crate::Error::Msg(format!("no i-quant dp4a kernel for {dtype:?}")).bt())?;
+    // i-quant super-block is 256 weights (8 q8_1 sub-blocks of 32) -- ncols is always a multiple, so
+    // the activation needs no MATRIX_ROW_PADDING (the dp4a core reads exactly ncols int8 + ncols/32 f16).
+    if ncols % 256 != 0 {
+        crate::bail!("i-quant ncols {ncols} must be a multiple of 256");
+    }
+    if b_size == 0 || b_size > 8 {
+        crate::bail!("only bsize between 1 and 8 are supported, got {b_size}");
+    }
+    if y.len() != ncols * b_size {
+        crate::bail!("unexpected y size {}, ncols {ncols} bsize {b_size}", y.len());
+    }
+    let nblk32 = ncols / 32;
+
+    // Quantize the f32 activation -> separated (int8 `xq` [b_size, ncols], f16 scale `xd`
+    // [b_size, ncols/32]). One warp per 32-block; guard `wid >= b_size*nblk32` in-kernel.
+    let mut xq = dev.alloc_zeros::<u8>(b_size * ncols)?;
+    let mut xd = dev.alloc_zeros::<f16>(b_size * nblk32)?;
+    {
+        let func = dev.get_or_load_func("iq_quantize_q8_f32", &hanzo_kernels::IQUANT_MMVQ)?;
+        let nwarp = (b_size * nblk32) as u32;
+        let threads = 256u32; // 8 warps/block
+        let blocks = nwarp.div_ceil(threads / WARP_SIZE as u32);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        barg!(builder, b_size as i32, ncols as i32);
+        builder.arg(y);
+        builder.arg(&xq);
+        builder.arg(&xd);
+        unsafe { builder.launch(cfg) }.w()?;
+    }
+
+    // Decode matvec: warp-per-row, lane-strided over (super-block x sub-unit). One launch per
+    // activation row (b_size is tiny on the decode/vec path).
+    let kernel_name = format!("qmatvec_dp4a_{suffix}_f32");
+    let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+    let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
+    const ROWS_PER_BLOCK: u32 = 8; // 8 warps/block
+    for bi in 0..b_size {
+        let xq_b = xq.slice(bi * ncols..(bi + 1) * ncols);
+        let xd_b = xd.slice(bi * nblk32..(bi + 1) * nblk32);
+        let dst_b = dst.slice(bi * nrows..(bi + 1) * nrows);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: ((nrows as u32).div_ceil(ROWS_PER_BLOCK), 1, 1),
+            block_dim: (ROWS_PER_BLOCK * WARP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        barg!(builder, nrows as i32, ncols as i32);
+        builder.arg(&data.inner);
+        builder.arg(&xq_b);
+        builder.arg(&xd_b);
+        builder.arg(&dst_b);
+        unsafe { builder.launch(cfg) }.w()?;
+    }
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
@@ -843,6 +952,14 @@ impl QCudaStorage {
         // (decode m=1 and prefill m>1), exact w.r.t. the CPU reference, and the only way these types
         // matmul on CUDA until a native mmvq kernel lands. ONE predicate, gated here, one fallback path.
         if !Self::has_native_q8_1_matmul(self.dtype) {
+            // SotA native i-quant DECODE: codebook-decode the weight to int8 grid magnitudes and dp4a
+            // against the q8_1-quantized activation directly (no dequant->f32 round-trip) -- the CUDA
+            // twin of the ROCm `qdp4a<IQ*>` 2.27x lever. Only the decode/vec shape (small b*m) takes
+            // it; prefill (m>1) keeps the dequant->dense matmul (i-quant qmmq prefill is a separate
+            // lever). ONE predicate (`iquant_dp4a_suffix`), gated here next to the fallback.
+            if use_vec_kernel && iquant_dp4a_suffix(self.dtype).is_some() && !iq_dequant_fallback() {
+                return self.mul_mat_vec_iquant(self_shape, storage, layout);
+            }
             return self.dequantize_matmul_dense(self_shape, storage, layout);
         }
         if use_vec_kernel {
@@ -907,6 +1024,38 @@ impl QCudaStorage {
                 self.device(),
             )?
         };
+        let mut out_shape = rhs_l.shape().dims().to_vec();
+        out_shape.pop();
+        out_shape.push(nrows);
+        Ok((out, out_shape.into()))
+    }
+
+    // Native i-quant mmvq DECODE (the SotA path for the IQ codebook quants). Mirrors
+    // `dequantize_matmul_vec`'s shape handling but routes to `mul_mat_vec_iquant_dp4a` (codebook-decode
+    // + dp4a vs the q8_1 activation) instead of a dequant round-trip. Reached from `fwd` only for the
+    // decode/vec shape of an i-quant weight.
+    fn mul_mat_vec_iquant(
+        &self,
+        self_shape: &crate::Shape,
+        rhs: &CudaStorage,
+        rhs_l: &crate::Layout,
+    ) -> Result<(CudaStorage, crate::Shape)> {
+        let (nrows, ncols) = self_shape.dims2()?;
+        let rhs = rhs.as_cuda_slice::<f32>()?;
+        let rhs = match rhs_l.contiguous_offsets() {
+            Some((o1, o2)) => rhs.slice(o1..o2),
+            None => Err(crate::Error::RequiresContiguous { op: "iq-mmvq" }.bt())?,
+        };
+        let (b_size, k) = match rhs_l.shape().dims() {
+            [b, m, k] => (b * m, *k),
+            [b, k] => (*b, *k),
+            _ => crate::bail!("unexpected rhs shape in iq-mmvq {:?}", rhs_l.shape()),
+        };
+        if ncols != k {
+            crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", rhs_l.shape())
+        }
+        let out =
+            mul_mat_vec_iquant_dp4a(&self.data, &rhs, self.dtype, ncols, nrows, b_size, self.device())?;
         let mut out_shape = rhs_l.shape().dims().to_vec();
         out_shape.pop();
         out_shape.push(nrows);
