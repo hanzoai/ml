@@ -872,6 +872,9 @@ impl QTensor {
     }
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        // The fused CUDA path reads ids as a flat row-major [batch*topk] buffer (rank-agnostic since
+        // 0.11.17); force dense strides so a non-contiguous router output can't misindex the kernel.
+        let ids = &ids.contiguous()?;
         match &self.storage {
             // Only dtypes with a fused CUDA indexed-MoE kernel take the fast path; others (e.g. MXFP4,
             // i-quant/ternary) fall through to the generic per-expert path below, which dequantizes via
