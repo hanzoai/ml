@@ -402,6 +402,7 @@ __device__ __forceinline__ void q3k_scales(const uint8_t* __restrict__ s, int8_t
 #define DW_TQ1_0  19   // 54 B,  256 elems, symmetric ternary base-3 (1.69 bpw). val = d*(xi-1)
 #define DW_IQ1_S  20   // 50 B,  256 elems, signed grid + delta bias.  val = dl*(grid_i8 + delta)
 #define DW_IQ1_M  21   // 56 B,  256 elems, signed grid + delta bias, scale from 4 nibbles.
+#define DW_MXFP4  22   // 17 B,  32 elems,  E8M0 scale + FP4 codebook (gpt-oss). val = e8m0_half(e)*KVALUES_MXFP4[idx]
 
 // Type-dispatched f32 -> output store (the only place the element type leaks): __half needs
 // __float2half, hip_bfloat16 takes float in its ctor. Keeps both cores' epilogue type-agnostic.
@@ -1236,6 +1237,16 @@ extern "C" __global__ void qmatvec_q4k_bf16(
 __device__ __constant__ int8_t KVALUES_IQ4NL_D[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
+// MXFP4 (gpt-oss) FP4 E2M1 codebook (iq_quants.rs KVALUES_MXFP4) + E8M0 1-byte exponent -> fp32
+// scale, halved (ggml-impl.h ggml_e8m0_to_fp32_half). qdec<DW_MXFP4> mirrors qdec<DW_IQ4_NL>: the
+// scale is the E8M0 byte (not an f16), and qs starts at blk+1 (1-byte scale, not 2).
+__device__ __constant__ int8_t KVALUES_MXFP4_D[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+};
+__device__ __forceinline__ float e8m0_to_fp32_half(uint8_t x) {
+    const uint32_t bits = (x < 2) ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
+    return __uint_as_float(bits);
+}
 // IQ1_S/IQ1_M delta bias (IQ1S_DELTA, iq_quants.rs:28). dequant adds +/-delta to the signed
 // grid byte before scaling: val = dl*(grid_i8 + delta). delta sign is a per-group qh bit.
 constexpr float IQ1S_DELTA = 0.125f;
@@ -1874,6 +1885,7 @@ template <> struct qdw_traits<DW_IQ4_NL> { static constexpr int BYTES = 18;  sta
 template <> struct qdw_traits<DW_TQ1_0>  { static constexpr int BYTES = 54;  static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
 template <> struct qdw_traits<DW_IQ1_S>  { static constexpr int BYTES = 50;  static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = false; static constexpr int NSC = 8; };
 template <> struct qdw_traits<DW_IQ1_M>  { static constexpr int BYTES = 56;  static constexpr int ELEMS = 256; static constexpr bool SYMMETRIC = false; static constexpr int NSC = 8; };
+template <> struct qdw_traits<DW_MXFP4>  { static constexpr int BYTES = 17;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
 
 // Per-type decode. `partial<XT>(blk, xb, lane)` returns lane L's partial dot over its owned
 // positions { e*32 + L } of ONE block, mirroring the CPU `to_float` for that type bit-for-bit.
@@ -2288,6 +2300,18 @@ template <> struct qdec<DW_IQ4_NL> {
         const uint8_t* qs = blk + 2;
         const int idx = (lane < 16) ? (qs[lane] & 0x0F) : (qs[lane - 16] >> 4);
         return d * (float)KVALUES_IQ4NL_D[idx] * (float)xb[lane];
+    }
+};
+
+// MXFP4 (gpt-oss): E8M0 1-byte scale at blk[0], qs at blk+1, FP4 codebook. Lane L owns element L:
+// low nibbles fill 0..15, high nibbles 16..31 (same split as IQ4_NL). Mirrors dequantize_row_mxfp4.
+template <> struct qdec<DW_MXFP4> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const float d = e8m0_to_fp32_half(blk[0]);
+        const uint8_t* qs = blk + 1;
+        const int idx = (lane < 16) ? (qs[lane] & 0x0F) : (qs[lane - 16] >> 4);
+        return d * (float)KVALUES_MXFP4_D[idx] * (float)xb[lane];
     }
 };
 
@@ -2789,6 +2813,7 @@ DEFINE_QMATVECU(iq4nl, DW_IQ4_NL)
 DEFINE_QMATVECU(tq1_0, DW_TQ1_0)
 DEFINE_QMATVECU(iq1_s, DW_IQ1_S)
 DEFINE_QMATVECU(iq1_m, DW_IQ1_M)
+DEFINE_QMATVECU(mxfp4,  DW_MXFP4)
 
 // THE unified indexed-MoE decode core. Same warp-per-row + lane-strided-block math as
 // `qmatvec_core`, but ALL routed slots run in ONE launch with the routed expert on grid.y:
@@ -2878,6 +2903,7 @@ DEFINE_MOE_QMATVECU(iq4nl, DW_IQ4_NL)
 DEFINE_MOE_QMATVECU(tq1_0, DW_TQ1_0)
 DEFINE_MOE_QMATVECU(iq1_s, DW_IQ1_S)
 DEFINE_MOE_QMATVECU(iq1_m, DW_IQ1_M)
+DEFINE_MOE_QMATVECU(mxfp4,  DW_MXFP4)
 
 #undef DEFINE_MOE_QMATVECU
 #undef DEFINE_QMATVECU
