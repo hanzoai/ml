@@ -3,9 +3,15 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
-    println!("cargo::rerun-if-changed=src/compatibility.cuh");
-    println!("cargo::rerun-if-changed=src/cuda_utils.cuh");
-    println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
+    // Recompile when ANY CUDA source or header changes. The statically-compiled kernels live in
+    // subdirs (src/mmq_gguf, src/moe) and #include shared headers (mmq_gguf.cuh, mmq_common.cuh, ...);
+    // without a rerun-if-changed for each, cargo silently reuses stale objects when only a .cu/.cuh
+    // changes (build.rs itself is unchanged), so an edited kernel never recompiles.
+    for pat in ["src/**/*.cu", "src/**/*.cuh"] {
+        for entry in glob::glob(pat).expect("invalid glob").flatten() {
+            println!("cargo::rerun-if-changed={}", entry.display());
+        }
+    }
 
     // Statically-compiled kernels. These provide `extern "C"` host launchers
     // (consumed via `hanzo-kernels/src/ffi.rs`) rather than standalone PTX
