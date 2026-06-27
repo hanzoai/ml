@@ -49,13 +49,18 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
     let w_deq: Vec<f32> = q.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
     let raw = q.data()?; // raw GGML block bytes
 
-    // 3. Upload bytes + run the GPU kernel.
+    // 3. Upload bytes + run the GPU kernel. Q6_K repacks to a padded 53-u32 stride on upload.
     let vk = dev.as_vulkan_device()?;
-    let wq = vk.upload_qweight(&raw)?;
+    let wq = match dtype {
+        GgmlDType::Q6K => vk.quantize_q6k(&raw, nout, k)?,
+        _ => vk.upload_qweight(&raw)?,
+    };
     let y_gpu: Vec<f32> = match dtype {
         GgmlDType::Q4_0 => vk.matvec_q4_0(&wq, &x_host, nout, k)?,
         GgmlDType::Q8_0 => vk.matvec_q8_0(&wq, &x_host, nout, k)?,
         GgmlDType::Q4K => vk.matvec_q4k(&wq, &x_host, nout, k)?,
+        GgmlDType::Q5K => vk.matvec_q5k(&wq, &x_host, nout, k)?,
+        GgmlDType::Q6K => vk.matvec_q6k(&wq, &x_host, nout, k)?,
         _ => panic!("unsupported dtype in run_case: {dtype:?}"),
     };
     assert_eq!(y_gpu.len(), nout);
@@ -170,6 +175,44 @@ fn vulkan_matvec_q4k_matches_cpu() -> hanzo_ml::Result<()> {
     Ok(())
 }
 
+#[test]
+fn vulkan_matvec_q5k_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::Q5K, nout, k)?;
+        println!(
+            "Q5_K  nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "Q5_K GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_matvec_q6k_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::Q6K, nout, k)?;
+        println!(
+            "Q6_K  nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "Q6_K GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // End-to-end: the actual model path. Build a quantized QTensor ON the Vulkan device (exactly like
 // the GGUF loader: QStorage::from_data on Device::Vulkan -> QTensor::new), wrap it in a QMatMul
@@ -222,7 +265,13 @@ fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
     // (nout, k); k divisible by 256 so all three dtypes are exercised on the same shapes.
     for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
-        for dt in [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType::Q4K] {
+        for dt in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q8_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
             let max_abs = end_to_end_case(&dev, dt, nout, k)?;
             println!("QMatMul::forward {dt:?}  nout={nout:5} k={k:5}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}");
             // GPU dequant-matvec vs the f64 dequant reference over identical quantized weights:
@@ -231,6 +280,91 @@ fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
                 max_abs < 1e-3,
                 "QMatMul::forward {dt:?} GPU/ref mismatch too large: {max_abs}"
             );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// End-to-end PREFILL (M>1): the prompt-processing GEMM path. Build a quantized QTensor on the Vulkan
+// device, wrap it in a QMatMul, and run forward on an [M, k] activation -- which now dispatches the
+// native quantized GEMM (`mul_mat_q*`: weights stay quantized in VRAM, each weight block decoded ONCE
+// per output column and reused across all M rows) instead of dequantizing the whole weight to f32.
+// Compare every output row to a host f64 matmul over the dequantized weights. M straddles the host's
+// MAX_M=8 row-tiling (partial tile / exact tile / multi-tile + remainder) so the tiling is exercised.
+fn prefill_case(
+    dev: &Device,
+    dtype: GgmlDType,
+    m: usize,
+    nout: usize,
+    k: usize,
+) -> hanzo_ml::Result<f32> {
+    let cpu = Device::Cpu;
+    let w_host: Vec<f32> = (0..nout * k).map(|i| pseudo(i) * 0.5).collect();
+    let x_host: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
+
+    // CPU quantized weight; reuse it for both the GPU upload bytes and the dequant reference.
+    let w_t = Tensor::from_vec(w_host, (nout, k), &cpu)?;
+    let q_cpu = Arc::new(QTensor::quantize(&w_t, dtype)?);
+    let bytes = q_cpu.data()?.into_owned();
+    let w_deq: Vec<f32> = q_cpu.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
+
+    // Reference: y[mi, n] = sum_k W_deq[n, k] * x[mi, k] in f64 (dequantize-then-dot ground truth).
+    let mut y_ref = vec![0f64; m * nout];
+    for mi in 0..m {
+        for n in 0..nout {
+            let mut acc = 0f64;
+            for j in 0..k {
+                acc += w_deq[n * k + j] as f64 * x_host[mi * k + j] as f64;
+            }
+            y_ref[mi * nout + n] = acc;
+        }
+    }
+
+    // Vulkan quantized weight built the loader way, then QMatMul (native VulkanQuant prefill GEMM).
+    let qs_vk = QStorage::from_data(std::borrow::Cow::Owned(bytes), dev, dtype)?;
+    let q_vk = QTensor::new(qs_vk, (nout, k))?;
+    let qm_vk = QMatMul::from_qtensor(q_vk)?;
+    // A multi-row [M, k] input on the Vulkan device triggers the native prefill GEMM.
+    let x_vk = Tensor::from_vec(x_host, (m, k), dev)?;
+    let y_vk = qm_vk.forward(&x_vk)?.flatten_all()?.to_vec1::<f32>()?;
+
+    assert_eq!(y_vk.len(), m * nout);
+    let mut max_abs = 0f32;
+    for i in 0..m * nout {
+        max_abs = max_abs.max((y_vk[i] as f64 - y_ref[i]).abs() as f32);
+    }
+    Ok(max_abs)
+}
+
+#[test]
+fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    // M straddles the host MAX_M=8 tiling AND the per-dtype GEMM gate (Q5_K/Q6_K: 64, else 128):
+    // 5/8/17 hit the native GEMM for every dtype; 100 hits the GEMM for Q4_0/Q8_0/Q4_K but the dequant
+    // fallback for Q5_K/Q6_K (exercising the split); 200 (> both gates) is the dequant path for all.
+    // BOTH prefill paths are thus validated against the same f64 reference.
+    // (nout, k) with k divisible by 256 so all five dtypes share the same shapes.
+    for &m in &[5usize, 8, 17, 100, 200] {
+        for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
+            for dt in [
+                GgmlDType::Q4_0,
+                GgmlDType::Q8_0,
+                GgmlDType::Q4K,
+                GgmlDType::Q5K,
+                GgmlDType::Q6K,
+            ] {
+                let max_abs = prefill_case(&dev, dt, m, nout, k)?;
+                println!(
+                    "QMatMul::prefill {dt:?}  M={m:3} nout={nout:5} k={k:5}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}"
+                );
+                // The GEMM decodes the SAME quantized bytes as the reference dequant and accumulates
+                // per row exactly like the decode matvec; only fp32-vs-f64 accumulation order differs.
+                assert!(
+                    max_abs < 1e-3,
+                    "QMatMul::prefill {dt:?} M={m} GPU/ref mismatch too large: {max_abs}"
+                );
+            }
         }
     }
     Ok(())
