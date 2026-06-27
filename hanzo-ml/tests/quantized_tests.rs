@@ -1049,6 +1049,9 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+        // Codebook / fractional / microscaling types (IQ*, TQ*, MXFP4, NVFP4): not exercised by this
+        // ggml-matmul-error reference test (decode-only; covered by the per-backend numeric oracles).
+        other => crate::bail!("no ggml reference matmul error for {other:?}"),
     };
     Ok(err)
 }

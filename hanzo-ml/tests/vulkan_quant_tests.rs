@@ -17,6 +17,7 @@
 
 use hanzo_ml::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use hanzo_ml::{Device, Module, Tensor};
+use std::sync::Arc;
 
 // Deterministic pseudo-random f32 in [-1, 1) from a counter (no rng dep; reproducible).
 fn pseudo(i: usize) -> f32 {
