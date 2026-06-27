@@ -451,15 +451,22 @@ fn indexed_moe_forward_fused_q8_1_input(
     input: &CudaSlice<f32>,
     in_shape: &crate::Shape, //[batch, topk or 1, k]
     ids: &CudaView<u32>,
-    idx_shape: &crate::Shape, //[batch, topk]
+    idx_shape: &crate::Shape, //[batch, topk] or flat [batch*topk]
     dev: &CudaDevice,
 ) -> Result<(CudaStorage, crate::Shape)> {
     let (_, n, k) = w_shape.dims3()?;
     let batch = in_shape.dims()[0];
     let input_dim1 = in_shape.dims()[1];
 
-    let topk = idx_shape.dims()[1];
-    assert!(batch == idx_shape.dims()[0], "batch dim not match!");
+    // The kernel reads ids as a flat [batch*topk] buffer (task_id = token*topk + slot), so derive topk
+    // from the element count and accept any ids rank: a router top-k may emit [batch, topk] (2-D) or a
+    // flattened [batch*topk] (1-D). batch comes from the input, which is always [batch, topk|1, k].
+    let n_slots = idx_shape.elem_count();
+    assert!(
+        n_slots % batch == 0,
+        "ids count {n_slots} not a multiple of batch {batch}"
+    );
+    let topk = n_slots / batch;
 
     // Quantize input into q8_1.
     let total_rows = batch * input_dim1;
