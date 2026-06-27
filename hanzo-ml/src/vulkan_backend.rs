@@ -63,6 +63,11 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q5k_sg" => spv!("mul_mat_vec_q5k_sg"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
         "mul_mat_vec_q6k_sg" => spv!("mul_mat_vec_q6k_sg"),
+        "mul_mat_vec_q2k" => spv!("mul_mat_vec_q2k"),
+        "mul_mat_vec_q3k" => spv!("mul_mat_vec_q3k"),
+        "mul_mat_vec_iq4xs" => spv!("mul_mat_vec_iq4xs"),
+        "mul_mat_vec_tq2_0" => spv!("mul_mat_vec_tq2_0"),
+        "mul_mat_vec_iq4nl" => spv!("mul_mat_vec_iq4nl"),
         "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
         "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
         "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
@@ -1559,6 +1564,249 @@ impl VulkanDevice {
             )?;
         }
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Additional native-GGML decode matvec coverage (memory-bound decode path): Q2_K, Q3_K,
+    // IQ4_XS, IQ4_NL, TQ2_0. Each reads its raw GGML block bytes (uploaded by `upload_qweight`,
+    // except Q3_K which repacks below) and its in-shader decode matches the CPU `*::to_float`. One
+    // invocation per output row (scalar kernel), push {nout, k}; no MoE woff (decode only).
+
+    /// Upload Q3_K weights to the GPU once. The CPU `k_quants::BlockQ3K` block is 110 bytes
+    /// (hmask[32], qs[64], scales[12], d f16) which is NOT u32-aligned, so each block is repacked
+    /// into a PADDED 112-byte (28 u32) stride here (trailing 2 bytes unused) -- mirrors
+    /// [`quantize_q6k`] -- so the shader can read the three 6-bit-packed scale words as aligned u32.
+    /// `data` must be exactly the `nout * (k/256) * 110` packed block bytes; `k` a multiple of 256.
+    pub fn quantize_q3k(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("quantize_q3k: k must be a multiple of 256, got {k}");
+        }
+        let nblocks = k / 256;
+        let total = nout * nblocks;
+        let want = total * 110;
+        if data.len() != want {
+            crate::bail!(
+                "quantize_q3k: data len {} != {nout}*{nblocks}*110 = {want}",
+                data.len()
+            );
+        }
+        // Repack 110-byte source blocks into 28-u32 (112-byte) padded blocks so every block starts on
+        // a u32 boundary. Trailing 2 bytes of each block are zero pad and never read by the shader.
+        let mut words = vec![0u32; total * 28];
+        for blk in 0..total {
+            let src = &data[blk * 110..blk * 110 + 110];
+            let dst = &mut words[blk * 28..blk * 28 + 28];
+            let dst_bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, 28 * 4) };
+            dst_bytes[..110].copy_from_slice(src);
+        }
+        self.upload_u32(&words)
+    }
+
+    /// Q2_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, weights stay
+    /// quantized in VRAM (~2.6 bits/elem). `Wq` is the raw GGML bytes from [`upload_qweight`].
+    pub fn matvec_q2k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_q2k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q2k_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q2k",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Q2_K matvec with the activation supplied as a host f32 slice (`x.len() == k`).
+    pub fn matvec_q2k(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q2k: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q2k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Q3_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, weights stay
+    /// quantized in VRAM (~3.4 bits/elem incl. pad). `Wq` is the padded 28-u32 stride from
+    /// [`quantize_q3k`].
+    pub fn matvec_q3k_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_q3k_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q3k_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_q3k",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Q3_K matvec with the activation supplied as a host f32 slice (`x.len() == k`).
+    pub fn matvec_q3k(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q3k: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q3k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// IQ4_XS matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, weights stay
+    /// quantized in VRAM (~4.25 bits/elem). `Wq` is the raw GGML bytes from [`upload_qweight`].
+    pub fn matvec_iq4xs_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_iq4xs_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_iq4xs_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_iq4xs",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// IQ4_XS matvec with the activation supplied as a host f32 slice (`x.len() == k`).
+    pub fn matvec_iq4xs(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_iq4xs: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_iq4xs_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// IQ4_NL matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, weights stay
+    /// quantized in VRAM (~4.5 bits/elem). `Wq` is the raw GGML bytes from [`upload_qweight`].
+    pub fn matvec_iq4nl_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(32) {
+            crate::bail!("matvec_iq4nl_gpu: k must be a multiple of 32, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_iq4nl_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_iq4nl",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// IQ4_NL matvec with the activation supplied as a host f32 slice (`x.len() == k`).
+    pub fn matvec_iq4nl(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_iq4nl: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_iq4nl_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// TQ2_0 matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, weights stay
+    /// quantized in VRAM (~2.06 bits/elem). `Wq` is the raw GGML bytes from [`upload_qweight`].
+    pub fn matvec_tq2_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_tq2_0_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_tq2_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_tq2_0",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// TQ2_0 matvec with the activation supplied as a host f32 slice (`x.len() == k`).
+    pub fn matvec_tq2_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_tq2_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_tq2_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
     }
 
     // Allocate a storage buffer of `bytes` bytes, returning it plus whether its memory is
