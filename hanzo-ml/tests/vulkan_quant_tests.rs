@@ -42,7 +42,11 @@ struct ErrStats {
 fn quantizable(dtype: GgmlDType) -> bool {
     !matches!(
         dtype,
-        GgmlDType::IQ4_NL | GgmlDType::IQ4_XS | GgmlDType::TQ2_0 | GgmlDType::IQ2_XXS
+        GgmlDType::IQ4_NL
+            | GgmlDType::IQ4_XS
+            | GgmlDType::TQ2_0
+            | GgmlDType::IQ2_XXS
+            | GgmlDType::IQ2_XS
     )
 }
 
@@ -109,6 +113,18 @@ fn synth_decode_only(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
                 }
             }
         }
+        // block_iq2_xs (74 B): f16 d + qs[32] (u16 = 64 B) + scales[8]. block of 256. Any byte
+        // pattern is valid (grid index 0..511 = qv&511, 7-bit sign = qv>>9, nibble scales in-range).
+        GgmlDType::IQ2_XS => {
+            for _ in 0..nout * (k / 256) {
+                out.extend_from_slice(&f16::from_f32(pseudo(c) * 0.05).to_le_bytes());
+                c += 1;
+                for _ in 0..72 {
+                    out.push(pbyte(c)); // qs[32] u16 (64 B) + scales[8]
+                    c += 1;
+                }
+            }
+        }
         _ => panic!("synth_decode_only: {dtype:?} is not a decode-only type"),
     }
     out
@@ -149,6 +165,7 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
         GgmlDType::Q6K => vk.quantize_q6k(&raw, nout, k)?,
         GgmlDType::Q3K => vk.quantize_q3k(&raw, nout, k)?,
         GgmlDType::IQ2_XXS => vk.quantize_iq2xxs(&raw, nout, k)?,
+        GgmlDType::IQ2_XS => vk.quantize_iq2xs(&raw, nout, k)?,
         _ => vk.upload_qweight(&raw)?,
     };
     let y_gpu: Vec<f32> = match dtype {
@@ -162,6 +179,7 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
         GgmlDType::IQ4_XS => vk.matvec_iq4xs(&wq, &x_host, nout, k)?,
         GgmlDType::IQ4_NL => vk.matvec_iq4nl(&wq, &x_host, nout, k)?,
         GgmlDType::IQ2_XXS => vk.matvec_iq2xxs(&wq, &x_host, nout, k)?,
+        GgmlDType::IQ2_XS => vk.matvec_iq2xs(&wq, &x_host, nout, k)?,
         GgmlDType::TQ2_0 => vk.matvec_tq2_0(&wq, &x_host, nout, k)?,
         _ => panic!("unsupported dtype in run_case: {dtype:?}"),
     };
@@ -384,6 +402,25 @@ fn vulkan_matvec_iq2xxs_matches_cpu() -> hanzo_ml::Result<()> {
         assert!(
             s.max_rel < 1e-3 && s.max_abs < 1e-3,
             "IQ2_XXS GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_matvec_iq2xs_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::IQ2_XS, nout, k)?;
+        println!(
+            "IQ2_XS  nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "IQ2_XS GPU/CPU mismatch too large: max_abs={} max_rel={}",
             s.max_abs,
             s.max_rel
         );
