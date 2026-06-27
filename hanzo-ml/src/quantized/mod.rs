@@ -904,6 +904,58 @@ impl QTensor {
                 }
                 }
             },
+            // Native CUDA i-quant MoE: the i-quant codebook types have no Blue-C fused q8_1 MoE kernel,
+            // but a native dp4a MoE-decode kernel (moe_qmatvec_dp4a_<iq*>). The [E,n,k] bank stays
+            // RESIDENT in VRAM and the router gather runs on-device -- the dp4a twin of the ROCm path.
+            // This intercepts i-quant MoE BEFORE the generic fallback below, which would DtoH the whole
+            // expert bank to host (self.data()) and re-upload every selected expert PER TOKEN.
+            #[cfg(feature = "cuda")]
+            QStorage::Cuda(s)
+                if cuda::QCudaStorage::supports_iquant_moe(s.dtype())
+                    && !cuda::iq_dequant_fallback() =>
+            {
+                let out_dtype = x.dtype();
+                let (_e_cnt, n, k) = self.shape().dims3()?;
+                let (t, topk) = ids.dims2()?;
+                let sdim = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+                let x_exp = if sdim == topk {
+                    x.clone()
+                } else {
+                    x.broadcast_as((t, topk, k))?
+                };
+                let nrows = t * topk;
+                // f32-native: the dp4a decode quantizes q8_1 from f32 and returns f32, so the routed
+                // activation stays F32 and the .to_dtype(out_dtype) below is a no-op for f32 models.
+                let x_flat = x_exp
+                    .reshape((nrows, k))?
+                    .to_dtype(crate::DType::F32)?
+                    .contiguous()?;
+                let ids_u32 = ids.reshape((nrows,))?.to_dtype(crate::DType::U32)?.contiguous()?;
+                let (xstore, _) = x_flat.storage_and_layout();
+                let xc = match &*xstore {
+                    Storage::Cuda(c) => c,
+                    _ => crate::bail!("cuda i-quant MoE: x not on cuda after contiguous()"),
+                };
+                let (idstore, _) = ids_u32.storage_and_layout();
+                let idc = match &*idstore {
+                    Storage::Cuda(c) => c,
+                    _ => crate::bail!("cuda i-quant MoE: ids not on cuda"),
+                };
+                let y = s.moe_iquant_dp4a(
+                    &xc.as_cuda_slice::<f32>()?.slice(0..),
+                    &idc.as_cuda_slice::<u32>()?.slice(0..),
+                    nrows,
+                    n,
+                    k,
+                )?;
+                let out = crate::tensor::from_storage(
+                    Storage::Cuda(y),
+                    (nrows, n),
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                out.reshape((t, topk, n))?.to_dtype(out_dtype)
+            }
             // Native Vulkan MoE: one fused grouped quant matvec dispatch reads the per-expert slice
             // out of the GGML weight bank [E, n, k] resident in VRAM and gathers by the router ids --
             // the whole expert compute runs on the GPU (no CPU expert loop; the CPU fallback below
