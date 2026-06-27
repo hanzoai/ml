@@ -8,13 +8,13 @@ language detection as well as multilingual speech recognition.
 ## Running some example
 
 If no audio file is passed as input, a [sample
-file](https://huggingface.co/datasets/Narsil/hanzo-ml-examples/resolve/main/samples_jfk.wav) is automatically downloaded
+file](https://huggingface.co/datasets/Narsil/candle-examples/resolve/main/samples_jfk.wav) is automatically downloaded
 from the hub.
 
 ```bash
  cargo run --example whisper --release --features="symphonia"
 
-> No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/hanzo_demo/blob/main/samples_jfk.wav
+> No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/candle_demo/blob/main/samples_jfk.wav
 > loaded wav data: Header { audio_format: 1, channel_count: 1, sampling_rate: 16000, bytes_per_second: 32000, bytes_per_sample: 2, bits_per_sample: 16 }
 > pcm data loaded 176000
 > loaded mel: [1, 80, 3000]
