@@ -917,26 +917,63 @@ impl QTensor {
                 let out_dtype = x.dtype();
                 let (_e_cnt, n, k) = self.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
+                let nrows = t * topk;
+
+                // PREFILL (t>1): expert-grouped int8-WMMA MMQ (qmmq) -- stage each expert's weight ONCE
+                // and amortize it over all its routed tokens via the tensor cores (llama mul_mat_id),
+                // instead of the per-slot dp4a re-streaming the weight per token. Uses the RAW [t,in1,k]
+                // input (indexed_moe_grouped broadcasts/gathers internally). IQ1_M (no MMQ kernel) returns
+                // None -> the per-slot dp4a below. HANZO_MOE_QMMQ_FALLBACK forces dp4a (A/B).
+                if t > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err() {
+                    let x_f32 = x.to_dtype(crate::DType::F32)?.contiguous()?;
+                    let ids_u32 = ids.to_dtype(crate::DType::U32)?.contiguous()?;
+                    let (xs, _) = x_f32.storage_and_layout();
+                    let xc = match &*xs {
+                        Storage::Cuda(c) => c,
+                        _ => crate::bail!("cuda i-quant MoE: x not on cuda after contiguous()"),
+                    };
+                    let (ids_s, _) = ids_u32.storage_and_layout();
+                    let idc = match &*ids_s {
+                        Storage::Cuda(c) => c,
+                        _ => crate::bail!("cuda i-quant MoE: ids not on cuda"),
+                    };
+                    if let Some((st, sh)) = s.moe_iquant_qmmq(
+                        self.shape(),
+                        xc.as_cuda_slice::<f32>()?,
+                        x.shape(),
+                        &idc.as_cuda_slice::<u32>()?.slice(0..),
+                        ids.shape(),
+                    )? {
+                        return crate::tensor::from_storage(
+                            Storage::Cuda(st),
+                            sh,
+                            crate::op::BackpropOp::none(),
+                            false,
+                        )
+                        .to_dtype(out_dtype);
+                    }
+                }
+
+                // DECODE (t==1) or qmmq-unsupported (IQ1_M): per-slot dp4a. Broadcast the shared gate/up
+                // input across topk to a per-slot [nrows,k] activation. f32-native -> the matvec returns
+                // F32 and the to_dtype below is a no-op for f32 models.
                 let sdim = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
                 let x_exp = if sdim == topk {
                     x.clone()
                 } else {
                     x.broadcast_as((t, topk, k))?
                 };
-                let nrows = t * topk;
-                // f32-native: the dp4a decode quantizes q8_1 from f32 and returns f32, so the routed
-                // activation stays F32 and the .to_dtype(out_dtype) below is a no-op for f32 models.
                 let x_flat = x_exp
                     .reshape((nrows, k))?
                     .to_dtype(crate::DType::F32)?
                     .contiguous()?;
-                let ids_u32 = ids.reshape((nrows,))?.to_dtype(crate::DType::U32)?.contiguous()?;
+                let ids_flat = ids.reshape((nrows,))?.to_dtype(crate::DType::U32)?.contiguous()?;
                 let (xstore, _) = x_flat.storage_and_layout();
                 let xc = match &*xstore {
                     Storage::Cuda(c) => c,
                     _ => crate::bail!("cuda i-quant MoE: x not on cuda after contiguous()"),
                 };
-                let (idstore, _) = ids_u32.storage_and_layout();
+                let (idstore, _) = ids_flat.storage_and_layout();
                 let idc = match &*idstore {
                     Storage::Cuda(c) => c,
                     _ => crate::bail!("cuda i-quant MoE: ids not on cuda"),
