@@ -40,7 +40,7 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut c = 0usize;
     let nblk = nout * (k / 256);
-    let mut emit_d_then = |scale: f32, nbytes: usize, out: &mut Vec<u8>, c: &mut usize| {
+    let emit_d_then = |scale: f32, nbytes: usize, out: &mut Vec<u8>, c: &mut usize| {
         out.extend_from_slice(&f16::from_f32(pseudo(*c) * scale).to_le_bytes());
         *c += 1;
         for _ in 0..nbytes {
@@ -206,4 +206,162 @@ fn cuda_matvec_iq1s_matches_cpu() {
 #[test]
 fn cuda_matvec_iq1m_matches_cpu() {
     check(GgmlDType::IQ1_M);
+}
+
+// ---- batched (b_size > 1) dense decode: the per-`bi` activation/output offsets in
+// mul_mat_vec_iquant_dp4a must be correct (the warp reduction is bit-deterministic, so a wrong
+// offset shows as a per-batch mismatch). ----
+#[test]
+fn cuda_matvec_iq2xxs_batched_matches_cpu() {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no CUDA device ({e})");
+            return;
+        }
+    };
+    let (nout, k) = (512usize, 2048usize);
+    let cpu = Device::Cpu;
+    let raw = synth(GgmlDType::IQ2_XXS, nout, k);
+    let w_deq: Vec<f32> = QTensor::new(
+        QStorage::from_data(Cow::Owned(raw.clone()), &cpu, GgmlDType::IQ2_XXS).unwrap(),
+        (nout, k),
+    )
+    .unwrap()
+    .dequantize(&cpu)
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+    let matmul = QMatMul::from_qtensor(
+        QTensor::new(QStorage::from_data(Cow::Owned(raw), &dev, GgmlDType::IQ2_XXS).unwrap(), (nout, k))
+            .unwrap(),
+    )
+    .unwrap();
+    for &b in &[1usize, 5, 8] {
+        let xh: Vec<f32> = (0..b * k).map(|i| pseudo(i + 99)).collect();
+        let xq: Vec<f32> = xh.chunks(k).flat_map(q8_1_roundtrip).collect();
+        let y: Vec<f32> = matmul
+            .forward(&Tensor::from_vec(xq.clone(), (b, k), &dev).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut sse = 0f64;
+        let mut rs = 0f64;
+        for bi in 0..b {
+            for nrow in 0..nout {
+                let mut r = 0f64;
+                for j in 0..k {
+                    r += w_deq[nrow * k + j] as f64 * xq[bi * k + j] as f64;
+                }
+                let g = y[bi * nout + nrow] as f64;
+                sse += (g - r) * (g - r);
+                rs += r * r;
+            }
+        }
+        let max_rel = ((sse / (b * nout) as f64).sqrt() / (rs / (b * nout) as f64).sqrt().max(1e-9)) as f32;
+        println!("IQ2_XXS batched b={b}: max_rel={max_rel:.3e}");
+        assert!(max_rel < 1e-3, "batched b={b} diverged: max_rel={max_rel:.3e}");
+    }
+}
+
+// ---- fused i-quant MoE decode: the native dp4a MoE path (bank resident in VRAM, on-device gather)
+// vs the CPU per-expert reference, both fed the same q8_1-level activation + router ids. Exercises the
+// mod.rs CUDA i-quant MoE arm + moe_iquant_dp4a (quantize + the moe_qmatvec_dp4a_<iq*> launch). ----
+fn run_moe(dev: &Device, e_cnt: usize, n: usize, k: usize, t: usize, topk: usize, shared: bool) -> Err {
+    let cpu = Device::Cpu;
+    // Bank [E, n, k]: synth over e_cnt*n rows -- the counter increments across experts so each expert's
+    // codebook bytes differ (a wrong-expert gather would mismatch).
+    let raw = synth(GgmlDType::IQ2_XXS, e_cnt * n, k);
+    let q_cuda = QTensor::new(
+        QStorage::from_data(Cow::Owned(raw.clone()), dev, GgmlDType::IQ2_XXS).unwrap(),
+        (e_cnt, n, k),
+    )
+    .unwrap();
+    // Ground-truth bank weights: dequantize on the CPU (the exact codebook values).
+    let w_deq: Vec<f32> = QTensor::new(
+        QStorage::from_data(Cow::Owned(raw), &cpu, GgmlDType::IQ2_XXS).unwrap(),
+        (e_cnt, n, k),
+    )
+    .unwrap()
+    .dequantize(&cpu)
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+    // Activation: [t, topk|1, k], pre-quantized to q8_1 levels (so dp4a's re-quant is idempotent and
+    // the reference sees identical activations).
+    let in1 = if shared { 1 } else { topk };
+    let x_host: Vec<f32> =
+        q8_1_roundtrip(&(0..t * in1 * k).map(|i| pseudo(i + 1_234_567)).collect::<Vec<_>>());
+    let x_cuda = Tensor::from_vec(x_host.clone(), (t, in1, k), dev).unwrap();
+    let ids_host: Vec<u32> = (0..t * topk).map(|i| (pbyte(i * 7 + 3) as u32) % e_cnt as u32).collect();
+    let ids_cuda = Tensor::from_vec(ids_host.clone(), (t, topk), dev).unwrap();
+
+    let y_cuda: Vec<f32> = q_cuda
+        .indexed_moe_forward(&x_cuda, &ids_cuda)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(y_cuda.len(), t * topk * n);
+
+    // Self-contained reference: for each slot s=(token,slot_in_topk), output[s] = W[ids[s]] . act, where
+    // act is the slot's activation row (shared token input for in1==1, else the per-slot row). f64 dot.
+    let mut max_abs = 0f32;
+    let mut sse = 0f64;
+    let mut rs = 0f64;
+    for token in 0..t {
+        for slot in 0..topk {
+            let s = token * topk + slot;
+            let expert = ids_host[s] as usize;
+            let act_off = if in1 == 1 { token * k } else { s * k };
+            for row in 0..n {
+                let mut r = 0f64;
+                let w_off = (expert * n + row) * k;
+                for j in 0..k {
+                    r += w_deq[w_off + j] as f64 * x_host[act_off + j] as f64;
+                }
+                let g = y_cuda[s * n + row] as f64;
+                max_abs = max_abs.max((g - r).abs() as f32);
+                sse += (g - r) * (g - r);
+                rs += r * r;
+            }
+        }
+    }
+    let cnt = (t * topk * n) as f64;
+    let max_rel = ((sse / cnt).sqrt() / (rs / cnt).sqrt().max(1e-9)) as f32;
+    Err { max_abs, max_rel }
+}
+
+#[test]
+fn cuda_moe_iq2xxs_matches_cpu() {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no CUDA device ({e})");
+            return;
+        }
+    };
+    // (e_cnt, n, k, t, topk, shared-input). Decode t=1 + a small prefill t=3; shared (gate/up) +
+    // per-slot (down) input layouts.
+    for &(e, n, k, t, topk, shared) in &[
+        (8usize, 512usize, 2048usize, 1usize, 4usize, true),
+        (8, 512, 2048, 1, 4, false),
+        (16, 768, 2048, 3, 6, true),
+    ] {
+        let s = run_moe(&dev, e, n, k, t, topk, shared);
+        println!("MoE IQ2_XXS [E{e} {n}x{k} t{t} topk{topk} shared{shared}]: max_abs={:.3e} max_rel={:.3e}", s.max_abs, s.max_rel);
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-1,
+            "fused MoE diverged: max_abs={:.3e} max_rel={:.3e}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
 }
