@@ -628,6 +628,33 @@ extern "C" {
         warp_size: i32,
         stream: *mut c_void,
     );
+    // i-quant codebook dense MMQ prefill launchers (int8 WMMA via load_tiles_iq*). Same signature as
+    // the K-quant launchers above; defined by the weak launch_mmq_gguf_<iq*> in each mmq_instance_iq*.cu.
+    pub fn launch_mmq_gguf_iq2_xxs(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_y: i64, stride_row_x: i64, stride_col_dst: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_iq2_xs(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_y: i64, stride_row_x: i64, stride_col_dst: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_iq2_s(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_y: i64, stride_row_x: i64, stride_col_dst: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_iq3_xxs(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_y: i64, stride_row_x: i64, stride_col_dst: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_iq3_s(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_y: i64, stride_row_x: i64, stride_col_dst: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
 
     // Expert-grouped MoE prefill launchers (llama mul_mat_id). Same int8 MMQ core as the dense
     // launchers above; experts ride the channel dim. `ids_dst[col]` scatters sorted column `col` to its
@@ -698,6 +725,42 @@ extern "C" {
         cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
     );
     pub fn launch_mmq_gguf_moe_q6_k(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void,
+        ids_dst: *const c_void, expert_bounds: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_dst: i64, ncols_max: i64,
+        stride_row_x: i64, stride_channel_x: i64, n_experts: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    // i-quant codebook MoE MMQ prefill launchers (DEFINE_MMQ_GGUF_MOE_LAUNCHER in mmq_instance_iq*.cu).
+    pub fn launch_mmq_gguf_moe_iq2_xxs(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void,
+        ids_dst: *const c_void, expert_bounds: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_dst: i64, ncols_max: i64,
+        stride_row_x: i64, stride_channel_x: i64, n_experts: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_moe_iq2_xs(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void,
+        ids_dst: *const c_void, expert_bounds: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_dst: i64, ncols_max: i64,
+        stride_row_x: i64, stride_channel_x: i64, n_experts: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_moe_iq2_s(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void,
+        ids_dst: *const c_void, expert_bounds: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_dst: i64, ncols_max: i64,
+        stride_row_x: i64, stride_channel_x: i64, n_experts: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_moe_iq3_xxs(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void,
+        ids_dst: *const c_void, expert_bounds: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_dst: i64, ncols_max: i64,
+        stride_row_x: i64, stride_channel_x: i64, n_experts: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_moe_iq3_s(
         tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void,
         ids_dst: *const c_void, expert_bounds: *const c_void, dst: *mut c_void,
         ncols_x: i64, nrows_x: i64, ncols_dst: i64, ncols_max: i64,
