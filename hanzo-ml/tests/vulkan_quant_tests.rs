@@ -48,6 +48,7 @@ fn quantizable(dtype: GgmlDType) -> bool {
             | GgmlDType::IQ2_XXS
             | GgmlDType::IQ2_S
             | GgmlDType::IQ3_XXS
+            | GgmlDType::IQ3_S
             | GgmlDType::IQ2_XS
     )
 }
@@ -151,6 +152,18 @@ fn synth_decode_only(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
                 }
             }
         }
+        // block_iq3s (110 B): f16 d THEN 108 bytes (qs/qh/scales). block of 256. Any byte
+        // pattern is a valid codebook block.
+        GgmlDType::IQ3_S => {
+            for _ in 0..nout * (k / 256) {
+                out.extend_from_slice(&f16::from_f32(pseudo(c) * 0.004).to_le_bytes());
+                c += 1;
+                for _ in 0..108 {
+                    out.push(pbyte(c));
+                    c += 1;
+                }
+            }
+        }
         _ => panic!("synth_decode_only: {dtype:?} is not a decode-only type"),
     }
     out
@@ -192,6 +205,7 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
         GgmlDType::Q3K => vk.quantize_q3k(&raw, nout, k)?,
         GgmlDType::IQ2_XXS => vk.quantize_iq2xxs(&raw, nout, k)?,
         GgmlDType::IQ2_XS => vk.quantize_iq2xs(&raw, nout, k)?,
+        GgmlDType::IQ3_S => vk.quantize_iq3s(&raw, nout, k)?,
         GgmlDType::IQ3_XXS => vk.quantize_iq3xxs(&raw, nout, k)?,
         GgmlDType::IQ2_S => vk.quantize_iq2s(&raw, nout, k)?,
         _ => vk.upload_qweight(&raw)?,
@@ -208,6 +222,7 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
         GgmlDType::IQ4_NL => vk.matvec_iq4nl(&wq, &x_host, nout, k)?,
         GgmlDType::IQ2_XXS => vk.matvec_iq2xxs(&wq, &x_host, nout, k)?,
         GgmlDType::IQ2_XS => vk.matvec_iq2xs(&wq, &x_host, nout, k)?,
+        GgmlDType::IQ3_S => vk.matvec_iq3s(&wq, &x_host, nout, k)?,
         GgmlDType::IQ3_XXS => vk.matvec_iq3xxs(&wq, &x_host, nout, k)?,
         GgmlDType::IQ2_S => vk.matvec_iq2s(&wq, &x_host, nout, k)?,
         GgmlDType::TQ2_0 => vk.matvec_tq2_0(&wq, &x_host, nout, k)?,
@@ -530,7 +545,25 @@ fn vulkan_matvec_iq3xxs_matches_cpu() -> hanzo_ml::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn vulkan_matvec_iq3s_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::IQ3_S, nout, k)?;
+        println!(
+            "IQ3_S nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}",
+            s.max_abs, s.max_rel, s.rms
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "IQ3_S GPU/CPU mismatch: max_abs={} max_rel={}", s.max_abs, s.max_rel
+        );
+    }
+    Ok(())
+}
 // ---------------------------------------------------------------------------------------------
+// End-to-end// ---------------------------------------------------------------------------------------------
 // End-to-end// ---------------------------------------------------------------------------------------------
 // End-to-end// ---------------------------------------------------------------------------------------------
 // End-to-end: the actual model path. Build a quantized QTensor ON the Vulkan device (exactly like
