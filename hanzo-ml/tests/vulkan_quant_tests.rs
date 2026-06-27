@@ -17,7 +17,6 @@
 
 use hanzo_ml::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use hanzo_ml::{Device, Module, Tensor};
-use std::sync::Arc;
 
 // Deterministic pseudo-random f32 in [-1, 1) from a counter (no rng dep; reproducible).
 fn pseudo(i: usize) -> f32 {
@@ -37,22 +36,105 @@ struct ErrStats {
 }
 
 // Run one (dtype, nout, k) case end to end on the GPU and return error stats vs the CPU reference.
-fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::Result<ErrStats> {
-    // 1. f32 weight W[nout, k] and activation x[k].
-    let w_host: Vec<f32> = (0..nout * k).map(|i| pseudo(i) * 0.5).collect();
-    let x_host: Vec<f32> = (0..k).map(|i| pseudo(i + 1_000_003)).collect();
+// True for GGML types with a CPU quantizer (`from_float`). The decode-only types (IQ4_NL / IQ4_XS /
+// TQ2_0) have no `from_float`, so their test weights are synthesized as raw blocks instead.
+fn quantizable(dtype: GgmlDType) -> bool {
+    !matches!(
+        dtype,
+        GgmlDType::IQ4_NL | GgmlDType::IQ4_XS | GgmlDType::TQ2_0
+    )
+}
 
-    // 2. Quantize on CPU, then dequantize to get the EXACT weights the kernel sees.
+// Deterministic pseudo-random byte (same splitmix source as `pseudo`).
+fn pbyte(i: usize) -> u8 {
+    (((pseudo(i) * 0.5 + 0.5) * 256.0) as i32).clamp(0, 255) as u8
+}
+
+// Synthesize valid raw GGML block bytes for a decode-only type (no `from_float` quantizer). Every
+// nibble / 2-bit field is a valid index/value; the f16 scale magnitude is chosen so the dequantized
+// weights stay O(0.5) -- the same range as the quantizable cases -- so the GPU-vs-CPU tolerance
+// (max_abs < 1e-3) applies unchanged. Block layouts are bit-for-bit the CPU block structs.
+fn synth_decode_only(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
+    use half::f16;
+    let mut out: Vec<u8> = Vec::new();
+    let mut c = 0usize;
+    match dtype {
+        // block_iq4_nl (18 B): f16 d, qs[16]. block of 32.
+        GgmlDType::IQ4_NL => {
+            for _ in 0..nout * (k / 32) {
+                out.extend_from_slice(&f16::from_f32(pseudo(c) * 0.003).to_le_bytes());
+                c += 1;
+                for _ in 0..16 {
+                    out.push(pbyte(c));
+                    c += 1;
+                }
+            }
+        }
+        // block_iq4_xs (136 B): f16 d, u16 scales_h, scales_l[4], qs[128]. block of 256.
+        GgmlDType::IQ4_XS => {
+            for _ in 0..nout * (k / 256) {
+                out.extend_from_slice(&f16::from_f32(pseudo(c) * 1e-4).to_le_bytes());
+                c += 1;
+                for _ in 0..6 {
+                    out.push(pbyte(c)); // scales_h (u16) + scales_l[4]
+                    c += 1;
+                }
+                for _ in 0..128 {
+                    out.push(pbyte(c)); // qs[128]
+                    c += 1;
+                }
+            }
+        }
+        // block_tq2_0 (66 B): qs[64] THEN f16 d. block of 256.
+        GgmlDType::TQ2_0 => {
+            for _ in 0..nout * (k / 256) {
+                for _ in 0..64 {
+                    out.push(pbyte(c)); // qs[64]
+                    c += 1;
+                }
+                out.extend_from_slice(&f16::from_f32(pseudo(c) * 0.3).to_le_bytes());
+                c += 1;
+            }
+        }
+        _ => panic!("synth_decode_only: {dtype:?} is not a decode-only type"),
+    }
+    out
+}
+
+// Raw GGML block bytes for `dtype`, the exact f32 weights they dequantize to (`w_deq`, the kernel's
+// ground truth), and the pre-quantization f32 source (`w_orig`, == w_deq for synthesized blocks).
+fn weight_bytes(
+    dtype: GgmlDType,
+    nout: usize,
+    k: usize,
+) -> hanzo_ml::Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
     let cpu = Device::Cpu;
-    let w_t = Tensor::from_vec(w_host.clone(), (nout, k), &cpu)?;
-    let q = QTensor::quantize(&w_t, dtype)?;
-    let w_deq: Vec<f32> = q.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
-    let raw = q.data()?; // raw GGML block bytes
+    if quantizable(dtype) {
+        let w_host: Vec<f32> = (0..nout * k).map(|i| pseudo(i) * 0.5).collect();
+        let w_t = Tensor::from_vec(w_host.clone(), (nout, k), &cpu)?;
+        let q = QTensor::quantize(&w_t, dtype)?;
+        let w_deq: Vec<f32> = q.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok((q.data()?.into_owned(), w_deq, w_host))
+    } else {
+        let raw = synth_decode_only(dtype, nout, k);
+        let qs = QStorage::from_data(std::borrow::Cow::Owned(raw.clone()), &cpu, dtype)?;
+        let q = QTensor::new(qs, (nout, k))?;
+        let w_deq: Vec<f32> = q.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok((raw, w_deq.clone(), w_deq))
+    }
+}
 
-    // 3. Upload bytes + run the GPU kernel. Q6_K repacks to a padded 53-u32 stride on upload.
+fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::Result<ErrStats> {
+    let x_host: Vec<f32> = (0..k).map(|i| pseudo(i + 1_000_003)).collect();
+    // Raw GGML bytes + the EXACT dequantized weights the kernel reads + the original f32 source.
+    let (raw, w_deq, w_host) = weight_bytes(dtype, nout, k)?;
+
+    // Upload bytes + run the GPU kernel. Q6_K / Q3_K repack to a padded u32 stride on upload; every
+    // other native type byte- or word-addresses the raw GGML bytes directly.
     let vk = dev.as_vulkan_device()?;
     let wq = match dtype {
         GgmlDType::Q6K => vk.quantize_q6k(&raw, nout, k)?,
+        GgmlDType::Q3K => vk.quantize_q3k(&raw, nout, k)?,
         _ => vk.upload_qweight(&raw)?,
     };
     let y_gpu: Vec<f32> = match dtype {
@@ -61,6 +143,11 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
         GgmlDType::Q4K => vk.matvec_q4k(&wq, &x_host, nout, k)?,
         GgmlDType::Q5K => vk.matvec_q5k(&wq, &x_host, nout, k)?,
         GgmlDType::Q6K => vk.matvec_q6k(&wq, &x_host, nout, k)?,
+        GgmlDType::Q2K => vk.matvec_q2k(&wq, &x_host, nout, k)?,
+        GgmlDType::Q3K => vk.matvec_q3k(&wq, &x_host, nout, k)?,
+        GgmlDType::IQ4_XS => vk.matvec_iq4xs(&wq, &x_host, nout, k)?,
+        GgmlDType::IQ4_NL => vk.matvec_iq4nl(&wq, &x_host, nout, k)?,
+        GgmlDType::TQ2_0 => vk.matvec_tq2_0(&wq, &x_host, nout, k)?,
         _ => panic!("unsupported dtype in run_case: {dtype:?}"),
     };
     assert_eq!(y_gpu.len(), nout);
@@ -213,6 +300,101 @@ fn vulkan_matvec_q6k_matches_cpu() -> hanzo_ml::Result<()> {
     Ok(())
 }
 
+#[test]
+fn vulkan_matvec_q2k_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::Q2K, nout, k)?;
+        println!(
+            "Q2_K  nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "Q2_K GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_matvec_q3k_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::Q3K, nout, k)?;
+        println!(
+            "Q3_K  nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "Q3_K GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_matvec_iq4xs_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::IQ4_XS, nout, k)?;
+        println!(
+            "IQ4_XS nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "IQ4_XS GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_matvec_iq4nl_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::IQ4_NL, nout, k)?;
+        println!(
+            "IQ4_NL nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "IQ4_NL GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_matvec_tq2_0_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for &(nout, k) in SHAPES {
+        let s = run_case(&dev, GgmlDType::TQ2_0, nout, k)?;
+        println!(
+            "TQ2_0  nout={nout:5} k={k:5}  max_abs={:.3e} max_rel={:.3e} rms={:.3e}  (quant err vs f32: {:.3e})",
+            s.max_abs, s.max_rel, s.rms, s.quant_max_abs
+        );
+        assert!(
+            s.max_rel < 1e-3 && s.max_abs < 1e-3,
+            "TQ2_0 GPU/CPU mismatch too large: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // End-to-end: the actual model path. Build a quantized QTensor ON the Vulkan device (exactly like
 // the GGUF loader: QStorage::from_data on Device::Vulkan -> QTensor::new), wrap it in a QMatMul
@@ -220,21 +402,14 @@ fn vulkan_matvec_q6k_matches_cpu() -> hanzo_ml::Result<()> {
 // a single-row Vulkan activation -- the decode hot path. Compare to the CPU QMatMul forward over
 // the same quantized weights. This validates the wiring, not just the raw kernel.
 fn end_to_end_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::Result<f32> {
-    let cpu = Device::Cpu;
-    let w_host: Vec<f32> = (0..nout * k).map(|i| pseudo(i) * 0.5).collect();
     let x_host: Vec<f32> = (0..k).map(|i| pseudo(i + 7)).collect();
 
-    // CPU quantized weight (quantized once); reuse it for both the raw bytes and the reference.
-    let w_t = Tensor::from_vec(w_host, (nout, k), &cpu)?;
-    let q_cpu = Arc::new(QTensor::quantize(&w_t, dtype)?);
-    let bytes = q_cpu.data()?.into_owned();
-
-    // Reference: dequantize the SAME quantized weights to f32 and do an f64 matvec. This is the
-    // ground truth the GPU kernel targets (dequantize-then-dot). NOTE we deliberately do NOT use the
-    // CPU `QMatMul::forward` here: for k-quants that path runs `vec_dot`, which quantizes the
-    // ACTIVATION to int8 per block first -- a different (lossier) algorithm than the GPU's
-    // f32-activation dequant matvec, so the two legitimately differ by ~1e-1, not a kernel bug.
-    let w_deq: Vec<f32> = q_cpu.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    // Raw GGML bytes + the exact dequantized weights. Quantizable types quantize on CPU; decode-only
+    // types (IQ4_NL/IQ4_XS/TQ2_0) synthesize raw blocks. The dequantized weights are the f64 ground
+    // truth the GPU kernel targets (dequantize-then-dot). NOTE we deliberately do NOT use the CPU
+    // `QMatMul::forward`: for k-quants it runs `vec_dot`, which quantizes the ACTIVATION to int8 per
+    // block first -- a lossier algorithm than the GPU's f32-activation dequant matvec (differs ~1e-1).
+    let (bytes, w_deq, _) = weight_bytes(dtype, nout, k)?;
     let mut y_ref = vec![0f64; nout];
     for n in 0..nout {
         let mut acc = 0f64;
@@ -263,7 +438,7 @@ fn end_to_end_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> han
 #[test]
 fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
-    // (nout, k); k divisible by 256 so all three dtypes are exercised on the same shapes.
+    // (nout, k); k divisible by 256 so every dtype is exercised on the same shapes.
     for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
         for dt in [
             GgmlDType::Q4_0,
@@ -271,6 +446,11 @@ fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
             GgmlDType::Q4K,
             GgmlDType::Q5K,
             GgmlDType::Q6K,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::IQ4_XS,
+            GgmlDType::IQ4_NL,
+            GgmlDType::TQ2_0,
         ] {
             let max_abs = end_to_end_case(&dev, dt, nout, k)?;
             println!("QMatMul::forward {dt:?}  nout={nout:5} k={k:5}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}");

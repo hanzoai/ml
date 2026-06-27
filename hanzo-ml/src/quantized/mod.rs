@@ -1434,6 +1434,11 @@ impl QMatMul {
                     | GgmlDType::Q4K
                     | GgmlDType::Q5K
                     | GgmlDType::Q6K
+                    | GgmlDType::Q2K
+                    | GgmlDType::Q3K
+                    | GgmlDType::IQ4_XS
+                    | GgmlDType::IQ4_NL
+                    | GgmlDType::TQ2_0
             );
             if native_vk {
                 if let Device::Vulkan(d) = qtensor.device() {
@@ -1441,14 +1446,15 @@ impl QMatMul {
                         let blk = dt.block_size();
                         if k % blk == 0 {
                             let bytes = qtensor.data()?;
-                            // Q6_K's 210-byte block is not u32-aligned; its shader reads a padded
-                            // 53-u32 stride, so repack on upload. Q8_0 repacks to the 9-u32/block
-                            // layout that BOTH its decode (mul_mat_vec_q8) and prefill GEMM
+                            // Q6_K (210 B) and Q3_K (110 B) blocks are not u32-aligned; their shaders
+                            // read a padded u32 stride, so repack on upload. Q8_0 repacks to the
+                            // 9-u32/block layout that BOTH its decode (mul_mat_vec_q8) and prefill GEMM
                             // (mul_mat_q8) read -- ONE layout, so decode + prefill + MoE all agree
                             // (mirrors how the MoE bank repacks Q8_0). Every other native type's
                             // shaders byte-address the raw GGML bytes directly.
                             let wq = match dt {
                                 GgmlDType::Q6K => d.quantize_q6k(&bytes, n, k)?,
+                                GgmlDType::Q3K => d.quantize_q3k(&bytes, n, k)?,
                                 GgmlDType::Q8_0 => d.quantize_q8_blocks(&bytes, n, k)?,
                                 _ => d.upload_qweight(&bytes)?,
                             };
@@ -2073,6 +2079,11 @@ impl crate::Module for QMatMul {
                             GgmlDType::Q4K => d.matvec_q4k_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q5K => d.matvec_q5k_gpu(wq, xv, *n, *k)?,
                             GgmlDType::Q6K => d.matvec_q6k_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q2K => d.matvec_q2k_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q3K => d.matvec_q3k_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::IQ4_XS => d.matvec_iq4xs_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::IQ4_NL => d.matvec_iq4nl_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::TQ2_0 => d.matvec_tq2_0_gpu(wq, xv, *n, *k)?,
                             other => crate::bail!("VulkanQuant: no native matvec for {other:?}"),
                         }
                     };
