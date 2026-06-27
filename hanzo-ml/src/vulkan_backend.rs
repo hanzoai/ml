@@ -68,6 +68,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_iq4xs" => spv!("mul_mat_vec_iq4xs"),
         "mul_mat_vec_iq2xxs" => spv!("mul_mat_vec_iq2xxs"),
         "mul_mat_vec_iq2xs" => spv!("mul_mat_vec_iq2xs"),
+        "mul_mat_vec_iq2s" => spv!("mul_mat_vec_iq2s"),
         "mul_mat_vec_tq2_0" => spv!("mul_mat_vec_tq2_0"),
         "mul_mat_vec_iq4nl" => spv!("mul_mat_vec_iq4nl"),
         "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
@@ -1855,6 +1856,69 @@ impl VulkanDevice {
         }
         let xs = self.upload_f32(x)?;
         self.matvec_iq2xs_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Upload IQ2_S weights, repacking each 82-byte GGML block into a padded 21-u32 stride
+    /// (u32 alignment; 82 is not a multiple of 4). Trailing pad bytes are zero and never read.
+    pub fn quantize_iq2s(&self, data: &[u8], nout: usize, k: usize) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("quantize_iq2s: k must be a multiple of 256, got {k}");
+        }
+        let nblocks = k / 256;
+        let total = nout * nblocks;
+        let want = total * 82;
+        if data.len() != want {
+            crate::bail!("quantize_iq2s: data len {} != {nout}*{nblocks}*82 = {want}", data.len());
+        }
+        let mut words = vec![0u32; total * 21];
+        for blk in 0..total {
+            let src = &data[blk * 82..blk * 82 + 82];
+            let dst = &mut words[blk * 21..blk * 21 + 21];
+            let dst_bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, 21 * 4) };
+            dst_bytes[..82].copy_from_slice(src);
+        }
+        self.upload_u32(&words)
+    }
+
+    /// IQ2_S matvec: `y[nout] = Wq * x[k]`, `Wq` from [`quantize_iq2s`]. 2.56 codebook decode.
+    pub fn matvec_iq2s_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("matvec_iq2s_gpu: k must be a multiple of 256, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_iq2s_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[nout as u32, k as u32]);
+        self.dispatch(
+            "mul_mat_vec_iq2s",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// IQ2_S matvec, host activation. `wq` is the [`quantize_iq2s`] repack.
+    pub fn matvec_iq2s(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_iq2s: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_iq2s_gpu(wq, &xs, nout, k)?.to_vec_f32()
     }
 
     /// IQ4_NL matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, weights stay
