@@ -9,7 +9,7 @@ use super::GgmlDType;
 use crate::cuda_backend::DeviceId;
 use crate::{backend::BackendStorage, CudaDevice, CudaStorage, DType, Result, Shape};
 
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaView, DevicePtr};
 
 const QK8_1: usize = 32;
 const BLOCK_Q8_1_MMQ_SIZE: usize = 4 * QK8_1 + 4 * 4; // 128 qs + 16 scale bytes = 144
@@ -397,4 +397,211 @@ pub fn try_fwd(
         let cast_storage = out_storage.to_dtype(&out_layout, input_dtype)?;
         Ok(Some((cast_storage, out_shape.into())))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Expert-grouped MoE prefill GEMM (llama's mul_mat_id).
+//
+// The decode/single-token MoE keeps the per-slot matvec in `cuda.rs` (bandwidth-bound, fine). This is
+// the prefill (rows>1) lever: instead of one matvec per (token, expert-slot) -- which re-streams the
+// whole expert weight for every routed token and runs no matrix cores -- we group the routed tokens by
+// expert (host-side counting sort over the router ids) and run ONE int8 MMQ where each expert's weight
+// is staged once and amortized over all its tokens via the tensor cores. Same `mul_mat_q` core as the
+// dense path; experts ride the channel dim (see DEFINE_MMQ_GGUF_MOE_LAUNCHER).
+// ---------------------------------------------------------------------------
+
+type MoeMmqLauncher = unsafe extern "C" fn(
+    tmp_fixup: *mut std::ffi::c_void,
+    x: *const std::ffi::c_void,
+    y: *const std::ffi::c_void,
+    ids_dst: *const std::ffi::c_void,
+    expert_bounds: *const std::ffi::c_void,
+    dst: *mut std::ffi::c_void,
+    ncols_x: i64,
+    nrows_x: i64,
+    ncols_dst: i64,
+    ncols_max: i64,
+    stride_row_x: i64,
+    stride_channel_x: i64,
+    n_experts: i64,
+    cc: i32,
+    nsm: i32,
+    smpbo: i64,
+    warp_size: i32,
+    stream: *mut std::ffi::c_void,
+);
+
+fn moe_mmq_launcher(dtype: GgmlDType) -> Option<MoeMmqLauncher> {
+    use hanzo_kernels::ffi;
+    let f: MoeMmqLauncher = match dtype {
+        GgmlDType::Q4_0 => ffi::launch_mmq_gguf_moe_q4_0,
+        GgmlDType::Q4_1 => ffi::launch_mmq_gguf_moe_q4_1,
+        GgmlDType::Q5_0 => ffi::launch_mmq_gguf_moe_q5_0,
+        GgmlDType::Q5_1 => ffi::launch_mmq_gguf_moe_q5_1,
+        GgmlDType::Q8_0 => ffi::launch_mmq_gguf_moe_q8_0,
+        GgmlDType::Q2K => ffi::launch_mmq_gguf_moe_q2_k,
+        GgmlDType::Q3K => ffi::launch_mmq_gguf_moe_q3_k,
+        GgmlDType::Q4K => ffi::launch_mmq_gguf_moe_q4_k,
+        GgmlDType::Q5K => ffi::launch_mmq_gguf_moe_q5_k,
+        GgmlDType::Q6K => ffi::launch_mmq_gguf_moe_q6_k,
+        _ => return None,
+    };
+    Some(f)
+}
+
+/// Expert-grouped MoE prefill GEMM. Mirrors the shape contract of
+/// `cuda::indexed_moe_forward_fused_q8_1_input` but runs ONE int8 MMQ (llama mul_mat_id) instead of the
+/// per-slot matvec. Returns `Ok(None)` when the weight dtype has no MMQ kernel (caller falls back to the
+/// per-slot path). `input` is read from offset 0 -- identical bytes to the per-slot path, so the A/B is
+/// apples-to-apples. Output is f32 `[batch, topk, n]`.
+pub(crate) fn indexed_moe_grouped(
+    weight: &CudaView<u8>,
+    w_shape: &Shape, // [E, n, k]
+    w_dtype: GgmlDType,
+    input: &CudaSlice<f32>,
+    in_shape: &Shape, // [batch, topk or 1, k]
+    ids: &CudaView<u32>,
+    idx_shape: &Shape, // [batch, topk] or flat [batch*topk]
+    dev: &CudaDevice,
+) -> Result<Option<(CudaStorage, Shape)>> {
+    if !supports(w_dtype) {
+        return Ok(None);
+    }
+    let (e_cnt, n, k) = w_shape.dims3()?;
+    let batch = in_shape.dims()[0];
+    let input_dim1 = in_shape.dims()[1];
+    let nslots = idx_shape.elem_count();
+    if nslots == 0 || batch == 0 || nslots % batch != 0 {
+        return Ok(None);
+    }
+    let topk = nslots / batch;
+
+    let qk = qk_for(w_dtype);
+    if k % qk != 0 {
+        return Ok(None);
+    }
+
+    // Host-side counting sort of the routed slots by expert (llama mul_mat_id). Prefill is never
+    // graph-captured, so the ids DtoH + the metadata HtoD below are free.
+    let ids_host: Vec<u32> = dev.clone_dtoh(ids)?;
+    if ids_host.len() != nslots {
+        return Ok(None);
+    }
+    let mut counts = vec![0i32; e_cnt];
+    for &e in &ids_host {
+        let e = e as usize;
+        if e >= e_cnt {
+            crate::bail!("indexed_moe_grouped: expert id {e} >= num_experts {e_cnt}");
+        }
+        counts[e] += 1;
+    }
+    // expert_bounds[e] = prefix sums over counts [e_cnt+1]; expert e owns sorted columns [eb[e],eb[e+1]).
+    let mut expert_bounds = vec![0i32; e_cnt + 1];
+    for e in 0..e_cnt {
+        expert_bounds[e + 1] = expert_bounds[e] + counts[e];
+    }
+    // For each sorted column p: ids_dst[p] = original output row = the routed slot s (= token*topk+slot,
+    // exactly the row of the [batch,topk,n] output); quantize_ids[p] = input row to gather (the token
+    // when the input is broadcast across topk, i.e. input_dim1==1; else the slot itself).
+    let mut ids_dst = vec![0i32; nslots];
+    let mut quantize_ids = vec![0i32; nslots];
+    let mut cursor = expert_bounds.clone();
+    for (s, &e) in ids_host.iter().enumerate() {
+        let e = e as usize;
+        let p = cursor[e] as usize;
+        ids_dst[p] = s as i32;
+        quantize_ids[p] = if input_dim1 == 1 { (s / topk) as i32 } else { s as i32 };
+        cursor[e] += 1;
+    }
+    let ncols_max = counts.iter().copied().max().unwrap_or(0) as i64;
+
+    let stream = dev.cuda_stream();
+    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+
+    // Padded k for the q8_1_mmq activation (matches the dense MMQ path exactly).
+    let k_padded = pad(pad(k, MATRIX_ROW_PADDING), 4 * QK8_1);
+    let blocks_per_row = k_padded / (4 * QK8_1);
+
+    // Workspace for the expert-sorted q8_1_mmq activations (one column per routed slot).
+    let workspace_main = nslots * blocks_per_row * BLOCK_Q8_1_MMQ_SIZE;
+    let workspace_extra = 128 * BLOCK_Q8_1_MMQ_SIZE;
+    let (scratch_ptr, _ws_guard) =
+        workspace_ensure(&MMQ_WORKSPACE, dev, workspace_main + workspace_extra)?;
+    let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
+
+    // Stream-k fixup workspace (same sizing as the dense path).
+    const MMQ_X_MAX: usize = 128;
+    const MMQ_Y_MAX: usize = 128;
+    const MAX_SMS: usize = 256;
+    let fixup_bytes = MAX_SMS * MMQ_X_MAX * MMQ_Y_MAX * std::mem::size_of::<f32>();
+    let (fixup_ptr, _fixup_guard) = workspace_ensure(&FIXUP_WORKSPACE, dev, fixup_bytes)?;
+    let fixup_ptr = fixup_ptr as *mut std::ffi::c_void;
+
+    // Upload routing metadata (kept alive until the launches are enqueued on the stream).
+    let eb_dev = dev.clone_htod(&expert_bounds)?;
+    let iddst_dev = dev.clone_htod(&ids_dst)?;
+    let qids_dev = dev.clone_htod(&quantize_ids)?;
+
+    let input_ptr = input.device_ptr(&stream).0 as *const std::ffi::c_void;
+    let eb_ptr = eb_dev.device_ptr(&stream).0 as *const std::ffi::c_void;
+    let iddst_ptr = iddst_dev.device_ptr(&stream).0 as *const std::ffi::c_void;
+    let qids_ptr = qids_dev.device_ptr(&stream).0 as *const i32;
+    let weight_ptr = weight.device_ptr(&stream).0 as *const std::ffi::c_void;
+
+    let out = dev.alloc_zeros::<f32>(nslots * n)?;
+    let out_ptr = out.device_ptr(&stream).0 as *mut std::ffi::c_void;
+
+    let di = get_device_info(dev);
+    let stride_row_x = (k / qk) as i64;
+    let stride_channel_x = (n * (k / qk)) as i64;
+
+    unsafe {
+        // Quantize the activation into expert-sorted q8_1_mmq columns (gather input row by quantize_ids).
+        let quantize = quantize_launcher(ds_layout_for(w_dtype));
+        quantize(
+            input_ptr,
+            qids_ptr,
+            scratch_ptr,
+            0,
+            k as i64,        // ne00 (real row length)
+            k as i64,        // s01  (input row stride, elements)
+            0,
+            0,
+            k_padded as i64, // ne0  (padded loop bound)
+            nslots as i64,   // ne1  (number of sorted columns)
+            1,
+            1,
+            stream_ptr,
+        );
+
+        let launcher = moe_mmq_launcher(w_dtype).expect("supports() checked");
+        launcher(
+            fixup_ptr,
+            weight_ptr,
+            scratch_ptr as *const std::ffi::c_void,
+            iddst_ptr,
+            eb_ptr,
+            out_ptr,
+            k as i64,      // ncols_x
+            n as i64,      // nrows_x
+            nslots as i64, // ncols_dst (total routed columns)
+            ncols_max,     // ncols_max (largest per-expert column count)
+            stride_row_x,
+            stride_channel_x,
+            e_cnt as i64,
+            di.cc,
+            di.nsm,
+            di.smpbo,
+            di.warp_size,
+            stream_ptr,
+        );
+    }
+
+    // eb_dev/iddst_dev/qids_dev free stream-ordered on drop here (after the launches are enqueued).
+    let out_storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
+    let mut out_shape = in_shape.dims().to_vec();
+    out_shape.pop();
+    out_shape.push(n);
+    out_shape[1] = topk;
+    Ok(Some((out_storage, out_shape.into())))
 }
