@@ -1416,3 +1416,141 @@ fn quantized_matmul_q8k() -> Result<()> {
     ggml_matmul_error_test::<BlockQ8K>()?;
     Ok(())
 }
+
+// ===========================================================================
+// IQ2_XXS CPU indexed-MoE: the weight-superblock vs activation-q8-block mismatch.
+//
+// An i-quant super-block is 256 weights but its `VecDotType` is Q8_0 (32-elem),
+// so each weight super-block dots against EIGHT Q8_0 activation blocks. The CPU
+// `k_quants::matmul`/`matmul_f16` used a single block count for both the weight
+// slice and the quantized-activation allocation; for i-quants that under-sized
+// the activation 8x and `vec_dot_dequant_q8_0` ran off the end of `ys`
+// (panic at quantized/quant_format.rs:58). K-quants/q8_0 were unaffected because
+// their VecDotType block size equals their own block size.
+// ===========================================================================
+
+/// Build a packed GGUF byte bank of `e * n * (k/256)` codebook i-quant blocks
+/// (`block_bytes` each, leading f16 `d`). Any byte pattern is a valid block; the
+/// per-block f16 scale's high byte is pinned small/positive so no block
+/// dequantizes to inf/nan.
+fn iquant_byte_bank(e: usize, n: usize, k: usize, block_bytes: usize) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "codebook i-quant block spans 256 weights");
+    let nblocks = e * n * (k / 256);
+    let mut data = vec![0u8; nblocks * block_bytes];
+    let mut s: u32 = 0x1234_5678;
+    for (i, b) in data.iter_mut().enumerate() {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *b = (s >> 16) as u8;
+        if i % block_bytes == 1 {
+            // f16 `d` high byte: exp ~2^-4, sign 0 -> d in [0.0625, 0.0664], never inf/nan.
+            *b = 0x2C;
+        }
+    }
+    data
+}
+
+/// Codebook i-quant types whose 256-elem super-block dots against Q8_0 (32-elem) vec-dot blocks:
+/// `(dtype, on-disk block bytes)`. Every one exercises the `matmul` weight/activation block-count
+/// split; before the fix each panicked at quant_format.rs:58 on CPU.
+const IQUANT_TYPES: &[(GgmlDType, usize)] = &[
+    (GgmlDType::IQ2_XXS, 66),
+    (GgmlDType::IQ2_XS, 74),
+    (GgmlDType::IQ2_S, 82),
+    (GgmlDType::IQ3_XXS, 98),
+    (GgmlDType::IQ3_S, 110),
+    (GgmlDType::IQ1_S, 50),
+];
+
+/// Max-abs error between two equal-shaped tensors, and the reference's max-abs magnitude.
+fn max_abs_err(got: &Tensor, want: &Tensor) -> Result<(f32, f32)> {
+    let err = (got - want)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    let scale = want.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+    Ok((err, scale))
+}
+
+#[test]
+fn iquant_indexed_moe_cpu() -> Result<()> {
+    use hanzo_ml::quantized::{QStorage, QTensor};
+    use std::borrow::Cow;
+    let dev = &Device::Cpu;
+    // [E, n, k] expert bank; k = 256 -> one 256-elem super-block / 8 Q8_0 activation blocks per row.
+    let (e, n, k) = (4usize, 128usize, 256usize);
+    let (t, topk) = (3usize, 2usize);
+
+    let x_vec: Vec<f32> = (0..t * topk * k).map(|i| (i as f32 * 0.013).sin() * 0.5).collect();
+    let x = Tensor::from_vec(x_vec, (t, topk, k), dev)?;
+    let ids_vec: Vec<u32> = (0..t * topk).map(|i| (i * 3 % e) as u32).collect();
+    let ids = Tensor::from_vec(ids_vec.clone(), (t, topk), dev)?;
+
+    for &(dtype, block_bytes) in IQUANT_TYPES {
+        let bank = iquant_byte_bank(e, n, k, block_bytes);
+        let qs = QStorage::from_data(Cow::Owned(bank), dev, dtype)?;
+        let w = QTensor::new(qs, (e, n, k))?;
+
+        // Pre-fix: panics at quantized/quant_format.rs:58 (vec_dot ys index out of bounds).
+        let y = w.indexed_moe_forward(&x, &ids)?;
+        assert_eq!(y.dims(), &[t, topk, n], "{dtype:?}");
+
+        // Reference: dequantize the bank, Q8_0-roundtrip the activation rows (matching the quantized
+        // matmul's own activation handling), then a dense matmul per routed slot W[ids[s]] @ x[s].
+        let w_dense = w.dequantize(dev)?.reshape((e, n, k))?;
+        let x_flat = x.reshape((t * topk, k))?;
+        let x_q8 = QTensor::quantize(&x_flat, GgmlDType::Q8_0)?.dequantize(dev)?;
+        let mut rows = Vec::with_capacity(t * topk);
+        for (s, &eid) in ids_vec.iter().enumerate() {
+            let w_e = w_dense.i(eid as usize)?; // [n, k]
+            let x_row = x_q8.i(s)?.reshape((1, k))?; // [1, k]
+            rows.push(x_row.matmul(&w_e.t()?)?); // [1, n]
+        }
+        let reference = Tensor::cat(&rows, 0)?.reshape((t, topk, n))?;
+
+        let (err, scale) = max_abs_err(&y, &reference)?;
+        assert!(
+            err <= 1e-3 * scale.max(1e-6) + 1e-4,
+            "{dtype:?} MoE != dequantize reference: max_abs_err {err}, ref scale {scale}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn iq2xxs_dense_matmul_cpu() -> Result<()> {
+    use hanzo_ml::quantized::{QMatMul, QStorage, QTensor};
+    use std::borrow::Cow;
+    let dev = &Device::Cpu;
+    // k = 512 = two 256-elem super-blocks per row -> vec_dot iterates bx>=1, the exact case that
+    // overran `ys` before the fix. m = 4 rows of activation.
+    let (m, n, k) = (4usize, 7usize, 512usize);
+    let bank = iquant_byte_bank(1, n, k, 66); // IQ2_XXS = 66 B/block
+    let qs = QStorage::from_data(Cow::Owned(bank), dev, GgmlDType::IQ2_XXS)?;
+    let w = QTensor::new(qs, (n, k))?;
+    let w_dense = w.dequantize(dev)?; // [n, k]
+    let qm = QMatMul::from_qtensor(w)?;
+
+    let x_vec: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.007).cos() * 0.3).collect();
+    let x = Tensor::from_vec(x_vec, (m, k), dev)?;
+    let x_q8 = QTensor::quantize(&x, GgmlDType::Q8_0)?.dequantize(dev)?;
+    let reference = x_q8.matmul(&w_dense.t()?)?; // [m, n]
+
+    // f32 activation -> k_quants::matmul.
+    let y32 = qm.forward(&x)?;
+    assert_eq!(y32.dims(), &[m, n]);
+    let (err, scale) = max_abs_err(&y32, &reference)?;
+    assert!(
+        err <= 1e-3 * scale.max(1e-6) + 1e-4,
+        "IQ2_XXS f32 matmul != reference: max_abs_err {err}, ref scale {scale}"
+    );
+
+    // f16 activation -> k_quants::matmul_f16 (f16 output rounding -> looser bound).
+    let y16 = qm.forward(&x.to_dtype(DType::F16)?)?.to_dtype(DType::F32)?;
+    let (err16, scale16) = max_abs_err(&y16, &reference)?;
+    assert!(
+        err16 <= 5e-3 * scale16.max(1e-6) + 5e-3,
+        "IQ2_XXS f16 matmul != reference: max_abs_err {err16}, ref scale {scale16}"
+    );
+    Ok(())
+}
