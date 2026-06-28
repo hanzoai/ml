@@ -50,7 +50,7 @@ anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 chrono = "0.4"
 # Hanzo-renamed workspace dependencies (at version 0.10.x)
-hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.23" }
+hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.24" }
 hanzo-datasets = { path = "./hanzo-datasets", version = "0.11.8" }
 hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.11.8" }
 hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.11.8" }
