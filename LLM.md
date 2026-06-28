@@ -545,3 +545,11 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   prefill path, ready to default-on after the MoE-bank (woff!=0) + end-to-end pass. The bench harness now
   3-ways default/f32-tile/dp4a-tile. Both quantize_act_q8 + mul_mat_q4k_dp4a were written-but-unwired by
   an earlier pass; this wires the activation quant and supersedes the column dp4a with the 2D-tiled one.
+- L1 DEFAULT-FLIP (shipped): the 2D tile is now the DEFAULT dense Q4_K prefill path (woff==0, m>1), no env
+  needed -- mul_mm_q4k_tiled_dp4a where the device advertises integer-dot (new `int_dot8` gate: query
+  PhysicalDeviceShaderIntegerDotProductFeatures at init), else the universal f32 mul_mm_q4k_tiled (2.06x).
+  MoE banks (woff!=0), m==1, k>LDS-bound, and HANZO_VK_Q4K_LEGACY fall to the column kernel; the per-kernel
+  envs {DP4A,TILED2D,TILED,LEGACY} force one path for the A/B gates. Validated: all 3 correctness gates
+  pass vs the forced-legacy reference, and the default bench baseline now runs dp4a (5.0ms = the 9.00x
+  default). VK_INT_DOT=0 forces the f32 tile. A gfx1151 engine gets ~224 T/s Vulkan prefill by default
+  (was ~24). REMAINING: woff!=0 MoE-bank 2D path (untested -> still legacy) and L4 coopmat for parity.
