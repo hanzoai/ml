@@ -436,9 +436,18 @@ impl Content {
             };
 
             dimensions.reverse();
-            let ggml_dtype = reader.read_u32::<LittleEndian>()?;
-            let ggml_dtype = GgmlDType::from_u32(ggml_dtype)?;
+            let ggml_dtype_u32 = reader.read_u32::<LittleEndian>()?;
             let offset = reader.read_u64::<LittleEndian>()?;
+            // Skip the integer GGML types (I8=24, I16=25, I32=26, I64=27): these are auxiliary
+            // index/routing tensors (e.g. deepseek4's `ffn_gate_tid2eid` expert-routing maps), NOT
+            // float/quant weights. The model computes routing itself and loads weights by name, so it
+            // never requests them -- record nothing and move on, rather than hard-failing the whole
+            // model load on an "unknown dtype". (Their header fields are still consumed above so the
+            // reader stays aligned for the following tensors + the data-offset computation.)
+            if (24..=27).contains(&ggml_dtype_u32) {
+                continue;
+            }
+            let ggml_dtype = GgmlDType::from_u32(ggml_dtype_u32)?;
             tensor_infos.insert(
                 tensor_name,
                 TensorInfo {
