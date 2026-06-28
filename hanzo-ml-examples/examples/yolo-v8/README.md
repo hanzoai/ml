@@ -8,8 +8,8 @@ and on the model architecture described in this
 [issue](https://github.com/ultralytics/ultralytics/issues/189). The supported
 tasks are object detection and pose estimation.
 
-You can try this model online on the [ML YOLOv8
-Space](https://huggingface.co/spaces/lmz/hanzo-ml-yolo). The model then fully runs
+You can run this model in your browser via the [YOLOv8 WASM
+example](https://github.com/hanzoai/ml/tree/main/hanzo-ml-wasm-examples/yolo). The model then fully runs
 in your browser using WebAssembly - if you use a custom image it will never
 leave your phone/computer!
 

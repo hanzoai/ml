@@ -12,8 +12,8 @@ Download assets:
 ```bash
 # Model and tokenizer
 
-wget -c https://huggingface.co/spaces/lmz/hanzo-ml-llama2/resolve/main/model.bin
-wget -c https://huggingface.co/spaces/lmz/hanzo-ml-llama2/resolve/main/tokenizer.json
+wget -c https://huggingface.co/spaces/lmz/candle-llama2/resolve/main/model.bin
+wget -c https://huggingface.co/spaces/lmz/candle-llama2/resolve/main/tokenizer.json
 
 ```
 

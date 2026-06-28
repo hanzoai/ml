@@ -252,7 +252,7 @@ If you use SmolLM3 in your research or applications, please cite:
 - **SmolLM Blog Series**: https://huggingface.co/blog/smollm and https://huggingface.co/blog/smollm3
 - **Model Card Details**: https://huggingface.co/HuggingFaceTB/SmolLM3-3B
 - **NoPE Paper**: https://arxiv.org/abs/2410.01926
-- **Hanzo Documentation**: https://huggingface.github.io/hanzo-ml/
+- **Hanzo Documentation**: https://github.com/hanzoai/ml
 
 ---
 
