@@ -113,14 +113,14 @@ $ cargo run --release
 
 ## Utilizing `hanzo_nn`
 
-Many classical layers (such as [Linear](https://github.com/huggingface/hanzo/blob/main/hanzo-nn/src/linear.rs)) are already implemented in [hanzo-nn](https://github.com/huggingface/hanzo/tree/main/hanzo-nn).
+Many classical layers (such as [Linear](https://github.com/hanzoai/ml/blob/main/hanzo-nn/src/linear.rs)) are already implemented in [hanzo-nn](https://github.com/hanzoai/ml/tree/main/hanzo-nn).
 
 This `Linear` implementation follows PyTorch conventions for improved compatibility with existing models, utilizing the transpose of weights rather than direct weights.
 
 Let's simplify our implementation. First, add `hanzo-nn` as a dependency:
 
 ```bash
-$ cargo add --git https://github.com/huggingface/hanzo.git hanzo-nn
+$ cargo add --git https://github.com/hanzoai/ml.git hanzo-nn
 ```
 
 Now, replace the entire content of `src/main.rs` with:
