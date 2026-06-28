@@ -379,6 +379,7 @@ fn iquant_dp4a_suffix(dtype: GgmlDType) -> Option<&'static str> {
         GgmlDType::IQ3_S => "iq3s",
         GgmlDType::IQ1_S => "iq1_s",
         GgmlDType::IQ1_M => "iq1_m",
+        GgmlDType::IQ4_XS => "iq4xs",
         _ => return None,
     })
 }

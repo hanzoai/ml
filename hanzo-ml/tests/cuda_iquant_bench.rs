@@ -17,14 +17,20 @@ fn pbyte(i: usize) -> u8 {
     (z >> 33) as u8
 }
 
-// IQ2_XXS raw blocks (66 B = f16 d + 64 B qs) -- any byte pattern is a valid codebook block.
-fn synth_iq2xxs(nout: usize, k: usize) -> Vec<u8> {
+// Raw i-quant blocks (any byte pattern is a valid codebook block). IQ2_XXS = 66 B (f16 d + 64 qs);
+// IQ4_XS = 136 B (f16 d + 134: u16 scales_h + 4 scales_l + 128 qs).
+fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
     use half::f16;
+    let (d, nbytes) = match dtype {
+        GgmlDType::IQ2_XXS => (0.05f32, 64usize),
+        GgmlDType::IQ4_XS => (0.001, 134),
+        _ => panic!("bench synth: {dtype:?} unsupported"),
+    };
     let mut out = Vec::new();
     let mut c = 0usize;
     for _ in 0..nout * (k / 256) {
-        out.extend_from_slice(&f16::from_f32(0.05).to_le_bytes());
-        for _ in 0..64 {
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        for _ in 0..nbytes {
             out.push(pbyte(c));
             c += 1;
         }
@@ -34,10 +40,10 @@ fn synth_iq2xxs(nout: usize, k: usize) -> Vec<u8> {
 
 // m == 1 -> decode (mmvq dp4a); m > 8 -> prefill (qmmq int8-WMMA GEMM). The fallback path (set via
 // HANZO_IQ_DEQUANT_FALLBACK=1) is the dequant-to-f32 round-trip for both.
-fn bench_shape(dev: &Device, nout: usize, k: usize, m: usize) -> hanzo_ml::Result<()> {
-    let raw = synth_iq2xxs(nout, k);
+fn bench_shape(dev: &Device, dtype: GgmlDType, nout: usize, k: usize, m: usize) -> hanzo_ml::Result<()> {
+    let raw = synth(dtype, nout, k);
     let bytes = raw.len();
-    let qs = QStorage::from_data(Cow::Owned(raw), dev, GgmlDType::IQ2_XXS)?;
+    let qs = QStorage::from_data(Cow::Owned(raw), dev, dtype)?;
     let q = QTensor::new(qs, (nout, k))?;
     let matmul = QMatMul::from_qtensor(q)?;
     let x = Tensor::from_vec(
@@ -67,7 +73,7 @@ fn bench_shape(dev: &Device, nout: usize, k: usize, m: usize) -> hanzo_ml::Resul
     };
     let kind = if m == 1 { "decode" } else { "prefill" };
     println!(
-        "[{path:>16}] {kind} IQ2_XXS [n={nout:>5} k={k:>5} m={m:>4}]  {us:9.2} us/call",
+        "[{path:>16}] {kind} {dtype:?} [n={nout:>5} k={k:>5} m={m:>4}]  {us:9.2} us/call",
     );
     Ok(())
 }
@@ -82,14 +88,11 @@ fn bench_iq2xxs_decode() {
             return;
         }
     };
-    // Decode (m=1, mmvq) + prefill (m=128, qmmq) on realistic proj shapes (attn k=2048; FFN k=4096).
-    for &(n, k, m) in &[
-        (2048usize, 2048usize, 1usize),
-        (4096, 4096, 1),
-        (8192, 4096, 1),
-        (4096, 4096, 128),
-        (8192, 4096, 128),
-    ] {
-        bench_shape(&dev, n, k, m).unwrap();
+    // Decode (m=1, mmvq) + prefill (m=128, qmmq) on realistic proj shapes (attn k=2048; FFN k=4096),
+    // for IQ2_XXS (grid codebook) and IQ4_XS (LUT codebook -- the dominant type in UD-IQ2_M MoE quants).
+    for dtype in [GgmlDType::IQ2_XXS, GgmlDType::IQ4_XS] {
+        for &(n, k, m) in &[(4096usize, 4096usize, 1usize), (8192, 4096, 1), (4096, 4096, 128)] {
+            bench_shape(&dev, dtype, n, k, m).unwrap();
+        }
     }
 }
