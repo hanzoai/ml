@@ -23,6 +23,12 @@ OUT_MMQ = Path(sys.argv[3]) if len(sys.argv) > 3 else None  # iquant_grids_mmq.c
 # IQ1 uses a distinct GPU-packed table (iq1s_grid_gpu) not derivable here, so it is MMQ-excluded.
 MMQ_GRIDS = {"IQ2XXS_GRID", "IQ2XS_GRID", "IQ2S_GRID", "IQ3XXS_GRID", "IQ3S_GRID"}
 
+# Grids NOT materialized for the CUDA dp4a DECODE header: KSIGNS_IQ2XS is reconstructed in-kernel
+# from the 7-bit index's popcount-parity (unpack_ksigns, iquant_mmvq.cu) instead of a divergent
+# __constant__ gather, so the decode no longer reads the table. The Rust grid stays (the CPU
+# to_float oracle uses it); the MMQ path has its own ksigns handling.
+DECODE_SKIP = {"KSIGNS_IQ2XS"}
+
 # Rust name -> (CUDA elem type, value suffix). CUDA array name = Rust name + "_D".
 TYPES = {
     "u64": ("uint64_t", "ULL"),
@@ -69,11 +75,12 @@ for m in pat.finditer(text):
     vals = [v.strip() for v in body.split(",") if v.strip()]
     assert len(vals) == n, f"{name}: token count {len(vals)} != declared {n}"
     svals = [v + suf for v in vals] if suf else vals
-    emit.append(f"__device__ __constant__ {cty} {name}_D[{n}] = {{")
-    emit.extend(rows(svals))
-    emit.append("};")
-    emit.append("")
-    count += 1
+    if name not in DECODE_SKIP:
+        emit.append(f"__device__ __constant__ {cty} {name}_D[{n}] = {{")
+        emit.extend(rows(svals))
+        emit.append("};")
+        emit.append("")
+        count += 1
     if name in MMQ_GRIDS:
         emit_mmq.append(f"static const __device__ {cty} {name.lower()}[{n}] = {{")
         emit_mmq.extend(rows(svals))

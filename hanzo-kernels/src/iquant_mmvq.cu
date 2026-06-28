@@ -53,8 +53,8 @@ template <int WTYPE> struct qdp4a_traits;
 // ---- unpack_ksigns + dp4a_signed + the 7 qdp4a<IQ*> decoders + traits ----
 // Table-free ksigns (llama.cpp parity trick): the 7-bit index carries 7 sign bits; the 8th is the
 // popcount-parity of those 7, so __popc reconstructs it -- NO divergent __constant__ gather. Returns
-// the 8 sign bits broadcast to all 4 bytes (== KSIGNS_IQ2XS_D[v & 127] broadcast), ready for the
-// dp4a_signed byte selectors below.
+// the 8 sign bits broadcast to all 4 bytes (== the ksigns_iq2xs[v & 127] codebook value, broadcast),
+// ready for the dp4a_signed byte selectors below.
 __device__ __forceinline__ uint32_t unpack_ksigns(uint32_t v) {
     v &= 127u;
     return (v ^ ((uint32_t)(__popc(v) & 1) << 7)) * 0x01010101u;
