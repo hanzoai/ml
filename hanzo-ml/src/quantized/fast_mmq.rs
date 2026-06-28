@@ -20,9 +20,9 @@ fn pad(p: usize, q: usize) -> usize {
 }
 
 /// Quant types with an int8-WMMA MMQ prefill kernel: the 10 K-quants + the 5 IQ2/IQ3 codebooks whose
-/// `load_tiles_iq*` read the standard ggml codebook grids (filled from iq_grids.rs in mmq_common.cuh).
-/// IQ1_S/IQ1_M (distinct GPU-packed iq1s_grid_gpu) + IQ1_M (no kernel) keep dequant prefill -- they
-/// still have native dp4a DECODE.
+/// `load_tiles_iq*` read the standard ggml codebook grids (filled from iq_grids.rs in mmq_common.cuh) +
+/// IQ4_XS (LUT) + IQ1_S (its distinct GPU-packed iq1s_grid_gpu, now filled in mmq_common.cuh). IQ1_M
+/// (no MMQ kernel) keeps dequant prefill -- it still has native dp4a DECODE.
 fn supports(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
@@ -42,6 +42,7 @@ fn supports(dtype: GgmlDType) -> bool {
             | GgmlDType::IQ3_XXS
             | GgmlDType::IQ3_S
             | GgmlDType::IQ4_XS
+            | GgmlDType::IQ1_S
     )
 }
 
@@ -57,7 +58,8 @@ fn qk_for(dtype: GgmlDType) -> usize {
         | GgmlDType::IQ2_S
         | GgmlDType::IQ3_XXS
         | GgmlDType::IQ3_S
-        | GgmlDType::IQ4_XS => 256,
+        | GgmlDType::IQ4_XS
+        | GgmlDType::IQ1_S => 256,
         _ => unreachable!(),
     }
 }
@@ -79,13 +81,15 @@ fn ds_layout_for(dtype: GgmlDType) -> DsLayout {
         GgmlDType::Q3K => DsLayout::D4,
         GgmlDType::Q4K | GgmlDType::Q5K => DsLayout::DS4,
         GgmlDType::Q6K => DsLayout::D4,
-        // i-quant codebooks (mmq_get_q8_1_ds_layout): IQ2/IQ3 symmetric -> D4.
+        // i-quant codebooks (mmq_get_q8_1_ds_layout): IQ2/IQ3/IQ4_XS symmetric -> D4.
         GgmlDType::IQ2_XXS
         | GgmlDType::IQ2_XS
         | GgmlDType::IQ2_S
         | GgmlDType::IQ3_XXS
         | GgmlDType::IQ3_S
         | GgmlDType::IQ4_XS => DsLayout::D4,
+        // IQ1_S carries a delta bias -> needs the activation sum (ds = scale + sum), i.e. DS4.
+        GgmlDType::IQ1_S => DsLayout::DS4,
         _ => unreachable!(),
     }
 }
@@ -151,6 +155,7 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
         GgmlDType::IQ3_XXS => ffi::launch_mmq_gguf_iq3_xxs,
         GgmlDType::IQ3_S => ffi::launch_mmq_gguf_iq3_s,
         GgmlDType::IQ4_XS => ffi::launch_mmq_gguf_iq4_xs,
+        GgmlDType::IQ1_S => ffi::launch_mmq_gguf_iq1_s,
         _ => return None,
     };
     Some(f)
@@ -478,6 +483,7 @@ fn moe_mmq_launcher(dtype: GgmlDType) -> Option<MoeMmqLauncher> {
         GgmlDType::IQ3_XXS => ffi::launch_mmq_gguf_moe_iq3_xxs,
         GgmlDType::IQ3_S => ffi::launch_mmq_gguf_moe_iq3_s,
         GgmlDType::IQ4_XS => ffi::launch_mmq_gguf_moe_iq4_xs,
+        GgmlDType::IQ1_S => ffi::launch_mmq_gguf_moe_iq1_s,
         _ => return None,
     };
     Some(f)

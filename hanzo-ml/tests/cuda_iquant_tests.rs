@@ -336,8 +336,9 @@ fn cuda_qmmq_iquant_prefill_matches_dequant() {
             return;
         }
     };
-    // The 6 i-quant types with an int8-WMMA MMQ kernel: the 5 IQ2/IQ3 codebook grids + IQ4_XS (LUT).
-    // IQ1_S/IQ1_M use a distinct GPU-packed grid / have no kernel -> dequant prefill, not tested here.
+    // The 7 i-quant types with an int8-WMMA MMQ kernel: the 5 IQ2/IQ3 codebook grids + IQ4_XS (LUT) +
+    // IQ1_S (its distinct GPU-packed iq1s_grid_gpu, DS4 ds-layout for the delta bias). IQ1_M has no MMQ
+    // kernel -> dequant prefill, not tested here.
     for dtype in [
         GgmlDType::IQ2_XXS,
         GgmlDType::IQ2_XS,
@@ -345,6 +346,7 @@ fn cuda_qmmq_iquant_prefill_matches_dequant() {
         GgmlDType::IQ3_XXS,
         GgmlDType::IQ3_S,
         GgmlDType::IQ4_XS,
+        GgmlDType::IQ1_S,
     ] {
         for &m in &[16usize, 32] {
             let s = run_prefill(&dev, dtype, 512, 2048, m);
