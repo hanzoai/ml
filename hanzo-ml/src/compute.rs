@@ -46,6 +46,8 @@ pub struct ComputeCtx {
     pub kv: DType,
     /// Dtype precision-sensitive ops accumulate in internally.
     pub accum: DType,
+    /// Where weights live (the residency axis — orthogonal to dtype).
+    pub residency: Residency,
     /// Device the model runs on.
     pub device: Device,
 }
@@ -57,6 +59,7 @@ impl ComputeCtx {
             compute,
             kv: compute,
             accum: DType::F32,
+            residency: Residency::Auto,
             device,
         }
     }
@@ -68,6 +71,7 @@ impl ComputeCtx {
             compute: DType::F32,
             kv: DType::F32,
             accum: DType::F32,
+            residency: Residency::Auto,
             device,
         }
     }
@@ -79,6 +83,7 @@ impl ComputeCtx {
             compute: DType::BF16,
             kv: DType::F32,
             accum: DType::F32,
+            residency: Residency::Auto,
             device,
         }
     }
@@ -123,6 +128,47 @@ impl ComputeCtx {
     /// activation dtype split.
     pub fn to_kv(&self, t: &Tensor) -> Result<Tensor> {
         cast_if(t, self.kv)
+    }
+}
+
+/// Where a model's weights live — the residency axis, orthogonal to dtype. This is
+/// the "right-size, right-place" policy: a model declares it once, the loader reads
+/// it, instead of the decision being scattered across every weight-load call site.
+///
+/// `Device` materializes every weight onto the compute device (classic: fastest,
+/// needs the model to fit). `Mmap` memory-maps weights and references pages no-copy
+/// — on unified-memory systems (GB10) those pages are GPU-addressable, so a model
+/// far larger than a clean RAM window still runs (pages fault in on access). `Auto`
+/// picks `Device` when the model fits the available budget and falls back to `Mmap`
+/// otherwise — the residency analogue of [`promote`]: the minimal placement that
+/// works. For MoE, `Mmap` is also the lever that keeps the 256 experts resident
+/// only as their rows are selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Residency {
+    /// Materialize all weights on the compute device (fits-in-memory fast path).
+    Device,
+    /// Memory-map weights, reference pages no-copy (runs models > RAM window).
+    Mmap,
+    /// Device if it fits the budget, else Mmap — the minimal placement that works.
+    #[default]
+    Auto,
+}
+
+impl Residency {
+    /// Resolve `Auto` against a fit decision: `Device` if the model fits the
+    /// available budget, else `Mmap`. `Device`/`Mmap` pass through unchanged. The
+    /// one place a residency policy becomes a concrete placement.
+    pub fn resolve(self, model_bytes: usize, available_bytes: usize) -> Residency {
+        match self {
+            Residency::Auto => {
+                if model_bytes <= available_bytes {
+                    Residency::Device
+                } else {
+                    Residency::Mmap
+                }
+            }
+            other => other,
+        }
     }
 }
 
@@ -243,6 +289,16 @@ mod tests {
         })?;
         assert_eq!(out.dtype(), DType::F32);
         Ok(())
+    }
+
+    #[test]
+    fn residency_auto_resolves_by_fit() {
+        // fits -> Device; doesn't fit -> Mmap; explicit policies pass through.
+        assert_eq!(Residency::Auto.resolve(80, 100), Residency::Device);
+        assert_eq!(Residency::Auto.resolve(120, 100), Residency::Mmap);
+        assert_eq!(Residency::Auto.resolve(100, 100), Residency::Device); // exact fit
+        assert_eq!(Residency::Device.resolve(999, 1), Residency::Device);
+        assert_eq!(Residency::Mmap.resolve(1, 999), Residency::Mmap);
     }
 
     #[test]
