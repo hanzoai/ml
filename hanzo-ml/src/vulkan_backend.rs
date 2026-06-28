@@ -55,6 +55,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q4_0" => spv!("mul_mat_q4_0"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
+        "mul_mm_q4k_shared" => spv!("mul_mm_q4k_shared"),
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
         "mul_mat_q6k" => spv!("mul_mat_q6k"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
@@ -960,6 +961,20 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// Host-operand Q4_K prefill matmul: uploads `x` (`[m, k]` row-major), runs the GPU GEMM, returns
+    /// `[m, nout]` row-major. Mirrors [`matvec_q4k`] for the M>1 path; used by the bit-exact A/B gate.
+    pub fn matmul_q4k(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        let xs = self.upload_f32(x)?;
+        self.matmul_q4k_gpu(wq, &xs, m, nout, k)?.to_vec_f32()
+    }
+
     /// Q4_K matrix-matrix (prefill): `y[m, nout] = x[m, k] * Wq^T`, weights stay quantized in VRAM
     /// (verbatim GGUF Q4_K super-blocks, same decode as [`matvec_q4k_gpu`]). Decodes each weight value
     /// once and reuses it across a tile of up to [`MATMUL_Q_MAX_M`] rows, so weight memory traffic
@@ -996,6 +1011,19 @@ impl VulkanDevice {
             crate::bail!("matmul_q4k_gpu: x count {} < m*k {}", x.count, m * k);
         }
         let out = self.alloc_f32(m * nout)?;
+        // L1 tiled path (HANZO_VK_Q4K_TILED): one workgroup per column stages the column's weight in LDS
+        // once and reuses it across all M rows, so weight VRAM traffic is 1x instead of ceil(M/MAX_M)x.
+        // Bit-identical f32 decode + accumulation order to mul_mat_q4k. LDS bounds k <= MAX_BLOCKS*256.
+        if k / 256 <= MUL_MM_Q4K_MAX_BLOCKS && std::env::var_os("HANZO_VK_Q4K_TILED").is_some() {
+            let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mm_q4k_shared",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                (nout as u32, 1, 1),
+            )?;
+            return Ok(out);
+        }
         let cols = (nout as u32).div_ceil(WG1D);
         let mut m0 = 0usize;
         while m0 < m {
@@ -3266,6 +3294,11 @@ const WG1D: u32 = 64;
 // bound). The host tiles the M dimension by this so each weight block is still read once per output
 // column across a tile of up to MATMUL_Q_MAX_M rows.
 const MATMUL_Q_MAX_M: usize = 8;
+
+// Max Q4_K super-blocks (k/256) the tiled prefill kernel (mul_mm_q4k_shared) stages in LDS. MUST equal
+// MAX_BLOCKS in mul_mm_q4k_shared.comp. k <= 64*256 = 16384 covers every Qwen3 projection (max 14336);
+// larger k falls back to the column-per-invocation mul_mat_q4k.
+const MUL_MM_Q4K_MAX_BLOCKS: usize = 64;
 
 // Compile-time per-invocation array bounds in gdn_step.comp / gdn_conv1d_step.comp (MAX_K #defines).
 // head_k_dim must be <= GDN_STEP_MAX_K and the conv kernel <= GDN_CONV_MAX_K; both checked host-side.
