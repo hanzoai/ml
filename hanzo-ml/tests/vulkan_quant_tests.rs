@@ -1105,3 +1105,81 @@ fn vulkan_q4k_tiled2d_bench() -> hanzo_ml::Result<()> {
     );
     Ok(())
 }
+
+// L1 dp4a 2D-tiled GEMM (mul_mm_q4k_tiled_dp4a, HANZO_VK_Q4K_DP4A): the 2D tile with an int8 dp4a inner
+// loop -- activations are quantized to q8_1 (int8 + per-32-block scale/sum) so the dot is integer. That
+// q8_1 quant adds ~0.5-1% error on top of the f32 tiling reorder, so the gate vs the exact f32 default
+// is a ~1.5% relative bound (a decode/index/pack bug is a systematic >>1.5% garble).
+#[test]
+fn vulkan_q4k_dp4a2d_matches_default() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else {
+        return Ok(());
+    };
+    let vk = dev.as_vulkan_device()?;
+    for &(nout, k) in &[(512usize, 256usize), (2048, 2048), (256, 4096), (320, 1024)] {
+        for &m in &[1usize, 7, 64, 65, 512] {
+            let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
+            let wq = vk.upload_qweight(&raw)?;
+            let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 13)).collect();
+            std::env::remove_var("HANZO_VK_Q4K_DP4A");
+            let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::set_var("HANZO_VK_Q4K_DP4A", "1");
+            let y_dp = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::remove_var("HANZO_VK_Q4K_DP4A");
+            assert_eq!(y_dp.len(), m * nout);
+            let mut max_abs = 0f32;
+            let mut max_ref = 0f32;
+            for (a, b) in y_ref.iter().zip(y_dp.iter()) {
+                max_abs = max_abs.max((a - b).abs());
+                max_ref = max_ref.max(a.abs());
+            }
+            let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+            assert!(
+                rel < 1.5e-2,
+                "dp4a-2d != default (m={m}, nout={nout}, k={k}): max_abs={max_abs}, max_ref={max_ref}, rel={rel}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// L1 perf: default vs 2D-f32 vs 2D-dp4a at a realistic prefill shape (run --ignored).
+#[test]
+#[ignore]
+fn vulkan_q4k_dp4a2d_bench() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else {
+        return Ok(());
+    };
+    let vk = dev.as_vulkan_device()?;
+    let (m, nout, k) = (512usize, 4096usize, 4096usize);
+    let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
+    let wq = vk.upload_qweight(&raw)?;
+    let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
+    let iters = 20;
+    let bench = |var: Option<&str>| -> hanzo_ml::Result<f64> {
+        for v in ["HANZO_VK_Q4K_TILED2D", "HANZO_VK_Q4K_DP4A"] {
+            std::env::remove_var(v);
+        }
+        if let Some(v) = var {
+            std::env::set_var(v, "1");
+        }
+        let _ = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+        }
+        if let Some(v) = var {
+            std::env::remove_var(v);
+        }
+        Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
+    };
+    let def_ms = bench(None)?;
+    let f32_ms = bench(Some("HANZO_VK_Q4K_TILED2D"))?;
+    let dp4a_ms = bench(Some("HANZO_VK_Q4K_DP4A"))?;
+    eprintln!(
+        "[L1 dp4a bench] m={m} nout={nout} k={k}: default={def_ms:.3} 2d_f32={f32_ms:.3} 2d_dp4a={dp4a_ms:.3} ms | dp4a vs default={:.2}x vs 2d_f32={:.2}x",
+        def_ms / dp4a_ms,
+        f32_ms / dp4a_ms
+    );
+    Ok(())
+}
