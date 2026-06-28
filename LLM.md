@@ -553,3 +553,18 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   pass vs the forced-legacy reference, and the default bench baseline now runs dp4a (5.0ms = the 9.00x
   default). VK_INT_DOT=0 forces the f32 tile. A gfx1151 engine gets ~224 T/s Vulkan prefill by default
   (was ~24). REMAINING: woff!=0 MoE-bank 2D path (untested -> still legacy) and L4 coopmat for parity.
+- L4 ATTEMPT -- coopmat (tensor cores) = CORRECT but a measured LOSS to dp4a on gfx1151 (decode-bound).
+  `mul_mm_q4k_coopmat.comp` (env HANZO_VK_Q4K_COOPMAT, gated on device coopmat): per 16-wide K-step the
+  64 threads decode the Q4_K weight 16x64 slice to f16 LDS (transposed [K,N]) + cast the activation to
+  f16 LDS, then subgroup 0 coopMatLoads from LDS and issues RM*RN(4x4) coopMatMulAdds into f32 accs --
+  the llama-Vulkan tensor-core path. PROVED the matrix cores work on gfx1151 RADV (coopMatLoad-from-LDS
+  validates + runs; correctness vulkan_q4k_coopmat_matches_default rel<1e-2 f16-rounding, all shapes).
+  But PERF A/B (m=512,nout=k=4096): legacy 46.1 / dp4a 4.7 / coopmat 18.0 ms = coopmat is 0.26x of dp4a
+  (3.8x SLOWER), only 2.56x over the column kernel. WHY: the kernel is DECODE-bound, not tensor-core-
+  bound -- it re-decodes the weight to f16 every K=16 step (k/16=256 passes), and the Q4_K decode
+  (get_scale_min_k4 + byte extraction per element) swamps the fast coopMatMulAdds; only subgroup 0
+  computes while both subgroups decoded. So on gfx1151 dp4a-2D (4.7ms, the shipped default) is the
+  PRACTICAL prefill ceiling, BEATING naive coopmat. llama's 1058 needs a DECODE-AMORTIZED coopmat (decode
+  a large K-chunk to f16 LDS ONCE, reuse across many MulAdds, double-buffered) -- a bigger uncertain
+  kernel; the f16-decode cost is the wall, not the cores. Committed env-gated OFF as the documented L4
+  negative (mirrors the 1D dead-end); the coopmat infra + harness is proven for the amortized follow-up.
