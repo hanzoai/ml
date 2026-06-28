@@ -23,9 +23,15 @@
 #define DW_IQ3_S   17
 #define DW_IQ1_S   20
 #define DW_IQ1_M   21
+#define DW_IQ4_XS  4
 
 // IQ1_S/IQ1_M signed-grid delta bias (iq_quants.rs:28); both 1-bit types share it.
 constexpr float IQ1S_DELTA = 0.125f;
+
+// IQ4_XS/IQ4_NL int8 codebook LUT (KVALUES_IQ4NL, k_quants.rs:43): a 4-bit nibble indexes one of 16
+// signed int8 values. IQ4_XS is symmetric + LUT-based (no grid, no signs) -> decode = dl*KVALUES[idx].
+__device__ __constant__ int8_t KVALUES_IQ4NL[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 // dp4a: 4x signed-int8 dot-accumulate. Native on CUDA (sm_61+, incl. GB10 Blackwell).
 // Kept under the name `hip_dp4a` so the extracted dp4a_signed + qdp4a<> structs are
@@ -310,6 +316,48 @@ template <> struct qdp4a<DW_IQ1_M> {
     }
 };
 
+// IQ4_XS (LUT codebook, SYMMETRIC, no signs). Block (136B): f16 d + u16 scales_h + scales_l[4] + qs[128];
+// 8 sub-blocks of 32. Per sub-block e: 6-bit scale ls = (scales_l[e/2]>>4*(e&1) &0xF) | ((scales_h>>2e &3)<<4);
+// dl = d*(ls-32). 4-bit nibble idx -> KVALUES_IQ4NL[idx] (int8). Positions p<16 = LOW nibble qs[e*16+p],
+// p>=16 = HIGH nibble qs[e*16+(p-16)] (BlockIQ4xs::to_float / ROCm qdec<DW_IQ4_XS>). dp4a: pack the 4
+// LUT int8 per group into an int and dot the q8 activation -- no grid/ksigns/dp4a_signed needed.
+template <> struct qdp4a<DW_IQ4_XS> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint16_t scales_h = *reinterpret_cast<const uint16_t*>(blk + 2);
+        const uint8_t* scales_l = blk + 4;
+        const uint8_t* qs = blk + 8 + (size_t)e * 16; // sub-block e's 16 bytes (32 nibbles)
+        const int ls = ((scales_l[e >> 1] >> (4 * (e & 1))) & 0xF) | (((scales_h >> (2 * e)) & 3) << 4);
+        const float dl = d * (float)(ls - 32);
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            // i<4: positions 4i..4i+3 = LOW nibbles of qs[4i..]; i>=4: HIGH nibbles of qs[4(i-4)..].
+            const uint8_t* b = qs + 4 * (i & 3);
+            const bool hi = i >= 4;
+            const int n0 = hi ? (b[0] >> 4) : (b[0] & 0xF);
+            const int n1 = hi ? (b[1] >> 4) : (b[1] & 0xF);
+            const int n2 = hi ? (b[2] >> 4) : (b[2] & 0xF);
+            const int n3 = hi ? (b[3] >> 4) : (b[3] & 0xF);
+            const int kv = (KVALUES_IQ4NL[n0] & 0xFF) | ((KVALUES_IQ4NL[n1] & 0xFF) << 8)
+                         | ((KVALUES_IQ4NL[n2] & 0xFF) << 16) | ((KVALUES_IQ4NL[n3] & 0xFF) << 24);
+            idot += hip_dp4a(kv, u[i], 0);
+        }
+        return dl * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
 // IQ dp4a byte strides (= on-disk super-block bytes; mirror qdw_traits::BYTES). All 256-elem.
 template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  };
 template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  };
@@ -318,6 +366,7 @@ template <> struct qdp4a_traits<DW_IQ3_XXS> { static constexpr int BYTES = 98;  
 template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; };
 template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  };
 template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  };
+template <> struct qdp4a_traits<DW_IQ4_XS>  { static constexpr int BYTES = 136; };
 
 // ---- activation -> q8 (separated int8 qs `xq` + per-32 f16 scale `xd`) ----
 extern "C" __global__ void iq_quantize_q8_f16(
@@ -565,4 +614,5 @@ DEFINE_QMATVEC_DP4A(iq3xxs, DW_IQ3_XXS)
 DEFINE_QMATVEC_DP4A(iq3s,   DW_IQ3_S)
 DEFINE_QMATVEC_DP4A(iq1_s,  DW_IQ1_S)
 DEFINE_QMATVEC_DP4A(iq1_m,  DW_IQ1_M)
+DEFINE_QMATVEC_DP4A(iq4xs,  DW_IQ4_XS)
 

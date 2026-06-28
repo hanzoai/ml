@@ -655,6 +655,11 @@ extern "C" {
         ncols_x: i64, nrows_x: i64, ncols_y: i64, stride_row_x: i64, stride_col_dst: i64,
         cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
     );
+    pub fn launch_mmq_gguf_iq4_xs(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_y: i64, stride_row_x: i64, stride_col_dst: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
 
     // Expert-grouped MoE prefill launchers (llama mul_mat_id). Same int8 MMQ core as the dense
     // launchers above; experts ride the channel dim. `ids_dst[col]` scatters sorted column `col` to its
@@ -761,6 +766,13 @@ extern "C" {
         cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
     );
     pub fn launch_mmq_gguf_moe_iq3_s(
+        tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void,
+        ids_dst: *const c_void, expert_bounds: *const c_void, dst: *mut c_void,
+        ncols_x: i64, nrows_x: i64, ncols_dst: i64, ncols_max: i64,
+        stride_row_x: i64, stride_channel_x: i64, n_experts: i64,
+        cc: i32, nsm: i32, smpbo: i64, warp_size: i32, stream: *mut c_void,
+    );
+    pub fn launch_mmq_gguf_moe_iq4_xs(
         tmp_fixup: *mut c_void, x: *const c_void, y: *const c_void,
         ids_dst: *const c_void, expert_bounds: *const c_void, dst: *mut c_void,
         ncols_x: i64, nrows_x: i64, ncols_dst: i64, ncols_max: i64,
