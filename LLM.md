@@ -516,3 +516,16 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   GEMM, NOT this 1D weight-only stage. The bit-exact + bench harness (vulkan_quant_tests.rs) is the
   reusable gate for the real 2D kernel; mul_mm_q4k_shared stays env-gated OFF (never default) as the
   documented negative. NOT committed as a win.
+- L1 ATTEMPT #2 -- 2D-tiled GEMM = the REAL WIN (2.06x, correct). `mul_mm_q4k_tiled.comp` (env
+  HANZO_VK_Q4K_TILED2D): a 64x64 output tile per workgroup stages a BMxBK(64x32) activation tile AND a
+  BNxBK decoded-weight tile into LDS once per K-step (BK=32 == one Q4_K sub-block), then each of 256
+  threads accumulates a 4x4 sub-tile from LDS -- BOTH operands read from VRAM once per K-step and reused
+  across the tile (weight across BM rows, activation across BN cols), coalesced loads, full occupancy.
+  Decode per element identical to mul_mat_q4k; accumulation is tiled (partial sums) so it matches within
+  f32 reorder (vulkan_q4k_tiled2d_matches_default, rel<2e-3 across shapes incl partial tiles m=7/65,
+  nout=320). PERF A/B (m=512,nout=k=4096): default 46.2ms vs tiled2d 22.4ms = 2.06x (187->390 GFLOP/s).
+  This is the structure the column kernel + the 1D dead-end lacked. Still f32-scalar-bound (390 of ~10000
+  GFLOP/s peak) so NOT yet llama-parity (1058 prefill T/s); the next layer is int8 dp4a or coopmat
+  (tensor-core) staging on the SAME 2D tile -- that closes to parity. Committed env-gated
+  (HANZO_VK_Q4K_TILED2D), ready to default-on for dense (woff==0) prefill after MoE-bank (woff!=0) + an
+  end-to-end engine pass. The bit-exact/tolerance + bench harness gates both.
