@@ -502,3 +502,17 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   contraction is written once and lowered to all backends -- collapses the backends x types x ops
   product to `types + ops + backends`. The 3 axes (decode value / parametric contraction / backend
   functor) want to be orthogonal.
+- L1 ATTEMPT #1 -- naive per-column LDS tiling = a MEASURED DEAD-END (0.21x, bit-exact). `mul_mm_q4k_
+  shared.comp` (env HANZO_VK_Q4K_TILED): one workgroup per output column cooperatively stages that
+  column's Q4_K weight into LDS once, then 256 threads split the M rows -- weight VRAM traffic 64x->1x at
+  M=512. BIT-EXACT to mul_mat_q4k (vulkan_q4k_tiled_prefill_matches_default, rel<1e-5, all shapes incl
+  k=16384 LDS bound + M 2/8/9/64/512), but the perf A/B (m=512,nout=k=4096) is default 46.4ms vs tiled
+  223.7ms = 0.21x (4.8x SLOWER). LESSON: weight re-read was NOT the prefill bottleneck -- the default's
+  many-light-invocations (nout*M/8 register-tiled) beats few-heavy-workgroups (nout WGs, each thread
+  loops full k, activations re-read from VRAM per column, ~16KB LDS caps occupancy). The default scalar
+  f32 kernel runs at only ~187 GFLOP/s (gfx1151 ~10+ TFLOP) so there IS headroom, but the lever is
+  real 2D tiling (BM x BN output tile staging BOTH a weight tile AND an activation tile in LDS, coalesced
+  loads, sub-tile-per-thread -- llama mul_mm / ROCm qmmq) and/or wiring the int8 dp4a/coopmat prefill
+  GEMM, NOT this 1D weight-only stage. The bit-exact + bench harness (vulkan_quant_tests.rs) is the
+  reusable gate for the real 2D kernel; mul_mm_q4k_shared stays env-gated OFF (never default) as the
+  documented negative. NOT committed as a win.
