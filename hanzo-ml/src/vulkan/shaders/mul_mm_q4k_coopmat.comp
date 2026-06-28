@@ -1,0 +1,124 @@
+#version 450
+// Q4_K coopmat prefill matmul (L4, llama-parity attempt): y[m,n] = sum_k x[m,k]*W[n,k] on the matrix
+// cores (VK_KHR_cooperative_matrix), the same path llama-Vulkan uses for ~1058 T/s. Per K-step the
+// workgroup's 64 threads cooperatively (a) DECODE the Q4_K weight 16xRN*16 K-slice to f16 in LDS in
+// coopmat B layout [K,N] (transposed: s_b[ki, n] = W[col0+n, koff+ki]) and (b) CAST the activation
+// RM*16x16 M-slice to f16 in LDS [M,K]; then subgroup 0 coopMatLoads RM A-frags + RN B-frags from LDS
+// and issues RM*RN coopMatMulAdds into f32 accumulators. Decode per element == mul_mat_q4k (f16-rounded
+// weight), so the gate is the f64-oracle tolerance (f16 weight + f16 activation rounding). Bounds:
+// m,n multiples handled by per-fragment edge checks; k multiple of 256 (Q4_K super-block).
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+const uint T = 16u;
+const uint RM = 4u;            // 16x16 output tiles, row direction (M)
+const uint RN = 4u;            // 16x16 output tiles, col direction (N)
+const uint BM = RM * T;        // 64
+const uint BN = RN * T;        // 64
+const uint WG = 64u;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer W { uint  w[]; };   // Q4_K blocks, 36 u32 / 256-block
+layout(set = 0, binding = 1) readonly  buffer X { float x[]; };   // activations, row-major [M, k]
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };   // output, row-major [M, nout]
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
+
+const uint QK_K = 256u;
+const uint BLK_U32 = 36u;
+
+shared float16_t s_a[BM * T];   // [M=64, K=16]
+shared float16_t s_b[T * BN];   // [K=16, N=64]
+
+uint scale_byte(uint base, uint b) {
+    uint word = w[base + 1u + (b >> 2u)];
+    return (word >> ((b & 3u) * 8u)) & 0xFFu;
+}
+uint get_scale_min_k4(uint base, uint j) {
+    uint sc, m;
+    if (j < 4u) {
+        sc = scale_byte(base, j) & 63u;
+        m  = scale_byte(base, j + 4u) & 63u;
+    } else {
+        uint s_j4 = scale_byte(base, j + 4u);
+        uint s_jm4 = scale_byte(base, j - 4u);
+        uint s_j = scale_byte(base, j);
+        sc = (s_j4 & 0x0Fu) | ((s_jm4 >> 6u) << 4u);
+        m  = (s_j4 >> 4u)   | ((s_j   >> 6u) << 4u);
+    }
+    return (sc << 8u) | m;
+}
+float decode_w(uint n, uint kpos, uint nblocks) {
+    uint blk = kpos / QK_K;
+    uint within = kpos - blk * QK_K;
+    uint sub = within / 32u;
+    uint kk = within - sub * 32u;
+    uint base = woff + n * nblocks * BLK_U32 + blk * BLK_U32;
+    float d    = float(unpackHalf2x16(w[base]).x);
+    float dmin = float(unpackHalf2x16(w[base]).y);
+    uint sm = get_scale_min_k4(base, sub);
+    float ds = d * float(sm >> 8u);
+    float ms = dmin * float(sm & 0xFFu);
+    uint c = sub >> 1u;
+    uint qb = c * 32u + kk;
+    uint qword = w[base + 4u + (qb >> 2u)];
+    uint byte = (qword >> ((qb & 3u) * 8u)) & 0xFFu;
+    uint q = ((sub & 1u) == 0u) ? (byte & 0x0Fu) : (byte >> 4u);
+    return ds * float(q) - ms;
+}
+
+void main() {
+    uint nblocks = k / QK_K;
+    uint row0 = gl_WorkGroupID.y * BM;
+    uint col0 = gl_WorkGroupID.x * BN;
+    uint tid = gl_LocalInvocationID.x;
+    uint mt = (mcount + T - 1u) / T;      // valid 16-row tiles
+    uint nt = (nout + T - 1u) / T;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[RM][RN];
+    [[unroll]] for (uint i = 0u; i < RM; i++)
+        [[unroll]] for (uint j = 0u; j < RN; j++)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint koff = 0u; koff < k; koff += T) {
+        // Stage A (f16 [BM,16] from f32 x) and B (f16 [16,BN] decoded+transposed) into LDS.
+        for (uint idx = tid; idx < BM * T; idx += WG) {
+            uint r = idx / T;
+            uint kk = idx - r * T;
+            uint mrow = row0 + r;
+            s_a[idx] = (mrow < mcount) ? float16_t(x[mrow * k + koff + kk]) : float16_t(0.0);
+        }
+        for (uint idx = tid; idx < T * BN; idx += WG) {
+            uint kk = idx / BN;
+            uint cc = idx - kk * BN;
+            uint n = col0 + cc;
+            s_b[idx] = (n < nout) ? float16_t(decode_w(n, koff + kk, nblocks)) : float16_t(0.0);
+        }
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[RM];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[RN];
+            [[unroll]] for (uint i = 0u; i < RM; i++)
+                coopMatLoad(ma[i], s_a, i * T * T, T, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint j = 0u; j < RN; j++)
+                coopMatLoad(mb[j], s_b, j * T, BN, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0u; i < RM; i++)
+                [[unroll]] for (uint j = 0u; j < RN; j++)
+                    acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    if (gl_SubgroupID == 0u) {
+        uint trow0 = row0 / T;
+        uint tcol0 = col0 / T;
+        [[unroll]] for (uint i = 0u; i < RM; i++)
+            [[unroll]] for (uint j = 0u; j < RN; j++)
+                if (trow0 + i < mt && tcol0 + j < nt)
+                    coopMatStore(acc[i][j], y, (row0 + i * T) * nout + (col0 + j * T), nout,
+                                 gl_CooperativeMatrixLayoutRowMajor);
+    }
+}

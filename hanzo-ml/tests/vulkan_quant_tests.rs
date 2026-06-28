@@ -1186,3 +1186,89 @@ fn vulkan_q4k_dp4a2d_bench() -> hanzo_ml::Result<()> {
     );
     Ok(())
 }
+
+// L4 coopmat Q4_K prefill GEMM (mul_mm_q4k_coopmat, HANZO_VK_Q4K_COOPMAT): tensor-core path (decode
+// weight to f16 LDS tiles + coopMatMulAdd). f16 weight + f16 activation rounding (f32 accumulate), so
+// the gate vs the exact legacy column kernel is ~1% relative (a decode/transpose/tile bug is >>1%).
+// Skips if the device lacks coopmat (the env path is a no-op fallthrough -> equals the default).
+#[test]
+fn vulkan_q4k_coopmat_matches_default() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else {
+        return Ok(());
+    };
+    let vk = dev.as_vulkan_device()?;
+    if vk.coopmat_info().is_none() {
+        eprintln!("[vulkan_quant_tests] no coopmat; skipping coopmat gate");
+        return Ok(());
+    }
+    for &(nout, k) in &[(512usize, 256usize), (2048, 2048), (256, 4096), (320, 1024)] {
+        for &m in &[2usize, 16, 17, 64, 512] {
+            let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
+            let wq = vk.upload_qweight(&raw)?;
+            let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 17)).collect();
+            std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
+            let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::remove_var("HANZO_VK_Q4K_LEGACY");
+            std::env::set_var("HANZO_VK_Q4K_COOPMAT", "1");
+            let y_cm = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::remove_var("HANZO_VK_Q4K_COOPMAT");
+            let mut max_abs = 0f32;
+            let mut max_ref = 0f32;
+            for (a, b) in y_ref.iter().zip(y_cm.iter()) {
+                max_abs = max_abs.max((a - b).abs());
+                max_ref = max_ref.max(a.abs());
+            }
+            let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+            assert!(
+                rel < 1e-2,
+                "coopmat != legacy (m={m}, nout={nout}, k={k}): max_abs={max_abs}, rel={rel}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// L4 perf: default (dp4a) vs coopmat at a realistic prefill shape (run --ignored).
+#[test]
+#[ignore]
+fn vulkan_q4k_coopmat_bench() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else {
+        return Ok(());
+    };
+    let vk = dev.as_vulkan_device()?;
+    if vk.coopmat_info().is_none() {
+        eprintln!("[vulkan_quant_tests] no coopmat; skipping");
+        return Ok(());
+    }
+    let (m, nout, k) = (512usize, 4096usize, 4096usize);
+    let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
+    let wq = vk.upload_qweight(&raw)?;
+    let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
+    let iters = 20;
+    let bench = |var: Option<&str>| -> hanzo_ml::Result<f64> {
+        for v in ["HANZO_VK_Q4K_COOPMAT", "HANZO_VK_Q4K_LEGACY"] {
+            std::env::remove_var(v);
+        }
+        if let Some(v) = var {
+            std::env::set_var(v, "1");
+        }
+        let _ = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+        }
+        if let Some(v) = var {
+            std::env::remove_var(v);
+        }
+        Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
+    };
+    let dp4a_ms = bench(None)?; // default == dp4a on this device
+    let legacy_ms = bench(Some("HANZO_VK_Q4K_LEGACY"))?;
+    let cm_ms = bench(Some("HANZO_VK_Q4K_COOPMAT"))?;
+    eprintln!(
+        "[L4 coopmat bench] m={m} nout={nout} k={k}: legacy={legacy_ms:.3} dp4a={dp4a_ms:.3} coopmat={cm_ms:.3} ms | coopmat vs dp4a={:.2}x vs legacy={:.2}x",
+        dp4a_ms / cm_ms,
+        legacy_ms / cm_ms
+    );
+    Ok(())
+}
