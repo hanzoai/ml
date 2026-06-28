@@ -366,10 +366,10 @@ fn mul_mat_vec_via_q8_1(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
-/// i-quant codebook kernel suffix for the native dp4a decode (qmatvec_dp4a_<suffix>_f32 in
-/// iquant_mmvq.cu). `Some` iff this dtype has a native i-quant decode path; `None` routes to the
+/// i-quant / ternary codebook kernel suffix for the native dp4a decode (qmatvec_dp4a_<suffix>_f32 in
+/// iquant_mmvq.cu). `Some` iff this dtype has a native codebook decode path; `None` routes to the
 /// dequantize-to-f32 dense fallback. This is the ONE predicate that selects the SotA decode path --
-/// the CUDA twin of `RocmQuantType::dp4a_capable` (the i-quant subset).
+/// the CUDA twin of `RocmQuantType::dp4a_capable` (the i-quant + ternary subset).
 fn iquant_dp4a_suffix(dtype: GgmlDType) -> Option<&'static str> {
     Some(match dtype {
         GgmlDType::IQ2_XXS => "iq2xxs",
@@ -380,6 +380,9 @@ fn iquant_dp4a_suffix(dtype: GgmlDType) -> Option<&'static str> {
         GgmlDType::IQ1_S => "iq1_s",
         GgmlDType::IQ1_M => "iq1_m",
         GgmlDType::IQ4_XS => "iq4xs",
+        // Symmetric ternary {-1,0,1}: 2-bit (TQ2_0, clean) + base-3 (TQ1_0, scalar unpack + dp4a dot).
+        GgmlDType::TQ2_0 => "tq2_0",
+        GgmlDType::TQ1_0 => "tq1_0",
         _ => return None,
     })
 }
@@ -1062,8 +1065,8 @@ impl QCudaStorage {
                     return self.mul_mat_vec_iquant(self_shape, storage, layout);
                 }
                 // PREFILL: native int8-WMMA MMQ GEMM (qmmq) for the 7 i-quants with an MMQ kernel
-                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS, IQ1_S). IQ1_M (no MMQ kernel) + any unsupported
-                // shape return None and fall through to the dequant dense matmul.
+                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS, IQ1_S). Decode-only types (IQ1_M, TQ1_0/TQ2_0)
+                // have no MMQ kernel -> try_fwd returns None and they fall to the dequant dense matmul.
                 if let Some(out) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
                     return Ok(out);
                 }
