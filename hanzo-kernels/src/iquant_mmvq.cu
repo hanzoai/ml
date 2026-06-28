@@ -24,6 +24,9 @@
 #define DW_IQ1_S   20
 #define DW_IQ1_M   21
 #define DW_IQ4_XS  4
+// Ternary (base-3 / 2-bit) weight ids (match quant.hip's DW_* id space). Symmetric ternary {-1,0,1}.
+#define DW_TQ2_0   5
+#define DW_TQ1_0   19
 
 // IQ1_S/IQ1_M signed-grid delta bias (iq_quants.rs:28); both 1-bit types share it.
 constexpr float IQ1S_DELTA = 0.125f;
@@ -358,6 +361,90 @@ template <> struct qdp4a<DW_IQ4_XS> {
     }
 };
 
+// TQ2_0 (SYMMETRIC ternary, 2-bit, 2.06bpw). Block (66B): qs[64] + f16 d at +64. Mirrors
+// qdec<DW_TQ2_0> / BlockTQ2_0::to_float: sub-block e (0..7) has half=e>>2, l=e&3; coord m in 0..31 reads
+// byte qs[half*32+m], value ((byte>>(2l))&3) - 1 in {-1,0,1} -- already a valid SIGNED int8, so pack 4
+// per int and dp4a directly (the -1 offset rides in the int8; no bias-sum term, unlike Q6_K/IQ1). The
+// single super-block scale d is applied in float exactly like the scalar qdec.
+template <> struct qdp4a<DW_TQ2_0> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk + 64));
+        const float d8 = __half2float(xd8[e]);
+        const int shift = (e & 3) * 2;
+        const uint8_t* b = blk + (size_t)(e >> 2) * 32; // this sub-block's 32 packed bytes
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int w0 = (int)((b[4 * i + 0] >> shift) & 3) - 1;
+            const int w1 = (int)((b[4 * i + 1] >> shift) & 3) - 1;
+            const int w2 = (int)((b[4 * i + 2] >> shift) & 3) - 1;
+            const int w3 = (int)((b[4 * i + 3] >> shift) & 3) - 1;
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// TQ1_0 base-3 unpack of ONE logical coord p in [0,256) -> ternary {-1,0,1}. The 256 coords are packed
+// across digit-planes (5 base-3 digits/byte), so the (byte,digit) of coord p is piecewise -- mirrors
+// qdec<DW_TQ1_0> / BlockTQ1_0::to_float exactly: q = (uint8)(byte*pow3[n]); xi = ((q*3)>>8) in [0,2].
+__device__ __forceinline__ int tq1_0_w(const uint8_t* __restrict__ qs, const uint8_t* __restrict__ qh, int p) {
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+    uint8_t b; int n;
+    if (p < 160)      { n = p >> 5;             b = qs[p & 31]; }
+    else if (p < 240) { const int p2 = p - 160; n = p2 >> 4; b = qs[32 + (p2 & 15)]; }
+    else              { const int p3 = p - 240; n = p3 >> 2; b = qh[p3 & 3]; }
+    const uint16_t q = (uint16_t)(uint8_t)(b * pow3[n]);
+    return (int)((q * 3) >> 8) - 1;
+}
+
+// TQ1_0 (SYMMETRIC ternary, base-3, 1.69bpw). Block (54B): qs[48] + qh[4] at +48 + f16 d at +52. The
+// base-3 packing means each coord needs a scalar pow3 unpack (tq1_0_w) -- the int8 production is
+// inherently scalar (unlike the 2-bit TQ2_0); dp4a accelerates only the final 32-wide dot. Sub-block e
+// owns the contiguous coords [e*32, e*32+32) (which straddle digit-planes for e>=5), decoded to signed
+// int8 {-1,0,1}, packed 4/int, dp4a'd. Scale d applied in float like the scalar qdec.
+template <> struct qdp4a<DW_TQ1_0> {
+    static constexpr int NSUB = 8;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint8_t* qs = blk;       // 48
+        const uint8_t* qh = blk + 48;  // 4
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk + 52));
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        const int p0 = e * 32;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int w0 = tq1_0_w(qs, qh, p0 + 4 * i + 0);
+            const int w1 = tq1_0_w(qs, qh, p0 + 4 * i + 1);
+            const int w2 = tq1_0_w(qs, qh, p0 + 4 * i + 2);
+            const int w3 = tq1_0_w(qs, qh, p0 + 4 * i + 3);
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
 // IQ dp4a byte strides (= on-disk super-block bytes; mirror qdw_traits::BYTES). All 256-elem.
 template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  };
 template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  };
@@ -367,6 +454,8 @@ template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; 
 template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  };
 template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  };
 template <> struct qdp4a_traits<DW_IQ4_XS>  { static constexpr int BYTES = 136; };
+template <> struct qdp4a_traits<DW_TQ2_0>   { static constexpr int BYTES = 66;  };
+template <> struct qdp4a_traits<DW_TQ1_0>   { static constexpr int BYTES = 54;  };
 
 // ---- activation -> q8 (separated int8 qs `xq` + per-32 f16 scale `xd`) ----
 extern "C" __global__ void iq_quantize_q8_f16(
@@ -615,4 +704,6 @@ DEFINE_QMATVEC_DP4A(iq3s,   DW_IQ3_S)
 DEFINE_QMATVEC_DP4A(iq1_s,  DW_IQ1_S)
 DEFINE_QMATVEC_DP4A(iq1_m,  DW_IQ1_M)
 DEFINE_QMATVEC_DP4A(iq4xs,  DW_IQ4_XS)
+DEFINE_QMATVEC_DP4A(tq2_0,  DW_TQ2_0)
+DEFINE_QMATVEC_DP4A(tq1_0,  DW_TQ1_0)
 

@@ -368,3 +368,37 @@ Complete + stable-release OUR engine/ml first; file these PRs only on explicit g
   one shifts cost across the F32-residual/F16-KV boundary; the f32-native cast cut was historically
   FLAT) and the quantize-fold loses (above). Closing it = the Vulkan strategy of fusing the WHOLE
   attention epilogue (norm+rope+cache, no casts), a multi-kernel rewrite, not a single lever.
+
+## CUDA i-quant completeness: IQ1_S qmmq prefill + TQ1_0/TQ2_0 dp4a decode (bit-exact)
+Two gaps closed on the CUDA path (GB10), both validated by `cuda_iquant_tests.rs` (now 13/13, was 11/11).
+- **IQ1_S qmmq PREFILL (Part 1).** IQ1_S already had native dp4a DECODE but was MMQ-EXCLUDED at prefill
+  because `mmq_common.cuh`'s `iq1s_grid_gpu` was a ZEROED `[512]` stub (mis-sized: `load_tiles_iq1_s`
+  indexes `qs | ((qh>>3l)&7)<<8` = 11 bits = 2048). The whole int8-WMMA machine (`load_tiles_iq1_s`,
+  `mmq_type_traits<IQ1_S>` via `vec_dot_q8_1_q8_1_*`, DS4 ds-layout) was already a faithful llama.cpp
+  port -- only the table was missing. FIX: filled the real `iq1s_grid_gpu[2048]` verbatim from llama.cpp
+  `ggml-common.h` (GPU-packed nibble codebook, DISTINCT from the iq_grids.rs decode codebook), added
+  `mmq_instance_iq1_s.cu` (mirrors iq3_s), 2 ffi decls (`launch_mmq_gguf_iq1_s` + `_moe_iq1_s`), and wired
+  `fast_mmq.rs` (supports/qk=256/`DsLayout::DS4`/both launcher tables). IQ1_S needs DS4 (not the IQ2/IQ3
+  D4) because its delta bias rides the activation-sum term: ds = (d1q, d1q*delta). Bit-exact vs the GPU
+  dequant-weight matmul: max_rel 5.6e-4 (vs ~1.5e-7 for the symmetric D4 types -- the gap is the f16
+  `make_half2(d1q, d1q*delta)` ds rounding, not a bug; well under the 1e-3 gate). IQ1_M stays
+  dequant-prefill (no MMQ kernel); both keep native dp4a decode.
+- **TQ1_0/TQ2_0 native dp4a DECODE (Part 2).** Ternary types were dequant-fallback only. Added
+  `qdp4a<DW_TQ2_0>`/`<DW_TQ1_0>` to `iquant_mmvq.cu` (NSUB=8, mirroring the IQ structs + the ROCm scalar
+  `qdec<DW_TQ*>` bit layout) and wired `iquant_dp4a_suffix` (tq2_0/tq1_0) -> decode + MoE-decode route
+  natively; prefill falls through to dequant-dense (not in fast_mmq `supports`). Symmetric ternary
+  {-1,0,1} packs straight to SIGNED int8 -> dp4a directly, NO bias-sum term (unlike Q6_K/IQ1 centering).
+  TQ2_0 (2-bit) is CLEAN: `((qs[half*32+m]>>2l)&3)-1`. TQ1_0 (base-3, 1.69bpw) FITS but is irregular:
+  the 256 coords pack across digit-planes (5 base-3 digits/byte) so the contiguous-32 sub-block straddles
+  planes (e>=5) and each coord needs a scalar `(uint8)(byte*pow3[n])*3>>8` unpack -- dp4a accelerates only
+  the 32-wide dot, not the unpack. Both bit-exact vs CPU `to_float` (max_rel ~1.7e-4). NOTE: llama.cpp has
+  NO CUDA ternary path at all (no vec_dot/mmq/mmvq) -- this is pioneering, so the ROCm `qdec` is the layout
+  oracle.
+- **Bench (native vs `HANZO_IQ_DEQUANT_FALLBACK=1`, 4096x4096, GB10).** Native: TQ2_0 decode 76.5us,
+  TQ1_0 decode 390.6us, IQ1_S decode 311.7us, IQ1_S prefill(m=64) 180.6us. Fallback (dequant-dense):
+  154-210 MILLISECONDS -- because these types have NO GPU dequant kernel, so the fallback DtoH's the whole
+  weight, CPU `to_float`s 16M elems, and HtoD's it back EVERY call. So native is ~400-2700x (the ratio is
+  dominated by the avoided CPU round-trip, not pure kernel-vs-kernel). Within native, TQ1_0 is ~5x TQ2_0
+  -- the base-3 scalar unpack is the wall (compute-bound), exactly as the "fits-but-irregular" call
+  predicted; TQ2_0's clean 2-bit dp4a is the real win. GOTCHA (unchanged): bindgen_cuda tracks .cu mtimes
+  not .cuh -- a new mmq_instance_*.cu compiles fresh, but after a .cuh-only edit `touch` the dependents.
