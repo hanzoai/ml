@@ -57,6 +57,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mm_q4k_shared" => spv!("mul_mm_q4k_shared"),
         "mul_mm_q4k_tiled" => spv!("mul_mm_q4k_tiled"),
+        "mul_mm_q4k_tiled_dp4a" => spv!("mul_mm_q4k_tiled_dp4a"),
+        "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
         "mul_mat_q6k" => spv!("mul_mat_q6k"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
@@ -962,6 +964,30 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// Quantize GPU-resident f32 activations `x[m, k]` to q8_1-style int8 for the dp4a prefill GEMM:
+    /// returns (xq `[m*k/32*8]` u32, xs `[m*k/32]` f32 scale, xsum `[m*k/32]` f32 dequant block sum).
+    /// One O(m*k) pass amortized over the O(m*nout*k) matmul; layout matches `mul_mm_q4k_tiled_dp4a`.
+    fn quantize_act_q8(
+        &self,
+        x: &VulkanStorage,
+        m: usize,
+        k: usize,
+    ) -> Result<(VulkanStorage, VulkanStorage, VulkanStorage)> {
+        let kb = k / 32;
+        let xq = self.alloc_u32(m * kb * 8)?;
+        let xs = self.alloc_f32(m * kb)?;
+        let xsum = self.alloc_f32(m * kb)?;
+        let push = push_u32(&[m as u32, k as u32]);
+        self.dispatch_outs(
+            "quantize_act_q8",
+            &[x.buffer, xq.buffer, xs.buffer, xsum.buffer],
+            &[1, 2, 3],
+            &push,
+            (((m * kb) as u32).div_ceil(64), 1, 1),
+        )?;
+        Ok((xq, xs, xsum))
+    }
+
     /// Host-operand Q4_K prefill matmul: uploads `x` (`[m, k]` row-major), runs the GPU GEMM, returns
     /// `[m, nout]` row-major. Mirrors [`matvec_q4k`] for the M>1 path; used by the bit-exact A/B gate.
     pub fn matmul_q4k(
@@ -1012,6 +1038,19 @@ impl VulkanDevice {
             crate::bail!("matmul_q4k_gpu: x count {} < m*k {}", x.count, m * k);
         }
         let out = self.alloc_f32(m * nout)?;
+        // L1 dp4a path (HANZO_VK_Q4K_DP4A): quantize activations to int8 q8_1 once, then the 2D-tiled
+        // int8-dp4a GEMM (mul_mm_q4k_tiled_dp4a) -- ~4x the f32 tile's compute on the same VRAM traffic.
+        if std::env::var_os("HANZO_VK_Q4K_DP4A").is_some() {
+            let (xq, xs, xsum) = self.quantize_act_q8(x, m, k)?;
+            let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mm_q4k_tiled_dp4a",
+                &[wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
+            )?;
+            return Ok(out);
+        }
         // L1 2D-tiled path (HANZO_VK_Q4K_TILED2D): a 64x64 output tile per workgroup stages BOTH a BMxBK
         // activation tile and a BNxBK decoded-weight tile in LDS, so each operand is read from VRAM once
         // per K-step and reused across the tile. Workgroup grid = (ceil(nout/64), ceil(m/64)). Numerically
