@@ -56,6 +56,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mm_q4k_shared" => spv!("mul_mm_q4k_shared"),
+        "mul_mm_q4k_tiled" => spv!("mul_mm_q4k_tiled"),
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
         "mul_mat_q6k" => spv!("mul_mat_q6k"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
@@ -1011,9 +1012,22 @@ impl VulkanDevice {
             crate::bail!("matmul_q4k_gpu: x count {} < m*k {}", x.count, m * k);
         }
         let out = self.alloc_f32(m * nout)?;
-        // L1 tiled path (HANZO_VK_Q4K_TILED): one workgroup per column stages the column's weight in LDS
-        // once and reuses it across all M rows, so weight VRAM traffic is 1x instead of ceil(M/MAX_M)x.
-        // Bit-identical f32 decode + accumulation order to mul_mat_q4k. LDS bounds k <= MAX_BLOCKS*256.
+        // L1 2D-tiled path (HANZO_VK_Q4K_TILED2D): a 64x64 output tile per workgroup stages BOTH a BMxBK
+        // activation tile and a BNxBK decoded-weight tile in LDS, so each operand is read from VRAM once
+        // per K-step and reused across the tile. Workgroup grid = (ceil(nout/64), ceil(m/64)). Numerically
+        // matches mul_mat_q4k within f32 reorder tolerance (tiled partial sums), not bit-exact.
+        if std::env::var_os("HANZO_VK_Q4K_TILED2D").is_some() {
+            let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mm_q4k_tiled",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
+            )?;
+            return Ok(out);
+        }
+        // L1 1D tiled path (HANZO_VK_Q4K_TILED): one workgroup per column stages the column's weight in
+        // LDS once and reuses it across all M rows -- a MEASURED DEAD-END (0.21x), kept env-gated off.
         if k / 256 <= MUL_MM_Q4K_MAX_BLOCKS && std::env::var_os("HANZO_VK_Q4K_TILED").is_some() {
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
             self.dispatch(
