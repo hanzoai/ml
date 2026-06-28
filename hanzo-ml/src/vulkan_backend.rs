@@ -214,6 +214,10 @@ struct VkInner {
     // Dozen configs) provides. `subgroup_size` is the reported subgroup width.
     subgroup_matvec: bool,
     subgroup_size: u32,
+    // SPV_KHR_integer_dot_product (OpSDotAccSat 4x8) availability -- gates the int8 dp4a prefill GEMM
+    // (mul_mm_q4k_tiled_dp4a, 9.35x over the column kernel). Present on RDNA3.5/native AMD+NV; absent
+    // on old/WSL drivers (those fall back to the universal f32 2D tile). VK_INT_DOT=0 forces off.
+    int_dot8: bool,
     // Cooperative-matrix (matrix-core / WMMA) availability and the chosen MxNxK tile for an
     // fp16xfp16 -> fp32 subgroup config. Present on native AMD/NV drivers (RDNA3.5 8060S),
     // absent on WSL/Dozen.
@@ -1038,9 +1042,23 @@ impl VulkanDevice {
             crate::bail!("matmul_q4k_gpu: x count {} < m*k {}", x.count, m * k);
         }
         let out = self.alloc_f32(m * nout)?;
-        // L1 dp4a path (HANZO_VK_Q4K_DP4A): quantize activations to int8 q8_1 once, then the 2D-tiled
-        // int8-dp4a GEMM (mul_mm_q4k_tiled_dp4a) -- ~4x the f32 tile's compute on the same VRAM traffic.
-        if std::env::var_os("HANZO_VK_Q4K_DP4A").is_some() {
+        // Q4_K prefill path selection. DEFAULT for dense prefill (woff==0, m>1): the best available 2D
+        // tile -- mul_mm_q4k_tiled_dp4a (int8 dp4a, 9.35x over the column kernel) where the device has
+        // int_dot8, else the universal f32 mul_mm_q4k_tiled (2.06x). Both stage weight+activation in LDS
+        // and reuse across the 64x64 output tile. MoE banks (woff!=0), m==1, k beyond the LDS bound, and
+        // HANZO_VK_Q4K_LEGACY fall to the column-per-invocation mul_mat_q4k. The per-kernel env vars
+        // (HANZO_VK_Q4K_{DP4A,TILED2D,TILED,LEGACY}) force one path for the A/B gates.
+        let legacy = std::env::var_os("HANZO_VK_Q4K_LEGACY").is_some();
+        let force_dp4a = std::env::var_os("HANZO_VK_Q4K_DP4A").is_some();
+        let force_2d = std::env::var_os("HANZO_VK_Q4K_TILED2D").is_some();
+        let force_1d = std::env::var_os("HANZO_VK_Q4K_TILED").is_some();
+        let dense_default = !legacy && woff == 0 && m > 1;
+        let use_dp4a = !legacy
+            && (force_dp4a || (dense_default && self.inner.int_dot8 && !force_2d && !force_1d));
+        let use_2d = !legacy && !use_dp4a && (force_2d || (dense_default && !force_1d));
+        let use_1d =
+            !legacy && !use_dp4a && !use_2d && force_1d && k / 256 <= MUL_MM_Q4K_MAX_BLOCKS;
+        if use_dp4a {
             let (xq, xs, xsum) = self.quantize_act_q8(x, m, k)?;
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
             self.dispatch(
@@ -1051,11 +1069,7 @@ impl VulkanDevice {
             )?;
             return Ok(out);
         }
-        // L1 2D-tiled path (HANZO_VK_Q4K_TILED2D): a 64x64 output tile per workgroup stages BOTH a BMxBK
-        // activation tile and a BNxBK decoded-weight tile in LDS, so each operand is read from VRAM once
-        // per K-step and reused across the tile. Workgroup grid = (ceil(nout/64), ceil(m/64)). Numerically
-        // matches mul_mat_q4k within f32 reorder tolerance (tiled partial sums), not bit-exact.
-        if std::env::var_os("HANZO_VK_Q4K_TILED2D").is_some() {
+        if use_2d {
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
             self.dispatch(
                 "mul_mm_q4k_tiled",
@@ -1065,9 +1079,7 @@ impl VulkanDevice {
             )?;
             return Ok(out);
         }
-        // L1 1D tiled path (HANZO_VK_Q4K_TILED): one workgroup per column stages the column's weight in
-        // LDS once and reuses it across all M rows -- a MEASURED DEAD-END (0.21x), kept env-gated off.
-        if k / 256 <= MUL_MM_Q4K_MAX_BLOCKS && std::env::var_os("HANZO_VK_Q4K_TILED").is_some() {
+        if use_1d {
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
             self.dispatch(
                 "mul_mm_q4k_shared",
@@ -3517,6 +3529,17 @@ impl BackendDevice for VulkanDevice {
                     .map(|v| v != "0")
                     .unwrap_or(true);
 
+            // Integer dot-product (OpSDotAccSat 4x8) feature: gates the int8 dp4a prefill GEMM. Core in
+            // Vulkan 1.3 but optional, so query it; the dp4a kernels declare the SPIR-V capability and
+            // only validate where this is true. VK_INT_DOT=0 forces the f32 2D-tile path instead.
+            let mut idot_feat = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+            {
+                let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut idot_feat);
+                instance.get_physical_device_features2(pdev, &mut f2);
+            }
+            let int_dot8 = idot_feat.shader_integer_dot_product != 0
+                && std::env::var("VK_INT_DOT").map(|v| v != "0").unwrap_or(true);
+
             // Build the enabled-extension list dynamically: coopmat and push_descriptor are
             // independent and either may be present. push_descriptor needs no extra device feature
             // struct (just the extension + a fn-pointer load), so it's a bare name here.
@@ -3628,6 +3651,7 @@ impl BackendDevice for VulkanDevice {
                 has_mem_budget,
                 subgroup_matvec,
                 subgroup_size,
+                int_dot8,
                 seed: Mutex::new(299792458),
                 profile,
                 push_descriptor,

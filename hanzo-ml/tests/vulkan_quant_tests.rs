@@ -970,8 +970,9 @@ fn vulkan_q4k_tiled_prefill_matches_default() -> hanzo_ml::Result<()> {
             let wq = vk.upload_qweight(&raw)?;
             let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
 
-            std::env::remove_var("HANZO_VK_Q4K_TILED");
+            std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
             let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::remove_var("HANZO_VK_Q4K_LEGACY");
             std::env::set_var("HANZO_VK_Q4K_TILED", "1");
             let y_tiled = vk.matmul_q4k(&wq, &x, m, nout, k)?;
             std::env::remove_var("HANZO_VK_Q4K_TILED");
@@ -1047,8 +1048,9 @@ fn vulkan_q4k_tiled2d_matches_default() -> hanzo_ml::Result<()> {
             let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
             let wq = vk.upload_qweight(&raw)?;
             let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 11)).collect();
-            std::env::remove_var("HANZO_VK_Q4K_TILED2D");
+            std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
             let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::remove_var("HANZO_VK_Q4K_LEGACY");
             std::env::set_var("HANZO_VK_Q4K_TILED2D", "1");
             let y_2d = vk.matmul_q4k(&wq, &x, m, nout, k)?;
             std::env::remove_var("HANZO_VK_Q4K_TILED2D");
@@ -1097,7 +1099,7 @@ fn vulkan_q4k_tiled2d_bench() -> hanzo_ml::Result<()> {
         }
         Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
     };
-    let def_ms = bench(None)?;
+    let def_ms = bench(Some("HANZO_VK_Q4K_LEGACY"))?;
     let tiled2d_ms = bench(Some("HANZO_VK_Q4K_TILED2D"))?;
     eprintln!(
         "[L1 2D bench] m={m} nout={nout} k={k}: default={def_ms:.3} ms  tiled2d={tiled2d_ms:.3} ms  speedup={:.2}x",
@@ -1121,8 +1123,9 @@ fn vulkan_q4k_dp4a2d_matches_default() -> hanzo_ml::Result<()> {
             let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
             let wq = vk.upload_qweight(&raw)?;
             let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 13)).collect();
-            std::env::remove_var("HANZO_VK_Q4K_DP4A");
+            std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
             let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::remove_var("HANZO_VK_Q4K_LEGACY");
             std::env::set_var("HANZO_VK_Q4K_DP4A", "1");
             let y_dp = vk.matmul_q4k(&wq, &x, m, nout, k)?;
             std::env::remove_var("HANZO_VK_Q4K_DP4A");
@@ -1173,7 +1176,7 @@ fn vulkan_q4k_dp4a2d_bench() -> hanzo_ml::Result<()> {
         }
         Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
     };
-    let def_ms = bench(None)?;
+    let def_ms = bench(Some("HANZO_VK_Q4K_LEGACY"))?;
     let f32_ms = bench(Some("HANZO_VK_Q4K_TILED2D"))?;
     let dp4a_ms = bench(Some("HANZO_VK_Q4K_DP4A"))?;
     eprintln!(
