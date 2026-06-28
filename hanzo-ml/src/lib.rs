@@ -77,6 +77,7 @@ pub mod model_delta;
 pub mod npy;
 pub mod op;
 pub mod pickle;
+pub mod compute;
 pub mod quantized;
 #[cfg(feature = "rocm")]
 pub mod rocm_backend;
