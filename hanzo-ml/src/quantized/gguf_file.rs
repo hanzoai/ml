@@ -6,6 +6,7 @@ use super::{GgmlDType, QTensor};
 use crate::{Context, Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
@@ -78,6 +79,81 @@ impl TensorInfo {
             self.shape.dims().to_vec(),
             device,
         )
+    }
+
+    /// No-copy / mmap-backed twin of [`TensorInfo::read`]. Instead of `read_exact`-ing the tensor's
+    /// bytes into an owned `Vec`, it references them *in place* inside `mmap`:
+    ///   * on the CPU the blocks are wrapped by `QMmap` and never copied resident -- the OS pages
+    ///     the mapped GGUF in on access and evicts it under pressure, so a model larger than RAM
+    ///     runs (antirez ds4_ssd, "RAM as a speed spectrum");
+    ///   * every other backend stages weights in its own device buffer regardless, so it borrows
+    ///     the mmap slice directly as the upload source (`qtensor_from_ggml`) -- still no resident
+    ///     intermediate `Vec`. (CUDA-UMA no-copy upload on coherent devices is the documented
+    ///     follow-up; see `cuda_backend::device` `is_unified`/`cuMemPrefetchAsync`.)
+    ///
+    /// A region whose absolute address is not aligned for the dtype's block type (only possible
+    /// with a pathological `general.alignment`) falls back to an owned, naturally-aligned copy on
+    /// the CPU -- correctness over the no-copy fast path; the loader never reads misaligned memory.
+    pub fn read_mmap(
+        &self,
+        mmap: &Arc<memmap2::Mmap>,
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+        }
+        let n_blocks = tensor_elems / block_size;
+        let size_in_bytes = n_blocks * self.ggml_dtype.type_size();
+        // Bounds-check in u64 *before* narrowing to usize: `self.offset` comes straight from the
+        // (untrusted) GGUF header, so a crafted file could otherwise overflow the add and alias an
+        // in-bounds-looking slice. Fail closed on overflow or out-of-range -- exactly like the
+        // resident path's seek + read_exact rejects a bad offset.
+        let start_u64 = tensor_data_offset
+            .checked_add(self.offset)
+            .context("gguf mmap: tensor offset overflows u64")?;
+        let end_u64 = start_u64
+            .checked_add(size_in_bytes as u64)
+            .context("gguf mmap: tensor extent overflows u64")?;
+        if end_u64 > mmap.len() as u64 {
+            crate::bail!(
+                "gguf mmap: tensor data [{start_u64}, {end_u64}) is out of bounds of the {}-byte mapping",
+                mmap.len()
+            )
+        }
+        let start = start_u64 as usize;
+        let end = end_u64 as usize;
+        let dims = self.shape.dims().to_vec();
+        match device {
+            Device::Cpu => {
+                // No-copy only when the mapped region is correctly aligned for the block type
+                // (page-aligned base + 32-aligned GGUF offsets satisfy this for every real model).
+                let addr = mmap.as_ptr() as usize + start;
+                if addr.is_multiple_of(self.ggml_dtype.type_align()) {
+                    let storage = super::QStorage::Cpu(
+                        self.ggml_dtype.from_mmap(mmap.clone(), start, n_blocks),
+                    );
+                    QTensor::new(storage, dims)
+                } else {
+                    super::ggml_file::qtensor_from_ggml(
+                        self.ggml_dtype,
+                        &mmap[start..end],
+                        dims,
+                        device,
+                    )
+                }
+            }
+            _ => super::ggml_file::qtensor_from_ggml(
+                self.ggml_dtype,
+                &mmap[start..end],
+                dims,
+                device,
+            ),
+        }
     }
 }
 
@@ -487,6 +563,39 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
+    }
+
+    /// mmap the whole GGUF at `path`, parse the header from the mapped bytes, and return the parsed
+    /// [`Content`] together with the live mapping. Tensor *data* is not touched here -- call
+    /// [`Content::tensor_mmap`] per tensor to reference (CPU: no-copy) or stage (GPU) it from `mmap`.
+    /// This is the loader seam for running models larger than RAM: only the header (KB) is read up
+    /// front; weights are demand-paged from the mapping as the forward pass touches them.
+    pub fn read_mmap<P: AsRef<std::path::Path>>(path: P) -> Result<(Self, Arc<memmap2::Mmap>)> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: same contract as `MmapedSafetensors` / `MmapedFile` in `safetensors.rs` -- a
+        // read-only weights file mapped read-only; we never mutate it and keep it alive via `Arc`.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let content = {
+            let mut cursor = std::io::Cursor::new(&mmap[..]);
+            Self::read(&mut cursor)?
+        };
+        Ok((content, Arc::new(mmap)))
+    }
+
+    /// Load one tensor by name, referencing its bytes in `mmap` (from [`Content::read_mmap`])
+    /// instead of reading them into an owned buffer. See [`TensorInfo::read_mmap`] for the
+    /// per-device copy / no-copy policy.
+    pub fn tensor_mmap(
+        &self,
+        mmap: &Arc<memmap2::Mmap>,
+        name: &str,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_mmap(mmap, self.tensor_data_offset, device)
     }
 }
 
