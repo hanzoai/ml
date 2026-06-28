@@ -71,6 +71,31 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
                 out.extend_from_slice(&[0u8, 0, 0, 0, 0, 0xC0, 0, 0x20]);
             }
         }
+        // Ternary: field order is qs THEN d (NOT d-first like the IQ codebooks). value = (xi-1)*d in
+        // {-d,0,d}, so d~0.25 keeps weights O(0.25). Any byte pattern is a valid ternary word (2-bit
+        // field for TQ2_0; base-3 (b*pow3[n] mod 256)*3>>8 in [0,2] for TQ1_0).
+        // TQ2_0 (66 B): qs[64] + f16 d.
+        GgmlDType::TQ2_0 => {
+            for _ in 0..nblk {
+                for _ in 0..64 {
+                    out.push(pbyte(c));
+                    c += 1;
+                }
+                out.extend_from_slice(&f16::from_f32(pseudo(c) * 0.25).to_le_bytes());
+                c += 1;
+            }
+        }
+        // TQ1_0 (54 B): qs[48] + qh[4] + f16 d.
+        GgmlDType::TQ1_0 => {
+            for _ in 0..nblk {
+                for _ in 0..52 {
+                    out.push(pbyte(c));
+                    c += 1;
+                }
+                out.extend_from_slice(&f16::from_f32(pseudo(c) * 0.25).to_le_bytes());
+                c += 1;
+            }
+        }
         _ => panic!("synth: {dtype:?} is not an i-quant type"),
     }
     out
@@ -213,6 +238,15 @@ fn cuda_matvec_iq1m_matches_cpu() {
 #[test]
 fn cuda_matvec_iq4xs_matches_cpu() {
     check(GgmlDType::IQ4_XS);
+}
+// Ternary native dp4a decode (Part 2): TQ2_0 (clean 2-bit) + TQ1_0 (base-3 scalar unpack + dp4a dot).
+#[test]
+fn cuda_matvec_tq2_0_matches_cpu() {
+    check(GgmlDType::TQ2_0);
+}
+#[test]
+fn cuda_matvec_tq1_0_matches_cpu() {
+    check(GgmlDType::TQ1_0);
 }
 
 // ---- batched (b_size > 1) dense decode: the per-`bi` activation/output offsets in
