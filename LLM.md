@@ -435,6 +435,20 @@ artifacts, BOTH fixed bit-identically to match llama -- and the A/B isolates whi
   is now dead in the decode path -- drop from the table + `gen_iquant_grids.py`. Bit-exact: 13/13
   `cuda_iquant_tests` (max_rel ~1.7e-4 = the f32-weight-materialization floor). SHIPPED ml 0.11.26 /
   kernels 0.11.23.
+- **MODEL-LEVEL: a GB10 NON-LEVER (the honest end-to-end result).** Same-engine A/B (hanzo-engine
+  v1.4.1, ml 0.11.25 baseline vs 0.11.26 dp4a, Qwen3-4B-UD-IQ2_XXS = IQ2_XXS-dominated 204 tensors,
+  `bench --prompt-len 128 --gen-len 256`): **FLAT** both graphs-ON (dp4a 66.1 vs base 66.2 T/s) AND
+  eager (60.2 vs 60.2). The 1.71x KERNEL win does NOT surface end-to-end because GB10 hanzo i-quant
+  decode is **HOST/launch-overhead-bound, not matvec-GPU-bound** -- the GPU finishes the (now faster)
+  matvec and stalls on per-token host work, so shrinking matvec GPU-time doesn't move the wall. (The
+  op-fusion profile's "75% matvec" was GPU-BUSY share, NOT wall share.) So dp4a joins occupancy /
+  graphs-for-kernel / op-fusion / moe_route as a real kernel win that is a GB10 **model-level non-lever**;
+  the actual GB10 decode lever is LAUNCH reduction -- which is exactly what the dense-Llama decode-graph
+  gate (+6.8%, hanzo-engine v1.4.1) attacks. dp4a STILL ships and stays: bit-exact (zero regression),
+  decomplects (one selector helper, drops a 128-entry table + a divergent constant gather, matches
+  llama), and is a LATENT win for genuinely matvec-bound regimes (ROCm 30B-A3B eager surfaced the
+  i-quant kernel 2.27x -- a different platform/bottleneck). NOTE: corrects this section's earlier
+  "compute-bound, kernel wins fully surface" framing, which held on ROCm-eager but NOT GB10-under-graphs.
 
 ## CUDA fused moe_route router -- ported + bit-exact, but a MEASURED NON-LEVER on GB10 (NOT shipped)
 Ported the ROCm `moe_route` fusion (softmax->topk->renorm, one block/token) to CUDA + a bit-exact gate
