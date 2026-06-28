@@ -1,0 +1,133 @@
+#version 450
+// Q4_K 2D-TILED prefill matmul (L1 real): y[m,n] = sum_k x[m,k]*W[n,k]. A workgroup computes a BMxBN
+// output tile; the K loop stages a BMxBK activation tile AND a BNxBK decoded-weight tile into LDS once
+// per K-step, then each thread accumulates its TMxTN sub-tile from LDS. So BOTH operands are read from
+// VRAM once per K-step and reused across the whole tile (weight across BM rows, activation across BN
+// cols) with coalesced loads and 256-thread occupancy -- the structure the column-per-invocation
+// mul_mat_q4k (and the 1D weight-only mul_mm_q4k_shared dead-end) lack. The 32-wide K-tile aligns 1:1
+// with a Q4_K sub-block (256 weights/super-block = 8 sub-blocks of 32; sub-block s spans activation
+// [blk*256+s*32, +32), s even = low nibbles of chunk s/2, s odd = high). f32 decode is identical to
+// mul_mat_q4k per element; only the accumulation is tiled (partial sums per K-step), so the gate is the
+// f64-oracle tolerance test (vulkan_q4k_tiled2d_matches_cpu), not bit-equality.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+const uint BM = 64u;   // output rows per workgroup
+const uint BN = 64u;   // output cols per workgroup
+const uint BK = 32u;   // contraction tile == one Q4_K sub-block
+const uint TM = 4u;    // rows per thread
+const uint TN = 4u;    // cols per thread
+const uint WG = 256u;  // (BM/TM) * (BN/TN) = 16 * 16
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint  w[]; };  // Q4_K blocks, 36 u32 / 256-block
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };  // activations, row-major [M, k]
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; }; // output, row-major [M, nout]
+// m0 unused (kept for ABI parity with mul_mat_q4k); mcount=M total rows; nout cols; k; woff weight base.
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
+
+const uint QK_K = 256u;
+const uint BLK_U32 = 36u;
+
+shared float s_a[BM * BK];
+shared float s_w[BN * BK];
+
+uint scale_byte(uint base, uint b) {
+    uint word = w[base + 1u + (b >> 2u)];
+    return (word >> ((b & 3u) * 8u)) & 0xFFu;
+}
+uint get_scale_min_k4(uint base, uint j) {
+    uint sc, m;
+    if (j < 4u) {
+        sc = scale_byte(base, j) & 63u;
+        m  = scale_byte(base, j + 4u) & 63u;
+    } else {
+        uint s_j4 = scale_byte(base, j + 4u);
+        uint s_jm4 = scale_byte(base, j - 4u);
+        uint s_j = scale_byte(base, j);
+        sc = (s_j4 & 0x0Fu) | ((s_jm4 >> 6u) << 4u);
+        m  = (s_j4 >> 4u)   | ((s_j   >> 6u) << 4u);
+    }
+    return (sc << 8u) | m;
+}
+
+// Dequantized Q4_K weight W[n, kpos], decode identical to mul_mat_q4k.
+float decode_w(uint n, uint kpos, uint nblocks) {
+    uint blk = kpos / QK_K;
+    uint within = kpos - blk * QK_K;
+    uint sub = within / 32u;          // 0..7
+    uint kk = within - sub * 32u;     // 0..31
+    uint base = woff + n * nblocks * BLK_U32 + blk * BLK_U32;
+    float d    = float(unpackHalf2x16(w[base]).x);
+    float dmin = float(unpackHalf2x16(w[base]).y);
+    uint sm = get_scale_min_k4(base, sub);
+    float ds = d * float(sm >> 8u);
+    float ms = dmin * float(sm & 0xFFu);
+    uint c = sub >> 1u;
+    uint qb = c * 32u + kk;           // byte index into qs (low and high nibble share the byte)
+    uint qword = w[base + 4u + (qb >> 2u)];
+    uint byte = (qword >> ((qb & 3u) * 8u)) & 0xFFu;
+    uint q = ((sub & 1u) == 0u) ? (byte & 0x0Fu) : (byte >> 4u);
+    return ds * float(q) - ms;
+}
+
+void main() {
+    uint nblocks = k / QK_K;
+    uint row0 = gl_WorkGroupID.y * BM;   // first output row of this tile
+    uint col0 = gl_WorkGroupID.x * BN;   // first output col of this tile
+    uint tid = gl_LocalInvocationID.x;
+    uint tr = tid / (BN / TN);           // thread row in the 16x16 grid (0..15)
+    uint tc = tid % (BN / TN);           // thread col (0..15)
+
+    float acc[TM][TN];
+    for (uint i = 0u; i < TM; i++) {
+        for (uint j = 0u; j < TN; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (uint koff = 0u; koff < k; koff += BK) {
+        // Stage the activation tile [BM, BK] and decoded weight tile [BN, BK] into LDS (coalesced).
+        for (uint idx = tid; idx < BM * BK; idx += WG) {
+            uint r = idx / BK;
+            uint kk = idx - r * BK;
+            uint mrow = row0 + r;
+            s_a[idx] = (mrow < mcount) ? x[mrow * k + koff + kk] : 0.0;
+        }
+        for (uint idx = tid; idx < BN * BK; idx += WG) {
+            uint cc = idx / BK;
+            uint kk = idx - cc * BK;
+            uint n = col0 + cc;
+            s_w[idx] = (n < nout) ? decode_w(n, koff + kk, nblocks) : 0.0;
+        }
+        barrier();
+        for (uint kk = 0u; kk < BK; kk++) {
+            float ar[TM];
+            float wr[TN];
+            for (uint i = 0u; i < TM; i++) {
+                ar[i] = s_a[(tr * TM + i) * BK + kk];
+            }
+            for (uint j = 0u; j < TN; j++) {
+                wr[j] = s_w[(tc * TN + j) * BK + kk];
+            }
+            for (uint i = 0u; i < TM; i++) {
+                for (uint j = 0u; j < TN; j++) {
+                    acc[i][j] += ar[i] * wr[j];
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < TM; i++) {
+        uint mrow = row0 + tr * TM + i;
+        if (mrow >= mcount) {
+            continue;
+        }
+        for (uint j = 0u; j < TN; j++) {
+            uint n = col0 + tc * TN + j;
+            if (n < nout) {
+                y[mrow * nout + n] = acc[i][j];
+            }
+        }
+    }
+}

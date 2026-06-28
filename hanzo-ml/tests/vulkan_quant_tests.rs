@@ -1031,3 +1031,77 @@ fn vulkan_q4k_tiled_prefill_bench() -> hanzo_ml::Result<()> {
     );
     Ok(())
 }
+
+// L1 2D-tiled prefill GEMM (mul_mm_q4k_tiled, HANZO_VK_Q4K_TILED2D): 64x64 output tile, both operands
+// staged in LDS per K-step. Decode per element is identical to mul_mat_q4k but accumulation is tiled
+// (partial sums), so it matches the default within f32-reorder tolerance, not bit-exact. A decode/index
+// bug is a systematic >>1e-3 divergence; f32 reassociation is <~1e-4.
+#[test]
+fn vulkan_q4k_tiled2d_matches_default() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else {
+        return Ok(());
+    };
+    let vk = dev.as_vulkan_device()?;
+    for &(nout, k) in &[(512usize, 256usize), (2048, 2048), (256, 4096), (320, 1024)] {
+        for &m in &[1usize, 7, 64, 65, 512] {
+            let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
+            let wq = vk.upload_qweight(&raw)?;
+            let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 11)).collect();
+            std::env::remove_var("HANZO_VK_Q4K_TILED2D");
+            let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::set_var("HANZO_VK_Q4K_TILED2D", "1");
+            let y_2d = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+            std::env::remove_var("HANZO_VK_Q4K_TILED2D");
+            assert_eq!(y_2d.len(), m * nout);
+            let mut max_abs = 0f32;
+            let mut max_ref = 0f32;
+            for (a, b) in y_ref.iter().zip(y_2d.iter()) {
+                max_abs = max_abs.max((a - b).abs());
+                max_ref = max_ref.max(a.abs());
+            }
+            let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+            assert!(
+                rel < 2e-3,
+                "2d-tiled != default (m={m}, nout={nout}, k={k}): max_abs={max_abs}, rel={rel}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// L1 perf: default mul_mat_q4k vs 2D-tiled mul_mm_q4k_tiled at a realistic prefill shape (run --ignored).
+#[test]
+#[ignore]
+fn vulkan_q4k_tiled2d_bench() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else {
+        return Ok(());
+    };
+    let vk = dev.as_vulkan_device()?;
+    let (m, nout, k) = (512usize, 4096usize, 4096usize);
+    let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
+    let wq = vk.upload_qweight(&raw)?;
+    let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
+    let iters = 20;
+    let bench = |var: Option<&str>| -> hanzo_ml::Result<f64> {
+        std::env::remove_var("HANZO_VK_Q4K_TILED2D");
+        if let Some(v) = var {
+            std::env::set_var(v, "1");
+        }
+        let _ = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = vk.matmul_q4k(&wq, &x, m, nout, k)?;
+        }
+        if let Some(v) = var {
+            std::env::remove_var(v);
+        }
+        Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
+    };
+    let def_ms = bench(None)?;
+    let tiled2d_ms = bench(Some("HANZO_VK_Q4K_TILED2D"))?;
+    eprintln!(
+        "[L1 2D bench] m={m} nout={nout} k={k}: default={def_ms:.3} ms  tiled2d={tiled2d_ms:.3} ms  speedup={:.2}x",
+        def_ms / tiled2d_ms
+    );
+    Ok(())
+}
