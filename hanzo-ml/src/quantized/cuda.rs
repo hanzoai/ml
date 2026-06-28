@@ -296,6 +296,61 @@ fn dequantize_mul_mat_vec(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// Fused MoE router: softmax(logits over ALL experts) -> top-k by descending logit -> optional
+/// renorm of the top-k weights to sum 1 (`norm_topk_prob`). ONE `moe_route` kernel (one block/token)
+/// replaces the candle softmax->asort->narrow->sum->div op chain (~6 launches/layer). `logits` is a
+/// contiguous [ntok, n_experts] f32 view; returns (ids [ntok,topk] u32, weights [ntok,topk] f32).
+/// The full-softmax denominator makes norm=0 byte-faithful to a plain softmax-then-topk and to the
+/// ROCm kernel of the same name (one source of truth for the routing math).
+pub fn moe_route(
+    logits: &CudaView<f32>,
+    ntok: usize,
+    n_experts: usize,
+    topk: usize,
+    norm: bool,
+    dev: &CudaDevice,
+) -> Result<(CudaStorage, CudaStorage)> {
+    const MOE_ROUTE_MAX_E: usize = 256;
+    const MOE_ROUTE_MAX_K: usize = 32;
+    if n_experts > MOE_ROUTE_MAX_E {
+        crate::bail!("moe_route: n_experts {n_experts} exceeds kernel max {MOE_ROUTE_MAX_E}");
+    }
+    if topk > MOE_ROUTE_MAX_K {
+        crate::bail!("moe_route: topk {topk} exceeds kernel max {MOE_ROUTE_MAX_K}");
+    }
+    if logits.len() != ntok * n_experts {
+        crate::bail!(
+            "moe_route: logits len {} != ntok*n_experts {}",
+            logits.len(),
+            ntok * n_experts
+        );
+    }
+    let func = dev.get_or_load_func("moe_route", &hanzo_kernels::QUANTIZED)?;
+    let ids = unsafe { dev.alloc::<u32>(ntok * topk)? };
+    let w = unsafe { dev.alloc::<f32>(ntok * topk)? };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (ntok as u32, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    barg!(
+        builder,
+        ntok as i32,
+        n_experts as i32,
+        topk as i32,
+        i32::from(norm)
+    );
+    builder.arg(logits);
+    builder.arg(&ids);
+    builder.arg(&w);
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok((
+        CudaStorage::wrap_cuda_slice(ids, dev.clone()),
+        CudaStorage::wrap_cuda_slice(w, dev.clone()),
+    ))
+}
+
 fn mul_mat_vec_via_q8_1(
     data: &PaddedCudaSlice,
     y: &CudaView<f32>,

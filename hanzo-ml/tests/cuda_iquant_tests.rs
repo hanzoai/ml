@@ -558,3 +558,73 @@ fn cuda_moe_iq2xxs_matches_cpu() {
         }
     }
 }
+
+// ---- fused MoE ROUTER (moe_route kernel): softmax-over-all-experts -> top-k by descending logit ->
+// optional renorm of the top-k to sum 1. ONE block/token replaces the candle softmax->asort->narrow->
+// sum->div op chain. Oracle: the CUDA kernel vs the ml-op reference -- the SAME public `moe_route` run
+// on a CPU tensor (no fast path -> it executes the op chain). Mirrors the ROCm `moe_route_numeric`
+// gate. ids must match EXACTLY (descending logit; random data has no f32 ties); weights agree to f32
+// reduction-order tolerance (the kernel sums Z in a shared-mem tree, the CPU sequentially). ----
+#[test]
+fn cuda_moe_route_numeric() {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no CUDA device ({e})");
+            return;
+        }
+    };
+    let cpu = Device::Cpu;
+    let mut worst = 0f32;
+    for &(ntok, n_experts) in &[
+        (1usize, 60usize),
+        (1, 128),
+        (1, 256), // == MOE_ROUTE_MAX_E (exercises the full shared-mem expert buffer)
+        (7, 128),
+        (181, 128), // the decode-microbatch token count from the 30B-A3B profile
+        (64, 256),
+        (1024, 160),
+    ] {
+        for &topk in &[4usize, 8] {
+            for &norm in &[false, true] {
+                // logits in [-4, 4) -> a peaked softmax (real dynamic range, not near-uniform).
+                let seed = ntok * 131 + n_experts * 17 + topk * 7 + norm as usize;
+                let logits: Vec<f32> =
+                    (0..ntok * n_experts).map(|i| pseudo(i + seed) * 4.0).collect();
+                let lg_cuda = Tensor::from_vec(logits.clone(), (ntok, n_experts), &dev).unwrap();
+                let lg_cpu = Tensor::from_vec(logits, (ntok, n_experts), &cpu).unwrap();
+
+                let (ids_g, w_g) = hanzo_ml::quantized::moe_route(&lg_cuda, topk, norm).unwrap();
+                let (ids_r, w_r) = hanzo_ml::quantized::moe_route(&lg_cpu, topk, norm).unwrap();
+
+                let ids_g = ids_g.flatten_all().unwrap().to_vec1::<u32>().unwrap();
+                let ids_r = ids_r.flatten_all().unwrap().to_vec1::<u32>().unwrap();
+                let w_g = w_g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let w_r = w_r.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert_eq!(ids_g.len(), ntok * topk, "fused ids shape");
+
+                let mut nbad_id = 0usize;
+                let mut max_w_err = 0f32;
+                for i in 0..ntok * topk {
+                    if ids_g[i] != ids_r[i] {
+                        nbad_id += 1;
+                    }
+                    max_w_err = max_w_err.max((w_g[i] - w_r[i]).abs());
+                }
+                worst = worst.max(max_w_err);
+                println!(
+                    "moe_route ntok={ntok} E={n_experts} topk={topk} norm={norm}: nbad_id={nbad_id} max_w_err={max_w_err:.3e}"
+                );
+                assert_eq!(
+                    nbad_id, 0,
+                    "expert-id mismatch ntok={ntok} E={n_experts} topk={topk} norm={norm}"
+                );
+                assert!(
+                    max_w_err < 1e-5,
+                    "weights diverged ntok={ntok} E={n_experts} topk={topk} norm={norm}: max_w_err={max_w_err:.3e}"
+                );
+            }
+        }
+    }
+    println!("cuda_moe_route_numeric: worst max_w_err across all configs = {worst:.3e}");
+}

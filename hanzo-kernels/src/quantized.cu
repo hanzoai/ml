@@ -4602,3 +4602,117 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
     indexed_moe_forward<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
         (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
+
+// ---------------------------------------------------------------------------
+// moe_route: fused MoE router (softmax over all experts -> top-k -> optional renorm).
+// ONE block/token replaces the candle softmax->asort->narrow->sum->div chain (~6 launches/
+// layer). Ported verbatim from the ROCm kernel (hanzo-rocm-kernels quant.hip) -- the algorithm
+// is backend-agnostic (shared-mem reductions only, no warp intrinsics), so it is byte-faithful
+// to the ROCm path and to softmax-then-topk. One source of truth for the routing math.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// moe_route: fused MoE router (softmax over all experts -> top-k -> optional renorm).
+// ONE block/token replaces the candle softmax->asort->narrow->sum->div chain (~6 launches/
+// layer). Ported verbatim from the ROCm kernel (hanzo-rocm-kernels quant.hip) -- the algorithm
+// is backend-agnostic (shared-mem reductions only, no warp intrinsics), so it is byte-faithful
+// to the ROCm path and to softmax-then-topk. One source of truth for the routing math.
+// ---------------------------------------------------------------------------
+// softmax-then-topk), so this is numerically faithful to the chain it replaces.
+#define MOE_ROUTE_MAX_E 256
+#define MOE_ROUTE_MAX_K 32
+#define MOE_ROUTE_THREADS 64
+#define MOE_ROUTE_NEG_INF (-3.402823466e38f)
+
+extern "C" __global__ __launch_bounds__(MOE_ROUTE_THREADS) void moe_route(
+    const int ntok, const int n_experts, const int topk, const int norm,
+    const float* __restrict__ logits,   // [ntok, n_experts]
+    unsigned int* __restrict__ out_ids, // [ntok, topk]
+    float* __restrict__ out_w           // [ntok, topk]
+) {
+    const int tok = blockIdx.x;
+    if (tok >= ntok) return;
+    const int t = threadIdx.x;
+    __shared__ float sl[MOE_ROUTE_MAX_E];
+    __shared__ float se[MOE_ROUTE_MAX_E];
+    __shared__ float red[MOE_ROUTE_THREADS];
+    __shared__ int rid[MOE_ROUTE_THREADS];
+    __shared__ float sp[MOE_ROUTE_MAX_K];
+    __shared__ int sidx[MOE_ROUTE_MAX_K];
+    const float* __restrict__ lp = logits + (size_t)tok * n_experts;
+    for (int e = t; e < n_experts; e += MOE_ROUTE_THREADS) sl[e] = lp[e];
+    __syncthreads();
+
+    float m = MOE_ROUTE_NEG_INF;
+    for (int e = t; e < n_experts; e += MOE_ROUTE_THREADS) m = fmaxf(m, sl[e]);
+    red[t] = m;
+    __syncthreads();
+    for (int s = MOE_ROUTE_THREADS / 2; s > 0; s >>= 1) {
+        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        __syncthreads();
+    }
+    const float mx = red[0];
+    __syncthreads();
+
+    float zp = 0.0f;
+    for (int e = t; e < n_experts; e += MOE_ROUTE_THREADS) {
+        const float v = expf(sl[e] - mx);
+        se[e] = v;
+        zp += v;
+    }
+    red[t] = zp;
+    __syncthreads();
+    for (int s = MOE_ROUTE_THREADS / 2; s > 0; s >>= 1) {
+        if (t < s) red[t] += red[t + s];
+        __syncthreads();
+    }
+    const float Z = red[0];
+    __syncthreads();
+
+    // Parallel top-k: each round is a block-wide argmax (max logit, lowest index on tie) over the
+    // not-yet-selected experts. Selection is tracked by clobbering the chosen logit to -inf in `sl`.
+    for (int r = 0; r < topk; ++r) {
+        float lv = MOE_ROUTE_NEG_INF;
+        int li = n_experts;
+        for (int e = t; e < n_experts; e += MOE_ROUTE_THREADS) {
+            const float v = sl[e];
+            if (v > lv || (v == lv && e < li)) { lv = v; li = e; }
+        }
+        red[t] = lv;
+        rid[t] = li;
+        __syncthreads();
+        for (int s = MOE_ROUTE_THREADS / 2; s > 0; s >>= 1) {
+            if (t < s) {
+                const float ov = red[t + s];
+                const int oi = rid[t + s];
+                if (ov > red[t] || (ov == red[t] && oi < rid[t])) { red[t] = ov; rid[t] = oi; }
+            }
+            __syncthreads();
+        }
+        const int best = rid[0];
+        if (t == 0) {
+            sidx[r] = best;
+            sp[r] = se[best] / Z;
+        }
+        __syncthreads();
+        if (t == 0) sl[best] = MOE_ROUTE_NEG_INF;
+        __syncthreads();
+    }
+
+    if (t == 0) {
+        float inv = 1.0f;
+        if (norm) {
+            float wsum = 0.0f;
+            for (int r = 0; r < topk; ++r) wsum += sp[r];
+            inv = 1.0f / wsum;
+        }
+        for (int r = 0; r < topk; ++r) {
+            out_ids[(size_t)tok * topk + r] = (unsigned int)sidx[r];
+            out_w[(size_t)tok * topk + r] = norm ? sp[r] * inv : sp[r];
+        }
+    }
+}
+#undef MOE_ROUTE_MAX_E
+#undef MOE_ROUTE_MAX_K
+#undef MOE_ROUTE_THREADS
+#undef MOE_ROUTE_NEG_INF
