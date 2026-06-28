@@ -1538,6 +1538,32 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
             return Ok((ids_t, w_t));
         }
     }
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(cdev) = logits.device() {
+        if std::env::var("HANZO_MOE_ROUTE_FALLBACK").is_err() && n_experts <= 256 && topk <= 32 {
+            let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
+            let (lg_store, _) = logits_c.storage_and_layout();
+            let lr = match &*lg_store {
+                Storage::Cuda(c) => c,
+                _ => crate::bail!("moe_route: logits not on cuda after contiguous()"),
+            };
+            let lview = lr.as_cuda_slice::<f32>()?.slice(0..);
+            let (ids, w) = cuda::moe_route(&lview, ntok, n_experts, topk, norm, cdev)?;
+            let ids_t = crate::tensor::from_storage(
+                Storage::Cuda(ids),
+                (ntok, topk),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            let w_t = crate::tensor::from_storage(
+                Storage::Cuda(w),
+                (ntok, topk),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            return Ok((ids_t, w_t));
+        }
+    }
     let lf = logits.to_dtype(DType::F32)?;
     let mx = lf.max_keepdim(D::Minus1)?;
     let e = lf.broadcast_sub(&mx)?.exp()?;
