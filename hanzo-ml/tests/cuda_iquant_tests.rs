@@ -398,19 +398,29 @@ fn cuda_qmmq_iquant_prefill_matches_dequant() {
 // ---- fused i-quant MoE decode: the native dp4a MoE path (bank resident in VRAM, on-device gather)
 // vs the CPU per-expert reference, both fed the same q8_1-level activation + router ids. Exercises the
 // mod.rs CUDA i-quant MoE arm + moe_iquant_dp4a (quantize + the moe_qmatvec_dp4a_<iq*> launch). ----
-fn run_moe(dev: &Device, e_cnt: usize, n: usize, k: usize, t: usize, topk: usize, shared: bool) -> Err {
+#[allow(clippy::too_many_arguments)]
+fn run_moe(
+    dev: &Device,
+    dtype: GgmlDType,
+    e_cnt: usize,
+    n: usize,
+    k: usize,
+    t: usize,
+    topk: usize,
+    shared: bool,
+) -> Err {
     let cpu = Device::Cpu;
     // Bank [E, n, k]: synth over e_cnt*n rows -- the counter increments across experts so each expert's
     // codebook bytes differ (a wrong-expert gather would mismatch).
-    let raw = synth(GgmlDType::IQ2_XXS, e_cnt * n, k);
+    let raw = synth(dtype, e_cnt * n, k);
     let q_cuda = QTensor::new(
-        QStorage::from_data(Cow::Owned(raw.clone()), dev, GgmlDType::IQ2_XXS).unwrap(),
+        QStorage::from_data(Cow::Owned(raw.clone()), dev, dtype).unwrap(),
         (e_cnt, n, k),
     )
     .unwrap();
     // Ground-truth bank weights: dequantize on the CPU (the exact codebook values).
     let w_deq: Vec<f32> = QTensor::new(
-        QStorage::from_data(Cow::Owned(raw), &cpu, GgmlDType::IQ2_XXS).unwrap(),
+        QStorage::from_data(Cow::Owned(raw), &cpu, dtype).unwrap(),
         (e_cnt, n, k),
     )
     .unwrap()
@@ -475,20 +485,25 @@ fn cuda_moe_iq2xxs_matches_cpu() {
             return;
         }
     };
-    // (e_cnt, n, k, t, topk, shared-input). Decode t=1 + a small prefill t=3; shared (gate/up) +
+    // Cover BOTH the codebook-grid headline (IQ2_XXS) AND the LUT headline (IQ4_XS -- the dominant
+    // MoE-quant type) so an IQ4_XS-specific MoE wiring regression (decode moe_qmatvec_dp4a_iq4xs /
+    // prefill moe qmmq) can't slip past the suite (closes red's [LOW] coverage gap).
+    // (e_cnt, n, k, t, topk, shared-input): decode t=1 + a small prefill t=3; shared (gate/up) +
     // per-slot (down) input layouts.
-    for &(e, n, k, t, topk, shared) in &[
-        (8usize, 512usize, 2048usize, 1usize, 4usize, true),
-        (8, 512, 2048, 1, 4, false),
-        (16, 768, 2048, 3, 6, true),
-    ] {
-        let s = run_moe(&dev, e, n, k, t, topk, shared);
-        println!("MoE IQ2_XXS [E{e} {n}x{k} t{t} topk{topk} shared{shared}]: max_abs={:.3e} max_rel={:.3e}", s.max_abs, s.max_rel);
-        assert!(
-            s.max_rel < 1e-3 && s.max_abs < 1e-1,
-            "fused MoE diverged: max_abs={:.3e} max_rel={:.3e}",
-            s.max_abs,
-            s.max_rel
-        );
+    for dtype in [GgmlDType::IQ2_XXS, GgmlDType::IQ4_XS] {
+        for &(e, n, k, t, topk, shared) in &[
+            (8usize, 512usize, 2048usize, 1usize, 4usize, true),
+            (8, 512, 2048, 1, 4, false),
+            (16, 768, 2048, 3, 6, true),
+        ] {
+            let s = run_moe(&dev, dtype, e, n, k, t, topk, shared);
+            println!("MoE {dtype:?} [E{e} {n}x{k} t{t} topk{topk} shared{shared}]: max_abs={:.3e} max_rel={:.3e}", s.max_abs, s.max_rel);
+            assert!(
+                s.max_rel < 1e-3 && s.max_abs < 1e-1,
+                "fused MoE {dtype:?} diverged: max_abs={:.3e} max_rel={:.3e}",
+                s.max_abs,
+                s.max_rel
+            );
+        }
     }
 }
