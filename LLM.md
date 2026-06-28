@@ -465,3 +465,40 @@ hold (the ROCm fast path already exists; CUDA was the only backend still on the 
 perf is fine to re-bench on a 256-expert model (DeepSeek-V4, 2x router math) where it may clear the floor.
 ALSO in this release: dropped the now-dead `KSIGNS_IQ2XS_D` CUDA decode table (gen_iquant_grids.py
 `DECODE_SKIP` -- unpack_ksigns reconstructs it in-kernel; the Rust ksigns stays for the CPU oracle).
+
+## Vulkan prefill DEADLOCK fix (gfx1151 Strix Halo UMA) -- the dequant path self-deadlocks the allocator
+hanzo Vulkan HUNG at the first long prefill of any GGUF on gfx1151 (Radeon 8060S / Strix Halo), while
+llama.cpp-Vulkan AND hanzo's own ROCm ran the same model fine. NOT a shader/compute hang and NOT
+push_desc/coopmat/subgroup (all `VK_*` kill-switches off still hang). ROOT CAUSE (gdb of the live hung
+process): the engine thread blocks in the KERNEL at `__ioctl(DRM_IOCTL_AMDGPU_GEM_CREATE)` <- `amdgpu_bo
+_alloc` <- RADV <- `VulkanDevice::raw_buffer` <- `upload_f32` <- `QTensor::dequantize` <- `QMatMul::
+forward` (PREFILL). The Vulkan `VulkanQuant::forward` prefill `else` branch (rows > the gate) DEQUANTIZES
+each Q4_K/Q6_K weight to a fresh ~100-235 MB f32 BO via `upload_f32`; under the deferred single command
+batch (`BATCH_CAP`) NONE free until the end-of-forward flush, so a dense prefill re-expands the whole
+model to f32 (~32 GB for an 8B) in fresh `amdgpu_bo_alloc`s. On the 64 GB-carveout + ~31 GB-GTT UMA the
+accumulated BOs exhaust memory and GEM_CREATE BLOCKS waiting for a free that can only happen after the
+still-recording batch flushes -- a self-deadlock. ROCm never hits it (prefill rides the int8-WMMA `qmmq`
+GEMM, never dequantizes; that asymmetry is exactly why ROCm worked and Vulkan hung). Decode (rows==1)
+also fine -- it uses the native `matvec_q4k_gpu` straight out of the block format, no dequant.
+- FIX (`vulkan_prefill_gemm_max_rows`, quantized/mod.rs): for every dtype that HAS a native quantized
+  GEMM (`matmul_q*_gpu` = {Q4_0,Q8_0,Q4K,Q5K,Q6K}) return `usize::MAX` -> ALWAYS use the GEMM, NEVER the
+  f32-dequant fallback; types without a GEMM kernel return 0 (rows>1 dequantize, their only path, and a
+  handful of such weights do not accumulate enough to deadlock). Liveness beats the old at-large-M
+  throughput edge the dequant path won (the column-per-invocation GEMM re-reads the weight ceil(M/8)
+  times so it is slower at big M, but it CANNOT deadlock). The gate is now effectively the "has a GEMM
+  kernel?" predicate.
+- BENCH STANDING (evo gfx1151, Qwen3-8B-Q4_K_M, pp512/tg128, idle box): hanzo ROCm decode 40.2 / prefill
+  1002.6 T/s BEATS llama.cpp-HIP 38.95 / 953 (decode +3%, prefill +5%, with PagedAttention active) --
+  ABOVE the prior "decode = parity" law. llama-Vulkan 41.07/1058; hanzo-Vulkan was the deadlock (now
+  fixed). hanzo CPU 14.1/34 vs llama 18.93/556 (CPU is the known dispatch-bound gap, same F32-dequant
+  pattern). So on its primary GPU path hanzo is now AHEAD of llama.cpp on gfx1151.
+- DECOMPLECTION ROADMAP (the fix is liveness; the real cleanup is structural): the bug is a SYMPTOM of
+  the missing uniform Vulkan GEMM. ROCm already decomplected this (`qmatvec_core<WTYPE>` / `qmmq_core
+  <WTYPE>` -- ONE contraction, type injected as a trait); Vulkan still hand-writes per-type shaders AND
+  only has GEMM for 5/22 types (the hole that forces the dequant fallback). L1: port the generic
+  `qgemm<T>` to Vulkan (all types) -> DELETE `vulkan_prefill_gemm_max_rows` and the dequant `else`
+  branch entirely (bug impossible by construction). L2: codegen the per-type `decode` into each backend
+  from one block-format spec (extend gen_iquant_grids.py). L3: a kernel DSL (CubeCL/Triton/MLIR) so the
+  contraction is written once and lowered to all backends -- collapses the backends x types x ops
+  product to `types + ops + backends`. The 3 axes (decode value / parametric contraction / backend
+  functor) want to be orthogonal.
