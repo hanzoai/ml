@@ -56,6 +56,9 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
         GgmlDType::IQ3_XXS => (0..nblk).for_each(|_| emit_d_then(0.02, 96, &mut out, &mut c)),
         GgmlDType::IQ3_S => (0..nblk).for_each(|_| emit_d_then(0.004, 108, &mut out, &mut c)),
         GgmlDType::IQ1_S => (0..nblk).for_each(|_| emit_d_then(0.05, 48, &mut out, &mut c)),
+        // block_iq4_xs (136 B): f16 d + u16 scales_h + scales_l[4] + qs[128]. Any byte pattern is valid
+        // (4-bit LUT indices + 6-bit scales all in range). dl = d*(ls-32) amplifies, so d is kept small.
+        GgmlDType::IQ4_XS => (0..nblk).for_each(|_| emit_d_then(0.001, 134, &mut out, &mut c)),
         // block_iq1m (56 B): qs[32]+qh[16]+scales[8], NO leading d -- d is reconstructed from the high
         // nibbles of the 4 scale u16. scales -> scale_u16 = 0x2C00 (f16 0.0625), per-sub-block 3-bit
         // fields 0 (dl = d); qs/qh random (valid indices + signs).
@@ -207,6 +210,10 @@ fn cuda_matvec_iq1s_matches_cpu() {
 fn cuda_matvec_iq1m_matches_cpu() {
     check(GgmlDType::IQ1_M);
 }
+#[test]
+fn cuda_matvec_iq4xs_matches_cpu() {
+    check(GgmlDType::IQ4_XS);
+}
 
 // ---- batched (b_size > 1) dense decode: the per-`bi` activation/output offsets in
 // mul_mat_vec_iquant_dp4a must be correct (the warp reduction is bit-deterministic, so a wrong
@@ -329,14 +336,15 @@ fn cuda_qmmq_iquant_prefill_matches_dequant() {
             return;
         }
     };
-    // The 5 i-quant types with an int8-WMMA MMQ kernel reading the standard codebook grids (IQ1_S/IQ1_M
-    // use a distinct GPU-packed grid / have no kernel -> dequant prefill, not tested here).
+    // The 6 i-quant types with an int8-WMMA MMQ kernel: the 5 IQ2/IQ3 codebook grids + IQ4_XS (LUT).
+    // IQ1_S/IQ1_M use a distinct GPU-packed grid / have no kernel -> dequant prefill, not tested here.
     for dtype in [
         GgmlDType::IQ2_XXS,
         GgmlDType::IQ2_XS,
         GgmlDType::IQ2_S,
         GgmlDType::IQ3_XXS,
         GgmlDType::IQ3_S,
+        GgmlDType::IQ4_XS,
     ] {
         for &m in &[16usize, 32] {
             let s = run_prefill(&dev, dtype, 512, 2048, m);

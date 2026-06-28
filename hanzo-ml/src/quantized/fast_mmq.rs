@@ -41,6 +41,7 @@ fn supports(dtype: GgmlDType) -> bool {
             | GgmlDType::IQ2_S
             | GgmlDType::IQ3_XXS
             | GgmlDType::IQ3_S
+            | GgmlDType::IQ4_XS
     )
 }
 
@@ -55,7 +56,8 @@ fn qk_for(dtype: GgmlDType) -> usize {
         | GgmlDType::IQ2_XS
         | GgmlDType::IQ2_S
         | GgmlDType::IQ3_XXS
-        | GgmlDType::IQ3_S => 256,
+        | GgmlDType::IQ3_S
+        | GgmlDType::IQ4_XS => 256,
         _ => unreachable!(),
     }
 }
@@ -82,7 +84,8 @@ fn ds_layout_for(dtype: GgmlDType) -> DsLayout {
         | GgmlDType::IQ2_XS
         | GgmlDType::IQ2_S
         | GgmlDType::IQ3_XXS
-        | GgmlDType::IQ3_S => DsLayout::D4,
+        | GgmlDType::IQ3_S
+        | GgmlDType::IQ4_XS => DsLayout::D4,
         _ => unreachable!(),
     }
 }
@@ -147,6 +150,7 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
         GgmlDType::IQ2_S => ffi::launch_mmq_gguf_iq2_s,
         GgmlDType::IQ3_XXS => ffi::launch_mmq_gguf_iq3_xxs,
         GgmlDType::IQ3_S => ffi::launch_mmq_gguf_iq3_s,
+        GgmlDType::IQ4_XS => ffi::launch_mmq_gguf_iq4_xs,
         _ => return None,
     };
     Some(f)
@@ -473,6 +477,7 @@ fn moe_mmq_launcher(dtype: GgmlDType) -> Option<MoeMmqLauncher> {
         GgmlDType::IQ2_S => ffi::launch_mmq_gguf_moe_iq2_s,
         GgmlDType::IQ3_XXS => ffi::launch_mmq_gguf_moe_iq3_xxs,
         GgmlDType::IQ3_S => ffi::launch_mmq_gguf_moe_iq3_s,
+        GgmlDType::IQ4_XS => ffi::launch_mmq_gguf_moe_iq4_xs,
         _ => return None,
     };
     Some(f)
