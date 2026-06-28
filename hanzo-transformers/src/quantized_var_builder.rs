@@ -18,11 +18,40 @@ pub struct VarBuilder {
 
 impl VarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
+        // Opt-in mmap weight streaming: reference weights in the page cache instead of
+        // materializing them resident, so a model larger than RAM runs (`HANZO_GGUF_MMAP=1`;
+        // `=0`/empty keeps the default resident path). See `VarBuilder::from_gguf_mmap`.
+        if std::env::var("HANZO_GGUF_MMAP")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
+            return Self::from_gguf_mmap(p, device);
+        }
         let mut file = std::fs::File::open(p)?;
         let content = hanzo_ml::quantized::gguf_file::Content::read(&mut file)?;
         let mut data = std::collections::HashMap::new();
         for tensor_name in content.tensor_infos.keys() {
             let tensor = content.tensor(&mut file, tensor_name, device)?;
+            data.insert(tensor_name.to_string(), Arc::new(tensor));
+        }
+        Ok(Self {
+            data: Arc::new(data),
+            path: Vec::new(),
+            device: device.clone(),
+        })
+    }
+
+    /// mmap-backed twin of [`VarBuilder::from_gguf`]: the GGUF stays memory-mapped and each weight
+    /// is referenced in place. On the CPU the quantized blocks are never copied resident -- the OS
+    /// demand-pages them from the file and reclaims them under pressure -- so a model whose weights
+    /// exceed free RAM loads and runs (antirez ds4_ssd, "RAM as a speed spectrum"). GPU backends
+    /// stage each weight into their own device buffer directly from the mapping (no resident Vec).
+    /// Explicit constructor for the `HANZO_GGUF_MMAP=1` toggle.
+    pub fn from_gguf_mmap<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
+        let (content, mmap) = hanzo_ml::quantized::gguf_file::Content::read_mmap(p)?;
+        let mut data = std::collections::HashMap::new();
+        for tensor_name in content.tensor_infos.keys() {
+            let tensor = content.tensor_mmap(&mmap, tensor_name, device)?;
             data.insert(tensor_name.to_string(), Arc::new(tensor));
         }
         Ok(Self {
