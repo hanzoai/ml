@@ -50,17 +50,25 @@ __device__ __forceinline__ void qstore(float* p, float v)         { *p = v; }
 template <int WTYPE> struct qdp4a;
 template <int WTYPE> struct qdp4a_traits;
 
-// ---- iq_bytemask4 + dp4a_signed + the 7 qdp4a<IQ*> decoders + traits ----
-__device__ __forceinline__ unsigned iq_bytemask4(unsigned sgn) {
-    const unsigned s = (sgn & 1u) | ((sgn & 2u) << 7) | ((sgn & 4u) << 14) | ((sgn & 8u) << 21);
-    return s * 0xFFu;
+// ---- unpack_ksigns + dp4a_signed + the 7 qdp4a<IQ*> decoders + traits ----
+// Table-free ksigns (llama.cpp parity trick): the 7-bit index carries 7 sign bits; the 8th is the
+// popcount-parity of those 7, so __popc reconstructs it -- NO divergent __constant__ gather. Returns
+// the 8 sign bits broadcast to all 4 bytes (== KSIGNS_IQ2XS_D[v & 127] broadcast), ready for the
+// dp4a_signed byte selectors below.
+__device__ __forceinline__ uint32_t unpack_ksigns(uint32_t v) {
+    v &= 127u;
+    return (v ^ ((uint32_t)(__popc(v) & 1) << 7)) * 0x01010101u;
 }
 
 // Signed-grid 4-wide int8 dot: sum_i (-1)^sgn_i * g_i * u_i for the 4 magnitude bytes packed in `grid`
-// (each in [0,127]) against the q8_1 int `u`, signs from the low 4 bits of `sgn`. dp4a-only (above).
-__device__ __forceinline__ int dp4a_signed(int grid, int u, unsigned sgn) {
-    const int gm = (int)((unsigned)grid & iq_bytemask4(sgn));
-    return hip_dp4a(grid, u, 0) - 2 * hip_dp4a(gm, u, 0);
+// (each in [0,127]) against the q8_1 int `u`. `b` is the 8 sign bits broadcast to every byte (from
+// unpack_ksigns, or raw_sign_byte * 0x01010101); `sel` selects which 4 map to these 4 grid bytes --
+// 0x08040201 for coords 0-3, 0x80402010 for coords 4-7. Negates each byte in place via CUDA-native
+// __vsub4 ((g ^ m) - m = -g where m = 0xFF) -> ONE dp4a. Replaces the 2-dp4a `dp4a(g,u) - 2*dp4a(g &
+// mask, u)` form the ROCm port needed for RDNA3.5 (no __vsub4); bit-identical. == llama vec_dot_iq2*.
+__device__ __forceinline__ int dp4a_signed(uint32_t b, uint32_t sel, int grid, int u) {
+    const int s = __vcmpne4(b & sel, 0);
+    return hip_dp4a(__vsub4(grid ^ s, s), u, 0);
 }
 
 // IQ2_XXS (SYM 2.06bpw). Mirrors qdec<DW_IQ2_XXS>: per sub-block e, db = d*(0.5+(aux32_1>>28))*0.25
@@ -81,9 +89,9 @@ template <> struct qdp4a<DW_IQ2_XXS> {
         for (int l = 0; l < 4; ++l) {
             const int gi = (int)((aux32_0 >> (8 * l)) & 0xFF);
             const uint64_t entry = IQ2XXS_GRID_D[gi];
-            const uint32_t signs = KSIGNS_IQ2XS_D[(aux32_1 >> (7 * l)) & 127];
-            idot += dp4a_signed((int)(uint32_t)entry, u[2 * l], signs & 0xF);
-            idot += dp4a_signed((int)(uint32_t)(entry >> 32), u[2 * l + 1], (signs >> 4) & 0xF);
+            const uint32_t signs = unpack_ksigns(aux32_1 >> (7 * l));
+            idot += dp4a_signed(signs, 0x08040201u, (int)(uint32_t)entry, u[2 * l]);
+            idot += dp4a_signed(signs, 0x80402010u, (int)(uint32_t)(entry >> 32), u[2 * l + 1]);
         }
         return db * d8 * (float)idot;
     }
@@ -114,9 +122,9 @@ template <> struct qdp4a<DW_IQ2_XS> {
         for (int l = 0; l < 4; ++l) {
             const uint16_t qv = qs[4 * e + l];
             const uint64_t entry = IQ2XS_GRID_D[qv & 511];
-            const uint32_t signs = KSIGNS_IQ2XS_D[qv >> 9];
-            const int part = dp4a_signed((int)(uint32_t)entry, u[2 * l], signs & 0xF)
-                           + dp4a_signed((int)(uint32_t)(entry >> 32), u[2 * l + 1], (signs >> 4) & 0xF);
+            const uint32_t signs = unpack_ksigns(qv >> 9);
+            const int part = dp4a_signed(signs, 0x08040201u, (int)(uint32_t)entry, u[2 * l])
+                           + dp4a_signed(signs, 0x80402010u, (int)(uint32_t)(entry >> 32), u[2 * l + 1]);
             if (l < 2) idot_lo += part; else idot_hi += part;
         }
         return d8 * (db_lo * (float)idot_lo + db_hi * (float)idot_hi);
@@ -149,9 +157,9 @@ template <> struct qdp4a<DW_IQ2_S> {
         for (int l = 0; l < 4; ++l) {
             const int idx = (int)qs[4 * e + l] | (((int)qh[e] << (8 - 2 * l)) & 0x300);
             const uint64_t entry = IQ2S_GRID_D[idx];
-            const uint32_t signs = qs[32 + 4 * e + l];
-            const int part = dp4a_signed((int)(uint32_t)entry, u[2 * l], signs & 0xF)
-                           + dp4a_signed((int)(uint32_t)(entry >> 32), u[2 * l + 1], (signs >> 4) & 0xF);
+            const uint32_t signs = (uint32_t)qs[32 + 4 * e + l] * 0x01010101u;
+            const int part = dp4a_signed(signs, 0x08040201u, (int)(uint32_t)entry, u[2 * l])
+                           + dp4a_signed(signs, 0x80402010u, (int)(uint32_t)(entry >> 32), u[2 * l + 1]);
             if (l < 2) idot_lo += part; else idot_hi += part;
         }
         return d8 * (db_lo * (float)idot_lo + db_hi * (float)idot_hi);
@@ -182,9 +190,9 @@ template <> struct qdp4a<DW_IQ3_XXS> {
         int idot = 0;
         #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint32_t signs = KSIGNS_IQ2XS_D[(aux32 >> (7 * l)) & 127];
-            idot += dp4a_signed((int)IQ3XXS_GRID_D[qs[8 * e + 2 * l]], u[2 * l], signs & 0xF);
-            idot += dp4a_signed((int)IQ3XXS_GRID_D[qs[8 * e + 2 * l + 1]], u[2 * l + 1], (signs >> 4) & 0xF);
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
+            idot += dp4a_signed(signs, 0x08040201u, (int)IQ3XXS_GRID_D[qs[8 * e + 2 * l]], u[2 * l]);
+            idot += dp4a_signed(signs, 0x80402010u, (int)IQ3XXS_GRID_D[qs[8 * e + 2 * l + 1]], u[2 * l + 1]);
         }
         return db * d8 * (float)idot;
     }
@@ -218,9 +226,9 @@ template <> struct qdp4a<DW_IQ3_S> {
         for (int l = 0; l < 4; ++l) {
             const int idx0 = (int)qs[8 * e + 2 * l] | (((int)qh[e] << (8 - 2 * l)) & 256);
             const int idx1 = (int)qs[8 * e + 2 * l + 1] | (((int)qh[e] << (7 - 2 * l)) & 256);
-            const uint32_t signs = signs_b[4 * e + l];
-            idot += dp4a_signed((int)IQ3S_GRID_D[idx0], u[2 * l], signs & 0xF);
-            idot += dp4a_signed((int)IQ3S_GRID_D[idx1], u[2 * l + 1], (signs >> 4) & 0xF);
+            const uint32_t signs = (uint32_t)signs_b[4 * e + l] * 0x01010101u;
+            idot += dp4a_signed(signs, 0x08040201u, (int)IQ3S_GRID_D[idx0], u[2 * l]);
+            idot += dp4a_signed(signs, 0x80402010u, (int)IQ3S_GRID_D[idx1], u[2 * l + 1]);
         }
         return db * d8 * (float)idot;
     }
