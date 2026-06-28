@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-ml"
-version = "0.11.25"
+version = "0.11.26"
 edition = "2021"
 description = "Fast multi-backend tensor & ML framework for Rust (CPU/CUDA/Metal/Vulkan/ROCm) with quantization — the compute core of the Hanzo stack."
 repository = "https://github.com/hanzoai/ml"
