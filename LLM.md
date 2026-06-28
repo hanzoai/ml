@@ -568,3 +568,18 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   a large K-chunk to f16 LDS ONCE, reuse across many MulAdds, double-buffered) -- a bigger uncertain
   kernel; the f16-decode cost is the wall, not the cores. Committed env-gated OFF as the documented L4
   negative (mirrors the 1D dead-end); the coopmat infra + harness is proven for the amortized follow-up.
+- L1 MAX-OUT sweep (the practical ceiling, measured): added a KERNEL-ISOLATED bench (`bench_matmul_q4k`:
+  upload x+wq once, loop the GPU GEMM, one final synchronize -> the real per-matmul kernel cost, vs the
+  host-wrapper bench whose per-iter 8MB upload+readback masked it). True kernel times (m=512,nout=k=4096,
+  17.2 GFLOP): legacy 38.5 / f32-2D 19.0 / dp4a 3.4 / coopmat 17.4-19 ms -> dp4a = 5056 GFLOP/s = ~34% of
+  the 8060S ~14.8 TFLOP f32 peak (~8.6% of int8 peak), 9x over the column kernel. TILE SWEEP pins the
+  bottleneck as OCCUPANCY, not VRAM/LDS-reads: register-blocking the inner dp4a (LDS->regs) = FLAT (the
+  compiler already did it / added VGPRs traded occupancy); BM=128 (half the weight re-read) = 3x SLOWER
+  (10.7ms, occupancy collapse / register spill); BM=32 (more occupancy) = 3.72ms (slightly slower, re-
+  read+barrier overhead). So 64x64 (4x4 sub-tile) is the OPTIMAL tile -- the shipped dp4a is already at
+  its sweet spot. The residual gap to f32-peak is the INHERENT Q4_K cost (the per-sub-block f32 scale
+  application acc+=d*xs*dot-m*xsum every K-step + the in-kernel decode + the q8_1 activation quant pass),
+  not a tiling defect; closing it needs a structurally different kernel (decode-amortized coopmat, the
+  one untried path -- my naive coopmat was decode-bound). CONCLUSION: dp4a-2D 64x64 (5056 GFLOP/s, 9x) is
+  the validated practical max for blind kernel-tuning on gfx1151; the last-mile to peak is the amortized-
+  coopmat follow-up (profiler-guided). The kernel-isolated bench (vulkan_q4k_kernel_bench) is the harness.
