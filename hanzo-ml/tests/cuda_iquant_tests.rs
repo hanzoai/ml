@@ -130,6 +130,57 @@ fn q8_1_roundtrip(x: &[f32]) -> Vec<f32> {
 // Run one (dtype, nout, k) case through the native CUDA decode and return error stats vs the CPU
 // `to_float` reference (over the q8_1-roundtripped activation). b_size = 1 (decode shape) so `fwd`
 // routes to `mul_mat_vec_iquant`.
+// --- kernel-level decode microbench (perf A/B; run: `cargo test ... -- --ignored bench_iquant_decode --nocapture`) ---
+// Times the native dp4a i-quant DECODE matvec (M=1 -> mul_mat_vec_iquant, the kernel measured at ~75%
+// of GB10 i-quant decode GPU-time). At 4096x4096 the call is GPU-time-dominated (~60us kernel >> ~5us
+// launch), so us/call isolates the sign-decode kernel A/B vs the prior 2-dp4a + KSIGNS-gather form.
+// IQ1_S/IQ4_XS are unchanged controls (their us/call must match baseline -> confirms thermal/harness
+// stability, isolating the changed-types delta). GB/s = actual quantized weight bytes / us.
+#[test]
+#[ignore]
+fn bench_iquant_decode() {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip bench: no CUDA device ({e})");
+            return;
+        }
+    };
+    let (nout, k) = (4096usize, 4096usize);
+    let (warm, iters) = (64usize, 3000usize);
+    println!("=== iquant decode microbench {nout}x{k}, {iters} iters (GB10) ===");
+    for &dtype in &[
+        GgmlDType::IQ2_XXS, // changed: ksigns
+        GgmlDType::IQ2_XS,  // changed: ksigns
+        GgmlDType::IQ2_S,   // changed: raw-byte signs
+        GgmlDType::IQ3_XXS, // changed: ksigns
+        GgmlDType::IQ3_S,   // changed: raw-byte signs
+        GgmlDType::IQ1_S,   // control: unchanged (pre-signed)
+        GgmlDType::IQ4_XS,  // control: unchanged (no signs)
+    ] {
+        let raw = synth(dtype, nout, k);
+        let wbytes = raw.len() as f64;
+        let qs = QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap();
+        let q = QTensor::new(qs, (nout, k)).unwrap();
+        let mm = QMatMul::from_qtensor(q).unwrap();
+        let xh: Vec<f32> = q8_1_roundtrip(&(0..k).map(|i| pseudo(i + 7)).collect::<Vec<_>>());
+        let x = Tensor::from_vec(xh, (1, k), &dev).unwrap();
+        for _ in 0..warm {
+            let _ = mm.forward(&x).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let y = mm.forward(&x).unwrap();
+            std::hint::black_box(y);
+        }
+        dev.synchronize().unwrap();
+        let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let gbps = wbytes / us / 1e3;
+        println!("BENCH {dtype:>8?} {nout}x{k}: {us:7.2} us/call  {gbps:6.1} GB/s");
+    }
+}
+
 fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::Result<Err> {
     let cpu = Device::Cpu;
     let raw = synth(dtype, nout, k);
