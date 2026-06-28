@@ -402,3 +402,41 @@ Two gaps closed on the CUDA path (GB10), both validated by `cuda_iquant_tests.rs
   -- the base-3 scalar unpack is the wall (compute-bound), exactly as the "fits-but-irregular" call
   predicted; TQ2_0's clean 2-bit dp4a is the real win. GOTCHA (unchanged): bindgen_cuda tracks .cu mtimes
   not .cuh -- a new mmq_instance_*.cu compiles fresh, but after a .cuh-only edit `touch` the dependents.
+
+## CUDA fused moe_route router -- ported + bit-exact, but a MEASURED NON-LEVER on GB10 (flat, NOT shipped)
+The ROCm `moe_route` fusion (+13-15% decode there) was ported to CUDA: ONE `moe_route` kernel (one
+block/token, shared-mem softmax over ALL experts -> parallel top-k by descending logit -> optional
+renorm) added to the QUANTIZED PTX module (`hanzo-kernels/src/quantized.cu`), a `cuda::moe_route`
+dispatch (`quantized/cuda.rs`, grid=ntok/block=64), and the `Device::Cuda` arm of `quantized::moe_route`
+(`quantized/mod.rs`) mirroring the ROCm arm and keeping the ml-op fallback. The kernel is backend-
+agnostic (shared-mem reductions only, NO warp intrinsics) so it is a VERBATIM port -- one source of truth
+for the routing math. `quantized_qwen3_moe.rs:56` already calls `quantized::moe_route`, so the
+Qwen3-30B-A3B GGUF model exercises the new CUDA arm directly (no model-side wiring needed).
+- CORRECT + bit-exact: `cuda_moe_route_numeric` (hanzo-ml `tests/cuda_iquant_tests.rs`) gates the kernel
+  vs the ml-op reference -- the SAME public `moe_route` run on a CPU tensor, where there is no fast path
+  so it executes the softmax->sort->narrow->sum->div chain. Across ntok 1..1024, experts 60..256 (== the
+  MAX_E=256 shared-mem bound), topk 4/8, norm on/off: expert-ids match EXACTLY (nbad_id=0) and weights to
+  worst max_w_err=5.96e-8 (f32 reduction-order only -- the kernel tree-sums Z, the CPU sums sequentially).
+  Coherent 30B output (768-token robot-painting story, no garble).
+- NON-LEVER (the honest finding): device-map-free interleaved A/B on Qwen3-30B-A3B-UD-IQ2_M (fused kernel
+  vs `HANZO_MOE_ROUTE_FALLBACK=1` ml-op chain), BOTH CUDA-graph regimes on GB10:
+    graphs-ON (default): kernel 34.25 vs fallback 34.37 T/s (mean of 4 runs) -- FLAT, kernel marginally LOWER
+    eager (CUDA_GRAPHS=0):  kernel 32.32 vs fallback 32.38 T/s (mean of 3 runs) -- FLAT
+  Both within +-3% thermal noise, NO consistent direction (kernel wins some rounds, fallback wins others).
+  UNLIKE the ROCm +13%, CUDA shows nothing.
+- WHY it is flat (restates the ROCm rule "a fusion helps ONLY if it ELIMINATES work, not if it repackages
+  it"): the router fusion REPACKAGES softmax+topk+norm into one block-serial launch, it does not ELIMINATE
+  the work. At decode ntok=1 the fused kernel runs ONE block (64 threads, 8 SERIAL top-k argmax rounds) --
+  it underutilizes the GPU exactly as the parallel ml-op sort/sum/div kernels do, so GPU TIME is ~equal.
+  And CUDA decode here is NOT router-launch-bound: graphs buy only ~6% over eager TOTAL, and the router is
+  a sliver of that, so collapsing 6-8 router launches -> 1 saves nothing measurable even eager. The ~5% the
+  nsys profile attributed to the router op-chain was tiny-kernel dispatch/exec that neither graphs nor
+  fusion recover into throughput -- NOT eliminable matvec-class GPU time. ROCm benefited because its
+  amdgcn gpu-sort (asort) kernel is disproportionately expensive vs CUDA's cheap sort, NOT because the
+  fusion is a universal lever.
+- DISPOSITION: validated commit kept on branch `wip/cuda-moe-route` (spark) / `perf/cuda-moe-route-fusion`,
+  UNMERGED + UNPUBLISHED. Deliberately NOT shipped: a flat kernel would add a SECOND CUDA routing path
+  (kernel + env-gated fallback) with no perf justification, violating "one way to do everything" -- the
+  ml-op chain already routes CUDA MoE correctly and completely. Code PRESERVED for a future re-test on a
+  256-expert model (DeepSeek-V4 = 2x the router math) where the fusion MIGHT clear the noise floor;
+  unmeasurable now (deepseek4 GGUF load is still WIP). To resurrect: the branch is the whole port.
