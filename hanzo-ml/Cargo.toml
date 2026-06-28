@@ -1,8 +1,8 @@
 [package]
 name = "hanzo-ml"
-version = "0.11.21"
+version = "0.11.22"
 edition = "2021"
-description = "Minimalist ML framework."
+description = "Fast multi-backend tensor & ML framework for Rust (CPU/CUDA/Metal/Vulkan/ROCm) with quantization — the compute core of the Hanzo stack."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
