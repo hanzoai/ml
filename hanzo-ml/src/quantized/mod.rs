@@ -4,6 +4,7 @@ use crate::{
 use iq_quants::*;
 use k_quants::*;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 #[cfg(target_feature = "avx2")]
 pub mod avx;
@@ -548,12 +549,54 @@ macro_rules! gen_type_size {
     };
 }
 
+macro_rules! gen_type_align {
+    ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
+        /// Alignment (bytes) required to reinterpret raw GGUF bytes as this dtype's block type.
+        /// The mmap loader uses it to decide whether a mapped region can be referenced no-copy
+        /// (`from_mmap`) or must fall back to an owned, naturally-aligned copy. Single source of
+        /// truth (generated from the `for_each_quant!` table), so it can't drift from `type_size`.
+        pub fn type_align(&self) -> usize {
+            use k_quants::*;
+            match self {
+                Self::F32 => std::mem::align_of::<f32>(),
+                Self::F16 | Self::BF16 => std::mem::align_of::<f16>(),
+                $( Self::$v => std::mem::align_of::<$b>(), )+
+            }
+        }
+    };
+}
+
+macro_rules! gen_from_mmap {
+    ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
+        /// No-copy CPU constructor: wrap a tensor's blocks *in place* inside the mmap'd GGUF region
+        /// (`QMmap`) instead of copying them into an owned `Vec` (the `to_vec` in `from_data`). The
+        /// returned store references the mapped pages directly, so the weight bytes stay on disk and
+        /// the OS pages them in/out under memory pressure. Mirrors `from_data` arm-for-arm so the
+        /// dtype -> block-type mapping can never disagree between the resident and mmap paths.
+        pub(crate) fn from_mmap(
+            &self,
+            mmap: Arc<memmap2::Mmap>,
+            offset: usize,
+            n_blocks: usize,
+        ) -> Box<dyn QuantizedType> {
+            match self {
+                Self::F32 => Box::new(QMmap::<f32>::new(mmap, offset, n_blocks)),
+                Self::F16 => Box::new(QMmap::<f16>::new(mmap, offset, n_blocks)),
+                Self::BF16 => Box::new(QMmap::<bf16>::new(mmap, offset, n_blocks)),
+                $( Self::$v => Box::new(QMmap::<$b>::new(mmap, offset, n_blocks)), )+
+            }
+        }
+    };
+}
+
 impl GgmlDType {
     for_each_quant!(gen_from_u32);
     for_each_quant!(gen_to_u32);
     for_each_quant!(gen_cpu_zeros);
     for_each_quant!(gen_from_data);
+    for_each_quant!(gen_from_mmap);
     for_each_quant!(gen_type_size);
+    for_each_quant!(gen_type_align);
 
     /// The block size, i.e. the number of elements stored in each block.
     pub fn block_size(&self) -> usize {
@@ -646,6 +689,92 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
 
     fn as_ptr(&self) -> *const u8 {
         self.as_ptr() as *const u8
+    }
+}
+
+/// A CPU quantized store whose blocks live in an mmap'd GGUF region rather than an owned `Vec`.
+///
+/// Holds an `Arc<memmap2::Mmap>` plus the byte offset and block count of one tensor inside it, and
+/// hands the dequant/matmul path a `&[T]` that points *directly* into the mapped file -- so the
+/// quantized weight bytes are never copied resident; the OS pages them in on access and reclaims
+/// them under memory pressure (page cache = "RAM as a speed spectrum", antirez ds4_ssd). The `Arc`
+/// keeps the mapping alive for as long as any tensor references it.
+///
+/// This is the no-copy twin of `QuantizedType for Vec<T>`: every method forwards the same
+/// `k_quants` routine over `self.as_slice()` instead of over a `Vec`. It is read-only -- the two
+/// `from_float*` (quantize) entry points are unreachable in the load path and panic if ever called
+/// (you cannot quantize *into* a memory-mapped, read-only weight file).
+pub struct QMmap<T> {
+    mmap: Arc<memmap2::Mmap>,
+    /// Byte offset of this tensor's first block within the mapping.
+    offset: usize,
+    /// Number of `T` blocks.
+    n_blocks: usize,
+    _t: std::marker::PhantomData<T>,
+}
+
+impl<T> QMmap<T> {
+    fn new(mmap: Arc<memmap2::Mmap>, offset: usize, n_blocks: usize) -> Self {
+        Self {
+            mmap,
+            offset,
+            n_blocks,
+            _t: std::marker::PhantomData,
+        }
+    }
+
+    /// The tensor's blocks as a slice into the live mapping. No copy: the pointer is inside the
+    /// mmap'd region, valid for as long as `self` (and thus the `Arc<Mmap>`) is alive. Alignment is
+    /// guaranteed by the caller (`TensorInfo::read_mmap` falls back to an owned copy for the rare
+    /// misaligned region); `as_t_slice`'s asserts are the in-place safety net.
+    #[inline]
+    fn as_slice(&self) -> &[T] {
+        let len = self.n_blocks * std::mem::size_of::<T>();
+        as_t_slice::<T>(&self.mmap[self.offset..self.offset + len])
+    }
+}
+
+impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for QMmap<T> {
+    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+        k_quants::matmul(mkn, lhs, self.as_slice(), dst)
+    }
+
+    fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
+        k_quants::matmul_f16(mkn, lhs, self.as_slice(), dst)
+    }
+
+    fn size(&self) -> usize {
+        self.n_blocks * std::mem::size_of::<T>()
+    }
+
+    fn from_float(&mut self, _xs: &[f32]) {
+        panic!("QMmap is read-only: cannot quantize into a memory-mapped weight region")
+    }
+
+    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
+        panic!("QMmap is read-only: cannot quantize into a memory-mapped weight region")
+    }
+
+    fn dtype(&self) -> GgmlDType {
+        T::DTYPE
+    }
+
+    fn block_size(&self) -> usize {
+        T::BLCK_SIZE
+    }
+
+    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
+        let mut ys = vec![0.0f32; elem_count];
+        T::to_float(self.as_slice(), &mut ys);
+        Ok(CpuStorage::F32(ys))
+    }
+
+    fn storage_size_in_bytes(&self) -> usize {
+        self.n_blocks * std::mem::size_of::<T>()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.as_slice().as_ptr() as *const u8
     }
 }
 
