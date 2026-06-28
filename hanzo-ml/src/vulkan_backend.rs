@@ -58,6 +58,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mm_q4k_shared" => spv!("mul_mm_q4k_shared"),
         "mul_mm_q4k_tiled" => spv!("mul_mm_q4k_tiled"),
         "mul_mm_q4k_tiled_dp4a" => spv!("mul_mm_q4k_tiled_dp4a"),
+        "mul_mm_q4k_coopmat" => spv!("mul_mm_q4k_coopmat"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
         "mul_mat_q6k" => spv!("mul_mat_q6k"),
@@ -1052,6 +1053,24 @@ impl VulkanDevice {
         let force_dp4a = std::env::var_os("HANZO_VK_Q4K_DP4A").is_some();
         let force_2d = std::env::var_os("HANZO_VK_Q4K_TILED2D").is_some();
         let force_1d = std::env::var_os("HANZO_VK_Q4K_TILED").is_some();
+        // L4 coopmat (tensor cores) -- decode Q4_K weight to f16 LDS tiles + coopMatMulAdd, the
+        // llama-parity path. Env-forced + requires device coopmat; off by default until benched faster
+        // than dp4a on this device (gfx1151 coopmat has had flakiness). woff==0 dense only.
+        if !legacy
+            && self.inner.coopmat
+            && woff == 0
+            && m > 1
+            && std::env::var_os("HANZO_VK_Q4K_COOPMAT").is_some()
+        {
+            let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mm_q4k_coopmat",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
+            )?;
+            return Ok(out);
+        }
         let dense_default = !legacy && woff == 0 && m > 1;
         let use_dp4a = !legacy
             && (force_dp4a || (dense_default && self.inner.int_dot8 && !force_2d && !force_1d));
