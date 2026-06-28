@@ -1061,9 +1061,9 @@ impl QCudaStorage {
                     // DECODE: native dp4a mmvq.
                     return self.mul_mat_vec_iquant(self_shape, storage, layout);
                 }
-                // PREFILL: native int8-WMMA MMQ GEMM (qmmq) for the 6 i-quants with an MMQ kernel
-                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S). IQ1_M (no MMQ kernel) + any unsupported shape
-                // return None and fall through to the dequant dense matmul.
+                // PREFILL: native int8-WMMA MMQ GEMM (qmmq) for the 7 i-quants with an MMQ kernel
+                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS, IQ1_S). IQ1_M (no MMQ kernel) + any unsupported
+                // shape return None and fall through to the dequant dense matmul.
                 if let Some(out) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
                     return Ok(out);
                 }
