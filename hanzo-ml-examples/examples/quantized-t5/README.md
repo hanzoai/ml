@@ -26,11 +26,11 @@ $ cargo run --bin tensor-tools --release -- quantize --quantization q6k PATH/TO/
 
 To use a different model, specify the `model-id`.
 
-For example, for text editing, you can use quantized [CoEdit models](https://huggingface.co/jbochi/hanzo-ml-coedit-quantized).
+For example, for text editing, you can use quantized [CoEdit models](https://huggingface.co/jbochi/candle-coedit-quantized).
 
 ```bash
 $ cargo run --example quantized-t5 --release  -- \
-  --model-id "jbochi/hanzo-ml-coedit-quantized" \
+  --model-id "jbochi/candle-coedit-quantized" \
   --prompt "Make this text coherent: Their flight is weak. They run quickly through the tree canopy." \
   --temperature 0
 ...
@@ -42,7 +42,7 @@ custom local or remote `weight-file` and `config-file`s:
 
 ```bash
 cargo run --example quantized-t5 --release  -- \
-  --model-id "jbochi/hanzo-ml-coedit-quantized" \
+  --model-id "jbochi/candle-coedit-quantized" \
   --weight-file "model-xl.gguf" \
   --config-file "config-xl.json" \
   --prompt "Rewrite to make this easier to understand: Note that a storm surge is what forecasters consider a hurricane's most treacherous aspect." \

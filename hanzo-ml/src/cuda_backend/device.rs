@@ -1,14 +1,15 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use cudarc;
-use cudarc::driver::CudaFunction;
+use cudarc::driver::{result as cuda_result, sys as cuda_sys, CudaFunction, DevicePtr, UnifiedSlice};
 use float8::F8E4M3;
 use half::{bf16, f16};
 pub use hanzo_kernels as kernels;
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
 
@@ -394,6 +395,274 @@ impl CudaDevice {
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified / managed memory (CUDA UMA path for GB10-class coherent devices).
+//
+// A discrete GPU keeps model state in host RAM *and* a separate VRAM copy; on a
+// physically unified device (e.g. GB10 DGX Spark, 128 GiB coherent memory) that
+// double-counting caps everything >= ~80 GiB. This section adds, additively:
+//   * detection of the unified / managed capability (mirrors the ROCm APU
+//     `RocmDevice::is_integrated()` precedent),
+//   * a size-gated `cuMemAllocManaged`-backed allocation path (cudarc's
+//     `UnifiedSlice`, which frees with the correct `cuMemFree` — a managed
+//     pointer wrapped in a device-malloc `CudaSlice` would be freed with the
+//     invalid `cuMemFreeAsync`), and
+//   * `cuMemAdvise` / `cuMemPrefetchAsync` (v2) hint helpers, usable on managed
+//     buffers *and* on an mmap'd weight region (the HMM-direct loader seam).
+//
+// Discrete behaviour is unchanged: a non-unified device reports `is_unified() ==
+// false`, `should_use_managed()` returns false, and the managed entry points are
+// simply never called.
+//
+// Toolkit pinning: the v2 advise/prefetch entry points require CUDA >= 12.2, and
+// the `CUmemLocation { type_, id }` literal matches the cudarc binding layout for
+// CUDA < 13.2. The stack targets CUDA 13.0; on 13.2 (cudarc feature
+// `cuda-13020`) the `id` field moves into an anonymous union and this section
+// needs a one-line cfg.
+// ---------------------------------------------------------------------------
+
+/// Default managed-allocation size gate: a buffer at least this large on a
+/// unified device is backed by `cuMemAllocManaged` instead of device-malloc.
+/// Mirrors the ds4 reference's ">= 8 GiB KV" rule. Override (bytes) with
+/// `HANZO_ML_CUDA_UMA_THRESHOLD`.
+const DEFAULT_UMA_THRESHOLD_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+/// Process-wide managed-allocation threshold, read once from the environment.
+fn uma_threshold_bytes() -> usize {
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("HANZO_ML_CUDA_UMA_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_UMA_THRESHOLD_BYTES)
+    })
+}
+
+/// Pure managed-allocation policy: managed memory is chosen only on a unified
+/// device that supports it, for buffers at or above the threshold. Factored out
+/// so the decision is testable without a GPU.
+fn want_managed(
+    is_unified: bool,
+    supports_managed: bool,
+    num_bytes: usize,
+    threshold: usize,
+) -> bool {
+    is_unified && supports_managed && num_bytes >= threshold
+}
+
+impl CudaDevice {
+    fn device_attr(&self, attr: cuda_sys::CUdevice_attribute) -> i32 {
+        // Fail safe: an unreadable attribute reads as 0 ("not supported"), which
+        // keeps the device on the conservative discrete-GPU path.
+        self.context.attribute(attr).unwrap_or(0)
+    }
+
+    /// True when the device can coherently access pageable host memory
+    /// (`cudaDevAttrPageableMemoryAccess`) — i.e. a physically unified / HMM
+    /// device such as GB10. This is the signal that the managed and HMM-direct
+    /// paths are worthwhile; a discrete GPU returns false and stays on
+    /// device-malloc.
+    pub fn is_unified(&self) -> bool {
+        self.device_attr(cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS)
+            != 0
+    }
+
+    /// True for an integrated GPU that shares physical RAM with the CPU
+    /// (`cudaDevAttrIntegrated`). Mirrors `RocmDevice::is_integrated()`.
+    pub fn is_integrated(&self) -> bool {
+        self.device_attr(cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED) != 0
+    }
+
+    /// True when the device supports `cuMemAllocManaged`
+    /// (`cudaDevAttrManagedMemory`).
+    pub fn supports_managed_memory(&self) -> bool {
+        self.device_attr(cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY) != 0
+    }
+
+    /// True when the device may access managed memory concurrently with the host
+    /// (`cudaDevAttrConcurrentManagedAccess`); required for device prefetch.
+    pub fn concurrent_managed_access(&self) -> bool {
+        self.device_attr(
+            cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS,
+        ) != 0
+    }
+
+    /// The managed-allocation size gate in bytes (see `HANZO_ML_CUDA_UMA_THRESHOLD`).
+    pub fn unified_alloc_threshold(&self) -> usize {
+        uma_threshold_bytes()
+    }
+
+    /// Whether a buffer of `num_bytes` should be backed by managed memory on this
+    /// device. The single source of truth for the discrete-vs-managed decision;
+    /// the loader / storage layer calls this and routes large, long-lived buffers
+    /// to [`Self::alloc_unified`].
+    pub fn should_use_managed(&self, num_bytes: usize) -> bool {
+        want_managed(
+            self.is_unified(),
+            self.supports_managed_memory(),
+            num_bytes,
+            uma_threshold_bytes(),
+        )
+    }
+
+    /// Allocate an uninitialised managed (`cuMemAllocManaged`) buffer attached
+    /// globally, so any stream and the host may access it. It is freed with the
+    /// correct `cuMemFree` via `UnifiedSlice`'s drop.
+    ///
+    /// # Safety
+    /// The memory is returned uninitialised; it must be written before it is read
+    /// (same contract as the device-malloc [`Self::alloc`]).
+    pub unsafe fn alloc_unified<T: cudarc::driver::DeviceRepr>(
+        &self,
+        len: usize,
+    ) -> Result<UnifiedSlice<T>> {
+        unsafe { self.context.alloc_unified::<T>(len, true) }.w()
+    }
+
+    /// Allocate a zeroed managed buffer. The fill runs on the host view of the
+    /// coherent buffer, matching the device-malloc `alloc_zeros` result.
+    pub fn alloc_unified_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+        &self,
+        len: usize,
+    ) -> Result<UnifiedSlice<T>> {
+        // SAFETY: written immediately below before any read.
+        let mut buf = unsafe { self.alloc_unified::<T>(len) }?;
+        {
+            let host = buf.as_mut_slice().w()?;
+            let num_bytes = std::mem::size_of_val(host);
+            // SAFETY: the all-zero byte pattern is valid for `T: ValidAsZeroBits`,
+            // and `num_bytes` is exactly this buffer's extent.
+            unsafe { std::ptr::write_bytes(host.as_mut_ptr().cast::<u8>(), 0u8, num_bytes) };
+        }
+        Ok(buf)
+    }
+
+    fn unified_location(&self, to_device: bool) -> cuda_sys::CUmemLocation {
+        if to_device {
+            cuda_sys::CUmemLocation {
+                type_: cuda_sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+                id: self.context.ordinal() as i32,
+            }
+        } else {
+            cuda_sys::CUmemLocation {
+                type_: cuda_sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_HOST,
+                id: 0,
+            }
+        }
+    }
+
+    fn mem_advise_raw(
+        &self,
+        dptr: cuda_sys::CUdeviceptr,
+        num_bytes: usize,
+        advice: cuda_sys::CUmem_advise,
+        to_device: bool,
+    ) -> Result<()> {
+        let location = self.unified_location(to_device);
+        // SAFETY: the caller guarantees `dptr`/`num_bytes` cover a single managed
+        // or HMM-accessible range; `cuMemAdvise` only sets migration hints.
+        unsafe { cuda_result::mem_advise(dptr, num_bytes, advice, location) }.w()
+    }
+
+    fn mem_prefetch_raw(
+        &self,
+        dptr: cuda_sys::CUdeviceptr,
+        num_bytes: usize,
+        to_device: bool,
+    ) -> Result<()> {
+        let location = self.unified_location(to_device);
+        // SAFETY: as `mem_advise_raw`; prefetch is a stream-ordered migration.
+        unsafe {
+            cuda_result::mem_prefetch_async(dptr, num_bytes, location, self.stream.cu_stream())
+        }
+        .w()
+    }
+
+    /// Hint that a managed buffer is read-mostly (duplicate-on-read, cheap GPU
+    /// reads) — the correct advice for read-only model weights.
+    pub fn advise_read_mostly<T>(&self, buf: &UnifiedSlice<T>) -> Result<()> {
+        let (dptr, _guard) = buf.device_ptr(&self.stream);
+        self.mem_advise_raw(
+            dptr,
+            buf.num_bytes(),
+            cuda_sys::CUmem_advise::CU_MEM_ADVISE_SET_READ_MOSTLY,
+            true,
+        )
+    }
+
+    /// Hint that a managed buffer's preferred residency is this device — keeps
+    /// hot, write-heavy state (e.g. the KV cache) from migrating back to host.
+    pub fn advise_preferred_location_device<T>(&self, buf: &UnifiedSlice<T>) -> Result<()> {
+        let (dptr, _guard) = buf.device_ptr(&self.stream);
+        self.mem_advise_raw(
+            dptr,
+            buf.num_bytes(),
+            cuda_sys::CUmem_advise::CU_MEM_ADVISE_SET_PREFERRED_LOCATION,
+            true,
+        )
+    }
+
+    /// Hint that this device accesses a managed buffer, establishing a direct
+    /// mapping so reads resolve over the coherent link without faulting.
+    pub fn advise_accessed_by_device<T>(&self, buf: &UnifiedSlice<T>) -> Result<()> {
+        let (dptr, _guard) = buf.device_ptr(&self.stream);
+        self.mem_advise_raw(
+            dptr,
+            buf.num_bytes(),
+            cuda_sys::CUmem_advise::CU_MEM_ADVISE_SET_ACCESSED_BY,
+            true,
+        )
+    }
+
+    /// Stream-ordered prefetch of a managed buffer onto this device. Requires
+    /// `concurrent_managed_access()`; otherwise CUDA returns an error.
+    pub fn prefetch_to_device<T>(&self, buf: &UnifiedSlice<T>) -> Result<()> {
+        let (dptr, _guard) = buf.device_ptr(&self.stream);
+        self.mem_prefetch_raw(dptr, buf.num_bytes(), true)
+    }
+
+    /// Stream-ordered prefetch of a managed buffer back to host memory.
+    pub fn prefetch_to_host<T>(&self, buf: &UnifiedSlice<T>) -> Result<()> {
+        let (dptr, _guard) = buf.device_ptr(&self.stream);
+        self.mem_prefetch_raw(dptr, buf.num_bytes(), false)
+    }
+
+    /// HMM-direct loader seam: advise an mmap'd (pageable) weight region as
+    /// read-mostly so the GPU reads it in place over the coherent link, with no
+    /// host-to-device copy. Meaningful only on a unified device (`is_unified()`).
+    ///
+    /// # Safety
+    /// `ptr`/`num_bytes` must describe a single, currently-mapped host range
+    /// (e.g. an mmap'd safetensors region) that outlives the GPU work using it.
+    pub unsafe fn advise_hmm_read_mostly(
+        &self,
+        ptr: *const c_void,
+        num_bytes: usize,
+    ) -> Result<()> {
+        self.mem_advise_raw(
+            ptr as cuda_sys::CUdeviceptr,
+            num_bytes,
+            cuda_sys::CUmem_advise::CU_MEM_ADVISE_SET_READ_MOSTLY,
+            true,
+        )
+    }
+
+    /// HMM-direct loader seam: prefetch an mmap'd (pageable) weight region onto
+    /// this device. Meaningful only on a unified device with concurrent managed
+    /// access.
+    ///
+    /// # Safety
+    /// As [`Self::advise_hmm_read_mostly`].
+    pub unsafe fn prefetch_hmm_to_device(
+        &self,
+        ptr: *const c_void,
+        num_bytes: usize,
+    ) -> Result<()> {
+        self.mem_prefetch_raw(ptr as cuda_sys::CUdeviceptr, num_bytes, true)
     }
 }
 
@@ -818,5 +1087,75 @@ impl BackendDevice for CudaDevice {
     fn synchronize(&self) -> Result<()> {
         self.stream.synchronize().map_err(crate::Error::wrap)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod uma_tests {
+    use super::*;
+
+    // Pure managed-allocation policy — runs without a GPU.
+    #[test]
+    fn want_managed_policy() {
+        let t = DEFAULT_UMA_THRESHOLD_BYTES;
+        // Discrete device: never managed, regardless of size.
+        assert!(!want_managed(false, true, t, t));
+        // Unified but no managed support: never.
+        assert!(!want_managed(true, false, t, t));
+        // Unified + managed, below the gate: stay on device-malloc.
+        assert!(!want_managed(true, true, t - 1, t));
+        // Unified + managed, at / above the gate: use managed memory.
+        assert!(want_managed(true, true, t, t));
+        assert!(want_managed(true, true, t + 1, t));
+    }
+
+    // Detection + managed alloc/advise/prefetch roundtrip on real hardware.
+    // Skips cleanly when no CUDA device (or no managed support) is present.
+    #[test]
+    fn unified_alloc_roundtrip_and_hints() {
+        let dev = match CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => return, // no device in this environment
+        };
+
+        // Detection must never panic.
+        let unified = dev.is_unified();
+        let integrated = dev.is_integrated();
+        let managed = dev.supports_managed_memory();
+        let concurrent = dev.concurrent_managed_access();
+        eprintln!(
+            "cuda uma: unified={unified} integrated={integrated} managed={managed} \
+             concurrent={concurrent} threshold={}",
+            dev.unified_alloc_threshold()
+        );
+
+        if !managed {
+            return; // device cannot allocate managed memory
+        }
+
+        let n = 4096usize;
+        // SAFETY: written before any read, below.
+        let mut buf = unsafe { dev.alloc_unified::<f32>(n) }.unwrap();
+        for (i, x) in buf.as_mut_slice().unwrap().iter_mut().enumerate() {
+            *x = i as f32;
+        }
+
+        // Exercise the v2 advise/prefetch hint path on the live device.
+        dev.advise_read_mostly(&buf).unwrap();
+        dev.advise_preferred_location_device(&buf).unwrap();
+        dev.advise_accessed_by_device(&buf).unwrap();
+        if concurrent {
+            dev.prefetch_to_device(&buf).unwrap();
+        }
+        dev.synchronize().unwrap();
+
+        // Read back through the coherent host view: same values.
+        for (i, &x) in buf.as_slice().unwrap().iter().enumerate() {
+            assert_eq!(x, i as f32);
+        }
+
+        // Zeroed managed allocation.
+        let zeros = dev.alloc_unified_zeros::<f32>(n).unwrap();
+        assert!(zeros.as_slice().unwrap().iter().all(|&x| x == 0.0));
     }
 }

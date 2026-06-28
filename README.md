@@ -1,16 +1,16 @@
 # Hanzo ML
-[![Latest version](https://img.shields.io/crates/v/hanzo-ml.svg)](https://crates.io/crates/hanzo-ml)
-[![Documentation](https://docs.rs/hanzo-ml/badge.svg)](https://docs.rs/hanzo-ml)
-[![License](https://img.shields.io/github/license/hanzoai/ml?color=blue)](https://github.com/hanzoai/ml/blob/main/LICENSE-MIT)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/hanzoai/ml/blob/main/LICENSE-APACHE)
+[![crates.io](https://img.shields.io/crates/v/hanzo-ml.svg?style=flat-square&color=black)](https://crates.io/crates/hanzo-ml)
+[![docs.rs](https://img.shields.io/docsrs/hanzo-ml?style=flat-square&color=black)](https://docs.rs/hanzo-ml)
+[![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-black?style=flat-square)](https://github.com/hanzoai/ml)
 
-Hanzo ML is a minimalist ML framework for Rust with a focus on performance (including GPU support) 
-and ease of use. Based on Hanzo from Hugging Face, Hanzo ML provides optimizations for Edge AI, 
-quantization, and multimodal workloads.
+Hanzo ML is a fast, multi-backend tensor and machine-learning framework for Rust with a focus on
+performance (GPU-accelerated) and ease of use — the compute substrate behind [Hanzo](https://hanzo.ai)
+inference. Derived from `candle` and rebuilt for the Hanzo stack, it adds optimizations for Edge AI,
+quantization, multimodal workloads, and NVIDIA GB10 / DGX Spark unified memory.
 
 ## Key Features
 
-- **High Performance**: GPU acceleration via CUDA, Metal (Apple Silicon), ROCm (AMD RDNA3.5 APUs), Vulkan, and CPU optimizations
+- **High Performance**: GPU acceleration via CUDA (incl. unified/managed memory for NVIDIA GB10 / DGX Spark), Metal (Apple Silicon), ROCm (AMD RDNA3.5 APUs), Vulkan, and CPU optimizations
 - **Edge AI Optimized**: Quantization support (GGUF, GGML, AFQ, GPTQ, AWQ). On AMD `gfx1151` the full GGUF quant zoo (22 types: Q/K, legacy, IQ1-4, TQ) decodes resident + bit-exact through one unified compute core -- prefill beats llama.cpp (1.1-1.26x), decode at HIP parity.
 - **Multimodal**: Text, vision, audio, and 3D model support
 - **WebAssembly**: Run models in the browser with WASM support
@@ -19,7 +19,7 @@ quantization, and multimodal workloads.
 
 ## Get started
 
-Make sure that you have [`hanzo-ml`](https://github.com/huggingface/hanzo/tree/main/hanzo-ml) correctly installed as described in [**Installation**](https://huggingface.github.io/hanzo/guide/installation.html).
+Make sure that you have [`hanzo-ml`](https://github.com/hanzoai/ml/tree/main/hanzo-ml) correctly installed as described in the [installation guide](https://github.com/hanzoai/ml/blob/main/hanzo-ml-book/src/guide/installation.md).
 
 Let's see how to run a simple matrix multiplication.
 Write the following to your `myapp/src/main.rs` file:
@@ -52,15 +52,14 @@ For more advanced examples, please have a look at the following section.
 
 ## Check out our examples
 
-These online demos run entirely in your browser:
-- [yolo](https://huggingface.co/spaces/lmz/hanzo-ml-yolo): pose estimation and
-  object recognition.
-- [whisper](https://huggingface.co/spaces/lmz/hanzo-ml-whisper): speech recognition.
-- [LLaMA2](https://huggingface.co/spaces/lmz/hanzo-ml-llama2): text generation.
-- [T5](https://huggingface.co/spaces/radames/ML-T5-Generation-Wasm): text generation.
-- [Phi-1.5, and Phi-2](https://huggingface.co/spaces/radames/ML-Phi-1.5-Wasm): text generation.
-- [Segment Anything Model](https://huggingface.co/spaces/radames/hanzo-ml-segment-anything-wasm): Image segmentation.
-- [BLIP](https://huggingface.co/spaces/radames/ML-BLIP-Image-Captioning): image captioning.
+Browser (WASM) examples — build and run locally from [`hanzo-ml-wasm-examples`](https://github.com/hanzoai/ml/tree/main/hanzo-ml-wasm-examples):
+- **yolo**: pose estimation and object recognition.
+- **whisper**: speech recognition.
+- **llama2.c**: text generation.
+- **T5**: text generation.
+- **Phi-1.5 / Phi-2**: text generation.
+- **Segment Anything Model**: image segmentation.
+- **BLIP**: image captioning.
 
 We also provide some command line based examples using state of the art models:
 
@@ -96,27 +95,27 @@ We also provide some command line based examples using state of the art models:
   the LLaMA model using the same quantization techniques as
   [llama.cpp](https://github.com/ggerganov/llama.cpp).
 
-<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/quantized/assets/aoc.gif" width="600">
+<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/quantized/assets/aoc.gif" width="600">
   
 - [Stable Diffusion](./hanzo-ml-examples/examples/stable-diffusion/): text to
   image generative model, support for the 1.5, 2.1, SDXL 1.0 and Turbo versions.
 
-<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg" width="200">
+<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg" width="200">
 
 - [Wuerstchen](./hanzo-ml-examples/examples/wuerstchen/): another text to
   image generative model.
 
-<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/wuerstchen/assets/cat.jpg" width="200">
+<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/wuerstchen/assets/cat.jpg" width="200">
 
 - [yolo-v3](./hanzo-ml-examples/examples/yolo-v3/) and
   [yolo-v8](./hanzo-ml-examples/examples/yolo-v8/): object detection and pose
   estimation models.
 
-<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.od.jpg" width="200"><img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.pose.jpg" width="200">
+<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.od.jpg" width="200"><img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.pose.jpg" width="200">
 - [segment-anything](./hanzo-ml-examples/examples/segment-anything/): image
   segmentation model with prompt.
 
-<img src="https://github.com/huggingface/hanzo/raw/main/hanzo-ml-examples/examples/segment-anything/assets/sam_merged.jpg" width="200">
+<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/segment-anything/assets/sam_merged.jpg" width="200">
 
 - [SegFormer](./hanzo-ml-examples/examples/segformer/): transformer based semantic segmentation model.
 - [Whisper](./hanzo-ml-examples/examples/whisper/): speech recognition model.
@@ -153,20 +152,16 @@ In order to use **CUDA** add `--features cuda` to the example command line. If
 you have cuDNN installed, use `--features cudnn` for even more speedups.
 
 There are also some wasm examples for whisper and
-[llama2.c](https://github.com/karpathy/llama2.c). You can either build them with
-`trunk` or try them online:
-[whisper](https://huggingface.co/spaces/lmz/hanzo-ml-whisper),
-[llama2](https://huggingface.co/spaces/lmz/hanzo-ml-llama2),
-[T5](https://huggingface.co/spaces/radames/ML-T5-Generation-Wasm),
-[Phi-1.5, and Phi-2](https://huggingface.co/spaces/radames/ML-Phi-1.5-Wasm),
-[Segment Anything Model](https://huggingface.co/spaces/radames/hanzo-ml-segment-anything-wasm).
+[llama2.c](https://github.com/karpathy/llama2.c). Build and run them locally with
+`trunk` from [`hanzo-ml-wasm-examples`](https://github.com/hanzoai/ml/tree/main/hanzo-ml-wasm-examples)
+(whisper, llama2.c, T5, Phi-1.5 / Phi-2, Segment Anything Model).
 
 For LLaMA2, run the following command to retrieve the weight files and start a
 test server:
 ```bash
 cd hanzo-ml-wasm-examples/llama2-c
-wget https://huggingface.co/spaces/lmz/hanzo-ml-llama2/resolve/main/model.bin
-wget https://huggingface.co/spaces/lmz/hanzo-ml-llama2/resolve/main/tokenizer.json
+# Tiny Llama-2 weights from Andrej Karpathy's tinyllamas (see the example README for tokenizer.json):
+wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin -O model.bin
 trunk serve --release --port 8081
 ```
 And then head over to
@@ -204,7 +199,7 @@ If you have an addition to this list, please submit a pull request.
 
 - Simple syntax, looks and feels like PyTorch.
     - Model training.
-    - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/huggingface/hanzo/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/hanzo-flash-attn/src/lib.rs#L152).
+    - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/hanzoai/ml/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/hanzo-flash-attn/src/lib.rs#L152).
 - Backends.
     - Optimized CPU backend with optional MKL support for x86 and Accelerate for macs.
     - CUDA backend for efficiently running on GPUs, multiple GPU distribution via NCCL.
@@ -366,7 +361,7 @@ This is likely because you're not permissioned for the LLaMA-v2 model. To fix
 this, you have to register on the huggingface-hub, accept the [LLaMA-v2 model
 conditions](https://huggingface.co/meta-llama/Llama-2-7b-hf), and set up your
 authentication token. See issue
-[#350](https://github.com/huggingface/hanzo/issues/350) for more details.
+[#350](https://github.com/hanzoai/ml/issues/350) for more details.
 
 #### Missing cute/cutlass headers when compiling flash-attn
 

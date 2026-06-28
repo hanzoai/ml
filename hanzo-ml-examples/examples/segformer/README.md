@@ -24,7 +24,7 @@ classification logits [3.275261e-5, 0.0008562019, 0.0008868563, 0.9977506, 0.000
 label: hamburger
 ```
 
-[pr]: https://github.com/huggingface/hanzo/pull/1617
+[pr]: https://github.com/hanzoai/ml/pull/1617
 [segformer]: https://huggingface.co/docs/transformers/model_doc/segformer
 [encoder]: https://huggingface.co/nvidia/mit-b0
 [ade512]: https://huggingface.co/nvidia/segformer-b0-finetuned-ade-512-512

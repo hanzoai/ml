@@ -128,17 +128,17 @@ fn main() -> Result<()> {
 ```
 
 Now it works, it is a great way to create your own layers.
-But most of the classical layers are already implemented in [hanzo-nn](https://github.com/huggingface/hanzo/tree/main/hanzo-nn).
+But most of the classical layers are already implemented in [hanzo-nn](https://github.com/hanzoai/ml/tree/main/hanzo-nn).
 
 ## Using `hanzo_nn`.
 
-For instance [Linear](https://github.com/huggingface/hanzo/blob/main/hanzo-nn/src/linear.rs) is already there.
+For instance [Linear](https://github.com/hanzoai/ml/blob/main/hanzo-nn/src/linear.rs) is already there.
 This Linear is coded with PyTorch layout in mind, to reuse better existing models out there, so it uses the transpose of the weights and not the weights directly.
 
 So instead we can simplify our example:
 
 ```bash
-cargo add --git https://github.com/huggingface/hanzo.git hanzo-nn
+cargo add --git https://github.com/hanzoai/ml.git hanzo-nn
 ```
 
 And rewrite our examples using it
