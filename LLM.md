@@ -450,7 +450,7 @@ artifacts, BOTH fixed bit-identically to match llama -- and the A/B isolates whi
   i-quant kernel 2.27x -- a different platform/bottleneck). NOTE: corrects this section's earlier
   "compute-bound, kernel wins fully surface" framing, which held on ROCm-eager but NOT GB10-under-graphs.
 
-## CUDA fused moe_route router -- ported + bit-exact, but a MEASURED NON-LEVER on GB10 (NOT shipped)
+## CUDA fused moe_route router -- bit-exact, a GB10 model-level NON-LEVER but SHIPPED for backend symmetry
 Ported the ROCm `moe_route` fusion (softmax->topk->renorm, one block/token) to CUDA + a bit-exact gate
 (`cuda_moe_route_numeric`, nbad_id=0, max_w_err 5.96e-8) -- but the decode A/B on Qwen3-30B-A3B-UD-IQ2_M
 is FLAT both graph regimes (graphs-ON 34.25 vs 34.37, eager 32.32 vs 32.38; +-3% noise, no direction).
@@ -458,5 +458,10 @@ WHY (the ROCm rule "a fusion helps only if it ELIMINATES work"): the fusion REPA
 one block-serial launch, it doesn't eliminate it -- at decode ntok=1 the single 64-thread block
 underutilizes the GPU exactly as the parallel ml-op sort/sum/div do, and CUDA decode is not router-
 launch-bound (graphs buy ~6% total). ROCm's +13% came from its disproportionately expensive amdgcn
-gpu-sort, which CUDA lacks. NOT shipped (a flat kernel adds a 2nd CUDA routing path = violates "one
-way"); preserved on branch `perf/cuda-moe-route-fusion` for a future 256-expert (DeepSeek-V4) re-test.
+gpu-sort, which CUDA lacks. SHIPPED (ml 0.11.29) as the backend-TWIN of the ROCm moe_route: composing it
+completes the abstraction -- ONE `quantized::moe_route` with ROCm + CUDA fast paths + the ml-op fallback,
+symmetric backends -- which is MORE decomplected than CUDA-missing, so the earlier "2nd path" worry doesn't
+hold (the ROCm fast path already exists; CUDA was the only backend still on the unfused ml-op chain). Flat
+perf is fine to re-bench on a 256-expert model (DeepSeek-V4, 2x router math) where it may clear the floor.
+ALSO in this release: dropped the now-dead `KSIGNS_IQ2XS_D` CUDA decode table (gen_iquant_grids.py
+`DECODE_SKIP` -- unpack_ksigns reconstructs it in-kernel; the Rust ksigns stays for the CPU oracle).
