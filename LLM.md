@@ -529,3 +529,19 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   (tensor-core) staging on the SAME 2D tile -- that closes to parity. Committed env-gated
   (HANZO_VK_Q4K_TILED2D), ready to default-on for dense (woff==0) prefill after MoE-bank (woff!=0) + an
   end-to-end engine pass. The bit-exact/tolerance + bench harness gates both.
+- L1 ATTEMPT #3 -- 2D-tiled int8 dp4a GEMM = the BIG WIN (9.35x, correct). `mul_mm_q4k_tiled_dp4a.comp`
+  (env HANZO_VK_Q4K_DP4A): the same 64x64 2D tile, but the BK=32 contraction is an int8 dot-product
+  (OpSDotAccSat) not f32 MACs. Activations are quantized to q8_1 once per prefill via the previously-
+  UNWIRED quantize_act_q8.comp (now wired: VulkanDevice::quantize_act_q8 -> xq/xs/xsum), then per K-step
+  the tile stages the BN cols' 32 q4 codes + d1/m1 and the BM rows' int8 xq + xs/xsum in LDS; each thread
+  dp4a's its 4x4 sub-tile: acc += d1[col]*xs[row]*dot(q4,xq) - m1[col]*xsum[row] (the Q4_K x q8_1 affine
+  identity, decode == mul_mat_q4k_dp4a). Gate: vulkan_q4k_dp4a2d_matches_default (rel<1.5e-2 -- q8_1
+  activation quant adds ~0.5-1% on top of f32 reorder; a decode/pack bug is >>1.5%), all shapes incl
+  partial tiles. PERF A/B (m=512,nout=k=4096): default 46.7ms / 2d_f32 22.5ms / 2d_dp4a 5.0ms =
+  9.35x over default, 4.51x over the f32 tile (~1720 GFLOP/s effective). Lifts the engine's Vulkan
+  prefill ~24 -> ~224 T/s (0.023x -> ~0.21x of llama-Vulkan 1058). The remaining gap to llama is
+  tensor-cores: llama uses coopmat; dp4a is int8-ALU-bound. L4 = coopmat (f16 tile + cooperative-matrix
+  ops) on the SAME 2D tile -> parity. Committed env-gated (HANZO_VK_Q4K_DP4A); this is the new best Q4_K
+  prefill path, ready to default-on after the MoE-bank (woff!=0) + end-to-end pass. The bench harness now
+  3-ways default/f32-tile/dp4a-tile. Both quantize_act_q8 + mul_mat_q4k_dp4a were written-but-unwired by
+  an earlier pass; this wires the activation quant and supersedes the column dp4a with the 2D-tiled one.
