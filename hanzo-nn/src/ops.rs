@@ -1081,7 +1081,7 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
             beta.shape()
         )
     }
-    if xs.device().is_rocm() {
+    if xs.device().is_rocm() || xs.device().is_vulkan() {
         return layer_norm_slow(xs, alpha, beta, eps);
     }
     xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
