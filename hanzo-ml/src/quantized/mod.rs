@@ -14,6 +14,7 @@ pub mod ggml_file;
 pub mod gguf_file;
 mod iq_grids;
 pub mod iq_quants;
+pub mod dsv4_qat;
 pub mod imatrix_file;
 pub mod k_quants;
 #[cfg(feature = "metal")]
