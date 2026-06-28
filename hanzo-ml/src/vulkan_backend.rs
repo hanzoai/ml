@@ -993,6 +993,30 @@ impl VulkanDevice {
         Ok((xq, xs, xsum))
     }
 
+    /// Kernel-isolated Q4_K prefill timing: upload `x` + reuse `wq` once, then loop the GPU GEMM
+    /// `iters` times with a single final `synchronize` (no per-iter host upload or readback). Returns
+    /// ms/call -- the realistic engine kernel cost (in a real forward `x` is already GPU-resident), vs
+    /// the host-wrapper bench whose per-iter 8 MB upload+readback swamps the kernel. Used by the perf gates.
+    pub fn bench_matmul_q4k(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        m: usize,
+        nout: usize,
+        k: usize,
+        iters: usize,
+    ) -> Result<f64> {
+        let xs = self.upload_f32(x)?;
+        let _ = self.matmul_q4k_gpu(wq, &xs, m, nout, k)?;
+        self.synchronize()?;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = self.matmul_q4k_gpu(wq, &xs, m, nout, k)?;
+        }
+        self.synchronize()?;
+        Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
+    }
+
     /// Host-operand Q4_K prefill matmul: uploads `x` (`[m, k]` row-major), runs the GPU GEMM, returns
     /// `[m, nout]` row-major. Mirrors [`matvec_q4k`] for the M>1 path; used by the bit-exact A/B gate.
     pub fn matmul_q4k(
