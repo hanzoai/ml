@@ -1392,3 +1392,27 @@ fn vulkan_add_rmsnorm_matches_unfused() {
         assert!(ms < 1e-5 && my < 1e-4, "add_rmsnorm r{nrows} m{m} mismatch s={ms} y={my}");
     }
 }
+
+// dp4a decode matvec (matvec_q4k_dp4a) must match the scalar matvec_q4k within the q8_1 activation
+// quant tolerance. Validates the HANZO_VK_DP4A_DECODE path -- the 1.8x Vulkan decode lever.
+#[test]
+fn vulkan_q4k_dp4a_decode_matches_scalar() {
+    let Some(dev) = gpu() else { return; };
+    let vk = dev.as_vulkan_device().unwrap();
+    for &(nout, k) in SHAPES {
+        let x: Vec<f32> = (0..k).map(|i| pseudo(i + 5)).collect();
+        let (raw, _w_deq, _w_host) = weight_bytes(GgmlDType::Q4K, nout, k).unwrap();
+        let wq = vk.upload_qweight(&raw).unwrap();
+        let scalar = vk.matvec_q4k(&wq, &x, nout, k).unwrap();
+        let dp4a = vk.matvec_q4k_dp4a(&wq, &x, nout, k).unwrap();
+        let (mut sse, mut refsq) = (0f64, 0f64);
+        for i in 0..nout {
+            let d = (dp4a[i] - scalar[i]) as f64;
+            sse += d * d;
+            refsq += (scalar[i] as f64) * (scalar[i] as f64);
+        }
+        let rel = (sse / refsq.max(1e-9)).sqrt();
+        eprintln!("dp4a-decode vs scalar nout={nout} k={k}: rel={rel:.3e}");
+        assert!(rel < 2e-2, "dp4a decode rel err {rel} too large (nout={nout} k={k})");
+    }
+}
