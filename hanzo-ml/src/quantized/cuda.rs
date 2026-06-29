@@ -28,17 +28,30 @@ pub fn set_force_dmmv(f: bool) {
 
 // Opt-in switch for the modern llama-style mmq/mmvq path (int8 MMA matrix-core + stream-K) ported
 // in fast_mmq.rs / fast_mmvq.rs. Off by default until validated on NVIDIA hardware; enable with
-// HANZO_CUDA_FAST_MMQ=1. When on, QCudaStorage::fwd tries it first and falls back to the legacy
-// on-GPU q8_1 kernels for any dtype/shape it doesn't support.
+// HANZO_CUDA_FAST_MMQ=1 (env) or `set_fast_mmq(true)` (programmatic — a model that needs the int8
+// dp4a path for *correctness*, e.g. DeepSeek-V4's W8A8 QAT, turns it on at load). When on,
+// QCudaStorage::fwd tries it first and falls back to the legacy on-GPU q8_1 kernels for any
+// dtype/shape it doesn't support. Mirrors `FORCE_DMMV`: an AtomicBool seeded once from the env.
+pub(crate) static FAST_MMQ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FAST_MMQ_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Programmatically enable/disable the fast int8 mmq/mmvq path (overrides the env default,
+/// and pins it so a later first-read won't reseed from env). Validated on NVIDIA sm_121
+/// (GB10) for DeepSeek-V4 — exact W8A8 (int32 accumulate) matching antirez/ds4.
+pub fn set_fast_mmq(f: bool) {
+    FAST_MMQ_INIT.call_once(|| {});
+    FAST_MMQ.store(f, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn fast_mmq_enabled() -> bool {
-    use std::sync::OnceLock;
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        matches!(
+    FAST_MMQ_INIT.call_once(|| {
+        let env = matches!(
             std::env::var("HANZO_CUDA_FAST_MMQ").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
-        )
-    })
+        );
+        FAST_MMQ.store(env, std::sync::atomic::Ordering::Relaxed);
+    });
+    FAST_MMQ.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // Force i-quant codebook weights back to the dequantize-to-f32 dense matmul instead of the native
