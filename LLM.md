@@ -613,3 +613,28 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   (paper 06, the kernel-level companion to paper 05's model-level parity result; builds clean, 12pp). The
   same-kernel regime flips (dp4a i-quant: ROCm 2.27x / GB10 flat; moe_route: ROCm +13% / CUDA flat) are
   the sharpest confirmation of the taxonomy.
+
+### Vulkan decode fusion campaign -- rungs 1+2 SHIPPED to ml (bit-exact), engine scaffold found ready
+- Built the first two op-fusion kernels the barrier-serialization diagnosis calls for, both bit-exact-gated
+  (tests/vulkan_quant_tests.rs, `matches_unfused`):
+  (1) **`rope_norm.comp`** -- fused per-head RMSNorm + NeoX RoPE in ONE dispatch (VulkanStorage::rope_norm
+      + host wrapper rope_norm_f32). Bit-identical to rms_norm.comp o rope.comp (same f32 ops, same
+      order): maxabs 3.6e-7..4.8e-7 over decode (t=1) + prefill + GQA shapes. Removes the q_norm->rope and
+      k_norm->rope global barriers (4 attn-epilogue ops -> 2 rope_norm calls).
+  (2) **`add_rmsnorm.comp`** -- fused residual-add + RMSNorm, returns BOTH (s=x+res, y=rms_norm(s)*alpha)
+      in one dispatch (mirrors ROCm add_rms_norm). s bit-IDENTICAL (maxabs 0.0), y 4.8e-7. Removes the
+      badd->rmsnorm barrier.
+  cos/sin convention = indexed by i_t=row%t (engine pre-slices the [s,d/2] cache to position, NOT a
+  positions array) -- matches the existing rope.comp + the engine's Vulkan cos/sin path.
+- ENGINE SCAFFOLD ALREADY EXISTS (swarm built the engine half): `vulkan_qk_rms_norm_rope` (layers.rs:2687,
+  env HANZO_VK_FUSED_QKNORM at 2767) extracts all 6 Vulkan storages then returns Ok(None) with comment
+  "Fused per-head RMSNorm+RoPE is not yet wired in hanzo-ml" -- i.e. it was WAITING for exactly this
+  rope_norm op. Wiring = ~15 lines: `qv.rope_norm(q_l, qwv, qw_l, q_eps as f32, cv, cos_l, siv, sin_l)?`
+  for q+k, wrap `Tensor::from((Storage::Vulkan(out), q_l.shape().clone()))` (mirror rocm_qk_rms_norm_rope_
+  positions at 3003). silu_mul is ALREADY wired (ops.rs:3339); add_rms_norm engine path is ROCm-only
+  (ops.rs:1686) -> add a Vulkan branch. DRY NOTE: wire the engine to the SHIPPED rope_norm (don't let the
+  swarm add a parallel `qk_norm_rope_gpu`); reconcile to ONE op.
+- PENDING (blocked on engine repo being free of the concurrent ml-bump push; do on a FEATURE branch since
+  the swarm churns engine main): wire vulkan_qk_rms_norm_rope -> rope_norm, [patch.crates-io] -> local ml,
+  build --features vulkan, measure decode T/s (the end-to-end proof; kernels are necessary-not-sufficient
+  until wired). Then publish ml (rope_norm + add_rmsnorm) at the next patch + land the engine wiring.

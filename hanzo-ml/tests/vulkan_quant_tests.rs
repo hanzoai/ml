@@ -1320,3 +1320,75 @@ fn vulkan_q4k_kernel_bench() -> hanzo_ml::Result<()> {
     );
     Ok(())
 }
+
+// Fused rope_norm (rms_norm + NeoX rope in ONE dispatch) must match the unfused two-op chain
+// bit-exactly (same f32 ops, same order). First rung of the Vulkan decode op-fusion campaign:
+// it removes the inter-op global barrier that serializes decode (see LLM.md / paper 06).
+#[test]
+fn vulkan_rope_norm_matches_unfused() {
+    let Some(dev) = gpu() else { return; };
+    let vk = dev.as_vulkan_device().unwrap();
+    // (b, h, t, d): decode (t=1) + short prefill; q/k head counts; head dims 64 and 128.
+    for &(b, h, t, d) in &[(1usize, 4usize, 1usize, 128usize), (1, 8, 5, 64), (2, 4, 3, 128)] {
+        let hd = d / 2;
+        let n = b * h * t * d;
+        let x: Vec<f32> = (0..n).map(|i| pseudo(i + 7)).collect();
+        let weight: Vec<f32> = (0..d).map(|i| 0.5 + pseudo(i + 99).abs()).collect();
+        let cs: Vec<f32> = (0..t * hd).map(|i| pseudo(i + 3).cos()).collect();
+        let sn: Vec<f32> = (0..t * hd).map(|i| pseudo(i + 3).sin()).collect();
+        let eps = 1e-6f32;
+        // CPU reference: rms_norm (x / sqrt(mean(x^2)+eps) * weight) then NeoX rope.
+        let mut refv = vec![0f32; n];
+        for row in 0..b * h * t {
+            let base = row * d;
+            let mut ss = 0f32;
+            for i in 0..d { let v = x[base + i]; ss += v * v; }
+            let denom = (ss / d as f32 + eps).sqrt();
+            let i_t = row % t;
+            for i_d in 0..hd {
+                let (i1, i2) = (base + i_d, base + i_d + hd);
+                let x1 = x[i1] / denom * weight[i_d];
+                let x2 = x[i2] / denom * weight[i_d + hd];
+                let (c, s) = (cs[i_t * hd + i_d], sn[i_t * hd + i_d]);
+                refv[i1] = x1 * c - x2 * s;
+                refv[i2] = x1 * s + x2 * c;
+            }
+        }
+        let got = vk.rope_norm_f32(&x, &weight, &cs, &sn, b, h, t, d, eps).unwrap();
+        assert_eq!(got.len(), n);
+        let mut maxabs = 0f32;
+        for i in 0..n { maxabs = maxabs.max((got[i] - refv[i]).abs()); }
+        eprintln!("rope_norm b{b} h{h} t{t} d{d}: maxabs={maxabs:.3e}");
+        assert!(maxabs < 1e-4, "rope_norm (b{b} h{h} t{t} d{d}) mismatch maxabs={maxabs}");
+    }
+}
+
+// Fused add_rmsnorm (residual-add + RMSNorm -> (s, y) in one dispatch) must match the unfused
+// add-then-rms_norm chain bit-exactly. Rung 2 of the Vulkan decode op-fusion campaign.
+#[test]
+fn vulkan_add_rmsnorm_matches_unfused() {
+    let Some(dev) = gpu() else { return; };
+    let vk = dev.as_vulkan_device().unwrap();
+    for &(nrows, m) in &[(1usize, 2048usize), (5, 64), (3, 4096)] {
+        let n = nrows * m;
+        let x: Vec<f32> = (0..n).map(|i| pseudo(i + 11)).collect();
+        let res: Vec<f32> = (0..n).map(|i| pseudo(i + 222)).collect();
+        let alpha: Vec<f32> = (0..m).map(|i| 0.5 + pseudo(i + 9).abs()).collect();
+        let eps = 1e-5f32;
+        // CPU reference: s = x + res ; y = s / sqrt(mean(s^2)+eps) * alpha.
+        let mut s_ref = vec![0f32; n];
+        let mut y_ref = vec![0f32; n];
+        for row in 0..nrows {
+            let base = row * m;
+            let mut ss = 0f32;
+            for i in 0..m { let v = x[base + i] + res[base + i]; s_ref[base + i] = v; ss += v * v; }
+            let denom = (ss / m as f32 + eps).sqrt();
+            for i in 0..m { y_ref[base + i] = s_ref[base + i] / denom * alpha[i]; }
+        }
+        let (s_gpu, y_gpu) = vk.add_rmsnorm_f32(&x, &res, &alpha, nrows, m, eps).unwrap();
+        let (mut ms, mut my) = (0f32, 0f32);
+        for i in 0..n { ms = ms.max((s_gpu[i] - s_ref[i]).abs()); my = my.max((y_gpu[i] - y_ref[i]).abs()); }
+        eprintln!("add_rmsnorm r{nrows} m{m}: s_maxabs={ms:.3e} y_maxabs={my:.3e}");
+        assert!(ms < 1e-5 && my < 1e-4, "add_rmsnorm r{nrows} m{m} mismatch s={ms} y={my}");
+    }
+}

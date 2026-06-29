@@ -1,0 +1,43 @@
+#version 450
+// Fused per-head RMSNorm + GPT-NeoX RoPE. One invocation per head-vector (row) of x[b,h,t,d].
+// Bit-identical to rms_norm.comp (y = x / sqrt(mean(x^2) + eps) * weight) composed with rope.comp
+// (NeoX pairwise rotation): the SAME f32 ops in the SAME order, so it matches the two-kernel chain
+// to float-reorder tolerance. cos/sin are [t,d/2] (unbatched) or [b,t,d/2]; the engine pre-slices
+// them to the decode position exactly as the standalone rope path does. This collapses the four
+// attention-epilogue decode ops (q_norm, k_norm, rope_q, rope_k -> two rope_norm calls) and, more
+// importantly on Vulkan, removes the global memory barriers between norm and rope (the decode wall
+// is barrier serialization, not arithmetic -- see hanzo-kernel-optimization.tex sec. 9).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly  buffer W { float weight[]; };
+layout(set = 0, binding = 2) readonly  buffer C { float cosb[]; };
+layout(set = 0, binding = 3) readonly  buffer N { float sinb[]; };
+layout(set = 0, binding = 4) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Pc { uint b; uint h; uint t; uint d; float eps; uint unbatched; };
+void main() {
+    uint row = gl_GlobalInvocationID.x;     // head-vector index over [b,h,t]
+    uint nrows = b * h * t;
+    if (row >= nrows) { return; }
+    uint base = row * d;
+    uint hd = d / 2u;
+    // 1) RMS over the head dim -- matches rms_norm.comp: denom = sqrt(sum(x^2)/d + eps).
+    float ss = 0.0;
+    for (uint i = 0u; i < d; i++) { float v = x[base + i]; ss += v * v; }
+    float denom = sqrt(ss / float(d) + eps);
+    // cos/sin time index: row = (b_i*h + h_i)*t + i_t  ->  i_t = row % t, bh_i = row / t.
+    uint i_t  = row % t;
+    uint bh_i = row / t;
+    uint cs_base = i_t * hd;
+    if (unbatched != 0u) { cs_base += (bh_i / h) * (t * hd); }
+    // 2)+3) normalize+weight (rms_norm.comp) then NeoX rope (rope.comp) per rotation pair.
+    for (uint i_d = 0u; i_d < hd; i_d++) {
+        uint i1 = base + i_d;
+        uint i2 = i1 + hd;
+        float x1 = x[i1] / denom * weight[i_d];
+        float x2 = x[i2] / denom * weight[i_d + hd];
+        float c = cosb[cs_base + i_d];
+        float s = sinb[cs_base + i_d];
+        y[i1] = x1 * c - x2 * s;
+        y[i2] = x1 * s + x2 * c;
+    }
+}
