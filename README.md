@@ -1,3 +1,5 @@
+<p align="center"><img src=".github/hero.svg" alt="ml" width="880"></p>
+
 # Hanzo ML
 [![crates.io](https://img.shields.io/crates/v/hanzo-ml.svg?style=flat-square&color=black)](https://crates.io/crates/hanzo-ml)
 [![docs.rs](https://img.shields.io/docsrs/hanzo-ml?style=flat-square&color=black)](https://docs.rs/hanzo-ml)
