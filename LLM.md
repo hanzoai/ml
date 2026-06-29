@@ -751,3 +751,15 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
 - VULKAN DECODE CAMPAIGN CLOSED at 1.8x shipped. Honest cross-backend standing: decode parity on ROCm
   (0.8-0.9x), CUDA (0.99x), Metal (0.96x); Vulkan decode 0.26x of llama (1.8x lifted from 0.08x) = the
   one backend where hanzo's decode trails, bounded as a RADV-vs-HIP codegen gap not blind-tunable further.
+
+### Vulkan GPU test suite: fixed the env-race flakiness (was the "pre-existing prefill failures")
+- The intermittent qmatmul_prefill / tiled{2d,_prefill} / dp4a2d / coopmat failures were NOT kernel bugs:
+  6 tests select a Q4_K kernel via process-global env (HANZO_VK_Q4K_{LEGACY,TILED,TILED2D,DP4A,COOPMAT},
+  HANZO_VK_DP4A_DECODE_OFF) with set_var/remove_var, and cargo runs tests in parallel threads -> one
+  test's remove_var clobbered another's set_var mid-run, so a forced-LEGACY prefill silently ran dp4a
+  (q8_1 error 0.10) at random. FIX: a single poison-safe `static ENV_LOCK: Mutex<()>` that EVERY
+  env-using test holds for its whole body (serializes them; non-env tests still parallel) + force the
+  exact path in the correctness tests (qmatmul_forward: HANZO_VK_DP4A_DECODE_OFF; qmatmul_prefill:
+  HANZO_VK_Q4K_LEGACY). Result: 28 passed / 0 failed, 3x consecutive, deterministic. (The #[ignore]'d
+  bench tests also use env -- lock them too before running with --ignored.) So the earlier "pre-existing
+  prefill kernel discrepancy" framing was WRONG: there is no kernel bug, it was test-harness env-racing.
