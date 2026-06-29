@@ -1,0 +1,31 @@
+#version 450
+// Fused residual-add + RMSNorm, one invocation per row. Emits BOTH outputs in one dispatch:
+//   s = x + residual                              (the new residual stream, binding 3)
+//   y = s / sqrt(mean(s^2) + eps) * alpha         (the normalized output,  binding 4)
+// Bit-identical to add.comp (elementwise add) then rms_norm.comp (same f32 ops, same order), but
+// with no global memory barrier between the add and the norm -- the Vulkan decode wall is barrier
+// serialization (see LLM.md / paper 06). Mirrors ROCm add_rms_norm (which also returns the pair).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly  buffer R { float res[]; };
+layout(set = 0, binding = 2) readonly  buffer A { float alpha[]; };
+layout(set = 0, binding = 3) writeonly buffer S { float s_out[]; };
+layout(set = 0, binding = 4) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Pc { uint nrows; uint m; float eps; };
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= nrows) { return; }
+    uint base = row * m;
+    // Pass 1: write the summed residual stream and accumulate sum-of-squares.
+    float ss = 0.0;
+    for (uint i = 0u; i < m; i++) {
+        float v = x[base + i] + res[base + i];
+        s_out[base + i] = v;
+        ss += v * v;
+    }
+    float denom = sqrt(ss / float(m) + eps);
+    // Pass 2: normalize. Recompute (x+res) (bit-identical to s_out, avoids reading a writeonly buffer).
+    for (uint i = 0u; i < m; i++) {
+        y[base + i] = (x[base + i] + res[base + i]) / denom * alpha[i];
+    }
+}
