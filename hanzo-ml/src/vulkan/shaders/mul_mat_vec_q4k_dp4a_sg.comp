@@ -1,0 +1,92 @@
+#version 450
+// Subgroup-reduced int8-dp4a Q4_K decode matvec: y[n] = sum_k W[n,k]*x[k]. Combines the memory-level
+// parallelism of the subgroup matvec (one subgroup per output row, lanes stride the super-blocks,
+// subgroupAdd) with int8 dp4a (the compute win that lifted the column dp4a 1.8x over the scalar
+// subgroup matvec). Activations are pre-quantized to q8_1 once (quantize_act_q8 -> xq/xs/xsum).
+// Decode is the Q4_K x q8_1 affine identity, identical to mul_mat_q4k_dp4a: per 32-weight sub-block
+//   acc += d1*xs*dot(q4, xq) - m1*xsum,  d1 = d*sc6, m1 = dmin*min6, dot via OpSDotAccSat.
+// Reduced across the subgroup; lane 0 writes the row. Gated on int8 dot + subgroup arithmetic.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4453)
+  int sdot_accsat(int a, int b, int acc, spirv_literal int fmt);
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W    { uint  w[];    }; // Q4_K blocks, 36 u32 / 256-block
+layout(set = 0, binding = 1) readonly buffer XQ   { uint  xq[];   }; // int8 acts, 4/u32, [k/32, 8]
+layout(set = 0, binding = 2) readonly buffer XS   { float xs[];   }; // act block scales, [k/32]
+layout(set = 0, binding = 3) readonly buffer XSUM { float xsum[]; }; // act block sums (xs*sum xq), [k/32]
+layout(set = 0, binding = 4) writeonly buffer Y   { float y[];    }; // output, length nout
+layout(push_constant) uniform Pc { uint nout; uint k; uint woff; };
+
+const uint QK_K = 256u;
+const uint BLK_U32 = 36u; // 144 bytes / 4
+const int  FMT4x8 = 0;    // PackedVectorFormat4x8Bit
+
+uint scale_byte(uint base, uint b) {
+    uint word = w[base + 1u + (b >> 2u)];
+    return (word >> ((b & 3u) * 8u)) & 0xFFu;
+}
+uint get_scale_min_k4(uint base, uint j) {
+    uint sc, m;
+    if (j < 4u) {
+        sc = scale_byte(base, j) & 63u;
+        m  = scale_byte(base, j + 4u) & 63u;
+    } else {
+        uint s_j4 = scale_byte(base, j + 4u);
+        uint s_jm4 = scale_byte(base, j - 4u);
+        uint s_j = scale_byte(base, j);
+        sc = (s_j4 & 0x0Fu) | ((s_jm4 >> 6u) << 4u);
+        m  = (s_j4 >> 4u)   | ((s_j   >> 6u) << 4u);
+    }
+    return (sc << 8u) | m;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID; // one subgroup per output row
+    if (n >= nout) { return; }
+    uint nblocks = k / QK_K;
+    uint rowbase = woff + n * nblocks * BLK_U32;
+    uint lane = gl_SubgroupInvocationID;
+    uint lanes = gl_SubgroupSize;
+
+    float acc = 0.0;
+    for (uint blk = lane; blk < nblocks; blk += lanes) {
+        uint base = rowbase + blk * BLK_U32;
+        float d    = float(unpackHalf2x16(w[base]).x);
+        float dmin = float(unpackHalf2x16(w[base]).y);
+        uint qbase = base + 4u;
+        uint ablk  = blk * 8u; // first activation 32-block of this super-block (global xs/xsum index)
+        for (uint c = 0u; c < 4u; c++) {
+            uint is = c * 2u;
+            uint sm1 = get_scale_min_k4(base, is);
+            uint sm2 = get_scale_min_k4(base, is + 1u);
+            float d1 = d * float(sm1 >> 8u);
+            float m1 = dmin * float(sm1 & 0xFFu);
+            float d2 = d * float(sm2 >> 8u);
+            float m2 = dmin * float(sm2 & 0xFFu);
+            uint qcw = qbase + c * 8u; // 8 u32 = the 32 qs bytes of this chunk
+            uint blo = ablk + is;      // low-nibble sub-block's activation 32-block (hi = blo+1)
+            uint xqlo = blo * 8u;
+            uint xqhi = (blo + 1u) * 8u;
+            int dlo = 0;
+            int dhi = 0;
+            for (uint j = 0u; j < 8u; j++) {
+                uint qw = w[qcw + j];
+                uint plo =  qw        & 0x0F0F0F0Fu; // low nibbles (0..15, positive int8)
+                uint phi = (qw >> 4u) & 0x0F0F0F0Fu; // high nibbles
+                dlo = sdot_accsat(int(plo), int(xq[xqlo + j]), dlo, FMT4x8);
+                dhi = sdot_accsat(int(phi), int(xq[xqhi + j]), dhi, FMT4x8);
+            }
+            acc += d1 * xs[blo] * float(dlo) - m1 * xsum[blo];
+            acc += d2 * xs[blo + 1u] * float(dhi) - m2 * xsum[blo + 1u];
+        }
+    }
+    float total = subgroupAdd(acc);
+    if (subgroupElect()) {
+        y[n] = total;
+    }
+}

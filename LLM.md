@@ -690,3 +690,29 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
 - SEPARATE PRE-EXISTING BUG (not the matvec): `hanzo run -i` one-shot on this raw Q4K GGUF emits
   garbage ("53A(Parameter...") for BOTH scalar AND dp4a (identical) -- a detokenize/template/sampling
   bug in the run path; the bench forward is clean (no NaN, tight T/s). Worth a separate fix.
+
+### Subgroup-dp4a decode = MEASURED DEAD END; column dp4a (one-thread/row) is the decode optimum
+- Tried mul_mat_vec_q4k_dp4a_sg (subgroup-reduced int8 dp4a: one subgroup/row, lane-strided super-
+  blocks, subgroupAdd -- combine dp4a's compute win with the scalar-subgroup matvec's memory
+  parallelism). Bit-exact (gate: both column + subgroup vs forced-scalar, rel 0.4%). PERF A/B (8B-Q4K
+  decode, prompt-len 64): subgroup-dp4a 5.9 T/s = FLAT vs scalar 5.9, LOSES to the column dp4a 10.8
+  (1.8x). WHY: decode wants MANY ROWS IN FLIGHT -- the per-thread COLUMN layout runs 64 rows/workgroup
+  (memory-level parallelism across rows); the subgroup layout starves it at 1-2 rows/wg (gl_NumSubgroups),
+  and dp4a's compute win cannot compensate a 32x parallelism cut. So the COLUMN dp4a stays the default
+  (env HANZO_VK_DP4A_DECODE_SG forces the subgroup variant for the record). Mirrors the prefill finding
+  (naive coopmat lost to dp4a): on this APU the simplest high-occupancy layout wins. Column dp4a 1.8x is
+  the Vulkan Q4_K decode optimum for blind tuning; closing the rest to llama's 41 needs a different
+  structure (llama's mul_mat_vec packs multiple super-blocks/thread + vectorized loads), not subgroup.
+- TEST RIGOR FIX (a regression my earlier column-dp4a default-flip merged unnoticed -- I'd only run the
+  dp4a gate, not the full GPU suite): the dp4a default put q8_1 activation-quant error (~0.4%) into the
+  production matvec, breaking the EXACT-vs-CPU checks. Fixed by forcing the scalar path in the exact
+  correctness tests (run_case Q4K -> matvec_q4k_scalar; vulkan_qmatmul_forward_matches_cpu sets
+  HANZO_VK_DP4A_DECODE_OFF) and adding explicit matvec_q4k_{scalar,dp4a,dp4a_sg} host methods so the
+  gate tests every path vs forced-scalar. vulkan_quant_tests decode set now GREEN.
+- PRE-EXISTING (NOT this decode work, prefill path, left for the prefill owner): vulkan_qmatmul_prefill_
+  matches_cpu Q4K fails deterministically (prefill dp4a-2D default vs exact f64 ref -- same q8_1 class,
+  shipped by an earlier prefill default-flip without updating the test; fix = force HANZO_VK_Q4K_LEGACY
+  or a per-dtype tolerance, but NOT via more env-set since the tiled tests already FLAKE on env-race).
+  vulkan_q4k_tiled{2d,_prefill}_matches_default FLAKE (pass/fail at varying shapes) -- the tests'
+  set_var/remove_var of HANZO_VK_Q4K_{LEGACY,TILED} races under cargo's parallel test threads; real fix
+  = run the Vulkan GPU tests serially (--test-threads=1 or a serial guard), a test-infra change.
