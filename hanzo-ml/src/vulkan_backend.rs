@@ -58,6 +58,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mm_q4k_shared" => spv!("mul_mm_q4k_shared"),
         "mul_mm_q4k_tiled" => spv!("mul_mm_q4k_tiled"),
         "mul_mm_q4k_tiled_dp4a" => spv!("mul_mm_q4k_tiled_dp4a"),
+        "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
         "mul_mm_q4k_coopmat" => spv!("mul_mm_q4k_coopmat"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
@@ -781,6 +782,23 @@ impl VulkanDevice {
         self.matvec_q4k_gpu(wq, &xs, nout, k)?.to_vec_f32()
     }
 
+    /// Q4_K decode matvec via int8 dp4a (the HANZO_VK_DP4A_DECODE path, forced): quantize x to q8_1,
+    /// then dp4a the Q4_K codes (column dp4a at mcount=1). ~1.8x faster than the scalar subgroup matvec
+    /// on gfx1151; the q8_1 activation quant adds ~0.5-1% vs the scalar reference (gated < 2e-2).
+    pub fn matvec_q4k_dp4a(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        let xin = self.upload_f32(x)?;
+        let (xq, xs, xsum) = self.quantize_act_q8(&xin, 1, k)?;
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[0u32, 1u32, nout as u32, k as u32, 0u32]);
+        self.dispatch(
+            "mul_mat_q4k_dp4a",
+            &[wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(WG1D), 1, 1),
+        )?;
+        out.to_vec_f32()
+    }
+
     /// Host helper for the fused rope_norm gate/bench: f32 in -> Vec<f32> out (mirrors `matvec_q4k`).
     /// `x` is [b,h,t,d], `weight` [d], `cos`/`sin` [t,d/2]. Runs `rms_norm(x,weight,eps)` then NeoX
     /// rope in ONE dispatch; compare against the two-op chain to validate bit-exactness.
@@ -871,6 +889,22 @@ impl VulkanDevice {
             crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
+        // DEFAULT Q4_K decode path where the device has int8 dot-product: quantize the activation to
+        // q8_1 once, then dp4a the Q4_K codes against it (column dp4a at mcount=1). 1.8x over the
+        // scalar-float subgroup matvec on gfx1151 -- Vulkan decode was matvec-compute-bound, and int8
+        // dp4a is the lever (the scalar f32 decode+MAC per weight was the wall). HANZO_VK_DP4A_DECODE_OFF
+        // forces the scalar subgroup matvec. Bit-exact gate: vulkan_q4k_dp4a_decode_matches_scalar.
+        if self.inner.int_dot8 && std::env::var_os("HANZO_VK_DP4A_DECODE_OFF").is_none() {
+            let (xq, xs, xsum) = self.quantize_act_q8(x, 1, k)?;
+            let pushd = push_u32(&[0u32, 1u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mat_q4k_dp4a",
+                &[wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer],
+                &pushd,
+                ((nout as u32).div_ceil(WG1D), 1, 1),
+            )?;
+            return Ok(out);
+        }
         let push = push_u32(&[nout as u32, k as u32, woff as u32]);
         if self.inner.subgroup_matvec {
             // Subgroup-reduced kernel: one subgroup per output row, fused subgroupAdd, more
