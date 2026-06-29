@@ -638,3 +638,55 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   the swarm churns engine main): wire vulkan_qk_rms_norm_rope -> rope_norm, [patch.crates-io] -> local ml,
   build --features vulkan, measure decode T/s (the end-to-end proof; kernels are necessary-not-sufficient
   until wired). Then publish ml (rope_norm + add_rmsnorm) at the next patch + land the engine wiring.
+
+### Vulkan decode rung-1 (rope_norm) is MODEL-FLAT -> the binding resource is the DECODE MATVEC, not op-fusion
+- Wired rope_norm into engine vulkan_qk_rms_norm_rope (env HANZO_VK_FUSED_QKNORM), built --features vulkan
+  with [patch]->local ml, in-binary A/B on Qwen3-8B-Q4K Vulkan decode: BASELINE 3.3 T/s (307.4ms/T) vs
+  FUSED 3.3 T/s (305.8ms/T) = FLAT (0.5%, noise). Bit-exact + correct (model runs coherently), but the
+  decode needle did not move. This is the PAPER'S OWN SURFACING RULE confirming itself: rope_norm
+  eliminated work (norm/rope ops + ~72 of 1336 dispatches + their barriers) but NOT in the BINDING
+  resource -> flat. The 903-barrier diagnosis was right that decode is GPU-bound, but the barriers I
+  removed were on CHEAP ops; the expensive dispatches remain.
+- ROOT CAUSE (read mul_mat_q4k.comp): DECODE (M=1) routes to the SCALAR COLUMN kernel -- one invocation
+  per output row, FLOAT MACs (`acc += wlo*x[..] + whi*x[..]`), NO dp4a, NO subgroup reduction. It runs
+  ~15x BELOW the bandwidth roofline. (The dp4a-2D win was PREFILL only: matmul_q4k_gpu_off routes dp4a
+  iff m>1; m==1 falls to this scalar column kernel.) ROCm/CUDA/Metal decode at roofline via dp4a/tensor
+  mat-vecs; Vulkan decode is the ONLY backend still scalar -> 0.08x vs llama, 12x behind llama's OWN
+  Vulkan (which has an optimized mul_mat_vec). THE LEVER = a dp4a DECODE matvec (one WG per output row,
+  threads dp4a-partial over k, subgroup-reduce), reusing the prefill dp4a infra (quantize_act_q8 + the
+  Q4_K x q8_1 affine identity + the bit-exact harness). NOT more op-fusion.
+- rope_norm + add_rmsnorm stay shipped (bit-exact, decomplecting, latent wins for a future busy-bound
+  regime -- like the documented ROCm/CUDA model-level non-levers). The campaign redirects to the matvec.
+
+### CROSS-BACKEND PARITY MATRIX (hanzo vs llama.cpp, clean idle-box, ml ~0.11.32, Qwen3 0.6/4/8B)
+- CUDA (GB10/spark): decode geomean 0.99x (0.96/0.99/1.02 -- BEATS llama on 8B), prefill geomean 0.60x
+  (0.52/0.60/0.70). Decode PARITY (stronger than ROCm); prefill = Blackwell tensor-core MMQ frontier.
+- Metal (M4 Max/dbc): decode 0.96x (4B+8B), prefill 0.84x(4B)/0.91x(8B). Near parity. BUG: Qwen3-0.6B
+  emits NaN/Inf logits on the ml Metal forward (quant-independent, specific to tied-embedding 0.6B) ->
+  upstream ml Metal-forward bug to fix+republish.
+- ROCm (gfx1151/evo): decode 0.79-0.91x, prefill 0.82-0.93x. Near parity both.
+- Vulkan (gfx1151/evo): decode 0.08x (the scalar-matvec outlier above); prefill dp4a-2D shipped.
+- LAW: decode = at/near parity on ROCm+CUDA+Metal (bandwidth-bound, both hit the wall); the ONE gap is
+  Vulkan decode (scalar matvec). Prefill = universal frontier (0.60-0.93x), worst on Blackwell (llama
+  CUDA prefill elite), best on ROCm (llama iGPU prefill weak). Universal prefill lever = tensor-core MMQ
+  + kill f32<->bf16 casts.
+
+### Vulkan decode dp4a matvec = the REAL lever, VALIDATED +1.8x (the redirect paid off)
+- The rope_norm-flat result correctly redirected to the matvec. Confirmed decode (m==1) used a SCALAR
+  subgroup matvec (mul_mat_vec_q4k_sg: subgroupAdd reduction but f32 decode+MAC per weight). Routed
+  decode through int8 dp4a instead: quantize_act_q8(x,1,k) -> dp4a the Q4_K codes (the existing column
+  dp4a mul_mat_q4k_dp4a.comp at mcount=1, now registered). matvec_q4k_dp4a host method + bit-exact gate.
+- RESULT (Qwen3-8B-Q4K Vulkan decode A/B, in-binary via env, idle evo): scalar 6.0 T/s (166.9ms/T) ->
+  dp4a 10.8 T/s (92.3ms/T) = **1.8x**. Proves Vulkan decode was MATVEC-COMPUTE-BOUND (the scalar f32
+  decode was the wall), NOT op-count/barrier-bound (rope_norm was flat). CORRECT: dp4a vs scalar matvec
+  rel=3.7e-3 (<2e-2 gate, q8_1 activation-quant floor) across 4 shapes; one-shot output BYTE-IDENTICAL
+  to the scalar baseline (same seed). SHIPPED default-on where int_dot8 (HANZO_VK_DP4A_DECODE_OFF forces
+  scalar); mirrors the prefill dp4a flip. Committed on ml branch wip/vulkan-decode-fusion.
+- STILL 0.26x of llama-vulkan (41 T/s) -- the column dp4a is one-thread-per-row (lost the subgroup
+  reduction's memory parallelism). NEXT LEVER = a SUBGROUP dp4a matvec (one subgroup per row,
+  cooperative coalesced weight read + dp4a + subgroupAdd) = combine both wins -> toward parity. Then
+  the same dp4a-decode treatment for Q5K/Q6K (still scalar). rope_norm + add_rmsnorm stay shipped
+  (latent/decomplecting, model-flat here as the taxonomy predicted).
+- SEPARATE PRE-EXISTING BUG (not the matvec): `hanzo run -i` one-shot on this raw Q4K GGUF emits
+  garbage ("53A(Parameter...") for BOTH scalar AND dp4a (identical) -- a detokenize/template/sampling
+  bug in the run path; the bench forward is clean (no NaN, tight T/s). Worth a separate fix.
