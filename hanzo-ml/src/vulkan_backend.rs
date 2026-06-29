@@ -60,6 +60,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mm_q4k_tiled_dp4a" => spv!("mul_mm_q4k_tiled_dp4a"),
         "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
         "mul_mat_vec_q4k_dp4a_sg" => spv!("mul_mat_vec_q4k_dp4a_sg"),
+        "mul_mat_q4k_dp4a_r2" => spv!("mul_mat_q4k_dp4a_r2"),
         "mul_mm_q4k_coopmat" => spv!("mul_mm_q4k_coopmat"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
@@ -818,6 +819,22 @@ impl VulkanDevice {
         out.to_vec_f32()
     }
 
+    /// Q4_K decode matvec via int8 dp4a, TWO output rows per invocation (ILP + activation reuse,
+    /// env HANZO_VK_DP4A_DECODE_R2). For the gate + the latency-vs-bandwidth A/B.
+    pub fn matvec_q4k_dp4a_r2(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+        let xin = self.upload_f32(x)?;
+        let (xq, xs, xsum) = self.quantize_act_q8(&xin, 1, k)?;
+        let out = self.alloc_f32(nout)?;
+        let push = push_u32(&[0u32, 1u32, nout as u32, k as u32, 0u32]);
+        self.dispatch(
+            "mul_mat_q4k_dp4a_r2",
+            &[wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer],
+            &push,
+            (((nout as u32).div_ceil(2)).div_ceil(WG1D), 1, 1),
+        )?;
+        out.to_vec_f32()
+    }
+
     /// Q4_K decode matvec via the SCALAR float path (forces the non-dp4a kernel regardless of the
     /// HANZO_VK_DP4A_DECODE_OFF default): the exact CPU-faithful reference for the dp4a gates.
     pub fn matvec_q4k_scalar(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
@@ -946,6 +963,7 @@ impl VulkanDevice {
         if self.inner.int_dot8 && std::env::var_os("HANZO_VK_DP4A_DECODE_OFF").is_none() {
             let (xq, xs, xsum) = self.quantize_act_q8(x, 1, k)?;
             let bufs = [wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer];
+            let pushd = push_u32(&[0u32, 1u32, nout as u32, k as u32, woff as u32]);
             if self.inner.subgroup_matvec && std::env::var_os("HANZO_VK_DP4A_DECODE_SG").is_some() {
                 let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
                 let push = push_u32(&[nout as u32, k as u32, woff as u32]);
@@ -955,8 +973,10 @@ impl VulkanDevice {
                     &push,
                     ((nout as u32).div_ceil(rows_per_wg), 1, 1),
                 )?;
+            } else if std::env::var_os("HANZO_VK_DP4A_DECODE_R2").is_some() {
+                // 2 output rows per invocation (ILP + activation reuse); ceil(nout/2 / WG1D) workgroups.
+                self.dispatch("mul_mat_q4k_dp4a_r2", &bufs, &pushd, (((nout as u32).div_ceil(2)).div_ceil(WG1D), 1, 1))?;
             } else {
-                let pushd = push_u32(&[0u32, 1u32, nout as u32, k as u32, woff as u32]);
                 self.dispatch("mul_mat_q4k_dp4a", &bufs, &pushd, ((nout as u32).div_ceil(WG1D), 1, 1))?;
             }
             return Ok(out);

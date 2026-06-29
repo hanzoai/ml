@@ -716,3 +716,19 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   vulkan_q4k_tiled{2d,_prefill}_matches_default FLAKE (pass/fail at varying shapes) -- the tests'
   set_var/remove_var of HANZO_VK_Q4K_{LEGACY,TILED} races under cargo's parallel test threads; real fix
   = run the Vulkan GPU tests serially (--test-threads=1 or a serial guard), a test-infra change.
+
+### R2 (2 output rows/thread) decode = 2nd MEASURED NON-LEVER -> column dp4a is bandwidth-access-bound
+- mul_mat_q4k_dp4a_r2.comp: column dp4a but 2 output rows/invocation -- shared activation (xq) loaded
+  once/super-block + reused across both rows, 2 independent dp4a chains for ILP (env HANZO_VK_DP4A_DECODE
+  _R2, gate adds "r2" leg, bit-exact). A/B (8B-Q4K decode, same load): R2 5.8 vs column 5.9 = FLAT.
+- CONCLUSION (two negatives bound it): subgroup-coalescing FLAT + ILP FLAT -> the column dp4a is neither
+  occupancy- nor latency-bound; it is MEMORY-ACCESS-PATTERN-bound at ~22% of the 230 GB/s roofline (10.8
+  T/s idle), while ROCm's HIP qmatvec hits ~72% and llama-Vulkan ~85% on the SAME APU. So the column dp4a
+  1.8x is the practical ceiling for blind GLSL kernel tuning on RADV; the residual 3.8x to llama is NOT
+  reachable by occupancy/ILP/subgroup tweaks. The real lever is the RADV-specific memory layout llama's
+  mul_mat_vec uses (vectorized uvec4/uvec2 weight loads at the right 16-byte alignment + the staged
+  activation tile) -- which needs RGP profiling to target, not blind iteration. Both subgroup + R2 kept
+  env-gated as documented negatives (HANZO_VK_DP4A_DECODE_{SG,R2}); column stays default.
+- NOTE on bench hygiene: evo runs a continuous swarm (load ~4-60); idle decode = 10.8, load-4 decode =
+  5.9 -- absolute Vulkan-decode numbers need a truly idle box, but in-binary A/Bs at matched load are
+  valid (the dp4a 1.8x, subgroup-flat, R2-flat all reproduce relatively).
