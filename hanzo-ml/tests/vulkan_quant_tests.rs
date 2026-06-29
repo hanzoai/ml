@@ -1413,7 +1413,8 @@ fn vulkan_q4k_dp4a_decode_matches_scalar() {
         let scalar = vk.matvec_q4k_scalar(&wq, &x, nout, k).unwrap();
         let column = vk.matvec_q4k_dp4a(&wq, &x, nout, k).unwrap();
         let subgroup = vk.matvec_q4k_dp4a_sg(&wq, &x, nout, k).unwrap();
-        for (name, got) in [("column", &column), ("subgroup", &subgroup)] {
+        let r2 = vk.matvec_q4k_dp4a_r2(&wq, &x, nout, k).unwrap();
+        for (name, got) in [("column", &column), ("subgroup", &subgroup), ("r2", &r2)] {
             let (mut sse, mut refsq) = (0f64, 0f64);
             for i in 0..nout {
                 let d = (got[i] - scalar[i]) as f64;
