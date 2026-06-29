@@ -43,23 +43,23 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 rocm-rs = { package = "hanzo-rocm", version = "0.5.2", default-features = false, features = ["macros"] }
-hanzo-rocm-kernels = { path = "./hanzo-rocm-kernels", version = "0.11.16" }
+hanzo-rocm-kernels = { path = "./hanzo-rocm-kernels", version = "0.11.33" }
 ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 chrono = "0.4"
 # Hanzo-renamed workspace dependencies (at version 0.10.x)
-hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.32" }
+hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.33" }
 hanzo-datasets = { path = "./hanzo-datasets", version = "0.11.8" }
-hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.11.8" }
+hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.11.33" }
 hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.11.8" }
-hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.24" }
-hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.8" }
-hanzo-nn = { path = "./hanzo-nn", version = "0.11.8" }
+hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.33" }
+hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.33" }
+hanzo-nn = { path = "./hanzo-nn", version = "0.11.33" }
 hanzo-onnx = { path = "./hanzo-onnx", version = "0.11.8" }
 hanzo-transformers = { path = "./hanzo-transformers", version = "0.11.8" }
-hanzo-ug = { path = "./hanzo-ug", version = "0.11.8" }
+hanzo-ug = { path = "./hanzo-ug", version = "0.11.33" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
 cudarc = { version = "0.19.4", features = [
