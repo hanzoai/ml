@@ -19,6 +19,11 @@ use hanzo_ml::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use hanzo_ml::{Device, Module, Tensor};
 use std::sync::Arc;
 
+// Tests that force a kernel via a process-global env var (HANZO_VK_DP4A_DECODE_OFF, HANZO_VK_Q4K_{LEGACY,
+// TILED}) must not run concurrently: cargo runs tests in parallel threads and the env set/remove races
+// otherwise (flaky pass/fail at varying shapes). Each such test holds this lock for its whole body.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Deterministic pseudo-random f32 in [-1, 1) from a counter (no rng dep; reproducible).
 fn pseudo(i: usize) -> f32 {
     // splitmix64-ish; take 24 mantissa bits.
@@ -675,6 +680,7 @@ fn end_to_end_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> han
 #[test]
 fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Q4_K decode defaults to int8 dp4a (q8_1 activation quant, ~0.4%); force the scalar path so this
     // exact-vs-CPU check validates the decode math. The dp4a q8_1 path is gated separately by
     // vulkan_q4k_dp4a_decode_matches_scalar.
@@ -762,6 +768,11 @@ fn prefill_case(
 #[test]
 fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Q4_K prefill defaults to int8 dp4a-2D (q8_1 activation quant, ~0.4%); force the exact column path
+    // so this exact-vs-CPU check validates the prefill math. The dp4a-2D path is gated by
+    // vulkan_q4k_dp4a2d_matches_default. (Q5_K/Q6_K still exercise the GEMM/dequant-fallback split.)
+    std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
     // M straddles the host MAX_M=8 tiling AND the per-dtype GEMM gate (Q5_K/Q6_K: 64, else 128):
     // 5/8/17 hit the native GEMM for every dtype; 100 hits the GEMM for Q4_0/Q8_0/Q4_K but the dequant
     // fallback for Q5_K/Q6_K (exercising the split); 200 (> both gates) is the dequant path for all.
@@ -789,6 +800,7 @@ fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
             }
         }
     }
+    std::env::remove_var("HANZO_VK_Q4K_LEGACY");
     Ok(())
 }
 
@@ -961,6 +973,7 @@ fn vulkan_q4k_tiled_prefill_matches_default() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else {
         return Ok(());
     };
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vk = dev.as_vulkan_device()?;
     // M>1 prefill across nout/k shapes incl. multi-superblock k and k at the LDS bound (64 superblocks),
     // and M values straddling the default kernel's 8-row tile (8, 9, 64, 512).
@@ -1047,6 +1060,7 @@ fn vulkan_q4k_tiled2d_matches_default() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else {
         return Ok(());
     };
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vk = dev.as_vulkan_device()?;
     for &(nout, k) in &[(512usize, 256usize), (2048, 2048), (256, 4096), (320, 1024)] {
         for &m in &[1usize, 7, 64, 65, 512] {
@@ -1122,6 +1136,7 @@ fn vulkan_q4k_dp4a2d_matches_default() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else {
         return Ok(());
     };
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vk = dev.as_vulkan_device()?;
     for &(nout, k) in &[(512usize, 256usize), (2048, 2048), (256, 4096), (320, 1024)] {
         for &m in &[1usize, 7, 64, 65, 512] {
@@ -1201,6 +1216,7 @@ fn vulkan_q4k_coopmat_matches_default() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else {
         return Ok(());
     };
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vk = dev.as_vulkan_device()?;
     if vk.coopmat_info().is_none() {
         eprintln!("[vulkan_quant_tests] no coopmat; skipping coopmat gate");
