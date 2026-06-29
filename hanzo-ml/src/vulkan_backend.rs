@@ -95,6 +95,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "softmax_rows" => spv!("softmax_rows"),
         "rms_norm" => spv!("rms_norm"),
         "rope" => spv!("rope"),
+        "rope_norm" => spv!("rope_norm"),
+        "add_rmsnorm" => spv!("add_rmsnorm"),
         "sin" => spv!("sin"),
         "cos" => spv!("cos"),
         "log" => spv!("log"),
@@ -777,6 +779,64 @@ impl VulkanDevice {
         }
         let xs = self.upload_f32(x)?;
         self.matvec_q4k_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    /// Host helper for the fused rope_norm gate/bench: f32 in -> Vec<f32> out (mirrors `matvec_q4k`).
+    /// `x` is [b,h,t,d], `weight` [d], `cos`/`sin` [t,d/2]. Runs `rms_norm(x,weight,eps)` then NeoX
+    /// rope in ONE dispatch; compare against the two-op chain to validate bit-exactness.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_norm_f32(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        b: usize,
+        h: usize,
+        t: usize,
+        d: usize,
+        eps: f32,
+    ) -> Result<Vec<f32>> {
+        let xs = self.upload_f32(x)?;
+        let ws = self.upload_f32(weight)?;
+        let cs = self.upload_f32(cos)?;
+        let ss = self.upload_f32(sin)?;
+        let out = xs.rope_norm(
+            &Layout::contiguous((b, h, t, d)),
+            &ws,
+            &Layout::contiguous(d),
+            eps,
+            &cs,
+            &Layout::contiguous((t, d / 2)),
+            &ss,
+            &Layout::contiguous((t, d / 2)),
+        )?;
+        out.to_vec_f32()
+    }
+
+    /// Host helper for the fused add_rmsnorm gate: f32 in -> (s, y) out. `x`/`residual` are [nrows,m],
+    /// `alpha` [m]. s = x+residual; y = rms_norm(s)*alpha. Compare against the add-then-rms_norm chain.
+    pub fn add_rmsnorm_f32(
+        &self,
+        x: &[f32],
+        residual: &[f32],
+        alpha: &[f32],
+        nrows: usize,
+        m: usize,
+        eps: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let xs = self.upload_f32(x)?;
+        let rs = self.upload_f32(residual)?;
+        let al = self.upload_f32(alpha)?;
+        let (s, y) = xs.add_rmsnorm(
+            &Layout::contiguous((nrows, m)),
+            &rs,
+            &Layout::contiguous((nrows, m)),
+            &al,
+            &Layout::contiguous(m),
+            eps,
+        )?;
+        Ok((s.to_vec_f32()?, y.to_vec_f32()?))
     }
 
     /// Q4_K matvec with both operands already on the GPU: `y[nout] = Wq * x[k]`, no host round-trip.
@@ -3999,6 +4059,40 @@ impl VulkanStorage {
         Ok(out)
     }
 
+    // Fused residual-add + RMSNorm in ONE dispatch. Returns (s, y): s = self + residual (the new
+    // residual stream), y = rms_norm(s) * alpha. Bit-identical to add then rms_norm, no barrier
+    // between them. Mirrors ROCm add_rms_norm; the decode lever on barrier-serialized Vulkan.
+    pub fn add_rmsnorm(
+        &self,
+        layout: &Layout,
+        residual: &VulkanStorage,
+        residual_l: &Layout,
+        alpha: &VulkanStorage,
+        alpha_l: &Layout,
+        eps: f32,
+    ) -> Result<(VulkanStorage, VulkanStorage)> {
+        let mut xk = None;
+        let mut rk = None;
+        let mut ak = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
+        let rb = residual.contig_buf(residual_l, &mut rk)?;
+        let ab = alpha.contig_buf(alpha_l, &mut ak)?;
+        let dims = layout.dims();
+        let m = *dims.last().unwrap_or(&1);
+        let nrows = layout.shape().elem_count() / m.max(1);
+        let s_out = self.device.alloc_f32(nrows * m)?;
+        let y = self.device.alloc_f32(nrows * m)?;
+        let mut push = push_u32(&[nrows as u32, m as u32]);
+        push.extend_from_slice(&eps.to_ne_bytes());
+        self.device.dispatch(
+            "add_rmsnorm",
+            &[xb, rb, ab, s_out.buffer, y.buffer],
+            &push,
+            Self::groups_1d(nrows),
+        )?;
+        Ok((s_out, y))
+    }
+
     // Fused SwiGLU: out = silu(self) * rhs, elementwise. One dispatch instead of silu + mul.
     pub fn silu_mul(
         &self,
@@ -4063,6 +4157,44 @@ impl VulkanStorage {
             &[srcb, cb, sb, out.buffer],
             &push_u32(&[b as u32, h as u32, t as u32, d as u32, unbatched]),
             Self::groups_1d(pairs),
+        )?;
+        Ok(out)
+    }
+
+    // Fused per-head RMSNorm + NeoX RoPE: rms_norm(self, weight, eps) then rope(., cos, sin) in ONE
+    // dispatch. `self` = x [b,h,t,d]; cos/sin [t,d/2] or [b,t,d/2]. Bit-identical to the two-op chain
+    // (rope_norm.comp), but emits no inter-op barrier -- the decode lever on Vulkan (barrier-serialized).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_norm(
+        &self,
+        layout: &Layout,
+        weight: &VulkanStorage,
+        weight_l: &Layout,
+        eps: f32,
+        cos: &VulkanStorage,
+        cos_l: &Layout,
+        sin: &VulkanStorage,
+        sin_l: &Layout,
+    ) -> Result<VulkanStorage> {
+        let mut xk = None;
+        let mut wk = None;
+        let mut ck = None;
+        let mut sk = None;
+        let xb = self.contig_buf(layout, &mut xk)?;
+        let wb = weight.contig_buf(weight_l, &mut wk)?;
+        let cb = cos.contig_buf(cos_l, &mut ck)?;
+        let sb = sin.contig_buf(sin_l, &mut sk)?;
+        let (b, h, t, d) = layout.shape().dims4()?;
+        let unbatched = (cos_l.dims().len() == 3 && sin_l.dims().len() == 3) as u32;
+        let out = self.device.alloc_f32(b * h * t * d)?;
+        let mut push = push_u32(&[b as u32, h as u32, t as u32, d as u32]);
+        push.extend_from_slice(&eps.to_ne_bytes());
+        push.extend_from_slice(&unbatched.to_ne_bytes());
+        self.device.dispatch(
+            "rope_norm",
+            &[xb, wb, cb, sb, out.buffer],
+            &push,
+            Self::groups_1d(b * h * t),
         )?;
         Ok(out)
     }
