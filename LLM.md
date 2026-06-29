@@ -583,3 +583,33 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   one untried path -- my naive coopmat was decode-bound). CONCLUSION: dp4a-2D 64x64 (5056 GFLOP/s, 9x) is
   the validated practical max for blind kernel-tuning on gfx1151; the last-mile to peak is the amortized-
   coopmat follow-up (profiler-guided). The kernel-isolated bench (vulkan_q4k_kernel_bench) is the harness.
+
+## Vulkan DECODE is the open frontier: op-count-serialization-bound (NOT recording-bound) -- fusion roadmap
+- The L1 arc above fixed Vulkan PREFILL (dp4a-2D 9.35x default). Vulkan DECODE is the remaining gap vs
+  llama: clean idle-box evo matrix (ml 0.11.32, Qwen3-8B-Q4_K, load<0.5) = hanzo-Vulkan decode 3.3 vs
+  llama-Vulkan 41 T/s (~0.08x) AND vs hanzo's OWN ROCm decode 35 -- so it's a Vulkan-backend defect, not
+  the kernel or the GPU. (ROCm clean matrix = 0.82-0.93x prefill / 0.79-0.91x decode across 0.6/4/8B =
+  NEAR PARITY; ROCm is "there", Vulkan decode is not.)
+- ROOT CAUSE (VK_PROFILE=1, one decode token, 8B): `flush: dispatch=1336 barriers=903 record=0.766ms
+  submit=1.406ms fence_wait=142.827ms`. So decode is NOT recording-bound (CPU record 0.77ms = free ->
+  command-buffer/graph REUSE would buy NOTHING, hypothesis killed by the profile) -- it is GPU-EXECUTION-
+  bound on OP-COUNT SERIALIZATION: 1336 tiny M=1 dispatches chained through 903 GLOBAL memory barriers
+  (vk::MemoryBarrier, full SHADER_WRITE->READ, emitted on TRUE read-after-write deps at vulkan_backend.rs
+  ~3050) serialize the GPU at ~107us/op on compute that's only ~us. The barriers are CORRECT (real data
+  deps); the ONLY way to remove them is to FUSE the dependent ops so the dep lives INSIDE a kernel.
+- FIX = the SAME op-fusion campaign that took ROCm decode from launch/busy-bound to parity, ported to
+  Vulkan .comp shaders (per the taxonomy: GPU-busy-bound decode -> lever is ELIMINATING ops, not faster
+  arithmetic -- matvec is already roofline). Roadmap, each step ROCm-precedented + bit-exact-gated:
+  (1) fuse attention epilogue: q/k RMSNorm+RoPE+KV-write into ONE shader (ROCm rope_norm_positions twin,
+      +2.8% there) + residual-add+RMSNorm (add_rmsnorm); these ELIMINATE per-op barriers not just launches.
+  (2) fuse FFN: gate+up shared-quantize + silu+mul.
+  (3) fuse routing: moe_route shader (ROCm +13%; Vulkan pays the same sort cost so it should surface).
+  (4) uniform Vulkan GEMM for all 22 formats -> deletes the dequant fallback + the deadlock gate by
+      construction (the structural endpoint of vulkan_prefill_gemm_max_rows).
+  STATUS: characterized down to dispatch/barrier counts, NOT yet shipped -- labeled frontier, not result.
+- PAPER: the full cross-backend kernel-optimization catalog (every KEPT lever + every measured DEAD-END +
+  the 4-regime bottleneck taxonomy + the surfacing rule "a kernel change helps end-to-end only if it
+  eliminates work in the BINDING resource") is written up at ~/work/hanzo/papers/hanzo-kernel-optimization.tex
+  (paper 06, the kernel-level companion to paper 05's model-level parity result; builds clean, 12pp). The
+  same-kernel regime flips (dp4a i-quant: ROCm 2.27x / GB10 flat; moe_route: ROCm +13% / CUDA flat) are
+  the sharpest confirmation of the taxonomy.
