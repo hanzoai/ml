@@ -242,7 +242,7 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
     let y_gpu: Vec<f32> = match dtype {
         GgmlDType::Q4_0 => vk.matvec_q4_0(&wq, &x_host, nout, k)?,
         GgmlDType::Q8_0 => vk.matvec_q8_0(&wq, &x_host, nout, k)?,
-        GgmlDType::Q4K => vk.matvec_q4k(&wq, &x_host, nout, k)?,
+        GgmlDType::Q4K => vk.matvec_q4k_scalar(&wq, &x_host, nout, k)?,
         GgmlDType::Q5K => vk.matvec_q5k(&wq, &x_host, nout, k)?,
         GgmlDType::Q6K => vk.matvec_q6k(&wq, &x_host, nout, k)?,
         GgmlDType::Q2K => vk.matvec_q2k(&wq, &x_host, nout, k)?,
@@ -675,6 +675,10 @@ fn end_to_end_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> han
 #[test]
 fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
+    // Q4_K decode defaults to int8 dp4a (q8_1 activation quant, ~0.4%); force the scalar path so this
+    // exact-vs-CPU check validates the decode math. The dp4a q8_1 path is gated separately by
+    // vulkan_q4k_dp4a_decode_matches_scalar.
+    std::env::set_var("HANZO_VK_DP4A_DECODE_OFF", "1");
     // (nout, k); k divisible by 256 so every dtype is exercised on the same shapes.
     for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
         for dt in [
@@ -699,6 +703,7 @@ fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
             );
         }
     }
+    std::env::remove_var("HANZO_VK_DP4A_DECODE_OFF");
     Ok(())
 }
 
@@ -1393,8 +1398,10 @@ fn vulkan_add_rmsnorm_matches_unfused() {
     }
 }
 
-// dp4a decode matvec (matvec_q4k_dp4a) must match the scalar matvec_q4k within the q8_1 activation
-// quant tolerance. Validates the HANZO_VK_DP4A_DECODE path -- the 1.8x Vulkan decode lever.
+// Both dp4a decode matvecs -- column (matvec_q4k_dp4a) and subgroup (matvec_q4k_dp4a_sg, the default
+// where the device has subgroup arithmetic) -- must match the SCALAR matvec within the q8_1 activation
+// quant tolerance. matvec_q4k_scalar forces the non-dp4a path (the exact reference) regardless of the
+// dp4a default. Validates the Vulkan decode lever (1.8x) for both reductions.
 #[test]
 fn vulkan_q4k_dp4a_decode_matches_scalar() {
     let Some(dev) = gpu() else { return; };
@@ -1403,16 +1410,19 @@ fn vulkan_q4k_dp4a_decode_matches_scalar() {
         let x: Vec<f32> = (0..k).map(|i| pseudo(i + 5)).collect();
         let (raw, _w_deq, _w_host) = weight_bytes(GgmlDType::Q4K, nout, k).unwrap();
         let wq = vk.upload_qweight(&raw).unwrap();
-        let scalar = vk.matvec_q4k(&wq, &x, nout, k).unwrap();
-        let dp4a = vk.matvec_q4k_dp4a(&wq, &x, nout, k).unwrap();
-        let (mut sse, mut refsq) = (0f64, 0f64);
-        for i in 0..nout {
-            let d = (dp4a[i] - scalar[i]) as f64;
-            sse += d * d;
-            refsq += (scalar[i] as f64) * (scalar[i] as f64);
+        let scalar = vk.matvec_q4k_scalar(&wq, &x, nout, k).unwrap();
+        let column = vk.matvec_q4k_dp4a(&wq, &x, nout, k).unwrap();
+        let subgroup = vk.matvec_q4k_dp4a_sg(&wq, &x, nout, k).unwrap();
+        for (name, got) in [("column", &column), ("subgroup", &subgroup)] {
+            let (mut sse, mut refsq) = (0f64, 0f64);
+            for i in 0..nout {
+                let d = (got[i] - scalar[i]) as f64;
+                sse += d * d;
+                refsq += (scalar[i] as f64) * (scalar[i] as f64);
+            }
+            let rel = (sse / refsq.max(1e-9)).sqrt();
+            eprintln!("dp4a-{name} vs scalar nout={nout} k={k}: rel={rel:.3e}");
+            assert!(rel < 2e-2, "dp4a {name} rel err {rel} too large (nout={nout} k={k})");
         }
-        let rel = (sse / refsq.max(1e-9)).sqrt();
-        eprintln!("dp4a-decode vs scalar nout={nout} k={k}: rel={rel:.3e}");
-        assert!(rel < 2e-2, "dp4a decode rel err {rel} too large (nout={nout} k={k})");
     }
 }
