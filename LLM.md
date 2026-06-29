@@ -732,3 +732,22 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
 - NOTE on bench hygiene: evo runs a continuous swarm (load ~4-60); idle decode = 10.8, load-4 decode =
   5.9 -- absolute Vulkan-decode numbers need a truly idle box, but in-binary A/Bs at matched load are
   valid (the dp4a 1.8x, subgroup-flat, R2-flat all reproduce relatively).
+
+### V2 (uvec2 vectorized weight loads) = 3rd MEASURED NON-LEVER -> blind RADV tuning DEFINITIVELY exhausted
+- mul_mat_q4k_dp4a_v2.comp: column dp4a with the weight SSBO typed uvec2, the 8 qs u32/chunk read as 4
+  uvec2 (8-byte, alignment-safe: blocks are 36 u32 even, qs at base+4 even) -- wider memory transactions
+  for the bandwidth-access-bound path (env HANZO_VK_DP4A_DECODE_V2, gate "v2" leg, bit-exact rel 3.7e-3).
+  A/B (8B-Q4K, load 1.87): V2 5.9 vs column 6.0 = FLAT (RADV likely already vectorizes the sequential
+  scalar loads; transaction size is not the lever either).
+- DEFINITIVE BOUND -- THREE negatives now fence the Vulkan Q4_K decode optimum: subgroup-coalescing FLAT,
+  R2-ILP FLAT, V2-transaction-size FLAT. The column dp4a (one thread/output-row, 64 rows/wg, int8 dp4a,
+  1.8x = 10.8 T/s idle) is the practical ceiling for BLIND GLSL kernel tuning on RADV/gfx1151. The
+  residual gap (3.8x to llama-Vulkan 41, 3.3x to hanzo's OWN ROCm-HIP 35 on the SAME APU) is NOT an
+  occupancy/ILP/coalescing/vectorization problem -- it is a fundamental RADV-Vulkan-compute vs ROCm-HIP
+  codegen/driver-efficiency gap for int8 matvec on this APU (same kernel math, same dp4a, 22% vs 72%
+  roofline). Closing it needs RGP/radv-shader-stats profiling to find what RADV mis-compiles vs HIP (or
+  accepting the path difference), NOT more blind kernel variants. All three negatives kept env-gated
+  (HANZO_VK_DP4A_DECODE_{SG,R2,V2}), bit-exact, as the documented boundary; column dp4a stays default.
+- VULKAN DECODE CAMPAIGN CLOSED at 1.8x shipped. Honest cross-backend standing: decode parity on ROCm
+  (0.8-0.9x), CUDA (0.99x), Metal (0.96x); Vulkan decode 0.26x of llama (1.8x lifted from 0.08x) = the
+  one backend where hanzo's decode trails, bounded as a RADV-vs-HIP codegen gap not blind-tunable further.
