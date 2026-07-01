@@ -690,3 +690,71 @@ FAST_OP(double, fast_min_f64, fast_max_f64, fast_argmin_f64, fast_argmax_f64, fa
 FAST_OP(uint32_t, fast_min_u32, fast_max_u32, fast_argmin_u32, fast_argmax_u32, fast_sum_u32)
 FAST_OP(int64_t, fast_min_i64, fast_max_i64, fast_argmin_i64, fast_argmax_i64, fast_sum_i64)
 FAST_OP(uint8_t, fast_min_u8, fast_max_u8, fast_argmin_u8, fast_argmax_u8, fast_sum_u8)
+
+// =============================================================================
+// DeepSeek-V4 mHC fused Sinkhorn — one block per tiny nh×nh combine matrix.
+// Replaces ~120 tiny tensor-op launches (softmax + 20-iter row/col alternation)
+// with ONE launch, in f32 (the GPU tensor-op path ran it in bf16). Semantics match
+// the reference exactly: softmax over `src` (last axis) + eps; col-norm (over dst)
+// with denom = colsum+eps; then (iters-1)× (row-norm over src, col-norm over dst).
+// grid = nmat (=B*L), block = one warp (guard tid<nh), shared = nh*nh floats.
+extern "C" __global__ void hc_sinkhorn_f32(
+    const float *__restrict__ logits, // [nmat, nh, nh] row-major
+    float *__restrict__ out,          // [nmat, nh, nh]
+    const int nh, const int iters, const float eps) {
+  extern __shared__ float s[]; // nh*nh
+  const int m = blockIdx.x;
+  const int t = threadIdx.x; // one thread per row (row ops) / column (col ops)
+  const float *src = logits + (size_t)m * nh * nh;
+
+  // softmax over row t (src = the last axis) + eps
+  if (t < nh) {
+    float mx = -INFINITY;
+    for (int c = 0; c < nh; c++)
+      mx = fmaxf(mx, src[t * nh + c]);
+    float sum = 0.f;
+    for (int c = 0; c < nh; c++) {
+      float e = expf(src[t * nh + c] - mx);
+      s[t * nh + c] = e;
+      sum += e;
+    }
+    for (int c = 0; c < nh; c++)
+      s[t * nh + c] = s[t * nh + c] / sum + eps;
+  }
+  __syncthreads();
+
+  // col-norm: thread t owns column t; denom = colsum + eps
+  if (t < nh) {
+    float sum = eps;
+    for (int r = 0; r < nh; r++)
+      sum += s[r * nh + t];
+    for (int r = 0; r < nh; r++)
+      s[r * nh + t] /= sum;
+  }
+  __syncthreads();
+
+  for (int it = 1; it < iters; it++) {
+    // row-norm: thread t owns row t; denom = rowsum + eps
+    if (t < nh) {
+      float sum = eps;
+      for (int c = 0; c < nh; c++)
+        sum += s[t * nh + c];
+      for (int c = 0; c < nh; c++)
+        s[t * nh + c] /= sum;
+    }
+    __syncthreads();
+    // col-norm
+    if (t < nh) {
+      float sum = eps;
+      for (int r = 0; r < nh; r++)
+        sum += s[r * nh + t];
+      for (int r = 0; r < nh; r++)
+        s[r * nh + t] /= sum;
+    }
+    __syncthreads();
+  }
+
+  if (t < nh)
+    for (int c = 0; c < nh; c++)
+      out[(size_t)m * nh * nh + t * nh + c] = s[t * nh + c];
+}
