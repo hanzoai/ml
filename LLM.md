@@ -763,3 +763,31 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   HANZO_VK_Q4K_LEGACY). Result: 28 passed / 0 failed, 3x consecutive, deterministic. (The #[ignore]'d
   bench tests also use env -- lock them too before running with --ignored.) So the earlier "pre-existing
   prefill kernel discrepancy" framing was WRONG: there is no kernel bug, it was test-harness env-racing.
+
+### 30B-A3B MoE cross-backend (evo, the original-ask MoE data point)
+- ROCm: hanzo prefill 1002 / decode 67.9 T/s vs llama 1150 / 66.0 = 0.87x prefill, **1.03x decode (BEATS
+  llama)**. The shipped ROCm MoE stack (indexed dp4a decode + moe_route + qmmq MoE prefill) is at/above
+  parity on the 30B-A3B-Q4K too -- confirms the dense cross-backend law extends to MoE.
+- Vulkan: hanzo TIMED OUT (>600s, rc=143) -- the known-weak Vulkan decode (0.08-0.26x dense) is too slow
+  on the 30B MoE to finish the 512pp/128tg bench in 600s (llama-Vulkan does 1108/88.5). Not a new bug;
+  the Vulkan-decode codegen ceiling (RADV-vs-HIP, documented above) just makes the big MoE impractical.
+- CUDA (spark) + Metal (dbc) 30B not benched (boxes busy with the prefill/NaN fix agents + the deepseek
+  swarm); ROCm 30B numbers already canonical in the MoE sections above.
+
+### Qwen3-8B-Q4_K_M produces GARBAGE on Vulkan (8B-specific forward bug) -- precisely isolated, OPEN
+- REPRO: `hanzo run -i "The capital of France is /no_think" --format gguf -f Qwen_Qwen3-8B-Q4_K_M.gguf`
+  on the Vulkan engine -> byte-identical garbage from token 1 (`53A(Parameter6,936$((Parameter...`).
+- ISOLATION (what it is NOT): 8B-CPU is COHERENT ("...Paris"); 4B-Vulkan is COHERENT (both with/without
+  --seed) -> NOT the run-path/chat-template/detokenizer/sampler, NOT --seed, NOT a universal Vulkan bug.
+  It is 8B-SPECIFIC on the Vulkan forward, deterministic, from the first token.
+- RULED OUT by A/B (all give the SAME byte-identical garbage): Q4_K matmul (default dp4a-2D, scalar
+  decode HANZO_VK_DP4A_DECODE_OFF, legacy column HANZO_VK_Q4K_LEGACY -- all identical) AND the BufPool
+  bucketing (HANZO_VK_POOL_EXACT=1 forcing exact-size keys -- still garbage, so not stale-tail reuse).
+- KEY DEDUCTION: garbage is IDENTICAL regardless of which Q4_K kernel runs -> the source is COMMON to
+  all variants, i.e. NOT Q4_K. The heavy 8B kernels untouched by any toggle = **Q6_K** (lm_head +
+  ffn_down + attn_v are Q6_K in Q4_K_M) and attention/RMSNorm at n_embd=4096. Q6_K is the prime suspect:
+  8B ffn_down k=12288 (48 Q6_K superblocks) vs 4B 9728 (38) -- a block-count/u32 threshold bug in
+  mul_mat_q6k / mul_mat_vec_q6k at k>~40 superblocks would garble the FFN (and lm_head) -> all tokens,
+  while 4B stays under it. NEXT: force Q6_K through dequant (vulkan_prefill_gemm_max_rows Q6K->0) to
+  confirm, then bisect mul_mat_q6k for the large-k bug. (Vulkan is the weak backend; this is a real
+  correctness bug that makes 8B-Q4K_M unusable there -- distinct from the decode-perf codegen ceiling.)
