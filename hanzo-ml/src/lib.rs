@@ -84,6 +84,7 @@ pub mod rocm_backend;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
+mod hc_sinkhorn;
 mod sort;
 mod storage;
 pub mod streaming;
