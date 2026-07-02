@@ -1,0 +1,11 @@
+Hanzo ML
+Copyright (c) 2024 Hanzo AI, Inc.
+
+This product includes software from candle (https://github.com/huggingface/candle),
+licensed under the MIT License or the Apache License 2.0:
+
+    Copyright (c) The candle authors
+
+The upstream candle license texts are retained in this repository as LICENSE-MIT
+and LICENSE-APACHE. This work is a derivative of candle and remains dual-licensed
+under "MIT OR Apache-2.0"; the upstream license has not been changed.
