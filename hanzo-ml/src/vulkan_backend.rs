@@ -141,6 +141,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "paged_attn" => spv!("paged_attn"),
         "reshape_and_cache" => spv!("reshape_and_cache"),
         "dsl_mul" => include_bytes!("vulkan/spv/dsl_mul.spv"),
+        "dsl_matvec" => include_bytes!("vulkan/spv/dsl_matvec.spv"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -5341,5 +5342,47 @@ mod dsl_dispatch_proof {
         eprintln!("[dsl-proof] DSL kernel via ml::VulkanDevice::dispatch  N={N} groups={groups}  maxerr={maxerr:.2e}");
         eprintln!("[dsl-proof] first4 got={:?} ref={:?}", &got[..4], &refout[..4]);
         assert_eq!(maxerr, 0.0, "DSL-generated kernel not bit-exact through ml dispatch");
+    }
+
+    // Generalization: a REDUCTION kernel (matvec, comptime k=32/rows=64) auto-processed by the
+    // reusable spv_to_ml codegen (entry->main, cubecl info-var removed from the entry interface),
+    // dispatched through ml's own VulkanDevice. Proves the codegen isn't limited to elementwise.
+    // Note: cubecl encodes runtime scalars as a buffer binding, not push constants -- so kernels use
+    // comptime dims here; ml would bind a small scalar SSBO for the runtime-param path.
+    #[test]
+    fn dsl_matvec_runs_through_ml_vulkan() {
+        const K: usize = 32;
+        const ROWS: usize = 64;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[dsl-proof] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let w: Vec<f32> = (0..ROWS * K).map(|i| (i as f32 % 7.0) * 0.25 - 1.0).collect();
+        let x: Vec<f32> = (0..K).map(|i| (i as f32 % 5.0) * 0.5 - 1.0).collect();
+        let refout: Vec<f32> = (0..ROWS)
+            .map(|r| {
+                let mut acc = 0.0f32;
+                for i in 0..K {
+                    acc += w[r * K + i] * x[i];
+                }
+                acc
+            })
+            .collect();
+
+        let ws = dev.upload_f32(&w).unwrap();
+        let xs = dev.upload_f32(&x).unwrap();
+        let out = dev.alloc_f32(ROWS).unwrap();
+        dev.dispatch("dsl_matvec", &[ws.buffer, xs.buffer, out.buffer], &[], (1, 1, 1))
+            .unwrap();
+        dev.flush().unwrap();
+        let got = out.to_vec_f32().unwrap();
+
+        let maxerr = got.iter().zip(&refout).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("[dsl-proof] DSL matvec via ml::VulkanDevice::dispatch  rows={ROWS} k={K}  maxerr={maxerr:.2e}");
+        eprintln!("[dsl-proof] first4 got={:?} ref={:?}", &got[..4], &refout[..4]);
+        assert!(maxerr < 1e-4, "DSL matvec through ml diverged: maxerr={maxerr:.3e}");
     }
 }
