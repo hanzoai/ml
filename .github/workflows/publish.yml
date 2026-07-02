@@ -27,6 +27,10 @@ jobs:
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
             echo "::error::CARGO_REGISTRY_TOKEN is empty -- set it (from KMS) as a repo/org secret"; exit 1
           fi
+          # GHA runs `run:` under `bash -e`; disable errexit so `out=$(cargo publish ...); rc=$?` can
+          # CAPTURE a non-zero rc and let the already-uploaded->skip logic run. Without this, the first
+          # already-published crate (e.g. hanzo-kernels) aborts the whole loop before reaching hanzo-ml.
+          set +e
           # bottom-up: leaf kernels + ug + flash-attn-build, then hanzo-ml, then nn, then flash-attn
           fail=0
           for c in hanzo-kernels hanzo-metal-kernels hanzo-rocm-kernels hanzo-ug \
