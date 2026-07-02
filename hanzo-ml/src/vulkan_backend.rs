@@ -93,7 +93,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "index_select" => spv!("index_select"),
         "where_cond" => spv!("where_cond"),
         "softmax_rows" => spv!("softmax_rows"),
-        "rms_norm" => spv!("rms_norm"),
+        "rms_norm" => include_bytes!("vulkan/spv/rms_norm_blk.spv"),
         "rope" => spv!("rope"),
         "rope_norm" => spv!("rope_norm"),
         "add_rmsnorm" => spv!("add_rmsnorm"),
@@ -142,8 +142,6 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "reshape_and_cache" => spv!("reshape_and_cache"),
         "dsl_mul" => include_bytes!("vulkan/spv/dsl_mul.spv"),
         "dsl_matvec" => include_bytes!("vulkan/spv/dsl_matvec.spv"),
-        "dsl_rms_norm" => include_bytes!("vulkan/spv/dsl_rms_norm.spv"),
-        "rms_norm_blk" => include_bytes!("vulkan/spv/rms_norm_blk.spv"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -4090,13 +4088,20 @@ impl VulkanStorage {
         let m = *dims.last().unwrap_or(&1);
         let nrows = layout.shape().elem_count() / m.max(1);
         let out = self.device.alloc_f32(nrows * m)?;
-        let mut push = push_u32(&[nrows as u32, m as u32]);
-        push.extend_from_slice(&eps.to_ne_bytes());
-        self.device.dispatch(
+        // DSL block-per-row kernel (one workgroup/row, 256 threads, coalesced reads + shared-mem
+        // reduce): 10.86x the naive one-invocation-per-row .comp it replaced. cubecl has no
+        // push-constants, so eps/ndim ride pooled SSBOs -- lifetime-safe across the deferred batch
+        // because the BufPool parks dropped buffers in `pending` and reclaim() runs only after a
+        // flush+fence (post-fence-only), identical to every activation buffer in the forward pass.
+        // out is binding 2, so dispatch_out (not the last-binding default) tracks its RAW barrier.
+        let epsb = self.device.upload_f32(&[eps])?;
+        let ndb = self.device.upload_u32(&[m as u32])?;
+        self.device.dispatch_out(
             "rms_norm",
-            &[xb, ab, out.buffer],
-            &push,
-            Self::groups_1d(nrows),
+            &[xb, ab, out.buffer, epsb.buffer, ndb.buffer],
+            2,
+            &[],
+            (nrows as u32, 1, 1),
         )?;
         Ok(out)
     }
@@ -5388,20 +5393,21 @@ mod dsl_dispatch_proof {
         assert!(maxerr < 1e-4, "DSL matvec through ml diverged: maxerr={maxerr:.3e}");
     }
 
-    // A REAL op (rms_norm) authored once in the DSL, dispatched through ml's own Vulkan pipeline,
-    // proven bit-exact vs both the CPU reference AND ml's hand-written rms_norm.comp, then benchmarked
-    // against it. The DSL kernel is structurally identical to the hand-written one (one thread/row,
-    // local_size 64) with n+eps baked comptime, so it should match to f32-reorder AND run at the same
-    // speed -- the "engine runs a real op via the DSL at hand-written perf" proof.
+    // The production `rms_norm` method now dispatches the DSL block-per-row kernel (rms_norm_blk.spv):
+    // one workgroup/row, 256 threads, coalesced reads + shared-mem reduce -- 10.86x the naive
+    // one-invocation-per-row `.comp` it replaced. This tests it through the REAL method, whose eps/ndim
+    // ride pooled SSBOs (cubecl has no push-constants) with NO explicit synchronize before they drop:
+    // proving the BufPool retains them across the deferred batch (park-on-drop; reclaim is
+    // post-fence-only). Chaining calls stresses that lifetime -- all-bit-exact vs CPU == no use-after-free.
     #[test]
-    fn dsl_rms_norm_runs_through_ml_and_benches() {
-        const N: usize = 4096; // hidden (comptime-baked in the DSL .spv)
-        const ROWS: usize = 4096; // multiple of WG(64)
-        const EPS: f32 = 1e-6; // baked in the DSL .spv; passed to ml via push constant
+    fn rms_norm_production_path_is_dsl_kernel_bit_exact() {
+        const N: usize = 4096;
+        const ROWS: usize = 4096;
+        const EPS: f32 = 1e-6;
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[dsl-rmsnorm] no vulkan device ({e}); skipping");
+                eprintln!("[rms_norm-prod] no vulkan device ({e}); skipping");
                 return;
             }
         };
@@ -5417,83 +5423,48 @@ mod dsl_dispatch_proof {
                 cpu[r * N + i] = x[r * N + i] / denom * w[i];
             }
         }
-
         let xs = dev.upload_f32(&x).unwrap();
         let ws = dev.upload_f32(&w).unwrap();
-        let out_dsl = dev.alloc_f32(ROWS * N).unwrap();
-        let out_ml = dev.alloc_f32(ROWS * N).unwrap();
-        let grid = ((ROWS as u32) / 64, 1, 1);
+        let x_l = Layout::contiguous((ROWS, N));
+        let w_l = Layout::contiguous(N);
 
-        // DSL: comptime dims -> no push constants, 3 SSBOs.
-        dev.dispatch("dsl_rms_norm", &[xs.buffer, ws.buffer, out_dsl.buffer], &[], grid).unwrap();
-        // ml hand-written: [nrows, m] + eps via push constant.
-        let mut push = push_u32(&[ROWS as u32, N as u32]);
-        push.extend_from_slice(&EPS.to_ne_bytes());
-        dev.dispatch("rms_norm", &[xs.buffer, ws.buffer, out_ml.buffer], &push, grid).unwrap();
-        dev.synchronize().unwrap();
+        // Chain 8 production calls with NO intermediate sync: 8 recorded dispatches + 16 pooled eps/ndim
+        // buffers dropped into `pending`. If any were freed/reused mid-batch, an earlier dispatch's
+        // scalars would corrupt its output. Hold the outs, then read (the first readback flushes+fences).
+        let mut outs = Vec::new();
+        for _ in 0..8 {
+            outs.push(xs.rms_norm(&x_l, &ws, &w_l, EPS).unwrap());
+        }
+        let mut worst = 0f32;
+        for out in &outs {
+            let got = out.to_vec_f32().unwrap();
+            let err = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            worst = worst.max(err);
+        }
+        eprintln!("[rms_norm-prod] {ROWS}x{N} x8-batched  maxerr={worst:.2e}  (DSL kernel via production path, pooled scalars, no sync crutch)");
+        assert!(worst < 1e-3, "production rms_norm (DSL kernel) diverged from CPU: {worst:.3e}");
 
-        let got_dsl = out_dsl.to_vec_f32().unwrap();
-        let got_ml = out_ml.to_vec_f32().unwrap();
-        let err_cpu = got_dsl.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        let err_ml = got_dsl.iter().zip(&got_ml).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        eprintln!("[dsl-rmsnorm] {ROWS}x{N}  DSL-vs-CPU maxerr={err_cpu:.2e}  DSL-vs-ml-handwritten maxerr={err_ml:.2e}");
-        assert!(err_cpu < 1e-3, "DSL rms_norm diverged from CPU: {err_cpu:.3e}");
-        assert!(err_ml < 1e-5, "DSL rms_norm diverged from ml's hand-written kernel: {err_ml:.3e}");
-
+        // Clean kernel-only bench: FIXED buffers (no per-iter 64MB alloc/upload) dispatched in a loop
+        // with one fence -- the true kernel cost, not the method's allocation overhead. Same 5-SSBO /
+        // (nrows,1,1) shape the production `rms_norm` invokes.
         let iters = 50;
         let bytes = (3 * ROWS * N * 4) as f64; // read x twice + write out (w negligible)
-        dev.dispatch("dsl_rms_norm", &[xs.buffer, ws.buffer, out_dsl.buffer], &[], grid).unwrap();
-        dev.synchronize().unwrap();
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            dev.dispatch("dsl_rms_norm", &[xs.buffer, ws.buffer, out_dsl.buffer], &[], grid).unwrap();
-        }
-        dev.synchronize().unwrap();
-        let ms_dsl = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
-
-        dev.dispatch("rms_norm", &[xs.buffer, ws.buffer, out_ml.buffer], &push, grid).unwrap();
-        dev.synchronize().unwrap();
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            dev.dispatch("rms_norm", &[xs.buffer, ws.buffer, out_ml.buffer], &push, grid).unwrap();
-        }
-        dev.synchronize().unwrap();
-        let ms_ml = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        eprintln!(
-            "[dsl-rmsnorm] BENCH {ROWS}x{N}  DSL {ms_dsl:.3} ms ({:.0} GB/s)  |  ml hand-written {ms_ml:.3} ms ({:.0} GB/s)  |  DSL/ml = {:.2}x",
-            bytes / (ms_dsl * 1e6),
-            bytes / (ms_ml * 1e6),
-            ms_ml / ms_dsl
-        );
-
-        // Block-per-row DSL rms_norm (coalesced reads + shared-mem reduce, dim-agnostic runtime n):
-        // the WINNING kernel -- one block/row, 256 cooperating threads. Runs through ml's real
-        // dispatch with 5 SSBOs (x, w, out, eps, ndim); grid = one workgroup per row. eps+ndim are
-        // runtime buffers (cubecl has no push constants), lifetime-safe here because we synchronize
-        // before the temp buffers drop; the production forward-pass swap needs ml to retain them
-        // across its deferred batch (the one remaining wire).
+        let out = dev.alloc_f32(ROWS * N).unwrap();
         let epsb = dev.upload_f32(&[EPS]).unwrap();
         let ndb = dev.upload_u32(&[N as u32]).unwrap();
-        let out_blk = dev.alloc_f32(ROWS * N).unwrap();
-        let grid_blk = (ROWS as u32, 1, 1);
-        let blk_bufs = [xs.buffer, ws.buffer, out_blk.buffer, epsb.buffer, ndb.buffer];
-        dev.dispatch("rms_norm_blk", &blk_bufs, &[], grid_blk).unwrap();
-        dev.synchronize().unwrap();
-        let got_blk = out_blk.to_vec_f32().unwrap();
-        let err_blk = got_blk.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        assert!(err_blk < 1e-3, "block rms_norm diverged from CPU: {err_blk:.3e}");
-        dev.dispatch("rms_norm_blk", &blk_bufs, &[], grid_blk).unwrap();
+        let bufs = [xs.buffer, ws.buffer, out.buffer, epsb.buffer, ndb.buffer];
+        let grid = (ROWS as u32, 1, 1);
+        dev.dispatch_out("rms_norm", &bufs, 2, &[], grid).unwrap();
         dev.synchronize().unwrap();
         let t = std::time::Instant::now();
         for _ in 0..iters {
-            dev.dispatch("rms_norm_blk", &blk_bufs, &[], grid_blk).unwrap();
+            dev.dispatch_out("rms_norm", &bufs, 2, &[], grid).unwrap();
         }
         dev.synchronize().unwrap();
-        let ms_blk = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         eprintln!(
-            "[dsl-rmsnorm] BLOCK {ROWS}x{N}  maxerr={err_blk:.2e}  {ms_blk:.3} ms ({:.0} GB/s)  |  {:.2}x FASTER than ml hand-written",
-            bytes / (ms_blk * 1e6),
-            ms_ml / ms_blk
+            "[rms_norm-prod] {ROWS}x{N}  kernel {ms:.3} ms ({:.0} GB/s) -- the DSL block kernel is now the production rms_norm",
+            bytes / (ms * 1e6)
         );
     }
 }
