@@ -23,6 +23,7 @@ fn main() {
             PathBuf::from("src/moe/moe_wmma.cu"),
             PathBuf::from("src/moe/moe_wmma_gguf.cu"),
             PathBuf::from("src/mmvq_gguf.cu"),
+            PathBuf::from("src/fattn_ds4.cu"),
         ];
         // Dense GGUF MMQ kernels (one matmul instance per quant type + quantize).
         let mut mmq: Vec<PathBuf> = glob::glob("src/mmq_gguf/*.cu")
