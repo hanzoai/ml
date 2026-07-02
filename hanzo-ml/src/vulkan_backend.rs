@@ -143,6 +143,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "dsl_mul" => include_bytes!("vulkan/spv/dsl_mul.spv"),
         "dsl_matvec" => include_bytes!("vulkan/spv/dsl_matvec.spv"),
         "dsl_rms_norm" => include_bytes!("vulkan/spv/dsl_rms_norm.spv"),
+        "rms_norm_blk" => include_bytes!("vulkan/spv/rms_norm_blk.spv"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -5463,6 +5464,36 @@ mod dsl_dispatch_proof {
             bytes / (ms_dsl * 1e6),
             bytes / (ms_ml * 1e6),
             ms_ml / ms_dsl
+        );
+
+        // Block-per-row DSL rms_norm (coalesced reads + shared-mem reduce, dim-agnostic runtime n):
+        // the WINNING kernel -- one block/row, 256 cooperating threads. Runs through ml's real
+        // dispatch with 5 SSBOs (x, w, out, eps, ndim); grid = one workgroup per row. eps+ndim are
+        // runtime buffers (cubecl has no push constants), lifetime-safe here because we synchronize
+        // before the temp buffers drop; the production forward-pass swap needs ml to retain them
+        // across its deferred batch (the one remaining wire).
+        let epsb = dev.upload_f32(&[EPS]).unwrap();
+        let ndb = dev.upload_u32(&[N as u32]).unwrap();
+        let out_blk = dev.alloc_f32(ROWS * N).unwrap();
+        let grid_blk = (ROWS as u32, 1, 1);
+        let blk_bufs = [xs.buffer, ws.buffer, out_blk.buffer, epsb.buffer, ndb.buffer];
+        dev.dispatch("rms_norm_blk", &blk_bufs, &[], grid_blk).unwrap();
+        dev.synchronize().unwrap();
+        let got_blk = out_blk.to_vec_f32().unwrap();
+        let err_blk = got_blk.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(err_blk < 1e-3, "block rms_norm diverged from CPU: {err_blk:.3e}");
+        dev.dispatch("rms_norm_blk", &blk_bufs, &[], grid_blk).unwrap();
+        dev.synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            dev.dispatch("rms_norm_blk", &blk_bufs, &[], grid_blk).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let ms_blk = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "[dsl-rmsnorm] BLOCK {ROWS}x{N}  maxerr={err_blk:.2e}  {ms_blk:.3} ms ({:.0} GB/s)  |  {:.2}x FASTER than ml hand-written",
+            bytes / (ms_blk * 1e6),
+            ms_ml / ms_blk
         );
     }
 }
