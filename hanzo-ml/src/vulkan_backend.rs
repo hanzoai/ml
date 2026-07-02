@@ -140,6 +140,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "gdn_gating" => spv!("gdn_gating"),
         "paged_attn" => spv!("paged_attn"),
         "reshape_and_cache" => spv!("reshape_and_cache"),
+        "dsl_mul" => include_bytes!("vulkan/spv/dsl_mul.spv"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -5294,5 +5295,51 @@ impl BackendStorage for VulkanStorage {
                     .write_f32(self.buffer, self.memory, self.host_visible, &data)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dsl_dispatch_proof {
+    use super::*;
+
+    // Proof that the CubeCL kernel DSL plugs into the engine as a CODE GENERATOR, not a second
+    // runtime: a `#[kernel]`-authored elementwise-mul kernel, compiled by cubecl to SPIR-V (entry
+    // renamed `main`, cubecl's unused info buffer stripped via spirv-opt --remove-unused-interface-
+    // variables), is dispatched through hanzo-ml's OWN VulkanDevice::dispatch and matches the CPU
+    // reference bit-exactly -- using the same pipeline/descriptor/command-buffer path every hand-
+    // written `.comp` shader uses. The DSL .spv lives at src/vulkan/spv/dsl_mul.spv, registered in
+    // kernel_spv as "dsl_mul".
+    #[test]
+    fn dsl_generated_kernel_runs_through_ml_vulkan() {
+        const N: usize = 256;
+        const WG: u32 = 64;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[dsl-proof] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let x: Vec<f32> = (0..N).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let w: Vec<f32> = (0..N).map(|i| i as f32 * 0.01 + 1.0).collect();
+        let refout: Vec<f32> = x.iter().zip(&w).map(|(a, b)| a * b).collect();
+
+        let xs = dev.upload_f32(&x).unwrap();
+        let ws = dev.upload_f32(&w).unwrap();
+        let out = dev.alloc_f32(N).unwrap();
+        let groups = (N as u32).div_ceil(WG);
+        dev.dispatch("dsl_mul", &[xs.buffer, ws.buffer, out.buffer], &[], (groups, 1, 1))
+            .unwrap();
+        dev.flush().unwrap();
+        let got = out.to_vec_f32().unwrap();
+
+        let maxerr = got
+            .iter()
+            .zip(&refout)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("[dsl-proof] DSL kernel via ml::VulkanDevice::dispatch  N={N} groups={groups}  maxerr={maxerr:.2e}");
+        eprintln!("[dsl-proof] first4 got={:?} ref={:?}", &got[..4], &refout[..4]);
+        assert_eq!(maxerr, 0.0, "DSL-generated kernel not bit-exact through ml dispatch");
     }
 }
