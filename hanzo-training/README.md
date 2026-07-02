@@ -433,7 +433,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 
 This project is licensed under either of:
 
-- BSD 3-Clause License ([LICENSE-BSD](LICENSE-BSD))
+- BSD 3-Clause License ([LICENSE-MIT (or LICENSE-APACHE)](LICENSE-MIT (or LICENSE-APACHE)))
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 
 at your option.
