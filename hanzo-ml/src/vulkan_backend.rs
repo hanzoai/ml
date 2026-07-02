@@ -55,7 +55,6 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q4_0" => spv!("mul_mat_q4_0"),
         "mul_mat_q8" => spv!("mul_mat_q8"),
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
-        "mul_mm_q4k_shared" => spv!("mul_mm_q4k_shared"),
         "mul_mm_q4k_tiled" => spv!("mul_mm_q4k_tiled"),
         "mul_mm_q4k_tiled_dp4a" => spv!("mul_mm_q4k_tiled_dp4a"),
         "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
@@ -1187,13 +1186,12 @@ impl VulkanDevice {
         // Q4_K prefill path selection. DEFAULT for dense prefill (woff==0, m>1): the best available 2D
         // tile -- mul_mm_q4k_tiled_dp4a (int8 dp4a, 9.35x over the column kernel) where the device has
         // int_dot8, else the universal f32 mul_mm_q4k_tiled (2.06x). Both stage weight+activation in LDS
-        // and reuse across the 64x64 output tile. MoE banks (woff!=0), m==1, k beyond the LDS bound, and
-        // HANZO_VK_Q4K_LEGACY fall to the column-per-invocation mul_mat_q4k. The per-kernel env vars
-        // (HANZO_VK_Q4K_{DP4A,TILED2D,TILED,LEGACY}) force one path for the A/B gates.
+        // and reuse across the 64x64 output tile. MoE banks (woff!=0), m==1, and HANZO_VK_Q4K_LEGACY
+        // fall to the column-per-invocation mul_mat_q4k. The per-kernel env vars
+        // (HANZO_VK_Q4K_{DP4A,TILED2D,LEGACY}) force one path for the A/B gates.
         let legacy = std::env::var_os("HANZO_VK_Q4K_LEGACY").is_some();
         let force_dp4a = std::env::var_os("HANZO_VK_Q4K_DP4A").is_some();
         let force_2d = std::env::var_os("HANZO_VK_Q4K_TILED2D").is_some();
-        let force_1d = std::env::var_os("HANZO_VK_Q4K_TILED").is_some();
         // L4 coopmat (tensor cores) -- decode Q4_K weight to f16 LDS tiles + coopMatMulAdd, the
         // llama-parity path. Env-forced + requires device coopmat; off by default until benched faster
         // than dp4a on this device (gfx1151 coopmat has had flakiness). woff==0 dense only.
@@ -1213,11 +1211,9 @@ impl VulkanDevice {
             return Ok(out);
         }
         let dense_default = !legacy && woff == 0 && m > 1;
-        let use_dp4a = !legacy
-            && (force_dp4a || (dense_default && self.inner.int_dot8 && !force_2d && !force_1d));
-        let use_2d = !legacy && !use_dp4a && (force_2d || (dense_default && !force_1d));
-        let use_1d =
-            !legacy && !use_dp4a && !use_2d && force_1d && k / 256 <= MUL_MM_Q4K_MAX_BLOCKS;
+        let use_dp4a =
+            !legacy && (force_dp4a || (dense_default && self.inner.int_dot8 && !force_2d));
+        let use_2d = !legacy && !use_dp4a && (force_2d || dense_default);
         if use_dp4a {
             let (xq, xs, xsum) = self.quantize_act_q8(x, m, k)?;
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
@@ -1236,16 +1232,6 @@ impl VulkanDevice {
                 &[wq.buffer, x.buffer, out.buffer],
                 &push,
                 ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
-            )?;
-            return Ok(out);
-        }
-        if use_1d {
-            let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
-            self.dispatch(
-                "mul_mm_q4k_shared",
-                &[wq.buffer, x.buffer, out.buffer],
-                &push,
-                (nout as u32, 1, 1),
             )?;
             return Ok(out);
         }
@@ -3519,11 +3505,6 @@ const WG1D: u32 = 64;
 // bound). The host tiles the M dimension by this so each weight block is still read once per output
 // column across a tile of up to MATMUL_Q_MAX_M rows.
 const MATMUL_Q_MAX_M: usize = 8;
-
-// Max Q4_K super-blocks (k/256) the tiled prefill kernel (mul_mm_q4k_shared) stages in LDS. MUST equal
-// MAX_BLOCKS in mul_mm_q4k_shared.comp. k <= 64*256 = 16384 covers every Qwen3 projection (max 14336);
-// larger k falls back to the column-per-invocation mul_mat_q4k.
-const MUL_MM_Q4K_MAX_BLOCKS: usize = 64;
 
 // Compile-time per-invocation array bounds in gdn_step.comp / gdn_conv1d_step.comp (MAX_K #defines).
 // head_k_dim must be <= GDN_STEP_MAX_K and the conv kernel <= GDN_CONV_MAX_K; both checked host-side.
