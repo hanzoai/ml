@@ -54,7 +54,7 @@ hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.38" }
 hanzo-datasets = { path = "./hanzo-datasets", version = "0.11.8" }
 hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.11.34" }
 hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.11.8" }
-hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.35" }
+hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.36" }
 hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.33" }
 hanzo-nn = { path = "./hanzo-nn", version = "0.11.33" }
 hanzo-onnx = { path = "./hanzo-onnx", version = "0.11.8" }
