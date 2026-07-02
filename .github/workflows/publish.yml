@@ -12,7 +12,10 @@ on:
 
 jobs:
   publish:
-    runs-on: hanzo-build-linux-amd64
+    # GitHub-hosted: publish is a pure `cargo publish --no-verify` upload (no GPU build), and the
+    # self-hosted hanzo-build runner does NOT inject Actions secrets -> CARGO_REGISTRY_TOKEN read
+    # empty there. ubuntu-latest is the proven org pattern (hanzoai/node) and receives the secret.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
