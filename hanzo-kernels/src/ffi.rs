@@ -3,10 +3,12 @@ use core::ffi::c_void;
 #[allow(improper_ctypes)]
 extern "C" {
     // Fused F32 head_dim-512 online-softmax flash-decode attention (from fattn_ds4.cu).
-    // q/out are [n_head, 512]; k/v are [n_kv_head, kv_len, 512] (n_kv_head == 1 => plain
-    // [kv_len, 512], the V4 MQA case). `sinks` ([n_head]) may be null. `window` == 0
-    // disables the sliding window; otherwise the query (newest token) attends the last
-    // `window` KV rows. `scale` is applied to the QK dot (e.g. 1/sqrt(512)).
+    // q/out are [n_head, q_len, 512] with q_len in 1..=8 (speculative-verify query width, 1 for
+    // plain decode); k/v are [n_kv_head, kv_len, 512] (n_kv_head == 1 => plain [kv_len, 512], the
+    // V4 MQA case) and already hold all q_len new positions (kv_len >= q_len). `sinks` ([n_head])
+    // may be null. `window` == 0 disables the sliding window; otherwise query row s (absolute
+    // position kv_len - q_len + s) attends kv rows (kv_len-q_len+s+1-window .. kv_len-q_len+s]
+    // clamped to >= 0. `scale` is applied to the QK dot (e.g. 1/sqrt(512)).
     pub fn hanzo_fattn_decode_f32_hd512(
         stream: *mut c_void,
         q: *const f32,
@@ -17,6 +19,7 @@ extern "C" {
         n_head: i32,
         n_kv_head: i32,
         kv_len: i32,
+        q_len: i32,
         window: i32,
         scale: f32,
     );
