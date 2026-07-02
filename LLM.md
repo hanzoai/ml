@@ -791,3 +791,28 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   while 4B stays under it. NEXT: force Q6_K through dequant (vulkan_prefill_gemm_max_rows Q6K->0) to
   confirm, then bisect mul_mat_q6k for the large-k bug. (Vulkan is the weak backend; this is a real
   correctness bug that makes 8B-Q4K_M unusable there -- distinct from the decode-perf codegen ceiling.)
+
+### DEFINITIVE re-bench (the honest "are we beating llama?" answer) -- NEAR-PARITY, NOT beating
+- Fresh matched-load A/B on evo (gfx1151, hanzo-rocm vs llama-HIP, pp512/tg128, -n forced-all-GPU),
+  box under the continuous swarm (load ~3.65 -- NOT idle; absolute T/s depressed, but the hanzo-vs-llama
+  RATIO at matched load is valid, both suffer the same steal):
+    Qwen3-8B-Q4_K_M (dense):  hanzo  968.5 pp / 32.3 tg  vs llama 1022 pp / 37.1 tg = prefill 0.95x, decode 0.87x
+    Qwen3-30B-A3B-Q4K (MoE):  hanzo  953.5 pp / 55.8 tg  vs llama 1112 pp / 63.6 tg = prefill 0.86x, decode 0.88x
+- HONEST CONCLUSION: hanzo is at **NEAR-PARITY, TRAILING (~0.86-0.95x)** on ROCm across dense + MoE,
+  prefill + decode. We are **NOT** reliably "beating" llama.cpp. The earlier "30B decode 1.03x BEATS
+  llama" was FAVORABLE VARIANCE, not a durable win: hanzo decode variance here was +-6.0 T/s vs llama's
+  +-1.97 -- hanzo is MORE sensitive to background load, so a lucky low-contention window read as a "beat."
+  On a truly idle box both numbers rise and the ratio recovers toward the canonical ~0.91x, but "beating"
+  is not evidence-supported. The prior optimistic scoreboard mixed fresh + compacted-session numbers;
+  this section is the corrected, freshly-measured record. Cross-backend law holds: decode near-parity,
+  prefill the frontier -- but "near-parity" means ~0.9x, not >=1.0x.
+- PUBLISH STATUS (blocked, ops): ml is version-staged at 0.11.36 on main (decode dp4a + Vulkan decode
+  cleanup + DS4 Sinkhorn all merged, vulkan_quant_tests 28/0 green), but crates.io publishing is BROKEN:
+  the publish.yml CI (workflow_dispatch + bare-semver-tag trigger) FAILS on every run (incl. a fresh
+  2026-07-02 dispatch) with "CARGO_REGISTRY_TOKEN is empty" -- the repo secret is LISTED (set 2026-06-23)
+  but reads empty at runtime on the self-hosted runner hanzo-build-linux-amd64. Zero successful publish
+  runs since 0.11.19, so ml 0.11.20-0.11.36 were never published via CI (engine has been git-pinning ml).
+  FIX (ops, NOT code -- I won't fabricate/plaintext a registry token): re-provision CARGO_REGISTRY_TOKEN
+  from KMS into the repo/org secret AND ensure the self-hosted runner can read it, then re-fire
+  `gh workflow run publish.yml -R hanzoai/ml --ref main` (idempotent: the script skips already-uploaded
+  crates). Code + version are ready; publishing awaits the runner-secret fix.
