@@ -1,0 +1,38 @@
+// Automation probe: dump ml-ready SPIR-V for (a) elementwise and (b) a REDUCTION matvec, both
+// comptime-dims (no runtime .len -> no info buffer -> 3 SSBOs at bindings 0,1,2). Proves the codegen
+// generalizes past elementwise to a compute-heavy kernel that ml can dispatch.
+use cubecl::prelude::*;
+
+#[cube(launch_unchecked)]
+fn dsl_mul<F: Float>(x: &Array<F>, w: &Array<F>, out: &mut Array<F>, #[comptime] n: usize) {
+    if ABSOLUTE_POS < n { out[ABSOLUTE_POS] = x[ABSOLUTE_POS] * w[ABSOLUTE_POS]; }
+}
+
+#[cube(launch_unchecked)]
+fn dsl_matvec<F: Float>(w: &Array<F>, x: &Array<F>, out: &mut Array<F>, #[comptime] k: usize, #[comptime] rows: usize) {
+    let row = ABSOLUTE_POS;
+    if row < rows {
+        let mut acc = F::new(0.0);
+        for i in 0..k { acc += w[row * k + i] * x[i]; }
+        out[row] = acc;
+    }
+}
+
+fn main() {
+    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    let c = WgpuRuntime::client(&WgpuDevice::default());
+    let n = 256usize; let (rows, k) = (64usize, 32usize);
+    let x = vec![1.0f32; n];
+    let xh = c.create_from_slice(f32::as_bytes(&x));
+    let oh = c.create_from_slice(f32::as_bytes(&vec![0.0f32; n]));
+    unsafe { dsl_mul::launch_unchecked::<f32, WgpuRuntime>(&c, CubeCount::Static(4,1,1), CubeDim::new_1d(64),
+        ArrayArg::from_raw_parts(xh.clone(), n), ArrayArg::from_raw_parts(xh.clone(), n), ArrayArg::from_raw_parts(oh, n), n); }
+    let w = vec![1.0f32; rows * k]; let xv = vec![2.0f32; k];
+    let wh = c.create_from_slice(f32::as_bytes(&w));
+    let xvh = c.create_from_slice(f32::as_bytes(&xv));
+    let mo = c.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    unsafe { dsl_matvec::launch_unchecked::<f32, WgpuRuntime>(&c, CubeCount::Static(1,1,1), CubeDim::new_1d(64),
+        ArrayArg::from_raw_parts(wh, rows*k), ArrayArg::from_raw_parts(xvh, k), ArrayArg::from_raw_parts(mo.clone(), rows), k, rows); }
+    let got = f32::from_bytes(&c.read_one_unchecked(mo)).to_vec();
+    println!("[probe] dsl_matvec out[0]={} (expect {})", got[0], 2.0*k as f32);
+}
