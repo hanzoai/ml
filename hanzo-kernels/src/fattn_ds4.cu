@@ -19,9 +19,15 @@
 //   2. ds4's decode dispatch drives row selection through a KV ring buffer (pos0/raw_start/
 //      raw_cap) and passes window == 0. Here the KV cache is a plain contiguous
 //      [n_kv_head, kv_len, 512] tensor and the sliding window is applied directly with the
-//      identical clamp from the kernel's own window branch (ds4_cuda.cu:5470-5472),
-//      specialized to decode where the query is the newest token (qpos = kv_len - 1):
-//      start_row = kv_len - window when kv_len > window, else 0.
+//      identical clamp from the kernel's own window branch (ds4_cuda.cu:5470-5472).
+//
+// Speculative-verify query width: q is [n_head, q_len, 512] with q_len in 1..=8 (the trailing
+// block of tokens a draft proposed; the KV cache already holds all q_len new K/V rows appended
+// at the end). One grid.z plane per query row, so each block is the 1-row kernel body applied to
+// row s = blockIdx.z. Row s is the token at absolute position qpos = kv_len - q_len + s, and
+// attends kv rows [start_row, end_row): end_row = qpos + 1 (causal, up to and including its own
+// position) and start_row = max(0, qpos + 1 - window) when window != 0 (its own sliding window).
+// q_len == 1 collapses to qpos = kv_len - 1, byte-identical to plain single-token decode.
 //
 // GQA/MQA: ds4 indexes the KV cache with no per-head offset (raw_kv + row*head_dim), i.e.
 // a single shared KV head (MQA / n_kv_head == 1), which V4 uses. This port generalizes to
@@ -51,18 +57,20 @@ __device__ static float fattn_warp_sum_f32(float v) {
 }
 
 extern "C" __global__ void hanzo_fattn_decode_f32_hd512_kernel(
-        const float *q,     // [n_head, 512]
+        const float *q,     // [n_head, q_len, 512]
         const float *k,     // [n_kv_head, kv_len, 512]
         const float *v,     // [n_kv_head, kv_len, 512]
         const float *sinks, // [n_head] or nullptr
-        float *out,         // [n_head, 512]
+        float *out,         // [n_head, q_len, 512]
         uint32_t n_head,
         uint32_t n_kv_head,
         uint32_t kv_len,
+        uint32_t q_len,
         uint32_t window,
         float scale) {
     const uint32_t lane = threadIdx.x & (FATTN_WARP - 1u);
     const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t s = blockIdx.z; // query row within the trailing block, 0..q_len-1
 
     // Head <-> block mapping. group = q-heads per kv-head (== n_head for MQA). Each block
     // owns 8 heads of ONE kv head, so the shared KV tile below is valid for all 8 warps.
@@ -74,11 +82,15 @@ extern "C" __global__ void hanzo_fattn_decode_f32_hd512_kernel(
     const uint32_t head = kv_head * group + head_in_kv;
     const bool valid_head = (head_in_kv < group) && (head < n_head);
 
-    // Sliding window: query is the newest token (position kv_len-1); attend the last
-    // `window` rows. Identical clamp to ds4 (lo = qpos+1-window), specialized to decode.
+    // Per-row causal + sliding window. Query row s is the token at absolute position
+    // qpos = kv_len - q_len + s; it attends kv rows [start_row, end_row): end_row = qpos + 1
+    // (causal, up to & incl. its own position), start_row = max(0, qpos+1-window) (its own
+    // window). Identical clamp to ds4 (lo = qpos+1-window). q_len==1 => qpos = kv_len-1.
+    const uint32_t qpos = kv_len - q_len + s;
+    const uint32_t end_row = qpos + 1u;
     uint32_t start_row = 0u;
-    if (window != 0u && kv_len > window) start_row = kv_len - window;
-    const uint32_t n_score = kv_len - start_row;
+    if (window != 0u && end_row > window) start_row = end_row - window;
+    const uint32_t n_score = end_row - start_row;
 
     __shared__ float4 k_shared[FATTN_TILE_ROWS * FATTN_F4_PER_ROW]; // 8 KB
     __shared__ float4 v_shared[FATTN_TILE_ROWS * FATTN_F4_PER_ROW]; // 8 KB
@@ -87,7 +99,7 @@ extern "C" __global__ void hanzo_fattn_decode_f32_hd512_kernel(
     float4 q0 = make_float4(0.f, 0.f, 0.f, 0.f);
     float4 q1 = q0, q2 = q0, q3 = q0;
     if (valid_head) {
-        const float4 *q4 = (const float4 *)(q + (uint64_t)head * FATTN_HEAD_DIM);
+        const float4 *q4 = (const float4 *)(q + ((uint64_t)head * q_len + s) * FATTN_HEAD_DIM);
         q0 = q4[lane + 0u];
         q1 = q4[lane + 32u];
         q2 = q4[lane + 64u];
@@ -175,16 +187,17 @@ extern "C" __global__ void hanzo_fattn_decode_f32_hd512_kernel(
     o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
     o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
 
-    float4 *out4 = (float4 *)(out + (uint64_t)head * FATTN_HEAD_DIM);
+    float4 *out4 = (float4 *)(out + ((uint64_t)head * q_len + s) * FATTN_HEAD_DIM);
     out4[lane + 0u] = o0;
     out4[lane + 32u] = o1;
     out4[lane + 64u] = o2;
     out4[lane + 96u] = o3;
 }
 
-// Host launcher. `stream` is a cudaStream_t (passed as void*). q/out are [n_head, 512];
-// k/v are [n_kv_head, kv_len, 512] (n_kv_head == 1 => plain [kv_len, 512]). `sinks` may be
-// null. `scale` is the softmax scale applied to the QK dot (e.g. 1/sqrt(512)).
+// Host launcher. `stream` is a cudaStream_t (passed as void*). q/out are [n_head, q_len, 512]
+// with q_len in 1..=8; k/v are [n_kv_head, kv_len, 512] (n_kv_head == 1 => plain [kv_len, 512])
+// and must already hold all q_len new positions (kv_len >= q_len). `sinks` may be null. `scale`
+// is the softmax scale applied to the QK dot (e.g. 1/sqrt(512)).
 extern "C" void hanzo_fattn_decode_f32_hd512(
         void *stream,
         const float *q,
@@ -195,14 +208,16 @@ extern "C" void hanzo_fattn_decode_f32_hd512(
         int n_head,
         int n_kv_head,
         int kv_len,
+        int q_len,
         int window,
         float scale) {
     cudaStream_t s = static_cast<cudaStream_t>(stream);
     const uint32_t group = (uint32_t)n_head / (uint32_t)n_kv_head;
     const uint32_t blocks_per_kv = (group + FATTN_HEADS_PER_BLOCK - 1u) / FATTN_HEADS_PER_BLOCK;
-    dim3 grid(1u, (uint32_t)n_kv_head * blocks_per_kv, 1u);
+    dim3 grid(1u, (uint32_t)n_kv_head * blocks_per_kv, (uint32_t)q_len);
     dim3 block(FATTN_BLOCK, 1u, 1u);
     hanzo_fattn_decode_f32_hd512_kernel<<<grid, block, 0, s>>>(
             q, k, v, sinks, out,
-            (uint32_t)n_head, (uint32_t)n_kv_head, (uint32_t)kv_len, (uint32_t)window, scale);
+            (uint32_t)n_head, (uint32_t)n_kv_head, (uint32_t)kv_len,
+            (uint32_t)q_len, (uint32_t)window, scale);
 }
