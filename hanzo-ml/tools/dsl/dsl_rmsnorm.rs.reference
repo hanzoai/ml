@@ -1,0 +1,66 @@
+// DSL rms_norm, comptime hidden `n` + baked eps, one thread per row (identical structure to ml's
+// hand-written rms_norm.comp). rows come from the exact dispatch grid (multiple of WG -> no guard ->
+// cubecl emits ONLY the 3 data buffers at bindings 0,1,2). Drops into ml's Vulkan dispatch via spv_to_ml.sh.
+use cubecl::prelude::*;
+
+#[cube(launch_unchecked)]
+fn dsl_rms_norm<F: Float>(x: &Array<F>, w: &Array<F>, out: &mut Array<F>, #[comptime] n: usize) {
+    let row = ABSOLUTE_POS;
+    let base = row * n;
+    let mut ss = F::new(0.0);
+    for i in 0..n {
+        let v = x[base + i];
+        ss += v * v;
+    }
+    let denom = (ss / F::cast_from(n as u32) + F::new(1e-6)).sqrt();
+    for i in 0..n {
+        out[base + i] = x[base + i] / denom * w[i];
+    }
+}
+
+const N: usize = 4096; // hidden dim (comptime, fixed per model)
+const ROWS: usize = 4096; // multiple of WG -> exact grid, no bounds guard needed
+const WG: u32 = 64;
+
+// Same deterministic data the ml test regenerates (no giant bins to shuttle).
+fn gen_x(row: usize, i: usize) -> f32 {
+    (((row * 7 + i * 13) % 1000) as f32) / 500.0 - 1.0
+}
+fn gen_w(i: usize) -> f32 {
+    (((i * 3) % 100) as f32) / 100.0 + 0.5
+}
+
+fn main() {
+    let x: Vec<f32> = (0..ROWS * N).map(|idx| gen_x(idx / N, idx % N)).collect();
+    let w: Vec<f32> = (0..N).map(gen_w).collect();
+
+    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    let c = WgpuRuntime::client(&WgpuDevice::default());
+    let xh = c.create_from_slice(f32::as_bytes(&x));
+    let wh = c.create_from_slice(f32::as_bytes(&w));
+    let oh = c.create_from_slice(f32::as_bytes(&vec![0.0f32; ROWS * N]));
+    let groups = (ROWS as u32) / WG;
+    unsafe {
+        dsl_rms_norm::launch_unchecked::<f32, WgpuRuntime>(
+            &c,
+            CubeCount::Static(groups, 1, 1),
+            CubeDim::new_1d(WG),
+            ArrayArg::from_raw_parts(xh.clone(), ROWS * N),
+            ArrayArg::from_raw_parts(wh.clone(), N),
+            ArrayArg::from_raw_parts(oh.clone(), ROWS * N),
+            N,
+        );
+    }
+    let got = f32::from_bytes(&c.read_one_unchecked(oh)).to_vec();
+    // CPU reference (row 0) for a self-check.
+    let mut ss = 0f32;
+    for i in 0..N {
+        let v = gen_x(0, i);
+        ss += v * v;
+    }
+    let denom = (ss / N as f32 + 1e-6).sqrt();
+    let r0: Vec<f32> = (0..4).map(|i| gen_x(0, i) / denom * gen_w(i)).collect();
+    let maxerr = (0..4).map(|i| (got[i] - r0[i]).abs()).fold(0.0f32, f32::max);
+    println!("[cubecl-vulkan] dsl_rms_norm N={N} ROWS={ROWS} WG={WG} groups={groups} row0_maxerr_vs_cpu={maxerr:.2e}");
+    println!("first4: {:?} vs ref {:?}", &got[..4], r0);
+}

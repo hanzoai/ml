@@ -142,6 +142,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "reshape_and_cache" => spv!("reshape_and_cache"),
         "dsl_mul" => include_bytes!("vulkan/spv/dsl_mul.spv"),
         "dsl_matvec" => include_bytes!("vulkan/spv/dsl_matvec.spv"),
+        "dsl_rms_norm" => include_bytes!("vulkan/spv/dsl_rms_norm.spv"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -5384,5 +5385,84 @@ mod dsl_dispatch_proof {
         eprintln!("[dsl-proof] DSL matvec via ml::VulkanDevice::dispatch  rows={ROWS} k={K}  maxerr={maxerr:.2e}");
         eprintln!("[dsl-proof] first4 got={:?} ref={:?}", &got[..4], &refout[..4]);
         assert!(maxerr < 1e-4, "DSL matvec through ml diverged: maxerr={maxerr:.3e}");
+    }
+
+    // A REAL op (rms_norm) authored once in the DSL, dispatched through ml's own Vulkan pipeline,
+    // proven bit-exact vs both the CPU reference AND ml's hand-written rms_norm.comp, then benchmarked
+    // against it. The DSL kernel is structurally identical to the hand-written one (one thread/row,
+    // local_size 64) with n+eps baked comptime, so it should match to f32-reorder AND run at the same
+    // speed -- the "engine runs a real op via the DSL at hand-written perf" proof.
+    #[test]
+    fn dsl_rms_norm_runs_through_ml_and_benches() {
+        const N: usize = 4096; // hidden (comptime-baked in the DSL .spv)
+        const ROWS: usize = 4096; // multiple of WG(64)
+        const EPS: f32 = 1e-6; // baked in the DSL .spv; passed to ml via push constant
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[dsl-rmsnorm] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let gen_x = |row: usize, i: usize| (((row * 7 + i * 13) % 1000) as f32) / 500.0 - 1.0;
+        let gen_w = |i: usize| (((i * 3) % 100) as f32) / 100.0 + 0.5;
+        let x: Vec<f32> = (0..ROWS * N).map(|idx| gen_x(idx / N, idx % N)).collect();
+        let w: Vec<f32> = (0..N).map(gen_w).collect();
+        let mut cpu = vec![0f32; ROWS * N];
+        for r in 0..ROWS {
+            let ss: f32 = (0..N).map(|i| x[r * N + i] * x[r * N + i]).sum();
+            let denom = (ss / N as f32 + EPS).sqrt();
+            for i in 0..N {
+                cpu[r * N + i] = x[r * N + i] / denom * w[i];
+            }
+        }
+
+        let xs = dev.upload_f32(&x).unwrap();
+        let ws = dev.upload_f32(&w).unwrap();
+        let out_dsl = dev.alloc_f32(ROWS * N).unwrap();
+        let out_ml = dev.alloc_f32(ROWS * N).unwrap();
+        let grid = ((ROWS as u32) / 64, 1, 1);
+
+        // DSL: comptime dims -> no push constants, 3 SSBOs.
+        dev.dispatch("dsl_rms_norm", &[xs.buffer, ws.buffer, out_dsl.buffer], &[], grid).unwrap();
+        // ml hand-written: [nrows, m] + eps via push constant.
+        let mut push = push_u32(&[ROWS as u32, N as u32]);
+        push.extend_from_slice(&EPS.to_ne_bytes());
+        dev.dispatch("rms_norm", &[xs.buffer, ws.buffer, out_ml.buffer], &push, grid).unwrap();
+        dev.synchronize().unwrap();
+
+        let got_dsl = out_dsl.to_vec_f32().unwrap();
+        let got_ml = out_ml.to_vec_f32().unwrap();
+        let err_cpu = got_dsl.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let err_ml = got_dsl.iter().zip(&got_ml).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        eprintln!("[dsl-rmsnorm] {ROWS}x{N}  DSL-vs-CPU maxerr={err_cpu:.2e}  DSL-vs-ml-handwritten maxerr={err_ml:.2e}");
+        assert!(err_cpu < 1e-3, "DSL rms_norm diverged from CPU: {err_cpu:.3e}");
+        assert!(err_ml < 1e-5, "DSL rms_norm diverged from ml's hand-written kernel: {err_ml:.3e}");
+
+        let iters = 50;
+        let bytes = (3 * ROWS * N * 4) as f64; // read x twice + write out (w negligible)
+        dev.dispatch("dsl_rms_norm", &[xs.buffer, ws.buffer, out_dsl.buffer], &[], grid).unwrap();
+        dev.synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            dev.dispatch("dsl_rms_norm", &[xs.buffer, ws.buffer, out_dsl.buffer], &[], grid).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let ms_dsl = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+        dev.dispatch("rms_norm", &[xs.buffer, ws.buffer, out_ml.buffer], &push, grid).unwrap();
+        dev.synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            dev.dispatch("rms_norm", &[xs.buffer, ws.buffer, out_ml.buffer], &push, grid).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let ms_ml = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "[dsl-rmsnorm] BENCH {ROWS}x{N}  DSL {ms_dsl:.3} ms ({:.0} GB/s)  |  ml hand-written {ms_ml:.3} ms ({:.0} GB/s)  |  DSL/ml = {:.2}x",
+            bytes / (ms_dsl * 1e6),
+            bytes / (ms_ml * 1e6),
+            ms_ml / ms_dsl
+        );
     }
 }
