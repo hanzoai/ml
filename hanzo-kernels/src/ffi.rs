@@ -2,6 +2,25 @@ use core::ffi::c_void;
 #[allow(dead_code)]
 #[allow(improper_ctypes)]
 extern "C" {
+    // Fused F32 head_dim-512 online-softmax flash-decode attention (from fattn_ds4.cu).
+    // q/out are [n_head, 512]; k/v are [n_kv_head, kv_len, 512] (n_kv_head == 1 => plain
+    // [kv_len, 512], the V4 MQA case). `sinks` ([n_head]) may be null. `window` == 0
+    // disables the sliding window; otherwise the query (newest token) attends the last
+    // `window` KV rows. `scale` is applied to the QK dot (e.g. 1/sqrt(512)).
+    pub fn hanzo_fattn_decode_f32_hd512(
+        stream: *mut c_void,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        sinks: *const f32,
+        out: *mut f32,
+        n_head: i32,
+        n_kv_head: i32,
+        kv_len: i32,
+        window: i32,
+        scale: f32,
+    );
+
     // for unquntized models
     pub fn moe_gemm_wmma(
         input: *const c_void,         // device pointer [size_m, size_k]
