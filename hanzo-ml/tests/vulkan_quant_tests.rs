@@ -19,7 +19,7 @@ use hanzo_ml::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use hanzo_ml::{Device, Module, Tensor};
 use std::sync::Arc;
 
-// Tests that force a kernel via a process-global env var (HANZO_VK_DP4A_DECODE_OFF, HANZO_VK_Q4K_{LEGACY,
+// Tests that force a kernel via a process-global env var (VK_DP4A_DECODE_OFF, HANZO_VK_Q4K_{LEGACY,
 // TILED}) must not run concurrently: cargo runs tests in parallel threads and the env set/remove races
 // otherwise (flaky pass/fail at varying shapes). Each such test holds this lock for its whole body.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -684,7 +684,7 @@ fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
     // Q4_K decode defaults to int8 dp4a (q8_1 activation quant, ~0.4%); force the scalar path so this
     // exact-vs-CPU check validates the decode math. The dp4a q8_1 path is gated separately by
     // vulkan_q4k_dp4a_decode_matches_scalar.
-    std::env::set_var("HANZO_VK_DP4A_DECODE_OFF", "1");
+    std::env::set_var("VK_DP4A_DECODE_OFF", "1");
     // (nout, k); k divisible by 256 so every dtype is exercised on the same shapes.
     for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
         for dt in [
@@ -709,7 +709,7 @@ fn vulkan_qmatmul_forward_matches_cpu() -> hanzo_ml::Result<()> {
             );
         }
     }
-    std::env::remove_var("HANZO_VK_DP4A_DECODE_OFF");
+    std::env::remove_var("VK_DP4A_DECODE_OFF");
     Ok(())
 }
 
@@ -1414,10 +1414,9 @@ fn vulkan_add_rmsnorm_matches_unfused() {
     }
 }
 
-// Both dp4a decode matvecs -- column (matvec_q4k_dp4a) and subgroup (matvec_q4k_dp4a_sg, the default
-// where the device has subgroup arithmetic) -- must match the SCALAR matvec within the q8_1 activation
-// quant tolerance. matvec_q4k_scalar forces the non-dp4a path (the exact reference) regardless of the
-// dp4a default. Validates the Vulkan decode lever (1.8x) for both reductions.
+// The dp4a column decode matvec (matvec_q4k_dp4a, the shipped optimum) must match the SCALAR matvec
+// within the q8_1 activation-quant tolerance. matvec_q4k_scalar forces the non-dp4a path (the exact
+// reference) regardless of the dp4a default. Validates the Vulkan decode lever (1.8x).
 #[test]
 fn vulkan_q4k_dp4a_decode_matches_scalar() {
     let Some(dev) = gpu() else { return; };
@@ -1428,10 +1427,7 @@ fn vulkan_q4k_dp4a_decode_matches_scalar() {
         let wq = vk.upload_qweight(&raw).unwrap();
         let scalar = vk.matvec_q4k_scalar(&wq, &x, nout, k).unwrap();
         let column = vk.matvec_q4k_dp4a(&wq, &x, nout, k).unwrap();
-        let subgroup = vk.matvec_q4k_dp4a_sg(&wq, &x, nout, k).unwrap();
-        let r2 = vk.matvec_q4k_dp4a_r2(&wq, &x, nout, k).unwrap();
-        let v2 = vk.matvec_q4k_dp4a_v2(&wq, &x, nout, k).unwrap();
-        for (name, got) in [("column", &column), ("subgroup", &subgroup), ("r2", &r2), ("v2", &v2)] {
+        for (name, got) in [("column", &column)] {
             let (mut sse, mut refsq) = (0f64, 0f64);
             for i in 0..nout {
                 let d = (got[i] - scalar[i]) as f64;
