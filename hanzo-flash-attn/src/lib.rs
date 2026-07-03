@@ -242,7 +242,27 @@ impl hanzo_ml::CustomOp3 for FlashAttn {
     ) -> Result<(hanzo_ml::CudaStorage, Shape)> {
         match q.dtype() {
             hanzo_ml::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
-            hanzo_ml::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
+            hanzo_ml::DType::BF16 => {
+                // flash-attn-2 casts the f32 softmax probabilities P to Element (bf16 = 7 mantissa
+                // bits) before the P*V tensor-core matmul (flash_fwd_kernel.h convert_type<Element>);
+                // that precision loss tips repetition-prone models (Qwen3-8B-Q4K) into collapse. Route
+                // bf16 through the f16 kernel (10 mantissa bits, P in [0,1] fits f16, fp16 MMA == bf16
+                // MMA rate = no speed cost). HANZO_CUDA_FLASH_BF16=1 forces raw bf16 for the A/B.
+                if std::env::var("HANZO_CUDA_FLASH_BF16").is_ok_and(|s| s == "1") {
+                    self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true)
+                } else {
+                    let qf = q.to_dtype(q_l, hanzo_ml::DType::F16)?;
+                    let kf = k.to_dtype(k_l, hanzo_ml::DType::F16)?;
+                    let vf = v.to_dtype(v_l, hanzo_ml::DType::F16)?;
+                    let qcl = Layout::contiguous(q_l.shape());
+                    let kcl = Layout::contiguous(k_l.shape());
+                    let vcl = Layout::contiguous(v_l.shape());
+                    let (out, shape) = self.cuda_fwd_t::<f16>(&qf, &qcl, &kf, &kcl, &vf, &vcl, false)?;
+                    let out_l = Layout::contiguous(&shape);
+                    let out = out.to_dtype(&out_l, hanzo_ml::DType::BF16)?;
+                    Ok((out, shape))
+                }
+            }
             dt => hanzo_ml::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
         }
     }
@@ -709,7 +729,27 @@ impl hanzo_ml::CustomOp3 for FlashAttnVarLen {
     ) -> Result<(hanzo_ml::CudaStorage, Shape)> {
         match q.dtype() {
             hanzo_ml::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
-            hanzo_ml::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
+            hanzo_ml::DType::BF16 => {
+                // flash-attn-2 casts the f32 softmax probabilities P to Element (bf16 = 7 mantissa
+                // bits) before the P*V tensor-core matmul (flash_fwd_kernel.h convert_type<Element>);
+                // that precision loss tips repetition-prone models (Qwen3-8B-Q4K) into collapse. Route
+                // bf16 through the f16 kernel (10 mantissa bits, P in [0,1] fits f16, fp16 MMA == bf16
+                // MMA rate = no speed cost). HANZO_CUDA_FLASH_BF16=1 forces raw bf16 for the A/B.
+                if std::env::var("HANZO_CUDA_FLASH_BF16").is_ok_and(|s| s == "1") {
+                    self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true)
+                } else {
+                    let qf = q.to_dtype(q_l, hanzo_ml::DType::F16)?;
+                    let kf = k.to_dtype(k_l, hanzo_ml::DType::F16)?;
+                    let vf = v.to_dtype(v_l, hanzo_ml::DType::F16)?;
+                    let qcl = Layout::contiguous(q_l.shape());
+                    let kcl = Layout::contiguous(k_l.shape());
+                    let vcl = Layout::contiguous(v_l.shape());
+                    let (out, shape) = self.cuda_fwd_t::<f16>(&qf, &qcl, &kf, &kcl, &vf, &vcl, false)?;
+                    let out_l = Layout::contiguous(&shape);
+                    let out = out.to_dtype(&out_l, hanzo_ml::DType::BF16)?;
+                    Ok((out, shape))
+                }
+            }
             dt => hanzo_ml::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
         }
     }
