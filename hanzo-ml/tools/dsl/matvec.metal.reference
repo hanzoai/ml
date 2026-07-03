@@ -1,0 +1,35 @@
+[[kernel]]
+void matvec_q8_f_f32(
+    const device float * buffer_0 [[buffer(0)]],
+    const device int * buffer_1 [[buffer(1)]],
+    const device float * buffer_2 [[buffer(2)]],
+    device float * buffer_3 [[buffer(3)]],
+    constant info_st& info [[buffer(4)]],
+    uint3 thread_pos_in_grid [[thread_position_in_grid]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]]
+) {
+uint thread_index_in_grid = (
+                thread_pos_in_grid.z * threadgroups_per_grid.x * threads_per_threadgroup.x * threadgroups_per_grid.y * threads_per_threadgroup.y)
+                + (thread_pos_in_grid.y * threadgroups_per_grid.x * threads_per_threadgroup.x)
+                + thread_pos_in_grid.x;
+float l_mut_4;
+const uint l_0 = info.static_meta[uint(7)];
+const bool l_1 = thread_index_in_grid < l_0;
+if (l_1) {
+const uint l_2 = thread_index_in_grid * uint(4096);
+const uint l_3 = thread_index_in_grid * uint(128);
+l_mut_4 = float(0.0);
+
+for (uint l_mut_5 = uint(0); l_mut_5 < uint(4096); ++l_mut_5) {
+const uint l_6 = l_mut_5 / uint(32);
+const uint l_7 = l_3 + l_6;
+const float l_8 = buffer_0[l_7];
+const uint l_9 = l_2 + l_mut_5;
+const int l_10 = buffer_1[l_9];
+const float l_11 = float(l_10);
+const float l_12 = l_8 * l_11;
+const float l_13 = buffer_2[l_mut_5];
+const float l_14 = l_12 * l_13;
+l_mut_4 = l_mut_4 + l_14;
+}
