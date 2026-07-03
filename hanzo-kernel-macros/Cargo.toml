@@ -1,0 +1,15 @@
+[package]
+name = "hanzo-kernel-macros"
+version = "0.1.0"
+edition = "2021"
+description = "The #[kernel(targets(...))] attribute for hanzo-kernel: one Rust fn, declared backends."
+license = "BSD-3-Clause"
+repository = "https://github.com/hanzoai/ml"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

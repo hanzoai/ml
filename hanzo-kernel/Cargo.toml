@@ -1,0 +1,36 @@
+[package]
+name = "hanzo-kernel"
+version = "0.2.10"
+edition = "2021"
+description = "Hanzo's first-party GPU kernel DSL: one Rust source, lowered to CUDA/ROCm/Vulkan/Metal."
+license = "BSD-3-Clause"
+repository = "https://github.com/hanzoai/ml"
+documentation = "https://docs.rs/hanzo-kernel"
+readme = "README.md"
+keywords = ["gpu", "kernel", "cuda", "vulkan", "metal"]
+categories = ["hardware-support", "science"]
+
+[dependencies]
+# CubeCL is the lowering engine (the value); hanzo-kernel is the namespace (the place).
+# Kernel source only ever names `hanzo_kernel::*` -- `cubecl` appears nowhere but this manifest.
+cubecl = { version = "0.10", default-features = false }
+hanzo-kernel-macros = { path = "../hanzo-kernel-macros", version = "0.1.0" }
+half = "2"
+
+[features]
+default = ["cpu"]
+cpu = ["cubecl/cpu"]
+vulkan = ["cubecl/wgpu", "cubecl/vulkan"]
+spirv-dump = ["cubecl/spirv-dump"]
+metal = ["cubecl/wgpu", "cubecl/metal"]
+cuda = ["cubecl/cuda"]
+rocm = ["cubecl/hip", "cubecl/rocm"]
+
+[[bin]]
+name = "matvec-check"
+path = "src/main.rs"
+
+[[bin]]
+name = "dp4a-probe"
+path = "src/dp4a_probe.rs"
+required-features = ["vulkan"]
