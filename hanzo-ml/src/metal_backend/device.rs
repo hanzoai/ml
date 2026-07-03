@@ -120,6 +120,29 @@ impl MetalDevice {
         Ok(pl)
     }
 
+    /// Compile a raw MSL source string into a compute pipeline. The DSL-codegen analog of `compile`:
+    /// cubecl-generated MSL (extracted via CUBECL_DEBUG_LOG, see tools/dsl/msl_extract.sh) drops in
+    /// here exactly like the `ug` path, so a `#[kernel]` runs through the same Metal pipeline as every
+    /// hand-written kernel -- the Metal twin of the Vulkan kernel_spv seam.
+    pub fn compile_msl(
+        &self,
+        func_name: &str,
+        msl: &str,
+    ) -> Result<hanzo_metal_kernels::metal::ComputePipeline> {
+        let lib = self
+            .device
+            .new_library_with_source(msl, None)
+            .map_err(MetalError::from)?;
+        let func = lib
+            .get_function(func_name, None)
+            .map_err(MetalError::from)?;
+        let pl = self
+            .device
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(MetalError::from)?;
+        Ok(pl)
+    }
+
     pub fn id(&self) -> DeviceId {
         self.id
     }
