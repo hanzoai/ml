@@ -1,0 +1,33 @@
+# Metal DSL dispatch -- concrete findings (dbc / M4 Max, verified)
+
+## MSL binding convention (cubecl-cpp MslCompiler, dumped via CUBECL_DEBUG_LOG=1 -> /tmp/cubecl.log)
+A cubecl #[kernel] with N data Arrays + M scalar Arrays emits (verified on the DSL norm kernels):
+    const device T* buffer_0 [[buffer(0)]]   // data Array 0 (x)
+    ...                                       // data + scalar Arrays at buffer(0..N+M-1), in declared order
+    device T* buffer_k [[buffer(k)]]          // &mut Array = the output (NOT necessarily last -- see below)
+    constant info_st& info [[buffer(N+M)]]    // struct info_st { uint static_meta[K]; }
+    uint3 threads_per_threadgroup, threadgroups_per_grid  // thread built-ins (NOT buffers)
+Entry point keeps its cubecl name (Metal get_function(name) -- NO `main` rename, unlike Vulkan/SPIR-V).
+
+## The correctness-critical de-risk: length-free kernels need NO static_meta population
+- The NAIVE rms_norm (`out.len()/n` guard) READS `info.static_meta[6]` -> the runtime must populate
+  static_meta with buffer lengths (cubecl-internal index convention = the risky part).
+- The PRODUCTION kernel `rms_norm_blk` (norm.rs:43) is `launch_unchecked` + reads the dim from a runtime
+  `ndim: &Array<u32>` buffer (ndim[0]=n), NOT `.len()` -> it does NOT read static_meta. So Metal dispatch
+  binds the 5 data/scalar buffers (x,w,out,eps,ndim) + a DUMMY zeroed info_st (declared, never read).
+  This is the SAME reason the Vulkan production swap worked (info interface stripped/unread). So the
+  static_meta hand-population risk the prior scoping flagged DOES NOT APPLY to the length-free block
+  kernels -- the Metal primitive is low-risk for exactly the kernels we migrate.
+
+## The remaining bounded step (NOT done here -- correctness non-negotiable, needs build+bit-exact)
+1. Add a metal-gated `rms_norm_blk` test in hanzo-kernel (the existing one is #[cfg(feature="vulkan")])
+   to dump the block MSL + CONFIRM zero `static_meta[` reads.
+2. Build the ~30-line objc2-metal primitive mirroring MetalDevice::compile (device.rs:101,
+   new_library_with_source -> get_function(name) -> new_compute_pipeline_state) + an encoder that
+   set_buffer's the 5 buffers + a dummy info + dispatch_thread_groups(grid=rows, tg=nt).
+3. Wire ml's Metal rms_norm to it; bit-exact vs CPU (the win is UNIFORMITY -- Metal's rms_norm is
+   already a real reduction, so match not beat). dispatch_out out_idx = the &mut Array binding index.
+
+## Verified on dbc this session
+hanzo-kernel 0.2.5 builds Metal clean (--no-default-features --features metal); DSL norm kernels
+bit-exact on M4 Max (rms_norm 2.43e-7, layer_norm 3.03e-6). MSL extraction reproduced.
