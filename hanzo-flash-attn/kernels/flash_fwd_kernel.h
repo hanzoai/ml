@@ -365,6 +365,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs_lo_correction<Kernel_traits::TiledMma>(acc_o, acc_s, rP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -426,6 +427,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs_lo_correction<Kernel_traits::TiledMma>(acc_o, acc_s, rP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
@@ -925,6 +927,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs_lo_correction<Kernel_traits::TiledMma>(acc_o, acc_s, rP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
@@ -990,6 +993,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs_lo_correction<Kernel_traits::TiledMma>(acc_o, acc_s, rP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
