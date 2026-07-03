@@ -34,3 +34,8 @@ path = "src/main.rs"
 name = "dp4a-probe"
 path = "src/dp4a_probe.rs"
 required-features = ["vulkan"]
+
+[[bin]]
+name = "cmma-probe"
+path = "src/bin/cmma_probe.rs"
+required-features = ["cuda"]
