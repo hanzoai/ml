@@ -1,0 +1,23 @@
+[package]
+name = "hanzo-train"
+version.workspace = true
+edition.workspace = true
+description = "Native-Rust training loop for DSpark speculative-draft models (hanzo-ml autograd)."
+license.workspace = true
+
+[[bin]]
+name = "hanzo-train"
+path = "src/main.rs"
+
+[lib]
+name = "hanzo_train"
+path = "src/lib.rs"
+
+[dependencies]
+hanzo-ml = { workspace = true }
+hanzo-nn = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+clap = { workspace = true }

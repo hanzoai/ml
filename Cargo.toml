@@ -11,6 +11,7 @@ members = [
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
     "hanzo-nn",
+    "hanzo-train",
     "hanzo-training",
     "hanzo-transformers",
     "tensor-tools",
