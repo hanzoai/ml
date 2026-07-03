@@ -19,6 +19,8 @@ exclude = [
     "hanzo-ml-book",
     "hanzo-flash-attn",
     "hanzo-flash-attn-v3",
+    "hanzo-kernel",
+    "hanzo-kernel-macros",
     "hanzo-kernels",
     "hanzo-metal-kernels",
     "hanzo-rocm-kernels",
