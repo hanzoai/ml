@@ -408,4 +408,23 @@ __forceinline__ __device__ void calculate_dtanh(Tensor<Engine0, Layout0> &src_te
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Split-precision P*V correction (recovers ~f32-class softmax precision on tensor cores).
+template <typename TiledMmaT, typename TensorAccO, typename TensorAccS, typename TensorRP,
+          typename TensorVt, typename TensorSVt, typename TiledCopyB, typename ThrCopyB>
+__forceinline__ __device__ void gemm_rs_lo_correction(
+        TensorAccO &acc_o, TensorAccS const &acc_s, TensorRP const &rP_hi,
+        TensorVt &tOrVt, TensorSVt const &tOsVt, TiledMmaT tiled_mma,
+        TiledCopyB smem_tiled_copy_V, ThrCopyB smem_thr_copy_V) {
+    using ElementLo = typename TensorRP::value_type;
+    Tensor rP_hi_f32 = flash::convert_type<float>(rP_hi);
+    Tensor rP_lo = make_fragment_like(rP_hi);
+    #pragma unroll
+    for (int i = 0; i < size(rP_lo); ++i) { rP_lo(i) = static_cast<ElementLo>(acc_s(i) - rP_hi_f32(i)); }
+    Tensor tOrP_lo = make_tensor(rP_lo.data(), flash::convert_layout_acc_Aregs<TiledMmaT>(rP_lo.layout()));
+    flash::gemm_rs(acc_o, tOrP_lo, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+}
+
 }  // namespace flash
