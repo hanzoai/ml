@@ -92,7 +92,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "strided_copy" => spv!("strided_copy"),
         "index_select" => spv!("index_select"),
         "where_cond" => spv!("where_cond"),
-        "softmax_rows" => spv!("softmax_rows"),
+        "softmax_rows" => include_bytes!("vulkan/spv/softmax_rows_blk.spv"),
         "rms_norm" => include_bytes!("vulkan/spv/rms_norm_blk.spv"),
         "rope" => spv!("rope"),
         "rope_norm" => spv!("rope_norm"),
@@ -4063,11 +4063,18 @@ impl VulkanStorage {
         let m = *dims.last().unwrap_or(&1);
         let nrows = layout.shape().elem_count() / m.max(1);
         let out = self.device.alloc_f32(nrows * m)?;
-        self.device.dispatch(
+        // DSL block-per-row kernel (one workgroup/row, 256 threads, coalesced reads + shared-mem
+        // max/sum reductions): replaces the naive one-invocation-per-row softmax_rows.comp. cubecl
+        // has no push-constants, so n rides a pooled SSBO -- lifetime-safe across the deferred batch
+        // (BufPool reclaim is post-fence-only). out is binding 1, so dispatch_out (not the last-binding
+        // default) tracks its RAW barrier.
+        let ndb = self.device.upload_u32(&[m as u32])?;
+        self.device.dispatch_out(
             "softmax_rows",
-            &[xb, out.buffer],
-            &push_u32(&[nrows as u32, m as u32]),
-            Self::groups_1d(nrows),
+            &[xb, out.buffer, ndb.buffer],
+            1,
+            &[],
+            (nrows as u32, 1, 1),
         )?;
         Ok(out)
     }
@@ -5464,6 +5471,69 @@ mod dsl_dispatch_proof {
         let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         eprintln!(
             "[rms_norm-prod] {ROWS}x{N}  kernel {ms:.3} ms ({:.0} GB/s) -- the DSL block kernel is now the production rms_norm",
+            bytes / (ms * 1e6)
+        );
+    }
+
+    // The production `softmax_last_dim` method now dispatches the DSL block-per-row softmax
+    // (softmax_rows_blk.spv): one workgroup/row, coalesced reads + shared-mem max & sum reductions,
+    // replacing the naive one-invocation-per-row softmax_rows.comp (same uncoalesced access pattern
+    // rms_norm proved is ~10x slower). n rides a pooled SSBO (no push-constants), lifetime-safe across
+    // the deferred batch; chaining 8 calls with no sync stresses it -- all bit-exact == no use-after-free.
+    #[test]
+    fn softmax_production_path_is_dsl_kernel_bit_exact() {
+        const M: usize = 2048;
+        const ROWS: usize = 1024;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[softmax-prod] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let gen_x = |row: usize, i: usize| (((row * 7 + i * 13) % 1000) as f32) / 250.0 - 2.0;
+        let x: Vec<f32> = (0..ROWS * M).map(|idx| gen_x(idx / M, idx % M)).collect();
+        let mut cpu = vec![0f32; ROWS * M];
+        for r in 0..ROWS {
+            let mx = (0..M).map(|i| x[r * M + i]).fold(f32::MIN, f32::max);
+            let exps: Vec<f32> = (0..M).map(|i| (x[r * M + i] - mx).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for i in 0..M {
+                cpu[r * M + i] = exps[i] / sum;
+            }
+        }
+        let xs = dev.upload_f32(&x).unwrap();
+        let x_l = Layout::contiguous((ROWS, M));
+
+        let mut outs = Vec::new();
+        for _ in 0..8 {
+            outs.push(xs.softmax_last_dim(&x_l).unwrap());
+        }
+        let mut worst = 0f32;
+        for out in &outs {
+            let got = out.to_vec_f32().unwrap();
+            let err = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            worst = worst.max(err);
+        }
+        eprintln!("[softmax-prod] {ROWS}x{M} x8-batched  maxerr={worst:.2e}  (DSL kernel via production path, pooled n, no sync crutch)");
+        assert!(worst < 1e-4, "production softmax (DSL kernel) diverged from CPU: {worst:.3e}");
+
+        let iters = 50;
+        let bytes = (2 * ROWS * M * 4) as f64; // read x + write out
+        let out = dev.alloc_f32(ROWS * M).unwrap();
+        let ndb = dev.upload_u32(&[M as u32]).unwrap();
+        let bufs = [xs.buffer, out.buffer, ndb.buffer];
+        let grid = (ROWS as u32, 1, 1);
+        dev.dispatch_out("softmax_rows", &bufs, 1, &[], grid).unwrap();
+        dev.synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            dev.dispatch_out("softmax_rows", &bufs, 1, &[], grid).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "[softmax-prod] {ROWS}x{M}  kernel {ms:.3} ms ({:.0} GB/s) -- the DSL block kernel is now the production softmax_rows",
             bytes / (ms * 1e6)
         );
     }
