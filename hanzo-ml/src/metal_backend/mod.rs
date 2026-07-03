@@ -2168,3 +2168,73 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
     slice.to_vec()
 }
+
+#[cfg(test)]
+mod dsl_metal_dispatch {
+    use super::*;
+    use crate::Device;
+
+    fn rms_ref(x: &[f32], w: &[f32], rows: usize, n: usize, eps: f32) -> Vec<f32> {
+        let mut o = vec![0f32; rows * n];
+        for r in 0..rows {
+            let b = r * n;
+            let ss: f32 = (0..n).map(|i| x[b + i] * x[b + i]).sum();
+            let d = (ss / n as f32 + eps).sqrt();
+            for i in 0..n {
+                o[b + i] = x[b + i] / d * w[i];
+            }
+        }
+        o
+    }
+
+    // A DSL-generated (cubecl) rms_norm_blk kernel, extracted to MSL, dispatched through ml's REAL
+    // Metal pipeline (compile_msl + command_encoder) -- the Metal twin of the Vulkan kernel_spv seam.
+    #[test]
+    fn rms_norm_blk_dsl_via_ml_metal() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let (rows, n) = (37usize, 128usize);
+        let (nt, eps) = (n, 1e-5f32);
+        let x: Vec<f32> = (0..rows * n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 5) as f32 * 0.1).collect();
+        let want = rms_ref(&x, &w, rows, n, eps);
+
+        let msl = format!(
+            "#include <metal_stdlib>\n{}",
+            include_str!("../metal/dsl/rms_norm_blk.metal")
+        );
+        let pl = md.compile_msl("rms_norm_blk_f_f32", &msl).unwrap();
+
+        let xb = md.new_buffer_with_data(&x).unwrap();
+        let wb = md.new_buffer_with_data(&w).unwrap();
+        let ob = md.new_buffer_with_data(&vec![0f32; rows * n]).unwrap();
+        let eb = md.new_buffer_with_data(&[eps][..]).unwrap();
+        let ndb = md.new_buffer_with_data(&[n as u32][..]).unwrap();
+        let ib = md.new_buffer_with_data(&[0u32; 10][..]).unwrap();
+        {
+            let enc = md.command_encoder().unwrap();
+            let e = enc.as_ref();
+            e.set_compute_pipeline_state(&pl);
+            e.set_input_buffer(0, Some(&*xb), 0);
+            e.set_input_buffer(1, Some(&*wb), 0);
+            e.set_output_buffer(2, Some(&*ob), 0);
+            e.set_input_buffer(3, Some(&*eb), 0);
+            e.set_input_buffer(4, Some(&*ndb), 0);
+            e.set_input_buffer(5, Some(&*ib), 0);
+            let grid = objc2_metal::MTLSize { width: rows, height: 1, depth: 1 };
+            let tg = objc2_metal::MTLSize { width: nt, height: 1, depth: 1 };
+            e.dispatch_thread_groups(grid, tg);
+        }
+        md.wait_until_completed().unwrap();
+        let got: Vec<f32> = read_to_vec(&*ob, rows * n);
+        let mut mr = 0f32;
+        for (a, b) in want.iter().zip(got.iter()) {
+            mr = mr.max((a - b).abs() / a.abs().max(1e-4));
+        }
+        eprintln!("[rms_norm_blk DSL-via-ml-Metal] rows={rows} n={n} max_rel={mr:.2e}");
+        assert!(mr < 2e-3, "DSL rms_norm_blk metal dispatch max_rel {mr}");
+    }
+}
