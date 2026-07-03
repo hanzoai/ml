@@ -95,6 +95,11 @@ struct Args {
     /// optimizer/grad memory; use on memory-constrained hosts. The head is still saved at its init.
     #[arg(long, default_value_t = false)]
     freeze_markov: bool,
+
+    /// Overfit a single fixed batch (same samples+anchors every step). Removes sample-to-sample
+    /// variance for a clean monotonic curve — the standard proof that the training loop learns.
+    #[arg(long, default_value_t = false)]
+    fixed_batch: bool,
 }
 
 /// Host MemAvailable in GB from /proc/meminfo; `+inf` if it can't be read (never blocks then).
@@ -206,6 +211,28 @@ fn main() -> Result<()> {
 
     let mut rng = StdRng::seed_from_u64(args.seed);
     let ln_vocab = (cfg.vocab as f64).ln();
+
+    // Optional fixed batch (overfit): draw the samples+anchors ONCE and reuse them every step so the
+    // loss curve is variance-free — the canonical sanity check that the training loop reduces loss.
+    let fixed_plan: Option<Vec<(usize, Vec<usize>)>> = if args.fixed_batch {
+        let mut plan = Vec::new();
+        let mut guard = 0usize;
+        while plan.len() < args.micro_batch && guard < args.micro_batch * 50 {
+            guard += 1;
+            let si = eligible[rng.random_range(0..eligible.len())];
+            let s = cache.read_sample(si)?;
+            let anchors = pick_anchors(&s.loss_mask, s.seq_len, cfg.block, args.num_anchors, &mut rng);
+            if !anchors.is_empty() {
+                plan.push((si, anchors));
+            }
+        }
+        let n_anch: usize = plan.iter().map(|(_, a)| a.len()).sum();
+        println!("fixed batch (overfit): {} samples, {} anchors", plan.len(), n_anch);
+        Some(plan)
+    } else {
+        None
+    };
+
     println!("baseline CE = ln(vocab) = {:.4}\n--- training ---", ln_vocab);
 
     let t_start = Instant::now();
@@ -225,17 +252,29 @@ fn main() -> Result<()> {
         let mut bias_chunks: Vec<Tensor> = Vec::new();
         let mut targets: Vec<u32> = Vec::new();
 
-        for _ in 0..args.micro_batch {
-            let si = eligible[rng.random_range(0..eligible.len())];
-            let mut s = cache.read_sample(si)?;
-            let seq = s.seq_len;
-            let anchors = pick_anchors(&s.loss_mask, seq, cfg.block, args.num_anchors, &mut rng);
-            if anchors.is_empty() {
-                continue;
+        // This step's (sample, anchors) list: the fixed batch, or a fresh random draw.
+        let plan: Vec<(usize, Vec<usize>)> = match &fixed_plan {
+            Some(p) => p.clone(),
+            None => {
+                let mut p = Vec::with_capacity(args.micro_batch);
+                for _ in 0..args.micro_batch {
+                    let si = eligible[rng.random_range(0..eligible.len())];
+                    let s = cache.read_sample(si)?;
+                    let anchors = pick_anchors(&s.loss_mask, s.seq_len, cfg.block, args.num_anchors, &mut rng);
+                    if !anchors.is_empty() {
+                        p.push((si, anchors));
+                    }
+                }
+                p
             }
+        };
+
+        for (si, anchors) in &plan {
+            let mut s = cache.read_sample(*si)?;
+            let seq = s.seq_len;
             let th = Tensor::from_vec(std::mem::take(&mut s.target_hidden), (seq, n_fused * hidden), &dev)?;
             let fused = model.fuse(&th)?;
-            for a in anchors {
+            for &a in anchors {
                 if let Some((block, bias, tgt)) = model.draft_anchor(&fused, &s.input_ids, &s.loss_mask, a)? {
                     targets.extend_from_slice(&tgt);
                     block_chunks.push(block);
