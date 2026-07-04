@@ -19,9 +19,9 @@ pub struct VarBuilder {
 impl VarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
         // Opt-in mmap weight streaming: reference weights in the page cache instead of
-        // materializing them resident, so a model larger than RAM runs (`HANZO_GGUF_MMAP=1`;
+        // materializing them resident, so a model larger than RAM runs (`GGUF_MMAP=1`;
         // `=0`/empty keeps the default resident path). See `VarBuilder::from_gguf_mmap`.
-        if std::env::var("HANZO_GGUF_MMAP")
+        if std::env::var("GGUF_MMAP")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
         {
@@ -46,7 +46,7 @@ impl VarBuilder {
     /// demand-pages them from the file and reclaims them under pressure -- so a model whose weights
     /// exceed free RAM loads and runs (antirez ds4_ssd, "RAM as a speed spectrum"). GPU backends
     /// stage each weight into their own device buffer directly from the mapping (no resident Vec).
-    /// Explicit constructor for the `HANZO_GGUF_MMAP=1` toggle.
+    /// Explicit constructor for the `GGUF_MMAP=1` toggle.
     pub fn from_gguf_mmap<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
         let (content, mmap) = hanzo_ml::quantized::gguf_file::Content::read_mmap(p)?;
         let mut data = std::collections::HashMap::new();
