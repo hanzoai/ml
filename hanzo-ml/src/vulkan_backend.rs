@@ -783,7 +783,7 @@ impl VulkanDevice {
         self.matvec_q4k_gpu(wq, &xs, nout, k)?.to_vec_f32()
     }
 
-    /// Q4_K decode matvec via int8 dp4a (the HANZO_VK_DP4A_DECODE path, forced): quantize x to q8_1,
+    /// Q4_K decode matvec via int8 dp4a (the VK_DP4A_DECODE path, forced): quantize x to q8_1,
     /// then dp4a the Q4_K codes (column dp4a at mcount=1). ~1.8x faster than the scalar subgroup matvec
     /// on gfx1151; the q8_1 activation quant adds ~0.5-1% vs the scalar reference (gated < 2e-2).
     pub fn matvec_q4k_dp4a(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
@@ -1188,12 +1188,12 @@ impl VulkanDevice {
         // Q4_K prefill path selection. DEFAULT for dense prefill (woff==0, m>1): the best available 2D
         // tile -- mul_mm_q4k_tiled_dp4a (int8 dp4a, 9.35x over the column kernel) where the device has
         // int_dot8, else the universal f32 mul_mm_q4k_tiled (2.06x). Both stage weight+activation in LDS
-        // and reuse across the 64x64 output tile. MoE banks (woff!=0), m==1, and HANZO_VK_Q4K_LEGACY
+        // and reuse across the 64x64 output tile. MoE banks (woff!=0), m==1, and VK_Q4K_LEGACY
         // fall to the column-per-invocation mul_mat_q4k. The per-kernel env vars
-        // (HANZO_VK_Q4K_{DP4A,TILED2D,LEGACY}) force one path for the A/B gates.
-        let legacy = std::env::var_os("HANZO_VK_Q4K_LEGACY").is_some();
-        let force_dp4a = std::env::var_os("HANZO_VK_Q4K_DP4A").is_some();
-        let force_2d = std::env::var_os("HANZO_VK_Q4K_TILED2D").is_some();
+        // (VK_Q4K_{DP4A,TILED2D,LEGACY}) force one path for the A/B gates.
+        let legacy = std::env::var_os("VK_Q4K_LEGACY").is_some();
+        let force_dp4a = std::env::var_os("VK_Q4K_DP4A").is_some();
+        let force_2d = std::env::var_os("VK_Q4K_TILED2D").is_some();
         // L4 coopmat (tensor cores) -- decode Q4_K weight to f16 LDS tiles + coopMatMulAdd, the
         // llama-parity path. Env-forced + requires device coopmat; off by default until benched faster
         // than dp4a on this device (gfx1151 coopmat has had flakiness). woff==0 dense only.
@@ -1201,7 +1201,7 @@ impl VulkanDevice {
             && self.inner.coopmat
             && woff == 0
             && m > 1
-            && std::env::var_os("HANZO_VK_Q4K_COOPMAT").is_some()
+            && std::env::var_os("VK_Q4K_COOPMAT").is_some()
         {
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
             self.dispatch(

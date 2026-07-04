@@ -1066,8 +1066,8 @@ impl QTensor {
                 // and amortize it over all its routed tokens via the tensor cores (llama mul_mat_id),
                 // instead of the per-slot dp4a re-streaming the weight per token. Uses the RAW [t,in1,k]
                 // input (indexed_moe_grouped broadcasts/gathers internally). IQ1_M (no MMQ kernel) returns
-                // None -> the per-slot dp4a below. HANZO_MOE_QMMQ_FALLBACK forces dp4a (A/B).
-                if t > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err() {
+                // None -> the per-slot dp4a below. MOE_QMMQ_FALLBACK forces dp4a (A/B).
+                if t > 1 && std::env::var("MOE_QMMQ_FALLBACK").is_err() {
                     let x_f32 = x.to_dtype(crate::DType::F32)?.contiguous()?;
                     let ids_u32 = ids.to_dtype(crate::DType::U32)?.contiguous()?;
                     let (xs, _) = x_f32.storage_and_layout();
@@ -1281,11 +1281,11 @@ impl QTensor {
                 let nrows = t * topk;
                 // PREFILL (t>1) routes to the fused expert-grouped WMMA GEMM (f16 activations); DECODE
                 // (t==1) keeps the model's native bf16/f16 on the capture-clean matvec. See the twin in
-                // QStorage::indexed_moe_forward. HANZO_MOE_QMMQ_FALLBACK forces matvec for the A/B.
+                // QStorage::indexed_moe_forward. MOE_QMMQ_FALLBACK forces matvec for the A/B.
                 // Decode-only types (no qmmq kernel) ride the per-slot matvec core for prefill too
                 // (correct at any token count). ONE predicate gates every prefill site.
                 let use_qmmq =
-                    t > 1 && qt.qmmq_capable() && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
+                    t > 1 && qt.qmmq_capable() && std::env::var("MOE_QMMQ_FALLBACK").is_err();
                 let x_flat = match x_exp.dtype() {
                     // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
                     // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
@@ -1481,7 +1481,7 @@ pub fn moe_combine(ys: &Tensor, scores: &Tensor) -> Result<Tensor> {
     let (t, topk, n) = ys.dims3()?;
     #[cfg(feature = "rocm")]
     if let Device::Rocm(dev) = ys.device() {
-        if std::env::var("HANZO_MOE_COMBINE_FALLBACK").is_ok() {
+        if std::env::var("MOE_COMBINE_FALLBACK").is_ok() {
             return ys.broadcast_mul(&scores.unsqueeze(D::Minus1)?)?.sum(D::Minus2);
         }
         let ys_c = ys.contiguous()?;
@@ -1515,7 +1515,7 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
     let (ntok, n_experts) = logits.dims2()?;
     #[cfg(feature = "rocm")]
     if let Device::Rocm(dev) = logits.device() {
-        if std::env::var("HANZO_MOE_ROUTE_FALLBACK").is_err() {
+        if std::env::var("MOE_ROUTE_FALLBACK").is_err() {
             let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
             let (lg_store, _) = logits_c.storage_and_layout();
             let lr = match &*lg_store {
@@ -1540,7 +1540,7 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
     }
     #[cfg(feature = "cuda")]
     if let Device::Cuda(cdev) = logits.device() {
-        if std::env::var("HANZO_MOE_ROUTE_FALLBACK").is_err() && n_experts <= 256 && topk <= 32 {
+        if std::env::var("MOE_ROUTE_FALLBACK").is_err() && n_experts <= 256 && topk <= 32 {
             let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
             let (lg_store, _) = logits_c.storage_and_layout();
             let lr = match &*lg_store {
@@ -1584,7 +1584,7 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
 /// [t,topk,n]; the caller applies silu(gate)*up. Each output is bit-identical to the unfused
 /// `indexed_moe_forward` because the q8_1 activation is deterministic in `x`. ROCm decode/matvec path
 /// only (the prefill qmmq path keeps its own per-bank quantize); every other case runs the two
-/// unfused forwards. HANZO_MOE_GATEUP_FALLBACK forces the unfused path (the A/B + equivalence lever).
+/// unfused forwards. MOE_GATEUP_FALLBACK forces the unfused path (the A/B + equivalence lever).
 pub fn moe_gate_up(
     x: &Tensor,
     ids: &Tensor,
@@ -1592,7 +1592,7 @@ pub fn moe_gate_up(
     up: &QMatMul,
 ) -> Result<(Tensor, Tensor)> {
     #[cfg(feature = "rocm")]
-    if std::env::var("HANZO_MOE_GATEUP_FALLBACK").is_err() {
+    if std::env::var("MOE_GATEUP_FALLBACK").is_err() {
         if let (QMatMul::QTensor(gq), QMatMul::QTensor(uq)) = (gate, up) {
             if let (QStorage::Rocm(_, dev), QStorage::Rocm(..)) = (&gq.storage, &uq.storage) {
                 let dt = gq.storage.dtype();
@@ -1602,7 +1602,7 @@ pub fn moe_gate_up(
                         let (t, topk) = ids.dims2()?;
                         let use_qmmq = t > 1
                             && qt.qmmq_capable()
-                            && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
+                            && std::env::var("MOE_QMMQ_FALLBACK").is_err();
                         if x.dim(1)? == 1 && !use_qmmq {
                             let nrows = t * topk;
                             let x_exp = x.broadcast_as((t, topk, k))?;
@@ -1910,12 +1910,12 @@ impl QMatMul {
                 let nrows = t * topk;
                 // PREFILL (t>1, never graph-captured) routes to the FUSED expert-grouped WMMA GEMM
                 // (`moe_qmmq_quant`), which needs f16 activations; DECODE (t==1) stays on the
-                // capture-clean dp4a/scalar matvec, which takes bf16/f16 natively. HANZO_MOE_QMMQ_FALLBACK
+                // capture-clean dp4a/scalar matvec, which takes bf16/f16 natively. MOE_QMMQ_FALLBACK
                 // forces the matvec on prefill too (the before/after A/B + oracle-equivalence lever).
                 // Decode-only types (no qmmq kernel) ride the per-slot matvec core for prefill too
                 // (correct at any token count). ONE predicate gates every prefill site.
                 let use_qmmq =
-                    t > 1 && qt.qmmq_capable() && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err();
+                    t > 1 && qt.qmmq_capable() && std::env::var("MOE_QMMQ_FALLBACK").is_err();
                 let x_flat = match x_exp.dtype() {
                     // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
                     // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
@@ -2168,7 +2168,7 @@ impl crate::Module for QMatMul {
                 let xs_recovered = if xs.device().is_rocm() {
                     None
                 } else {
-                    if std::env::var("HANZO_DBG_PATH").is_ok() {
+                    if std::env::var("DBG_PATH").is_ok() {
                         eprintln!(
                             "[ROCm-RECOVER] activation off-device {:?} dims {:?}",
                             xs.device().location(),
@@ -2185,14 +2185,14 @@ impl crate::Module for QMatMul {
                     static DBG_DECODE: AtomicUsize = AtomicUsize::new(0);
                     static DBG_PREFILL: AtomicUsize = AtomicUsize::new(0);
                     static DBG_FALLBACK: AtomicUsize = AtomicUsize::new(0);
-                    if std::env::var("HANZO_DBG_PATH").is_ok() {
+                    if std::env::var("DBG_PATH").is_ok() {
                         // Buckets MATCH the real dispatch below: decode = rows==1 wired (the dp4a-vs-
                         // scalar A/B is internal to matvec_quant, still native); prefill = rows>1 wired
-                        // native qmmq_core<WTYPE>; fallback = unwired OR HANZO_QMMQ_FALLBACK dequantize.
+                        // native qmmq_core<WTYPE>; fallback = unwired OR QMMQ_FALLBACK dequantize.
                         let qt = crate::RocmQuantType::from_ggml(*dtype);
                         let decode_wired = qt.is_some();
                         let prefill_wired = qt.is_some_and(|qt| qt.qmmq_capable());
-                        let prefill_fb = std::env::var("HANZO_QMMQ_FALLBACK").is_ok();
+                        let prefill_fb = std::env::var("QMMQ_FALLBACK").is_ok();
                         if rows == 1 && decode_wired {
                             DBG_DECODE.fetch_add(1, Ordering::Relaxed);
                         } else if rows > 1 && prefill_wired && !prefill_fb {
@@ -2219,7 +2219,7 @@ impl crate::Module for QMatMul {
                 // Table-driven unified decode: a type is decode-native iff the single
                 // `qmatvec_core<WTYPE>` has a `decode_block` wired for it (RocmQuantType::from_ggml).
                 // Q8_0/Q4_0/Q4_K/Q6_K/IQ4_XS/TQ2_0 today; adding a type is one enum row, no kernel.
-                // The dp4a-vs-scalar A/B for dp4a-capable types (HANZO_Q4K_FALLBACK / HANZO_Q6K_FALLBACK)
+                // The dp4a-vs-scalar A/B for dp4a-capable types (Q4K_FALLBACK / Q6K_FALLBACK)
                 // lives entirely inside `matvec_quant` (dp4a_active) -- ONE fallback, one place; it
                 // switches the decode core, the type stays on the native path either way.
                 #[cfg(feature = "rocm")]
@@ -2283,7 +2283,7 @@ impl crate::Module for QMatMul {
                         false,
                     ))
                 } else if let Some(qt) =
-                    unified_qt.filter(|_| qmmq_ok && std::env::var("HANZO_QMMQ_FALLBACK").is_err())
+                    unified_qt.filter(|_| qmmq_ok && std::env::var("QMMQ_FALLBACK").is_err())
                 {
                     // Prefill (rows>1): native int8 WMMA gemm through the ONE unified core
                     // (`qmmq_core<WTYPE>` in quant.hip). Weights stay quantized in VRAM (no resident
@@ -2292,7 +2292,7 @@ impl crate::Module for QMatMul {
                     // spread: Q8_0/Q4_0 (symmetric, proven), Q4_K (asymmetric -- min bias via the
                     // q8_1 block-sum), and the symmetric super-block / IQ / ternary types (Q6_K,
                     // IQ4_XS, TQ2_0). Selecting the type is one `RocmQuantType` row + the in-kernel
-                    // decode; there is NO per-quant prefill kernel. HANZO_QMMQ_FALLBACK=1 forces the
+                    // decode; there is NO per-quant prefill kernel. QMMQ_FALLBACK=1 forces the
                     // dequant-f16 matmul below (the prefill before/after A/B benchmark lever).
                     let xs = xs.to_dtype(DType::F16)?.contiguous()?;
                     let d = match xs.device() {
@@ -2329,7 +2329,7 @@ impl crate::Module for QMatMul {
                     // Unwired-type / forced-fallback prefill: dequantize to a temporary f16 weight
                     // (freed after; a persistent f16 copy would slow the memory-bound decode). Only
                     // reached for quants with no `qmmq_core<WTYPE>` wired (e.g. Q5_K/MXFP4) or when
-                    // HANZO_QMMQ_FALLBACK forces it for the prefill A/B measurement.
+                    // QMMQ_FALLBACK forces it for the prefill A/B measurement.
                     let w = qtensor.dequantize_f16(&xs.device())?;
                     let w = match *xs.dims() {
                         [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
