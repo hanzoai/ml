@@ -19,7 +19,7 @@ use hanzo_ml::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use hanzo_ml::{Device, Module, Tensor};
 use std::sync::Arc;
 
-// Tests that force a kernel via a process-global env var (VK_DP4A_DECODE_OFF, HANZO_VK_Q4K_{LEGACY,
+// Tests that force a kernel via a process-global env var (VK_DP4A_DECODE_OFF, VK_Q4K_{LEGACY,
 // TILED}) must not run concurrently: cargo runs tests in parallel threads and the env set/remove races
 // otherwise (flaky pass/fail at varying shapes). Each such test holds this lock for its whole body.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -772,7 +772,7 @@ fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
     // Q4_K prefill defaults to int8 dp4a-2D (q8_1 activation quant, ~0.4%); force the exact column path
     // so this exact-vs-CPU check validates the prefill math. The dp4a-2D path is gated by
     // vulkan_q4k_dp4a2d_matches_default. (Q5_K/Q6_K still exercise the GEMM/dequant-fallback split.)
-    std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
+    std::env::set_var("VK_Q4K_LEGACY", "1");
     // M straddles the host MAX_M=8 tiling AND the per-dtype GEMM gate (Q5_K/Q6_K: 64, else 128):
     // 5/8/17 hit the native GEMM for every dtype; 100 hits the GEMM for Q4_0/Q8_0/Q4_K but the dequant
     // fallback for Q5_K/Q6_K (exercising the split); 200 (> both gates) is the dequant path for all.
@@ -800,7 +800,7 @@ fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
             }
         }
     }
-    std::env::remove_var("HANZO_VK_Q4K_LEGACY");
+    std::env::remove_var("VK_Q4K_LEGACY");
     Ok(())
 }
 
@@ -962,7 +962,7 @@ fn vulkan_moe_forward_matches_cpu() -> hanzo_ml::Result<()> {
     Ok(())
 }
 
-// L1 2D-tiled prefill GEMM (mul_mm_q4k_tiled, HANZO_VK_Q4K_TILED2D): 64x64 output tile, both operands
+// L1 2D-tiled prefill GEMM (mul_mm_q4k_tiled, VK_Q4K_TILED2D): 64x64 output tile, both operands
 // staged in LDS per K-step. Decode per element is identical to mul_mat_q4k but accumulation is tiled
 // (partial sums), so it matches the default within f32-reorder tolerance, not bit-exact. A decode/index
 // bug is a systematic >>1e-3 divergence; f32 reassociation is <~1e-4.
@@ -978,12 +978,12 @@ fn vulkan_q4k_tiled2d_matches_default() -> hanzo_ml::Result<()> {
             let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
             let wq = vk.upload_qweight(&raw)?;
             let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 11)).collect();
-            std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
+            std::env::set_var("VK_Q4K_LEGACY", "1");
             let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
-            std::env::remove_var("HANZO_VK_Q4K_LEGACY");
-            std::env::set_var("HANZO_VK_Q4K_TILED2D", "1");
+            std::env::remove_var("VK_Q4K_LEGACY");
+            std::env::set_var("VK_Q4K_TILED2D", "1");
             let y_2d = vk.matmul_q4k(&wq, &x, m, nout, k)?;
-            std::env::remove_var("HANZO_VK_Q4K_TILED2D");
+            std::env::remove_var("VK_Q4K_TILED2D");
             assert_eq!(y_2d.len(), m * nout);
             let mut max_abs = 0f32;
             let mut max_ref = 0f32;
@@ -1015,7 +1015,7 @@ fn vulkan_q4k_tiled2d_bench() -> hanzo_ml::Result<()> {
     let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
     let iters = 20;
     let bench = |var: Option<&str>| -> hanzo_ml::Result<f64> {
-        std::env::remove_var("HANZO_VK_Q4K_TILED2D");
+        std::env::remove_var("VK_Q4K_TILED2D");
         if let Some(v) = var {
             std::env::set_var(v, "1");
         }
@@ -1029,8 +1029,8 @@ fn vulkan_q4k_tiled2d_bench() -> hanzo_ml::Result<()> {
         }
         Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
     };
-    let def_ms = bench(Some("HANZO_VK_Q4K_LEGACY"))?;
-    let tiled2d_ms = bench(Some("HANZO_VK_Q4K_TILED2D"))?;
+    let def_ms = bench(Some("VK_Q4K_LEGACY"))?;
+    let tiled2d_ms = bench(Some("VK_Q4K_TILED2D"))?;
     eprintln!(
         "[L1 2D bench] m={m} nout={nout} k={k}: default={def_ms:.3} ms  tiled2d={tiled2d_ms:.3} ms  speedup={:.2}x",
         def_ms / tiled2d_ms
@@ -1038,7 +1038,7 @@ fn vulkan_q4k_tiled2d_bench() -> hanzo_ml::Result<()> {
     Ok(())
 }
 
-// L1 dp4a 2D-tiled GEMM (mul_mm_q4k_tiled_dp4a, HANZO_VK_Q4K_DP4A): the 2D tile with an int8 dp4a inner
+// L1 dp4a 2D-tiled GEMM (mul_mm_q4k_tiled_dp4a, VK_Q4K_DP4A): the 2D tile with an int8 dp4a inner
 // loop -- activations are quantized to q8_1 (int8 + per-32-block scale/sum) so the dot is integer. That
 // q8_1 quant adds ~0.5-1% error on top of the f32 tiling reorder, so the gate vs the exact f32 default
 // is a ~1.5% relative bound (a decode/index/pack bug is a systematic >>1.5% garble).
@@ -1054,12 +1054,12 @@ fn vulkan_q4k_dp4a2d_matches_default() -> hanzo_ml::Result<()> {
             let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
             let wq = vk.upload_qweight(&raw)?;
             let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 13)).collect();
-            std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
+            std::env::set_var("VK_Q4K_LEGACY", "1");
             let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
-            std::env::remove_var("HANZO_VK_Q4K_LEGACY");
-            std::env::set_var("HANZO_VK_Q4K_DP4A", "1");
+            std::env::remove_var("VK_Q4K_LEGACY");
+            std::env::set_var("VK_Q4K_DP4A", "1");
             let y_dp = vk.matmul_q4k(&wq, &x, m, nout, k)?;
-            std::env::remove_var("HANZO_VK_Q4K_DP4A");
+            std::env::remove_var("VK_Q4K_DP4A");
             assert_eq!(y_dp.len(), m * nout);
             let mut max_abs = 0f32;
             let mut max_ref = 0f32;
@@ -1091,7 +1091,7 @@ fn vulkan_q4k_dp4a2d_bench() -> hanzo_ml::Result<()> {
     let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
     let iters = 20;
     let bench = |var: Option<&str>| -> hanzo_ml::Result<f64> {
-        for v in ["HANZO_VK_Q4K_TILED2D", "HANZO_VK_Q4K_DP4A"] {
+        for v in ["VK_Q4K_TILED2D", "VK_Q4K_DP4A"] {
             std::env::remove_var(v);
         }
         if let Some(v) = var {
@@ -1107,9 +1107,9 @@ fn vulkan_q4k_dp4a2d_bench() -> hanzo_ml::Result<()> {
         }
         Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
     };
-    let def_ms = bench(Some("HANZO_VK_Q4K_LEGACY"))?;
-    let f32_ms = bench(Some("HANZO_VK_Q4K_TILED2D"))?;
-    let dp4a_ms = bench(Some("HANZO_VK_Q4K_DP4A"))?;
+    let def_ms = bench(Some("VK_Q4K_LEGACY"))?;
+    let f32_ms = bench(Some("VK_Q4K_TILED2D"))?;
+    let dp4a_ms = bench(Some("VK_Q4K_DP4A"))?;
     eprintln!(
         "[L1 dp4a bench] m={m} nout={nout} k={k}: default={def_ms:.3} 2d_f32={f32_ms:.3} 2d_dp4a={dp4a_ms:.3} ms | dp4a vs default={:.2}x vs 2d_f32={:.2}x",
         def_ms / dp4a_ms,
@@ -1118,7 +1118,7 @@ fn vulkan_q4k_dp4a2d_bench() -> hanzo_ml::Result<()> {
     Ok(())
 }
 
-// L4 coopmat Q4_K prefill GEMM (mul_mm_q4k_coopmat, HANZO_VK_Q4K_COOPMAT): tensor-core path (decode
+// L4 coopmat Q4_K prefill GEMM (mul_mm_q4k_coopmat, VK_Q4K_COOPMAT): tensor-core path (decode
 // weight to f16 LDS tiles + coopMatMulAdd). f16 weight + f16 activation rounding (f32 accumulate), so
 // the gate vs the exact legacy column kernel is ~1% relative (a decode/transpose/tile bug is >>1%).
 // Skips if the device lacks coopmat (the env path is a no-op fallthrough -> equals the default).
@@ -1138,12 +1138,12 @@ fn vulkan_q4k_coopmat_matches_default() -> hanzo_ml::Result<()> {
             let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
             let wq = vk.upload_qweight(&raw)?;
             let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 17)).collect();
-            std::env::set_var("HANZO_VK_Q4K_LEGACY", "1");
+            std::env::set_var("VK_Q4K_LEGACY", "1");
             let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
-            std::env::remove_var("HANZO_VK_Q4K_LEGACY");
-            std::env::set_var("HANZO_VK_Q4K_COOPMAT", "1");
+            std::env::remove_var("VK_Q4K_LEGACY");
+            std::env::set_var("VK_Q4K_COOPMAT", "1");
             let y_cm = vk.matmul_q4k(&wq, &x, m, nout, k)?;
-            std::env::remove_var("HANZO_VK_Q4K_COOPMAT");
+            std::env::remove_var("VK_Q4K_COOPMAT");
             let mut max_abs = 0f32;
             let mut max_ref = 0f32;
             for (a, b) in y_ref.iter().zip(y_cm.iter()) {
@@ -1178,7 +1178,7 @@ fn vulkan_q4k_coopmat_bench() -> hanzo_ml::Result<()> {
     let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
     let iters = 20;
     let bench = |var: Option<&str>| -> hanzo_ml::Result<f64> {
-        for v in ["HANZO_VK_Q4K_COOPMAT", "HANZO_VK_Q4K_LEGACY"] {
+        for v in ["VK_Q4K_COOPMAT", "VK_Q4K_LEGACY"] {
             std::env::remove_var(v);
         }
         if let Some(v) = var {
@@ -1195,8 +1195,8 @@ fn vulkan_q4k_coopmat_bench() -> hanzo_ml::Result<()> {
         Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
     };
     let dp4a_ms = bench(None)?; // default == dp4a on this device
-    let legacy_ms = bench(Some("HANZO_VK_Q4K_LEGACY"))?;
-    let cm_ms = bench(Some("HANZO_VK_Q4K_COOPMAT"))?;
+    let legacy_ms = bench(Some("VK_Q4K_LEGACY"))?;
+    let cm_ms = bench(Some("VK_Q4K_COOPMAT"))?;
     eprintln!(
         "[L4 coopmat bench] m={m} nout={nout} k={k}: legacy={legacy_ms:.3} dp4a={dp4a_ms:.3} coopmat={cm_ms:.3} ms | coopmat vs dp4a={:.2}x vs legacy={:.2}x",
         dp4a_ms / cm_ms,
@@ -1220,10 +1220,10 @@ fn vulkan_q4k_kernel_bench() -> hanzo_ml::Result<()> {
     let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7)).collect();
     let bench = |var: Option<&str>| -> hanzo_ml::Result<f64> {
         for v in [
-            "HANZO_VK_Q4K_LEGACY",
-            "HANZO_VK_Q4K_TILED2D",
-            "HANZO_VK_Q4K_DP4A",
-            "HANZO_VK_Q4K_COOPMAT",
+            "VK_Q4K_LEGACY",
+            "VK_Q4K_TILED2D",
+            "VK_Q4K_DP4A",
+            "VK_Q4K_COOPMAT",
         ] {
             std::env::remove_var(v);
         }
@@ -1236,11 +1236,11 @@ fn vulkan_q4k_kernel_bench() -> hanzo_ml::Result<()> {
         }
         r
     };
-    let leg = bench(Some("HANZO_VK_Q4K_LEGACY"))?;
-    let f32t = bench(Some("HANZO_VK_Q4K_TILED2D"))?;
+    let leg = bench(Some("VK_Q4K_LEGACY"))?;
+    let f32t = bench(Some("VK_Q4K_TILED2D"))?;
     let dp = bench(None)?; // default == dp4a on int_dot8 devices
     let cm = if vk.coopmat_info().is_some() {
-        bench(Some("HANZO_VK_Q4K_COOPMAT"))?
+        bench(Some("VK_Q4K_COOPMAT"))?
     } else {
         0.0
     };
