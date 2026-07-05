@@ -505,6 +505,18 @@ pub fn launch_config(num_elems: usize) -> (rocm_rs::hip::Dim3, rocm_rs::hip::Dim
 /// `qdw_traits<WTYPE>` in the .hip = a fully wired type, for BOTH decode and MoE. No per-quant
 /// kernel, no per-quant launcher: `matvec_quant` reads the (type, activation) pair off this enum
 /// and dispatches the single core's f16/bf16 entry point. Mirrors the CPU `for_each_quant!` table.
+static FORCE_SCALAR_MATVEC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only: force `dp4a_active` to false so the scalar `qmatvec_core` runs, letting the bit-exact
+/// numeric oracles gate the scalar decode against the exact reference. Never set in production.
+pub fn set_force_scalar_matvec(force: bool) {
+    FORCE_SCALAR_MATVEC.store(force, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn force_scalar_matvec() -> bool {
+    FORCE_SCALAR_MATVEC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)] // intentionally mirror GgmlDType variant spelling (Q8_0/IQ4_XS/TQ2_0)
 pub enum RocmQuantType {
@@ -840,8 +852,7 @@ impl RocmQuantType {
     /// int8 (magnitudes + sign, or pre-signed for IQ1) and dp4a against the q8_1 activation, killing
     /// the COMPUTE-bound scalar grid-table float MACs. IQ4_NL stays scalar (32-elem legacy block, not
     /// the 256-elem super-block the dp4a core strides). This is the ONE predicate that routes
-    /// decode/MoE to the dp4a core; every other type falls to the scalar `qmatvec_core`. The per-type
-    /// `HANZO_<T>_FALLBACK` env var forces the scalar path for A/B + as the numeric oracle.
+    /// decode/MoE to the dp4a core; every other type falls to the scalar `qmatvec_core`.
     fn dp4a_capable(self) -> bool {
         matches!(
             self,
@@ -860,33 +871,12 @@ impl RocmQuantType {
         )
     }
 
-    /// Env var that forces this dp4a-capable type back to the scalar `qmatvec_core` (A/B + the
-    /// correctness reference the dp4a output is gated against). `None` for non-dp4a types.
-    fn dp4a_fallback_env(self) -> Option<&'static str> {
-        match self {
-            Self::Q4K => Some("HANZO_Q4K_FALLBACK"),
-            Self::Q6K => Some("HANZO_Q6K_FALLBACK"),
-            Self::Q2K => Some("HANZO_Q2K_FALLBACK"),
-            Self::Q3K => Some("HANZO_Q3K_FALLBACK"),
-            Self::Q5K => Some("HANZO_Q5K_FALLBACK"),
-            Self::IQ2_XXS => Some("HANZO_IQ2XXS_FALLBACK"),
-            Self::IQ2_XS => Some("HANZO_IQ2XS_FALLBACK"),
-            Self::IQ2_S => Some("HANZO_IQ2S_FALLBACK"),
-            Self::IQ3_XXS => Some("HANZO_IQ3XXS_FALLBACK"),
-            Self::IQ3_S => Some("HANZO_IQ3S_FALLBACK"),
-            Self::IQ1_S => Some("HANZO_IQ1S_FALLBACK"),
-            Self::IQ1_M => Some("HANZO_IQ1M_FALLBACK"),
-            _ => None,
-        }
-    }
-
-    /// Whether the dp4a path is selected NOW: dp4a-capable AND its fallback env is unset. The single
-    /// gate `matvec_quant` and `moe_matvec_quant` read to choose the dp4a core vs the scalar core.
+    /// Whether the dp4a path is selected: exactly the dp4a-capable types. The single gate
+    /// `matvec_quant` and `moe_matvec_quant` read to choose the dp4a core vs the scalar core.
+    /// `force_scalar_matvec` (test-only) forces the scalar core so the bit-exact oracles can gate
+    /// the scalar decode against the exact reference; it is never set in production.
     pub fn dp4a_active(self) -> bool {
-        self.dp4a_capable()
-            && self
-                .dp4a_fallback_env()
-                .is_none_or(|e| std::env::var_os(e).is_none())
+        self.dp4a_capable() && !force_scalar_matvec()
     }
 
     /// The unified dp4a decode entry point (`qmatvec_dp4a_core<WTYPE,XT>`). One core, one table.
@@ -1039,9 +1029,9 @@ impl RocmDevice {
         };
         // dp4a FAST PATH (trait-selected, NOT a per-quant special-case): for any dp4a-capable type
         // (Q4_K/Q6_K now, Q5_K-ready) pre-quantize the activation row to q8_1 once and run v_dot4
-        // against the weight blocks -- ~4x the scalar-float dequant on this APU. Every other type, and
-        // any type with its `HANZO_<T>_FALLBACK` set, falls through to the scalar `qmatvec_core`
-        // below. ONE dp4a path + ONE scalar fallback, chosen by `dp4a_active`.
+        // against the weight blocks -- ~4x the scalar-float dequant on this APU. Every other type
+        // falls through to the scalar `qmatvec_core` below. ONE dp4a path, one scalar path, chosen
+        // by `dp4a_active`.
         if qt.dp4a_active() {
             return self.matvec_dp4a(qt, wq_ptr, x, n, k);
         }
@@ -1862,15 +1852,15 @@ impl RocmDevice {
         // full prefill (~64 tok/expert -> ~50% fill at 128, the headline), 64/32 for the micro-batches
         // (~1-8 tok/expert -> a 128-tile would be ~1-6% full). Capacity-rounding only: tile count and
         // weight reads scale with ceil(c/TILE_M), so a smaller tile trades a little weight re-read for
-        // far less empty WMMA work. HANZO_MOE_TILE_M overrides for the A/B. The dense path is untouched.
+        // far less empty WMMA work. MOE_TILE_M overrides for the A/B. The dense path is untouched.
         let active_experts = counts.iter().filter(|&&c| c > 0).count().max(1);
         let avg_tok = nslots / active_experts;
         // Thresholds from the gfx1151 A/B (Qwen3-30B-A3B): TILE_M=64 wins the full prefill (~64 tok/
         // expert, ~50% fill at 128 -> ~75% at 64, +5%) AND is robust to the per-expert spread, so it
         // beats 128 across the whole prefill range; TILE_M=32 wins the few-token decode micro-batches
         // (~1-8 tok/expert, where a 128-tile is ~1-6% full); 128 only pays off for very dense routing
-        // (avg >> 64), which needs a very long prompt. HANZO_MOE_TILE_M overrides for the A/B.
-        let tile_m: i32 = match std::env::var("HANZO_MOE_TILE_M").ok().and_then(|s| s.parse().ok()) {
+        // (avg >> 64), which needs a very long prompt. MOE_TILE_M overrides for the A/B.
+        let tile_m: i32 = match std::env::var("MOE_TILE_M").ok().and_then(|s| s.parse().ok()) {
             Some(v @ (32 | 64 | 128)) => v,
             _ if avg_tok >= 160 => 128,
             _ if avg_tok >= 24 => 64,
@@ -1896,7 +1886,7 @@ impl RocmDevice {
         }
         // M-tile fill telemetry (LEVER-1 measurement): valid rows vs WMMA tile capacity. The wasted
         // fraction = empty WMMA M-rows = the directly-recoverable matrix-core work. Env-gated.
-        if std::env::var("HANZO_MOE_STATS").is_ok() {
+        if std::env::var("MOE_STATS").is_ok() {
             let cap = (num_row_tiles as i32) * tile_m;
             let valid: i32 = tile_nrows.iter().sum();
             eprintln!(
@@ -2791,13 +2781,6 @@ impl RocmStorage {
         }
         if hkv == 0 || hq % hkv != 0 {
             crate::bail!("flash_attn requires Hq % Hkv == 0, got Hq={hq} Hkv={hkv}");
-        }
-        if std::env::var("HANZO_ROCM_FLASH_DEBUG").as_deref() == Ok("1") {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static SEEN: AtomicBool = AtomicBool::new(false);
-            if !SEEN.swap(true, Ordering::Relaxed) {
-                eprintln!("[rocm-flash-attn] WMMA kernel active: B={b} Hq={hq} Hkv={hkv} Lq={lq} Lk={lk} D={d} causal={causal}");
-            }
         }
         let device = self.device.clone();
         let o_el = b * hq * lq * d;

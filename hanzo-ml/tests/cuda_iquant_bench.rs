@@ -1,7 +1,5 @@
-//! Decode-throughput micro-benchmark for the native CUDA i-quant mmvq path vs the dequantize-to-f32
-//! fallback. Run it TWICE (the path is selected once per process from the env):
+//! Decode-throughput micro-benchmark for the native CUDA i-quant mmvq path:
 //!   cargo test -p hanzo-ml --features cuda --release --test cuda_iquant_bench -- --nocapture --ignored
-//!   HANZO_IQ_DEQUANT_FALLBACK=1 cargo test ... (same line)
 //! and compare the reported us/matvec + GB/s. Marked #[ignore] so it never runs in the normal suite.
 #![cfg(feature = "cuda")]
 
@@ -38,8 +36,7 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
     out
 }
 
-// m == 1 -> decode (mmvq dp4a); m > 8 -> prefill (qmmq int8-WMMA GEMM). The fallback path (set via
-// HANZO_IQ_DEQUANT_FALLBACK=1) is the dequant-to-f32 round-trip for both.
+// m == 1 -> decode (mmvq dp4a); m > 8 -> prefill (qmmq int8-WMMA GEMM).
 fn bench_shape(dev: &Device, dtype: GgmlDType, nout: usize, k: usize, m: usize) -> hanzo_ml::Result<()> {
     let raw = synth(dtype, nout, k);
     let bytes = raw.len();
@@ -65,12 +62,7 @@ fn bench_shape(dev: &Device, dtype: GgmlDType, nout: usize, k: usize, m: usize) 
     }
     dev.synchronize()?;
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-    let fallback = std::env::var("HANZO_IQ_DEQUANT_FALLBACK").is_ok();
-    let path = match (fallback, m) {
-        (true, _) => "dequant-fallback",
-        (false, 1) => "native-dp4a",
-        (false, _) => "native-qmmq",
-    };
+    let path = if m == 1 { "native-dp4a" } else { "native-qmmq" };
     let kind = if m == 1 { "decode" } else { "prefill" };
     println!(
         "[{path:>16}] {kind} {dtype:?} [n={nout:>5} k={k:>5} m={m:>4}]  {us:9.2} us/call",

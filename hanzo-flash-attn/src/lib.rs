@@ -247,8 +247,8 @@ impl hanzo_ml::CustomOp3 for FlashAttn {
                 // bits) before the P*V tensor-core matmul (flash_fwd_kernel.h convert_type<Element>);
                 // that precision loss tips repetition-prone models (Qwen3-8B-Q4K) into collapse. Route
                 // bf16 through the f16 kernel (10 mantissa bits, P in [0,1] fits f16, fp16 MMA == bf16
-                // MMA rate = no speed cost). HANZO_CUDA_FLASH_BF16=1 forces raw bf16 for the A/B.
-                if std::env::var("HANZO_CUDA_FLASH_BF16").is_ok_and(|s| s == "1") {
+                // MMA rate = no speed cost). CUDA_FLASH_BF16=1 forces raw bf16 for the A/B.
+                if std::env::var("CUDA_FLASH_BF16").is_ok_and(|s| s == "1") {
                     self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true)
                 } else {
                     let qf = q.to_dtype(q_l, hanzo_ml::DType::F16)?;
@@ -734,8 +734,8 @@ impl hanzo_ml::CustomOp3 for FlashAttnVarLen {
                 // bits) before the P*V tensor-core matmul (flash_fwd_kernel.h convert_type<Element>);
                 // that precision loss tips repetition-prone models (Qwen3-8B-Q4K) into collapse. Route
                 // bf16 through the f16 kernel (10 mantissa bits, P in [0,1] fits f16, fp16 MMA == bf16
-                // MMA rate = no speed cost). HANZO_CUDA_FLASH_BF16=1 forces raw bf16 for the A/B.
-                if std::env::var("HANZO_CUDA_FLASH_BF16").is_ok_and(|s| s == "1") {
+                // MMA rate = no speed cost). CUDA_FLASH_BF16=1 forces raw bf16 for the A/B.
+                if std::env::var("CUDA_FLASH_BF16").is_ok_and(|s| s == "1") {
                     self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true)
                 } else {
                     let qf = q.to_dtype(q_l, hanzo_ml::DType::F16)?;
