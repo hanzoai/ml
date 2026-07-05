@@ -427,14 +427,14 @@ impl CudaDevice {
 /// Default managed-allocation size gate: a buffer at least this large on a
 /// unified device is backed by `cuMemAllocManaged` instead of device-malloc.
 /// Mirrors the ds4 reference's ">= 8 GiB KV" rule. Override (bytes) with
-/// `HANZO_ML_CUDA_UMA_THRESHOLD`.
+/// `ML_CUDA_UMA_THRESHOLD`.
 const DEFAULT_UMA_THRESHOLD_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// Process-wide managed-allocation threshold, read once from the environment.
 fn uma_threshold_bytes() -> usize {
     static THRESHOLD: OnceLock<usize> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
-        std::env::var("HANZO_ML_CUDA_UMA_THRESHOLD")
+        std::env::var("ML_CUDA_UMA_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0)
@@ -491,7 +491,7 @@ impl CudaDevice {
         ) != 0
     }
 
-    /// The managed-allocation size gate in bytes (see `HANZO_ML_CUDA_UMA_THRESHOLD`).
+    /// The managed-allocation size gate in bytes (see `ML_CUDA_UMA_THRESHOLD`).
     pub fn unified_alloc_threshold(&self) -> usize {
         uma_threshold_bytes()
     }
