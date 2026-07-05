@@ -834,7 +834,15 @@ pub fn naive3_run<R: Runtime>(client: &ComputeClient<R>, a: &[f32], b: &[f32], c
 /// To fuse an **arbitrary op DAG** the model *already* emits (fuse a whole forward pass with no
 /// builder), there are three routes. Recommendation and honest effort estimates:
 ///
-/// ## Option A — hanzo-native pass over our own trace  *(RECOMMENDED)*
+/// ## Option A — hanzo-native pass over our own trace  *(RECOMMENDED — now SHIPPED in [`crate::dag`])*
+/// **Implemented.** [`crate::dag`] realizes this exactly: a `NodeId`-taping [`Var`](crate::dag::Var) /
+/// [`Tape`](crate::dag::Tape) records an arbitrary pointwise DAG; [`Dag::fuse`](crate::dag::Dag::fuse)
+/// partitions it into convex Map regions cut at every fence; and ONE generic
+/// [`dag_interp`](crate::dag::dag_interp()) kernel lowers each region (a per-element slot array + a
+/// comptime-unrolled DAG program, so fan-out/fan-in fuse into one launch). Bit-exact-gated on the CPU
+/// runtime (full-DAG-fused == naive per-op == plain-Rust ref) with the launch-count reduction reported.
+/// The description below is the design it implements.
+///
 /// `Expr`/`Chain` here is already the IR; a DAG is the same node types with sharing (a `Vec<Node>` +
 /// indices instead of `Box`). The pass is the exact rule this module documents, generalized from a line
 /// to a graph:

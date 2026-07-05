@@ -54,3 +54,4 @@ pub mod rope;
 pub mod attn;
 pub mod gdn;
 pub mod fuse;
+pub mod dag;
