@@ -2,17 +2,17 @@
 //! deepseek4's `ffn_gate_tid2eid` expert-routing maps (GGML_TYPE_I32 = 26) -- instead of hard-failing
 //! the whole model load with "unknown dtype for tensor 26".
 //!
-//! Run against a real model by setting HANZO_TEST_GGUF to its path (only the headers are read, not the
+//! Run against a real model by setting TEST_GGUF to its path (only the headers are read, not the
 //! 86 GB of tensor data, so it's fast). Skips cleanly when the env var / file is absent.
 
 use hanzo_ml::quantized::gguf_file::Content;
 
 #[test]
 fn gguf_header_loads_skipping_integer_tensors() {
-    let path = match std::env::var("HANZO_TEST_GGUF") {
+    let path = match std::env::var("TEST_GGUF") {
         Ok(p) => p,
         Err(_) => {
-            eprintln!("skip: set HANZO_TEST_GGUF to a model path to exercise the I32-skip loader");
+            eprintln!("skip: set TEST_GGUF to a model path to exercise the I32-skip loader");
             return;
         }
     };
