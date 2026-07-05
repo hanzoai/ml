@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_target_msvc = target.contains("msvc");
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
-    println!("cargo:rerun-if-env-changed=HANZO_NVCC_CCBIN");
+    println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
 
     for file in KERNEL_FILES {
         println!("cargo:rerun-if-changed=hkernel/{file}");
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     // You can optionally allow an environment variable to cache the compiled artifacts.
     // If not found, we compile into the standard OUT_DIR.
-    let build_dir = match std::env::var("HANZO_FLASH_ATTN_BUILD_DIR") {
+    let build_dir = match std::env::var("FLASH_ATTN_BUILD_DIR") {
         Err(_) => out_dir.clone(),
         Ok(build_dir) => {
             let path = PathBuf::from(build_dir);
