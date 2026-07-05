@@ -1221,4 +1221,60 @@ mod tests {
         assert!(fused.launches < naive.launches, "fusion must cut launches");
         assert!(maxerr < 1e-5, "reference disagreement {maxerr}");
     }
+
+    #[test]
+    fn rms_norm_gated_engine_pattern_fuses() {
+        // The exact per-GDN-layer chain from hanzo-engine `models/gdn.rs` `RmsNormGated`:
+        //   rms_norm(x) * weight * silu(gate)  ==  x·rsqrt(Σ x² + eps) · w · silu(g)
+        // Ops-composed in the engine, this is ~8 kernel launches on EVERY Gated-DeltaNet layer — a
+        // direct contributor to the prefill launch storm (nsys: hanzo prefill ~33k launches vs
+        // llama 3089, the whole remaining 0.86x->1.0x gap is launch overhead). Full-DAG fusion
+        // collapses it to 3 regions: the `x·x` prologue | the row-sum fence | the fused
+        // `rsqrt(Σ+eps)·x·w·silu(g)` epilogue. This is the mechanism that closes prefill.
+        let client = cpu_client();
+        let rows = 16usize;
+        let n = 128usize;
+        let len = rows * n;
+        let x = xorshift_vec(len, 0xa1b2_c3d4_e5f6_0718);
+        let w = xorshift_vec(len, 0x1122_3344_5566_7788);
+        let g = xorshift_vec(len, 0x9900_aabb_ccdd_eeff);
+
+        let tape = Tape::new();
+        let vx = tape.input();
+        let vw = tape.input();
+        let vg = tape.input();
+        let eps = tape.konst(1e-6);
+        let ss = (vx * vx).reduce(Red::Sum); // FENCE — rms_norm's reduction
+        let inv = (ss + eps).rsqrt(); // per-row inverse-RMS scale
+        let y = vx * inv * vw * vg.silu(); // fused epilogue: normed · weight · silu(gate)
+        let dag = tape.finish(y);
+
+        let fused = dag.fuse_and_run::<cubecl::cpu::CpuRuntime>(&client, &[&x, &w, &g], n);
+        let naive = dag.naive_run::<cubecl::cpu::CpuRuntime>(&client, &[&x, &w, &g], n);
+
+        let mut refv = vec![0.0f32; len];
+        for row in 0..rows {
+            let base = row * n;
+            let ss: f32 = x[base..base + n].iter().map(|v| v * v).sum();
+            let inv = 1.0f32 / (ss + 1e-6).sqrt();
+            for i in 0..n {
+                let j = base + i;
+                refv[j] = x[j] * inv * w[j] * apply_un(UnOp::Silu, g[j]);
+            }
+        }
+
+        assert_eq!(bits(&fused.out), bits(&naive.out), "fused != naive (bit level)");
+        let maxerr = fused
+            .out
+            .iter()
+            .zip(&refv)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "[dag CPU] RmsNormGated rms_norm(x)*w*silu(g) (real engine gdn.rs chain): fused {} vs naive {} launches; bit-exact; max|fused-ref|={maxerr:.2e}",
+            fused.launches, naive.launches
+        );
+        assert!(fused.launches < naive.launches, "fusion must cut the per-layer launch count");
+        assert!(maxerr < 1e-5, "reference disagreement {maxerr}");
+    }
 }
