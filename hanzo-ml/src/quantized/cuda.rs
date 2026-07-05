@@ -28,7 +28,7 @@ pub fn set_force_dmmv(f: bool) {
 
 // Opt-in switch for the modern llama-style mmq/mmvq path (int8 MMA matrix-core + stream-K) ported
 // in fast_mmq.rs / fast_mmvq.rs. Off by default until validated on NVIDIA hardware; enable with
-// HANZO_CUDA_FAST_MMQ=1 (env) or `set_fast_mmq(true)` (programmatic — a model that needs the int8
+// CUDA_FAST_MMQ=1 (env) or `set_fast_mmq(true)` (programmatic — a model that needs the int8
 // dp4a path for *correctness*, e.g. DeepSeek-V4's W8A8 QAT, turns it on at load). When on,
 // QCudaStorage::fwd tries it first and falls back to the legacy on-GPU q8_1 kernels for any
 // dtype/shape it doesn't support. Mirrors `FORCE_DMMV`: an AtomicBool seeded once from the env.
@@ -46,26 +46,12 @@ pub fn set_fast_mmq(f: bool) {
 pub(crate) fn fast_mmq_enabled() -> bool {
     FAST_MMQ_INIT.call_once(|| {
         let env = matches!(
-            std::env::var("HANZO_CUDA_FAST_MMQ").as_deref(),
+            std::env::var("CUDA_FAST_MMQ").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
         );
         FAST_MMQ.store(env, std::sync::atomic::Ordering::Relaxed);
     });
     FAST_MMQ.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-// Force i-quant codebook weights back to the dequantize-to-f32 dense matmul instead of the native
-// dp4a decode -- the A/B knob (mirrors ROCm's HANZO_IQ*_FALLBACK) and a production safety fallback.
-// Read once. Set HANZO_IQ_DEQUANT_FALLBACK=1 to disable the native i-quant mmvq decode path.
-pub(crate) fn iq_dequant_fallback() -> bool {
-    use std::sync::OnceLock;
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        matches!(
-            std::env::var("HANZO_IQ_DEQUANT_FALLBACK").as_deref(),
-            Ok("1") | Ok("true") | Ok("TRUE")
-        )
-    })
 }
 
 pub const WARP_SIZE: usize = 32;
@@ -653,9 +639,9 @@ fn indexed_moe_forward_fused_q8_1_input(
     // expert and stage each expert's weight ONCE, amortizing it over all its tokens via the tensor
     // cores. The per-slot matvec below instead re-streams the whole expert weight for EVERY routed token
     // (no matrix cores) -- fine at decode (one token), the 10x deficit at prefill. Decode (batch==1)
-    // keeps the per-slot matvec (bandwidth-bound, capture-clean). HANZO_MOE_QMMQ_FALLBACK forces the
-    // per-slot path for the A/B; unsupported weight dtypes return None and fall through to per-slot.
-    if batch > 1 && std::env::var("HANZO_MOE_QMMQ_FALLBACK").is_err() {
+    // keeps the per-slot matvec (bandwidth-bound, capture-clean). Unsupported weight dtypes return None
+    // and fall through to per-slot.
+    if batch > 1 {
         if let Some(res) = super::fast_mmq::indexed_moe_grouped(
             weight, w_shape, w_dtype, input, in_shape, ids, idx_shape, dev,
         )? {
@@ -1106,7 +1092,7 @@ impl QCudaStorage {
             _ => false,
         };
         // Modern llama mmq/mmvq path (int8 MMA matrix-core + stream-K). Opt-in via
-        // HANZO_CUDA_FAST_MMQ=1; try_fwd returns Ok(None) for unsupported dtype/shape, falling
+        // CUDA_FAST_MMQ=1; try_fwd returns Ok(None) for unsupported dtype/shape, falling
         // through to the legacy on-GPU q8_1 kernels below. Skipped under FORCE_DMMV.
         if fast_mmq_enabled() && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             if use_vec_kernel {
@@ -1128,7 +1114,7 @@ impl QCudaStorage {
             // twin of the ROCm `qdp4a<IQ*>` 2.27x lever. Only the decode/vec shape (small b*m) takes
             // it; prefill (m>1) keeps the dequant->dense matmul (i-quant qmmq prefill is a separate
             // lever). ONE predicate (`iquant_dp4a_suffix`), gated here next to the fallback.
-            if iquant_dp4a_suffix(self.dtype).is_some() && !iq_dequant_fallback() {
+            if iquant_dp4a_suffix(self.dtype).is_some() {
                 if use_vec_kernel {
                     // DECODE: native dp4a mmvq.
                     return self.mul_mat_vec_iquant(self_shape, storage, layout);

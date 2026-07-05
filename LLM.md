@@ -58,19 +58,28 @@ ml/
   regression). The on-device numeric oracles (`qmatvec_unified_numeric`, `moe_route_numeric`,
   `qmmq_unified_numeric`, `rmsnorm_numeric`) live in `engine/hanzo-cli/tests/` and gate GPU builds.
 
-## Env vars (bare names -- de-brand in progress)
-The env-flag convention is BARE names, no `HANZO_` brand prefix (see the perf/backend flags in
-`engine/hanzo-engine/src/perf_flags.rs`). The de-brand is PARTIAL -- both forms currently coexist:
-- **Bare (de-branded)**: `CUDA_GRAPHS`, `ROCM_GRAPHS`, `METAL_GRAPHS`, `FLASHINFER_DECODE` (all default
-  ON, set `=0` to force eager); `VK_COOPMAT`, `VK_INT_DOT`, `VK_PROFILE`, `VK_PUSH_DESC`,
-  `VK_DP4A_DECODE_OFF`, `VK_SUBGROUP_MATVEC` (Vulkan, ml); `MOE_BACKEND`, `MTP_CONF_THRESHOLD`,
-  `SAMPLER_TRACE`, `DEQUANTIZE_ALL`, `GEMMA4_DISABLE_FAST_PREFILL`, `V4_*`, `ZEN3_*`, `ZEN_OMNI_*`.
-- **Still `HANZO_`-branded (A/B fallback knobs, NOT yet de-branded)**: `HANZO_Q{2,3,4,5,6}K_FALLBACK`,
-  `HANZO_IQ*_FALLBACK`, `HANZO_MOE_{QMMQ,ROUTE,GATEUP,COMBINE}_FALLBACK`, `HANZO_MOE_TILE_M`,
-  `HANZO_VK_Q4K_{LEGACY,DP4A,TILED2D,COOPMAT}`, `HANZO_VK_DP4A_DECODE`, `HANZO_GDN_FUSED_FALLBACK`,
-  `HANZO_ADD_RMSNORM_FALLBACK`, `HANZO_QK_NORM_ROPE_FALLBACK`, `HANZO_ML_CUDA_UMA_THRESHOLD`.
-- INCONSISTENCY to resolve: ml reads BOTH `HANZO_VK_DP4A_DECODE` and bare `VK_DP4A_DECODE_OFF` for the
-  same path. Finish the de-brand to ONE bare name per knob (one way to do everything).
+## Env vars (bare names, one-way -- de-brand DONE)
+The env-flag convention is BARE names, no `HANZO_` brand prefix. The de-brand is COMPLETE: every runtime
+knob is a bare name, and the one-off dev A/B "fallback" toggles are GONE (production always runs the fast
+path; runtime HW auto-select is kept). One bare name per real knob, one way to do everything.
+- **Bare runtime knobs**: `CUDA_GRAPHS`, `ROCM_GRAPHS`, `METAL_GRAPHS`, `FLASHINFER_DECODE` (default ON,
+  `=0` forces eager); `VK_COOPMAT`, `VK_INT_DOT`, `VK_PROFILE`, `VK_PUSH_DESC`, `VK_DP4A_DECODE_OFF`,
+  `VK_SUBGROUP_MATVEC`, `VK_Q4K_{LEGACY,DP4A,TILED2D,COOPMAT}` (Vulkan Q4_K path A/B gates, test-driven);
+  `MOE_BACKEND`, `MTP_CONF_THRESHOLD`, `GEMMA4_DISABLE_FAST_PREFILL`, `V4_*`, `ZEN3_*`, `ZEN_OMNI_*`;
+  `MOE_TILE_M`, `MOE_STATS`, `CUDA_FAST_MMQ`, `MIN_LEN`, `ML_CUDA_UMA_THRESHOLD` (ml); `ROCM_GFX_ARCH`,
+  `ROCM_VERSION`, `GGUF_MMAP`, `CUDA_FLASH_BF16`, `FLASH_ATTN_BUILD_DIR`, `METAL_PRECOMPILE`
+  (build/backend config).
+- **DELETED (were one-off dev A/B toggles that forced the OLD/slow path; production always wants fast)**:
+  `HANZO_Q{2,3,4,5,6}K_FALLBACK`, `HANZO_IQ*_FALLBACK`, `HANZO_IQ_DEQUANT_FALLBACK`,
+  `HANZO_MOE_{QMMQ,ROUTE,GATEUP,COMBINE}_FALLBACK`, `HANZO_DBG_PATH`, `HANZO_ROCM_FLASH_DEBUG`,
+  `SAMPLER_TRACE`, `DEQUANTIZE_ALL(_F16)`. The dp4a-vs-scalar decision is now purely runtime
+  (`RocmQuantType::dp4a_active` == `dp4a_capable`, HW/type auto-select); the scalar core is still the
+  path for non-dp4a types. Bit-exact oracle tests force the scalar core via the test-only
+  `hanzo_ml::set_force_scalar_matvec(bool)` (a programmatic flag, never env, never set in production).
+- **`VK_DP4A_DECODE` two-ways inconsistency RESOLVED**: ONE bare name `VK_DP4A_DECODE_OFF` (the doc that
+  named a phantom `HANZO_VK_DP4A_DECODE` was corrected; only the bare `_OFF` is read).
+- **Kept `HANZO_`-branded (product identity, NOT a perf knob)**: `HANZO_ENGINE_LICENSE{,_FILE,_TOKEN}`,
+  `HANZO_LICENSE_SIGNING_KEY` -- the license identity vars are the ONLY remaining `HANZO_` env names.
 
 ## ROCm indexed-MoE decode (gfx1151 / WSL HIP graphs)
 
