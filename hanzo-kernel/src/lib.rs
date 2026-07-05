@@ -38,6 +38,11 @@ pub mod prelude {
     // *source* only writes `#[kernel]` / `#[device]`; `cube` is never named by a human.
     #[doc(hidden)]
     pub use cubecl::cube;
+    // Internal: the `#[cube]` expansion emits `cubecl::` paths, which must resolve in a DOWNSTREAM
+    // crate that depends only on `hanzo-kernel` (not `cubecl`). Re-export the crate through the prelude
+    // so `use hanzo_kernel::prelude::*;` brings the `cubecl` name into scope. Never named by a human.
+    #[doc(hidden)]
+    pub use cubecl;
 }
 
 pub use cubecl;
@@ -47,3 +52,5 @@ pub mod quant;
 pub mod norm;
 pub mod rope;
 pub mod attn;
+pub mod gdn;
+pub mod fuse;
