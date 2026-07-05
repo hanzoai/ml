@@ -37,6 +37,41 @@ ml/
 - `Cargo.toml` -- Rust crate config
 - `Makefile` -- Build automation
 
+## Current state (portable kernel DSL, auto-fusion, GDN, qwen3.5)
+- **hanzo-kernel** (the portable kernel DSL, homed in this repo at `hanzo-kernel/`, published 0.2.15)
+  is a CODEGEN not a runtime: one `#[kernel(targets(...))]` Rust source lowers to CUDA/ROCm/Vulkan/
+  Metal/WebGPU/CPU via CubeCL. The built-in op library (`hanzo-kernel/src/`) is bit-exact on the CPU
+  runtime: `norm` (rms/layer), `rope`, `attn` (`sdpa` + `sdpa_runtime`, online-softmax = the 8B
+  flash-collapse structural cure), `gdn` (gating/conv1d/scan), `quant` (matvec_q8/q4k), and `fuse`.
+- **`fuse` (auto-fusion): fusion is composition.** `hanzo-kernel/src/fuse.rs` implements the op algebra
+  where legal fusion is a total function of op CLASS (Map = index-local, freely fusible by the functor
+  law `map g . map f == map (g . f)`; Reduce = a fence). `Fuse::new(a).mul(w).add(b).silu().run()`
+  compiles a chain to a comptime op program and dispatches ONE `fused_interp` launch (zero
+  intermediates). No pattern-matcher, no separate fusion pass -- only composition of morphisms.
+  Bit-exact-gated three ways (fused kernel == naive N-kernel == plain-Rust ref).
+- **Fused GDN kernel** (Gated-DeltaNet linear attention) drives Qwen3.5/3.6 hybrid archs to near-parity;
+  the portable `gdn_conv1d`/`gdn_gating`/`gdn_scan` DSL source replaces the ops-composed CUDA/ROCm path,
+  with the engine model (`quantized_qwen3_5_moe`) fully wired (GGUF arch + loaders).
+- **CPU test gates** (no GPU, safe): `cargo test -p hanzo-kernel --no-default-features --features cpu`
+  = 15/15 (the norm/rope/attn/gdn/fuse bit-exact oracles); `cargo test -p hanzo-ml` = green except the
+  pre-existing `serialization_tests::npz` (a missing git-tracked fixture `tests/test.npz`, NOT a code
+  regression). The on-device numeric oracles (`qmatvec_unified_numeric`, `moe_route_numeric`,
+  `qmmq_unified_numeric`, `rmsnorm_numeric`) live in `engine/hanzo-cli/tests/` and gate GPU builds.
+
+## Env vars (bare names -- de-brand in progress)
+The env-flag convention is BARE names, no `HANZO_` brand prefix (see the perf/backend flags in
+`engine/hanzo-engine/src/perf_flags.rs`). The de-brand is PARTIAL -- both forms currently coexist:
+- **Bare (de-branded)**: `CUDA_GRAPHS`, `ROCM_GRAPHS`, `METAL_GRAPHS`, `FLASHINFER_DECODE` (all default
+  ON, set `=0` to force eager); `VK_COOPMAT`, `VK_INT_DOT`, `VK_PROFILE`, `VK_PUSH_DESC`,
+  `VK_DP4A_DECODE_OFF`, `VK_SUBGROUP_MATVEC` (Vulkan, ml); `MOE_BACKEND`, `MTP_CONF_THRESHOLD`,
+  `SAMPLER_TRACE`, `DEQUANTIZE_ALL`, `GEMMA4_DISABLE_FAST_PREFILL`, `V4_*`, `ZEN3_*`, `ZEN_OMNI_*`.
+- **Still `HANZO_`-branded (A/B fallback knobs, NOT yet de-branded)**: `HANZO_Q{2,3,4,5,6}K_FALLBACK`,
+  `HANZO_IQ*_FALLBACK`, `HANZO_MOE_{QMMQ,ROUTE,GATEUP,COMBINE}_FALLBACK`, `HANZO_MOE_TILE_M`,
+  `HANZO_VK_Q4K_{LEGACY,DP4A,TILED2D,COOPMAT}`, `HANZO_VK_DP4A_DECODE`, `HANZO_GDN_FUSED_FALLBACK`,
+  `HANZO_ADD_RMSNORM_FALLBACK`, `HANZO_QK_NORM_ROPE_FALLBACK`, `HANZO_ML_CUDA_UMA_THRESHOLD`.
+- INCONSISTENCY to resolve: ml reads BOTH `HANZO_VK_DP4A_DECODE` and bare `VK_DP4A_DECODE_OFF` for the
+  same path. Finish the de-brand to ONE bare name per knob (one way to do everything).
+
 ## ROCm indexed-MoE decode (gfx1151 / WSL HIP graphs)
 
 ### Upstream forks/patches we maintain (validated in our forks, ready to PR upstream, NOT filed)
