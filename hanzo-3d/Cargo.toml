@@ -1,0 +1,16 @@
+[package]
+name = "hanzo-3d"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "3D representations, geometry, and mesh/point-cloud I/O for the Hanzo generative-3D stack (Pixal3D / TRELLIS / TripoSR)."
+repository = "https://github.com/hanzoai/ml"
+
+# Zero-dependency foundation: representations, geometry (Vec3/Mat/Quat/Camera), and
+# glTF-adjacent I/O (OBJ, PLY — including the 3D-Gaussian-Splatting PLY layout) are all
+# pure std. A `candle` feature adds tensor interop for the diffusion pipelines; kept optional
+# so the crate builds and its roundtrip gates run with no external toolchain.
+[features]
+default = []
+
+[dependencies]

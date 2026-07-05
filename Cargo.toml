@@ -4,6 +4,7 @@
 # `hanzo-ml` name from the workspace and resolves the hanzo-ml-pyo3 vs hanzo-ml-pyo3 `links="python"`
 # conflict. The dirs remain on disk for now and can be deleted in a follow-up.
 members = [
+    "hanzo-3d",
     "hanzo-datasets",
     "hanzo-ml",
     "hanzo-ml-examples",
