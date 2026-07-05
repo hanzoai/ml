@@ -94,8 +94,23 @@ Reusable, bit-exact kernels — not toys. Each ships with a CPU oracle and a bit
 - **`norm`** — `rms_norm`, `layer_norm`, `add_rmsnorm` (fused, multi-output).
 - **`rope`** — `rope_half` (GPT-NeoX) and `rope_interleaved` (GPT-J) conventions.
 - **`attn`** — `sdpa` and `sdpa_runtime`: GQA + online (flash-style) softmax with a runtime-length KV cache. One stable attention implementation across backends — the structural cure for repetition-collapse.
+- **`gdn`** — Gated-DeltaNet linear-attention for hybrid `qwen3_5_moe` archs (Qwen3.5 / 3.6 / AgentWorld): `gdn_conv1d` (causal depthwise conv1d + SiLU), `gdn_gating` (fused `beta`/`g` gates), `gdn_scan` (the recurrent gated delta-rule, fused into one launch). One source replaces the ops-composed CUDA/ROCm GDN path.
+- **`fuse`** — auto-fusion, because **fusion is composition**. `Fuse::new(a).mul(w).add(b).silu().run()` folds a chain of pointwise Maps into ONE kernel launch with zero materialized intermediates — the functor law `map g . map f == map (g . f)` read right-to-left. Legal fusion is a total function of op *class* (Map = index-local, freely fusible; Reduce = a fence), not a pattern-matcher. Bit-exact-gated three ways (fused kernel == naive N-kernel == plain-Rust reference).
 
-Run the correctness + throughput gate yourself:
+Call them straight from your own crate — the common case when you fork a model and want the transformer ops without writing kernels. `use hanzo_kernel::prelude::*;` (it brings the `Runtime` trait into scope; you always want it):
+
+```rust
+use hanzo_kernel::cubecl::cpu::{CpuDevice, CpuRuntime};
+use hanzo_kernel::prelude::*;
+
+let client = CpuRuntime::client(&CpuDevice::default()); // or a CUDA/Metal/Vulkan runtime — same call
+
+let normed = hanzo_kernel::norm::rms_norm_run::<CpuRuntime>(&client, &x, &weight, rows, hidden, 1e-6);
+let rotated = hanzo_kernel::rope::rope_run::<CpuRuntime>(&client, &x, &cos, &sin, rows, head_dim, /*interleaved=*/false);
+let y = hanzo_kernel::quant::matvec_q8_run::<CpuRuntime>(&client, &scales, &qweight, &x, out_rows, k);
+```
+
+`cargo run --example model_ops` runs all of them; `cargo run --example hello_kernel` shows authoring a `#[kernel]`. Run the correctness + throughput gate yourself:
 
 ```bash
 cargo run --release --bin matvec-check --no-default-features --features "cpu,vulkan"
@@ -113,6 +128,16 @@ Four ideas, borrowed from Rich Hickey and applied to kernels:
 ## Status
 
 Published and in production. `rms_norm` and `softmax` are live DSL kernels in the [Hanzo ML](https://github.com/hanzoai/ml) inference engine — their hand-written predecessors are deleted. The full op library is bit-exact on CPU, Vulkan, and Metal, and shelf-ready for the backends still on hand-tuned kernels. A generated DSL kernel dispatches through the engine's real Vulkan and Metal pipelines with `maxerr = 0` — the DSL plugs in as a **code generator**, not a second runtime.
+
+## The stack
+
+| Crate | What |
+|---|---|
+| **hanzo-kernel** | this crate — write a GPU kernel once, lower it to every backend |
+| [**hanzo-ml**](https://crates.io/crates/hanzo-ml) | the multi-backend tensor + ML framework (6 backends, the full quant zoo) |
+| [**hanzo-flash-attn**](https://crates.io/crates/hanzo-flash-attn) | flash-attention-2 CUDA kernels |
+| [**hanzo-kernels**](https://crates.io/crates/hanzo-kernels) | the hand-tuned CUDA quant kernels the DSL is migrating |
+| [Hanzo Engine](https://github.com/hanzoai/engine) | the serving engine: OpenAI + Anthropic + MCP APIs |
 
 ## License
 
