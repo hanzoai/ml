@@ -1704,6 +1704,157 @@ mod test {
         Ok(())
     }
 
+    // ============================ RED ADVERSARIAL TESTS ============================
+    // RED: Deterministic proof of the scatter-loop OOB. Drives the PUBLIC indexed_moe_forward
+    // with batch>1 (grouped path) and an ids buffer that contains out-of-range "garbage" expert
+    // ids (exactly the class of value a CUDA-graph capture-warmup DtoH can observe). On the
+    // pre-fix code (main 5443ec7d) the scatter loop does `cursor[e as usize]` with the raw id ->
+    // `index out of bounds` panic. On the fix (aedfb2f9) both loops clamp to e_cnt-1, so the run
+    // completes AND the garbage slots route to the LAST expert while every valid slot is untouched.
+    #[test]
+    fn cuda_red_grouped_oob_garbage_id() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let (e, n, k) = (8usize, 64usize, 512usize);
+        let (batch, topk) = (4usize, 2usize); // nslots=8, grouped (batch>1)
+
+        // Valid ids, then poison two slots with the exact panic value Blue saw + u32::MAX.
+        let mut ids: Vec<u32> = vec![0, 3, 1, 6, 2, 4, 7, 5];
+        ids[2] = 3_864_936_047u32; // the exact index from Blue's reported panic
+        ids[6] = u32::MAX;
+        // Expected (fix) routing: garbage clamps to e-1.
+        let want_ex: Vec<usize> = ids.iter().map(|&x| (x as usize).min(e - 1)).collect();
+
+        let mut st: u32 = 0x1234_5678;
+        let mut nextf = || -> f32 {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        let w: Vec<f32> = (0..e * n * k).map(|_| nextf() * 0.5).collect();
+        let inp: Vec<f32> = (0..batch * k).map(|_| nextf()).collect();
+
+        let dtype = GgmlDType::Q4K;
+        let mut bank = QCudaStorage::zeros(&dev, e * n * k, dtype)?;
+        bank.quantize(&CudaStorage::wrap_cuda_slice(dev.clone_htod(&w)?, dev.clone()))?;
+        let deq = bank.dequantize(e * n * k)?;
+        let w_deq = dev.clone_dtoh(&deq.as_cuda_slice::<f32>()?.as_view())?;
+        let self_shape: crate::Shape = (e, n, k).into();
+
+        let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+        let input_l = crate::Layout::contiguous((batch, 1usize, k)); // input_dim1==1 -> broadcast per token
+        let ids_storage = CudaStorage::wrap_cuda_slice(dev.clone_htod(&ids)?, dev.clone());
+        let ids_l = crate::Layout::contiguous((batch, topk));
+
+        // On pre-fix code THIS LINE PANICS (scatter loop OOB). On the fix it returns Ok.
+        let (g_st, g_sh) =
+            bank.indexed_moe_forward(&self_shape, &input, &input_l, &ids_storage, &ids_l)?;
+        assert_eq!(g_sh.dims().to_vec(), vec![batch, topk, n]);
+        let got = dev.clone_dtoh(&g_st.as_cuda_slice::<f32>()?.as_view())?;
+
+        // Verify clamp SEMANTICS: every slot (valid AND clamped-garbage) matches its expert oracle.
+        let mut max_abs = 0f32;
+        let mut err = 0f32;
+        for b in 0..batch {
+            for t in 0..topk {
+                let s = b * topk + t;
+                let ex = want_ex[s]; // token=b because input_dim1==1
+                for j in 0..n {
+                    let mut acc = 0f32;
+                    for i in 0..k {
+                        acc += w_deq[ex * n * k + j * k + i] * inp[b * k + i];
+                    }
+                    let g = got[s * n + j];
+                    assert!(g.is_finite(), "non-finite at slot {s} col {j}");
+                    max_abs = max_abs.max(acc.abs());
+                    err = err.max((g - acc).abs());
+                }
+            }
+        }
+        let tol = 0.05 * max_abs + 1e-3;
+        assert!(
+            err <= tol,
+            "RED-OOB: clamped grouped output diverges from per-expert oracle err {err} > tol {tol} (max_abs {max_abs})"
+        );
+        eprintln!("[RED_OOB] survived garbage ids {{3864936047,u32::MAX}}: max_abs={max_abs:.4} err={err:.5} (clamp routes garbage->expert{})", e - 1);
+        Ok(())
+    }
+
+    // RED: attack the 0.05*max_abs qmmq tolerance across adversarial shapes and an extra dtype.
+    // Reports RELATIVE error so we can compare to q8_1 activation-quant theory (~1/256 per element,
+    // partially averaging over k). If any shape's relative error blows past the ~1-2% q8_1 regime,
+    // the fixed tolerance is masking a real kernel bug.
+    #[test]
+    fn cuda_red_dense_qmmq_adversarial() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let cuda_dev = crate::Device::Cuda(dev.clone());
+
+        let mut st: u32 = 0x9E37_79B9;
+        let mut nextf = || -> f32 {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+
+        // (m, n, k): single-row prefill; skinny; wide-N; large-K. k stays a multiple of 256 (block).
+        let shapes = [(1usize, 128usize, 512usize), (3, 64, 256), (16, 2048, 512), (7, 128, 4096)];
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0, GgmlDType::Q2K] {
+            for &(m, n, k) in &shapes {
+                let inp: Vec<f32> = (0..m * k).map(|_| nextf()).collect();
+                let wf: Vec<f32> = (0..n * k).map(|_| nextf() * 0.5).collect();
+
+                let qcpu = crate::Device::Cpu.qzeros(n * k, dtype)?;
+                let qcpu = match qcpu {
+                    QStorage::Cpu(mut storage) => {
+                        storage.from_float(&wf);
+                        QStorage::Cpu(storage)
+                    }
+                    _ => unreachable!(),
+                };
+                let bytes = qcpu.data()?.into_owned();
+                let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)? {
+                    QStorage::Cuda(s) => s,
+                    _ => unreachable!(),
+                };
+                let w_dev = qcuda.dequantize(n * k)?;
+                let w_host = dev.clone_dtoh(&w_dev.as_cuda_slice::<f32>()?.as_view())?;
+
+                let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+                let input_l = crate::Layout::contiguous((m, k));
+                let self_shape: crate::Shape = (n, k).into();
+
+                let res = crate::quantized::fast_mmq::try_fwd(&qcuda, &self_shape, &input, &input_l)?;
+                let (q_out, q_shape) = match res {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("[RED_ADV] {dtype:?} {m}x{n}x{k}: try_fwd returned None (no MMQ kernel) -- skip");
+                        continue;
+                    }
+                };
+                assert_eq!(q_shape.dims().to_vec(), vec![m, n]);
+                let q_got = dev.clone_dtoh(&q_out.as_cuda_slice::<f32>()?.as_view())?;
+
+                let mut max_abs = 0f32;
+                let mut err_q = 0f32;
+                for r in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0f32;
+                        for i in 0..k {
+                            acc += w_host[j * k + i] * inp[r * k + i];
+                        }
+                        let gq = q_got[r * n + j];
+                        assert!(gq.is_finite(), "{dtype:?} {m}x{n}x{k}: non-finite output");
+                        max_abs = max_abs.max(acc.abs());
+                        err_q = err_q.max((gq - acc).abs());
+                    }
+                }
+                let rel = if max_abs > 0.0 { err_q / max_abs } else { 0.0 };
+                eprintln!("[RED_ADV] {dtype:?} {m}x{n}x{k}: max_abs={max_abs:.4} err={err_q:.5} rel={:.4}%", rel * 100.0);
+                // q8_1 activation quant should keep relative error well under 5%. Flag anything worse.
+                assert!(rel <= 0.05, "{dtype:?} {m}x{n}x{k}: RELATIVE qmmq err {rel} exceeds q8_1 regime (5%)");
+            }
+        }
+        Ok(())
+    }
+    // ========================== END RED ADVERSARIAL TESTS ==========================
+
     // Expert-grouped MoE PREFILL GEMM (llama mul_mat_id) numeric gate. batch>1 routes
     // indexed_moe_forward through fast_mmq::indexed_moe_grouped (the new int8 MMQ path); batch==1 keeps
     // the per-slot matvec (decode). This exercises a multi-tile, multi-expert prefill (160 routed slots
