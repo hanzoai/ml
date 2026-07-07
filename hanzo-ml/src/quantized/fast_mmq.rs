@@ -529,10 +529,13 @@ pub(crate) fn indexed_moe_grouped(
     }
     let mut counts = vec![0i32; e_cnt];
     for &e in &ids_host {
-        let e = e as usize;
-        if e >= e_cnt {
-            crate::bail!("indexed_moe_grouped: expert id {e} >= num_experts {e_cnt}");
-        }
+        // Clamp instead of bail: during CUDA-graph *capture* the warmup DtoH read of `ids` can
+        // observe not-yet-populated routing (garbage expert ids), and bailing there aborts capture
+        // -> the whole MoE decode falls back to eager (measured: Qwen3.6-35B decode 0.71x vs llama).
+        // In normal eager operation topk always yields ids in 0..e_cnt, so this clamp is a no-op;
+        // on graph *replay* the ids are the real routed experts. Tolerating capture-time garbage is
+        // what lets the MoE decode graph capture succeed (dense models already capture + hit parity).
+        let e = (e as usize).min(e_cnt - 1);
         counts[e] += 1;
     }
     // expert_bounds[e] = prefix sums over counts [e_cnt+1]; expert e owns sorted columns [eb[e],eb[e+1]).
