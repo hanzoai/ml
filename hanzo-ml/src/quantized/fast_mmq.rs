@@ -550,7 +550,10 @@ pub(crate) fn indexed_moe_grouped(
     let mut quantize_ids = vec![0i32; nslots];
     let mut cursor = expert_bounds.clone();
     for (s, &e) in ids_host.iter().enumerate() {
-        let e = e as usize;
+        // Same capture-time garbage tolerance as the counts loop above: clamp so a not-yet-populated
+        // routing id (observed during CUDA-graph capture warmup) indexes a valid expert bucket instead
+        // of panicking on `cursor[e]` (len e_cnt+1). No-op in eager (ids always in 0..e_cnt).
+        let e = (e as usize).min(e_cnt - 1);
         let p = cursor[e] as usize;
         ids_dst[p] = s as i32;
         quantize_ids[p] = if input_dim1 == 1 { (s / topk) as i32 } else { s as i32 };
