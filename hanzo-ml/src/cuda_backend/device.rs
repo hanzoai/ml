@@ -194,6 +194,7 @@ impl CudaDevice {
         let byte_len = std::mem::size_of_val(src_slice);
         if byte_len > CUDA_GRAPH_HTOD_CACHE_MAX_BYTES {
             if self.cuda_graph_capture_active() {
+                eprintln!("[RED_HTOD_BAIL oversize] byte_len={byte_len} limit={CUDA_GRAPH_HTOD_CACHE_MAX_BYTES}\n{}", std::backtrace::Backtrace::force_capture());
                 crate::bail!("CUDA graph capture cannot upload uncached host data");
             }
             return Ok(None);
@@ -213,6 +214,7 @@ impl CudaDevice {
             return Ok(Some(cached));
         }
         if self.cuda_graph_capture_active() {
+            eprintln!("[RED_HTOD_BAIL missing] byte_len={byte_len}\n{}", std::backtrace::Backtrace::force_capture());
             crate::bail!("CUDA graph capture missing cached host data");
         }
 
