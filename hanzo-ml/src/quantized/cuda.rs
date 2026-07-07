@@ -1626,6 +1626,84 @@ mod test {
         Ok(())
     }
 
+    // Dense 2D qmmq PREFILL numeric gate (Lever-1). For a native-q8_1 weight (Q4_K etc.) and a
+    // prefill-shaped input (m>1), fast_mmq::try_fwd runs the int8-WMMA stream-K MMQ GEMM -- the SAME
+    // kernel family the engine uses for dense prefill. Checks it against (a) the exact-weight f32
+    // oracle within q8_1 tolerance, and (b) the dequant-dense reference (dequantize_matmul_dense).
+    #[test]
+    fn cuda_dense_qmmq_prefill_vs_dequant_and_oracle() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let cuda_dev = crate::Device::Cuda(dev.clone());
+        let (m, n, k) = (16usize, 128usize, 512usize);
+
+        let mut st: u32 = 0x9E37_79B9;
+        let mut nextf = || -> f32 {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        let inp: Vec<f32> = (0..m * k).map(|_| nextf()).collect();
+        let wf: Vec<f32> = (0..n * k).map(|_| nextf() * 0.5).collect();
+
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0] {
+            let qcpu = crate::Device::Cpu.qzeros(n * k, dtype)?;
+            let qcpu = match qcpu {
+                QStorage::Cpu(mut storage) => {
+                    storage.from_float(&wf);
+                    QStorage::Cpu(storage)
+                }
+                _ => unreachable!(),
+            };
+            let bytes = qcpu.data()?.into_owned();
+            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)? {
+                QStorage::Cuda(s) => s,
+                _ => unreachable!(),
+            };
+
+            let w_dev = qcuda.dequantize(n * k)?;
+            let w_host = dev.clone_dtoh(&w_dev.as_cuda_slice::<f32>()?.as_view())?;
+
+            let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+            let input_l = crate::Layout::contiguous((m, k));
+            let self_shape: crate::Shape = (n, k).into();
+
+            let (q_out, q_shape) = crate::quantized::fast_mmq::try_fwd(&qcuda, &self_shape, &input, &input_l)?
+                .expect("fast_mmq::try_fwd must support q8_1 dense prefill");
+            assert_eq!(q_shape.dims().to_vec(), vec![m, n]);
+            let q_got = dev.clone_dtoh(&q_out.as_cuda_slice::<f32>()?.as_view())?;
+
+            let (d_out, d_shape) = qcuda.dequantize_matmul_dense(&self_shape, &input, &input_l)?;
+            assert_eq!(d_shape.dims().to_vec(), vec![m, n]);
+            let d_got = dev.clone_dtoh(&d_out.as_cuda_slice::<f32>()?.as_view())?;
+
+            let mut max_abs = 0f32;
+            let mut err_q = 0f32;
+            let mut err_d = 0f32;
+            let mut err_qd = 0f32;
+            for r in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f32;
+                    for i in 0..k {
+                        acc += w_host[j * k + i] * inp[r * k + i];
+                    }
+                    let gq = q_got[r * n + j];
+                    let gd = d_got[r * n + j];
+                    assert!(gq.is_finite() && gd.is_finite(), "{dtype:?}: non-finite output");
+                    max_abs = max_abs.max(acc.abs());
+                    err_q = err_q.max((gq - acc).abs());
+                    err_d = err_d.max((gd - acc).abs());
+                    err_qd = err_qd.max((gq - gd).abs());
+                }
+            }
+            let tol_q = 0.05 * max_abs + 1e-3;
+            let tol_d = 1e-3 * max_abs + 1e-4;
+            assert!(err_q <= tol_q, "{dtype:?}: DENSE QMMQ vs oracle err {err_q} > tol {tol_q} (max_abs {max_abs})");
+            assert!(err_d <= tol_d, "{dtype:?}: DEQUANT-DENSE vs oracle err {err_d} > tol {tol_d} (max_abs {max_abs})");
+            assert!(err_qd <= tol_q, "{dtype:?}: QMMQ vs DEQUANT-DENSE err {err_qd} > tol {tol_q} (max_abs {max_abs})");
+            eprintln!("[DENSE_QMMQ] {dtype:?}: max_abs={max_abs:.4} err_qmmq={err_q:.5} err_dequant={err_d:.6} err_qmmq_vs_dequant={err_qd:.5}");
+        }
+        Ok(())
+    }
+
     // Expert-grouped MoE PREFILL GEMM (llama mul_mat_id) numeric gate. batch>1 routes
     // indexed_moe_forward through fast_mmq::indexed_moe_grouped (the new int8 MMQ path); batch==1 keeps
     // the per-slot matvec (decode). This exercises a multi-tile, multi-expert prefill (160 routed slots
