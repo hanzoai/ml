@@ -54,6 +54,7 @@ pub use cubecl;
 pub mod tune;
 
 pub mod quant;
+pub mod mmq;
 
 pub mod island;
 pub mod norm;
