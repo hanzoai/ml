@@ -1,0 +1,60 @@
+# hanzo-cubecl-hip — a fork of cubecl-hip 0.10.0 (Tracel Technologies Inc. / the CubeCL Framework
+# Contributors, https://github.com/tracel-ai/cubecl) redistributed under its original MIT OR
+# Apache-2.0 license. The SOLE functional change is the `cubecl-hip-sys` dependency: it is repointed
+# to `hanzo-cubecl-hip-sys` (a fork carrying a ROCm 7.13+ build.rs fallback) via a package rename that
+# keeps every `use cubecl_hip_sys` in src/ working unchanged. The library target is renamed to
+# `hanzo_cubecl_hip` so downstreams import it as `hanzo_cubecl_hip`. See README.md + NOTICE.
+[package]
+name = "hanzo-cubecl-hip"
+version = "0.10.0"
+edition = "2024"
+authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
+description = "AMD ROCm HIP runtime for CubeCL. Hanzo fork of cubecl-hip 0.10.0 repointing the sys bindings to hanzo-cubecl-hip-sys (ROCm 7.13+ build fix)."
+readme = "README.md"
+keywords = ["gpu", "amd", "rocm", "hip"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hanzoai/ml"
+
+[features]
+default = ["std", "cubecl-runtime/default", "cubecl-common/default", "cubecl-core/default"]
+rocwmma = []
+std = ["cubecl-runtime/std", "cubecl-common/std", "cubecl-core/std"]
+tracing = ["dep:tracing", "cubecl-runtime/tracing", "cubecl-common/tracing", "cubecl-core/tracing"]
+
+[lib]
+name = "hanzo_cubecl_hip"
+path = "src/lib.rs"
+
+[dependencies]
+bytemuck = "1.16.1"
+cubecl-common = { version = "0.10.0", features = ["compilation-cache", "std", "hash"] }
+cubecl-core = { version = "0.10.0", default-features = false }
+cubecl-cpp = { version = "0.10.0", features = ["hip"], default-features = false }
+# Package rename: pull `hanzo-cubecl-hip-sys` but keep the extern name `cubecl_hip_sys` so all
+# `use cubecl_hip_sys::...` in src/ resolve unchanged. The `^7.2.5321101` range excludes the broken
+# upstream cubecl-hip-sys entirely (different crate name).
+cubecl-hip-sys = { package = "hanzo-cubecl-hip-sys", version = "7.2.5321101" }
+cubecl-runtime = { version = "0.10.0", features = ["channel-mutex"], default-features = false }
+derive-new = { version = "0.7.0", default-features = false }
+half = { version = "2.5", features = ["alloc", "num-traits", "serde"], default-features = false }
+log = { version = "0.4.22", default-features = false }
+paste = "1"
+serde = { version = "1.0.204", features = ["derive", "alloc"], default-features = false }
+tracing = { version = "0.1.43", features = ["attributes"], optional = true, default-features = false }
+
+[dev-dependencies]
+cubecl-core = { version = "0.10.0", features = ["export_tests"] }
+cubecl-std = { version = "0.10.0", features = ["export_tests"] }
+pretty_assertions = "1.4"
+test-log = { version = "0.2", features = ["trace"], default-features = false }
+
+[lints.clippy]
+doc_markdown = "warn"
+
+[lints.rust]
+warnings = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+invalid_html_tags = "warn"
