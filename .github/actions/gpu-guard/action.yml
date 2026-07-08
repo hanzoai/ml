@@ -1,0 +1,21 @@
+name: gpu-guard
+description: >-
+  Fail fast when the GPU is already busy, to avoid contention with dev/bench
+  work on these shared boxes (and the ROCm kfd wedge on Strix Halo, where two
+  concurrent GPU inits permanently hang the driver until reboot).
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        pat='llama-bench|llama-server|llama-cli|hanzo-bench|cargo (test|bench)'
+        busy=$(ps ax -o pid=,command= 2>/dev/null \
+          | grep -E "$pat" \
+          | grep -vE 'grep|Runner\.|actions-runner|/run(svc)?\.sh' \
+          || true)
+        if [ -n "$busy" ]; then
+          echo "::error::GPU busy — refusing to run to avoid contention"
+          echo "$busy"
+          exit 1
+        fi
+        echo "GPU free — proceeding"
