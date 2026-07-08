@@ -44,7 +44,11 @@ impl EmbedReader {
         }
         let shape: Vec<usize> = meta["shape"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         if shape != [vocab, hidden] {
             hanzo_ml::bail!("embed_tokens.weight shape {shape:?} != [{vocab}, {hidden}]");
@@ -75,7 +79,11 @@ impl EmbedReader {
             hanzo_ml::bail!("embed row {token} out of vocab {}", self.vocab);
         }
         let off = self.data_start + (token * self.hidden * 2) as u64;
-        Ok(self.read_f16_at(off, self.hidden)?.into_iter().map(|h| h.to_f32()).collect())
+        Ok(self
+            .read_f16_at(off, self.hidden)?
+            .into_iter()
+            .map(|h| h.to_f32())
+            .collect())
     }
 
     /// The full `[vocab, hidden]` f16 table — materialized only at checkpoint-save time.
@@ -137,19 +145,25 @@ pub struct Dspark {
     hidden_norm: Tensor,
     layers: Vec<Layer>,
     norm: Tensor,
-    markov_w1: Tensor, // [vocab, rank] (nn.Embedding weight)
-    markov_w2: Tensor, // [vocab, rank] (nn.Linear rank->vocab weight)
-    embed: EmbedReader, // FROZEN [vocab, hidden], streamed on demand
+    markov_w1: Tensor,    // [vocab, rank] (nn.Embedding weight)
+    markov_w2: Tensor,    // [vocab, rank] (nn.Linear rank->vocab weight)
+    embed: EmbedReader,   // FROZEN [vocab, hidden], streamed on demand
     mask_embed: Vec<f32>, // FROZEN embedding row for `mask_token_id` (block slots 1..)
-    lm_head: Linear,   // FROZEN weight [vocab, hidden] (F16)
-    conf_w: Tensor,    // zero-init [1, hidden] (load-compat, untrained)
-    conf_b: Tensor,    // zero-init [1]
-    cos: Tensor,       // [max_pos, head_dim]
-    sin: Tensor,       // [max_pos, head_dim]
+    lm_head: Linear,      // FROZEN weight [vocab, hidden] (F16)
+    conf_w: Tensor,       // zero-init [1, hidden] (load-compat, untrained)
+    conf_b: Tensor,       // zero-init [1]
+    cos: Tensor,          // [max_pos, head_dim]
+    sin: Tensor,          // [max_pos, head_dim]
     train_markov: bool, // when false, the Markov head is frozen (excluded from the optimizer + detached)
 }
 
-fn tvar(vm: &VarMap, dev: &Device, shape: impl Into<Shape>, name: &str, init: hanzo_nn::Init) -> Result<Tensor> {
+fn tvar(
+    vm: &VarMap,
+    dev: &Device,
+    shape: impl Into<Shape>,
+    name: &str,
+    init: hanzo_nn::Init,
+) -> Result<Tensor> {
     vm.get(shape, name, init, DType::F32, dev)
 }
 
@@ -160,7 +174,10 @@ impl Dspark {
     /// which removes its AdamW state — a memory lever for constrained hosts.
     pub fn new(cfg: DsparkCfg, init_path: &Path, dev: &Device, train_markov: bool) -> Result<Self> {
         use hanzo_nn::Init;
-        let normal = Init::Randn { mean: 0.0, stdev: 0.02 };
+        let normal = Init::Randn {
+            mean: 0.0,
+            stdev: 0.02,
+        };
         let ones = Init::Const(1.0);
         let vm = VarMap::new();
 
@@ -177,23 +194,74 @@ impl Dspark {
         for i in 0..cfg.layers {
             let p = |s: &str| format!("layers.{i}.{s}");
             layers.push(Layer {
-                q_proj: Linear::new(tvar(&vm, dev, (qd, h), &p("self_attn.q_proj.weight"), normal)?, None),
-                k_proj: Linear::new(tvar(&vm, dev, (kvd, h), &p("self_attn.k_proj.weight"), normal)?, None),
-                v_proj: Linear::new(tvar(&vm, dev, (kvd, h), &p("self_attn.v_proj.weight"), normal)?, None),
-                o_proj: Linear::new(tvar(&vm, dev, (h, qd), &p("self_attn.o_proj.weight"), normal)?, None),
+                q_proj: Linear::new(
+                    tvar(&vm, dev, (qd, h), &p("self_attn.q_proj.weight"), normal)?,
+                    None,
+                ),
+                k_proj: Linear::new(
+                    tvar(&vm, dev, (kvd, h), &p("self_attn.k_proj.weight"), normal)?,
+                    None,
+                ),
+                v_proj: Linear::new(
+                    tvar(&vm, dev, (kvd, h), &p("self_attn.v_proj.weight"), normal)?,
+                    None,
+                ),
+                o_proj: Linear::new(
+                    tvar(&vm, dev, (h, qd), &p("self_attn.o_proj.weight"), normal)?,
+                    None,
+                ),
                 q_norm: tvar(&vm, dev, hd, &p("self_attn.q_norm.weight"), ones)?,
                 k_norm: tvar(&vm, dev, hd, &p("self_attn.k_norm.weight"), ones)?,
                 input_ln: tvar(&vm, dev, h, &p("input_layernorm.weight"), ones)?,
                 post_ln: tvar(&vm, dev, h, &p("post_attention_layernorm.weight"), ones)?,
-                gate: Linear::new(tvar(&vm, dev, (cfg.intermediate, h), &p("mlp.gate_proj.weight"), normal)?, None),
-                up: Linear::new(tvar(&vm, dev, (cfg.intermediate, h), &p("mlp.up_proj.weight"), normal)?, None),
-                down: Linear::new(tvar(&vm, dev, (h, cfg.intermediate), &p("mlp.down_proj.weight"), normal)?, None),
+                gate: Linear::new(
+                    tvar(
+                        &vm,
+                        dev,
+                        (cfg.intermediate, h),
+                        &p("mlp.gate_proj.weight"),
+                        normal,
+                    )?,
+                    None,
+                ),
+                up: Linear::new(
+                    tvar(
+                        &vm,
+                        dev,
+                        (cfg.intermediate, h),
+                        &p("mlp.up_proj.weight"),
+                        normal,
+                    )?,
+                    None,
+                ),
+                down: Linear::new(
+                    tvar(
+                        &vm,
+                        dev,
+                        (h, cfg.intermediate),
+                        &p("mlp.down_proj.weight"),
+                        normal,
+                    )?,
+                    None,
+                ),
             });
         }
 
         let norm = tvar(&vm, dev, h, "norm.weight", Init::Const(cfg.final_norm_init))?;
-        let markov_w1 = tvar(&vm, dev, (cfg.vocab, cfg.markov_rank), "markov_head.markov_w1.weight", normal)?;
-        let markov_w2 = tvar(&vm, dev, (cfg.vocab, cfg.markov_rank), "markov_head.markov_w2.weight", normal)?;
+        let markov_w1 = tvar(
+            &vm,
+            dev,
+            (cfg.vocab, cfg.markov_rank),
+            "markov_head.markov_w1.weight",
+            normal,
+        )?;
+        let markov_w2 = tvar(
+            &vm,
+            dev,
+            (cfg.vocab, cfg.markov_rank),
+            "markov_head.markov_w2.weight",
+            normal,
+        )?;
 
         // FROZEN embed streamed on demand (not resident); FROZEN lm_head kept in F16 (1.05GB, vs
         // 2.1GB f32). The CPU backend supports F16 matmul (not BF16). `lm_head`'s [hidden, vocab]
@@ -241,7 +309,9 @@ impl Dspark {
             return all;
         }
         let skip = [self.markov_w1.id(), self.markov_w2.id()];
-        all.into_iter().filter(|v| !skip.contains(&v.id())).collect()
+        all.into_iter()
+            .filter(|v| !skip.contains(&v.id()))
+            .collect()
     }
 
     /// Fuse the target hidden states into the DSpark context memory, over the whole sequence at once
@@ -287,7 +357,8 @@ impl Dspark {
 
         // create_noise_embed: slot 0 = anchor token, slots 1.. = mask_token_id. Streamed from the
         // FROZEN embedding; the block state is a plain leaf (never optimized, no grad to the table).
-        let anchor_tok = tok(a).ok_or_else(|| hanzo_ml::Error::msg("anchor token out of vocab"))? as usize;
+        let anchor_tok =
+            tok(a).ok_or_else(|| hanzo_ml::Error::msg("anchor token out of vocab"))? as usize;
         let mut hv = Vec::with_capacity(bs * h);
         hv.extend_from_slice(&self.embed.row_f32(anchor_tok)?);
         for _ in 1..bs {
@@ -304,7 +375,9 @@ impl Dspark {
 
         for layer in &self.layers {
             let normed = ops::rms_norm(&hstate.contiguous()?, &layer.input_ln, eps)?;
-            let attn = self.attention(layer, &normed, &ctx, &cos_draft, &sin_draft, &cos_full, &sin_full, &mask)?;
+            let attn = self.attention(
+                layer, &normed, &ctx, &cos_draft, &sin_draft, &cos_full, &sin_full, &mask,
+            )?;
             hstate = hstate.add(&attn)?;
             let normed2 = ops::rms_norm(&hstate.contiguous()?, &layer.post_ln, eps)?;
             let gate = ops::silu(&layer.gate.forward(&normed2)?)?;
@@ -318,7 +391,9 @@ impl Dspark {
         // later, once, over the whole batch — see `frozen_head_ce`.)
         let mut prevs = Vec::with_capacity(bs);
         for k in 0..bs {
-            prevs.push(tok(a + k).ok_or_else(|| hanzo_ml::Error::msg("markov prev token out of vocab"))?);
+            prevs.push(
+                tok(a + k).ok_or_else(|| hanzo_ml::Error::msg("markov prev token out of vocab"))?,
+            );
         }
         let prev_t = Tensor::from_vec(prevs, (bs,), &self.dev)?;
         // Frozen Markov ⇒ detach so no vocab×rank grad is formed and it stays at init.
@@ -344,12 +419,21 @@ impl Dspark {
             return Ok(None);
         }
         let nv = targets.len();
-        Ok(Some((block_out.narrow(0, 0, nv)?, bias.narrow(0, 0, nv)?, targets)))
+        Ok(Some((
+            block_out.narrow(0, 0, nv)?,
+            bias.narrow(0, 0, nv)?,
+            targets,
+        )))
     }
 
     /// Cross-entropy through the FROZEN `lm_head` for a whole batch, returning
     /// `(loss_value, surrogate)`. See [`frozen_head_ce`]; this just supplies the head weight.
-    pub fn head_ce(&self, block_cat: &Tensor, bias_cat: &Tensor, targets: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn head_ce(
+        &self,
+        block_cat: &Tensor,
+        bias_cat: &Tensor,
+        targets: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         frozen_head_ce(block_cat, self.lm_head.weight(), bias_cat, targets)
     }
 
@@ -381,7 +465,8 @@ impl Dspark {
         let q = apply_rope(&q, cos_draft, sin_draft)?;
 
         // Keys/values: [fused context ‖ block].
-        let k = Tensor::cat(&[&layer.k_proj.forward(ctx)?, &layer.k_proj.forward(x)?], 0)?.reshape((kl, nkv, hd))?;
+        let k = Tensor::cat(&[&layer.k_proj.forward(ctx)?, &layer.k_proj.forward(x)?], 0)?
+            .reshape((kl, nkv, hd))?;
         let k = ops::rms_norm(&k.contiguous()?, &layer.k_norm, eps)?;
         let k = k.transpose(0, 1)?.contiguous()?; // [nkv, kl, hd]
         let k = apply_rope(&k, cos_full, sin_full)?;
@@ -411,7 +496,10 @@ impl Dspark {
         for (k, v) in self.varmap.data().lock().unwrap().iter() {
             map.insert(k.clone(), v.as_tensor().clone());
         }
-        map.insert("embed_tokens.weight".into(), self.embed.full_f16(&self.dev)?);
+        map.insert(
+            "embed_tokens.weight".into(),
+            self.embed.full_f16(&self.dev)?,
+        );
         map.insert("lm_head.weight".into(), self.lm_head.weight().clone());
         map.insert("confidence_head.proj.weight".into(), self.conf_w.clone());
         map.insert("confidence_head.proj.bias".into(), self.conf_b.clone());
@@ -484,7 +572,12 @@ fn repeat_kv(x: &Tensor, nrep: usize) -> Result<Tensor> {
 }
 
 /// Precompute neox RoPE cos/sin tables `[max_pos, head_dim]` (each half duplicated).
-fn rope_tables(max_pos: usize, head_dim: usize, theta: f64, dev: &Device) -> Result<(Tensor, Tensor)> {
+fn rope_tables(
+    max_pos: usize,
+    head_dim: usize,
+    theta: f64,
+    dev: &Device,
+) -> Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let mut cos = vec![0f32; max_pos * head_dim];
     let mut sin = vec![0f32; max_pos * head_dim];
@@ -507,7 +600,12 @@ fn rope_tables(max_pos: usize, head_dim: usize, theta: f64, dev: &Device) -> Res
 /// Additive DSpark attention mask `[block, ctx_len+block]`: `0` where attended, `-inf` where masked.
 /// A context column `j` is attended iff `j < anchor_pos`; every block column is attended
 /// (bidirectional block self-attention). Mirrors `create_dspark_attention_mask`.
-pub fn dspark_mask(ctx_len: usize, block: usize, anchor_pos: usize, dev: &Device) -> Result<Tensor> {
+pub fn dspark_mask(
+    ctx_len: usize,
+    block: usize,
+    anchor_pos: usize,
+    dev: &Device,
+) -> Result<Tensor> {
     let kl = ctx_len + block;
     let neg = f32::NEG_INFINITY;
     let mut row = vec![0f32; kl];
@@ -599,8 +697,14 @@ pub fn verify_checkpoint(path: &Path, cfg: &DsparkCfg) -> Result<()> {
         ("hidden_norm.weight".into(), vec![h]),
         ("norm.weight".into(), vec![h]),
         ("lm_head.weight".into(), vec![cfg.vocab, h]),
-        ("markov_head.markov_w1.weight".into(), vec![cfg.vocab, cfg.markov_rank]),
-        ("markov_head.markov_w2.weight".into(), vec![cfg.vocab, cfg.markov_rank]),
+        (
+            "markov_head.markov_w1.weight".into(),
+            vec![cfg.vocab, cfg.markov_rank],
+        ),
+        (
+            "markov_head.markov_w2.weight".into(),
+            vec![cfg.vocab, cfg.markov_rank],
+        ),
         ("confidence_head.proj.weight".into(), vec![1, h]),
         ("confidence_head.proj.bias".into(), vec![1]),
     ];
@@ -649,13 +753,16 @@ mod tests {
         // vocab=2, rank=2. w1 rows = prev-token latents; w2 rows = per-vocab projection.
         let w1 = Tensor::from_vec(vec![1f32, 0., 0., 1.], (2, 2), &dev)?; // [[1,0],[0,1]]
         let w2 = Tensor::from_vec(vec![1f32, 2., 3., 4.], (2, 2), &dev)?; // [[1,2],[3,4]]
-        // prev token 0 -> latent [1,0]; bias = latent · w2^T = [1*1+0*2, 1*3+0*4] = [1,3].
+                                                                          // prev token 0 -> latent [1,0]; bias = latent · w2^T = [1*1+0*2, 1*3+0*4] = [1,3].
         let prev = Tensor::from_vec(vec![0u32], (1,), &dev)?;
         let bias = markov_bias(&w1, &w2, &prev)?;
         assert_eq!(bias.to_vec2::<f32>()?, vec![vec![1.0, 3.0]]);
         // prev token 1 -> latent [0,1]; bias = [2,4].
         let prev1 = Tensor::from_vec(vec![1u32], (1,), &dev)?;
-        assert_eq!(markov_bias(&w1, &w2, &prev1)?.to_vec2::<f32>()?, vec![vec![2.0, 4.0]]);
+        assert_eq!(
+            markov_bias(&w1, &w2, &prev1)?.to_vec2::<f32>()?,
+            vec![vec![2.0, 4.0]]
+        );
         Ok(())
     }
 
@@ -670,26 +777,34 @@ mod tests {
             &dev,
         )?)?;
         let lm_w = Tensor::from_vec(
-            (0..v * h).map(|i| (i % 7) as f32 * 0.13 - 0.4).collect::<Vec<_>>(),
+            (0..v * h)
+                .map(|i| (i % 7) as f32 * 0.13 - 0.4)
+                .collect::<Vec<_>>(),
             (v, h),
             &dev,
         )?;
         let bias = Var::from_tensor(&Tensor::from_vec(
-            (0..n * v).map(|i| (i % 5) as f32 * 0.05).collect::<Vec<_>>(),
+            (0..n * v)
+                .map(|i| (i % 5) as f32 * 0.05)
+                .collect::<Vec<_>>(),
             (n, v),
             &dev,
         )?)?;
         let targets = Tensor::from_vec(vec![1u32, 4, 2], (n,), &dev)?;
 
         // Reference: full autograd through the head (lm_w kept f32 so no rounding).
-        let z_ref = block.as_tensor().matmul(&lm_w.t()?)?.add(bias.as_tensor())?;
+        let z_ref = block
+            .as_tensor()
+            .matmul(&lm_w.t()?)?
+            .add(bias.as_tensor())?;
         let loss_ref = hanzo_nn::loss::cross_entropy(&z_ref, &targets)?;
         let g_ref = loss_ref.backward()?;
         let gb_ref = g_ref.get(&block).unwrap().flatten_all()?.to_vec1::<f32>()?;
         let gbias_ref = g_ref.get(&bias).unwrap().flatten_all()?.to_vec1::<f32>()?;
 
         // Surrogate: same grads, no [hidden, vocab] head grad formed.
-        let (loss_val, surrogate) = frozen_head_ce(block.as_tensor(), &lm_w, bias.as_tensor(), &targets)?;
+        let (loss_val, surrogate) =
+            frozen_head_ce(block.as_tensor(), &lm_w, bias.as_tensor(), &targets)?;
         let g = surrogate.backward()?;
         let gb = g.get(&block).unwrap().flatten_all()?.to_vec1::<f32>()?;
         let gbias = g.get(&bias).unwrap().flatten_all()?.to_vec1::<f32>()?;
@@ -715,21 +830,37 @@ mod tests {
         let dev = Device::Cpu;
         let (n, d, h, v) = (8usize, 6usize, 5usize, 11usize);
         let x = Tensor::from_vec(
-            (0..n * d).map(|i| ((i * 7) % 13) as f32 * 0.1 - 0.6).collect::<Vec<_>>(),
+            (0..n * d)
+                .map(|i| ((i * 7) % 13) as f32 * 0.1 - 0.6)
+                .collect::<Vec<_>>(),
             (n, d),
             &dev,
         )?;
         let w = Tensor::from_vec(
-            (0..v * h).map(|i| ((i * 5) % 17) as f32 * 0.1 - 0.8).collect::<Vec<_>>(),
+            (0..v * h)
+                .map(|i| ((i * 5) % 17) as f32 * 0.1 - 0.8)
+                .collect::<Vec<_>>(),
             (v, h),
             &dev,
         )?;
         let bias = Tensor::zeros((n, v), DType::F32, &dev)?;
-        let targets = Tensor::from_vec((0..n as u32).map(|i| (i * 3) % v as u32).collect::<Vec<_>>(), (n,), &dev)?;
+        let targets = Tensor::from_vec(
+            (0..n as u32)
+                .map(|i| (i * 3) % v as u32)
+                .collect::<Vec<_>>(),
+            (n,),
+            &dev,
+        )?;
         // theta = 0 ⇒ block = 0 ⇒ uniform logits ⇒ CE ≈ ln(v) at step 0.
         let theta = Var::from_tensor(&Tensor::zeros((d, h), DType::F32, &dev)?)?;
 
-        let mut opt = AdamW::from_slice(&[&theta], ParamsAdamW { lr: 0.2, ..Default::default() })?;
+        let mut opt = AdamW::from_slice(
+            &[&theta],
+            ParamsAdamW {
+                lr: 0.2,
+                ..Default::default()
+            },
+        )?;
         let mut first = 0f32;
         let mut last = 0f32;
         for step in 0..60 {
@@ -746,8 +877,14 @@ mod tests {
             }
         }
         let ln_v = (v as f32).ln();
-        assert!((first - ln_v).abs() < 0.2, "start CE {first} should be ~ln(v) {ln_v}");
-        assert!(last < first * 0.6, "CE should drop substantially: {first} -> {last}");
+        assert!(
+            (first - ln_v).abs() < 0.2,
+            "start CE {first} should be ~ln(v) {ln_v}"
+        );
+        assert!(
+            last < first * 0.6,
+            "CE should drop substantially: {first} -> {last}"
+        );
         Ok(())
     }
 

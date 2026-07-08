@@ -31,7 +31,9 @@ fn tmp_path() -> PathBuf {
 /// A deterministic f32 tensor with enough spread that quantization is non-trivial.
 fn sample(rows: usize, cols: usize, dev: &Device) -> Result<Tensor> {
     let n = rows * cols;
-    let data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.017).sin() * 1.3 - 0.2).collect();
+    let data: Vec<f32> = (0..n)
+        .map(|i| ((i as f32) * 0.017).sin() * 1.3 - 0.2)
+        .collect();
     Tensor::from_vec(data, (rows, cols), dev)
 }
 
@@ -47,11 +49,7 @@ fn write_fixture(path: &Path) -> Result<Vec<&'static str>> {
     gguf_file::write(
         &mut file,
         &[],
-        &[
-            ("blk.q4_0", &q4_0),
-            ("blk.q8_0", &q8_0),
-            ("blk.f32", &f32t),
-        ],
+        &[("blk.q4_0", &q4_0), ("blk.q8_0", &q8_0), ("blk.f32", &f32t)],
     )?;
     file.sync_all()?;
     Ok(vec!["blk.q4_0", "blk.q8_0", "blk.f32"])
@@ -138,9 +136,7 @@ fn gguf_mmap_tensors_reference_mapping_not_heap() {
 
     let mut total_mapped_bytes = 0usize;
     for name in names {
-        let t = mapped
-            .tensor_mmap(&mmap, name, &dev)
-            .expect("tensor_mmap");
+        let t = mapped.tensor_mmap(&mmap, name, &dev).expect("tensor_mmap");
         let d = t.data().expect("data");
         let p = d.as_ptr() as usize;
         assert!(

@@ -57,10 +57,10 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
+use clap::{Parser, ValueEnum};
 use hanzo_ml::{DType, Device, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::paddleocr_vl::{Config, PaddleOCRVLModel};
-use clap::{Parser, ValueEnum};
 use tokenizers::Tokenizer;
 
 const DEFAULT_MODEL_ID: &str = "PaddlePaddle/PaddleOCR-VL";

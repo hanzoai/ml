@@ -1,7 +1,9 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use cudarc;
-use cudarc::driver::{result as cuda_result, sys as cuda_sys, CudaFunction, DevicePtr, UnifiedSlice};
+use cudarc::driver::{
+    result as cuda_result, sys as cuda_sys, CudaFunction, DevicePtr, UnifiedSlice,
+};
 use float8::F8E4M3;
 use half::{bf16, f16};
 pub use hanzo_kernels as kernels;

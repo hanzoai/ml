@@ -32,7 +32,8 @@ pub fn set_force_dmmv(f: bool) {
 // dp4a path for *correctness*, e.g. DeepSeek-V4's W8A8 QAT, turns it on at load). When on,
 // QCudaStorage::fwd tries it first and falls back to the legacy on-GPU q8_1 kernels for any
 // dtype/shape it doesn't support. Mirrors `FORCE_DMMV`: an AtomicBool seeded once from the env.
-pub(crate) static FAST_MMQ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static FAST_MMQ: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static FAST_MMQ_INIT: std::sync::Once = std::sync::Once::new();
 
 /// Programmatically enable/disable the fast int8 mmq/mmvq path (overrides the env default,
@@ -467,7 +468,10 @@ fn mul_mat_vec_iquant_dp4a(
         crate::bail!("only bsize between 1 and 8 are supported, got {b_size}");
     }
     if y.len() != ncols * b_size {
-        crate::bail!("unexpected y size {}, ncols {ncols} bsize {b_size}", y.len());
+        crate::bail!(
+            "unexpected y size {}, ncols {ncols} bsize {b_size}",
+            y.len()
+        );
     }
     let nblk32 = ncols / 32;
 
@@ -771,13 +775,17 @@ impl QCudaStorage {
         n: usize,
         k: usize,
     ) -> Result<CudaStorage> {
-        let suffix = iquant_dp4a_suffix(self.dtype)
-            .ok_or_else(|| crate::Error::Msg(format!("no i-quant MoE kernel for {:?}", self.dtype)).bt())?;
+        let suffix = iquant_dp4a_suffix(self.dtype).ok_or_else(|| {
+            crate::Error::Msg(format!("no i-quant MoE kernel for {:?}", self.dtype)).bt()
+        })?;
         if k % 256 != 0 {
             crate::bail!("i-quant MoE ncols {k} must be a multiple of 256");
         }
         if x_flat.len() != nrows * k {
-            crate::bail!("unexpected x_flat size {}, nrows {nrows} k {k}", x_flat.len());
+            crate::bail!(
+                "unexpected x_flat size {}, nrows {nrows} k {k}",
+                x_flat.len()
+            );
         }
         let dev = self.device();
         let nblk32 = k / 32;
@@ -1220,8 +1228,15 @@ impl QCudaStorage {
         if ncols != k {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", rhs_l.shape())
         }
-        let out =
-            mul_mat_vec_iquant_dp4a(&self.data, &rhs, self.dtype, ncols, nrows, b_size, self.device())?;
+        let out = mul_mat_vec_iquant_dp4a(
+            &self.data,
+            &rhs,
+            self.dtype,
+            ncols,
+            nrows,
+            b_size,
+            self.device(),
+        )?;
         let mut out_shape = rhs_l.shape().dims().to_vec();
         out_shape.pop();
         out_shape.push(nrows);
@@ -1584,7 +1599,8 @@ mod test {
                 .collect();
 
             // LOAD onto CUDA (this is the call that used to bail for these dtypes).
-            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)? {
+            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)?
+            {
                 QStorage::Cuda(s) => s,
                 _ => unreachable!("from_data on a CUDA device must yield CUDA storage"),
             };
@@ -1654,7 +1670,8 @@ mod test {
                 _ => unreachable!(),
             };
             let bytes = qcpu.data()?.into_owned();
-            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)? {
+            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)?
+            {
                 QStorage::Cuda(s) => s,
                 _ => unreachable!(),
             };
@@ -1666,8 +1683,9 @@ mod test {
             let input_l = crate::Layout::contiguous((m, k));
             let self_shape: crate::Shape = (n, k).into();
 
-            let (q_out, q_shape) = crate::quantized::fast_mmq::try_fwd(&qcuda, &self_shape, &input, &input_l)?
-                .expect("fast_mmq::try_fwd must support q8_1 dense prefill");
+            let (q_out, q_shape) =
+                crate::quantized::fast_mmq::try_fwd(&qcuda, &self_shape, &input, &input_l)?
+                    .expect("fast_mmq::try_fwd must support q8_1 dense prefill");
             assert_eq!(q_shape.dims().to_vec(), vec![m, n]);
             let q_got = dev.clone_dtoh(&q_out.as_cuda_slice::<f32>()?.as_view())?;
 
@@ -1687,7 +1705,10 @@ mod test {
                     }
                     let gq = q_got[r * n + j];
                     let gd = d_got[r * n + j];
-                    assert!(gq.is_finite() && gd.is_finite(), "{dtype:?}: non-finite output");
+                    assert!(
+                        gq.is_finite() && gd.is_finite(),
+                        "{dtype:?}: non-finite output"
+                    );
                     max_abs = max_abs.max(acc.abs());
                     err_q = err_q.max((gq - acc).abs());
                     err_d = err_d.max((gd - acc).abs());
@@ -1696,9 +1717,18 @@ mod test {
             }
             let tol_q = 0.05 * max_abs + 1e-3;
             let tol_d = 1e-3 * max_abs + 1e-4;
-            assert!(err_q <= tol_q, "{dtype:?}: DENSE QMMQ vs oracle err {err_q} > tol {tol_q} (max_abs {max_abs})");
-            assert!(err_d <= tol_d, "{dtype:?}: DEQUANT-DENSE vs oracle err {err_d} > tol {tol_d} (max_abs {max_abs})");
-            assert!(err_qd <= tol_q, "{dtype:?}: QMMQ vs DEQUANT-DENSE err {err_qd} > tol {tol_q} (max_abs {max_abs})");
+            assert!(
+                err_q <= tol_q,
+                "{dtype:?}: DENSE QMMQ vs oracle err {err_q} > tol {tol_q} (max_abs {max_abs})"
+            );
+            assert!(
+                err_d <= tol_d,
+                "{dtype:?}: DEQUANT-DENSE vs oracle err {err_d} > tol {tol_d} (max_abs {max_abs})"
+            );
+            assert!(
+                err_qd <= tol_q,
+                "{dtype:?}: QMMQ vs DEQUANT-DENSE err {err_qd} > tol {tol_q} (max_abs {max_abs})"
+            );
             eprintln!("[DENSE_QMMQ] {dtype:?}: max_abs={max_abs:.4} err_qmmq={err_q:.5} err_dequant={err_d:.6} err_qmmq_vs_dequant={err_qd:.5}");
         }
         Ok(())
@@ -1745,7 +1775,10 @@ mod test {
 
         for dtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0] {
             let mut bank = QCudaStorage::zeros(&dev, e * n * k, dtype)?;
-            bank.quantize(&CudaStorage::wrap_cuda_slice(dev.clone_htod(&w)?, dev.clone()))?;
+            bank.quantize(&CudaStorage::wrap_cuda_slice(
+                dev.clone_htod(&w)?,
+                dev.clone(),
+            ))?;
             let deq = bank.dequantize(e * n * k)?;
             let w_deq = dev.clone_dtoh(&deq.as_cuda_slice::<f32>()?.as_view())?;
             let self_shape: crate::Shape = (e, n, k).into();

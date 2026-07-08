@@ -1,5 +1,5 @@
-use hanzo_ml::{test_device, test_utils, DType, Device, IndexOp, Result, Tensor, D};
 use float8::F8E4M3;
+use hanzo_ml::{test_device, test_utils, DType, Device, IndexOp, Result, Tensor, D};
 
 fn zeros(device: &Device) -> Result<()> {
     let tensor = Tensor::zeros((5, 2), DType::F32, device)?;

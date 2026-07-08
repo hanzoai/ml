@@ -5,9 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use hanzo_ml::quantized::gguf_file;
 use hanzo_ml::quantized::tokenizer::TokenizerFromGguf;
-use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 

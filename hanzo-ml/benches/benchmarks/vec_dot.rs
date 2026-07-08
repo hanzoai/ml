@@ -1,6 +1,6 @@
-use hanzo_ml::cpu::kernels::VecOps;
 use criterion::{criterion_group, BatchSize, Criterion, Throughput};
 use half::{bf16, f16};
+use hanzo_ml::cpu::kernels::VecOps;
 
 fn bench_vec_dot_f32(c: &mut Criterion, k: usize) {
     let a: Vec<f32> = (0..k).map(|i| i as f32).collect();

@@ -1,9 +1,9 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
+use criterion::{criterion_group, Criterion, Throughput};
 use hanzo_ml::{
     quantized::{self, GgmlDType, QMatMul},
     Device, Module, Tensor,
 };
-use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
 

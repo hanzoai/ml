@@ -128,9 +128,7 @@ impl Commands {
         residency_set: &ResidencySet,
     ) -> Result<Self, MetalKernelError> {
         let compute_per_buffer = match std::env::var("METAL_COMPUTE_PER_BUFFER") {
-            Ok(val) => val
-                .parse()
-                .unwrap_or(DEFAULT_METAL_COMPUTE_PER_BUFFER),
+            Ok(val) => val.parse().unwrap_or(DEFAULT_METAL_COMPUTE_PER_BUFFER),
             _ => DEFAULT_METAL_COMPUTE_PER_BUFFER,
         };
 

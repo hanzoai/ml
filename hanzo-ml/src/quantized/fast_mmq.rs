@@ -556,7 +556,11 @@ pub(crate) fn indexed_moe_grouped(
         let e = (e as usize).min(e_cnt - 1);
         let p = cursor[e] as usize;
         ids_dst[p] = s as i32;
-        quantize_ids[p] = if input_dim1 == 1 { (s / topk) as i32 } else { s as i32 };
+        quantize_ids[p] = if input_dim1 == 1 {
+            (s / topk) as i32
+        } else {
+            s as i32
+        };
         cursor[e] += 1;
     }
     let ncols_max = counts.iter().copied().max().unwrap_or(0) as i64;
@@ -609,8 +613,8 @@ pub(crate) fn indexed_moe_grouped(
             qids_ptr,
             scratch_ptr,
             0,
-            k as i64,        // ne00 (real row length)
-            k as i64,        // s01  (input row stride, elements)
+            k as i64, // ne00 (real row length)
+            k as i64, // s01  (input row stride, elements)
             0,
             0,
             k_padded as i64, // ne0  (padded loop bound)
