@@ -5,6 +5,7 @@
 //! and the int8-dp4a fast path (`Line<i8>.dot`) follow the identical shape with more bit-twiddling.
 
 use crate::prelude::*;
+use crate::tune::Tuned;
 
 /// Q8_0 block size (weights per scale).
 pub const QK8_0: usize = 32;
@@ -746,4 +747,193 @@ pub fn matvec_q8_dp4a_blk_run<R: Runtime>(
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / bench_iters as f64;
     (out, ms)
+}
+
+// ============================================================================================
+// Autotuned dp4a matvec -- ONE source, the schedule exposed as comptime knobs the tuner picks over.
+// The "collapse": instead of forking a block-per-row / warp-per-row / vector-width kernel per device,
+// `matvec_q8_dp4a_tuned` carries the vector-width (ILP) knob `vw` as comptime and takes the cube dim
+// from the host; the tuner benchmarks the variant set once per (device, rows x k) and caches the winner.
+// The knobs never change the numerics: the per-group int8 dot is accumulated in the same `g` order for
+// every `vw`, so all variants are byte-identical to each other and match the CPU oracle within f32 reorder.
+// ============================================================================================
+
+/// Autotuned dp4a matvec source. `vw` = groups processed per unrolled step (the ILP / "vector width"
+/// knob); the cube dim is the host's knob. `out[row] = sum_g wd[g/8] * dot(wq_g, xq_g)`, `g` ascending.
+/// Packed int8 weights (`Vector<i8,4>`, 4 bytes/group) -> `.dot` lowers to dp4a / OpSDot.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn matvec_q8_dp4a_tuned<F: Float>(
+    wq: &Array<Vector<i8, Const<4>>>,
+    xq: &Array<Vector<i8, Const<4>>>,
+    wd: &Array<F>,
+    out: &mut Array<F>,
+    #[comptime] k: usize,
+    #[comptime] vw: usize, // groups per unrolled step (ILP / vector width); ng = k/4 must be a multiple
+) {
+    let row = ABSOLUTE_POS;
+    if row < out.len() {
+        let ng = k / 4;
+        let wbase = row * ng;
+        let dbase = row * (k / 32);
+        let mut acc = F::new(0.0);
+        let steps = ng / vw;
+        for s in 0..steps {
+            #[unroll]
+            for j in 0..vw {
+                let g = s * vw + j;
+                let wi = Vector::<i32, Const<4>>::cast_from(wq[wbase + g]);
+                let xi = Vector::<i32, Const<4>>::cast_from(xq[g]);
+                acc += wd[dbase + g / 8] * F::cast_from(wi.dot(xi));
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+/// Kernel-only bench for one `(vw, block)` schedule; returns `(output, ms/dispatch)` -- the
+/// [`crate::tune::Variant`] contract (`iters == 1` on a cache hit, many iters when tuning). Weights +
+/// activation are real int8 (`&[i8]`), 4 bytes/group.
+pub fn matvec_q8_dp4a_tuned_bench<R: Runtime>(
+    client: &ComputeClient<R>,
+    wq: &[i8],
+    xq: &[i8],
+    wd: &[f32],
+    rows: usize,
+    k: usize,
+    vw: usize,
+    block: u32,
+    iters: usize,
+) -> (Vec<f32>, f64) {
+    let wqh = client.create_from_slice(i8::as_bytes(wq));
+    let xqh = client.create_from_slice(i8::as_bytes(xq));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    let grid = (rows as u32).div_ceil(block);
+    let ng = k / 4;
+    let launch = |c: &ComputeClient<R>| unsafe {
+        matvec_q8_dp4a_tuned::launch_unchecked::<f32, R>(
+            c,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
+            ArrayArg::from_raw_parts(wqh.clone(), rows * ng),
+            ArrayArg::from_raw_parts(xqh.clone(), ng),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(oh.clone(), rows),
+            k,
+            vw,
+        );
+    };
+    for _ in 0..3 {
+        launch(client);
+    }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(client);
+    }
+    let out = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    (f32::from_bytes(&out).to_vec(), ms)
+}
+
+/// The 4-variant dp4a-matvec set (cube dim {64,128,256} x vector width {1,2,4,8}) as a reusable
+/// [`Tuned`], so tests can drive it against an explicit tuner. All four are byte-identical.
+pub fn matvec_q8_dp4a_tuned_set<'a, R: Runtime>(
+    client: &'a ComputeClient<R>,
+    wq: &'a [i8],
+    xq: &'a [i8],
+    wd: &'a [f32],
+    rows: usize,
+    k: usize,
+) -> Tuned<'a, Vec<f32>> {
+    Tuned::new("matvec_q8_dp4a", format!("rows={rows},k={k}"))
+        .variant("b64_v1", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 1, 64, it))
+        .variant("b64_v4", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 4, 64, it))
+        .variant("b128_v2", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 2, 128, it))
+        .variant("b256_v8", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 8, 256, it))
+}
+
+/// Autotuned dp4a matvec: tune (or read the cache) over the schedule knobs and run the winner. ONE
+/// source, picked per `(device, rows x k)`, no forks. The production surface.
+pub fn matvec_q8_dp4a_autotuned<R: Runtime>(
+    client: &ComputeClient<R>,
+    wq: &[i8],
+    xq: &[i8],
+    wd: &[f32],
+    rows: usize,
+    k: usize,
+) -> Vec<f32> {
+    matvec_q8_dp4a_tuned_set(client, wq, xq, wd, rows, k).run(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn max_rel(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs() / x.abs().max(1e-6)).fold(0.0, f32::max)
+    }
+
+    /// Deterministic int8 weights/activations + per-32 scales for the dp4a tuned tests.
+    fn gen_dp4a(rows: usize, k: usize) -> (Vec<i8>, Vec<i8>, Vec<f32>) {
+        let mut s = 0xA5A5_1234_9E37_79B9u64;
+        let mut nx = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let wq: Vec<i8> = (0..rows * k).map(|_| (nx() % 251) as i8).collect();
+        let xq: Vec<i8> = (0..k).map(|_| (nx() % 251) as i8).collect();
+        let wd: Vec<f32> = (0..rows * (k / 32)).map(|_| (nx() % 1000) as f32 / 8000.0 + 0.01).collect();
+        (wq, xq, wd)
+    }
+
+    /// Autotuned dp4a matvec on the CPU runtime: (1) every schedule variant is byte-identical to the
+    /// first (the vector-width / cube-dim knobs are numerically invariant) and within f32-reorder
+    /// tolerance of the per-element oracle; (2) the tuner benchmarks all 4 on a miss, caches the winner,
+    /// and the second call skips timing.
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn matvec_q8_dp4a_autotune_cpu_bit_exact_and_cached() {
+        use crate::tune::Tuner;
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let (rows, k) = (48usize, 256usize); // ng = 64, divisible by every vw in {1,2,4,8}
+        let (wq, xq, wd) = gen_dp4a(rows, k);
+        let wq32: Vec<i32> = wq.iter().map(|&v| v as i32).collect();
+        let xq32: Vec<i32> = xq.iter().map(|&v| v as i32).collect();
+        let want = matvec_q8_dp4a_ref(&wq32, &xq32, &wd, rows, k);
+        let c = CpuRuntime::client(&CpuDevice::default());
+
+        // (1) schedule-invariance + oracle agreement.
+        let mut ref_bits: Option<Vec<u32>> = None;
+        for &(vw, block) in &[(1usize, 64u32), (4, 64), (2, 128), (8, 256)] {
+            let (got, _ms) = matvec_q8_dp4a_tuned_bench::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k, vw, block, 1);
+            let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            match &ref_bits {
+                None => ref_bits = Some(gbits),
+                Some(rb) => assert_eq!(&gbits, rb, "vw={vw} block={block} not byte-identical to b64_v1"),
+            }
+            let rel = max_rel(&want, &got);
+            eprintln!("[matvec_q8_dp4a_tuned CPU] vw={vw} block={block} max_rel={rel:.2e}");
+            assert!(rel < 2e-3, "dp4a tuned vw={vw} block={block} max_rel {rel} vs oracle");
+        }
+
+        // (2) select + cache against an isolated temp tuner.
+        let dir = std::env::temp_dir().join(format!(
+            "hk-tune-dp4a-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let tuner = Tuner::new(&dir);
+        let p = matvec_q8_dp4a_tuned_set::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k).pick_with(&tuner, "cpu");
+        assert!(!p.from_cache && p.benched == 4, "first call must benchmark all 4 variants");
+        assert!(max_rel(&want, &p.output) < 2e-3, "autotuned winner not within tolerance");
+        eprintln!("[matvec_q8_dp4a autotune CPU] winner={} timings={:?}", p.winner, p.timings);
+
+        let p2 = matvec_q8_dp4a_tuned_set::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k).pick_with(&tuner, "cpu");
+        assert!(p2.from_cache && p2.benched == 0, "second call must hit the cache and skip timing");
+        assert_eq!(p2.winner, p.winner, "cache returned a different winner");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

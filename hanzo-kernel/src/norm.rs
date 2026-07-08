@@ -6,6 +6,7 @@
 //! loops lower cleanly and no runtime `.len()` metadata buffer is needed for it.
 
 use crate::prelude::*;
+use crate::tune::Tuned;
 
 /// RMSNorm over the last dim: `out[i] = x[i] / sqrt(mean(x^2) + eps) * w[i]`, per row of `n`.
 #[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
@@ -390,6 +391,120 @@ pub fn layer_norm_ref(x: &[f32], w: &[f32], b: &[f32], rows: usize, n: usize, ep
     out
 }
 
+// ============================================================================================
+// Autotuned RMSNorm -- ONE source, the schedule exposed as comptime knobs the tuner picks over.
+// The "collapse": no per-device fork; the same `rms_norm_tuned` is monomorphized per comptime tuple,
+// and the tuner caches the winning tuple per (device, rows x n). Mirror of `quant::matvec_q8_dp4a_tuned`.
+// ============================================================================================
+
+/// Autotuned RMSNorm source. `rpt` = rows-per-thread (the unroll knob); the launch block size (cube
+/// dim) is the other knob, set by the host. Every `(rpt, block)` is a distinct compiled kernel yet
+/// bit-IDENTICAL to `rms_norm_ref`: the per-row sum-of-squares is the same left fold in the same order,
+/// so only the thread->row mapping and occupancy differ. This is the object the autotuner schedules.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn rms_norm_tuned<F: Float>(
+    x: &Array<F>,
+    w: &Array<F>,
+    out: &mut Array<F>,
+    eps: &Array<F>,
+    #[comptime] n: usize,
+    #[comptime] rpt: usize,
+) {
+    let nrows = out.len() / n;
+    let base = ABSOLUTE_POS * rpt;
+    #[unroll]
+    for r in 0..rpt {
+        let row = base + r;
+        if row < nrows {
+            let b = row * n;
+            let mut ss = F::new(0.0);
+            for i in 0..n {
+                let v = x[b + i];
+                ss += v * v;
+            }
+            let denom = (ss / F::cast_from(n as u32) + eps[0]).sqrt();
+            for i in 0..n {
+                out[b + i] = x[b + i] / denom * w[i];
+            }
+        }
+    }
+}
+
+/// Kernel-only bench for one `(rpt, block)` schedule of `rms_norm_tuned`; returns `(output, ms/dispatch)`
+/// -- the [`crate::tune::Variant`] contract. `iters == 1` on a cache hit (single launch, produce output);
+/// many iters when tuning. Grid rounds up so `ceil(rows/rpt)` row-groups are covered.
+pub fn rms_norm_tuned_bench<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+    rpt: usize,
+    block: u32,
+    iters: usize,
+) -> (Vec<f32>, f64) {
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let wh = client.create_from_slice(f32::as_bytes(w));
+    let eph = client.create_from_slice(f32::as_bytes(&[eps]));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows * n]));
+    let grid = (rows as u32).div_ceil(block * rpt as u32);
+    let launch = |c: &ComputeClient<R>| unsafe {
+        rms_norm_tuned::launch_unchecked::<f32, R>(
+            c,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(oh.clone(), rows * n),
+            ArrayArg::from_raw_parts(eph.clone(), 1),
+            n,
+            rpt,
+        );
+    };
+    for _ in 0..3 {
+        launch(client);
+    }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(client);
+    }
+    let out = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    (f32::from_bytes(&out).to_vec(), ms)
+}
+
+/// The 4-variant RMSNorm set (cube dim {64,128,256} x unroll {1,2}) as a reusable [`Tuned`], so tests
+/// can drive it against an explicit tuner. All four are bit-identical; they differ only in schedule.
+pub fn rms_norm_tuned_set<'a, R: Runtime>(
+    client: &'a ComputeClient<R>,
+    x: &'a [f32],
+    w: &'a [f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+) -> Tuned<'a, Vec<f32>> {
+    Tuned::new("rms_norm", format!("rows={rows},n={n}"))
+        .variant("b64_r1", move |it| rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 64, it))
+        .variant("b128_r1", move |it| rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 128, it))
+        .variant("b256_r1", move |it| rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 256, it))
+        .variant("b64_r2", move |it| rms_norm_tuned_bench(client, x, w, rows, n, eps, 2, 64, it))
+}
+
+/// Autotuned RMSNorm: tune (or read the cache) over the schedule knobs and run the winner. ONE source,
+/// picked per `(device, rows x n)`, no forks. The production surface.
+pub fn rms_norm_autotuned<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+) -> Vec<f32> {
+    rms_norm_tuned_set(client, x, w, rows, n, eps).run(client)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +544,45 @@ mod tests {
         let rel = max_rel(&want, &got);
         eprintln!("[rms_norm  CPU] {rows}x{n} max_rel={rel:.2e}");
         assert!(rel < 2e-3, "rms_norm max_rel {rel}");
+    }
+
+    /// Autotuned RMSNorm on the CPU runtime: (1) every schedule variant is bit-IDENTICAL to the oracle
+    /// (the knobs don't touch the numerics), and (2) the tuner benchmarks all 4 on a miss, caches the
+    /// winner, and the second call skips timing entirely.
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn rms_norm_autotune_cpu_bit_exact_and_cached() {
+        use crate::tune::Tuner;
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let (rows, n) = (64usize, 128usize);
+        let (x, w, _) = data(rows, n);
+        let c = CpuRuntime::client(&CpuDevice::default());
+        let want = rms_norm_ref(&x, &w, rows, n, EPS);
+        let wbits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+
+        // (1) each of the 4 schedules is byte-identical to the oracle (same left-fold, same order).
+        for &(rpt, block) in &[(1usize, 64u32), (1, 128), (1, 256), (2, 64)] {
+            let (got, _ms) = rms_norm_tuned_bench::<CpuRuntime>(&c, &x, &w, rows, n, EPS, rpt, block, 1);
+            let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(gbits, wbits, "rms_norm_tuned rpt={rpt} block={block} not bit-exact vs oracle");
+        }
+
+        // (2) select + cache, against an isolated temp tuner (no env, no globals).
+        let dir = std::env::temp_dir().join(format!(
+            "hk-tune-rms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let tuner = Tuner::new(&dir);
+        let p = rms_norm_tuned_set::<CpuRuntime>(&c, &x, &w, rows, n, EPS).pick_with(&tuner, "cpu");
+        assert!(!p.from_cache && p.benched == 4, "first call must benchmark all 4 variants");
+        assert_eq!(p.output.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), wbits, "winner not bit-exact");
+        eprintln!("[rms_norm autotune CPU] winner={} timings={:?}", p.winner, p.timings);
+
+        let p2 = rms_norm_tuned_set::<CpuRuntime>(&c, &x, &w, rows, n, EPS).pick_with(&tuner, "cpu");
+        assert!(p2.from_cache && p2.benched == 0, "second call must hit the cache and skip timing");
+        assert_eq!(p2.winner, p.winner, "cache returned a different winner");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(feature = "cpu")]

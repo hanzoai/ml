@@ -47,6 +47,8 @@ pub mod prelude {
 
 pub use cubecl;
 
+pub mod tune;
+
 pub mod quant;
 
 pub mod norm;
