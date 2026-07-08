@@ -1,0 +1,19 @@
+hanzo-cubecl-hip
+================
+
+This crate is a fork of `cubecl-hip` 0.10.0 by Tracel Technologies Inc. / the
+CubeCL Framework Contributors (https://github.com/tracel-ai/cubecl),
+redistributed under its original MIT OR Apache-2.0 license (see LICENSE-MIT and
+LICENSE-APACHE).
+
+Sole modification by Hanzo AI, Inc. (manifest only; no source change):
+  * The `cubecl-hip-sys` dependency is repointed to `hanzo-cubecl-hip-sys` (a
+    fork of cubecl-hip-sys carrying a ROCm 7.13+ build.rs fallback) via a
+    package rename that keeps every `use cubecl_hip_sys` in src/ working
+    unchanged.
+  * The library target is renamed from `cubecl_hip` to `hanzo_cubecl_hip`.
+
+All Rust source under src/ is verbatim from upstream cubecl-hip 0.10.0. No
+upstream authorship is claimed.
+
+Upstream PR (against cubecl-hip-sys, the root cause): (to be filed; link added here.)
