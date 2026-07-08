@@ -11,6 +11,7 @@ use hanzo_kernel::quant::{
     matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref, matvec_q8_run, QK8_0,
 };
 use std::time::Instant;
+use hanzo_kernel::norm::rms_norm_run;
 
 // dp4a matvec parity: i8-packed one-thread-per-row (portable) vs block-per-row (coalesced reads +
 // shared-mem reduction, the bandwidth-bound winner). GB/s is on REAL int8 bytes (rows*k) so it
@@ -154,6 +155,30 @@ fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usiz
     );
 }
 
+// RMSNorm DSL dispatch gate: the SAME #[kernel] rms_norm source lowered per backend, vs a plain-Rust
+// oracle. Proves the norm op family dispatches bit-exact on each compiled backend (norm column).
+fn check_rms<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, n: usize) {
+    let mut s = 0x1234_5678_9ABC_DEF1u64;
+    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let x: Vec<f32> = (0..rows * n).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let w: Vec<f32> = (0..n).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let eps = 1e-6f32;
+    let mut reference = vec![0f32; rows * n];
+    for r in 0..rows {
+        let base = r * n;
+        let mut ss = 0f32;
+        for i in 0..n { let v = x[base + i]; ss += v * v; }
+        let denom = (ss / n as f32 + eps).sqrt();
+        for i in 0..n { reference[base + i] = x[base + i] / denom * w[i]; }
+    }
+    let got = rms_norm_run::<R>(client, &x, &w, rows, n, eps);
+    let rel = max_rel(&reference, &got);
+    println!(
+        "[{:<7}] rmsnorm {}x{}  max_rel={:.2e}  {}",
+        name, rows, n, rel, if rel < 3e-3 { "MATCH ✓" } else { "MISMATCH ✗" }
+    );
+}
+
 fn main() {
     let (rows, k) = (4096usize, 4096usize);
     let ctrl = 256usize; // small-K control: reorder noise ~ ctrl*eps, should be ~1e-6
@@ -167,6 +192,7 @@ fn main() {
         check::<CpuRuntime>("CPU/ctrl", &c, rows, ctrl);
         check_q4k::<CpuRuntime>("CPU", &c, rows, k);
         check_dp4a::<CpuRuntime>("CPU", &c, rows, k, false); // cubecl-cpu: no cooperative blocks
+        check_rms::<CpuRuntime>("CPU", &c, rows, k);
     }
     #[cfg(feature = "vulkan")]
     {
@@ -199,6 +225,7 @@ fn main() {
         check::<CudaRuntime>("CUDA", &c, rows, k);
         check_q4k::<CudaRuntime>("CUDA", &c, rows, k);
         check_dp4a::<CudaRuntime>("CUDA", &c, rows, k, true);
+        check_rms::<CudaRuntime>("CUDA", &c, rows, k);
     }
     #[cfg(feature = "rocm")]
     {
