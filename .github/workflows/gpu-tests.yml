@@ -1,0 +1,36 @@
+name: gpu-tests
+
+# Real-GPU test matrix on self-hosted boxes (one label == one backend):
+#   cuda  -> spark  (NVIDIA GB10, sm_121)
+#   rocm  -> evo    (AMD Strix Halo gfx1151, ROCm 7.x)
+#   metal -> dbc    (Apple M4 Max)
+#
+# These boxes double as dev/bench machines, so this is NOT per-push: it runs
+# nightly and on demand (`gh workflow run gpu-tests`). --test-threads 1 + the
+# gpu-guard step keep a single GPU consumer at a time (critical on ROCm, where
+# concurrent inits wedge the kfd driver until reboot).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * *'
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cuda, rocm, metal]
+    runs-on: [self-hosted, "${{ matrix.backend }}"]
+    timeout-minutes: 60
+    concurrency:
+      group: gpu-${{ matrix.backend }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Remove cargo config (macOS ring crate fix)
+        if: matrix.backend == 'metal'
+        run: rm -f .cargo/config.toml
+      - uses: ./.github/actions/gpu-guard
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test (${{ matrix.backend }})
+        run: cargo test -p hanzo-ml --features ${{ matrix.backend }} -- --test-threads 1
