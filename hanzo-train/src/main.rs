@@ -14,14 +14,20 @@ use hanzo_train::cache::Cache;
 use hanzo_train::model::{verify_checkpoint, Dspark, DsparkCfg};
 
 #[derive(Parser, Debug)]
-#[command(name = "hanzo-train", about = "Native-Rust DSpark draft trainer (CPU/f32 MVP)")]
+#[command(
+    name = "hanzo-train",
+    about = "Native-Rust DSpark draft trainer (CPU/f32 MVP)"
+)]
 struct Args {
     /// DeepSpec target-cache v2 directory (manifest.json + samples.idx + shard-*.bin).
     #[arg(long)]
     cache_dir: PathBuf,
 
     /// Frozen embed_tokens + lm_head init safetensors (keys embed_tokens.weight, lm_head.weight).
-    #[arg(long, default_value = "/home/z/work/zen/hf/v4-dspark-init/embed_head.safetensors")]
+    #[arg(
+        long,
+        default_value = "/home/z/work/zen/hf/v4-dspark-init/embed_head.safetensors"
+    )]
     init: PathBuf,
 
     /// Output checkpoint directory (writes model.safetensors + config.json).
@@ -109,7 +115,7 @@ fn mem_available_gb() -> f64 {
     };
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            if let Some(kb) = rest.trim().split_whitespace().next() {
+            if let Some(kb) = rest.split_whitespace().next() {
                 if let Ok(kb) = kb.parse::<f64>() {
                     return kb / 1024.0 / 1024.0;
                 }
@@ -119,7 +125,13 @@ fn mem_available_gb() -> f64 {
     f64::INFINITY
 }
 
-fn pick_anchors(loss_mask: &[u8], seq: usize, block: usize, n: usize, rng: &mut StdRng) -> Vec<usize> {
+fn pick_anchors(
+    loss_mask: &[u8],
+    seq: usize,
+    block: usize,
+    n: usize,
+    rng: &mut StdRng,
+) -> Vec<usize> {
     // Candidate anchors: loss_mask[a] && loss_mask[a+1], and a+block <= seq-1 so all block targets fit.
     if seq < block + 2 {
         return Vec::new();
@@ -152,7 +164,12 @@ fn main() -> Result<()> {
     );
 
     // RoPE table must cover the longest sequence (+ block) in the cache.
-    let max_seq = cache.records.iter().map(|r| r.seq_len as usize).max().unwrap_or(0);
+    let max_seq = cache
+        .records
+        .iter()
+        .map(|r| r.seq_len as usize)
+        .max()
+        .unwrap_or(0);
     let max_pos = max_seq + args.block + 1;
 
     let cfg = DsparkCfg {
@@ -172,11 +189,22 @@ fn main() -> Result<()> {
         target_layer_ids,
         final_norm_init: args.final_norm_init,
     };
-    assert_eq!(cfg.heads * cfg.head_dim, cfg.hidden, "heads*head_dim must equal hidden");
+    assert_eq!(
+        cfg.heads * cfg.head_dim,
+        cfg.hidden,
+        "heads*head_dim must equal hidden"
+    );
 
     println!(
         "model: layers={} heads={}/{} head_dim={} intermediate={} vocab={} block={} markov_rank={}",
-        cfg.layers, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.intermediate, cfg.vocab, cfg.block, cfg.markov_rank
+        cfg.layers,
+        cfg.heads,
+        cfg.kv_heads,
+        cfg.head_dim,
+        cfg.intermediate,
+        cfg.vocab,
+        cfg.block,
+        cfg.markov_rank
     );
 
     let model = Dspark::new(cfg.clone(), &args.init, &dev, !args.freeze_markov)?;
@@ -186,7 +214,11 @@ fn main() -> Result<()> {
         "trainable vars: {} ({} params){}",
         vars.len(),
         n_params,
-        if args.freeze_markov { " [markov frozen]" } else { "" }
+        if args.freeze_markov {
+            " [markov frozen]"
+        } else {
+            ""
+        }
     );
 
     let mut opt = AdamW::new(
@@ -205,9 +237,18 @@ fn main() -> Result<()> {
         })
         .collect();
     if eligible.is_empty() {
-        hanzo_ml::bail!("no eligible samples (seq_len in [{}, {}])", cfg.block + 2, args.max_seq);
+        hanzo_ml::bail!(
+            "no eligible samples (seq_len in [{}, {}])",
+            cfg.block + 2,
+            args.max_seq
+        );
     }
-    println!("eligible samples: {}/{} (max_seq={})", eligible.len(), cache.len(), args.max_seq);
+    println!(
+        "eligible samples: {}/{} (max_seq={})",
+        eligible.len(),
+        cache.len(),
+        args.max_seq
+    );
 
     let mut rng = StdRng::seed_from_u64(args.seed);
     let ln_vocab = (cfg.vocab as f64).ln();
@@ -221,19 +262,32 @@ fn main() -> Result<()> {
             guard += 1;
             let si = eligible[rng.random_range(0..eligible.len())];
             let s = cache.read_sample(si)?;
-            let anchors = pick_anchors(&s.loss_mask, s.seq_len, cfg.block, args.num_anchors, &mut rng);
+            let anchors = pick_anchors(
+                &s.loss_mask,
+                s.seq_len,
+                cfg.block,
+                args.num_anchors,
+                &mut rng,
+            );
             if !anchors.is_empty() {
                 plan.push((si, anchors));
             }
         }
         let n_anch: usize = plan.iter().map(|(_, a)| a.len()).sum();
-        println!("fixed batch (overfit): {} samples, {} anchors", plan.len(), n_anch);
+        println!(
+            "fixed batch (overfit): {} samples, {} anchors",
+            plan.len(),
+            n_anch
+        );
         Some(plan)
     } else {
         None
     };
 
-    println!("baseline CE = ln(vocab) = {:.4}\n--- training ---", ln_vocab);
+    println!(
+        "baseline CE = ln(vocab) = {:.4}\n--- training ---",
+        ln_vocab
+    );
 
     let t_start = Instant::now();
     let mut tok_total = 0usize;
@@ -260,7 +314,13 @@ fn main() -> Result<()> {
                 for _ in 0..args.micro_batch {
                     let si = eligible[rng.random_range(0..eligible.len())];
                     let s = cache.read_sample(si)?;
-                    let anchors = pick_anchors(&s.loss_mask, s.seq_len, cfg.block, args.num_anchors, &mut rng);
+                    let anchors = pick_anchors(
+                        &s.loss_mask,
+                        s.seq_len,
+                        cfg.block,
+                        args.num_anchors,
+                        &mut rng,
+                    );
                     if !anchors.is_empty() {
                         p.push((si, anchors));
                     }
@@ -272,10 +332,16 @@ fn main() -> Result<()> {
         for (si, anchors) in &plan {
             let mut s = cache.read_sample(*si)?;
             let seq = s.seq_len;
-            let th = Tensor::from_vec(std::mem::take(&mut s.target_hidden), (seq, n_fused * hidden), &dev)?;
+            let th = Tensor::from_vec(
+                std::mem::take(&mut s.target_hidden),
+                (seq, n_fused * hidden),
+                &dev,
+            )?;
             let fused = model.fuse(&th)?;
             for &a in anchors {
-                if let Some((block, bias, tgt)) = model.draft_anchor(&fused, &s.input_ids, &s.loss_mask, a)? {
+                if let Some((block, bias, tgt)) =
+                    model.draft_anchor(&fused, &s.input_ids, &s.loss_mask, a)?
+                {
                     targets.extend_from_slice(&tgt);
                     block_chunks.push(block);
                     bias_chunks.push(bias);

@@ -1,6 +1,6 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use hanzo_ml::{DType, Device, Tensor};
 use criterion::{criterion_group, Criterion, Throughput};
+use hanzo_ml::{DType, Device, Tensor};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -8,7 +8,7 @@ fn run_sqrt(a: &Tensor) {
     a.sqrt().unwrap();
 }
 
-fn run_binary_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
+fn run_unary_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
     let b = 1;
     let m = 1024;
     let k = 1024;
