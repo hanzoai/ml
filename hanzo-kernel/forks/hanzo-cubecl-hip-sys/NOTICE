@@ -19,4 +19,5 @@ Modification by Hanzo AI, Inc.:
 
 All other files are verbatim from upstream. No upstream authorship is claimed.
 
-Upstream PR offering the build.rs fallback: (to be filed; link added here.)
+Upstream PR offering the build.rs fallback:
+  https://github.com/tracel-ai/cubecl-hip-sys/pull/35
