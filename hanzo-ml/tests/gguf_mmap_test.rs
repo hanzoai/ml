@@ -17,14 +17,15 @@ use hanzo_ml::{Device, Result, Tensor};
 use std::path::{Path, PathBuf};
 
 fn tmp_path() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    // Monotonic per-call counter: SystemTime has microsecond resolution on macOS, so two
+    // parallel test threads can collide on a timestamp-derived name -- one test's cleanup
+    // then deletes the file under the other (ENOENT in read_mmap).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!(
         "hanzo_gguf_mmap_{}_{}.gguf",
         std::process::id(),
-        nanos
+        seq
     ))
 }
 
