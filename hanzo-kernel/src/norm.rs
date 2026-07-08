@@ -553,7 +553,7 @@ mod tests {
     #[cfg(feature = "rocm")]
     #[test]
     fn rms_norm_rocm_bit_exact() {
-        use cubecl::hip::{AmdDevice, HipRuntime};
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
         let (rows, n) = (37, 128);
         let (x, w, _) = data(rows, n);
         let c = HipRuntime::client(&AmdDevice::default());
