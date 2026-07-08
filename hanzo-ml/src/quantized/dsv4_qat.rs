@@ -149,7 +149,7 @@ pub fn e2m1_nearest(x: f32) -> f32 {
 // ---------------------------------------------------------------------------------------------
 
 /// `1 / sqrt(128)` — the orthonormal normalization (matches ds4.c's literal).
-const HADAMARD128_SCALE: f32 = 0.088_388_347_648_318_45;
+const HADAMARD128_SCALE: f32 = 0.088_388_346;
 
 /// In-place size-128 fast Walsh-Hadamard transform, normalized by `1/sqrt(128)`.
 /// `x.len()` must be 128. Port of `dsv4_hadamard128_inplace_cpu` (ds4.c:2531-2544).
@@ -196,17 +196,12 @@ fn fp4_act_quantize_blocks(x: &mut [f32]) {
             }
         }
         // 6 * FLT_MIN: keeps amax/6 >= 2^-126 so the scale stays a normal float.
-        if amax < 7.052_966_104_933_725e-38 {
-            amax = 7.052_966_104_933_725e-38;
+        if amax < 7.052_966e-38 {
+            amax = 7.052_966e-38;
         }
         let scale = block_scale(amax, 6.0);
         for v in block.iter_mut() {
-            let mut t = *v / scale;
-            if t > 6.0 {
-                t = 6.0;
-            } else if t < -6.0 {
-                t = -6.0;
-            }
+            let t = (*v / scale).clamp(-6.0, 6.0);
             *v = e2m1_nearest(t) * scale;
         }
     }
@@ -229,12 +224,7 @@ fn fp8_kv_quantize_row(row: &mut [f32], n_nope: usize) {
         }
         let scale = block_scale(amax, 448.0);
         for v in block.iter_mut() {
-            let mut t = *v / scale;
-            if t > 448.0 {
-                t = 448.0;
-            } else if t < -448.0 {
-                t = -448.0;
-            }
+            let t = (*v / scale).clamp(-448.0, 448.0);
             *v = e4m3_nearest(t) * scale;
         }
     }

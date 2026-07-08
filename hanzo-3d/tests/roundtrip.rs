@@ -41,7 +41,12 @@ fn gaussian_splat_ply_roundtrip_is_exact() {
             Gaussian {
                 position: Vec3::new(0.1, -0.2, 0.3),
                 scale: Vec3::new(0.01, 0.02, 0.03),
-                rotation: Quat::new(0.7071068, 0.7071068, 0.0, 0.0),
+                rotation: Quat::new(
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    0.0,
+                    0.0,
+                ),
                 color: [0.9, 0.4, 0.1],
                 opacity: 0.75,
             },
@@ -56,7 +61,10 @@ fn gaussian_splat_ply_roundtrip_is_exact() {
     };
     let back = ply_to_splat(&splat_to_ply(&g)).expect("parse splat PLY");
     assert_eq!(back, g, "splat PLY roundtrip differs");
-    println!("[hanzo-3d] 3DGS PLY roundtrip: {} splats bit-match", back.len());
+    println!(
+        "[hanzo-3d] 3DGS PLY roundtrip: {} splats bit-match",
+        back.len()
+    );
 }
 
 #[test]

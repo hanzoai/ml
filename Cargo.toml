@@ -134,3 +134,6 @@ unnecessary_unwrap = "allow"
 manual_checked_ops = "allow"
 needless_borrow = "allow"
 large_const_arrays = "allow"
+# Quant-kernel idioms: parallel-array indexing and wide kernel signatures are intentional.
+needless_range_loop = "allow"
+too_many_arguments = "allow"
