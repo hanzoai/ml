@@ -35,6 +35,6 @@ beyond the manifest, so the version stays aligned. Future fork-only fixes bump t
 
 ## Upstream
 
-The underlying `build.rs` fix has been offered upstream against `cubecl-hip-sys`; see `NOTICE` for
-the PR link when filed. If upstream ships the fallback, `hanzo-kernel` can return to depending on the
-`cubecl` facade's `hip` feature directly and both forks can be retired.
+The underlying `build.rs` fix has been offered upstream against `cubecl-hip-sys`:
+<https://github.com/tracel-ai/cubecl-hip-sys/pull/35>. If upstream ships the fallback, `hanzo-kernel`
+can return to depending on the `cubecl` facade's `hip` feature directly and both forks can be retired.

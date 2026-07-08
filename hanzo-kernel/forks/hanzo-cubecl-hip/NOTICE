@@ -16,4 +16,5 @@ Sole modification by Hanzo AI, Inc. (manifest only; no source change):
 All Rust source under src/ is verbatim from upstream cubecl-hip 0.10.0. No
 upstream authorship is claimed.
 
-Upstream PR (against cubecl-hip-sys, the root cause): (to be filed; link added here.)
+Upstream PR (against cubecl-hip-sys, the root cause):
+  https://github.com/tracel-ai/cubecl-hip-sys/pull/35
