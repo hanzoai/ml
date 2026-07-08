@@ -8,14 +8,14 @@ use std::sync::Arc;
 
 #[cfg(target_feature = "avx2")]
 pub mod avx;
+pub mod dsv4_qat;
 mod dummy_cuda;
 mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
+pub mod imatrix_file;
 mod iq_grids;
 pub mod iq_quants;
-pub mod dsv4_qat;
-pub mod imatrix_file;
 pub mod k_quants;
 #[cfg(feature = "metal")]
 pub mod metal;
@@ -585,6 +585,7 @@ macro_rules! gen_from_mmap {
         /// returned store references the mapped pages directly, so the weight bytes stay on disk and
         /// the OS pages them in/out under memory pressure. Mirrors `from_data` arm-for-arm so the
         /// dtype -> block-type mapping can never disagree between the resident and mmap paths.
+        #[allow(clippy::wrong_self_convention)] // dispatches on the block-type value, mirroring from_data
         pub(crate) fn from_mmap(
             &self,
             mmap: Arc<memmap2::Mmap>,
@@ -996,10 +997,7 @@ impl QTensor {
     // (ptr,len) of the QTensor's CPU bytes. Re-uploading the multi-GB bank per token/layer would
     // dominate decode, so the cache makes MoE bandwidth-bound on the quant matvec, not the H2D copy.
     #[cfg(feature = "rocm")]
-    fn rocm_moe_bank(
-        &self,
-        dev: &crate::RocmDevice,
-    ) -> Result<std::sync::Arc<crate::RocmStorage>> {
+    fn rocm_moe_bank(&self, dev: &crate::RocmDevice) -> Result<std::sync::Arc<crate::RocmStorage>> {
         use crate::backend::BackendDevice;
         let bank = self.data()?;
         let key = (bank.as_ref().as_ptr() as usize, bank.as_ref().len());
@@ -1024,29 +1022,28 @@ impl QTensor {
             // QMatMul. The supported set is derived from the ONE kernel-name table (cuda.rs), so this gate
             // can't drift from the kernels that actually exist -- which is exactly what had stranded
             // Q4_0/Q4_1/Q5_0/Q5_1 on the CPU even though their fused kernels are now compiled.
-            QStorage::Cuda(s) if cuda::QCudaStorage::supports_indexed_moe(s.dtype()) =>
-            {
+            QStorage::Cuda(s) if cuda::QCudaStorage::supports_indexed_moe(s.dtype()) => {
                 match (&*x.storage(), &*ids.storage()) {
-                (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
-                    let (storage, out_shape) = s.indexed_moe_forward(
-                        self.shape(),
-                        x_storage,
-                        x.layout(),
-                        ids_storage,
-                        ids.layout(),
-                    )?;
-                    Ok(crate::tensor::from_storage(
-                        Storage::Cuda(storage),
-                        out_shape,
-                        crate::op::BackpropOp::none(),
-                        false,
-                    ))
+                    (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
+                        let (storage, out_shape) = s.indexed_moe_forward(
+                            self.shape(),
+                            x_storage,
+                            x.layout(),
+                            ids_storage,
+                            ids.layout(),
+                        )?;
+                        Ok(crate::tensor::from_storage(
+                            Storage::Cuda(storage),
+                            out_shape,
+                            crate::op::BackpropOp::none(),
+                            false,
+                        ))
+                    }
+                    _ => {
+                        panic!("Non-cuda indexed_moe_forward is not implemented!");
+                    }
                 }
-                _ => {
-                    panic!("Non-cuda indexed_moe_forward is not implemented!");
-                }
-                }
-            },
+            }
             // Native CUDA i-quant MoE: the i-quant codebook types have no Blue-C fused q8_1 MoE kernel,
             // but a native dp4a MoE-decode kernel (moe_qmatvec_dp4a_<iq*>). The [E,n,k] bank stays
             // RESIDENT in VRAM and the router gather runs on-device -- the dp4a twin of the ROCm path.
@@ -1107,7 +1104,10 @@ impl QTensor {
                     .reshape((nrows, k))?
                     .to_dtype(crate::DType::F32)?
                     .contiguous()?;
-                let ids_flat = ids.reshape((nrows,))?.to_dtype(crate::DType::U32)?.contiguous()?;
+                let ids_flat = ids
+                    .reshape((nrows,))?
+                    .to_dtype(crate::DType::U32)?
+                    .contiguous()?;
                 let (xstore, _) = x_flat.storage_and_layout();
                 let xc = match &*xstore {
                     Storage::Cuda(c) => c,
@@ -1176,8 +1176,8 @@ impl QTensor {
                     other => crate::bail!("vulkan MoE: no kernel for {other:?}"),
                 };
                 let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
-                // moe_matvec_q8_0's shader reads the repacked 9-u32/block layout (same as the decode
-                // matvec_q8 path); Q4_0/Q4_K shaders read the raw GGML bytes directly.
+                                         // moe_matvec_q8_0's shader reads the repacked 9-u32/block layout (same as the decode
+                                         // matvec_q8 path); Q4_0/Q4_K shaders read the raw GGML bytes directly.
                 let wbank = match self.storage.dtype() {
                     GgmlDType::Q8_0 => vk_dev.quantize_q8_blocks(&bank, e_cnt * n, k)?,
                     _ => vk_dev.upload_qweight(&bank)?,
@@ -1286,14 +1286,22 @@ impl QTensor {
                     // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
                     // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
                     // a symmetric expert type) still cast to f16.
-                    DType::F16 | DType::F32 if use_qmmq => x_exp.reshape((nrows, k))?.contiguous()?,
-                    _ if use_qmmq => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
+                    DType::F16 | DType::F32 if use_qmmq => {
+                        x_exp.reshape((nrows, k))?.contiguous()?
+                    }
+                    _ if use_qmmq => x_exp
+                        .reshape((nrows, k))?
+                        .to_dtype(DType::F16)?
+                        .contiguous()?,
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
                     // DECODE f32-native: dp4a experts quantize q8_1 from f32 and store f32, so an F32
                     // routed activation stays F32 (the matvec returns F32 -> the .to_dtype(out_dtype)
                     // below is a no-op), removing the cast pair that wrapped each gate/up/down matvec.
                     DType::F32 if qt.dp4a_active() => x_exp.reshape((nrows, k))?.contiguous()?,
-                    _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
+                    _ => x_exp
+                        .reshape((nrows, k))?
+                        .to_dtype(DType::F16)?
+                        .contiguous()?,
                 };
                 let wbank = self.rocm_moe_bank(rocm_dev)?;
                 // Keep router ids ON the GPU for EVERY wired quant type and run ONE batched launch
@@ -1459,11 +1467,13 @@ pub enum QMatMul {
 // are owned by the model's QTensor for its lifetime, so the pointer is a stable key. Keyed by
 // usize (raw ptr) to stay Send+Sync; the RocmStorage is reference-counted and reused.
 #[cfg(feature = "rocm")]
-fn rocm_moe_bank_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>>
-{
+fn rocm_moe_bank_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>,
+> {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>,
+        >,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -1473,6 +1483,7 @@ fn rocm_moe_bank_cache(
 /// ONE fused kernel (`RocmDevice::moe_combine`) instead of `ys.broadcast_mul(scores).sum(Minus2)`,
 /// which cast ys -> f32, wrote a [t,topk,n] f32 product temp, and ran an 8-wide strided reduce.
 /// Other backends keep the generic broadcast-mul + sum.
+#[cfg_attr(not(feature = "rocm"), allow(unused_variables))]
 pub fn moe_combine(ys: &Tensor, scores: &Tensor) -> Result<Tensor> {
     let (t, topk, n) = ys.dims3()?;
     #[cfg(feature = "rocm")]
@@ -1497,13 +1508,15 @@ pub fn moe_combine(ys: &Tensor, scores: &Tensor) -> Result<Tensor> {
             false,
         ));
     }
-    ys.broadcast_mul(&scores.unsqueeze(D::Minus1)?)?.sum(D::Minus2)
+    ys.broadcast_mul(&scores.unsqueeze(D::Minus1)?)?
+        .sum(D::Minus2)
 }
 
 /// Fused MoE router. Reduces the F32 router logits [ntok, n_experts] to the topk selected expert
 /// ids [ntok, topk] (descending logit) and their softmax weights [ntok, topk]; `norm` renormalizes
 /// the topk weights to sum 1 (norm_topk_prob). On ROCm this is ONE `moe_route` kernel replacing the
 /// softmax->sort->narrow->sum->div chain (~6 launches/layer); elsewhere it is that chain via ml ops.
+#[cfg_attr(not(feature = "rocm"), allow(unused_variables))]
 pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Tensor)> {
     let (ntok, n_experts) = logits.dims2()?;
     #[cfg(feature = "rocm")]
@@ -1596,13 +1609,16 @@ pub fn moe_gate_up(
                             let nrows = t * topk;
                             let x_exp = x.broadcast_as((t, topk, k))?;
                             let x_flat = match x_exp.dtype() {
-                                DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
+                                DType::BF16 | DType::F16 => {
+                                    x_exp.reshape((nrows, k))?.contiguous()?
+                                }
                                 DType::F32 if qt.dp4a_active() => {
                                     x_exp.reshape((nrows, k))?.contiguous()?
                                 }
-                                _ => {
-                                    x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?
-                                }
+                                _ => x_exp
+                                    .reshape((nrows, k))?
+                                    .to_dtype(DType::F16)?
+                                    .contiguous()?,
                             };
                             let out_dtype = x.dtype();
                             let ids_u32 =
@@ -1652,7 +1668,10 @@ pub fn moe_gate_up(
             }
         }
     }
-    Ok((gate.indexed_moe_forward(x, ids)?, up.indexed_moe_forward(x, ids)?))
+    Ok((
+        gate.indexed_moe_forward(x, ids)?,
+        up.indexed_moe_forward(x, ids)?,
+    ))
 }
 
 impl QMatMul {
@@ -1880,13 +1899,21 @@ impl QMatMul {
                     // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
                     // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
                     // a symmetric expert type) still cast to f16.
-                    DType::F16 | DType::F32 if use_qmmq => x_exp.reshape((nrows, k))?.contiguous()?,
-                    _ if use_qmmq => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
+                    DType::F16 | DType::F32 if use_qmmq => {
+                        x_exp.reshape((nrows, k))?.contiguous()?
+                    }
+                    _ if use_qmmq => x_exp
+                        .reshape((nrows, k))?
+                        .to_dtype(DType::F16)?
+                        .contiguous()?,
                     DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
                     // DECODE f32-native dp4a: keep F32 routed activation F32 end-to-end (matvec stores
                     // F32), eliding the cast pair around each expert matvec. See QStorage twin above.
                     DType::F32 if qt.dp4a_active() => x_exp.reshape((nrows, k))?.contiguous()?,
-                    _ => x_exp.reshape((nrows, k))?.to_dtype(DType::F16)?.contiguous()?,
+                    _ => x_exp
+                        .reshape((nrows, k))?
+                        .to_dtype(DType::F16)?
+                        .contiguous()?,
                 };
                 let out_dtype = x.dtype();
                 // Keep router ids ON the GPU for EVERY wired quant type: the batched kernels index
@@ -1908,9 +1935,13 @@ impl QMatMul {
                     _ => crate::bail!("rocm MoE: ids not on rocm"),
                 };
                 let y = if use_qmmq {
-                    wbank.device.moe_qmmq_quant(qt, wbank, xr, idr, nrows, n, k)?
+                    wbank
+                        .device
+                        .moe_qmmq_quant(qt, wbank, xr, idr, nrows, n, k)?
                 } else {
-                    wbank.device.moe_matvec_quant(qt, wbank, xr, idr, nrows, n, k)?
+                    wbank
+                        .device
+                        .moe_matvec_quant(qt, wbank, xr, idr, nrows, n, k)?
                 };
                 let out = crate::tensor::from_storage(
                     crate::Storage::Rocm(y),
