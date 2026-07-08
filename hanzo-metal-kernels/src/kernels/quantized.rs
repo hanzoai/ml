@@ -344,3 +344,143 @@ pub fn call_quantized_matmul_mm_t_offset(
 fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
+
+/// Fused MoE matvec — ggml `kernel_mul_mv_id`. One dispatch computes the routed expert matvec for
+/// every (token, expert-slot) pair, reading the expert id per row from the on-device `ids` buffer:
+/// no host round-trip, no per-expert loop. `src0s` is the resident `[n_experts, n, k]` quantized
+/// bank (expert blocks `expert_bytes` apart); `src1` is `[t, s, k]` f32 (`s == 1` shared input for
+/// gate/up, or `s == topk` per-slot for down); `ids` is `[t, topk]` u32/i32; `dst` is `[t, topk, n]`
+/// f32. Mirrors the classic ggml-metal dispatch: same per-quant `(nth0, nth1, align)` table as the
+/// plain `kernel_mul_mv_*`, with the expert/token pair carried on the grid's z axis.
+#[allow(clippy::too_many_arguments)]
+pub fn call_mul_mv_id(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    n_experts: usize,
+    n: usize,
+    k: usize,
+    t: usize,
+    topk: usize,
+    s: usize,
+    expert_bytes: usize,
+    src0s: &Buffer,
+    src0_offset: usize,
+    src1: &Buffer,
+    src1_offset: usize,
+    ids: &Buffer,
+    ids_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = n_experts as i64;
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = expert_bytes as i64;
+
+    let ne10 = k as i64;
+    let ne11 = s as i64;
+    let ne12 = t as i64;
+    let ne13 = 1i64;
+    let nb10 = std::mem::size_of::<f32>() as i64;
+    let nb11 = (k * std::mem::size_of::<f32>()) as i64;
+    let nb12 = (s * k * std::mem::size_of::<f32>()) as i64;
+
+    let nei0 = topk as i64;
+    let nei1 = t as i64;
+    let nbi1 = (topk * std::mem::size_of::<u32>()) as i64;
+
+    let ne0 = n as i64;
+    let ne1 = topk as i64;
+    let nb1 = (n * std::mem::size_of::<f32>()) as i64;
+
+    let (nth0, nth1, align): (usize, usize, usize) = match dtype {
+        GgmlDType::Q4_0
+        | GgmlDType::Q4_1
+        | GgmlDType::Q5_0
+        | GgmlDType::Q5_1
+        | GgmlDType::Q8_0
+        | GgmlDType::Q8_1 => (8, 8, 8),
+        GgmlDType::Q2K => (2, 32, 4),
+        GgmlDType::Q4K => (4, 8, 4),
+        GgmlDType::Q3K | GgmlDType::Q5K => (2, 32, 4),
+        GgmlDType::Q6K => (2, 32, 2),
+        GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K => (32, 1, 8),
+        GgmlDType::F32 => (32, 1, 8),
+    };
+
+    let name = match dtype {
+        GgmlDType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
+        GgmlDType::Q4_1 => "kernel_mul_mv_id_q4_1_f32",
+        GgmlDType::Q5_0 => "kernel_mul_mv_id_q5_0_f32",
+        GgmlDType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
+        GgmlDType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
+        GgmlDType::Q2K => "kernel_mul_mv_id_q2_K_f32",
+        GgmlDType::Q3K => "kernel_mul_mv_id_q3_K_f32",
+        GgmlDType::Q4K => "kernel_mul_mv_id_q4_K_f32",
+        GgmlDType::Q5K => "kernel_mul_mv_id_q5_K_f32",
+        GgmlDType::Q6K => "kernel_mul_mv_id_q6_K_f32",
+        GgmlDType::F16 => "kernel_mul_mv_id_f16_f32",
+        GgmlDType::F32 => "kernel_mul_mv_id_f32_f32",
+        other => {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "no kernel_mul_mv_id for {other:?}"
+            )))
+        }
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            (src0s, src0_offset),
+            (src1, src1_offset),
+            Output::with_offset(dst, dst_offset),
+            (ids, ids_offset),
+            nei0,
+            nei1,
+            nbi1,
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            ne13,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            nb1
+        )
+    );
+
+    // The k-quant / q_n matvec impls reduce in-simdgroup and ignore the threadgroup scratch (their
+    // plain wrappers pass nullptr), but the `_id` kernel declares `shared_values [[threadgroup(0)]]`;
+    // bind a nominal buffer so the argument is valid. Well within the 32 KiB threadgroup limit.
+    encoder.set_threadgroup_memory_length(0, 8192);
+
+    let thread_groups = MTLSize {
+        width: divide(ne01 as usize, align),
+        height: 1,
+        depth: (nei0 * nei1) as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups, threads_per_threadgroup);
+    Ok(())
+}

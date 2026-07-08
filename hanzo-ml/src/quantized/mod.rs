@@ -1337,6 +1337,41 @@ impl QTensor {
                 );
                 out.reshape((t, topk, n))?.to_dtype(out_dtype)
             }
+            // Native Metal MoE decode: for the single-token step (t == 1) every routed slot is a
+            // distinct expert with exactly one row, and `QMetalStorage::indexed_moe_forward` runs
+            // the whole expert compute in ONE fused `mul_mv_id` dispatch -- expert id read per row
+            // on-device, no per-expert loop, no `ids` host sync -- straight out of the resident
+            // quantized bank. This is the fix for the ~200x Metal MoE decode cliff. Prefill
+            // (t > 1) is left on the generic per-expert path below, which the qwen35moe forward
+            // runs under a per-layer completion drain to dodge a Metal buffer-pool aliasing hazard
+            // in the churny prefill command stream; routing prefill through the fused path without
+            // that drain reintroduces NaN logits, so a drain-free fused prefill stays a follow-up.
+            // Guarded to Metal-resident x/ids (always true on the Metal forward).
+            #[cfg(feature = "metal")]
+            QStorage::Metal(s)
+                if ids.dims2().map_or(false, |(t, _)| t == 1)
+                    && matches!(&*x.storage(), Storage::Metal(_))
+                    && matches!(&*ids.storage(), Storage::Metal(_)) =>
+            {
+                let out_dtype = x.dtype();
+                let x = x.contiguous()?;
+                let (xs_guard, x_l) = x.storage_and_layout();
+                let (ids_guard, ids_l) = ids.storage_and_layout();
+                let (Storage::Metal(x_storage), Storage::Metal(ids_storage)) =
+                    (&*xs_guard, &*ids_guard)
+                else {
+                    unreachable!("metal MoE arm is guarded on Metal x/ids storage");
+                };
+                let (storage, out_shape) =
+                    s.indexed_moe_forward(self.shape(), x_storage, x_l, ids_storage, ids_l)?;
+                let out = crate::tensor::from_storage(
+                    Storage::Metal(storage),
+                    out_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                out.to_dtype(out_dtype)
+            }
             _ => {
                 // CPU / non-CUDA fallback: per-expert quantized matmul. The packed expert bank
                 // [E, n, k] is sliced into equal, contiguous per-expert quantized blocks; for
