@@ -121,7 +121,7 @@ cargo run --release --bin matvec-check --no-default-features --features "cpu,vul
 Four ideas, borrowed from Rich Hickey and applied to kernels:
 
 - **Decomplect.** Ops, quantization types, and backends are three orthogonal axes braided together in hand-written code. Pulled apart, they compose — you write each axis once. `backends × types × ops` becomes `backends + types + ops`.
-- **Values, not places.** [CubeCL](https://github.com/tracel-ai/cubecl) is the lowering engine — the implementation *value*. `hanzo_kernel` is the stable *namespace* you build against; the string `cubecl` appears in exactly one line of one `Cargo.toml`. The engine can be upgraded or vendored without touching a kernel.
+- **Values, not places.** [CubeCL](https://github.com/tracel-ai/cubecl) is the lowering engine — the implementation *value*. `hanzo_kernel` is the stable *namespace* you build against; the engine is named only in this crate's `Cargo.toml`, never in a kernel source. It can be upgraded, vendored, or forked (the `rocm` feature pulls `hanzo-cubecl-hip`, our published fork that builds on ROCm ≥ 7.13) without touching a kernel.
 - **One numeric behavior.** A single source means a single rounding path. The "coherent on Metal, collapsed on CUDA" class of bug cannot occur — not because four copies were tested into agreement, but because there is one copy.
 - **Perf-gated migration, never a downgrade.** A hand-tuned kernel is retired for its DSL twin **only** when the twin is bit-exact *and* at least as fast. Where a hand-tuned kernel still wins, it stays as the peak path and the DSL is the portable fallback for backends that lack it. Coverage always grows; speed never regresses.
 

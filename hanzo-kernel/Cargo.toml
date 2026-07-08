@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-kernel"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2021"
 description = "Hanzo's first-party GPU kernel DSL: one Rust source, lowered to CUDA/ROCm/Vulkan/Metal."
 license = "BSD-3-Clause"
@@ -16,6 +16,13 @@ categories = ["hardware-support", "science"]
 cubecl = { version = "0.10", default-features = false }
 hanzo-kernel-macros = { path = "../hanzo-kernel-macros", version = "0.1.1" }
 half = "2"
+# The ROCm backend deps our own published fork of cubecl-hip rather than the cubecl facade's `hip`
+# feature: upstream cubecl-hip -> cubecl-hip-sys can't build on ROCm >= 7.13 (unknown-newer HIP patch),
+# and a crates.io consumer can't inject the fix via `[patch.crates-io]`. `hanzo-cubecl-hip` (fork of
+# cubecl-hip 0.10.0) pulls `hanzo-cubecl-hip-sys` (the build-fixed fork) and is imported as
+# `hanzo_cubecl_hip`. It resolves the SAME cubecl-core 0.10 as the facade, so `HipRuntime` is the
+# runtime the DSL dispatches through. See hanzo-kernel/forks/.
+hanzo-cubecl-hip = { version = "0.10", optional = true }
 
 [features]
 default = ["cpu"]
@@ -25,9 +32,9 @@ spirv-dump = ["cubecl/spirv-dump"]
 metal = ["cubecl/wgpu", "cubecl/metal"]
 cuda = ["cubecl/cuda"]
 # `cubecl/std` is required: cubecl-hip's server uses cubecl-runtime's `MultiStream`, which lives
-# behind the `multi_threading` cfg = `all(feature="std", not(wasm))`. cubecl's `hip`/`rocm` features
-# do not pull std, so without this the ROCm backend fails to compile (MultiStream unresolved).
-rocm = ["cubecl/hip", "cubecl/rocm", "cubecl/std"]
+# behind the `multi_threading` cfg = `all(feature="std", not(wasm))`. Without it the ROCm backend
+# fails to compile (MultiStream unresolved). The HIP runtime itself comes from `hanzo-cubecl-hip`.
+rocm = ["dep:hanzo-cubecl-hip", "cubecl/std"]
 
 [[bin]]
 name = "matvec-check"
@@ -37,12 +44,3 @@ path = "src/main.rs"
 name = "dp4a-probe"
 path = "src/dp4a_probe.rs"
 required-features = ["vulkan"]
-
-# ROCm 7.13 (gfx1151) reports HIP patch 99004, past the newest bindings published in
-# cubecl-hip-sys 7.2.5321100 (53211). Upstream's build.rs then emits a `hip_99004` feature that has
-# no bindings module -> every `cubecl_hip_sys` symbol is undefined and cubecl-hip fails to build.
-# This vendored fork adds a build.rs fallback: an unknown newer HIP patch selects the latest shipped
-# bindings, which is ABI-safe because AMD versions every changed symbol (R0600) and 7.13 still maps
-# `hipGetDeviceProperties` -> the R0600 revision. Bindings for known versions are unchanged.
-[patch.crates-io]
-cubecl-hip-sys = { path = "vendor/cubecl-hip-sys" }
