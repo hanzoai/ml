@@ -147,6 +147,15 @@ fn quantized_matmul(device: &Device) -> Result<()> {
         // match exhaustiveness when the feature is enabled; the test harness never dispatches the
         // quantized_matmul case onto these devices (no _vulkan/_wgpu test variant), so they compile
         // but do not execute.
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => assert_eq!(
+            to_vec2_round(&res, 0)?,
+            &[
+                [84866.0, 214045.0, 344676.0, 473707.0],
+                [213425.0, 604313.0, 1000431.0, 1387960.0],
+                [342030.0, 994630.0, 1656248.0, 2302250.0]
+            ]
+        ),
         #[cfg(feature = "vulkan")]
         Device::Vulkan(_) => {}
         #[cfg(feature = "wgpu")]
@@ -216,6 +225,15 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
             ]
         ),
         // See note above: exhaustiveness-only arms for the vulkan/wgpu features; not executed.
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => assert_eq!(
+            to_vec2_round(&res, 0)?,
+            &[
+                [84866.0, 214045.0, 344676.0, 473707.0],
+                [213425.0, 604313.0, 1000431.0, 1387960.0],
+                [342030.0, 994630.0, 1656248.0, 2302250.0]
+            ]
+        ),
         #[cfg(feature = "vulkan")]
         Device::Vulkan(_) => {}
         #[cfg(feature = "wgpu")]
