@@ -448,19 +448,20 @@ impl QMetalStorage {
     pub fn indexed_moe_forward(
         &self,
         self_shape: &Shape,   // [num_experts, n, k]
-        input: &MetalStorage, // [t, topk or 1, k]
+        input: &MetalStorage, // [t, 1 (gate/up) or topk (down), k]
         input_l: &crate::Layout,
         ids: &MetalStorage, // [t, topk]
         ids_l: &crate::Layout,
     ) -> Result<(MetalStorage, Shape)> {
-        use std::collections::HashMap;
-
+        // Fused ggml `mul_mv_id`: ONE dispatch computes every routed (token, expert-slot) matvec,
+        // reading the expert id per row from the on-device `ids` buffer. Replaces the per-expert host
+        // loop -- which did an `ids.to_vec1` device->host sync plus a gather/matmul/scatter per expert,
+        // per projection, per layer (the dominant Metal MoE decode cost). The [E, n, k] GGUF bank
+        // stays quantized and resident in `self.buffer`; each expert block is `expert_bytes` apart.
         let device = self.device.clone();
-        let mdev = crate::Device::Metal(device.clone());
         let (e_cnt, n, k) = self_shape.dims3()?;
         let (t, topk) = ids_l.shape().dims2()?;
         let s = input_l.shape().dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
-        let nrows = t * topk;
 
         // Mirrors the CUDA indexed-MoE contract: inputs arrive contiguous at offset 0.
         if !input_l.is_contiguous() || input_l.start_offset() != 0 {
@@ -469,42 +470,6 @@ impl QMetalStorage {
         if !ids_l.is_contiguous() || ids_l.start_offset() != 0 {
             crate::bail!("indexed_moe_forward: ids must be contiguous at offset 0");
         }
-        let none = crate::op::BackpropOp::none();
-        let input_t = crate::tensor::from_storage(
-            crate::Storage::Metal(input.clone()),
-            input_l.shape().clone(),
-            none.clone(),
-            false,
-        );
-        let x_exp = if s == topk {
-            input_t.clone()
-        } else {
-            input_t.broadcast_as((t, topk, k))?
-        };
-        // [nrows, k] contiguous f32 routed-slot inputs, resident on the Metal device.
-        let x_flat = x_exp
-            .reshape((nrows, k))?
-            .to_dtype(DType::F32)?
-            .contiguous()?;
-
-        let ids_t = crate::tensor::from_storage(
-            crate::Storage::Metal(ids.clone()),
-            ids_l.shape().clone(),
-            none.clone(),
-            false,
-        );
-        let ids_vec = ids_t
-            .reshape((nrows,))?
-            .to_dtype(DType::U32)?
-            .to_vec1::<u32>()?;
-        if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
-            crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
-        }
-
-        let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (slot, eid) in ids_vec.iter().enumerate() {
-            groups.entry(*eid).or_default().push(slot as u32);
-        }
 
         let block_size = self.dtype.block_size();
         let type_size = self.dtype.type_size();
@@ -512,43 +477,72 @@ impl QMetalStorage {
             crate::bail!("indexed_moe_forward: k {k} not a multiple of block size {block_size}");
         }
         let expert_bytes = n * (k / block_size) * type_size;
-        // Each expert is bound at byte offset eid*expert_bytes; Metal setBuffer:offset: needs a
-        // 4-byte-aligned offset, so expert_bytes must be a multiple of 4. Holds for every supported
-        // GGML block size when n is even, which it always is for real weight dims. Fail loudly else.
+        // Metal setBuffer:offset: needs a 4-byte-aligned offset; holds for every GGML block size at
+        // even n, which real weight dims always are. Fail loudly otherwise.
         if !expert_bytes.is_multiple_of(4) {
-            crate::bail!(
-                "indexed_moe_forward: expert stride {expert_bytes} bytes not 4-byte aligned"
-            );
+            crate::bail!("indexed_moe_forward: expert stride {expert_bytes} bytes not 4-byte aligned");
         }
 
-        let mut out_flat = crate::Tensor::zeros((nrows, n), DType::F32, &mdev)?;
-        for (eid, slots) in groups.into_iter() {
-            let m = slots.len();
-            let idx = crate::Tensor::from_vec(slots, (m,), &mdev)?;
-            let x_e = x_flat.index_select(&idx, 0)?.contiguous()?; // [m, k]
-            let y_e = {
-                let (store, _) = x_e.storage_and_layout();
-                let xs = match &*store {
-                    crate::Storage::Metal(st) => st,
-                    _ => crate::bail!("indexed_moe_forward: x_e not on metal"),
-                };
-                self.moe_expert_matmul(xs, eid as usize * expert_bytes, m, n, k)?
-            };
-            let y_e = crate::tensor::from_storage(
-                crate::Storage::Metal(y_e),
-                (m, n),
-                none.clone(),
-                false,
-            );
-            out_flat = out_flat.index_add(&idx, &y_e, 0)?;
-        }
+        let none = crate::op::BackpropOp::none();
+        // src1: [t, s, k] contiguous f32, resident on the Metal device.
+        let input_t = crate::tensor::from_storage(
+            crate::Storage::Metal(input.clone()),
+            input_l.shape().clone(),
+            none.clone(),
+            false,
+        );
+        let x_f32 = input_t.to_dtype(DType::F32)?.contiguous()?;
 
-        let out_flat = out_flat.contiguous()?;
-        let (store, _) = out_flat.storage_and_layout();
-        let out_storage = match &*store {
-            crate::Storage::Metal(st) => st.clone(),
-            _ => crate::bail!("indexed_moe_forward: output not on metal"),
+        // ids: [t, topk] contiguous u32, resident on the Metal device (read on-GPU by the kernel).
+        let ids_t = crate::tensor::from_storage(
+            crate::Storage::Metal(ids.clone()),
+            ids_l.shape().clone(),
+            none,
+            false,
+        );
+        let ids_u32 = ids_t.to_dtype(DType::U32)?.contiguous()?;
+
+        let dst = device.new_buffer(t * topk * n, DType::F32, "moe_mv_id")?;
+        let kdtype: hanzo_metal_kernels::GgmlDType = self.dtype.try_into()?;
+
+        let (x_store, _) = x_f32.storage_and_layout();
+        let x_metal = match &*x_store {
+            crate::Storage::Metal(st) => st,
+            _ => crate::bail!("indexed_moe_forward: x not on metal after contiguous()"),
         };
+        let (ids_store, _) = ids_u32.storage_and_layout();
+        let ids_metal = match &*ids_store {
+            crate::Storage::Metal(st) => st,
+            _ => crate::bail!("indexed_moe_forward: ids not on metal after contiguous()"),
+        };
+
+        {
+            let encoder = device.command_encoder()?;
+            hanzo_metal_kernels::call_mul_mv_id(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                kdtype,
+                e_cnt,
+                n,
+                k,
+                t,
+                topk,
+                s,
+                expert_bytes,
+                &self.buffer,
+                0,
+                x_metal.buffer(),
+                0,
+                ids_metal.buffer(),
+                0,
+                &dst,
+                0,
+            )
+            .map_err(crate::MetalError::from)?;
+        }
+
+        let out_storage = MetalStorage::new(dst, device, t * topk * n, DType::F32);
         Ok((out_storage, (t, topk, n).into()))
     }
 }
