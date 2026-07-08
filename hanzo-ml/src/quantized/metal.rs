@@ -534,8 +534,12 @@ impl QMetalStorage {
                 };
                 self.moe_expert_matmul(xs, eid as usize * expert_bytes, m, n, k)?
             };
-            let y_e =
-                crate::tensor::from_storage(crate::Storage::Metal(y_e), (m, n), none.clone(), false);
+            let y_e = crate::tensor::from_storage(
+                crate::Storage::Metal(y_e),
+                (m, n),
+                none.clone(),
+                false,
+            );
             out_flat = out_flat.index_add(&idx, &y_e, 0)?;
         }
 

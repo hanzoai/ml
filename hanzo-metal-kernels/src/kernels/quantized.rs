@@ -217,8 +217,21 @@ pub fn call_quantized_matmul_mm_t(
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
     call_quantized_matmul_mm_t_offset(
-        device, ep, kernels, dtype, src0_shape, src0_stride, src0, 0, src1_shape,
-        src1_stride, src1, src1_offset, dst_shape, dst_offset, dst,
+        device,
+        ep,
+        kernels,
+        dtype,
+        src0_shape,
+        src0_stride,
+        src0,
+        0,
+        src1_shape,
+        src1_stride,
+        src1,
+        src1_offset,
+        dst_shape,
+        dst_offset,
+        dst,
     )
 }
 
@@ -331,4 +344,3 @@ pub fn call_quantized_matmul_mm_t_offset(
 fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
-

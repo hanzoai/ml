@@ -14,7 +14,11 @@ pub struct Vec3 {
 }
 
 impl Vec3 {
-    pub const ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+    pub const ZERO: Vec3 = Vec3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
 
     pub const fn new(x: f32, y: f32, z: f32) -> Self {
         Vec3 { x, y, z }
@@ -110,7 +114,12 @@ pub struct Quat {
 }
 
 impl Quat {
-    pub const IDENTITY: Quat = Quat { w: 1.0, x: 0.0, y: 0.0, z: 0.0 };
+    pub const IDENTITY: Quat = Quat {
+        w: 1.0,
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
 
     pub const fn new(w: f32, x: f32, y: f32, z: f32) -> Self {
         Quat { w, x, y, z }
@@ -159,7 +168,14 @@ pub struct Camera {
 impl Camera {
     /// A camera at the origin looking down `+z` with the given intrinsics.
     pub fn look_forward(fx: f32, fy: f32, cx: f32, cy: f32) -> Self {
-        Camera { fx, fy, cx, cy, rot: Mat3::IDENTITY, t: Vec3::ZERO }
+        Camera {
+            fx,
+            fy,
+            cx,
+            cy,
+            rot: Mat3::IDENTITY,
+            t: Vec3::ZERO,
+        }
     }
 
     /// World point → `(u, v, depth)`. `depth` is the camera-space `z`.

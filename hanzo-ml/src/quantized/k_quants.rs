@@ -2595,7 +2595,10 @@ pub fn matmul<T: GgmlType>(
     // already has plenty of work to spread.
     //
     // `MIN_LEN` overrides the heuristic entirely (must be >= 1).
-    let min_len = match std::env::var("MIN_LEN").ok().and_then(|s| s.parse::<usize>().ok()) {
+    let min_len = match std::env::var("MIN_LEN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         Some(v) if v >= 1 => v,
         _ => {
             if m == 1 {
@@ -2616,8 +2619,8 @@ pub fn matmul<T: GgmlType>(
             .with_min_len(min_len)
             .with_max_len(512)
             .for_each(|(col_idx, dst)| {
-                let rhs_col = &rhs_t
-                    [col_idx * weight_blocks_per_row..(col_idx + 1) * weight_blocks_per_row];
+                let rhs_col =
+                    &rhs_t[col_idx * weight_blocks_per_row..(col_idx + 1) * weight_blocks_per_row];
                 *dst = T::vec_dot(k, rhs_col, lhs_row);
             });
     }

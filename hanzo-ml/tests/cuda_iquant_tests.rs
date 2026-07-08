@@ -199,7 +199,8 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
     let qs_cuda = QStorage::from_data(Cow::Owned(raw), dev, dtype)?;
     let q_cuda = QTensor::new(qs_cuda, (nout, k))?;
     let matmul = QMatMul::from_qtensor(q_cuda)?;
-    let x_host: Vec<f32> = q8_1_roundtrip(&(0..k).map(|i| pseudo(i + 1_000_003)).collect::<Vec<_>>());
+    let x_host: Vec<f32> =
+        q8_1_roundtrip(&(0..k).map(|i| pseudo(i + 1_000_003)).collect::<Vec<_>>());
     let x = Tensor::from_vec(x_host.clone(), (1, k), dev)?;
     let y_cuda: Vec<f32> = matmul.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
     assert_eq!(y_cuda.len(), nout);
@@ -240,7 +241,10 @@ fn check(dtype: GgmlDType) {
     // A couple of decode shapes (attn-proj k=2048, ffn k=4096; non-square nout).
     for &(nout, k) in &[(512usize, 2048usize), (768, 4096)] {
         let s = run_case(&dev, dtype, nout, k).unwrap();
-        println!("{dtype:?} [{nout}x{k}]: max_abs={:.3e} max_rel={:.3e}", s.max_abs, s.max_rel);
+        println!(
+            "{dtype:?} [{nout}x{k}]: max_abs={:.3e} max_rel={:.3e}",
+            s.max_abs, s.max_rel
+        );
         // max_rel (RMS-normalized) is the correctness metric. The dp4a path sums the integer
         // grid x activation products EXACTLY in int32 and applies the f32 scale once, so it is actually
         // MORE precise than the reference, which materializes each weight as f32 (`to_float` rounds
@@ -327,8 +331,11 @@ fn cuda_matvec_iq2xxs_batched_matches_cpu() {
     .to_vec1::<f32>()
     .unwrap();
     let matmul = QMatMul::from_qtensor(
-        QTensor::new(QStorage::from_data(Cow::Owned(raw), &dev, GgmlDType::IQ2_XXS).unwrap(), (nout, k))
-            .unwrap(),
+        QTensor::new(
+            QStorage::from_data(Cow::Owned(raw), &dev, GgmlDType::IQ2_XXS).unwrap(),
+            (nout, k),
+        )
+        .unwrap(),
     )
     .unwrap();
     for &b in &[1usize, 5, 8] {
@@ -354,9 +361,13 @@ fn cuda_matvec_iq2xxs_batched_matches_cpu() {
                 rs += r * r;
             }
         }
-        let max_rel = ((sse / (b * nout) as f64).sqrt() / (rs / (b * nout) as f64).sqrt().max(1e-9)) as f32;
+        let max_rel =
+            ((sse / (b * nout) as f64).sqrt() / (rs / (b * nout) as f64).sqrt().max(1e-9)) as f32;
         println!("IQ2_XXS batched b={b}: max_rel={max_rel:.3e}");
-        assert!(max_rel < 1e-3, "batched b={b} diverged: max_rel={max_rel:.3e}");
+        assert!(
+            max_rel < 1e-3,
+            "batched b={b} diverged: max_rel={max_rel:.3e}"
+        );
     }
 }
 
@@ -378,7 +389,11 @@ fn run_prefill(dev: &Device, dtype: GgmlDType, nout: usize, k: usize, m: usize) 
     .to_vec1::<f32>()
     .unwrap();
     let matmul = QMatMul::from_qtensor(
-        QTensor::new(QStorage::from_data(Cow::Owned(raw), dev, dtype).unwrap(), (nout, k)).unwrap(),
+        QTensor::new(
+            QStorage::from_data(Cow::Owned(raw), dev, dtype).unwrap(),
+            (nout, k),
+        )
+        .unwrap(),
     )
     .unwrap();
     // m>8 activation, pre-quantized to q8_1 levels per row (idempotent re-quant -> bit-identical inputs).
@@ -389,7 +404,13 @@ fn run_prefill(dev: &Device, dtype: GgmlDType, nout: usize, k: usize, m: usize) 
         .flat_map(q8_1_roundtrip)
         .collect();
     let x = Tensor::from_vec(x_host.clone(), (m, k), dev).unwrap();
-    let y: Vec<f32> = matmul.forward(&x).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let y: Vec<f32> = matmul
+        .forward(&x)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
     // Reference: GPU dense matmul of the exact f32 codebook weights x the same activation.
     let w_gpu = Tensor::from_vec(w_deq, (nout, k), dev).unwrap();
     let y_ref: Vec<f32> = x
@@ -435,7 +456,10 @@ fn cuda_qmmq_iquant_prefill_matches_dequant() {
     ] {
         for &m in &[16usize, 32] {
             let s = run_prefill(&dev, dtype, 512, 2048, m);
-            println!("qmmq {dtype:?} prefill m={m}: max_abs={:.3e} max_rel={:.3e}", s.max_abs, s.max_rel);
+            println!(
+                "qmmq {dtype:?} prefill m={m}: max_abs={:.3e} max_rel={:.3e}",
+                s.max_abs, s.max_rel
+            );
             assert!(
                 s.max_rel < 1e-3 && s.max_abs < 1e-1,
                 "{dtype:?} qmmq prefill m={m} diverged: max_abs={:.3e} max_rel={:.3e}",
@@ -484,10 +508,15 @@ fn run_moe(
     // Activation: [t, topk|1, k], pre-quantized to q8_1 levels (so dp4a's re-quant is idempotent and
     // the reference sees identical activations).
     let in1 = if shared { 1 } else { topk };
-    let x_host: Vec<f32> =
-        q8_1_roundtrip(&(0..t * in1 * k).map(|i| pseudo(i + 1_234_567)).collect::<Vec<_>>());
+    let x_host: Vec<f32> = q8_1_roundtrip(
+        &(0..t * in1 * k)
+            .map(|i| pseudo(i + 1_234_567))
+            .collect::<Vec<_>>(),
+    );
     let x_cuda = Tensor::from_vec(x_host.clone(), (t, in1, k), dev).unwrap();
-    let ids_host: Vec<u32> = (0..t * topk).map(|i| (pbyte(i * 7 + 3) as u32) % e_cnt as u32).collect();
+    let ids_host: Vec<u32> = (0..t * topk)
+        .map(|i| (pbyte(i * 7 + 3) as u32) % e_cnt as u32)
+        .collect();
     let ids_cuda = Tensor::from_vec(ids_host.clone(), (t, topk), dev).unwrap();
 
     let y_cuda: Vec<f32> = q_cuda
@@ -589,8 +618,9 @@ fn cuda_moe_route_numeric() {
             for &norm in &[false, true] {
                 // logits in [-4, 4) -> a peaked softmax (real dynamic range, not near-uniform).
                 let seed = ntok * 131 + n_experts * 17 + topk * 7 + norm as usize;
-                let logits: Vec<f32> =
-                    (0..ntok * n_experts).map(|i| pseudo(i + seed) * 4.0).collect();
+                let logits: Vec<f32> = (0..ntok * n_experts)
+                    .map(|i| pseudo(i + seed) * 4.0)
+                    .collect();
                 let lg_cuda = Tensor::from_vec(logits.clone(), (ntok, n_experts), &dev).unwrap();
                 let lg_cpu = Tensor::from_vec(logits, (ntok, n_experts), &cpu).unwrap();
 

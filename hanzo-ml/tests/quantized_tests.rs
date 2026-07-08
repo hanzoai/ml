@@ -1481,7 +1481,9 @@ fn iquant_indexed_moe_cpu() -> Result<()> {
     let (e, n, k) = (4usize, 128usize, 256usize);
     let (t, topk) = (3usize, 2usize);
 
-    let x_vec: Vec<f32> = (0..t * topk * k).map(|i| (i as f32 * 0.013).sin() * 0.5).collect();
+    let x_vec: Vec<f32> = (0..t * topk * k)
+        .map(|i| (i as f32 * 0.013).sin() * 0.5)
+        .collect();
     let x = Tensor::from_vec(x_vec, (t, topk, k), dev)?;
     let ids_vec: Vec<u32> = (0..t * topk).map(|i| (i * 3 % e) as u32).collect();
     let ids = Tensor::from_vec(ids_vec.clone(), (t, topk), dev)?;

@@ -6,9 +6,9 @@ extern crate accelerate_src;
 use hanzo_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
 
 use anyhow::{Error as E, Result};
+use clap::Parser;
 use hanzo_ml::{Device, Tensor};
 use hanzo_nn::VarBuilder;
-use clap::Parser;
 use tokenizers::{PaddingParams, Tokenizer};
 
 #[derive(Parser, Debug)]
