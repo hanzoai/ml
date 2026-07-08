@@ -5,9 +5,9 @@
 //! `mul_mat_q*` GEMM (each weight block decoded once per output column, reused across all M rows). We
 //! time both for the SAME (dtype, M, N, K) and report us/call, GFLOP/s, and the speedup.
 //!
-//!   * BEFORE = `qtensor.dequantize(dev)` + `x.matmul(w^T)` + readback   (the old prefill `else` arm)
-//!   * AFTER  = `QMatMul::forward(x)`                       + readback   (the SHIPPED VulkanQuant path:
-//!             the native GEMM for M <= the per-dtype gate (Q5_K/Q6_K: 64, else 128), dequant beyond)
+//! * BEFORE = `qtensor.dequantize(dev)` + `x.matmul(w^T)` + readback   (the old prefill `else` arm)
+//! * AFTER  = `QMatMul::forward(x)`                       + readback   (the SHIPPED VulkanQuant path:
+//!   the native GEMM for M <= the per-dtype gate (Q5_K/Q6_K: 64, else 128), dequant beyond)
 //!
 //! Both produce [M, N] and read it back to host, so the readback cancels in the ratio. The crossover
 //! grid sweeps M past the gate so you see BOTH the native-GEMM win (M <= 128: 1-27x) and the gate
@@ -46,7 +46,10 @@ fn median_us(mut v: Vec<f64>) -> f64 {
 }
 
 // Time a closure that returns the [M*N] output, forcing GPU completion via the host readback inside.
-fn time_us(iters: usize, mut f: impl FnMut() -> hanzo_ml::Result<Vec<f32>>) -> hanzo_ml::Result<f64> {
+fn time_us(
+    iters: usize,
+    mut f: impl FnMut() -> hanzo_ml::Result<Vec<f32>>,
+) -> hanzo_ml::Result<f64> {
     let mut s = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t0 = Instant::now();
@@ -156,7 +159,12 @@ fn vulkan_prefill_gemm_vs_dequant() -> hanzo_ml::Result<()> {
     // wins decisively at low M then goes weight-bandwidth-bound. Pin the crossover across M and N
     // (the larger-N FFN weights cross earlier) to set the gate threshold from data.
     println!("\n== Crossover grid: K=4096, M in {{16,64,128,256,512}}, N in {{4096,11008}} ==");
-    for dt in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0, GgmlDType::Q4_0] {
+    for dt in [
+        GgmlDType::Q4K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+    ] {
         for &nout in &[4096usize, 11008] {
             for &m in &[16usize, 64, 128, 256, 512] {
                 run(&dev, dt, m, nout, 4096)?;

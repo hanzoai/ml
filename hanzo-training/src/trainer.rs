@@ -277,7 +277,7 @@ impl Trainer {
             #[cfg(feature = "metal")]
             {
                 Device::new_metal(0)
-                    .map_err(|e| format!("Failed to setup Metal device: {}", e).into())
+                    .map_err(|e| anyhow::anyhow!("Failed to setup Metal device: {}", e))
             }
             #[cfg(not(feature = "metal"))]
             {

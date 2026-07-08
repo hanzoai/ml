@@ -6,6 +6,7 @@ use hanzo_ml::{Layout, Result, Shape, Tensor};
 /// Flash-attention forward over `[B, Hq, Lq, D]` Q and `[B, Hkv, Lk, D]` K/V (GQA: `Hq % Hkv == 0`),
 /// head dim D == 128, f16/bf16. ROCm-only; the kernel applies causal masking internally when set.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))] // fields read only in the rocm-gated fwd
 struct RocmFlashAttn {
     scale: f32,
     causal: bool,
