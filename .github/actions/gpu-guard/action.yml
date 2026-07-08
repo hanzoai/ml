@@ -8,11 +8,14 @@ runs:
   steps:
     - shell: bash
       run: |
-        pat='llama-bench|llama-server|llama-cli|hanzo-bench|cargo (test|bench)'
-        busy=$(ps ax -o pid=,command= 2>/dev/null \
-          | grep -E "$pat" \
-          | grep -vE 'grep|Runner\.|actions-runner|/run(svc)?\.sh' \
-          || true)
+        # Match the actual executable (anchored on argv[0]'s basename), not any
+        # substring — so monitors like earlyoom, whose --prefer regex literally
+        # contains "cargo"/"hanzo-bench", never trip us.
+        busy=$(ps ax -o pid=,args= 2>/dev/null \
+          | awk '{cmd=$2; n=split(cmd,a,"/"); exe=a[n];
+                  if (exe ~ /^(llama-bench|llama-server|llama-cli|hanzo-bench)$/) print;
+                  else if (exe=="cargo" && ($3=="test"||$3=="bench")) print}' \
+          | grep -vE 'Runner\.|actions-runner|run(svc)?\.sh' || true)
         if [ -n "$busy" ]; then
           echo "::error::GPU busy — refusing to run to avoid contention"
           echo "$busy"
