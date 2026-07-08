@@ -101,6 +101,25 @@ impl KernelSource for FlashKernel {
     const CODE: &'static str = include_str!("kernels/flash.hip");
 }
 
+// DSL-lowered kernels (the ROCm collapse): one authored `#[kernel]` in hanzo-kernel/src/*.rs, lowered
+// to HIP via cubecl-hip and checked in here. Compiled + launched through the SAME hipcc pipeline as the
+// hand-written kernels above -- the DSL is a codegen frontend, not a second runtime. See the DSL launch
+// helper in `rocm_backend`. Entry points are cubecl's dtype-suffixed names (e.g. `rms_norm_blk_f_f32`).
+
+/// DSL block-per-row RMSNorm (f32 + f16 I/O). Replaces the hand-written `rmsnorm` in `reduce.hip`.
+pub struct DslRmsNormKernel;
+impl KernelSource for DslRmsNormKernel {
+    const NAME: &'static str = "dsl_rms_norm";
+    const CODE: &'static str = include_str!("kernels/dsl_rms_norm.hip");
+}
+
+/// DSL fused residual-add + RMSNorm (f32). Replaces the hand-written `add_rmsnorm` in `reduce.hip`.
+pub struct DslAddRmsNormKernel;
+impl KernelSource for DslAddRmsNormKernel {
+    const NAME: &'static str = "dsl_add_rmsnorm";
+    const CODE: &'static str = include_str!("kernels/dsl_add_rmsnorm.hip");
+}
+
 /// Binary operation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
