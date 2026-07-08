@@ -36,6 +36,7 @@ pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;
 pub mod sequential;
+pub mod sigreg;
 pub mod var_builder;
 pub mod var_map;
 /// Re-export of [`attention::varlen`] for backward compatibility.
@@ -62,6 +63,7 @@ pub use ops::Dropout;
 pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
+pub use sigreg::{random_directions, SigReg};
 pub use var_builder::VarBuilder;
 pub use var_map::VarMap;
 
