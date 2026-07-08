@@ -33,4 +33,13 @@ jobs:
       - uses: ./.github/actions/gpu-guard
       - uses: dtolnay/rust-toolchain@stable
       - name: Test (${{ matrix.backend }})
-        run: cargo test -p hanzo-ml --features ${{ matrix.backend }} -- --test-threads 1
+        # The rocm test binary dynamically links libamdhip64.so.7 (ROCm 7.x) at run time. /opt/rocm/lib
+        # is NOT on the runner service's loader path -- there is no ld.so.conf.d entry for it, so only the
+        # interactive shell finds it (via the profile's `export LD_LIBRARY_PATH=/opt/rocm/lib:...`, which
+        # the systemd-launched runner does not inherit). Mirror that one export for the rocm arm so the
+        # binary loads; it is a no-op on cuda/metal (the dir is absent and the loader ignores it).
+        run: |
+          if [ "${{ matrix.backend }}" = "rocm" ]; then
+            export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+          fi
+          cargo test -p hanzo-ml --features ${{ matrix.backend }} -- --test-threads 1
