@@ -50,6 +50,7 @@ pub use cubecl;
 pub mod tune;
 
 pub mod quant;
+pub mod mmq;
 
 pub mod norm;
 pub mod rope;
