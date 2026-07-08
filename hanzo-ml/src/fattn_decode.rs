@@ -46,7 +46,11 @@ fn fattn_decode_cpu_f32(
             // end = qpos + 1 (causal), start = max(0, qpos+1-window) (its own window).
             let qpos = kv_len - q_len + s;
             let end = qpos + 1;
-            let start = if window != 0 && end > window { end - window } else { 0 };
+            let start = if window != 0 && end > window {
+                end - window
+            } else {
+                0
+            };
             let qbase = (h * q_len + s) * HEAD_DIM;
             let qh = &q[qbase..qbase + HEAD_DIM];
 
@@ -93,16 +97,25 @@ fn fattn_decode_cpu_f32(
 /// Derive `(n_head, n_kv_head, kv_len, q_len)` from the tensor shapes and validate the contract.
 fn dims(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<(usize, usize, usize, usize)> {
     if k.dims().last().copied() != Some(HEAD_DIM) {
-        crate::bail!("fattn_decode: k last dim must be {HEAD_DIM}, got {:?}", k.dims());
+        crate::bail!(
+            "fattn_decode: k last dim must be {HEAD_DIM}, got {:?}",
+            k.dims()
+        );
     }
     if k.dims() != v.dims() {
-        crate::bail!("fattn_decode: k {:?} and v {:?} must have equal shape", k.dims(), v.dims());
+        crate::bail!(
+            "fattn_decode: k {:?} and v {:?} must have equal shape",
+            k.dims(),
+            v.dims()
+        );
     }
     // q is [n_head, q_len, 512] (canonical) or [n_head, 512] (q_len == 1).
     let (n_head, q_len) = match q.dims() {
         [n_head, hd] if *hd == HEAD_DIM => (*n_head, 1usize),
         [n_head, q_len, hd] if *hd == HEAD_DIM => (*n_head, *q_len),
-        other => crate::bail!("fattn_decode: q must be [n_head, 512] or [n_head, q_len, 512], got {other:?}"),
+        other => crate::bail!(
+            "fattn_decode: q must be [n_head, 512] or [n_head, q_len, 512], got {other:?}"
+        ),
     };
     let (n_kv_head, kv_len) = match k.dims() {
         [kv_len, _] => (1usize, *kv_len),
@@ -110,7 +123,9 @@ fn dims(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<(usize, usize, usize, usiz
         other => crate::bail!("fattn_decode: k rank must be 2 or 3, got {other:?}"),
     };
     if n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 {
-        crate::bail!("fattn_decode: n_head {n_head} must be a nonzero multiple of n_kv_head {n_kv_head}");
+        crate::bail!(
+            "fattn_decode: n_head {n_head} must be a nonzero multiple of n_kv_head {n_kv_head}"
+        );
     }
     if q_len == 0 || !(1..=8).contains(&q_len) {
         crate::bail!("fattn_decode: q_len {q_len} must be in 1..=8");
@@ -141,7 +156,10 @@ pub fn fattn_decode_f32_hd512(
     let sinks = match sinks {
         Some(s) => {
             if s.elem_count() != n_head {
-                crate::bail!("fattn_decode: sinks must have {n_head} elems, got {}", s.elem_count());
+                crate::bail!(
+                    "fattn_decode: sinks must have {n_head} elems, got {}",
+                    s.elem_count()
+                );
             }
             Some(s.to_dtype(crate::DType::F32)?.contiguous()?)
         }
@@ -173,7 +191,17 @@ pub fn fattn_decode_f32_hd512(
         }
         #[cfg(feature = "cuda")]
         Device::Cuda(dev) => cuda_impl(
-            dev, &q, &k, &v, sinks.as_ref(), n_head, n_kv_head, kv_len, q_len, window, scale,
+            dev,
+            &q,
+            &k,
+            &v,
+            sinks.as_ref(),
+            n_head,
+            n_kv_head,
+            kv_len,
+            q_len,
+            window,
+            scale,
             out_shape,
         ),
         _ => crate::bail!("fattn_decode_f32_hd512: unsupported device"),
@@ -273,9 +301,15 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(
             0x00d5_4f10 ^ (kv_len as u64) ^ ((n_kv_head as u64) << 20) ^ ((q_len as u64) << 40),
         );
-        let q: Vec<f32> = (0..n_head * q_len * HEAD_DIM).map(|_| rng.random::<f32>() - 0.5).collect();
-        let k: Vec<f32> = (0..n_kv_head * kv_len * HEAD_DIM).map(|_| rng.random::<f32>() - 0.5).collect();
-        let v: Vec<f32> = (0..n_kv_head * kv_len * HEAD_DIM).map(|_| rng.random::<f32>() - 0.5).collect();
+        let q: Vec<f32> = (0..n_head * q_len * HEAD_DIM)
+            .map(|_| rng.random::<f32>() - 0.5)
+            .collect();
+        let k: Vec<f32> = (0..n_kv_head * kv_len * HEAD_DIM)
+            .map(|_| rng.random::<f32>() - 0.5)
+            .collect();
+        let v: Vec<f32> = (0..n_kv_head * kv_len * HEAD_DIM)
+            .map(|_| rng.random::<f32>() - 0.5)
+            .collect();
         let sinks: Option<Vec<f32>> = if with_sink {
             Some((0..n_head).map(|_| rng.random::<f32>() - 0.5).collect())
         } else {
@@ -303,7 +337,16 @@ mod tests {
         assert_eq!(out.dims(), &[n_head, q_len, HEAD_DIM]);
         let got = out.flatten_all()?.to_vec1::<f32>()?;
         let want = fattn_decode_cpu_f32(
-            &q, &k, &v, sinks.as_deref(), n_head, n_kv_head, kv_len, q_len, window, scale,
+            &q,
+            &k,
+            &v,
+            sinks.as_deref(),
+            n_head,
+            n_kv_head,
+            kv_len,
+            q_len,
+            window,
+            scale,
         );
 
         assert_eq!(got.len(), want.len());

@@ -60,24 +60,31 @@ pub fn obj_to_mesh(src: &str) -> Result<Mesh> {
         let mut it = line.split_whitespace();
         match it.next() {
             Some("v") => {
-                let v = read_vec3(&mut it).map_err(|e| Error(format!("line {}: v: {}", lineno + 1, e.0)))?;
+                let v = read_vec3(&mut it)
+                    .map_err(|e| Error(format!("line {}: v: {}", lineno + 1, e.0)))?;
                 m.vertices.push(v);
             }
             Some("vn") => {
-                let n = read_vec3(&mut it).map_err(|e| Error(format!("line {}: vn: {}", lineno + 1, e.0)))?;
+                let n = read_vec3(&mut it)
+                    .map_err(|e| Error(format!("line {}: vn: {}", lineno + 1, e.0)))?;
                 m.normals.push(n);
             }
             Some("f") => {
                 let mut idx = [0u32; 3];
                 for (k, slot) in idx.iter_mut().enumerate() {
-                    let tok = it.next().ok_or_else(|| Error(format!("line {}: f needs 3 verts", lineno + 1)))?;
+                    let tok = it
+                        .next()
+                        .ok_or_else(|| Error(format!("line {}: f needs 3 verts", lineno + 1)))?;
                     // "a", "a/b", "a//c" — the vertex index is the first field, 1-based.
                     let first = tok.split('/').next().unwrap_or(tok);
-                    let one_based: u32 = first
-                        .parse()
-                        .map_err(|_| Error(format!("line {}: bad face index {:?}", lineno + 1, tok)))?;
+                    let one_based: u32 = first.parse().map_err(|_| {
+                        Error(format!("line {}: bad face index {:?}", lineno + 1, tok))
+                    })?;
                     if one_based == 0 {
-                        return err(format!("line {}: face vertex 0 (OBJ is 1-indexed)", lineno + 1));
+                        return err(format!(
+                            "line {}: face vertex 0 (OBJ is 1-indexed)",
+                            lineno + 1
+                        ));
                     }
                     let _ = k;
                     *slot = one_based - 1;
@@ -122,14 +129,21 @@ pub fn ply_to_mesh(src: &str) -> Result<Mesh> {
     let mut lines = body.lines().filter(|l| !l.trim().is_empty());
     let mut m = Mesh::default();
     for _ in 0..n_vert {
-        let line = lines.next().ok_or_else(|| Error("ply: truncated vertices".into()))?;
+        let line = lines
+            .next()
+            .ok_or_else(|| Error("ply: truncated vertices".into()))?;
         let mut it = line.split_whitespace();
         m.vertices.push(read_vec3(&mut it)?);
     }
     for _ in 0..n_face {
-        let line = lines.next().ok_or_else(|| Error("ply: truncated faces".into()))?;
+        let line = lines
+            .next()
+            .ok_or_else(|| Error("ply: truncated faces".into()))?;
         let mut it = line.split_whitespace();
-        let k: usize = it.next().and_then(|t| t.parse().ok()).ok_or_else(|| Error("ply: bad face count".into()))?;
+        let k: usize = it
+            .next()
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(|| Error("ply: bad face count".into()))?;
         if k != 3 {
             return err(format!("ply: only triangles supported, got a {k}-gon"));
         }
@@ -190,7 +204,9 @@ pub fn ply_to_splat(src: &str) -> Result<GaussianSplat> {
     let mut out = GaussianSplat::default();
     let mut lines = body.lines().filter(|l| !l.trim().is_empty());
     for _ in 0..n {
-        let line = lines.next().ok_or_else(|| Error("ply: truncated splats".into()))?;
+        let line = lines
+            .next()
+            .ok_or_else(|| Error("ply: truncated splats".into()))?;
         let mut it = line.split_whitespace();
         let mut f = [0f32; 14];
         for (i, slot) in f.iter_mut().enumerate() {
@@ -239,7 +255,9 @@ fn split_ply_header(src: &str) -> Result<(PlyHeader<'_>, &str)> {
         return err("not a PLY (missing 'ply' magic)");
     }
     let marker = "end_header";
-    let pos = src.find(marker).ok_or_else(|| Error("ply: no end_header".into()))?;
+    let pos = src
+        .find(marker)
+        .ok_or_else(|| Error("ply: no end_header".into()))?;
     let header = &src[..pos];
     let body = &src[pos + marker.len()..];
     Ok((PlyHeader { text: header }, body))

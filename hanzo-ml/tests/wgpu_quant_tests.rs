@@ -98,7 +98,10 @@ fn gpu() -> Option<Device> {
     match Device::new_wgpu(0) {
         Ok(d) => {
             if let Ok(g) = d.as_wgpu_device() {
-                eprintln!("[wgpu_quant_tests] selected adapter: {}", g.adapter_description());
+                eprintln!(
+                    "[wgpu_quant_tests] selected adapter: {}",
+                    g.adapter_description()
+                );
             }
             Some(d)
         }
@@ -319,7 +322,9 @@ fn moe_case(
     let bytes = q_bank.data()?.into_owned();
 
     let x_host: Vec<f32> = (0..t * topk * k).map(|i| pseudo(i + 11) * 0.7).collect();
-    let ids_host: Vec<u32> = (0..t * topk).map(|i| ((i * 7 + 3) % e_cnt) as u32).collect();
+    let ids_host: Vec<u32> = (0..t * topk)
+        .map(|i| ((i * 7 + 3) % e_cnt) as u32)
+        .collect();
 
     let qs = QStorage::from_data(std::borrow::Cow::Owned(bytes), dev, dtype)?;
     let q = QTensor::new(qs, (e_cnt, n, k))?;

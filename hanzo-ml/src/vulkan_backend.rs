@@ -511,7 +511,8 @@ impl VulkanDevice {
             packed[o] = u16::from_le_bytes([src[0], src[1]]) as u32;
             for j in 0..8 {
                 let b = 2 + j * 4;
-                packed[o + 1 + j] = u32::from_le_bytes([src[b], src[b + 1], src[b + 2], src[b + 3]]);
+                packed[o + 1 + j] =
+                    u32::from_le_bytes([src[b], src[b + 1], src[b + 2], src[b + 3]]);
             }
         }
         self.upload_u32(&packed)
@@ -689,10 +690,17 @@ impl VulkanDevice {
             crate::bail!("flash_attn_gpu: head_dim {d} > 256 (kernel limit)");
         }
         if q.count < bh * lq * d {
-            crate::bail!("flash_attn_gpu: q count {} < bh*lq*d {}", q.count, bh * lq * d);
+            crate::bail!(
+                "flash_attn_gpu: q count {} < bh*lq*d {}",
+                q.count,
+                bh * lq * d
+            );
         }
         if k.count < bh * lk * d || v.count < bh * lk * d {
-            crate::bail!("flash_attn_gpu: k/v count too small for bh*lk*d {}", bh * lk * d);
+            crate::bail!(
+                "flash_attn_gpu: k/v count too small for bh*lk*d {}",
+                bh * lk * d
+            );
         }
         let out = self.alloc_f32(bh * lq * d)?;
         // Push block matches flash_attn.comp: {u32 bh, lq, lk, d; f32 scale; u32 causal}.
@@ -786,7 +794,13 @@ impl VulkanDevice {
     /// Q4_K decode matvec via int8 dp4a (default where int_dot8; VK_DP4A_DECODE_OFF forces scalar):
     /// quantize x to q8_1, then dp4a the Q4_K codes (column dp4a at mcount=1). ~1.8x faster than the scalar subgroup matvec
     /// on gfx1151; the q8_1 activation quant adds ~0.5-1% vs the scalar reference (gated < 2e-2).
-    pub fn matvec_q4k_dp4a(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+    pub fn matvec_q4k_dp4a(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
         let xin = self.upload_f32(x)?;
         let (xq, xs, xsum) = self.quantize_act_q8(&xin, 1, k)?;
         let out = self.alloc_f32(nout)?;
@@ -802,7 +816,13 @@ impl VulkanDevice {
 
     /// Q4_K decode matvec via the SCALAR float path (forces the non-dp4a kernel regardless of the
     /// VK_DP4A_DECODE_OFF default): the exact CPU-faithful reference for the dp4a gates.
-    pub fn matvec_q4k_scalar(&self, wq: &VulkanStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+    pub fn matvec_q4k_scalar(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
         let xin = self.upload_f32(x)?;
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32, 0u32]);
@@ -926,7 +946,12 @@ impl VulkanDevice {
             let (xq, xs, xsum) = self.quantize_act_q8(x, 1, k)?;
             let bufs = [wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer];
             let pushd = push_u32(&[0u32, 1u32, nout as u32, k as u32, woff as u32]);
-            self.dispatch("mul_mat_q4k_dp4a", &bufs, &pushd, ((nout as u32).div_ceil(WG1D), 1, 1))?;
+            self.dispatch(
+                "mul_mat_q4k_dp4a",
+                &bufs,
+                &pushd,
+                ((nout as u32).div_ceil(WG1D), 1, 1),
+            )?;
             return Ok(out);
         }
         let push = push_u32(&[nout as u32, k as u32, woff as u32]);
@@ -978,7 +1003,11 @@ impl VulkanDevice {
         k: usize,
     ) -> Result<VulkanStorage> {
         if x.count < nrows * k {
-            crate::bail!("moe_matvec_gpu: x count {} < nrows*k {}", x.count, nrows * k);
+            crate::bail!(
+                "moe_matvec_gpu: x count {} < nrows*k {}",
+                x.count,
+                nrows * k
+            );
         }
         if ids.count < nrows {
             crate::bail!("moe_matvec_gpu: ids count {} < nrows {nrows}", ids.count);
@@ -1387,7 +1416,13 @@ impl VulkanDevice {
         let out = self.alloc_f32(bh * seq_len * v_dim)?;
         let push = push_u32(&[seq_len as u32, k_dim as u32, v_dim as u32]);
         let bufs = [
-            q.buffer, k.buffer, v.buffer, g.buffer, beta.buffer, state.buffer, out.buffer,
+            q.buffer,
+            k.buffer,
+            v.buffer,
+            g.buffer,
+            beta.buffer,
+            state.buffer,
+            out.buffer,
         ];
         let v_tiles = (v_dim as u32).div_ceil(WG1D);
         // Chunked prefill kernel bounds its shared key array at K<=128; fall back to the sequential
@@ -1518,7 +1553,10 @@ impl VulkanDevice {
     #[allow(clippy::too_many_arguments)]
     pub fn paged_attention_vk(&self, p: &PagedAttnArgs<'_>) -> Result<VulkanStorage> {
         if p.head_size as u64 > 256 {
-            crate::bail!("vulkan paged_attn: head_size {} > 256 (shared mem bound)", p.head_size);
+            crate::bail!(
+                "vulkan paged_attn: head_size {} > 256 (shared mem bound)",
+                p.head_size
+            );
         }
         let out = self.alloc_f32(p.num_seqs * p.num_heads * p.head_size)?;
         // push: 10 u32 then 1 f32 (scale). std430 scalar packing, tightly packed.
@@ -1736,9 +1774,8 @@ impl VulkanDevice {
             let src = &data[blk * 210..blk * 210 + 210];
             let dst = &mut words[blk * 53..blk * 53 + 53];
             // Copy the 210 bytes into the low 210 bytes of the 212-byte (53 u32) padded block.
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, 53 * 4)
-            };
+            let dst_bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, 53 * 4) };
             dst_bytes[..210].copy_from_slice(src);
         }
         self.upload_u32(&words)
@@ -1986,7 +2023,10 @@ impl VulkanDevice {
         let total = nout * nblocks;
         let want = total * 66;
         if data.len() != want {
-            crate::bail!("quantize_iq2xxs: data len {} != {nout}*{nblocks}*66 = {want}", data.len());
+            crate::bail!(
+                "quantize_iq2xxs: data len {} != {nout}*{nblocks}*66 = {want}",
+                data.len()
+            );
         }
         let mut words = vec![0u32; total * 17];
         for blk in 0..total {
@@ -2050,7 +2090,10 @@ impl VulkanDevice {
         let total = nout * nblocks;
         let want = total * 74;
         if data.len() != want {
-            crate::bail!("quantize_iq2xs: data len {} != {nout}*{nblocks}*74 = {want}", data.len());
+            crate::bail!(
+                "quantize_iq2xs: data len {} != {nout}*{nblocks}*74 = {want}",
+                data.len()
+            );
         }
         let mut words = vec![0u32; total * 19];
         for blk in 0..total {
@@ -2113,7 +2156,10 @@ impl VulkanDevice {
         let total = nout * nblocks;
         let want = total * 56;
         if data.len() != want {
-            crate::bail!("quantize_iq1m: data len {} != {nout}*{nblocks}*56 = {want}", data.len());
+            crate::bail!(
+                "quantize_iq1m: data len {} != {nout}*{nblocks}*56 = {want}",
+                data.len()
+            );
         }
         let mut words = vec![0u32; total * 14];
         for blk in 0..total {
@@ -2176,7 +2222,10 @@ impl VulkanDevice {
         let total = nout * nblocks;
         let want = total * 50;
         if data.len() != want {
-            crate::bail!("quantize_iq1s: data len {} != {nout}*{nblocks}*50 = {want}", data.len());
+            crate::bail!(
+                "quantize_iq1s: data len {} != {nout}*{nblocks}*50 = {want}",
+                data.len()
+            );
         }
         let mut words = vec![0u32; total * 13];
         for blk in 0..total {
@@ -2239,7 +2288,10 @@ impl VulkanDevice {
         let total = nout * nblocks;
         let want = total * 110;
         if data.len() != want {
-            crate::bail!("quantize_iq3s: data len {} != {nout}*{nblocks}*110 = {want}", data.len());
+            crate::bail!(
+                "quantize_iq3s: data len {} != {nout}*{nblocks}*110 = {want}",
+                data.len()
+            );
         }
         let mut words = vec![0u32; total * 28];
         for blk in 0..total {
@@ -2302,7 +2354,10 @@ impl VulkanDevice {
         let total = nout * nblocks;
         let want = total * 98;
         if data.len() != want {
-            crate::bail!("quantize_iq3xxs: data len {} != {nout}*{nblocks}*98 = {want}", data.len());
+            crate::bail!(
+                "quantize_iq3xxs: data len {} != {nout}*{nblocks}*98 = {want}",
+                data.len()
+            );
         }
         let mut words = vec![0u32; total * 25];
         for blk in 0..total {
@@ -2365,7 +2420,10 @@ impl VulkanDevice {
         let total = nout * nblocks;
         let want = total * 82;
         if data.len() != want {
-            crate::bail!("quantize_iq2s: data len {} != {nout}*{nblocks}*82 = {want}", data.len());
+            crate::bail!(
+                "quantize_iq2s: data len {} != {nout}*{nblocks}*82 = {want}",
+                data.len()
+            );
         }
         let mut words = vec![0u32; total * 21];
         for blk in 0..total {
@@ -2712,10 +2770,7 @@ impl VulkanDevice {
     // Allocate a buffer that is guaranteed HOST_VISIBLE (for staging). Forces the host-visible
     // policy regardless of the device strategy; staging buffers are transient and always small
     // relative to the host-visible heap (one tensor's worth at a time). Not pooled.
-    unsafe fn raw_buffer_host_visible(
-        &self,
-        bytes: u64,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    unsafe fn raw_buffer_host_visible(&self, bytes: u64) -> Result<(vk::Buffer, vk::DeviceMemory)> {
         let bytes = bytes.max(4);
         let dev = self.dev();
         let info = vk::BufferCreateInfo::default()
@@ -3154,9 +3209,7 @@ impl VulkanDevice {
             if reads_inflight_write {
                 let bar = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                    )];
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
                 dev.cmd_pipeline_barrier(
                     s.cmd,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -3448,7 +3501,12 @@ const BATCH_CAP: u32 = 4096;
 // when nothing is recorded. Caller must hold the submitter lock. When `profile` is set, prints the
 // per-batch phase breakdown (recording / submit / fence-wait time, dispatch + barrier counts) so
 // the real GPU shows where per-token milliseconds go; the timers are only sampled when profiling.
-fn flush_locked(dev: &ash::Device, queue: vk::Queue, s: &mut Submitter, profile: bool) -> Result<()> {
+fn flush_locked(
+    dev: &ash::Device,
+    queue: vk::Queue,
+    s: &mut Submitter,
+    profile: bool,
+) -> Result<()> {
     if !s.recording {
         return Ok(());
     }
@@ -3681,7 +3739,9 @@ impl BackendDevice for VulkanDevice {
                 instance.get_physical_device_features2(pdev, &mut f2);
             }
             let int_dot8 = idot_feat.shader_integer_dot_product != 0
-                && std::env::var("VK_INT_DOT").map(|v| v != "0").unwrap_or(true);
+                && std::env::var("VK_INT_DOT")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
 
             // Build the enabled-extension list dynamically: coopmat and push_descriptor are
             // independent and either may be present. push_descriptor needs no extra device feature
@@ -3719,8 +3779,8 @@ impl BackendDevice for VulkanDevice {
             }
             let device = instance.create_device(pdev, &dci, None).map_err(vkerr)?;
             // Load push_descriptor device fns now that the device exists with the extension enabled.
-            let push_descriptor = use_pd
-                .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+            let push_descriptor =
+                use_pd.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
             let queue = device.get_device_queue(qfi, 0);
             let mem_props = instance.get_physical_device_memory_properties(pdev);
 
@@ -4277,10 +4337,14 @@ impl VulkanStorage {
         v_dim: usize,
     ) -> Result<VulkanStorage> {
         if k_dim > GDN_STEP_MAX_K {
-            crate::bail!("vulkan: gdn_step head_k_dim {k_dim} exceeds GDN_STEP_MAX_K {GDN_STEP_MAX_K}");
+            crate::bail!(
+                "vulkan: gdn_step head_k_dim {k_dim} exceeds GDN_STEP_MAX_K {GDN_STEP_MAX_K}"
+            );
         }
         if !(state_l.is_contiguous() && state_l.start_offset() == 0) {
-            crate::bail!("vulkan: gdn_step state must be contiguous and offset 0 (it is updated in place)");
+            crate::bail!(
+                "vulkan: gdn_step state must be contiguous and offset 0 (it is updated in place)"
+            );
         }
         let mut qk = None;
         let mut kk = None;
@@ -4323,7 +4387,9 @@ impl VulkanStorage {
         k_size: usize,
     ) -> Result<VulkanStorage> {
         if k_size > GDN_CONV_MAX_K {
-            crate::bail!("vulkan: gdn_conv1d_step kernel {k_size} exceeds GDN_CONV_MAX_K {GDN_CONV_MAX_K}");
+            crate::bail!(
+                "vulkan: gdn_conv1d_step kernel {k_size} exceeds GDN_CONV_MAX_K {GDN_CONV_MAX_K}"
+            );
         }
         if !(state_l.is_contiguous() && state_l.start_offset() == 0) {
             crate::bail!("vulkan: gdn_conv1d_step conv_state must be contiguous and offset 0 (updated in place)");
@@ -4498,7 +4564,9 @@ impl BackendStorage for VulkanStorage {
             perm.push(d);
             (self.contiguous(&layout.permute(&perm)?)?, dims[d])
         } else {
-            crate::bail!("vulkan: reduce over multiple axes at once not supported (got {sum_dims:?})");
+            crate::bail!(
+                "vulkan: reduce over multiple axes at once not supported (got {sum_dims:?})"
+            );
         };
         let rows: usize = layout.shape().elem_count() / cols;
         // arg-reductions return u32 indices; value reductions return f32.
@@ -5129,7 +5197,8 @@ impl BackendStorage for VulkanStorage {
         // it: if the two scratch buffers won't fit in the largest usable heap's *free* bytes (plus a
         // margin), fall through to the fp32 tiled GEMM, which needs no extra f16 buffers — correct
         // result, just slower, instead of an OOM abort.
-        let scratch_bytes = ((b * m * k * 2).max(4) as u64).saturating_add((b * k * n * 2).max(4) as u64);
+        let scratch_bytes =
+            ((b * m * k * 2).max(4) as u64).saturating_add((b * k * n * 2).max(4) as u64);
         if self.device.inner.cm_use
             && self.device.scratch_fits(scratch_bytes)
             && matches!(self.device.coopmat_info(), Some((16, 16, 16)))
@@ -5195,7 +5264,12 @@ impl BackendStorage for VulkanStorage {
             crate::bail!("vulkan: copy_strided_src supports rank <= 6, got {rank}");
         }
         let strides = src_l.stride();
-        let mut p = vec![n as u32, rank as u32, src_l.start_offset() as u32, dst_offset as u32];
+        let mut p = vec![
+            n as u32,
+            rank as u32,
+            src_l.start_offset() as u32,
+            dst_offset as u32,
+        ];
         let mut shape6 = [0u32; 6];
         let mut stride6 = [0u32; 6];
         for d in 0..rank {
@@ -5343,8 +5417,13 @@ mod dsl_dispatch_proof {
         let ws = dev.upload_f32(&w).unwrap();
         let out = dev.alloc_f32(N).unwrap();
         let groups = (N as u32).div_ceil(WG);
-        dev.dispatch("dsl_mul", &[xs.buffer, ws.buffer, out.buffer], &[], (groups, 1, 1))
-            .unwrap();
+        dev.dispatch(
+            "dsl_mul",
+            &[xs.buffer, ws.buffer, out.buffer],
+            &[],
+            (groups, 1, 1),
+        )
+        .unwrap();
         dev.flush().unwrap();
         let got = out.to_vec_f32().unwrap();
 
@@ -5354,8 +5433,15 @@ mod dsl_dispatch_proof {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         eprintln!("[dsl-proof] DSL kernel via ml::VulkanDevice::dispatch  N={N} groups={groups}  maxerr={maxerr:.2e}");
-        eprintln!("[dsl-proof] first4 got={:?} ref={:?}", &got[..4], &refout[..4]);
-        assert_eq!(maxerr, 0.0, "DSL-generated kernel not bit-exact through ml dispatch");
+        eprintln!(
+            "[dsl-proof] first4 got={:?} ref={:?}",
+            &got[..4],
+            &refout[..4]
+        );
+        assert_eq!(
+            maxerr, 0.0,
+            "DSL-generated kernel not bit-exact through ml dispatch"
+        );
     }
 
     // Generalization: a REDUCTION kernel (matvec, comptime k=32/rows=64) auto-processed by the
@@ -5374,7 +5460,9 @@ mod dsl_dispatch_proof {
                 return;
             }
         };
-        let w: Vec<f32> = (0..ROWS * K).map(|i| (i as f32 % 7.0) * 0.25 - 1.0).collect();
+        let w: Vec<f32> = (0..ROWS * K)
+            .map(|i| (i as f32 % 7.0) * 0.25 - 1.0)
+            .collect();
         let x: Vec<f32> = (0..K).map(|i| (i as f32 % 5.0) * 0.5 - 1.0).collect();
         let refout: Vec<f32> = (0..ROWS)
             .map(|r| {
@@ -5389,15 +5477,31 @@ mod dsl_dispatch_proof {
         let ws = dev.upload_f32(&w).unwrap();
         let xs = dev.upload_f32(&x).unwrap();
         let out = dev.alloc_f32(ROWS).unwrap();
-        dev.dispatch("dsl_matvec", &[ws.buffer, xs.buffer, out.buffer], &[], (1, 1, 1))
-            .unwrap();
+        dev.dispatch(
+            "dsl_matvec",
+            &[ws.buffer, xs.buffer, out.buffer],
+            &[],
+            (1, 1, 1),
+        )
+        .unwrap();
         dev.flush().unwrap();
         let got = out.to_vec_f32().unwrap();
 
-        let maxerr = got.iter().zip(&refout).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let maxerr = got
+            .iter()
+            .zip(&refout)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("[dsl-proof] DSL matvec via ml::VulkanDevice::dispatch  rows={ROWS} k={K}  maxerr={maxerr:.2e}");
-        eprintln!("[dsl-proof] first4 got={:?} ref={:?}", &got[..4], &refout[..4]);
-        assert!(maxerr < 1e-4, "DSL matvec through ml diverged: maxerr={maxerr:.3e}");
+        eprintln!(
+            "[dsl-proof] first4 got={:?} ref={:?}",
+            &got[..4],
+            &refout[..4]
+        );
+        assert!(
+            maxerr < 1e-4,
+            "DSL matvec through ml diverged: maxerr={maxerr:.3e}"
+        );
     }
 
     // The production `rms_norm` method now dispatches the DSL block-per-row kernel (rms_norm_blk.spv):
@@ -5445,11 +5549,18 @@ mod dsl_dispatch_proof {
         let mut worst = 0f32;
         for out in &outs {
             let got = out.to_vec_f32().unwrap();
-            let err = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let err = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             worst = worst.max(err);
         }
         eprintln!("[rms_norm-prod] {ROWS}x{N} x8-batched  maxerr={worst:.2e}  (DSL kernel via production path, pooled scalars, no sync crutch)");
-        assert!(worst < 1e-3, "production rms_norm (DSL kernel) diverged from CPU: {worst:.3e}");
+        assert!(
+            worst < 1e-3,
+            "production rms_norm (DSL kernel) diverged from CPU: {worst:.3e}"
+        );
 
         // Clean kernel-only bench: FIXED buffers (no per-iter 64MB alloc/upload) dispatched in a loop
         // with one fence -- the true kernel cost, not the method's allocation overhead. Same 5-SSBO /
@@ -5512,11 +5623,18 @@ mod dsl_dispatch_proof {
         let mut worst = 0f32;
         for out in &outs {
             let got = out.to_vec_f32().unwrap();
-            let err = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let err = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             worst = worst.max(err);
         }
         eprintln!("[softmax-prod] {ROWS}x{M} x8-batched  maxerr={worst:.2e}  (DSL kernel via production path, pooled n, no sync crutch)");
-        assert!(worst < 1e-4, "production softmax (DSL kernel) diverged from CPU: {worst:.3e}");
+        assert!(
+            worst < 1e-4,
+            "production softmax (DSL kernel) diverged from CPU: {worst:.3e}"
+        );
 
         let iters = 50;
         let bytes = (2 * ROWS * M * 4) as f64; // read x + write out
@@ -5524,11 +5642,13 @@ mod dsl_dispatch_proof {
         let ndb = dev.upload_u32(&[M as u32]).unwrap();
         let bufs = [xs.buffer, out.buffer, ndb.buffer];
         let grid = (ROWS as u32, 1, 1);
-        dev.dispatch_out("softmax_rows", &bufs, 1, &[], grid).unwrap();
+        dev.dispatch_out("softmax_rows", &bufs, 1, &[], grid)
+            .unwrap();
         dev.synchronize().unwrap();
         let t = std::time::Instant::now();
         for _ in 0..iters {
-            dev.dispatch_out("softmax_rows", &bufs, 1, &[], grid).unwrap();
+            dev.dispatch_out("softmax_rows", &bufs, 1, &[], grid)
+                .unwrap();
         }
         dev.synchronize().unwrap();
         let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
