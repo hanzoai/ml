@@ -333,6 +333,139 @@ pub fn mmq_q8_ref(xq: &[i8], xs: &[f32], wq: &[i8], wd: &[f32], m: usize, n: usi
     out
 }
 
+// ================================================================================================
+// STAGE 3 (tiled) -- the FAIR high-level-WMMA ceiling. 32x64 output tile per block, 8 warps, A/B
+// staged to shared memory ONCE per 32-block and reused across the tile (A across 4 N-subtiles, B
+// across 2 M-subtiles). This isolates "DSL/API limit" from "naive 1-warp structure": occupancy +
+// operand reuse are fixed; the ONLY remaining WMMA-API tax is the per-block scale round-trip through
+// the opaque i32 fragment (cmma::store -> shared -> scale). Requires M%32==0, N%64==0, K%32==0.
+// ================================================================================================
+
+/// Tiled int8 MMQ GEMM. Grid = (N/64, M/32); block = 256 threads (8 warps, 2x4 of 16x16 subtiles).
+#[kernel(targets(cuda), unchecked)]
+pub fn mmq_q8_wmma_blk(
+    xq: &Array<i8>,
+    xs: &Array<f32>,
+    wq: &Array<i8>,
+    wd: &Array<f32>,
+    out: &mut Array<f32>,
+    #[comptime] m: usize,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+) {
+    let tid = UNIT_POS as usize;
+    let warp = tid / 32; // 0..7
+    let lane = tid % 32; // 0..31
+    let wm = warp / 4; // 0..1  (M-subtile)
+    let wn = warp % 4; // 0..3  (N-subtile)
+    let mrow0 = CUBE_POS_Y as usize * 32;
+    let ncol0 = CUBE_POS_X as usize * 64;
+    let kb_count = k / 32;
+
+    let mut sa = SharedMemory::<i8>::new(1024usize); // A tile [32 x 32]
+    let mut sb = SharedMemory::<i8>::new(2048usize); // B tile [64 x 32]
+    let mut ci = SharedMemory::<i32>::new(2048usize); // per-warp i32 fragment scratch [8 x 256]
+    let mut accf = SharedMemory::<f32>::new(2048usize); // f32 output tile [32 x 64]
+
+    for e in 0usize..8 {
+        accf[tid * 8 + e] = 0.0f32;
+    }
+    sync_cube();
+
+    for kb in 0..kb_count {
+        let k0 = kb * 32;
+        // Stage A[32x32] and B[64x32] int8 tiles into shared memory (coalesced, reused across warps).
+        for i in 0usize..4 {
+            let idx = tid + i * 256;
+            sa[idx] = xq[(mrow0 + idx / 32) * k + k0 + idx % 32];
+        }
+        for i in 0usize..8 {
+            let idx = tid + i * 256;
+            sb[idx] = wq[(ncol0 + idx / 32) * k + k0 + idx % 32];
+        }
+        sync_cube();
+
+        // This warp's 16x16 subtile: accumulate the 32-block via 2 WMMA(K=16) from shared memory.
+        let c = cmma::Matrix::<i32>::from_value(
+            cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0i32,
+        );
+        let a0 = cmma::Matrix::<i8>::from_slice(
+            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+            &sa.slice(wm * 512, 1024), 32,
+        );
+        let b0 = cmma::Matrix::<i8>::from_slice(
+            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
+            &sb.slice(wn * 512, 2048), 32,
+        );
+        cmma::execute::<i8, i8, i32, i32>(&a0, &b0, &c, &c);
+        let a1 = cmma::Matrix::<i8>::from_slice(
+            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+            &sa.slice(wm * 512 + 16, 1024), 32,
+        );
+        let b1 = cmma::Matrix::<i8>::from_slice(
+            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
+            &sb.slice(wn * 512 + 16, 2048), 32,
+        );
+        cmma::execute::<i8, i8, i32, i32>(&a1, &b1, &c, &c);
+
+        // Spill this warp's i32 tile, apply the per-block f32 scale, accumulate into the f32 tile.
+        cmma::store(&mut ci.slice_mut(warp * 256, warp * 256 + 256), &c, 16, cmma::MatrixLayout::RowMajor);
+        sync_cube();
+        for e in 0usize..8 {
+            let p = lane * 8 + e;
+            let smm = p / 16;
+            let snn = p % 16;
+            let gmm = wm * 16 + smm;
+            let gnn = wn * 16 + snn;
+            let xsc = xs[(mrow0 + gmm) * kb_count + kb];
+            let wsc = wd[(ncol0 + gnn) * kb_count + kb];
+            accf[gmm * 64 + gnn] += f32::cast_from(ci[warp * 256 + p]) * xsc * wsc;
+        }
+        sync_cube();
+    }
+
+    for e in 0usize..8 {
+        let p = lane * 8 + e;
+        let gmm = wm * 16 + p / 16;
+        let gnn = wn * 16 + p % 16;
+        out[(mrow0 + gmm) * n + (ncol0 + gnn)] = accf[gmm * 64 + gnn];
+    }
+}
+
+/// Host launch for the tiled MMQ GEMM. Returns (out, ms/dispatch over `iters`).
+pub fn mmq_q8_wmma_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    xq: &[i8], xs: &[f32], wq: &[i8], wd: &[f32],
+    m: usize, n: usize, k: usize, iters: usize,
+) -> (Vec<f32>, f64) {
+    let xqh = client.create_from_slice(i8::as_bytes(xq));
+    let xsh = client.create_from_slice(f32::as_bytes(xs));
+    let wqh = client.create_from_slice(i8::as_bytes(wq));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; m * n]));
+    let grid = Grid::Static((n / 64) as u32, (m / 32) as u32, 1);
+    let launch = |c: &ComputeClient<R>| unsafe {
+        mmq_q8_wmma_blk::launch_unchecked::<R>(
+            c, grid.clone(), Block::new_1d(256),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(wqh.clone(), wq.len()),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(oh.clone(), m * n),
+            m, n, k,
+        );
+    };
+    launch(client);
+    let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    (out, ms)
+}
+
 /// Deterministic MMQ test data: random int8 X/W in [-127,127], positive f32 block scales.
 pub fn gen_mmq(m: usize, n: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec<f32>) {
     let kb = k / 32;
