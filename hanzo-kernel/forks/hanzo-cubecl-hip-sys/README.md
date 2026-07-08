@@ -42,4 +42,5 @@ bindings). This keeps `^`-resolution sane for consumers: `hanzo-cubecl-hip` depe
 
 ## Upstream
 
-The `build.rs` fallback has been offered upstream; see `NOTICE` for the PR link when filed.
+The `build.rs` fallback has been offered upstream:
+<https://github.com/tracel-ai/cubecl-hip-sys/pull/35>. If it merges, this fork can be retired.
