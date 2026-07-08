@@ -4,11 +4,11 @@
 //! `*Demo` names and assert, on sample GGUF bytes, that the macro-generated impl is
 //! byte-for-byte identical to the hand-written impl already in the tree:
 //!
-//!   * `BlockQ4_0`  — the simplest "real" type: f16 `d` + packed 4-bit nibbles.
-//!   * `BlockQ8_0`  — f16 `d` + 32 signed int8 (also the universal `VecDotType`).
-//!   * `BlockIQ4nl` — a genuine *decode-only* type (panic `from_float`,
-//!                    dequant-then-dot `vec_dot`) — i.e. exactly the shape of the 11
-//!                    IQ types the macro is meant to absorb.
+//! * `BlockQ4_0`  — the simplest "real" type: f16 `d` + packed 4-bit nibbles.
+//! * `BlockQ8_0`  — f16 `d` + 32 signed int8 (also the universal `VecDotType`).
+//! * `BlockIQ4nl` — a genuine *decode-only* type (panic `from_float`,
+//!   dequant-then-dot `vec_dot`) — i.e. exactly the shape of the 11
+//!   IQ types the macro is meant to absorb.
 //!
 //! The demo decode bodies are the existing `to_float` bodies pasted verbatim. The test
 //! reinterprets ONE buffer of fixed pseudo-random bytes as both the real block and the
@@ -223,5 +223,9 @@ fn iq4nl_macro_vec_dot_matches_reference() {
             want += xf[b * QK8_0 + j] * (y.qs[j] as f32 * dy);
         }
     }
-    assert_eq!(got.to_bits(), want.to_bits(), "vec_dot mismatch: {got} vs {want}");
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "vec_dot mismatch: {got} vs {want}"
+    );
 }
