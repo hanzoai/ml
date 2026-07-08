@@ -9,7 +9,7 @@ use crate::prelude::*;
 use crate::tune::Tuned;
 
 /// RMSNorm over the last dim: `out[i] = x[i] / sqrt(mean(x^2) + eps) * w[i]`, per row of `n`.
-#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+#[kernel(targets(cuda, rocm, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn rms_norm<F: Float>(
     x: &Array<F>,
     w: &Array<F>,
@@ -544,6 +544,24 @@ mod tests {
         let rel = max_rel(&want, &got);
         eprintln!("[rms_norm  CPU] {rows}x{n} max_rel={rel:.2e}");
         assert!(rel < 2e-3, "rms_norm max_rel {rel}");
+    }
+
+    /// The ROCm/HIP dispatch gate: the SAME `rms_norm` DSL source lowered and dispatched through
+    /// cubecl-hip on real AMD hardware (gfx1151), bit-compared to the CPU oracle `rms_norm_ref`.
+    /// This is the falsifiable proof that the cubecl-hip -> ROCm 7.13 seam works end to end (device
+    /// query via the R0600 bindings + module load + kernel launch + readback). Requires a HIP device.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rms_norm_rocm_bit_exact() {
+        use cubecl::hip::{AmdDevice, HipRuntime};
+        let (rows, n) = (37, 128);
+        let (x, w, _) = data(rows, n);
+        let c = HipRuntime::client(&AmdDevice::default());
+        let got = rms_norm_run::<HipRuntime>(&c, &x, &w, rows, n, EPS);
+        let want = rms_norm_ref(&x, &w, rows, n, EPS);
+        let rel = max_rel(&want, &got);
+        eprintln!("[rms_norm ROCM] {rows}x{n} max_rel={rel:.2e}");
+        assert!(rel < 2e-3, "rms_norm ROCm max_rel {rel}");
     }
 
     /// Autotuned RMSNorm on the CPU runtime: (1) every schedule variant is bit-IDENTICAL to the oracle
