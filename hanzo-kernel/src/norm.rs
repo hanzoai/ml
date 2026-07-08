@@ -40,42 +40,78 @@ pub fn rms_norm<F: Float>(
 /// `n` (the normalized dim) is RUNTIME (`ndim[0]`), so one compiled kernel is a drop-in for every model's
 /// hidden size and any row width -- no per-dim specialization, no `n % nt == 0` requirement (strided guard).
 /// Only `nt` (the block/shared-mem size) is comptime, because shared memory is statically sized.
-#[kernel(targets(cuda, metal, vulkan, webgpu), unchecked)]
+///
+/// ROCm: this is the production `rms_norm` on the ROCm backend. It lowers to a HIP source artifact
+/// (metadata-free -> `has_info=false` -> a clean pointer-only `extern "C" __global__` signature) that
+/// hanzo-ml compiles + launches through its existing rocm-rs pipeline, on its own device buffers -- the
+/// ROCm mirror of the Vulkan `.spv` collapse. `eps`/`ndim` ride cached 1-elem device buffers (capture-clean).
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
 pub fn rms_norm_blk<F: Float>(
     x: &Array<F>,
     w: &Array<F>,
     out: &mut Array<F>,
-    eps: &Array<F>,
+    eps: &Array<f32>,      // f32 regardless of F -- the reduction + scale are f32 (see below)
     ndim: &Array<u32>,     // ndim[0] = n; runtime so the kernel is dim-agnostic
     #[comptime] nt: usize, // threads per block (one block per row); shared-mem size
+    #[comptime] tgt: Target, // island scrutinee: picks the block-reduction idiom per backend
 ) {
+    // Reduce + scale in f32 regardless of the I/O dtype F, matching every hand-written norm kernel
+    // (ggml/ROCm `rmsnorm<T>`, CUDA, Metal): f16 sum-of-squares overflows/underflows, so accumulate in
+    // f32 and cast F only at load/store. For F=f32 every cast is the identity.
     let n = ndim[0] as usize;
     let base = CUBE_POS as usize * n;
     let step = CUBE_DIM as usize;
     let t = UNIT_POS as usize;
-    let mut partial = F::new(0.0);
+    let mut partial = 0f32;
     let mut idx = t; // seed from a runtime builtin (comptime consts can't be mutated)
     while idx < n {
-        let v = x[base + idx];
+        let v = f32::cast_from(x[base + idx]);
         partial += v * v;
         idx += step;
     }
-    let mut smem = SharedMemory::<F>::new(nt);
-    smem[t] = partial;
-    sync_cube();
-    let mut stride = CUBE_DIM / 2;
-    while stride > 0 {
-        if UNIT_POS < stride {
-            let v = smem[(UNIT_POS + stride) as usize];
-            smem[t] += v;
+    let mut smem = SharedMemory::<f32>::new(nt);
+    // Block reduction, target-gated (island): the whole point of the ROCm collapse's perf parity. The
+    // hand-written ROCm `rmsnorm` reduces via warp-shuffle (`__shfl_xor`) + a single cross-warp shared
+    // pass -- decode (rows=1) is a SINGLE block, so the tree reduction's log(nt) `__syncthreads` is ~2x
+    // slower. ROCm therefore uses `plane_sum` (lowers to `__shfl`) + one cross-warp combine, matching the
+    // incumbent. Every other backend takes the shared-mem tree (`default`), so the shipped Vulkan .spv --
+    // regenerated at target=Vulkan -- is byte-identical to the one on main. `s` = the block sum-of-squares.
+    let s = island! {
+        rocm => {
+            let ws = plane_sum(partial); // shuffle-reduce within each plane (warp)
+            let nwarps = CUBE_DIM / PLANE_DIM;
+            if UNIT_POS % PLANE_DIM == 0 {
+                smem[(UNIT_POS / PLANE_DIM) as usize] = ws;
+            }
+            sync_cube();
+            // EVERY warp reads the per-warp partials and reduces -> all threads get the total with a
+            // SINGLE barrier (no broadcast), exactly like the incumbent's `s_sum` + second warp_reduce.
+            let lane = UNIT_POS % PLANE_DIM;
+            let mut v = 0f32;
+            if lane < nwarps {
+                v = smem[lane as usize];
+            }
+            plane_sum(v)
         }
-        sync_cube();
-        stride /= 2;
-    }
-    let denom = (smem[0] / F::cast_from(n as u32) + eps[0]).sqrt();
+        default => {
+            smem[t] = partial;
+            sync_cube();
+            let mut stride = CUBE_DIM / 2;
+            while stride > 0 {
+                if UNIT_POS < stride {
+                    let v = smem[(UNIT_POS + stride) as usize];
+                    smem[t] += v;
+                }
+                sync_cube();
+                stride /= 2;
+            }
+            smem[0]
+        }
+    };
+    let denom = (s / f32::cast_from(n as u32) + eps[0]).sqrt();
     let mut o = t;
     while o < n {
-        out[base + o] = x[base + o] / denom * w[o];
+        out[base + o] = F::cast_from(f32::cast_from(x[base + o]) / denom * f32::cast_from(w[o]));
         o += step;
     }
 }
@@ -84,47 +120,78 @@ pub fn rms_norm_blk<F: Float>(
 /// `s = x + res` and `y = s / sqrt(mean(s^2) + eps) * alpha` in one dispatch -- bit-identical to
 /// `add.comp` then `rms_norm.comp` (same f32 ops, same order), the coalesced twin of the naive
 /// per-row `add_rmsnorm.comp`. GPU-only (cubecl-cpu has no cooperative blocks).
-#[kernel(targets(cuda, metal, vulkan, webgpu), unchecked)]
+///
+/// ROCm: the production fused residual-add + rmsnorm on the ROCm backend, same collapse as `rms_norm_blk`.
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
 pub fn add_rmsnorm_blk<F: Float>(
     x: &Array<F>,
     res: &Array<F>,
     alpha: &Array<F>,
     s_out: &mut Array<F>,
     y: &mut Array<F>,
-    eps: &Array<F>,
+    eps: &Array<f32>,      // f32 regardless of F (see `rms_norm_blk`)
     ndim: &Array<u32>,     // ndim[0] = n; runtime so the kernel is dim-agnostic
     #[comptime] nt: usize, // threads per block (one block per row); shared-mem size
+    #[comptime] tgt: Target, // island scrutinee (see `rms_norm_blk`)
 ) {
+    // Same f32-internal reduce/scale as `rms_norm_blk`: sum in f32, cast F only at load/store. The
+    // residual add `s = x + res` is done in f32 then cast to F for `s_out` (the new residual stream),
+    // exactly as the hand-written ROCm `add_rmsnorm`. Byte-identical for F=f32; bit-faithful for f16.
     let n = ndim[0] as usize;
     let base = CUBE_POS as usize * n;
     let step = CUBE_DIM as usize;
     let t = UNIT_POS as usize;
     // Pass 1: write the summed residual stream and accumulate sum-of-squares.
-    let mut partial = F::new(0.0);
+    let mut partial = 0f32;
     let mut idx = t;
     while idx < n {
-        let v = x[base + idx] + res[base + idx];
-        s_out[base + idx] = v;
+        let v = f32::cast_from(x[base + idx]) + f32::cast_from(res[base + idx]);
+        s_out[base + idx] = F::cast_from(v);
         partial += v * v;
         idx += step;
     }
-    let mut smem = SharedMemory::<F>::new(nt);
-    smem[t] = partial;
-    sync_cube();
-    let mut stride = CUBE_DIM / 2;
-    while stride > 0 {
-        if UNIT_POS < stride {
-            let v = smem[(UNIT_POS + stride) as usize];
-            smem[t] += v;
+    let mut smem = SharedMemory::<f32>::new(nt);
+    // Target-gated block reduction (see `rms_norm_blk`): warp-shuffle on ROCm, shared-mem tree elsewhere.
+    let ss = island! {
+        rocm => {
+            let ws = plane_sum(partial);
+            let nwarps = CUBE_DIM / PLANE_DIM;
+            if UNIT_POS % PLANE_DIM == 0 {
+                smem[(UNIT_POS / PLANE_DIM) as usize] = ws;
+            }
+            sync_cube();
+            let mut v = 0f32;
+            if UNIT_POS < nwarps {
+                v = smem[t];
+            }
+            let comb = plane_sum(v);
+            if UNIT_POS == 0 {
+                smem[0] = comb;
+            }
+            sync_cube();
+            smem[0]
         }
-        sync_cube();
-        stride /= 2;
-    }
-    let denom = (smem[0] / F::cast_from(n as u32) + eps[0]).sqrt();
-    // Pass 2: normalize. Recompute (x+res) (bit-identical to s_out, avoids reading a writeonly buffer).
+        default => {
+            smem[t] = partial;
+            sync_cube();
+            let mut stride = CUBE_DIM / 2;
+            while stride > 0 {
+                if UNIT_POS < stride {
+                    let v = smem[(UNIT_POS + stride) as usize];
+                    smem[t] += v;
+                }
+                sync_cube();
+                stride /= 2;
+            }
+            smem[0]
+        }
+    };
+    let denom = (ss / f32::cast_from(n as u32) + eps[0]).sqrt();
+    // Pass 2: normalize. Recompute (x+res) in f32 (bit-identical to s_out, avoids reading a writeonly buffer).
     let mut o = t;
     while o < n {
-        y[base + o] = (x[base + o] + res[base + o]) / denom * alpha[o];
+        let s = f32::cast_from(x[base + o]) + f32::cast_from(res[base + o]);
+        y[base + o] = F::cast_from(s / denom * f32::cast_from(alpha[o]));
         o += step;
     }
 }
@@ -190,23 +257,25 @@ pub fn rms_norm_run<R: Runtime>(
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
 }
 
-/// Host launch for the block-per-row RMSNorm: one block per row, `nt` cooperating threads.
-pub fn rms_norm_blk_run<R: Runtime>(
+/// Host launch for the block-per-row RMSNorm: one block per row, `nt` cooperating threads. Generic
+/// over the I/O element `E` (f32 or f16 -- `eps` is always f32, matching the kernel). f32 callers
+/// infer `E=f32` from the slice, so this stays source-compatible.
+pub fn rms_norm_blk_run<E: Float + CubeElement + Default, R: Runtime>(
     client: &ComputeClient<R>,
-    x: &[f32],
-    w: &[f32],
+    x: &[E],
+    w: &[E],
     rows: usize,
     n: usize,
     eps: f32,
     nt: usize,
-) -> Vec<f32> {
-    let xh = client.create_from_slice(f32::as_bytes(x));
-    let wh = client.create_from_slice(f32::as_bytes(w));
+) -> Vec<E> {
+    let xh = client.create_from_slice(E::as_bytes(x));
+    let wh = client.create_from_slice(E::as_bytes(w));
     let eph = client.create_from_slice(f32::as_bytes(&[eps]));
     let ndh = client.create_from_slice(u32::as_bytes(&[n as u32]));
-    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows * n]));
+    let oh = client.create_from_slice(E::as_bytes(&vec![E::default(); rows * n]));
     unsafe {
-        rms_norm_blk::launch_unchecked::<f32, R>(
+        rms_norm_blk::launch_unchecked::<E, R>(
             client,
             Grid::Static(rows as u32, 1, 1),
             Block::new_1d(nt as u32),
@@ -216,9 +285,10 @@ pub fn rms_norm_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(eph.clone(), 1),
             ArrayArg::from_raw_parts(ndh.clone(), 1),
             nt,
+            Target::of(client),
         );
     }
-    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+    E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
 }
 
 /// Kernel-only timing (ms/dispatch) for the block RMSNorm -- reads the output handle to force
@@ -249,6 +319,7 @@ pub fn rms_norm_blk_bench<R: Runtime>(
             ArrayArg::from_raw_parts(eph.clone(), 1),
             ArrayArg::from_raw_parts(ndh.clone(), 1),
             nt,
+            Target::of(client),
         );
     };
     for _ in 0..3 {
@@ -369,6 +440,7 @@ pub fn add_rmsnorm_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(eph.clone(), 1),
             ArrayArg::from_raw_parts(ndh.clone(), 1),
             nt,
+            Target::of(client),
         );
     }
     let s = f32::from_bytes(&client.read_one_unchecked(sh)).to_vec();
@@ -635,7 +707,7 @@ mod tests {
         // dim-agnostic: n not a multiple of nt, and n < nt -- the strided guard must still be exact
         for &m in &[130usize, 1536, 3072] {
             let (xx, ww, _) = data(11, m);
-            let g = rms_norm_blk_run::<WgpuRuntime>(&c, &xx, &ww, 11, m, EPS, 256);
+            let g = rms_norm_blk_run::<f32, WgpuRuntime>(&c, &xx, &ww, 11, m, EPS, 256);
             let r = max_rel(&rms_norm_ref(&xx, &ww, 11, m, EPS), &g);
             eprintln!("[rms_norm_blk VULKAN] 11x{m} (n%nt!=0)  max_rel={r:.2e}");
             assert!(r < 2e-3, "rms_norm_blk n={m} max_rel {r}");
@@ -671,6 +743,71 @@ mod tests {
         }
     }
 
+    /// The ROCm/HIP gate for the block-per-row RMSNorm -- the DSL kernel hanzo-ml's ROCm backend
+    /// migrates its hand-written `rmsnorm` to. Lowered through cubecl-hip on gfx1151, bit-compared to
+    /// the CPU oracle at the migration's gate shapes (hidden 4096/5120, rows 1 decode + 512 prefill)
+    /// plus dim-agnostic (n%nt!=0, n<nt). Run with `CUBECL_DEBUG_LOG=<file>` to also DUMP the generated
+    /// HIP source (the checked-in `.hip` artifact ml compiles). Requires a HIP device.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rms_norm_blk_rocm_bit_exact() {
+        use cubecl::hip::{AmdDevice, HipRuntime};
+        let c = HipRuntime::client(&AmdDevice::default());
+        for &(rows, n) in &[(1usize, 4096usize), (512, 4096), (1, 5120), (512, 5120), (11, 130), (7, 3072)] {
+            let (x, w, _) = data(rows, n);
+            let want = rms_norm_ref(&x, &w, rows, n, EPS);
+            let got = rms_norm_blk_run::<f32, HipRuntime>(&c, &x, &w, rows, n, EPS, 1024);
+            let rel = max_rel(&want, &got);
+            eprintln!("[rms_norm_blk ROCM f32] {rows}x{n} nt=1024  max_rel={rel:.2e}");
+            assert!(rel < 2e-3, "rms_norm_blk ROCm f32 {rows}x{n} max_rel {rel}");
+        }
+        // f16 I/O: the kernel reduces + scales in f32 (eps is f32), casting F only at load/store, so it
+        // is bit-faithful to the incumbent ROCm `rmsnorm<half>` (f32 accumulation). Compare to the f32
+        // oracle evaluated on the f16-ROUNDED inputs -> only f16 output rounding remains (tol 6e-3).
+        use half::f16;
+        for &(rows, n) in &[(1usize, 4096usize), (512, 4096), (7, 3072)] {
+            let (xf, wf, _) = data(rows, n);
+            let x: Vec<f16> = xf.iter().map(|&v| f16::from_f32(v)).collect();
+            let w: Vec<f16> = wf.iter().map(|&v| f16::from_f32(v)).collect();
+            let xr: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
+            let wr: Vec<f32> = w.iter().map(|v| v.to_f32()).collect();
+            let want = rms_norm_ref(&xr, &wr, rows, n, EPS);
+            let got_h = rms_norm_blk_run::<f16, HipRuntime>(&c, &x, &w, rows, n, EPS, 1024);
+            let got: Vec<f32> = got_h.iter().map(|v| v.to_f32()).collect();
+            let rel = max_rel(&want, &got);
+            eprintln!("[rms_norm_blk ROCM f16] {rows}x{n} nt=1024  max_rel={rel:.2e}");
+            assert!(rel < 6e-3, "rms_norm_blk ROCm f16 {rows}x{n} max_rel {rel}");
+        }
+    }
+
+    /// The ROCm/HIP gate for the fused residual-add + RMSNorm block kernel (ml's `add_rms_norm` twin).
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn add_rmsnorm_blk_rocm_bit_exact() {
+        use cubecl::hip::{AmdDevice, HipRuntime};
+        let c = HipRuntime::client(&AmdDevice::default());
+        let gen_res = |rows: usize, n: usize| -> Vec<f32> {
+            let mut s = 0x9E3779B9_7F4A7C15u64;
+            (0..rows * n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s % 2000) as f32 / 1000.0 - 1.0
+                })
+                .collect()
+        };
+        for &(rows, n) in &[(1usize, 4096usize), (512, 4096), (1, 5120), (512, 5120), (11, 130), (7, 3072)] {
+            let (x, alpha, _) = data(rows, n);
+            let res = gen_res(rows, n);
+            let (ws, wy) = add_rmsnorm_ref(&x, &res, &alpha, rows, n, EPS);
+            let (gs, gy) = add_rmsnorm_blk_run::<HipRuntime>(&c, &x, &res, &alpha, rows, n, EPS, 1024);
+            let (rs, ry) = (max_rel(&ws, &gs), max_rel(&wy, &gy));
+            eprintln!("[add_rmsnorm_blk ROCM] {rows}x{n} nt=1024  s_rel={rs:.2e} y_rel={ry:.2e}");
+            assert!(rs < 2e-3 && ry < 2e-3, "add_rmsnorm_blk ROCm {rows}x{n} s={rs} y={ry}");
+        }
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn norm_metal_bit_exact() {
@@ -680,7 +817,7 @@ mod tests {
         let c = WgpuRuntime::client(&WgpuDevice::default());
         let r = rms_norm_run::<WgpuRuntime>(&c, &x, &w, rows, n, EPS);
         let l = layer_norm_run::<WgpuRuntime>(&c, &x, &w, &b, rows, n, EPS);
-        let blk = rms_norm_blk_run::<WgpuRuntime>(&c, &x, &w, rows, n, EPS, n);
+        let blk = rms_norm_blk_run::<f32, WgpuRuntime>(&c, &x, &w, rows, n, EPS, n);
         let rr = max_rel(&rms_norm_ref(&x, &w, rows, n, EPS), &r);
         let lr = max_rel(&layer_norm_ref(&x, &w, &b, rows, n, EPS), &l);
         let br = max_rel(&rms_norm_ref(&x, &w, rows, n, EPS), &blk);
