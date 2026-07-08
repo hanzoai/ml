@@ -21,6 +21,20 @@ fn max_rel(a: &[f32], b: &[f32]) -> f32 {
     m
 }
 
+/// Robust error vs the quantized oracle: max abs error, and rel to the tile's max |ref| (not to a
+/// per-element denom, which explodes on near-zero cancellations of signed int8 sums). Returns
+/// (max_abs, rel_to_max). A real decode/accumulation bug moves BOTH; a near-zero cancellation moves
+/// only per-element max_rel.
+fn err_robust(a: &[f32], b: &[f32]) -> (f32, f32) {
+    let mut maxabs = 0f32;
+    let mut refmax = 1e-9f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        maxabs = maxabs.max((x - y).abs());
+        refmax = refmax.max(x.abs());
+    }
+    (maxabs, maxabs / refmax)
+}
+
 fn rand_i8(n: usize, seed: u64) -> Vec<i8> {
     let mut s = seed;
     (0..n)
@@ -80,10 +94,11 @@ fn main() {
             let (got, _) = mmq_q8_wmma_run::<CudaRuntime>(&client, &xq, &xs, &wq, &wd, m, n, k, 1);
             let want = mmq_q8_ref(&xq, &xs, &wq, &wd, m, n, k);
             let rel = max_rel(&want, &got);
+            let (maxabs, relmax) = err_robust(&want, &got);
             println!(
-                "[2 ] MMQ {}x{}x{:<4}  max_rel={:.2e}  {}",
-                m, n, k, rel,
-                if rel < 3e-3 { "BIT-CLOSE ✓" } else { "MISMATCH ✗" }
+                "[2 ] MMQ {}x{}x{:<4}  per-elt max_rel={:.2e}  max_abs={:.2e}  rel_to_max={:.2e}  {}",
+                m, n, k, rel, maxabs, relmax,
+                if relmax < 1e-3 { "BIT-CLOSE ✓" } else { "MISMATCH ✗" }
             );
         }));
         if r.is_err() {
@@ -91,22 +106,35 @@ fn main() {
         }
     }
 
-    // ---- Stage 3: full prefill GEMM, verify + kernel-only bench ----
+    // ---- Stage 3: full prefill GEMM, verify + kernel-only bench (naive 1-warp vs tiled 8-warp) ----
     let r = catch_unwind(AssertUnwindSafe(|| {
         let (m, n, k) = (512usize, 4096usize, 4096usize);
         let (xq, xs, wq, wd) = gen_mmq(m, n, k);
-        let (got, ms) = mmq_q8_wmma_run::<CudaRuntime>(&client, &xq, &xs, &wq, &wd, m, n, k, 50);
-        // verify on a stripe (full oracle is O(M*N*K) on host -- check first 8 rows exactly).
-        let mrows = 8usize;
-        let want = mmq_q8_ref(&xq, &xs, &wq, &wd, mrows, n, k);
-        let rel = max_rel(&want, &got[..mrows * n]);
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
-        let wbytes = (n * k) as f64;          // int8 weight stream (the MMQ footprint)
-        let abytes = (m * k) as f64;          // int8 activation
+        let wbytes = (n * k) as f64; // int8 weight stream (the MMQ footprint)
+        let mrows = 8usize;
+        let want = mmq_q8_ref(&xq, &xs, &wq, &wd, mrows, n, k); // exact 8-row stripe oracle
+
+        let (g0, ms0) = mmq_q8_wmma_run::<CudaRuntime>(&client, &xq, &xs, &wq, &wd, m, n, k, 50);
+        let (a0, r0) = err_robust(&want, &g0[..mrows * n]);
         println!(
-            "\n[3 ] GEMM {m}x{n}x{k}  max_rel(8 rows)={:.2e} {}\n     {:.3} ms/dispatch   {:.0} GFLOP/s   {:.0} GB/s (W)   {:.0} GB/s (W+X)",
-            rel, if rel < 3e-3 { "✓" } else { "✗" },
-            ms, flop / (ms * 1e6), wbytes / (ms * 1e6), (wbytes + abytes) / (ms * 1e6),
+            "\n[3 ] GEMM {m}x{n}x{k}  (naive 1-warp/16x16 tile)   verify rel_to_max={:.2e} max_abs={:.2e} {}",
+            r0, a0, if r0 < 3e-3 { "✓" } else { "✗" }
+        );
+        println!(
+            "     {:.3} ms/dispatch   {:.0} GFLOP/s   {:.0} GB/s (W-stream)",
+            ms0, flop / (ms0 * 1e6), wbytes / (ms0 * 1e6)
+        );
+
+        let (g1, ms1) = mmq_q8_wmma_blk_run::<CudaRuntime>(&client, &xq, &xs, &wq, &wd, m, n, k, 50);
+        let (a1, r1) = err_robust(&want, &g1[..mrows * n]);
+        println!(
+            "[3 ] GEMM {m}x{n}x{k}  (tiled 8-warp/32x64 tile)   verify rel_to_max={:.2e} max_abs={:.2e} {}",
+            r1, a1, if r1 < 3e-3 { "✓" } else { "✗" }
+        );
+        println!(
+            "     {:.3} ms/dispatch   {:.0} GFLOP/s   {:.0} GB/s (W-stream)   [{:.2}x the naive kernel]",
+            ms1, flop / (ms1 * 1e6), wbytes / (ms1 * 1e6), ms0 / ms1
         );
     }));
     if r.is_err() {
