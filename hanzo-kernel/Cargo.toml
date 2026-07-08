@@ -44,3 +44,8 @@ path = "src/main.rs"
 name = "dp4a-probe"
 path = "src/dp4a_probe.rs"
 required-features = ["vulkan"]
+
+[[bin]]
+name = "mmq-check"
+path = "src/mmq_check.rs"
+required-features = ["cuda"]
