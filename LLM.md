@@ -885,3 +885,48 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   from KMS into the repo/org secret AND ensure the self-hosted runner can read it, then re-fire
   `gh workflow run publish.yml -R hanzoai/ml --ref main` (idempotent: the script skips already-uploaded
   crates). Code + version are ready; publishing awaits the runner-secret fix.
+
+## DSL collapse Phase 2 (ROCm norm) -- DSL is BIT-EXACT but the tuned incumbent WINS -> KEEP (survivor)
+The ROCm mirror of the Vulkan `.spv` collapse was built + validated for `rms_norm` + `add_rmsnorm`, and
+the result is a NEGATIVE (correctly gate-blocked): the DSL twin is bit-exact but ~84-92% of the
+hand-written kernel, so the incumbent STAYS. This is the OPPOSITE of Vulkan (where the incumbent was a
+naive one-invocation-per-row `.comp` and the DSL block kernel won ~10x) -- the ROCm `reduce.hip` norm
+kernels are ALREADY warp-shuffle-optimal (adaptive 32/1024-thread block + `__shfl_xor` + one cross-warp
+`s_sum` pass), so there is no headroom for the DSL to reclaim, only codegen overhead to lose.
+- **Integration design (proven, the ROCm seam):** NOT runtime cubecl-hip dispatch -- cubecl-hip's
+  `ComputeStorage` only `alloc()`s via `hipMallocAsync` into its own `StorageId` pool, with NO API to
+  adopt ml's external `rocm-rs` device pointers, so a runtime handoff forces a per-call host round-trip
+  (~15x slower on a 67 MB rms_norm; fails any perf gate). Instead: the `#[kernel]` Rust in
+  `hanzo-kernel/src/norm.rs` is the ONE source; cubecl-hip LOWERS it to a HIP source STRING (captured
+  via `CUBECL_DEBUG_LOG=<file>` during the `*_rocm_bit_exact` test); the `.hip` artifact is checked into
+  `hanzo-rocm-kernels/src/kernels/dsl_*.hip`; ml compiles + launches it through its EXISTING hipcc +
+  rocm-rs pipeline on its own device buffers -- zero-copy, single runtime, no 2nd HIP context on the
+  fragile gfx1151/ROCm-7.13 stack. cubecl-cpp is a pure host transpiler; a pure-no-GPU codegen was
+  blocked only because cubecl 0.10's `create_dummy_kernel` omits the client its `new` requires.
+- **ABI facts (from the real generated source):** cubecl emits an unused `info_st*` metadata param even
+  for metadata-free kernels (a cached zeroed dummy satisfies it -- the body never reads it); shared
+  memory is DYNAMIC (`extern __shared__`, launch `sharedMemBytes = nt*4`); kernel params are in the DSL
+  DECLARATION order (x,w,out,eps,ndim) + `info_ptr` last; entrypoints are dtype-suffixed
+  (`rms_norm_blk_f_f32`, and `rms_norm_blk_f_` for f16). eps/ndim are DEVICE BUFFERS (cubecl has no
+  inline scalar args on HIP) -- the incumbent passes them inline in registers, which is exactly the
+  residual overhead (a per-block dependent load the DSL can't avoid).
+- **The kernel work that took it 50%->~88%:** (1) `rms_norm_blk`/`add_rmsnorm_blk` reduce/scale in f32
+  regardless of I/O dtype F (was F-typed -> a latent f16-accumulation bug; byte-identical for F=f32 so
+  the shipped Vulkan spv is unchanged), `eps: &Array<f32>`. (2) An `island!`-gated block reduction:
+  ROCm uses `plane_sum` (lowers to inline `__shfl_xor`, == the incumbent) + a SINGLE cross-warp barrier
+  (every warp re-reads the per-warp partials and re-reduces, no broadcast), while `default` keeps the
+  shared-mem tree so Vulkan/CPU are unchanged. nt=1024 to match the incumbent's wide-row thread count.
+- **Numbers (interleaved-min A/B, gfx1151, matched load; `dsl_norm_bench` in rocm_backend/mod.rs):**
+  bit-exact f32 max_rel ~1e-6, f16 ~5e-4. Perf dsl/incumbent: rms_norm 88% (rows=1) / 84% (rows=512);
+  add_rmsnorm 87-88% (rows=1) / 91-99% (rows=512, higher because its heavier compute amortizes the fixed
+  per-block overhead). ALL below the >=97% gate -> incumbents retained, exactly like the dp4a quant
+  cores (the documented stop-line survivor). softmax + rope share the same tuned-incumbent situation, so
+  they are the same class: the DSL provides COVERAGE (bit-exact portability), the hand-written kernels
+  keep the ROCm PEAK. This is the migration policy in `hanzo-kernel/src/lib.rs` working as written.
+- **Gotchas for the next agent:** `island!` needs a `#[comptime] <name>: Target` param (Target isn't a
+  launchable arg); run helpers derive it via `Target::of(client)`. cubecl if-else expr arms must be the
+  same CubeType (init a `let mut v = 0f32;` then conditional-assign, don't `if..{smem[t]} else {0f32}`).
+  f16/f32 of one kernel share the `info_st` preamble ONLY if buffer-count matches (they do) -- merge by
+  appending the 2nd `extern "C"` block, but keep the f16 preamble (it adds `#include <hip/hip_fp16.h>`).
+  `clippy -D warnings` is PRE-EXISTING-red on ml+hanzo-kernel (the 106x `*const *mut c_void as *mut
+  c_void` idiom + operator-method-confusion) -- not introduced here.
