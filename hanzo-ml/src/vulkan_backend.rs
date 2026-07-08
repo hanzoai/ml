@@ -96,7 +96,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "rms_norm" => include_bytes!("vulkan/spv/rms_norm_blk.spv"),
         "rope" => spv!("rope"),
         "rope_norm" => spv!("rope_norm"),
-        "add_rmsnorm" => spv!("add_rmsnorm"),
+        "add_rmsnorm" => include_bytes!("vulkan/spv/add_rmsnorm_blk.spv"),
         "sin" => spv!("sin"),
         "cos" => spv!("cos"),
         "log" => spv!("log"),
@@ -4196,13 +4196,20 @@ impl VulkanStorage {
         let nrows = layout.shape().elem_count() / m.max(1);
         let s_out = self.device.alloc_f32(nrows * m)?;
         let y = self.device.alloc_f32(nrows * m)?;
-        let mut push = push_u32(&[nrows as u32, m as u32]);
-        push.extend_from_slice(&eps.to_ne_bytes());
-        self.device.dispatch(
+        // DSL block-per-row fused add+rmsnorm (add_rmsnorm_blk.spv): one workgroup/row, coalesced reads
+        // + shared-mem reduce -- the coalesced twin of the naive per-row add_rmsnorm.comp it replaced
+        // (the same ~10x uncoalesced penalty rms_norm proved). cubecl has no push-constants, so eps/ndim
+        // ride pooled SSBOs -- lifetime-safe across the deferred batch (BufPool reclaim is post-fence-only,
+        // identical to rms_norm). Both s (binding 3) and y (binding 4) are outputs, so dispatch_outs tracks
+        // each write for the selective RAW barrier (mirrors gdn_step's state+output pair).
+        let epsb = self.device.upload_f32(&[eps])?;
+        let ndb = self.device.upload_u32(&[m as u32])?;
+        self.device.dispatch_outs(
             "add_rmsnorm",
-            &[xb, rb, ab, s_out.buffer, y.buffer],
-            &push,
-            Self::groups_1d(nrows),
+            &[xb, rb, ab, s_out.buffer, y.buffer, epsb.buffer, ndb.buffer],
+            &[3, 4],
+            &[],
+            (nrows as u32, 1, 1),
         )?;
         Ok((s_out, y))
     }
@@ -5582,6 +5589,103 @@ mod dsl_dispatch_proof {
         let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         eprintln!(
             "[rms_norm-prod] {ROWS}x{N}  kernel {ms:.3} ms ({:.0} GB/s) -- the DSL block kernel is now the production rms_norm",
+            bytes / (ms * 1e6)
+        );
+    }
+
+    // The production `add_rmsnorm` method dispatches the DSL block-per-row fused kernel
+    // (add_rmsnorm_blk.spv): one workgroup/row, coalesced reads + shared-mem reduce, emitting BOTH
+    // s = x + res (the new residual stream) and y = rms_norm(s) * alpha in one dispatch. Replaces the
+    // naive one-invocation-per-row add_rmsnorm.comp (uncoalesced, the pattern rms_norm proved ~10x
+    // slower). eps + ndim ride pooled SSBOs (cubecl has no push-constants); both outputs are tracked
+    // via dispatch_outs so a later in-batch reader of either gets its RAW barrier. Chaining 8 calls
+    // with no sync stresses the pooled scalars -- all bit-exact == no use-after-free.
+    #[test]
+    fn add_rmsnorm_production_path_is_dsl_kernel_bit_exact() {
+        const N: usize = 4096;
+        const ROWS: usize = 4096;
+        const EPS: f32 = 1e-6;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[add_rmsnorm-prod] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let gen_x = |row: usize, i: usize| (((row * 7 + i * 13) % 1000) as f32) / 500.0 - 1.0;
+        let gen_r = |row: usize, i: usize| (((row * 11 + i * 5) % 800) as f32) / 400.0 - 1.0;
+        let gen_a = |i: usize| (((i * 3) % 100) as f32) / 100.0 + 0.5;
+        let x: Vec<f32> = (0..ROWS * N).map(|idx| gen_x(idx / N, idx % N)).collect();
+        let res: Vec<f32> = (0..ROWS * N).map(|idx| gen_r(idx / N, idx % N)).collect();
+        let alpha: Vec<f32> = (0..N).map(gen_a).collect();
+        // CPU reference: s = x + res; y = s / sqrt(mean(s^2) + eps) * alpha.
+        let mut cpu_s = vec![0f32; ROWS * N];
+        let mut cpu_y = vec![0f32; ROWS * N];
+        for r in 0..ROWS {
+            let mut ss = 0f32;
+            for i in 0..N {
+                let v = x[r * N + i] + res[r * N + i];
+                cpu_s[r * N + i] = v;
+                ss += v * v;
+            }
+            let denom = (ss / N as f32 + EPS).sqrt();
+            for i in 0..N {
+                cpu_y[r * N + i] = cpu_s[r * N + i] / denom * alpha[i];
+            }
+        }
+        let xs = dev.upload_f32(&x).unwrap();
+        let rs = dev.upload_f32(&res).unwrap();
+        let as_ = dev.upload_f32(&alpha).unwrap();
+        let x_l = Layout::contiguous((ROWS, N));
+        let a_l = Layout::contiguous(N);
+
+        // Chain 8 production calls with NO intermediate sync (pooled eps/ndim stress; both outputs held).
+        let mut outs = Vec::new();
+        for _ in 0..8 {
+            outs.push(xs.add_rmsnorm(&x_l, &rs, &x_l, &as_, &a_l, EPS).unwrap());
+        }
+        let (mut worst_s, mut worst_y) = (0f32, 0f32);
+        for (s_out, y) in &outs {
+            let gs = s_out.to_vec_f32().unwrap();
+            let gy = y.to_vec_f32().unwrap();
+            worst_s = worst_s.max(
+                gs.iter()
+                    .zip(&cpu_s)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max),
+            );
+            worst_y = worst_y.max(
+                gy.iter()
+                    .zip(&cpu_y)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max),
+            );
+        }
+        eprintln!("[add_rmsnorm-prod] {ROWS}x{N} x8-batched  s_maxerr={worst_s:.2e} y_maxerr={worst_y:.2e}");
+        assert!(
+            worst_s < 1e-3,
+            "production add_rmsnorm s diverged from CPU: {worst_s:.3e}"
+        );
+        assert!(
+            worst_y < 1e-3,
+            "production add_rmsnorm y diverged from CPU: {worst_y:.3e}"
+        );
+
+        // Method-loop bench (same harness runs on incumbent .comp and DSL kernel -- apples to apples).
+        let iters = 50;
+        let bytes = (4 * ROWS * N * 4) as f64; // read x+res, write s+y
+        for _ in 0..3 {
+            let _ = xs.add_rmsnorm(&x_l, &rs, &x_l, &as_, &a_l, EPS).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = xs.add_rmsnorm(&x_l, &rs, &x_l, &as_, &a_l, EPS).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "[add_rmsnorm-prod] {ROWS}x{N}  method {ms:.3} ms ({:.0} GB/s)",
             bytes / (ms * 1e6)
         );
     }
