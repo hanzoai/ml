@@ -163,7 +163,11 @@ fn bench_matmul(dev: &Device) -> hanzo_ml::Result<Row> {
         s.push(t0.elapsed().as_secs_f64() * 1e6);
     }
     // matmul FLOPs = 2*m*n*k.
-    Ok(report("f32_matmul_4096", s, 2.0 * m as f64 * n as f64 * k as f64))
+    Ok(report(
+        "f32_matmul_4096",
+        s,
+        2.0 * m as f64 * n as f64 * k as f64,
+    ))
 }
 
 // ---- quant matvec: y[nout] = Wq * x[k], nout = k = 4096 (single decode row) ---------------------
@@ -217,7 +221,9 @@ fn bench_moe(dev: &Device) -> hanzo_ml::Result<Row> {
     let qs = QStorage::from_data(std::borrow::Cow::Owned(bytes), dev, dtype)?;
     let qv = QTensor::new(qs, (e_cnt, n, k))?;
     let x: Vec<f32> = (0..t * topk * k).map(|i| pseudo(i + 11) * 0.7).collect();
-    let ids: Vec<u32> = (0..t * topk).map(|i| ((i * 7 + 3) % e_cnt) as u32).collect();
+    let ids: Vec<u32> = (0..t * topk)
+        .map(|i| ((i * 7 + 3) % e_cnt) as u32)
+        .collect();
     let x_t = Tensor::from_vec(x, (t, topk, k), dev)?;
     let ids_t = Tensor::from_vec(ids, (t, topk), dev)?;
 
@@ -271,7 +277,9 @@ fn spark_bench() -> hanzo_ml::Result<()> {
     } else {
         "wgpu"
     };
-    println!("=== spark_bench backend={backend} adapter=\"{adapter}\" warmup={WARMUP} iters={ITERS} ===");
+    println!(
+        "=== spark_bench backend={backend} adapter=\"{adapter}\" warmup={WARMUP} iters={ITERS} ==="
+    );
 
     let mut rows = Vec::new();
 
@@ -299,7 +307,10 @@ fn spark_bench() -> hanzo_ml::Result<()> {
         Err(e) => rows.push(skip_row("flash_attn_d128_s512", &format!("ERR: {e}"))),
     }
 
-    println!("{:<26}  {:>12}  {:>12}  {}", "kernel", "us/call", "GFLOP/s", "note");
+    println!(
+        "{:<26}  {:>12}  {:>12}  {}",
+        "kernel", "us/call", "GFLOP/s", "note"
+    );
     println!("{}", "-".repeat(72));
     for r in &rows {
         if r.us.is_nan() {

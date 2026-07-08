@@ -33,6 +33,7 @@
 //! <https://huggingface.co/Tongyi-MAI/Z-Image-Turbo>
 
 use anyhow::{Error as E, Result};
+use clap::Parser;
 use hanzo_ml::{DType, IndexOp, Tensor};
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::z_image::{
@@ -40,7 +41,6 @@ use hanzo_transformers::models::z_image::{
     FlowMatchEulerDiscreteScheduler, SchedulerConfig, TextEncoderConfig, VaeConfig,
     ZImageTextEncoder, ZImageTransformer2DModel,
 };
-use clap::Parser;
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 

@@ -204,7 +204,10 @@ mod tests {
             return Ok(());
         }
         let cache = Cache::open(dir)?;
-        assert_eq!(cache.n_fused, 5, "target_layer_ids [1,11,21,31,41] => 5 fused");
+        assert_eq!(
+            cache.n_fused, 5,
+            "target_layer_ids [1,11,21,31,41] => 5 fused"
+        );
         assert_eq!(cache.manifest.hidden_size, 4096);
 
         // Record 1 has seq_len 274 (verified against the idx layout).

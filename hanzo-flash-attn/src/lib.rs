@@ -257,7 +257,8 @@ impl hanzo_ml::CustomOp3 for FlashAttn {
                     let qcl = Layout::contiguous(q_l.shape());
                     let kcl = Layout::contiguous(k_l.shape());
                     let vcl = Layout::contiguous(v_l.shape());
-                    let (out, shape) = self.cuda_fwd_t::<f16>(&qf, &qcl, &kf, &kcl, &vf, &vcl, false)?;
+                    let (out, shape) =
+                        self.cuda_fwd_t::<f16>(&qf, &qcl, &kf, &kcl, &vf, &vcl, false)?;
                     let out_l = Layout::contiguous(&shape);
                     let out = out.to_dtype(&out_l, hanzo_ml::DType::BF16)?;
                     Ok((out, shape))
@@ -744,7 +745,8 @@ impl hanzo_ml::CustomOp3 for FlashAttnVarLen {
                     let qcl = Layout::contiguous(q_l.shape());
                     let kcl = Layout::contiguous(k_l.shape());
                     let vcl = Layout::contiguous(v_l.shape());
-                    let (out, shape) = self.cuda_fwd_t::<f16>(&qf, &qcl, &kf, &kcl, &vf, &vcl, false)?;
+                    let (out, shape) =
+                        self.cuda_fwd_t::<f16>(&qf, &qcl, &kf, &kcl, &vf, &vcl, false)?;
                     let out_l = Layout::contiguous(&shape);
                     let out = out.to_dtype(&out_l, hanzo_ml::DType::BF16)?;
                     Ok((out, shape))

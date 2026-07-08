@@ -212,8 +212,10 @@ mod tests {
     }
 
     fn write(path: &Path, tensors: &[(&str, Tensor)]) {
-        let map: HashMap<String, Tensor> =
-            tensors.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let map: HashMap<String, Tensor> = tensors
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
         save_checkpoint(&map, path).unwrap();
     }
 
@@ -375,7 +377,10 @@ mod tests {
         let o = tmp("dp_o.safetensors");
         write(
             &base,
-            &[("w", t(&[1.0, 1.0], &[2])), ("frozen", t(&[7.0, 8.0], &[2]))],
+            &[
+                ("w", t(&[1.0, 1.0], &[2])),
+                ("frozen", t(&[7.0, 8.0], &[2])),
+            ],
         );
         write(&ft, &[("w", t(&[3.0, 3.0], &[2]))]);
 

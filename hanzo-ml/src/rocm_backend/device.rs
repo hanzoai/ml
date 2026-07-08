@@ -4,12 +4,11 @@ use half::{bf16, f16};
 use hanzo_rocm_kernels::compile::KernelCache;
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::wrappers::{
-    DevicePool, SendSyncDeviceMemory, SendSyncPseudoRng,
-    SendSyncRocblasHandle, SendSyncStream,
-};
 #[cfg(feature = "rocm-miopen")]
 use super::wrappers::SendSyncMIOpenHandle;
+use super::wrappers::{
+    DevicePool, SendSyncDeviceMemory, SendSyncPseudoRng, SendSyncRocblasHandle, SendSyncStream,
+};
 use super::{Affine, RocmError, RocmStorage, RocmStorageSlice};
 use rocm_rs::hip::Device as HipDevice;
 
@@ -133,7 +132,9 @@ impl RocmDevice {
         let mut guard = self.rocrand.lock().unwrap();
         if guard.is_none() {
             let mut rng = SendSyncPseudoRng::new(rocm_rs::rocrand::rng_type::PSEUDO_DEFAULT)
-                .map_err(|e| crate::Error::Msg(format!("Failed to create rocrand generator: {}", e)))?;
+                .map_err(|e| {
+                    crate::Error::Msg(format!("Failed to create rocrand generator: {}", e))
+                })?;
             rng.set_seed(*self.seed_value.read().unwrap())
                 .map_err(|e| crate::Error::Msg(format!("Failed to set rocrand seed: {}", e)))?;
             *guard = Some(rng);

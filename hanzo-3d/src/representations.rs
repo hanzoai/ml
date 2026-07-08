@@ -34,13 +34,21 @@ pub struct Material {
 
 impl Default for Material {
     fn default() -> Self {
-        Material { base_color: [0.8, 0.8, 0.8, 1.0], roughness: 1.0, metallic: 0.0 }
+        Material {
+            base_color: [0.8, 0.8, 0.8, 1.0],
+            roughness: 1.0,
+            metallic: 0.0,
+        }
     }
 }
 
 impl Mesh {
     pub fn new(vertices: Vec<Vec3>, faces: Vec<[u32; 3]>) -> Self {
-        Mesh { vertices, faces, ..Default::default() }
+        Mesh {
+            vertices,
+            faces,
+            ..Default::default()
+        }
     }
 
     pub fn vertex_count(&self) -> usize {
@@ -95,7 +103,10 @@ pub struct Voxel {
 
 impl Voxel {
     pub fn new(resolution: u32) -> Self {
-        Voxel { resolution, occupied: Vec::new() }
+        Voxel {
+            resolution,
+            occupied: Vec::new(),
+        }
     }
 }
 
