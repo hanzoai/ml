@@ -108,7 +108,10 @@ pub(crate) fn launch_conv2d<
     };
     let workspace_size = match conv2d.get_workspace_size(alg) {
         Ok(ws) => ws,
-        Err(_) => { alg = conv2d.pick_algorithm()?; conv2d.get_workspace_size(alg)? }
+        Err(_) => {
+            alg = conv2d.pick_algorithm()?;
+            conv2d.get_workspace_size(alg)?
+        }
     };
     let mut workspace = dev.cuda_stream().alloc_zeros::<u8>(workspace_size)?;
     unsafe {

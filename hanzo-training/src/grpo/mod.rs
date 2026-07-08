@@ -82,11 +82,8 @@ mod toy_tests {
             let varmap = VarMap::new();
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
             // Initialize logits to zero -> uniform policy at start.
-            let logits = vb.get_with_hints(
-                (max_len, vocab),
-                "logits",
-                hanzo_nn::Init::Const(0.0),
-            )?;
+            let logits =
+                vb.get_with_hints((max_len, vocab), "logits", hanzo_nn::Init::Const(0.0))?;
             Ok(Self {
                 logits,
                 varmap,
@@ -135,7 +132,7 @@ mod toy_tests {
             for (pos, &tok) in completion_tokens.iter().enumerate() {
                 debug_assert!((tok as usize) < self.vocab);
                 let idx = Tensor::new(&[tok], &self.device)?; // [1]
-                // row `pos`, then gather the token's logprob -> scalar tensor
+                                                              // row `pos`, then gather the token's logprob -> scalar tensor
                 let row = logp.narrow(0, pos, 1)?.squeeze(0)?; // [vocab]
                 let val = row.index_select(&idx, 0)?.squeeze(0)?; // scalar
                 total = Some(match total {
@@ -234,8 +231,7 @@ mod toy_tests {
             seed: 7,
         };
         let rewards: Vec<Box<dyn Reward>> = vec![Box::new(TokenMatchReward::new(2))];
-        let mut trainer =
-            GrpoTrainer::with_reference(cfg, policy, rewards, Some(reference))?;
+        let mut trainer = GrpoTrainer::with_reference(cfg, policy, rewards, Some(reference))?;
 
         let prompts = vec![vec![1u32], vec![2u32]];
         let mut last = trainer.step(&prompts)?;

@@ -343,8 +343,10 @@ mod tests {
     }
 
     fn write_ckpt(path: &Path, tensors: &[(&str, Tensor)]) {
-        let map: HashMap<String, Tensor> =
-            tensors.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let map: HashMap<String, Tensor> = tensors
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
         save_checkpoint(&map, path).unwrap();
     }
 
@@ -404,11 +406,17 @@ mod tests {
 
         write_ckpt(
             &base,
-            &[("w", Tensor::from_slice(&base_v, &shape, &Device::Cpu).unwrap())],
+            &[(
+                "w",
+                Tensor::from_slice(&base_v, &shape, &Device::Cpu).unwrap(),
+            )],
         );
         write_ckpt(
             &ft,
-            &[("w", Tensor::from_slice(&ft_v, &shape, &Device::Cpu).unwrap())],
+            &[(
+                "w",
+                Tensor::from_slice(&ft_v, &shape, &Device::Cpu).unwrap(),
+            )],
         );
 
         encode(&base, &ft, &bdfile).unwrap();
@@ -470,11 +478,17 @@ mod tests {
         let recon = tmp("ub_recon.safetensors");
         write_ckpt(
             &base,
-            &[("w", Tensor::from_slice(&base_v, &shape, &Device::Cpu).unwrap())],
+            &[(
+                "w",
+                Tensor::from_slice(&base_v, &shape, &Device::Cpu).unwrap(),
+            )],
         );
         write_ckpt(
             &ft,
-            &[("w", Tensor::from_slice(&ft_v, &shape, &Device::Cpu).unwrap())],
+            &[(
+                "w",
+                Tensor::from_slice(&ft_v, &shape, &Device::Cpu).unwrap(),
+            )],
         );
 
         encode(&base, &ft, &bdfile).unwrap();
@@ -508,7 +522,10 @@ mod tests {
         write_ckpt(
             &base,
             &[
-                ("a", Tensor::zeros((2, 3), DType::F32, &Device::Cpu).unwrap()),
+                (
+                    "a",
+                    Tensor::zeros((2, 3), DType::F32, &Device::Cpu).unwrap(),
+                ),
                 ("b", Tensor::zeros((5,), DType::F32, &Device::Cpu).unwrap()),
             ],
         );
@@ -564,7 +581,11 @@ mod tests {
         // dtype preserved on the reconstructed tensor.
         assert_eq!(recon_map["w"].dtype(), DType::BF16);
         // untouched tensor copied through unchanged.
-        let frozen_v: Vec<f32> = recon_map["frozen"].flatten_all().unwrap().to_vec1().unwrap();
+        let frozen_v: Vec<f32> = recon_map["frozen"]
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         assert_eq!(frozen_v, vec![9.0, 8.0]);
 
         for p in [base, ft, bdfile, recon] {
@@ -579,11 +600,17 @@ mod tests {
         let bdfile = tmp("em.bitdelta");
         write_ckpt(
             &base,
-            &[("w", Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap())],
+            &[(
+                "w",
+                Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
+            )],
         );
         write_ckpt(
             &ft,
-            &[("w", Tensor::zeros((3, 3), DType::F32, &Device::Cpu).unwrap())],
+            &[(
+                "w",
+                Tensor::zeros((3, 3), DType::F32, &Device::Cpu).unwrap(),
+            )],
         );
 
         let err = encode(&base, &ft, &bdfile).unwrap_err();

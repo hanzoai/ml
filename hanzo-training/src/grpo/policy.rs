@@ -55,11 +55,7 @@ pub trait Policy {
     /// (a single scalar per completion) is the sequence-level objective; a
     /// per-token vector is also valid for token-level KL but the GRPO PG term
     /// only needs the sum (see `math::policy_gradient_loss`).
-    fn sequence_logprob(
-        &self,
-        prompt_tokens: &[u32],
-        completion_tokens: &[u32],
-    ) -> Result<Tensor>;
+    fn sequence_logprob(&self, prompt_tokens: &[u32], completion_tokens: &[u32]) -> Result<Tensor>;
 
     /// Optional decoder from token ids to text, used to populate
     /// [`Completion::completion_text`] for text-based rewards. Default: `None`.

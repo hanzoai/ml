@@ -51,6 +51,7 @@
 mod accelerate;
 pub mod backend;
 pub mod backprop;
+pub mod compute;
 pub mod conv;
 mod convert;
 pub mod cpu;
@@ -67,6 +68,8 @@ mod dummy_metal_backend;
 pub mod dummy_vulkan_backend;
 pub mod dummy_wgpu_backend;
 pub mod error;
+pub mod fattn_decode;
+mod hc_sinkhorn;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]
@@ -77,15 +80,12 @@ pub mod model_delta;
 pub mod npy;
 pub mod op;
 pub mod pickle;
-pub mod compute;
 pub mod quantized;
 #[cfg(feature = "rocm")]
 pub mod rocm_backend;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
-pub mod fattn_decode;
-mod hc_sinkhorn;
 mod sort;
 mod storage;
 pub mod streaming;

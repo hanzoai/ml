@@ -21,7 +21,10 @@ fn gguf_header_loads_skipping_integer_tensors() {
     // routing tensors are skipped and the header parses.
     let content = Content::read(&mut f).expect("gguf header must parse (I32 tensors skipped)");
     let n = content.tensor_infos.len();
-    assert!(n > 0, "expected weight tensors after skipping integer auxiliaries");
+    assert!(
+        n > 0,
+        "expected weight tensors after skipping integer auxiliaries"
+    );
     // None of the kept tensors are the skipped integer routing maps.
     let leaked_int = content
         .tensor_infos

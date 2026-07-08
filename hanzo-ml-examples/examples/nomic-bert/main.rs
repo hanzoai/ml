@@ -7,9 +7,9 @@ extern crate accelerate_src;
 use hanzo_transformers::models::nomic_bert::{self, Config, NomicBertModel};
 
 use anyhow::{bail, Error as E, Result};
+use clap::Parser;
 use hanzo_ml::{DType, Tensor};
 use hanzo_nn::VarBuilder;
-use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer};
 

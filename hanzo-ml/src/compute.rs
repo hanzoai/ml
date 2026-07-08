@@ -305,8 +305,14 @@ mod tests {
     fn policies_set_expected_dtypes() {
         let dev = Device::Cpu;
         let s = ComputeCtx::serving(dev.clone());
-        assert_eq!((s.compute, s.kv, s.accum), (DType::BF16, DType::F32, DType::F32));
+        assert_eq!(
+            (s.compute, s.kv, s.accum),
+            (DType::BF16, DType::F32, DType::F32)
+        );
         let p = ComputeCtx::ds4_parity(dev);
-        assert_eq!((p.compute, p.kv, p.accum), (DType::F32, DType::F32, DType::F32));
+        assert_eq!(
+            (p.compute, p.kv, p.accum),
+            (DType::F32, DType::F32, DType::F32)
+        );
     }
 }

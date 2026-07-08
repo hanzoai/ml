@@ -21,7 +21,9 @@ impl From<String> for WgpuError {
 }
 
 fn err<T>() -> Result<T> {
-    Err(Error::Msg("hanzo was not compiled with wgpu support".into()))
+    Err(Error::Msg(
+        "hanzo was not compiled with wgpu support".into(),
+    ))
 }
 
 macro_rules! fail {

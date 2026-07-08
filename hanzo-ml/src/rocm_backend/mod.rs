@@ -505,7 +505,8 @@ pub fn launch_config(num_elems: usize) -> (rocm_rs::hip::Dim3, rocm_rs::hip::Dim
 /// `qdw_traits<WTYPE>` in the .hip = a fully wired type, for BOTH decode and MoE. No per-quant
 /// kernel, no per-quant launcher: `matvec_quant` reads the (type, activation) pair off this enum
 /// and dispatches the single core's f16/bf16 entry point. Mirrors the CPU `for_each_quant!` table.
-static FORCE_SCALAR_MATVEC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FORCE_SCALAR_MATVEC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Test-only: force `dp4a_active` to false so the scalar `qmatvec_core` runs, letting the bit-exact
 /// numeric oracles gate the scalar decode against the exact reference. Never set in production.
@@ -586,11 +587,29 @@ impl RocmQuantType {
     /// Elements per block (must divide `k`). Matches `qdw_traits<WTYPE>::ELEMS` in quant.hip.
     pub fn block_elems(self) -> usize {
         match self {
-            Self::Q8_0 | Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_1
-            | Self::IQ4_NL | Self::MXFP4 => 32,
-            Self::Q4K | Self::Q6K | Self::IQ4_XS | Self::TQ2_0 | Self::Q2K | Self::Q3K | Self::Q5K
-            | Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS | Self::IQ3_S
-            | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M => 256,
+            Self::Q8_0
+            | Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_1
+            | Self::IQ4_NL
+            | Self::MXFP4 => 32,
+            Self::Q4K
+            | Self::Q6K
+            | Self::IQ4_XS
+            | Self::TQ2_0
+            | Self::Q2K
+            | Self::Q3K
+            | Self::Q5K
+            | Self::IQ2_XXS
+            | Self::IQ2_XS
+            | Self::IQ2_S
+            | Self::IQ3_XXS
+            | Self::IQ3_S
+            | Self::TQ1_0
+            | Self::IQ1_S
+            | Self::IQ1_M => 256,
         }
     }
 
@@ -682,8 +701,17 @@ impl RocmQuantType {
             Self::Q5_0 => "qmmq_q5_0_f16",
             Self::Q5_1 => "qmmq_q5_1_f16",
             Self::Q8_1 => "qmmq_q8_1_f16",
-            Self::Q2K | Self::Q3K | Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS
-            | Self::IQ3_S | Self::IQ4_NL | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M
+            Self::Q2K
+            | Self::Q3K
+            | Self::IQ2_XXS
+            | Self::IQ2_XS
+            | Self::IQ2_S
+            | Self::IQ3_XXS
+            | Self::IQ3_S
+            | Self::IQ4_NL
+            | Self::TQ1_0
+            | Self::IQ1_S
+            | Self::IQ1_M
             | Self::MXFP4 => {
                 unreachable!("prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
             }
@@ -729,11 +757,22 @@ impl RocmQuantType {
             (Self::Q8_1, 64) => "moe_qmmq_q8_1_tm64_f16",
             (Self::Q8_1, _) => "moe_qmmq_q8_1_tm32_f16",
             (
-                Self::Q2K | Self::Q3K | Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS
-                | Self::IQ3_S | Self::IQ4_NL | Self::TQ1_0 | Self::IQ1_S | Self::IQ1_M
+                Self::Q2K
+                | Self::Q3K
+                | Self::IQ2_XXS
+                | Self::IQ2_XS
+                | Self::IQ2_S
+                | Self::IQ3_XXS
+                | Self::IQ3_S
+                | Self::IQ4_NL
+                | Self::TQ1_0
+                | Self::IQ1_S
+                | Self::IQ1_M
                 | Self::MXFP4,
                 _,
-            ) => unreachable!("moe_prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)"),
+            ) => {
+                unreachable!("moe_prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
+            }
         }
     }
 
@@ -985,7 +1024,10 @@ impl Act {
             RocmStorageSlice::F16(_) => Ok(Act::F16),
             RocmStorageSlice::BF16(_) => Ok(Act::Bf16),
             RocmStorageSlice::F32(_) => Ok(Act::F32),
-            other => crate::bail!("dp4a activation must be f16/bf16/f32, got {:?}", other.dtype()),
+            other => crate::bail!(
+                "dp4a activation must be f16/bf16/f32, got {:?}",
+                other.dtype()
+            ),
         }
     }
 
@@ -1483,7 +1525,10 @@ impl RocmDevice {
         match &w.slice {
             RocmStorageSlice::F16(_) => launch_gemv!(F16, f16, "dense_gemv_f16"),
             RocmStorageSlice::F32(_) => launch_gemv!(F32, f32, "dense_gemv_f32"),
-            other => crate::bail!("dense_gemv: weight dtype {:?} unsupported (f16/f32 only)", other.dtype()),
+            other => crate::bail!(
+                "dense_gemv: weight dtype {:?} unsupported (f16/f32 only)",
+                other.dtype()
+            ),
         }
     }
 
@@ -1609,8 +1654,14 @@ impl RocmDevice {
             )?;
         }
         Ok((
-            RocmStorage { slice: RocmStorageSlice::U8(xq), device: self.clone() },
-            RocmStorage { slice: RocmStorageSlice::F16(xd), device: self.clone() },
+            RocmStorage {
+                slice: RocmStorageSlice::U8(xq),
+                device: self.clone(),
+            },
+            RocmStorage {
+                slice: RocmStorageSlice::F16(xd),
+                device: self.clone(),
+            },
         ))
     }
 
@@ -1664,7 +1715,10 @@ impl RocmDevice {
             RocmStorageSlice::F16(s) => ("quantize_q8_1", s.as_ptr()),
             RocmStorageSlice::F32(s) => ("quantize_q8_1_f32", s.as_ptr()),
             RocmStorageSlice::BF16(s) => ("quantize_q8_1_bf16", s.as_ptr()),
-            other => crate::bail!("quantize_q8_1: x must be f16/f32/bf16, got {:?}", other.dtype()),
+            other => crate::bail!(
+                "quantize_q8_1: x must be f16/f32/bf16, got {:?}",
+                other.dtype()
+            ),
         };
         let nblk = k / 32;
         let xq = self.alloc::<u8>(m * k)?;
@@ -1697,9 +1751,18 @@ impl RocmDevice {
             )?;
         }
         Ok((
-            RocmStorage { slice: RocmStorageSlice::U8(xq), device: self.clone() },
-            RocmStorage { slice: RocmStorageSlice::F16(xd), device: self.clone() },
-            RocmStorage { slice: RocmStorageSlice::I32(xs), device: self.clone() },
+            RocmStorage {
+                slice: RocmStorageSlice::U8(xq),
+                device: self.clone(),
+            },
+            RocmStorage {
+                slice: RocmStorageSlice::F16(xd),
+                device: self.clone(),
+            },
+            RocmStorage {
+                slice: RocmStorageSlice::I32(xs),
+                device: self.clone(),
+            },
         ))
     }
 
@@ -1720,7 +1783,10 @@ impl RocmDevice {
     ) -> Result<RocmStorage> {
         use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
         if k % qt.block_elems() != 0 {
-            crate::bail!("qmmq_quant({qt:?}): k={k} not a multiple of block size {}", qt.block_elems());
+            crate::bail!(
+                "qmmq_quant({qt:?}): k={k} not a multiple of block size {}",
+                qt.block_elems()
+            );
         }
         // Pre-quantize activations once. SYMMETRIC weights need only xq/xd; ASYMMETRIC (Q4_K) also
         // needs the per-block int8 sum xs (the q8_1 bias term). xq/xd/xs own their VRAM until the end
@@ -1735,7 +1801,11 @@ impl RocmDevice {
         };
         // Dummy 1-elem xs for the symmetric path (the kernel's asym branch elides, so it is never
         // dereferenced; we just need a non-null device pointer to bind to the kernel parameter).
-        let xs_dummy = if xs_opt.is_none() { Some(self.alloc::<i32>(1)?) } else { None };
+        let xs_dummy = if xs_opt.is_none() {
+            Some(self.alloc::<i32>(1)?)
+        } else {
+            None
+        };
         let xq_ptr = match &xq.slice {
             RocmStorageSlice::U8(s) => s.as_ptr(),
             _ => crate::bail!("qmmq_quant: xq must be u8"),
@@ -1789,7 +1859,10 @@ impl RocmDevice {
                 ],
             )?;
         }
-        Ok(RocmStorage { slice: RocmStorageSlice::F16(out), device: self.clone() })
+        Ok(RocmStorage {
+            slice: RocmStorageSlice::F16(out),
+            device: self.clone(),
+        })
     }
 
     /// FUSED indexed-MoE PREFILL GEMM. Groups the routed slots by expert (host-side counting sort over
@@ -1812,7 +1885,10 @@ impl RocmDevice {
         use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
         use std::ffi::c_void;
         if k % qt.block_elems() != 0 {
-            crate::bail!("moe_qmmq_quant({qt:?}): k={k} not a multiple of block size {}", qt.block_elems());
+            crate::bail!(
+                "moe_qmmq_quant({qt:?}): k={k} not a multiple of block size {}",
+                qt.block_elems()
+            );
         }
         let wbank_mem = match &wbank.slice {
             RocmStorageSlice::U8(m) => m,
@@ -1860,7 +1936,10 @@ impl RocmDevice {
         // beats 128 across the whole prefill range; TILE_M=32 wins the few-token decode micro-batches
         // (~1-8 tok/expert, where a 128-tile is ~1-6% full); 128 only pays off for very dense routing
         // (avg >> 64), which needs a very long prompt. MOE_TILE_M overrides for the A/B.
-        let tile_m: i32 = match std::env::var("MOE_TILE_M").ok().and_then(|s| s.parse().ok()) {
+        let tile_m: i32 = match std::env::var("MOE_TILE_M")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             Some(v @ (32 | 64 | 128)) => v,
             _ if avg_tok >= 160 => 128,
             _ if avg_tok >= 24 => 64,
@@ -1882,7 +1961,10 @@ impl RocmDevice {
         let num_row_tiles = tile_expert.len();
         if num_row_tiles == 0 {
             let out = self.alloc::<f16>(nslots * n)?;
-            return Ok(RocmStorage { slice: RocmStorageSlice::F16(out), device: self.clone() });
+            return Ok(RocmStorage {
+                slice: RocmStorageSlice::F16(out),
+                device: self.clone(),
+            });
         }
         // M-tile fill telemetry (LEVER-1 measurement): valid rows vs WMMA tile capacity. The wasted
         // fraction = empty WMMA M-rows = the directly-recoverable matrix-core work. Env-gated.
@@ -1902,7 +1984,11 @@ impl RocmDevice {
             let (xq, xd, xs) = self.quantize_q8_1(x, nslots, k)?;
             (xq, xd, Some(xs))
         };
-        let xs_dummy = if xs_opt.is_none() { Some(self.alloc::<i32>(1)?) } else { None };
+        let xs_dummy = if xs_opt.is_none() {
+            Some(self.alloc::<i32>(1)?)
+        } else {
+            None
+        };
         let xq_ptr = match &xq.slice {
             RocmStorageSlice::U8(s) => s.as_ptr(),
             _ => crate::bail!("moe_qmmq_quant: xq must be u8"),
@@ -1965,7 +2051,10 @@ impl RocmDevice {
                 ],
             )?;
         }
-        Ok(RocmStorage { slice: RocmStorageSlice::F16(out), device: self.clone() })
+        Ok(RocmStorage {
+            slice: RocmStorageSlice::F16(out),
+            device: self.clone(),
+        })
     }
 
     /// FUSED MoE expert-combine: `out[i,j] = sum_e scores[i,e] * ys[i,e,j]` in ONE launch. Replaces
@@ -2017,7 +2106,10 @@ impl RocmDevice {
                         ],
                     )?;
                 }
-                RocmStorage { slice: RocmStorageSlice::$variant(out), device: self.clone() }
+                RocmStorage {
+                    slice: RocmStorageSlice::$variant(out),
+                    device: self.clone(),
+                }
             }};
         }
         let out = match &ys.slice {
@@ -2081,8 +2173,14 @@ impl RocmDevice {
             )?;
         }
         Ok((
-            RocmStorage { slice: RocmStorageSlice::U32(ids), device: self.clone() },
-            RocmStorage { slice: RocmStorageSlice::F32(w), device: self.clone() },
+            RocmStorage {
+                slice: RocmStorageSlice::U32(ids),
+                device: self.clone(),
+            },
+            RocmStorage {
+                slice: RocmStorageSlice::F32(w),
+                device: self.clone(),
+            },
         ))
     }
 }
@@ -2315,11 +2413,9 @@ impl RocmStorage {
         let r_off = residual_layout.start_offset();
         let alpha_off = alpha_layout.start_offset();
         let (x_mem, r_mem, alpha_mem) = match (&x.slice, &residual.slice, &alpha.slice) {
-            (
-                RocmStorageSlice::F32(xm),
-                RocmStorageSlice::F32(rm),
-                RocmStorageSlice::F32(am),
-            ) => (xm, rm, am),
+            (RocmStorageSlice::F32(xm), RocmStorageSlice::F32(rm), RocmStorageSlice::F32(am)) => {
+                (xm, rm, am)
+            }
             _ => crate::bail!(
                 "add_rms_norm: f32 inputs required (x={:?} residual={:?} alpha={:?})",
                 x.slice.dtype(),
@@ -2511,7 +2607,10 @@ impl RocmStorage {
         }
         let pos_mem = match &positions.slice {
             RocmStorageSlice::U32(m) => m,
-            other => crate::bail!("rope_positions positions must be u32, got {:?}", other.dtype()),
+            other => crate::bail!(
+                "rope_positions positions must be u32, got {:?}",
+                other.dtype()
+            ),
         };
         let device = self.device.clone();
         let q_el = b * h * t * d;
@@ -2614,7 +2713,10 @@ impl RocmStorage {
             RocmStorageSlice::F32(_) => launch_rope_pos!(F32, f32, "rope_positions_f32"),
             RocmStorageSlice::F16(_) => launch_rope_pos!(F16, f16, "rope_positions_f16"),
             RocmStorageSlice::BF16(_) => launch_rope_pos!(BF16, bf16, "rope_positions_bf16"),
-            other => crate::bail!("rope_positions on rocm unsupported dtype {:?}", other.dtype()),
+            other => crate::bail!(
+                "rope_positions on rocm unsupported dtype {:?}",
+                other.dtype()
+            ),
         }
     }
 
@@ -2660,7 +2762,10 @@ impl RocmStorage {
         }
         let pos_mem = match &positions.slice {
             RocmStorageSlice::U32(m) => m,
-            other => crate::bail!("rope_norm_positions positions must be u32, got {:?}", other.dtype()),
+            other => crate::bail!(
+                "rope_norm_positions positions must be u32, got {:?}",
+                other.dtype()
+            ),
         };
         let device = self.device.clone();
         let q_el = b * h * t * d;
@@ -2682,7 +2787,12 @@ impl RocmStorage {
         macro_rules! launch_rope_norm {
             ($variant:ident, $ty:ty, $func:literal) => {{
                 let (q_mem, k_mem, qw_mem, kw_mem, cos_mem, sin_mem) = match (
-                    &q.slice, &k.slice, &q_weight.slice, &k_weight.slice, &cos.slice, &sin.slice,
+                    &q.slice,
+                    &k.slice,
+                    &q_weight.slice,
+                    &k_weight.slice,
+                    &cos.slice,
+                    &sin.slice,
                 ) {
                     (
                         RocmStorageSlice::$variant(a),
@@ -2692,7 +2802,9 @@ impl RocmStorage {
                         RocmStorageSlice::$variant(e),
                         RocmStorageSlice::$variant(f),
                     ) => (a, b, c, d, e, f),
-                    _ => crate::bail!("rope_norm_positions: q/k/weights/cos/sin must share q's dtype"),
+                    _ => crate::bail!(
+                        "rope_norm_positions: q/k/weights/cos/sin must share q's dtype"
+                    ),
                 };
                 let q_out = device.alloc::<$ty>(q_el)?;
                 let k_out = device.alloc::<$ty>(k_el)?;
@@ -2736,8 +2848,14 @@ impl RocmStorage {
                     )?;
                 }
                 Ok((
-                    Self { slice: RocmStorageSlice::$variant(q_out), device: device.clone() },
-                    Self { slice: RocmStorageSlice::$variant(k_out), device: device.clone() },
+                    Self {
+                        slice: RocmStorageSlice::$variant(q_out),
+                        device: device.clone(),
+                    },
+                    Self {
+                        slice: RocmStorageSlice::$variant(k_out),
+                        device: device.clone(),
+                    },
                 ))
             }};
         }
@@ -2746,7 +2864,10 @@ impl RocmStorage {
             RocmStorageSlice::F32(_) => launch_rope_norm!(F32, f32, "rope_norm_positions_f32"),
             RocmStorageSlice::F16(_) => launch_rope_norm!(F16, f16, "rope_norm_positions_f16"),
             RocmStorageSlice::BF16(_) => launch_rope_norm!(BF16, bf16, "rope_norm_positions_bf16"),
-            other => crate::bail!("rope_norm_positions on rocm unsupported dtype {:?}", other.dtype()),
+            other => crate::bail!(
+                "rope_norm_positions on rocm unsupported dtype {:?}",
+                other.dtype()
+            ),
         }
     }
 
@@ -2774,7 +2895,9 @@ impl RocmStorage {
         let (kb, hkv, lk, kd) = k_layout.shape().dims4()?;
         let (vb, vhkv, vlk, vd) = v_layout.shape().dims4()?;
         if d != FA_DH || kd != FA_DH || vd != FA_DH {
-            crate::bail!("flash_attn on rocm requires head_dim == {FA_DH}, got q={d} k={kd} v={vd}");
+            crate::bail!(
+                "flash_attn on rocm requires head_dim == {FA_DH}, got q={d} k={kd} v={vd}"
+            );
         }
         if (kb, vb, vhkv, vlk) != (b, b, hkv, lk) {
             crate::bail!("flash_attn q/k/v batch/kv-head/kv-len mismatch {q_layout:?} {k_layout:?} {v_layout:?}");
@@ -2862,7 +2985,10 @@ impl RocmStorage {
         match &q.slice {
             RocmStorageSlice::F16(_) => launch_flash!(F16, f16, "flash_attn_f16"),
             RocmStorageSlice::BF16(_) => launch_flash!(BF16, bf16, "flash_attn_bf16"),
-            other => crate::bail!("flash_attn on rocm unsupported dtype {:?} (f16/bf16 only)", other.dtype()),
+            other => crate::bail!(
+                "flash_attn on rocm unsupported dtype {:?} (f16/bf16 only)",
+                other.dtype()
+            ),
         }
     }
 
@@ -2923,7 +3049,10 @@ impl RocmStorage {
             RocmStorageSlice::F32(_) => launch_softmax!(F32, f32, "softmax_f32"),
             RocmStorageSlice::F16(_) => launch_softmax!(F16, f16, "softmax_f16"),
             RocmStorageSlice::BF16(_) => launch_softmax!(BF16, bf16, "softmax_bf16"),
-            other => crate::bail!("softmax_last_dim on rocm unsupported dtype {:?}", other.dtype()),
+            other => crate::bail!(
+                "softmax_last_dim on rocm unsupported dtype {:?}",
+                other.dtype()
+            ),
         }
     }
 
@@ -3827,90 +3956,27 @@ impl BackendStorage for RocmStorage {
 
         let src_dtype = self.slice.dtype();
         let slice = match dtype {
-            DType::U8 => cast_launch!(
-                dev,
-                grid,
-                block,
-                el,
-                num_dims,
-                ds,
-                src_ptr,
-                src_dtype,
-                u8,
-                U8
-            ),
-            DType::U32 => cast_launch!(
-                dev,
-                grid,
-                block,
-                el,
-                num_dims,
-                ds,
-                src_ptr,
-                src_dtype,
-                u32,
-                U32
-            ),
-            DType::I64 => cast_launch!(
-                dev,
-                grid,
-                block,
-                el,
-                num_dims,
-                ds,
-                src_ptr,
-                src_dtype,
-                i64,
-                I64
-            ),
-            DType::BF16 => cast_launch!(
-                dev,
-                grid,
-                block,
-                el,
-                num_dims,
-                ds,
-                src_ptr,
-                src_dtype,
-                bf16,
-                BF16
-            ),
-            DType::F16 => cast_launch!(
-                dev,
-                grid,
-                block,
-                el,
-                num_dims,
-                ds,
-                src_ptr,
-                src_dtype,
-                f16,
-                F16
-            ),
-            DType::F32 => cast_launch!(
-                dev,
-                grid,
-                block,
-                el,
-                num_dims,
-                ds,
-                src_ptr,
-                src_dtype,
-                f32,
-                F32
-            ),
-            DType::F64 => cast_launch!(
-                dev,
-                grid,
-                block,
-                el,
-                num_dims,
-                ds,
-                src_ptr,
-                src_dtype,
-                f64,
-                F64
-            ),
+            DType::U8 => {
+                cast_launch!(dev, grid, block, el, num_dims, ds, src_ptr, src_dtype, u8, U8)
+            }
+            DType::U32 => {
+                cast_launch!(dev, grid, block, el, num_dims, ds, src_ptr, src_dtype, u32, U32)
+            }
+            DType::I64 => {
+                cast_launch!(dev, grid, block, el, num_dims, ds, src_ptr, src_dtype, i64, I64)
+            }
+            DType::BF16 => {
+                cast_launch!(dev, grid, block, el, num_dims, ds, src_ptr, src_dtype, bf16, BF16)
+            }
+            DType::F16 => {
+                cast_launch!(dev, grid, block, el, num_dims, ds, src_ptr, src_dtype, f16, F16)
+            }
+            DType::F32 => {
+                cast_launch!(dev, grid, block, el, num_dims, ds, src_ptr, src_dtype, f32, F32)
+            }
+            DType::F64 => {
+                cast_launch!(dev, grid, block, el, num_dims, ds, src_ptr, src_dtype, f64, F64)
+            }
             DType::I16 | DType::I32 => {
                 return Err(crate::Error::Msg(
                     "i16/i32 dtypes are not supported for to_dtype on ROCm".to_string(),
@@ -3942,8 +4008,7 @@ impl BackendStorage for RocmStorage {
     fn where_cond(&self, l: &Layout, a: &Self, la: &Layout, b: &Self, lb: &Layout) -> Result<Self> {
         let device = self.device.clone();
         let numel = l.shape().elem_count();
-        let (ds, num_dims) =
-            DimsStrides::build(l.dims(), &[l.stride(), la.stride(), lb.stride()])?;
+        let (ds, num_dims) = DimsStrides::build(l.dims(), &[l.stride(), la.stride(), lb.stride()])?;
         let (cond_prefix, cond_ptr) = match &self.slice {
             RocmStorageSlice::U8(s) => ("where_u8", unsafe { s.offset_ptr(l.start_offset()) }
                 as *mut std::ffi::c_void),
@@ -4313,7 +4378,12 @@ impl BackendStorage for RocmStorage {
         // the filled inline payload. Both are byte-identical math.
         let ids_contig = ids_l.is_contiguous();
         let (ds, num_dims) = if ids_contig {
-            (DimsStrides { v: [0; ROCM_DS_MAX * ROCM_DS_SETS] }, 0)
+            (
+                DimsStrides {
+                    v: [0; ROCM_DS_MAX * ROCM_DS_SETS],
+                },
+                0,
+            )
         } else {
             DimsStrides::build(ids_l.shape().dims(), &[ids_l.stride()])?
         };
@@ -4325,15 +4395,24 @@ impl BackendStorage for RocmStorage {
 
         let prefix_base = if ids_contig { "isc" } else { "is" };
         let (ids_prefix, ids_ptr): (String, *mut std::ffi::c_void) = match &idx.slice {
-            RocmStorageSlice::U32(s) => (format!("{prefix_base}_u32"), unsafe {
-                s.offset_ptr(ids_l.start_offset())
-            } as *mut std::ffi::c_void),
-            RocmStorageSlice::U8(s) => (format!("{prefix_base}_u8"), unsafe {
-                s.offset_ptr(ids_l.start_offset())
-            } as *mut std::ffi::c_void),
-            RocmStorageSlice::I64(s) => (format!("{prefix_base}_i64"), unsafe {
-                s.offset_ptr(ids_l.start_offset())
-            } as *mut std::ffi::c_void),
+            RocmStorageSlice::U32(s) => {
+                (
+                    format!("{prefix_base}_u32"),
+                    unsafe { s.offset_ptr(ids_l.start_offset()) } as *mut std::ffi::c_void,
+                )
+            }
+            RocmStorageSlice::U8(s) => {
+                (
+                    format!("{prefix_base}_u8"),
+                    unsafe { s.offset_ptr(ids_l.start_offset()) } as *mut std::ffi::c_void,
+                )
+            }
+            RocmStorageSlice::I64(s) => {
+                (
+                    format!("{prefix_base}_i64"),
+                    unsafe { s.offset_ptr(ids_l.start_offset()) } as *mut std::ffi::c_void,
+                )
+            }
             _ => crate::bail!("index_select ids should be u8, u32, or i64"),
         };
         let ids_prefix = ids_prefix.as_str();

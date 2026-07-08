@@ -37,14 +37,22 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
 }
 
 // m == 1 -> decode (mmvq dp4a); m > 8 -> prefill (qmmq int8-WMMA GEMM).
-fn bench_shape(dev: &Device, dtype: GgmlDType, nout: usize, k: usize, m: usize) -> hanzo_ml::Result<()> {
+fn bench_shape(
+    dev: &Device,
+    dtype: GgmlDType,
+    nout: usize,
+    k: usize,
+    m: usize,
+) -> hanzo_ml::Result<()> {
     let raw = synth(dtype, nout, k);
     let bytes = raw.len();
     let qs = QStorage::from_data(Cow::Owned(raw), dev, dtype)?;
     let q = QTensor::new(qs, (nout, k))?;
     let matmul = QMatMul::from_qtensor(q)?;
     let x = Tensor::from_vec(
-        (0..m * k).map(|i| (pbyte(i) as f32 / 128.0) - 1.0).collect(),
+        (0..m * k)
+            .map(|i| (pbyte(i) as f32 / 128.0) - 1.0)
+            .collect(),
         (m, k),
         dev,
     )?;
@@ -64,9 +72,7 @@ fn bench_shape(dev: &Device, dtype: GgmlDType, nout: usize, k: usize, m: usize) 
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     let path = if m == 1 { "native-dp4a" } else { "native-qmmq" };
     let kind = if m == 1 { "decode" } else { "prefill" };
-    println!(
-        "[{path:>16}] {kind} {dtype:?} [n={nout:>5} k={k:>5} m={m:>4}]  {us:9.2} us/call",
-    );
+    println!("[{path:>16}] {kind} {dtype:?} [n={nout:>5} k={k:>5} m={m:>4}]  {us:9.2} us/call",);
     Ok(())
 }
 
@@ -83,7 +89,11 @@ fn bench_iq2xxs_decode() {
     // Decode (m=1, mmvq) + prefill (m=128, qmmq) on realistic proj shapes (attn k=2048; FFN k=4096),
     // for IQ2_XXS (grid codebook) and IQ4_XS (LUT codebook -- the dominant type in UD-IQ2_M MoE quants).
     for dtype in [GgmlDType::IQ2_XXS, GgmlDType::IQ4_XS] {
-        for &(n, k, m) in &[(4096usize, 4096usize, 1usize), (8192, 4096, 1), (4096, 4096, 128)] {
+        for &(n, k, m) in &[
+            (4096usize, 4096usize, 1usize),
+            (8192, 4096, 1),
+            (4096, 4096, 128),
+        ] {
             bench_shape(&dev, dtype, n, k, m).unwrap();
         }
     }

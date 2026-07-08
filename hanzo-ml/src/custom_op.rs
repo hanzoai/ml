@@ -17,7 +17,10 @@ use std::sync::Arc;
 /// `#[cfg(feature = "vulkan")]`), so it never touches other backends.
 #[cfg(feature = "vulkan")]
 fn log_vulkan_custom_op_bail(name: &str, l: &Layout) {
-    if std::env::var("VK_PROFILE").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("VK_PROFILE")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
         eprintln!(
             "[VK_PROFILE] custom-op bail op={name} shape={:?} (no vulkan_fwd; would round-trip/err)",
             l.shape().dims()

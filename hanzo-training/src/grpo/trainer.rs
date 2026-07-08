@@ -146,9 +146,12 @@ impl<P: Policy, R: Policy> GrpoTrainer<P, R> {
                 .wrapping_add((pi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut sampler = LogitsSampler::with_seed(&self.config, seed);
 
-            let mut group =
-                self.policy
-                    .sample_group(prompt, g, self.config.max_completion_len, &mut sampler)?;
+            let mut group = self.policy.sample_group(
+                prompt,
+                g,
+                self.config.max_completion_len,
+                &mut sampler,
+            )?;
             debug_assert_eq!(group.completions.len(), g);
 
             // Populate decoded text for text-based rewards if the policy can.
@@ -163,7 +166,11 @@ impl<P: Policy, R: Policy> GrpoTrainer<P, R> {
 
             let mean = group_rewards.iter().copied().sum::<f32>() / g as f32;
             let var = if g > 1 {
-                group_rewards.iter().map(|&r| (r - mean).powi(2)).sum::<f32>() / (g as f32 - 1.0)
+                group_rewards
+                    .iter()
+                    .map(|&r| (r - mean).powi(2))
+                    .sum::<f32>()
+                    / (g as f32 - 1.0)
             } else {
                 0.0
             };

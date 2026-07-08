@@ -32,7 +32,7 @@
 #![allow(unused_macros)]
 #![allow(unused_imports)]
 
-use super::k_quants::{GgmlType, BlockQ8_0, QK8_0};
+use super::k_quants::{BlockQ8_0, GgmlType, QK8_0};
 use half::f16;
 
 /// The one shared matmul building block behind every decode-only type's `vec_dot`.

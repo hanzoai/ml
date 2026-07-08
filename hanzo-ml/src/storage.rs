@@ -5,9 +5,9 @@ use crate::scalar::Scalar;
 use crate::RocmStorage;
 #[cfg(feature = "vulkan")]
 use crate::VulkanStorage;
-use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape};
 #[cfg(feature = "wgpu")]
 use crate::WgpuStorage;
+use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape};
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
 // We do not want to implement Clone on Storage as cloning may fail because of
@@ -512,9 +512,7 @@ impl Storage {
                 c.vulkan_fwd(s1, l1, s2, l2, s3, l3)
             }
             #[cfg(feature = "wgpu")]
-            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => {
-                c.wgpu_fwd(s1, l1, s2, l2, s3, l3)
-            }
+            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => c.wgpu_fwd(s1, l1, s2, l2, s3, l3),
             _ => unreachable!(),
         }
     }
@@ -1286,9 +1284,7 @@ impl Storage {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
             #[cfg(feature = "wgpu")]
-            (Self::Wgpu(src), Self::Wgpu(dst)) => {
-                Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
-            }
+            (Self::Wgpu(src), Self::Wgpu(dst)) => Ok(src.copy_strided_src(dst, dst_offset, src_l)?),
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
