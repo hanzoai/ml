@@ -34,6 +34,10 @@ pub mod prelude {
     pub use hanzo_kernel_macros::{device, kernel};
     pub use cubecl::CubeCount as Grid;
     pub use cubecl::CubeDim as Block;
+    // The intrinsic-island tag. `#[kernel]` rewrites `island! { ... }` into a comptime match over a
+    // `Target` param, so `Target` must be in scope wherever islands are authored — the prelude carries
+    // it exactly like `Array`/`Float`, the one import a kernel source needs.
+    pub use crate::island::Target;
     // Internal: `#[kernel]`/`#[device]` expand to `#[cube(...)]`, resolved via this glob. Kernel
     // *source* only writes `#[kernel]` / `#[device]`; `cube` is never named by a human.
     #[doc(hidden)]
@@ -51,6 +55,7 @@ pub mod tune;
 
 pub mod quant;
 
+pub mod island;
 pub mod norm;
 pub mod rope;
 pub mod attn;
