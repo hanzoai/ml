@@ -27,3 +27,94 @@ pub fn normalize_loudness(
         Ok(wav)
     }
 }
+
+/// Decode an audio file (any symphonia-supported container/codec) to mono f32 PCM.
+/// Returns the samples of channel 0 and the source sample rate.
+#[cfg(feature = "symphonia")]
+pub fn pcm_decode<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<(Vec<f32>, u32)> {
+    use symphonia::core::audio::{AudioBufferRef, Signal};
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+    use symphonia::core::conv::FromSample;
+
+    fn conv<T>(
+        samples: &mut Vec<f32>,
+        data: std::borrow::Cow<symphonia::core::audio::AudioBuffer<T>>,
+    ) where
+        T: symphonia::core::sample::Sample,
+        f32: symphonia::core::conv::FromSample<T>,
+    {
+        samples.extend(data.chan(0).iter().map(|v| f32::from_sample(*v)))
+    }
+
+    let src = std::fs::File::open(path)?;
+    let mss = symphonia::core::io::MediaSourceStream::new(Box::new(src), Default::default());
+    let hint = symphonia::core::probe::Hint::new();
+    let meta_opts: symphonia::core::meta::MetadataOptions = Default::default();
+    let fmt_opts: symphonia::core::formats::FormatOptions = Default::default();
+    let probed = symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| anyhow::anyhow!("no supported audio tracks"))?;
+    let dec_opts: DecoderOptions = Default::default();
+    let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &dec_opts)?;
+    let track_id = track.id;
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let mut pcm_data = Vec::new();
+    while let Ok(packet) = format.next_packet() {
+        while !format.metadata().is_latest() {
+            format.metadata().pop();
+        }
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet)? {
+            AudioBufferRef::F32(buf) => pcm_data.extend(buf.chan(0)),
+            AudioBufferRef::U8(data) => conv(&mut pcm_data, data),
+            AudioBufferRef::U16(data) => conv(&mut pcm_data, data),
+            AudioBufferRef::U24(data) => conv(&mut pcm_data, data),
+            AudioBufferRef::U32(data) => conv(&mut pcm_data, data),
+            AudioBufferRef::S8(data) => conv(&mut pcm_data, data),
+            AudioBufferRef::S16(data) => conv(&mut pcm_data, data),
+            AudioBufferRef::S24(data) => conv(&mut pcm_data, data),
+            AudioBufferRef::S32(data) => conv(&mut pcm_data, data),
+            AudioBufferRef::F64(data) => conv(&mut pcm_data, data),
+        }
+    }
+    Ok((pcm_data, sample_rate))
+}
+
+/// One-shot mono resample from `sr_in` to `sr_out`.
+#[cfg(feature = "rubato")]
+pub fn resample(pcm_in: &[f32], sr_in: u32, sr_out: u32) -> anyhow::Result<Vec<f32>> {
+    use rubato::Resampler;
+
+    let resample_ratio = sr_out as f64 / sr_in as f64;
+    let mut resampler = rubato::FastFixedIn::<f32>::new(
+        resample_ratio,
+        f64::max(resample_ratio, 1.0),
+        rubato::PolynomialDegree::Septic,
+        1024,
+        1,
+    )?;
+    let mut pcm_out = Vec::with_capacity((pcm_in.len() as f64 * resample_ratio) as usize + 1024);
+    let mut output_buffer = resampler.output_buffer_allocate(true).remove(0);
+    let mut pos_in = 0;
+    while pos_in + resampler.input_frames_next() <= pcm_in.len() {
+        let (in_len, out_len) =
+            resampler.process_into_buffer(&[&pcm_in[pos_in..]], &mut [&mut output_buffer], None)?;
+        pos_in += in_len;
+        pcm_out.extend_from_slice(&output_buffer[..out_len]);
+    }
+    if pos_in < pcm_in.len() {
+        let (_in_len, out_len) = resampler.process_partial_into_buffer(
+            Some(&[&pcm_in[pos_in..]]),
+            &mut [&mut output_buffer],
+            None,
+        )?;
+        pcm_out.extend_from_slice(&output_buffer[..out_len]);
+    }
+    Ok(pcm_out)
+}
