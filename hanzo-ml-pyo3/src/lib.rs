@@ -3,8 +3,8 @@
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
-use pyo3::types::{IntoPyDict, PyDict, PyTuple};
-use pyo3::ToPyObject;
+use pyo3::types::{IntoPyDict, PyDict, PyString, PyTuple};
+use pyo3::IntoPyObjectExt;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -127,26 +127,30 @@ impl<'py> FromPyObject<'py> for PyDevice {
     }
 }
 
-impl ToPyObject for PyDevice {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyDevice {
+    type Target = PyString;
+    type Output = Bound<'py, PyString>;
+    type Error = std::convert::Infallible;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let str = match self {
             PyDevice::Cpu => "cpu",
             PyDevice::Cuda => "cuda",
             PyDevice::Metal => "metal",
         };
-        str.to_object(py)
+        str.into_pyobject(py)
     }
 }
 
 trait PyWithDType: WithDType {
-    fn to_py(&self, py: Python<'_>) -> PyObject;
+    fn to_py(&self, py: Python<'_>) -> PyResult<PyObject>;
 }
 
 macro_rules! pydtype {
     ($ty:ty, $conv:expr) => {
         impl PyWithDType for $ty {
-            fn to_py(&self, py: Python<'_>) -> PyObject {
-                $conv(*self).to_object(py)
+            fn to_py(&self, py: Python<'_>) -> PyResult<PyObject> {
+                $conv(*self).into_py_any(py)
             }
         }
     };
@@ -300,19 +304,26 @@ impl PyTensor {
             type Output = PyObject;
             fn f<T: PyWithDType>(&self, t: &Tensor) -> PyResult<Self::Output> {
                 match t.rank() {
-                    0 => Ok(t.to_scalar::<T>().map_err(wrap_err)?.to_py(self.0)),
+                    0 => t.to_scalar::<T>().map_err(wrap_err)?.to_py(self.0),
                     1 => {
                         let v = t.to_vec1::<T>().map_err(wrap_err)?;
-                        let v = v.iter().map(|v| v.to_py(self.0)).collect::<Vec<_>>();
-                        Ok(v.to_object(self.0))
+                        let v = v
+                            .iter()
+                            .map(|v| v.to_py(self.0))
+                            .collect::<PyResult<Vec<_>>>()?;
+                        v.into_py_any(self.0)
                     }
                     2 => {
                         let v = t.to_vec2::<T>().map_err(wrap_err)?;
                         let v = v
                             .iter()
-                            .map(|v| v.iter().map(|v| v.to_py(self.0)).collect())
-                            .collect::<Vec<Vec<_>>>();
-                        Ok(v.to_object(self.0))
+                            .map(|v| {
+                                v.iter()
+                                    .map(|v| v.to_py(self.0))
+                                    .collect::<PyResult<Vec<_>>>()
+                            })
+                            .collect::<PyResult<Vec<Vec<_>>>>()?;
+                        v.into_py_any(self.0)
                     }
                     3 => {
                         let v = t.to_vec3::<T>().map_err(wrap_err)?;
@@ -320,15 +331,19 @@ impl PyTensor {
                             .iter()
                             .map(|v| {
                                 v.iter()
-                                    .map(|v| v.iter().map(|v| v.to_py(self.0)).collect())
-                                    .collect()
+                                    .map(|v| {
+                                        v.iter()
+                                            .map(|v| v.to_py(self.0))
+                                            .collect::<PyResult<Vec<_>>>()
+                                    })
+                                    .collect::<PyResult<Vec<Vec<_>>>>()
                             })
-                            .collect::<Vec<Vec<Vec<_>>>>();
-                        Ok(v.to_object(self.0))
+                            .collect::<PyResult<Vec<Vec<Vec<_>>>>>()?;
+                        v.into_py_any(self.0)
                     }
                     n => Err(PyTypeError::new_err(format!(
                         "TODO: conversion to PyObject is not handled for rank {n}"
-                    )))?,
+                    ))),
                 }
             }
         }
@@ -341,7 +356,7 @@ impl PyTensor {
     fn to_torch(&self, py: Python<'_>) -> PyResult<PyObject> {
         let hanzo_values = self.values(py)?;
         let torch_tensor: PyObject = py
-            .import_bound("torch")?
+            .import("torch")?
             .getattr("tensor")?
             .call1((hanzo_values,))?
             .extract()?;
@@ -351,8 +366,8 @@ impl PyTensor {
     #[getter]
     /// Gets the tensor's shape.
     /// &RETURNS&: Tuple[int]
-    fn shape(&self, py: Python<'_>) -> PyObject {
-        PyTuple::new_bound(py, self.0.dims()).to_object(py)
+    fn shape(&self, py: Python<'_>) -> PyResult<PyObject> {
+        PyTuple::new(py, self.0.dims())?.into_py_any(py)
     }
 
     #[getter]
@@ -365,8 +380,8 @@ impl PyTensor {
     #[getter]
     /// Gets the tensor's strides.
     /// &RETURNS&: Tuple[int]
-    fn stride(&self, py: Python<'_>) -> PyObject {
-        PyTuple::new_bound(py, self.0.stride()).to_object(py)
+    fn stride(&self, py: Python<'_>) -> PyResult<PyObject> {
+        PyTuple::new(py, self.0.stride())?.into_py_any(py)
     }
 
     #[getter]
@@ -379,8 +394,8 @@ impl PyTensor {
     #[getter]
     /// Gets the tensor's device.
     /// &RETURNS&: Device
-    fn device(&self, py: Python<'_>) -> PyObject {
-        PyDevice::from_device(self.0.device()).to_object(py)
+    fn device(&self, py: Python<'_>) -> PyResult<PyObject> {
+        PyDevice::from_device(self.0.device()).into_py_any(py)
     }
 
     #[getter]
@@ -1242,8 +1257,8 @@ impl PyQTensor {
     #[getter]
     ///Gets the shape of the tensor.
     /// &RETURNS&: Tuple[int]
-    fn shape(&self, py: Python<'_>) -> PyObject {
-        PyTuple::new_bound(py, self.0.shape().dims()).to_object(py)
+    fn shape(&self, py: Python<'_>) -> PyResult<PyObject> {
+        PyTuple::new(py, self.0.shape().dims())?.into_py_any(py)
     }
 
     fn __repr__(&self) -> String {
@@ -1279,9 +1294,9 @@ fn load_safetensors(path: &str, py: Python<'_>) -> PyResult<PyObject> {
     let res = ::hanzo_ml::safetensors::load(path, &Device::Cpu).map_err(wrap_err)?;
     let res = res
         .into_iter()
-        .map(|(key, value)| (key, PyTensor(value).into_py(py)))
+        .map(|(key, value)| (key, PyTensor(value)))
         .collect::<Vec<_>>();
-    Ok(res.into_py_dict_bound(py).to_object(py))
+    Ok(res.into_py_dict(py)?.into_any().unbind())
 }
 
 #[pyfunction]
@@ -1316,10 +1331,9 @@ fn load_ggml(
     let tensors = ggml
         .tensors
         .into_iter()
-        .map(|(key, qtensor)| Ok((key, PyQTensor(Arc::new(qtensor)).into_py(py))))
-        .collect::<::hanzo_ml::Result<Vec<_>>>()
-        .map_err(wrap_err)?;
-    let tensors = tensors.into_py_dict_bound(py).to_object(py);
+        .map(|(key, qtensor)| (key, PyQTensor(Arc::new(qtensor))))
+        .collect::<Vec<_>>();
+    let tensors = tensors.into_py_dict(py)?.into_any().unbind();
     let hparams = [
         ("n_vocab", ggml.hparams.n_vocab),
         ("n_embd", ggml.hparams.n_embd),
@@ -1329,14 +1343,14 @@ fn load_ggml(
         ("n_rot", ggml.hparams.n_rot),
         ("ftype", ggml.hparams.ftype),
     ];
-    let hparams = hparams.into_py_dict_bound(py).to_object(py);
+    let hparams = hparams.into_py_dict(py)?.into_any().unbind();
     let vocab = ggml
         .vocab
         .token_score_pairs
         .iter()
         .map(|(bytes, _)| String::from_utf8_lossy(bytes.as_slice()).to_string())
         .collect::<Vec<String>>()
-        .to_object(py);
+        .into_py_any(py)?;
     Ok((tensors, hparams, vocab))
 }
 
@@ -1354,20 +1368,20 @@ fn load_gguf(
     use ::hanzo_ml::quantized::gguf_file;
     fn gguf_value_to_pyobject(v: &gguf_file::Value, py: Python<'_>) -> PyResult<PyObject> {
         let v: PyObject = match v {
-            gguf_file::Value::U8(x) => x.into_py(py),
-            gguf_file::Value::I8(x) => x.into_py(py),
-            gguf_file::Value::U16(x) => x.into_py(py),
-            gguf_file::Value::I16(x) => x.into_py(py),
-            gguf_file::Value::U32(x) => x.into_py(py),
-            gguf_file::Value::I32(x) => x.into_py(py),
-            gguf_file::Value::U64(x) => x.into_py(py),
-            gguf_file::Value::I64(x) => x.into_py(py),
-            gguf_file::Value::F32(x) => x.into_py(py),
-            gguf_file::Value::F64(x) => x.into_py(py),
-            gguf_file::Value::Bool(x) => x.into_py(py),
-            gguf_file::Value::String(x) => x.into_py(py),
+            gguf_file::Value::U8(x) => x.into_py_any(py)?,
+            gguf_file::Value::I8(x) => x.into_py_any(py)?,
+            gguf_file::Value::U16(x) => x.into_py_any(py)?,
+            gguf_file::Value::I16(x) => x.into_py_any(py)?,
+            gguf_file::Value::U32(x) => x.into_py_any(py)?,
+            gguf_file::Value::I32(x) => x.into_py_any(py)?,
+            gguf_file::Value::U64(x) => x.into_py_any(py)?,
+            gguf_file::Value::I64(x) => x.into_py_any(py)?,
+            gguf_file::Value::F32(x) => x.into_py_any(py)?,
+            gguf_file::Value::F64(x) => x.into_py_any(py)?,
+            gguf_file::Value::Bool(x) => x.into_py_any(py)?,
+            gguf_file::Value::String(x) => x.into_py_any(py)?,
             gguf_file::Value::Array(x) => {
-                let list = pyo3::types::PyList::empty_bound(py);
+                let list = pyo3::types::PyList::empty(py);
                 for elem in x.iter() {
                     list.append(gguf_value_to_pyobject(elem, py)?)?;
                 }
@@ -1383,18 +1397,19 @@ fn load_gguf(
         .keys()
         .map(|key| {
             let qtensor = gguf.tensor(&mut file, key, &device)?;
-            Ok((key, PyQTensor(Arc::new(qtensor)).into_py(py)))
+            Ok((key, PyQTensor(Arc::new(qtensor))))
         })
         .collect::<::hanzo_ml::Result<Vec<_>>>()
         .map_err(wrap_err)?;
-    let tensors = tensors.into_py_dict_bound(py).to_object(py);
+    let tensors = tensors.into_py_dict(py)?.into_any().unbind();
     let metadata = gguf
         .metadata
         .iter()
         .map(|(key, value)| Ok((key, gguf_value_to_pyobject(value, py)?)))
         .collect::<PyResult<Vec<_>>>()?
-        .into_py_dict_bound(py)
-        .to_object(py);
+        .into_py_dict(py)?
+        .into_any()
+        .unbind();
     Ok((tensors, metadata))
 }
 
@@ -1615,15 +1630,15 @@ fn hanzo_onnx_m(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[pymodule]
 fn hanzo(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let utils = PyModule::new_bound(py, "utils")?;
+    let utils = PyModule::new(py, "utils")?;
     hanzo_utils(py, &utils)?;
     m.add_submodule(&utils)?;
-    let nn = PyModule::new_bound(py, "functional")?;
+    let nn = PyModule::new(py, "functional")?;
     hanzo_functional_m(py, &nn)?;
     m.add_submodule(&nn)?;
     #[cfg(feature = "onnx")]
     {
-        let onnx = PyModule::new_bound(py, "onnx")?;
+        let onnx = PyModule::new(py, "onnx")?;
         hanzo_onnx_m(py, &onnx)?;
         m.add_submodule(&onnx)?;
     }
