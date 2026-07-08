@@ -14,7 +14,7 @@ categories = ["hardware-support", "science"]
 # CubeCL is the lowering engine (the value); hanzo-kernel is the namespace (the place).
 # Kernel source only ever names `hanzo_kernel::*` -- `cubecl` appears nowhere but this manifest.
 cubecl = { version = "0.10", default-features = false }
-hanzo-kernel-macros = { path = "../hanzo-kernel-macros", version = "0.1.0" }
+hanzo-kernel-macros = { path = "../hanzo-kernel-macros", version = "0.1.1" }
 half = "2"
 
 [features]
