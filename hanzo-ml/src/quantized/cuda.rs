@@ -1586,6 +1586,7 @@ mod test {
             GgmlDType::IQ2_S,
             GgmlDType::IQ3_XXS,
             GgmlDType::IQ3_S,
+            GgmlDType::IQ4_XS,
             GgmlDType::IQ1_S,
             GgmlDType::IQ1_M,
             GgmlDType::TQ1_0,
