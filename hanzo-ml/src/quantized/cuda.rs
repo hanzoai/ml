@@ -1565,12 +1565,14 @@ mod test {
         Ok(())
     }
 
-    // i-quant / ternary / NVFP4 weights have no native CUDA matmul kernel, so QStorage::from_data used to
+    // i-quant / ternary / NVFP4 weights have no native q8_1 matmul kernel, so QStorage::from_data used to
     // BAIL when loading them onto CUDA -- an i-quant GGUF could not run on CUDA at all. They now upload
-    // like any quant and QCudaStorage::fwd dequantizes-to-f32 for a dense matmul. This loads a
-    // deterministic block pattern for EACH formerly-bailing type onto CUDA, runs fwd, and checks it
-    // against the matmul of the SAME dequantized weights computed on the host -> proves each type LOADS
-    // and DECODES (matmuls) coherently on CUDA, exact w.r.t. the dequantize reference.
+    // like any quant and QCudaStorage::fwd matmuls them: the i-quant / ternary types via the native dp4a
+    // mmvq DECODE kernel (codebook-decode the weight + dp4a against the q8_1-quantized activation), the
+    // rest (NVFP4, Q1_0) via the dequantize-to-f32 dense fallback. This loads a deterministic block
+    // pattern for EACH formerly-bailing type onto CUDA, runs fwd, and checks it against the matmul of the
+    // SAME dequantized weights on the host -> proves each type LOADS and DECODES (matmuls) coherently on
+    // CUDA, within the numeric bound of the path fwd routes it to (dp4a q8_1-activation vs f32-exact dense).
     #[test]
     fn cuda_iquant_load_and_dense_matmul() -> Result<()> {
         let dev = CudaDevice::new(0)?;
@@ -1609,7 +1611,8 @@ mod test {
             let w_dev = qcuda.dequantize(n * k)?;
             let w_host = dev.clone_dtoh(&w_dev.as_cuda_slice::<f32>()?.as_view())?;
 
-            // CUDA forward: input [m,k] @ weight^T via the dequant-dense fallback (no native kernel).
+            // CUDA forward: input [m,k] @ weight^T. For the i-quant / ternary types this is the native
+            // dp4a mmvq DECODE path (b*m=2 <= 8 -> vec shape); NVFP4 / Q1_0 take the dequant-dense fallback.
             let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
             let input_l = crate::Layout::contiguous((m, k));
             let self_shape: crate::Shape = (n, k).into();
@@ -1617,7 +1620,8 @@ mod test {
             assert_eq!(out_shape.dims().to_vec(), vec![m, n]);
             let got = dev.clone_dtoh(&out.as_cuda_slice::<f32>()?.as_view())?;
 
-            // Host oracle with the SAME dequantized weights: out[r,j] = sum_i w[j,i] * inp[r,i].
+            // Host oracle: dense matmul of the SAME dequantized weights against the f32 input,
+            // out[r,j] = sum_i w[j,i] * inp[r,i].
             let mut max_abs = 0f32;
             let mut max_err = 0f32;
             for r in 0..m {
@@ -1632,11 +1636,23 @@ mod test {
                     max_err = max_err.max((g - acc).abs());
                 }
             }
-            // Same weights + same input on GPU vs host -> only f32 accumulation-order noise remains.
-            let tol = 1e-3 * max_abs + 1e-4;
+            // Tolerance follows the SAME predicate fwd() routes on. The i-quant / ternary types decode via
+            // the dp4a mmvq kernel, which quantizes the f32 activation to q8_1 (int8 + per-32 scale) before
+            // the dot -> the result carries the q8_1 activation-quant error, ~1/256 of the activation and
+            // inflated by cancellation in the short k=256 dot (measured worst case IQ1_M ~2.7% of scale).
+            // 0.05*max_abs + 1e-3 is that q8_1 bound (same gate as the sibling cuda_indexed_moe_legacy_32block
+            // test) with ~2x headroom. NVFP4 / Q1_0 have no dp4a kernel -> dequant-dense, f32-exact vs this
+            // oracle, so they keep the tight 1e-3*max_abs + 1e-4 accumulation bound. The gate still catches a
+            // real defect: a dp4a kernel decoding the wrong weight is ~100% off (>> 5%), and any dense-path
+            // regression breaks the tight f32 bound.
+            let tol = if iquant_dp4a_suffix(dtype).is_some() {
+                0.05 * max_abs + 1e-3
+            } else {
+                1e-3 * max_abs + 1e-4
+            };
             assert!(
                 max_err <= tol,
-                "{dtype:?}: i-quant CUDA dense matmul max_err {max_err} > tol {tol} (max_abs {max_abs})"
+                "{dtype:?}: i-quant CUDA matmul max_err {max_err} > tol {tol} (max_abs {max_abs})"
             );
         }
         Ok(())
