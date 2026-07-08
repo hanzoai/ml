@@ -202,8 +202,8 @@ fn main() {
     }
     #[cfg(feature = "rocm")]
     {
-        use cubecl::hip::{HipDevice, HipRuntime};
-        let c = HipRuntime::client(&HipDevice::default());
+        use cubecl::hip::{AmdDevice, HipRuntime};
+        let c = HipRuntime::client(&AmdDevice::default());
         check::<HipRuntime>("ROCM", &c, rows, k);
         check_q4k::<HipRuntime>("ROCM", &c, rows, k);
         check_dp4a::<HipRuntime>("ROCM", &c, rows, k, true);
