@@ -529,13 +529,17 @@ pub(crate) fn indexed_moe_grouped(
     }
     let mut counts = vec![0i32; e_cnt];
     for &e in &ids_host {
-        // Clamp instead of bail: during CUDA-graph *capture* the warmup DtoH read of `ids` can
-        // observe not-yet-populated routing (garbage expert ids), and bailing there aborts capture
-        // -> the whole MoE decode falls back to eager (measured: Qwen3.6-35B decode 0.71x vs llama).
-        // In normal eager operation topk always yields ids in 0..e_cnt, so this clamp is a no-op;
-        // on graph *replay* the ids are the real routed experts. Tolerating capture-time garbage is
-        // what lets the MoE decode graph capture succeed (dense models already capture + hit parity).
-        let e = (e as usize).min(e_cnt - 1);
+        // BAIL on out-of-range ids -- do not clamp. Grouped's host-side counting sort is
+        // structurally uncapturable (blocking DtoH + host-derived launch config), so an invalid id
+        // here means either (a) a CUDA-graph capture warmup read garbage routing -- the bail aborts
+        // that capture cleanly and decode falls back to eager (baking the garbage into a replayed
+        // graph silently mis-routes every token; see RED-1), or (b) a genuine upstream routing bug
+        // that must fail loudly. Correctly-capturable decode (batch==1, t==1) uses the per-slot
+        // device-id matvec and never reaches this path, so the bail costs it nothing.
+        let e = e as usize;
+        if e >= e_cnt {
+            crate::bail!("indexed_moe_grouped: expert id {e} >= num_experts {e_cnt}");
+        }
         counts[e] += 1;
     }
     // expert_bounds[e] = prefix sums over counts [e_cnt+1]; expert e owns sorted columns [eb[e],eb[e+1]).
@@ -550,10 +554,8 @@ pub(crate) fn indexed_moe_grouped(
     let mut quantize_ids = vec![0i32; nslots];
     let mut cursor = expert_bounds.clone();
     for (s, &e) in ids_host.iter().enumerate() {
-        // Same capture-time garbage tolerance as the counts loop above: clamp so a not-yet-populated
-        // routing id (observed during CUDA-graph capture warmup) indexes a valid expert bucket instead
-        // of panicking on `cursor[e]` (len e_cnt+1). No-op in eager (ids always in 0..e_cnt).
-        let e = (e as usize).min(e_cnt - 1);
+        // Ids were range-checked in the counting loop above.
+        let e = e as usize;
         let p = cursor[e] as usize;
         ids_dst[p] = s as i32;
         quantize_ids[p] = if input_dim1 == 1 {
