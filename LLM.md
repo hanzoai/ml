@@ -58,6 +58,31 @@ ml/
   regression). The on-device numeric oracles (`qmatvec_unified_numeric`, `moe_route_numeric`,
   `qmmq_unified_numeric`, `rmsnorm_numeric`) live in `engine/hanzo-cli/tests/` and gate GPU builds.
 
+### hanzo-kernel ROCm/HIP seam UNBLOCKED on ROCm 7.13 (gfx1151) -- the DSL now dispatches on AMD (0.2.18)
+The `rocm` feature (`cubecl/hip`) was un-buildable against ROCm 7.13. TWO independent upstream cubecl 0.10
+defects, both fixed WITHOUT bumping cubecl (0.10 is the newest published; no version escapes either bug):
+1. **cubecl-hip-sys binding selection.** Its `build.rs` reads `hipconfig --version` and emits
+   `feature="hip_<patch>"`; ROCm 7.13 reports patch **99004**, past the newest shipped binding
+   (`hip_53211` = ROCm 7.2), so it emitted a `hip_99004` feature with NO bindings module -> every
+   `cubecl_hip_sys` symbol undefined (the "67 R0600 errors"). FIX = a vendored `[patch.crates-io]` fork
+   at `hanzo-kernel/vendor/cubecl-hip-sys` (upstream verbatim + a build.rs clamp: an unknown-newer patch
+   falls back to the latest shipped binding, mirroring the existing no-hipconfig branch). ABI-SAFE and
+   proven: ROCm 7.13's `hip_runtime_api.h` still `#define hipGetDeviceProperties hipGetDevicePropertiesR0600`
+   (no R0700), so the 7.2 (R0600) bindings link against the 7.13 runtime unchanged.
+2. **`multi_threading` cfg / std.** cubecl-hip's server uses `cubecl_runtime::stream::MultiStream`, gated
+   behind cfg `multi_threading = all(feature="std", not(wasm))`. cubecl's `hip`/`rocm` features pull NO
+   std, and hanzo-kernel builds `default-features=false`, so `MultiStream` was `#[cfg]`'d out. FIX =
+   `rocm = ["cubecl/hip", "cubecl/rocm", "cubecl/std"]` (`cubecl/std` -> `cubecl-core/std` ->
+   `cubecl-runtime/std`). NOTE: `cuda` almost certainly needs the same `cubecl/std` (untested, no NVIDIA
+   on evo) -- add it when the CUDA DSL path is first built.
+- PROOF (the falsifiable gate): `norm::tests::rms_norm_rocm_bit_exact` (feature `rocm`) lowers the `rms_norm`
+  DSL source through cubecl-hip and dispatches on evo's gfx1151, bit-compared to the CPU oracle
+  `rms_norm_ref`: **max_rel = 2.43e-7** (f32-reorder noise, gate 2e-3). End-to-end: R0600 device query +
+  HIP-RTC module compile + launch + readback all correct on real hardware. `rms_norm` targets now list
+  `rocm`. Zero regression: CPU gate 30/30. Build/run: `source ~/work/hanzo/rocmenv.sh` then
+  `cargo test -p hanzo-kernel --features rocm` (ONE ROCm process at a time on evo -- concurrent kfd init
+  wedges the driver).
+
 ## Env vars (bare names, one-way -- de-brand DONE)
 The env-flag convention is BARE names, no `HANZO_` brand prefix. The de-brand is COMPLETE: every runtime
 knob is a bare name, and the one-off dev A/B "fallback" toggles are GONE (production always runs the fast
