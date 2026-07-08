@@ -7,8 +7,8 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use hanzo_ml::{DType, Device, Result, Storage, Tensor};
 use half::f16;
+use hanzo_ml::{DType, Device, Result, Storage, Tensor};
 use rayon::prelude::*;
 
 use super::standard::FLASH_ATTN_POOL;

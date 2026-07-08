@@ -172,9 +172,11 @@ impl TensorInfo {
                 // (page-aligned base + 32-aligned GGUF offsets satisfy this for every real model).
                 let addr = mmap.as_ptr() as usize + start;
                 if addr.is_multiple_of(self.ggml_dtype.type_align()) {
-                    let storage = super::QStorage::Cpu(
-                        self.ggml_dtype.from_mmap(mmap.clone(), start, n_blocks),
-                    );
+                    let storage = super::QStorage::Cpu(self.ggml_dtype.from_mmap(
+                        mmap.clone(),
+                        start,
+                        n_blocks,
+                    ));
                     QTensor::new(storage, dims)
                 } else {
                     super::ggml_file::qtensor_from_ggml(

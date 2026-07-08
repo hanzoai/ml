@@ -2198,7 +2198,9 @@ mod dsl_metal_dispatch {
         };
         let (rows, n) = (37usize, 128usize);
         let (nt, eps) = (n, 1e-5f32);
-        let x: Vec<f32> = (0..rows * n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.1)
+            .collect();
         let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 5) as f32 * 0.1).collect();
         let want = rms_ref(&x, &w, rows, n, eps);
 
@@ -2224,8 +2226,16 @@ mod dsl_metal_dispatch {
             e.set_input_buffer(3, Some(&*eb), 0);
             e.set_input_buffer(4, Some(&*ndb), 0);
             e.set_input_buffer(5, Some(&*ib), 0);
-            let grid = objc2_metal::MTLSize { width: rows, height: 1, depth: 1 };
-            let tg = objc2_metal::MTLSize { width: nt, height: 1, depth: 1 };
+            let grid = objc2_metal::MTLSize {
+                width: rows,
+                height: 1,
+                depth: 1,
+            };
+            let tg = objc2_metal::MTLSize {
+                width: nt,
+                height: 1,
+                depth: 1,
+            };
             e.dispatch_thread_groups(grid, tg);
         }
         md.wait_until_completed().unwrap();

@@ -140,7 +140,11 @@ pub struct WgpuDevice {
 
 impl std::fmt::Debug for WgpuDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WgpuDevice({}, {})", self.inner.gpu_id, self.inner.adapter_desc)
+        write!(
+            f,
+            "WgpuDevice({}, {})",
+            self.inner.gpu_id, self.inner.adapter_desc
+        )
     }
 }
 
@@ -155,7 +159,11 @@ pub struct WgpuStorage {
 
 impl std::fmt::Debug for WgpuStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WgpuStorage(count={}, dtype={:?})", self.count, self.dtype)
+        write!(
+            f,
+            "WgpuStorage(count={}, dtype={:?})",
+            self.count, self.dtype
+        )
     }
 }
 
@@ -202,14 +210,16 @@ impl WgpuDevice {
             label: Some(name),
             source: wgpu::ShaderSource::Wgsl(src.into()),
         });
-        let pipeline = Arc::new(dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(name),
-            layout: None,
-            module: &module,
-            entry_point: "main",
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        }));
+        let pipeline = Arc::new(
+            dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(name),
+                layout: None,
+                module: &module,
+                entry_point: "main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            }),
+        );
         self.inner
             .pipelines
             .lock()
@@ -256,7 +266,8 @@ impl WgpuDevice {
             layout: &bgl,
             entries: &entries,
         });
-        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(name) });
+        let mut enc =
+            dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(name) });
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(name),
@@ -292,13 +303,15 @@ impl WgpuDevice {
         let nwords = init.len().div_ceil(4).max(1);
         let mut words = vec![0u8; nwords * 4];
         words[..init.len()].copy_from_slice(init);
-        let buffer = self.dev().create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("storage_init"),
-            contents: &words,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-        });
+        let buffer = self
+            .dev()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("storage_init"),
+                contents: &words,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            });
         Arc::new(buffer)
     }
 
@@ -405,7 +418,13 @@ impl WgpuDevice {
     }
 
     /// Host-input convenience: uploads `x` then runs [`matvec_q4_0_gpu`]. Returns the f32 result.
-    pub fn matvec_q4_0(&self, wq: &WgpuStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+    pub fn matvec_q4_0(
+        &self,
+        wq: &WgpuStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
         if x.len() != k {
             crate::bail!("matvec_q4_0: x len {} != k {k}", x.len());
         }
@@ -414,7 +433,13 @@ impl WgpuDevice {
     }
 
     /// Host-input convenience: uploads `x` then runs [`matvec_q8_0_gpu`]. Returns the f32 result.
-    pub fn matvec_q8_0(&self, wq: &WgpuStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+    pub fn matvec_q8_0(
+        &self,
+        wq: &WgpuStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
         if x.len() != k {
             crate::bail!("matvec_q8_0: x len {} != k {k}", x.len());
         }
@@ -448,7 +473,13 @@ impl WgpuDevice {
     }
 
     /// Host-input convenience: uploads `x` then runs [`matvec_q4k_gpu`]. Returns the f32 result.
-    pub fn matvec_q4k(&self, wq: &WgpuStorage, x: &[f32], nout: usize, k: usize) -> Result<Vec<f32>> {
+    pub fn matvec_q4k(
+        &self,
+        wq: &WgpuStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
         if x.len() != k {
             crate::bail!("matvec_q4k: x len {} != k {k}", x.len());
         }
@@ -478,7 +509,11 @@ impl WgpuDevice {
         k: usize,
     ) -> Result<WgpuStorage> {
         if x.count < nrows * k {
-            crate::bail!("moe_matvec_gpu: x count {} < nrows*k {}", x.count, nrows * k);
+            crate::bail!(
+                "moe_matvec_gpu: x count {} < nrows*k {}",
+                x.count,
+                nrows * k
+            );
         }
         if ids.count < nrows {
             crate::bail!("moe_matvec_gpu: ids count {} < nrows {nrows}", ids.count);
@@ -515,10 +550,17 @@ impl WgpuDevice {
             crate::bail!("flash_attn_gpu: head_dim {d} > 256 (kernel limit)");
         }
         if q.count < bh * lq * d {
-            crate::bail!("flash_attn_gpu: q count {} < bh*lq*d {}", q.count, bh * lq * d);
+            crate::bail!(
+                "flash_attn_gpu: q count {} < bh*lq*d {}",
+                q.count,
+                bh * lq * d
+            );
         }
         if k.count < bh * lk * d || v.count < bh * lk * d {
-            crate::bail!("flash_attn_gpu: k/v count too small for bh*lk*d {}", bh * lk * d);
+            crate::bail!(
+                "flash_attn_gpu: k/v count too small for bh*lk*d {}",
+                bh * lk * d
+            );
         }
         let out = self.alloc_f32(bh * lq * d)?;
         // Uniform block matches flash_attn.wgsl: {u32 bh, lq, lk, d; f32 scale; u32 causal}.
@@ -572,8 +614,9 @@ impl WgpuDevice {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut enc =
-            dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("readback"),
+        });
         enc.copy_buffer_to_buffer(src, 0, &staging, 0, bytes);
         self.queue().submit(std::iter::once(enc.finish()));
 
@@ -682,7 +725,11 @@ impl WgpuStorage {
     // Buffer for a contiguous, offset-0 f32 view of `layout`: no copy when the storage already is
     // one (returns its own buffer), otherwise materializes a packed copy returned via `keep` (held
     // alive by the caller until the dispatch is recorded). Mirrors VulkanStorage::contig_buf.
-    fn contig_buf(&self, layout: &Layout, keep: &mut Option<WgpuStorage>) -> Result<Arc<wgpu::Buffer>> {
+    fn contig_buf(
+        &self,
+        layout: &Layout,
+        keep: &mut Option<WgpuStorage>,
+    ) -> Result<Arc<wgpu::Buffer>> {
         if layout.is_contiguous() && layout.start_offset() == 0 {
             Ok(self.buffer.clone())
         } else {
@@ -941,10 +988,17 @@ impl BackendDevice for WgpuDevice {
         match s {
             CpuStorage::F32(v) => self.upload_f32(v),
             CpuStorage::U32(v) => self.upload_u32(v),
-            CpuStorage::F16(v) => self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>()),
-            CpuStorage::BF16(v) => self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>()),
+            CpuStorage::F16(v) => {
+                self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>())
+            }
+            CpuStorage::BF16(v) => {
+                self.upload_f32(&v.iter().map(|x| x.to_f32()).collect::<Vec<_>>())
+            }
             CpuStorage::U8(v) => self.upload_u32(&v.iter().map(|&x| x as u32).collect::<Vec<_>>()),
-            _ => crate::bail!("wgpu: only f32/u32/f16/bf16/u8 supported, got {:?}", s.dtype()),
+            _ => crate::bail!(
+                "wgpu: only f32/u32/f16/bf16/u8 supported, got {:?}",
+                s.dtype()
+            ),
         }
     }
 
@@ -952,7 +1006,13 @@ impl BackendDevice for WgpuDevice {
         self.storage_from_cpu_storage(&s)
     }
 
-    fn rand_uniform(&self, shape: &Shape, dtype: DType, min: f64, max: f64) -> Result<Self::Storage> {
+    fn rand_uniform(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        min: f64,
+        max: f64,
+    ) -> Result<Self::Storage> {
         if dtype != DType::F32 {
             crate::bail!("wgpu: rand_uniform only f32, got {dtype:?}");
         }
@@ -967,7 +1027,13 @@ impl BackendDevice for WgpuDevice {
         self.upload_f32(&data)
     }
 
-    fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<Self::Storage> {
+    fn rand_normal(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        mean: f64,
+        std: f64,
+    ) -> Result<Self::Storage> {
         if dtype != DType::F32 {
             crate::bail!("wgpu: rand_normal only f32, got {dtype:?}");
         }
@@ -1195,12 +1261,21 @@ impl BackendStorage for WgpuStorage {
         let cb = self.contig_buf(layout, &mut ck)?;
         let n = layout.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
-        self.device
-            .dispatch(kernel, &[&cb, &out.buffer], &pack_u32(&[n as u32]), Self::groups_1d(n))?;
+        self.device.dispatch(
+            kernel,
+            &[&cb, &out.buffer],
+            &pack_u32(&[n as u32]),
+            Self::groups_1d(n),
+        )?;
         Ok(out)
     }
 
-    fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+    fn binary_impl<B: BinaryOpT>(
+        &self,
+        rhs: &Self,
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<Self> {
         let kernel: &'static str = match B::NAME {
             "add" => "add",
             "sub" => "sub",
@@ -1224,8 +1299,12 @@ impl BackendStorage for WgpuStorage {
         let rb = rhs.contig_buf(rhs_l, &mut rk)?;
         let n = lhs_l.shape().elem_count();
         let out = self.device.alloc_f32(n)?;
-        self.device
-            .dispatch(kernel, &[&lb, &rb, &out.buffer], &pack_u32(&[n as u32]), Self::groups_1d(n))?;
+        self.device.dispatch(
+            kernel,
+            &[&lb, &rb, &out.buffer],
+            &pack_u32(&[n as u32]),
+            Self::groups_1d(n),
+        )?;
         Ok(out)
     }
 
@@ -1239,7 +1318,10 @@ impl BackendStorage for WgpuStorage {
     ) -> Result<Self> {
         // self is the condition mask (u32). The kernel reads it linearly.
         if self.dtype != DType::U32 {
-            crate::bail!("wgpu: where_cond requires u32 condition, got {:?}", self.dtype);
+            crate::bail!(
+                "wgpu: where_cond requires u32 condition, got {:?}",
+                self.dtype
+            );
         }
         let mut condk = None;
         let condb = if l.is_contiguous() && l.start_offset() == 0 {
@@ -1463,7 +1545,12 @@ impl BackendStorage for WgpuStorage {
             crate::bail!("wgpu: copy_strided_src supports rank <= 6, got {rank}");
         }
         let strides = src_l.stride();
-        let mut p = vec![n as u32, rank as u32, src_l.start_offset() as u32, dst_offset as u32];
+        let mut p = vec![
+            n as u32,
+            rank as u32,
+            src_l.start_offset() as u32,
+            dst_offset as u32,
+        ];
         let mut shape6 = [0u32; 6];
         let mut stride6 = [0u32; 6];
         for d in 0..rank {
@@ -1502,8 +1589,12 @@ impl BackendStorage for WgpuStorage {
             src_offset as u32,
             dst_offset as u32,
         ]);
-        self.device
-            .dispatch("copy2d", &[&self.buffer, &dst.buffer], &p, Self::groups_1d(total))
+        self.device.dispatch(
+            "copy2d",
+            &[&self.buffer, &dst.buffer],
+            &p,
+            Self::groups_1d(total),
+        )
     }
 
     fn const_set(&mut self, s: crate::scalar::Scalar, layout: &Layout) -> Result<()> {

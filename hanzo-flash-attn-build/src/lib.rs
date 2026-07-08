@@ -108,7 +108,10 @@ pub fn cutlass_include_arg(cutlass_dir: &Path) -> String {
 /// A directory is a usable CUTLASS checkout iff its primary public header is
 /// present. This is cheap and robust against partial downloads.
 fn is_valid_cutlass(dir: &Path) -> bool {
-    dir.join("include").join("cutlass").join("cutlass.h").is_file()
+    dir.join("include")
+        .join("cutlass")
+        .join("cutlass.h")
+        .is_file()
 }
 
 /// Download the pinned CUTLASS source archive from GitHub and extract it into
@@ -136,9 +139,12 @@ fn download_and_extract(out_dir: &Path, commit: &str) -> Result<()> {
 
     // Extract underneath out_dir; the archive's own top-level directory is
     // `cutlass-<commit>/`, matching the path `fetch_cutlass` expects.
-    archive
-        .unpack(out_dir)
-        .with_context(|| format!("failed to extract CUTLASS archive into {}", out_dir.display()))?;
+    archive.unpack(out_dir).with_context(|| {
+        format!(
+            "failed to extract CUTLASS archive into {}",
+            out_dir.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -148,7 +154,8 @@ fn download_and_extract(out_dir: &Path, commit: &str) -> Result<()> {
 #[allow(dead_code)]
 fn read_all(mut r: impl Read) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    r.read_to_end(&mut buf).context("failed to read response body")?;
+    r.read_to_end(&mut buf)
+        .context("failed to read response body")?;
     Ok(buf)
 }
 
@@ -185,7 +192,11 @@ mod tests {
         fs::create_dir_all(tmp.join("include")).unwrap();
         assert!(!is_valid_cutlass(&tmp));
         fs::create_dir_all(tmp.join("include").join("cutlass")).unwrap();
-        fs::write(tmp.join("include").join("cutlass").join("cutlass.h"), b"// hdr").unwrap();
+        fs::write(
+            tmp.join("include").join("cutlass").join("cutlass.h"),
+            b"// hdr",
+        )
+        .unwrap();
         assert!(is_valid_cutlass(&tmp));
         let _ = fs::remove_dir_all(&tmp);
     }

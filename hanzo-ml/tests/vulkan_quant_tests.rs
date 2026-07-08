@@ -547,7 +547,6 @@ fn vulkan_matvec_tq2_0_matches_cpu() -> hanzo_ml::Result<()> {
     Ok(())
 }
 
-
 #[test]
 fn vulkan_matvec_iq2s_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
@@ -559,7 +558,9 @@ fn vulkan_matvec_iq2s_matches_cpu() -> hanzo_ml::Result<()> {
         );
         assert!(
             s.max_rel < 1e-3 && s.max_abs < 1e-3,
-            "IQ2_S GPU/CPU mismatch: max_abs={} max_rel={}", s.max_abs, s.max_rel
+            "IQ2_S GPU/CPU mismatch: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
         );
     }
     Ok(())
@@ -576,7 +577,9 @@ fn vulkan_matvec_iq3xxs_matches_cpu() -> hanzo_ml::Result<()> {
         );
         assert!(
             s.max_rel < 1e-3 && s.max_abs < 1e-3,
-            "IQ3_XXS GPU/CPU mismatch: max_abs={} max_rel={}", s.max_abs, s.max_rel
+            "IQ3_XXS GPU/CPU mismatch: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
         );
     }
     Ok(())
@@ -593,7 +596,9 @@ fn vulkan_matvec_iq3s_matches_cpu() -> hanzo_ml::Result<()> {
         );
         assert!(
             s.max_rel < 1e-3 && s.max_abs < 1e-3,
-            "IQ3_S GPU/CPU mismatch: max_abs={} max_rel={}", s.max_abs, s.max_rel
+            "IQ3_S GPU/CPU mismatch: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
         );
     }
     Ok(())
@@ -610,7 +615,9 @@ fn vulkan_matvec_iq1s_matches_cpu() -> hanzo_ml::Result<()> {
         );
         assert!(
             s.max_rel < 1e-3 && s.max_abs < 1e-3,
-            "IQ1_S GPU/CPU mismatch: max_abs={} max_rel={}", s.max_abs, s.max_rel
+            "IQ1_S GPU/CPU mismatch: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
         );
     }
     Ok(())
@@ -627,7 +634,9 @@ fn vulkan_matvec_iq1m_matches_cpu() -> hanzo_ml::Result<()> {
         );
         assert!(
             s.max_rel < 1e-3 && s.max_abs < 1e-3,
-            "IQ1_M GPU/CPU mismatch: max_abs={} max_rel={}", s.max_abs, s.max_rel
+            "IQ1_M GPU/CPU mismatch: max_abs={} max_rel={}",
+            s.max_abs,
+            s.max_rel
         );
     }
     Ok(())
@@ -829,7 +838,9 @@ fn moe_case(
     // Activations [t, topk, k] (per-slot inputs) and router ids [t, topk].
     let x_host: Vec<f32> = (0..t * topk * k).map(|i| pseudo(i + 11) * 0.7).collect();
     // Deterministic expert assignment spread across all experts.
-    let ids_host: Vec<u32> = (0..t * topk).map(|i| ((i * 7 + 3) % e_cnt) as u32).collect();
+    let ids_host: Vec<u32> = (0..t * topk)
+        .map(|i| ((i * 7 + 3) % e_cnt) as u32)
+        .collect();
 
     // Build the Vulkan QTensor bank the loader way and run the fused MoE forward.
     let qs_vk = QStorage::from_data(std::borrow::Cow::Owned(bytes), dev, dtype)?;
@@ -920,9 +931,9 @@ fn vulkan_flash_attn_matches_cpu() -> hanzo_ml::Result<()> {
     // (bh, lq, lk, d, causal). d = 128 is Qwen3's head dim.
     let cases = [
         (8usize, 16usize, 16usize, 128usize, false), // prefill, non-causal
-        (8, 16, 16, 128, true),                       // prefill, causal
-        (8, 1, 64, 128, true),                        // decode: single query over a 64-key cache
-        (4, 7, 13, 64, false),                        // ragged Lq != Lk, smaller d
+        (8, 16, 16, 128, true),                      // prefill, causal
+        (8, 1, 64, 128, true),                       // decode: single query over a 64-key cache
+        (4, 7, 13, 64, false),                       // ragged Lq != Lk, smaller d
     ];
     for &(bh, lq, lk, d, causal) in &cases {
         let max_abs = flash_case(&dev, bh, lq, lk, d, causal)?;
@@ -991,7 +1002,11 @@ fn vulkan_q4k_tiled2d_matches_default() -> hanzo_ml::Result<()> {
                 max_abs = max_abs.max((a - b).abs());
                 max_ref = max_ref.max(a.abs());
             }
-            let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+            let rel = if max_ref > 0.0 {
+                max_abs / max_ref
+            } else {
+                max_abs
+            };
             assert!(
                 rel < 2e-3,
                 "2d-tiled != default (m={m}, nout={nout}, k={k}): max_abs={max_abs}, rel={rel}"
@@ -1067,7 +1082,11 @@ fn vulkan_q4k_dp4a2d_matches_default() -> hanzo_ml::Result<()> {
                 max_abs = max_abs.max((a - b).abs());
                 max_ref = max_ref.max(a.abs());
             }
-            let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+            let rel = if max_ref > 0.0 {
+                max_abs / max_ref
+            } else {
+                max_abs
+            };
             assert!(
                 rel < 1.5e-2,
                 "dp4a-2d != default (m={m}, nout={nout}, k={k}): max_abs={max_abs}, max_ref={max_ref}, rel={rel}"
@@ -1150,7 +1169,11 @@ fn vulkan_q4k_coopmat_matches_default() -> hanzo_ml::Result<()> {
                 max_abs = max_abs.max((a - b).abs());
                 max_ref = max_ref.max(a.abs());
             }
-            let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+            let rel = if max_ref > 0.0 {
+                max_abs / max_ref
+            } else {
+                max_abs
+            };
             assert!(
                 rel < 1e-2,
                 "coopmat != legacy (m={m}, nout={nout}, k={k}): max_abs={max_abs}, rel={rel}"
@@ -1258,10 +1281,16 @@ fn vulkan_q4k_kernel_bench() -> hanzo_ml::Result<()> {
 // it removes the inter-op global barrier that serializes decode (see LLM.md / paper 06).
 #[test]
 fn vulkan_rope_norm_matches_unfused() {
-    let Some(dev) = gpu() else { return; };
+    let Some(dev) = gpu() else {
+        return;
+    };
     let vk = dev.as_vulkan_device().unwrap();
     // (b, h, t, d): decode (t=1) + short prefill; q/k head counts; head dims 64 and 128.
-    for &(b, h, t, d) in &[(1usize, 4usize, 1usize, 128usize), (1, 8, 5, 64), (2, 4, 3, 128)] {
+    for &(b, h, t, d) in &[
+        (1usize, 4usize, 1usize, 128usize),
+        (1, 8, 5, 64),
+        (2, 4, 3, 128),
+    ] {
         let hd = d / 2;
         let n = b * h * t * d;
         let x: Vec<f32> = (0..n).map(|i| pseudo(i + 7)).collect();
@@ -1274,7 +1303,10 @@ fn vulkan_rope_norm_matches_unfused() {
         for row in 0..b * h * t {
             let base = row * d;
             let mut ss = 0f32;
-            for i in 0..d { let v = x[base + i]; ss += v * v; }
+            for i in 0..d {
+                let v = x[base + i];
+                ss += v * v;
+            }
             let denom = (ss / d as f32 + eps).sqrt();
             let i_t = row % t;
             for i_d in 0..hd {
@@ -1286,12 +1318,19 @@ fn vulkan_rope_norm_matches_unfused() {
                 refv[i2] = x1 * s + x2 * c;
             }
         }
-        let got = vk.rope_norm_f32(&x, &weight, &cs, &sn, b, h, t, d, eps).unwrap();
+        let got = vk
+            .rope_norm_f32(&x, &weight, &cs, &sn, b, h, t, d, eps)
+            .unwrap();
         assert_eq!(got.len(), n);
         let mut maxabs = 0f32;
-        for i in 0..n { maxabs = maxabs.max((got[i] - refv[i]).abs()); }
+        for i in 0..n {
+            maxabs = maxabs.max((got[i] - refv[i]).abs());
+        }
         eprintln!("rope_norm b{b} h{h} t{t} d{d}: maxabs={maxabs:.3e}");
-        assert!(maxabs < 1e-4, "rope_norm (b{b} h{h} t{t} d{d}) mismatch maxabs={maxabs}");
+        assert!(
+            maxabs < 1e-4,
+            "rope_norm (b{b} h{h} t{t} d{d}) mismatch maxabs={maxabs}"
+        );
     }
 }
 
@@ -1299,7 +1338,9 @@ fn vulkan_rope_norm_matches_unfused() {
 // add-then-rms_norm chain bit-exactly. Rung 2 of the Vulkan decode op-fusion campaign.
 #[test]
 fn vulkan_add_rmsnorm_matches_unfused() {
-    let Some(dev) = gpu() else { return; };
+    let Some(dev) = gpu() else {
+        return;
+    };
     let vk = dev.as_vulkan_device().unwrap();
     for &(nrows, m) in &[(1usize, 2048usize), (5, 64), (3, 4096)] {
         let n = nrows * m;
@@ -1313,15 +1354,27 @@ fn vulkan_add_rmsnorm_matches_unfused() {
         for row in 0..nrows {
             let base = row * m;
             let mut ss = 0f32;
-            for i in 0..m { let v = x[base + i] + res[base + i]; s_ref[base + i] = v; ss += v * v; }
+            for i in 0..m {
+                let v = x[base + i] + res[base + i];
+                s_ref[base + i] = v;
+                ss += v * v;
+            }
             let denom = (ss / m as f32 + eps).sqrt();
-            for i in 0..m { y_ref[base + i] = s_ref[base + i] / denom * alpha[i]; }
+            for i in 0..m {
+                y_ref[base + i] = s_ref[base + i] / denom * alpha[i];
+            }
         }
         let (s_gpu, y_gpu) = vk.add_rmsnorm_f32(&x, &res, &alpha, nrows, m, eps).unwrap();
         let (mut ms, mut my) = (0f32, 0f32);
-        for i in 0..n { ms = ms.max((s_gpu[i] - s_ref[i]).abs()); my = my.max((y_gpu[i] - y_ref[i]).abs()); }
+        for i in 0..n {
+            ms = ms.max((s_gpu[i] - s_ref[i]).abs());
+            my = my.max((y_gpu[i] - y_ref[i]).abs());
+        }
         eprintln!("add_rmsnorm r{nrows} m{m}: s_maxabs={ms:.3e} y_maxabs={my:.3e}");
-        assert!(ms < 1e-5 && my < 1e-4, "add_rmsnorm r{nrows} m{m} mismatch s={ms} y={my}");
+        assert!(
+            ms < 1e-5 && my < 1e-4,
+            "add_rmsnorm r{nrows} m{m} mismatch s={ms} y={my}"
+        );
     }
 }
 
@@ -1330,7 +1383,9 @@ fn vulkan_add_rmsnorm_matches_unfused() {
 // reference) regardless of the dp4a default. Validates the Vulkan decode lever (1.8x).
 #[test]
 fn vulkan_q4k_dp4a_decode_matches_scalar() {
-    let Some(dev) = gpu() else { return; };
+    let Some(dev) = gpu() else {
+        return;
+    };
     let vk = dev.as_vulkan_device().unwrap();
     for &(nout, k) in SHAPES {
         let x: Vec<f32> = (0..k).map(|i| pseudo(i + 5)).collect();
@@ -1347,7 +1402,10 @@ fn vulkan_q4k_dp4a_decode_matches_scalar() {
             }
             let rel = (sse / refsq.max(1e-9)).sqrt();
             eprintln!("dp4a-{name} vs scalar nout={nout} k={k}: rel={rel:.3e}");
-            assert!(rel < 2e-2, "dp4a {name} rel err {rel} too large (nout={nout} k={k})");
+            assert!(
+                rel < 2e-2,
+                "dp4a {name} rel err {rel} too large (nout={nout} k={k})"
+            );
         }
     }
 }

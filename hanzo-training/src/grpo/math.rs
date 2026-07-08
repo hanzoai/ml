@@ -91,7 +91,10 @@ pub fn policy_gradient_loss(
 ) -> Result<Tensor> {
     assert_eq!(advantages.len(), seq_logprobs.len());
     assert_eq!(advantages.len(), completion_lengths.len());
-    assert!(!advantages.is_empty(), "empty batch in policy_gradient_loss");
+    assert!(
+        !advantages.is_empty(),
+        "empty batch in policy_gradient_loss"
+    );
 
     // Per-completion contribution: A_i * (logprob_i / len_i). We build it as a
     // sum of differentiable scalars then divide by N for the mean.
@@ -185,8 +188,16 @@ mod tests {
         let r = vec![0.0f32, 10.0];
         let a = group_advantages(&r, true, 1e-4);
         // With ddof=1 std of {0,10} is ~7.071; (10-5)/7.071 ~= 0.707
-        assert!((a[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-2, "got {}", a[1]);
-        assert!((a[0] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-2, "got {}", a[0]);
+        assert!(
+            (a[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-2,
+            "got {}",
+            a[1]
+        );
+        assert!(
+            (a[0] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-2,
+            "got {}",
+            a[0]
+        );
     }
 
     #[test]
