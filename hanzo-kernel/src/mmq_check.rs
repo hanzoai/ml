@@ -62,7 +62,12 @@ fn main() {
         let bad = got.iter().zip(&want).filter(|(x, y)| x != y).count();
         println!(
             "[1a] WMMA hello   i8 16x16x16->i32   {} ({} / 256 mismatched)",
-            if bad == 0 { "EXACT ✓" } else { "MISMATCH ✗" }, bad
+            if bad == 0 {
+                "EXACT ✓"
+            } else {
+                "MISMATCH ✗"
+            },
+            bad
         );
         bad == 0
     }));
@@ -79,7 +84,12 @@ fn main() {
         let bad = got.iter().zip(&want).filter(|(x, y)| x != y).count();
         println!(
             "[1b] manual MMA   i8 m16n8k32->i32   {} ({} / 128 mismatched)",
-            if bad == 0 { "EXACT ✓" } else { "MISMATCH ✗" }, bad
+            if bad == 0 {
+                "EXACT ✓"
+            } else {
+                "MISMATCH ✗"
+            },
+            bad
         );
         bad == 0
     }));
@@ -123,10 +133,13 @@ fn main() {
         );
         println!(
             "     {:.3} ms/dispatch   {:.0} GFLOP/s   {:.0} GB/s (W-stream)",
-            ms0, flop / (ms0 * 1e6), wbytes / (ms0 * 1e6)
+            ms0,
+            flop / (ms0 * 1e6),
+            wbytes / (ms0 * 1e6)
         );
 
-        let (g1, ms1) = mmq_q8_wmma_blk_run::<CudaRuntime>(&client, &xq, &xs, &wq, &wd, m, n, k, 50);
+        let (g1, ms1) =
+            mmq_q8_wmma_blk_run::<CudaRuntime>(&client, &xq, &xs, &wq, &wd, m, n, k, 50);
         let (a1, r1) = err_robust(&want, &g1[..mrows * n]);
         println!(
             "[3 ] GEMM {m}x{n}x{k}  (tiled 8-warp/32x64 tile)   verify rel_to_max={:.2e} max_abs={:.2e} {}",
