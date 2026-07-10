@@ -480,7 +480,9 @@ impl QMetalStorage {
         // Metal setBuffer:offset: needs a 4-byte-aligned offset; holds for every GGML block size at
         // even n, which real weight dims always are. Fail loudly otherwise.
         if !expert_bytes.is_multiple_of(4) {
-            crate::bail!("indexed_moe_forward: expert stride {expert_bytes} bytes not 4-byte aligned");
+            crate::bail!(
+                "indexed_moe_forward: expert stride {expert_bytes} bytes not 4-byte aligned"
+            );
         }
 
         let none = crate::op::BackpropOp::none();
