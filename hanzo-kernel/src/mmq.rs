@@ -31,16 +31,38 @@ use crate::prelude::*;
 #[kernel(targets(cuda), unchecked)]
 pub fn wmma_hello_i8(a: &Array<i8>, b: &Array<i8>, out: &mut Array<i32>) {
     let ma = cmma::Matrix::<i8>::from_slice(
-        cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &a.to_slice(), 16,
+        cmma::MatrixIdent::A,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::RowMajor,
+        &a.to_slice(),
+        16,
     );
     let mb = cmma::Matrix::<i8>::from_slice(
-        cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &b.to_slice(), 16,
+        cmma::MatrixIdent::B,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::ColMajor,
+        &b.to_slice(),
+        16,
     );
     let mc = cmma::Matrix::<i32>::from_value(
-        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0i32,
+        cmma::MatrixIdent::Accumulator,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::Undefined,
+        0i32,
     );
     cmma::execute::<i8, i8, i32, i32>(&ma, &mb, &mc, &mc);
-    cmma::store(&mut out.to_slice_mut(), &mc, 16, cmma::MatrixLayout::RowMajor);
+    cmma::store(
+        &mut out.to_slice_mut(),
+        &mc,
+        16,
+        cmma::MatrixLayout::RowMajor,
+    );
 }
 
 /// Run the WMMA hello on a runtime; returns the 256 i32 outputs.
@@ -50,7 +72,9 @@ pub fn wmma_hello_i8_run<R: Runtime>(client: &ComputeClient<R>, a: &[i8], b: &[i
     let oh = client.create_from_slice(i32::as_bytes(&vec![0i32; 256]));
     unsafe {
         wmma_hello_i8::launch_unchecked::<R>(
-            client, Grid::Static(1, 1, 1), Block::new_1d(32),
+            client,
+            Grid::Static(1, 1, 1),
+            Block::new_1d(32),
             ArrayArg::from_raw_parts(ah.clone(), 256),
             ArrayArg::from_raw_parts(bh.clone(), 256),
             ArrayArg::from_raw_parts(oh.clone(), 256),
@@ -83,8 +107,8 @@ pub fn hello_i8_ref(a: &[i8], b: &[i8]) -> Vec<i32> {
 /// out[16,8] = A[16,32] @ B[32,8] over int8, i32 accumulate, via one `mma.sync.m16n8k32.s8`.
 #[kernel(targets(cuda), unchecked)]
 pub fn mma_hello_i8(
-    a: &Array<i8>,   // [16,32] row-major
-    b: &Array<i8>,   // [32,8]  row-major
+    a: &Array<i8>,        // [16,32] row-major
+    b: &Array<i8>,        // [32,8]  row-major
     out: &mut Array<i32>, // [16,8] row-major
     #[comptime] size_m: usize,
     #[comptime] size_n: usize,
@@ -152,24 +176,34 @@ pub fn mma_hello_i8(
         #[unroll]
         for kk in 0..vector_size_c {
             let n_elem = i * vector_size_c + kk;
-            let (row, col) = def.position_of_nth(lane_id, n_elem as u32, cmma::MatrixIdent::Accumulator);
+            let (row, col) =
+                def.position_of_nth(lane_id, n_elem as u32, cmma::MatrixIdent::Accumulator);
             out[(row * size_n as u32 + col) as usize] = reg[kk];
         }
     }
 }
 
 /// Run the manual MMA hello (m16n8k32). Returns 128 i32 (16x8).
-pub fn mma_hello_i8_run<R: Runtime>(client: &ComputeClient<R>, a: &[i8], b: &[i8], plane: u32) -> Vec<i32> {
+pub fn mma_hello_i8_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &[i8],
+    b: &[i8],
+    plane: u32,
+) -> Vec<i32> {
     let ah = client.create_from_slice(i8::as_bytes(a));
     let bh = client.create_from_slice(i8::as_bytes(b));
     let oh = client.create_from_slice(i32::as_bytes(&vec![0i32; 16 * 8]));
     unsafe {
         mma_hello_i8::launch_unchecked::<R>(
-            client, Grid::Static(1, 1, 1), Block::new_1d(plane),
+            client,
+            Grid::Static(1, 1, 1),
+            Block::new_1d(plane),
             ArrayArg::from_raw_parts(ah.clone(), 16 * 32),
             ArrayArg::from_raw_parts(bh.clone(), 32 * 8),
             ArrayArg::from_raw_parts(oh.clone(), 16 * 8),
-            16, 8, 32,
+            16,
+            8,
+            32,
         );
     }
     i32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -219,7 +253,7 @@ pub fn mmq_q8_wmma(
     let ncol0 = nt * 16;
 
     let mut accf = SharedMemory::<f32>::new(256usize); // f32 output tile [16x16]
-    let mut ci = SharedMemory::<i32>::new(256usize);   // i32 fragment store scratch [16x16]
+    let mut ci = SharedMemory::<i32>::new(256usize); // i32 fragment store scratch [16x16]
 
     // Zero the f32 accumulator (each lane owns 8 of 256).
     #[unroll]
@@ -232,25 +266,50 @@ pub fn mmq_q8_wmma(
         let k0 = kb * 32;
         // Accumulate int8 over the 32-wide block into one i32 fragment (2 WMMA K=16 steps).
         let c = cmma::Matrix::<i32>::from_value(
-            cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0i32,
+            cmma::MatrixIdent::Accumulator,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::Undefined,
+            0i32,
         );
         let a0 = cmma::Matrix::<i8>::from_slice(
-            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-            &xq.slice(mrow0 * k + k0, m * k), k as u32,
+            cmma::MatrixIdent::A,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::RowMajor,
+            &xq.slice(mrow0 * k + k0, m * k),
+            k as u32,
         );
         let b0 = cmma::Matrix::<i8>::from_slice(
-            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
-            &wq.slice(ncol0 * k + k0, n * k), k as u32,
+            cmma::MatrixIdent::B,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::ColMajor,
+            &wq.slice(ncol0 * k + k0, n * k),
+            k as u32,
         );
         cmma::execute::<i8, i8, i32, i32>(&a0, &b0, &c, &c);
 
         let a1 = cmma::Matrix::<i8>::from_slice(
-            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-            &xq.slice(mrow0 * k + k0 + 16, m * k), k as u32,
+            cmma::MatrixIdent::A,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::RowMajor,
+            &xq.slice(mrow0 * k + k0 + 16, m * k),
+            k as u32,
         );
         let b1 = cmma::Matrix::<i8>::from_slice(
-            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
-            &wq.slice(ncol0 * k + k0 + 16, n * k), k as u32,
+            cmma::MatrixIdent::B,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::ColMajor,
+            &wq.slice(ncol0 * k + k0 + 16, n * k),
+            k as u32,
         );
         cmma::execute::<i8, i8, i32, i32>(&a1, &b1, &c, &c);
 
@@ -279,10 +338,17 @@ pub fn mmq_q8_wmma(
 }
 
 /// Host launch for the MMQ GEMM. `iters` amortized kernel-only bench dispatches; returns (out, ms).
+#[allow(clippy::too_many_arguments)]
 pub fn mmq_q8_wmma_run<R: Runtime>(
     client: &ComputeClient<R>,
-    xq: &[i8], xs: &[f32], wq: &[i8], wd: &[f32],
-    m: usize, n: usize, k: usize, iters: usize,
+    xq: &[i8],
+    xs: &[f32],
+    wq: &[i8],
+    wd: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    iters: usize,
 ) -> (Vec<f32>, f64) {
     let xqh = client.create_from_slice(i8::as_bytes(xq));
     let xsh = client.create_from_slice(f32::as_bytes(xs));
@@ -292,21 +358,29 @@ pub fn mmq_q8_wmma_run<R: Runtime>(
     let grid = Grid::Static((n / 16) as u32, (m / 16) as u32, 1);
     let launch = |c: &ComputeClient<R>| unsafe {
         mmq_q8_wmma::launch_unchecked::<R>(
-            c, grid.clone(), Block::new_1d(32),
+            c,
+            grid.clone(),
+            Block::new_1d(32),
             ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
             ArrayArg::from_raw_parts(wqh.clone(), wq.len()),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
-            m, n, k,
+            m,
+            n,
+            k,
         );
     };
     launch(client);
     let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
     (out, ms)
@@ -314,7 +388,15 @@ pub fn mmq_q8_wmma_run<R: Runtime>(
 
 /// CPU oracle: the exact MMQ math -- int8 dot per 32-block, f32 per-block scale, summed in f32.
 /// The DSL kernel must match this to f32-reorder precision (this IS the quantized reference).
-pub fn mmq_q8_ref(xq: &[i8], xs: &[f32], wq: &[i8], wd: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+pub fn mmq_q8_ref(
+    xq: &[i8],
+    xs: &[f32],
+    wq: &[i8],
+    wd: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
     let kb = k / 32;
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
@@ -349,7 +431,6 @@ pub fn mmq_q8_wmma_blk(
     wq: &Array<i8>,
     wd: &Array<f32>,
     out: &mut Array<f32>,
-    #[comptime] m: usize,
     #[comptime] n: usize,
     #[comptime] k: usize,
 ) {
@@ -387,29 +468,59 @@ pub fn mmq_q8_wmma_blk(
 
         // This warp's 16x16 subtile: accumulate the 32-block via 2 WMMA(K=16) from shared memory.
         let c = cmma::Matrix::<i32>::from_value(
-            cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0i32,
+            cmma::MatrixIdent::Accumulator,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::Undefined,
+            0i32,
         );
         let a0 = cmma::Matrix::<i8>::from_slice(
-            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-            &sa.slice(wm * 512, 1024), 32,
+            cmma::MatrixIdent::A,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::RowMajor,
+            &sa.slice(wm * 512, 1024),
+            32,
         );
         let b0 = cmma::Matrix::<i8>::from_slice(
-            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
-            &sb.slice(wn * 512, 2048), 32,
+            cmma::MatrixIdent::B,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::ColMajor,
+            &sb.slice(wn * 512, 2048),
+            32,
         );
         cmma::execute::<i8, i8, i32, i32>(&a0, &b0, &c, &c);
         let a1 = cmma::Matrix::<i8>::from_slice(
-            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-            &sa.slice(wm * 512 + 16, 1024), 32,
+            cmma::MatrixIdent::A,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::RowMajor,
+            &sa.slice(wm * 512 + 16, 1024),
+            32,
         );
         let b1 = cmma::Matrix::<i8>::from_slice(
-            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
-            &sb.slice(wn * 512 + 16, 2048), 32,
+            cmma::MatrixIdent::B,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::ColMajor,
+            &sb.slice(wn * 512 + 16, 2048),
+            32,
         );
         cmma::execute::<i8, i8, i32, i32>(&a1, &b1, &c, &c);
 
         // Spill this warp's i32 tile, apply the per-block f32 scale, accumulate into the f32 tile.
-        cmma::store(&mut ci.slice_mut(warp * 256, warp * 256 + 256), &c, 16, cmma::MatrixLayout::RowMajor);
+        cmma::store(
+            &mut ci.slice_mut(warp * 256, warp * 256 + 256),
+            &c,
+            16,
+            cmma::MatrixLayout::RowMajor,
+        );
         sync_cube();
         for e in 0usize..8 {
             let p = lane * 8 + e;
@@ -433,10 +544,17 @@ pub fn mmq_q8_wmma_blk(
 }
 
 /// Host launch for the tiled MMQ GEMM. Returns (out, ms/dispatch over `iters`).
+#[allow(clippy::too_many_arguments)]
 pub fn mmq_q8_wmma_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    xq: &[i8], xs: &[f32], wq: &[i8], wd: &[f32],
-    m: usize, n: usize, k: usize, iters: usize,
+    xq: &[i8],
+    xs: &[f32],
+    wq: &[i8],
+    wd: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    iters: usize,
 ) -> (Vec<f32>, f64) {
     let xqh = client.create_from_slice(i8::as_bytes(xq));
     let xsh = client.create_from_slice(f32::as_bytes(xs));
@@ -446,21 +564,28 @@ pub fn mmq_q8_wmma_blk_run<R: Runtime>(
     let grid = Grid::Static((n / 64) as u32, (m / 32) as u32, 1);
     let launch = |c: &ComputeClient<R>| unsafe {
         mmq_q8_wmma_blk::launch_unchecked::<R>(
-            c, grid.clone(), Block::new_1d(256),
+            c,
+            grid.clone(),
+            Block::new_1d(256),
             ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
             ArrayArg::from_raw_parts(wqh.clone(), wq.len()),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
-            m, n, k,
+            n,
+            k,
         );
     };
     launch(client);
     let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
     (out, ms)
@@ -476,10 +601,18 @@ pub fn gen_mmq(m: usize, n: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec
         s ^= s << 17;
         s
     };
-    let xq: Vec<i8> = (0..m * k).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
-    let wq: Vec<i8> = (0..n * k).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
+    let xq: Vec<i8> = (0..m * k)
+        .map(|_| ((next() % 255) as i64 - 127) as i8)
+        .collect();
+    let wq: Vec<i8> = (0..n * k)
+        .map(|_| ((next() % 255) as i64 - 127) as i8)
+        .collect();
     // q8_1 / Q8_0 scales are amax/127-ish small positives.
-    let xs: Vec<f32> = (0..m * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
-    let wd: Vec<f32> = (0..n * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+    let xs: Vec<f32> = (0..m * kb)
+        .map(|_| (next() % 1000) as f32 / 50000.0 + 0.002)
+        .collect();
+    let wd: Vec<f32> = (0..n * kb)
+        .map(|_| (next() % 1000) as f32 / 50000.0 + 0.002)
+        .collect();
     (xq, xs, wq, wd)
 }
