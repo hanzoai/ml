@@ -83,6 +83,32 @@ defects, both fixed WITHOUT bumping cubecl (0.10 is the newest published; no ver
   `cargo test -p hanzo-kernel --features rocm` (ONE ROCm process at a time on evo -- concurrent kfd init
   wedges the driver).
 
+### hanzo-kernel CUDA tensor-core path PROVEN on GB10 (sm_121 Blackwell) -- the DSL MMQ + cmma gate
+Answers the ROCm-seam note above ("cuda ... untested, no NVIDIA on evo -- add it when the CUDA DSL path is
+first built"): the CUDA DSL path now BUILDS + gates on GB10 (spark, CUDA 13, aarch64, sm_121). `cuda =
+["cubecl/cuda"]` alone is sufficient -- the ROCm `cubecl/std` was a HIP-server (`MultiStream`) requirement,
+not needed for the CUDA runtime.
+- **int8 tensor-core MMQ GEMM in the DSL (`hanzo-kernel/src/mmq.rs`, MERGED).** The prefill lever written
+  ONCE: `wmma_hello_i8` (cmma::Matrix i8 16x16x16 -> i32) + `mma_hello_i8` (manual cmma::MmaDefinition
+  `mma.sync` m16n8k32, register element<->lane map via `position_of_nth`) + `mmq_q8_wmma` / `mmq_q8_wmma_blk`
+  (Q8_0 x q8_1 block-scaled GEMM: int8 tensor-core dot per 32-block, f32 per-block scale in the epilogue).
+  Probe bin `mmq-check` (required-features=cuda), staged cheapest-kill-first vs a CPU quantized oracle.
+  GATE (GB10 sm_121, all green): WMMA hello EXACT (0/256), manual MMA EXACT (0/128), MMQ tiles BIT-CLOSE
+  (rel_to_max 5.9e-8 / 1.25e-7 / 1.62e-7), full 512x4096x4096 GEMM verify rel_to_max 2.32e-7. So the DSL
+  emits working int8 matrix-core ops on Blackwell, numerically faithful to the block-quantized reference.
+- **PERF CAVEAT (foundation, not yet the optimized kernel).** The tiled 8-warp/32x64 kernel is 0.58x the
+  naive 1-warp (4183 vs 7263 GFLOP/s) -- the high-level WMMA `cmma::store -> shared -> scale` round-trip
+  (the per-block f32 scale applied through the OPAQUE i32 fragment) is the API tax the tiling can't hide.
+  mmq.rs is the correct, bit-exact FOUNDATION of the MoE-prefill fusion lever; the next step is applying
+  the scale IN-REGISTER on the manual-MMA path (`position_of_nth` exposes the element<->lane map), not the
+  smem round-trip. Merged for the primitive + gate; the tuned prefill GEMM is the follow-up.
+- **f16 cmma verified, REPORT-ONLY (branch `feat/dsl-flash-attn` NOT merged).** A go/no-go probe proved the
+  SAME DSL cmma path lowers f16 16x16x16 -> f32 on GB10: max_rel 1.18e-7 (MATCH). This is the primitive a
+  hand-rolled DSL flash-attention-2 needs (Q@K^T + P@V on tensor cores). The probe bin itself is NOT merged:
+  it is a bin with no library surface, and mmq.rs's `wmma_hello_i8` already proves DSL->tensor-core lowering
+  IN THE LIBRARY (i8); the f16 result is recorded here as the positive that makes a hand-rolled DSL
+  flash-attn viable. Build/run: `cd hanzo-kernel && cargo run --release --features cuda --bin mmq-check`.
+
 ## Env vars (bare names, one-way -- de-brand DONE)
 The env-flag convention is BARE names, no `HANZO_` brand prefix. The de-brand is COMPLETE: every runtime
 knob is a bare name, and the one-off dev A/B "fallback" toggles are GONE (production always runs the fast
