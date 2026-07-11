@@ -1349,20 +1349,16 @@ impl QTensor {
                 );
                 out.reshape((t, topk, n))?.to_dtype(out_dtype)
             }
-            // Native Metal MoE decode: for the single-token step (t == 1) every routed slot is a
-            // distinct expert with exactly one row, and `QMetalStorage::indexed_moe_forward` runs
-            // the whole expert compute in ONE fused `mul_mv_id` dispatch -- expert id read per row
-            // on-device, no per-expert loop, no `ids` host sync -- straight out of the resident
-            // quantized bank. This is the fix for the ~200x Metal MoE decode cliff. Prefill
-            // (t > 1) is left on the generic per-expert path below, which the qwen35moe forward
-            // runs under a per-layer completion drain to dodge a Metal buffer-pool aliasing hazard
-            // in the churny prefill command stream; routing prefill through the fused path without
-            // that drain reintroduces NaN logits, so a drain-free fused prefill stays a follow-up.
-            // Guarded to Metal-resident x/ids (always true on the Metal forward).
+            // Native Metal MoE: `QMetalStorage::indexed_moe_forward` runs the whole expert compute in
+            // ONE fused dispatch straight out of the resident quantized bank -- decode (t == 1) via
+            // `mul_mv_id` (per-slot matvec), prefill (t > 1) via `mul_mm_id` (expert-grouped GEMM, each
+            // expert's weight read once and amortized over its tokens). Expert id read per row
+            // on-device, no per-expert host loop, no `ids` DtoH sync. Same low buffer churn on both
+            // paths (x_f32 + ids_u32 + dst), unlike the generic per-expert fallback whose per-expert
+            // `from_data`+forward churned the Metal pool. Guarded to Metal-resident x/ids.
             #[cfg(feature = "metal")]
             QStorage::Metal(s)
-                if ids.dims2().map_or(false, |(t, _)| t == 1)
-                    && matches!(&*x.storage(), Storage::Metal(_))
+                if matches!(&*x.storage(), Storage::Metal(_))
                     && matches!(&*ids.storage(), Storage::Metal(_)) =>
             {
                 let out_dtype = x.dtype();
