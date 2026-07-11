@@ -118,7 +118,38 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockMXFP4> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockMXFP4::to_float(&vec, &mut out);
             }
-            // dbc-validation: dequant-to-float not wired for these newer IQ/ternary/FP4
+            // i-quant codebook family: CPU codebook decode of the resident block bytes (the exact
+            // `to_float` the MSL matvec kernels reconstruct), backing ISQ / dequant-to-f32. The native
+            // matvec/matmul path (fwd) keeps the weights quantized and never hits this.
+            GgmlDType::IQ2_XXS => {
+                let vec: Vec<crate::quantized::BlockIQ2xxs> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ2xxs::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ2_XS => {
+                let vec: Vec<crate::quantized::BlockIQ2xs> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ2xs::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ2_S => {
+                let vec: Vec<crate::quantized::BlockIQ2s> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ2s::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ3_XXS => {
+                let vec: Vec<crate::quantized::BlockIQ3xxs> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ3xxs::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ3_S => {
+                let vec: Vec<crate::quantized::BlockIQ3s> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ3s::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ1_S => {
+                let vec: Vec<crate::quantized::BlockIQ1s> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ1s::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ1_M => {
+                let vec: Vec<crate::quantized::BlockIQ1m> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIQ1m::to_float(&vec, &mut out);
+            }
+            // dbc-validation: dequant-to-float not wired for these newer ternary/FP4
             // codecs on the Metal readback path (GAP in source). Bail honestly rather
             // than silently mis-decode. Q8_0/Q4_K (the validated models) have arms above.
             other => crate::bail!(
@@ -592,6 +623,16 @@ impl TryFrom<GgmlDType> for hanzo_metal_kernels::GgmlDType {
             GgmlDType::F16 => hanzo_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => hanzo_metal_kernels::GgmlDType::F32,
             GgmlDType::BF16 => hanzo_metal_kernels::GgmlDType::BF16,
+            // i-quant codebook family -- native MSL matvec/matmul/mul_mv_id kernels.
+            GgmlDType::IQ2_XXS => hanzo_metal_kernels::GgmlDType::IQ2_XXS,
+            GgmlDType::IQ2_XS => hanzo_metal_kernels::GgmlDType::IQ2_XS,
+            GgmlDType::IQ2_S => hanzo_metal_kernels::GgmlDType::IQ2_S,
+            GgmlDType::IQ3_XXS => hanzo_metal_kernels::GgmlDType::IQ3_XXS,
+            GgmlDType::IQ3_S => hanzo_metal_kernels::GgmlDType::IQ3_S,
+            GgmlDType::IQ1_S => hanzo_metal_kernels::GgmlDType::IQ1_S,
+            GgmlDType::IQ1_M => hanzo_metal_kernels::GgmlDType::IQ1_M,
+            GgmlDType::IQ4_NL => hanzo_metal_kernels::GgmlDType::IQ4_NL,
+            GgmlDType::IQ4_XS => hanzo_metal_kernels::GgmlDType::IQ4_XS,
             #[allow(unreachable_patterns)]
             other => crate::bail!("no Metal quantized kernel for dtype {other:?}"),
         };
