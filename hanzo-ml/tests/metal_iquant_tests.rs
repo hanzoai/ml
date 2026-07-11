@@ -338,3 +338,120 @@ fn metal_prefill_iquant_matches_cpu() {
         }
     }
 }
+
+// ---- FUSED MoE PREFILL (native kernel_mul_mm_id_iq*_f32, t>1 -> the expert-grouped GEMM). Builds an
+// [E, n, k] quantized expert bank and routes t tokens (topk distinct experts each) through
+// `QTensor::indexed_moe_forward`; for t>1 that dispatches `call_mul_mm_id`. Reference = CPU f64
+// per-(token,slot) matvec of the dequantized routed expert. `per_slot` picks the down-proj input
+// layout ([t,topk,k], one row per slot) vs the shared gate/up layout ([t,1,k]). ----
+#[allow(clippy::too_many_arguments)]
+fn run_moe_prefill(
+    dev: &Device,
+    dtype: GgmlDType,
+    e_cnt: usize,
+    n: usize,
+    k: usize,
+    t: usize,
+    topk: usize,
+    per_slot: bool,
+) -> ErrStat {
+    let cpu = Device::Cpu;
+    // One synth over E*n rows = E distinct [n,k] expert weight banks (the counter advances per row).
+    let raw = synth(dtype, e_cnt * n, k);
+    let w_deq: Vec<f32> = QTensor::new(
+        QStorage::from_data(Cow::Owned(raw.clone()), &cpu, dtype).unwrap(),
+        (e_cnt, n, k),
+    )
+    .unwrap()
+    .dequantize(&cpu)
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+    let bank = QTensor::new(
+        QStorage::from_data(Cow::Owned(raw), dev, dtype).unwrap(),
+        (e_cnt, n, k),
+    )
+    .unwrap();
+
+    // Router: topk distinct experts per token (topk <= e_cnt), varied per token.
+    let mut ids_host = vec![0u32; t * topk];
+    for ti in 0..t {
+        let base = (ti * 3) % e_cnt;
+        for j in 0..topk {
+            ids_host[ti * topk + j] = ((base + j) % e_cnt) as u32;
+        }
+    }
+    let ids = Tensor::from_vec(ids_host.clone(), (t, topk), dev).unwrap();
+
+    // gate/up share one input row per token (s=1); down feeds a distinct row per slot (s=topk).
+    let s = if per_slot { topk } else { 1 };
+    let x_host: Vec<f32> = (0..t * s * k).map(|i| pseudo(i + 777)).collect();
+    let x = Tensor::from_vec(x_host.clone(), (t, s, k), dev).unwrap();
+
+    let y: Vec<f32> = bank
+        .indexed_moe_forward(&x, &ids)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(y.len(), t * topk * n);
+
+    let mut max_abs = 0f32;
+    let mut sse = 0f64;
+    let mut rs = 0f64;
+    for ti in 0..t {
+        for j in 0..topk {
+            let e = ids_host[ti * topk + j] as usize;
+            let xrow = if per_slot { ti * topk + j } else { ti };
+            for ni in 0..n {
+                let mut r = 0f64;
+                for kk in 0..k {
+                    r += w_deq[(e * n + ni) * k + kk] as f64 * x_host[xrow * k + kk] as f64;
+                }
+                let g = y[(ti * topk + j) * n + ni] as f64;
+                max_abs = max_abs.max((g - r).abs() as f32);
+                sse += (g - r) * (g - r);
+                rs += r * r;
+            }
+        }
+    }
+    let cnt = (t * topk * n) as f64;
+    let max_rel = ((sse / cnt).sqrt() / (rs / cnt).sqrt().max(1e-9)) as f32;
+    ErrStat { max_abs, max_rel }
+}
+
+#[test]
+fn metal_moe_prefill_iquant_matches_cpu() {
+    let dev = match Device::new_metal(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip moe prefill: no Metal device ({e})");
+            return;
+        }
+    };
+    // (dtype, E, n, k, t, topk, per_slot). E=2/t=40 => 40 rows/expert = 2 column tiles (BN=32); t=33
+    // => 2 token tiles; per_slot exercises the down-proj [t,topk,k] input. IQ1_S primary + IQ2/IQ3.
+    let cases = [
+        (GgmlDType::IQ1_S, 2usize, 256usize, 2048usize, 40usize, 2usize, false),
+        (GgmlDType::IQ1_S, 8, 256, 2048, 16, 2, true),
+        (GgmlDType::IQ2_XXS, 4, 256, 2048, 33, 2, false),
+        (GgmlDType::IQ3_S, 4, 512, 4096, 16, 2, false),
+    ];
+    for (dtype, e, n, k, t, topk, per_slot) in cases {
+        let stat = run_moe_prefill(&dev, dtype, e, n, k, t, topk, per_slot);
+        println!(
+            "moe prefill {dtype:?} E={e} [{n}x{k}] t={t} topk={topk} per_slot={per_slot}: \
+             max_abs={:.3e} max_rel={:.3e}",
+            stat.max_abs, stat.max_rel
+        );
+        assert!(
+            stat.max_rel < 3e-2 && stat.max_abs.is_finite(),
+            "{dtype:?} Metal MoE prefill diverged: max_abs={:.3e} max_rel={:.3e}",
+            stat.max_abs,
+            stat.max_rel
+        );
+    }
+}
