@@ -572,3 +572,134 @@ pub fn call_mul_mv_id(
     encoder.dispatch_thread_groups(thread_groups, threads_per_threadgroup);
     Ok(())
 }
+
+/// Fused MoE prefill GEMM -- ggml `kernel_mul_mm_id`, the multi-token twin of [`call_mul_mv_id`].
+/// One dispatch tiles a 64x32 simdgroup matmul over the tokens routed to each expert (expert on the
+/// grid's z axis; the ids are scanned on-device into a threadgroup rowid map), so each expert's
+/// quantized weight is read once and amortized over all its tokens -- llama's `mul_mat_id`. Args
+/// mirror `call_mul_mv_id`: `src0s` is the resident `[n_experts, n, k]` bank (blocks `expert_bytes`
+/// apart), `src1` is `[t, s, k]` f32 (`s == 1` shared gate/up input or `s == topk` per-slot down),
+/// `ids` is `[t, topk]` u32, `dst` is `[t, topk, n]` f32 -- same layout the matvec path writes.
+#[allow(clippy::too_many_arguments)]
+pub fn call_mul_mm_id(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    n_experts: usize,
+    n: usize,
+    k: usize,
+    t: usize,
+    topk: usize,
+    s: usize,
+    expert_bytes: usize,
+    src0s: &Buffer,
+    src0_offset: usize,
+    src1: &Buffer,
+    src1_offset: usize,
+    ids: &Buffer,
+    ids_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne02 = n_experts as i64;
+    // The mm impl indexes weight rows explicitly (unlike the matvec wrappers that pass nb01=0), so the
+    // real quantized row stride is required: expert_bytes = n * (k/block_size) * type_size.
+    let nb01 = (expert_bytes / n) as i64;
+    let nb02 = expert_bytes as i64;
+
+    let ne11 = s as i64;
+    let ne12 = t as i64;
+    let ne13 = 1i64;
+    let nb10 = std::mem::size_of::<f32>() as i64;
+    let nb11 = (k * std::mem::size_of::<f32>()) as i64;
+    let nb12 = (s * k * std::mem::size_of::<f32>()) as i64;
+
+    let nei0 = topk as i64;
+    let nei1 = t as i64;
+    let nbi1 = (topk * std::mem::size_of::<u32>()) as i64;
+
+    let ne0 = n as i64;
+    let ne1 = topk as i64;
+    let nb1 = (n * std::mem::size_of::<f32>()) as i64;
+
+    let name = match dtype {
+        GgmlDType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
+        GgmlDType::Q4_1 => "kernel_mul_mm_id_q4_1_f32",
+        GgmlDType::Q5_0 => "kernel_mul_mm_id_q5_0_f32",
+        GgmlDType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
+        GgmlDType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
+        GgmlDType::Q2K => "kernel_mul_mm_id_q2_K_f32",
+        GgmlDType::Q3K => "kernel_mul_mm_id_q3_K_f32",
+        GgmlDType::Q4K => "kernel_mul_mm_id_q4_K_f32",
+        GgmlDType::Q5K => "kernel_mul_mm_id_q5_K_f32",
+        GgmlDType::Q6K => "kernel_mul_mm_id_q6_K_f32",
+        GgmlDType::F16 => "kernel_mul_mm_id_f16_f32",
+        GgmlDType::F32 => "kernel_mul_mm_id_f32_f32",
+        GgmlDType::IQ2_XXS => "kernel_mul_mm_id_iq2_xxs_f32",
+        GgmlDType::IQ2_XS => "kernel_mul_mm_id_iq2_xs_f32",
+        GgmlDType::IQ2_S => "kernel_mul_mm_id_iq2_s_f32",
+        GgmlDType::IQ3_XXS => "kernel_mul_mm_id_iq3_xxs_f32",
+        GgmlDType::IQ3_S => "kernel_mul_mm_id_iq3_s_f32",
+        GgmlDType::IQ1_S => "kernel_mul_mm_id_iq1_s_f32",
+        GgmlDType::IQ1_M => "kernel_mul_mm_id_iq1_m_f32",
+        GgmlDType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
+        GgmlDType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_f32",
+        other => {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "no kernel_mul_mm_id for {other:?}"
+            )))
+        }
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            (src0s, src0_offset),
+            (src1, src1_offset),
+            Output::with_offset(dst, dst_offset),
+            (ids, ids_offset),
+            nei0,
+            nei1,
+            nbi1,
+            ne00,
+            ne02,
+            nb01,
+            nb02,
+            ne11,
+            ne12,
+            ne13,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            nb1
+        )
+    );
+
+    // 8192 B of sa/sb GEMM tiles + the on-device rowid map (one ushort2 per routed row). MoE top-k ids
+    // are distinct per token, so a single expert receives at most `t` rows -> `t` ushort2 entries.
+    let rowids_bytes = (t * std::mem::size_of::<u32>()).next_multiple_of(16);
+    encoder.set_threadgroup_memory_length(0, 8192 + rowids_bytes);
+
+    // Classic ggml mul_mat_id grid: token tiles (x) x output-row tiles (y) x experts (z); 128 threads.
+    let thread_groups = MTLSize {
+        width: divide(t, 32),
+        height: divide(n, 64),
+        depth: n_experts,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups, threads_per_threadgroup);
+    Ok(())
+}

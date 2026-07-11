@@ -484,11 +484,11 @@ impl QMetalStorage {
         ids: &MetalStorage, // [t, topk]
         ids_l: &crate::Layout,
     ) -> Result<(MetalStorage, Shape)> {
-        // Fused ggml `mul_mv_id`: ONE dispatch computes every routed (token, expert-slot) matvec,
-        // reading the expert id per row from the on-device `ids` buffer. Replaces the per-expert host
-        // loop -- which did an `ids.to_vec1` device->host sync plus a gather/matmul/scatter per expert,
-        // per projection, per layer (the dominant Metal MoE decode cost). The [E, n, k] GGUF bank
-        // stays quantized and resident in `self.buffer`; each expert block is `expert_bytes` apart.
+        // Fused ggml `mul_mv_id` (decode) / `mul_mm_id` (prefill): ONE dispatch computes every routed
+        // (token, expert-slot) product, reading the expert id per row from the on-device `ids` buffer.
+        // Replaces the per-expert host loop -- which did an `ids.to_vec1` device->host sync plus a
+        // gather/matmul/scatter per expert, per projection, per layer. The [E, n, k] GGUF bank stays
+        // quantized and resident in `self.buffer`; each expert block is `expert_bytes` apart.
         let device = self.device.clone();
         let (e_cnt, n, k) = self_shape.dims3()?;
         let (t, topk) = ids_l.shape().dims2()?;
@@ -551,27 +551,54 @@ impl QMetalStorage {
 
         {
             let encoder = device.command_encoder()?;
-            hanzo_metal_kernels::call_mul_mv_id(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                kdtype,
-                e_cnt,
-                n,
-                k,
-                t,
-                topk,
-                s,
-                expert_bytes,
-                &self.buffer,
-                0,
-                x_metal.buffer(),
-                0,
-                ids_metal.buffer(),
-                0,
-                &dst,
-                0,
-            )
+            // Prefill (t>1) rides the fused expert-grouped GEMM (mul_mm_id): each expert's weight is
+            // read once and amortized over its routed tokens. Decode (t==1) keeps the per-slot matvec
+            // (mul_mv_id). Identical arg block and [t,topk,n] output, so only the kernel differs.
+            if t > 1 {
+                hanzo_metal_kernels::call_mul_mm_id(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    kdtype,
+                    e_cnt,
+                    n,
+                    k,
+                    t,
+                    topk,
+                    s,
+                    expert_bytes,
+                    &self.buffer,
+                    0,
+                    x_metal.buffer(),
+                    0,
+                    ids_metal.buffer(),
+                    0,
+                    &dst,
+                    0,
+                )
+            } else {
+                hanzo_metal_kernels::call_mul_mv_id(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    kdtype,
+                    e_cnt,
+                    n,
+                    k,
+                    t,
+                    topk,
+                    s,
+                    expert_bytes,
+                    &self.buffer,
+                    0,
+                    x_metal.buffer(),
+                    0,
+                    ids_metal.buffer(),
+                    0,
+                    &dst,
+                    0,
+                )
+            }
             .map_err(crate::MetalError::from)?;
         }
 
