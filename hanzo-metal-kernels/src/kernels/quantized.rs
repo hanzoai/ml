@@ -4,6 +4,9 @@ use crate::{
 };
 use objc2_metal::MTLSize;
 
+// Variant names mirror `hanzo_ml::quantized::GgmlDType` one-to-one (IQ2_XXS, IQ4_XS, ...) so the
+// TryFrom mapping stays mechanical; the i-quant acronyms are not upper-camel-case.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy)]
 pub enum GgmlDType {
     Q4_0,
@@ -21,6 +24,35 @@ pub enum GgmlDType {
     F16,
     F32,
     BF16,
+    // i-quant codebook family. The MSL kernels (get_rows / mul_mv / mul_mm / mul_mv_id /
+    // mul_mm_id) are all present in quantized.metal; these variants just route the dispatch.
+    IQ2_XXS,
+    IQ2_XS,
+    IQ2_S,
+    IQ3_XXS,
+    IQ3_S,
+    IQ1_S,
+    IQ1_M,
+    IQ4_NL,
+    IQ4_XS,
+}
+
+/// Threadgroup scratch (bytes) the matvec kernel stages its codebook grid into. The IQ2/IQ3 kernels
+/// copy their `__constant__` grid + sign table into threadgroup memory; IQ4_NL/IQ4_XS stage the
+/// 16-value LUT. IQ1_S/IQ1_M pass `nullptr` (no staging) and every non-i-quant reduces in-simdgroup,
+/// so they need none. 8192 is the ggml-metal upper bound (max real need is IQ2_XS at 512*8+128=4224)
+/// and matches the flat scratch `call_mul_mv_id` binds; well within the 32 KiB threadgroup limit.
+fn matvec_threadgroup_mem(dtype: GgmlDType) -> usize {
+    match dtype {
+        GgmlDType::IQ2_XXS
+        | GgmlDType::IQ2_XS
+        | GgmlDType::IQ2_S
+        | GgmlDType::IQ3_XXS
+        | GgmlDType::IQ3_S
+        | GgmlDType::IQ4_NL
+        | GgmlDType::IQ4_XS => 8192,
+        _ => 0,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,6 +166,17 @@ pub fn call_quantized_matmul_mv_t_offset(
             let align = 8;
             (nth0, nth1, align)
         }
+        // i-quant matvec kernels run 2 simdgroups (nth0*nth1 == 2*32 == 64 threads). IQ1/IQ2/IQ3
+        // emit N_DST=4 rows/simdgroup -> 8 rows/threadgroup (align 8); IQ4_NL/IQ4_XS emit 2 rows
+        // -> 4 rows/threadgroup (align 4). Matches ggml-metal's per-type dispatch.
+        GgmlDType::IQ2_XXS
+        | GgmlDType::IQ2_XS
+        | GgmlDType::IQ2_S
+        | GgmlDType::IQ3_XXS
+        | GgmlDType::IQ3_S
+        | GgmlDType::IQ1_S
+        | GgmlDType::IQ1_M => (4, 16, 8),
+        GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
     };
     let thread_groups_count = MTLSize {
         width: divide(ne01 as usize, align),
@@ -161,6 +204,15 @@ pub fn call_quantized_matmul_mv_t_offset(
         GgmlDType::F16 => "kernel_mul_mv_f16_f32",
         GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mv_f32_f32",
+        GgmlDType::IQ2_XXS => "kernel_mul_mv_iq2_xxs_f32",
+        GgmlDType::IQ2_XS => "kernel_mul_mv_iq2_xs_f32",
+        GgmlDType::IQ2_S => "kernel_mul_mv_iq2_s_f32",
+        GgmlDType::IQ3_XXS => "kernel_mul_mv_iq3_xxs_f32",
+        GgmlDType::IQ3_S => "kernel_mul_mv_iq3_s_f32",
+        GgmlDType::IQ1_S => "kernel_mul_mv_iq1_s_f32",
+        GgmlDType::IQ1_M => "kernel_mul_mv_iq1_m_f32",
+        GgmlDType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
+        GgmlDType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -192,6 +244,13 @@ pub fn call_quantized_matmul_mv_t_offset(
             r3
         )
     );
+
+    // The i-quant matvec kernels stage their codebook grid into threadgroup scratch (IQ1_S/IQ1_M
+    // pass nullptr and need none). Non-i-quants reduce in-simdgroup and bind nothing, as before.
+    let tg_mem = matvec_threadgroup_mem(dtype);
+    if tg_mem > 0 {
+        encoder.set_threadgroup_memory_length(0, tg_mem);
+    }
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -303,6 +362,15 @@ pub fn call_quantized_matmul_mm_t_offset(
         GgmlDType::F16 => "kernel_mul_mm_f16_f32",
         GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mm_f32_f32",
+        GgmlDType::IQ2_XXS => "kernel_mul_mm_iq2_xxs_f32",
+        GgmlDType::IQ2_XS => "kernel_mul_mm_iq2_xs_f32",
+        GgmlDType::IQ2_S => "kernel_mul_mm_iq2_s_f32",
+        GgmlDType::IQ3_XXS => "kernel_mul_mm_iq3_xxs_f32",
+        GgmlDType::IQ3_S => "kernel_mul_mm_iq3_s_f32",
+        GgmlDType::IQ1_S => "kernel_mul_mm_iq1_s_f32",
+        GgmlDType::IQ1_M => "kernel_mul_mm_iq1_m_f32",
+        GgmlDType::IQ4_NL => "kernel_mul_mm_iq4_nl_f32",
+        GgmlDType::IQ4_XS => "kernel_mul_mm_iq4_xs_f32",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
     };
@@ -410,6 +478,17 @@ pub fn call_mul_mv_id(
         GgmlDType::Q6K => (2, 32, 2),
         GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K => (32, 1, 8),
         GgmlDType::F32 => (32, 1, 8),
+        // Same per-type layout as the plain matvec above (2 simdgroups; 8 rows/threadgroup for
+        // IQ1/IQ2/IQ3, 4 for IQ4_NL/IQ4_XS). The `_id` kernels stage their grid into the flat
+        // 8192-byte threadgroup scratch already bound below.
+        GgmlDType::IQ2_XXS
+        | GgmlDType::IQ2_XS
+        | GgmlDType::IQ2_S
+        | GgmlDType::IQ3_XXS
+        | GgmlDType::IQ3_S
+        | GgmlDType::IQ1_S
+        | GgmlDType::IQ1_M => (4, 16, 8),
+        GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
     };
 
     let name = match dtype {
@@ -425,6 +504,15 @@ pub fn call_mul_mv_id(
         GgmlDType::Q6K => "kernel_mul_mv_id_q6_K_f32",
         GgmlDType::F16 => "kernel_mul_mv_id_f16_f32",
         GgmlDType::F32 => "kernel_mul_mv_id_f32_f32",
+        GgmlDType::IQ2_XXS => "kernel_mul_mv_id_iq2_xxs_f32",
+        GgmlDType::IQ2_XS => "kernel_mul_mv_id_iq2_xs_f32",
+        GgmlDType::IQ2_S => "kernel_mul_mv_id_iq2_s_f32",
+        GgmlDType::IQ3_XXS => "kernel_mul_mv_id_iq3_xxs_f32",
+        GgmlDType::IQ3_S => "kernel_mul_mv_id_iq3_s_f32",
+        GgmlDType::IQ1_S => "kernel_mul_mv_id_iq1_s_f32",
+        GgmlDType::IQ1_M => "kernel_mul_mv_id_iq1_m_f32",
+        GgmlDType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
+        GgmlDType::IQ4_XS => "kernel_mul_mv_id_iq4_xs_f32",
         other => {
             return Err(MetalKernelError::LoadFunctionError(format!(
                 "no kernel_mul_mv_id for {other:?}"
