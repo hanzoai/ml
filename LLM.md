@@ -753,6 +753,35 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
 - rope_norm + add_rmsnorm stay shipped (bit-exact, decomplecting, latent wins for a future busy-bound
   regime -- like the documented ROCm/CUDA model-level non-levers). The campaign redirects to the matvec.
 
+### Metal i-quant dequant/matvec family WIRED (GLM-5.2 IQ1_S unblock; ml 0.11.47 / metal-kernels 0.11.35)
+- GLM-5.2 (UD-IQ1_S) failed to load on Metal: `IQ1_S is not supported on the Metal backend` at
+  `QStorage::from_data` (quantized/mod.rs). The MSL kernels were ALREADY present in quantized.metal
+  (get_rows / mul_mv / mul_mm / mul_mv_id / mul_mm_id + dequantize_iq* + the iq1s_grid/iq2xs_grid/etc.
+  codebooks -- a verbatim ggml-metal port); the gap was 100% Rust dispatch. Wired the WHOLE i-quant
+  family (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS) in 5 places, no new MSL:
+  (1) `hanzo_metal_kernels::GgmlDType` +9 variants (names mirror ml's GgmlDType 1:1, `#[allow(non_camel_
+  case_types)]`); (2) the 3 dispatch fns -- `call_quantized_matmul_mv_t_offset` (decode), `_mm_t_offset`
+  (prefill), `call_mul_mv_id` (MoE) -- +per-type `(nth0,nth1,align)` and kernel-name arms; (3) mod.rs
+  Metal load arm; (4) metal.rs `dequantize()` readback (`BlockIQ*::to_float`); (5) metal.rs `TryFrom`.
+- DISPATCH FACTS (from the kernel bodies, not memory): the iq matvec wrappers take the SAME 19-arg param
+  block as the k-quants (so the existing `set_params!` is reused verbatim) and run 2 simdgroups = 64
+  threads (nth0=4,nth1=16). Rows/threadgroup = N_SIMDGROUP*N_DST: IQ1/IQ2/IQ3 emit N_DST=4 -> align 8;
+  IQ4_NL/IQ4_XS emit N_DST=2 -> align 4. IQ1_S/IQ1_M pass `nullptr` (no threadgroup scratch); IQ2/IQ3/IQ4
+  stage their codebook grid into threadgroup memory -> bind 8192 B (ggml upper bound, max real need IQ2_XS
+  512*8+128=4224; matches the flat scratch call_mul_mv_id already binds). mm (prefill) is the generic
+  `kernel_mul_mm` template -> just the name arm; 8192 B already bound. On Metal the iq matvec reads the
+  RAW f32 activation (NO q8_1 quant, unlike CUDA/ROCm dp4a) -> float MACs, so the bit-exact reference is
+  a plain CPU f64 matvec of the dequantized weights (no q8_1-roundtrip needed).
+- GATE (dbc M4 Max, tests/metal_iquant_tests.rs, 14/14): dequant round-trip Metal-vs-CPU BIT-IDENTICAL
+  (max_abs=0.0, IQ1_S/IQ2_XXS/IQ3_S/IQ4_XS); native matvec (kernel_mul_mv_iq*) vs CPU f64 ref = max_rel
+  ~1.0-2.1e-7 (f32-accum floor -- TIGHTER than CUDA's ~1.8e-4 since no q8_1 activation floor) across all
+  9 types @ k=2048/4096; prefill mm (kernel_mul_mm_iq*) max_rel ~2.1e-4 (f16 tile). Integration: TinyLlama
+  -1.1B-IQ1_S-imat loads on Metal (201 tensors, 269MB) + generates coherent grammatical English @ 264 T/s
+  (no NaN/garbage) -- proves the dequant feeds attention+FFN. IQ4_NL/IQ4_XS were half-wired before (load+
+  dequant only, no matmul -> would bail at TryFrom); now complete. Ternary (TQ1/TQ2) + NVFP4 still
+  CPU-only on Metal (no MSL kernel). Synthetic block bytes span the full input space (any byte pattern is
+  a valid codebook block), so the gate covers real GLM IQ1_S bit-patterns.
+
 ### CROSS-BACKEND PARITY MATRIX (hanzo vs llama.cpp, clean idle-box, ml ~0.11.32, Qwen3 0.6/4/8B)
 - CUDA (GB10/spark): decode geomean 0.99x (0.96/0.99/1.02 -- BEATS llama on 8B), prefill geomean 0.60x
   (0.52/0.60/0.70). Decode PARITY (stronger than ROCm); prefill = Blackwell tensor-core MMQ frontier.

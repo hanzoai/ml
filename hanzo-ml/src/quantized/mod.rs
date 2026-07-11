@@ -157,7 +157,19 @@ impl QStorage {
                 GgmlDType::MXFP4 => metal::load_quantized(d, as_t_slice::<BlockMXFP4>(&data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(&data)),
                 GgmlDType::I32 => metal::load_quantized(d, as_t_slice::<i32>(&data)),
-                // IQ / ternary / 1-bit / NVFP4 codec types have no native Metal loader (CPU-decode only).
+                // i-quant codebook family: the GGML blocks upload to the Metal buffer byte-for-byte
+                // like any other quant, and the native MSL matvec/matmul/mul_mv_id kernels
+                // (kernel_mul_mv_iq*_f32 etc.) read the block format directly -- no CPU dequant on the
+                // hot path. QMetalStorage::dequantize (CPU codebook decode) backs ISQ / dequant-to-f32.
+                // Exhaustive on purpose: a future GgmlDType fails-closed at compile rather than at load.
+                GgmlDType::IQ2_XXS => metal::load_quantized(d, as_t_slice::<BlockIQ2xxs>(&data)),
+                GgmlDType::IQ2_XS => metal::load_quantized(d, as_t_slice::<BlockIQ2xs>(&data)),
+                GgmlDType::IQ2_S => metal::load_quantized(d, as_t_slice::<BlockIQ2s>(&data)),
+                GgmlDType::IQ3_XXS => metal::load_quantized(d, as_t_slice::<BlockIQ3xxs>(&data)),
+                GgmlDType::IQ3_S => metal::load_quantized(d, as_t_slice::<BlockIQ3s>(&data)),
+                GgmlDType::IQ1_S => metal::load_quantized(d, as_t_slice::<BlockIQ1s>(&data)),
+                GgmlDType::IQ1_M => metal::load_quantized(d, as_t_slice::<BlockIQ1m>(&data)),
+                // Ternary / NVFP4 have no native Metal kernel yet (CPU-decode only).
                 other => crate::bail!("{other:?} is not supported on the Metal backend"),
             },
             Device::Cuda(d) => match dtype {
