@@ -1551,8 +1551,15 @@ pub fn moe_combine(ys: &Tensor, scores: &Tensor) -> Result<Tensor> {
             false,
         ));
     }
-    ys.broadcast_mul(&scores.unsqueeze(D::Minus1)?)?
-        .sum(D::Minus2)
+    // scores come from moe_route in f32; ys carries the model compute dtype, which on a backend
+    // without a native moe_combine kernel (Metal) is bf16/f16 -> a raw broadcast_mul would hit a
+    // dtype mismatch. Accumulate in f32 (as the rocm/cuda kernels do), then restore ys's dtype.
+    // No-op for the f32 path, so CPU/CUDA stay byte-identical.
+    let out_dtype = ys.dtype();
+    ys.to_dtype(DType::F32)?
+        .broadcast_mul(&scores.to_dtype(DType::F32)?.unsqueeze(D::Minus1)?)?
+        .sum(D::Minus2)?
+        .to_dtype(out_dtype)
 }
 
 /// Fused MoE router. Reduces the F32 router logits [ntok, n_experts] to the topk selected expert

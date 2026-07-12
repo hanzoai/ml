@@ -1015,3 +1015,98 @@ kernels are ALREADY warp-shuffle-optimal (adaptive 32/1024-thread block + `__shf
   appending the 2nd `extern "C"` block, but keep the f16 preamble (it adds `#include <hip/hip_fp16.h>`).
   `clippy -D warnings` is PRE-EXISTING-red on ml+hanzo-kernel (the 106x `*const *mut c_void as *mut
   c_void` idiom + operator-method-confusion) -- not introduced here.
+
+## GLM-5.2 fast-ring (evo+spark+dbc): the `--cpu` root cause, and why dbc-Metal still can't hold 30 layers
+
+**The <0.04 tok/s 3-node collapse was NOT a stale build.** A prior hand-off blamed dbc's ring `ml` for
+predating the `kernel_mul_mv_id` wiring. Disproven, three ways: dbc's ring source
+(`~/work/hanzo/ml-ring`, which is what `engine-ring/Cargo.toml [patch.crates-io]` actually points at --
+NOT `~/work/hanzo/ml`) is **byte-identical to current main** (138/138 files, sha256); the ring binary
+already **embeds `kernel_mul_mv_id_iq1_s_f32`**; and its `Cargo.lock` resolves hanzo-ml 0.11.48 /
+hanzo-metal-kernels 0.11.36 to the **local path** (no `source = "registry+..."` -> patch applied).
+No rebuild was needed or done.
+
+**The actual cause: dbc's `hanzo cluster join` was passed `--cpu`.** Proof is one line in
+`/tmp/glm-dbc.log`: `Launching: hanzo serve -m glm-5.2 --cpu ...`. `engine/hanzo/src/model.rs`
+`best_device(force_cpu)` returns `Device::Cpu`, so weights land in `QStorage::Cpu`; the fused Metal MoE
+arm in `hanzo-ml/src/quantized/mod.rs` is guarded on
+`QStorage::Metal(s) if x/ids are Storage::Metal(_)`, so it falls through to the `_ =>` per-expert CPU
+fallback -- the 250-900 ms/layer path. `engine_args` are **per-node** (`cluster init`/`join` each take
+their own after `--`); they are not broadcast from the head. Fix = just don't pass `--cpu`.
+
+**Metal i-quant MoE is correct at GLM-5.2's REAL dims.** The shipped tests only covered E<=32; the model
+is `expert_count=256`, `expert_used_count=8`, `embedding_length=6144`, `expert_feed_forward_length=2048`,
+`block_count=79` (n_layers=78; `leading_dense_block_count=3`). Re-ran the gate at real dims on dbc (M4
+Max): decode `mul_mv_id` max_rel **2.15e-7** (per_slot both ways), prefill `mul_mm_id` max_rel **2.09e-4**
+-- 2 passed, 0 failed (211.9 s; the wall is the CPU *reference* quantizing 3.2 B weights, not the GPU).
+Throughput gate: **GPU 2.66 ms vs CPU 893 ms per MoE layer (335.8x)**. The kernel is not the blocker.
+
+**What still blocks the all-GPU ring (two separate, real bugs):**
+1. **dbc-Metal OOMs at 30 layers -- FIXED by capping it at 20.** The old `--cpu` rank only "fit" because
+   **mmap is lazy** -- it never materialized the weights. The Metal path must allocate the buffers for
+   real (~78 GiB for 30 layers). dbc (128 GiB but only ~65 GiB actually free: desktop + Go/Xcode
+   toolchains + agent sessions, **7 GiB swap cap**) died silently mid-load at ~81 GiB RSS with `free=0`.
+   At **20 layers (blocks 58-77, shards 5+6 only)** it loads and holds fine: 54.8 GiB resident in Metal.
+   Verified split **28/30/20** loads on all 3 ranks. dbc's practical ceiling is ~55 GiB.
+2. **A METAL RANK IN THE PIPELINE-PARALLEL RING DEADLOCKS.** Bisected, and it is *sufficient on its own*
+   -- this CORRECTS an earlier guess in this file that blamed evo-on-ROCm:
+
+   | ring config                                   | result |
+   |-----------------------------------------------|--------|
+   | evo-CPU + spark-CUDA (2-box)                   | works, 0.42 tok/s |
+   | evo-CPU + spark-CUDA + dbc-**CPU**             | works (slow -- the `--cpu` bug above) |
+   | evo-CPU + spark-CUDA + dbc-**Metal**           | **DEADLOCK** (only dbc's device changed) |
+   | evo-ROCm + spark-CUDA + dbc-Metal              | DEADLOCK |
+
+   Symptom: all 3 ranks load, all 3 TCP hops ESTABLISH, `:1234` serves `/v1/models` -- then **zero tokens
+   in 290 s, zero engine throughput lines** (the logger ticks every 5 s whenever a request is live), and
+   **every ring socket has Recv-Q=0/Send-Q=0 on all three boxes** (the wire is idle -- no activation is
+   ever exchanged). dbc's rank spins at 100% of one core with the GPU ~0%.
+   dbc really IS on Metal -- `vmmap -summary` shows **`IOAccelerator (graphics) 54.8G`** resident, so
+   `best_device` picked Metal and the weights are in GPU memory. And the MoE kernel is bit-exact at real
+   dims (above). So the bug is **not** the MoE kernel and **not** ROCm: it is the ring's pipeline-parallel
+   activation exchange when a rank's tensors are Metal-resident (`hanzo-quant/src/distributed/`).
+   evo-on-ROCm is UNTESTED in isolation -- do not assume it is broken.
+   **Fixing the Metal-rank ring deadlock is the single highest-value fix** -- it is what unlocks dbc.
+
+**Layer->shard map (exact, from GGUF tensor names -- get this right or a rank can't find its tensors):**
+shard2=blk 0-20, shard3=20-38, shard4=38-55, shard5=55-73, shard6=73-78. Nodes hold *different* subsets:
+evo has 1-4 (can serve blk<=55), spark has all 6, dbc has 1,4,5,6 (**can only serve blk>=38**) -- so dbc
+must always be the LAST rank. `RING_LAYER_SPLIT="a,b,c"` (env, identical on every rank) forces the split;
+rank0 additionally owns embed+final-norm+lm_head.
+
+**Holding config (rock-stable):** 2-box, `RING_LAYER_SPLIT=48,30`, evo rank0 CPU head (blk 0-47, `--cpu`,
+`-p 1234`, shards 1-4) + spark rank1 CUDA (blk 48-77, all 6 shards). ~0.42 tok/s decode. A zero-downtime
+cutover to any 3-node is **impossible**: spark's 78 GiB is fully committed and every 3-node split moves
+spark's layer range, so it must free and reload.
+
+### Metal PP-ring "deadlock" ROOT-CAUSED + FIXED: moe_combine bf16*f32 dtype panic (0.11.49)
+The heterogeneous ring "deadlock" (evo-CPU + spark-CUDA + dbc-**Metal** hangs; only dbc's device
+changed) was NOT the activation exchange and NOT a Metal command-buffer sync gap. It is a **dtype
+mismatch panic in `hanzo_ml::quantized::moe_combine`** that kills the PP worker thread, after which the
+daemon's `loop {}` (engine lib.rs:1143, the worker's main thread busy-spins) keeps one core at 100% with
+the GPU idle -> reads as a hang (that "100% CPU one core" is the loop, NOT Metal, on EVERY worker rank).
+- ROOT CAUSE (dbc backtrace, 2-process localhost ring rank0-CPU+rank1-Metal, Qwen3-30B-A3B-Q4_K_M):
+  `moe_combine` -> `Tensor::broadcast_mul` -> "dtype mismatch in mul, lhs: BF16, rhs: F32" <-
+  `LayerWeights::forward_block` <- `pp_run_local` <- `pp_worker_step`. `scores` come from `moe_route`
+  in f32; `ys` (down-expert output) carries the model compute dtype. The generic fallback did
+  `ys.broadcast_mul(scores.unsqueeze(-1))` with NO dtype reconcile. Works on CPU (dtype f32 == scores
+  f32) and on ROCm (native `moe_combine` kernel takes f32 scores + bf16/f16 ys), but a **Metal rank runs
+  bf16 ys and has NO native moe_combine kernel** -> the fallback panics. That is exactly why CPU and CUDA
+  ranks work and only a Metal rank "deadlocks".
+- FIX (mod.rs moe_combine fallback): accumulate in f32 like the native kernels, then restore ys's dtype:
+  `ys.to_dtype(F32).broadcast_mul(scores.to_dtype(F32).unsqueeze(-1)).sum(-2).to_dtype(ys.dtype())`.
+  BYTE-IDENTICAL for the f32 path (CPU/CUDA/ROCm unaffected, no-op casts); fixes bf16/f16 ys. Zero regress.
+- SCOPE: the unsafe shared `moe_combine` is used by `quantized_qwen3_moe` (PP-wired, the repro) and
+  `quantized_deepseek4` (DS4-Pro) -> both fixed. GLM (`quantized_glm4_moe`) and `quantized_deepseek2` use
+  `gguf_moe::FusedMoe` whose INLINE combine already casts `topk_weight.to_dtype(ys.dtype())` -> already
+  safe. FOLLOW-UP (DRY, not done): gguf_moe's inline combine duplicates moe_combine; unify to the one
+  now-safe `moe_combine` (also routes gguf_moe through the ROCm kernel) after a GLM/Deepseek2 e2e pass.
+- GATE (dbc M4 Max, hanzo-ml/tests/metal_ring_moe_combine.rs, feature=metal): pre-fix `moe_combine` PANICS
+  for f16/bf16 ys (red); post-fix f32/f16/bf16 all match a CPU f32 reference (maxerr 6e-8 / 2.2e-4 /
+  2.3e-3, green) and output dtype follows ys. Plus a 2-rank CPU<->Metal socket micro-harness proving a
+  Metal rank round-trips an activation (send_right tensor_to_f32 / recv_left from_vec+to_dtype) BYTE-OK --
+  confirming the exchange itself was never the bug. branch `fix/moe-combine-mixed-dtype-metal-ring`.
+- HANDOFF: the daemon `loop {}` (lib.rs:1143 worker main thread) MASKS a worker-thread panic as a spinning
+  hang -- worth surfacing worker errors to the head instead of spinning. The 3-node full-ring reboot to
+  confirm end-to-end is the ring agent's job (dbc GPU was busy with the fabric's standalone 30B serve).
