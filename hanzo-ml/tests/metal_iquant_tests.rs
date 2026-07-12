@@ -339,13 +339,14 @@ fn metal_prefill_iquant_matches_cpu() {
     }
 }
 
-// ---- FUSED MoE PREFILL (native kernel_mul_mm_id_iq*_f32, t>1 -> the expert-grouped GEMM). Builds an
-// [E, n, k] quantized expert bank and routes t tokens (topk distinct experts each) through
-// `QTensor::indexed_moe_forward`; for t>1 that dispatches `call_mul_mm_id`. Reference = CPU f64
-// per-(token,slot) matvec of the dequantized routed expert. `per_slot` picks the down-proj input
-// layout ([t,topk,k], one row per slot) vs the shared gate/up layout ([t,1,k]). ----
+// ---- INDEXED (fused) MoE. Builds an [E, n, k] quantized expert bank and routes t tokens (topk
+// distinct experts each) through `QTensor::indexed_moe_forward`. The `t` value selects the SAME path
+// production does: t == 1 (decode) dispatches `call_mul_mv_id` (per-slot matrix-VECTOR), t > 1
+// (prefill) dispatches `call_mul_mm_id` (expert-grouped GEMM). Reference = CPU f64 per-(token,slot)
+// matvec of the dequantized routed expert. `per_slot` picks the down-proj input layout ([t,topk,k],
+// one row per slot) vs the shared gate/up layout ([t,1,k]). ----
 #[allow(clippy::too_many_arguments)]
-fn run_moe_prefill(
+fn run_moe_indexed(
     dev: &Device,
     dtype: GgmlDType,
     e_cnt: usize,
@@ -441,7 +442,7 @@ fn metal_moe_prefill_iquant_matches_cpu() {
         (GgmlDType::IQ3_S, 4, 512, 4096, 16, 2, false),
     ];
     for (dtype, e, n, k, t, topk, per_slot) in cases {
-        let stat = run_moe_prefill(&dev, dtype, e, n, k, t, topk, per_slot);
+        let stat = run_moe_indexed(&dev, dtype, e, n, k, t, topk, per_slot);
         println!(
             "moe prefill {dtype:?} E={e} [{n}x{k}] t={t} topk={topk} per_slot={per_slot}: \
              max_abs={:.3e} max_rel={:.3e}",
@@ -454,4 +455,174 @@ fn metal_moe_prefill_iquant_matches_cpu() {
             stat.max_rel
         );
     }
+}
+
+// ---- FUSED MoE DECODE (native kernel_mul_mv_id_iq*_f32, t == 1 -> the per-slot matrix-VECTOR). This
+// is the decode twin of the prefill test above and the path GLM-5.2 (UD-IQ1_S) takes for every
+// generated token. `indexed_moe_forward` with t == 1 dispatches `call_mul_mv_id`, reading each routed
+// slot's expert id on-device and dotting the resident IQ codebook weight against the f32 activation
+// in ONE fused GPU dispatch -- replacing the per-expert single-core CPU-scalar fallback. Decode does
+// pure f32 MACs (no f16 GEMM tile), so the tolerance is TIGHT (the f32-accumulation-order floor),
+// matching the plain-matvec gate -- a codebook/index/scale bug spikes max_rel to O(1e-2..1). ----
+#[test]
+fn metal_moe_decode_iquant_matches_cpu() {
+    let dev = match Device::new_metal(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip moe decode: no Metal device ({e})");
+            return;
+        }
+    };
+    // (dtype, E, n, k, topk, per_slot). t == 1 (decode). GLM-5.2 primary IQ1_S + a ksigns grid
+    // (IQ2_XXS), a raw-byte-sign grid (IQ2_S), a 3-bit grid (IQ3_S), and the LUT (IQ4_XS). Both the
+    // shared gate/up input (per_slot=false, s=1) and the per-slot down input (per_slot=true, s=topk)
+    // routing layouts; attn-proj k=2048 and ffn k=4096; topk 6/8 (>1 slot/token, distinct experts).
+    let cases = [
+        (GgmlDType::IQ1_S, 16usize, 256usize, 2048usize, 8usize, false),
+        (GgmlDType::IQ1_S, 16, 512, 4096, 8, true),
+        (GgmlDType::IQ2_XXS, 12, 256, 2048, 6, false),
+        (GgmlDType::IQ2_S, 8, 256, 2048, 6, true),
+        (GgmlDType::IQ3_S, 8, 512, 4096, 6, false),
+        (GgmlDType::IQ4_XS, 8, 256, 2048, 6, true),
+    ];
+    for (dtype, e, n, k, topk, per_slot) in cases {
+        let stat = run_moe_indexed(&dev, dtype, e, n, k, 1, topk, per_slot);
+        println!(
+            "moe decode {dtype:?} E={e} [{n}x{k}] topk={topk} per_slot={per_slot}: \
+             max_abs={:.3e} max_rel={:.3e}",
+            stat.max_abs, stat.max_rel
+        );
+        assert!(
+            stat.max_rel < 2e-3 && stat.max_abs < 1e-1,
+            "{dtype:?} Metal MoE decode (mul_mv_id) diverged: max_abs={:.3e} max_rel={:.3e}",
+            stat.max_abs,
+            stat.max_rel
+        );
+    }
+}
+
+// ---- DECODE THROUGHPUT: the whole point of the kernel. A GLM-5.2-shaped IQ1_S expert bank routed for
+// one token, timed on the Metal GPU (fused `call_mul_mv_id`) vs the CPU per-expert fallback (the
+// single-core-scalar path that pegs one core to 99.9% and collapses ring decode). Proves the decode
+// MoE compute is now ON THE GPU and reports the speedup + a per-decode-step budget. `#[ignore]` (a
+// benchmark, not a gate); run with `--ignored --nocapture`. ----
+#[test]
+#[ignore]
+fn metal_moe_decode_iquant_throughput() {
+    let dev = match Device::new_metal(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip moe decode throughput: no Metal device ({e})");
+            return;
+        }
+    };
+    let cpu = Device::Cpu;
+    // GLM-5.2-representative MoE FFN projection: n = moe-intermediate 1536, k = hidden 5120 (both
+    // multiples of the IQ1_S 256 super-block), topk = 8 routed experts / token. E kept modest -- decode
+    // cost is topk*n*k (routed slots), independent of the resident expert count.
+    let (dtype, e_cnt, n, k, topk) = (GgmlDType::IQ1_S, 32usize, 1536usize, 5120usize, 8usize);
+    let raw = synth(dtype, e_cnt * n, k);
+    let bank_metal = QTensor::new(
+        QStorage::from_data(Cow::Owned(raw.clone()), &dev, dtype).unwrap(),
+        (e_cnt, n, k),
+    )
+    .unwrap();
+    let bank_cpu = QTensor::new(
+        QStorage::from_data(Cow::Owned(raw), &cpu, dtype).unwrap(),
+        (e_cnt, n, k),
+    )
+    .unwrap();
+
+    // One decode token, topk distinct experts (shared gate/up input, s = 1).
+    let ids_host: Vec<u32> = (0..topk).map(|j| (j % e_cnt) as u32).collect();
+    let x_host: Vec<f32> = (0..k).map(|i| pseudo(i + 42)).collect();
+    let mk = |d: &Device| {
+        (
+            Tensor::from_vec(ids_host.clone(), (1, topk), d).unwrap(),
+            Tensor::from_vec(x_host.clone(), (1, 1, k), d).unwrap(),
+        )
+    };
+    let (ids_m, x_m) = mk(&dev);
+    let (ids_c, x_c) = mk(&cpu);
+
+    // Sanity: GPU decode == CPU decode (same fused-vs-fallback math) before timing.
+    let ym: Vec<f32> = bank_metal
+        .indexed_moe_forward(&x_m, &ids_m)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let yc: Vec<f32> = bank_cpu
+        .indexed_moe_forward(&x_c, &ids_c)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let mut mrel = 0f64;
+    let mut rs = 0f64;
+    for (a, b) in ym.iter().zip(&yc) {
+        mrel += (*a as f64 - *b as f64).powi(2);
+        rs += (*b as f64).powi(2);
+    }
+    let mrel = (mrel / rs.max(1e-12)).sqrt();
+    println!("gpu-vs-cpu decode rel={mrel:.3e} (topk={topk} n={n} k={k})");
+    // ~q8 floor (1/256 ~= 3.9e-3): the CPU IQ1_S fallback quantizes the ACTIVATION to q8_K (integer
+    // vec_dot), while the Metal kernel dots the RAW f32 activation -- the Metal path is the MORE precise
+    // one (f64-exact at ~2e-7 in metal_moe_decode_iquant_matches_cpu). So GPU and CPU agree only to the
+    // CPU's own activation-quant floor; this is a liveness sanity, not the correctness gate.
+    assert!(mrel < 1.5e-2, "GPU decode disagrees with CPU beyond the q8 floor: rel={mrel:.3e}");
+
+    let time_it = |run: &dyn Fn() -> Vec<f32>, iters: usize| -> f64 {
+        let _ = run(); // warm
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(run());
+        }
+        t0.elapsed().as_secs_f64() * 1e6 / iters as f64 // us / call
+    };
+    // Reading the output back to host forces the Metal command buffer to complete each iteration.
+    let gpu = time_it(
+        &|| {
+            bank_metal
+                .indexed_moe_forward(&x_m, &ids_m)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        },
+        100,
+    );
+    let cpu_us = time_it(
+        &|| {
+            bank_cpu
+                .indexed_moe_forward(&x_c, &ids_c)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        },
+        20,
+    );
+
+    // A GLM-5.2 decode token drives ~3 such routed MoE projections (gate + up + down) per MoE layer.
+    let proj_per_tok = 3.0;
+    println!(
+        "MoE decode (IQ1_S, topk={topk}, [{n}x{k}]): GPU {gpu:.1} us/proj | CPU {cpu_us:.1} us/proj \
+         | speedup {:.1}x",
+        cpu_us / gpu
+    );
+    println!(
+        "per-MoE-layer decode (x{proj_per_tok} proj): GPU {:.1} us | CPU {:.1} us  \
+         (GPU offloads the pegged core)",
+        gpu * proj_per_tok,
+        cpu_us * proj_per_tok
+    );
+    assert!(
+        gpu < cpu_us,
+        "GPU decode ({gpu:.1} us) is not faster than CPU fallback ({cpu_us:.1} us) -- kernel not offloading"
+    );
 }
