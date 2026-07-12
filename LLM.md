@@ -561,6 +561,30 @@ perf is fine to re-bench on a 256-expert model (DeepSeek-V4, 2x router math) whe
 ALSO in this release: dropped the now-dead `KSIGNS_IQ2XS_D` CUDA decode table (gen_iquant_grids.py
 `DECODE_SKIP` -- unpack_ksigns reconstructs it in-kernel; the Rust ksigns stays for the CPU oracle).
 
+## The `cuda_topk` last-row-collapse bug is CUDA-ENGINE-ONLY -- do NOT re-port it to HIP/ROCm
+Recurring mis-diagnosis: a "ROCm forward is slightly off, first-token argmax flips on a borderline prompt"
+symptom gets pattern-matched to the `cuda_topk` "last-row collapse" (engine ops.rs `final_logits_row`
+narrowed [tokens, experts] to its LAST row -> every prefill token routed by the last token's experts;
+fixed in engine feaccfcaa / ml 0.11.17, the `final_logits_row` helper is now fully DELETED). That bug
+NEVER existed on ROCm and there is no HIP kernel to patch:
+- `cuda_topk` is `#[cfg(feature = "cuda")]` and `is_cuda()` is `matches!(Cuda)` == false for `Device::Rocm`;
+  the `rocm` feature does NOT enable `cuda`. On a ROCm build the whole `cuda_topk` path is compiled out.
+- The GGUF Qwen3-30B-A3B (+ every `.topk()` MoE) routes through `quantized::moe_route`, whose ROCm arm
+  dispatches the fused `moe_route` HIP kernel: ONE block per token (`tok = blockIdx.x`, guard `tok>=ntok`,
+  grid = ntok), full-softmax weight, deterministic lowest-index tie-break -- structurally identical to the
+  CUDA fused kernel, per-token, never last-row. `moe_combine_core` accumulates in f32 (same as CUDA/Metal).
+- The exact property the CUDA bug violated (per-token routing, not last-token broadcast) is ALREADY gated
+  GREEN on evo by `moe_route_numeric` (hanzo-cli, feature rocm) at the real prefill shape (ntok=1024, 128
+  experts, topk=8) -- if ROCm had the collapse, tokens 0..N-2 would mismatch the per-token reference. A
+  named `check_last_row_distinct` case + a CPU-runnable `hanzo-ml/tests/moe_route_lastrow.rs` pin it
+  explicitly (staggered per-token experts; token 0 must NOT wear the last token's ids).
+So the residual "7/8 clean, one contrived-prompt flip" is NOT a routing collapse -- it is inherent
+cross-backend f32 non-associativity at the FINAL logits (bf16/f16 accumulation + reduction-order differ
+per backend and vs CPU). On a borderline prompt where top-1/top-2 vocab logits are within the ~1e-3 noise
+floor of a 48-layer bf16 forward, ANY backend flips relative to any other (CUDA vs Metal vs CPU too). Each
+backend is guaranteed clean by matching its OWN correct reference (the per-kernel numeric oracles), NOT by
+being bit-identical to the others. Routing is deterministic and reference-exact even at near-ties (proven).
+
 ## Vulkan prefill DEADLOCK fix (gfx1151 Strix Halo UMA) -- the dequant path self-deadlocks the allocator
 hanzo Vulkan HUNG at the first long prefill of any GGUF on gfx1151 (Radeon 8060S / Strix Halo), while
 llama.cpp-Vulkan AND hanzo's own ROCm ran the same model fine. NOT a shader/compute hang and NOT
