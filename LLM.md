@@ -782,6 +782,36 @@ also fine -- it uses the native `matvec_q4k_gpu` straight out of the block forma
   CPU-only on Metal (no MSL kernel). Synthetic block bytes span the full input space (any byte pattern is
   a valid codebook block), so the gate covers real GLM IQ1_S bit-patterns.
 
+### Metal i-quant MoE DECODE (mul_mv_id) VERIFIED -- the GLM-5.2 decode unblock (dbc M4 Max)
+- The i-quant MoE PREFILL twin (`call_mul_mm_id`, t>1) had a bit-exact gate; the DECODE path
+  (`call_mul_mv_id`, t==1 -- the per-slot matrix-VECTOR GLM-5.2 UD-IQ1_S takes for EVERY generated
+  token) had NONE, so it was wired-but-unproven. On dbc the RING binary predated the wiring entirely
+  (`~/work/hanzo/ml` there is a Jul-9 non-git copy, pre-aa0e9f82) -> i-quant MoE decode fell to the
+  per-expert single-core CPU-scalar fallback (mod.rs `_ =>` arm), pegging one core at 99.9% and
+  collapsing 3-node ring decode to <0.04 T/s while dbc's GPU sat idle. NOT a kernel bug -- a stale
+  binary + a coverage hole.
+- CLOSED the hole: `metal_moe_decode_iquant_matches_cpu` (hanzo-ml/tests/metal_iquant_tests.rs) exercises
+  `QTensor::indexed_moe_forward` with t==1 (-> `call_mul_mv_id` -> `kernel_mul_mv_id_iq*_f32`) for
+  IQ1_S (primary) + IQ2_XXS (ksigns grid) + IQ2_S (raw-byte-sign grid) + IQ3_S (3-bit grid) + IQ4_XS
+  (LUT), in BOTH routing layouts (gate/up shared input s=1; down per-slot input s=topk). The `run_moe_
+  prefill` helper was renamed `run_moe_indexed` -- ONE helper, the `t` value selects mul_mv_id vs
+  mul_mm_id exactly as production does. GATE (dbc M4 Max, all pass): max_rel ~1.1-2.4e-7 vs the CPU f64
+  matvec of the SAME dequantized weights -- the pure f32-accumulation floor (TIGHTER than the CPU IQ1_S
+  fallback, which q8_K-quantizes the activation ~3.8e-3; the Metal kernel dots the RAW f32 activation).
+  Full metal_iquant suite 16/16 (+1 ignored bench).
+- THROUGHPUT (metal_moe_decode_iquant_throughput, GLM-shaped IQ1_S topk=8 [1536x5120]): fused GPU
+  `call_mul_mv_id` = 548.7 us/proj vs the CPU per-expert fallback 84,382.8 us/proj = **153.8x**; per
+  MoE layer (gate+up+down = 3 projections) GPU 1.65 ms vs CPU 253 ms. The CPU 253 ms/layer x ~90 GLM
+  layers ~= 22.8 s/token = 0.044 T/s == the observed ring collapse; the GPU path takes decode MoE
+  compute OFF the pegged core.
+- END-TO-END path confirmed sound (engine gguf_moe.rs / glm5_moe.rs): the MoE gate computes
+  `topk_idx = scores.topk(top_k).indices` on the Metal device, so `ids` is Metal-resident; gate/up/down
+  each call `indexed_moe_forward(xs, topk_idx)` with x+ids both on Metal -> the fused Metal arm's guard
+  is satisfied -> decode (t==1) dispatches `call_mul_mv_id` on the GPU. No host `ids` sync, no per-expert
+  loop. So a binary built from current-main ml runs GLM-5.2 i-quant MoE decode fully on dbc's GPU.
+  Branch `feat/metal-iquant-moe-mv-id` (test + this note); no kernel change (the MSL + dispatch were
+  already correct), so no version bump.
+
 ### CROSS-BACKEND PARITY MATRIX (hanzo vs llama.cpp, clean idle-box, ml ~0.11.32, Qwen3 0.6/4/8B)
 - CUDA (GB10/spark): decode geomean 0.99x (0.96/0.99/1.02 -- BEATS llama on 8B), prefill geomean 0.60x
   (0.52/0.60/0.70). Decode PARITY (stronger than ROCm); prefill = Blackwell tensor-core MMQ frontier.
