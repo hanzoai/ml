@@ -406,10 +406,12 @@ pub fn repin_all() -> usize {
     if repin_interval() == 0 {
         return 0;
     }
-    registry()
-        .lock()
-        .expect("registry lock")
-        .live()
+    // Snapshot the live banks and DROP the registry guard before iterating: repin() takes each
+    // bank's own Mutex across up to REPIN_MAX_SWAPS blocking preads, so holding the global
+    // registry lock across all of them would serialize every bank behind one. Same idiom as
+    // finalize()/save_usage() below.
+    let banks = registry().lock().expect("registry lock").live();
+    banks
         .iter()
         .map(|b| b.repin(REPIN_MAX_SWAPS).unwrap_or(0))
         .sum()
