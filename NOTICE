@@ -9,3 +9,41 @@ licensed under the MIT License or the Apache License 2.0:
 The upstream candle license texts are retained in this repository as LICENSE-MIT
 and LICENSE-APACHE. This work is a derivative of candle and remains dual-licensed
 under "MIT OR Apache-2.0"; the upstream license has not been changed.
+
+PROVENANCE
+
+Forked from https://github.com/huggingface/candle. The candle sources are vendored
+and renamed to hanzo-* crates, so no pinned candle crate version is declared; this
+fork tracks upstream candle main. The nearest upstream reference point on this line
+of development is candle commit 3091caf9 (upstream PR #3408).
+
+Upstream candle ships no NOTICE file; no Apache-2.0 section 4(d) attributions to
+propagate.
+
+DEVIATIONS
+
+Changes from upstream candle in this fork:
+
+- Rebranded to "Hanzo ML"; the top-level crate candle-core is renamed to hanzo-ml
+  (core module hanzo_ml_core).
+- Companion crates renamed: candle-nn -> hanzo-nn, candle-transformers ->
+  hanzo-transformers, candle-datasets -> hanzo-datasets, candle-onnx -> hanzo-onnx,
+  candle-flash-attn -> hanzo-flash-attn, candle-kernels -> hanzo-kernels,
+  candle-metal-kernels -> hanzo-metal-kernels, candle-pyo3 -> hanzo-ml-pyo3,
+  candle-examples -> hanzo-ml-examples, candle-book -> hanzo-ml-book.
+- Added a first-party GPU kernel DSL (hanzo-kernel + hanzo-kernel-macros): one Rust
+  source lowered to CUDA, ROCm, Vulkan, and Metal.
+- Added a ROCm/HIP backend and kernels (hanzo-rocm-kernels; rocm-rs vendored and
+  renamed to the hanzo-rocm package; hanzo-cubecl-hip fork).
+- Added a Vulkan compute backend.
+- Added FlashAttention-3 for Hopper/sm90 (hanzo-flash-attn-v3).
+- Added NVIDIA GB10 / DGX Spark unified/managed-memory support in the CUDA backend.
+- Extended quantization: the full GGUF quant zoo (Q/K, legacy, IQ1-4, TQ; 22 types)
+  decodes resident and bit-exact on AMD gfx1151 through one unified compute core.
+- Added hanzo-3d (generative-3D geometry and mesh I/O: Pixal3D / TRELLIS / TripoSR)
+  and native-Rust training crates (hanzo-train, hanzo-training) targeting the
+  zen-agentic and zen-identity datasets and DSpark speculative-draft models.
+- Integrated with Hanzo Engine (OpenAI + Anthropic + MCP serving APIs) and the
+  Hanzo/zen model hubs.
+- Dependency and layout changes: cudarc pinned at 0.19.4; an orphaned duplicate
+  crate cluster is excluded from the workspace build.
