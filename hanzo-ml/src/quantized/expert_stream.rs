@@ -606,7 +606,9 @@ fn read_exact_at(_file: &File, _buf: &mut [u8], _offset: u64) -> Result<()> {
 }
 
 /// Drop the just-read file pages so the page cache stays bounded. Best-effort; no alignment needed.
-#[cfg(unix)]
+/// Linux-only: Darwin has no `posix_fadvise` (its nearest hint, `F_NOCACHE`, changes fd semantics
+/// rather than advising a range), so everywhere else this is a no-op and the page cache self-evicts.
+#[cfg(target_os = "linux")]
 fn fadvise_dontneed(file: &File, offset: u64, len: u64) {
     use std::os::unix::io::AsRawFd;
     unsafe {
@@ -619,7 +621,7 @@ fn fadvise_dontneed(file: &File, offset: u64, len: u64) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn fadvise_dontneed(_file: &File, _offset: u64, _len: u64) {}
 
 /// MemAvailable in bytes: `/proc/meminfo` on Linux, a conservative fallback elsewhere.
