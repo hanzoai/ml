@@ -195,6 +195,43 @@ impl TensorInfo {
             ),
         }
     }
+
+    /// Disk-streaming twin for a stacked MoE expert bank (`[n_experts, n, k]`). Instead of reading
+    /// the whole bank resident, returns a `QStorage::Stream` that keeps the bank on `path` and preads
+    /// one expert's `[n, k]` slice on demand through the pin/LRU cache (see `expert_stream`). Only
+    /// valid for a rank-3 tensor on CPU; the caller falls back to `read` for anything else.
+    pub fn read_stream(
+        &self,
+        path: &std::path::Path,
+        tensor_data_offset: u64,
+        name: &str,
+    ) -> Result<QTensor> {
+        let dims = self.shape.dims();
+        if dims.len() != 3 {
+            crate::bail!("read_stream: expected a rank-3 expert bank, got shape {:?}", self.shape)
+        }
+        let (n_experts, n, k) = (dims[0], dims[1], dims[2]);
+        let block_size = self.ggml_dtype.block_size();
+        let per_expert_elems = n * k;
+        if !per_expert_elems.is_multiple_of(block_size) {
+            crate::bail!(
+                "read_stream: per-expert elems {per_expert_elems} not divisible by block size {block_size}"
+            )
+        }
+        let expert_bytes = per_expert_elems / block_size * self.ggml_dtype.type_size();
+        let base_offset = tensor_data_offset.saturating_add(self.offset);
+        let bank = super::expert_stream::ExpertStreamBank::open(
+            name.to_string(),
+            path,
+            base_offset,
+            expert_bytes,
+            n_experts,
+            self.ggml_dtype,
+            n,
+            k,
+        )?;
+        QTensor::new(super::QStorage::Stream(bank), self.shape.dims().to_vec())
+    }
 }
 
 #[derive(Debug)]
@@ -695,6 +732,15 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read_mmap(mmap, self.tensor_data_offset, device)
+    }
+
+    /// Load a stacked expert bank as a disk-streaming `QTensor` (see [`TensorInfo::read_stream`]).
+    pub fn tensor_stream(&self, path: &std::path::Path, name: &str) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_stream(path, self.tensor_data_offset, name)
     }
 }
 
