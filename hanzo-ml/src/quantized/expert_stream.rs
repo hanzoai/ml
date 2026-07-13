@@ -310,6 +310,7 @@ pub fn finalize() {
     }
 
     let pinned = load_and_pin(&banks, cap);
+    register_atexit_save();
 
     eprintln!(
         "[stream-experts] {} banks x {:.1} MB/expert; MemAvailable {:.1} GB -> per-bank cap {} \
@@ -397,6 +398,24 @@ pub fn save_usage() -> Result<()> {
     }
     std::fs::write(&path, out)?;
     Ok(())
+}
+
+/// Persist the learned usage on clean process exit so the next run can AUTOPIN, without threading a
+/// shutdown hook through the engine. Registered once; a SIGKILL won't fire it, a normal exit/SIGTERM
+/// will. Best-effort: a write failure only means no learning carried forward.
+fn register_atexit_save() {
+    #[cfg(unix)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            extern "C" fn on_exit() {
+                let _ = save_usage();
+            }
+            unsafe {
+                libc::atexit(on_exit);
+            }
+        });
+    }
 }
 
 // ---- platform: positional read + page-cache drop ---------------------------------------------
