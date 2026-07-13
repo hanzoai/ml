@@ -1050,6 +1050,12 @@ impl QTensor {
             // can't drift from the kernels that actually exist -- which is exactly what had stranded
             // Q4_0/Q4_1/Q5_0/Q5_1 on the CPU even though their fused kernels are now compiled.
             QStorage::Cuda(s) if cuda::QCudaStorage::supports_indexed_moe(s.dtype()) => {
+                // The fused q8_1 MoE kernel reads the activation as f32 (as_cuda_slice::<f32>), so a
+                // BF16/F16 compute dtype must ride f32 into the kernel and restore on the way out --
+                // the same reconciliation the i-quant and Vulkan sibling branches already perform. A
+                // f32 model no-ops both casts.
+                let out_dtype = x.dtype();
+                let x = x.to_dtype(crate::DType::F32)?.contiguous()?;
                 match (&*x.storage(), &*ids.storage()) {
                     (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
                         let (storage, out_shape) = s.indexed_moe_forward(
@@ -1059,12 +1065,13 @@ impl QTensor {
                             ids_storage,
                             ids.layout(),
                         )?;
-                        Ok(crate::tensor::from_storage(
+                        crate::tensor::from_storage(
                             Storage::Cuda(storage),
                             out_shape,
                             crate::op::BackpropOp::none(),
                             false,
-                        ))
+                        )
+                        .to_dtype(out_dtype)
                     }
                     _ => {
                         panic!("Non-cuda indexed_moe_forward is not implemented!");
