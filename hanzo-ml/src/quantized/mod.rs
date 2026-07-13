@@ -11,6 +11,7 @@ pub mod avx;
 pub mod dsv4_qat;
 mod dummy_cuda;
 mod dummy_metal;
+pub mod expert_stream;
 pub mod ggml_file;
 pub mod gguf_file;
 pub mod imatrix_file;
@@ -131,6 +132,10 @@ pub enum QStorage {
     // dequantizes to an f32 wgpu tensor on demand.
     #[cfg(feature = "wgpu")]
     Wgpu(Box<dyn QuantizedType>, crate::WgpuDevice),
+    // Disk-streaming MoE expert bank: the stacked [n_experts, n, k] quantized weight lives on NVMe,
+    // not resident. Only `indexed_moe_forward` consumes it -- it fetches one expert's [n, k] slice
+    // through the pin/LRU cache per token (host, CPU matmul). The low-memory mode for huge MoEs.
+    Stream(Arc<expert_stream::ExpertStreamBank>),
 }
 
 impl QStorage {
@@ -231,6 +236,7 @@ impl QStorage {
             QStorage::Vulkan(storage, _) => storage.block_size(),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(storage, _) => storage.block_size(),
+            QStorage::Stream(bank) => bank.dtype().block_size(),
         }
     }
 
@@ -245,6 +251,7 @@ impl QStorage {
             QStorage::Vulkan(storage, _) => storage.dtype(),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(storage, _) => storage.dtype(),
+            QStorage::Stream(bank) => bank.dtype(),
         }
     }
 
@@ -259,6 +266,7 @@ impl QStorage {
             QStorage::Vulkan(_storage, device) => Device::Vulkan(device.clone()),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(_storage, device) => Device::Wgpu(device.clone()),
+            QStorage::Stream(_) => Device::Cpu,
         }
     }
 
@@ -273,6 +281,7 @@ impl QStorage {
             QStorage::Vulkan(storage, _) => storage.storage_size_in_bytes(),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(storage, _) => storage.storage_size_in_bytes(),
+            QStorage::Stream(bank) => bank.logical_bytes(),
         }
     }
 
@@ -366,6 +375,9 @@ impl QStorage {
                 let cpu = storage.dequantize(elem_count)?;
                 Ok(Storage::Wgpu(device.upload_f32(cpu.as_slice::<f32>()?)?))
             }
+            QStorage::Stream(_) => {
+                crate::bail!("streaming expert bank has no whole-tensor dequantize; consume it via indexed_moe_forward")
+            }
         }
     }
 
@@ -400,6 +412,9 @@ impl QStorage {
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
                 Ok(Cow::from(data))
             }
+            QStorage::Stream(_) => {
+                crate::bail!("streaming expert bank is not resident; consume it via indexed_moe_forward")
+            }
         }
     }
 
@@ -412,7 +427,7 @@ impl QStorage {
             QStorage::Vulkan(..) => crate::bail!("not implemented"),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(..) => crate::bail!("not implemented"),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Stream(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -428,7 +443,7 @@ impl QStorage {
     )> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr_with_guard(stream),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Stream(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -1380,56 +1395,38 @@ impl QTensor {
                 );
                 out.to_dtype(out_dtype)
             }
+            // Disk-streaming bank: same per-expert quantized matmul as the resident fallback below,
+            // but each selected expert's [n, k] slice is fetched through the pin/LRU cache (disk)
+            // instead of sliced out of a resident blob. Bit-identical -- only the fetch path differs.
+            QStorage::Stream(bank) => {
+                let (e_cnt, n, k) = self.shape().dims3()?;
+                let dtype = bank.dtype();
+                moe_grouped_per_expert(x, ids, n, k, |eid, device| {
+                    if eid as usize >= e_cnt {
+                        crate::bail!("indexed_moe_forward: expert id {eid} >= num_experts {e_cnt}");
+                    }
+                    let bytes = bank.fetch(eid)?;
+                    QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), device, dtype)
+                })
+            }
             _ => {
                 // CPU / non-CUDA fallback: per-expert quantized matmul. The packed expert bank
                 // [E, n, k] is sliced into equal, contiguous per-expert quantized blocks; for
                 // each expert that is actually selected we run hanzo-ml's native quantized matmul
                 // on just the tokens routed to it. Nothing is dequantized, so quantized MoE runs
                 // on any backend (CPU, Metal, ...) at a cost proportional to the active experts.
-                use crate::Module; // brings QMatMul::forward into scope
-                use std::collections::HashMap;
-                use std::sync::Arc;
-                let device = x.device();
-                let out_dtype = x.dtype();
                 let (e_cnt, n, k) = self.shape().dims3()?;
-                let (t, topk) = ids.dims2()?;
-                let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
-                let x_exp = if s == topk {
-                    x.clone()
-                } else {
-                    x.broadcast_as((t, topk, k))?
-                };
-                let x_flat = x_exp
-                    .reshape((t * topk, k))?
-                    .to_dtype(crate::DType::F32)?
-                    .contiguous()?;
-                let ids_flat = ids.reshape((t * topk,))?.to_dtype(crate::DType::U32)?;
-                let ids_vec = ids_flat.to_vec1::<u32>()?;
-                let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
-                for (slot, eid) in ids_vec.iter().enumerate() {
-                    groups.entry(*eid).or_default().push(slot as u32);
-                }
                 let dtype = self.storage.dtype();
                 let all_bytes = self.data()?;
                 let expert_bytes = all_bytes.len() / e_cnt;
-                let mut out_flat = Tensor::zeros((t * topk, n), crate::DType::F32, device)?;
-                for (eid, slots) in groups.into_iter() {
+                moe_grouped_per_expert(x, ids, n, k, |eid, device| {
                     let off = eid as usize * expert_bytes;
-                    let qs = QStorage::from_data(
+                    QStorage::from_data(
                         std::borrow::Cow::Borrowed(&all_bytes[off..off + expert_bytes]),
                         device,
                         dtype,
-                    )?;
-                    let shape: crate::Shape = (n, k).into();
-                    let w_e = QTensor { storage: qs, shape };
-                    let qm = QMatMul::from_arc(Arc::new(w_e))?;
-                    let m = slots.len();
-                    let idx = Tensor::from_vec(slots, (m,), device)?;
-                    let x_e = x_flat.index_select(&idx, 0)?; // [m, k]
-                    let y_e = qm.forward(&x_e)?.to_dtype(crate::DType::F32)?; // [m, n]
-                    out_flat = out_flat.index_add(&idx, &y_e, 0)?;
-                }
-                out_flat.reshape((t, topk, n))?.to_dtype(out_dtype)
+                    )
+                })
             }
         }
     }
@@ -1443,7 +1440,7 @@ impl QTensor {
             QStorage::Vulkan(..) => crate::bail!("not implemented"),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(..) => crate::bail!("not implemented"),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Stream(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -1519,6 +1516,54 @@ fn rocm_moe_bank_cache() -> &'static std::sync::Mutex<
         >,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Per-expert quantized MoE matmul, shared by the resident and disk-streaming paths. Groups the
+/// routed slots by expert id, and for each active expert builds a `QTensor` from `make_storage`
+/// (resident slice or streamed slab), runs the native quantized matmul on just that expert's tokens,
+/// and scatters the result back. The ONLY difference between resident and streaming is the closure.
+fn moe_grouped_per_expert(
+    x: &Tensor,
+    ids: &Tensor,
+    n: usize,
+    k: usize,
+    mut make_storage: impl FnMut(u32, &Device) -> Result<QStorage>,
+) -> Result<Tensor> {
+    use crate::Module; // brings QMatMul::forward into scope
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let device = x.device();
+    let out_dtype = x.dtype();
+    let (t, topk) = ids.dims2()?;
+    let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
+    let x_exp = if s == topk {
+        x.clone()
+    } else {
+        x.broadcast_as((t, topk, k))?
+    };
+    let x_flat = x_exp
+        .reshape((t * topk, k))?
+        .to_dtype(DType::F32)?
+        .contiguous()?;
+    let ids_flat = ids.reshape((t * topk,))?.to_dtype(DType::U32)?;
+    let ids_vec = ids_flat.to_vec1::<u32>()?;
+    let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (slot, eid) in ids_vec.iter().enumerate() {
+        groups.entry(*eid).or_default().push(slot as u32);
+    }
+    let mut out_flat = Tensor::zeros((t * topk, n), DType::F32, device)?;
+    for (eid, slots) in groups.into_iter() {
+        let qs = make_storage(eid, device)?;
+        let shape: crate::Shape = (n, k).into();
+        let w_e = QTensor { storage: qs, shape };
+        let qm = QMatMul::from_arc(Arc::new(w_e))?;
+        let m = slots.len();
+        let idx = Tensor::from_vec(slots, (m,), device)?;
+        let x_e = x_flat.index_select(&idx, 0)?; // [m, k]
+        let y_e = qm.forward(&x_e)?.to_dtype(DType::F32)?; // [m, n]
+        out_flat = out_flat.index_add(&idx, &y_e, 0)?;
+    }
+    out_flat.reshape((t, topk, n))?.to_dtype(out_dtype)
 }
 
 /// FUSED MoE expert-combine: `out[i,j] = sum_e scores[i,e] * ys[i,e,j]`, reducing the per-expert
@@ -2050,7 +2095,9 @@ impl crate::CustomOp1 for QTensor {
             QStorage::Vulkan(..) => crate::bail!("Invalid storage"),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(..) => crate::bail!("Invalid storage"),
-            QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
+            QStorage::Metal(_) | QStorage::Cuda(_) | QStorage::Stream(_) => {
+                crate::bail!("Invalid storage")
+            }
         };
         match storage.dtype() {
             DType::F32 => {
