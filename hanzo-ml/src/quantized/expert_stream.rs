@@ -1,21 +1,12 @@
-//! Disk-streaming LRU expert cache for large MoE GGUFs (the colibri "low memory mode").
+//! Disk-streaming LRU expert cache: the low-memory mode for large MoE GGUFs.
 //!
-//! A GGUF MoE stores each layer's routed experts as three stacked banks -- `ffn_gate_exps`,
-//! `ffn_up_exps`, `ffn_down_exps` -- each a `[n_experts, n, k]` quantized tensor. Loading them
-//! resident is what makes GLM-5.2 (202 GB) need 202 GB of RAM. This module keeps them on NVMe and
-//! streams one expert's `[n, k]` slice on demand: pin -> per-bank LRU -> `pread` (+ `fadvise`
-//! DONTNEED so the page cache can't balloon). Resident RAM becomes `pinned + LRU` owned slabs --
-//! bounded and under our control, not at the mercy of the OS page cache. With a warm cache and the
-//! hot experts pinned, decode is matmul/bandwidth bound just like the resident path.
+//! Each GGUF MoE layer stores its routed experts as three stacked `[n_experts, n, k]` banks
+//! (`ffn_{gate,up,down}_exps`). Instead of loading them resident, keep them on NVMe and stream one
+//! expert's `[n, k]` slice on demand: pin -> per-bank LRU -> pread (+ fadvise DONTNEED). Resident
+//! RAM is then `pinned + LRU` slabs -- bounded, not the whole model. One bank per layer x projection.
 //!
-//! Faithful to colibri (`c/glm.c`): `expert_load` (pread coalesced + fadvise), `cap_for_ram`
-//! (auto-size the cache from MemAvailable, auto-raise to fill big-RAM boxes), `pin_load`/AUTOPIN
-//! (learn the hottest experts into a sidecar and pin them at startup). Here the natural unit is one
-//! bank per (layer x projection) rather than colibri's per-expert triple, because the three
-//! projections are three separate GGUF tensors -- more orthogonal, same mechanism.
-//!
-//! Bit-exact by construction: a streamed expert is the identical file bytes the resident slice
-//! would hold, so `indexed_moe_forward` produces the identical output; only the fetch path differs.
+//! Bit-exact: a streamed expert is the same file bytes the resident slice holds, so
+//! `indexed_moe_forward` yields identical output; only the fetch path changes.
 
 use crate::Result;
 use std::collections::HashMap;
@@ -26,8 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::GgmlDType;
 
-/// Runtime gate. Streaming is OFF by default so resident behaviour is unchanged for models that
-/// fit; the loader flips it on for `--stream-experts`. Compile-time-always, runtime-gated -- one way.
+/// Runtime gate, default OFF so resident behaviour is unchanged. The loader flips it on.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_enabled(on: bool) {
@@ -38,22 +28,22 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// Reserve left to the kernel page cache + activations/logits, mirroring colibri's honest slack.
+/// Reserved out of the RAM budget for page cache and activations.
 const PAGE_CACHE_RESERVE: u64 = 2_500_000_000;
 const ACTIVATION_RESERVE: u64 = 1_200_000_000;
-/// Fraction of MemAvailable the cache may claim (rest breathes for OS + wrapper); colibri's 0.88.
+/// Fraction of MemAvailable the cache may claim.
 const BUDGET_FRACTION: f64 = 0.88;
-/// Default hot-set: fraction of a bank's cap auto-pinned from the learned usage sidecar.
+/// Fraction of a bank's cap auto-pinned from the learned usage sidecar.
 const PIN_FRACTION: f64 = 0.25;
 
-/// One streaming expert bank = one stacked `[n_experts, n, k]` GGUF tensor kept on disk.
+/// One stacked `[n_experts, n, k]` GGUF expert bank kept on disk.
 pub struct ExpertStreamBank {
-    /// Tensor name (`blk.{L}.ffn_gate_exps.weight`); the stable key for the usage sidecar.
+    /// Tensor name; the sidecar key for learned pinning.
     name: String,
     file: File,
-    /// Byte offset of expert 0 within the file (`tensor_data_offset + tensor.offset`).
+    /// Byte offset of expert 0 in the file.
     base_offset: u64,
-    /// Bytes per expert = `n*k / block_size * type_size`.
+    /// Bytes per expert (`n*k / block_size * type_size`).
     expert_bytes: usize,
     n_experts: usize,
     dtype: GgmlDType,
@@ -63,12 +53,12 @@ pub struct ExpertStreamBank {
 }
 
 struct BankState {
-    /// Max experts held in the LRU (the pinned hot-set is separate and unbounded by `cap`).
+    /// Max experts in the LRU; the pinned set is separate.
     cap: usize,
     clock: u64,
     lru: HashMap<u32, LruEntry>,
     pinned: HashMap<u32, Arc<[u8]>>,
-    /// Per-expert routing frequency this run; persisted to the sidecar for AUTOPIN next run.
+    /// Per-expert routing frequency this run, persisted for pinning next run.
     usage: Vec<u64>,
     hits: u64,
     misses: u64,
@@ -80,7 +70,6 @@ struct LruEntry {
 }
 
 impl ExpertStreamBank {
-    /// Open a bank over `path`. Registers it so the global budget can size every bank at once.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         name: String,
@@ -102,9 +91,8 @@ impl ExpertStreamBank {
             dtype,
             n,
             k,
+            // cap starts at 1 (never 0: a miss must be admittable); `finalize` sizes it from RAM.
             inner: Mutex::new(BankState {
-                // Provisional cap of 1 until `finalize` sizes it from RAM; never zero (a miss must
-                // always be admittable so a fetch can't deadlock waiting for room).
                 cap: 1,
                 clock: 0,
                 lru: HashMap::new(),
@@ -126,7 +114,6 @@ impl ExpertStreamBank {
         self.n_experts
     }
 
-    /// Per-expert matrix dims `[n, k]` (the shape a fetched expert's `QTensor` takes).
     pub fn expert_dims(&self) -> (usize, usize) {
         (self.n, self.k)
     }
@@ -135,18 +122,15 @@ impl ExpertStreamBank {
         self.expert_bytes
     }
 
-    /// Full logical size of the whole bank as if resident (for shape/size accounting only).
+    /// Full size of the bank as if resident (shape/size accounting only).
     pub fn logical_bytes(&self) -> usize {
         self.expert_bytes * self.n_experts
     }
 
-    /// Fetch expert `eid`'s raw GGML bytes: pinned hot-set -> LRU -> disk. Bit-identical to the
-    /// resident slice; records the access for AUTOPIN learning.
+    /// pinned -> LRU -> disk.
     pub fn fetch(&self, eid: u32) -> Result<Arc<[u8]>> {
         let mut guard = self.inner.lock().expect("expert bank lock poisoned");
-        // Reborrow as `&mut BankState` so disjoint fields (hits/clock vs pinned/lru) can be borrowed
-        // independently -- the MutexGuard's Deref would otherwise treat every field access as the
-        // whole guard.
+        // Reborrow so disjoint fields (hits/clock vs pinned/lru) can be borrowed independently.
         let st = &mut *guard;
         if (eid as usize) < st.usage.len() {
             st.usage[eid as usize] = st.usage[eid as usize].saturating_add(1);
@@ -167,15 +151,9 @@ impl ExpertStreamBank {
         Ok(bytes)
     }
 
-    /// Insert into the LRU, evicting the least-recently-used entry when at cap.
     fn admit(&self, st: &mut BankState, eid: u32, bytes: Arc<[u8]>) {
         if st.lru.len() >= st.cap {
-            if let Some(&victim) = st
-                .lru
-                .iter()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(k, _)| k)
-            {
+            if let Some(&victim) = st.lru.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k) {
                 st.lru.remove(&victim);
             }
         }
@@ -184,8 +162,6 @@ impl ExpertStreamBank {
         st.lru.insert(eid, LruEntry { bytes, used });
     }
 
-    /// Positional read of one expert's bytes (thread-safe, no shared seek), then advise the kernel
-    /// to drop those file pages so the page cache stays bounded (colibri's `POSIX_FADV_DONTNEED`).
     fn read_expert(&self, eid: u32) -> Result<Arc<[u8]>> {
         let off = self.base_offset + eid as u64 * self.expert_bytes as u64;
         let mut buf = vec![0u8; self.expert_bytes];
@@ -194,7 +170,7 @@ impl ExpertStreamBank {
         Ok(Arc::from(buf.into_boxed_slice()))
     }
 
-    /// Pin expert `eid` into the hot-set (loads it if absent). Idempotent.
+    /// Load `eid` into the pinned hot-set (idempotent).
     pub fn pin(&self, eid: u32) -> Result<()> {
         let mut st = self.inner.lock().expect("expert bank lock poisoned");
         if st.pinned.contains_key(&eid) {
@@ -212,20 +188,18 @@ impl ExpertStreamBank {
         Ok(())
     }
 
-    /// Set the LRU cap (max non-pinned experts held resident). Sized by [`finalize`] from RAM; also
-    /// settable directly (tests, manual budgets).
+    /// Sized by [`finalize`] from RAM; also settable directly.
     pub fn set_cap(&self, cap: usize) {
         let mut st = self.inner.lock().expect("expert bank lock poisoned");
         st.cap = cap.max(1);
     }
 
-    /// `(pinned, cached, cap, hits, misses)` snapshot for the resident-RAM / hit-rate proof.
+    /// `(pinned, cached, cap, hits, misses)`.
     pub fn stats(&self) -> (usize, usize, usize, u64, u64) {
         let st = self.inner.lock().expect("expert bank lock poisoned");
         (st.pinned.len(), st.lru.len(), st.cap, st.hits, st.misses)
     }
 
-    /// Bytes currently held resident by this bank (pinned + cached slabs).
     pub fn resident_bytes(&self) -> usize {
         let st = self.inner.lock().expect("expert bank lock poisoned");
         (st.pinned.len() + st.lru.len()) * self.expert_bytes
@@ -242,8 +216,7 @@ impl ExpertStreamBank {
     }
 }
 
-/// Global registry: every live bank + the learned-usage sidecar path. Lets one budget size all
-/// banks together (colibri `cap_for_ram`) and one pass learn/pin the hottest experts.
+/// Every live bank + the usage sidecar path, so one budget sizes all banks and one pass pins.
 struct Registry {
     banks: Vec<Weak<ExpertStreamBank>>,
     sidecar: Option<PathBuf>,
@@ -269,12 +242,10 @@ impl Registry {
     }
 }
 
-/// Point the learning-pin at a sidecar file (`<model_dir>/.hanzo_experts_usage`).
 pub fn set_usage_sidecar(path: PathBuf) {
     registry().lock().expect("registry lock").sidecar = Some(path);
 }
 
-/// Total bytes held resident across all live streaming banks (the low-RAM proof).
 pub fn total_resident_bytes() -> usize {
     registry()
         .lock()
@@ -285,24 +256,30 @@ pub fn total_resident_bytes() -> usize {
         .sum()
 }
 
-/// Size every bank's LRU cap from available RAM and auto-pin the hottest experts from the sidecar.
-/// Call once after the dense weights are resident and all expert banks are open.
+/// Size every bank's LRU cap from available RAM and pin the learned-hot experts. Call once after
+/// the dense weights are resident and all banks are open.
 pub fn finalize() {
     let banks = registry().lock().expect("registry lock").live();
     if banks.is_empty() {
         return;
     }
-    // Largest per-expert stride across banks -> the conservative divisor (banks are near-equal).
     let expert_bytes = banks.iter().map(|b| b.expert_bytes).max().unwrap_or(1).max(1);
     let n_banks = banks.len() as u64;
 
-    let avail = mem_available_bytes();
+    // STREAM_EXPERTS_RAM_GB forces the cache budget; otherwise size from live MemAvailable.
+    let forced_gb = std::env::var("STREAM_EXPERTS_RAM_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|g| *g > 0.0);
+    let avail = match forced_gb {
+        Some(gb) => (gb * 1e9) as u64,
+        None => mem_available_bytes(),
+    };
     let budget = (avail as f64 * BUDGET_FRACTION) as u64;
     let slack = PAGE_CACHE_RESERVE + ACTIVATION_RESERVE;
     let for_cache = budget.saturating_sub(slack);
     let mut cap = (for_cache / (n_banks * expert_bytes as u64)) as usize;
 
-    // Never below 1 (a miss must be admittable), never above n_experts (a bank can't fill more).
     let max_experts = banks.iter().map(|b| b.n_experts).max().unwrap_or(1);
     cap = cap.clamp(1, max_experts);
     for b in &banks {
@@ -313,8 +290,8 @@ pub fn finalize() {
     register_atexit_save();
 
     eprintln!(
-        "[stream-experts] {} banks x {:.1} MB/expert; MemAvailable {:.1} GB -> per-bank cap {} \
-         (projected cache {:.1} GB), auto-pinned {} experts",
+        "[stream-experts] {} banks x {:.1} MB/expert; budget {:.1} GB -> cap {}/bank \
+         (cache {:.1} GB), pinned {}",
         banks.len(),
         expert_bytes as f64 / 1e6,
         avail as f64 / 1e9,
@@ -324,7 +301,7 @@ pub fn finalize() {
     );
 }
 
-/// Read the usage sidecar (if any) and pin each bank's hottest experts, up to `PIN_FRACTION * cap`.
+/// Pin each bank's hottest experts (up to `PIN_FRACTION * cap`) from the usage sidecar.
 fn load_and_pin(banks: &[Arc<ExpertStreamBank>], cap: usize) -> usize {
     let sidecar = match registry().lock().expect("registry lock").sidecar.clone() {
         Some(p) if p.exists() => p,
@@ -334,7 +311,6 @@ fn load_and_pin(banks: &[Arc<ExpertStreamBank>], cap: usize) -> usize {
         Ok(t) => t,
         Err(_) => return 0,
     };
-    // `name eid count` per line.
     let mut by_name: HashMap<&str, Vec<(u32, u64)>> = HashMap::new();
     for line in text.lines() {
         let mut it = line.split_whitespace();
@@ -365,8 +341,7 @@ fn load_and_pin(banks: &[Arc<ExpertStreamBank>], cap: usize) -> usize {
     pinned
 }
 
-/// Persist this run's per-expert routing frequencies (merged with any prior counts) so the next
-/// startup can AUTOPIN the hottest. Call at shutdown.
+/// Persist this run's routing frequencies (merged with prior counts) for next-run pinning.
 pub fn save_usage() -> Result<()> {
     let (banks, sidecar) = {
         let reg = registry().lock().expect("registry lock");
@@ -375,7 +350,6 @@ pub fn save_usage() -> Result<()> {
     let Some(path) = sidecar else {
         return Ok(());
     };
-    // Merge with existing counts so the learned distribution accumulates across runs.
     let mut merged: HashMap<(String, u32), u64> = HashMap::new();
     if let Ok(text) = std::fs::read_to_string(&path) {
         for line in text.lines() {
@@ -400,9 +374,7 @@ pub fn save_usage() -> Result<()> {
     Ok(())
 }
 
-/// Persist the learned usage on clean process exit so the next run can AUTOPIN, without threading a
-/// shutdown hook through the engine. Registered once; a SIGKILL won't fire it, a normal exit/SIGTERM
-/// will. Best-effort: a write failure only means no learning carried forward.
+/// Persist usage on clean exit so the next run can pin. A SIGKILL won't fire it; a normal exit will.
 fn register_atexit_save() {
     #[cfg(unix)]
     {
@@ -418,8 +390,6 @@ fn register_atexit_save() {
     }
 }
 
-// ---- platform: positional read + page-cache drop ---------------------------------------------
-
 #[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
     use std::os::unix::fs::FileExt;
@@ -432,13 +402,10 @@ fn read_exact_at(_file: &File, _buf: &mut [u8], _offset: u64) -> Result<()> {
     crate::bail!("streaming experts require a unix positional-read (pread) platform")
 }
 
-/// Advise the kernel to drop the just-read file pages so the page cache can't grow unbounded while
-/// we stream the whole model past it. Best-effort: a failure only means more page cache, not wrong
-/// results. Offset/len need no alignment for `POSIX_FADV_DONTNEED`.
+/// Drop the just-read file pages so the page cache stays bounded. Best-effort; no alignment needed.
 #[cfg(unix)]
 fn fadvise_dontneed(file: &File, offset: u64, len: u64) {
     use std::os::unix::io::AsRawFd;
-    // SAFETY: fd is valid for the call; posix_fadvise only advises, never mutates our memory.
     unsafe {
         libc::posix_fadvise(
             file.as_raw_fd(),
@@ -452,15 +419,13 @@ fn fadvise_dontneed(file: &File, offset: u64, len: u64) {
 #[cfg(not(unix))]
 fn fadvise_dontneed(_file: &File, _offset: u64, _len: u64) {}
 
-/// MemAvailable in bytes. Linux reads `/proc/meminfo` (the true reclaimable ceiling); elsewhere a
-/// conservative fallback keeps the cache small rather than risking OOM.
+/// MemAvailable in bytes: `/proc/meminfo` on Linux, a conservative fallback elsewhere.
 fn mem_available_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
             for line in text.lines() {
                 if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                    // `MemAvailable:   12345678 kB`
                     if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok())
                     {
                         return kb.saturating_mul(1024);
@@ -469,7 +434,6 @@ fn mem_available_bytes() -> u64 {
             }
         }
     }
-    // Fallback (non-linux or unreadable): assume 8 GB free, matching colibri's floor.
     static WARNED: AtomicU64 = AtomicU64::new(0);
     if WARNED.swap(1, Ordering::Relaxed) == 0 {
         eprintln!("[stream-experts] MemAvailable unreadable; assuming 8 GB free");
