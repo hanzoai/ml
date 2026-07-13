@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::GgmlDType;
@@ -35,6 +36,9 @@ const ACTIVATION_RESERVE: u64 = 1_200_000_000;
 const BUDGET_FRACTION: f64 = 0.88;
 /// Fraction of a bank's cap auto-pinned from the learned usage sidecar.
 const PIN_FRACTION: f64 = 0.25;
+/// Max hot-set swaps per [`repin`] pass. Colibri's four-swap cap: bounds work and
+/// stops a single turn from churning the whole tier.
+const REPIN_MAX_SWAPS: usize = 4;
 
 /// One stacked `[n_experts, n, k]` GGUF expert bank kept on disk.
 pub struct ExpertStreamBank {
@@ -58,8 +62,13 @@ struct BankState {
     clock: u64,
     lru: HashMap<u32, LruEntry>,
     pinned: HashMap<u32, Arc<[u8]>>,
-    /// Per-expert routing frequency this run, persisted for pinning next run.
+    /// Per-expert routing frequency this run, persisted for pinning next run. The long-term
+    /// signal: never decayed, so `.coli_usage`-style pinning stays stable across runs.
     usage: Vec<u64>,
+    /// Per-expert session heat: the short-term signal `repin` adapts on. Halved each pass
+    /// (`tier_decay`) so recent routing dominates and a warm expert cools once it stops
+    /// being picked. Distinct from `usage` precisely because it is decayed.
+    heat: Vec<u32>,
     hits: u64,
     misses: u64,
 }
@@ -98,6 +107,7 @@ impl ExpertStreamBank {
                 lru: HashMap::new(),
                 pinned: HashMap::new(),
                 usage: vec![0; n_experts],
+                heat: vec![0; n_experts],
                 hits: 0,
                 misses: 0,
             }),
@@ -134,6 +144,7 @@ impl ExpertStreamBank {
         let st = &mut *guard;
         if (eid as usize) < st.usage.len() {
             st.usage[eid as usize] = st.usage[eid as usize].saturating_add(1);
+            st.heat[eid as usize] = st.heat[eid as usize].saturating_add(1);
         }
         if let Some(bytes) = st.pinned.get(&eid) {
             st.hits += 1;
@@ -186,6 +197,76 @@ impl ExpertStreamBank {
         };
         st.pinned.insert(eid, bytes);
         Ok(())
+    }
+
+    /// Live tier adaptation (colibri `--repin`). Decay the session heat, then swap up to
+    /// [`REPIN_MAX_SWAPS`] of the coldest pinned experts for the hottest streamed ones, each
+    /// only when the heat gap clears the hysteresis margin ([`tier_pick_swap`]). Correctness
+    /// neutral: the pinned *set* changes, never the bytes -- a promoted expert is the same
+    /// file slice it would stream, so `indexed_moe_forward` output is bit-identical. Cold
+    /// experts fall back to the LRU (still warm), hot experts come from the LRU or disk.
+    /// Call at a turn boundary. Returns the number of swaps performed.
+    pub fn repin(&self, max_swaps: usize) -> Result<usize> {
+        let mut guard = self.inner.lock().expect("expert bank lock poisoned");
+        let st = &mut *guard;
+        tier_decay(&mut st.heat);
+        let mut swaps = 0usize;
+        while swaps < max_swaps {
+            let pinned: Vec<u32> = st.pinned.keys().copied().collect();
+            let Some((slot, hot, _gain)) = tier_pick_swap(&st.heat, &pinned) else {
+                break;
+            };
+            let cold = pinned[slot];
+            // Demote the cold expert to the LRU: still resident, still a bit-identical hit.
+            if let Some(bytes) = st.pinned.remove(&cold) {
+                self.admit(st, cold, bytes);
+            }
+            // Promote the hot expert: reuse an LRU copy if present, else read it from disk.
+            let bytes = match st.lru.remove(&hot) {
+                Some(entry) => entry.bytes,
+                None => self.read_expert(hot)?,
+            };
+            st.pinned.insert(hot, bytes);
+            swaps += 1;
+        }
+        Ok(swaps)
+    }
+
+    /// Background-thread readahead (colibri PILOT): warm `eid` into the LRU ahead of the
+    /// `fetch` that needs it, overlapping disk I/O with compute. The read owns its bytes in an
+    /// `Arc` (unlike a bare `WILLNEED` page-cache hint, which memory pressure can re-evict), so
+    /// a later `fetch` is a guaranteed hit on identical bytes -- correctness neutral. Skips
+    /// experts already resident. Runs on the shared prefetch worker; never on the caller.
+    fn prefetch_resident(&self, eid: u32) -> Result<()> {
+        {
+            let st = self.inner.lock().expect("expert bank lock poisoned");
+            if st.pinned.contains_key(&eid) || st.lru.contains_key(&eid) {
+                return Ok(());
+            }
+        }
+        // Read without the lock so concurrent fetches on this bank are not stalled by disk.
+        let bytes = self.read_expert(eid)?;
+        let mut guard = self.inner.lock().expect("expert bank lock poisoned");
+        let st = &mut *guard;
+        // Re-check: a fetch may have admitted it while we were reading.
+        if st.pinned.contains_key(&eid) || st.lru.contains_key(&eid) {
+            return Ok(());
+        }
+        self.admit(st, eid, bytes);
+        Ok(())
+    }
+
+    /// Enqueue a router-lookahead prefetch of `eid` (colibri PILOT). Best effort and
+    /// non-blocking: dropped when disabled, out of range, or the worker queue is full -- a
+    /// missed prefetch only costs a later on-demand `fetch`, never correctness.
+    pub fn prefetch(self: &Arc<Self>, eid: u32) {
+        if !prefetch_enabled() || eid as usize >= self.n_experts {
+            return;
+        }
+        let _ = prefetcher().try_send(PrefetchJob {
+            bank: Arc::downgrade(self),
+            eid,
+        });
     }
 
     /// Sized by [`finalize`] from RAM; also settable directly.
@@ -254,6 +335,126 @@ pub fn total_resident_bytes() -> usize {
         .iter()
         .map(|b| b.resident_bytes())
         .sum()
+}
+
+// ---------------------------------------------------------------------------
+// Live tier adaptation (colibri tier.h): a pure heat-swap decision + decay, so
+// the swap policy is testable in isolation from the I/O and locking around it.
+// ---------------------------------------------------------------------------
+
+/// Pick one pinned slot to replace with the hottest streamed expert, or `None` if no swap
+/// clears the hysteresis margin. Pure and total: the caller owns all I/O and locking.
+///
+/// `heat[e]` is expert `e`'s session heat; `pinned` lists the currently pinned expert ids.
+/// Mirrors colibri `tier_pick_swap`: coldest pinned vs hottest non-resident, admitted only
+/// when `hot > cold + cold/4 + 4`. The `cold/4` (25%) margin stops ping-pong between two
+/// near-equal experts; the `+4` covers tiny samples where the ratio alone is noisy. Returns
+/// `(slot, hot_eid, gain)` where `slot` indexes `pinned` and `gain = hot_heat - cold_heat`.
+fn tier_pick_swap(heat: &[u32], pinned: &[u32]) -> Option<(usize, u32, i64)> {
+    if heat.is_empty() || pinned.is_empty() {
+        return None;
+    }
+    // Coldest pinned slot (first minimum wins on ties, as in colibri's strict `<`).
+    let cold = pinned
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &p)| heat[p as usize])
+        .map(|(z, _)| z)
+        .expect("pinned is non-empty");
+    // Hottest non-resident expert (first maximum wins on ties, colibri's strict `>`).
+    let mut hot: Option<usize> = None;
+    let mut hot_heat = 0u32;
+    for (e, &h) in heat.iter().enumerate() {
+        let resident = pinned.iter().any(|&p| p as usize == e);
+        if !resident && h > hot_heat {
+            hot_heat = h;
+            hot = Some(e);
+        }
+    }
+    let hot = hot?;
+    let cold_heat = heat[pinned[cold] as usize];
+    if hot_heat <= cold_heat + (cold_heat >> 2) + 4 {
+        return None;
+    }
+    Some((cold, hot as u32, hot_heat as i64 - cold_heat as i64))
+}
+
+/// Halve every expert's session heat (colibri `tier_decay`): recent routing keeps its lead,
+/// stale heat fades toward zero so a once-hot expert eventually loses its pin.
+fn tier_decay(heat: &mut [u32]) {
+    for h in heat.iter_mut() {
+        *h >>= 1;
+    }
+}
+
+/// Tokens between [`repin_all`] passes (colibri `--repin N`); `0`/unset disables live tier
+/// adaptation, so the hot-set stays exactly as [`finalize`] pinned it. Read once.
+pub fn repin_interval() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("STREAM_EXPERTS_REPIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Adapt every live bank's hot-set to recent routing heat. No-op unless `STREAM_EXPERTS_REPIN`
+/// is set. The engine calls this at turn boundaries every [`repin_interval`] tokens. Returns
+/// the total number of swaps performed across all banks.
+pub fn repin_all() -> usize {
+    if repin_interval() == 0 {
+        return 0;
+    }
+    registry()
+        .lock()
+        .expect("registry lock")
+        .live()
+        .iter()
+        .map(|b| b.repin(REPIN_MAX_SWAPS).unwrap_or(0))
+        .sum()
+}
+
+// ---------------------------------------------------------------------------
+// Async prefetch (colibri PILOT): one shared I/O worker warms experts into the
+// LRU ahead of the fetch that needs them, overlapping disk with compute.
+// ---------------------------------------------------------------------------
+
+/// Whether router-lookahead prefetch is on (`STREAM_EXPERTS_PREFETCH`, default OFF). Read once.
+pub fn prefetch_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("STREAM_EXPERTS_PREFETCH")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+struct PrefetchJob {
+    bank: Weak<ExpertStreamBank>,
+    eid: u32,
+}
+
+/// The single background readahead worker, started on first use. Bounded queue: `try_send`
+/// drops a job when full (colibri's ring buffer "pieno = scarta"), so a saturated disk can
+/// never back-pressure or block the compute thread. `Weak` keeps a queued job from pinning a
+/// bank whose model has been dropped.
+fn prefetcher() -> &'static SyncSender<PrefetchJob> {
+    static P: OnceLock<SyncSender<PrefetchJob>> = OnceLock::new();
+    P.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PrefetchJob>(256);
+        std::thread::Builder::new()
+            .name("stream-experts-prefetch".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    if let Some(bank) = job.bank.upgrade() {
+                        let _ = bank.prefetch_resident(job.eid);
+                    }
+                }
+            })
+            .expect("spawn stream-experts prefetch worker");
+        tx
+    })
 }
 
 /// Size every bank's LRU cap from available RAM and pin the learned-hot experts. Call once after
@@ -439,4 +640,112 @@ fn mem_available_bytes() -> u64 {
         eprintln!("[stream-experts] MemAvailable unreadable; assuming 8 GB free");
     }
     8_000_000_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tier_decay, tier_pick_swap, REPIN_MAX_SWAPS};
+
+    /// Apply the swap policy to a pinned set exactly as `repin` does (cold slot -> hot expert),
+    /// minus the disk I/O, so we can assert on convergence and the swap cap in isolation.
+    fn simulate(heat: &[u32], pinned: &mut Vec<u32>, max_swaps: usize) -> usize {
+        let mut swaps = 0;
+        while swaps < max_swaps {
+            match tier_pick_swap(heat, pinned) {
+                Some((slot, hot, _gain)) => {
+                    pinned[slot] = hot;
+                    swaps += 1;
+                }
+                None => break,
+            }
+        }
+        swaps
+    }
+
+    #[test]
+    fn swaps_coldest_pinned_for_hottest_streamed() {
+        // heat: e0=100, e1=5 (pinned, cold), e2=200 (streamed, hot), e3=50.
+        let heat = [100, 5, 200, 50];
+        let pinned = [0, 1];
+        let (slot, hot, gain) = tier_pick_swap(&heat, &pinned).expect("beneficial swap");
+        assert_eq!(slot, 1, "coldest pinned is at slot 1 (eid 1)");
+        assert_eq!(hot, 2, "hottest streamed is eid 2");
+        assert_eq!(gain, 195, "gain is hot_heat - cold_heat = 200 - 5");
+    }
+
+    #[test]
+    fn hysteresis_blocks_near_equal_experts() {
+        // Cold pinned heat 100 -> threshold 100 + 25 + 4 = 129; a streamed expert at 110 is
+        // hotter but inside the margin, so no swap (no ping-pong on noise).
+        let heat = [100, 100, 110];
+        let pinned = [0, 1];
+        assert!(tier_pick_swap(&heat, &pinned).is_none());
+    }
+
+    #[test]
+    fn hysteresis_margin_is_exclusive_at_the_boundary() {
+        // cold_heat 100 -> threshold = 100 + (100>>2=25) + 4 = 129.
+        assert!(
+            tier_pick_swap(&[100, 100, 129], &[0, 1]).is_none(),
+            "equal to the threshold must not swap"
+        );
+        let (slot, hot, gain) =
+            tier_pick_swap(&[100, 100, 130], &[0, 1]).expect("one over the threshold swaps");
+        assert_eq!((slot, hot, gain), (0, 2, 30));
+    }
+
+    #[test]
+    fn no_swap_when_every_expert_is_already_pinned() {
+        assert!(tier_pick_swap(&[10, 20], &[0, 1]).is_none());
+    }
+
+    #[test]
+    fn empty_inputs_are_safe() {
+        assert!(tier_pick_swap(&[], &[]).is_none());
+        assert!(tier_pick_swap(&[1, 2, 3], &[]).is_none());
+        assert!(tier_pick_swap(&[], &[0, 1]).is_none());
+    }
+
+    #[test]
+    fn picks_the_coldest_slot_and_hottest_candidate_among_many() {
+        // pinned e0=50, e2=30 (cold), e4=80; streamed e1=10, e3=200 (hot), e5=5.
+        let heat = [50, 10, 30, 200, 80, 5];
+        let pinned = [0, 2, 4];
+        let (slot, hot, gain) = tier_pick_swap(&heat, &pinned).expect("swap");
+        assert_eq!(slot, 1, "eid 2 (heat 30) is the coldest pinned, at slot 1");
+        assert_eq!(hot, 3, "eid 3 (heat 200) is the hottest streamed");
+        assert_eq!(gain, 170);
+    }
+
+    #[test]
+    fn decay_halves_every_expert() {
+        let mut heat = [10, 3, 0, 255, 1];
+        tier_decay(&mut heat);
+        assert_eq!(heat, [5, 1, 0, 127, 0]);
+    }
+
+    #[test]
+    fn repeated_swaps_converge_then_stop_under_hysteresis() {
+        // Two genuinely hot streamed experts (100, 90) displace two cold pins (5, 4); once both
+        // hot experts are pinned the margin blocks further churn well under the swap cap.
+        let heat = [100, 90, 5, 4];
+        let mut pinned = vec![2, 3];
+        let swaps = simulate(&heat, &mut pinned, REPIN_MAX_SWAPS);
+        assert_eq!(swaps, 2, "exactly the two hot experts get pinned");
+        pinned.sort_unstable();
+        assert_eq!(pinned, vec![0, 1], "hot-set converged to the two hottest experts");
+        // A second pass over the same (now settled) heat is a no-op: stable, no ping-pong.
+        assert_eq!(simulate(&heat, &mut pinned, REPIN_MAX_SWAPS), 0);
+    }
+
+    #[test]
+    fn one_dominant_expert_settles_after_a_single_swap() {
+        // A lone hot streamed expert takes one cold slot, then hysteresis stops the pass -- the
+        // other pinned experts are far enough ahead of the remaining stream to stay put.
+        let heat = [50, 10, 30, 200, 80, 5];
+        let mut pinned = vec![0, 2, 4];
+        assert_eq!(simulate(&heat, &mut pinned, REPIN_MAX_SWAPS), 1);
+        pinned.sort_unstable();
+        assert_eq!(pinned, vec![0, 3, 4]);
+    }
 }
