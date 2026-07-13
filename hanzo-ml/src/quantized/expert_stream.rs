@@ -36,7 +36,7 @@ const ACTIVATION_RESERVE: u64 = 1_200_000_000;
 const BUDGET_FRACTION: f64 = 0.88;
 /// Fraction of a bank's cap auto-pinned from the learned usage sidecar.
 const PIN_FRACTION: f64 = 0.25;
-/// Max hot-set swaps per [`repin`] pass. Colibri's four-swap cap: bounds work and
+/// Max hot-set swaps per [`repin`] pass. Four-swap cap: bounds work and
 /// stops a single turn from churning the whole tier.
 const REPIN_MAX_SWAPS: usize = 4;
 
@@ -199,7 +199,7 @@ impl ExpertStreamBank {
         Ok(())
     }
 
-    /// Live tier adaptation (colibri `--repin`). Decay the session heat, then swap up to
+    /// Live tier adaptation (`--repin`). Decay the session heat, then swap up to
     /// [`REPIN_MAX_SWAPS`] of the coldest pinned experts for the hottest streamed ones, each
     /// only when the heat gap clears the hysteresis margin ([`tier_pick_swap`]). Correctness
     /// neutral: the pinned *set* changes, never the bytes -- a promoted expert is the same
@@ -232,7 +232,7 @@ impl ExpertStreamBank {
         Ok(swaps)
     }
 
-    /// Background-thread readahead (colibri PILOT): warm `eid` into the LRU ahead of the
+    /// Background-thread readahead (router-lookahead): warm `eid` into the LRU ahead of the
     /// `fetch` that needs it, overlapping disk I/O with compute. The read owns its bytes in an
     /// `Arc` (unlike a bare `WILLNEED` page-cache hint, which memory pressure can re-evict), so
     /// a later `fetch` is a guaranteed hit on identical bytes -- correctness neutral. Skips
@@ -256,7 +256,7 @@ impl ExpertStreamBank {
         Ok(())
     }
 
-    /// Enqueue a router-lookahead prefetch of `eid` (colibri PILOT). Best effort and
+    /// Enqueue a router-lookahead prefetch of `eid`. Best effort and
     /// non-blocking: dropped when disabled, out of range, or the worker queue is full -- a
     /// missed prefetch only costs a later on-demand `fetch`, never correctness.
     pub fn prefetch(self: &Arc<Self>, eid: u32) {
@@ -338,7 +338,7 @@ pub fn total_resident_bytes() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Live tier adaptation (colibri tier.h): a pure heat-swap decision + decay, so
+// Live tier adaptation: a pure heat-swap decision + decay, so
 // the swap policy is testable in isolation from the I/O and locking around it.
 // ---------------------------------------------------------------------------
 
@@ -346,7 +346,7 @@ pub fn total_resident_bytes() -> usize {
 /// clears the hysteresis margin. Pure and total: the caller owns all I/O and locking.
 ///
 /// `heat[e]` is expert `e`'s session heat; `pinned` lists the currently pinned expert ids.
-/// Mirrors colibri `tier_pick_swap`: coldest pinned vs hottest non-resident, admitted only
+/// Heat-swap rule: coldest pinned vs hottest non-resident, admitted only
 /// when `hot > cold + cold/4 + 4`. The `cold/4` (25%) margin stops ping-pong between two
 /// near-equal experts; the `+4` covers tiny samples where the ratio alone is noisy. Returns
 /// `(slot, hot_eid, gain)` where `slot` indexes `pinned` and `gain = hot_heat - cold_heat`.
@@ -354,14 +354,14 @@ fn tier_pick_swap(heat: &[u32], pinned: &[u32]) -> Option<(usize, u32, i64)> {
     if heat.is_empty() || pinned.is_empty() {
         return None;
     }
-    // Coldest pinned slot (first minimum wins on ties, as in colibri's strict `<`).
+    // Coldest pinned slot (first minimum wins on ties, strict `<`).
     let cold = pinned
         .iter()
         .enumerate()
         .min_by_key(|&(_, &p)| heat[p as usize])
         .map(|(z, _)| z)
         .expect("pinned is non-empty");
-    // Hottest non-resident expert (first maximum wins on ties, colibri's strict `>`).
+    // Hottest non-resident expert (first maximum wins on ties, strict `>`).
     let mut hot: Option<usize> = None;
     let mut hot_heat = 0u32;
     for (e, &h) in heat.iter().enumerate() {
@@ -379,7 +379,7 @@ fn tier_pick_swap(heat: &[u32], pinned: &[u32]) -> Option<(usize, u32, i64)> {
     Some((cold, hot as u32, hot_heat as i64 - cold_heat as i64))
 }
 
-/// Halve every expert's session heat (colibri `tier_decay`): recent routing keeps its lead,
+/// Halve every expert's session heat (heat decay): recent routing keeps its lead,
 /// stale heat fades toward zero so a once-hot expert eventually loses its pin.
 fn tier_decay(heat: &mut [u32]) {
     for h in heat.iter_mut() {
@@ -387,7 +387,7 @@ fn tier_decay(heat: &mut [u32]) {
     }
 }
 
-/// Tokens between [`repin_all`] passes (colibri `--repin N`); `0`/unset disables live tier
+/// Tokens between [`repin_all`] passes (`--repin N`); `0`/unset disables live tier
 /// adaptation, so the hot-set stays exactly as [`finalize`] pinned it. Read once.
 pub fn repin_interval() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
@@ -418,7 +418,7 @@ pub fn repin_all() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Async prefetch (colibri PILOT): one shared I/O worker warms experts into the
+// Async prefetch (router-lookahead): one shared I/O worker warms experts into the
 // LRU ahead of the fetch that needs them, overlapping disk with compute.
 // ---------------------------------------------------------------------------
 
@@ -438,7 +438,7 @@ struct PrefetchJob {
 }
 
 /// The single background readahead worker, started on first use. Bounded queue: `try_send`
-/// drops a job when full (colibri's ring buffer "pieno = scarta"), so a saturated disk can
+/// drops a job when full (ring buffer: full = drop), so a saturated disk can
 /// never back-pressure or block the compute thread. `Weak` keeps a queued job from pinning a
 /// bank whose model has been dropped.
 fn prefetcher() -> &'static SyncSender<PrefetchJob> {
