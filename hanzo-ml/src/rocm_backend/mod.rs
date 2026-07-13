@@ -2292,6 +2292,77 @@ impl RocmStorage {
         })
     }
 
+    /// Top-k along the last dim WITHOUT a full sort: one block per row runs `k` block-wide argmax
+    /// passes (value DESC, index ASC -- first-index-wins on equal scores), the canonical tie-break of
+    /// a stable descending sort narrowed to `k`, matching the fused `moe_route` selection and the
+    /// engine's `deterministic_topk_indices`. Replaces `asort(desc) + narrow(k)` (the bitonic full
+    /// sort over every column) on the router hot path -- `k` of `last_dim` selected, no O(n log^2 n)
+    /// sort network, no full index-permutation write-back. Returns `(values, indices)`: `values` is
+    /// `[nrows, k]` in the input dtype (descending), `indices` is `[nrows, k]` u32. Bounded to the
+    /// single-workgroup regime the router lives in; callers narrow-then-sort for anything larger.
+    pub fn topk_last_dim(&self, layout: &Layout, k: usize, last_dim: usize) -> Result<(Self, Self)> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, SortKernel};
+        use std::ffi::c_void;
+        const TOPK_MAX_N: usize = 1024;
+        const TOPK_MAX_K: usize = 32;
+        if last_dim == 0 || last_dim > TOPK_MAX_N {
+            crate::bail!("topk_last_dim: last_dim {last_dim} out of range (1..={TOPK_MAX_N})");
+        }
+        if k == 0 || k > last_dim || k > TOPK_MAX_K {
+            crate::bail!("topk_last_dim: k {k} out of range (1..=min(last_dim,{TOPK_MAX_K}))");
+        }
+        let device = self.device.clone();
+        let elem_count = layout.shape().elem_count();
+        let nrows = elem_count / last_dim;
+        let ncols = last_dim as i32;
+        let kk = k as i32;
+        let x_ptr = unsafe { self.slice.offset_ptr(layout.start_offset()) };
+        let idx = device.alloc::<u32>(nrows * k)?;
+        let idx_ptr = idx.as_ptr();
+        let grid = rocm_rs::hip::Dim3::from(nrows as u32);
+        let block = rocm_rs::hip::Dim3::from(256u32);
+        macro_rules! launch_topk {
+            ($variant:ident, $rty:ty, $suffix:literal) => {{
+                let out_v = device.alloc::<$rty>(nrows * k)?;
+                let out_v_ptr = out_v.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        &device,
+                        SortKernel::NAME,
+                        SortKernel::CODE,
+                        concat!("topk_last_dim_", $suffix),
+                        grid,
+                        block,
+                        &mut [
+                            (&x_ptr) as *const *mut c_void as *mut c_void,
+                            (&out_v_ptr) as *const *mut c_void as *mut c_void,
+                            (&idx_ptr) as *const *mut c_void as *mut c_void,
+                            &ncols as *const i32 as *mut c_void,
+                            &kk as *const i32 as *mut c_void,
+                        ],
+                    )?;
+                }
+                RocmStorageSlice::$variant(out_v)
+            }};
+        }
+        let v_slice = match &self.slice {
+            RocmStorageSlice::F32(_) => launch_topk!(F32, f32, "f32"),
+            RocmStorageSlice::F16(_) => launch_topk!(F16, f16, "f16"),
+            RocmStorageSlice::BF16(_) => launch_topk!(BF16, bf16, "bf16"),
+            other => crate::bail!("topk_last_dim: unsupported dtype {:?}", other.dtype()),
+        };
+        Ok((
+            Self {
+                slice: v_slice,
+                device: device.clone(),
+            },
+            Self {
+                slice: RocmStorageSlice::U32(idx),
+                device,
+            },
+        ))
+    }
+
     /// Fused RMSNorm along the last dim: `out[i] = x[i] * rsqrt(mean(x^2)+eps) * alpha[i]`.
     /// One block per row (row = elem_count / last_dim); f32 accumulation regardless of dtype.
     /// `alpha` must be a contiguous vector of length `last_dim` on this device. Supports
