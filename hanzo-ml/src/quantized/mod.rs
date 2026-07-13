@@ -1056,14 +1056,18 @@ impl QTensor {
                 // f32 model no-ops both casts.
                 let out_dtype = x.dtype();
                 let x = x.to_dtype(crate::DType::F32)?.contiguous()?;
-                match (&*x.storage(), &*ids.storage()) {
+                // Bind the storage guards to named locals (declared after `x`, dropped before it)
+                // so the borrow can't outlive the reconciled activation -- mirrors the Metal branch.
+                let (x_guard, x_l) = x.storage_and_layout();
+                let (ids_guard, ids_l) = ids.storage_and_layout();
+                match (&*x_guard, &*ids_guard) {
                     (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
                         let (storage, out_shape) = s.indexed_moe_forward(
                             self.shape(),
                             x_storage,
-                            x.layout(),
+                            x_l,
                             ids_storage,
-                            ids.layout(),
+                            ids_l,
                         )?;
                         crate::tensor::from_storage(
                             Storage::Cuda(storage),
