@@ -332,6 +332,7 @@ fn main() {
         check_moe_q4k_blk::<WgpuRuntime>("VK/dump", &c, 128, 768, 8, 2048, 64); // gate/up: LocalSize 64
         check_moe_q4k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
         check_moe_q6k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
+        check_moe_route::<WgpuRuntime>("VK/dump", &c, 8, 128, 8, 128); // fused router: E128 top8 nt128
         return;
     }
 
