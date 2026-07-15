@@ -2162,6 +2162,32 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// Command-graph variant of [`Self::sdpa_blk_vk`]: the same `sdpa_blk` .spv, but `out`, `scale`
+    /// and `meta` are CALLER-OWNED STABLE buffers instead of freshly allocated/uploaded each call.
+    /// The kernel reads the attended key count from `meta[1]` (seq_k), so a captured decode graph
+    /// records this attention once against the FULL, fixed-shape KV cache and every replay attends the
+    /// ADVANCING span by refreshing `meta[1]` in place -- no re-narrow, no re-upload, no re-record.
+    /// Because every layer's decode attention has the identical shape and cache strides, ONE shared
+    /// `meta` (and `scale`, and a per-role `out`) serves the whole forward. `meta` layout matches
+    /// `sdpa_blk_vk`: `[seq_q, seq_k, n_heads, n_kv, causal, kv_batch_stride, kv_head_stride, key_stride]`
+    /// (u32, elements). Writes `out` (binding 3) in place; returns nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa_blk_vk_graph(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        out: &VulkanStorage,
+        scale: &VulkanStorage,
+        meta: &VulkanStorage,
+        b: usize,
+        n_heads: usize,
+        seq_q: usize,
+    ) -> Result<()> {
+        let bufs = [q.buffer, k.buffer, v.buffer, out.buffer, scale.buffer, meta.buffer];
+        self.dispatch_outs("sdpa_blk", &bufs, &[3], &[], ((b * n_heads * seq_q) as u32, 1, 1))
+    }
+
     /// Q6_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q6k`]. Reads weights
     /// at ~6.5 bits/elem (incl. pad) instead of 32 -- the bandwidth lever for memory-bound decode on
     /// this APU. Decode matches the CPU `BlockQ6K::to_float`.
@@ -6762,6 +6788,107 @@ mod dsl_dispatch_proof {
         );
         eprintln!(
             "[graph-proof] {N} replays bit-exact vs eager; every advancing KV slot correct; in-graph RAW barrier replayed. Command-graph mechanism VERIFIED."
+        );
+    }
+
+    // Proof that fused GQA flash SDPA replays correctly INSIDE a command graph while the attended KV
+    // span GROWS -- the decode attention piece. The captured graph binds the FULL fixed-shape KV cache
+    // and a caller-owned stable `meta` (sdpa_blk_vk_graph); each replay attends [0, seq_k) by
+    // refreshing only `meta[1]` in place. Output at every seq_k must match an eager CPU flash-softmax
+    // over that exact span (a frozen seq_k would attend the wrong -- warmup -- span).
+    #[test]
+    fn sdpa_in_command_graph_dynamic_seqk_bit_exact() {
+        const H: usize = 8;
+        const KV: usize = 2;
+        const D: usize = 128; // sdpa_blk .spv bakes d=128
+        const CAP: usize = 8; // KV cache capacity
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[graph-sdpa] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        if dev.inner.push_descriptor.is_none() {
+            eprintln!("[graph-sdpa] no VK_KHR_push_descriptor; skipping");
+            return;
+        }
+        let f = |x: usize| ((x * 2654435761usize) & 0xffff) as f32 / 65535.0 - 0.5;
+        let q: Vec<f32> = (0..H * D).map(f).collect();
+        let kf: Vec<f32> = (0..KV * CAP * D).map(|i| f(i + 7)).collect();
+        let vf: Vec<f32> = (0..KV * CAP * D).map(|i| f(i + 13)).collect();
+        let scale = 1.0f32 / (D as f32).sqrt();
+        let groups = H / KV;
+        // CPU flash-softmax reference for a given attended span seq_k.
+        let cpu_ref = |seq_k: usize| -> Vec<f32> {
+            let mut out = vec![0f32; H * D];
+            for h in 0..H {
+                let kv = h / groups;
+                let qb = h * D;
+                let sc: Vec<f32> = (0..seq_k)
+                    .map(|kk| {
+                        (0..D).map(|dd| q[qb + dd] * kf[(kv * CAP + kk) * D + dd]).sum::<f32>() * scale
+                    })
+                    .collect();
+                let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
+                let sum: f32 = ex.iter().sum();
+                for dd in 0..D {
+                    out[qb + dd] =
+                        (0..seq_k).map(|kk| ex[kk] / sum * vf[(kv * CAP + kk) * D + dd]).sum();
+                }
+            }
+            out
+        };
+
+        let qs = dev.upload_f32(&q).unwrap();
+        let ks = dev.upload_f32(&kf).unwrap();
+        let vs = dev.upload_f32(&vf).unwrap();
+        let out = dev.alloc_f32(H * D).unwrap();
+        let scale_buf = dev.upload_f32(&[scale]).unwrap();
+        // Stable meta; full-cache strides constant, seq_k (field 1) refreshed per replay.
+        let meta = dev
+            .upload_u32(&[
+                1,
+                CAP as u32,
+                H as u32,
+                KV as u32,
+                0,
+                (KV * CAP * D) as u32,
+                (CAP * D) as u32,
+                D as u32,
+            ])
+            .unwrap();
+
+        dev.begin_graph_capture().unwrap();
+        dev.sdpa_blk_vk_graph(&qs, &ks, &vs, &out, &scale_buf, &meta, 1, H, 1)
+            .unwrap();
+        let graph = dev.end_graph_capture().unwrap();
+
+        let maxref = (1..=CAP)
+            .flat_map(|sk| cpu_ref(sk))
+            .fold(0f32, |m, v| m.max(v.abs()))
+            .max(1e-30);
+        let mut worst = 0f32;
+        for &seq_k in &[1usize, 3, 5, 8] {
+            unsafe {
+                dev.write_u32(meta.buffer, meta.memory, meta.host_visible, &[1, seq_k as u32])
+                    .unwrap();
+            }
+            graph.replay().unwrap();
+            let got = out.to_vec_f32().unwrap();
+            let refv = cpu_ref(seq_k);
+            let err = got
+                .iter()
+                .zip(&refv)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(err / maxref);
+        }
+        eprintln!("[graph-sdpa] sdpa replayed in-graph over growing seq_k in {{1,3,5,8}}  scale_rel={worst:.2e}");
+        assert!(
+            worst < 1e-4,
+            "graph-replayed sdpa diverged from eager span attention: scale_rel={worst:.3e}"
         );
     }
 }
