@@ -6,9 +6,11 @@
 
 use hanzo_kernel::prelude::*;
 use hanzo_kernel::quant::{
-    gen_q4k, gen_q8_0_packed, matvec_q4k_bench, matvec_q4k_ref, matvec_q4k_run,
+    gen_moe_q4k, gen_moe_q6k, gen_q4k, gen_q8_0_packed, matvec_q4k_bench, matvec_q4k_ref, matvec_q4k_run,
     matvec_q8_0_packed_ref, matvec_q8_0_packed_run, matvec_q8_0_packed_sg_run, matvec_q8_bench, matvec_q8_dp4a_blk_run,
-    matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref, matvec_q8_run, QK8_0,
+    matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref, matvec_q8_run,
+    moe_matvec_q4k_bench, moe_matvec_q4k_blk_bench, moe_matvec_q4k_blk_run, moe_matvec_q4k_ref, moe_matvec_q4k_run,
+    moe_matvec_q6k_bench, moe_matvec_q6k_blk_bench, moe_matvec_q6k_blk_run, moe_matvec_q6k_ref, moe_matvec_q6k_run, QK8_0,
 };
 use std::time::Instant;
 use hanzo_kernel::norm::rms_norm_run;
@@ -53,6 +55,15 @@ fn maxrel(a: &[f32], b: &[f32]) -> f32 {
     m
 }
 
+// Scale-relative error: max |a-b| over the output's own magnitude scale (max|a|). The correct gate
+// for a matvec with sign cancellation -- per-element rel-error blows up on near-zero outputs (a tiny
+// absolute FMA-vs-separate-rounding delta over a value that cancelled to ~0), which is precision, not
+// a logic error. The CPU kernel is bit-exact to the same oracle; this isolates true GPU accuracy.
+fn scalerel(a: &[f32], b: &[f32]) -> f32 {
+    let scale = a.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-20);
+    a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale
+}
+
 // Q4_K: the real K-quant decoded in-kernel from packed bytes. Bit-exact gate + honest kernel-only BW.
 fn check_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize) {
     let (wqs, wsc, wd, wdm, x) = gen_q4k(rows, k);
@@ -69,6 +80,83 @@ fn check_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: 
         "[{:<7}] Q4_K   {}x{}  max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, rows, k, rel,
         if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+    );
+}
+
+// Q4_K indexed-MoE matvec: the DSL expert-gather kernel. Bit-exact gate + kernel-only weight BW on
+// the REAL Q4_K footprint of the routed rows (slots*n rows x 144 B/superblock). This is the DSL twin
+// the hand-rolled moe_matvec_q4k shader is gated against before it can be retired to an oracle.
+fn check_moe_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize) {
+    let (wqs, wsc, wd, wdm, x, ids) = gen_moe_q4k(e, n, slots, k);
+    let reference = moe_matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
+    let got = moe_matvec_q4k_run::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
+    let rel = maxrel(&reference, &got);
+    let ok = rel < 3e-3;
+    let ms = moe_matvec_q4k_bench::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k, 50);
+    // Each of the slots*n output rows reads one expert's [k] row = k/256 superblocks x 144 B.
+    let wbytes = slots * n * (k / 256) * 144;
+    let gbps = wbytes as f64 / (ms * 1e6);
+    let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] MoEQ4K E{} {}x{}x{}  max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
+        name, e, slots, n, k, rel,
+        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+    );
+}
+
+// Block-reduced Q4_K MoE matvec: the decode-perf lever (one workgroup per output, shared-mem reduce).
+// scale-relative gate vs the naive-order oracle (block reduce reorders the f32 sum) + throughput.
+fn check_moe_q4k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
+    let (wqs, wsc, wd, wdm, x, ids) = gen_moe_q4k(e, n, slots, k);
+    let reference = moe_matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
+    let got = moe_matvec_q4k_blk_run::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k, nt);
+    let srel = scalerel(&reference, &got);
+    let ok = srel < 1e-3;
+    let ms = moe_matvec_q4k_blk_bench::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k, nt, 50);
+    let wbytes = slots * n * (k / 256) * 144;
+    let gbps = wbytes as f64 / (ms * 1e6);
+    let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] MoEQ4Kb E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
+        name, e, slots, n, k, nt, srel,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+    );
+}
+
+// Q6_K indexed-MoE matvec: the DSL twin of moe_matvec_q6k.comp. Bit-exact gate + kernel-only weight
+// BW on the real Q6_K footprint of the routed rows (slots*n rows x 210 B/superblock).
+fn check_moe_q6k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize) {
+    let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
+    let reference = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
+    let got = moe_matvec_q6k_run::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
+    let srel = scalerel(&reference, &got);
+    let ok = srel < 1e-3;
+    let ms = moe_matvec_q6k_bench::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, 50);
+    let wbytes = slots * n * (k / 256) * 210; // Q6_K: 210 B/superblock
+    let gbps = wbytes as f64 / (ms * 1e6);
+    let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] MoEQ6K E{} {}x{}x{}  scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
+        name, e, slots, n, k, srel,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+    );
+}
+
+// Block-reduced Q6_K MoE matvec: the Q6_K decode-perf lever (naive Q6_K is decode-ALU-bound).
+fn check_moe_q6k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
+    let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
+    let reference = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
+    let got = moe_matvec_q6k_blk_run::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, nt);
+    let srel = scalerel(&reference, &got);
+    let ok = srel < 1e-3;
+    let ms = moe_matvec_q6k_blk_bench::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, nt, 50);
+    let wbytes = slots * n * (k / 256) * 210;
+    let gbps = wbytes as f64 / (ms * 1e6);
+    let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] MoEQ6Kb E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
+        name, e, slots, n, k, nt, srel,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
     );
 }
 
@@ -182,6 +270,25 @@ fn check_rms<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, n: 
 fn main() {
     let (rows, k) = (4096usize, 4096usize);
     let ctrl = 256usize; // small-K control: reorder noise ~ ctrl*eps, should be ~1e-6
+
+    // `matvec-check dump` dispatches exactly the engine-bound MoE block kernels at their evo-optimal
+    // baked nt (Q4_K 64, Q6_K 32) so `CUBECL_DEBUG_SPIRV=<dir>` writes exactly one .spv per kernel --
+    // the committed hanzo-ml Vulkan artifact. Build with `--features vulkan,spirv-dump`.
+    // `matvec-check dump` dispatches exactly the engine-bound MoE block kernels for each LIVE model
+    // shape at its evo-optimal power-of-2 nt, so `CUBECL_DEBUG_SPIRV=<dir>` writes one .spv per (shape).
+    // The DSL source is ONE fn per quant; comptime lowers it to a fast specialized artifact per shape
+    // (like llama's templated kernels). Disambiguate by LocalSize (nt): q4k 64 = gate/up, 8 = down.
+    //   Qwen3-30B-A3B Q4_K_M: ffn_gate/up_exps Q4_K [128,768,2048]; ffn_down_exps Q6_K/Q4_K [128,2048,768].
+    #[cfg(all(feature = "vulkan", feature = "spirv-dump"))]
+    if std::env::args().any(|a| a == "dump") {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        check_moe_q4k_blk::<WgpuRuntime>("VK/dump", &c, 128, 768, 8, 2048, 64); // gate/up: LocalSize 64
+        check_moe_q4k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
+        check_moe_q6k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
+        return;
+    }
+
     println!("hanzo-kernel :: one #[device] matvec_q8 source, lowered per backend, gated bit-exact\n");
 
     #[cfg(feature = "cpu")]
@@ -191,6 +298,8 @@ fn main() {
         check::<CpuRuntime>("CPU", &c, rows, k);
         check::<CpuRuntime>("CPU/ctrl", &c, rows, ctrl);
         check_q4k::<CpuRuntime>("CPU", &c, rows, k);
+        check_moe_q4k::<CpuRuntime>("CPU", &c, 8, 64, 4, 512); // small MoE bank for the CPU oracle
+        check_moe_q6k::<CpuRuntime>("CPU", &c, 8, 64, 4, 512);
         check_dp4a::<CpuRuntime>("CPU", &c, rows, k, false); // cubecl-cpu: no cooperative blocks
         check_rms::<CpuRuntime>("CPU", &c, rows, k);
     }
@@ -201,6 +310,22 @@ fn main() {
         check::<WgpuRuntime>("VULKAN", &c, rows, k);
         check::<WgpuRuntime>("VK/ctrl", &c, rows, ctrl);
         check_q4k::<WgpuRuntime>("VULKAN", &c, rows, k);
+        // Qwen3-30B-A3B-shaped MoE decode: 128 experts, 8 routed slots, n=768 intermediate, k=2048 hidden.
+        check_moe_q4k::<WgpuRuntime>("VULKAN", &c, 128, 768, 8, 2048);
+        check_moe_q4k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 32); // decode-perf lever
+        check_moe_q4k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 64);
+        // down-projection shape (n=2048, k=768 -> nsub=24): tree-reduce needs nt a power of 2; the
+        // ceil+guard lets nt EXCEED nsub (extra lanes contribute 0), so sweep 8/16/32 for best occupancy.
+        // A distinct specialized .spv from gate/up -- same source fn.
+        check_moe_q4k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 8);
+        check_moe_q4k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 16);
+        check_moe_q4k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 32);
+        check_moe_q6k::<WgpuRuntime>("VULKAN", &c, 128, 768, 8, 2048); // ffn_down_exps are Q6_K in Q4_K_M
+        check_moe_q6k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 32);
+        check_moe_q6k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 64);
+        check_moe_q6k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 8);
+        check_moe_q6k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 16);
+        check_moe_q6k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 32);
         check_dp4a::<WgpuRuntime>("VULKAN", &c, rows, k, true);
         check_dp4a::<WgpuRuntime>("VK/big", &c, 8192, 8192, true); // 67MB weights: cache-busting BW
         check_q8_0_packed::<WgpuRuntime>("VULKAN", &c, rows, k, 64);
