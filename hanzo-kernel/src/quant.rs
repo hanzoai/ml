@@ -1683,6 +1683,74 @@ pub fn moe_route_run<R: Runtime>(
     (ids, w)
 }
 
+/// f32 GEMV: `out[n] = W[n,k] @ x[k]`, W row-major contiguous. One workgroup per output row, `nt`
+/// threads stride over k, shared-mem tree reduce. The decode fix for a small f32 Linear (e.g. the MoE
+/// router gate `[128,4096] @ [4096]`) that the tiled GEMM otherwise runs as ~2 occupancy-starved
+/// workgroups (m=1 wastes 63/64 of every 64x64 tile). `k` is runtime (one .spv serves any Linear);
+/// `nt` comptime, a power of 2 (tree reduce). `n` is the grid bound (launch exactly n workgroups).
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn gemv<F: Float>(
+    w: &Array<F>,
+    x: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>, // [k]
+    #[comptime] nt: usize,
+) {
+    let row = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let k = meta[0] as usize;
+    let wbase = row * k;
+    let mut acc = F::new(0.0);
+    let mut i = t;
+    while i < k {
+        acc += w[wbase + i] * x[i];
+        i += nt;
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = acc;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        out[row] = smem[0];
+    }
+}
+
+/// Host launch for the f32 GEMV (one workgroup per output row `n`, `nt` threads split `k`).
+pub fn gemv_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    w: &[f32],
+    x: &[f32],
+    n: usize,
+    k: usize,
+    nt: usize,
+) -> Vec<f32> {
+    let wh = client.create_from_slice(f32::as_bytes(w));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n]));
+    let mh = client.create_from_slice(u32::as_bytes(&[k as u32]));
+    unsafe {
+        gemv::launch_unchecked::<f32, R>(
+            client,
+            Grid::Static(n as u32, 1, 1),
+            Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(oh.clone(), n),
+            ArrayArg::from_raw_parts(mh.clone(), 1),
+            nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
 /// CPU reference: softmax over all experts, take the top-k by weight (descending), renormalize.
 /// Mirrors `moe_route` (hanzo-ml generic path softmax_last_dim + sort_last_dim(desc) + narrow + norm).
 pub fn moe_route_ref(

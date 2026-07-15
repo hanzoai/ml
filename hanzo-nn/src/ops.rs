@@ -1172,6 +1172,60 @@ impl hanzo_ml::CustomOp3 for Sdpa {
         hanzo_ml::bail!("SDPA has no cpu impl")
     }
 
+    // Fused GQA flash SDPA on Vulkan: the DSL `sdpa_blk` .spv, one workgroup per (batch,head,query),
+    // GQA-native (reads the shared KV head, no repeat_kv). Preconditions (single-query decode shape,
+    // head_dim 128, no softcap/mask) are gated by the caller (engine attention::vulkan_decode_attn);
+    // this validates defensively and bails so an unsupported call surfaces an error rather than a
+    // silent miscompute. Inputs are contiguous f32 (the caller makes them contiguous).
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        q: &hanzo_ml::VulkanStorage,
+        q_l: &Layout,
+        k: &hanzo_ml::VulkanStorage,
+        k_l: &Layout,
+        v: &hanzo_ml::VulkanStorage,
+        v_l: &Layout,
+    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
+        use hanzo_ml::backend::BackendStorage;
+        if q.dtype() != hanzo_ml::DType::F32
+            || k.dtype() != hanzo_ml::DType::F32
+            || v.dtype() != hanzo_ml::DType::F32
+        {
+            hanzo_ml::bail!("sdpa_blk vulkan: f32 only (got q{:?})", q.dtype());
+        }
+        let (b, h, sq, d) = q_l.shape().dims4()?;
+        let (_, hkv, l, kd) = k_l.shape().dims4()?;
+        let (_, _, _, vd) = v_l.shape().dims4()?;
+        if d != 128 || kd != 128 || vd != 128 {
+            hanzo_ml::bail!("sdpa_blk vulkan: only head_dim 128 (got q{d}/k{kd}/v{vd})");
+        }
+        if self.softcapping != 1.0 || self.mask.is_some() {
+            hanzo_ml::bail!("sdpa_blk vulkan: no softcap/mask support");
+        }
+        if hkv == 0 || h % hkv != 0 {
+            hanzo_ml::bail!("sdpa_blk vulkan: n_heads {h} not a multiple of n_kv {hkv}");
+        }
+        // q must be contiguous at offset 0 (it's a single decode token -- tiny to materialize). k/v may
+        // be a STRIDED view of a max_seq-sized KV cache: the kernel reads them in place at their real
+        // strides (no per-layer .contiguous() of the whole active cache), needing only the innermost
+        // (head_dim) stride == 1, offset 0, and k/v sharing one layout (one kbase feeds both reads).
+        if !q_l.is_contiguous() || q_l.start_offset() != 0 {
+            hanzo_ml::bail!("sdpa_blk vulkan: q must be contiguous at offset 0");
+        }
+        let ks = k_l.stride();
+        let vs = v_l.stride();
+        if k_l.start_offset() != 0 || v_l.start_offset() != 0 || ks != vs || ks[3] != 1 {
+            hanzo_ml::bail!("sdpa_blk vulkan: k/v need matching strides, head_dim contiguous, offset 0");
+        }
+        let dev = q.device().clone();
+        let out = dev.sdpa_blk_vk(
+            q, k, v, b, h, hkv, sq, l, d, self.scale, self.do_causal,
+            ks[0], ks[1], ks[2],
+        )?;
+        Ok((out, Shape::from_dims(&[b, h, sq, d])))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
