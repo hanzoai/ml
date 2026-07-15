@@ -250,6 +250,26 @@ impl crate::CustomOp1 for ArgSort {
         let dst = storage.asort(layout, self.asc, self.last_dim)?;
         Ok((dst, layout.shape().clone()))
     }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &crate::VulkanStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, crate::Shape)> {
+        use crate::backend::{BackendDevice, BackendStorage};
+        // The bitonic argsort shader reads f32 rows and stays on the GPU while the padded row
+        // width fits its shared-index scratch (ARGSORT_MAX_COLS_PAD) -- the MoE routing case
+        // (cols == num_experts) always does. Any other dtype, or an over-wide row, takes the
+        // dtype-generic CPU argsort and re-uploads the u32 permutation to the device.
+        if storage.dtype() == crate::DType::F32 {
+            if let Some(dst) = storage.arg_sort_last_dim(layout, self.asc, self.last_dim)? {
+                return Ok((dst, layout.shape().clone()));
+            }
+        }
+        let (idx, shape) = self.cpu_fwd(&storage.to_cpu_storage()?, layout)?;
+        Ok((storage.device().storage_from_cpu_storage(&idx)?, shape))
+    }
 }
 
 #[allow(unused)]

@@ -315,6 +315,666 @@ pub fn gen_q4k(rows: usize, k: usize) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>
 }
 
 // ============================================================================================
+// Q4_K indexed-MoE matvec: `out[s, r] = sum_k W[ids[s], r, k] * x[s, k]`. The ONLY delta from
+// `matvec_q4k` is the expert gather (weight row = ids[slot]*n + r, out of a flat [E*n] Q4_K bank)
+// and the per-slot activation offset (slot*k). The in-kernel Q4_K decode is byte-identical --
+// `decode ⊥ gather`, composed. One invocation = one output element `out[slot*n + r]`.
+// ============================================================================================
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn moe_matvec_q4k<F: Float>(
+    wqs: &Array<u32>,
+    wsc: &Array<u32>,
+    wd: &Array<F>,
+    wdm: &Array<F>,
+    x: &Array<F>,
+    ids: &Array<u32>,
+    out: &mut Array<F>,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+) {
+    let gid = ABSOLUTE_POS;
+    if gid < out.len() {
+        let slot = gid / n;
+        let r = gid % n;
+        let wrow = ids[slot] as usize * n + r; // weight row in the flat [E*n, k] bank
+        let nb = k / 256;
+        let xbase = slot * k;
+        let mut acc = F::new(0.0);
+        for b in 0..nb {
+            let blk = wrow * nb + b;
+            let qbase = blk * 32;
+            let scbase = blk * 3;
+            let d = wd[blk];
+            let dmin = wdm[blk];
+            let xblk = xbase + b * 256;
+            for g in 0..4 {
+                let is = g * 2;
+                let d1 = d * F::cast_from(q4k_sc(wsc, scbase, is));
+                let mm1 = dmin * F::cast_from(q4k_m(wsc, scbase, is));
+                let d2 = d * F::cast_from(q4k_sc(wsc, scbase, is + 1));
+                let mm2 = dmin * F::cast_from(q4k_m(wsc, scbase, is + 1));
+                for qi in 0..32 {
+                    let qb = byte_at(wqs, qbase, g * 32 + qi);
+                    let wlo = d1 * F::cast_from(qb & 15) - mm1;
+                    acc += wlo * x[xblk + g * 64 + qi];
+                    let whi = d2 * F::cast_from(qb >> 4) - mm2;
+                    acc += whi * x[xblk + g * 64 + 32 + qi];
+                }
+            }
+        }
+        out[gid] = acc;
+    }
+}
+
+/// Host launch for the Q4_K MoE matvec. `wqs/wsc/wd/wdm` are the flat [E*n] Q4_K bank; `x` is
+/// `[slots, k]`; `ids[slot]` is slot's expert; output is `[slots, n]`. All runtimes, one fn.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q4k_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize,
+) -> Vec<f32> {
+    let qh = client.create_from_slice(u32::as_bytes(wqs));
+    let sh = client.create_from_slice(u32::as_bytes(wsc));
+    let dh = client.create_from_slice(f32::as_bytes(wd));
+    let mh = client.create_from_slice(f32::as_bytes(wdm));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let ih = client.create_from_slice(u32::as_bytes(ids));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
+    let block = 64u32;
+    let grid = ((slots * n) as u32).div_ceil(block);
+    unsafe {
+        moe_matvec_q4k::launch_unchecked::<f32, R>(
+            client, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(mh.clone(), wdm.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+// Block-reduced Q4_K MoE matvec: ONE workgroup per output element, `nt` threads split the row's
+// k/32 sub-blocks (each 32 weights = one Q4_K scale index), shared-mem tree reduce. This is the
+// bandwidth-bound decode structure that took the plain Q8_0/dp4a kernels from ~90 to ~500 GB/s --
+// the decode-perf lever. Q4_K sub-block sb -> superblock sb/8, scale index sb%8, low nibble if even
+// / high if odd. Matches `moe_matvec_q4k` within f32-reorder (different, valid, reduction order).
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn moe_matvec_q4k_blk<F: Float>(
+    wqs: &Array<u32>,
+    wsc: &Array<u32>,
+    wd: &Array<F>,
+    wdm: &Array<F>,
+    x: &Array<F>,
+    ids: &Array<u32>,
+    out: &mut Array<F>,
+    #[comptime] n: usize,  // comptime shape: outrow/n & nsub/nt fold to magic-multiply + full unroll
+    #[comptime] k: usize,  // (the DSL's job -- one source fn, one fast .spv per live shape, like llama)
+    #[comptime] nt: usize, // threads per output element (k/32 a multiple of nt)
+) {
+    let outrow = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let slot = outrow / n;
+    let r = outrow % n;
+    let wrow = ids[slot] as usize * n + r;
+    let nb = k / 256;
+    let nsub = k / 32; // 32-weight sub-blocks per row
+    let per = (nsub + nt - 1) / nt; // comptime ceil: nt (power of 2) need not divide nsub
+    let xrow = slot * k;
+    let mut partial = F::new(0.0);
+    for j in 0..per {
+        let sb = j * nt + t;
+        if sb < nsub {
+            let sup = sb / 8;
+            let jloc = sb % 8;
+            let blk = wrow * nb + sup;
+            let qbase = blk * 32;
+            let scbase = blk * 3;
+            let dj = wd[blk] * F::cast_from(q4k_sc(wsc, scbase, jloc));
+            let mj = wdm[blk] * F::cast_from(q4k_m(wsc, scbase, jloc));
+            let shift = ((jloc % 2) * 4) as u32; // low nibble (even sub-block) or high (odd)
+            let boff = (jloc / 2) * 32; // qs byte offset for this sub-block's chunk
+            let xoff = xrow + sup * 256 + jloc * 32;
+            let mut sbsum = F::new(0.0);
+            for qi in 0..32 {
+                let nib = (byte_at(wqs, qbase, boff + qi) >> shift) & 15;
+                sbsum += (dj * F::cast_from(nib) - mj) * x[xoff + qi];
+            }
+            partial += sbsum;
+        }
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        out[outrow] = smem[0];
+    }
+}
+
+/// Host launch for the block-reduced Q4_K MoE matvec (one workgroup per output, `nt` threads).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q4k_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize, nt: usize,
+) -> Vec<f32> {
+    let (qh, sh, dh, mh, xh, ih, oh) = (
+        client.create_from_slice(u32::as_bytes(wqs)),
+        client.create_from_slice(u32::as_bytes(wsc)),
+        client.create_from_slice(f32::as_bytes(wd)),
+        client.create_from_slice(f32::as_bytes(wdm)),
+        client.create_from_slice(f32::as_bytes(x)),
+        client.create_from_slice(u32::as_bytes(ids)),
+        client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n])),
+    );
+    unsafe {
+        moe_matvec_q4k_blk::launch_unchecked::<f32, R>(
+            client, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(mh.clone(), wdm.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k, nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Kernel-only throughput for the block-reduced Q4_K MoE matvec.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q4k_blk_bench<R: Runtime>(
+    client: &ComputeClient<R>,
+    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize, nt: usize, iters: usize,
+) -> f64 {
+    let (qh, sh, dh, mh, xh, ih, oh) = (
+        client.create_from_slice(u32::as_bytes(wqs)),
+        client.create_from_slice(u32::as_bytes(wsc)),
+        client.create_from_slice(f32::as_bytes(wd)),
+        client.create_from_slice(f32::as_bytes(wdm)),
+        client.create_from_slice(f32::as_bytes(x)),
+        client.create_from_slice(u32::as_bytes(ids)),
+        client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n])),
+    );
+    let launch = |c: &ComputeClient<R>| unsafe {
+        moe_matvec_q4k_blk::launch_unchecked::<f32, R>(
+            c, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(mh.clone(), wdm.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k, nt,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    t.elapsed().as_secs_f64() * 1e3 / iters as f64
+}
+
+/// Kernel-only throughput for the Q4_K MoE matvec (buffers once, `iters` dispatches, one sync).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q4k_bench<R: Runtime>(
+    client: &ComputeClient<R>,
+    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize, iters: usize,
+) -> f64 {
+    let qh = client.create_from_slice(u32::as_bytes(wqs));
+    let sh = client.create_from_slice(u32::as_bytes(wsc));
+    let dh = client.create_from_slice(f32::as_bytes(wd));
+    let mh = client.create_from_slice(f32::as_bytes(wdm));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let ih = client.create_from_slice(u32::as_bytes(ids));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
+    let block = 64u32;
+    let grid = ((slots * n) as u32).div_ceil(block);
+    let launch = |c: &ComputeClient<R>| unsafe {
+        moe_matvec_q4k::launch_unchecked::<f32, R>(
+            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(mh.clone(), wdm.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    t.elapsed().as_secs_f64() * 1e3 / iters as f64
+}
+
+/// CPU oracle for the Q4_K MoE matvec (same packed inputs; BlockQ4K::to_float decode order).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q4k_ref(
+    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize,
+) -> Vec<f32> {
+    let nb = k / 256;
+    let mut out = vec![0.0f32; slots * n];
+    for slot in 0..slots {
+        let expert = ids[slot] as usize;
+        for r in 0..n {
+            let wrow = expert * n + r;
+            let mut acc = 0.0f32;
+            for b in 0..nb {
+                let blk = wrow * nb + b;
+                let (qbase, scbase) = (blk * 32, blk * 3);
+                let (d, dmin) = (wd[blk], wdm[blk]);
+                let xblk = slot * k + b * 256;
+                for g in 0..4 {
+                    let is = g * 2;
+                    let d1 = d * cpu_sc(wsc, scbase, is) as f32;
+                    let mm1 = dmin * cpu_m(wsc, scbase, is) as f32;
+                    let d2 = d * cpu_sc(wsc, scbase, is + 1) as f32;
+                    let mm2 = dmin * cpu_m(wsc, scbase, is + 1) as f32;
+                    for qi in 0..32 {
+                        let qb = cpu_byte(wqs, qbase, g * 32 + qi);
+                        acc += (d1 * (qb & 15) as f32 - mm1) * x[xblk + g * 64 + qi];
+                        acc += (d2 * (qb >> 4) as f32 - mm2) * x[xblk + g * 64 + 32 + qi];
+                    }
+                }
+            }
+            out[slot * n + r] = acc;
+        }
+    }
+    out
+}
+
+/// Deterministic MoE test data: a flat [E*n] Q4_K bank, `slots` activations `[slots,k]`, and a
+/// per-slot expert id in `[0,e)`. Reuses `gen_q4k` for the bank (its lone x is discarded).
+pub fn gen_moe_q4k(e: usize, n: usize, slots: usize, k: usize)
+    -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
+    let (wqs, wsc, wd, wdm, _x1) = gen_q4k(e * n, k);
+    let mut s = 0xC2B2AE3D27D4EB4Fu64;
+    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let x: Vec<f32> = (0..slots * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let ids: Vec<u32> = (0..slots).map(|_| (next() % e as u64) as u32).collect();
+    (wqs, wsc, wd, wdm, x, ids)
+}
+
+// ============================================================================================
+// Q6_K indexed-MoE matvec: `out[s, r] = sum_k W[ids[s], r, k] * x[s, k]`, gathering per-expert rows
+// from a flat [E*n] Q6_K bank. Same `decode ⊥ gather` split as `moe_matvec_q4k`; the decode is the
+// 210-byte Q6_K superblock (ql[128] low-4b, qh[64] high-2b, scales[16] SIGNED i8, d f16), passed as
+// split u32 arrays. Bit-identical to BlockQ6K::to_float: weight = d * sc * (6-bit code - 32).
+//   wql: ql, 32 u32/block (128 B)    wqh: qh, 16 u32/block (64 B)
+//   wsc: scales, 4 u32/block (16 B, signed)    wd: d, 1 f32/block
+// ============================================================================================
+// Sign-extended byte: `(b ^ 128) - 128` maps u8 0..255 to i8 -128..127 (branchless).
+#[device]
+fn sbyte_at(a: &Array<u32>, base: usize, i: usize) -> i32 {
+    let b = (a[base + i / 4] >> ((8 * (i % 4)) as u32)) & 255;
+    (b ^ 128) as i32 - 128
+}
+
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn moe_matvec_q6k<F: Float>(
+    wql: &Array<u32>,
+    wqh: &Array<u32>,
+    wsc: &Array<u32>,
+    wd: &Array<F>,
+    x: &Array<F>,
+    ids: &Array<u32>,
+    out: &mut Array<F>,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+) {
+    let gid = ABSOLUTE_POS;
+    if gid < out.len() {
+        let slot = gid / n;
+        let r = gid % n;
+        let wrow = ids[slot] as usize * n + r;
+        let nb = k / 256;
+        let xbase = slot * k;
+        let mut acc = F::new(0.0);
+        for b in 0..nb {
+            let blk = wrow * nb + b;
+            let qlb = blk * 32; // ql: 32 u32/block
+            let qhb = blk * 16; // qh: 16 u32/block
+            let scb = blk * 4; // scales: 4 u32/block
+            let d = wd[blk];
+            let xblk = xbase + b * 256;
+            for idx in 0..2 {
+                let scoff = idx * 8;
+                let qloff = idx * 64;
+                let qhoff = idx * 32;
+                let xb = xblk + idx * 128;
+                for l in 0..32 {
+                    let is = l / 16;
+                    let qll = byte_at(wql, qlb, qloff + l);
+                    let qlh = byte_at(wql, qlb, qloff + l + 32);
+                    let qhv = byte_at(wqh, qhb, qhoff + l);
+                    let q1 = ((qll & 15) | ((qhv & 3) << 4)) as i32 - 32;
+                    let q2 = ((qlh & 15) | (((qhv >> 2) & 3) << 4)) as i32 - 32;
+                    let q3 = ((qll >> 4) | (((qhv >> 4) & 3) << 4)) as i32 - 32;
+                    let q4 = ((qlh >> 4) | (((qhv >> 6) & 3) << 4)) as i32 - 32;
+                    let s1 = d * F::cast_from(sbyte_at(wsc, scb, scoff + is));
+                    let s2 = d * F::cast_from(sbyte_at(wsc, scb, scoff + is + 2));
+                    let s3 = d * F::cast_from(sbyte_at(wsc, scb, scoff + is + 4));
+                    let s4 = d * F::cast_from(sbyte_at(wsc, scb, scoff + is + 6));
+                    acc += s1 * F::cast_from(q1) * x[xb + l];
+                    acc += s2 * F::cast_from(q2) * x[xb + l + 32];
+                    acc += s3 * F::cast_from(q3) * x[xb + l + 64];
+                    acc += s4 * F::cast_from(q4) * x[xb + l + 96];
+                }
+            }
+        }
+        out[gid] = acc;
+    }
+}
+
+/// Host launch for the Q6_K MoE matvec. Split [E*n] Q6_K bank + `[slots,k]` x + per-slot expert id.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q6k_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize,
+) -> Vec<f32> {
+    let qlh = client.create_from_slice(u32::as_bytes(wql));
+    let qhh = client.create_from_slice(u32::as_bytes(wqh));
+    let sh = client.create_from_slice(u32::as_bytes(wsc));
+    let dh = client.create_from_slice(f32::as_bytes(wd));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let ih = client.create_from_slice(u32::as_bytes(ids));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
+    let block = 64u32;
+    let grid = ((slots * n) as u32).div_ceil(block);
+    unsafe {
+        moe_matvec_q6k::launch_unchecked::<f32, R>(
+            client, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
+            ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Kernel-only throughput for the Q6_K MoE matvec.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q6k_bench<R: Runtime>(
+    client: &ComputeClient<R>,
+    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize, iters: usize,
+) -> f64 {
+    let qlh = client.create_from_slice(u32::as_bytes(wql));
+    let qhh = client.create_from_slice(u32::as_bytes(wqh));
+    let sh = client.create_from_slice(u32::as_bytes(wsc));
+    let dh = client.create_from_slice(f32::as_bytes(wd));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let ih = client.create_from_slice(u32::as_bytes(ids));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
+    let block = 64u32;
+    let grid = ((slots * n) as u32).div_ceil(block);
+    let launch = |c: &ComputeClient<R>| unsafe {
+        moe_matvec_q6k::launch_unchecked::<f32, R>(
+            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
+            ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    t.elapsed().as_secs_f64() * 1e3 / iters as f64
+}
+
+#[inline]
+fn cpu_sbyte(a: &[u32], base: usize, i: usize) -> i32 {
+    let b = (a[base + i / 4] >> (8 * (i % 4))) & 255;
+    (b ^ 128) as i32 - 128
+}
+
+/// CPU oracle for the Q6_K MoE matvec (BlockQ6K::to_float decode order: weight = d * sc * (code-32)).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q6k_ref(
+    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize,
+) -> Vec<f32> {
+    let nb = k / 256;
+    let mut out = vec![0.0f32; slots * n];
+    for slot in 0..slots {
+        let expert = ids[slot] as usize;
+        for r in 0..n {
+            let wrow = expert * n + r;
+            let mut acc = 0.0f32;
+            for b in 0..nb {
+                let blk = wrow * nb + b;
+                let (qlb, qhb, scb) = (blk * 32, blk * 16, blk * 4);
+                let d = wd[blk];
+                let xblk = slot * k + b * 256;
+                for idx in 0..2 {
+                    let (scoff, qloff, qhoff) = (idx * 8, idx * 64, idx * 32);
+                    let xb = xblk + idx * 128;
+                    for l in 0..32 {
+                        let is = l / 16;
+                        let qll = cpu_byte(wql, qlb, qloff + l);
+                        let qlh = cpu_byte(wql, qlb, qloff + l + 32);
+                        let qhv = cpu_byte(wqh, qhb, qhoff + l);
+                        let q1 = ((qll & 15) | ((qhv & 3) << 4)) as i32 - 32;
+                        let q2 = ((qlh & 15) | (((qhv >> 2) & 3) << 4)) as i32 - 32;
+                        let q3 = ((qll >> 4) | (((qhv >> 4) & 3) << 4)) as i32 - 32;
+                        let q4 = ((qlh >> 4) | (((qhv >> 6) & 3) << 4)) as i32 - 32;
+                        let s1 = d * cpu_sbyte(wsc, scb, scoff + is) as f32;
+                        let s2 = d * cpu_sbyte(wsc, scb, scoff + is + 2) as f32;
+                        let s3 = d * cpu_sbyte(wsc, scb, scoff + is + 4) as f32;
+                        let s4 = d * cpu_sbyte(wsc, scb, scoff + is + 6) as f32;
+                        acc += s1 * q1 as f32 * x[xb + l];
+                        acc += s2 * q2 as f32 * x[xb + l + 32];
+                        acc += s3 * q3 as f32 * x[xb + l + 64];
+                        acc += s4 * q4 as f32 * x[xb + l + 96];
+                    }
+                }
+            }
+            out[slot * n + r] = acc;
+        }
+    }
+    out
+}
+
+/// Deterministic Q6_K MoE test data: flat [E*n] bank (ql/qh/scales/d) + `[slots,k]` x + expert ids.
+pub fn gen_moe_q6k(e: usize, n: usize, slots: usize, k: usize)
+    -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<u32>) {
+    let nb = k / 256;
+    let nblk = e * n * nb;
+    let mut s = 0x27D4EB2F165667C5u64;
+    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let wql: Vec<u32> = (0..nblk * 32).map(|_| next() as u32).collect(); // 128 ql bytes/block
+    let wqh: Vec<u32> = (0..nblk * 16).map(|_| next() as u32).collect(); // 64 qh bytes/block
+    let wsc: Vec<u32> = (0..nblk * 4).map(|_| next() as u32).collect();  // 16 scale bytes/block (i8)
+    let wd: Vec<f32> = (0..nblk).map(|_| half::f16::from_f32((next() % 1000) as f32 / 20000.0 + 0.002).to_f32()).collect();
+    let x: Vec<f32> = (0..slots * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let ids: Vec<u32> = (0..slots).map(|_| (next() % e as u64) as u32).collect();
+    (wql, wqh, wsc, wd, x, ids)
+}
+
+// Block-reduced Q6_K MoE matvec (slice ② for Q6_K). One workgroup/output, nt threads split the
+// k/32 sub-blocks, shared-mem tree reduce -- same lever as `moe_matvec_q4k_blk`. Q6_K sub-block sb
+// -> superblock sb/8, and within the superblock chunk = (sb%8)/4, sub = (sb%8)%4: ql byte l+(sub&1)*32
+// nibble (sub>>1)*4, qh byte l shift 2*sub, scale index 8*chunk + l/16 + 2*sub. Matches the
+// naive-order oracle within f32-reorder.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn moe_matvec_q6k_blk<F: Float>(
+    wql: &Array<u32>,
+    wqh: &Array<u32>,
+    wsc: &Array<u32>,
+    wd: &Array<F>,
+    x: &Array<F>,
+    ids: &Array<u32>,
+    out: &mut Array<F>,
+    #[comptime] n: usize, // comptime shape (see moe_matvec_q4k_blk): fold + full unroll
+    #[comptime] k: usize,
+    #[comptime] nt: usize,
+) {
+    let outrow = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let slot = outrow / n;
+    let r = outrow % n;
+    let wrow = ids[slot] as usize * n + r;
+    let nb = k / 256;
+    let nsub = k / 32;
+    let per = (nsub + nt - 1) / nt; // comptime ceil: nt (power of 2) need not divide nsub
+    let xrow = slot * k;
+    let mut partial = F::new(0.0);
+    for j in 0..per {
+        let sb = j * nt + t;
+        if sb < nsub {
+            let sup = sb / 8;
+            let sbloc = sb % 8;
+            let idx = sbloc / 4; // chunk 0/1
+            let sub = sbloc % 4; // 0..4
+            let blk = wrow * nb + sup;
+            let d = wd[blk];
+            let qlbase = blk * 32;
+            let qhbase = blk * 16;
+            let scbase = blk * 4;
+            let qloff = idx * 64 + (sub % 2) * 32; // ql byte base for this (chunk,sub)
+            let qhoff = idx * 32; // qh byte base for this chunk
+            let qlshift = ((sub / 2) * 4) as u32; // low nibble (sub 0,1) or high (sub 2,3)
+            let qhshift = (sub * 2) as u32; // 2-bit high field for this sub
+            let scb0 = idx * 8 + sub * 2; // scale index for l<16 (is=0); +1 for l>=16
+            let xoff = xrow + sup * 256 + idx * 128 + sub * 32;
+            let mut sbsum = F::new(0.0);
+            for l in 0..32 {
+                let is = l / 16;
+                let sc = sbyte_at(wsc, scbase, scb0 + is);
+                let qlb = byte_at(wql, qlbase, qloff + l);
+                let qhb = byte_at(wqh, qhbase, qhoff + l);
+                let q = ((qlb >> qlshift) & 15) | (((qhb >> qhshift) & 3) << 4);
+                let qv = q as i32 - 32;
+                sbsum += d * F::cast_from(sc) * F::cast_from(qv) * x[xoff + l];
+            }
+            partial += sbsum;
+        }
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        out[outrow] = smem[0];
+    }
+}
+
+/// Host launch for the block-reduced Q6_K MoE matvec.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q6k_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize, nt: usize,
+) -> Vec<f32> {
+    let (qlh, qhh, sh, dh, xh, ih, oh) = (
+        client.create_from_slice(u32::as_bytes(wql)),
+        client.create_from_slice(u32::as_bytes(wqh)),
+        client.create_from_slice(u32::as_bytes(wsc)),
+        client.create_from_slice(f32::as_bytes(wd)),
+        client.create_from_slice(f32::as_bytes(x)),
+        client.create_from_slice(u32::as_bytes(ids)),
+        client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n])),
+    );
+    unsafe {
+        moe_matvec_q6k_blk::launch_unchecked::<f32, R>(
+            client, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
+            ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k, nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Kernel-only throughput for the block-reduced Q6_K MoE matvec.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q6k_blk_bench<R: Runtime>(
+    client: &ComputeClient<R>,
+    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize, nt: usize, iters: usize,
+) -> f64 {
+    let (qlh, qhh, sh, dh, xh, ih, oh) = (
+        client.create_from_slice(u32::as_bytes(wql)),
+        client.create_from_slice(u32::as_bytes(wqh)),
+        client.create_from_slice(u32::as_bytes(wsc)),
+        client.create_from_slice(f32::as_bytes(wd)),
+        client.create_from_slice(f32::as_bytes(x)),
+        client.create_from_slice(u32::as_bytes(ids)),
+        client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n])),
+    );
+    let launch = |c: &ComputeClient<R>| unsafe {
+        moe_matvec_q6k_blk::launch_unchecked::<f32, R>(
+            c, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
+            ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k, nt,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    t.elapsed().as_secs_f64() * 1e3 / iters as f64
+}
+
+// ============================================================================================
 // dp4a matvec: the inner product uses Vector<i32,4>.dot -> SPIR-V OpSDot (hardware integer dot,
 // SPV_KHR_integer_dot_product), verified emitted. Integer activations (xq) so the int dot is exact;
 // out[row] = sum_block wd[block] * dot(qw_group, xq_group). Bit-exact vs matvec_q8_dp4a_ref.
@@ -935,5 +1595,38 @@ mod tests {
         assert!(p2.from_cache && p2.benched == 0, "second call must hit the cache and skip timing");
         assert_eq!(p2.winner, p.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Q4_K indexed-MoE matvec on the CPU runtime is byte-for-byte the plain-Rust oracle: the
+    /// expert gather + per-slot activation ride on top of the SAME bit-exact Q4_K decode. This is the
+    /// correctness gate the hand-rolled `moe_matvec_q4k` shader becomes the on-device twin of.
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn moe_matvec_q4k_cpu_bit_exact() {
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let (e, n, slots, k) = (8usize, 12usize, 5usize, 512usize);
+        let (wqs, wsc, wd, wdm, x, ids) = gen_moe_q4k(e, n, slots, k);
+        let c = CpuRuntime::client(&CpuDevice::default());
+        let got = moe_matvec_q4k_run::<CpuRuntime>(&c, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
+        let want = moe_matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
+        let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+        let wbits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(gbits, wbits, "moe_matvec_q4k CPU kernel != oracle bit-exact");
+    }
+
+    /// The Q6_K indexed-MoE matvec on the CPU runtime is byte-for-byte the plain-Rust oracle: signed
+    /// i8 scales + 6-bit code decode + expert gather, all bit-exact. Twin of `moe_matvec_q6k.comp`.
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn moe_matvec_q6k_cpu_bit_exact() {
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let (e, n, slots, k) = (8usize, 12usize, 5usize, 512usize);
+        let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
+        let c = CpuRuntime::client(&CpuDevice::default());
+        let got = moe_matvec_q6k_run::<CpuRuntime>(&c, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
+        let want = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
+        let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+        let wbits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(gbits, wbits, "moe_matvec_q6k CPU kernel != oracle bit-exact");
     }
 }
