@@ -111,6 +111,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // (mul_mat_q4k_dp4a, 1-thread/row) starves. Bindings: wq(packed), xq, xs, xsum, out, meta=[k].
         "matvec_q4k_dp4a_blk" => include_bytes!("vulkan/spv/matvec_q4k_dp4a_blk.spv"),
         "moe_matvec_q6k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_blk_dn.spv"),
+        "moe_matvec_q6k_dp4a_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_dp4a_blk_dn.spv"),
         "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
         "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
         "flash_attn" => spv!("flash_attn"),
@@ -442,10 +443,13 @@ impl Drop for VkGraph {
     fn drop(&mut self) {
         let dev = self.device.dev();
         unsafe {
-            // Quiesce the device so no in-flight replay reads the buffer/fence we are destroying.
-            let _ = dev.device_wait_idle();
-            dev.destroy_fence(self.fence, None);
+            // The whole teardown runs under the submitter lock: queue access (device_wait_idle waits
+            // every queue) must be externally synchronized with eager submits, and holding the lock
+            // for the wait + destroy makes dropping a graph sound from ANY thread -- the engine drops
+            // retired graphs on a background thread so the quiesce never lands on a token's latency.
             if let Ok(s) = self.device.inner.submitter.lock() {
+                let _ = dev.device_wait_idle();
+                dev.destroy_fence(self.fence, None);
                 dev.free_command_buffers(s.cpool, &[self.cmd]);
             }
         }
@@ -2098,11 +2102,15 @@ impl VulkanDevice {
     }
 
     /// dp4a twin of `moe_matvec_blk_gpu`: quantize the activation to q8 ONCE (reused across all n
-    /// outputs), then dispatch the int8-dot MoE kernel. Same split bank + 2D (n, nrows) grid. Bindings:
-    /// wqs,wsc,wd,wdm (bank), xq,xs,xsum (q8 activation), ids, out.
+    /// outputs), then dispatch the int8-dot MoE kernel. Same split bank + 2D (n, nrows) grid. Bindings
+    /// follow the kernel's parameter order: bank arrays, then xq,xs[,xsum],ids,out — `with_xsum` says
+    /// whether the kernel folds its bias against the per-32 activation sums (Q4_K's dmin fold) or
+    /// derives its own half-block sums in-register (Q6_K's −32 fold), i.e. whether xsum is a binding.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_matvec_blk_dp4a_gpu(
         &self,
         kernel: &'static str,
+        with_xsum: bool,
         bank: &MoeBankSplit,
         x: &VulkanStorage,
         ids: &VulkanStorage,
@@ -2121,7 +2129,9 @@ impl VulkanDevice {
         let mut bufs: Vec<vk::Buffer> = bank.0.iter().map(|s| s.buffer).collect();
         bufs.push(xq.buffer);
         bufs.push(xs.buffer);
-        bufs.push(xsum.buffer);
+        if with_xsum {
+            bufs.push(xsum.buffer);
+        }
         bufs.push(ids.buffer);
         bufs.push(out.buffer);
         self.dispatch(kernel, &bufs, &[], (n as u32, nrows as u32, 1))?;
@@ -6691,6 +6701,79 @@ mod dsl_dispatch_proof {
         let rel = maxerr / maxref.max(1e-30);
         eprintln!("[moe-q6k-blk] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (DSL blk spv via ml dispatch + split repack)");
         assert!(rel < 1e-3, "moe q6k blk DSL diverged from CPU: scale_rel={rel:.3e}");
+    }
+
+    // dp4a twin of the Q6_K proof: same split bank and shape, dispatched through
+    // `moe_matvec_blk_dp4a_gpu` with `with_xsum = false` (Q6_K derives its half-block activation sums
+    // in-register, so xsum is not a binding). This gates the GLUE — bank order + the no-xsum binding
+    // set — against CPU dequant+matvec; the kernel itself is gated bit-tight in hanzo-kernel's
+    // matvec-check. Tolerance is 1e-2 scale-relative: the q8 activation round-trip is the only
+    // approximation, and a binding/order bug lands orders of magnitude outside it.
+    #[test]
+    fn moe_q6k_dp4a_blk_dsl_runs_through_ml_vulkan() {
+        use crate::quantized::k_quants::{BlockQ6K, GgmlType};
+        const E: usize = 4;
+        const N: usize = 2048;
+        const K: usize = 768;
+        const NROWS: usize = 8;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[moe-q6k-dp4a] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        if !dev.has_int_dot8() {
+            eprintln!("[moe-q6k-dp4a] device lacks integer dot-product; skipping");
+            return;
+        }
+        let rows = E * N;
+        let nb = K / 256;
+        let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
+        let mut blocks: Vec<BlockQ6K> = (0..rows * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut wdeq = vec![0f32; rows * K];
+        for r in 0..rows {
+            let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
+            BlockQ6K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+            BlockQ6K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * K..(r + 1) * K]);
+        }
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                blocks.as_ptr() as *const u8,
+                blocks.len() * std::mem::size_of::<BlockQ6K>(),
+            )
+        };
+        let gen_x = |s: usize, i: usize| (((s * 19 + i * 7) % 700) as f32) / 350.0 - 1.0;
+        let x: Vec<f32> = (0..NROWS * K).map(|idx| gen_x(idx / K, idx % K)).collect();
+        let ids: Vec<u32> = (0..NROWS).map(|s| (s % E) as u32).collect();
+        let mut cpu = vec![0f32; NROWS * N];
+        for s in 0..NROWS {
+            let e = ids[s] as usize;
+            for r in 0..N {
+                let wrow = (e * N + r) * K;
+                let mut acc = 0f32;
+                for i in 0..K {
+                    acc += wdeq[wrow + i] * x[s * K + i];
+                }
+                cpu[s * N + r] = acc;
+            }
+        }
+        let bank = dev.quantize_q6k_split(bytes, rows, K).unwrap();
+        let xs = dev.upload_f32(&x).unwrap();
+        let ids_buf = dev.upload_ids(&ids).unwrap();
+        let y = dev
+            .moe_matvec_blk_dp4a_gpu("moe_matvec_q6k_dp4a_blk_dn", false, &bank, &xs, &ids_buf, NROWS, N, K)
+            .unwrap();
+        let got = y.to_vec_f32().unwrap();
+        let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let maxerr = got
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let rel = maxerr / maxref.max(1e-30);
+        eprintln!("[moe-q6k-dp4a] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (dp4a spv via ml dispatch, no-xsum binding set)");
+        assert!(rel < 1e-2, "moe q6k dp4a DSL diverged from CPU: scale_rel={rel:.3e}");
     }
 
     // The committed DSL flash-SDPA .spv (`sdpa_blk`, d=128 nt=64) dispatched through ml's own
