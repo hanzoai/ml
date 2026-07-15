@@ -106,6 +106,10 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // xsum,ids,out. Gated on the device's integer-dot capability (int_dot8).
         "moe_matvec_q4k_dp4a_blk_gu" => include_bytes!("vulkan/spv/moe_matvec_q4k_dp4a_blk_gu.spv"),
         "moe_matvec_q4k_dp4a_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q4k_dp4a_blk_dn.spv"),
+        // DENSE dp4a Q4_K matvec (block-reduce, one workgroup/output row, nt=64): reads the verbatim
+        // packed weight; the m=1 decode fix for the attention projections that the prefill dp4a GEMM
+        // (mul_mat_q4k_dp4a, 1-thread/row) starves. Bindings: wq(packed), xq, xs, xsum, out, meta=[k].
+        "matvec_q4k_dp4a_blk" => include_bytes!("vulkan/spv/matvec_q4k_dp4a_blk.spv"),
         "moe_matvec_q6k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_blk_dn.spv"),
         "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
         "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
@@ -989,6 +993,15 @@ impl VulkanDevice {
         // reference for the bit-exact gate vulkan_q4k_dp4a_decode_matches_scalar).
         if self.inner.int_dot8 && std::env::var_os("VK_DP4A_DECODE_OFF").is_none() {
             let (xq, xs, xsum) = self.quantize_act_q8(x, 1, k)?;
+            // Block-reduce dp4a (one workgroup per output row, nt=64 threads tree-reduce over k) beats
+            // the 1-thread-per-row prefill GEMM at m=1 decode (~3x: 74 -> ~250 GB/s). Reads the verbatim
+            // packed weight; dense (woff==0) only. VK_DP4A_BLK_OFF forces the column kernel for the A/B.
+            if woff == 0 && std::env::var_os("VK_DP4A_BLK_OFF").is_none() {
+                let meta = self.upload_u32(&[k as u32])?;
+                let bufs = [wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer, meta.buffer];
+                self.dispatch_out("matvec_q4k_dp4a_blk", &bufs, 4, &[], (nout as u32, 1, 1))?;
+                return Ok(out);
+            }
             let bufs = [wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer];
             let pushd = push_u32(&[0u32, 1u32, nout as u32, k as u32, woff as u32]);
             self.dispatch(

@@ -604,6 +604,113 @@ pub fn moe_matvec_q4k_dp4a_blk_run<R: Runtime>(
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
 }
 
+/// Interleave the split Q4_K arrays into the verbatim GGUF packed layout (36 u32/superblock:
+/// [d(f16)|dmin(f16), scales(3 u32), qs(32 u32)]) -- the layout the dense QMatMul weight is stored in.
+pub fn pack_q4k(wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32]) -> Vec<u32> {
+    let nblk = wd.len();
+    let mut p = vec![0u32; nblk * 36];
+    for b in 0..nblk {
+        let d = half::f16::from_f32(wd[b]).to_bits() as u32;
+        let dm = half::f16::from_f32(wdm[b]).to_bits() as u32;
+        p[b * 36] = d | (dm << 16);
+        p[b * 36 + 1..b * 36 + 4].copy_from_slice(&wsc[b * 3..b * 3 + 3]);
+        p[b * 36 + 4..b * 36 + 36].copy_from_slice(&wqs[b * 32..b * 32 + 32]);
+    }
+    p
+}
+
+// DENSE dp4a Q4_K matvec: `out[n] = W[n,k] @ x[k]`, W = VERBATIM PACKED GGUF Q4_K (36 u32/superblock),
+// read directly (same buffer the dense QMatMul holds -- no re-split). int8-dot decode: q8 activation,
+// nibbles reinterpret to i8x4, OpSDot; d/dmin unpacked in-kernel (f16lo_to_f32). RUNTIME k -> one .spv
+// per nt for every projection shape. One workgroup per output row, `nt` threads tree-reduce over k --
+// the decode fix for the prefill dp4a GEMM that runs 1-thread-per-row (occupancy-starved at m=1), ~3x.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn matvec_q4k_dp4a_blk<F: Float>(
+    wq: &Array<u32>,   // packed Q4_K, 36 u32/superblock
+    xq: &Array<u32>,   // q8 activation, int8 4/u32, [k/32, 8]
+    xs: &Array<F>,     // per-32-block scale, [k/32]
+    xsum: &Array<F>,   // per-32-block xs*Sum(xq), [k/32]
+    out: &mut Array<F>,
+    meta: &Array<u32>, // [k]
+    #[comptime] nt: usize,
+) {
+    let row = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let k = meta[0] as usize;
+    let nb = k / 256;
+    let nsub = k / 32;
+    let per = (nsub + nt - 1) / nt;
+    let mut partial = F::new(0.0);
+    for j in 0..per {
+        let sb = j * nt + t;
+        if sb < nsub {
+            let sup = sb / 8;
+            let jloc = sb % 8;
+            let bb = (row * nb + sup) * 36; // packed superblock base (u32)
+            let d = F::cast_from(f16lo_to_f32(wq[bb]));
+            let dmin = F::cast_from(f16lo_to_f32(wq[bb] >> 16));
+            let scbase = bb + 1; // scales: 3 u32 after d/dmin
+            let dj = d * F::cast_from(q4k_sc(wq, scbase, jloc));
+            let mj = dmin * F::cast_from(q4k_m(wq, scbase, jloc));
+            let shift = ((jloc % 2) * 4) as u32;
+            let cw = bb + 4 + (jloc / 2) * 8; // qs: 32 u32 after scales; this sub-block's chunk
+            let xg = sb * 8;
+            let mut idot = 0i32;
+            for g in 0..8 {
+                let nibs = (wq[cw + g] >> shift) & 0x0F0F0F0F;
+                let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(nibs));
+                let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(xq[xg + g]));
+                idot += wv.dot(xv);
+            }
+            partial += dj * xs[sb] * F::cast_from(idot) - mj * xsum[sb];
+        }
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        out[row] = smem[0];
+    }
+}
+
+/// Host launch for the dense packed-Q4_K dp4a matvec (activation q8-quantized on the host for the bench).
+pub fn matvec_q4k_dp4a_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32],
+    nout: usize, k: usize, nt: usize,
+) -> Vec<f32> {
+    let packed = pack_q4k(wqs, wsc, wd, wdm);
+    let (xq, xs, xsum) = quant_act_q8_cpu(x, 1, k);
+    let wh = client.create_from_slice(u32::as_bytes(&packed));
+    let xqh = client.create_from_slice(u32::as_bytes(&xq));
+    let xsh = client.create_from_slice(f32::as_bytes(&xs));
+    let xsumh = client.create_from_slice(f32::as_bytes(&xsum));
+    let meta = client.create_from_slice(u32::as_bytes(&[k as u32]));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; nout]));
+    unsafe {
+        matvec_q4k_dp4a_blk::launch_unchecked::<f32, R>(
+            client, Grid::Static(nout as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wh.clone(), packed.len()),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
+            ArrayArg::from_raw_parts(oh.clone(), nout),
+            ArrayArg::from_raw_parts(meta.clone(), 1),
+            nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
 /// Host launch for the block-reduced Q4_K MoE matvec (one workgroup per output, `nt` threads).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q4k_blk_run<R: Runtime>(
