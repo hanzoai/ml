@@ -81,6 +81,13 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_tq2_0" => spv!("mul_mat_vec_tq2_0"),
         "mul_mat_vec_iq4nl" => spv!("mul_mat_vec_iq4nl"),
         "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
+        "moe_matvec_q6k" => spv!("moe_matvec_q6k"),
+        // DSL block-reduced MoE (hanzo-kernel quant::moe_matvec_q{4,6}k_blk, lowered per live shape):
+        // planar bank, one workgroup per output, shared-mem tree reduce. `_gu` = gate/up (k=2048,
+        // nt=64), `_dn` = down (k=768, nt=32). ~2-3x the packed `moe_matvec_q4k` naive path on evo.
+        "moe_matvec_q4k_blk_gu" => include_bytes!("vulkan/spv/moe_matvec_q4k_blk_gu.spv"),
+        "moe_matvec_q4k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q4k_blk_dn.spv"),
+        "moe_matvec_q6k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_blk_dn.spv"),
         "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
         "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
         "flash_attn" => spv!("flash_attn"),
@@ -326,6 +333,13 @@ impl std::fmt::Debug for VulkanStorage {
         )
     }
 }
+
+/// A quantized expert bank de-interleaved into PLANAR field arrays (the layout the DSL block-reduced
+/// MoE kernels bind), in the kernel's parameter order: Q4_K = `[wqs, wsc, wd, wdm]`, Q6_K =
+/// `[wql, wqh, wsc, wd]`. Built once at model load by `quantize_q{4,6}k_split`, held resident and
+/// reused every token via the MoE bank cache. One newtype for both quant types keeps the cache and
+/// dispatch uniform -- the dtype-specific field count lives only in the repack + the .spv.
+pub struct MoeBankSplit(pub Vec<VulkanStorage>);
 
 /// Arguments for [`VulkanDevice::paged_attention_vk`]. All tensors are f32 `VulkanStorage`
 /// except `block_tables`/`context_lens` (u32). Strides are in f32 ELEMENTS. Grouped into a
@@ -1781,6 +1795,121 @@ impl VulkanDevice {
         self.upload_u32(&words)
     }
 
+    /// De-interleave a packed Q4_K expert bank into the PLANAR layout the DSL block kernel
+    /// (`hanzo_kernel::quant::moe_matvec_q4k_blk`) binds: four device arrays instead of one packed
+    /// blob, so `nt` threads read coalesced runs of a single field. Each 144-byte GGUF `block_q4_K`
+    /// (d f16, dmin f16, 12 scale bytes, 128 qs bytes) splits to: `wqs` (32 u32 = the 128 qs bytes),
+    /// `wsc` (3 u32 = the 12 scale bytes), `wd`/`wdm` (f16->f32 of d/dmin). Block order is preserved
+    /// (`(expert*n+r)*nb + b`), so the kernel's `blk = wrow*nb + sup` indexes identically. One-time,
+    /// at model load; the resident bank is reused every token via `cache_or_upload`.
+    pub fn quantize_q4k_split(&self, data: &[u8], rows: usize, k: usize) -> Result<MoeBankSplit> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("quantize_q4k_split: k must be a multiple of 256, got {k}");
+        }
+        let nb = k / 256;
+        let nblk = rows * nb;
+        let want = nblk * 144;
+        if data.len() != want {
+            crate::bail!("quantize_q4k_split: data len {} != {rows}*{nb}*144 = {want}", data.len());
+        }
+        let mut qs = vec![0u32; nblk * 32];
+        let mut sc = vec![0u32; nblk * 3];
+        let mut d = vec![0f32; nblk];
+        let mut dm = vec![0f32; nblk];
+        let rd16 = |b: &[u8]| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        for blk in 0..nblk {
+            let src = &data[blk * 144..blk * 144 + 144];
+            d[blk] = rd16(&src[0..2]);
+            dm[blk] = rd16(&src[2..4]);
+            let scb: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(sc[blk * 3..blk * 3 + 3].as_mut_ptr() as *mut u8, 12) };
+            scb.copy_from_slice(&src[4..16]);
+            let qsb: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(qs[blk * 32..blk * 32 + 32].as_mut_ptr() as *mut u8, 128) };
+            qsb.copy_from_slice(&src[16..144]);
+        }
+        Ok(MoeBankSplit(vec![
+            self.upload_u32(&qs)?,
+            self.upload_u32(&sc)?,
+            self.upload_f32(&d)?,
+            self.upload_f32(&dm)?,
+        ]))
+    }
+
+    /// De-interleave a packed Q6_K expert bank into the planar layout the DSL block kernel
+    /// (`hanzo_kernel::quant::moe_matvec_q6k_blk`) binds. Each 210-byte GGUF `block_q6_K`
+    /// (ql[128], qh[64], scales[16] i8, d f16) splits to: `wql` (32 u32 = ql), `wqh` (16 u32 = qh),
+    /// `wsc` (4 u32 = the 16 signed scale bytes, read sign-extended in-shader), `wd` (f16->f32 d).
+    pub fn quantize_q6k_split(&self, data: &[u8], rows: usize, k: usize) -> Result<MoeBankSplit> {
+        if !k.is_multiple_of(256) {
+            crate::bail!("quantize_q6k_split: k must be a multiple of 256, got {k}");
+        }
+        let nb = k / 256;
+        let nblk = rows * nb;
+        let want = nblk * 210;
+        if data.len() != want {
+            crate::bail!("quantize_q6k_split: data len {} != {rows}*{nb}*210 = {want}", data.len());
+        }
+        let mut ql = vec![0u32; nblk * 32];
+        let mut qh = vec![0u32; nblk * 16];
+        let mut sc = vec![0u32; nblk * 4];
+        let mut d = vec![0f32; nblk];
+        for blk in 0..nblk {
+            let src = &data[blk * 210..blk * 210 + 210];
+            let qlb: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(ql[blk * 32..blk * 32 + 32].as_mut_ptr() as *mut u8, 128) };
+            qlb.copy_from_slice(&src[0..128]);
+            let qhb: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(qh[blk * 16..blk * 16 + 16].as_mut_ptr() as *mut u8, 64) };
+            qhb.copy_from_slice(&src[128..192]);
+            let scb: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(sc[blk * 4..blk * 4 + 4].as_mut_ptr() as *mut u8, 16) };
+            scb.copy_from_slice(&src[192..208]);
+            d[blk] = half::f16::from_bits(u16::from_le_bytes([src[208], src[209]])).to_f32();
+        }
+        Ok(MoeBankSplit(vec![
+            self.upload_u32(&ql)?,
+            self.upload_u32(&qh)?,
+            self.upload_u32(&sc)?,
+            self.upload_f32(&d)?,
+        ]))
+    }
+
+    /// Dispatch a DSL block-reduced MoE matvec (`moe_matvec_q{4,6}k_blk_{gu,dn}`) over a planar
+    /// [`MoeBankSplit`]. ONE workgroup per output element `out[slot*n + r]` (the kernel's `CUBE_POS`),
+    /// `nt` threads baked into the .spv; comptime dims mean NO push constants. Bindings are the bank's
+    /// planar arrays followed by `x` (`[nrows, k]`), `ids` (`[nrows]`), `out` (`[nrows, n]`) -- exactly
+    /// the DSL kernel's parameter order, which cubecl lowered to bindings 0..N.
+    pub fn moe_matvec_blk_gpu(
+        &self,
+        kernel: &'static str,
+        bank: &MoeBankSplit,
+        x: &VulkanStorage,
+        ids: &VulkanStorage,
+        nrows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if x.count < nrows * k {
+            crate::bail!("moe_matvec_blk_gpu: x count {} < nrows*k {}", x.count, nrows * k);
+        }
+        if ids.count < nrows {
+            crate::bail!("moe_matvec_blk_gpu: ids count {} < nrows {nrows}", ids.count);
+        }
+        let out = self.alloc_f32(nrows * n)?;
+        let mut bufs: Vec<vk::Buffer> = bank.0.iter().map(|s| s.buffer).collect();
+        bufs.push(x.buffer);
+        bufs.push(ids.buffer);
+        bufs.push(out.buffer);
+        // One workgroup per output element (workgroup size nt is baked into the .spv). Grid is 2D
+        // (n, nrows): cubecl flattens CUBE_POS = x + y*NumWorkGroups.x = r + slot*n = outrow, which the
+        // kernel maps back to (slot, r). This keeps each grid dimension well under the Vulkan
+        // maxComputeWorkGroupCount ceiling at prefill (nrows = tokens*topk), where a flat (nrows*n,1,1)
+        // would overflow dim 0 and silently drop outputs.
+        self.dispatch(kernel, &bufs, &[], (n as u32, nrows as u32, 1))?;
+        Ok(out)
+    }
+
     /// Q6_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q6k`]. Reads weights
     /// at ~6.5 bits/elem (incl. pad) instead of 32 -- the bandwidth lever for memory-bound decode on
     /// this APU. Decode matches the CPU `BlockQ6K::to_float`.
@@ -3168,6 +3297,12 @@ impl VulkanDevice {
         push: &[u8],
         groups: (u32, u32, u32),
     ) -> Result<()> {
+        // Per-kernel dispatch tally (VK_PROFILE): the decode wall is launch-overhead-bound
+        // (~3266 dispatches/token), so `[VK_OP] <name>` | sort | uniq -c names exactly which unfused
+        // op-chains to collapse first. One line/dispatch, only on the profiling path.
+        if self.inner.profile {
+            eprintln!("[VK_OP] {name}");
+        }
         let p = self.pipeline(name, bufs.len(), push.len())?;
         debug_assert_eq!(
             p.n_buffers,
@@ -3883,21 +4018,22 @@ impl BackendDevice for VulkanDevice {
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let count = shape.elem_count();
-        // Invariant: Vulkan computes in f32; f16/bf16 are represented as f32 and u8 as u32. So
-        // e.g. zeros(bf16) yields an f32 buffer of zeros (zero is the same in any of these reprs).
+        // Invariant: Vulkan computes in f32; f16/bf16 are represented as f32, and the integer index
+        // dtypes (u8, i64) as u32. So zeros(bf16) yields an f32 buffer, zeros(i64) a u32 buffer --
+        // zero is identical in every repr.
         match dtype {
             DType::F32 | DType::F16 | DType::BF16 => self.upload_f32(&vec![0f32; count]),
-            DType::U32 | DType::U8 => self.upload_u32(&vec![0u32; count]),
-            _ => crate::bail!("vulkan: only f32/u32/f16/bf16/u8 supported, got {dtype:?}"),
+            DType::U32 | DType::U8 | DType::I64 | DType::I32 => self.upload_u32(&vec![0u32; count]),
+            _ => crate::bail!("vulkan: only f32/u32/f16/bf16/u8/i64/i32 supported, got {dtype:?}"),
         }
     }
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
-        // Same dtype mapping as zeros_impl: f16/bf16 -> f32 storage, u8 -> u32 storage.
+        // Same dtype mapping as zeros_impl: f16/bf16 -> f32 storage, u8/i64/i32 -> u32 storage.
         match dtype {
             DType::F32 | DType::F16 | DType::BF16 => self.alloc_f32(shape.elem_count()),
-            DType::U32 | DType::U8 => self.alloc_u32(shape.elem_count()),
-            _ => crate::bail!("vulkan: only f32/u32/f16/bf16/u8 supported, got {dtype:?}"),
+            DType::U32 | DType::U8 | DType::I64 | DType::I32 => self.alloc_u32(shape.elem_count()),
+            _ => crate::bail!("vulkan: only f32/u32/f16/bf16/u8/i64/i32 supported, got {dtype:?}"),
         }
     }
 
@@ -3919,8 +4055,14 @@ impl BackendDevice for VulkanDevice {
             }
             // u8 (e.g. boolean attention masks) -> u32: where_cond and casts use u32 on Vulkan.
             CpuStorage::U8(v) => self.upload_u32(&v.iter().map(|&x| x as u32).collect::<Vec<_>>()),
+            // i64/i32 index metadata (paged-attn slot_mapping/block_tables/context_lens, argsort ids)
+            // -> u32: the Vulkan shaders read these as `uint`, and index values fit in u32. `-1 as u32`
+            // = u32::MAX, which is exactly the pad sentinel slot_mapping uses (the shader skips it),
+            // so the coercion is value-preserving for every case the engine produces.
+            CpuStorage::I64(v) => self.upload_u32(&v.iter().map(|&x| x as u32).collect::<Vec<_>>()),
+            CpuStorage::I32(v) => self.upload_u32(&v.iter().map(|&x| x as u32).collect::<Vec<_>>()),
             _ => crate::bail!(
-                "vulkan: only f32/u32/f16/bf16/u8 supported, got {:?}",
+                "vulkan: only f32/u32/f16/bf16/u8/i64/i32 supported, got {:?}",
                 s.dtype()
             ),
         }
@@ -5760,5 +5902,142 @@ mod dsl_dispatch_proof {
             "[softmax-prod] {ROWS}x{M}  kernel {ms:.3} ms ({:.0} GB/s) -- the DSL block kernel is now the production softmax_rows",
             bytes / (ms * 1e6)
         );
+    }
+
+    // The committed DSL block-reduced MoE .spv (`moe_matvec_q4k_blk_gu`, gate/up shape n=768 k=2048)
+    // dispatched through the PRODUCTION path: `quantize_q4k_split` de-interleaves a real packed Q4_K
+    // bank into the planar layout, `moe_matvec_blk_gpu` binds the 7 SSBOs and runs the .spv via ml's
+    // own VulkanDevice. Matches a CPU dequant(to_float)+gather+matvec within f32-reorder tolerance --
+    // proving the repack + registration + dispatch wiring is correct end-to-end (kernel math is
+    // separately bit-exact-verified upstream in hanzo-kernel). Scale-relative metric: the block
+    // reduction sums in a different (valid) order than the sequential CPU dot.
+    #[test]
+    fn moe_q4k_blk_dsl_runs_through_ml_vulkan() {
+        use crate::quantized::k_quants::{BlockQ4K, GgmlType};
+        const E: usize = 4;
+        const N: usize = 768;
+        const K: usize = 2048;
+        const NROWS: usize = 8;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[moe-q4k-blk] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let rows = E * N;
+        let nb = K / 256;
+        let gen_w = |row: usize, i: usize| (((row * 13 + i * 7) % 1000) as f32) / 500.0 - 1.0;
+        // Quantize each weight row to Q4_K, and dequantize it back for the CPU reference.
+        let mut blocks: Vec<BlockQ4K> = (0..rows * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut wdeq = vec![0f32; rows * K];
+        for r in 0..rows {
+            let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
+            BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+            BlockQ4K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * K..(r + 1) * K]);
+        }
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                blocks.as_ptr() as *const u8,
+                blocks.len() * std::mem::size_of::<BlockQ4K>(),
+            )
+        };
+        let gen_x = |s: usize, i: usize| (((s * 17 + i * 3) % 800) as f32) / 400.0 - 1.0;
+        let x: Vec<f32> = (0..NROWS * K).map(|idx| gen_x(idx / K, idx % K)).collect();
+        let ids: Vec<u32> = (0..NROWS).map(|s| (s % E) as u32).collect();
+        let mut cpu = vec![0f32; NROWS * N];
+        for s in 0..NROWS {
+            let e = ids[s] as usize;
+            for r in 0..N {
+                let wrow = (e * N + r) * K;
+                let mut acc = 0f32;
+                for i in 0..K {
+                    acc += wdeq[wrow + i] * x[s * K + i];
+                }
+                cpu[s * N + r] = acc;
+            }
+        }
+        let bank = dev.quantize_q4k_split(bytes, rows, K).unwrap();
+        let xs = dev.upload_f32(&x).unwrap();
+        let ids_buf = dev.upload_ids(&ids).unwrap();
+        let y = dev
+            .moe_matvec_blk_gpu("moe_matvec_q4k_blk_gu", &bank, &xs, &ids_buf, NROWS, N, K)
+            .unwrap();
+        let got = y.to_vec_f32().unwrap();
+        let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let maxerr = got
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let rel = maxerr / maxref.max(1e-30);
+        eprintln!("[moe-q4k-blk] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (DSL blk spv via ml dispatch + split repack)");
+        assert!(rel < 1e-3, "moe q4k blk DSL diverged from CPU: scale_rel={rel:.3e}");
+    }
+
+    // Twin of the Q4_K proof for the committed `moe_matvec_q6k_blk_dn` .spv (down shape n=2048 k=768):
+    // `quantize_q6k_split` de-interleaves the packed Q6_K bank (ql/qh/i8-scales/d) into the planar
+    // arrays the DSL kernel binds, dispatched via ml's VulkanDevice, matched to CPU dequant+matvec.
+    #[test]
+    fn moe_q6k_blk_dsl_runs_through_ml_vulkan() {
+        use crate::quantized::k_quants::{BlockQ6K, GgmlType};
+        const E: usize = 4;
+        const N: usize = 2048;
+        const K: usize = 768;
+        const NROWS: usize = 8;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[moe-q6k-blk] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let rows = E * N;
+        let nb = K / 256;
+        let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
+        let mut blocks: Vec<BlockQ6K> = (0..rows * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut wdeq = vec![0f32; rows * K];
+        for r in 0..rows {
+            let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
+            BlockQ6K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+            BlockQ6K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * K..(r + 1) * K]);
+        }
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                blocks.as_ptr() as *const u8,
+                blocks.len() * std::mem::size_of::<BlockQ6K>(),
+            )
+        };
+        let gen_x = |s: usize, i: usize| (((s * 19 + i * 7) % 700) as f32) / 350.0 - 1.0;
+        let x: Vec<f32> = (0..NROWS * K).map(|idx| gen_x(idx / K, idx % K)).collect();
+        let ids: Vec<u32> = (0..NROWS).map(|s| (s % E) as u32).collect();
+        let mut cpu = vec![0f32; NROWS * N];
+        for s in 0..NROWS {
+            let e = ids[s] as usize;
+            for r in 0..N {
+                let wrow = (e * N + r) * K;
+                let mut acc = 0f32;
+                for i in 0..K {
+                    acc += wdeq[wrow + i] * x[s * K + i];
+                }
+                cpu[s * N + r] = acc;
+            }
+        }
+        let bank = dev.quantize_q6k_split(bytes, rows, K).unwrap();
+        let xs = dev.upload_f32(&x).unwrap();
+        let ids_buf = dev.upload_ids(&ids).unwrap();
+        let y = dev
+            .moe_matvec_blk_gpu("moe_matvec_q6k_blk_dn", &bank, &xs, &ids_buf, NROWS, N, K)
+            .unwrap();
+        let got = y.to_vec_f32().unwrap();
+        let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let maxerr = got
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let rel = maxerr / maxref.max(1e-30);
+        eprintln!("[moe-q6k-blk] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (DSL blk spv via ml dispatch + split repack)");
+        assert!(rel < 1e-3, "moe q6k blk DSL diverged from CPU: scale_rel={rel:.3e}");
     }
 }
