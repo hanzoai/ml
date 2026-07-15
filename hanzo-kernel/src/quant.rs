@@ -465,6 +465,145 @@ pub fn moe_matvec_q4k_blk<F: Float>(
     }
 }
 
+// dp4a twin of `moe_matvec_q4k_blk`: same expert-gather + block/reduce skeleton, but the activation
+// is pre-quantized to int8 (q8_1: xq int8 4/u32, xs scale, xsum = xs*Sum(xq) per 32-block) and the
+// 32-wide f32 MAC becomes 8 hardware int8 dot-products (OpSDot). Q4_K nibbles are 0..15 -> reinterpret
+// a masked u32 of 4 packed nibbles as a non-negative i8x4 (llama's mmvq trick), widen to i32x4, .dot
+// the signed-i8 activation lane-for-lane. Affine apply is the same identity as the scalar path:
+// Sum (d*q4 - m)*x = d*xs*dot(q4,xq) - m*xsum. int8 dot is faster ALU than f32 decode+MAC at equal
+// (4-bit) weight bandwidth -> the decode-perf lever. Gated on the device's integer-dot capability.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q4k_dp4a_blk<F: Float>(
+    wqs: &Array<u32>,
+    wsc: &Array<u32>,
+    wd: &Array<F>,
+    wdm: &Array<F>,
+    xq: &Array<u32>,   // q8 activation, int8 packed 4/u32, [slots, k/32, 8]
+    xs: &Array<F>,     // per-32-block activation scale, [slots, k/32]
+    xsum: &Array<F>,   // per-32-block xs*Sum(xq), [slots, k/32]
+    ids: &Array<u32>,
+    out: &mut Array<F>,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+    #[comptime] nt: usize,
+) {
+    let outrow = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let slot = outrow / n;
+    let r = outrow % n;
+    let wrow = ids[slot] as usize * n + r;
+    let nb = k / 256;
+    let nsub = k / 32;
+    let per = (nsub + nt - 1) / nt;
+    let mut partial = F::new(0.0);
+    for j in 0..per {
+        let sb = j * nt + t;
+        if sb < nsub {
+            let sup = sb / 8;
+            let jloc = sb % 8;
+            let blk = wrow * nb + sup;
+            let qbase = blk * 32; // u32 base of this super-block's 128 qs bytes
+            let scbase = blk * 3;
+            let dj = wd[blk] * F::cast_from(q4k_sc(wsc, scbase, jloc));
+            let mj = wdm[blk] * F::cast_from(q4k_m(wsc, scbase, jloc));
+            let shift = ((jloc % 2) * 4) as u32; // 0 = low nibble, 4 = high
+            let cw = qbase + (jloc / 2) * 8; // 8 u32 = the 32 qs bytes of this sub-block's chunk
+            let xg = (slot * nsub + sb) * 8; // activation group base (weight sub-block sb == act 32-block sb)
+            let mut idot = 0i32;
+            for g in 0..8 {
+                let nibs = (wqs[cw + g] >> shift) & 0x0F0F0F0F; // 4 nibbles as 4 bytes (0..15, +ve i8)
+                let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(nibs));
+                let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(xq[xg + g]));
+                idot += wv.dot(xv); // OpSDot: 4 int8 products -> i32
+            }
+            let xi = slot * nsub + sb;
+            partial += dj * xs[xi] * F::cast_from(idot) - mj * xsum[xi];
+        }
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        out[outrow] = smem[0];
+    }
+}
+
+/// CPU q8_1 activation quant matching `quantize_act_q8.comp`: per 32-block, symmetric int8 (amax/127),
+/// packed 4/u32 little-endian; returns (xq, xs, xsum) with xsum = scale*Sum(xq). Used by the dp4a run.
+pub fn quant_act_q8_cpu(x: &[f32], slots: usize, k: usize) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+    let kb = k / 32;
+    let mut xq = vec![0u32; slots * kb * 8];
+    let mut xs = vec![0f32; slots * kb];
+    let mut xsum = vec![0f32; slots * kb];
+    for s in 0..slots {
+        for b in 0..kb {
+            let base = s * k + b * 32;
+            let amax = (0..32).fold(0f32, |m, i| m.max(x[base + i].abs()));
+            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            let gid = s * kb + b;
+            let mut isum = 0i32;
+            for j in 0..8 {
+                let mut word = 0u32;
+                for l in 0..4 {
+                    let q = (x[base + j * 4 + l] * inv).round().clamp(-127.0, 127.0) as i32;
+                    isum += q;
+                    word |= ((q as u32) & 0xFF) << (l * 8);
+                }
+                xq[gid * 8 + j] = word;
+            }
+            xs[gid] = scale;
+            xsum[gid] = scale * isum as f32;
+        }
+    }
+    (xq, xs, xsum)
+}
+
+/// Host launch for the dp4a Q4_K MoE matvec (activation q8-quantized on the host for the bench).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q4k_dp4a_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize, nt: usize,
+) -> Vec<f32> {
+    let (xq, xs, xsum) = quant_act_q8_cpu(x, slots, k);
+    let qh = client.create_from_slice(u32::as_bytes(wqs));
+    let sh = client.create_from_slice(u32::as_bytes(wsc));
+    let dh = client.create_from_slice(f32::as_bytes(wd));
+    let mh = client.create_from_slice(f32::as_bytes(wdm));
+    let xqh = client.create_from_slice(u32::as_bytes(&xq));
+    let xsh = client.create_from_slice(f32::as_bytes(&xs));
+    let xsumh = client.create_from_slice(f32::as_bytes(&xsum));
+    let ih = client.create_from_slice(u32::as_bytes(ids));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
+    unsafe {
+        moe_matvec_q4k_dp4a_blk::launch_unchecked::<f32, R>(
+            client, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(mh.clone(), wdm.len()),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k, nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
 /// Host launch for the block-reduced Q4_K MoE matvec (one workgroup per output, `nt` threads).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q4k_blk_run<R: Runtime>(
