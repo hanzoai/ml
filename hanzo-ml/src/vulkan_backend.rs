@@ -111,6 +111,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // (mul_mat_q4k_dp4a, 1-thread/row) starves. Bindings: wq(packed), xq, xs, xsum, out, meta=[k].
         "matvec_q4k_dp4a_blk" => include_bytes!("vulkan/spv/matvec_q4k_dp4a_blk.spv"),
         "moe_matvec_q6k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_blk_dn.spv"),
+        "moe_matvec_q6k_dp4a_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_dp4a_blk_dn.spv"),
         "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
         "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
         "flash_attn" => spv!("flash_attn"),
@@ -400,6 +401,10 @@ pub struct VkGraph {
     fence: vk::Fence,
     n_dispatch: u32,
     device: VulkanDevice,
+    /// The pool buffers reserved during this graph's capture (its recorded descriptors bake their
+    /// handles). Owned for the graph's lifetime; drop returns them to the pool's `pending` list so a
+    /// retired graph's working set is recycled instead of stranded (see BufPool).
+    reserved: Vec<(u64, PooledBuf)>,
 }
 
 // Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex (replay)
@@ -442,12 +447,21 @@ impl Drop for VkGraph {
     fn drop(&mut self) {
         let dev = self.device.dev();
         unsafe {
-            // Quiesce the device so no in-flight replay reads the buffer/fence we are destroying.
-            let _ = dev.device_wait_idle();
-            dev.destroy_fence(self.fence, None);
+            // The teardown runs under the submitter lock: queue access (device_wait_idle waits every
+            // queue) must be externally synchronized with eager submits, which makes dropping a graph
+            // sound from any thread. The engine retires graphs at capture points, so this cost never
+            // lands on a first token.
             if let Ok(s) = self.device.inner.submitter.lock() {
+                let _ = dev.device_wait_idle();
+                dev.destroy_fence(self.fence, None);
                 dev.free_command_buffers(s.cpool, &[self.cmd]);
             }
+        }
+        // Return the capture-reserved working set to the pool. The device was just quiesced and the
+        // recorded commands that baked these handles no longer exist, so recycling is safe; `pending`
+        // keeps the conservative post-fence reclaim flow.
+        if let Ok(mut pool) = self.device.inner.bufpool.lock() {
+            pool.pending.append(&mut self.reserved);
         }
     }
 }
@@ -588,12 +602,15 @@ struct BufPool {
     // into its recorded descriptors; on every replay it reads/writes those exact buffers. If such a
     // buffer were dropped back into `pending`/`free` and later handed to an unrelated allocation, the
     // replay would alias — and corrupt — live tensor storage: the fluent-but-stale decode loop. While
-    // `capture_depth > 0`, a dropped buffer is instead parked in `reserved` (kept alive, never
-    // recycled) so no later allocation can reuse a handle the in-flight graph captured. Reserved
-    // buffers stay reserved for the process; the decode graph cache is bounded and each bucket's
-    // working set is captured once, so this is a fixed one-time reservation, not a growing leak.
+    // `capture_depth > 0`, a dropped buffer is instead parked in `reserved` (bucket key kept for its
+    // later return) so no later allocation can reuse a handle the in-flight graph captured. The
+    // reservation follows the GRAPH's lifetime, not the process's: `end_graph_capture` moves this
+    // era's reservations into the returned `VkGraph`, whose drop hands them back to `pending`.
+    // Without that return, every recapture (sequences retire graphs on the naive KV cache) would
+    // strand a full transient working set here — an unbounded leak that also forces each new
+    // sequence to allocate a fresh working set instead of reusing the pool.
     capture_depth: usize,
-    reserved: Vec<PooledBuf>,
+    reserved: Vec<(u64, PooledBuf)>,
 }
 
 // drop: park (size, buffer, memory) for reuse after the next fence. No Vulkan calls here, just
@@ -613,12 +630,13 @@ impl Drop for VulkanStorage {
                 host_visible: self.host_visible,
             };
             // During a command-graph capture, this handle may be baked into the graph; reserve it
-            // (never recycle) so no later allocation aliases the graph's storage on replay. Gating at
-            // drop time (not alloc time) is correct and needs no per-storage flag: every buffer the
-            // capture touches and then releases is dropped while `capture_depth > 0`; buffers the
-            // engine keeps live across the graph (weights, KV cache, logits) never hit this path.
+            // (recycled only when the graph is torn down) so no later allocation aliases the graph's
+            // storage on replay. Gating at drop time (not alloc time) is correct and needs no
+            // per-storage flag: every buffer the capture touches and then releases is dropped while
+            // `capture_depth > 0`; buffers the engine keeps live across the graph (weights, KV cache,
+            // logits) never hit this path.
             if pool.capture_depth > 0 {
-                pool.reserved.push(pooled);
+                pool.reserved.push((bytes, pooled));
             } else {
                 pool.pending.push((bytes, pooled));
             }
@@ -2098,11 +2116,15 @@ impl VulkanDevice {
     }
 
     /// dp4a twin of `moe_matvec_blk_gpu`: quantize the activation to q8 ONCE (reused across all n
-    /// outputs), then dispatch the int8-dot MoE kernel. Same split bank + 2D (n, nrows) grid. Bindings:
-    /// wqs,wsc,wd,wdm (bank), xq,xs,xsum (q8 activation), ids, out.
+    /// outputs), then dispatch the int8-dot MoE kernel. Same split bank + 2D (n, nrows) grid. Bindings
+    /// follow the kernel's parameter order: bank arrays, then xq,xs[,xsum],ids,out — `with_xsum` says
+    /// whether the kernel folds its bias against the per-32 activation sums (Q4_K's dmin fold) or
+    /// derives its own half-block sums in-register (Q6_K's −32 fold), i.e. whether xsum is a binding.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_matvec_blk_dp4a_gpu(
         &self,
         kernel: &'static str,
+        with_xsum: bool,
         bank: &MoeBankSplit,
         x: &VulkanStorage,
         ids: &VulkanStorage,
@@ -2121,7 +2143,9 @@ impl VulkanDevice {
         let mut bufs: Vec<vk::Buffer> = bank.0.iter().map(|s| s.buffer).collect();
         bufs.push(xq.buffer);
         bufs.push(xs.buffer);
-        bufs.push(xsum.buffer);
+        if with_xsum {
+            bufs.push(xsum.buffer);
+        }
         bufs.push(ids.buffer);
         bufs.push(out.buffer);
         self.dispatch(kernel, &bufs, &[], (n as u32, nrows as u32, 1))?;
@@ -3935,7 +3959,13 @@ impl VulkanDevice {
             s.written_since_barrier.clear();
             (cmd, n)
         };
-        self.inner.bufpool.lock().unwrap().capture_depth -= 1;
+        // This capture era's reservations transfer to the graph (captures never nest: begin bails on
+        // an in-flight capture), so tearing the graph down returns exactly its own working set.
+        let reserved = {
+            let mut pool = self.inner.bufpool.lock().unwrap();
+            pool.capture_depth -= 1;
+            std::mem::take(&mut pool.reserved)
+        };
         // A dedicated fence per graph so replays of distinct graphs never contend on one fence.
         let fence = unsafe {
             dev.create_fence(&vk::FenceCreateInfo::default(), None)
@@ -3946,6 +3976,7 @@ impl VulkanDevice {
             fence,
             n_dispatch: n,
             device: self.clone(),
+            reserved,
         })
     }
 
@@ -3969,6 +4000,10 @@ impl VulkanDevice {
         drop(s);
         let mut pool = self.inner.bufpool.lock().unwrap();
         pool.capture_depth = pool.capture_depth.saturating_sub(1);
+        // Nothing was baked (the capture buffer was freed unsubmitted), so this era's reservations
+        // are plain droppable transients again; return them for post-fence reclaim.
+        let mut reserved = std::mem::take(&mut pool.reserved);
+        pool.pending.append(&mut reserved);
     }
 
     // Move buffers dropped before this point into the reuse pool. Sound only right after a
@@ -4048,7 +4083,7 @@ impl VulkanDevice {
             };
             // Reserve rather than recycle while a graph capture is in flight (see VulkanStorage::drop).
             if pool.capture_depth > 0 {
-                pool.reserved.push(pooled);
+                pool.reserved.push((bytes, pooled));
             } else {
                 pool.pending.push((bytes, pooled));
             }
@@ -6691,6 +6726,79 @@ mod dsl_dispatch_proof {
         let rel = maxerr / maxref.max(1e-30);
         eprintln!("[moe-q6k-blk] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (DSL blk spv via ml dispatch + split repack)");
         assert!(rel < 1e-3, "moe q6k blk DSL diverged from CPU: scale_rel={rel:.3e}");
+    }
+
+    // dp4a twin of the Q6_K proof: same split bank and shape, dispatched through
+    // `moe_matvec_blk_dp4a_gpu` with `with_xsum = false` (Q6_K derives its half-block activation sums
+    // in-register, so xsum is not a binding). This gates the GLUE — bank order + the no-xsum binding
+    // set — against CPU dequant+matvec; the kernel itself is gated bit-tight in hanzo-kernel's
+    // matvec-check. Tolerance is 1e-2 scale-relative: the q8 activation round-trip is the only
+    // approximation, and a binding/order bug lands orders of magnitude outside it.
+    #[test]
+    fn moe_q6k_dp4a_blk_dsl_runs_through_ml_vulkan() {
+        use crate::quantized::k_quants::{BlockQ6K, GgmlType};
+        const E: usize = 4;
+        const N: usize = 2048;
+        const K: usize = 768;
+        const NROWS: usize = 8;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[moe-q6k-dp4a] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        if !dev.has_int_dot8() {
+            eprintln!("[moe-q6k-dp4a] device lacks integer dot-product; skipping");
+            return;
+        }
+        let rows = E * N;
+        let nb = K / 256;
+        let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
+        let mut blocks: Vec<BlockQ6K> = (0..rows * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut wdeq = vec![0f32; rows * K];
+        for r in 0..rows {
+            let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
+            BlockQ6K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+            BlockQ6K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * K..(r + 1) * K]);
+        }
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                blocks.as_ptr() as *const u8,
+                blocks.len() * std::mem::size_of::<BlockQ6K>(),
+            )
+        };
+        let gen_x = |s: usize, i: usize| (((s * 19 + i * 7) % 700) as f32) / 350.0 - 1.0;
+        let x: Vec<f32> = (0..NROWS * K).map(|idx| gen_x(idx / K, idx % K)).collect();
+        let ids: Vec<u32> = (0..NROWS).map(|s| (s % E) as u32).collect();
+        let mut cpu = vec![0f32; NROWS * N];
+        for s in 0..NROWS {
+            let e = ids[s] as usize;
+            for r in 0..N {
+                let wrow = (e * N + r) * K;
+                let mut acc = 0f32;
+                for i in 0..K {
+                    acc += wdeq[wrow + i] * x[s * K + i];
+                }
+                cpu[s * N + r] = acc;
+            }
+        }
+        let bank = dev.quantize_q6k_split(bytes, rows, K).unwrap();
+        let xs = dev.upload_f32(&x).unwrap();
+        let ids_buf = dev.upload_ids(&ids).unwrap();
+        let y = dev
+            .moe_matvec_blk_dp4a_gpu("moe_matvec_q6k_dp4a_blk_dn", false, &bank, &xs, &ids_buf, NROWS, N, K)
+            .unwrap();
+        let got = y.to_vec_f32().unwrap();
+        let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let maxerr = got
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let rel = maxerr / maxref.max(1e-30);
+        eprintln!("[moe-q6k-dp4a] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (dp4a spv via ml dispatch, no-xsum binding set)");
+        assert!(rel < 1e-2, "moe q6k dp4a DSL diverged from CPU: scale_rel={rel:.3e}");
     }
 
     // The committed DSL flash-SDPA .spv (`sdpa_blk`, d=128 nt=64) dispatched through ml's own
