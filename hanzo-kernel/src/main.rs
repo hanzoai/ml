@@ -595,6 +595,10 @@ fn main() {
         check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dproj", &c, 2048, 4096, 64);
         check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dproj", &c, 2048, 4096, 128);
         check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dproj", &c, 512, 2048, 64);
+        // CACHE-COLD: 32768x2048 = 32MB weights (busts the 32MB MALL) -> the REAL in-engine GTT BW.
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/cold", &c, 32768, 2048, 32);
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/cold", &c, 32768, 2048, 64);
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/cold", &c, 32768, 2048, 128);
         check_moe_q6k::<WgpuRuntime>("VULKAN", &c, 128, 768, 8, 2048); // ffn_down_exps are Q6_K in Q4_K_M
         check_moe_q6k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 32);
         check_moe_q6k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 64);
