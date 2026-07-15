@@ -109,6 +109,175 @@ pub fn sdpa_run<R: Runtime>(
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
 }
 
+/// Block (workgroup)-per-(head,query) GQA flash SDPA. Threads split the keys; each runs an online
+/// (flash) softmax over its key slice into a per-thread (m, l, acc[d]) state, then the workgroup
+/// combines those partials with the flash rescale (global max, exp-weighted l/acc). This is the decode
+/// occupancy cure for `sdpa` (which is one thread per (head,query) -> one thread streams the entire
+/// head serially). GQA-native (reads the shared KV head, no repeat_kv), single-pass, numerically the
+/// same online softmax as `sdpa`. `nt` = threads/workgroup (power of 2). GPU-only (cooperative block).
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn sdpa_blk<F: Float>(
+    q: &Array<F>,
+    k: &Array<F>,
+    v: &Array<F>,
+    out: &mut Array<F>,
+    scale: &Array<F>,
+    meta: &Array<u32>, // [seq_q, seq_k, n_heads, n_kv, causal, kv_batch_stride, kv_head_stride, key_stride]
+    #[comptime] d: usize,
+    #[comptime] nt: usize,
+) {
+    let row = CUBE_POS as usize; // (batch, head, query) over b * n_heads * seq_q
+    let t = UNIT_POS as usize;
+    let sc = scale[0];
+    let seq_q = meta[0] as usize;
+    let seq_k = meta[1] as usize;
+    let n_heads = meta[2] as usize;
+    let n_kv = meta[3] as usize;
+    let causal = meta[4];
+    // KV strides (in elements): the cache is a max_seq-sized buffer sliced to seq_k, so k/v reach the
+    // kernel STRIDED (kv_head_stride = max_seq*d, not seq_k*d). Reading them in place with these
+    // strides removes the per-layer .contiguous() copy of the whole active cache -- the dominant
+    // decode cost. `d` is always the innermost contiguous dim (element stride 1).
+    let kv_batch_stride = meta[5] as usize;
+    let kv_head_stride = meta[6] as usize;
+    let key_stride = meta[7] as usize;
+    // Decompose the flat workgroup index into (batch, head, query); GQA maps head -> shared kv head.
+    let hq = n_heads * seq_q;
+    let b_i = row / hq;
+    let rem = row - b_i * hq;
+    let h = rem / seq_q;
+    let qpos = rem % seq_q;
+    let kv = h / (n_heads / n_kv);
+    let qbase = row * d; // q is [b, n_heads, seq_q, d] contiguous
+    let kvbase = b_i * kv_batch_stride + kv * kv_head_stride; // k/v read in place at their real strides
+    // Per-thread online-softmax state over this thread's strided key slice.
+    let mut m = F::new(-3.4e38);
+    let mut l = F::new(0.0);
+    let mut acc = Array::<F>::new(d);
+    for dd in 0..d {
+        acc[dd] = F::new(0.0);
+    }
+    let mut kk = t;
+    while kk < seq_k {
+        let masked = causal == 1 && kk > qpos;
+        if !masked {
+            let kbase = kvbase + kk * key_stride;
+            let mut score = F::new(0.0);
+            for dd in 0..d {
+                score += q[qbase + dd] * k[kbase + dd];
+            }
+            score *= sc;
+            let mut new_m = m;
+            if score > new_m {
+                new_m = score;
+            }
+            let corr = (m - new_m).exp();
+            let p = (score - new_m).exp();
+            l = l * corr + p;
+            for dd in 0..d {
+                let av = acc[dd];
+                acc[dd] = av * corr + p * v[kbase + dd];
+            }
+            m = new_m;
+        }
+        kk += nt;
+    }
+    // Workgroup combine of the per-thread (m, l, acc[d]) partials, flash-style (tree reduce).
+    let mut sm = SharedMemory::<F>::new(nt);
+    let mut sl = SharedMemory::<F>::new(nt);
+    let mut sacc = SharedMemory::<F>::new(nt * d);
+    sm[t] = m;
+    sl[t] = l;
+    for dd in 0..d {
+        sacc[t * d + dd] = acc[dd];
+    }
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let mo = sm[(UNIT_POS + stride) as usize];
+            let lo = sl[(UNIT_POS + stride) as usize];
+            let mc = sm[t];
+            let lc = sl[t];
+            let mut gm = mc;
+            if mo > gm {
+                gm = mo;
+            }
+            let ca = (mc - gm).exp();
+            let cb = (mo - gm).exp();
+            sm[t] = gm;
+            sl[t] = lc * ca + lo * cb;
+            let obase = ((UNIT_POS + stride) as usize) * d;
+            for dd in 0..d {
+                let a = sacc[t * d + dd];
+                let b = sacc[obase + dd];
+                sacc[t * d + dd] = a * ca + b * cb;
+            }
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        let ll = sl[0];
+        for dd in 0..d {
+            out[qbase + dd] = sacc[dd] / ll;
+        }
+    }
+}
+
+/// Host launch for the block flash SDPA (one workgroup per (head,query), `nt` threads split the keys).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_heads: usize,
+    n_kv: usize,
+    seq_q: usize,
+    seq_k: usize,
+    kv_seq_pad: usize, // physical seq dim of the k/v buffers (>= seq_k); models the max_seq-sized cache
+    d: usize,
+    causal: bool,
+    nt: usize,
+) -> Vec<f32> {
+    let scale = 1.0f32 / (d as f32).sqrt();
+    // KV strides for a [b, n_kv, kv_seq_pad, d] contiguous buffer read as [b, n_kv, seq_k, d]: heads are
+    // kv_seq_pad*d apart (the padding gap), keys d apart, d contiguous. kv_seq_pad==seq_k is the packed case.
+    let meta = [
+        seq_q as u32,
+        seq_k as u32,
+        n_heads as u32,
+        n_kv as u32,
+        causal as u32,
+        (n_kv * kv_seq_pad * d) as u32,
+        (kv_seq_pad * d) as u32,
+        d as u32,
+    ];
+    let qh = client.create_from_slice(f32::as_bytes(q));
+    let kh = client.create_from_slice(f32::as_bytes(k));
+    let vh = client.create_from_slice(f32::as_bytes(v));
+    let sh = client.create_from_slice(f32::as_bytes(&[scale]));
+    let mh = client.create_from_slice(u32::as_bytes(&meta));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n_heads * seq_q * d]));
+    unsafe {
+        sdpa_blk::launch_unchecked::<f32, R>(
+            client,
+            Grid::Static((n_heads * seq_q) as u32, 1, 1),
+            Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qh.clone(), q.len()),
+            ArrayArg::from_raw_parts(kh.clone(), k.len()),
+            ArrayArg::from_raw_parts(vh.clone(), v.len()),
+            ArrayArg::from_raw_parts(oh.clone(), n_heads * seq_q * d),
+            ArrayArg::from_raw_parts(sh.clone(), 1),
+            ArrayArg::from_raw_parts(mh.clone(), 8),
+            d,
+            nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
 /// CPU oracle: full-precision two-pass softmax attention, the reference the DSL kernel is gated against.
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_ref(

@@ -1786,6 +1786,34 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
             return Ok((ids_t, w_t));
         }
     }
+    // Fused Vulkan router (one workgroup/token, softmax + top-k in shared mem) for the committed .spv
+    // shape (E=128, top-8) with norm_topk_prob; replaces the generic softmax+sort+gather op-chain and
+    // its per-op layout copies. Other shapes / norm=false fall through to the generic path below.
+    #[cfg(feature = "vulkan")]
+    if let Device::Vulkan(vdev) = logits.device() {
+        if norm && n_experts == 128 && topk == 8 {
+            let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
+            let (lg_store, _) = logits_c.storage_and_layout();
+            let lv = match &*lg_store {
+                Storage::Vulkan(v) => v,
+                _ => crate::bail!("moe_route: logits not on vulkan after contiguous()"),
+            };
+            let (ids, w) = vdev.moe_route_vk(lv, ntok, n_experts, topk)?;
+            let ids_t = crate::tensor::from_storage(
+                Storage::Vulkan(ids),
+                (ntok, topk),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            let w_t = crate::tensor::from_storage(
+                Storage::Vulkan(w),
+                (ntok, topk),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            return Ok((ids_t, w_t));
+        }
+    }
     let lf = logits.to_dtype(DType::F32)?;
     let mx = lf.max_keepdim(D::Minus1)?;
     let e = lf.broadcast_sub(&mx)?.exp()?;
