@@ -85,6 +85,10 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // DSL block-reduced MoE (hanzo-kernel quant::moe_matvec_q{4,6}k_blk, lowered per live shape):
         // planar bank, one workgroup per output, shared-mem tree reduce. `_gu` = gate/up (k=2048,
         // nt=64), `_dn` = down (k=768, nt=32). ~2-3x the packed `moe_matvec_q4k` naive path on evo.
+        // DSL fused MoE top-k router (hanzo-kernel quant::moe_route, E=128 top-8): one workgroup per
+        // token does softmax + top-k in shared memory, replacing the ~11-dispatch softmax+sort+gather
+        // op-chain. Bindings: logits(0), ids_out(1), w_out(2).
+        "moe_route" => include_bytes!("vulkan/spv/moe_route.spv"),
         "moe_matvec_q4k_blk_gu" => include_bytes!("vulkan/spv/moe_matvec_q4k_blk_gu.spv"),
         "moe_matvec_q4k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q4k_blk_dn.spv"),
         "moe_matvec_q6k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_blk_dn.spv"),
@@ -1908,6 +1912,30 @@ impl VulkanDevice {
         // would overflow dim 0 and silently drop outputs.
         self.dispatch(kernel, &bufs, &[], (n as u32, nrows as u32, 1))?;
         Ok(out)
+    }
+
+    /// Fused MoE top-k router: `logits[ntok, n_experts]` -> (ids[ntok, topk] u32, weights[ntok, topk]
+    /// f32), softmax + top-k + renormalize in ONE kernel (the DSL `moe_route` .spv, one workgroup per
+    /// token). Replaces the generic softmax_last_dim + sort_last_dim + narrow + gather + norm op-chain
+    /// (~11 dispatches/layer, each with a layout copy). The .spv bakes n_experts/topk/nt, so the caller
+    /// must match the committed shape (E=128, top-8, nt=128).
+    pub fn moe_route_vk(
+        &self,
+        logits: &VulkanStorage,
+        ntok: usize,
+        n_experts: usize,
+        topk: usize,
+    ) -> Result<(VulkanStorage, VulkanStorage)> {
+        if logits.count < ntok * n_experts {
+            crate::bail!("moe_route_vk: logits count {} < ntok*n_experts {}", logits.count, ntok * n_experts);
+        }
+        let ids = self.alloc_u32(ntok * topk)?;
+        let w = self.alloc_f32(ntok * topk)?;
+        // Bindings match the kernel param order: logits(0), ids_out(1), w_out(2). No push (comptime
+        // dims). One workgroup per token; two outputs (ids, weights) for the RAW-hazard tracking.
+        let bufs = [logits.buffer, ids.buffer, w.buffer];
+        self.dispatch_outs("moe_route", &bufs, &[1, 2], &[], (ntok as u32, 1, 1))?;
+        Ok((ids, w))
     }
 
     /// Q6_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q6k`]. Reads weights
