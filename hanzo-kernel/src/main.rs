@@ -12,7 +12,8 @@ use hanzo_kernel::quant::{
     moe_matvec_q4k_bench, moe_matvec_q4k_blk_bench, moe_matvec_q4k_blk_run, moe_matvec_q4k_ref, moe_matvec_q4k_run,
     moe_matvec_q6k_bench, moe_matvec_q6k_blk_bench, moe_matvec_q6k_blk_run, moe_matvec_q6k_ref, moe_matvec_q6k_run,
     moe_route, moe_route_ref, moe_route_run, gemv, gemv_run,
-    moe_matvec_q4k_dp4a_blk, moe_matvec_q4k_dp4a_blk_run, quant_act_q8_cpu, QK8_0,
+    moe_matvec_q4k_dp4a_blk, moe_matvec_q4k_dp4a_blk_run, quant_act_q8_cpu,
+    matvec_q4k_dp4a_blk, matvec_q4k_dp4a_blk_run, pack_q4k, QK8_0,
 };
 use std::time::Instant;
 use hanzo_kernel::norm::rms_norm_run;
@@ -109,6 +110,48 @@ fn check_moe_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n:
 
 // Block-reduced Q4_K MoE matvec: the decode-perf lever (one workgroup per output, shared-mem reduce).
 // scale-relative gate vs the naive-order oracle (block reduce reorders the f32 sum) + throughput.
+// Dense dp4a Q4_K matvec (block-reduce) vs the f32 oracle. The decode-perf fix for the attention
+// projections that the prefill dp4a GEMM runs 1-thread-per-row. Kernel-only GB/s on the real 144 B/
+// superblock weight footprint -- directly comparable to the scalar/prefill dp4a paths.
+fn check_matvec_q4k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, nout: usize, k: usize, nt: usize) {
+    let (wqs, wsc, wd, wdm, x) = gen_q4k(nout, k);
+    let reference = matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, nout, k);
+    let got = matvec_q4k_dp4a_blk_run::<R>(client, &wqs, &wsc, &wd, &wdm, &x, nout, k, nt);
+    let srel = scalerel(&reference, &got);
+    let ok = srel < 1e-2;
+    let packed = pack_q4k(&wqs, &wsc, &wd, &wdm);
+    let (xq, xs, xsum) = quant_act_q8_cpu(&x, 1, k);
+    let wh = client.create_from_slice(u32::as_bytes(&packed));
+    let xqh = client.create_from_slice(u32::as_bytes(&xq));
+    let xsh = client.create_from_slice(f32::as_bytes(&xs));
+    let xsumh = client.create_from_slice(f32::as_bytes(&xsum));
+    let meta = client.create_from_slice(u32::as_bytes(&[k as u32]));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; nout]));
+    let launch = |c: &ComputeClient<R>| unsafe {
+        matvec_q4k_dp4a_blk::launch_unchecked::<f32, R>(
+            c, Grid::Static(nout as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wh.clone(), packed.len()),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
+            ArrayArg::from_raw_parts(oh.clone(), nout),
+            ArrayArg::from_raw_parts(meta.clone(), 1),
+            nt,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t0 = Instant::now();
+    for _ in 0..100 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / 100.0;
+    let gbps = (nout * (k / 256) * 144) as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] Q4Kdp4a {}x{} nt={:<3} scale_rel={:.2e}  {}  {:.4} ms  {:.0} GB/s",
+        name, nout, k, nt, srel, if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps
+    );
+}
+
 fn check_moe_q4k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
     let (wqs, wsc, wd, wdm, x, ids) = gen_moe_q4k(e, n, slots, k);
     let reference = moe_matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
@@ -502,6 +545,7 @@ fn main() {
         check_moe_q4k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
         check_moe_q4k_dp4a_blk::<WgpuRuntime>("VK/dump", &c, 128, 768, 8, 2048, 64); // dp4a gate/up: LocalSize 64
         check_moe_q4k_dp4a_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // dp4a down:    LocalSize 32
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dump", &c, 4096, 2048, 64); // dense dp4a: LocalSize 64
         check_moe_q6k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
         check_moe_route::<WgpuRuntime>("VK/dump", &c, 8, 128, 8, 128); // fused router: E128 top8 nt128
         check_sdpa_blk::<WgpuRuntime>("VK/dump", &c, 32, 8, 1, 2048, 2048, 128, false, 64); // decode attn: d128 nt64
@@ -545,6 +589,12 @@ fn main() {
         check_moe_q4k_dp4a_blk::<WgpuRuntime>("VK/dp4a", &c, 128, 768, 8, 2048, 32);
         check_moe_q4k_dp4a_blk::<WgpuRuntime>("VK/dp4a", &c, 128, 2048, 8, 768, 32); // down
         check_moe_q4k_dp4a_blk::<WgpuRuntime>("VK/dp4a", &c, 128, 2048, 8, 768, 16);
+        // DENSE dp4a matvec (attention projections). q_proj 4096x2048, o_proj 2048x4096, kv_proj 512x2048.
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dproj", &c, 4096, 2048, 64);
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dproj", &c, 4096, 2048, 32);
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dproj", &c, 2048, 4096, 64);
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dproj", &c, 2048, 4096, 128);
+        check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dproj", &c, 512, 2048, 64);
         check_moe_q6k::<WgpuRuntime>("VULKAN", &c, 128, 768, 8, 2048); // ffn_down_exps are Q6_K in Q4_K_M
         check_moe_q6k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 32);
         check_moe_q6k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 64);
