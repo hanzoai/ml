@@ -10,7 +10,8 @@ use hanzo_kernel::quant::{
     matvec_q8_0_packed_ref, matvec_q8_0_packed_run, matvec_q8_0_packed_sg_run, matvec_q8_bench, matvec_q8_dp4a_blk_run,
     matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref, matvec_q8_run,
     moe_matvec_q4k_bench, moe_matvec_q4k_blk_bench, moe_matvec_q4k_blk_run, moe_matvec_q4k_ref, moe_matvec_q4k_run,
-    moe_matvec_q6k_bench, moe_matvec_q6k_blk_bench, moe_matvec_q6k_blk_run, moe_matvec_q6k_ref, moe_matvec_q6k_run, QK8_0,
+    moe_matvec_q6k_bench, moe_matvec_q6k_blk_bench, moe_matvec_q6k_blk_run, moe_matvec_q6k_ref, moe_matvec_q6k_run,
+    moe_route, moe_route_ref, moe_route_run, QK8_0,
 };
 use std::time::Instant;
 use hanzo_kernel::norm::rms_norm_run;
@@ -157,6 +158,51 @@ fn check_moe_q6k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize
         "[{:<7}] MoEQ6Kb E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
         if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+    );
+}
+
+fn check_moe_route<R: Runtime>(name: &str, client: &ComputeClient<R>, ntok: usize, n_experts: usize, topk: usize, nt: usize) {
+    // Deterministic router logits [ntok, n_experts].
+    let mut s = 0x9E3779B97F4A7C15u64;
+    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let logits: Vec<f32> = (0..ntok * n_experts).map(|_| (next() % 4000) as f32 / 1000.0 - 2.0).collect();
+    let (ids_ref, w_ref) = moe_route_ref(&logits, ntok, n_experts, topk);
+    let (ids_got, w_got) = moe_route_run::<R>(client, &logits, ntok, n_experts, topk, nt);
+    // Weights are the correctness contract (scale-exact). A per-token SET difference is a top-k
+    // BOUNDARY TIE (two experts with ~equal logit at slot topk; GPU tree-reduce vs CPU sort pick
+    // different-but-equivalent ones) -- inconsequential downstream (weighted expert sum), same
+    // non-determinism as llama's unstable Vulkan sort. Count ties; pass on the weights.
+    let mut ties = 0usize;
+    for tok in 0..ntok {
+        let mut a: Vec<u32> = ids_ref[tok * topk..(tok + 1) * topk].to_vec(); a.sort_unstable();
+        let mut b: Vec<u32> = ids_got[tok * topk..(tok + 1) * topk].to_vec(); b.sort_unstable();
+        if a != b { ties += 1; }
+    }
+    let wrel = scalerel(&w_ref, &w_got);
+    let ok = wrel < 1e-4;
+    // Kernel-only throughput (fixed buffers, iters dispatches, one sync).
+    let lh = client.create_from_slice(f32::as_bytes(&logits));
+    let ih = client.create_from_slice(u32::as_bytes(&vec![0u32; ntok * topk]));
+    let wh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; ntok * topk]));
+    let launch = |c: &ComputeClient<R>| unsafe {
+        moe_route::launch_unchecked::<f32, R>(
+            c, Grid::Static(ntok as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(lh.clone(), logits.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ntok * topk),
+            ArrayArg::from_raw_parts(wh.clone(), ntok * topk),
+            n_experts, topk, nt,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(ih.clone());
+    let t0 = std::time::Instant::now();
+    for _ in 0..200 { launch(client); }
+    let _ = client.read_one_unchecked(ih.clone());
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / 200.0;
+    println!(
+        "[{:<7}] MoERoute ntok={} E{} topk={} nt={:<3} w_rel={:.2e} ties={}/{}  {}  {:.4} ms/batch",
+        name, ntok, n_experts, topk, nt, wrel, ties, ntok,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms
     );
 }
 
@@ -326,6 +372,9 @@ fn main() {
         check_moe_q6k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 8);
         check_moe_q6k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 16);
         check_moe_q6k_blk::<WgpuRuntime>("VK/down", &c, 128, 2048, 8, 768, 32);
+        // Fused MoE top-k router (Qwen3-30B-A3B: 128 experts, top-8): decode batch + prefill batch.
+        check_moe_route::<WgpuRuntime>("VULKAN", &c, 8, 128, 8, 128);
+        check_moe_route::<WgpuRuntime>("VK/pref", &c, 512, 128, 8, 128);
         check_dp4a::<WgpuRuntime>("VULKAN", &c, rows, k, true);
         check_dp4a::<WgpuRuntime>("VK/big", &c, 8192, 8192, true); // 67MB weights: cache-busting BW
         check_q8_0_packed::<WgpuRuntime>("VULKAN", &c, rows, k, 64);
