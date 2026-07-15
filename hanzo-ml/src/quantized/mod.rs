@@ -1262,9 +1262,9 @@ impl QTensor {
                     // one workgroup/output, ~2-3x packed). Else the packed `vk_moe_kernel`. Same split
                     // bank feeds both block paths; the dp4a path q8-quantizes the activation once.
                     match vk_moe_blk_dp4a_kernel(dt, n, k).filter(|_| vk_dev.has_int_dot8()) {
-                        Some(blk) => {
+                        Some((blk, with_xsum)) => {
                             let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
-                            vk_dev.moe_matvec_blk_dp4a_gpu(blk, bank.as_ref(), xv, ids_v, nrows, n, k)?
+                            vk_dev.moe_matvec_blk_dp4a_gpu(blk, with_xsum, bank.as_ref(), xv, ids_v, nrows, n, k)?
                         }
                         None => match vk_moe_blk_kernel(dt, n, k) {
                         Some(blk) => {
@@ -1640,14 +1640,17 @@ fn vk_moe_blk_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<&'static str> 
 
 // dp4a (int8 OpSDot) block kernels for the shapes with a committed .spv. Selected before the f32 block
 // kernel when the device advertises integer dot-product (see has_int_dot8). VK_MOE_DP4A_OFF forces the
-// f32 path for an A/B. Q6_K has no dp4a variant yet -> its down proj stays on the f32 block kernel.
-fn vk_moe_blk_dp4a_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<&'static str> {
+// f32 path for an A/B. The bool is the kernel's activation-binding contract: whether it binds the
+// per-32 q8 sums (`xsum`; Q4_K folds dmin against them) or derives its own half-block sums in-register
+// (Q6_K's −32 fold needs per-16 sums, which per-32 xsum cannot express).
+fn vk_moe_blk_dp4a_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<(&'static str, bool)> {
     if std::env::var_os("VK_MOE_PACKED").is_some() || std::env::var_os("VK_MOE_DP4A_OFF").is_some() {
         return None;
     }
     match (dt, n, k) {
-        (GgmlDType::Q4K, 768, 2048) => Some("moe_matvec_q4k_dp4a_blk_gu"),
-        (GgmlDType::Q4K, 2048, 768) => Some("moe_matvec_q4k_dp4a_blk_dn"),
+        (GgmlDType::Q4K, 768, 2048) => Some(("moe_matvec_q4k_dp4a_blk_gu", true)),
+        (GgmlDType::Q4K, 2048, 768) => Some(("moe_matvec_q4k_dp4a_blk_dn", true)),
+        (GgmlDType::Q6K, 2048, 768) => Some(("moe_matvec_q6k_dp4a_blk_dn", false)),
         _ => None,
     }
 }
