@@ -101,6 +101,11 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "gemv" => include_bytes!("vulkan/spv/gemv.spv"),
         "moe_matvec_q4k_blk_gu" => include_bytes!("vulkan/spv/moe_matvec_q4k_blk_gu.spv"),
         "moe_matvec_q4k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q4k_blk_dn.spv"),
+        // dp4a (int8 OpSDot) MoE matvec: activation q8-quantized, Q4_K nibbles int8-dotted. Same split
+        // bank as the f32 block kernels; ~1.4-1.6x their throughput. Bindings: wqs,wsc,wd,wdm,xq,xs,
+        // xsum,ids,out. Gated on the device's integer-dot capability (int_dot8).
+        "moe_matvec_q4k_dp4a_blk_gu" => include_bytes!("vulkan/spv/moe_matvec_q4k_dp4a_blk_gu.spv"),
+        "moe_matvec_q4k_dp4a_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q4k_dp4a_blk_dn.spv"),
         "moe_matvec_q6k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_blk_dn.spv"),
         "moe_matvec_q8_0" => spv!("moe_matvec_q8_0"),
         "moe_matvec_q4_0" => spv!("moe_matvec_q4_0"),
@@ -1936,6 +1941,42 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// Whether the device advertises the integer dot-product extension (gates the dp4a MoE path).
+    pub fn has_int_dot8(&self) -> bool {
+        self.inner.int_dot8
+    }
+
+    /// dp4a twin of `moe_matvec_blk_gpu`: quantize the activation to q8 ONCE (reused across all n
+    /// outputs), then dispatch the int8-dot MoE kernel. Same split bank + 2D (n, nrows) grid. Bindings:
+    /// wqs,wsc,wd,wdm (bank), xq,xs,xsum (q8 activation), ids, out.
+    pub fn moe_matvec_blk_dp4a_gpu(
+        &self,
+        kernel: &'static str,
+        bank: &MoeBankSplit,
+        x: &VulkanStorage,
+        ids: &VulkanStorage,
+        nrows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if x.count < nrows * k {
+            crate::bail!("moe_matvec_blk_dp4a_gpu: x count {} < nrows*k {}", x.count, nrows * k);
+        }
+        if ids.count < nrows {
+            crate::bail!("moe_matvec_blk_dp4a_gpu: ids count {} < nrows {nrows}", ids.count);
+        }
+        let (xq, xs, xsum) = self.quantize_act_q8(x, nrows, k)?;
+        let out = self.alloc_f32(nrows * n)?;
+        let mut bufs: Vec<vk::Buffer> = bank.0.iter().map(|s| s.buffer).collect();
+        bufs.push(xq.buffer);
+        bufs.push(xs.buffer);
+        bufs.push(xsum.buffer);
+        bufs.push(ids.buffer);
+        bufs.push(out.buffer);
+        self.dispatch(kernel, &bufs, &[], (n as u32, nrows as u32, 1))?;
+        Ok(out)
+    }
+
     /// Fused MoE top-k router: `logits[ntok, n_experts]` -> (ids[ntok, topk] u32, weights[ntok, topk]
     /// f32), softmax + top-k + renormalize in ONE kernel (the DSL `moe_route` .spv, one workgroup per
     /// token). Replaces the generic softmax_last_dim + sort_last_dim + narrow + gather + norm op-chain
@@ -3478,13 +3519,13 @@ impl VulkanDevice {
             // these, so they must outlive the update/push call below.) Built on the stack into a
             // fixed array — never a heap Vec — because this is the decode hot path: hundreds of
             // dispatches x N layers re-recorded every token, where a per-dispatch Vec alloc+free for
-            // both `infos` and `writes` was pure CPU churn the GPU then stalled on. MAX_BINDINGS (8)
+            // both `infos` and `writes` was pure CPU churn the GPU then stalled on. MAX_BINDINGS (10)
             // comfortably covers the widest kernel (4 buffers: where_cond/index_select); only the
             // first `nb = bufs.len()` entries are populated and passed on, and the debug_assert
             // above (kernel binding-count drift) plus the one here pin the bound, so it can never be
             // exceeded in a correct build. The arrays live for the rest of this unsafe block,
             // satisfying the borrows the push/update calls hold on them.
-            const MAX_BINDINGS: usize = 8;
+            const MAX_BINDINGS: usize = 10;
             let nb = bufs.len();
             debug_assert!(
                 nb <= MAX_BINDINGS,
@@ -4126,12 +4167,12 @@ impl BackendDevice for VulkanDevice {
                 )
                 .map_err(vkerr)?;
             // Sized for a whole batch: one descriptor set per recorded dispatch (up to
-            // BATCH_CAP), each binding up to MAX_BINDINGS (8) storage buffers. The widest kernels
+            // BATCH_CAP), each binding up to MAX_BINDINGS (10) storage buffers. The widest kernels
             // are the GDN mixers (gdn_recurrence/gdn_chunked bind 7: q,k,v,g,beta,state,out); sizing
             // at 4 starved the pool on the legacy (non-push-descriptor: Dozen/WSL) allocate-set path,
             // which drew STORAGE_BUFFER descriptors here and hit OUT_OF_POOL_MEMORY. MAX_BINDINGS
             // matches the per-dispatch bind cap in `dispatch_outs`, so no kernel can exceed it.
-            const MAX_BINDINGS: u32 = 8;
+            const MAX_BINDINGS: u32 = 10;
             let dpool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(BATCH_CAP * MAX_BINDINGS)];
