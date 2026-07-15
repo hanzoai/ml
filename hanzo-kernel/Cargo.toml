@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-kernel"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2021"
 description = "Hanzo's first-party GPU kernel DSL: one Rust source, lowered to CUDA/ROCm/Vulkan/Metal."
 license = "BSD-3-Clause"
@@ -21,7 +21,7 @@ half = "2"
 # and a crates.io consumer can't inject the fix via `[patch.crates-io]`. `hanzo-cubecl-hip` (fork of
 # cubecl-hip 0.10.0) pulls `hanzo-cubecl-hip-sys` (the build-fixed fork) and is imported as
 # `hanzo_cubecl_hip`. It resolves the SAME cubecl-core 0.10 as the facade, so `HipRuntime` is the
-# runtime the DSL dispatches through. See hanzo-kernel/forks/.
+# runtime the DSL dispatches through. Consumed from crates.io; fork source lives in git history.
 hanzo-cubecl-hip = { version = "0.10", optional = true }
 
 [features]

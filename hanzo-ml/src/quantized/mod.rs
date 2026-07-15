@@ -1027,16 +1027,60 @@ impl QTensor {
     fn rocm_moe_bank(&self, dev: &crate::RocmDevice) -> Result<std::sync::Arc<crate::RocmStorage>> {
         use crate::backend::BackendDevice;
         let bank = self.data()?;
-        let key = (bank.as_ref().as_ptr() as usize, bank.as_ref().len());
-        let cache = rocm_moe_bank_cache();
-        let mut guard = cache.lock().expect("moe bank cache lock");
-        if let Some(w) = guard.get(&key) {
-            Ok(w.clone())
-        } else {
-            let w = std::sync::Arc::new(dev.storage_from_slice(bank.as_ref())?);
-            guard.insert(key, w.clone());
-            Ok(w)
-        }
+        cache_or_upload(rocm_moe_bank_cache(), bank.as_ref(), |b| {
+            dev.storage_from_slice(b)
+        })
+    }
+
+    // Resident Vulkan MoE expert bank (twin of `rocm_moe_bank`). Q8_0 repacks to the 9-u32/block
+    // layout and Q6_K to the padded 53-u32 super-block layout their MoE shaders read (mirrors the 2D
+    // decode paths); Q4_0/Q4_K shaders byte-address the raw GGML bytes, so a plain upload suffices.
+    #[cfg(feature = "vulkan")]
+    fn vulkan_moe_bank(
+        &self,
+        dev: &crate::VulkanDevice,
+        e_cnt: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<std::sync::Arc<crate::VulkanStorage>> {
+        let bank = self.data()?;
+        let dt = self.storage.dtype();
+        cache_or_upload(vulkan_moe_bank_cache(), bank.as_ref(), |b| match dt {
+            GgmlDType::Q8_0 => dev.quantize_q8_blocks(b, e_cnt * n, k),
+            GgmlDType::Q6K => dev.quantize_q6k(b, e_cnt * n, k),
+            _ => dev.upload_qweight(b),
+        })
+    }
+
+    // Resident PLANAR expert bank for the DSL block-reduced MoE kernels: the packed GGML bank is
+    // de-interleaved into per-field device arrays once (at first sight of its CPU bytes) and reused
+    // every token. Only Q4_K/Q6_K -- the dtypes with a committed `moe_matvec_q*k_blk_*` .spv.
+    #[cfg(feature = "vulkan")]
+    fn vulkan_moe_bank_split(
+        &self,
+        dev: &crate::VulkanDevice,
+        e_cnt: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<std::sync::Arc<crate::vulkan::MoeBankSplit>> {
+        let bank = self.data()?;
+        let dt = self.storage.dtype();
+        cache_or_upload(vulkan_moe_split_cache(), bank.as_ref(), |b| match dt {
+            GgmlDType::Q4K => dev.quantize_q4k_split(b, e_cnt * n, k),
+            GgmlDType::Q6K => dev.quantize_q6k_split(b, e_cnt * n, k),
+            _ => crate::bail!("vulkan_moe_bank_split: unsupported dtype {dt:?}"),
+        })
+    }
+
+    // Resident wgpu MoE expert bank (twin of `vulkan_moe_bank`). The wgpu MoE shaders byte-address
+    // the raw GGML bytes for every native type, so one upload path covers Q4_0/Q8_0/Q4K.
+    #[cfg(feature = "wgpu")]
+    fn wgpu_moe_bank(
+        &self,
+        dev: &crate::WgpuDevice,
+    ) -> Result<std::sync::Arc<crate::WgpuStorage>> {
+        let bank = self.data()?;
+        cache_or_upload(wgpu_moe_bank_cache(), bank.as_ref(), |b| dev.upload_qweight(b))
     }
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
@@ -1177,12 +1221,7 @@ impl QTensor {
             // would also hit the unimplemented Vulkan index_add). Supported for Q4_0/Q8_0/Q4_K; other
             // quant dtypes fall through to the (CPU-bound) generic path.
             #[cfg(feature = "vulkan")]
-            QStorage::Vulkan(_, vk_dev)
-                if matches!(
-                    self.storage.dtype(),
-                    GgmlDType::Q4_0 | GgmlDType::Q8_0 | GgmlDType::Q4K
-                ) =>
-            {
+            QStorage::Vulkan(_, vk_dev) if vk_moe_kernel(self.storage.dtype()).is_some() => {
                 let out_dtype = x.dtype();
                 let (e_cnt, n, k) = self.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
@@ -1198,36 +1237,40 @@ impl QTensor {
                     .reshape((nrows, k))?
                     .to_dtype(crate::DType::F32)?
                     .contiguous()?;
-                let ids_vec = ids
-                    .reshape((nrows,))?
-                    .to_dtype(crate::DType::U32)?
-                    .to_vec1::<u32>()?;
-                // Defend against a stray id (model bug / corrupt router) reading OOB in the bank.
-                if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
-                    crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
-                }
-
-                let kernel = match self.storage.dtype() {
-                    GgmlDType::Q4_0 => "moe_matvec_q4_0",
-                    GgmlDType::Q8_0 => "moe_matvec_q8_0",
-                    GgmlDType::Q4K => "moe_matvec_q4k",
-                    other => crate::bail!("vulkan MoE: no kernel for {other:?}"),
-                };
-                let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
-                                         // moe_matvec_q8_0's shader reads the repacked 9-u32/block layout (same as the decode
-                                         // matvec_q8 path); Q4_0/Q4_K shaders read the raw GGML bytes directly.
-                let wbank = match self.storage.dtype() {
-                    GgmlDType::Q8_0 => vk_dev.quantize_q8_blocks(&bank, e_cnt * n, k)?,
-                    _ => vk_dev.upload_qweight(&bank)?,
-                };
-                let ids_buf = vk_dev.upload_ids(&ids_vec)?;
+                // Keep routing ids on the GPU. They came from `moe_route`'s on-device sort, so reading
+                // them to host (`to_vec1`) and re-uploading forced a GPU->CPU->GPU sync on EVERY expert
+                // call -- 3x/layer (gate, up, down), ~144 fence stalls/token that serialized the whole
+                // forward (the GPU sat idle-waiting). Bind the resident U32 buffer directly; the router
+                // selects topk over exactly `e_cnt` logits, so ids are in-range by construction (the old
+                // host-side OOB scan was the round-trip's only excuse).
+                let dt = self.storage.dtype();
+                let ids_u32 = ids.reshape((nrows,))?.to_dtype(crate::DType::U32)?.contiguous()?;
                 let y = {
                     let (store, _) = x_flat.storage_and_layout();
                     let xv = match &*store {
                         Storage::Vulkan(v) => v,
                         _ => crate::bail!("vulkan MoE: x not on vulkan after contiguous()"),
                     };
-                    vk_dev.moe_matvec_gpu(kernel, &wbank, xv, &ids_buf, nrows, n, k)?
+                    let (ids_store, _) = ids_u32.storage_and_layout();
+                    let ids_v = match &*ids_store {
+                        Storage::Vulkan(v) => v,
+                        _ => crate::bail!("vulkan MoE: ids not on vulkan after contiguous()"),
+                    };
+                    // Prefer the DSL block-reduced kernel when a specialized .spv exists for this
+                    // (dtype, n, k): planar bank, one workgroup per output, ~2-3x the packed naive
+                    // path. Shapes without a committed .spv fall back to the packed `vk_moe_kernel`.
+                    match vk_moe_blk_kernel(dt, n, k) {
+                        Some(blk) => {
+                            let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
+                            vk_dev.moe_matvec_blk_gpu(blk, bank.as_ref(), xv, ids_v, nrows, n, k)?
+                        }
+                        None => {
+                            // Guarded by `vk_moe_kernel(..).is_some()`, so the packed kernel is present.
+                            let kernel = vk_moe_kernel(dt).unwrap();
+                            let wbank = self.vulkan_moe_bank(vk_dev, e_cnt, n, k)?;
+                            vk_dev.moe_matvec_gpu(kernel, wbank.as_ref(), xv, ids_v, nrows, n, k)?
+                        }
+                    }
                 };
                 let out = crate::tensor::from_storage(
                     Storage::Vulkan(y),
@@ -1241,12 +1284,7 @@ impl QTensor {
             // weight bank [E, n, k] is uploaded once and the router gather + per-expert GEMM run in
             // one WGSL dispatch. Supported for Q4_0/Q8_0/Q4_K.
             #[cfg(feature = "wgpu")]
-            QStorage::Wgpu(_, wgpu_dev)
-                if matches!(
-                    self.storage.dtype(),
-                    GgmlDType::Q4_0 | GgmlDType::Q8_0 | GgmlDType::Q4K
-                ) =>
-            {
+            QStorage::Wgpu(_, wgpu_dev) if wgpu_moe_kernel(self.storage.dtype()).is_some() => {
                 let out_dtype = x.dtype();
                 let (e_cnt, n, k) = self.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
@@ -1268,14 +1306,10 @@ impl QTensor {
                 if let Some(&bad) = ids_vec.iter().find(|&&e| e as usize >= e_cnt) {
                     crate::bail!("indexed_moe_forward: expert id {bad} >= num_experts {e_cnt}");
                 }
-                let kernel = match self.storage.dtype() {
-                    GgmlDType::Q4_0 => "moe_matvec_q4_0",
-                    GgmlDType::Q8_0 => "moe_matvec_q8_0",
-                    GgmlDType::Q4K => "moe_matvec_q4k",
-                    other => crate::bail!("wgpu MoE: no kernel for {other:?}"),
-                };
-                let bank = self.data()?; // raw GGML bytes for all E experts, [E, n, k]
-                let wbank = wgpu_dev.upload_qweight(&bank)?;
+                // Guarded by `wgpu_moe_kernel(..).is_some()` above, so the kernel is always present.
+                let kernel = wgpu_moe_kernel(self.storage.dtype()).unwrap();
+                // Resident bank: uploaded once, reused every token (see `wgpu_moe_bank`).
+                let wbank = self.wgpu_moe_bank(wgpu_dev)?;
                 let ids_buf = wgpu_dev.upload_ids(&ids_vec)?;
                 let y = {
                     let (store, _) = x_flat.storage_and_layout();
@@ -1283,7 +1317,7 @@ impl QTensor {
                         Storage::Wgpu(v) => v,
                         _ => crate::bail!("wgpu MoE: x not on wgpu after contiguous()"),
                     };
-                    wgpu_dev.moe_matvec_gpu(kernel, &wbank, xv, &ids_buf, nrows, n, k)?
+                    wgpu_dev.moe_matvec_gpu(kernel, wbank.as_ref(), xv, &ids_buf, nrows, n, k)?
                 };
                 let out = crate::tensor::from_storage(
                     Storage::Wgpu(y),
@@ -1513,20 +1547,98 @@ pub enum QMatMul {
     },
 }
 
-// Resident ROCm MoE expert-bank cache: maps a (CPU bank ptr, len) to its uploaded VRAM copy so
-// the multi-GB GGML expert bank is host->device copied ONCE, not per token/layer. The CPU bytes
-// are owned by the model's QTensor for its lifetime, so the pointer is a stable key. Keyed by
-// usize (raw ptr) to stay Send+Sync; the RocmStorage is reference-counted and reused.
+// Resident MoE expert-bank cache: maps a (CPU bank ptr, len) to its uploaded VRAM copy so the
+// multi-GB GGML expert bank is host->device copied ONCE, not per token/layer. The CPU bytes are
+// owned by the model's QTensor for its lifetime, so the pointer is a stable key. Keyed by usize
+// (raw ptr) to stay Send+Sync; the device storage is reference-counted and reused. ONE mechanism
+// (this macro + `cache_or_upload`), one instantiation per GPU backend.
+#[cfg(any(feature = "rocm", feature = "vulkan", feature = "wgpu"))]
+macro_rules! moe_bank_cache {
+    ($name:ident, $storage:ty) => {
+        fn $name() -> &'static std::sync::Mutex<
+            std::collections::HashMap<(usize, usize), std::sync::Arc<$storage>>,
+        > {
+            static CACHE: std::sync::OnceLock<
+                std::sync::Mutex<
+                    std::collections::HashMap<(usize, usize), std::sync::Arc<$storage>>,
+                >,
+            > = std::sync::OnceLock::new();
+            CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        }
+    };
+}
 #[cfg(feature = "rocm")]
-fn rocm_moe_bank_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>,
-> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<(usize, usize), std::sync::Arc<crate::RocmStorage>>,
-        >,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+moe_bank_cache!(rocm_moe_bank_cache, crate::RocmStorage);
+#[cfg(feature = "vulkan")]
+moe_bank_cache!(vulkan_moe_bank_cache, crate::VulkanStorage);
+#[cfg(feature = "vulkan")]
+moe_bank_cache!(vulkan_moe_split_cache, crate::vulkan::MoeBankSplit);
+#[cfg(feature = "wgpu")]
+moe_bank_cache!(wgpu_moe_bank_cache, crate::WgpuStorage);
+
+// Upload `bank` through `upload` on first sight of its (ptr,len), then hand back the resident copy
+// on every later call. The whole point of the cache: the H2D copy happens once, not per token.
+#[cfg(any(feature = "rocm", feature = "vulkan", feature = "wgpu"))]
+fn cache_or_upload<S>(
+    cache: &std::sync::Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<S>>>,
+    bank: &[u8],
+    upload: impl FnOnce(&[u8]) -> Result<S>,
+) -> Result<std::sync::Arc<S>> {
+    let key = (bank.as_ptr() as usize, bank.len());
+    let mut guard = cache.lock().expect("moe bank cache lock");
+    if let Some(w) = guard.get(&key) {
+        return Ok(w.clone());
+    }
+    let w = std::sync::Arc::new(upload(bank)?);
+    guard.insert(key, w.clone());
+    Ok(w)
+}
+
+// GGML dtype -> native fused grouped quant-matvec MoE kernel name on the Vulkan backend. ONE source
+// of truth: the construction gate keeps the [E,n,k] bank quantized iff this returns Some, the
+// dispatch guard fires on Some, and the branch selects the returned kernel. `None` dtypes fall
+// through to dequantize. Q4_0/Q8_0/Q4K read the raw (or Q8_0-repacked) GGML bytes; Q6_K reads the
+// padded 53-u32 super-block layout from `quantize_q6k`.
+#[cfg(feature = "vulkan")]
+fn vk_moe_kernel(dt: GgmlDType) -> Option<&'static str> {
+    match dt {
+        GgmlDType::Q4_0 => Some("moe_matvec_q4_0"),
+        GgmlDType::Q8_0 => Some("moe_matvec_q8_0"),
+        GgmlDType::Q4K => Some("moe_matvec_q4k"),
+        GgmlDType::Q6K => Some("moe_matvec_q6k"),
+        _ => None,
+    }
+}
+
+// (dtype, n, k) -> committed DSL block-reduced MoE .spv. `n,k` are baked into each artifact at dump
+// time (comptime -> full unroll + magic-multiply divide), so selection is per shape: gate/up (k=2048,
+// nt=64) and down (k=768, nt=32) for Qwen3-30B-A3B. Shapes without a committed .spv return None and
+// take the packed `vk_moe_kernel` path -- add a shape by dumping it in `matvec-check dump`. The split
+// bank (`vulkan_moe_bank_split`) is uploaded iff this returns Some, keeping the two paths orthogonal.
+#[cfg(feature = "vulkan")]
+fn vk_moe_blk_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<&'static str> {
+    // A/B escape hatch: VK_MOE_PACKED forces the packed naive path so the block kernels' end-to-end
+    // contribution is measurable under identical conditions (no cheating -- show the delta).
+    if std::env::var_os("VK_MOE_PACKED").is_some() {
+        return None;
+    }
+    match (dt, n, k) {
+        (GgmlDType::Q4K, 768, 2048) => Some("moe_matvec_q4k_blk_gu"),
+        (GgmlDType::Q4K, 2048, 768) => Some("moe_matvec_q4k_blk_dn"),
+        (GgmlDType::Q6K, 2048, 768) => Some("moe_matvec_q6k_blk_dn"),
+        _ => None,
+    }
+}
+
+// wgpu twin of `vk_moe_kernel`. The WGSL MoE shaders cover Q4_0/Q8_0/Q4K; Q6_K is Vulkan-only so far.
+#[cfg(feature = "wgpu")]
+fn wgpu_moe_kernel(dt: GgmlDType) -> Option<&'static str> {
+    match dt {
+        GgmlDType::Q4_0 => Some("moe_matvec_q4_0"),
+        GgmlDType::Q8_0 => Some("moe_matvec_q8_0"),
+        GgmlDType::Q4K => Some("moe_matvec_q4k"),
+        _ => None,
+    }
 }
 
 /// Per-expert quantized MoE matmul, shared by the resident and disk-streaming paths. Groups the
@@ -1914,6 +2026,29 @@ impl QMatMul {
             if qtensor.device().is_rocm()
                 && qtensor.shape().dims().len() == 3
                 && crate::RocmQuantType::from_ggml(qtensor.dtype()).is_some()
+            {
+                return Ok(Self::QTensor(qtensor));
+            }
+        }
+        // Vulkan/wgpu MoE bank: a 3D [E,n,k] expert bank whose dtype has a native fused grouped
+        // quant-matvec kernel stays QUANTIZED (kept as QTensor), so `indexed_moe_forward` gathers
+        // the routed experts on the GPU straight from the resident bank -- the twin of the ROCm
+        // case above. Dequantizing here instead explodes the bank to dense f32 in VRAM (30B-A3B ->
+        // 100+ GB) AND lands on the generic path, whose Vulkan/wgpu index_add is unwired.
+        #[cfg(feature = "vulkan")]
+        {
+            if qtensor.device().is_vulkan()
+                && qtensor.shape().dims().len() == 3
+                && vk_moe_kernel(qtensor.dtype()).is_some()
+            {
+                return Ok(Self::QTensor(qtensor));
+            }
+        }
+        #[cfg(feature = "wgpu")]
+        {
+            if qtensor.device().is_wgpu()
+                && qtensor.shape().dims().len() == 3
+                && wgpu_moe_kernel(qtensor.dtype()).is_some()
             {
                 return Ok(Self::QTensor(qtensor));
             }
