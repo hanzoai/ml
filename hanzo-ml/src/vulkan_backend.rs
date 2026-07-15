@@ -457,11 +457,17 @@ impl Drop for VkGraph {
                 dev.free_command_buffers(s.cpool, &[self.cmd]);
             }
         }
-        // Return the capture-reserved working set to the pool. The device was just quiesced and the
-        // recorded commands that baked these handles no longer exist, so recycling is safe; `pending`
-        // keeps the conservative post-fence reclaim flow.
+        // Return the capture-reserved working set straight to the free lists. The device was just
+        // quiesced and the recorded commands that baked these handles no longer exist, so this is
+        // strictly stronger than reclaim()'s post-flush-fence precondition — and it matters that the
+        // buffers become allocatable NOW: the next sequence's first forward allocates its transients
+        // before it ever flushes, so a `pending` hand-off would leave the returned set unreachable
+        // exactly when it is needed and force a fresh working-set allocation.
         if let Ok(mut pool) = self.device.inner.bufpool.lock() {
-            pool.pending.append(&mut self.reserved);
+            for (bytes, p) in self.reserved.drain(..) {
+                pool.free.entry(bytes).or_default().push(p);
+                pool.free_bytes += bytes;
+            }
         }
     }
 }
