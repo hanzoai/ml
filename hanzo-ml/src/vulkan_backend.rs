@@ -116,6 +116,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "flash_attn" => spv!("flash_attn"),
         "copy" => spv!("copy"),
         "copy2d" => spv!("copy2d"),
+        "copy2d_off" => spv!("copy2d_off"),
         "const_fill" => spv!("const_fill"),
         "reduce_sum" => spv!("reduce_sum"),
         "reduce_max" => spv!("reduce_max"),
@@ -332,6 +333,15 @@ struct Submitter {
     // numerous ones. Unused (empty op_names, pool never written) when the flag is off.
     qpool: vk::QueryPool,
     op_names: Vec<&'static str>,
+    // Command-graph capture. When `capturing`, `dispatch_outs` records into `graph_cmd` (a dedicated,
+    // re-submittable command buffer owned by the in-flight capture) instead of `cmd`, and never
+    // auto-flushes: the whole decode forward records into one buffer that later replays per token
+    // with a single queue submit + fence wait (no per-op re-record, no descriptor churn). `graph_cmd`
+    // is null except between begin/end capture. The hazard-barrier bookkeeping (`written_since_barrier`)
+    // and the selective barriers are recorded into `graph_cmd` exactly as for eager batches, so a
+    // replay reproduces the identical dependency chain.
+    capturing: bool,
+    graph_cmd: vk::CommandBuffer,
 }
 // Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex.
 unsafe impl Send for Submitter {}
@@ -375,6 +385,72 @@ impl std::fmt::Debug for VulkanStorage {
 /// reused every token via the MoE bank cache. One newtype for both quant types keeps the cache and
 /// dispatch uniform -- the dtype-specific field count lives only in the repack + the .spv.
 pub struct MoeBankSplit(pub Vec<VulkanStorage>);
+
+/// A captured, replayable Vulkan decode command-graph. Holds a closed primary command buffer that
+/// records one whole decode forward against stable input / KV / weight buffers. [`Self::replay`]
+/// re-submits it in a single `queue_submit` + fence wait; the caller refreshes only the CONTENTS of
+/// the stable input buffers (token embedding, decode position, attention seq_k) in place before each
+/// replay -- none of the recorded commands change. This collapses the eager path's per-token re-record
+/// of ~1.7k dispatches (record + submit CPU) into one replay, mirroring the shipped ROCm
+/// `RocmGraphHandle` for the command-buffer-based Vulkan backend. The intermediates the capture
+/// touched are reserved out of the buffer pool for the graph's lifetime (see BufPool), so every
+/// replay reads/writes the exact storage it was captured against.
+pub struct VkGraph {
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    n_dispatch: u32,
+    device: VulkanDevice,
+}
+
+// Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex (replay)
+// or after device_wait_idle (drop). Mirrors `unsafe impl Send for RocmGraphHandle`.
+unsafe impl Send for VkGraph {}
+
+impl VkGraph {
+    /// Number of dispatches captured into the graph (diagnostics).
+    pub fn n_dispatch(&self) -> u32 {
+        self.n_dispatch
+    }
+
+    /// Submit the captured decode forward and block until it completes. Serialized with eager submits
+    /// through the submitter lock (a Vulkan queue is externally synchronized). The caller must have
+    /// refreshed the stable input buffers (and awaited those writes) before calling; cross-submit
+    /// ordering on the single queue makes the refreshed inputs visible to the replay, exactly as the
+    /// eager path relies on queue_submit + fence for its cross-batch ordering.
+    pub fn replay(&self) -> Result<()> {
+        let dev = self.device.dev();
+        let queue = self.device.inner.queue;
+        let s = self.device.inner.submitter.lock().unwrap();
+        unsafe {
+            dev.reset_fences(&[self.fence]).map_err(vkerr)?;
+            let cmds = [self.cmd];
+            dev.queue_submit(
+                queue,
+                &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                self.fence,
+            )
+            .map_err(vkerr)?;
+            dev.wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(vkerr)?;
+        }
+        drop(s);
+        Ok(())
+    }
+}
+
+impl Drop for VkGraph {
+    fn drop(&mut self) {
+        let dev = self.device.dev();
+        unsafe {
+            // Quiesce the device so no in-flight replay reads the buffer/fence we are destroying.
+            let _ = dev.device_wait_idle();
+            dev.destroy_fence(self.fence, None);
+            if let Ok(s) = self.device.inner.submitter.lock() {
+                dev.free_command_buffers(s.cpool, &[self.cmd]);
+            }
+        }
+    }
+}
 
 /// Arguments for [`VulkanDevice::paged_attention_vk`]. All tensors are f32 `VulkanStorage`
 /// except `block_tables`/`context_lens` (u32). Strides are in f32 ELEMENTS. Grouped into a
@@ -463,6 +539,17 @@ struct BufPool {
     // Sum of bucket sizes currently held in `free` (idle, reusable). Tracked so reclaim can enforce
     // POOL_FREE_CAP_BYTES without walking the whole map.
     free_bytes: u64,
+    // Command-graph capture reservation (mirrors the shipped ROCm `PoolInner` capture pinning). A
+    // captured decode command buffer bakes the vk::Buffer handle of every intermediate it touches
+    // into its recorded descriptors; on every replay it reads/writes those exact buffers. If such a
+    // buffer were dropped back into `pending`/`free` and later handed to an unrelated allocation, the
+    // replay would alias — and corrupt — live tensor storage: the fluent-but-stale decode loop. While
+    // `capture_depth > 0`, a dropped buffer is instead parked in `reserved` (kept alive, never
+    // recycled) so no later allocation can reuse a handle the in-flight graph captured. Reserved
+    // buffers stay reserved for the process; the decode graph cache is bounded and each bucket's
+    // working set is captured once, so this is a fixed one-time reservation, not a growing leak.
+    capture_depth: usize,
+    reserved: Vec<PooledBuf>,
 }
 
 // drop: park (size, buffer, memory) for reuse after the next fence. No Vulkan calls here, just
@@ -476,14 +563,21 @@ impl Drop for VulkanStorage {
         // physical buffer matches the key a later same-bucket request looks up.
         let bytes = pool_bucket((self.count * self.dtype.size_in_bytes()) as u64);
         if let Ok(mut pool) = self.device.inner.bufpool.lock() {
-            pool.pending.push((
-                bytes,
-                PooledBuf {
-                    buffer: self.buffer,
-                    memory: self.memory,
-                    host_visible: self.host_visible,
-                },
-            ));
+            let pooled = PooledBuf {
+                buffer: self.buffer,
+                memory: self.memory,
+                host_visible: self.host_visible,
+            };
+            // During a command-graph capture, this handle may be baked into the graph; reserve it
+            // (never recycle) so no later allocation aliases the graph's storage on replay. Gating at
+            // drop time (not alloc time) is correct and needs no per-storage flag: every buffer the
+            // capture touches and then releases is dropped while `capture_depth > 0`; buffers the
+            // engine keeps live across the graph (weights, KV cache, logits) never hit this path.
+            if pool.capture_depth > 0 {
+                pool.reserved.push(pooled);
+            } else {
+                pool.pending.push((bytes, pooled));
+            }
         }
     }
 }
@@ -3473,7 +3567,7 @@ impl VulkanDevice {
         let rec_t0 = profile.then(std::time::Instant::now);
         let mut s = self.inner.submitter.lock().unwrap();
         unsafe {
-            if !s.recording {
+            if !s.capturing && !s.recording {
                 // Start a fresh batch: free the previous batch's descriptor sets (its GPU work
                 // already completed at the last flush) and open the command buffer. The pool reset
                 // is a no-op for the push-descriptor path (no sets are allocated from it) but stays
@@ -3501,6 +3595,11 @@ impl VulkanDevice {
                     s.op_names.clear();
                 }
             }
+            // Command-graph capture records into the dedicated `graph_cmd` (begun by
+            // `begin_graph_capture`, never auto-flushed); eager work records into the batch `cmd`.
+            // Both paths share the identical descriptor-push + barrier + dispatch recording below, so a
+            // captured graph replays the exact op/barrier sequence the eager forward would run.
+            let cmd = if s.capturing { s.graph_cmd } else { s.cmd };
             // RAW hazard: if this dispatch touches a buffer that an earlier dispatch in this same
             // batch wrote (and we haven't barriered since), insert ONE memory barrier first, then
             // start a new barrier-free group. Independent dispatches (disjoint buffers, or reading
@@ -3517,7 +3616,7 @@ impl VulkanDevice {
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
                 dev.cmd_pipeline_barrier(
-                    s.cmd,
+                    cmd,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
@@ -3550,7 +3649,6 @@ impl VulkanDevice {
                     .buffer(b)
                     .range(vk::WHOLE_SIZE)];
             }
-            let cmd = s.cmd;
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
 
             if let Some(pd) = &self.inner.push_descriptor {
@@ -3607,7 +3705,7 @@ impl VulkanDevice {
                 dev.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
             dev.cmd_dispatch(cmd, groups.0, groups.1, groups.2);
-            if self.inner.gpu_profile {
+            if self.inner.gpu_profile && !s.capturing {
                 let q = s.op_names.len() as u32 + 1;
                 if q <= BATCH_CAP {
                     dev.cmd_write_timestamp(
@@ -3638,8 +3736,9 @@ impl VulkanDevice {
                 }
             }
             // Bound the descriptor-set budget: a forward longer than BATCH_CAP ops just flushes
-            // a handful of times instead of once.
-            if s.n >= BATCH_CAP {
+            // a handful of times instead of once. Never mid-capture: a graph must record whole into
+            // one command buffer (a partial submit would tear the replayable forward in two).
+            if s.n >= BATCH_CAP && !s.capturing {
                 flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period)?;
                 drop(s);
                 self.reclaim();
@@ -3660,6 +3759,113 @@ impl VulkanDevice {
         }
         self.reclaim();
         Ok(())
+    }
+
+    /// Begin capturing every subsequent dispatch into a dedicated, re-submittable command buffer --
+    /// the decode command-graph. Any pending eager batch is flushed first so the capture buffer starts
+    /// clean and independent. While the capture is in flight, `dispatch_outs` records into it and never
+    /// auto-flushes, and the buffer pool reserves (never recycles) every intermediate the capture
+    /// touches, so a later replay reads/writes stable storage instead of aliasing live tensors.
+    ///
+    /// Requires `VK_KHR_push_descriptor`: buffer handles are then pushed inline into the command
+    /// buffer, so no per-dispatch descriptor set has to remain live for the replay. Without it the
+    /// legacy path would allocate descriptor sets whose pool is reset every batch -- unsound to
+    /// replay -- so we return an error and the caller stays on the (correct) eager path.
+    pub fn begin_graph_capture(&self) -> Result<()> {
+        if self.inner.push_descriptor.is_none() {
+            crate::bail!("vulkan graph capture requires VK_KHR_push_descriptor");
+        }
+        // Drain recorded-but-unsubmitted eager work; the capture buffer must be independent of it.
+        self.flush()?;
+        let dev = self.dev();
+        let cmd = {
+            let mut s = self.inner.submitter.lock().unwrap();
+            if s.capturing {
+                crate::bail!("vulkan graph capture already in flight");
+            }
+            // A fresh primary command buffer owned by this capture (freed on VkGraph drop). Begun with
+            // DEFAULT flags -- explicitly NOT ONE_TIME_SUBMIT -- so it is legal to re-submit per token.
+            let cmd = unsafe {
+                dev.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(s.cpool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .map_err(vkerr)?[0]
+            };
+            unsafe {
+                dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+                    .map_err(vkerr)?;
+            }
+            s.graph_cmd = cmd;
+            s.capturing = true;
+            s.written_since_barrier.clear();
+            s.n = 0;
+            s.barriers = 0;
+            cmd
+        };
+        // Reserve every buffer the capture touches until the graph is torn down (see BufPool).
+        self.inner.bufpool.lock().unwrap().capture_depth += 1;
+        let _ = cmd;
+        Ok(())
+    }
+
+    /// End the in-flight capture and return the replayable decode graph. The command buffer is closed
+    /// (never submitted here); the caller replays it per token via [`VkGraph::replay`] after refreshing
+    /// the stable input buffers in place. Mirrors `RocmGraphHandle::end_capture`.
+    pub fn end_graph_capture(&self) -> Result<VkGraph> {
+        let dev = self.dev();
+        let (cmd, n) = {
+            let mut s = self.inner.submitter.lock().unwrap();
+            if !s.capturing {
+                crate::bail!("vulkan graph end_capture with no capture in flight");
+            }
+            let cmd = s.graph_cmd;
+            let n = s.n;
+            unsafe {
+                dev.end_command_buffer(cmd).map_err(vkerr)?;
+            }
+            s.capturing = false;
+            s.graph_cmd = vk::CommandBuffer::null();
+            s.n = 0;
+            s.written_since_barrier.clear();
+            (cmd, n)
+        };
+        self.inner.bufpool.lock().unwrap().capture_depth -= 1;
+        // A dedicated fence per graph so replays of distinct graphs never contend on one fence.
+        let fence = unsafe {
+            dev.create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(vkerr)?
+        };
+        Ok(VkGraph {
+            cmd,
+            fence,
+            n_dispatch: n,
+            device: self.clone(),
+        })
+    }
+
+    /// Abort an in-flight capture without producing a graph (used when the forward errors mid-capture).
+    /// Closes and frees the capture buffer and releases the pool reservation so eager decode resumes.
+    pub fn abort_graph_capture(&self) {
+        let dev = self.dev();
+        let mut s = self.inner.submitter.lock().unwrap();
+        if !s.capturing {
+            return;
+        }
+        let cmd = s.graph_cmd;
+        unsafe {
+            let _ = dev.end_command_buffer(cmd);
+            dev.free_command_buffers(s.cpool, &[cmd]);
+        }
+        s.capturing = false;
+        s.graph_cmd = vk::CommandBuffer::null();
+        s.n = 0;
+        s.written_since_barrier.clear();
+        drop(s);
+        let mut pool = self.inner.bufpool.lock().unwrap();
+        pool.capture_depth = pool.capture_depth.saturating_sub(1);
     }
 
     // Move buffers dropped before this point into the reuse pool. Sound only right after a
@@ -3732,14 +3938,17 @@ impl VulkanDevice {
         // Park under the bucket key, matching the size raw_buffer allocated and looks up.
         let bytes = pool_bucket(bytes);
         if let Ok(mut pool) = self.inner.bufpool.lock() {
-            pool.pending.push((
-                bytes,
-                PooledBuf {
-                    buffer,
-                    memory,
-                    host_visible,
-                },
-            ));
+            let pooled = PooledBuf {
+                buffer,
+                memory,
+                host_visible,
+            };
+            // Reserve rather than recycle while a graph capture is in flight (see VulkanStorage::drop).
+            if pool.capture_depth > 0 {
+                pool.reserved.push(pooled);
+            } else {
+                pool.pending.push((bytes, pooled));
+            }
         }
     }
 
@@ -4209,6 +4418,8 @@ impl BackendDevice for VulkanDevice {
                 barriers: 0,
                 qpool,
                 op_names: Vec::new(),
+                capturing: false,
+                graph_cmd: vk::CommandBuffer::null(),
             });
 
             // Phase profiling: opt-in, read once here so the hot path only checks a bool.
@@ -4388,6 +4599,48 @@ impl BackendDevice for VulkanDevice {
 impl VulkanStorage {
     fn count(&self) -> usize {
         self.count
+    }
+
+    /// Device-offset copy2d for the decode command-graph KV append: identical to the `copy2d`
+    /// primitive except the destination base offset is `off[0] * off_mult`, read from the `off` device
+    /// buffer instead of a push constant. A captured graph records this append once; each replay writes
+    /// the new token's K/V at the ADVANCING cache slot by refreshing `off[0]` (the decode position) in
+    /// place -- a push-constant offset would bake the warmup slot into the graph and freeze every
+    /// replay's write there (the fluent-but-stale decode bug). `off_mult` scales the position to
+    /// elements (the KV row width = head_dim), so one shared position buffer serves every layer's
+    /// append. `off` is read (binding 2); only `dst` (binding 1) is written, so the hazard tracker
+    /// barriers a later reader of the cache, not the position buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy2d_off(
+        &self,
+        dst: &mut Self,
+        off: &Self,
+        d1: usize,
+        d2: usize,
+        src_stride1: usize,
+        dst_stride1: usize,
+        src_offset: usize,
+        off_mult: usize,
+    ) -> Result<()> {
+        let total = d1 * d2;
+        if total == 0 {
+            return Ok(());
+        }
+        let push = push_u32(&[
+            d1 as u32,
+            d2 as u32,
+            src_stride1 as u32,
+            dst_stride1 as u32,
+            src_offset as u32,
+            off_mult as u32,
+        ]);
+        self.device.dispatch_out(
+            "copy2d_off",
+            &[self.buffer, dst.buffer, off.buffer],
+            1,
+            &push,
+            Self::groups_1d(total),
+        )
     }
 
     /// Number of u32 words in this buffer. For a quantized weight/bank uploaded via the `quantize_*`
@@ -6394,5 +6647,121 @@ mod dsl_dispatch_proof {
         }
         eprintln!("[sdpa-blk] h{H}kv{KV} q{SQ} k{SK} d{D} x8-batched  scale_rel={worst:.2e}  (DSL flash-SDPA spv via ml dispatch, pooled scale/meta, no sync crutch)");
         assert!(worst < 1e-4, "sdpa_blk DSL diverged from CPU: scale_rel={worst:.3e}");
+    }
+
+    // Proof that the Vulkan decode COMMAND-GRAPH (begin/end_graph_capture + VkGraph::replay), the
+    // BufPool capture pinning, and the device-offset copy2d_off together replay BIT-EXACTLY and, the
+    // crux, ADVANCE the KV-write slot per replay -- the exact stale-buffer hazard a record-once graph
+    // faces. Mirrors decode: a stable KV-like cache, a stable "new token" src, and a stable device
+    // position buffer. The captured graph (two dispatches, exercising the in-graph RAW barrier)
+    // appends src into cache[pos] via the device-offset copy, then mirrors the whole cache; every
+    // replay refreshes only src + pos in place. A frozen push-constant offset would leave all but one
+    // slot stale -- caught by the per-slot assert. Graph output must equal the eager per-token append
+    // byte-for-byte (the ship-criterion "graph-on == graph-off", proven at the ml layer).
+    #[test]
+    fn decode_command_graph_replays_bit_exact() {
+        const WIDTH: usize = 64; // KV row width (head_dim-like)
+        const N: usize = 6; // decode tokens
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[graph-proof] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        if dev.inner.push_descriptor.is_none() {
+            eprintln!("[graph-proof] no VK_KHR_push_descriptor (capture path unsupported); skipping");
+            return;
+        }
+        // Distinct data per token so any stale slot is detectable.
+        let token: Vec<Vec<f32>> = (0..N)
+            .map(|t| (0..WIDTH).map(|i| (t * 1000 + i) as f32 + 0.5).collect())
+            .collect();
+        let zero = vec![0f32; N * WIDTH];
+
+        // --- EAGER reference: append each token into a fresh cache, one eager op per token ---
+        let mut eager_cache = dev.alloc_f32(N * WIDTH).unwrap();
+        unsafe {
+            dev.write_f32(
+                eager_cache.buffer,
+                eager_cache.memory,
+                eager_cache.host_visible,
+                &zero,
+            )
+            .unwrap();
+        }
+        for (t, td) in token.iter().enumerate() {
+            let src = dev.upload_f32(td).unwrap();
+            let pos = dev.upload_u32(&[t as u32]).unwrap();
+            // dst base = pos[0] * WIDTH; one row of WIDTH contiguous elems.
+            src.copy2d_off(&mut eager_cache, &pos, 1, WIDTH, WIDTH, WIDTH, 0, WIDTH)
+                .unwrap();
+        }
+        dev.flush().unwrap();
+        let eager = eager_cache.to_vec_f32().unwrap();
+
+        // --- GRAPH: capture once, replay per token refreshing only src + pos in place ---
+        let mut g_cache = dev.alloc_f32(N * WIDTH).unwrap();
+        let mut g_mirror = dev.alloc_f32(N * WIDTH).unwrap();
+        let g_src = dev.alloc_f32(WIDTH).unwrap();
+        let g_pos = dev.alloc_u32(1).unwrap();
+        unsafe {
+            dev.write_f32(g_cache.buffer, g_cache.memory, g_cache.host_visible, &zero)
+                .unwrap();
+            // Seed the stable inputs with token 0 so the capture records a well-formed forward.
+            dev.write_f32(g_src.buffer, g_src.memory, g_src.host_visible, &token[0])
+                .unwrap();
+            dev.write_u32(g_pos.buffer, g_pos.memory, g_pos.host_visible, &[0])
+                .unwrap();
+        }
+
+        dev.begin_graph_capture().unwrap();
+        // dispatch 1: device-offset append of the stable src into cache[pos].
+        g_src
+            .copy2d_off(&mut g_cache, &g_pos, 1, WIDTH, WIDTH, WIDTH, 0, WIDTH)
+            .unwrap();
+        // dispatch 2: mirror the WHOLE cache (RAW on cache from dispatch 1 -> in-graph barrier).
+        g_cache
+            .copy2d(&mut g_mirror, N, WIDTH, WIDTH, WIDTH, 0, 0)
+            .unwrap();
+        let graph = dev.end_graph_capture().unwrap();
+        eprintln!(
+            "[graph-proof] captured {} dispatches into the decode command-graph",
+            graph.n_dispatch()
+        );
+
+        for (t, td) in token.iter().enumerate() {
+            unsafe {
+                dev.write_f32(g_src.buffer, g_src.memory, g_src.host_visible, td)
+                    .unwrap();
+                dev.write_u32(g_pos.buffer, g_pos.memory, g_pos.host_visible, &[t as u32])
+                    .unwrap();
+            }
+            graph.replay().unwrap();
+        }
+        let got_cache = g_cache.to_vec_f32().unwrap();
+        let got_mirror = g_mirror.to_vec_f32().unwrap();
+
+        // Per-slot: each advancing slot holds ITS token (a frozen offset fails all but one).
+        for (t, td) in token.iter().enumerate() {
+            let slot = &got_cache[t * WIDTH..(t + 1) * WIDTH];
+            assert_eq!(
+                slot, &td[..],
+                "graph replay slot {t} stale/wrong -> KV-write offset did not advance (frozen-buffer bug)"
+            );
+        }
+        // Byte-for-byte identical to the eager per-token append (graph-on == graph-off).
+        assert_eq!(
+            got_cache, eager,
+            "graph decode cache diverged from eager append"
+        );
+        // The RAW-barriered second dispatch mirrored the final cache exactly.
+        assert_eq!(
+            got_mirror, eager,
+            "in-graph RAW-barriered mirror diverged (barrier not replayed correctly)"
+        );
+        eprintln!(
+            "[graph-proof] {N} replays bit-exact vs eager; every advancing KV slot correct; in-graph RAW barrier replayed. Command-graph mechanism VERIFIED."
+        );
     }
 }
