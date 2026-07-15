@@ -1220,6 +1220,149 @@ pub fn moe_matvec_q6k_blk_bench<R: Runtime>(
     t.elapsed().as_secs_f64() * 1e3 / iters as f64
 }
 
+// dp4a Q6_K MoE matvec: the last un-dp4a'd hot path (the ffn_down projection; `moe_matvec_q6k_blk`
+// above decodes it one byte at a time in f32). Same block-per-output-row shape as its Q6_K sibling and
+// the same int8-dot decode as `moe_matvec_q4k_dp4a_blk`: four consecutive weights share one aligned ql
+// word and one qh word, so a group is `((ql >> qlshift) & 0x0F0F0F0F) | (((qh >> qhshift) & 0x03030303)
+// << 4)` -- four 6-bit codes (0..63, so they reinterpret to i8 unsigned-safe) dotted against the q8
+// activation via OpSDot.
+//
+// The `- 32` bias folds out affinely, exactly as Q4_K folds `dmin`: within a 16-weight half-block the
+// scale is constant, so `sum d*sc*(q-32)*x` with `x = xs*xq` is `d*xs*sc*(dot(q,xq) - 32*sum(xq))`.
+// `sum(xq)` comes from dotting the activation with a vector of ones -- one extra OpSDot per group, and
+// no new host-side array (unlike Q4_K's `xsum`, which is per-32 and cannot express a half-block sum).
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q6k_dp4a_blk<F: Float>(
+    wql: &Array<u32>,
+    wqh: &Array<u32>,
+    wsc: &Array<u32>,
+    wd: &Array<F>,
+    xq: &Array<u32>, // q8 activation, int8 packed 4/u32, [slots, k/32, 8]
+    xs: &Array<F>,   // per-32-block activation scale, [slots, k/32]
+    ids: &Array<u32>,
+    out: &mut Array<F>,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+    #[comptime] nt: usize,
+) {
+    let outrow = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let slot = outrow / n;
+    let r = outrow % n;
+    let wrow = ids[slot] as usize * n + r;
+    let nb = k / 256;
+    let nsub = k / 32;
+    let per = (nsub + nt - 1) / nt;
+    let xrow = slot * nsub;
+    let ones = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(
+        0x0101_0101u32,
+    ));
+    let mut partial = F::new(0.0);
+    for j in 0..per {
+        let sb = j * nt + t;
+        if sb < nsub {
+            // Same (superblock, chunk, sub-block) decomposition as `moe_matvec_q6k_blk`.
+            let sup = sb / 8;
+            let sbloc = sb % 8;
+            let idx = sbloc / 4;
+            let sub = sbloc % 4;
+            let blk = wrow * nb + sup;
+            let d = wd[blk];
+            let qlw0 = blk * 32 + (idx * 64 + (sub % 2) * 32) / 4; // ql word base (byte offs are 32-aligned)
+            let qhw0 = blk * 16 + (idx * 32) / 4; // qh word base
+            let scbase = blk * 4;
+            let qlshift = ((sub / 2) * 4) as u32;
+            let qhshift = (sub * 2) as u32;
+            let scb0 = idx * 8 + sub * 2;
+            let sc0 = F::cast_from(sbyte_at(wsc, scbase, scb0)); // weights 0..15
+            let sc1 = F::cast_from(sbyte_at(wsc, scbase, scb0 + 1)); // weights 16..31
+            let xg = (xrow + sb) * 8;
+            let mut idot0 = 0i32;
+            let mut isum0 = 0i32;
+            let mut idot1 = 0i32;
+            let mut isum1 = 0i32;
+            // Groups 0..4 are the first half-block (scale sc0), 4..8 the second (sc1).
+            for g in 0..4 {
+                let qw = ((wql[qlw0 + g] >> qlshift) & 0x0F0F_0F0F)
+                    | (((wqh[qhw0 + g] >> qhshift) & 0x0303_0303) << 4);
+                let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<
+                    u32,
+                >(qw));
+                let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<
+                    u32,
+                >(xq[xg + g]));
+                idot0 += wv.dot(xv);
+                isum0 += xv.dot(ones);
+            }
+            for g in 4..8 {
+                let qw = ((wql[qlw0 + g] >> qlshift) & 0x0F0F_0F0F)
+                    | (((wqh[qhw0 + g] >> qhshift) & 0x0303_0303) << 4);
+                let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<
+                    u32,
+                >(qw));
+                let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<
+                    u32,
+                >(xq[xg + g]));
+                idot1 += wv.dot(xv);
+                isum1 += xv.dot(ones);
+            }
+            partial += d
+                * xs[xrow + sb]
+                * (sc0 * F::cast_from(idot0 - 32 * isum0) + sc1 * F::cast_from(idot1 - 32 * isum1));
+        }
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = partial;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        out[outrow] = smem[0];
+    }
+}
+
+/// Host launch for the dp4a Q6_K MoE matvec (activation q8-quantized on the host, as for Q4_K).
+/// `xsum` is unused here: Q6_K's scale changes mid-block, so the kernel derives its half-block sums.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_matvec_q6k_dp4a_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
+    slots: usize, n: usize, k: usize, nt: usize,
+) -> Vec<f32> {
+    let (xq, xs, _) = quant_act_q8_cpu(x, slots, k);
+    let qlh = client.create_from_slice(u32::as_bytes(wql));
+    let qhh = client.create_from_slice(u32::as_bytes(wqh));
+    let sh = client.create_from_slice(u32::as_bytes(wsc));
+    let dh = client.create_from_slice(f32::as_bytes(wd));
+    let xqh = client.create_from_slice(u32::as_bytes(&xq));
+    let xsh = client.create_from_slice(f32::as_bytes(&xs));
+    let ih = client.create_from_slice(u32::as_bytes(ids));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
+    unsafe {
+        moe_matvec_q6k_dp4a_blk::launch_unchecked::<f32, R>(
+            client, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
+            ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k, nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
 // ============================================================================================
 // dp4a matvec: the inner product uses Vector<i32,4>.dot -> SPIR-V OpSDot (hardware integer dot,
 // SPV_KHR_integer_dot_product), verified emitted. Integer activations (xq) so the int dot is exact;
