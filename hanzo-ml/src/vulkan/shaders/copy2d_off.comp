@@ -1,0 +1,35 @@
+#version 450
+// Device-offset variant of copy2d: identical 2D strided block copy, except the destination
+// base offset is read from a bound device buffer (`off[0]`, in elements) instead of a push
+// constant. This is the command-graph KV-cache append primitive: a captured decode forward
+// records the append once, and each replay writes the new token's K/V at the ADVANCING slot
+// by refreshing `off[0]` in place -- whereas a push-constant offset would be baked at capture
+// time, freezing every replay's write to the warmup slot (the fluent-but-stale decode bug).
+//
+// Buffers are `uint` (raw 4-byte words), bit-exact for both f32 and u32 storage, matching
+// copy2d.comp exactly (see its header for the denormal/NaN-preservation rationale).
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly  buffer In  { uint inp[]; };
+layout(set = 0, binding = 1)           buffer Out { uint outp[]; };
+layout(set = 0, binding = 2) readonly  buffer Off { uint off[]; };
+layout(push_constant) uniform Pc {
+    uint d1;          // number of rows
+    uint d2;          // contiguous elements per row
+    uint src_stride1; // elements between consecutive source rows
+    uint dst_stride1; // elements between consecutive dest rows
+    uint src_offset;  // base element offset into inp
+    uint off_mult;    // dst base = off[0] * off_mult (so one L buffer, scaled by row width, serves the append)
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = d1 * d2;
+    if (gid < total) {
+        uint row = gid / d2;
+        uint col = gid - row * d2;
+        uint s = src_offset + row * src_stride1 + col;
+        uint d = off[0] * off_mult + row * dst_stride1 + col;
+        outp[d] = inp[s];
+    }
+}
