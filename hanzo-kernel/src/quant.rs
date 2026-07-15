@@ -1526,6 +1526,257 @@ pub fn matvec_q8_dp4a_autotuned<R: Runtime>(
     matvec_q8_dp4a_tuned_set(client, wq, xq, wd, rows, k).run(client)
 }
 
+// ============================================================================================
+// Fused MoE top-k router. ONE workgroup per token: softmax over the `n_experts` router logits, select
+// the top-k experts, write their (index, renormalized softmax weight). Replaces the generic Vulkan
+// op-chain (max/sub/exp/sum/div + argsort + gather + narrow×2 + norm-div = ~11 dispatches/layer, each
+// wrapped in a layout copy — the bulk of Vulkan MoE decode's strided_copy churn) with a single kernel,
+// the same fusion the ROCm/CUDA `dev.moe_route` already does. Always renormalizes (Qwen3
+// norm_topk_prob); the engine gates the fused path on norm=true and falls back to the op-chain else.
+// Output order is descending weight (r=0 largest), matching softmax_last_dim + sort_last_dim(desc) +
+// narrow(topk). `nt` = threads/workgroup, a power of 2 (== the reduction width).
+// ============================================================================================
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn moe_route<F: Float>(
+    logits: &Array<F>,        // [ntok, n_experts]
+    ids_out: &mut Array<u32>, // [ntok, topk]
+    w_out: &mut Array<F>,     // [ntok, topk]
+    #[comptime] n_experts: usize,
+    #[comptime] topk: usize,
+    #[comptime] nt: usize,
+) {
+    let tok = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let base = tok * n_experts;
+    let ninf = F::new(-3.4e38); // -inf sentinel (cf. attn.rs running-max init)
+    // Maskable copy of this token's logits in shared memory (F = f32 at launch).
+    let mut slog = SharedMemory::<F>::new(n_experts);
+    let mut i = t;
+    while i < n_experts {
+        slog[i] = logits[base + i];
+        i += nt;
+    }
+    sync_cube();
+    // softmax denominator over ALL experts: max, then sum exp(logit - max).
+    let mut sred = SharedMemory::<F>::new(nt);
+    let mut lmax = ninf;
+    let mut a = t;
+    while a < n_experts {
+        if slog[a] > lmax {
+            lmax = slog[a];
+        }
+        a += nt;
+    }
+    sred[t] = lmax;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = sred[(UNIT_POS + stride) as usize];
+            let cur = sred[t];
+            if v > cur {
+                sred[t] = v;
+            }
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let m = sred[0];
+    sync_cube();
+    let mut lsum = F::new(0.0);
+    let mut b = t;
+    while b < n_experts {
+        lsum += (slog[b] - m).exp();
+        b += nt;
+    }
+    sred[t] = lsum;
+    sync_cube();
+    let mut st2 = CUBE_DIM / 2;
+    while st2 > 0 {
+        if UNIT_POS < st2 {
+            let v = sred[(UNIT_POS + st2) as usize];
+            sred[t] += v;
+        }
+        sync_cube();
+        st2 /= 2;
+    }
+    let denom = sred[0];
+    sync_cube();
+    // top-k: `topk` passes of argmax over the masked logits (index-tracking tree reduce).
+    let mut sidx = SharedMemory::<u32>::new(nt);
+    let mut wsum = F::new(0.0);
+    for _r in 0..topk {
+        let mut lv = ninf;
+        let mut li = 0u32;
+        let mut c = t;
+        while c < n_experts {
+            if slog[c] > lv {
+                lv = slog[c];
+                li = c as u32;
+            }
+            c += nt;
+        }
+        sred[t] = lv;
+        sidx[t] = li;
+        sync_cube();
+        let mut sr = CUBE_DIM / 2;
+        while sr > 0 {
+            if UNIT_POS < sr {
+                let ov = sred[(UNIT_POS + sr) as usize];
+                let oi = sidx[(UNIT_POS + sr) as usize];
+                let curv = sred[t];
+                if ov > curv {
+                    sred[t] = ov;
+                    sidx[t] = oi;
+                }
+            }
+            sync_cube();
+            sr /= 2;
+        }
+        let best = sidx[0];
+        let wr = (sred[0] - m).exp() / denom; // = softmax prob of the selected expert
+        wsum += wr;
+        if t == 0 {
+            ids_out[tok * topk + _r] = best;
+            w_out[tok * topk + _r] = wr;
+            slog[best as usize] = ninf; // mask so the next pass skips it
+        }
+        sync_cube();
+    }
+    // Renormalize the top-k weights to sum 1 (Qwen3 norm_topk_prob).
+    if t == 0 {
+        for _r in 0..topk {
+            let cur = w_out[tok * topk + _r];
+            w_out[tok * topk + _r] = cur / wsum;
+        }
+    }
+}
+
+/// Host launch for the fused MoE router. Returns (ids [ntok*topk], weights [ntok*topk]).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_route_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    logits: &[f32],
+    ntok: usize,
+    n_experts: usize,
+    topk: usize,
+    nt: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    let lh = client.create_from_slice(f32::as_bytes(logits));
+    let ih = client.create_from_slice(u32::as_bytes(&vec![0u32; ntok * topk]));
+    let wh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; ntok * topk]));
+    unsafe {
+        moe_route::launch_unchecked::<f32, R>(
+            client,
+            Grid::Static(ntok as u32, 1, 1),
+            Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(lh.clone(), logits.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ntok * topk),
+            ArrayArg::from_raw_parts(wh.clone(), ntok * topk),
+            n_experts,
+            topk,
+            nt,
+        );
+    }
+    let ids = u32::from_bytes(&client.read_one_unchecked(ih)).to_vec();
+    let w = f32::from_bytes(&client.read_one_unchecked(wh)).to_vec();
+    (ids, w)
+}
+
+/// f32 GEMV: `out[n] = W[n,k] @ x[k]`, W row-major contiguous. One workgroup per output row, `nt`
+/// threads stride over k, shared-mem tree reduce. The decode fix for a small f32 Linear (e.g. the MoE
+/// router gate `[128,4096] @ [4096]`) that the tiled GEMM otherwise runs as ~2 occupancy-starved
+/// workgroups (m=1 wastes 63/64 of every 64x64 tile). `k` is runtime (one .spv serves any Linear);
+/// `nt` comptime, a power of 2 (tree reduce). `n` is the grid bound (launch exactly n workgroups).
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn gemv<F: Float>(
+    w: &Array<F>,
+    x: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>, // [k]
+    #[comptime] nt: usize,
+) {
+    let row = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let k = meta[0] as usize;
+    let wbase = row * k;
+    let mut acc = F::new(0.0);
+    let mut i = t;
+    while i < k {
+        acc += w[wbase + i] * x[i];
+        i += nt;
+    }
+    let mut smem = SharedMemory::<F>::new(nt);
+    smem[t] = acc;
+    sync_cube();
+    let mut stride = CUBE_DIM / 2;
+    while stride > 0 {
+        if UNIT_POS < stride {
+            let v = smem[(UNIT_POS + stride) as usize];
+            smem[t] += v;
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if t == 0 {
+        out[row] = smem[0];
+    }
+}
+
+/// Host launch for the f32 GEMV (one workgroup per output row `n`, `nt` threads split `k`).
+pub fn gemv_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    w: &[f32],
+    x: &[f32],
+    n: usize,
+    k: usize,
+    nt: usize,
+) -> Vec<f32> {
+    let wh = client.create_from_slice(f32::as_bytes(w));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n]));
+    let mh = client.create_from_slice(u32::as_bytes(&[k as u32]));
+    unsafe {
+        gemv::launch_unchecked::<f32, R>(
+            client,
+            Grid::Static(n as u32, 1, 1),
+            Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(oh.clone(), n),
+            ArrayArg::from_raw_parts(mh.clone(), 1),
+            nt,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// CPU reference: softmax over all experts, take the top-k by weight (descending), renormalize.
+/// Mirrors `moe_route` (hanzo-ml generic path softmax_last_dim + sort_last_dim(desc) + narrow + norm).
+pub fn moe_route_ref(
+    logits: &[f32],
+    ntok: usize,
+    n_experts: usize,
+    topk: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    let mut ids = vec![0u32; ntok * topk];
+    let mut w = vec![0.0f32; ntok * topk];
+    for tok in 0..ntok {
+        let row = &logits[tok * n_experts..(tok + 1) * n_experts];
+        let m = row.iter().cloned().fold(f32::MIN, f32::max);
+        let exps: Vec<f32> = row.iter().map(|&x| (x - m).exp()).collect();
+        let denom: f32 = exps.iter().sum();
+        let mut p: Vec<(usize, f32)> = exps.iter().map(|&e| e / denom).enumerate().collect();
+        p.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let wsum: f32 = p[..topk].iter().map(|&(_, v)| v).sum();
+        for r in 0..topk {
+            ids[tok * topk + r] = p[r].0 as u32;
+            w[tok * topk + r] = p[r].1 / wsum;
+        }
+    }
+    (ids, w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
