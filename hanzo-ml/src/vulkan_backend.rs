@@ -85,6 +85,20 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // DSL block-reduced MoE (hanzo-kernel quant::moe_matvec_q{4,6}k_blk, lowered per live shape):
         // planar bank, one workgroup per output, shared-mem tree reduce. `_gu` = gate/up (k=2048,
         // nt=64), `_dn` = down (k=768, nt=32). ~2-3x the packed `moe_matvec_q4k` naive path on evo.
+        // DSL fused MoE top-k router (hanzo-kernel quant::moe_route, E=128 top-8): one workgroup per
+        // token does softmax + top-k in shared memory, replacing the ~11-dispatch softmax+sort+gather
+        // op-chain. Bindings: logits(0), ids_out(1), w_out(2).
+        "moe_route" => include_bytes!("vulkan/spv/moe_route.spv"),
+        // DSL block flash SDPA (hanzo-kernel attn::sdpa_blk, d=128 nt=64): one workgroup per
+        // (head,query) splits the keys, each thread runs an online softmax over its key slice, then the
+        // workgroup flash-combines the partials. GQA-native (reads the shared KV head, no repeat_kv), so
+        // it collapses the copy2d+bmm+softmax+bmm decode-attention chain to ONE dispatch. Bindings:
+        // q(0), k(1), v(2), out(3), scale(4), meta(5)=[seq_q,seq_k,n_kv_groups,causal].
+        "sdpa_blk" => include_bytes!("vulkan/spv/sdpa_blk.spv"),
+        // DSL f32 GEMV (hanzo-kernel quant::gemv, nt=128): out[n]=W[n,k]@x[k], one workgroup/output row,
+        // threads tree-reduce over k. Replaces the tiled GEMM for m==1 (the MoE router gate), where the
+        // 64x64-tile GEMM runs ~2 occupancy-starved workgroups. Bindings: w(0), x(1), out(2), meta(3)=[k].
+        "gemv" => include_bytes!("vulkan/spv/gemv.spv"),
         "moe_matvec_q4k_blk_gu" => include_bytes!("vulkan/spv/moe_matvec_q4k_blk_gu.spv"),
         "moe_matvec_q4k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q4k_blk_dn.spv"),
         "moe_matvec_q6k_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q6k_blk_dn.spv"),
@@ -247,6 +261,11 @@ struct VkInner {
     // print their map+copy time. Lets the 8060S show where the per-token milliseconds actually go.
     // Strictly zero-overhead when unset: the recording timer and all prints are behind this bool.
     profile: bool,
+    // Per-op GPU-time profiling opt-in (VK_PROFILE_GPU=1) plus the device's timestamp resolution
+    // (ns per tick). Only true when the compute queue advertises timestamp support; flush_locked then
+    // prints per-op on-GPU milliseconds so fusion targets the dispatches that actually cost.
+    gpu_profile: bool,
+    timestamp_period: f32,
     // VK_KHR_push_descriptor device fns, present iff the driver advertises the extension (native
     // AMD/NV; typically absent on WSL/Dozen). When set, `dispatch` pushes buffer handles inline
     // into the command buffer via `vkCmdPushDescriptorSetKHR` instead of allocating + updating +
@@ -297,6 +316,13 @@ struct Submitter {
     // recording timer is only sampled when the device's `profile` flag is set).
     record_ns: u128,
     barriers: u32,
+    // Per-op GPU-time profiling (VK_PROFILE_GPU=1). `qpool` holds one TIMESTAMP query per dispatch
+    // plus a batch baseline at index 0; `op_names[i]` is the kernel of query i+1, so
+    // (ts[i+1]-ts[i]) x timestamp_period is that dispatch's on-GPU duration. flush_locked reads and
+    // aggregates them by op name -- the measurement that separates EXPENSIVE dispatches from merely
+    // numerous ones. Unused (empty op_names, pool never written) when the flag is off.
+    qpool: vk::QueryPool,
+    op_names: Vec<&'static str>,
 }
 // Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex.
 unsafe impl Send for Submitter {}
@@ -1910,6 +1936,84 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// Fused MoE top-k router: `logits[ntok, n_experts]` -> (ids[ntok, topk] u32, weights[ntok, topk]
+    /// f32), softmax + top-k + renormalize in ONE kernel (the DSL `moe_route` .spv, one workgroup per
+    /// token). Replaces the generic softmax_last_dim + sort_last_dim + narrow + gather + norm op-chain
+    /// (~11 dispatches/layer, each with a layout copy). The .spv bakes n_experts/topk/nt, so the caller
+    /// must match the committed shape (E=128, top-8, nt=128).
+    pub fn moe_route_vk(
+        &self,
+        logits: &VulkanStorage,
+        ntok: usize,
+        n_experts: usize,
+        topk: usize,
+    ) -> Result<(VulkanStorage, VulkanStorage)> {
+        if logits.count < ntok * n_experts {
+            crate::bail!("moe_route_vk: logits count {} < ntok*n_experts {}", logits.count, ntok * n_experts);
+        }
+        let ids = self.alloc_u32(ntok * topk)?;
+        let w = self.alloc_f32(ntok * topk)?;
+        // Bindings match the kernel param order: logits(0), ids_out(1), w_out(2). No push (comptime
+        // dims). One workgroup per token; two outputs (ids, weights) for the RAW-hazard tracking.
+        let bufs = [logits.buffer, ids.buffer, w.buffer];
+        self.dispatch_outs("moe_route", &bufs, &[1, 2], &[], (ntok as u32, 1, 1))?;
+        Ok((ids, w))
+    }
+
+    /// Fused GQA flash SDPA (the DSL `sdpa_blk` .spv): `softmax(QKᵀ·scale + causal_mask)V` in ONE
+    /// dispatch, one workgroup per (batch,head,query). Collapses the decode-attention chain
+    /// repeat_kv(copy2d) → bmm(QKᵀ) → softmax → bmm(·V): the kernel reads the shared KV head directly
+    /// (GQA-native, no repeat_kv) and streams keys with a per-thread online softmax combined across the
+    /// workgroup. `q` is `[b·n_heads·seq_q·d]`, `k`/`v` are `[b·n_kv·seq_k·d]`, all contiguous f32.
+    /// `causal=false` for decode (the single query attends the whole cache). d=128, nt=64 baked in .spv.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa_blk_vk(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        b: usize,
+        n_heads: usize,
+        n_kv: usize,
+        seq_q: usize,
+        seq_k: usize,
+        d: usize,
+        softmax_scale: f32,
+        causal: bool,
+        // KV strides in elements (from the k/v Layout): lets the kernel read a max_seq-sized cache
+        // sliced to seq_k IN PLACE, with no `.contiguous()` copy of the active cache each layer.
+        kv_batch_stride: usize,
+        kv_head_stride: usize,
+        key_stride: usize,
+    ) -> Result<VulkanStorage> {
+        if q.count < b * n_heads * seq_q * d {
+            crate::bail!("sdpa_blk_vk: q count {} < b*n_heads*seq_q*d {}", q.count, b * n_heads * seq_q * d);
+        }
+        // k/v may be a strided view into a larger cache; bound-check against the furthest element read
+        // (last batch, last kv head, last key) rather than a packed size.
+        let kv_max = (b.saturating_sub(1)) * kv_batch_stride
+            + (n_kv.saturating_sub(1)) * kv_head_stride
+            + (seq_k.saturating_sub(1)) * key_stride
+            + d;
+        if k.count < kv_max || v.count < kv_max {
+            crate::bail!("sdpa_blk_vk: k/v count < strided extent {kv_max}");
+        }
+        let out = self.alloc_f32(b * n_heads * seq_q * d)?;
+        // Small runtime-scalar SSBOs (cubecl has no push constants): scale(4) + meta(5). They drop at
+        // method end but park in the BufPool `pending` list; reclaim is post-fence-only, so they stay
+        // live for the whole deferred batch that runs this dispatch.
+        let scale = self.upload_f32(&[softmax_scale])?;
+        let meta = self.upload_u32(&[
+            seq_q as u32, seq_k as u32, n_heads as u32, n_kv as u32, causal as u32,
+            kv_batch_stride as u32, kv_head_stride as u32, key_stride as u32,
+        ])?;
+        // Bindings match kernel param order: q(0) k(1) v(2) out(3) scale(4) meta(5). One workgroup per
+        // (batch,head,query); nt=64 (LocalSize) baked into the .spv. Only `out` (binding 3) is written.
+        let bufs = [q.buffer, k.buffer, v.buffer, out.buffer, scale.buffer, meta.buffer];
+        self.dispatch_outs("sdpa_blk", &bufs, &[3], &[], ((b * n_heads * seq_q) as u32, 1, 1))?;
+        Ok(out)
+    }
+
     /// Q6_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q6k`]. Reads weights
     /// at ~6.5 bits/elem (incl. pad) instead of 32 -- the bandwidth lever for memory-bound decode on
     /// this APU. Decode matches the CPU `BlockQ6K::to_float`.
@@ -3301,7 +3405,7 @@ impl VulkanDevice {
         // (~3266 dispatches/token), so `[VK_OP] <name>` | sort | uniq -c names exactly which unfused
         // op-chains to collapse first. One line/dispatch, only on the profiling path.
         if self.inner.profile {
-            eprintln!("[VK_OP] {name}");
+            eprintln!("[VK_OP] {name} grid={}", groups.0 * groups.1 * groups.2);
         }
         let p = self.pipeline(name, bufs.len(), push.len())?;
         debug_assert_eq!(
@@ -3329,6 +3433,19 @@ impl VulkanDevice {
                 s.written_since_barrier.clear();
                 s.record_ns = 0;
                 s.barriers = 0;
+                if self.inner.gpu_profile {
+                    // Reset the timestamp pool on the GPU timeline and stamp a batch baseline at
+                    // query 0; each dispatch then stamps at op_names.len()+1 so consecutive deltas
+                    // are per-op GPU durations.
+                    dev.cmd_reset_query_pool(s.cmd, s.qpool, 0, BATCH_CAP + 1);
+                    dev.cmd_write_timestamp(
+                        s.cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        s.qpool,
+                        0,
+                    );
+                    s.op_names.clear();
+                }
             }
             // RAW hazard: if this dispatch touches a buffer that an earlier dispatch in this same
             // batch wrote (and we haven't barriered since), insert ONE memory barrier first, then
@@ -3436,6 +3553,18 @@ impl VulkanDevice {
                 dev.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
             dev.cmd_dispatch(cmd, groups.0, groups.1, groups.2);
+            if self.inner.gpu_profile {
+                let q = s.op_names.len() as u32 + 1;
+                if q <= BATCH_CAP {
+                    dev.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        s.qpool,
+                        q,
+                    );
+                    s.op_names.push(name);
+                }
+            }
             // Mark this dispatch's output live in the current barrier-free group so a later
             // dispatch that READS it triggers the barrier above. WAW/WAR can't arise within a
             // batch: a buffer is written only as some op's freshly-allocated output, the pool only
@@ -3457,7 +3586,7 @@ impl VulkanDevice {
             // Bound the descriptor-set budget: a forward longer than BATCH_CAP ops just flushes
             // a handful of times instead of once.
             if s.n >= BATCH_CAP {
-                flush_locked(dev, queue, &mut s, profile)?;
+                flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period)?;
                 drop(s);
                 self.reclaim();
             }
@@ -3473,7 +3602,7 @@ impl VulkanDevice {
         let profile = self.inner.profile;
         {
             let mut s = self.inner.submitter.lock().unwrap();
-            flush_locked(dev, queue, &mut s, profile)?;
+            flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period)?;
         }
         self.reclaim();
         Ok(())
@@ -3641,6 +3770,8 @@ fn flush_locked(
     queue: vk::Queue,
     s: &mut Submitter,
     profile: bool,
+    gpu_profile: bool,
+    timestamp_period: f32,
 ) -> Result<()> {
     if !s.recording {
         return Ok(());
@@ -3678,6 +3809,48 @@ fn flush_locked(
             "[VK_PROFILE] flush: dispatch={n} barriers={barriers} \
              record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms",
         );
+    }
+    if gpu_profile && !s.op_names.is_empty() {
+        // Fence is signalled -> timestamps are ready. Read [0, op_names.len()] and turn consecutive
+        // deltas into per-op GPU nanoseconds, then aggregate by kernel name. This is the measurement
+        // that ranks dispatches by ACTUAL cost, not count (removing cheap-but-numerous ops is
+        // weightless -- proven by the router fusion). Top rows name the fusion targets.
+        let cnt = s.op_names.len() + 1;
+        let mut ts = vec![0u64; cnt];
+        let read = unsafe {
+            dev.get_query_pool_results(s.qpool, 0, &mut ts, vk::QueryResultFlags::TYPE_64)
+        };
+        if read.is_ok() {
+            let mut agg: std::collections::HashMap<&'static str, (u32, u128)> =
+                std::collections::HashMap::new();
+            for (i, &nm) in s.op_names.iter().enumerate() {
+                let dt = ts[i + 1].saturating_sub(ts[i]);
+                let ns = (dt as f64 * timestamp_period as f64) as u128;
+                let e = agg.entry(nm).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += ns;
+            }
+            let mut rows: Vec<_> = agg.into_iter().collect();
+            rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            let total: u128 = rows.iter().map(|r| r.1 .1).sum();
+            eprintln!(
+                "[VK_GPU] batch total={:.3}ms over {} dispatches, {} barriers -- by GPU time:",
+                total as f64 / 1e6,
+                s.op_names.len(),
+                barriers,
+            );
+            for (nm, (c, ns)) in rows.iter().take(20) {
+                eprintln!(
+                    "[VK_GPU]   {:<28} {:>8.3}ms  n={:<5} avg={:>6.1}us  {:>5.1}%",
+                    nm,
+                    *ns as f64 / 1e6,
+                    c,
+                    *ns as f64 / 1e3 / (*c).max(1) as f64,
+                    *ns as f64 / total.max(1) as f64 * 100.0,
+                );
+            }
+        }
+        s.op_names.clear();
     }
     s.recording = false;
     s.n = 0;
@@ -3941,6 +4114,17 @@ impl BackendDevice for VulkanDevice {
             let fence = device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(vkerr)?;
+            // One TIMESTAMP query per dispatch in a batch (BATCH_CAP) + a baseline at index 0, for
+            // per-op GPU timing under VK_PROFILE_GPU. Created unconditionally (cheap: (BATCH_CAP+1)*8
+            // bytes); only written when gpu_profile is on.
+            let qpool = device
+                .create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(BATCH_CAP + 1),
+                    None,
+                )
+                .map_err(vkerr)?;
             // Sized for a whole batch: one descriptor set per recorded dispatch (up to
             // BATCH_CAP), each binding up to MAX_BINDINGS (8) storage buffers. The widest kernels
             // are the GDN mixers (gdn_recurrence/gdn_chunked bind 7: q,k,v,g,beta,state,out); sizing
@@ -3969,12 +4153,28 @@ impl BackendDevice for VulkanDevice {
                 written_since_barrier: std::collections::HashSet::new(),
                 record_ns: 0,
                 barriers: 0,
+                qpool,
+                op_names: Vec::new(),
             });
 
             // Phase profiling: opt-in, read once here so the hot path only checks a bool.
             let profile = std::env::var("VK_PROFILE")
                 .map(|v| v != "0")
                 .unwrap_or(false);
+            // Per-op GPU timing: opt-in AND the compute queue must advertise timestamp support
+            // (valid bits + non-zero period), else the timestamp commands would be invalid.
+            let timestamp_period = instance
+                .get_physical_device_properties(pdev)
+                .limits
+                .timestamp_period;
+            let ts_supported = instance
+                .get_physical_device_queue_family_properties(pdev)
+                .get(qfi as usize)
+                .map(|q| q.timestamp_valid_bits > 0)
+                .unwrap_or(false);
+            let gpu_profile = ts_supported
+                && timestamp_period > 0.0
+                && std::env::var("VK_PROFILE_GPU").map(|v| v != "0").unwrap_or(false);
 
             let inner = VkInner {
                 _entry: entry,
@@ -3992,6 +4192,8 @@ impl BackendDevice for VulkanDevice {
                 int_dot8,
                 seed: Mutex::new(299792458),
                 profile,
+                gpu_profile,
+                timestamp_period,
                 push_descriptor,
                 pipelines: Mutex::new(HashMap::new()),
                 submitter,
@@ -4172,6 +4374,9 @@ impl VulkanStorage {
             crate::bail!("vulkan: contiguous supports rank <= 6, got {rank}");
         }
         let n = layout.shape().elem_count();
+        if self.device.inner.profile && n >= 1_000_000 {
+            eprintln!("[VK_CONTIG] dims={:?} strides={:?} n={n}", layout.dims(), layout.stride());
+        }
         let out = self.device.alloc_f32(n)?;
         let strides = layout.stride();
         // Push block MUST match strided_copy.comp exactly: {n, rank, offset, dst_offset, shape[6],
@@ -5217,7 +5422,21 @@ impl BackendStorage for VulkanStorage {
             b
         };
         let _ = &idk; // keep the materialized ids alive until the dispatch is recorded
-        let src_c = self.contiguous(l)?;
+        // Only materialize the source contiguous when it ISN'T already packed at offset 0. The kernel
+        // gathers whole `right`-sized rows by their leading index, so a source that is already
+        // contiguous is read directly -- a blind `contiguous()` here copied the WHOLE source every call
+        // (e.g. the [max_pos=262144, 64] RoPE cos/sin cache, 67MB, materialized twice per layer just to
+        // gather one position -- 62% of decode GPU time). Non-contiguous sources still get one copy.
+        let mut srck = None;
+        let src_buf = if l.is_contiguous() && l.start_offset() == 0 {
+            self.buffer
+        } else {
+            let s = self.contiguous(l)?;
+            let b = s.buffer;
+            srck = Some(s);
+            b
+        };
+        let _ = &srck;
         let dims = l.dims();
         let left: usize = dims[..dim].iter().product();
         let dim_size = dims[dim];
@@ -5228,7 +5447,7 @@ impl BackendStorage for VulkanStorage {
         let push = push_u32(&[left as u32, dim_size as u32, right as u32, n_ids as u32]);
         self.device.dispatch(
             "index_select",
-            &[ids_buf, src_c.buffer, out.buffer],
+            &[ids_buf, src_buf, out.buffer],
             &push,
             Self::groups_1d(total),
         )?;
@@ -5335,6 +5554,23 @@ impl BackendStorage for VulkanStorage {
         let _ = (&lkeep, &rkeep); // keep any materialized copies alive until the dispatch is recorded
                                   // C[b,m,n] = A[b,m,k] * B[b,k,n] (B = W[n,k]^T when nt), row-major. Push order {batch,m,k,n}.
         let out = self.device.alloc_f32(b * m * n)?;
+        // f32 GEMV fast path: a single-row (m==1) matmul against a transposed-contiguous weight W[n,k]
+        // (the `nt` case) is out[n] = W[n,k] @ x[k] -- e.g. the MoE router gate [128,4096]@[4096]. The
+        // tiled GEMM runs this at ~2 occupancy-starved workgroups (m=1 wastes 63/64 of every 64x64
+        // tile); the block-reduce `gemv` kernel runs it as n workgroups (~30x). rc_buf is W's natural
+        // [n,k] buffer (nt), lc_buf is x[k]. meta/out drop here but park in the BufPool (reclaim is
+        // post-fence-only), so they outlive the deferred dispatch.
+        if nt && b == 1 && m == 1 {
+            let meta = self.device.upload_u32(&[k as u32])?;
+            self.device.dispatch_out(
+                "gemv",
+                &[rc_buf, lc_buf, out.buffer, meta.buffer],
+                2,
+                &[],
+                (n as u32, 1, 1),
+            )?;
+            return Ok(out);
+        }
         let push = push_u32(&[b as u32, m as u32, k as u32, n as u32]);
 
         // Matrix-core path: 16x16x16 fp16 coopmat when every tile dim is a multiple of 16. Casts
@@ -6039,5 +6275,70 @@ mod dsl_dispatch_proof {
         let rel = maxerr / maxref.max(1e-30);
         eprintln!("[moe-q6k-blk] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (DSL blk spv via ml dispatch + split repack)");
         assert!(rel < 1e-3, "moe q6k blk DSL diverged from CPU: scale_rel={rel:.3e}");
+    }
+
+    // The committed DSL flash-SDPA .spv (`sdpa_blk`, d=128 nt=64) dispatched through ml's own
+    // VulkanDevice at the decode shape (seq_q=1, GQA 32/8). Matches a CPU two-pass softmax attention
+    // within f32-reorder tolerance (scale-relative: attention outputs are softmax-weighted sums of ±V
+    // that cancel near zero, so the honest metric normalizes by the output scale, not per-element).
+    // Chains 8 calls with NO intermediate sync: the runtime-scalar scale/meta SSBOs drop each call but
+    // ride the BufPool `pending` list (reclaim is post-fence-only) -- all bit-exact == no use-after-free.
+    #[test]
+    fn sdpa_blk_dsl_runs_through_ml_vulkan() {
+        const H: usize = 32;
+        const KV: usize = 8;
+        const SQ: usize = 1;
+        const SK: usize = 2048;
+        const D: usize = 128;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[sdpa-blk] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
+        let q: Vec<f32> = (0..H * SQ * D).map(|idx| gen(1, idx)).collect();
+        let k: Vec<f32> = (0..KV * SK * D).map(|idx| gen(2, idx)).collect();
+        let v: Vec<f32> = (0..KV * SK * D).map(|idx| gen(3, idx)).collect();
+        // CPU reference: two-pass softmax(QKᵀ·scale)V, GQA (head h reads kv head h/(H/KV)), non-causal.
+        let scale = 1.0f32 / (D as f32).sqrt();
+        let groups = H / KV;
+        let mut cpu = vec![0f32; H * SQ * D];
+        for h in 0..H {
+            let kv = h / groups;
+            for qp in 0..SQ {
+                let qb = (h * SQ + qp) * D;
+                let sc: Vec<f32> = (0..SK)
+                    .map(|kk| (0..D).map(|dd| q[qb + dd] * k[(kv * SK + kk) * D + dd]).sum::<f32>() * scale)
+                    .collect();
+                let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
+                let sum: f32 = ex.iter().sum();
+                for dd in 0..D {
+                    cpu[qb + dd] = (0..SK).map(|kk| ex[kk] / sum * v[(kv * SK + kk) * D + dd]).sum();
+                }
+            }
+        }
+        let qs = dev.upload_f32(&q).unwrap();
+        let ks = dev.upload_f32(&k).unwrap();
+        let vs = dev.upload_f32(&v).unwrap();
+        let mut outs = Vec::new();
+        for _ in 0..8 {
+            // Packed k/v: batch stride KV*SK*D, kv-head stride SK*D, key stride D.
+            outs.push(
+                dev.sdpa_blk_vk(&qs, &ks, &vs, 1, H, KV, SQ, SK, D, scale, false, KV * SK * D, SK * D, D)
+                    .unwrap(),
+            );
+        }
+        let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+        let mut worst = 0f32;
+        for out in &outs {
+            let got = out.to_vec_f32().unwrap();
+            let err = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            worst = worst.max(err / maxref);
+        }
+        eprintln!("[sdpa-blk] h{H}kv{KV} q{SQ} k{SK} d{D} x8-batched  scale_rel={worst:.2e}  (DSL flash-SDPA spv via ml dispatch, pooled scale/meta, no sync crutch)");
+        assert!(worst < 1e-4, "sdpa_blk DSL diverged from CPU: scale_rel={worst:.3e}");
     }
 }
