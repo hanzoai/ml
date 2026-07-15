@@ -401,6 +401,10 @@ pub struct VkGraph {
     fence: vk::Fence,
     n_dispatch: u32,
     device: VulkanDevice,
+    /// The pool buffers reserved during this graph's capture (its recorded descriptors bake their
+    /// handles). Owned for the graph's lifetime; drop returns them to the pool's `pending` list so a
+    /// retired graph's working set is recycled instead of stranded (see BufPool).
+    reserved: Vec<(u64, PooledBuf)>,
 }
 
 // Safety: the contained handles are only ever touched while holding VkInner.submitter's Mutex (replay)
@@ -443,15 +447,21 @@ impl Drop for VkGraph {
     fn drop(&mut self) {
         let dev = self.device.dev();
         unsafe {
-            // The whole teardown runs under the submitter lock: queue access (device_wait_idle waits
-            // every queue) must be externally synchronized with eager submits, and holding the lock
-            // for the wait + destroy makes dropping a graph sound from ANY thread -- the engine drops
-            // retired graphs on a background thread so the quiesce never lands on a token's latency.
+            // The teardown runs under the submitter lock: queue access (device_wait_idle waits every
+            // queue) must be externally synchronized with eager submits, which makes dropping a graph
+            // sound from any thread. The engine retires graphs at capture points, so this cost never
+            // lands on a first token.
             if let Ok(s) = self.device.inner.submitter.lock() {
                 let _ = dev.device_wait_idle();
                 dev.destroy_fence(self.fence, None);
                 dev.free_command_buffers(s.cpool, &[self.cmd]);
             }
+        }
+        // Return the capture-reserved working set to the pool. The device was just quiesced and the
+        // recorded commands that baked these handles no longer exist, so recycling is safe; `pending`
+        // keeps the conservative post-fence reclaim flow.
+        if let Ok(mut pool) = self.device.inner.bufpool.lock() {
+            pool.pending.append(&mut self.reserved);
         }
     }
 }
@@ -592,12 +602,15 @@ struct BufPool {
     // into its recorded descriptors; on every replay it reads/writes those exact buffers. If such a
     // buffer were dropped back into `pending`/`free` and later handed to an unrelated allocation, the
     // replay would alias — and corrupt — live tensor storage: the fluent-but-stale decode loop. While
-    // `capture_depth > 0`, a dropped buffer is instead parked in `reserved` (kept alive, never
-    // recycled) so no later allocation can reuse a handle the in-flight graph captured. Reserved
-    // buffers stay reserved for the process; the decode graph cache is bounded and each bucket's
-    // working set is captured once, so this is a fixed one-time reservation, not a growing leak.
+    // `capture_depth > 0`, a dropped buffer is instead parked in `reserved` (bucket key kept for its
+    // later return) so no later allocation can reuse a handle the in-flight graph captured. The
+    // reservation follows the GRAPH's lifetime, not the process's: `end_graph_capture` moves this
+    // era's reservations into the returned `VkGraph`, whose drop hands them back to `pending`.
+    // Without that return, every recapture (sequences retire graphs on the naive KV cache) would
+    // strand a full transient working set here — an unbounded leak that also forces each new
+    // sequence to allocate a fresh working set instead of reusing the pool.
     capture_depth: usize,
-    reserved: Vec<PooledBuf>,
+    reserved: Vec<(u64, PooledBuf)>,
 }
 
 // drop: park (size, buffer, memory) for reuse after the next fence. No Vulkan calls here, just
@@ -617,12 +630,13 @@ impl Drop for VulkanStorage {
                 host_visible: self.host_visible,
             };
             // During a command-graph capture, this handle may be baked into the graph; reserve it
-            // (never recycle) so no later allocation aliases the graph's storage on replay. Gating at
-            // drop time (not alloc time) is correct and needs no per-storage flag: every buffer the
-            // capture touches and then releases is dropped while `capture_depth > 0`; buffers the
-            // engine keeps live across the graph (weights, KV cache, logits) never hit this path.
+            // (recycled only when the graph is torn down) so no later allocation aliases the graph's
+            // storage on replay. Gating at drop time (not alloc time) is correct and needs no
+            // per-storage flag: every buffer the capture touches and then releases is dropped while
+            // `capture_depth > 0`; buffers the engine keeps live across the graph (weights, KV cache,
+            // logits) never hit this path.
             if pool.capture_depth > 0 {
-                pool.reserved.push(pooled);
+                pool.reserved.push((bytes, pooled));
             } else {
                 pool.pending.push((bytes, pooled));
             }
@@ -3945,7 +3959,13 @@ impl VulkanDevice {
             s.written_since_barrier.clear();
             (cmd, n)
         };
-        self.inner.bufpool.lock().unwrap().capture_depth -= 1;
+        // This capture era's reservations transfer to the graph (captures never nest: begin bails on
+        // an in-flight capture), so tearing the graph down returns exactly its own working set.
+        let reserved = {
+            let mut pool = self.inner.bufpool.lock().unwrap();
+            pool.capture_depth -= 1;
+            std::mem::take(&mut pool.reserved)
+        };
         // A dedicated fence per graph so replays of distinct graphs never contend on one fence.
         let fence = unsafe {
             dev.create_fence(&vk::FenceCreateInfo::default(), None)
@@ -3956,6 +3976,7 @@ impl VulkanDevice {
             fence,
             n_dispatch: n,
             device: self.clone(),
+            reserved,
         })
     }
 
@@ -3979,6 +4000,10 @@ impl VulkanDevice {
         drop(s);
         let mut pool = self.inner.bufpool.lock().unwrap();
         pool.capture_depth = pool.capture_depth.saturating_sub(1);
+        // Nothing was baked (the capture buffer was freed unsubmitted), so this era's reservations
+        // are plain droppable transients again; return them for post-fence reclaim.
+        let mut reserved = std::mem::take(&mut pool.reserved);
+        pool.pending.append(&mut reserved);
     }
 
     // Move buffers dropped before this point into the reuse pool. Sound only right after a
@@ -4058,7 +4083,7 @@ impl VulkanDevice {
             };
             // Reserve rather than recycle while a graph capture is in flight (see VulkanStorage::drop).
             if pool.capture_depth > 0 {
-                pool.reserved.push(pooled);
+                pool.reserved.push((bytes, pooled));
             } else {
                 pool.pending.push((bytes, pooled));
             }
