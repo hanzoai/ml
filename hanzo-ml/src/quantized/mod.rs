@@ -1256,10 +1256,17 @@ impl QTensor {
                         Storage::Vulkan(v) => v,
                         _ => crate::bail!("vulkan MoE: ids not on vulkan after contiguous()"),
                     };
-                    // Prefer the DSL block-reduced kernel when a specialized .spv exists for this
-                    // (dtype, n, k): planar bank, one workgroup per output, ~2-3x the packed naive
-                    // path. Shapes without a committed .spv fall back to the packed `vk_moe_kernel`.
-                    match vk_moe_blk_kernel(dt, n, k) {
+                    // Prefer the dp4a (int8 OpSDot) block kernel when the device supports integer
+                    // dot-product and a specialized .spv exists (~1.4-1.6x the f32-decode block kernel,
+                    // within activation-quant tolerance). Else the f32 DSL block kernel (planar bank,
+                    // one workgroup/output, ~2-3x packed). Else the packed `vk_moe_kernel`. Same split
+                    // bank feeds both block paths; the dp4a path q8-quantizes the activation once.
+                    match vk_moe_blk_dp4a_kernel(dt, n, k).filter(|_| vk_dev.has_int_dot8()) {
+                        Some(blk) => {
+                            let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
+                            vk_dev.moe_matvec_blk_dp4a_gpu(blk, bank.as_ref(), xv, ids_v, nrows, n, k)?
+                        }
+                        None => match vk_moe_blk_kernel(dt, n, k) {
                         Some(blk) => {
                             let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
                             vk_dev.moe_matvec_blk_gpu(blk, bank.as_ref(), xv, ids_v, nrows, n, k)?
@@ -1270,6 +1277,7 @@ impl QTensor {
                             let wbank = self.vulkan_moe_bank(vk_dev, e_cnt, n, k)?;
                             vk_dev.moe_matvec_gpu(kernel, wbank.as_ref(), xv, ids_v, nrows, n, k)?
                         }
+                        },
                     }
                 };
                 let out = crate::tensor::from_storage(
@@ -1626,6 +1634,20 @@ fn vk_moe_blk_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<&'static str> 
         (GgmlDType::Q4K, 768, 2048) => Some("moe_matvec_q4k_blk_gu"),
         (GgmlDType::Q4K, 2048, 768) => Some("moe_matvec_q4k_blk_dn"),
         (GgmlDType::Q6K, 2048, 768) => Some("moe_matvec_q6k_blk_dn"),
+        _ => None,
+    }
+}
+
+// dp4a (int8 OpSDot) block kernels for the shapes with a committed .spv. Selected before the f32 block
+// kernel when the device advertises integer dot-product (see has_int_dot8). VK_MOE_DP4A_OFF forces the
+// f32 path for an A/B. Q6_K has no dp4a variant yet -> its down proj stays on the f32 block kernel.
+fn vk_moe_blk_dp4a_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<&'static str> {
+    if std::env::var_os("VK_MOE_PACKED").is_some() || std::env::var_os("VK_MOE_DP4A_OFF").is_some() {
+        return None;
+    }
+    match (dt, n, k) {
+        (GgmlDType::Q4K, 768, 2048) => Some("moe_matvec_q4k_dp4a_blk_gu"),
+        (GgmlDType::Q4K, 2048, 768) => Some("moe_matvec_q4k_dp4a_blk_dn"),
         _ => None,
     }
 }
