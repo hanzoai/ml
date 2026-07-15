@@ -13,6 +13,7 @@ use hanzo_kernel::quant::{
     moe_matvec_q6k_bench, moe_matvec_q6k_blk_bench, moe_matvec_q6k_blk_run, moe_matvec_q6k_ref, moe_matvec_q6k_run,
     moe_route, moe_route_ref, moe_route_run, gemv, gemv_run,
     moe_matvec_q4k_dp4a_blk, moe_matvec_q4k_dp4a_blk_run, quant_act_q8_cpu,
+    moe_matvec_q6k_dp4a_blk, moe_matvec_q6k_dp4a_blk_run,
     matvec_q4k_dp4a_blk, matvec_q4k_dp4a_blk_run, pack_q4k, QK8_0,
 };
 use std::time::Instant;
@@ -240,6 +241,53 @@ fn check_moe_q6k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n:
 }
 
 // Block-reduced Q6_K MoE matvec: the Q6_K decode-perf lever (naive Q6_K is decode-ALU-bound).
+// dp4a Q6_K MoE parity + throughput, the Q6_K twin of `check_moe_q4k_dp4a_blk`. Same 1e-2 scale-relative
+// gate: the q8 activation is the only approximation, so a decode bug (nibble, 2-bit field, scale half,
+// word alignment) lands orders of magnitude outside it. Q6_K is 210 bytes/superblock, not Q4_K's 144.
+fn check_moe_q6k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
+    let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
+    let reference = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
+    let got = moe_matvec_q6k_dp4a_blk_run::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, nt);
+    let srel = scalerel(&reference, &got);
+    let ok = srel < 1e-2;
+    let (xq, xs, _) = quant_act_q8_cpu(&x, slots, k);
+    let qlh = client.create_from_slice(u32::as_bytes(&wql));
+    let qhh = client.create_from_slice(u32::as_bytes(&wqh));
+    let sh = client.create_from_slice(u32::as_bytes(&wsc));
+    let dh = client.create_from_slice(f32::as_bytes(&wd));
+    let xqh = client.create_from_slice(u32::as_bytes(&xq));
+    let xsh = client.create_from_slice(f32::as_bytes(&xs));
+    let ih = client.create_from_slice(u32::as_bytes(&ids));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
+    let launch = |c: &ComputeClient<R>| unsafe {
+        moe_matvec_q6k_dp4a_blk::launch_unchecked::<f32, R>(
+            c, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
+            ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
+            ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(dh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(ih.clone(), ids.len()),
+            ArrayArg::from_raw_parts(oh.clone(), slots * n),
+            n, k, nt,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t0 = Instant::now();
+    for _ in 0..50 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / 50.0;
+    let gbps = (slots * n * (k / 256) * 210) as f64 / (ms * 1e6);
+    let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] MoEq6dp4a E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
+        name, e, slots, n, k, nt, srel,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+    );
+}
+
 fn check_moe_q6k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
     let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
     let reference = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
@@ -547,6 +595,7 @@ fn main() {
         check_moe_q4k_dp4a_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // dp4a down:    LocalSize 32
         check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/dump", &c, 4096, 2048, 64); // dense dp4a: LocalSize 64
         check_moe_q6k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
+        check_moe_q6k_dp4a_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // dp4a down: LocalSize 32
         check_moe_route::<WgpuRuntime>("VK/dump", &c, 8, 128, 8, 128); // fused router: E128 top8 nt128
         check_sdpa_blk::<WgpuRuntime>("VK/dump", &c, 32, 8, 1, 2048, 2048, 128, false, 64); // decode attn: d128 nt64
         check_gemv::<WgpuRuntime>("VK/dump", &c, 128, 4096, 128); // router gate GEMV: nt128
