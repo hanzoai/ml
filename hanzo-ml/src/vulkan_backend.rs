@@ -452,6 +452,50 @@ impl Drop for VkGraph {
     }
 }
 
+/// The shared, refreshable attention buffers a captured decode graph binds for [`VulkanDevice::
+/// sdpa_blk_vk_graph`]. Decode attention has the identical shape and KV-cache strides in every layer,
+/// so ONE `scale` (constant) and ONE `meta` buffer serve the whole forward; the only per-token change
+/// is the attended key count `seq_k`, refreshed in `meta[1]` in place by [`Self::set_seq_k`] before
+/// each replay. This owns the buffers so their handles stay stable for the graph's lifetime and keeps
+/// the `meta` field layout in one place next to the kernel that reads it (the engine supplies dims,
+/// never the raw layout). `meta` layout matches `sdpa_blk_vk`:
+/// `[seq_q, seq_k, n_heads, n_kv, causal, kv_batch_stride, kv_head_stride, key_stride]` (u32, elements).
+pub struct VkGraphAttn {
+    scale: VulkanStorage,
+    meta: VulkanStorage,
+}
+
+// Safety: the contained storages' handles are only touched under the device locks (build/replay) or
+// via the host-coherent map in `set_seq_k`, exactly as the eager sdpa scalar SSBOs are.
+unsafe impl Send for VkGraphAttn {}
+
+impl VkGraphAttn {
+    /// The shared softmax-scale SSBO (binding 4 of `sdpa_blk`). Constant for the graph's life.
+    pub fn scale(&self) -> &VulkanStorage {
+        &self.scale
+    }
+
+    /// The shared attention-meta SSBO (binding 5 of `sdpa_blk`). `meta[1]` (seq_k) advances per replay.
+    pub fn meta(&self) -> &VulkanStorage {
+        &self.meta
+    }
+
+    /// Refresh the attended key count in place before a replay. A captured decode graph binds the FULL
+    /// fixed-shape KV cache once; this advances the span it attends to `[0, seq_k)` without re-record.
+    pub fn set_seq_k(&self, seq_k: usize) -> Result<()> {
+        // seq_q stays 1; only meta[1] moves. Host-coherent map (small SSBO placed host-visible), so the
+        // write is visible to the next queue_submit exactly as the eager per-call meta upload is.
+        unsafe {
+            self.meta.device.write_u32(
+                self.meta.buffer,
+                self.meta.memory,
+                self.meta.host_visible,
+                &[1, seq_k as u32],
+            )
+        }
+    }
+}
+
 /// Arguments for [`VulkanDevice::paged_attention_vk`]. All tensors are f32 `VulkanStorage`
 /// except `block_tables`/`context_lens` (u32). Strides are in f32 ELEMENTS. Grouped into a
 /// struct because the kernel needs many invariants (see the codebase 6+ arg convention).
@@ -2186,6 +2230,39 @@ impl VulkanDevice {
     ) -> Result<()> {
         let bufs = [q.buffer, k.buffer, v.buffer, out.buffer, scale.buffer, meta.buffer];
         self.dispatch_outs("sdpa_blk", &bufs, &[3], &[], ((b * n_heads * seq_q) as u32, 1, 1))
+    }
+
+    /// Build the shared [`VkGraphAttn`] buffers a decode command-graph binds for every layer's
+    /// [`Self::sdpa_blk_vk_graph`]. The KV cache is the contiguous `[b=1, n_kv, capacity, head_dim]`
+    /// buffer each layer appends into, so the per-head/per-key strides are fixed for the graph's life
+    /// and encoded once here; the caller advances only `seq_k` per replay via [`VkGraphAttn::set_seq_k`].
+    /// `softmax_scale`/`causal` match the eager [`Self::sdpa_blk_vk`] call for the same decode step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_graph_attn(
+        &self,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        capacity: usize,
+        softmax_scale: f32,
+        causal: bool,
+        seq_k: usize,
+    ) -> Result<VkGraphAttn> {
+        let key_stride = head_dim;
+        let kv_head_stride = capacity * head_dim;
+        let kv_batch_stride = n_kv * kv_head_stride;
+        let meta = self.upload_u32(&[
+            1, // seq_q (decode: single query)
+            seq_k as u32,
+            n_heads as u32,
+            n_kv as u32,
+            causal as u32,
+            kv_batch_stride as u32,
+            kv_head_stride as u32,
+            key_stride as u32,
+        ])?;
+        let scale = self.upload_f32(&[softmax_scale])?;
+        Ok(VkGraphAttn { scale, meta })
     }
 
     /// Q6_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q6k`]. Reads weights
@@ -4636,10 +4713,16 @@ impl VulkanStorage {
     /// elements (the KV row width = head_dim), so one shared position buffer serves every layer's
     /// append. `off` is read (binding 2); only `dst` (binding 1) is written, so the hazard tracker
     /// barriers a later reader of the cache, not the position buffer.
+    ///
+    /// `dst` is taken by shared reference: the write lands in device memory through the bound buffer
+    /// handle, the `VulkanStorage` value itself is untouched. This mirrors [`Self`]'s in-place cache
+    /// writers (e.g. `reshape_and_cache_vk`) and lets a caller holding only read guards on the source
+    /// and destination cache tensors (the engine KV-append seam) drive the append without a mutable
+    /// borrow it cannot obtain across the tensor storage lock.
     #[allow(clippy::too_many_arguments)]
     pub fn copy2d_off(
         &self,
-        dst: &mut Self,
+        dst: &Self,
         off: &Self,
         d1: usize,
         d2: usize,
@@ -6706,7 +6789,7 @@ mod dsl_dispatch_proof {
         let zero = vec![0f32; N * WIDTH];
 
         // --- EAGER reference: append each token into a fresh cache, one eager op per token ---
-        let mut eager_cache = dev.alloc_f32(N * WIDTH).unwrap();
+        let eager_cache = dev.alloc_f32(N * WIDTH).unwrap();
         unsafe {
             dev.write_f32(
                 eager_cache.buffer,
@@ -6720,14 +6803,14 @@ mod dsl_dispatch_proof {
             let src = dev.upload_f32(td).unwrap();
             let pos = dev.upload_u32(&[t as u32]).unwrap();
             // dst base = pos[0] * WIDTH; one row of WIDTH contiguous elems.
-            src.copy2d_off(&mut eager_cache, &pos, 1, WIDTH, WIDTH, WIDTH, 0, WIDTH)
+            src.copy2d_off(&eager_cache, &pos, 1, WIDTH, WIDTH, WIDTH, 0, WIDTH)
                 .unwrap();
         }
         dev.flush().unwrap();
         let eager = eager_cache.to_vec_f32().unwrap();
 
         // --- GRAPH: capture once, replay per token refreshing only src + pos in place ---
-        let mut g_cache = dev.alloc_f32(N * WIDTH).unwrap();
+        let g_cache = dev.alloc_f32(N * WIDTH).unwrap();
         let mut g_mirror = dev.alloc_f32(N * WIDTH).unwrap();
         let g_src = dev.alloc_f32(WIDTH).unwrap();
         let g_pos = dev.alloc_u32(1).unwrap();
@@ -6744,7 +6827,7 @@ mod dsl_dispatch_proof {
         dev.begin_graph_capture().unwrap();
         // dispatch 1: device-offset append of the stable src into cache[pos].
         g_src
-            .copy2d_off(&mut g_cache, &g_pos, 1, WIDTH, WIDTH, WIDTH, 0, WIDTH)
+            .copy2d_off(&g_cache, &g_pos, 1, WIDTH, WIDTH, WIDTH, 0, WIDTH)
             .unwrap();
         // dispatch 2: mirror the WHOLE cache (RAW on cache from dispatch 1 -> in-graph barrier).
         g_cache
