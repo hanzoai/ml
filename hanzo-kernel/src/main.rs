@@ -11,10 +11,11 @@ use hanzo_kernel::quant::{
     matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref, matvec_q8_run,
     moe_matvec_q4k_bench, moe_matvec_q4k_blk_bench, moe_matvec_q4k_blk_run, moe_matvec_q4k_ref, moe_matvec_q4k_run,
     moe_matvec_q6k_bench, moe_matvec_q6k_blk_bench, moe_matvec_q6k_blk_run, moe_matvec_q6k_ref, moe_matvec_q6k_run,
-    moe_route, moe_route_ref, moe_route_run, QK8_0,
+    moe_route, moe_route_ref, moe_route_run, gemv, gemv_run, QK8_0,
 };
 use std::time::Instant;
 use hanzo_kernel::norm::rms_norm_run;
+use hanzo_kernel::attn::{sdpa_blk, sdpa_blk_run, sdpa_ref};
 
 // dp4a matvec parity: i8-packed one-thread-per-row (portable) vs block-per-row (coalesced reads +
 // shared-mem reduction, the bandwidth-bound winner). GB/s is on REAL int8 bytes (rows*k) so it
@@ -206,6 +207,122 @@ fn check_moe_route<R: Runtime>(name: &str, client: &ComputeClient<R>, ntok: usiz
     );
 }
 
+// Block-per-(head,query) GQA flash SDPA vs the CPU two-pass oracle. This is the decode-attention
+// lever: naive `sdpa` streams one whole head on ONE thread (near-zero occupancy at decode, seq_q=1),
+// so on Vulkan decode the bmm+softmax+bmm+repeat_kv chain dominates. `sdpa_blk` puts `nt` threads on
+// each (head,query), splitting the keys and flash-combining the partials -- full occupancy, GQA-native
+// (no repeat_kv copy). GB/s on the KV bytes actually streamed: n_heads * seq_k * 2d * 4 (Q reread is
+// tiny). Decode shape: seq_q=1, causal=false (the single query attends the whole cache).
+fn check_sdpa_blk<R: Runtime>(
+    name: &str, client: &ComputeClient<R>,
+    n_heads: usize, n_kv: usize, seq_q: usize, seq_k: usize, kv_seq_pad: usize, d: usize, causal: bool, nt: usize,
+) {
+    let mut s = 0x2545F4914F6CDD1Du64;
+    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let mut rnd = |_| (next() % 2000) as f32 / 1000.0 - 1.0;
+    let q: Vec<f32> = (0..n_heads * seq_q * d).map(&mut rnd).collect();
+    // Packed k/v [n_kv, seq_k, d] for the CPU oracle.
+    let k: Vec<f32> = (0..n_kv * seq_k * d).map(&mut rnd).collect();
+    let v: Vec<f32> = (0..n_kv * seq_k * d).map(&mut rnd).collect();
+    let want = sdpa_ref(&q, &k, &v, n_heads, n_kv, seq_q, seq_k, d, causal);
+    // Padded k/v [n_kv, kv_seq_pad, d] modelling a max_seq-sized KV cache sliced to seq_k: copy the
+    // packed keys into the first seq_k rows of each head, leaving the padding tail garbage (never read).
+    // The kernel reads this STRIDED (no contiguous copy); result must equal the packed oracle.
+    let pad = |src: &[f32]| -> Vec<f32> {
+        let mut buf = vec![0.0f32; n_kv * kv_seq_pad * d];
+        for kvh in 0..n_kv {
+            let (s0, d0) = (kvh * seq_k * d, kvh * kv_seq_pad * d);
+            buf[d0..d0 + seq_k * d].copy_from_slice(&src[s0..s0 + seq_k * d]);
+        }
+        buf
+    };
+    let kp = pad(&k);
+    let vp = pad(&v);
+    let got = sdpa_blk_run::<R>(client, &q, &kp, &vp, n_heads, n_kv, seq_q, seq_k, kv_seq_pad, d, causal, nt);
+    // scale-relative (normalized by max output magnitude): the honest metric for attention. Per-element
+    // max_rel explodes on near-zero outputs (softmax-weighted sums of ±V cancel to ~0; flash vs two-pass
+    // differ only in fp summation ORDER, ~1e-6, amplified by that cancellation's condition number).
+    let srel = scalerel(&want, &got);
+    let mrel = max_rel(&want, &got);
+    let ok = srel < 1e-4;
+    // Kernel-only throughput (fixed buffers, 200 dispatches, one sync). Uses the padded strided buffers.
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let meta = [
+        seq_q as u32, seq_k as u32, n_heads as u32, n_kv as u32, causal as u32,
+        (n_kv * kv_seq_pad * d) as u32, (kv_seq_pad * d) as u32, d as u32,
+    ];
+    let qh = client.create_from_slice(f32::as_bytes(&q));
+    let kh = client.create_from_slice(f32::as_bytes(&kp));
+    let vh = client.create_from_slice(f32::as_bytes(&vp));
+    let sh = client.create_from_slice(f32::as_bytes(&[scale]));
+    let mh = client.create_from_slice(u32::as_bytes(&meta));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n_heads * seq_q * d]));
+    let launch = |c: &ComputeClient<R>| unsafe {
+        sdpa_blk::launch_unchecked::<f32, R>(
+            c, Grid::Static((n_heads * seq_q) as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(qh.clone(), q.len()),
+            ArrayArg::from_raw_parts(kh.clone(), kp.len()),
+            ArrayArg::from_raw_parts(vh.clone(), vp.len()),
+            ArrayArg::from_raw_parts(oh.clone(), n_heads * seq_q * d),
+            ArrayArg::from_raw_parts(sh.clone(), 1),
+            ArrayArg::from_raw_parts(mh.clone(), 8),
+            d, nt,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t0 = Instant::now();
+    for _ in 0..200 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / 200.0;
+    let kv_bytes = (n_heads * seq_k * 2 * d * 4) as f64; // Q@K + P@V both stream the GQA-expanded KV
+    let gbs = kv_bytes / (ms * 1e-3) / 1e9;
+    println!(
+        "[{:<7}] SDPAblk h{}kv{} q{} k{} d{} nt={:<3} scale_rel={:.2e} (max_rel={:.1e})  {}  {:.4} ms  {:.0} GB/s",
+        name, n_heads, n_kv, seq_q, seq_k, d, nt, srel, mrel,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbs
+    );
+}
+
+// f32 GEMV (W[n,k] @ x[k]) vs a plain CPU dot. The decode fix for the MoE router gate: a tiled GEMM
+// at m=1 is ~2 occupancy-starved workgroups; this block-reduce GEMV is n workgroups. GB/s on the
+// weight bytes (n*k*4) -- the router reads 2MB fp32 (128x4096) every layer.
+fn check_gemv<R: Runtime>(name: &str, client: &ComputeClient<R>, n: usize, k: usize, nt: usize) {
+    let mut s = 0x9E3779B97F4A7C15u64;
+    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let w: Vec<f32> = (0..n * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let x: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let want: Vec<f32> = (0..n).map(|r| (0..k).map(|i| w[r * k + i] * x[i]).sum()).collect();
+    let got = gemv_run::<R>(client, &w, &x, n, k, nt);
+    let rel = scalerel(&want, &got);
+    let ok = rel < 1e-4;
+    let wh = client.create_from_slice(f32::as_bytes(&w));
+    let xh = client.create_from_slice(f32::as_bytes(&x));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n]));
+    let mh = client.create_from_slice(u32::as_bytes(&[k as u32]));
+    let launch = |c: &ComputeClient<R>| unsafe {
+        gemv::launch_unchecked::<f32, R>(
+            c, Grid::Static(n as u32, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(oh.clone(), n),
+            ArrayArg::from_raw_parts(mh.clone(), 1),
+            nt,
+        );
+    };
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t0 = Instant::now();
+    for _ in 0..200 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / 200.0;
+    let gbs = (n * k * 4) as f64 / (ms * 1e-3) / 1e9;
+    println!(
+        "[{:<7}] GEMV {}x{} nt={:<3} scale_rel={:.2e}  {}  {:.4} ms  {:.0} GB/s",
+        name, n, k, nt, rel, if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbs
+    );
+}
+
 fn gen(rows: usize, k: usize) -> (Vec<f32>, Vec<i32>, Vec<f32>) {
     let nb = k / QK8_0;
     let mut s = 0x2545F491_4F6CDD1Du64; // xorshift, deterministic
@@ -333,6 +450,8 @@ fn main() {
         check_moe_q4k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
         check_moe_q6k_blk::<WgpuRuntime>("VK/dump", &c, 128, 2048, 8, 768, 32); // down:    LocalSize 32
         check_moe_route::<WgpuRuntime>("VK/dump", &c, 8, 128, 8, 128); // fused router: E128 top8 nt128
+        check_sdpa_blk::<WgpuRuntime>("VK/dump", &c, 32, 8, 1, 2048, 2048, 128, false, 64); // decode attn: d128 nt64
+        check_gemv::<WgpuRuntime>("VK/dump", &c, 128, 4096, 128); // router gate GEMV: nt128
         return;
     }
 
@@ -376,6 +495,19 @@ fn main() {
         // Fused MoE top-k router (Qwen3-30B-A3B: 128 experts, top-8): decode batch + prefill batch.
         check_moe_route::<WgpuRuntime>("VULKAN", &c, 8, 128, 8, 128);
         check_moe_route::<WgpuRuntime>("VK/pref", &c, 512, 128, 8, 128);
+        // Decode attention (seq_q=1, single query attends the whole cache): sweep threads/query.
+        // sacc shared = nt*d*4 bytes; nt=64,d=128 = 32KB (fits gfx1151 64KB LDS), nt=128 = 64KB (limit).
+        check_sdpa_blk::<WgpuRuntime>("VK/attn", &c, 32, 8, 1, 2048, 2048, 128, false, 32); // packed
+        check_sdpa_blk::<WgpuRuntime>("VK/attn", &c, 32, 8, 1, 2048, 2048, 128, false, 64); // packed
+        check_sdpa_blk::<WgpuRuntime>("VK/strd", &c, 32, 8, 1, 2048, 4096, 128, false, 64); // STRIDED: k/v in a 4096-cache, read in place
+        check_sdpa_blk::<WgpuRuntime>("VK/attn", &c, 32, 8, 1, 4096, 4096, 128, false, 64); // packed
+        // Prefill (causal) generality check at a modest square shape.
+        check_sdpa_blk::<WgpuRuntime>("VK/pref", &c, 32, 8, 128, 128, 128, 128, true, 64);
+        // MoE router gate GEMV (n=128 experts, k=4096 hidden): the fp32 Linear the tiled GEMM starves.
+        check_gemv::<WgpuRuntime>("VK/gemv", &c, 128, 4096, 32);
+        check_gemv::<WgpuRuntime>("VK/gemv", &c, 128, 4096, 64);
+        check_gemv::<WgpuRuntime>("VK/gemv", &c, 128, 4096, 128);
+        check_gemv::<WgpuRuntime>("VK/gemv", &c, 128, 4096, 256);
         check_dp4a::<WgpuRuntime>("VULKAN", &c, rows, k, true);
         check_dp4a::<WgpuRuntime>("VK/big", &c, 8192, 8192, true); // 67MB weights: cache-busting BW
         check_q8_0_packed::<WgpuRuntime>("VULKAN", &c, rows, k, 64);
