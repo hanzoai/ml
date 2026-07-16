@@ -602,6 +602,26 @@ fn main() {
         return;
     }
 
+    // `matvec-check coldsweep`: dense Q4_K decode matvec at a weight footprint far larger than the 32 MB
+    // MALL, so each pass re-reads weights from GTT -- the real in-engine decode regime. The small-shape
+    // benches below are cache-warm and overstate bandwidth; the cold sweep is what the per-token decode
+    // actually sees. Reuses the bit-exact-gated `check_matvec_q4k_dp4a_blk` (scale_rel < 1e-2) so a wrong
+    // nt cannot pass as a win. Finds the workgroup width (nt) that best saturates cold GTT bandwidth here.
+    #[cfg(feature = "vulkan")]
+    if std::env::args().any(|a| a == "coldsweep") {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        println!("== cache-cold nt sweep :: dense Q4_K decode matvec, footprint >> 32 MB MALL ==");
+        for (nout, k) in [(16384usize, 8192usize), (16384, 16384)] {
+            let mb = nout * (k / 256) * 144 / (1024 * 1024);
+            println!("-- {nout}x{k}  ({mb} MB weight footprint) --");
+            for nt in [32usize, 64, 128, 256] {
+                check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/cold", &c, nout, k, nt);
+            }
+        }
+        return;
+    }
+
     println!("hanzo-kernel :: one #[device] matvec_q8 source, lowered per backend, gated bit-exact\n");
 
     #[cfg(feature = "cpu")]
