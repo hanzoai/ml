@@ -324,12 +324,61 @@ fn sigmoid(device: &Device) -> Result<()> {
     Ok(())
 }
 
+// Large-magnitude inputs must still normalize to finite values. The block reduce combines partial sums
+// of squares, so any merge step that forms a difference between running sums and squares it overflows
+// F32 long before the sums themselves do -- and an overflowed term scaled by zero yields NaN.
+fn rms_norm_large_magnitude(device: &Device) -> Result<()> {
+    let (rows, hidden) = (4usize, 6912usize);
+    let data: Vec<f32> = (0..rows * hidden)
+        .map(|i| {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            sign * ((i as f32 * 0.17).sin().abs() * 7e9)
+        })
+        .collect();
+    let tensor = Tensor::from_vec(data, (rows, hidden), device)?;
+    let alpha = Tensor::ones(hidden, hanzo_ml::DType::F32, device)?;
+
+    let fused = hanzo_nn::ops::rms_norm(&tensor, &alpha, 1e-5)?;
+    let slow = hanzo_nn::ops::rms_norm_slow(&tensor, &alpha, 1e-5)?;
+
+    let fused_v = fused.flatten_all()?.to_vec1::<f32>()?;
+    let slow_v = slow.flatten_all()?.to_vec1::<f32>()?;
+    for &v in &fused_v {
+        assert!(
+            v.is_finite(),
+            "rms_norm produced a non-finite value for large-magnitude input"
+        );
+    }
+    for &v in &slow_v {
+        assert!(
+            v.is_finite(),
+            "rms_norm_slow produced a non-finite value for large-magnitude input"
+        );
+    }
+    let diff = fused_v
+        .iter()
+        .zip(slow_v.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        diff < 5e-3,
+        "rms_norm and rms_norm_slow disagree: max |Δ| = {diff}"
+    );
+    Ok(())
+}
+
 test_device!(ropei, ropei_cpu, ropei_gpu, ropei_metal);
 test_device!(rope, rope_cpu, rope_gpu, rope_metal);
 test_device!(rope_thd, rope_thd_cpu, rope_thd_gpu, rope_thd_metal);
 test_device!(softmax, softmax_cpu, softmax_gpu, softmax_metal);
 test_device!(rms_norm, rms_norm_cpu, rms_norm_gpu, rms_norm_metal);
 test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);
+test_device!(
+    rms_norm_large_magnitude,
+    rms_norm_large_magnitude_cpu,
+    rms_norm_large_magnitude_gpu,
+    rms_norm_large_magnitude_metal
+);
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
