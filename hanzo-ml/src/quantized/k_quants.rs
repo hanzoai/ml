@@ -2506,12 +2506,13 @@ impl GgmlType for BlockQ8K {
                 y.d = 0f32;
                 y.qs.fill(0)
             } else {
-                let iscale = -128f32 / max;
+                // -127 rather than -128 keeps both extremes of the block representable, so
+                // `+a` and `-a` quantize to -127/+127 instead of saturating one of them.
+                // Matches ggml-quants.c `quantize_row_q8_K_ref`.
+                let iscale = -127f32 / max;
                 for (j, q) in y.qs.iter_mut().enumerate() {
-                    // ggml uses nearest_int with bit magic here, maybe we want the same
-                    // but we would have to test and benchmark it.
                     let v = (iscale * xs[j]).round();
-                    *q = v.min(127.) as i8
+                    *q = v.clamp(-128., 127.) as i8
                 }
                 for j in 0..QK_K / 16 {
                     let mut sum = 0i32;
