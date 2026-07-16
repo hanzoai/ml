@@ -1013,7 +1013,8 @@ METAL_FUNC void rmsnorm(
 template<typename T>
 struct RMS {
     uint count;
-    T mean;
+    // Sum of squares over the block's elements; `rms_norm` divides by the element count and rsqrts it.
+    T sum_sq;
 
     constexpr RMS<T>() = default;
     constexpr RMS<T>() threadgroup = default;
@@ -1026,7 +1027,7 @@ struct RMSLoadOp {
     }
 
     METAL_FUNC RMS<T> operator()(RMS<T> a, RMS<T> b) {
-        a.mean += (b.mean * b.mean);
+        a.sum_sq += (b.sum_sq * b.sum_sq);
         a.count += 1;
         return a;
     }
@@ -1038,14 +1039,13 @@ struct RMSReduceOp {
         return { 0, 0 };
     }
 
+    // Merging two partial sums of squares is a plain sum. The Welford-style mean/variance merge this
+    // replaces formed `delta = b - a` over the running sums and squared it, which overflows to inf on
+    // large-magnitude F32 inputs; its `b.count / new_count` factor is integer division, hence 0, and
+    // inf * 0 is NaN -- so the norm poisoned the whole row.
     METAL_FUNC RMS<T> operator()(RMS<T> a, RMS<T> b) {
-        uint new_count = a.count + b.count;
-        uint nb_over_n = b.count / new_count;
-        T delta = b.mean - a.mean;
-        //a.mean += delta * nb_over_n;
-        a.mean += b.mean + delta * delta * a.count * nb_over_n;
-        // *m2 += b_m2 + delta * delta * (*count) * nb_over_n;
-        a.count = new_count;
+        a.sum_sq += b.sum_sq;
+        a.count += b.count;
         return a;
     }
 };
@@ -1067,7 +1067,7 @@ template <typename T>
 METAL_FUNC RMS<T> simd_shuffle_down(RMS<T> rms, ushort delta) {
     return RMS<T> {
         simd_shuffle_down(rms.count, delta),
-        simd_shuffle_down(rms.mean, delta)
+        simd_shuffle_down(rms.sum_sq, delta)
     };
 }
 
@@ -1112,12 +1112,12 @@ METAL_FUNC void rms_norm(
         offset,
         tid
     );
-    RMS<float> result = RMS<float> { value.count, static_cast<float>(value.mean) };
+    RMS<float> result = RMS<float> { value.count, static_cast<float>(value.sum_sq) };
 
     // Complete reduction
     result = reduce(result, tid);
     if (tid == 0) {
-        total = rsqrt(fast_divide(result.mean, float(el_per_block)) + eps);
+        total = rsqrt(fast_divide(result.sum_sq, float(el_per_block)) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

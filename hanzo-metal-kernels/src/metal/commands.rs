@@ -255,6 +255,26 @@ impl Commands {
         Ok(())
     }
 
+    /// Commit the current command buffer and wait on THAT buffer -- the correct wait for a CPU readback.
+    /// [`Self::flush_and_wait`] takes the whole in-flight set, so a concurrent call on another thread can
+    /// drain the buffer holding this caller's work and return before that work has actually run.
+    pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
+        let cb = {
+            let mut state = self.state.lock()?;
+            self.commit_swap_locked(&mut state, 0)?;
+            state.in_flight.last().cloned()
+        };
+        if let Some(cb) = cb {
+            Self::ensure_completed(&cb)?;
+            // The queue is FIFO, so everything committed before `cb` has completed as well.
+            let mut state = self.state.lock()?;
+            state
+                .in_flight
+                .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
+        }
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), MetalKernelError> {
         let mut state = self.state.lock()?;
         if self.compute_count.load(Ordering::Acquire) > 0 {
