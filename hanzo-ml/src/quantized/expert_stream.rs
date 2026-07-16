@@ -491,6 +491,7 @@ pub fn finalize() {
 
     let pinned = load_and_pin(&banks, cap);
     register_atexit_save();
+    spawn_usage_saver();
 
     eprintln!(
         "[stream-experts] {} banks x {:.1} MB/expert; budget {:.1} GB -> cap {}/bank \
@@ -578,6 +579,7 @@ pub fn save_usage() -> Result<()> {
 }
 
 /// Persist usage on clean exit so the next run can pin. A SIGKILL won't fire it; a normal exit will.
+/// This is the best-case path only -- see [`spawn_usage_saver`] for the one that actually runs.
 fn register_atexit_save() {
     #[cfg(unix)]
     {
@@ -591,6 +593,36 @@ fn register_atexit_save() {
             }
         });
     }
+}
+
+/// How often the learned routing histogram is checkpointed to the sidecar.
+const USAGE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Checkpoint usage periodically, so the learned hot set survives however the process ends.
+///
+/// The cache only gets faster than cold if a *previous* run left a routing histogram to pin from, so
+/// the histogram's durability is a property of the cache, not of the shutdown path. Registering an
+/// `atexit` hook silently made it the latter: `atexit` fires on a clean return, and a served replica
+/// is ended by a signal (SIGTERM/SIGKILL from an operator, a supervisor, or the OOM killer) --- so the
+/// sidecar was never written, every run started cold, and the learning cache never learned. The
+/// mechanism was present, correct, and unreachable.
+///
+/// A low-frequency checkpoint makes the signal durable against any ending, losing at most one
+/// interval. It runs off the fetch path (no bank lock is held across the write, so it cannot deadlock
+/// with `fetch`, and it adds nothing to the decode critical path): one ~MB merge-and-write per minute
+/// against the GB/s of expert traffic that same minute is free.
+fn spawn_usage_saver() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("expert-usage-saver".into())
+            .spawn(|| loop {
+                std::thread::sleep(USAGE_SAVE_INTERVAL);
+                // No live banks (or no sidecar configured) makes this a no-op; keep polling so a
+                // later model load is still covered by the same saver.
+                let _ = save_usage();
+            });
+    });
 }
 
 #[cfg(unix)]
