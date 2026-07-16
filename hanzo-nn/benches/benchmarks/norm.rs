@@ -44,7 +44,13 @@ fn run_layer_norm_benchmark(c: &mut Criterion, device: &Device, dtype: DType, na
 }
 
 fn run_rms_norm_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
-    let elements = B * M * K;
+    run_rms_norm_rows(c, device, dtype, name, M)
+}
+
+/// `rows` is the normalized-row count (`B * M`); decode drives a single row per call, so it
+/// separates the per-call dispatch cost from the per-element work.
+fn run_rms_norm_rows(c: &mut Criterion, device: &Device, dtype: DType, name: &str, rows: usize) {
+    let elements = B * rows * K;
 
     let weight = Tensor::arange(0.0, elements as f32, device)
         .unwrap()
@@ -74,6 +80,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         run_rms_norm_benchmark(c, &d, DType::F32, "rms_norm_f32");
         run_rms_norm_benchmark(c, &d, DType::BF16, "rms_norm_bf16");
         run_rms_norm_benchmark(c, &d, DType::F16, "rms_norm_f16");
+        run_rms_norm_rows(c, &d, DType::F32, "rms_norm_f32_decode", 1);
         run_layer_norm_benchmark(c, &d, DType::F32, "layer_norm_f32");
         run_layer_norm_benchmark(c, &d, DType::BF16, "layer_norm_bf16");
         run_layer_norm_benchmark(c, &d, DType::F16, "layer_norm_f16");
