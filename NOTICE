@@ -10,6 +10,54 @@ The upstream candle license texts are retained in this repository as LICENSE-MIT
 and LICENSE-APACHE. This work is a derivative of candle and remains dual-licensed
 under "MIT OR Apache-2.0"; the upstream license has not been changed.
 
+This product also includes software PORTED FROM llama.cpp / ggml
+(https://github.com/ggml-org/llama.cpp), licensed under the MIT License:
+
+    MIT License
+
+    Copyright (c) 2023-2026 The ggml authors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Ported from https://github.com/ggml-org/llama.cpp at commit
+0821c5fcfd729af70037bc1e9e60769d42c081ba. These are ports, not reimplementations:
+the GGUF/GGML on-disk quantization formats and their reference decode define the
+bit layout our kernels must reproduce, so the upstream source is the specification.
+The ported material is quantization-related and spans hanzo-ml, hanzo-kernel,
+hanzo-kernels, hanzo-metal-kernels, hanzo-rocm-kernels, hanzo-transformers and
+tensor-tools; the per-file provenance is recorded in source comments naming the
+upstream file (and, where useful, the line). It includes at least:
+
+- GGUF/GGML block formats and their CPU reference decode (quantized/k_quants.rs,
+  ggml_file.rs, gguf_file.rs) -- e.g. kvalues_mxfp4 from ggml-common.h and a
+  bit-for-bit replica of ggml_e8m0_to_fp32_half from ggml-impl.h.
+- The IQ-quant codebook grids and sign table (quantized/iq_grids.rs), extracted
+  verbatim from ggml/src/ggml-common.h, and the CUDA MMQ codebook tables.
+- GPU quantized matmul/matvec kernels whose structure follows the corresponding
+  ggml kernels (the q8_1 block-quantized dot-product decode used by the CUDA/ROCm
+  dp4a cores and the Vulkan dp4a shaders, and the expert-grouped MoE GEMM).
+
+Copyright in the ported material remains with The ggml authors; Hanzo AI claims
+no copyright over it. Hanzo's own contributions around it (the backends, the
+kernel DSL, and the original kernels) are covered by the Hanzo copyright above.
+llama.cpp ships no NOTICE file; there are no further attributions to propagate.
+
 PROVENANCE
 
 Forked from https://github.com/huggingface/candle. The candle sources are vendored
