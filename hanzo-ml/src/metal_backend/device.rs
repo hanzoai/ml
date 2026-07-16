@@ -199,6 +199,18 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Commit and wait on the command buffer holding the caller's own work. This is what a CPU readback
+    /// needs: [`Self::wait_until_completed`] waits on the last in-flight buffer, which a concurrent
+    /// flush on another thread may already have taken, returning before this caller's work has run.
+    pub fn flush_and_wait_current(&self) -> Result<()> {
+        self.commands
+            .flush_and_wait_current()
+            .map_err(MetalError::from)?;
+
+        self.drop_unused_buffers()?;
+        Ok(())
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }
