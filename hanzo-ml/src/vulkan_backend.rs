@@ -602,6 +602,38 @@ const fn pool_bucket(bytes: u64) -> u64 {
     }
 }
 
+#[cfg(test)]
+mod bufpool_key_invariant {
+    use super::{pool_bucket, POOL_EXACT_MAX};
+
+    /// A pool key must equal the requested byte size at every size. Rounding a large request up to a
+    /// size class hands the caller a buffer physically larger than its logical tensor, and a consumer
+    /// on the readback/copy path then reads the stale tail [logical, physical) -- garbled,
+    /// non-deterministic logits.
+    ///
+    /// This guards a regression that has landed twice. d9b70910 introduced the bucketing; eac0ddee
+    /// removed it; merge 8c2b480d then grafted onto a base that predated the region and silently
+    /// dropped the removal, and merge 3a4cf7b0 re-seeded the bucketing from a branch that never had
+    /// the fix. The commits stayed reachable, so the history read as fixed for eight weeks while the
+    /// defect was live. eac0ddee carried no test; this is that test, and it fails on the pre-fix
+    /// constant rather than trusting the log.
+    #[test]
+    fn keys_are_exact_at_every_size() {
+        assert_eq!(
+            POOL_EXACT_MAX,
+            u64::MAX,
+            "size-class bucketing corrupts inference: keys must be exact at every size"
+        );
+        for bytes in [4u64, 64 * 1024, 64 * 1024 + 1, 100_000, 1 << 20, (1 << 20) + 7, 1 << 30] {
+            assert_eq!(
+                pool_bucket(bytes),
+                bytes,
+                "pool key must equal the request exactly, got a rounded class for {bytes} bytes"
+            );
+        }
+    }
+}
+
 // Cap the idle (free, unreferenced) pool so a workload that touches many distinct large size-classes
 // can't retain them all forever. reclaim() destroys real device buffers once free exceeds this. The
 // peak working set of a forward fits well under this; it only bounds the long tail. ~12 GiB.
