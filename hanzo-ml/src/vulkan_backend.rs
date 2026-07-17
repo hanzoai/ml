@@ -7175,6 +7175,64 @@ mod dsl_dispatch_proof {
         assert!(rel < 1e-3, "mmq_q4k_rt prefill DSL diverged from CPU: scale_rel={rel:.3e}");
     }
 
+    /// A/B: coopmat runtime-dims MMQ (`mmq_q4k_rt`) vs the shipping dp4a-tiled prefill GEMM
+    /// (`mul_mm_q4k_tiled_dp4a`) at real prefill shapes, feeding BOTH the SAME logical Q4_K weight
+    /// (raw for dp4a, split for coopmat). Both submit through the same dispatch path, so per-submit
+    /// overhead cancels in the ratio -- this same-harness ratio is the go/no-go for routing coopmat
+    /// into matmul_q4k_gpu_off (a cache-warm ratio, NOT an absolute in-engine number). Gated on
+    /// HANZO_MMQ_AB=1 so it never runs in normal CI.
+    #[test]
+    fn mmq_q4k_coopmat_vs_dp4a_prefill_ab() {
+        if std::env::var_os("HANZO_MMQ_AB").is_none() {
+            return;
+        }
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[mmq-ab] no vulkan device ({e}); skipping"); return; }
+        };
+        let mut s = 0xD1B54A32D192ED03u64;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        // (m, n, k): prefill batch m=512 across llama/GLM attn+FFN projection shapes.
+        let shapes = [
+            (512usize, 4096usize, 4096usize),
+            (512, 11008, 4096),
+            (512, 4096, 11008),
+            (512, 14336, 4096),
+            (512, 4096, 14336),
+        ];
+        eprintln!("[mmq-ab] coopmat mmq_q4k_rt vs dp4a mul_mm_q4k_tiled_dp4a (same weight, same harness)");
+        for (m, n, k) in shapes {
+            let nb = k / 256;
+            let bytes: Vec<u8> = (0..n * nb * 144).map(|_| next() as u8).collect();
+            let wq = dev.upload_qweight(&bytes).unwrap();
+            let bank = dev.quantize_q4k_split(&bytes, n, k).unwrap();
+            let x: Vec<f32> = (0..m * k).map(|_| (next() % 1000) as f32 / 500.0 - 1.0).collect();
+            let xh = dev.upload_f32(&x).unwrap();
+            let (xq, xs, xsum) = dev.quantize_act_q8(&xh, m, k).unwrap();
+            let iters = 30;
+            // dp4a (shipping): matmul_q4k_gpu picks mul_mm_q4k_tiled_dp4a on int_dot8 devices.
+            for _ in 0..3 { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
+            dev.synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..iters { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
+            dev.synchronize().unwrap();
+            let dp4a_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            // coopmat (candidate): runtime-dims MMQ over the split bank.
+            for _ in 0..3 { let _ = dev.mmq_q4k_rt_gpu(&xq, &xs, &xsum, &bank, m, n, k).unwrap(); }
+            dev.synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..iters { let _ = dev.mmq_q4k_rt_gpu(&xq, &xs, &xsum, &bank, m, n, k).unwrap(); }
+            dev.synchronize().unwrap();
+            let coop_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            let gf = |ms: f64| 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
+            eprintln!(
+                "[mmq-ab] {m}x{n}x{k}  dp4a {dp4a_ms:.3}ms ({:.0} GF)  coopmat {coop_ms:.3}ms ({:.0} GF)  coopmat/dp4a={:.2}x {}",
+                gf(dp4a_ms), gf(coop_ms), dp4a_ms / coop_ms,
+                if dp4a_ms / coop_ms > 1.0 { "WIN" } else { "loss" }
+            );
+        }
+    }
+
     // Proof that the Vulkan decode COMMAND-GRAPH (begin/end_graph_capture + VkGraph::replay), the
     // BufPool capture pinning, and the device-offset copy2d_off together replay BIT-EXACTLY and, the
     // crux, ADVANCE the KV-write slot per replay -- the exact stale-buffer hazard a record-once graph
