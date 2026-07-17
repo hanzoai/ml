@@ -483,6 +483,23 @@ fn check_mmq_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize, n:
     );
 }
 
+/// Runtime-dims twin: same affine oracle, but n/k arrive in a meta SSBO so ONE .spv serves any shape.
+/// The dump shape is irrelevant to the .spv (dims are runtime) -- validating at a real multi-N-block
+/// shape (n=4096 = 64 N-blocks) is the proof the CPU oracle can't give (its barrier desyncs multi-cube).
+fn check_mmq_q4k_rt<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize, n: usize, k: usize) {
+    use hanzo_kernel::mmq::{gen_mmq_q4k, mmq_q4k_ref, mmq_q4k_wmma_rt_run};
+    let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
+    let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
+    let (got, ms) = mmq_q4k_wmma_rt_run::<R>(client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 50);
+    let rel = maxabs_over_max(&got, &want);
+    let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] MMQ-Q4K-RT {}x{}x{}  rel={:.2e}  {}  {:.3} ms  {:.0} GFLOP/s",
+        name, m, n, k, rel,
+        if rel < 1e-2 { "COOPMAT ✓" } else { "MISMATCH ✗" }, ms, gflops
+    );
+}
+
 fn maxabs_over_max(got: &[f32], want: &[f32]) -> f32 {
     let mut d = 0f32;
     let mut r = 1e-9f32;
@@ -632,6 +649,7 @@ fn main() {
         check_sdpa_blk::<WgpuRuntime>("VK/dump", &c, 32, 8, 1, 2048, 2048, 128, false, 64); // decode attn: d128 nt64
         check_gemv::<WgpuRuntime>("VK/dump", &c, 128, 4096, 128); // router gate GEMV: nt128
         check_mmq_q4k::<WgpuRuntime>("VK/dump", &c, 32, 2048, 2048); // Q4_K affine prefill MMQ (n=2048,k=2048)
+        check_mmq_q4k_rt::<WgpuRuntime>("VK/dump", &c, 32, 2048, 2048); // runtime-dims MMQ: ONE .spv, any shape
         return;
     }
 
@@ -678,6 +696,10 @@ fn main() {
         check_q4k::<WgpuRuntime>("VULKAN", &c, rows, k);
         // Affine Q4_K MMQ prefill on the coopmat path — the last gap vs llama-Vulkan (pp512=995).
         check_mmq_q4k::<WgpuRuntime>("VULKAN", &c, 512, 4096, 4096);
+        // Runtime-dims twin at the SAME shape (n=4096 = 64 N-blocks) — the multi-cube proof the CPU
+        // oracle can't give, and a tail shape (m=100, n=4032) to exercise the guards on real hardware.
+        check_mmq_q4k_rt::<WgpuRuntime>("VULKAN", &c, 512, 4096, 4096);
+        check_mmq_q4k_rt::<WgpuRuntime>("VK/tail", &c, 100, 4032, 4096);
         // Qwen3-30B-A3B-shaped MoE decode: 128 experts, 8 routed slots, n=768 intermediate, k=2048 hidden.
         check_moe_q4k::<WgpuRuntime>("VULKAN", &c, 128, 768, 8, 2048);
         check_moe_q4k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 32); // decode-perf lever
