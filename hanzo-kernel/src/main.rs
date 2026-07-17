@@ -631,6 +631,7 @@ fn main() {
         check_moe_route::<WgpuRuntime>("VK/dump", &c, 8, 128, 8, 128); // fused router: E128 top8 nt128
         check_sdpa_blk::<WgpuRuntime>("VK/dump", &c, 32, 8, 1, 2048, 2048, 128, false, 64); // decode attn: d128 nt64
         check_gemv::<WgpuRuntime>("VK/dump", &c, 128, 4096, 128); // router gate GEMV: nt128
+        check_mmq_q4k::<WgpuRuntime>("VK/dump", &c, 32, 2048, 2048); // Q4_K affine prefill MMQ (n=2048,k=2048)
         return;
     }
 
