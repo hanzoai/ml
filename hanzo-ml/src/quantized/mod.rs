@@ -2718,6 +2718,19 @@ impl crate::Module for QMatMul {
                         match dtype {
                             GgmlDType::Q4_0 => d.matmul_q4_0_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q8_0 => d.matmul_q8_gpu(wq, xv, m, *n, *k)?,
+                            // Coopmat (tensor-core) Q4_K prefill GEMM. The mmq_q4k .spv bakes n/k, so
+                            // only the committed shape routes here; the split bank is the 2D weight as
+                            // a 1-expert MoE bank (cached), the activation q8_1-quantized once. Opt-in
+                            // (VK_MMQ_Q4K) until measured against matmul_q4k_gpu with VK_PROFILE_GPU.
+                            GgmlDType::Q4K
+                                if *n == 2048
+                                    && *k == 2048
+                                    && std::env::var_os("VK_MMQ_Q4K").is_some() =>
+                            {
+                                let bank = qtensor.vulkan_moe_bank_split(d, 1, *n, *k)?;
+                                let (xq, xsq, xsum) = d.quantize_act_q8(xv, m, *k)?;
+                                d.mmq_q4k_gpu(&xq, &xsq, &xsum, bank.as_ref(), m, *n)?
+                            }
                             GgmlDType::Q4K => d.matmul_q4k_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q5K => d.matmul_q5k_gpu(wq, xv, m, *n, *k)?,
                             GgmlDType::Q6K => d.matmul_q6k_gpu(wq, xv, m, *n, *k)?,
