@@ -975,6 +975,200 @@ pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
     (out, ms)
 }
 
+/// Runtime-dims twin of [`mmq_q4k_wmma_blk`]. `m/n/k` arrive in a `meta` SSBO (the pattern
+/// `attn::sdpa_blk` uses for a growing `seq_k`) instead of `#[comptime]`, so ONE compiled `.spv`
+/// serves EVERY prefill shape -- the production seam that replaces `mul_mm_q4k_tiled_dp4a`. The
+/// 32x64 output tile and the 32-wide K-block are fixed (shared-memory sizes are shape-independent),
+/// so only the loop bounds and strides read from `meta`; `plane`/`target` stay comptime (a plane is
+/// a hardware constant, the island tag is the codegen target). Tail guards on `m` and `n` let the
+/// grid cover a partial tile -- k is a Q4_K super-block multiple (256) so it never tails.
+#[kernel(targets(cuda, rocm, vulkan, metal, cpu), unchecked)]
+pub fn mmq_q4k_wmma_rt(
+    xq: &Array<i8>,
+    xs: &Array<f32>,
+    xsum: &Array<f32>,
+    wqs: &Array<u32>,
+    wsc: &Array<u32>,
+    wd: &Array<f32>,
+    wdm: &Array<f32>,
+    out: &mut Array<f32>,
+    meta: &Array<u32>, // [m, n, k]
+    #[comptime] plane: usize,
+    #[comptime] target: Target,
+) {
+    let m = meta[0] as usize;
+    let n = meta[1] as usize;
+    let k = meta[2] as usize;
+    let tid = UNIT_POS as usize;
+    let warp = tid / plane;
+    let lane = tid % plane;
+    let wm = warp / 4;
+    let wn = warp % 4;
+    let mrow0 = CUBE_POS_Y as usize * 32;
+    let ncol0 = CUBE_POS_X as usize * 64;
+    let kb_count = k / 32;
+    let nsb = k / 256;
+    let nthread = 8 * plane;
+    let per = 256 / plane;
+
+    let mut sa = SharedMemory::<i8>::new(1024usize);
+    let mut sb = SharedMemory::<i8>::new(2048usize);
+    let mut ci = SharedMemory::<i32>::new(2048usize);
+    let mut accf = SharedMemory::<f32>::new(2048usize);
+
+    for e in 0usize..(2048 / nthread) {
+        accf[tid * (2048 / nthread) + e] = 0.0f32;
+    }
+    sync_cube();
+
+    for kb in 0..kb_count {
+        let k0 = kb * 32;
+        // A tile: rows past m stage as 0 so their cmma fragment is inert -- only in-range outputs
+        // are stored, so an out-of-range row can never pollute a real result.
+        for i in 0usize..(1024 / nthread) {
+            let idx = tid + i * nthread;
+            let arow = mrow0 + idx / 32;
+            sa[idx] = 0i8;
+            if arow < m {
+                sa[idx] = xq[arow * k + k0 + idx % 32];
+            }
+        }
+        let is = kb % 8;
+        let g = is / 2;
+        let sbk = kb / 8;
+        for i in 0usize..(2048 / nthread) {
+            let idx = tid + i * nthread;
+            let nrow = ncol0 + idx / 32;
+            let qi = idx % 32;
+            sb[idx] = 0i8;
+            if nrow < n {
+                let qb = q4k_byte(wqs, (nrow * nsb + sbk) * 32, g * 32 + qi);
+                let nib = (qb >> (4u32 * (is % 2) as u32)) & 15;
+                sb[idx] = i8::cast_from(nib);
+            }
+        }
+        sync_cube();
+
+        island! {
+            cuda | rocm | vulkan | metal => {
+                let c = cmma::Matrix::<i32>::from_value(
+                    cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::Undefined, 0i32,
+                );
+                let a0 = cmma::Matrix::<i8>::from_slice(
+                    cmma::MatrixIdent::A, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::RowMajor, &sa.slice(wm * 512, 1024), 32,
+                );
+                let b0 = cmma::Matrix::<i8>::from_slice(
+                    cmma::MatrixIdent::B, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::ColMajor, &sb.slice(wn * 512, 2048), 32,
+                );
+                cmma::execute::<i8, i8, i32, i32>(&a0, &b0, &c, &c);
+                let a1 = cmma::Matrix::<i8>::from_slice(
+                    cmma::MatrixIdent::A, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::RowMajor, &sa.slice(wm * 512 + 16, 1024), 32,
+                );
+                let b1 = cmma::Matrix::<i8>::from_slice(
+                    cmma::MatrixIdent::B, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::ColMajor, &sb.slice(wn * 512 + 16, 2048), 32,
+                );
+                cmma::execute::<i8, i8, i32, i32>(&a1, &b1, &c, &c);
+                cmma::store(&mut ci.slice_mut(warp * 256, warp * 256 + 256), &c, 16, cmma::MatrixLayout::RowMajor);
+            }
+            default => {
+                for e in 0usize..per {
+                    let p = lane * per + e;
+                    let smm = p / 16;
+                    let snn = p % 16;
+                    let mut isum = 0i32;
+                    for l in 0usize..32 {
+                        isum += i32::cast_from(sa[(wm * 16 + smm) * 32 + l])
+                            * i32::cast_from(sb[(wn * 16 + snn) * 32 + l]);
+                    }
+                    ci[warp * 256 + p] = isum;
+                }
+            }
+        };
+        sync_cube();
+
+        for e in 0usize..per {
+            let p = lane * per + e;
+            let gmm = wm * 16 + p / 16;
+            let gnn = wn * 16 + p % 16;
+            let arow = mrow0 + gmm;
+            let nrow = ncol0 + gnn;
+            if arow < m && nrow < n {
+                let blk = nrow * nsb + sbk;
+                let scbase = blk * 3;
+                let wdd = wd[blk] * f32::cast_from(q4k_sc(wsc, scbase, is));
+                let wmm = wdm[blk] * f32::cast_from(q4k_m(wsc, scbase, is));
+                let xsc = xs[arow * kb_count + kb];
+                let xsm = xsum[arow * kb_count + kb];
+                accf[gmm * 64 + gnn] += xsc * wdd * f32::cast_from(ci[warp * 256 + p]) - wmm * xsm;
+            }
+        }
+        sync_cube();
+    }
+
+    for e in 0usize..per {
+        let p = lane * per + e;
+        let gmm = wm * 16 + p / 16;
+        let gnn = wn * 16 + p % 16;
+        let arow = mrow0 + gmm;
+        let nrow = ncol0 + gnn;
+        if arow < m && nrow < n {
+            out[arow * n + nrow] = accf[gmm * 64 + gnn];
+        }
+    }
+}
+
+/// Host launch for the runtime-dims Q4_K MMQ. `m/n/k` go in `meta`; the grid rounds up so a partial
+/// output tile is covered and clipped by the in-kernel tail guards.
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_wmma_rt_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    xq: &[i8], xs: &[f32], xsum: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
+    m: usize, n: usize, k: usize, iters: usize,
+) -> (Vec<f32>, f64) {
+    let target = Target::of(client);
+    let plane = client.properties().hardware.plane_size_max;
+    let meta = [m as u32, n as u32, k as u32];
+    let xqh = client.create_from_slice(i8::as_bytes(xq));
+    let xsh = client.create_from_slice(f32::as_bytes(xs));
+    let xsumh = client.create_from_slice(f32::as_bytes(xsum));
+    let wqsh = client.create_from_slice(u32::as_bytes(wqs));
+    let wsch = client.create_from_slice(u32::as_bytes(wsc));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let wdmh = client.create_from_slice(f32::as_bytes(wdm));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; m * n]));
+    let mh = client.create_from_slice(u32::as_bytes(&meta));
+    let grid = Grid::Static(n.div_ceil(64) as u32, m.div_ceil(32) as u32, 1);
+    let launch = |c: &ComputeClient<R>| unsafe {
+        mmq_q4k_wmma_rt::launch_unchecked::<R>(
+            c, grid.clone(), Block::new_1d(8 * plane),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
+            ArrayArg::from_raw_parts(wqsh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(wsch.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(wdmh.clone(), wdm.len()),
+            ArrayArg::from_raw_parts(oh.clone(), m * n),
+            ArrayArg::from_raw_parts(mh.clone(), meta.len()),
+            plane as usize, target,
+        );
+    };
+    launch(client);
+    let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    (out, ms)
+}
+
 fn cpu_q4k_byte(a: &[u32], base: usize, i: usize) -> u32 { (a[base + i / 4] >> (8 * (i % 4))) & 255 }
 fn cpu_q4k_sc(wsc: &[u32], sb: usize, j: usize) -> u32 {
     if j < 4 { cpu_q4k_byte(wsc, sb, j) & 63 }
@@ -1116,6 +1310,27 @@ mod tests {
             let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
             let rel = rel_to_max(&got, &want);
             assert!(rel < 1e-6, "affine Q4_K MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_ref");
+        }
+    }
+
+    /// The runtime-dims twin agrees with the SAME `mmq_q4k_ref`, exercising both tail guards: m<32
+    /// (partial M) and n<64 (partial single N-block), across k=256 and k=512. The guards are the only
+    /// new logic over the comptime kernel; a missing one reads past a buffer or writes a garbage row,
+    /// which the oracle catches. Shapes stay single-N-block (n<=64): the cubecl CPU runtime does not
+    /// isolate SharedMemory across cubes (a cross-cube race -- the comptime kernel fails multi-N-block
+    /// on CPU identically), so multi-block N is gated on the real GPU where cmma is proven (the comptime
+    /// Vulkan test passes at n=2048 = 32 N-blocks, rel 4.7e-7). k stays a 256-multiple, never tails.
+    #[test]
+    fn mmq_q4k_rt_matches_ref_with_tails_on_cpu() {
+        let client = cpu_client();
+        for (m, n, k) in [(32usize, 64usize, 256usize), (32, 64, 512), (17, 64, 256), (32, 50, 256), (17, 50, 512), (1, 64, 256)] {
+            let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
+            let (got, _) = mmq_q4k_wmma_rt_run::<CpuRuntime>(
+                &client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 1,
+            );
+            let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
+            let rel = rel_to_max(&got, &want);
+            assert!(rel < 1e-6, "runtime Q4_K MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_ref");
         }
     }
 

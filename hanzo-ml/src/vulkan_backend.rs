@@ -111,6 +111,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // xs*(D*dot - M*xsum). Bindings: xq,xs,xsum,wqs,wsc,wd,wdm,out. The prefill twin of the dp4a
         // decode matvec: 3.4 TFLOP/s vs decode's ~92 GB/s, the path toward llama-Vulkan pp512.
         "mmq_q4k" => include_bytes!("vulkan/spv/mmq_q4k.spv"),
+        // Runtime-dims twin: m/n/k ride a meta SSBO (binding 8) so ONE .spv serves every prefill shape.
+        "mmq_q4k_rt" => include_bytes!("vulkan/spv/mmq_q4k_rt.spv"),
         // DENSE dp4a Q4_K matvec (block-reduce, one workgroup/output row, nt=64): reads the verbatim
         // packed weight; the m=1 decode fix for the attention projections that the prefill dp4a GEMM
         // (mul_mat_q4k_dp4a, 1-thread/row) starves. Bindings: wq(packed), xq, xs, xsum, out, meta=[k].
@@ -2252,6 +2254,34 @@ impl VulkanDevice {
         }
         bufs.push(out.buffer);
         self.dispatch("mmq_q4k", &bufs, &[], ((n / 64) as u32, (m / 32) as u32, 1))?;
+        Ok(out)
+    }
+
+    /// Runtime-dims affine Q4_K prefill MMQ: same tensor-core coopmat GEMM as [`Self::mmq_q4k_gpu`],
+    /// but m/n/k ride a meta SSBO (binding 8) instead of being baked into the .spv -- ONE `mmq_q4k_rt`
+    /// artifact serves EVERY prefill shape, and the grid rounds up so partial tiles are covered and
+    /// clipped by the kernel's tail guards. This is the seam that replaces `mul_mm_q4k_tiled_dp4a` for
+    /// all rows>1 Q4_K matmuls. k must be a Q4_K super-block multiple (256); m and n are free.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmq_q4k_rt_gpu(
+        &self,
+        xq: &VulkanStorage,
+        xs: &VulkanStorage,
+        xsum: &VulkanStorage,
+        bank: &MoeBankSplit,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        let out = self.alloc_f32(m * n)?;
+        let meta = self.upload_u32(&[m as u32, n as u32, k as u32])?;
+        let mut bufs = vec![xq.buffer, xs.buffer, xsum.buffer];
+        for s in &bank.0 {
+            bufs.push(s.buffer); // wqs, wsc, wd, wdm
+        }
+        bufs.push(out.buffer);
+        bufs.push(meta.buffer);
+        self.dispatch("mmq_q4k_rt", &bufs, &[], (n.div_ceil(64) as u32, m.div_ceil(32) as u32, 1))?;
         Ok(out)
     }
 
@@ -7062,6 +7092,87 @@ mod dsl_dispatch_proof {
         let rel = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
         eprintln!("[mmq-q4k] {M}x{N}x{K} scale_rel={rel:.2e}  (affine Q4_K coopmat PREFILL spv via ml dispatch)");
         assert!(rel < 1e-3, "mmq_q4k prefill DSL diverged from CPU: scale_rel={rel:.3e}");
+    }
+
+    /// The RUNTIME-DIMS twin (`mmq_q4k_rt`, m/n/k via meta SSBO) dispatches through ml at a shape the
+    /// baked-dims .spv can't serve -- multi-N-block AND both tails: M=40 (>32, tail), N=200 (3 N-blocks,
+    /// last partial), K=512. ONE .spv, arbitrary shape, tail guards clipping the partial tile. Same
+    /// affine oracle. This is the production seam that replaces mul_mm_q4k_tiled_dp4a for rows>1.
+    #[test]
+    fn mmq_q4k_rt_prefill_dsl_runs_through_ml_vulkan() {
+        const M: usize = 40;
+        const N: usize = 200;
+        const K: usize = 512;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[mmq-q4k-rt] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let kb = K / 32;
+        let nsb = K / 256;
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let xq: Vec<i8> = (0..M * K).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
+        let wqs: Vec<u32> = (0..N * nsb * 32).map(|_| next() as u32).collect();
+        let wsc: Vec<u32> = (0..N * nsb * 3).map(|_| next() as u32).collect();
+        let wd: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 20000.0 + 0.002).collect();
+        let wdm: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 40000.0).collect();
+        let xs: Vec<f32> = (0..M * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+        let mut xsum = vec![0f32; M * kb];
+        for i in 0..M {
+            for b in 0..kb {
+                let mut acc = 0i32;
+                for l in 0..32 { acc += xq[i * K + b * 32 + l] as i32; }
+                xsum[i * kb + b] = xs[i * kb + b] * acc as f32;
+            }
+        }
+        let byte = |a: &[u32], base: usize, i: usize| (a[base + i / 4] >> (8 * (i % 4))) & 255;
+        let sc_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
+            if j < 4 { byte(wsc, sb, j) & 63 } else { (byte(wsc, sb, j + 4) & 15) | ((byte(wsc, sb, j - 4) >> 6) << 4) }
+        };
+        let m_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
+            if j < 4 { byte(wsc, sb, j + 4) & 63 } else { (byte(wsc, sb, j + 4) >> 4) | ((byte(wsc, sb, j) >> 6) << 4) }
+        };
+        let mut want = vec![0f32; M * N];
+        for i in 0..M {
+            for j in 0..N {
+                let mut acc = 0f32;
+                for b in 0..kb {
+                    let is = b % 8;
+                    let g = is / 2;
+                    let blk = j * nsb + b / 8;
+                    let mut isum = 0i32;
+                    for qi in 0..32 {
+                        let qbyte = byte(&wqs, blk * 32, g * 32 + qi);
+                        let nib = ((qbyte >> (4 * (is % 2))) & 15) as i32;
+                        isum += xq[i * K + b * 32 + qi] as i32 * nib;
+                    }
+                    let dd = wd[blk] * sc_of(&wsc, blk * 3, is) as f32;
+                    let mm = wdm[blk] * m_of(&wsc, blk * 3, is) as f32;
+                    acc += xs[i * kb + b] * dd * isum as f32 - mm * xsum[i * kb + b];
+                }
+                want[i * N + j] = acc;
+            }
+        }
+        let xq_u8: Vec<u8> = xq.iter().map(|&b| b as u8).collect();
+        let xqh = dev.upload_qweight(&xq_u8).unwrap();
+        let xsh = dev.upload_f32(&xs).unwrap();
+        let xsumh = dev.upload_f32(&xsum).unwrap();
+        let u32_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let bank = MoeBankSplit(vec![
+            dev.upload_qweight(&u32_bytes(&wqs)).unwrap(),
+            dev.upload_qweight(&u32_bytes(&wsc)).unwrap(),
+            dev.upload_f32(&wd).unwrap(),
+            dev.upload_f32(&wdm).unwrap(),
+        ]);
+        let out = dev.mmq_q4k_rt_gpu(&xqh, &xsh, &xsumh, &bank, M, N, K).unwrap();
+        let got = out.to_vec_f32().unwrap();
+        let maxref = want.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+        let rel = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+        eprintln!("[mmq-q4k-rt] {M}x{N}x{K} multi-block+tail scale_rel={rel:.2e}  (runtime-dims coopmat MMQ via ml, one .spv)");
+        assert!(rel < 1e-3, "mmq_q4k_rt prefill DSL diverged from CPU: scale_rel={rel:.3e}");
     }
 
     // Proof that the Vulkan decode COMMAND-GRAPH (begin/end_graph_capture + VkGraph::replay), the
