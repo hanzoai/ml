@@ -1939,6 +1939,66 @@ pub fn moe_gate_up(
             }
         }
     }
+    // Vulkan dp4a twin of the ROCm block above: gate and up contract the SAME routed token, so the
+    // q8 activation quantize is hoisted out and both matvecs dispatch against one copy. Falling
+    // through to two `indexed_moe_forward` calls re-derives it per matvec -- byte-identical work,
+    // twice. Only the quantize is shared; the dispatch is `moe_matvec_blk_dp4a_pre_gpu` either way.
+    #[cfg(feature = "vulkan")]
+    {
+        if let (QMatMul::QTensor(gq), QMatMul::QTensor(uq)) = (gate, up) {
+            if let (QStorage::Vulkan(_, dev), QStorage::Vulkan(..)) = (&gq.storage, &uq.storage) {
+                let dt = gq.storage.dtype();
+                if dt == uq.storage.dtype() && dev.has_int_dot8() {
+                    let (e_cnt, n, k) = gq.shape().dims3()?;
+                    // gate/up share one input row per token; the per-slot (down) shape is not this path.
+                    if uq.shape().dims3()? == (e_cnt, n, k) && x.dim(1)? == 1 {
+                        if let Some((blk, with_xsum)) = vk_moe_blk_dp4a_kernel(dt, n, k) {
+                            let (t, topk) = ids.dims2()?;
+                            let nrows = t * topk;
+                            let x_flat = x
+                                .broadcast_as((t, topk, k))?
+                                .reshape((nrows, k))?
+                                .to_dtype(DType::F32)?
+                                .contiguous()?;
+                            let ids_u32 = ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
+                            let (xstore, _) = x_flat.storage_and_layout();
+                            let xv = match &*xstore {
+                                Storage::Vulkan(v) => v,
+                                _ => crate::bail!("moe_gate_up: x not on vulkan after contiguous()"),
+                            };
+                            let (idstore, _) = ids_u32.storage_and_layout();
+                            let idv = match &*idstore {
+                                Storage::Vulkan(v) => v,
+                                _ => crate::bail!("moe_gate_up: ids not on vulkan"),
+                            };
+                            // The one quantize both matvecs read.
+                            let (xq, xs, xsum) = dev.quantize_act_q8(xv, nrows, k)?;
+                            let gbank = gq.vulkan_moe_bank_split(dev, e_cnt, n, k)?;
+                            let ubank = uq.vulkan_moe_bank_split(dev, e_cnt, n, k)?;
+                            let out_dtype = x.dtype();
+                            let gy = dev.moe_matvec_blk_dp4a_pre_gpu(
+                                blk, with_xsum, gbank.as_ref(), &xq, &xs, &xsum, idv, nrows, n,
+                            )?;
+                            let uy = dev.moe_matvec_blk_dp4a_pre_gpu(
+                                blk, with_xsum, ubank.as_ref(), &xq, &xs, &xsum, idv, nrows, n,
+                            )?;
+                            let shape = |o| -> Result<Tensor> {
+                                crate::tensor::from_storage(
+                                    Storage::Vulkan(o),
+                                    (nrows, n),
+                                    crate::op::BackpropOp::none(),
+                                    false,
+                                )
+                                .reshape((t, topk, n))?
+                                .to_dtype(out_dtype)
+                            };
+                            return Ok((shape(gy)?, shape(uy)?));
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok((
         gate.indexed_moe_forward(x, ids)?,
         up.indexed_moe_forward(x, ids)?,
