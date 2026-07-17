@@ -27,6 +27,10 @@
 //! };
 //! ```
 //!
+//! An island sits in either position: bound (`let x = island! { ... };`) when the arms yield a value,
+//! or bare (`island! { ... };`) when they act on shared memory — a warp-cooperative tile op has no
+//! per-lane result to bind, so the bare form is the natural one for it.
+//!
 //! The scrutinee is found BY TYPE: the kernel must take one `#[comptime] <name>: Target` parameter
 //! (any name), which the launch layer fills from the runtime — so the branch site names no target and
 //! the selection stays out of the authoring surface. `default` is mandatory and defines the oracle:
@@ -41,7 +45,7 @@ use syn::{
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
     visit_mut::{self, VisitMut},
-    Expr, FnArg, Ident, ItemFn, Pat, Token, Type,
+    Expr, ExprMacro, FnArg, Ident, ItemFn, Pat, Stmt, Token, Type,
 };
 
 /// The backends a kernel can name. Each maps 1:1 to a runtime the same source lowers to.
@@ -148,6 +152,27 @@ struct IslandRewrite {
 }
 
 impl VisitMut for IslandRewrite {
+    /// `island! { ... }` at STATEMENT position — the form an island takes when its arms act on shared
+    /// memory instead of yielding a value (a warp-cooperative tile op has no per-lane result to bind).
+    /// syn parses a braced macro statement as `Stmt::Macro`, never `Stmt::Expr`, so `visit_expr_mut`
+    /// alone would never see it. Re-seat it as the equivalent expression statement and rewrite that,
+    /// preserving the original trailing semicolon (or its absence, when the island is the block's value).
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        if let Stmt::Macro(sm) = stmt {
+            if sm.mac.path.is_ident("island") {
+                let mut expr = Expr::Macro(ExprMacro {
+                    attrs: sm.attrs.clone(),
+                    mac: sm.mac.clone(),
+                });
+                let semi = sm.semi_token;
+                self.visit_expr_mut(&mut expr);
+                *stmt = Stmt::Expr(expr, semi);
+                return;
+            }
+        }
+        visit_mut::visit_stmt_mut(self, stmt);
+    }
+
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
         if let Expr::Macro(mac) = expr {
             if mac.mac.path.is_ident("island") {

@@ -577,14 +577,19 @@ fn main() {
     let (rows, k) = (4096usize, 4096usize);
     let ctrl = 256usize; // small-K control: reorder noise ~ ctrl*eps, should be ~1e-6
 
-    // `matvec-check dump` dispatches exactly the engine-bound MoE block kernels at their evo-optimal
-    // baked nt (Q4_K 64, Q6_K 32) so `CUBECL_DEBUG_SPIRV=<dir>` writes exactly one .spv per kernel --
-    // the committed hanzo-ml Vulkan artifact. Build with `--features vulkan,spirv-dump`.
-    // `matvec-check dump` dispatches exactly the engine-bound MoE block kernels for each LIVE model
-    // shape at its evo-optimal power-of-2 nt, so `CUBECL_DEBUG_SPIRV=<dir>` writes one .spv per (shape).
-    // The DSL source is ONE fn per quant; comptime lowers it to a fast specialized artifact per shape
-    // (like llama's templated kernels). Disambiguate by LocalSize (nt): q4k 64 = gate/up, 8 = down.
-    //   Qwen3-30B-A3B Q4_K_M: ffn_gate/up_exps Q4_K [128,768,2048]; ffn_down_exps Q6_K/Q4_K [128,2048,768].
+    // `matvec-check dump` dispatches the engine-bound kernels once per LIVE model shape at that
+    // shape's baked nt, so `CUBECL_DEBUG_SPIRV=<dir>` writes one .spv per shape. The DSL source is ONE
+    // fn per quant; comptime lowers it to a specialized artifact per shape (like llama's templated
+    // kernels). Disambiguate the two Q4_K MoE shapes by LocalSize (= nt): 64 = gate/up, 32 = down.
+    //   Qwen3-30B-A3B Q4_K_M: ffn_gate/up_exps Q4_K [128,768,2048]; ffn_down_exps Q6_K [128,2048,768].
+    // Build with `--features vulkan,spirv-dump`.
+    //
+    // A dumped .spv is NOT yet the committed artifact: CubeCL names the entry point after the kernel,
+    // while the hanzo-ml loader creates every pipeline with entry point `main` (vulkan_backend.rs).
+    // Installing a dump verbatim therefore binds a nonexistent entry point -- undefined behaviour, and
+    // RADV faults rather than erroring. Rename the entry point when installing:
+    //   spirv-dis in.spv | sed -E 's/(OpEntryPoint GLCompute %[0-9]+ )"[^"]+"/\1"main"/' \
+    //     | spirv-as --target-env vulkan1.2 -o hanzo-ml/src/vulkan/spv/<name>.spv
     #[cfg(all(feature = "vulkan", feature = "spirv-dump"))]
     if std::env::args().any(|a| a == "dump") {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
@@ -705,6 +710,9 @@ fn main() {
         let c = WgpuRuntime::client(&WgpuDevice::default());
         check::<WgpuRuntime>("METAL", &c, rows, k);
         check_q4k::<WgpuRuntime>("METAL", &c, rows, k);
+        // Same Qwen3-30B-A3B-shaped MoE decode the Vulkan block gates on, so the DSL's expert-gather is
+        // proven on Metal too and the two backends are compared on identical shapes.
+        check_moe_q4k::<WgpuRuntime>("METAL", &c, 128, 768, 8, 2048);
         check_dp4a::<WgpuRuntime>("METAL", &c, rows, k, true);
     }
     #[cfg(feature = "cuda")]
