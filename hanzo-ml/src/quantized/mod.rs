@@ -1943,8 +1943,10 @@ pub fn moe_gate_up(
     // q8 activation quantize is hoisted out and both matvecs dispatch against one copy. Falling
     // through to two `indexed_moe_forward` calls re-derives it per matvec -- byte-identical work,
     // twice. Only the quantize is shared; the dispatch is `moe_matvec_blk_dp4a_pre_gpu` either way.
+    // A/B escape hatch, mirroring VK_MOE_PACKED / VK_MOE_DP4A_OFF: VK_MOE_GU_FUSE_OFF falls through to
+    // the two-call path so the shared quantize can be measured against re-quantizing per matvec.
     #[cfg(feature = "vulkan")]
-    {
+    if std::env::var_os("VK_MOE_GU_FUSE_OFF").is_none() {
         if let (QMatMul::QTensor(gq), QMatMul::QTensor(uq)) = (gate, up) {
             if let (QStorage::Vulkan(_, dev), QStorage::Vulkan(..)) = (&gq.storage, &uq.storage) {
                 let dt = gq.storage.dtype();
