@@ -3231,9 +3231,12 @@ impl VulkanDevice {
             let mut pool = self.inner.bufpool.lock().unwrap();
             if let Some(p) = pool.free.get_mut(&bytes).and_then(Vec::pop) {
                 pool.free_bytes = pool.free_bytes.saturating_sub(bytes);
+                POOL_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok((p.buffer, p.memory, p.host_visible));
             }
         }
+        POOL_FRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        POOL_FRESH_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         let dev = self.dev();
         let info = vk::BufferCreateInfo::default()
             .size(bytes)
@@ -4169,8 +4172,15 @@ impl VulkanDevice {
             pool.free_bytes += bytes;
         }
         // Enforce the idle-pool cap: destroy real device buffers (largest buckets first, since those
-        // dominate the bytes and are the least likely to be reused) until back under the cap.
-        while pool.free_bytes > POOL_FREE_CAP_BYTES {
+        // dominate the bytes and are the least likely to be reused) until back under the cap. The cap
+        // is sized to the device's memory, not a fixed constant: the prefill working set (activations +
+        // attention scratch) scales with model/seq, and on a large UMA APU it exceeds a small fixed cap.
+        // A too-small cap evicts the cycling working set, so every forward re-allocates it fresh through
+        // the amdgpu kernel driver (bo_alloc) -- pure CPU/ioctl waste on the shared memory bus that a
+        // retained pool avoids. Measured on gfx1151: with a 12 GiB cap a 512-tok prefill re-allocated
+        // ~1.8 GB/forward (pool_fresh>0); heap-relative it re-allocates nothing (pool_fresh==0).
+        let cap = self.pool_free_cap();
+        while pool.free_bytes > cap {
             let Some(&bucket) = pool.free.keys().max() else {
                 break;
             };
@@ -4190,6 +4200,27 @@ impl VulkanDevice {
                 dev.free_memory(p.memory, None);
             }
         }
+    }
+
+    // Idle buffer-pool cap, sized to the device rather than a fixed constant. Returns 60% of the
+    // largest DEVICE_LOCAL heap, floored at the legacy `POOL_FREE_CAP_BYTES` so constrained GPUs keep
+    // their prior behaviour and only large-memory (UMA) devices raise it. The pool never holds more
+    // than the workload actually allocates and frees; this cap only decides when idle buffers are
+    // destroyed, so a generous value on a big-memory box merely retains the reusable working set.
+    fn pool_free_cap(&self) -> u64 {
+        // Explicit override (GiB) for A/B measurement and constrained deployments.
+        if let Some(gb) = std::env::var("HANZO_VK_POOL_CAP_GB").ok().and_then(|s| s.parse::<u64>().ok()) {
+            return gb * 1024 * 1024 * 1024;
+        }
+        let mp = &self.inner.mem_props;
+        let mut biggest_device_local = 0u64;
+        for h in 0..mp.memory_heap_count as usize {
+            let heap = mp.memory_heaps[h];
+            if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                biggest_device_local = biggest_device_local.max(heap.size);
+            }
+        }
+        (biggest_device_local / 5 * 3).max(POOL_FREE_CAP_BYTES)
     }
 
     // Allocate an f32 storage holding `count` elements (uninitialized device memory).
@@ -4312,6 +4343,14 @@ fn vkerr(e: vk::Result) -> Error {
 // (or a few times), turning hundreds of per-op fence stalls into a handful.
 const BATCH_CAP: u32 = 4096;
 
+// Per-flush buffer-pool fresh-alloc vs reuse tally (printed under VK_PROFILE). Fresh allocations go
+// through the amdgpu kernel driver (bo_alloc) and their memory traffic contends with in-flight GPU
+// GEMMs on a UMA APU; a rising `pool_fresh` is the signature of the idle-pool cap evicting a working
+// set that is about to be reused. Relaxed atomics: a coarse per-batch counter, never a correctness gate.
+static POOL_FRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POOL_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POOL_FRESH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // End, submit, and block on the current command batch, then mark the submitter idle. A no-op
 // when nothing is recorded. Caller must hold the submitter lock. When `profile` is set, prints the
 // per-batch phase breakdown (recording / submit / fence-wait time, dispatch + barrier counts) so
@@ -4356,9 +4395,13 @@ fn flush_locked(
         // One line per submitted batch. On decode this is ~one batch per token, so this is the
         // per-token GPU breakdown: `dispatch` = ops recorded, `barriers` = memory barriers emitted
         // (lower is better -- with selective barriers, independent ops in a row emit none).
+        let fresh = POOL_FRESH.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let hit = POOL_HIT.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let fresh_mb = POOL_FRESH_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
         eprintln!(
             "[VK_PROFILE] flush: dispatch={n} barriers={barriers} \
-             record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms",
+             record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms \
+             pool_fresh={fresh} pool_hit={hit} fresh_mb={fresh_mb:.1}",
         );
     }
     if gpu_profile && !s.op_names.is_empty() {
@@ -4773,14 +4816,27 @@ impl BackendDevice for VulkanDevice {
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let count = shape.elem_count();
-        // Invariant: Vulkan computes in f32; f16/bf16 are represented as f32, and the integer index
-        // dtypes (u8, i64) as u32. So zeros(bf16) yields an f32 buffer, zeros(i64) a u32 buffer --
-        // zero is identical in every repr.
+        // Allocate uninitialized device memory and clear it ON the GPU (const_fill) rather than
+        // uploading a host zero-vec. The upload path allocates a host Vec and memcpy's the whole tensor
+        // host->device on every call; a transformer forward calls zeros() hundreds of times, so this is
+        // ~835 MB/forward of pure host memory traffic on a UMA APU (measured on gfx1151, Qwen3-4B @512).
+        // const_fill is a GPU dispatch: no host allocation, no host->device copy. Zero is bit-identical
+        // across the f32/u32 storage reprs (f16/bf16 live as f32, u8/i64/i32 as u32), so one fill with
+        // 0 bits serves every dtype. Deferred like every other op -- a later CPU readback flushes first.
         match dtype {
-            DType::F32 | DType::F16 | DType::BF16 => self.upload_f32(&vec![0f32; count]),
-            DType::U32 | DType::U8 | DType::I64 | DType::I32 => self.upload_u32(&vec![0u32; count]),
+            DType::F32 | DType::F16 | DType::BF16 | DType::U32 | DType::U8 | DType::I64 | DType::I32 => {}
             _ => crate::bail!("vulkan: only f32/u32/f16/bf16/u8/i64/i32 supported, got {dtype:?}"),
         }
+        let s = unsafe { self.alloc_uninit(shape, dtype)? };
+        if count > 0 {
+            self.dispatch(
+                "const_fill",
+                &[s.buffer],
+                &push_u32(&[count as u32, 0u32]),
+                ((count as u32).div_ceil(WG1D), 1, 1),
+            )?;
+        }
+        Ok(s)
     }
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
