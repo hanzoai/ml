@@ -466,6 +466,33 @@ fn check_gemv<R: Runtime>(name: &str, client: &ComputeClient<R>, n: usize, k: us
     );
 }
 
+// Affine Q4_K MMQ prefill GEMM on the real tensor-core path: bit-exact gate vs the CPU oracle +
+// kernel-only GFLOP/s. This is the coopmat contraction the symmetric MMQ could not express (the
+// - M*xsum offset a plain int8 dot drops for a K-quant weight). M/N must be multiples of 32/64, K of 256.
+fn check_mmq_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize, n: usize, k: usize) {
+    use hanzo_kernel::mmq::{gen_mmq_q4k, mmq_q4k_ref, mmq_q4k_wmma_blk_run};
+    let (xq, xs, xsum, wq, wd, wmin) = gen_mmq_q4k(m, n, k);
+    let want = mmq_q4k_ref(&xq, &xs, &xsum, &wq, &wd, &wmin, m, n, k);
+    let (got, ms) = mmq_q4k_wmma_blk_run::<R>(client, &xq, &xs, &xsum, &wq, &wd, &wmin, m, n, k, 50);
+    let rel = maxabs_over_max(&got, &want);
+    let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] MMQ-Q4K {}x{}x{}  rel={:.2e}  {}  {:.3} ms  {:.0} GFLOP/s",
+        name, m, n, k, rel,
+        if rel < 1e-2 { "COOPMAT ✓" } else { "MISMATCH ✗" }, ms, gflops
+    );
+}
+
+fn maxabs_over_max(got: &[f32], want: &[f32]) -> f32 {
+    let mut d = 0f32;
+    let mut r = 1e-9f32;
+    for (g, w) in got.iter().zip(want) {
+        d = d.max((g - w).abs());
+        r = r.max(w.abs());
+    }
+    d / r
+}
+
 fn gen(rows: usize, k: usize) -> (Vec<f32>, Vec<i32>, Vec<f32>) {
     let nb = k / QK8_0;
     let mut s = 0x2545F491_4F6CDD1Du64; // xorshift, deterministic
@@ -648,6 +675,8 @@ fn main() {
         check::<WgpuRuntime>("VULKAN", &c, rows, k);
         check::<WgpuRuntime>("VK/ctrl", &c, rows, ctrl);
         check_q4k::<WgpuRuntime>("VULKAN", &c, rows, k);
+        // Affine Q4_K MMQ prefill on the coopmat path — the last gap vs llama-Vulkan (pp512=995).
+        check_mmq_q4k::<WgpuRuntime>("VULKAN", &c, 512, 4096, 4096);
         // Qwen3-30B-A3B-shaped MoE decode: 128 experts, 8 routed slots, n=768 intermediate, k=2048 hidden.
         check_moe_q4k::<WgpuRuntime>("VULKAN", &c, 128, 768, 8, 2048);
         check_moe_q4k_blk::<WgpuRuntime>("VK/blk", &c, 128, 768, 8, 2048, 32); // decode-perf lever
