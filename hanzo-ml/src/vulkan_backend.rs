@@ -7224,11 +7224,22 @@ mod dsl_dispatch_proof {
             for _ in 0..iters { let _ = dev.mmq_q4k_rt_gpu(&xq, &xs, &xsum, &bank, m, n, k).unwrap(); }
             dev.synchronize().unwrap();
             let coop_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            // f16 coopmat (llama-parity path): dequant Q4_K weight -> f16 LDS + coopMatMulAdd f16->f32.
+            // This is what llama's Vulkan (KHR_coopmat, mul_mm.comp COOPMAT) uses on RADV. Env-forced.
+            unsafe { std::env::set_var("VK_Q4K_COOPMAT", "1") };
+            for _ in 0..3 { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
+            dev.synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..iters { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
+            dev.synchronize().unwrap();
+            let f16c_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            unsafe { std::env::remove_var("VK_Q4K_COOPMAT") };
             let gf = |ms: f64| 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
             eprintln!(
-                "[mmq-ab] {m}x{n}x{k}  dp4a {dp4a_ms:.3}ms ({:.0} GF)  coopmat {coop_ms:.3}ms ({:.0} GF)  coopmat/dp4a={:.2}x {}",
-                gf(dp4a_ms), gf(coop_ms), dp4a_ms / coop_ms,
-                if dp4a_ms / coop_ms > 1.0 { "WIN" } else { "loss" }
+                "[mmq-ab] {m}x{n}x{k}  dp4a {dp4a_ms:.3}ms ({:.0} GF)  f16coop {f16c_ms:.3}ms ({:.0} GF, {:.2}x)  i8coop {coop_ms:.3}ms ({:.0} GF, {:.2}x)  best={}",
+                gf(dp4a_ms), gf(f16c_ms), dp4a_ms / f16c_ms, gf(coop_ms), dp4a_ms / coop_ms,
+                if f16c_ms < dp4a_ms && f16c_ms < coop_ms { "f16coop" }
+                else if dp4a_ms <= coop_ms { "dp4a" } else { "i8coop" }
             );
         }
     }
