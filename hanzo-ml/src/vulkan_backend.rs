@@ -62,6 +62,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "quantize_act_q8" => spv!("quantize_act_q8"),
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
         "mul_mat_q6k" => spv!("mul_mat_q6k"),
+        "mul_mm_q6k_tiled_dp4a" => spv!("mul_mm_q6k_tiled_dp4a"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q4k_sg" => spv!("mul_mat_vec_q4k_sg"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
@@ -1646,6 +1647,22 @@ impl VulkanDevice {
             crate::bail!("matmul_q6k_gpu: x count {} < m*k {}", x.count, m * k);
         }
         let out = self.alloc_f32(m * nout)?;
+        // Dense prefill (m>1) on an int_dot8 device: the 2D int8-dp4a tile stages weight+activation in
+        // LDS and reuses across the 64x64 output tile -- the Q6_K twin of mul_mm_q4k_tiled_dp4a. Q6_K is
+        // symmetric (no min), so it needs only xq/xs, not xsum. MoE banks (woff!=0), m==1, and the
+        // VK_Q6K_LEGACY escape hatch fall to the column-per-invocation mul_mat_q6k.
+        let legacy = std::env::var_os("VK_Q6K_LEGACY").is_some();
+        if !legacy && self.inner.int_dot8 && m > 1 {
+            let (xq, xsq, _xsum) = self.quantize_act_q8(x, m, k)?;
+            let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mm_q6k_tiled_dp4a",
+                &[wq.buffer, xq.buffer, xsq.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
+            )?;
+            return Ok(out);
+        }
         let cols = (nout as u32).div_ceil(WG1D);
         let mut m0 = 0usize;
         while m0 < m {
@@ -7241,6 +7258,148 @@ mod dsl_dispatch_proof {
                 if f16c_ms < dp4a_ms && f16c_ms < coop_ms { "f16coop" }
                 else if dp4a_ms <= coop_ms { "dp4a" } else { "i8coop" }
             );
+        }
+    }
+
+    /// Controlled decode gate: a uniform Q6_K weight (every q6=1, scale=1, d=1) times an all-ones
+    /// activation must yield exactly k on every output. Isolates the 6-bit decode + scale + dp4a from
+    /// any data-dependence: q6=1 needs ql nibble 1 (byte 0x11), qh 2-bit 0b10 (byte 0xAA), scale 1, d 1.
+    #[test]
+    fn q6k_tiled_controlled() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[q6k-ctrl] no vulkan device ({e}); skipping"); return; }
+        };
+        if !dev.inner.int_dot8 { eprintln!("[q6k-ctrl] no int_dot8; skipping"); return; }
+        let (m, n, k) = (5usize, 3usize, 256usize);
+        let nblk = n * (k / 256);
+        let dbits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut blocks = vec![0u8; nblk * 210];
+        for blk in 0..nblk {
+            let b = &mut blocks[blk * 210..blk * 210 + 210];
+            for e in b[0..128].iter_mut() { *e = 0x11; }   // ql: both nibbles = 1
+            for e in b[128..192].iter_mut() { *e = 0xAA; }  // qh: all 2-bit fields = 0b10
+            for e in b[192..208].iter_mut() { *e = 0x01; }  // scales = 1
+            b[208] = dbits[0]; b[209] = dbits[1];           // d = 1.0
+        }
+        let wq = dev.quantize_q6k(&blocks, n, k).unwrap();
+        let x = vec![1.0f32; m * k];
+        let xh = dev.upload_f32(&x).unwrap();
+        let got = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+        let worst = got.iter().map(|&v| (v - k as f32).abs()).fold(0f32, f32::max);
+        eprintln!("[q6k-ctrl] {m}x{n}x{k} uniform q6=1: got[0..3]={:?} expect {k}, worst_abs_err={worst:.3}", &got[0..3.min(got.len())]);
+        assert!(worst < 0.5, "Q6_K tiled controlled: got {:?} expect {k} (worst {worst})", &got[0..got.len().min(6)]);
+    }
+
+    /// The tiled int8-dp4a Q6_K prefill matmul (mul_mm_q6k_tiled_dp4a) agrees with the trusted column
+    /// kernel (mul_mat_q6k) on identical Q6_K weight bytes -- so the in-kernel 6-bit decode is correct;
+    /// the only divergence is the q8 activation quantization the dp4a path adds. Also times both at real
+    /// prefill shapes when HANZO_MMQ_AB=1 (the win over the column kernel that dominates Q4_K_M prefill).
+    #[test]
+    fn mul_mm_q6k_tiled_dp4a_matches_column() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[q6k-tiled] no vulkan device ({e}); skipping"); return; }
+        };
+        if !dev.inner.int_dot8 {
+            eprintln!("[q6k-tiled] device lacks int_dot8; skipping");
+            return;
+        }
+        let mut s = 0x2545F4914F6CDD1Du64;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let ab = std::env::var_os("HANZO_MMQ_AB").is_some();
+        let shapes: &[(usize, usize, usize)] = if ab {
+            &[(37, 64, 256), (512, 2048, 768), (512, 768, 2048), (512, 4096, 4096)]
+        } else {
+            &[(37, 64, 256), (40, 200, 512), (100, 256, 768)]
+        };
+        for &(m, n, k) in shapes {
+            let nblk = n * (k / 256);
+            // Valid, sane 210-byte Q6_K blocks: random 6-bit codes (ql/qh), small signed scales, a modest
+            // d. quantize_q6k repacks to the 53-u32 padded layout both kernels read. Sane magnitudes so
+            // the tiled-vs-column delta is the q8 activation quant, not decode of pathological weights.
+            let dbits = half::f16::from_f32(0.1).to_bits().to_le_bytes();
+            let mut blocks = vec![0u8; nblk * 210];
+            for blk in 0..nblk {
+                let b = &mut blocks[blk * 210..blk * 210 + 210];
+                for e in b[0..192].iter_mut() { *e = next() as u8; }          // ql[128] + qh[64]
+                for e in b[192..208].iter_mut() { *e = ((next() % 15) as i64 - 7) as u8; } // scales i8
+                b[208] = dbits[0];
+                b[209] = dbits[1];
+            }
+            let wq = dev.quantize_q6k(&blocks, n, k).unwrap();
+            let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let xh = dev.upload_f32(&x).unwrap();
+            // CPU oracle: decode Q6_K exactly (mirrors mul_mat_q6k) into dense f32, matmul with f32 x.
+            let nblocks = k / 256;
+            let mut wf = vec![0f32; n * k]; // [n, k]
+            for nn in 0..n {
+                for blk in 0..nblocks {
+                    let src = &blocks[(nn * nblocks + blk) * 210..(nn * nblocks + blk) * 210 + 210];
+                    let d = half::f16::from_le_bytes([src[208], src[209]]).to_f32();
+                    for idx in 0..2usize {
+                        let scoff = 192 + 8 * idx;
+                        let qloff = 64 * idx;
+                        let qhoff = 128 + 32 * idx;
+                        for l in 0..32usize {
+                            let is = l >> 4;
+                            let qll = src[qloff + l] as u32;
+                            let qlh = src[qloff + l + 32] as u32;
+                            let qhv = src[qhoff + l] as u32;
+                            let q1 = ((qll & 0xF) | ((qhv & 3) << 4)) as i32 - 32;
+                            let q2 = ((qlh & 0xF) | (((qhv >> 2) & 3) << 4)) as i32 - 32;
+                            let q3 = ((qll >> 4) | (((qhv >> 4) & 3) << 4)) as i32 - 32;
+                            let q4 = ((qlh >> 4) | (((qhv >> 6) & 3) << 4)) as i32 - 32;
+                            let sc = |b: usize| src[b] as i8 as i32;
+                            let base = nn * k + blk * 256 + idx * 128;
+                            wf[base + l] = d * sc(scoff + is) as f32 * q1 as f32;
+                            wf[base + l + 32] = d * sc(scoff + is + 2) as f32 * q2 as f32;
+                            wf[base + l + 64] = d * sc(scoff + is + 4) as f32 * q3 as f32;
+                            wf[base + l + 96] = d * sc(scoff + is + 6) as f32 * q4 as f32;
+                        }
+                    }
+                }
+            }
+            let mut want = vec![0f32; m * n];
+            for mm in 0..m {
+                for nn in 0..n {
+                    let mut acc = 0f32;
+                    for kk in 0..k { acc += x[mm * k + kk] * wf[nn * k + kk]; }
+                    want[mm * n + nn] = acc;
+                }
+            }
+            let relof = |g: &[f32]| -> f32 {
+                let maxref = want.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+                g.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref
+            };
+            unsafe { std::env::set_var("VK_Q6K_LEGACY", "1") };
+            let col = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            unsafe { std::env::remove_var("VK_Q6K_LEGACY") };
+            let got = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let rel = relof(&got);
+            eprintln!("[q6k-tiled] {m}x{n}x{k}  column_vs_cpu={:.2e}  tiled_vs_cpu={:.2e}", relof(&col), rel);
+            assert!(rel < 2e-2, "Q6_K tiled dp4a {m}x{n}x{k} diverged from CPU: rel={rel:.3e}");
+            if ab {
+                let iters = 20;
+                unsafe { std::env::set_var("VK_Q6K_LEGACY", "1") };
+                for _ in 0..3 { let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap(); }
+                dev.synchronize().unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..iters { let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap(); }
+                dev.synchronize().unwrap();
+                let col_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                unsafe { std::env::remove_var("VK_Q6K_LEGACY") };
+                for _ in 0..3 { let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap(); }
+                dev.synchronize().unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..iters { let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap(); }
+                dev.synchronize().unwrap();
+                let til_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                eprintln!(
+                    "[q6k-ab] {m}x{n}x{k}  column {col_ms:.3}ms  tiled {til_ms:.3}ms  speedup={:.2}x",
+                    col_ms / til_ms
+                );
+            }
         }
     }
 
