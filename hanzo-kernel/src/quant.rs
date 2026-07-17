@@ -413,7 +413,7 @@ pub fn moe_matvec_q4k_blk<F: Float>(
     x: &Array<F>,
     ids: &Array<u32>,
     out: &mut Array<F>,
-    #[comptime] n: usize,  // comptime shape: outrow/n & nsub/nt fold to magic-multiply + full unroll
+    #[comptime] n: usize,  // comptime shape: outrow/n & nsub/nt fold to magic-multiply divides
     #[comptime] k: usize,  // (the DSL's job -- one source fn, one fast .spv per live shape, like llama)
     #[comptime] nt: usize, // threads per output element (k/32 a multiple of nt)
 ) {
@@ -1089,7 +1089,7 @@ pub fn moe_matvec_q6k_blk<F: Float>(
     x: &Array<F>,
     ids: &Array<u32>,
     out: &mut Array<F>,
-    #[comptime] n: usize, // comptime shape (see moe_matvec_q4k_blk): fold + full unroll
+    #[comptime] n: usize, // comptime shape (see moe_matvec_q4k_blk): folds to magic-multiply divides
     #[comptime] k: usize,
     #[comptime] nt: usize,
 ) {

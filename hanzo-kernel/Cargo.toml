@@ -48,4 +48,3 @@ required-features = ["vulkan"]
 [[bin]]
 name = "mmq-check"
 path = "src/mmq_check.rs"
-required-features = ["cuda"]
