@@ -1,0 +1,156 @@
+#version 450
+// Q4_K 2D-TILED int8-dp4a prefill matmul, BM=128 (halves cold-weight re-reads vs BM=64): the 2D tile of mul_mm_q4k_tiled, but the BK=32
+// contraction (one Q4_K sub-block) is an int8 dot-product instead of f32 MACs. Per K-step the workgroup
+// stages, for its 64x64 output tile: the BN columns' 32 q4 nibble codes (8 u32/col, packed 4/u32) +
+// their d1/m1 (sub-block scale/min), and the BM rows' pre-quantized int8 activations xq (8 u32/row) +
+// their xs/xsum (quantize_act_q8 output). Each thread dp4a's its 4x4 sub-tile from LDS:
+//   acc[i][j] += d1[col]*xs[row]*dot(q4_col, xq_row) - m1[col]*xsum[row]
+// the affine Q4_K-x-q8_1 identity (sum x*w = d1*xs*dot(q4,xq) - m1*xsum), decode identical to
+// mul_mat_q4k_dp4a. int8 dp4a = ~4x the f32 tile's compute throughput on the same VRAM traffic.
+// Gate: vulkan_q4k_dp4a2d_matches_default (f64-oracle tolerance -- q8_1 activation quant adds error on
+// top of the f32 reorder, so the bound is looser than the f32 tile's).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4453)
+  int sdot_accsat(int a, int b, int acc, spirv_literal int fmt);
+
+const uint BM = 128u;
+const uint BN = 64u;
+const uint TM = 8u;
+const uint TN = 4u;
+const uint WG = 256u;
+const int  FMT4x8 = 0;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W    { uint  w[];    }; // Q4_K blocks, 36 u32 / 256-block
+layout(set = 0, binding = 1) readonly buffer XQ   { uint  xq[];   }; // int8 acts, 4/u32, [M, k/32, 8]
+layout(set = 0, binding = 2) readonly buffer XS   { float xs[];   }; // act block scales, [M, k/32]
+layout(set = 0, binding = 3) readonly buffer XSUM { float xsum[]; }; // act block sums, [M, k/32]
+layout(set = 0, binding = 4) writeonly buffer Y   { float y[];    }; // output, [M, nout]
+layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint woff; };
+
+const uint QK_K = 256u;
+const uint BLK_U32 = 36u;
+
+shared uint  s_wq[BN * 8u];  // 32 q4 codes/col, packed 4/u32
+shared float s_d[BN];
+shared float s_m[BN];
+shared uint  s_xq[BM * 8u];  // 32 int8 acts/row
+shared float s_xs[BM];
+shared float s_xsum[BM];
+
+uint scale_byte(uint base, uint b) {
+    uint word = w[base + 1u + (b >> 2u)];
+    return (word >> ((b & 3u) * 8u)) & 0xFFu;
+}
+uint get_scale_min_k4(uint base, uint j) {
+    uint sc, m;
+    if (j < 4u) {
+        sc = scale_byte(base, j) & 63u;
+        m  = scale_byte(base, j + 4u) & 63u;
+    } else {
+        uint s_j4 = scale_byte(base, j + 4u);
+        uint s_jm4 = scale_byte(base, j - 4u);
+        uint s_j = scale_byte(base, j);
+        sc = (s_j4 & 0x0Fu) | ((s_jm4 >> 6u) << 4u);
+        m  = (s_j4 >> 4u)   | ((s_j   >> 6u) << 4u);
+    }
+    return (sc << 8u) | m;
+}
+
+void main() {
+    uint nblocks = k / QK_K;
+    uint kblocks = k / 32u;
+    uint row0 = gl_WorkGroupID.y * BM;
+    uint col0 = gl_WorkGroupID.x * BN;
+    uint tid = gl_LocalInvocationID.x;
+    uint tr = tid / (BN / TN);
+    uint tc = tid % (BN / TN);
+
+    float acc[TM][TN];
+    for (uint i = 0u; i < TM; i++) {
+        for (uint j = 0u; j < TN; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (uint kt = 0u; kt < kblocks; kt++) {        // one 32-wide sub-block per K-step
+        uint blk = kt / 8u;
+        uint sub = kt - blk * 8u;
+        uint c = sub >> 1u;
+        bool lo = (sub & 1u) == 0u;
+        // Weight scales d1/m1 for the BN columns of this sub-block.
+        for (uint col = tid; col < BN; col += WG) {
+            uint n = col0 + col;
+            if (n < nout) {
+                uint base = woff + n * nblocks * BLK_U32 + blk * BLK_U32;
+                float d    = float(unpackHalf2x16(w[base]).x);
+                float dmin = float(unpackHalf2x16(w[base]).y);
+                uint sm = get_scale_min_k4(base, sub);
+                s_d[col] = d * float(sm >> 8u);
+                s_m[col] = dmin * float(sm & 0xFFu);
+            } else {
+                s_d[col] = 0.0;
+                s_m[col] = 0.0;
+            }
+        }
+        // Weight codes: 8 u32/col, word j = the 4 nibbles of qs u32 (base+4 + c*8 + j), lo or hi nibble.
+        for (uint idx = tid; idx < BN * 8u; idx += WG) {
+            uint col = idx >> 3u;
+            uint j = idx & 7u;
+            uint n = col0 + col;
+            uint packed = 0u;
+            if (n < nout) {
+                uint base = woff + n * nblocks * BLK_U32 + blk * BLK_U32;
+                uint qword = w[base + 4u + c * 8u + j];
+                packed = lo ? (qword & 0x0F0F0F0Fu) : ((qword >> 4u) & 0x0F0F0F0Fu);
+            }
+            s_wq[idx] = packed;
+        }
+        // Activation codes + scales for the BM rows of this sub-block (act 32-block index == kt).
+        for (uint idx = tid; idx < BM * 8u; idx += WG) {
+            uint r = idx >> 3u;
+            uint j = idx & 7u;
+            uint mrow = row0 + r;
+            s_xq[idx] = (mrow < mcount) ? xq[(mrow * kblocks + kt) * 8u + j] : 0u;
+        }
+        for (uint r = tid; r < BM; r += WG) {
+            uint mrow = row0 + r;
+            if (mrow < mcount) {
+                s_xs[r] = xs[mrow * kblocks + kt];
+                s_xsum[r] = xsum[mrow * kblocks + kt];
+            } else {
+                s_xs[r] = 0.0;
+                s_xsum[r] = 0.0;
+            }
+        }
+        barrier();
+        for (uint i = 0u; i < TM; i++) {
+            uint r = tr * TM + i;
+            float xsr = s_xs[r];
+            float xsumr = s_xsum[r];
+            for (uint j = 0u; j < TN; j++) {
+                uint col = tc * TN + j;
+                int dot = 0;
+                for (uint u = 0u; u < 8u; u++) {
+                    dot = sdot_accsat(int(s_wq[col * 8u + u]), int(s_xq[r * 8u + u]), dot, FMT4x8);
+                }
+                acc[i][j] += s_d[col] * xsr * float(dot) - s_m[col] * xsumr;
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < TM; i++) {
+        uint mrow = row0 + tr * TM + i;
+        if (mrow >= mcount) {
+            continue;
+        }
+        for (uint j = 0u; j < TN; j++) {
+            uint n = col0 + tc * TN + j;
+            if (n < nout) {
+                y[mrow * nout + n] = acc[i][j];
+            }
+        }
+    }
+}

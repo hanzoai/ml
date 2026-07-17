@@ -57,6 +57,10 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q4k" => spv!("mul_mat_q4k"),
         "mul_mm_q4k_tiled" => spv!("mul_mm_q4k_tiled"),
         "mul_mm_q4k_tiled_dp4a" => spv!("mul_mm_q4k_tiled_dp4a"),
+        // Larger-BM tiles: same kernel, BM=128/256 so a 512-row prefill re-reads each cold weight
+        // column 4x/2x instead of 8x (weight bytes read = full-weight * m/BM). Cold-weight-bound win.
+        "mul_mm_q4k_tiled_dp4a_bm128" => spv!("mul_mm_q4k_tiled_dp4a_bm128"),
+        "mul_mm_q4k_tiled_dp4a_bm256" => spv!("mul_mm_q4k_tiled_dp4a_bm256"),
         "mul_mat_q4k_dp4a" => spv!("mul_mat_q4k_dp4a"),
         "mul_mm_q4k_coopmat" => spv!("mul_mm_q4k_coopmat"),
         "quantize_act_q8" => spv!("quantize_act_q8"),
@@ -1522,11 +1526,21 @@ impl VulkanDevice {
         if use_dp4a {
             let (xq, xs, xsum) = self.quantize_act_q8(x, m, k)?;
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
+            // BM (rows per workgroup) sets the cold-weight re-read factor m/BM: a 512-row prefill reads
+            // each weight column m/BM times from GTT. BM=64 default; VK_Q4K_BM=128/256 picks the taller
+            // tile that reads cold weights 2x/4x fewer times (register pressure vs bandwidth -- measure
+            // in-engine, the only sound regime for a cold-weight-bound GEMM). The grid.y divisor MUST
+            // match the shader's BM.
+            let (kernel, bm) = match std::env::var("VK_Q4K_BM").ok().as_deref() {
+                Some("128") => ("mul_mm_q4k_tiled_dp4a_bm128", 128u32),
+                Some("256") => ("mul_mm_q4k_tiled_dp4a_bm256", 256u32),
+                _ => ("mul_mm_q4k_tiled_dp4a", 64u32),
+            };
             self.dispatch(
-                "mul_mm_q4k_tiled_dp4a",
+                kernel,
                 &[wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer],
                 &push,
-                ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
+                ((nout as u32).div_ceil(64), (m as u32).div_ceil(bm), 1),
             )?;
             return Ok(out);
         }
@@ -7314,6 +7328,37 @@ mod dsl_dispatch_proof {
                 if f16c_ms < dp4a_ms && f16c_ms < coop_ms { "f16coop" }
                 else if dp4a_ms <= coop_ms { "dp4a" } else { "i8coop" }
             );
+        }
+    }
+
+    /// The taller-BM dp4a tiles (BM=128/256, fewer cold-weight re-reads) must produce the same result
+    /// as the BM=64 default -- same int8 math, only the M-tiling and grid.y differ, so the tail guards
+    /// (mrow<mcount) at m not a multiple of 128/256 are the risk. Scale-relative (f32 add order differs).
+    #[test]
+    fn q4k_dp4a_bm_variants_match() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[q4k-bm] no vulkan device ({e}); skipping"); return; }
+        };
+        if !dev.inner.int_dot8 { eprintln!("[q4k-bm] no int_dot8; skipping"); return; }
+        let mut s = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        for (m, n, k) in [(200usize, 256usize, 512usize), (300, 128, 256), (512, 320, 768)] {
+            let nblk = n * (k / 256);
+            let wq_bytes: Vec<u8> = (0..nblk * 144).map(|_| next() as u8).collect(); // random Q4_K blocks
+            let wq = dev.upload_qweight(&wq_bytes).unwrap();
+            let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let xh = dev.upload_f32(&x).unwrap();
+            let base = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let maxref = base.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+            for bm in ["128", "256"] {
+                unsafe { std::env::set_var("VK_Q4K_BM", bm) };
+                let got = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+                unsafe { std::env::remove_var("VK_Q4K_BM") };
+                let rel = got.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+                eprintln!("[q4k-bm] {m}x{n}x{k} BM={bm} vs BM64 rel={rel:.2e}");
+                assert!(rel < 1e-5, "Q4_K dp4a BM={bm} {m}x{n}x{k} diverged from BM64: rel={rel:.3e}");
+            }
         }
     }
 
