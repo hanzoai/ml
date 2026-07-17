@@ -106,6 +106,11 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // xsum,ids,out. Gated on the device's integer-dot capability (int_dot8).
         "moe_matvec_q4k_dp4a_blk_gu" => include_bytes!("vulkan/spv/moe_matvec_q4k_dp4a_blk_gu.spv"),
         "moe_matvec_q4k_dp4a_blk_dn" => include_bytes!("vulkan/spv/moe_matvec_q4k_dp4a_blk_dn.spv"),
+        // Affine Q4_K PREFILL GEMM on the coopmat/tensor-core path (the mmq_q4k_wmma_blk DSL kernel,
+        // n=2048 k=2048, LocalSize 512 = 8*plane64). Decodes packed Q4_K in-kernel + affine epilogue
+        // xs*(D*dot - M*xsum). Bindings: xq,xs,xsum,wqs,wsc,wd,wdm,out. The prefill twin of the dp4a
+        // decode matvec: 3.4 TFLOP/s vs decode's ~92 GB/s, the path toward llama-Vulkan pp512.
+        "mmq_q4k" => include_bytes!("vulkan/spv/mmq_q4k.spv"),
         // DENSE dp4a Q4_K matvec (block-reduce, one workgroup/output row, nt=64): reads the verbatim
         // packed weight; the m=1 decode fix for the attention projections that the prefill dp4a GEMM
         // (mul_mat_q4k_dp4a, 1-thread/row) starves. Bindings: wq(packed), xq, xs, xsum, out, meta=[k].
@@ -2222,6 +2227,31 @@ impl VulkanDevice {
         bufs.push(ids.buffer);
         bufs.push(out.buffer);
         self.dispatch(kernel, &bufs, &[], (n as u32, nrows as u32, 1))?;
+        Ok(out)
+    }
+
+    /// Affine Q4_K PREFILL GEMM on the coopmat path: `out[m,n] = sum_k W[n,k]*x[m,k]` with W the packed
+    /// Q4_K split bank (wqs/wsc/wd/wdm, decoded in-kernel) and the activation q8-quantized to
+    /// (xq, xs, xsum). The `mmq_q4k` .spv bakes n/k/plane, so the caller must match the committed shape
+    /// (n=2048, k=2048); M rides grid.y and is free. Bindings in kernel arg order: xq,xs,xsum + the four
+    /// bank arrays + out. This is the tensor-core prefill twin of the dp4a decode matvec.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmq_q4k_gpu(
+        &self,
+        xq: &VulkanStorage,
+        xs: &VulkanStorage,
+        xsum: &VulkanStorage,
+        bank: &MoeBankSplit,
+        m: usize,
+        n: usize,
+    ) -> Result<VulkanStorage> {
+        let out = self.alloc_f32(m * n)?;
+        let mut bufs = vec![xq.buffer, xs.buffer, xsum.buffer];
+        for s in &bank.0 {
+            bufs.push(s.buffer); // wqs, wsc, wd, wdm
+        }
+        bufs.push(out.buffer);
+        self.dispatch("mmq_q4k", &bufs, &[], ((n / 64) as u32, (m / 32) as u32, 1))?;
         Ok(out)
     }
 
@@ -6937,6 +6967,99 @@ mod dsl_dispatch_proof {
         }
         eprintln!("[sdpa-blk] h{H}kv{KV} q{SQ} k{SK} d{D} x8-batched  scale_rel={worst:.2e}  (DSL flash-SDPA spv via ml dispatch, pooled scale/meta, no sync crutch)");
         assert!(worst < 1e-4, "sdpa_blk DSL diverged from CPU: scale_rel={worst:.3e}");
+    }
+
+    /// The affine Q4_K PREFILL MMQ .spv (mmq_q4k, coopmat/tensor-core) dispatches through ml's own
+    /// Vulkan path and matches a CPU affine-GEMM reference. Proves the codegen seam end-to-end for the
+    /// prefill kernel: the committed .spv's baked shape (n=2048,k=2048), the binding order
+    /// (xq,xs,xsum,wqs,wsc,wd,wdm,out), the LocalSize-512 dispatch, and the in-kernel Q4_K decode +
+    /// affine `- M*xsum` epilogue. Reference decodes the same packed layout (get_scale_min_k4) that
+    /// BlockQ4K::to_float uses. Scale-relative gate: a signed int8 sum cancels near zero.
+    #[test]
+    fn mmq_q4k_prefill_dsl_runs_through_ml_vulkan() {
+        const M: usize = 32;
+        const N: usize = 2048;
+        const K: usize = 2048;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[mmq-q4k] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let kb = K / 32;
+        let nsb = K / 256;
+        // Deterministic inputs (self-contained: hanzo-kernel is not a dep of hanzo-ml).
+        let mut s = 0x243F6A8885A308D3u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let xq: Vec<i8> = (0..M * K).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
+        let wqs: Vec<u32> = (0..N * nsb * 32).map(|_| next() as u32).collect();
+        let wsc: Vec<u32> = (0..N * nsb * 3).map(|_| next() as u32).collect();
+        let wd: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 20000.0 + 0.002).collect();
+        let wdm: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 40000.0).collect();
+        let mut xsum = vec![0f32; M * kb];
+        for i in 0..M {
+            for b in 0..kb {
+                let mut acc = 0i32;
+                for l in 0..32 {
+                    acc += xq[i * K + b * 32 + l] as i32;
+                }
+                xsum[i * kb + b] = acc as f32;
+            }
+        }
+        let xs: Vec<f32> = (0..M * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+        // CPU reference: affine MMQ with the same in-place Q4_K decode.
+        let byte = |a: &[u32], base: usize, i: usize| (a[base + i / 4] >> (8 * (i % 4))) & 255;
+        let sc_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
+            if j < 4 { byte(wsc, sb, j) & 63 } else { (byte(wsc, sb, j + 4) & 15) | ((byte(wsc, sb, j - 4) >> 6) << 4) }
+        };
+        let m_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
+            if j < 4 { byte(wsc, sb, j + 4) & 63 } else { (byte(wsc, sb, j + 4) >> 4) | ((byte(wsc, sb, j) >> 6) << 4) }
+        };
+        let mut want = vec![0f32; M * N];
+        for i in 0..M {
+            for j in 0..N {
+                let mut acc = 0f32;
+                for b in 0..kb {
+                    let is = b % 8;
+                    let g = is / 2;
+                    let blk = j * nsb + b / 8;
+                    let mut isum = 0i32;
+                    for qi in 0..32 {
+                        let qbyte = byte(&wqs, blk * 32, g * 32 + qi);
+                        let nib = ((qbyte >> (4 * (is % 2))) & 15) as i32;
+                        isum += xq[i * K + b * 32 + qi] as i32 * nib;
+                    }
+                    let dd = wd[blk] * sc_of(&wsc, blk * 3, is) as f32;
+                    let mm = wdm[blk] * m_of(&wsc, blk * 3, is) as f32;
+                    acc += xs[i * kb + b] * (dd * isum as f32 - mm * xsum[i * kb + b]);
+                }
+                want[i * N + j] = acc;
+            }
+        }
+        // Upload + dispatch through ml. xq as raw i8 bytes; wqs/wsc as u32; the rest f32.
+        let xq_u8: Vec<u8> = xq.iter().map(|&b| b as u8).collect();
+        let xqh = dev.upload_qweight(&xq_u8).unwrap();
+        let xsh = dev.upload_f32(&xs).unwrap();
+        let xsumh = dev.upload_f32(&xsum).unwrap();
+        let u32_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let bank = MoeBankSplit(vec![
+            dev.upload_qweight(&u32_bytes(&wqs)).unwrap(),
+            dev.upload_qweight(&u32_bytes(&wsc)).unwrap(),
+            dev.upload_f32(&wd).unwrap(),
+            dev.upload_f32(&wdm).unwrap(),
+        ]);
+        let out = dev.mmq_q4k_gpu(&xqh, &xsh, &xsumh, &bank, M, N).unwrap();
+        let got = out.to_vec_f32().unwrap();
+        let maxref = want.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+        let rel = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+        eprintln!("[mmq-q4k] {M}x{N}x{K} scale_rel={rel:.2e}  (affine Q4_K coopmat PREFILL spv via ml dispatch)");
+        assert!(rel < 1e-3, "mmq_q4k prefill DSL diverged from CPU: scale_rel={rel:.3e}");
     }
 
     // Proof that the Vulkan decode COMMAND-GRAPH (begin/end_graph_capture + VkGraph::replay), the
