@@ -802,7 +802,7 @@ fn q4k_m(wsc: &Array<u32>, scbase: usize, j: usize) -> u32 {
 pub fn mmq_q4k_wmma_blk(
     xq: &Array<i8>,
     xs: &Array<f32>,
-    xsum: &Array<f32>,
+    xsum: &Array<f32>, // per-32-block xs*Sum(xq) -- the DEQUANTIZED block sum, matching quantize_act_q8
     wqs: &Array<u32>, // packed Q4_K qs: 32 u32 (128 B) / super-block
     wsc: &Array<u32>, // packed Q4_K scales: 3 u32 (12 B) / super-block
     wd: &Array<f32>,  // d per super-block   [n * k/256]
@@ -916,7 +916,9 @@ pub fn mmq_q4k_wmma_blk(
             let wmm = wdm[blk] * f32::cast_from(q4k_m(wsc, scbase, is));
             let xsc = xs[(mrow0 + gmm) * kb_count + kb];
             let xsm = xsum[(mrow0 + gmm) * kb_count + kb];
-            accf[gmm * 64 + gnn] += xsc * (wdd * f32::cast_from(ci[warp * 256 + p]) - wmm * xsm);
+            // xs folds into the dot; xsum already carries xs (= xs*Sum(xq)), so the offset needs no
+            // outer xs -- the convention the dp4a MoE kernel and quantize_act_q8 share.
+            accf[gmm * 64 + gnn] += xsc * wdd * f32::cast_from(ci[warp * 256 + p]) - wmm * xsm;
         }
         sync_cube();
     }
@@ -1008,7 +1010,7 @@ pub fn mmq_q4k_ref(
                 }
                 let dd = wd[blk] * cpu_q4k_sc(wsc, blk * 3, is) as f32;
                 let mm = wdm[blk] * cpu_q4k_m(wsc, blk * 3, is) as f32;
-                acc += xs[i * kb + b] * (dd * isum as f32 - mm * xsum[i * kb + b]);
+                acc += xs[i * kb + b] * dd * isum as f32 - mm * xsum[i * kb + b];
             }
             out[i * n + j] = acc;
         }
@@ -1030,15 +1032,16 @@ pub fn gen_mmq_q4k(m: usize, n: usize, k: usize)
     let wsc: Vec<u32> = (0..n * nsb * 3).map(|_| next() as u32).collect(); //  12 scale bytes/super-block
     let wd: Vec<f32> = (0..n * nsb).map(|_| (next() % 1000) as f32 / 20000.0 + 0.002).collect();
     let wdm: Vec<f32> = (0..n * nsb).map(|_| (next() % 1000) as f32 / 40000.0).collect();
+    let xs: Vec<f32> = (0..m * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+    // xsum = xs*Sum(xq) per block -- the dequantized block sum, the convention quantize_act_q8 emits.
     let mut xsum = vec![0.0f32; m * kb];
     for i in 0..m {
         for b in 0..kb {
             let mut acc = 0i32;
             for l in 0..32 { acc += xq[i * k + b * 32 + l] as i32; }
-            xsum[i * kb + b] = acc as f32;
+            xsum[i * kb + b] = xs[i * kb + b] * acc as f32;
         }
     }
-    let xs: Vec<f32> = (0..m * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
     (xq, xs, xsum, wqs, wsc, wd, wdm)
 }
 

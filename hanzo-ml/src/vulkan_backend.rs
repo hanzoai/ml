@@ -7002,6 +7002,9 @@ mod dsl_dispatch_proof {
         let wsc: Vec<u32> = (0..N * nsb * 3).map(|_| next() as u32).collect();
         let wd: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 20000.0 + 0.002).collect();
         let wdm: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 40000.0).collect();
+        let xs: Vec<f32> = (0..M * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+        // xsum = xs*Sum(xq): the dequantized block sum quantize_act_q8 emits (so the offset term
+        // carries xs and the epilogue applies xs only to the dot).
         let mut xsum = vec![0f32; M * kb];
         for i in 0..M {
             for b in 0..kb {
@@ -7009,10 +7012,9 @@ mod dsl_dispatch_proof {
                 for l in 0..32 {
                     acc += xq[i * K + b * 32 + l] as i32;
                 }
-                xsum[i * kb + b] = acc as f32;
+                xsum[i * kb + b] = xs[i * kb + b] * acc as f32;
             }
         }
-        let xs: Vec<f32> = (0..M * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
         // CPU reference: affine MMQ with the same in-place Q4_K decode.
         let byte = |a: &[u32], base: usize, i: usize| (a[base + i / 4] >> (8 * (i % 4))) & 255;
         let sc_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
@@ -7037,7 +7039,7 @@ mod dsl_dispatch_proof {
                     }
                     let dd = wd[blk] * sc_of(&wsc, blk * 3, is) as f32;
                     let mm = wdm[blk] * m_of(&wsc, blk * 3, is) as f32;
-                    acc += xs[i * kb + b] * (dd * isum as f32 - mm * xsum[i * kb + b]);
+                    acc += xs[i * kb + b] * dd * isum as f32 - mm * xsum[i * kb + b];
                 }
                 want[i * N + j] = acc;
             }
