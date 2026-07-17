@@ -1382,7 +1382,10 @@ impl VulkanDevice {
     /// Quantize GPU-resident f32 activations `x[m, k]` to q8_1-style int8 for the dp4a prefill GEMM:
     /// returns (xq `[m*k/32*8]` u32, xs `[m*k/32]` f32 scale, xsum `[m*k/32]` f32 dequant block sum).
     /// One O(m*k) pass amortized over the O(m*nout*k) matmul; layout matches `mul_mm_q4k_tiled_dp4a`.
-    fn quantize_act_q8(
+    /// q8-quantize an activation for the dp4a kernels: `(xq, xs, xsum)`. Public so a caller feeding the
+    /// SAME activation to several matvecs (gate and up share one routed token) can quantize once and
+    /// hand the result to [`Self::moe_matvec_blk_dp4a_pre_gpu`], rather than re-deriving it per matvec.
+    pub fn quantize_act_q8(
         &self,
         x: &VulkanStorage,
         m: usize,
@@ -2188,6 +2191,27 @@ impl VulkanDevice {
             crate::bail!("moe_matvec_blk_dp4a_gpu: ids count {} < nrows {nrows}", ids.count);
         }
         let (xq, xs, xsum) = self.quantize_act_q8(x, nrows, k)?;
+        self.moe_matvec_blk_dp4a_pre_gpu(kernel, with_xsum, bank, &xq, &xs, &xsum, ids, nrows, n)
+    }
+
+    /// [`Self::moe_matvec_blk_dp4a_gpu`] against an ALREADY q8-quantized activation. Gate and up read
+    /// the same routed token, so the caller quantizes once via [`Self::quantize_act_q8`] and dispatches
+    /// twice against it; `moe_matvec_blk_dp4a_gpu` is this with the quantize folded back in, so the
+    /// dispatch itself is written once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_matvec_blk_dp4a_pre_gpu(
+        &self,
+        kernel: &'static str,
+        with_xsum: bool,
+        bank: &MoeBankSplit,
+        xq: &VulkanStorage,
+        xs: &VulkanStorage,
+        xsum: &VulkanStorage,
+        ids: &VulkanStorage,
+        nrows: usize,
+        n: usize,
+    ) -> Result<VulkanStorage> {
+        // No `k`: the .spv bakes the shape, so the dispatch carries no push constants.
         let out = self.alloc_f32(nrows * n)?;
         let mut bufs: Vec<vk::Buffer> = bank.0.iter().map(|s| s.buffer).collect();
         bufs.push(xq.buffer);
