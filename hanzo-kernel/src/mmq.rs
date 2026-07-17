@@ -756,6 +756,228 @@ pub fn gen_mmq(m: usize, n: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec
     (xq, xs, wq, wd)
 }
 
+// ================================================================================================
+// Q4_K MMQ GEMM: the same int8 tensor-core contraction, made AFFINE for K-quant weights.
+//
+// Q8_0/q8_1 is symmetric (w = scale*code), so the block scale is a single post-multiply. Q4_K is
+// AFFINE -- w = d*sc*nibble - dmin*m -- and the subtracted `dmin*m` offset does not survive a
+// tensor-core dot. It factors out of the contraction instead, because it is constant across a
+// 32-block (one Q4_K sub-block == one 32-wide MMQ tile: a 256-weight super-block is 8 sub-blocks):
+//
+//   sum_k (D*q_k - M) * (xs*xq_k) = xs * ( D * sum_k q_k*xq_k  -  M * sum_k xq_k )
+//                                          ^^^^^^ the cmma dot ^^^      ^^^ xsum ^^^
+//
+// So the cmma stage is IDENTICAL (int8 nibble x int8 activation -> i32); only the epilogue gains the
+// `- M*xsum` correction, and the kernel takes two extra inputs: `xsum` (per activation 32-block, sum
+// of xq -- `quantize_act_q8` already emits it) and `wmin` (M = dmin*m per weight 32-block). `wq` here
+// is the Q4_K nibble (0..15) as i8 and `wd` is D = d*sc, both produced host-side, mirroring how the
+// q8 kernel takes pre-quantized int8 + a scale. Decoding the super-block in-kernel to keep 4.5 bits
+// is the bandwidth follow-up; this proves the affine contraction first.
+// ================================================================================================
+#[kernel(targets(cuda, rocm, vulkan, metal, cpu), unchecked)]
+pub fn mmq_q4k_wmma_blk(
+    xq: &Array<i8>,
+    xs: &Array<f32>,
+    xsum: &Array<f32>,
+    wq: &Array<i8>,
+    wd: &Array<f32>,
+    wmin: &Array<f32>,
+    out: &mut Array<f32>,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+    #[comptime] plane: usize,
+    #[comptime] target: Target,
+) {
+    let tid = UNIT_POS as usize;
+    let warp = tid / plane;
+    let lane = tid % plane;
+    let wm = warp / 4; // M-subtile (0..1) -- a LOCAL, distinct from the `wmin` input above
+    let wn = warp % 4; // N-subtile (0..3)
+    let mrow0 = CUBE_POS_Y as usize * 32;
+    let ncol0 = CUBE_POS_X as usize * 64;
+    let kb_count = k / 32;
+    let nthread = 8 * plane;
+    let per = 256 / plane;
+
+    let mut sa = SharedMemory::<i8>::new(1024usize);
+    let mut sb = SharedMemory::<i8>::new(2048usize);
+    let mut ci = SharedMemory::<i32>::new(2048usize);
+    let mut accf = SharedMemory::<f32>::new(2048usize);
+
+    for e in 0usize..(2048 / nthread) {
+        accf[tid * (2048 / nthread) + e] = 0.0f32;
+    }
+    sync_cube();
+
+    for kb in 0..kb_count {
+        let k0 = kb * 32;
+        for i in 0usize..(1024 / nthread) {
+            let idx = tid + i * nthread;
+            sa[idx] = xq[(mrow0 + idx / 32) * k + k0 + idx % 32];
+        }
+        // B tile is the Q4_K nibble (0..15) already decoded to i8 host-side, staged exactly like the
+        // q8 weight -- the contraction cannot tell the difference, which is why the cmma stays intact.
+        for i in 0usize..(2048 / nthread) {
+            let idx = tid + i * nthread;
+            sb[idx] = wq[(ncol0 + idx / 32) * k + k0 + idx % 32];
+        }
+        sync_cube();
+
+        island! {
+            cuda | rocm | vulkan | metal => {
+                let c = cmma::Matrix::<i32>::from_value(
+                    cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::Undefined, 0i32,
+                );
+                let a0 = cmma::Matrix::<i8>::from_slice(
+                    cmma::MatrixIdent::A, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::RowMajor, &sa.slice(wm * 512, 1024), 32,
+                );
+                let b0 = cmma::Matrix::<i8>::from_slice(
+                    cmma::MatrixIdent::B, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::ColMajor, &sb.slice(wn * 512, 2048), 32,
+                );
+                cmma::execute::<i8, i8, i32, i32>(&a0, &b0, &c, &c);
+                let a1 = cmma::Matrix::<i8>::from_slice(
+                    cmma::MatrixIdent::A, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::RowMajor, &sa.slice(wm * 512 + 16, 1024), 32,
+                );
+                let b1 = cmma::Matrix::<i8>::from_slice(
+                    cmma::MatrixIdent::B, 16usize, 16usize, 16usize,
+                    cmma::MatrixLayout::ColMajor, &sb.slice(wn * 512 + 16, 2048), 32,
+                );
+                cmma::execute::<i8, i8, i32, i32>(&a1, &b1, &c, &c);
+                cmma::store(&mut ci.slice_mut(warp * 256, warp * 256 + 256), &c, 16, cmma::MatrixLayout::RowMajor);
+            }
+            default => {
+                for e in 0usize..per {
+                    let p = lane * per + e;
+                    let smm = p / 16;
+                    let snn = p % 16;
+                    let mut isum = 0i32;
+                    for l in 0usize..32 {
+                        isum += i32::cast_from(sa[(wm * 16 + smm) * 32 + l])
+                            * i32::cast_from(sb[(wn * 16 + snn) * 32 + l]);
+                    }
+                    ci[warp * 256 + p] = isum;
+                }
+            }
+        };
+        sync_cube();
+
+        // Affine epilogue: xs * (D*dot - M*xsum), per 32-block.
+        for e in 0usize..per {
+            let p = lane * per + e;
+            let smm = p / 16;
+            let snn = p % 16;
+            let gmm = wm * 16 + smm;
+            let gnn = wn * 16 + snn;
+            let xsc = xs[(mrow0 + gmm) * kb_count + kb];
+            let xsm = xsum[(mrow0 + gmm) * kb_count + kb];
+            let wdd = wd[(ncol0 + gnn) * kb_count + kb];
+            let wmm = wmin[(ncol0 + gnn) * kb_count + kb];
+            accf[gmm * 64 + gnn] += xsc * (wdd * f32::cast_from(ci[warp * 256 + p]) - wmm * xsm);
+        }
+        sync_cube();
+    }
+
+    for e in 0usize..per {
+        let p = lane * per + e;
+        let gmm = wm * 16 + p / 16;
+        let gnn = wn * 16 + p % 16;
+        out[(mrow0 + gmm) * n + (ncol0 + gnn)] = accf[gmm * 64 + gnn];
+    }
+}
+
+/// Host launch for the Q4_K affine MMQ GEMM (production surface; island tag from the runtime).
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    xq: &[i8], xs: &[f32], xsum: &[f32], wq: &[i8], wd: &[f32], wmin: &[f32],
+    m: usize, n: usize, k: usize, iters: usize,
+) -> (Vec<f32>, f64) {
+    let target = Target::of(client);
+    let plane = client.properties().hardware.plane_size_max;
+    let xqh = client.create_from_slice(i8::as_bytes(xq));
+    let xsh = client.create_from_slice(f32::as_bytes(xs));
+    let xsumh = client.create_from_slice(f32::as_bytes(xsum));
+    let wqh = client.create_from_slice(i8::as_bytes(wq));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let wmh = client.create_from_slice(f32::as_bytes(wmin));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; m * n]));
+    let grid = Grid::Static((n / 64) as u32, (m / 32) as u32, 1);
+    let launch = |c: &ComputeClient<R>| unsafe {
+        mmq_q4k_wmma_blk::launch_unchecked::<R>(
+            c, grid.clone(), Block::new_1d(8 * plane),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
+            ArrayArg::from_raw_parts(wqh.clone(), wq.len()),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(wmh.clone(), wmin.len()),
+            ArrayArg::from_raw_parts(oh.clone(), m * n),
+            n, k, plane as usize, target,
+        );
+    };
+    launch(client);
+    let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    (out, ms)
+}
+
+/// CPU oracle: the exact affine MMQ math. out[m,n] = sum_kb xs*(D*<xq,q> - M*xsum), summed in f32.
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_ref(
+    xq: &[i8], xs: &[f32], xsum: &[f32], wq: &[i8], wd: &[f32], wmin: &[f32],
+    m: usize, n: usize, k: usize,
+) -> Vec<f32> {
+    let kb = k / 32;
+    let mut out = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for b in 0..kb {
+                let mut isum = 0i32;
+                for l in 0..32 {
+                    isum += xq[i * k + b * 32 + l] as i32 * wq[j * k + b * 32 + l] as i32;
+                }
+                acc += xs[i * kb + b] * (wd[j * kb + b] * isum as f32 - wmin[j * kb + b] * xsum[i * kb + b]);
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    out
+}
+
+/// Deterministic Q4_K MMQ test data. `xsum` is DERIVED from `xq` (sum per 32-block) so the affine
+/// correction is exact, not approximate; `wq` are nibbles 0..15; D/M are small positives.
+pub fn gen_mmq_q4k(m: usize, n: usize, k: usize)
+    -> (Vec<i8>, Vec<f32>, Vec<f32>, Vec<i8>, Vec<f32>, Vec<f32>) {
+    let kb = k / 32;
+    let mut s = 0x243F6A8885A308D3u64;
+    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let xq: Vec<i8> = (0..m * k).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
+    let wq: Vec<i8> = (0..n * k).map(|_| (next() % 16) as i8).collect(); // Q4_K nibble
+    let xs: Vec<f32> = (0..m * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+    let wd: Vec<f32> = (0..n * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+    let wmin: Vec<f32> = (0..n * kb).map(|_| (next() % 1000) as f32 / 80000.0).collect();
+    // xsum MUST equal the per-block sum of xq for the offset term to be exact.
+    let mut xsum = vec![0.0f32; m * kb];
+    for i in 0..m {
+        for b in 0..kb {
+            let mut acc = 0i32;
+            for l in 0..32 { acc += xq[i * k + b * 32 + l] as i32; }
+            xsum[i * kb + b] = acc as f32;
+        }
+    }
+    (xq, xs, xsum, wq, wd, wmin)
+}
+
 #[cfg(all(test, feature = "cpu"))]
 mod tests {
     use super::*;
@@ -810,6 +1032,24 @@ mod tests {
         let want = mmq_q8_ref(&xq, &xs, &wq, &wd, m, n, k);
         let rel = rel_to_max(&got, &want);
         assert!(rel < 1e-6, "tiled MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q8_ref");
+    }
+
+    /// The AFFINE Q4_K MMQ agrees with `mmq_q4k_ref` through the same cmma/staging path. This is the
+    /// contract the symmetric kernel could not express: the `- M*xsum` correction is what a plain int8
+    /// tensor-core dot drops for a K-quant weight. `xsum` is the exact per-block sum of `xq`, so the
+    /// correction is not an approximation -- a wrong epilogue (e.g. omitting the term) fails loudly.
+    #[test]
+    fn mmq_q4k_affine_matches_ref_on_cpu() {
+        let client = cpu_client();
+        for (m, n, k) in [(32usize, 64usize, 128usize), (32, 64, 256)] {
+            let (xq, xs, xsum, wq, wd, wmin) = gen_mmq_q4k(m, n, k);
+            let (got, _) = mmq_q4k_wmma_blk_run::<CpuRuntime>(
+                &client, &xq, &xs, &xsum, &wq, &wd, &wmin, m, n, k, 1,
+            );
+            let want = mmq_q4k_ref(&xq, &xs, &xsum, &wq, &wd, &wmin, m, n, k);
+            let rel = rel_to_max(&got, &want);
+            assert!(rel < 1e-6, "affine Q4_K MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_ref");
+        }
     }
 
     /// The production surface derives the island tag from the runtime, so the CPU runtime resolves to
