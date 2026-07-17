@@ -471,9 +471,9 @@ fn check_gemv<R: Runtime>(name: &str, client: &ComputeClient<R>, n: usize, k: us
 // - M*xsum offset a plain int8 dot drops for a K-quant weight). M/N must be multiples of 32/64, K of 256.
 fn check_mmq_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize, n: usize, k: usize) {
     use hanzo_kernel::mmq::{gen_mmq_q4k, mmq_q4k_ref, mmq_q4k_wmma_blk_run};
-    let (xq, xs, xsum, wq, wd, wmin) = gen_mmq_q4k(m, n, k);
-    let want = mmq_q4k_ref(&xq, &xs, &xsum, &wq, &wd, &wmin, m, n, k);
-    let (got, ms) = mmq_q4k_wmma_blk_run::<R>(client, &xq, &xs, &xsum, &wq, &wd, &wmin, m, n, k, 50);
+    let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
+    let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
+    let (got, ms) = mmq_q4k_wmma_blk_run::<R>(client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 50);
     let rel = maxabs_over_max(&got, &want);
     let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
     println!(
