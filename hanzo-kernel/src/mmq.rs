@@ -774,14 +774,39 @@ pub fn gen_mmq(m: usize, n: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec
 // q8 kernel takes pre-quantized int8 + a scale. Decoding the super-block in-kernel to keep 4.5 bits
 // is the bandwidth follow-up; this proves the affine contraction first.
 // ================================================================================================
+// Q4_K decode helpers, byte-for-byte the ones in `quant.rs` that `matvec_q4k` is gated against
+// (BlockQ4K::to_float). Duplicated here rather than cross-module-exported: a `#[device]` fn is
+// module-private, and the copy is three lines each and proven.
+#[device]
+fn q4k_byte(a: &Array<u32>, base: usize, i: usize) -> u32 {
+    (a[base + i / 4] >> ((8 * (i % 4)) as u32)) & 255
+}
+#[device]
+fn q4k_sc(wsc: &Array<u32>, scbase: usize, j: usize) -> u32 {
+    let mut r = q4k_byte(wsc, scbase, j) & 63;
+    if j >= 4 {
+        r = (q4k_byte(wsc, scbase, j + 4) & 15) | ((q4k_byte(wsc, scbase, j - 4) >> 6) << 4);
+    }
+    r
+}
+#[device]
+fn q4k_m(wsc: &Array<u32>, scbase: usize, j: usize) -> u32 {
+    let mut r = q4k_byte(wsc, scbase, j + 4) & 63;
+    if j >= 4 {
+        r = (q4k_byte(wsc, scbase, j + 4) >> 4) | ((q4k_byte(wsc, scbase, j) >> 6) << 4);
+    }
+    r
+}
+
 #[kernel(targets(cuda, rocm, vulkan, metal, cpu), unchecked)]
 pub fn mmq_q4k_wmma_blk(
     xq: &Array<i8>,
     xs: &Array<f32>,
     xsum: &Array<f32>,
-    wq: &Array<i8>,
-    wd: &Array<f32>,
-    wmin: &Array<f32>,
+    wqs: &Array<u32>, // packed Q4_K qs: 32 u32 (128 B) / super-block
+    wsc: &Array<u32>, // packed Q4_K scales: 3 u32 (12 B) / super-block
+    wd: &Array<f32>,  // d per super-block   [n * k/256]
+    wdm: &Array<f32>, // dmin per super-block [n * k/256]
     out: &mut Array<f32>,
     #[comptime] n: usize,
     #[comptime] k: usize,
@@ -791,11 +816,12 @@ pub fn mmq_q4k_wmma_blk(
     let tid = UNIT_POS as usize;
     let warp = tid / plane;
     let lane = tid % plane;
-    let wm = warp / 4; // M-subtile (0..1) -- a LOCAL, distinct from the `wmin` input above
+    let wm = warp / 4; // M-subtile (0..1) -- a LOCAL, distinct from any weight input
     let wn = warp % 4; // N-subtile (0..3)
     let mrow0 = CUBE_POS_Y as usize * 32;
     let ncol0 = CUBE_POS_X as usize * 64;
     let kb_count = k / 32;
+    let nsb = k / 256; // super-blocks per weight row
     let nthread = 8 * plane;
     let per = 256 / plane;
 
@@ -815,11 +841,21 @@ pub fn mmq_q4k_wmma_blk(
             let idx = tid + i * nthread;
             sa[idx] = xq[(mrow0 + idx / 32) * k + k0 + idx % 32];
         }
-        // B tile is the Q4_K nibble (0..15) already decoded to i8 host-side, staged exactly like the
-        // q8 weight -- the contraction cannot tell the difference, which is why the cmma stays intact.
+        // B tile: decode the Q4_K nibble in-place, weights stay 4.5-bit. One 32-block == one Q4_K
+        // sub-block `is = kb % 8`; within the super-block's 4 groups of 64, sub-block 2g is the low
+        // nibble and 2g+1 the high nibble of qs byte `g*32 + qi` -- exactly matvec_q4k's mapping, so
+        // qi = column-in-block and the byte index is (is/2)*32 + qi. The staged i8 (0..15) then feeds
+        // the SAME cmma as the q8 kernel.
+        let is = kb % 8;
+        let g = is / 2;
+        let sbk = kb / 8; // super-block index along k
         for i in 0usize..(2048 / nthread) {
             let idx = tid + i * nthread;
-            sb[idx] = wq[(ncol0 + idx / 32) * k + k0 + idx % 32];
+            let nrow = ncol0 + idx / 32;
+            let qi = idx % 32;
+            let qb = q4k_byte(wqs, (nrow * nsb + sbk) * 32, g * 32 + qi);
+            let nib = (qb >> (4u32 * (is % 2) as u32)) & 15;
+            sb[idx] = i8::cast_from(nib);
         }
         sync_cube();
 
@@ -865,17 +901,21 @@ pub fn mmq_q4k_wmma_blk(
         };
         sync_cube();
 
-        // Affine epilogue: xs * (D*dot - M*xsum), per 32-block.
+        // Affine epilogue: xs * (D*dot - M*xsum) per 32-block, with D = d*sc and M = dmin*m decoded
+        // from the super-block's 6-bit packed scales for sub-block `is` (get_scale_min_k4).
         for e in 0usize..per {
             let p = lane * per + e;
             let smm = p / 16;
             let snn = p % 16;
             let gmm = wm * 16 + smm;
             let gnn = wn * 16 + snn;
+            let nrow = ncol0 + gnn;
+            let blk = nrow * nsb + sbk;
+            let scbase = blk * 3;
+            let wdd = wd[blk] * f32::cast_from(q4k_sc(wsc, scbase, is));
+            let wmm = wdm[blk] * f32::cast_from(q4k_m(wsc, scbase, is));
             let xsc = xs[(mrow0 + gmm) * kb_count + kb];
             let xsm = xsum[(mrow0 + gmm) * kb_count + kb];
-            let wdd = wd[(ncol0 + gnn) * kb_count + kb];
-            let wmm = wmin[(ncol0 + gnn) * kb_count + kb];
             accf[gmm * 64 + gnn] += xsc * (wdd * f32::cast_from(ci[warp * 256 + p]) - wmm * xsm);
         }
         sync_cube();
@@ -890,10 +930,11 @@ pub fn mmq_q4k_wmma_blk(
 }
 
 /// Host launch for the Q4_K affine MMQ GEMM (production surface; island tag from the runtime).
+/// Weights are the packed Q4_K super-block arrays (wqs/wsc/wd/wdm), decoded in-kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    xq: &[i8], xs: &[f32], xsum: &[f32], wq: &[i8], wd: &[f32], wmin: &[f32],
+    xq: &[i8], xs: &[f32], xsum: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
     m: usize, n: usize, k: usize, iters: usize,
 ) -> (Vec<f32>, f64) {
     let target = Target::of(client);
@@ -901,9 +942,10 @@ pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
     let xqh = client.create_from_slice(i8::as_bytes(xq));
     let xsh = client.create_from_slice(f32::as_bytes(xs));
     let xsumh = client.create_from_slice(f32::as_bytes(xsum));
-    let wqh = client.create_from_slice(i8::as_bytes(wq));
+    let wqsh = client.create_from_slice(u32::as_bytes(wqs));
+    let wsch = client.create_from_slice(u32::as_bytes(wsc));
     let wdh = client.create_from_slice(f32::as_bytes(wd));
-    let wmh = client.create_from_slice(f32::as_bytes(wmin));
+    let wdmh = client.create_from_slice(f32::as_bytes(wdm));
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; m * n]));
     let grid = Grid::Static((n / 64) as u32, (m / 32) as u32, 1);
     let launch = |c: &ComputeClient<R>| unsafe {
@@ -912,9 +954,10 @@ pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
             ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
-            ArrayArg::from_raw_parts(wqh.clone(), wq.len()),
+            ArrayArg::from_raw_parts(wqsh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(wsch.clone(), wsc.len()),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
-            ArrayArg::from_raw_parts(wmh.clone(), wmin.len()),
+            ArrayArg::from_raw_parts(wdmh.clone(), wdm.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
             n, k, plane as usize, target,
         );
@@ -930,23 +973,42 @@ pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
     (out, ms)
 }
 
-/// CPU oracle: the exact affine MMQ math. out[m,n] = sum_kb xs*(D*<xq,q> - M*xsum), summed in f32.
+fn cpu_q4k_byte(a: &[u32], base: usize, i: usize) -> u32 { (a[base + i / 4] >> (8 * (i % 4))) & 255 }
+fn cpu_q4k_sc(wsc: &[u32], sb: usize, j: usize) -> u32 {
+    if j < 4 { cpu_q4k_byte(wsc, sb, j) & 63 }
+    else { (cpu_q4k_byte(wsc, sb, j + 4) & 15) | ((cpu_q4k_byte(wsc, sb, j - 4) >> 6) << 4) }
+}
+fn cpu_q4k_m(wsc: &[u32], sb: usize, j: usize) -> u32 {
+    if j < 4 { cpu_q4k_byte(wsc, sb, j + 4) & 63 }
+    else { (cpu_q4k_byte(wsc, sb, j + 4) >> 4) | ((cpu_q4k_byte(wsc, sb, j) >> 6) << 4) }
+}
+
+/// CPU oracle: the exact affine MMQ math over packed Q4_K weights, decoded the same way the kernel
+/// (and BlockQ4K::to_float) does. out[m,n] = sum_kb xs*(D*<xq,q> - M*xsum), summed in f32.
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_q4k_ref(
-    xq: &[i8], xs: &[f32], xsum: &[f32], wq: &[i8], wd: &[f32], wmin: &[f32],
+    xq: &[i8], xs: &[f32], xsum: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
     m: usize, n: usize, k: usize,
 ) -> Vec<f32> {
     let kb = k / 32;
+    let nsb = k / 256;
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         for j in 0..n {
             let mut acc = 0.0f32;
             for b in 0..kb {
+                let is = b % 8;
+                let g = is / 2;
+                let blk = j * nsb + b / 8;
                 let mut isum = 0i32;
-                for l in 0..32 {
-                    isum += xq[i * k + b * 32 + l] as i32 * wq[j * k + b * 32 + l] as i32;
+                for qi in 0..32 {
+                    let qbyte = cpu_q4k_byte(wqs, blk * 32, g * 32 + qi);
+                    let nib = ((qbyte >> (4 * (is % 2))) & 15) as i32;
+                    isum += xq[i * k + b * 32 + qi] as i32 * nib;
                 }
-                acc += xs[i * kb + b] * (wd[j * kb + b] * isum as f32 - wmin[j * kb + b] * xsum[i * kb + b]);
+                let dd = wd[blk] * cpu_q4k_sc(wsc, blk * 3, is) as f32;
+                let mm = wdm[blk] * cpu_q4k_m(wsc, blk * 3, is) as f32;
+                acc += xs[i * kb + b] * (dd * isum as f32 - mm * xsum[i * kb + b]);
             }
             out[i * n + j] = acc;
         }
@@ -954,19 +1016,20 @@ pub fn mmq_q4k_ref(
     out
 }
 
-/// Deterministic Q4_K MMQ test data. `xsum` is DERIVED from `xq` (sum per 32-block) so the affine
-/// correction is exact, not approximate; `wq` are nibbles 0..15; D/M are small positives.
+/// Deterministic packed-Q4_K MMQ test data: (xq, xs, xsum, wqs, wsc, wd, wdm). `xsum` is DERIVED from
+/// `xq` (sum per 32-block) so the affine correction is exact; wqs are random nibbles, wsc random 6-bit
+/// scales, d/dmin small positives -- valid inputs for the get_scale_min_k4 decode.
 pub fn gen_mmq_q4k(m: usize, n: usize, k: usize)
-    -> (Vec<i8>, Vec<f32>, Vec<f32>, Vec<i8>, Vec<f32>, Vec<f32>) {
+    -> (Vec<i8>, Vec<f32>, Vec<f32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>) {
     let kb = k / 32;
+    let nsb = k / 256;
     let mut s = 0x243F6A8885A308D3u64;
     let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
     let xq: Vec<i8> = (0..m * k).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
-    let wq: Vec<i8> = (0..n * k).map(|_| (next() % 16) as i8).collect(); // Q4_K nibble
-    let xs: Vec<f32> = (0..m * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
-    let wd: Vec<f32> = (0..n * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
-    let wmin: Vec<f32> = (0..n * kb).map(|_| (next() % 1000) as f32 / 80000.0).collect();
-    // xsum MUST equal the per-block sum of xq for the offset term to be exact.
+    let wqs: Vec<u32> = (0..n * nsb * 32).map(|_| next() as u32).collect(); // 128 qs bytes/super-block
+    let wsc: Vec<u32> = (0..n * nsb * 3).map(|_| next() as u32).collect(); //  12 scale bytes/super-block
+    let wd: Vec<f32> = (0..n * nsb).map(|_| (next() % 1000) as f32 / 20000.0 + 0.002).collect();
+    let wdm: Vec<f32> = (0..n * nsb).map(|_| (next() % 1000) as f32 / 40000.0).collect();
     let mut xsum = vec![0.0f32; m * kb];
     for i in 0..m {
         for b in 0..kb {
@@ -975,7 +1038,8 @@ pub fn gen_mmq_q4k(m: usize, n: usize, k: usize)
             xsum[i * kb + b] = acc as f32;
         }
     }
-    (xq, xs, xsum, wq, wd, wmin)
+    let xs: Vec<f32> = (0..m * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+    (xq, xs, xsum, wqs, wsc, wd, wdm)
 }
 
 #[cfg(all(test, feature = "cpu"))]
@@ -1041,12 +1105,12 @@ mod tests {
     #[test]
     fn mmq_q4k_affine_matches_ref_on_cpu() {
         let client = cpu_client();
-        for (m, n, k) in [(32usize, 64usize, 128usize), (32, 64, 256)] {
-            let (xq, xs, xsum, wq, wd, wmin) = gen_mmq_q4k(m, n, k);
+        for (m, n, k) in [(32usize, 64usize, 256usize), (32, 64, 512)] {
+            let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
             let (got, _) = mmq_q4k_wmma_blk_run::<CpuRuntime>(
-                &client, &xq, &xs, &xsum, &wq, &wd, &wmin, m, n, k, 1,
+                &client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 1,
             );
-            let want = mmq_q4k_ref(&xq, &xs, &xsum, &wq, &wd, &wmin, m, n, k);
+            let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
             let rel = rel_to_max(&got, &want);
             assert!(rel < 1e-6, "affine Q4_K MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_ref");
         }
