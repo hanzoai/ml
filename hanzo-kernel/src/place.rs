@@ -92,8 +92,14 @@ impl Place {
         }
 
         // Largest first — place the experts that are hardest to fit while the fleet is still empty.
-        let mut order: Vec<(Expert, u64)> =
-            experts.iter().copied().filter(|(e, _)| !self.at.contains_key(e)).collect();
+        // Iterate the deduped `size` map, not the raw slice: the pool is a set, so a repeated id is
+        // charged and placed exactly once (a raw-slice iteration would place each occurrence, phantom-
+        // reserving room on the abandoned device). The (need desc, id) sort makes the map order irrelevant.
+        let mut order: Vec<(Expert, u64)> = size
+            .iter()
+            .map(|(&e, &need)| (e, need))
+            .filter(|(e, _)| !self.at.contains_key(e))
+            .collect();
         order.sort_by_key(|&(e, need)| (Reverse(need), e));
 
         for (e, need) in order {
@@ -188,6 +194,22 @@ mod tests {
             declared.pin(&[(Expert(0), 100)], &[(Device(2), 64)]),
             Err(Error::Over { device: Device(2), need: 100, have: 64 })
         );
+    }
+
+    #[test]
+    fn a_repeated_expert_id_is_charged_and_placed_once() {
+        // The pool is a set: listing an expert twice must not double-charge a device. E0(100) and E1(100)
+        // fit as a set on two 120-capacity devices; a per-occurrence charge would phantom-reserve 100 on a
+        // second device and spuriously refuse E1.
+        let pool = [(Expert(0), 100), (Expert(0), 100), (Expert(1), 100)];
+        let fleet = [(Device(0), 120), (Device(1), 120)];
+        let pi = Place::default().pin(&pool, &fleet).unwrap();
+        assert_eq!(pi.device(Expert(0)), Some(Device(0)));
+        assert_eq!(pi.device(Expert(1)), Some(Device(1)));
+        // One entry per distinct expert, and the same pool listed in another order is identical.
+        assert_eq!(pi.at.len(), 2);
+        let reordered = [(Expert(1), 100), (Expert(0), 100), (Expert(0), 100)];
+        assert_eq!(Place::default().pin(&reordered, &fleet).unwrap(), pi);
     }
 
     #[test]
