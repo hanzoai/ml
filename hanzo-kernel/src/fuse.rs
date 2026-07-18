@@ -63,7 +63,8 @@
 use crate::prelude::*;
 
 // ======================================================================================
-// 1. The op algebra — the entire surface. Two classes; the class decides fusibility.
+// 1. The op algebra — the entire surface. The class decides fusibility (this module emits Map and
+//    Reduce; Route, the cross-device fence, is added by `crate::route` and needs no change here).
 // ======================================================================================
 
 /// A unary pointwise morphism `F -> F`. Every variant is index-local, hence freely fusible.
@@ -110,12 +111,39 @@ pub enum Red {
     Max,
 }
 
-/// The class of an op decides whether it composes (Map) or fences (Reduce). This — not a pattern
-/// matcher over concrete ops — is what makes fusion decidable.
+/// The class of an op decides whether it composes or fences — and, when it fences, *why*. This, not a
+/// pattern matcher over concrete ops, is what makes fusion decidable; and because the class describes how
+/// an op composes and never what it computes, one fence class covers every op that fences for the same
+/// structural reason at once. That is why generality over *content* is free.
+///
+///   * [`Map`](Class::Map) — index-local; composes with a same-class neighbour (the functor law).
+///   * [`Reduce`](Class::Reduce) — a row contraction; fences **within a device** (its lanes must talk,
+///     but they are lanes of one device).
+///   * [`Route`](Class::Route) — an expert application; fences **across devices**, because the expert's
+///     weights live on the device the placement map `π` gives them ([`crate::place`]). The fence is a
+///     property of π, not of what the expert computes — so routing a diffusion expert and routing a text
+///     expert are one thing to the partitioner ([`crate::route`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     Map,
     Reduce,
+    Route,
+}
+
+impl Class {
+    /// A Map is the one class that composes with a same-class neighbour; every other class is a fence.
+    pub fn is_map(self) -> bool {
+        matches!(self, Class::Map)
+    }
+
+    /// Whether this op is a fusion **fence** — a seam a Map run cannot be folded across. The partitioner
+    /// asks *this*, never "is it a Reduce?", so adding a fence class (Route beside Reduce) needs no change
+    /// to the partition logic: a new way to fence partitions correctly the moment it answers `true` here.
+    /// The question is about composition and never about contents, which is the whole reason a new fence
+    /// class generalises for free.
+    pub fn fences(self) -> bool {
+        !self.is_map()
+    }
 }
 
 // ======================================================================================
@@ -934,6 +962,21 @@ mod tests {
         assert!(matches!(regions[0], Region::Map(_)));
         assert!(matches!(regions[1], Region::Reduce(Red::Sum)));
         assert!(matches!(regions[2], Region::Map(_)));
+    }
+
+    #[test]
+    fn class_predicates_split_map_from_fences() {
+        // The partition asks `fences()` / `is_map()`, never `== Reduce`. Map is the one composer; every
+        // other class — Reduce (within a device), Route (across devices) — is a fence. This is what lets a
+        // new fence class (Route) drop into the partitioner with no change to it.
+        assert!(Class::Map.is_map());
+        assert!(!Class::Map.fences());
+        assert!(Class::Reduce.fences() && !Class::Reduce.is_map());
+        assert!(Class::Route.fences() && !Class::Route.is_map());
+        // `fences` is exactly the complement of `is_map`, for every class.
+        for c in [Class::Map, Class::Reduce, Class::Route] {
+            assert_eq!(c.fences(), !c.is_map());
+        }
     }
 
     #[test]
