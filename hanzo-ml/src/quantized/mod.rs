@@ -68,9 +68,26 @@ fn as_t_slice<T>(data: &[u8]) -> &[T] {
     unsafe { std::slice::from_raw_parts(ptr as *const T, data.len() / size) }
 }
 
+// The GPU-resident copies of this tensor's expert bank. A resident bank is a value DERIVED from
+// these exact quantized bytes, so it is owned by the tensor that owns the bytes and dies with them.
+// One slot per backend; each fills at most once (first routed token) and is then shared by every
+// later call through the `Arc<QTensor>` all consumers already hold.
+#[derive(Default)]
+struct ResidentBanks {
+    #[cfg(feature = "rocm")]
+    rocm: std::sync::OnceLock<std::sync::Arc<crate::RocmStorage>>,
+    #[cfg(feature = "vulkan")]
+    vulkan: std::sync::OnceLock<std::sync::Arc<crate::VulkanStorage>>,
+    #[cfg(feature = "vulkan")]
+    vulkan_split: std::sync::OnceLock<std::sync::Arc<crate::vulkan::MoeBankSplit>>,
+    #[cfg(feature = "wgpu")]
+    wgpu: std::sync::OnceLock<std::sync::Arc<crate::WgpuStorage>>,
+}
+
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
+    banks: ResidentBanks,
 }
 
 impl Device {
@@ -841,10 +858,20 @@ fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
 }
 
 impl QTensor {
+    // The ONE way to build a QTensor from its parts: every constructor funnels here so a tensor's
+    // resident-bank slots start empty exactly once, alongside the bytes they are derived from.
+    fn make(storage: QStorage, shape: Shape) -> Self {
+        Self {
+            storage,
+            shape,
+            banks: ResidentBanks::default(),
+        }
+    }
+
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
         check_shape(&shape, storage.block_size())?;
-        Ok(Self { storage, shape })
+        Ok(Self::make(storage, shape))
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
@@ -861,10 +888,7 @@ impl QTensor {
         }
         let mut storage = src.device().qzeros(elem_count, dtype)?;
         storage.quantize(&src.storage())?;
-        Ok(Self {
-            storage,
-            shape: shape.clone(),
-        })
+        Ok(Self::make(storage, shape.clone()))
     }
 
     pub fn quantize_imatrix(
@@ -896,10 +920,7 @@ impl QTensor {
         }
         let mut storage = src.device().qzeros(elem_count, dtype)?;
         storage.quantize_imatrix(&src.storage(), imatrix_weights, n_per_row)?;
-        Ok(Self {
-            storage,
-            shape: shape.clone(),
-        })
+        Ok(Self::make(storage, shape.clone()))
     }
 
     /// Quantize `src` (currently on the CPU) to a QTensor on `dev`
@@ -939,10 +960,7 @@ impl QTensor {
         // storage is on the `dev`, src is on `cpu`
         let mut storage = dev.qzeros(elem_count, dtype)?;
         storage.quantize_imatrix_onto(&src.storage(), imatrix_weights, n_per_row)?;
-        Ok(Self {
-            storage,
-            shape: shape.clone(),
-        })
+        Ok(Self::make(storage, shape.clone()))
     }
 
     /// Quantize `src` (currently on the CPU) to a QTensor on `dev`
@@ -967,10 +985,7 @@ impl QTensor {
         // storage is on the `dev`, src is on `cpu`
         let mut storage = dev.qzeros(elem_count, dtype)?;
         storage.quantize_onto(&src.storage())?;
-        Ok(Self {
-            storage,
-            shape: shape.clone(),
-        })
+        Ok(Self::make(storage, shape.clone()))
     }
 
     pub fn dtype(&self) -> GgmlDType {
@@ -1027,7 +1042,7 @@ impl QTensor {
     fn rocm_moe_bank(&self, dev: &crate::RocmDevice) -> Result<std::sync::Arc<crate::RocmStorage>> {
         use crate::backend::BackendDevice;
         let bank = self.data()?;
-        cache_or_upload(rocm_moe_bank_cache(), bank.as_ref(), |b| {
+        cache_or_upload(&self.banks.rocm, bank.as_ref(), |b| {
             dev.storage_from_slice(b)
         })
     }
@@ -1045,7 +1060,7 @@ impl QTensor {
     ) -> Result<std::sync::Arc<crate::VulkanStorage>> {
         let bank = self.data()?;
         let dt = self.storage.dtype();
-        cache_or_upload(vulkan_moe_bank_cache(), bank.as_ref(), |b| match dt {
+        cache_or_upload(&self.banks.vulkan, bank.as_ref(), |b| match dt {
             GgmlDType::Q8_0 => dev.quantize_q8_blocks(b, e_cnt * n, k),
             GgmlDType::Q6K => dev.quantize_q6k(b, e_cnt * n, k),
             _ => dev.upload_qweight(b),
@@ -1065,7 +1080,7 @@ impl QTensor {
     ) -> Result<std::sync::Arc<crate::vulkan::MoeBankSplit>> {
         let bank = self.data()?;
         let dt = self.storage.dtype();
-        cache_or_upload(vulkan_moe_split_cache(), bank.as_ref(), |b| match dt {
+        cache_or_upload(&self.banks.vulkan_split, bank.as_ref(), |b| match dt {
             GgmlDType::Q4K => dev.quantize_q4k_split(b, e_cnt * n, k),
             GgmlDType::Q6K => dev.quantize_q6k_split(b, e_cnt * n, k),
             _ => crate::bail!("vulkan_moe_bank_split: unsupported dtype {dt:?}"),
@@ -1080,7 +1095,7 @@ impl QTensor {
         dev: &crate::WgpuDevice,
     ) -> Result<std::sync::Arc<crate::WgpuStorage>> {
         let bank = self.data()?;
-        cache_or_upload(wgpu_moe_bank_cache(), bank.as_ref(), |b| dev.upload_qweight(b))
+        cache_or_upload(&self.banks.wgpu, bank.as_ref(), |b| dev.upload_qweight(b))
     }
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
@@ -1555,51 +1570,28 @@ pub enum QMatMul {
     },
 }
 
-// Resident MoE expert-bank cache: maps a (CPU bank ptr, len) to its uploaded VRAM copy so the
-// multi-GB GGML expert bank is host->device copied ONCE, not per token/layer. The CPU bytes are
-// owned by the model's QTensor for its lifetime, so the pointer is a stable key. Keyed by usize
-// (raw ptr) to stay Send+Sync; the device storage is reference-counted and reused. ONE mechanism
-// (this macro + `cache_or_upload`), one instantiation per GPU backend.
-#[cfg(any(feature = "rocm", feature = "vulkan", feature = "wgpu"))]
-macro_rules! moe_bank_cache {
-    ($name:ident, $storage:ty) => {
-        fn $name() -> &'static std::sync::Mutex<
-            std::collections::HashMap<(usize, usize), std::sync::Arc<$storage>>,
-        > {
-            static CACHE: std::sync::OnceLock<
-                std::sync::Mutex<
-                    std::collections::HashMap<(usize, usize), std::sync::Arc<$storage>>,
-                >,
-            > = std::sync::OnceLock::new();
-            CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-        }
-    };
-}
-#[cfg(feature = "rocm")]
-moe_bank_cache!(rocm_moe_bank_cache, crate::RocmStorage);
-#[cfg(feature = "vulkan")]
-moe_bank_cache!(vulkan_moe_bank_cache, crate::VulkanStorage);
-#[cfg(feature = "vulkan")]
-moe_bank_cache!(vulkan_moe_split_cache, crate::vulkan::MoeBankSplit);
-#[cfg(feature = "wgpu")]
-moe_bank_cache!(wgpu_moe_bank_cache, crate::WgpuStorage);
-
-// Upload `bank` through `upload` on first sight of its (ptr,len), then hand back the resident copy
-// on every later call. The whole point of the cache: the H2D copy happens once, not per token.
+// Upload `bank` through `upload` into this tensor's own resident `slot` on first call, then hand back
+// that copy on every later call. The whole point: the H2D copy happens once, not per token.
+//
+// The slot lives in the owning QTensor, so a resident bank is reachable only from the bytes it was
+// built from and is freed with them. A global map keyed by the CPU buffer's (ptr,len) cannot express
+// that: the key stays live after the tensor drops, and the allocator reuses the address for the next
+// same-size bank, so a later tensor reads an earlier one's weights. That aliased silently -- Q4_0 and
+// Q4_K are both 0.5625 bytes/weight, so their banks are byte-identical in LENGTH for a given shape,
+// and dtype was not part of the key.
 #[cfg(any(feature = "rocm", feature = "vulkan", feature = "wgpu"))]
 fn cache_or_upload<S>(
-    cache: &std::sync::Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<S>>>,
+    slot: &std::sync::OnceLock<std::sync::Arc<S>>,
     bank: &[u8],
     upload: impl FnOnce(&[u8]) -> Result<S>,
 ) -> Result<std::sync::Arc<S>> {
-    let key = (bank.as_ptr() as usize, bank.len());
-    let mut guard = cache.lock().expect("moe bank cache lock");
-    if let Some(w) = guard.get(&key) {
+    if let Some(w) = slot.get() {
         return Ok(w.clone());
     }
     let w = std::sync::Arc::new(upload(bank)?);
-    guard.insert(key, w.clone());
-    Ok(w)
+    // A racing caller may have filled the slot meanwhile; whoever lands first wins and both return
+    // the same resident bank (the loser's upload drops).
+    Ok(slot.get_or_init(|| w).clone())
 }
 
 // GGML dtype -> native fused grouped quant-matvec MoE kernel name on the Vulkan backend. ONE source
@@ -1703,7 +1695,7 @@ fn moe_grouped_per_expert(
     for (eid, slots) in groups.into_iter() {
         let qs = make_storage(eid, device)?;
         let shape: crate::Shape = (n, k).into();
-        let w_e = QTensor { storage: qs, shape };
+        let w_e = QTensor::make(qs, shape);
         let qm = QMatMul::from_arc(Arc::new(w_e))?;
         let m = slots.len();
         let idx = Tensor::from_vec(slots, (m,), device)?;
