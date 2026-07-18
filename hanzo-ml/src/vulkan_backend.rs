@@ -6616,6 +6616,85 @@ impl BackendStorage for VulkanStorage {
 
 #[cfg(test)]
 mod dsl_dispatch_proof {
+
+    /// Enumerate every VkCooperativeMatrixPropertiesKHR config the device advertises and print the
+    /// A/B/C/result component types + M/N/K. Documents whether the f16-accumulate variant
+    /// (A=f16 B=f16 C=f16 result=f16, 16x16x16, subgroup) exists -- the prerequisite for the f16-acc
+    /// coopmat prefill GEMMs. vulkaninfo on some Mesa builds prints only the feature summary, not the
+    /// per-config list, so this is the authoritative probe. Never fails; it only reports.
+    #[test]
+    fn probe_coopmat_configs() {
+        unsafe {
+            let entry = match ash::Entry::load() {
+                Ok(e) => e,
+                Err(e) => { eprintln!("[cm-probe] no vulkan loader ({e}); skipping"); return; }
+            };
+            let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
+            let instance = match entry
+                .create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)
+            {
+                Ok(i) => i,
+                Err(e) => { eprintln!("[cm-probe] no instance ({e}); skipping"); return; }
+            };
+            let ct = |c: vk::ComponentTypeKHR| -> &'static str {
+                match c {
+                    vk::ComponentTypeKHR::FLOAT16 => "f16",
+                    vk::ComponentTypeKHR::FLOAT32 => "f32",
+                    vk::ComponentTypeKHR::SINT8 => "i8",
+                    vk::ComponentTypeKHR::UINT8 => "u8",
+                    vk::ComponentTypeKHR::SINT32 => "i32",
+                    vk::ComponentTypeKHR::UINT32 => "u32",
+                    _ => "?",
+                }
+            };
+            for pd in instance.enumerate_physical_devices().unwrap_or_default() {
+                let p = instance.get_physical_device_properties(pd);
+                let name = CStr::from_ptr(p.device_name.as_ptr()).to_string_lossy().into_owned();
+                if p.device_type == vk::PhysicalDeviceType::CPU || name.to_lowercase().contains("llvmpipe") {
+                    continue;
+                }
+                let exts = instance.enumerate_device_extension_properties(pd).unwrap_or_default();
+                let has_cm = exts.iter().any(|e| {
+                    CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::cooperative_matrix::NAME
+                });
+                if !has_cm {
+                    eprintln!("[cm-probe] {name}: no VK_KHR_cooperative_matrix");
+                    continue;
+                }
+                let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+                let props = cm.get_physical_device_cooperative_matrix_properties(pd).unwrap_or_default();
+                eprintln!("[cm-probe] {name}: {} coopmat configs", props.len());
+                let mut has_f16acc = false;
+                let mut has_f32acc = false;
+                for cfg in &props {
+                    let f16acc = cfg.a_type == vk::ComponentTypeKHR::FLOAT16
+                        && cfg.b_type == vk::ComponentTypeKHR::FLOAT16
+                        && cfg.c_type == vk::ComponentTypeKHR::FLOAT16
+                        && cfg.result_type == vk::ComponentTypeKHR::FLOAT16
+                        && (cfg.m_size, cfg.n_size, cfg.k_size) == (16, 16, 16)
+                        && cfg.scope == vk::ScopeKHR::SUBGROUP;
+                    let f32acc = cfg.a_type == vk::ComponentTypeKHR::FLOAT16
+                        && cfg.b_type == vk::ComponentTypeKHR::FLOAT16
+                        && cfg.c_type == vk::ComponentTypeKHR::FLOAT32
+                        && cfg.result_type == vk::ComponentTypeKHR::FLOAT32
+                        && (cfg.m_size, cfg.n_size, cfg.k_size) == (16, 16, 16)
+                        && cfg.scope == vk::ScopeKHR::SUBGROUP;
+                    has_f16acc |= f16acc;
+                    has_f32acc |= f32acc;
+                    eprintln!(
+                        "[cm-probe]   {}x{}x{} A={} B={} C={} D={} scope={}{}{}",
+                        cfg.m_size, cfg.n_size, cfg.k_size,
+                        ct(cfg.a_type), ct(cfg.b_type), ct(cfg.c_type), ct(cfg.result_type),
+                        cfg.scope.as_raw(),
+                        if f16acc { "  <- f16-acc 16x16x16 subgroup" } else { "" },
+                        if f32acc { "  <- f32-acc 16x16x16 subgroup" } else { "" },
+                    );
+                }
+                eprintln!("[cm-probe] {name}: f16acc_16x16x16_subgroup={has_f16acc} f32acc_16x16x16_subgroup={has_f32acc}");
+            }
+            instance.destroy_instance(None);
+        }
+    }
     use super::*;
 
     // Proof that the CubeCL kernel DSL plugs into the engine as a CODE GENERATOR, not a second
