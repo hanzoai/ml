@@ -7,7 +7,13 @@
 //   * BK=32 aligned to the Q4_K sub-block; BM=128 so each weight sub-block is decoded once per 128 rows;
 //   * WG=256 = 4 wave64 subgroups, each owning RM row tiles x RN col tiles of accumulator fragments;
 //   * DOUBLE-BUFFERED K loop: stage sub-block s+1 into the alternate LDS buffer while the matrix cores
-//     consume sub-block s, so global weight reads overlap coopMatMulAdd and there is one barrier/step.
+//     consume sub-block s, so global weight reads overlap coopMatMulAdd and there is one barrier/step;
+//   * PACKED f16vec2 LDS: two adjacent-k f16 share one 32-bit LDS word (llama's FLOAT_TYPEV2). The
+//     coopMatLoad that feeds the cores then issues one 32-bit LDS read per pair (ds_load_b32) instead of
+//     two 16-bit reads (ds_load_u16), halving the LDS-read traffic that gates the matrix cores; the
+//     decode likewise writes one 32-bit store per pair. s_a is [M, K/2] loaded RowMajor; s_b is the
+//     transposed weight [N, K/2] loaded ColumnMajor -- so a K-subtile is contiguous in each row and the
+//     pair-packing lands on the load's fast axis.
 // Per-element decode value is byte-identical to mul_mat_q4k / mul_mm_q4k_tiled_dp4a, so the correctness
 // gate is the f16-rounding f64-oracle tolerance. Shapes: m,n multiples of 16, k a multiple of 256.
 #extension GL_KHR_cooperative_matrix : require
@@ -35,14 +41,15 @@ layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint
 const uint QK_K = 256u;
 const uint BLK_U32 = 36u;
 
-// LDS row strides padded past the tile edge so the coopMatLoad row stride is not a power of 2:
-// a stride of BK=32 or BN=128 f16 aliases every row onto the same 32x4B bank set (2-way / full
-// conflict), throttling the loads that feed the matrix cores. +8 f16 breaks the aliasing (llama's
-// mul_mm.comp does the same via SHMEM_STRIDE = BK/2 + 4). Costs a few KB LDS, well under budget.
-const uint SA_STRIDE = BK + 8u;      // 40
-const uint SB_STRIDE = BN + 8u;      // 136
-shared float16_t s_a[2u][BM * SA_STRIDE];   // [M=128, K=32(pad40)] row-major, double-buffered
-shared float16_t s_b[2u][BK * SB_STRIDE];   // [K=32, N=128(pad136)] row-major (transposed W), double-buffered
+// f16vec2-packed LDS: each element is a (k, k+1) pair. Row stride padded to BK/2 + 4 pairs so the
+// coopMatLoad row stride is not a power of two (a stride of BK/2 = 16 pairs aliases every row onto the
+// same bank set, throttling the loads that feed the matrix cores; +4 breaks the aliasing -- llama's
+// mul_mm.comp uses the same SHMEM_STRIDE = BK/2 + 4). s_a holds activations [M, K/2]; s_b holds the
+// transposed weight [N, K/2].
+const uint SA_STRIDE = BK / 2u + 4u;      // 20 pairs
+const uint SB_STRIDE = BK / 2u + 4u;      // 20 pairs
+shared f16vec2 s_a[2u][BM * SA_STRIDE];   // [M=128, K/2=16(pad20)] row-major, double-buffered
+shared f16vec2 s_b[2u][BN * SB_STRIDE];   // [N=128, K/2=16(pad20)] row-major (transposed W), double-buffered
 
 uint scale_byte(uint base, uint b) {
     uint word = w[base + 1u + (b >> 2u)];
@@ -66,11 +73,18 @@ uint get_scale_min_k4(uint base, uint j) {
 // Stage activation [BM,BK] and decode weight sub-block [BK,BN] for K-offset `koff` into LDS buffer `buf`.
 void stage(uint buf, uint koff, uint row0, uint col0, uint nblocks) {
     uint tid = gl_LocalInvocationID.x;
-    for (uint idx = tid; idx < BM * BK; idx += WG) {
-        uint r = idx / BK;
-        uint kk = idx - r * BK;
+    // Activation: pack 2 adjacent k into one f16vec2, so BM*(BK/2) pairs.
+    for (uint idx = tid; idx < BM * (BK / 2u); idx += WG) {
+        uint r = idx / (BK / 2u);
+        uint kp = idx - r * (BK / 2u);
         uint mrow = row0 + r;
-        s_a[buf][r * SA_STRIDE + kk] = (mrow < mcount) ? float16_t(x[mrow * k + koff + kk]) : float16_t(0.0);
+        if (mrow < mcount) {
+            float lo = x[mrow * k + koff + 2u * kp];
+            float hi = x[mrow * k + koff + 2u * kp + 1u];
+            s_a[buf][r * SA_STRIDE + kp] = f16vec2(float16_t(lo), float16_t(hi));
+        } else {
+            s_a[buf][r * SA_STRIDE + kp] = f16vec2(0.0);
+        }
     }
     uint blk = koff / QK_K;
     uint sub = (koff / BK) & 7u;               // 0..7 within the 256-superblock (BK == 32)
@@ -85,17 +99,27 @@ void stage(uint buf, uint koff, uint row0, uint col0, uint nblocks) {
             uint sm = get_scale_min_k4(base, sub);
             float ds = d * float(sm >> 8u);
             float ms = dmin * float(sm & 0xFFu);
+            // Decode the sub-block's 32 nibbles into 16 f16vec2 pairs of adjacent k, one 32-bit store each.
             [[unroll]] for (uint u = 0u; u < 8u; u++) {
                 uint qword = w[base + 4u + c * 8u + u];
-                [[unroll]] for (uint b = 0u; b < 4u; b++) {
-                    uint byte = (qword >> (b * 8u)) & 0xFFu;
-                    uint q = lo ? (byte & 0x0Fu) : (byte >> 4u);
-                    s_b[buf][(u * 4u + b) * SB_STRIDE + col] = float16_t(ds * float(q) - ms);
-                }
+                uint b0 = (qword >>  0u) & 0xFFu;
+                uint b1 = (qword >>  8u) & 0xFFu;
+                uint b2 = (qword >> 16u) & 0xFFu;
+                uint b3 = (qword >> 24u) & 0xFFu;
+                uint q0 = lo ? (b0 & 0x0Fu) : (b0 >> 4u);
+                uint q1 = lo ? (b1 & 0x0Fu) : (b1 >> 4u);
+                uint q2 = lo ? (b2 & 0x0Fu) : (b2 >> 4u);
+                uint q3 = lo ? (b3 & 0x0Fu) : (b3 >> 4u);
+                float16_t v0 = float16_t(ds * float(q0) - ms);
+                float16_t v1 = float16_t(ds * float(q1) - ms);
+                float16_t v2 = float16_t(ds * float(q2) - ms);
+                float16_t v3 = float16_t(ds * float(q3) - ms);
+                s_b[buf][col * SB_STRIDE + u * 2u]      = f16vec2(v0, v1);
+                s_b[buf][col * SB_STRIDE + u * 2u + 1u] = f16vec2(v2, v3);
             }
         } else {
-            [[unroll]] for (uint kk = 0u; kk < BK; kk++)
-                s_b[buf][kk * SB_STRIDE + col] = float16_t(0.0);
+            [[unroll]] for (uint kp = 0u; kp < BK / 2u; kp++)
+                s_b[buf][col * SB_STRIDE + kp] = f16vec2(0.0);
         }
     }
 }
@@ -119,20 +143,23 @@ void main() {
         if (s + 1u < nsteps)
             stage((s + 1u) & 1u, (s + 1u) * BK, row0, col0, nblocks);
         if (warp < NWARP) {
+            // A fragments: [M-tile][K-subtile]. s_a is [M, K/2] f16vec2 -> K-subtile kc lands at pair
+            // offset kc*(T/2) and the row stride is SA_STRIDE pairs; RowMajor.
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[RM][2];
             [[unroll]] for (uint i = 0u; i < RM; i++)
                 [[unroll]] for (uint kc = 0u; kc < 2u; kc++)
-                    coopMatLoad(ma[i][kc], s_a[cur], (warp * RM + i) * T * SA_STRIDE + kc * T, SA_STRIDE,
+                    coopMatLoad(ma[i][kc], s_a[cur], (warp * RM + i) * T * SA_STRIDE + kc * (T / 2u), SA_STRIDE,
                                 gl_CooperativeMatrixLayoutRowMajor);
             // Load the RN B-fragments for one K-subtile at a time and reuse the registers across the two
             // K-subtiles. Halves the peak live B-fragment count (RN vs 2*RN) so the 16 f32 accumulators
-            // fit in registers without the scratch spill the 2*RN form pays; math is identical (the two
-            // K-subtiles just accumulate into acc in sequence rather than after a joint load).
+            // fit in registers without a scratch spill; math is identical (the two K-subtiles accumulate
+            // into acc in sequence rather than after a joint load). s_b is the transposed weight [N, K/2]
+            // f16vec2; ColumnMajor presents it as the [K, N] B fragment, K-subtile kc at pair kc*(T/2).
             [[unroll]] for (uint kc = 0u; kc < 2u; kc++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[RN];
                 [[unroll]] for (uint j = 0u; j < RN; j++)
-                    coopMatLoad(mb[j], s_b[cur], (kc * T) * SB_STRIDE + j * T, SB_STRIDE,
-                                gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(mb[j], s_b[cur], (j * T) * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
+                                gl_CooperativeMatrixLayoutColumnMajor);
                 [[unroll]] for (uint i = 0u; i < RM; i++)
                     [[unroll]] for (uint j = 0u; j < RN; j++)
                         acc[i][j] = coopMatMulAdd(ma[i][kc], mb[j], acc[i][j]);
