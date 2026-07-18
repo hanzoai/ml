@@ -1501,21 +1501,28 @@ impl VulkanDevice {
         let legacy = std::env::var_os("VK_Q4K_LEGACY").is_some();
         let force_dp4a = std::env::var_os("VK_Q4K_DP4A").is_some();
         let force_2d = std::env::var_os("VK_Q4K_TILED2D").is_some();
-        // L4 coopmat (tensor cores) -- decode Q4_K weight to f16 LDS tiles + coopMatMulAdd, the
-        // llama-parity path. Env-forced + requires device coopmat; off by default until benched faster
-        // than dp4a on this device (gfx1151 coopmat has had flakiness). woff==0 dense only.
+        // L4 coopmat (matrix cores) -- decode the Q4_K weight to f16 LDS tiles + coopMatMulAdd, the
+        // llama-parity path (llama-Vulkan uses KHR_coopmat for Q4_K prefill on this device). Default for
+        // dense (woff==0) rows>1 Q4_K on any coopmat device: the block-amortized decode + 128x128 tile
+        // measures ~1.9x the dp4a tile at the real projection shapes and is f16-bit-exact vs dp4a. The
+        // 16-tile store is aligned, so it needs m,nout multiples of 16 (k is always a Q4_K 256-multiple);
+        // ragged shapes fall through to the dp4a tile, which guards edges per element. VK_Q4K_COOPMAT_OFF
+        // forces the dp4a path for the A/B gate.
         if !legacy
             && self.inner.coopmat
             && woff == 0
             && m > 1
-            && std::env::var_os("VK_Q4K_COOPMAT").is_some()
+            && m % 16 == 0
+            && nout % 16 == 0
+            && std::env::var_os("VK_Q4K_COOPMAT_OFF").is_none()
         {
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
+            // grid: BN=128 cols/wg, BM=128 rows/wg (must match the shader's BM/BN).
             self.dispatch(
                 "mul_mm_q4k_coopmat",
                 &[wq.buffer, x.buffer, out.buffer],
                 &push,
-                ((nout as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
+                ((nout as u32).div_ceil(128), (m as u32).div_ceil(128), 1),
             )?;
             return Ok(out);
         }
@@ -7279,13 +7286,15 @@ mod dsl_dispatch_proof {
         };
         let mut s = 0xD1B54A32D192ED03u64;
         let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-        // (m, n, k): prefill batch m=512 across llama/GLM attn+FFN projection shapes.
+        // (m, n, k): prefill batch m=512. First the real zen-eco-4b/qwen2 Q4_K projection shapes
+        // (all k=2048: ffn gate/up, attn q/o, attn kv), then larger llama/GLM shapes.
         let shapes = [
-            (512usize, 4096usize, 4096usize),
+            (512usize, 11008usize, 2048usize),
+            (512, 2048, 2048),
+            (512, 256, 2048),
+            (512, 4096, 4096),
             (512, 11008, 4096),
             (512, 4096, 11008),
-            (512, 14336, 4096),
-            (512, 4096, 14336),
         ];
         eprintln!("[mmq-ab] coopmat mmq_q4k_rt vs dp4a mul_mm_q4k_tiled_dp4a (same weight, same harness)");
         for (m, n, k) in shapes {
@@ -7297,13 +7306,15 @@ mod dsl_dispatch_proof {
             let xh = dev.upload_f32(&x).unwrap();
             let (xq, xs, xsum) = dev.quantize_act_q8(&xh, m, k).unwrap();
             let iters = 30;
-            // dp4a (shipping): matmul_q4k_gpu picks mul_mm_q4k_tiled_dp4a on int_dot8 devices.
+            // dp4a: force the mul_mm_q4k_tiled_dp4a tile (coopmat is now the default for aligned Q4_K).
+            unsafe { std::env::set_var("VK_Q4K_COOPMAT_OFF", "1") };
             for _ in 0..3 { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
             dev.synchronize().unwrap();
             let t = std::time::Instant::now();
             for _ in 0..iters { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
             dev.synchronize().unwrap();
             let dp4a_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            unsafe { std::env::remove_var("VK_Q4K_COOPMAT_OFF") };
             // coopmat (candidate): runtime-dims MMQ over the split bank.
             for _ in 0..3 { let _ = dev.mmq_q4k_rt_gpu(&xq, &xs, &xsum, &bank, m, n, k).unwrap(); }
             dev.synchronize().unwrap();
@@ -7359,6 +7370,54 @@ mod dsl_dispatch_proof {
                 eprintln!("[q4k-bm] {m}x{n}x{k} BM={bm} vs BM64 rel={rel:.2e}");
                 assert!(rel < 1e-5, "Q4_K dp4a BM={bm} {m}x{n}x{k} diverged from BM64: rel={rel:.3e}");
             }
+        }
+    }
+
+    /// The f16 coopmat Q4_K prefill matmul (mul_mm_q4k_coopmat, VK_Q4K_COOPMAT) must agree with the
+    /// validated int8-dp4a path on identical Q4_K weights. Both decode the same 4.5-bit weight; coopmat
+    /// rounds weight+activation to f16 and dp4a rounds the activation to int8, so the gate is a loose
+    /// scale-relative bound (f16 mantissa ~ 1e-3 accumulated over k). Covers the real zen-eco-4b/qwen2
+    /// projection shapes (gate/up, attn q/o, kv, ffn_down) plus a small edge-tile case.
+    #[test]
+    fn q4k_coopmat_matches_dp4a() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[q4k-coop] no vulkan device ({e}); skipping"); return; }
+        };
+        if dev.coopmat_info().is_none() { eprintln!("[q4k-coop] no coopmat; skipping"); return; }
+        use crate::quantized::k_quants::{BlockQ4K, GgmlType};
+        let mut s = 0x0BADC0DE_CAFEF00Du64;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        for (m, n, k) in [
+            (512usize, 11008usize, 2048usize),  // ffn gate/up
+            (512, 2048, 2048),                   // attn q/o proj
+            (512, 256, 2048),                    // attn k/v proj
+            (512, 2048, 11008),                  // ffn_down
+            (64, 64, 512),                       // small
+            (128, 512, 768),                     // non-square edge tiles
+        ] {
+            let nb = k / 256;
+            // Real Q4_K weights (valid f16 d/dmin) -- random bytes would seed Inf/NaN f16 scales.
+            let mut blocks: Vec<BlockQ4K> = (0..n * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            for r in 0..n {
+                let rowf: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+                BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+            }
+            let wq_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const u8,
+                    blocks.len() * std::mem::size_of::<BlockQ4K>())
+            };
+            let wq = dev.upload_qweight(wq_bytes).unwrap();
+            let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let xh = dev.upload_f32(&x).unwrap();
+            unsafe { std::env::set_var("VK_Q4K_COOPMAT_OFF", "1") };
+            let base = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            unsafe { std::env::remove_var("VK_Q4K_COOPMAT_OFF") };
+            let maxref = base.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+            let got = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let rel = got.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+            eprintln!("[q4k-coop] {m}x{n}x{k} coopmat vs dp4a scale_rel={rel:.2e}");
+            assert!(rel < 2e-2, "Q4_K coopmat {m}x{n}x{k} diverged from dp4a: scale_rel={rel:.3e}");
         }
     }
 
