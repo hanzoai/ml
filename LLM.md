@@ -189,6 +189,29 @@ Gates: `q6k_tiled_controlled` (uniform-weight known-answer), `mul_mm_q6k_tiled_d
 + HANZO_MMQ_AB microbench), `q4k_dp4a_bm_variants_match` (BM tiles bit-exact vs BM64). Env: VK_Q4K_BM,
 VK_Q6K_LEGACY, VK_Q4K_COOPMAT, VK_PROFILE / VK_PROFILE_GPU, POOL_CAP_GB, VK_ROOFLINE (planned).
 
+## Coopmat prefill arc 0.11.69-71: packed LDS, Q6_K coopmat, single-buffer (1.38x vs llama, from 11.6x)
+Three shipped kernel wins on the f16 KHR_coopmat prefill GEMMs (evo gfx1151, zen-eco-4b Q4_K_M; every step
+bit-exact-gated + coherence-checked + in-engine A/B'd on the shape-honest bench, ±0.4%):
+- **0.11.69 packed f16vec2 LDS** (llama's FLOAT_TYPEV2): the coopmat was fed via 256 scalar ds_load_u16 per
+  K-step = half the LDS read BW the matrix cores consume; packing adjacent-k pairs -> wide ds_load_b32/b128
+  (ISA-verified: u16 loads 256->0). Q4_K GEMM 356->233ms (1.53x). pp512 946->1265.
+- **0.11.70 Q6_K coopmat**: the Q6_K prefill GEMM moved off the dp4a tile onto the same coopmat template
+  (only stage() decode swapped; symmetric w=d*sc*q6; decisive: WORD-loading the ql/qh planes, one u32 per
+  4 k-values). Op 104->62ms (1.67x). pp512 1265->1383.
+- **0.11.71 single-buffer** (the counter-intuitive one): the double-buffered K-tile paid 2x LDS (40KB ->
+  occupancy capped at 6 subgroups/SIMD vs VGPR-allowed ~9) for latency-hiding worth nothing -- the weight
+  stream is 23 GB/s = 10.8% of DRAM peak (NOT DRAM-bound; the "92% of peak" earlier was the `tot` roofline
+  column, dominated by MALL-cached f32 activation re-reads -- read wt vs tot carefully). Single-buffering
+  raised occupancy 6->8: Q4_K 232->181ms (13.3k GFLOP/s), Q6_K 62->38.7ms (11k). pp512 1383->1734.
+REFUTED EN ROUTE (do not re-chase): BK=64 (llama's K-quant COOPMAT uses BK=32 -- the "BK=64" was llama's
+SCALAR warptile, ggml-vulkan.cpp:3919 vs :3968), BM=64 (occ 12 but 2x weight re-read loses), per-shape tile
+family (skinny KV projections are 1.9% of Q4_K time), plus the phantom regimes killed by the honest-bench
+fix (engine v1.7.60: warmup now warms the measured shapes; the old 32-tok warmup manufactured a fake
+"120ms fast window" that spawned three wrong theories -- dispatch count is NOT workload identity).
+FINAL STANDING (CTO-confirmed on engine v1.7.63): pp512 1734.4 +- 4.4 vs llama-Vulkan 2390.1 +- 30.6 same
+run = 1.38x behind (campaign start 11.6x). Decode already at/above parity. NEXT MEASURED LEVERS: f16
+activations (ours f32 = 2x activation MALL traffic) and occupancy >8 via VGPR reduction (tile restructure).
+
 ## Env vars (bare names, one-way -- de-brand DONE)
 The env-flag convention is BARE names, no `HANZO_` brand prefix. The de-brand is COMPLETE: every runtime
 knob is a bare name, and the one-off dev A/B "fallback" toggles are GONE (production always runs the fast
