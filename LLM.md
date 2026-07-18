@@ -155,7 +155,18 @@ kernels -- measure in-engine. A visual dashboard (roofline plot + ranked table +
   2.4x SLOWER in-engine (VK_Q4K_BM A/B): occupancy collapse (32/64 f32 acc/thread) lowers ACHIEVED bandwidth
   more than fewer bytes helps. BM=64/TM=4 is the sweet spot; variants kept env-gated (VK_Q4K_BM) as A/B evidence.
 
-**THE COALESCING FRONTIER (the open prefill lever).** Our dp4a weight staging reads `w[base+4+c*8+j]`,
+**THE COALESCING FRONTIER — SHIPPED (0.11.67, `mul_mm_q4k_coopmat` is the Q4_K prefill DEFAULT).** The
+fix landed as a 128x128-tile block-amortized f16 KHR_coopmat GEMM: each Q4_K super-block decodes ONCE into
+coalesced f16 LDS tiles and coopMatMulAdd consumes them. Measured in-engine: Q4_K GEMM 473 -> 369ms (1.28x),
+prefill batch 646 -> 536ms, **pp512 704 -> 885 t/s confirmed on the published build (llama 2486 same box =
+2.81x, from 11.6x)**. Gate `q4k_coopmat_matches_dp4a` (scale_rel 3.2-4.0e-3 = the f16 accumulation floor);
+ragged shapes (m or nout not 16-multiples) + VK_Q4K_COOPMAT_OFF fall to the dp4a tile. This PARTIALLY
+UN-REFUTES the coopmat verdict above: the old kernel lost because of its ACCESS PATTERN, not its matrix
+cores -- with llama's layout, coopmat wins while reading HALF the bytes (4x re-read at BM=128 vs dp4a's 8x).
+Its achieved BW is still only ~15 GB/s vs the ~135 ceiling => the remaining ~2.8x = raise achieved BW
+(occupancy + uvec4 vectorized loads), give Q6_K the same coalesced coopmat treatment (100ms), and fuse the
+~67ms of small ops. Roofline arithmetic: ~200ms total is reachable = llama parity. Historical context (the
+pre-fix analysis): our dp4a weight staging reads `w[base+4+c*8+j]`,
 base=(col0+col)*nblocks*36+blk*36 -- adjacent threads read 8 consecutive words per column then JUMP 36 words
 (144 B) to the next column, so a 64-wide warp issues 8 scattered 32-byte reads, ~50% cache-line efficiency.
 llama REPACKS Q4_K into a coalesced GPU layout so a warp reads contiguous memory -- the ~3x achieved-bandwidth
