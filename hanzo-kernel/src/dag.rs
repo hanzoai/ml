@@ -62,10 +62,16 @@ pub enum Node {
 
 impl Node {
     /// The class decides fusibility — Map composes, Reduce fences. Same predicate as [`crate::fuse`], on nodes.
+    /// The class decides fusibility — Map composes, Reduce fences. Same predicate as [`crate::fuse`], on
+    /// nodes.
+    ///
+    /// Spelled out per variant, never `_`: every consumer of `class()` asks it a composition question
+    /// (`fences()` / `is_map()`), so a wildcard defaulting a new op to Map would mis-partition it in
+    /// silence — with nothing anywhere for the compiler to flag.
     pub fn class(&self) -> Class {
         match self {
+            Node::In(_) | Node::Const(_) | Node::Un(..) | Node::Bin(..) => Class::Map,
             Node::Reduce(..) => Class::Reduce,
-            _ => Class::Map,
         }
     }
     /// The node ids this node reads (its in-edges). Leaves read nothing.
@@ -260,7 +266,9 @@ impl Dag {
                     Node::Un(op, a) => Node::Un(op, remap[a]),
                     Node::Bin(op, a, b) => Node::Bin(op, remap[a], remap[b]),
                     Node::Reduce(r, a) => Node::Reduce(r, remap[a]),
-                    leaf => leaf,
+                    // Leaves reference nothing. Spelled out, not `_`: a new node *with* in-edges falling
+                    // in here would silently keep its stale ids.
+                    leaf @ (Node::In(_) | Node::Const(_)) => leaf,
                 };
                 kept.push(node);
             }
@@ -377,19 +385,20 @@ impl Dag {
                 .map(|i| level[i])
                 .max()
                 .unwrap_or(0);
-            level[id] = in_max + usize::from(self.nodes[id].class() == Class::Reduce);
+            level[id] = in_max + usize::from(self.nodes[id].class().fences());
         }
 
-        // 2. Components: union Map–Map edges ONLY at the same fence level (convexity). Reduce = fence;
-        //    Const is rematerializable (inlined per consumer), so it never merges into a component.
+        // 2. Components: union Map–Map edges ONLY at the same fence level (convexity). A fence (Reduce,
+        //    or Route once routing enters the graph) never merges; Const is rematerializable (inlined per
+        //    consumer), so it never merges into a component either.
         let mut uf = UnionFind::new(n);
         for (id, node) in self.nodes.iter().enumerate() {
-            if node.class() == Class::Reduce || matches!(node, Node::Const(_)) {
+            if node.class().fences() || matches!(node, Node::Const(_)) {
                 continue;
             }
             for input in node.inputs().into_iter() {
                 let inp = self.nodes[input];
-                if inp.class() == Class::Map
+                if inp.class().is_map()
                     && !matches!(inp, Node::Const(_))
                     && level[input] == level[id]
                 {
@@ -409,11 +418,11 @@ impl Dag {
             if matches!(self.nodes[id], Node::Const(_)) {
                 continue; // inlined at use sites, not a region of its own
             }
-            let is_reduce = self.nodes[id].class() == Class::Reduce;
-            let unit = if is_reduce { id } else { uf.find(id) };
+            let is_fence = self.nodes[id].class().fences();
+            let unit = if is_fence { id } else { uf.find(id) };
             let region_id = *region_of_unit.entry(unit).or_insert_with(|| {
                 let rid = kinds.len();
-                kinds.push(if is_reduce {
+                kinds.push(if is_fence {
                     RegionKind::Reduce
                 } else {
                     RegionKind::Map
@@ -429,8 +438,7 @@ impl Dag {
                 RegionKind::Reduce => {
                     let rid_node = (0..n)
                         .find(|&id| {
-                            self.nodes[id].class() == Class::Reduce
-                                && region_of_node[id] == region_id
+                            self.nodes[id].class().fences() && region_of_node[id] == region_id
                         })
                         .unwrap();
                     let Node::Reduce(r, a) = self.nodes[rid_node] else {
@@ -462,7 +470,7 @@ impl Dag {
     fn build_map_region(&self, region_id: usize, region_of_node: &[usize]) -> Region {
         let n = self.nodes.len();
         let members = (0..n)
-            .filter(|&id| self.nodes[id].class() == Class::Map && region_of_node[id] == region_id);
+            .filter(|&id| self.nodes[id].class().is_map() && region_of_node[id] == region_id);
 
         let mut local: Vec<Node> = Vec::new();
         let mut live_in: Vec<ValueSrc> = Vec::new();
