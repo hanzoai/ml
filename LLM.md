@@ -109,6 +109,75 @@ not needed for the CUDA runtime.
   IN THE LIBRARY (i8); the f16 result is recorded here as the positive that makes a hand-rolled DSL
   flash-attn viable. Build/run: `cd hanzo-kernel && cargo run --release --features cuda --bin mmq-check`.
 
+## Vulkan PREFILL: the Q6_K lever, the roofline method, the refuted levers, the coalescing frontier (0.11.64-66)
+GROUND TRUTH first (the premise in every stale note was wrong): on evo/gfx1151, `llama-bench` pp512 = 2459 t/s
+vs ours 212 for zen-eco-4b Q4_K_M, SAME box -- an 11.6x prefill gap, not the old "995"/"10x". Decode already
+wins/matches; PREFILL is the only gap.
+
+**THE WIN -- `mul_mm_q6k_tiled_dp4a` (0.11.64, pp512 212 -> 704).** Per-op GPU profiling (VK_PROFILE_GPU)
+named the bottleneck: `mul_mat_q6k` (the column-per-invocation matvec) was **76% of prefill GPU time**. Q4_K_M
+stores ~2 tensors/layer (attn_v, ffn_down) as Q6_K, and `matmul_q6k_gpu_off` had NO tiled path -- it always
+dispatched the column kernel and fragmented m into MATMUL_Q_MAX_M chunks (~2108 tiny dispatches for 512 tok, no
+weight reuse). The fix is the Q6_K twin of `mul_mm_q4k_tiled_dp4a`: a 64x64 int8-dp4a tile. Q6_K is SYMMETRIC
+(w = d*scale*q6, no min) so it needs only xq/xs, NO xsum -- simpler than the affine Q4_K. Beats the column
+kernel 7.5x (4096^2), 14.9x (ffn gate/up), 29.8x (ffn_down). In-engine: pp512 212 -> 704, TTFT 2545 -> 752ms.
+THE BUG that cost an hour: `QHB` (qh high-bit-plane byte base) was `32*idx+is*16`, MISSING the +128 qh-region
+offset (Q6_K block = ql[0..128] + qh[128..192] + scales[192..208] + d[208]) -- reading the high bits from the
+ql region. FOUND by a CONTROLLED uniform-weight test (all q6=1 -> answer must be exactly k, gave a clean -5888
+= 256*-23), NOT random-vs-oracle (which only says "wrong"). Lesson: a known-answer test localizes a decode bug
+in minutes. matmul_q6k_gpu_off routes m>1 int_dot8 to the tile; MoE/m==1/VK_Q6K_LEGACY keep the column kernel.
+
+**TWO CPU-WASTE FIXES (0.11.65).** (1) `zeros_impl` did `upload_f32(&vec![0f32;count])` -- ~835 MB/forward of
+host->device zeros (a transformer calls zeros() 100s of times); now `alloc_uninit` + GPU `const_fill` (bit-
+identical: f16/bf16->f32, ints->u32, const_fill writes `count` 4-byte 0-words). **+6% decode.** (2) The idle
+buf-pool cap was a fixed 12 GiB < the ~14 GB prefill working set on a big UMA box, so reclaim() evicted the
+cycling set and every forward re-allocated ~1.8 GB via amdgpu bo_alloc (36% process CPU in `perf`); now
+`pool_free_cap()` = 60% of the largest DEVICE_LOCAL heap, floored at the legacy 12 GiB (constrained GPUs
+unchanged), `POOL_CAP_GB` override. NEITHER touches the GPU prefill floor -- they remove per-forward CPU/bus
+waste; comments corrected to not overclaim causation.
+
+**THE ROOFLINE METHOD (the reusable tooling, not a one-off).** The universal diagnostic for any memory-bound
+kernel: achieved bandwidth = bytes-moved / GPU-time, vs device peak. The Q4_K GEMM moves ~1.4 GB of weight
+re-read 8x (m/BM, m=512 BM=64) = ~11 GB in 474ms = **~24 GB/s achieved vs gfx1151's ~135 GB/s practical GTT
+(~18%)**. That 18% IS the prefill gap: llama runs the same bytes at ~135 GB/s. The bound is ACHIEVED bandwidth
+(occupancy x coalescing), NOT total bytes -- see the BM refutation. A roofline harness (per-op bytes/FLOPs model
+joined to VK_PROFILE_GPU timestamps on a REAL cold-weight forward, gated VK_ROOFLINE) ranks every kernel by
+distance-from-roofline; the worst offenders surface themselves. Cache-warm microbenches LIE for memory-bound
+kernels -- measure in-engine. A visual dashboard (roofline plot + ranked table + tuning log) is the "find" UI.
+
+**REFUTED LEVERS (all measured in-engine, do NOT re-chase).**
+- COOPMAT is dead on gfx1151. The faithful register-blocked f16 port ALREADY EXISTS (`mul_mm_q4k_coopmat.comp`,
+  RM=RN=4, 16 f32 accumulator fragments, Q4_K->f16 LDS decode, coopMatMulAdd). It LOSES cold AND warm: cache-warm
+  dp4a 4113-4915 GF vs f16-coopmat 304-972 (0.07-0.20x), int8-coopmat 1570-3211 (0.32-0.71x); in-engine cache-
+  COLD (VK_Q4K_COOPMAT=1) 4x worse e2e. The matrix cores aren't enough faster than v_dot to overcome the
+  Q4_K->f16 decode-into-LDS cost. dp4a IS the best kernel here; never wire coopmat.
+- BIGGER-BM tiles REGRESS. Cutting the cold-weight re-read factor m/BM by raising BM (128/256, TM=8/16) went
+  2.4x SLOWER in-engine (VK_Q4K_BM A/B): occupancy collapse (32/64 f32 acc/thread) lowers ACHIEVED bandwidth
+  more than fewer bytes helps. BM=64/TM=4 is the sweet spot; variants kept env-gated (VK_Q4K_BM) as A/B evidence.
+
+**THE COALESCING FRONTIER (the open prefill lever).** Our dp4a weight staging reads `w[base+4+c*8+j]`,
+base=(col0+col)*nblocks*36+blk*36 -- adjacent threads read 8 consecutive words per column then JUMP 36 words
+(144 B) to the next column, so a 64-wide warp issues 8 scattered 32-byte reads, ~50% cache-line efficiency.
+llama REPACKS Q4_K into a coalesced GPU layout so a warp reads contiguous memory -- the ~3x achieved-bandwidth
+difference. Closing it needs a coalesced-read Q4_K path (repack at upload + contiguous-read kernel), bit-exact
+gated, measured in-engine.
+
+**DSL MAGIC (the structural fix, so this bug class stops being possible).** The coalescing bug is the signature
+of hand-rolling memory access PER KERNEL: we build on cubecl-CORE primitives (SharedMemory, cmma) and do NOT
+use a matmul/loader component (not in our deps). Decomplect the three braided concerns -- layout (where bytes
+live), decode (Q4_K->int8), compute (the tile) -- into reusable primitives: (a) LAYOUT AS A VALUE (logical
+[N,K] vs physical VRAM layout; repack once, read through a TilingLayout -> always coalesced), (b) a layout-aware
+LOADER that generates the coalesced global->shared staging (the ONE place coalescing is decided, for all
+kernels), (c) a tiled-matmul primitive, (d) quant-decode as a pluggable step, (e) AUTOTUNE over tile/occupancy
+configs per (kernel, shape, device) -- kernel-level latency search (like triton.autotune / cubecl autotune),
+NOT AutoML. Extract the loader AFTER the coalesced pattern is proven in-engine (don't design in a vacuum). This
+is hanzo-fusion's thesis: layout/coalescing belong to the compiler, not the kernel author.
+
+Shipped: ml 0.11.64 (Q6_K tile) / 0.11.65 (CPU-waste) / 0.11.66 (BM variants, env-gated). engine v1.7.55-57.
+Gates: `q6k_tiled_controlled` (uniform-weight known-answer), `mul_mm_q6k_tiled_dp4a_matches_column` (CPU oracle
++ HANZO_MMQ_AB microbench), `q4k_dp4a_bm_variants_match` (BM tiles bit-exact vs BM64). Env: VK_Q4K_BM,
+VK_Q6K_LEGACY, VK_Q4K_COOPMAT, VK_PROFILE / VK_PROFILE_GPU, POOL_CAP_GB, VK_ROOFLINE (planned).
+
 ## Env vars (bare names, one-way -- de-brand DONE)
 The env-flag convention is BARE names, no `HANZO_` brand prefix. The de-brand is COMPLETE: every runtime
 knob is a bare name, and the one-off dev A/B "fallback" toggles are GONE (production always runs the fast
