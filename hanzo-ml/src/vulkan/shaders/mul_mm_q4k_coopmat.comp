@@ -35,8 +35,14 @@ layout(push_constant) uniform Pc { uint m0; uint mcount; uint nout; uint k; uint
 const uint QK_K = 256u;
 const uint BLK_U32 = 36u;
 
-shared float16_t s_a[2u][BM * BK];   // [M=128, K=32] row-major, double-buffered
-shared float16_t s_b[2u][BK * BN];   // [K=32, N=128] row-major (transposed weight), double-buffered
+// LDS row strides padded past the tile edge so the coopMatLoad row stride is not a power of 2:
+// a stride of BK=32 or BN=128 f16 aliases every row onto the same 32x4B bank set (2-way / full
+// conflict), throttling the loads that feed the matrix cores. +8 f16 breaks the aliasing (llama's
+// mul_mm.comp does the same via SHMEM_STRIDE = BK/2 + 4). Costs a few KB LDS, well under budget.
+const uint SA_STRIDE = BK + 8u;      // 40
+const uint SB_STRIDE = BN + 8u;      // 136
+shared float16_t s_a[2u][BM * SA_STRIDE];   // [M=128, K=32(pad40)] row-major, double-buffered
+shared float16_t s_b[2u][BK * SB_STRIDE];   // [K=32, N=128(pad136)] row-major (transposed W), double-buffered
 
 uint scale_byte(uint base, uint b) {
     uint word = w[base + 1u + (b >> 2u)];
@@ -64,7 +70,7 @@ void stage(uint buf, uint koff, uint row0, uint col0, uint nblocks) {
         uint r = idx / BK;
         uint kk = idx - r * BK;
         uint mrow = row0 + r;
-        s_a[buf][idx] = (mrow < mcount) ? float16_t(x[mrow * k + koff + kk]) : float16_t(0.0);
+        s_a[buf][r * SA_STRIDE + kk] = (mrow < mcount) ? float16_t(x[mrow * k + koff + kk]) : float16_t(0.0);
     }
     uint blk = koff / QK_K;
     uint sub = (koff / BK) & 7u;               // 0..7 within the 256-superblock (BK == 32)
@@ -84,12 +90,12 @@ void stage(uint buf, uint koff, uint row0, uint col0, uint nblocks) {
                 [[unroll]] for (uint b = 0u; b < 4u; b++) {
                     uint byte = (qword >> (b * 8u)) & 0xFFu;
                     uint q = lo ? (byte & 0x0Fu) : (byte >> 4u);
-                    s_b[buf][(u * 4u + b) * BN + col] = float16_t(ds * float(q) - ms);
+                    s_b[buf][(u * 4u + b) * SB_STRIDE + col] = float16_t(ds * float(q) - ms);
                 }
             }
         } else {
             [[unroll]] for (uint kk = 0u; kk < BK; kk++)
-                s_b[buf][kk * BN + col] = float16_t(0.0);
+                s_b[buf][kk * SB_STRIDE + col] = float16_t(0.0);
         }
     }
 }
@@ -114,19 +120,23 @@ void main() {
             stage((s + 1u) & 1u, (s + 1u) * BK, row0, col0, nblocks);
         if (warp < NWARP) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[RM][2];
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[2][RN];
             [[unroll]] for (uint i = 0u; i < RM; i++)
                 [[unroll]] for (uint kc = 0u; kc < 2u; kc++)
-                    coopMatLoad(ma[i][kc], s_a[cur], (warp * RM + i) * T * BK + kc * T, BK,
+                    coopMatLoad(ma[i][kc], s_a[cur], (warp * RM + i) * T * SA_STRIDE + kc * T, SA_STRIDE,
                                 gl_CooperativeMatrixLayoutRowMajor);
-            [[unroll]] for (uint kc = 0u; kc < 2u; kc++)
+            // Load the RN B-fragments for one K-subtile at a time and reuse the registers across the two
+            // K-subtiles. Halves the peak live B-fragment count (RN vs 2*RN) so the 16 f32 accumulators
+            // fit in registers without the scratch spill the 2*RN form pays; math is identical (the two
+            // K-subtiles just accumulate into acc in sequence rather than after a joint load).
+            [[unroll]] for (uint kc = 0u; kc < 2u; kc++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[RN];
                 [[unroll]] for (uint j = 0u; j < RN; j++)
-                    coopMatLoad(mb[kc][j], s_b[cur], (kc * T) * BN + j * T, BN,
+                    coopMatLoad(mb[j], s_b[cur], (kc * T) * SB_STRIDE + j * T, SB_STRIDE,
                                 gl_CooperativeMatrixLayoutRowMajor);
-            [[unroll]] for (uint i = 0u; i < RM; i++)
-                [[unroll]] for (uint j = 0u; j < RN; j++)
-                    [[unroll]] for (uint kc = 0u; kc < 2u; kc++)
-                        acc[i][j] = coopMatMulAdd(ma[i][kc], mb[kc][j], acc[i][j]);
+                [[unroll]] for (uint i = 0u; i < RM; i++)
+                    [[unroll]] for (uint j = 0u; j < RN; j++)
+                        acc[i][j] = coopMatMulAdd(ma[i][kc], mb[j], acc[i][j]);
+            }
         }
         barrier();
     }
