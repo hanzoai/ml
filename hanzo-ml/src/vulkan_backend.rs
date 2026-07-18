@@ -289,6 +289,15 @@ struct VkInner {
     // prints per-op on-GPU milliseconds so fusion targets the dispatches that actually cost.
     gpu_profile: bool,
     timestamp_period: f32,
+    // Per-op roofline opt-in (VK_ROOFLINE=1, forces gpu_profile on). When set, flush_locked joins each
+    // matmul dispatch's exact moved-bytes + FLOPs (from its push shape, via `roofline_model`) to the
+    // measured GPU time and prints achieved GFLOP/s + achieved cold-weight GB/s + total GB/s per kernel,
+    // ranked. This is the honest bound (weight-bandwidth vs compute-peak) that says whether a kernel is
+    // memory-, compute-, or occupancy-bound BEFORE it is optimized. `peak_bw_gbps` is a one-shot
+    // device-to-device copy bandwidth measured at init when the flag is set (0.0 = not measured), the
+    // denominator for the %-of-peak column. f32 stored as bits in an atomic so &self stays shared.
+    roofline: bool,
+    peak_bw_gbps: std::sync::atomic::AtomicU32,
     // VK_KHR_push_descriptor device fns, present iff the driver advertises the extension (native
     // AMD/NV; typically absent on WSL/Dozen). When set, `dispatch` pushes buffer handles inline
     // into the command buffer via `vkCmdPushDescriptorSetKHR` instead of allocating + updating +
@@ -346,6 +355,11 @@ struct Submitter {
     // numerous ones. Unused (empty op_names, pool never written) when the flag is off.
     qpool: vk::QueryPool,
     op_names: Vec<&'static str>,
+    // Per-dispatch push-constant snapshot (first 5 u32), parallel to `op_names`, filled only when
+    // gpu_profile is on. For matmul kernels the push is [m0, mcount, nout, k, woff]; `roofline_model`
+    // reads it to compute exact moved-bytes/FLOPs. Non-matmul kernels store whatever their push holds
+    // (or zeros) and are modelled as (0,0,0) -- shown with GPU time only. Cleared with op_names.
+    op_push: Vec<[u32; 5]>,
     // Command-graph capture. When `capturing`, `dispatch_outs` records into `graph_cmd` (a dedicated,
     // re-submittable command buffer owned by the in-flight capture) instead of `cmd`, and never
     // auto-flushes: the whole decode forward records into one buffer that later replays per token
@@ -3532,6 +3546,35 @@ impl VulkanDevice {
         Ok(())
     }
 
+    // One-shot device-to-device copy bandwidth = the roofline BW denominator. Copies a large buffer a
+    // few times and reports 2*bytes/time (read src + write dst = the memory subsystem's streaming BW).
+    // Best-effort: any allocation/copy failure leaves peak_bw_gbps at 0.0 (the table then shows 0%).
+    // Runs once at init only when VK_ROOFLINE is set, so it is off the normal path entirely.
+    fn measure_and_store_peak_bw(&self) {
+        let bytes: u64 = 512 * 1024 * 1024;
+        let count = (bytes / 4) as usize;
+        let (Ok(a), Ok(b)) = (self.alloc_f32(count), self.alloc_f32(count)) else {
+            return;
+        };
+        unsafe {
+            if self.copy_buffer_blocking(a.buffer, 0, b.buffer, 0, bytes).is_err() {
+                return;
+            }
+            let iters = 5u32;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                if self.copy_buffer_blocking(a.buffer, 0, b.buffer, 0, bytes).is_err() {
+                    return;
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            let gbps = (2.0 * bytes as f64 * iters as f64) / 1e9 / secs.max(1e-9);
+            self.inner
+                .peak_bw_gbps
+                .store((gbps as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     // Bound on a single staging chunk. A non-host-visible buffer can be many GB (the 18.6GB model),
     // but the host-visible heap on this UMA part is a small carveout — so we stage in chunks of at
     // most this size, reusing one small staging buffer, instead of needing a full-size host-visible
@@ -3894,6 +3937,7 @@ impl VulkanDevice {
                         0,
                     );
                     s.op_names.clear();
+                    s.op_push.clear();
                 }
             }
             // Command-graph capture records into the dedicated `graph_cmd` (begun by
@@ -4016,6 +4060,16 @@ impl VulkanDevice {
                         q,
                     );
                     s.op_names.push(name);
+                    // Snapshot the first 5 push u32 (matmul shape [m0,mcount,nout,k,woff]); the roofline
+                    // model reads it at flush. Cheap fixed copy on the profiling path only.
+                    let mut p5 = [0u32; 5];
+                    for (i, w) in p5.iter_mut().enumerate() {
+                        let o = i * 4;
+                        if push.len() >= o + 4 {
+                            *w = u32::from_le_bytes([push[o], push[o + 1], push[o + 2], push[o + 3]]);
+                        }
+                    }
+                    s.op_push.push(p5);
                 }
             }
             // Mark this dispatch's output live in the current barrier-free group so a later
@@ -4040,7 +4094,7 @@ impl VulkanDevice {
             // a handful of times instead of once. Never mid-capture: a graph must record whole into
             // one command buffer (a partial submit would tear the replayable forward in two).
             if s.n >= BATCH_CAP && !s.capturing {
-                flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period)?;
+                flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period, self.inner.roofline, f32::from_bits(self.inner.peak_bw_gbps.load(std::sync::atomic::Ordering::Relaxed)))?;
                 drop(s);
                 self.reclaim();
             }
@@ -4056,7 +4110,7 @@ impl VulkanDevice {
         let profile = self.inner.profile;
         {
             let mut s = self.inner.submitter.lock().unwrap();
-            flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period)?;
+            flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period, self.inner.roofline, f32::from_bits(self.inner.peak_bw_gbps.load(std::sync::atomic::Ordering::Relaxed)))?;
         }
         self.reclaim();
         Ok(())
@@ -4372,6 +4426,35 @@ static POOL_FRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 static POOL_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POOL_FRESH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// Exact moved-bytes + FLOPs for one matmul dispatch, from its push shape [m0, mcount, nout, k, woff].
+// Returns (cold_weight_bytes, total_global_bytes, flops); a non-matmul or unknown kernel returns
+// (0,0,0) and is dropped from the roofline table. ONE place owns every kernel's byte/FLOP model --
+// the Q-block size, the tile BM/BN (hence the cold weight re-read factor ceil(m/BM), one full weight
+// pass per row-tile band), and the activation element width -- so the achieved-rate columns are exact
+// rather than eyeballed. `wbytes` is the cold-GTT weight traffic that must approach peak BW; the
+// activation is re-read once per column tile (ceil(nout/BN)) but is MALL-resident, so it lands in
+// `tbytes` (all global traffic) not `wbytes`. Output is written once.
+fn roofline_model(name: &str, p: &[u32; 5]) -> (u64, u64, u64) {
+    let (m, nout, k) = (p[1] as u64, p[2] as u64, p[3] as u64);
+    if m == 0 || nout == 0 || k == 0 {
+        return (0, 0, 0);
+    }
+    // (block bytes per 256-elem superblock, activation element bytes, BM, BN)
+    let (blk, act, bm, bn): (u64, u64, u64, u64) = match name {
+        "mul_mm_q4k_coopmat" => (144, 4, 128, 128), // f16 coopmat, x is f32
+        "mul_mm_q4k_tiled_dp4a" => (144, 1, 64, 64), // int8-dp4a tile, x quantized to q8
+        "mul_mm_q4k_tiled" => (144, 4, 64, 64),      // f32 tile
+        "mul_mm_q6k_tiled_dp4a" => (212, 1, 64, 64), // Q6_K block padded to 212 B
+        _ => return (0, 0, 0),
+    };
+    let blocks = k.div_ceil(256);
+    let reread = m.div_ceil(bm);
+    let wbytes = nout * blocks * blk * reread;
+    let abytes = nout.div_ceil(bn) * m * k * act;
+    let obytes = m * nout * 4;
+    (wbytes, wbytes + abytes + obytes, 2 * m * nout * k)
+}
+
 // End, submit, and block on the current command batch, then mark the submitter idle. A no-op
 // when nothing is recorded. Caller must hold the submitter lock. When `profile` is set, prints the
 // per-batch phase breakdown (recording / submit / fence-wait time, dispatch + barrier counts) so
@@ -4383,6 +4466,8 @@ fn flush_locked(
     profile: bool,
     gpu_profile: bool,
     timestamp_period: f32,
+    roofline: bool,
+    peak_bw_gbps: f32,
 ) -> Result<()> {
     if !s.recording {
         return Ok(());
@@ -4464,7 +4549,47 @@ fn flush_locked(
                     *ns as f64 / total.max(1) as f64 * 100.0,
                 );
             }
+            if roofline {
+                // Join each dispatch's exact moved-bytes + FLOPs (from its push shape) to the measured
+                // GPU ns, aggregate by kernel, and print achieved rates. `wbytes` = cold weight bytes
+                // (Q-block size x re-read factor) -- the number that must approach `peak_bw_gbps`;
+                // `tbytes` = all global traffic (weight + activation + output); `flops` = 2*m*n*k.
+                // A kernel far below BOTH peak-BW and peak-FLOP is occupancy/latency-bound, not
+                // bandwidth- or compute-bound -- that distinction is the whole point of this table.
+                let mut ragg: std::collections::HashMap<&'static str, (u32, u128, u128, u128, u128)> =
+                    std::collections::HashMap::new();
+                for (i, &nm) in s.op_names.iter().enumerate() {
+                    let dt = ts[i + 1].saturating_sub(ts[i]);
+                    let ns = (dt as f64 * timestamp_period as f64) as u128;
+                    let p5 = s.op_push.get(i).copied().unwrap_or([0u32; 5]);
+                    let (wb, tb, fl) = roofline_model(nm, &p5);
+                    let e = ragg.entry(nm).or_insert((0, 0, 0, 0, 0));
+                    e.0 += 1;
+                    e.1 += ns;
+                    e.2 += wb as u128;
+                    e.3 += tb as u128;
+                    e.4 += fl as u128;
+                }
+                let mut rr: Vec<_> = ragg.into_iter().filter(|r| r.1 .4 > 0).collect();
+                rr.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+                eprintln!(
+                    "[VK_ROOF] peak_bw={:.0}GB/s (measured d2d)  -- achieved per matmul kernel:",
+                    peak_bw_gbps,
+                );
+                for (nm, (c, ns, wb, tb, fl)) in rr.iter() {
+                    let secs = *ns as f64 / 1e9;
+                    let w_gbps = *wb as f64 / 1e9 / secs.max(1e-12);
+                    let t_gbps = *tb as f64 / 1e9 / secs.max(1e-12);
+                    let gflops = *fl as f64 / 1e9 / secs.max(1e-12);
+                    let pct = if peak_bw_gbps > 0.0 { w_gbps / peak_bw_gbps as f64 * 100.0 } else { 0.0 };
+                    eprintln!(
+                        "[VK_ROOF]   {:<24} n={:<4} {:>7.2}ms  wt={:>6.1}GB/s({:>4.1}% peak)  tot={:>6.1}GB/s  {:>7.0}GFLOP/s",
+                        nm, c, *ns as f64 / 1e6, w_gbps, pct, t_gbps, gflops,
+                    );
+                }
+            }
         }
+        s.op_push.clear();
         s.op_names.clear();
     }
     s.recording = false;
@@ -4770,6 +4895,7 @@ impl BackendDevice for VulkanDevice {
                 barriers: 0,
                 qpool,
                 op_names: Vec::new(),
+                op_push: Vec::new(),
                 capturing: false,
                 graph_cmd: vk::CommandBuffer::null(),
             });
@@ -4789,9 +4915,15 @@ impl BackendDevice for VulkanDevice {
                 .get(qfi as usize)
                 .map(|q| q.timestamp_valid_bits > 0)
                 .unwrap_or(false);
-            let gpu_profile = ts_supported
+            // VK_ROOFLINE implies the timestamp path (it joins bytes/FLOPs to the same GPU ns) and
+            // adds the per-kernel achieved-rate table + the one-shot peak-BW measurement below.
+            let roofline = ts_supported
                 && timestamp_period > 0.0
-                && std::env::var("VK_PROFILE_GPU").map(|v| v != "0").unwrap_or(false);
+                && std::env::var("VK_ROOFLINE").map(|v| v != "0").unwrap_or(false);
+            let gpu_profile = roofline
+                || (ts_supported
+                    && timestamp_period > 0.0
+                    && std::env::var("VK_PROFILE_GPU").map(|v| v != "0").unwrap_or(false));
 
             let inner = VkInner {
                 _entry: entry,
@@ -4811,6 +4943,8 @@ impl BackendDevice for VulkanDevice {
                 profile,
                 gpu_profile,
                 timestamp_period,
+                roofline,
+                peak_bw_gbps: std::sync::atomic::AtomicU32::new(0),
                 push_descriptor,
                 pipelines: Mutex::new(HashMap::new()),
                 submitter,
@@ -4819,9 +4953,13 @@ impl BackendDevice for VulkanDevice {
                 cm_mnk,
                 cm_use,
             };
-            Ok(Self {
+            let dev = Self {
                 inner: Arc::new(inner),
-            })
+            };
+            if roofline {
+                dev.measure_and_store_peak_bw();
+            }
+            Ok(dev)
         }
     }
 
