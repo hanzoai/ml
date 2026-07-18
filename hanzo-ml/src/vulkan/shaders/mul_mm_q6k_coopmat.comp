@@ -1,14 +1,17 @@
 #version 450
 // Q6_K coopmat prefill matmul, the Q6_K twin of mul_mm_q4k_coopmat: y[m,n] = sum_k x[m,k]*W[n,k] on the
-// f16 matrix cores (VK_KHR_cooperative_matrix). Tile/buffering/padding/split-B/f16vec2-packing are
-// IDENTICAL to the Q4_K coopmat kernel; only the weight decode differs. Q6_K is SYMMETRIC (w = d*sc*q6,
-// q6 in [-32,31], no min term), so the decode-into-LDS is simpler than Q4_K's affine `d*sc*nibble - dmin*m`.
+// f16 matrix cores (VK_KHR_cooperative_matrix). Tile/buffering/padding/f16vec2-packing are IDENTICAL to
+// the Q4_K coopmat kernel; only the weight decode differs. Q6_K is SYMMETRIC (w = d*sc*q6, q6 in
+// [-32,31], no min term), so the decode-into-LDS is simpler than Q4_K's affine `d*sc*nibble - dmin*m`.
 // Structure that feeds the cores:
 //   * BM=128 so each weight sub-block is decoded once per 128 rows; WG=256 = 4 wave64 subgroups, each
 //     owning RM row tiles x RN col tiles of accumulator fragments;
 //   * BK=32 K-step = TWO Q6_K 16-wide sub-blocks (Q6_K scales are per-16 vs Q4_K per-32), so a K-step
 //     fetches two signed scales: the first 16 k use scales[s0], the second 16 use scales[s0+1];
-//   * DOUBLE-BUFFERED K loop: stage sub-block s+1 into the alternate LDS buffer while the cores consume s;
+//   * SINGLE-BUFFERED K loop (like the Q4_K kernel): the weight streams from GTT well below DRAM peak,
+//     so the double buffer's global-read/compute overlap is worthless while its 2x LDS caps occupancy.
+//     Q6_K's heavier decode makes it register-limited sooner, so halving LDS lifts the resident-wave
+//     count that hides its decode/LDS latency across waves rather than within one;
 //   * PACKED f16vec2 LDS: two adjacent-k f16 share one 32-bit LDS word (llama's FLOAT_TYPEV2), so the
 //     coopMatLoad feeding the cores issues one ds_load_b32 per pair instead of two ds_load_u16.
 // Q6_K block = 210 B padded to 212 (53 u32): ql[128] low nibbles (bytes 0..127), qh[64] high 2 bits
@@ -46,8 +49,8 @@ const uint D_U32   = 52u;   // d f16 at byte 208 -> low half of u32[52]
 // coopMatLoad row stride is not a power of two (breaks bank aliasing -- llama's SHMEM_STRIDE = BK/2 + 4).
 const uint SA_STRIDE = BK / 2u + 4u;      // 20 pairs
 const uint SB_STRIDE = BK / 2u + 4u;      // 20 pairs
-shared f16vec2 s_a[2u][BM * SA_STRIDE];   // [M=128, K/2=16(pad20)] row-major, double-buffered
-shared f16vec2 s_b[2u][BN * SB_STRIDE];   // [N=128, K/2=16(pad20)] row-major (transposed W), double-buffered
+shared f16vec2 s_a[BM * SA_STRIDE];       // [M=128, K/2=16(pad20)] row-major, single-buffered
+shared f16vec2 s_b[BN * SB_STRIDE];       // [N=128, K/2=16(pad20)] row-major (transposed W), single
 
 // Signed byte `b` (0-based) within the block (sign-extended) -- the i8 scales.
 int byte_s(uint base, uint b) {
@@ -55,8 +58,8 @@ int byte_s(uint base, uint b) {
     return bitfieldExtract(int(word), int((b & 3u) * 8u), 8);
 }
 
-// Stage activation [BM,BK] and decode weight sub-block [BK,BN] for K-offset `koff` into LDS buffer `buf`.
-void stage(uint buf, uint koff, uint row0, uint col0, uint nblocks) {
+// Stage activation [BM,BK] and decode weight sub-block [BK,BN] for K-offset `koff` into the LDS buffer.
+void stage(uint koff, uint row0, uint col0, uint nblocks) {
     uint tid = gl_LocalInvocationID.x;
     // Activation: pack 2 adjacent k into one f16vec2, so BM*(BK/2) pairs. IDENTICAL to Q4_K coopmat.
     for (uint idx = tid; idx < BM * (BK / 2u); idx += WG) {
@@ -66,9 +69,9 @@ void stage(uint buf, uint koff, uint row0, uint col0, uint nblocks) {
         if (mrow < mcount) {
             float lo = x[mrow * k + koff + 2u * kp];
             float hi = x[mrow * k + koff + 2u * kp + 1u];
-            s_a[buf][r * SA_STRIDE + kp] = f16vec2(float16_t(lo), float16_t(hi));
+            s_a[r * SA_STRIDE + kp] = f16vec2(float16_t(lo), float16_t(hi));
         } else {
-            s_a[buf][r * SA_STRIDE + kp] = f16vec2(0.0);
+            s_a[r * SA_STRIDE + kp] = f16vec2(0.0);
         }
     }
     // Q6_K decode geometry for the 32 contiguous k of this K-step (BK == 32). koff is a 32-multiple, so
@@ -114,12 +117,12 @@ void stage(uint buf, uint koff, uint row0, uint col0, uint nblocks) {
                     int q6 = int(nib | hi) - 32;
                     v[b] = float16_t(dsc * float(q6));
                 }
-                s_b[buf][col * SB_STRIDE + 2u * wi]      = f16vec2(v[0], v[1]);
-                s_b[buf][col * SB_STRIDE + 2u * wi + 1u] = f16vec2(v[2], v[3]);
+                s_b[col * SB_STRIDE + 2u * wi]      = f16vec2(v[0], v[1]);
+                s_b[col * SB_STRIDE + 2u * wi + 1u] = f16vec2(v[2], v[3]);
             }
         } else {
             [[unroll]] for (uint kp = 0u; kp < BK / 2u; kp++)
-                s_b[buf][col * SB_STRIDE + kp] = f16vec2(0.0);
+                s_b[col * SB_STRIDE + kp] = f16vec2(0.0);
         }
     }
 }
@@ -136,19 +139,16 @@ void main() {
         [[unroll]] for (uint j = 0u; j < RN; j++)
             acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
-    stage(0u, 0u, row0, col0, nblocks);
-    barrier();
     for (uint s = 0u; s < nsteps; s++) {
-        uint cur = s & 1u;
-        if (s + 1u < nsteps)
-            stage((s + 1u) & 1u, (s + 1u) * BK, row0, col0, nblocks);
+        stage(s * BK, row0, col0, nblocks);
+        barrier();
         if (warp < NWARP) {
             // A fragments: [M-tile][K-subtile]. s_a is [M, K/2] f16vec2 -> K-subtile kc lands at pair
             // offset kc*(T/2) and the row stride is SA_STRIDE pairs; RowMajor.
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[RM][2];
             [[unroll]] for (uint i = 0u; i < RM; i++)
                 [[unroll]] for (uint kc = 0u; kc < 2u; kc++)
-                    coopMatLoad(ma[i][kc], s_a[cur], (warp * RM + i) * T * SA_STRIDE + kc * (T / 2u), SA_STRIDE,
+                    coopMatLoad(ma[i][kc], s_a, (warp * RM + i) * T * SA_STRIDE + kc * (T / 2u), SA_STRIDE,
                                 gl_CooperativeMatrixLayoutRowMajor);
             // Load the RN B-fragments for one K-subtile at a time and reuse the registers across the two
             // K-subtiles: halves the peak live B-fragment count (RN vs 2*RN) so the 16 f32 accumulators
@@ -157,7 +157,7 @@ void main() {
             [[unroll]] for (uint kc = 0u; kc < 2u; kc++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[RN];
                 [[unroll]] for (uint j = 0u; j < RN; j++)
-                    coopMatLoad(mb[j], s_b[cur], (j * T) * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
+                    coopMatLoad(mb[j], s_b, (j * T) * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
                                 gl_CooperativeMatrixLayoutColumnMajor);
                 [[unroll]] for (uint i = 0u; i < RM; i++)
                     [[unroll]] for (uint j = 0u; j < RN; j++)
