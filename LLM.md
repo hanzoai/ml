@@ -1214,3 +1214,11 @@ the GPU idle -> reads as a hang (that "100% CPU one core" is the loop, NOT Metal
 - HANDOFF: the daemon `loop {}` (lib.rs:1143 worker main thread) MASKS a worker-thread panic as a spinning
   hang -- worth surfacing worker errors to the head instead of spinning. The 3-node full-ring reboot to
   confirm end-to-end is the ring agent's job (dbc GPU was busy with the fabric's standalone 30B serve).
+
+## 0.11.69 + Class::Route (landed)
+- **0.11.69** — the q4k coopmat prefill GEMM stages dequantized weights as
+  `f16vec2` in LDS (was scalar), **1.53x** GEMM; builds on the accumulator
+  scratch-spill kill (padded LDS + split B-load). The deprecated
+  `cpu_flash_attention` backward-compat shim is removed (native path supersedes it).
+- **Class::Route + π placement (0.2.26)** — the cross-device MoE fence lands;
+  the expert pool is a set, so a repeated expert id is charged and placed once (0.2.27).
