@@ -67,6 +67,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_q5k" => spv!("mul_mat_q5k"),
         "mul_mat_q6k" => spv!("mul_mat_q6k"),
         "mul_mm_q6k_tiled_dp4a" => spv!("mul_mm_q6k_tiled_dp4a"),
+        "mul_mm_q6k_coopmat" => spv!("mul_mm_q6k_coopmat"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q4k_sg" => spv!("mul_mat_vec_q4k_sg"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
@@ -1687,6 +1688,30 @@ impl VulkanDevice {
         // symmetric (no min), so it needs only xq/xs, not xsum. MoE banks (woff!=0), m==1, and the
         // VK_Q6K_LEGACY escape hatch fall to the column-per-invocation mul_mat_q6k.
         let legacy = std::env::var_os("VK_Q6K_LEGACY").is_some();
+        // f16 coopmat (matrix cores) -- decode the Q6_K weight to f16 LDS tiles + coopMatMulAdd, the
+        // llama-parity path (llama-Vulkan runs Q6_K prefill on KHR_coopmat at ~13.7k GFLOP/s vs the dp4a
+        // tile's ~4k here). Default for dense (woff==0) rows>1 Q6_K on any coopmat device: the 128x128
+        // block-amortized decode is f16-bit-exact vs the column kernel. The 16-tile store needs m,nout
+        // multiples of 16 (k is always a Q6_K 256-multiple); ragged shapes and MoE banks (woff!=0) fall
+        // through to the dp4a tile, which guards edges per element. VK_Q6K_COOPMAT_OFF forces dp4a for A/B.
+        if !legacy
+            && self.inner.coopmat
+            && woff == 0
+            && m > 1
+            && m % 16 == 0
+            && nout % 16 == 0
+            && std::env::var_os("VK_Q6K_COOPMAT_OFF").is_none()
+        {
+            let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
+            // grid: BN=128 cols/wg, BM=128 rows/wg (must match the shader's BM/BN).
+            self.dispatch(
+                "mul_mm_q6k_coopmat",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(128), (m as u32).div_ceil(128), 1),
+            )?;
+            return Ok(out);
+        }
         if !legacy && self.inner.int_dot8 && m > 1 {
             let (xq, xsq, _xsum) = self.quantize_act_q8(x, m, k)?;
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
@@ -4445,6 +4470,7 @@ fn roofline_model(name: &str, p: &[u32; 5]) -> (u64, u64, u64) {
         "mul_mm_q4k_tiled_dp4a" => (144, 1, 64, 64), // int8-dp4a tile, x quantized to q8
         "mul_mm_q4k_tiled" => (144, 4, 64, 64),      // f32 tile
         "mul_mm_q6k_tiled_dp4a" => (212, 1, 64, 64), // Q6_K block padded to 212 B
+        "mul_mm_q6k_coopmat" => (212, 4, 128, 128),  // Q6_K f16 coopmat, x is f32
         _ => return (0, 0, 0),
     };
     let blocks = k.div_ceil(256);
@@ -7698,6 +7724,126 @@ mod dsl_dispatch_proof {
                     col_ms / til_ms
                 );
             }
+        }
+    }
+
+    /// Controlled decode gate for the COOPMAT path: a uniform Q6_K weight (every q6=1, scale=1, d=1)
+    /// times an all-ones activation must yield exactly k on every output. Aligned shape (m,nout % 16) so
+    /// matmul_q6k_gpu takes the coopmat arm; isolates the 6-bit decode + scale from any data-dependence.
+    /// q6=1 needs ql nibble 1 (byte 0x11), qh 2-bit 0b10 (byte 0xAA), scale 1, d 1 -- the same weight
+    /// bytes as q6k_tiled_controlled, but decoded into f16 LDS (1.0 is f16-exact => the f32 accumulator
+    /// sums to exactly k). This is the localizer for a wrong ql/qh byte base (cf. the dp4a QHB scar).
+    #[test]
+    fn q6k_coopmat_controlled() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[q6k-coop-ctrl] no vulkan device ({e}); skipping"); return; }
+        };
+        if dev.coopmat_info().is_none() { eprintln!("[q6k-coop-ctrl] no coopmat; skipping"); return; }
+        let (m, n, k) = (16usize, 16usize, 512usize); // m,n % 16 => coopmat arm; k spans 2 super-blocks
+        let nblk = n * (k / 256);
+        let dbits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut blocks = vec![0u8; nblk * 210];
+        for blk in 0..nblk {
+            let b = &mut blocks[blk * 210..blk * 210 + 210];
+            for e in b[0..128].iter_mut() { *e = 0x11; }    // ql: both nibbles = 1
+            for e in b[128..192].iter_mut() { *e = 0xAA; }  // qh: all 2-bit fields = 0b10
+            for e in b[192..208].iter_mut() { *e = 0x01; }  // scales = 1
+            b[208] = dbits[0]; b[209] = dbits[1];           // d = 1.0
+        }
+        let wq = dev.quantize_q6k(&blocks, n, k).unwrap();
+        let x = vec![1.0f32; m * k];
+        let xh = dev.upload_f32(&x).unwrap();
+        let got = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+        let worst = got.iter().map(|&v| (v - k as f32).abs()).fold(0f32, f32::max);
+        eprintln!("[q6k-coop-ctrl] {m}x{n}x{k} uniform q6=1: got[0..3]={:?} expect {k}, worst_abs_err={worst:.3}", &got[0..3.min(got.len())]);
+        assert!(worst < 0.5, "Q6_K coopmat controlled: got {:?} expect {k} (worst {worst})", &got[0..got.len().min(6)]);
+    }
+
+    /// The f16 coopmat Q6_K prefill matmul (mul_mm_q6k_coopmat) agrees with a CPU f32 oracle (decode
+    /// mirrors mul_mat_q6k) and the trusted column kernel on identical Q6_K weight bytes. The coopmat
+    /// path rounds weight+activation to f16, so the gate is a loose scale-relative bound (f16 mantissa
+    /// ~1e-3 accumulated over k). Covers the real zen-eco-4b projection shapes plus small/edge tiles;
+    /// all have m,nout multiples of 16 so matmul_q6k_gpu takes the coopmat arm.
+    #[test]
+    fn q6k_coopmat_matches_column() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[q6k-coop] no vulkan device ({e}); skipping"); return; }
+        };
+        if dev.coopmat_info().is_none() { eprintln!("[q6k-coop] no coopmat; skipping"); return; }
+        let mut s = 0x51C6C0DEF00DBEEFu64;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        for (m, n, k) in [
+            (512usize, 2048usize, 768usize), // ffn gate/up-ish
+            (512, 768, 2048),                 // ffn_down (Q6_K in Q4_K_M)
+            (512, 4096, 4096),                // square
+            (512, 256, 2048),                 // attn kv proj
+            (64, 64, 512),                     // small
+            (128, 512, 768),                   // non-square edge tiles
+        ] {
+            let nblk = n * (k / 256);
+            let dbits = half::f16::from_f32(0.1).to_bits().to_le_bytes();
+            let mut blocks = vec![0u8; nblk * 210];
+            for blk in 0..nblk {
+                let b = &mut blocks[blk * 210..blk * 210 + 210];
+                for e in b[0..192].iter_mut() { *e = next() as u8; }                    // ql[128] + qh[64]
+                for e in b[192..208].iter_mut() { *e = ((next() % 15) as i64 - 7) as u8; } // scales i8
+                b[208] = dbits[0];
+                b[209] = dbits[1];
+            }
+            let wq = dev.quantize_q6k(&blocks, n, k).unwrap();
+            let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let xh = dev.upload_f32(&x).unwrap();
+            // CPU oracle: decode Q6_K exactly (mirrors mul_mat_q6k) into dense f32, matmul with f32 x.
+            let nblocks = k / 256;
+            let mut wf = vec![0f32; n * k];
+            for nn in 0..n {
+                for blk in 0..nblocks {
+                    let src = &blocks[(nn * nblocks + blk) * 210..(nn * nblocks + blk) * 210 + 210];
+                    let d = half::f16::from_le_bytes([src[208], src[209]]).to_f32();
+                    for idx in 0..2usize {
+                        let scoff = 192 + 8 * idx;
+                        let qloff = 64 * idx;
+                        let qhoff = 128 + 32 * idx;
+                        for l in 0..32usize {
+                            let is = l >> 4;
+                            let qll = src[qloff + l] as u32;
+                            let qlh = src[qloff + l + 32] as u32;
+                            let qhv = src[qhoff + l] as u32;
+                            let q1 = ((qll & 0xF) | ((qhv & 3) << 4)) as i32 - 32;
+                            let q2 = ((qlh & 0xF) | (((qhv >> 2) & 3) << 4)) as i32 - 32;
+                            let q3 = ((qll >> 4) | (((qhv >> 4) & 3) << 4)) as i32 - 32;
+                            let q4 = ((qlh >> 4) | (((qhv >> 6) & 3) << 4)) as i32 - 32;
+                            let sc = |b: usize| src[b] as i8 as i32;
+                            let base = nn * k + blk * 256 + idx * 128;
+                            wf[base + l] = d * sc(scoff + is) as f32 * q1 as f32;
+                            wf[base + l + 32] = d * sc(scoff + is + 2) as f32 * q2 as f32;
+                            wf[base + l + 64] = d * sc(scoff + is + 4) as f32 * q3 as f32;
+                            wf[base + l + 96] = d * sc(scoff + is + 6) as f32 * q4 as f32;
+                        }
+                    }
+                }
+            }
+            let mut want = vec![0f32; m * n];
+            for mm in 0..m {
+                for nn in 0..n {
+                    let mut acc = 0f32;
+                    for kk in 0..k { acc += x[mm * k + kk] * wf[nn * k + kk]; }
+                    want[mm * n + nn] = acc;
+                }
+            }
+            let relof = |g: &[f32]| -> f32 {
+                let maxref = want.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+                g.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref
+            };
+            unsafe { std::env::set_var("VK_Q6K_LEGACY", "1") }; // column kernel reference
+            let col = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            unsafe { std::env::remove_var("VK_Q6K_LEGACY") };
+            let got = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap(); // coopmat default
+            let rel = relof(&got);
+            eprintln!("[q6k-coop] {m}x{n}x{k} coopmat_vs_cpu={rel:.2e} column_vs_cpu={:.2e}", relof(&col));
+            assert!(rel < 2e-2, "Q6_K coopmat {m}x{n}x{k} diverged from CPU: scale_rel={rel:.3e}");
         }
     }
 
