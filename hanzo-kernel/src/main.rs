@@ -653,6 +653,33 @@ fn main() {
         return;
     }
 
+    // `matvec-check dump-flash`: emit ONLY the flash-attention .spv (isolated from the dp4a/mmq dumps
+    // above, which need extensions a software adapter lacks). The flash kernel's cmma island lowers to
+    // OpCooperativeMatrixMulAddKHR; the .spv is written by cubecl at codegen, BEFORE the driver validates
+    // coopmat support, so forcing a non-coopmat adapter (e.g. `VK_ICD_FILENAMES=.../lvp_icd.json`) still
+    // yields the artifact even though the dispatch then fails -- caught here. d=128 (one .spv serves any
+    // seq via the runtime meta). plane=64: the coopmat runs at the device subgroup size, and RADV
+    // gfx1151 reports VkPhysicalDeviceCooperativeMatrixPropertiesKHR::subgroupSize=64 -- a 32-lane
+    // launch feeds the 16x16 f16 fragment only half its lanes, so the output tile past ~row 1 is
+    // undefined (mmq_q4k / sdpa_blk bake 64 for the same reason). `CUBECL_DEBUG_SPIRV=<dir>` sets the
+    // output directory.
+    #[cfg(all(feature = "vulkan", feature = "spirv-dump"))]
+    if std::env::args().any(|a| a == "dump-flash") {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let r = std::panic::catch_unwind(|| {
+            let c = WgpuRuntime::client(&WgpuDevice::default());
+            let q = vec![0.1f32; 2 * 16 * 128];
+            let k = vec![0.1f32; 1 * 32 * 128];
+            let v = k.clone();
+            hanzo_kernel::flash::flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, 2, 1, 16, 32, 32, 128, true, 64)
+        });
+        match r {
+            Ok(_) => println!("flash dump: dispatch succeeded (coopmat adapter) -- .spv emitted"),
+            Err(_) => println!("flash dump: dispatch failed (expected on a non-coopmat adapter) -- .spv should already be emitted at codegen"),
+        }
+        return;
+    }
+
     // `matvec-check coldsweep`: dense Q4_K decode matvec at a weight footprint far larger than the 32 MB
     // MALL, so each pass re-reads weights from GTT -- the real in-engine decode regime. The small-shape
     // benches below are cache-warm and overstate bandwidth; the cold sweep is what the per-token decode

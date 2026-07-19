@@ -103,6 +103,15 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // it collapses the copy2d+bmm+softmax+bmm decode-attention chain to ONE dispatch. Bindings:
         // q(0), k(1), v(2), out(3), scale(4), meta(5)=[seq_q,seq_k,n_kv_groups,causal].
         "sdpa_blk" => include_bytes!("vulkan/spv/sdpa_blk.spv"),
+        // DSL flash attention on the cooperative-matrix path (hanzo-kernel flash::flash_attn, d=128
+        // plane=64 BR=BC=16 baked): tiled online softmax where BOTH matmuls (Q@Kᵀ, P@V) run as f16
+        // 16x16x16 coopmat (OpCooperativeMatrixMulAddKHR, f16 A/B -> f32 acc, subgroup scope). One
+        // workgroup (cube) computes one (batch,head,query-tile) of 16 rows; the whole grid launches at
+        // once (meta[8]=cube_base=0). plane=64 matches the RADV gfx1151 coopmat subgroupSize (a 32-lane
+        // launch left the fragment half-fed -> garbage past query-row 1). GQA-native, causal-optional,
+        // runtime seq_q/seq_k via meta. Bindings: q(0), k(1), v(2), out(3), scale(4), meta(5)=[seq_q,
+        // seq_k,n_heads,n_kv,causal,kv_batch_stride,kv_head_stride,key_stride,cube_base].
+        "flash_attn_dsl" => include_bytes!("vulkan/spv/flash_attn_dsl_d128.spv"),
         // Flash-decoding (seq_q==1): split the KV sequence across n_split workgroups per (batch,head) so
         // the lone decode query fills the GPU, then combine the partials. Register-light wave64-subgroup
         // (lane owns head_dim {t,t+64}, subgroupAdd dot) -- high occupancy vs sdpa_blk's 256-VGPR path.
@@ -2625,6 +2634,63 @@ impl VulkanDevice {
         p2.extend_from_slice(&(nsplit as u32).to_le_bytes());
         let bufs2 = [pacc.buffer, pm.buffer, pl.buffer, out.buffer];
         self.dispatch_outs("sdpa_decode_reduce", &bufs2, &[3], &p2, (rows as u32, 1, 1))?;
+        Ok(out)
+    }
+
+    /// Fused DSL flash attention on the cooperative-matrix path (the `flash_attn_dsl` .spv): the same
+    /// `softmax(QKᵀ·scale + causal_mask)V` as [`Self::sdpa_blk_vk`], but both matmuls run as f16
+    /// 16x16x16 coopmat instead of scalar per-thread MACs. One workgroup (cube) computes one
+    /// `(batch, head, query-tile)` of BR=16 query rows over BC=16-key tiles with an online softmax; the
+    /// whole grid is launched at once (`cube_base=0`). GQA-native (reads the shared KV head, no
+    /// repeat_kv), causal-optional, runtime `seq_q`/`seq_k` via `meta`, KV read in place at its real
+    /// strides. `d`=128, `plane`(LocalSize)=64, BR=BC=16 are baked into the .spv. `q`/`out` are
+    /// `[b·n_heads·seq_q·d]`, `k`/`v` are `[b·n_kv··d]` (strided). Bindings match kernel param order:
+    /// q(0) k(1) v(2) out(3) scale(4) meta(5); only `out` (binding 3) is written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_dsl_vk(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        b: usize,
+        n_heads: usize,
+        n_kv: usize,
+        seq_q: usize,
+        seq_k: usize,
+        d: usize,
+        softmax_scale: f32,
+        causal: bool,
+        kv_batch_stride: usize,
+        kv_head_stride: usize,
+        key_stride: usize,
+    ) -> Result<VulkanStorage> {
+        // The committed .spv bakes d=128 (the coopmat contracts d in d/16 chunks). Other head dims
+        // need their own dumped .spv; guard rather than silently read past the 128-wide staged tiles.
+        if d != 128 {
+            crate::bail!("flash_attn_dsl_vk: committed .spv is baked d=128, got {d}");
+        }
+        if q.count < b * n_heads * seq_q * d {
+            crate::bail!("flash_attn_dsl_vk: q count {} < b*n_heads*seq_q*d {}", q.count, b * n_heads * seq_q * d);
+        }
+        // k/v may be a strided view into a larger cache; bound-check the furthest element read.
+        let kv_max = (b.saturating_sub(1)) * kv_batch_stride
+            + (n_kv.saturating_sub(1)) * kv_head_stride
+            + (seq_k.saturating_sub(1)) * key_stride
+            + d;
+        if k.count < kv_max || v.count < kv_max {
+            crate::bail!("flash_attn_dsl_vk: k/v count < strided extent {kv_max}");
+        }
+        let out = self.alloc_f32(b * n_heads * seq_q * d)?;
+        let scale = self.upload_f32(&[softmax_scale])?;
+        let meta = self.upload_u32(&[
+            seq_q as u32, seq_k as u32, n_heads as u32, n_kv as u32, causal as u32,
+            kv_batch_stride as u32, kv_head_stride as u32, key_stride as u32,
+            0u32, // cube_base = 0: dispatch the whole grid (production launch)
+        ])?;
+        let bufs = [q.buffer, k.buffer, v.buffer, out.buffer, scale.buffer, meta.buffer];
+        // Grid = one cube per (batch, head, query-tile); BR=16 query rows per tile. plane=64 (LocalSize).
+        let cubes = (b * n_heads * seq_q.div_ceil(16)) as u32;
+        self.dispatch_outs("flash_attn_dsl", &bufs, &[3], &[], (cubes, 1, 1))?;
         Ok(out)
     }
 
@@ -8214,6 +8280,157 @@ mod dsl_dispatch_proof {
             worst = worst.max(rel);
         }
         assert!(worst < 1e-4, "sdpa_decode_split diverged from CPU: scale_rel={worst:.3e}");
+    }
+
+    // The committed DSL flash-attention coopmat .spv (`flash_attn_dsl`, d=128 plane=64 BR=BC=16)
+    // dispatched through ml's own VulkanDevice. Both matmuls (Q@Kᵀ, P@V) run on the f16 16x16x16
+    // cooperative-matrix path (OpCooperativeMatrixMulAddKHR, f16 A/B -> f32 acc, subgroup scope), so
+    // the gate is the f16-tensor-core tolerance (~1e-3..1e-2 scale-relative), NOT the scalar arm's
+    // ~1e-7. Scale-relative (max|Δ| / max|ref|) is the honest metric: attention outputs are
+    // softmax-weighted sums of ±V that cancel near zero, so per-element rel-error explodes there.
+    //
+    // The .spv bakes d=128 but seq_q/seq_k ride the runtime `meta`, so ONE artifact serves every
+    // shape below. The set is chosen to exercise the flagged coopmat failure modes on RADV
+    // (16x16 fragments, distinct from Metal's validated 8x8 arm): the aligned 512x512 causal shape
+    // proves the ColMajor-K -> Kᵀ fragment layout + the PV store stride; the RAGGED key counts
+    // (kv1/kv17/kv33) hit the partial-tile path where the staged K/V tile is zero-padded past seq_k
+    // (a wrong direct-slice load would read OOB); the RAGGED query count (sq40, a 16+16+8 tile grid)
+    // hits the partial query-tile at store + normalize; the decode GQA 32/8 shape is the production
+    // per-token attention. Every shape is a fresh dispatch (no cross-shape state).
+    #[test]
+    fn flash_dsl_coopmat_matches_oracle() {
+        const D: usize = 128;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[flash-dsl] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        // Two-pass materialized softmax(QKᵀ·scale + causal_mask)V over PACKED k/v [n_kv, seq_k, d],
+        // GQA (head h reads kv head h/(n_heads/n_kv)). The normative reference the online-softmax
+        // coopmat flash must match. causal masks key kk > query qp (both 0-based within the call).
+        let flash_ref = |q: &[f32], k: &[f32], v: &[f32],
+                         nh: usize, nkv: usize, sq: usize, sk: usize, causal: bool| -> Vec<f32> {
+            let scale = 1.0f32 / (D as f32).sqrt();
+            let groups = nh / nkv;
+            let mut out = vec![0f32; nh * sq * D];
+            for h in 0..nh {
+                let kv = h / groups;
+                for qp in 0..sq {
+                    let qb = (h * sq + qp) * D;
+                    let mut sc = vec![f32::NEG_INFINITY; sk];
+                    for kk in 0..sk {
+                        if causal && kk > qp {
+                            continue;
+                        }
+                        sc[kk] = (0..D).map(|dd| q[qb + dd] * k[(kv * sk + kk) * D + dd]).sum::<f32>() * scale;
+                    }
+                    let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
+                    let sum: f32 = ex.iter().sum();
+                    for dd in 0..D {
+                        out[qb + dd] = (0..sk).map(|kk| ex[kk] / sum * v[(kv * sk + kk) * D + dd]).sum();
+                    }
+                }
+            }
+            out
+        };
+        // One shape: gen deterministic q/k/v, run the coopmat flash through ml dispatch (packed KV:
+        // batch stride nkv*sk*D, head stride sk*D, key stride D), gate scale-relative vs `flash_ref`.
+        let run = |nh: usize, nkv: usize, sq: usize, sk: usize, causal: bool, tag: &str| {
+            let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
+            let q: Vec<f32> = (0..nh * sq * D).map(|i| gen(1, i)).collect();
+            let k: Vec<f32> = (0..nkv * sk * D).map(|i| gen(2, i)).collect();
+            let v: Vec<f32> = (0..nkv * sk * D).map(|i| gen(3, i)).collect();
+            let want = flash_ref(&q, &k, &v, nh, nkv, sq, sk, causal);
+            let scale = 1.0f32 / (D as f32).sqrt();
+            let qs = dev.upload_f32(&q).unwrap();
+            let ks = dev.upload_f32(&k).unwrap();
+            let vs = dev.upload_f32(&v).unwrap();
+            let out = dev
+                .flash_attn_dsl_vk(&qs, &ks, &vs, 1, nh, nkv, sq, sk, D, scale, causal, nkv * sk * D, sk * D, D)
+                .unwrap();
+            let got = out.to_vec_f32().unwrap();
+            let maxref = want.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-30);
+            let maxd = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let rel = maxd / maxref;
+            eprintln!("[flash-dsl {tag}] nh{nh}/nkv{nkv} sq{sq} sk{sk} d{D} causal{causal}  scale_rel={rel:.2e}");
+            assert!(rel < 2e-2, "flash coopmat {tag}: scale_rel {rel:.3e} exceeds 2e-2 vs materialized ref");
+        };
+        // decode (seq_q=1, non-causal, the single query attends the whole cache), ragged key counts.
+        run(4, 2, 1, 1, false, "decode kv1");
+        run(4, 2, 1, 17, false, "decode kv17 (ragged key tile)");
+        run(4, 2, 1, 33, false, "decode kv33 (ragged key tile)");
+        run(4, 2, 1, 128, false, "decode kv128 (aligned)");
+        run(32, 8, 1, 2048, false, "decode kv2048 GQA4 (production)");
+        // prefill (causal): aligned single tile, aligned 3-tile, ragged query tile (16+16+8), 512x512.
+        run(4, 2, 16, 128, true, "prefill sq16 causal");
+        run(4, 2, 48, 48, true, "prefill sq48 causal (aligned 3-tile)");
+        run(4, 2, 40, 40, true, "prefill sq40 causal (ragged query tile)");
+        run(2, 1, 512, 512, true, "prefill 512x512 causal MHA");
+    }
+
+    // A/B: the fused coopmat flash (`flash_attn_dsl`) vs the block-flash base `sdpa_blk` in this crate.
+    // (Decode's live path is now `sdpa_decode_split_vk`, the occupancy split of `sdpa_blk`; this
+    // microbench A/Bs flash vs the `sdpa_blk` base -- the real prefill-wiring decision is the in-engine
+    // pp512 bench, not this kernel-level number.) Both kernels are measured identically: q/k/v uploaded
+    // once, out/scale/meta pre-allocated (no per-iter alloc), warmed, then a batch of N same-kernel
+    // dispatches timed with one flush. Run under `VK_PROFILE_GPU=1` for the per-op on-GPU `[VK_GPU]` avg
+    // us corroboration. This is a benchmark, not a gate; run explicitly (`--ignored`). Reports, never asserts speed.
+    #[test]
+    #[ignore]
+    fn flash_dsl_vs_sdpa_blk_ab() {
+        const D: usize = 128;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[flash-ab] no vulkan device ({e}); skipping"); return; }
+        };
+        let bench = |nh: usize, nkv: usize, sq: usize, sk: usize, causal: bool, iters: usize, tag: &str| {
+            let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
+            let q: Vec<f32> = (0..nh * sq * D).map(|i| gen(1, i)).collect();
+            let k: Vec<f32> = (0..nkv * sk * D).map(|i| gen(2, i)).collect();
+            let v: Vec<f32> = (0..nkv * sk * D).map(|i| gen(3, i)).collect();
+            let scale = 1.0f32 / (D as f32).sqrt();
+            let (kbs, khs, ks_) = (nkv * sk * D, sk * D, D); // packed KV strides
+            let qs = dev.upload_f32(&q).unwrap();
+            let ks = dev.upload_f32(&k).unwrap();
+            let vs = dev.upload_f32(&v).unwrap();
+            let out = dev.alloc_f32(nh * sq * D).unwrap();
+            let scl = dev.upload_f32(&[scale]).unwrap();
+            let m8: Vec<u32> = vec![sq as u32, sk as u32, nh as u32, nkv as u32, causal as u32, kbs as u32, khs as u32, ks_ as u32];
+            let mut m9 = m8.clone();
+            m9.push(0); // cube_base
+            let meta_blk = dev.upload_u32(&m8).unwrap();
+            let meta_flash = dev.upload_u32(&m9).unwrap();
+            let bufs_blk = [qs.buffer, ks.buffer, vs.buffer, out.buffer, scl.buffer, meta_blk.buffer];
+            let bufs_flash = [qs.buffer, ks.buffer, vs.buffer, out.buffer, scl.buffer, meta_flash.buffer];
+            let g_blk = ((nh * sq) as u32, 1u32, 1u32);
+            let g_flash = ((nh * sq.div_ceil(16)) as u32, 1u32, 1u32);
+            // Time N same-kernel dispatches in one batch, one flush. Pre-allocated buffers => kernel +
+            // record only. Both kernels pay the identical harness cost, so the ratio is honest.
+            let time_one = |name: &'static str, bufs: &[vk::Buffer], groups: (u32, u32, u32)| -> f64 {
+                for _ in 0..8 { dev.dispatch_outs(name, bufs, &[3], &[], groups).unwrap(); }
+                dev.flush().unwrap();
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters { dev.dispatch_outs(name, bufs, &[3], &[], groups).unwrap(); }
+                dev.flush().unwrap();
+                t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+            };
+            let ms_flash = time_one("flash_attn_dsl", &bufs_flash, g_flash);
+            let ms_blk = time_one("sdpa_blk", &bufs_blk, g_blk);
+            eprintln!(
+                "[flash-ab {tag}] nh{nh}/nkv{nkv} sq{sq} sk{sk} d{D} causal{causal}  flash={ms_flash:.4}ms (wg={})  sdpa_blk={ms_blk:.4}ms (wg={})  flash/blk={:.2}x",
+                g_flash.0, g_blk.0, ms_flash / ms_blk,
+            );
+        };
+        // Decode (seq_q=1, the single query attends the whole cache): flash computes a 16-row tile for
+        // 1 real query (15/16 wasted) -- sdpa_blk is purpose-built here. Prefill (causal, seq_q=seq_k):
+        // flash's coopmat QK/PV amortize over 16 queries/tile -- the regime the tensor-core path targets.
+        bench(32, 8, 1, 2048, false, 200, "decode kv2048 GQA4 (production)");
+        bench(32, 8, 1, 512, false, 200, "decode kv512 GQA4");
+        bench(8, 2, 512, 512, true, 50, "prefill 512x512 causal GQA4");
+        bench(32, 8, 512, 512, true, 30, "prefill 512x512 causal GQA4 (32h)");
     }
 
     /// The affine Q4_K PREFILL MMQ .spv (mmq_q4k, coopmat/tensor-core) dispatches through ml's own
