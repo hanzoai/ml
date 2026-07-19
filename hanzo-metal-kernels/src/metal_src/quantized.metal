@@ -4884,10 +4884,15 @@ kernel void kernel_mul_mv_q3_K_f32(
     kernel_mul_mv_q3_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q4_K_f32_impl(
+// Activation type T (float or bfloat) is templated so the same matvec serves both the f32 path and
+// a bf16-native path that skips the bf16<->f32 activation round-trip GgufMatMul otherwise inserts
+// around every quantized projection. Accumulation stays in f32; only the src1 load and dst store
+// carry T, so T=float reproduces the prior kernel bit-for-bit.
+template<typename T>
+void kernel_mul_mv_q4_K_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const T     * src1,
+        device       T     * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -4928,7 +4933,7 @@ void kernel_mul_mv_q4_K_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q4_K * x = (device const block_q4_K *) src0 + ib_row + offset0;
-    device const float      * y = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
+    device const T          * y = (device const T          *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[16];
     float yh[16];
@@ -4936,7 +4941,7 @@ void kernel_mul_mv_q4_K_f32_impl(
 
     const int step = sizeof(block_q4_K) * nb / 2;
 
-    device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+    device const T * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
@@ -4996,9 +5001,30 @@ void kernel_mul_mv_q4_K_f32_impl(
     for (int row = 0; row < NR0; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (T) all_sum;
         }
     }
+}
+
+// f32 forwarder — keeps the name the f32 host kernel and the MoE `mmv_fn` templates reference.
+void kernel_mul_mv_q4_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q4_K_impl<float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q4_K_f32")]]
@@ -5027,6 +5053,34 @@ kernel void kernel_mul_mv_q4_K_f32(
         uint sgitg[[simdgroup_index_in_threadgroup]]) {
 
     kernel_mul_mv_q4_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_bf16")]]
+kernel void kernel_mul_mv_q4_K_bf16(
+        device const  void * src0,
+        device const bfloat * src1,
+        device       bfloat * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint tiisg[[thread_index_in_simdgroup]],
+        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q4_K_impl<bfloat>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
 void kernel_mul_mv_q5_K_f32_impl(
@@ -5186,10 +5240,14 @@ kernel void kernel_mul_mv_q5_K_f32(
     kernel_mul_mv_q5_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q6_K_f32_impl(
+// See kernel_mul_mv_q4_K_impl: T (float or bfloat) templates the activation load and dst store so a
+// bf16-native decode path skips the activation round-trip; f32 accumulation is unchanged, so T=float
+// is bit-identical to the prior kernel.
+template<typename T>
+void kernel_mul_mv_q6_K_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const T     * src1,
+        device       T     * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5227,7 +5285,7 @@ void kernel_mul_mv_q6_K_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q6_K * x = (device const block_q6_K *) src0 + first_row*nb + offset0;
-    device const float     * yy = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
+    device const T         * yy = (device const T          *) src1 + r1*ne10 + im*ne00*ne1;
 
     float sumf[NR0] = { 0.f };
     float yl[16];
@@ -5244,7 +5302,7 @@ void kernel_mul_mv_q6_K_f32_impl(
     const int q_offset_h =  32*ip + l0;
 
     for (int i = ix; i < nb; i += 2) {
-        device const float * y = yy + i * QK_K + y_offset;
+        device const T * y = yy + i * QK_K + y_offset;
 
         for (int l = 0; l < 4; ++l) {
             yl[4*l + 0] = y[l +  0];
@@ -5277,9 +5335,58 @@ void kernel_mul_mv_q6_K_f32_impl(
     for (int row = 0; row < NR0; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < ne0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = tot;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (T) tot;
         }
     }
+}
+
+// f32 forwarder — keeps the name the f32 host kernel and the MoE `mmv_fn` templates reference.
+void kernel_mul_mv_q6_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q6_K_impl<float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q6_K_bf16")]]
+kernel void kernel_mul_mv_q6_K_bf16(
+        device const  void * src0,
+        device const bfloat * src1,
+        device       bfloat * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q6_K_impl<bfloat>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q6_K_f32")]]

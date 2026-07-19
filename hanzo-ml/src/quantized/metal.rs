@@ -271,9 +271,18 @@ impl QMetalStorage {
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
-        let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
-        let encoder = device.command_encoder()?;
         let kdtype: hanzo_metal_kernels::GgmlDType = self.dtype.try_into()?;
+        // bf16-native decode: when the activation arrives in bf16 and the weight is a K-quant with a
+        // bf16 matvec, read/write bf16 directly (f32 accumulation) so the bf16<->f32 round-trip that
+        // GgufMatMul wraps around the projection disappears. Any other activation stays f32.
+        let src1_bf16 = storage.dtype() == DType::BF16
+            && matches!(
+                kdtype,
+                hanzo_metal_kernels::GgmlDType::Q4K | hanzo_metal_kernels::GgmlDType::Q6K
+            );
+        let out_dtype = if src1_bf16 { DType::BF16 } else { DType::F32 };
+        let dst = device.new_buffer(dst_shape.elem_count(), out_dtype, "qmatmul")?;
+        let encoder = device.command_encoder()?;
         // In some cases it would be better to use the mm variant, though it has its drawbacks
         // around memory alignment.
         for batch_id in 0..m {
@@ -286,13 +295,14 @@ impl QMetalStorage {
                 storage.buffer(),
                 (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
                 &self.buffer,
-                batch_id * n * DType::F32.size_in_bytes(),
+                batch_id * n * out_dtype.size_in_bytes(),
                 &dst,
+                src1_bf16,
             )
             .map_err(MetalError::from)?;
         }
         let dst_storage =
-            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), out_dtype);
         Ok((dst_storage, dst_shape))
     }
 
@@ -430,6 +440,7 @@ impl QMetalStorage {
                 weight_offset,
                 0,
                 &dst,
+                false,
             )
             .map_err(MetalError::from)?;
         } else {
