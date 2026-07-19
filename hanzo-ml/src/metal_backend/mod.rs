@@ -23,6 +23,30 @@ pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffse
         offset_in_bytes: l.start_offset() * dtype.size_in_bytes(),
     }
 }
+
+/// Reduce a strided layout to at most three effective dimensions for `copy3d`. Unit-extent
+/// dims contribute a constant zero offset and no output stride, so dropping them preserves
+/// both the contiguous destination index and the source offset of every element. Returns
+/// `(d0, d1, d2, s0, s1, s2)` (left-padded with unit dims) when at most three non-unit dims
+/// remain and the innermost is contiguous; `None` otherwise (caller keeps the generic path).
+fn reduce_copy3d(dims: &[usize], strides: &[usize]) -> Option<(usize, usize, usize, usize, usize, usize)> {
+    let mut kept: Vec<(usize, usize)> = dims
+        .iter()
+        .zip(strides.iter())
+        .filter(|(d, _)| **d > 1)
+        .map(|(d, s)| (*d, *s))
+        .collect();
+    if kept.is_empty() || kept.len() > 3 {
+        return None;
+    }
+    if kept.last().unwrap().1 != 1 {
+        return None;
+    }
+    while kept.len() < 3 {
+        kept.insert(0, (1, 0));
+    }
+    Some((kept[0].0, kept[1].0, kept[2].0, kept[0].1, kept[1].1, kept[2].1))
+}
 /// Simple way to catch lock error without
 /// depending on T
 #[derive(thiserror::Error, Debug)]
@@ -1814,6 +1838,27 @@ impl BackendStorage for MetalStorage {
                             dst_offset,
                         );
                     }
+                    // Non-uniform block stride (a batched transpose, e.g.
+                    // `contiguous(x.transpose(1, 2))`): the block starts jump at the outer
+                    // axis so a single copy2d cannot express it, but a 3D-gridded copy can,
+                    // avoiding the per-element multi-dimensional index divide of the generic
+                    // strided kernel. Drop unit dims; usable when at most three non-unit dims
+                    // remain with a contiguous innermost dim.
+                    if let Some((d0, d1, d2, s0, s1, s2)) =
+                        reduce_copy3d(src_l.dims(), strides)
+                    {
+                        return self.copy3d(
+                            dst,
+                            d0,
+                            d1,
+                            d2,
+                            s0,
+                            s1,
+                            s2,
+                            src_l.start_offset(),
+                            dst_offset,
+                        );
+                    }
                 }
             }
             let kernel_name = match self.dtype {
@@ -1849,6 +1894,60 @@ impl BackendStorage for MetalStorage {
 }
 
 impl MetalStorage {
+    /// Coalesced copy of a strided source with a contiguous innermost dim into a contiguous
+    /// destination, over three effective dims. Handles the batched-transpose layout (e.g.
+    /// `contiguous(x.transpose(1, 2))`) whose per-block source stride is non-uniform across
+    /// the outer axis and so cannot be a single `copy2d`, without falling back to the generic
+    /// per-element strided copy (a full multi-dimensional index divide per element).
+    #[allow(clippy::too_many_arguments)]
+    fn copy3d(
+        &self,
+        dst: &mut Self,
+        d0: usize,
+        d1: usize,
+        d2: usize,
+        s0: usize,
+        s1: usize,
+        s2: usize,
+        src_o: usize,
+        dst_o: usize,
+    ) -> Result<()> {
+        if d0 * d1 * d2 == 0 {
+            return Ok(());
+        }
+        let kernel_name = match self.dtype {
+            DType::F32 => hanzo_metal_kernels::copy3d::FLOAT,
+            DType::F16 => hanzo_metal_kernels::copy3d::HALF,
+            DType::BF16 => hanzo_metal_kernels::copy3d::BFLOAT,
+            DType::I64 => hanzo_metal_kernels::copy3d::I64,
+            DType::I32 => hanzo_metal_kernels::copy3d::I32,
+            DType::I16 => hanzo_metal_kernels::copy3d::I16,
+            DType::U32 => hanzo_metal_kernels::copy3d::U32,
+            DType::U8 => hanzo_metal_kernels::copy3d::U8,
+            dtype => crate::bail!("Metal copy3d {dtype:?} not implemented"),
+        };
+        let encoder = self.device.command_encoder()?;
+        encoder.set_label("copy3d");
+        hanzo_metal_kernels::call_copy3d(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            kernel_name,
+            &self.buffer,
+            &dst.buffer,
+            d0,
+            d1,
+            d2,
+            s0,
+            s1,
+            s2,
+            src_o * self.dtype.size_in_bytes(),
+            dst_o * self.dtype.size_in_bytes(),
+        )
+        .map_err(MetalError::from)?;
+        Ok(())
+    }
+
     pub fn new(buffer: Arc<Buffer>, device: MetalDevice, count: usize, dtype: DType) -> Self {
         Self {
             buffer,
