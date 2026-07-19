@@ -60,6 +60,7 @@ pub mod island;
 pub mod norm;
 pub mod rope;
 pub mod attn;
+pub mod flash;
 pub mod gdn;
 pub mod fuse;
 pub mod dag;
