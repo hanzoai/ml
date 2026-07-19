@@ -1257,9 +1257,13 @@ impl VulkanDevice {
         // reference for the bit-exact gate vulkan_q4k_dp4a_decode_matches_scalar).
         if self.inner.int_dot8 && std::env::var_os("VK_DP4A_DECODE_OFF").is_none() {
             let (xq, xs, xsum) = self.quantize_act_q8(x, 1, k)?;
-            // Block-reduce dp4a (one workgroup per output row, nt=64 threads tree-reduce over k) beats
-            // the 1-thread-per-row prefill GEMM at m=1 decode (~3x: 74 -> ~250 GB/s). Reads the verbatim
-            // packed weight; dense (woff==0) only. VK_DP4A_BLK_OFF forces the column kernel for the A/B.
+            // Block-reduce dp4a (matvec_q4k_dp4a_blk: one workgroup/row, 64 threads tree-reduce over k)
+            // is the fast dense decode matvec: quantize the activation to q8 once, then dp4a the Q4_K
+            // codes. Reads the verbatim packed weight; dense (woff == 0) only -- a resident MoE bank
+            // (woff != 0) uses the column kernel below. VK_DP4A_BLK_OFF forces the column kernel for the
+            // A/B. (The block kernel's f16 scale decode was subnormal-broken and garbled qwen3 decode;
+            // fixed in hanzo-kernel f16lo_to_f32 + the regenerated .spv, gated by
+            // dense_q4k_block_real_qwen3_weight_repro.)
             if woff == 0 && std::env::var_os("VK_DP4A_BLK_OFF").is_none() {
                 let meta = self.upload_u32(&[k as u32])?;
                 let bufs = [wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer, meta.buffer];
@@ -7071,6 +7075,424 @@ mod dsl_dispatch_proof {
             "[rms_norm-prod] {ROWS}x{N}  kernel {ms:.3} ms ({:.0} GB/s) -- the DSL block kernel is now the production rms_norm",
             bytes / (ms * 1e6)
         );
+    }
+
+    // Qwen3 decode garbles on Vulkan while qwen2 is coherent (same backend) and qwen3-on-CPU is
+    // coherent. The ONE structural qwen3 addition upstream of attention is per-head q/k RMSNorm
+    // (qk-norm) over head_dim, which qwen2 never exercises: it feeds `rms_norm` a many-row /
+    // small-column shape ([b,h,t,128]) the 4096x4096 test above never covers, then `rope`. This
+    // gates BOTH Vulkan kernels at the live decode/prefill shapes against a hand CPU oracle, plus
+    // the rms_norm->rope chain (buffer-lifetime across the deferred batch).
+    fn cpu_rms_norm(x: &[f32], w: &[f32], rows: usize, m: usize, eps: f32) -> Vec<f32> {
+        let mut out = vec![0f32; rows * m];
+        for r in 0..rows {
+            let ss: f32 = (0..m).map(|i| x[r * m + i] * x[r * m + i]).sum();
+            let denom = (ss / m as f32 + eps).sqrt();
+            for i in 0..m {
+                out[r * m + i] = x[r * m + i] / denom * w[i];
+            }
+        }
+        out
+    }
+
+    // NeoX rope reference matching rope.comp exactly. src [b,h,t,d]; cos/sin [t,d/2] (batched=false)
+    // or [b,t,d/2] (batched=true).
+    fn cpu_neox_rope(
+        src: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        b: usize,
+        h: usize,
+        t: usize,
+        d: usize,
+        batched: bool,
+    ) -> Vec<f32> {
+        let hd = d / 2;
+        let mut out = vec![0f32; b * h * t * d];
+        for bh_i in 0..b * h {
+            let b_i = bh_i / h;
+            for i_t in 0..t {
+                for i_d in 0..hd {
+                    let sbase = bh_i * t * d;
+                    let i1 = sbase + i_t * d + i_d;
+                    let i2 = i1 + hd;
+                    let mut i_cs = i_t * hd + i_d;
+                    if batched {
+                        i_cs += b_i * (t * hd);
+                    }
+                    let (c, s) = (cos[i_cs], sin[i_cs]);
+                    let (x1, x2) = (src[i1], src[i2]);
+                    out[i1] = x1 * c - x2 * s;
+                    out[i2] = x1 * s + x2 * c;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn qwen3_qk_norm_and_rope_match_cpu_at_decode_shapes() {
+        const EPS: f32 = 1e-6;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[qwen3-qknorm] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let genf = |seed: usize, i: usize| (((seed * 131 + i * 17) % 1000) as f32) / 500.0 - 1.0;
+
+        // (1) qk-norm rms_norm at the exact decode shapes: q = 32 heads x 128, k = 8 heads x 128.
+        for (rows, tag) in [(32usize, "q"), (8usize, "k")] {
+            const M: usize = 128;
+            let x: Vec<f32> = (0..rows * M).map(|i| genf(1, i)).collect();
+            let w: Vec<f32> = (0..M).map(|i| 0.5 + genf(2, i) * 0.1).collect();
+            let cpu = cpu_rms_norm(&x, &w, rows, M, EPS);
+            let xs = dev.upload_f32(&x).unwrap();
+            let ws = dev.upload_f32(&w).unwrap();
+            let got = xs
+                .rms_norm(&Layout::contiguous((rows, M)), &ws, &Layout::contiguous(M), EPS)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+            let maxerr = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!("[qwen3-qknorm] rms_norm {tag} {rows}x{M} maxerr={maxerr:.3e}");
+            assert!(maxerr < 1e-4, "rms_norm {tag} {rows}x{M} diverged: {maxerr:.3e}");
+        }
+
+        // (2) NeoX rope at decode (t=1) and prefill (t=8) shapes, both 2D [t,d/2] and 3D [b,t,d/2].
+        const D: usize = 128;
+        const HD: usize = D / 2;
+        for (b, h, t) in [(1usize, 32usize, 1usize), (1, 8, 1), (1, 32, 8), (1, 8, 8)] {
+            let src: Vec<f32> = (0..b * h * t * D).map(|i| genf(3, i)).collect();
+            // realistic cos/sin: cos^2+sin^2=1 from an angle table
+            let mut cos2d = vec![0f32; t * HD];
+            let mut sin2d = vec![0f32; t * HD];
+            for it in 0..t {
+                for id in 0..HD {
+                    let ang = (it as f32 + 1.0) / 10000f32.powf(2.0 * id as f32 / D as f32);
+                    cos2d[it * HD + id] = ang.cos();
+                    sin2d[it * HD + id] = ang.sin();
+                }
+            }
+            let srcs = dev.upload_f32(&src).unwrap();
+            // 2D cos/sin -> unbatched=0
+            let c2 = dev.upload_f32(&cos2d).unwrap();
+            let s2 = dev.upload_f32(&sin2d).unwrap();
+            let got2 = srcs
+                .rope(
+                    &Layout::contiguous((b, h, t, D)),
+                    &c2,
+                    &Layout::contiguous((t, HD)),
+                    &s2,
+                    &Layout::contiguous((t, HD)),
+                )
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+            let cpu2 = cpu_neox_rope(&src, &cos2d, &sin2d, b, h, t, D, false);
+            let e2 = got2
+                .iter()
+                .zip(&cpu2)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!("[qwen3-qknorm] rope2D b{b}h{h}t{t} maxerr={e2:.3e}");
+            assert!(e2 < 1e-4, "rope 2D b{b}h{h}t{t} diverged: {e2:.3e}");
+
+            // 3D cos/sin [b,t,d/2] -> unbatched=1 (the decode gather shape)
+            let got3 = srcs
+                .rope(
+                    &Layout::contiguous((b, h, t, D)),
+                    &c2,
+                    &Layout::contiguous((b, t, HD)),
+                    &s2,
+                    &Layout::contiguous((b, t, HD)),
+                )
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+            let cpu3 = cpu_neox_rope(&src, &cos2d, &sin2d, b, h, t, D, true);
+            let e3 = got3
+                .iter()
+                .zip(&cpu3)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!("[qwen3-qknorm] rope3D b{b}h{h}t{t} maxerr={e3:.3e}");
+            assert!(e3 < 1e-4, "rope 3D b{b}h{h}t{t} diverged: {e3:.3e}");
+        }
+
+        // (3) The chain: rms_norm(q) then rope(., cos, sin) at the decode shape, no intermediate sync
+        // (stresses buffer lifetime across the deferred batch, the qwen3 live path).
+        {
+            let (b, h, t) = (1usize, 32usize, 1usize);
+            let x: Vec<f32> = (0..b * h * t * D).map(|i| genf(5, i)).collect();
+            let w: Vec<f32> = (0..D).map(|i| 0.5 + genf(6, i) * 0.1).collect();
+            let mut cos2d = vec![0f32; t * HD];
+            let mut sin2d = vec![0f32; t * HD];
+            for id in 0..HD {
+                let ang = 3.0 / 10000f32.powf(2.0 * id as f32 / D as f32);
+                cos2d[id] = ang.cos();
+                sin2d[id] = ang.sin();
+            }
+            let normed = cpu_rms_norm(&x, &w, b * h * t, D, EPS);
+            let cpu = cpu_neox_rope(&normed, &cos2d, &sin2d, b, h, t, D, false);
+            let xs = dev.upload_f32(&x).unwrap();
+            let ws = dev.upload_f32(&w).unwrap();
+            let cs = dev.upload_f32(&cos2d).unwrap();
+            let ss = dev.upload_f32(&sin2d).unwrap();
+            let normed_gpu = xs
+                .rms_norm(&Layout::contiguous((b * h * t, D)), &ws, &Layout::contiguous(D), EPS)
+                .unwrap();
+            let got = normed_gpu
+                .rope(
+                    &Layout::contiguous((b, h, t, D)),
+                    &cs,
+                    &Layout::contiguous((t, HD)),
+                    &ss,
+                    &Layout::contiguous((t, HD)),
+                )
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+            let e = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!("[qwen3-qknorm] rms_norm->rope chain b{b}h{h}t{t} maxerr={e:.3e}");
+            assert!(e < 1e-4, "rms_norm->rope chain diverged: {e:.3e}");
+        }
+    }
+
+    // Qwen3-4B decodes garbage on Vulkan while qwen2 (same backend) and qwen3-on-CPU are coherent;
+    // the root cause is the dense Q4_K decode matvec. This gates the shipped default (column dp4a,
+    // `mul_mat_q4k_dp4a`) bit-exact vs a CPU dequant matvec at the exact qwen3-4B projection shapes
+    // (k=2560 for q/k/gate/up, k=4096 for o) plus a qwen2 control (k=2048).
+    #[test]
+    fn dense_q4k_decode_matches_cpu_at_qwen3_shapes() {
+        use crate::quantized::k_quants::{BlockQ4K, GgmlType};
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[q4k-blk-dense] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let gen_w = |row: usize, i: usize| (((row * 13 + i * 7) % 1000) as f32) / 500.0 - 1.0;
+        let gen_x = |i: usize| (((i * 17 + 5) % 800) as f32) / 400.0 - 1.0;
+        // (nout, k): qwen3-4B q_proj(4096,2560) k/v_proj(1024,2560) o_proj(2560,4096); qwen2 ctrl(2048,2048).
+        for (nout, k) in [
+            (4096usize, 2560usize),
+            (1024, 2560),
+            (2560, 4096),
+            (2048, 2048),
+        ] {
+            let nb = k / 256;
+            let mut blocks: Vec<BlockQ4K> =
+                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut wdeq = vec![0f32; nout * k];
+            for r in 0..nout {
+                let rowf: Vec<f32> = (0..k).map(|i| gen_w(r, i)).collect();
+                BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+                BlockQ4K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * k..(r + 1) * k]);
+            }
+            let u32s: &[u32] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36)
+            };
+            let wq = dev.upload_u32(u32s).unwrap();
+            let x: Vec<f32> = (0..k).map(gen_x).collect();
+            let mut cpu = vec![0f32; nout];
+            for (r, c) in cpu.iter_mut().enumerate() {
+                *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
+            }
+            let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+            let rel = |got: &[f32]| {
+                got.iter()
+                    .zip(&cpu)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max)
+                    / maxref
+            };
+            let got = dev.matvec_q4k(&wq, &x, nout, k).unwrap(); // production default = column dp4a
+            let rdef = rel(&got);
+            eprintln!("[q4k-decode] default nout={nout} k={k} rel={rdef:.3e}");
+            assert!(rdef < 2e-2, "default dense q4k decode diverged nout={nout} k={k}: {rdef:.3e}");
+        }
+    }
+
+    // Gates the shipped default (column dp4a) under the engine's real dispatch pattern: many dense
+    // matvecs at TWO different k (2560 for q/k, 4096 for o) interleaved into ONE deferred batch with
+    // NO intermediate sync (hold every out, read at the end) -- the pooled-buffer-lifetime stress the
+    // per-call test's to_vec flush hides. All bit-exact vs CPU == the batch keeps every op's operands.
+    #[test]
+    fn dense_q4k_decode_batched_two_k_no_sync() {
+        use crate::quantized::k_quants::{BlockQ4K, GgmlType};
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[q4k-blk-batch] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let gen_w = |seed: usize, row: usize, i: usize| {
+            (((seed * 5 + row * 13 + i * 7) % 1000) as f32) / 500.0 - 1.0
+        };
+        let gen_x = |seed: usize, i: usize| (((seed * 11 + i * 3) % 800) as f32) / 400.0 - 1.0;
+        // Build a (nout,k) packed Q4_K weight + its CPU dequant, upload it, upload x, return (wq, x, cpu).
+        let build = |seed: usize, nout: usize, k: usize| {
+            let nb = k / 256;
+            let mut blocks: Vec<BlockQ4K> =
+                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut wdeq = vec![0f32; nout * k];
+            for r in 0..nout {
+                let rowf: Vec<f32> = (0..k).map(|i| gen_w(seed, r, i)).collect();
+                BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+                BlockQ4K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * k..(r + 1) * k]);
+            }
+            let u32s: &[u32] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36)
+            };
+            let wq = dev.upload_u32(u32s).unwrap();
+            let x: Vec<f32> = (0..k).map(|i| gen_x(seed, i)).collect();
+            let xs = dev.upload_f32(&x).unwrap();
+            let mut cpu = vec![0f32; nout];
+            for (r, c) in cpu.iter_mut().enumerate() {
+                *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
+            }
+            (wq, xs, cpu)
+        };
+        // Two shapes at DIFFERENT k, mirroring qwen3-4B q_proj (k=2560) and o_proj (k=4096).
+        let (wq_a, xa, cpu_a) = build(1, 1024, 2560);
+        let (wq_b, xb, cpu_b) = build(2, 1024, 4096);
+        // Interleave block dispatches with NO read in between (all deferred into one batch). 80 rounds =
+        // 160 block dispatches -> 160 dropped pooled `meta` buffers, matching a ~40-layer decode forward
+        // (the engine allocates one fresh meta per q/k/v/o Q4_K matvec) -- stresses pool/meta churn.
+        let mut outs: Vec<(&str, VulkanStorage, &Vec<f32>)> = Vec::new();
+        for _ in 0..80 {
+            outs.push(("a", dev.matvec_q4k_gpu(&wq_a, &xa, 1024, 2560).unwrap(), &cpu_a));
+            outs.push(("b", dev.matvec_q4k_gpu(&wq_b, &xb, 1024, 4096).unwrap(), &cpu_b));
+        }
+        // Read now (first readback flushes+fences the whole batch).
+        let mut worst = 0f32;
+        for (tag, out, cpu) in &outs {
+            let got = out.to_vec_f32().unwrap();
+            let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+            let rel = got.iter().zip(cpu.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+                / maxref;
+            if rel > 5e-3 {
+                eprintln!("[q4k-blk-batch] {tag} DIVERGED rel={rel:.3e}");
+            }
+            worst = worst.max(rel);
+        }
+        eprintln!("[q4k-decode-batch] 160 interleaved k=2560/4096 dispatches, no sync: worst_rel={worst:.3e}");
+        assert!(worst < 2e-2, "batched dense q4k decode diverged: {worst:.3e}");
+    }
+
+    // Gates the shipped default (column dp4a) when the activation is produced by rms_norm IN THE SAME
+    // BATCH (attn_norm -> quantize_act_q8 -> matvec), never pre-flushed -- the engine's real q_proj
+    // chain. Bit-exact vs a CPU rms_norm+matvec == the deferred RAW barrier between rms_norm and the
+    // matvec is correct.
+    #[test]
+    fn dense_q4k_decode_activation_produced_in_batch() {
+        use crate::quantized::k_quants::{BlockQ4K, GgmlType};
+        const NOUT: usize = 4096;
+        const K: usize = 2560;
+        const EPS: f32 = 1e-6;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[q4k-blk-inbatch] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let nb = K / 256;
+        let gen_w = |row: usize, i: usize| (((row * 13 + i * 7) % 1000) as f32) / 500.0 - 1.0;
+        let mut blocks: Vec<BlockQ4K> =
+            (0..NOUT * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut wdeq = vec![0f32; NOUT * K];
+        for r in 0..NOUT {
+            let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
+            BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+            BlockQ4K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * K..(r + 1) * K]);
+        }
+        let u32s: &[u32] =
+            unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36) };
+        let wq = dev.upload_u32(u32s).unwrap();
+        // Pre-norm input + rms weight; CPU computes act = rms_norm then q = W @ act.
+        let pre: Vec<f32> = (0..K).map(|i| (((i * 17 + 5) % 800) as f32) / 400.0 - 1.0).collect();
+        let nw: Vec<f32> = (0..K).map(|i| 0.9 + (((i * 3) % 100) as f32) / 500.0).collect();
+        let ss: f32 = pre.iter().map(|v| v * v).sum();
+        let denom = (ss / K as f32 + EPS).sqrt();
+        let act: Vec<f32> = (0..K).map(|i| pre[i] / denom * nw[i]).collect();
+        let cpu_q: Vec<f32> = (0..NOUT)
+            .map(|r| (0..K).map(|i| wdeq[r * K + i] * act[i]).sum())
+            .collect();
+        let maxref = cpu_q.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+        // GPU: rms_norm produces the activation IN-BATCH; block matvec reads it with NO sync.
+        let pres = dev.upload_f32(&pre).unwrap();
+        let nws = dev.upload_f32(&nw).unwrap();
+        let actg = pres
+            .rms_norm(&Layout::contiguous((1, K)), &nws, &Layout::contiguous(K), EPS)
+            .unwrap();
+        let out = dev.matvec_q4k_gpu(&wq, &actg, NOUT, K).unwrap();
+        let got = out.to_vec_f32().unwrap();
+        let rel = got.iter().zip(&cpu_q).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+        eprintln!("[q4k-blk-inbatch] q_proj k={K} nout={NOUT} (act from in-batch rms_norm) rel={rel:.3e}");
+        assert!(rel < 2e-2, "block dp4a with in-batch activation diverged: {rel:.3e}");
+    }
+
+    // Regression for the f16lo_to_f32 SUBNORMAL bug that garbled qwen3 Vulkan decode: build a Q4_K
+    // weight where some super-blocks have a subnormal fp16 scale (a tiny weight range -> d = amax/15
+    // lands in the fp16 subnormal domain ~6e-8..6e-5) -- exactly the regime real trained weights hit
+    // and that BlockQ4K::from_float on uniform [-1,1] data never produces (so the earlier synthetic
+    // gates missed it). The block kernel's manual fp16 decode must match the CPU BlockQ4K::to_float
+    // dequant; the old normal-only decode diverged ~10% on subnormal-scale super-blocks and, amplified
+    // by the near-cancellation of the affine dp4a sum (sub-block partials hundreds of x the output),
+    // produced decode gibberish. Real qwen3-4B blk.0.attn_q was the field repro (block-vs-cpu 12.9%).
+    #[test]
+    fn dense_q4k_block_subnormal_f16_scales() {
+        use crate::quantized::k_quants::{BlockQ4K, GgmlType};
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[q4k-subnormal] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let (nout, k) = (512usize, 2560usize); // multi-pass; mixes normal- and subnormal-scale blocks
+        let nb = k / 256;
+        let gen = |r: usize, i: usize| (((r * 13 + i * 7) % 1000) as f32) / 500.0 - 1.0;
+        let mut blocks: Vec<BlockQ4K> =
+            (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut wdeq = vec![0f32; nout * k];
+        for r in 0..nout {
+            let rowf: Vec<f32> = (0..k)
+                .map(|i| {
+                    // every 3rd super-block: tiny range -> subnormal fp16 d/dmin.
+                    let amp = if (i / 256) % 3 == 0 { 1.5e-5 } else { 0.4 };
+                    gen(r, i) * amp
+                })
+                .collect();
+            BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+            BlockQ4K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * k..(r + 1) * k]);
+        }
+        let u32s: &[u32] =
+            unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36) };
+        let wq = dev.upload_u32(u32s).unwrap();
+        let x: Vec<f32> = (0..k).map(|i| (((i * 17 + 5) % 800) as f32) / 400.0 - 1.0).collect();
+        let mut cpu = vec![0f32; nout];
+        for (r, c) in cpu.iter_mut().enumerate() {
+            *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
+        }
+        let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+        let block = dev.matvec_q4k(&wq, &x, nout, k).unwrap(); // production default = block kernel
+        let rel = block.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+        eprintln!("[q4k-subnormal] block kernel vs CPU, subnormal-scale super-blocks: rel={rel:.3e}");
+        assert!(rel < 2e-2, "block dp4a mis-decodes subnormal fp16 scales: {rel:.3e} (f16lo_to_f32 regression)");
     }
 
     // The production `add_rmsnorm` method dispatches the DSL block-per-row fused kernel
