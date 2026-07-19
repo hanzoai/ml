@@ -20,6 +20,7 @@
 
 /// The lowering engine, behind a stable path so `#[kernel]` never has to name `cubecl` and neither
 /// does kernel source. Values, not places: the engine can be swapped without touching a kernel.
+pub mod flash;
 pub mod engine {
     pub use cubecl::cube;
 }
