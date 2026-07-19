@@ -4,7 +4,10 @@
 // feeds the cores:
 //   * decode the Q4_K scale/min ONCE per 32-element sub-block, then unpack that sub-block's 32 nibbles;
 //   * BK=32 aligned to the Q4_K sub-block; BM=128 so each weight sub-block is decoded once per 128 rows;
-//   * WG=256 = 4 wave64 subgroups, each owning RM row tiles x RN col tiles of accumulator fragments;
+//   * WG=256 = 4 wave64 subgroups in a SQUARE 2x2 warp grid, each owning a WMT*T x WNT*T (64x64) region
+//     of the 128x128 block. The four warps split BOTH the s_a rows and the s_b columns two ways, so each
+//     warp reads only its 64 s_b columns -- vs a wide 4x1 stacking where every warp re-reads all 128 s_b
+//     columns, quadrupling the cold-weight LDS traffic that feeds the matrix cores (the measured bound);
 //   * SINGLE-BUFFERED K loop (llama's `shared FLOAT_TYPEV2 buf_a[...]`, no double buffer): the weight
 //     streams from GTT at a small fraction of DRAM peak, so a double buffer's global-read/compute
 //     overlap hides latency that is already hidden -- while its 2x LDS caps occupancy. Halving the LDS
@@ -155,41 +158,46 @@ void stage(uint koff, uint row0, uint col0, uint nblocks) {
     }
 }
 
+// Square warp grid: each warp owns a WMT*T x WNT*T region of the BM x BN block. With BM=BN=128 and 4
+// warps this is a 2x2 grid of 64x64 warps, so the four warps split BOTH the s_a rows and the s_b columns
+// two ways -- unlike the wide 4x1 stacking where every warp re-reads all BN s_b columns. Halves the
+// redundant s_b (cold weight) LDS traffic that feeds the matrix cores. WMT*WNT == RM*RN accumulators.
+const uint WMT = 4u;
+const uint WNT = 4u;
+const uint WGR = BM / (WMT * T);               // warp-grid rows (2)
+
 void main() {
     uint nblocks = k / QK_K;
     uint row0 = gl_WorkGroupID.y * BM;
     uint col0 = gl_WorkGroupID.x * BN;
     uint warp = gl_SubgroupID;                 // 0..NWARP-1 on wave64
+    uint warp_r = warp % WGR;                   // 0..1
+    uint warp_c = warp / WGR;                   // 0..1
     uint nsteps = k / BK;
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[RM][RN];
-    [[unroll]] for (uint i = 0u; i < RM; i++)
-        [[unroll]] for (uint j = 0u; j < RN; j++)
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[WMT][WNT];
+    [[unroll]] for (uint i = 0u; i < WMT; i++)
+        [[unroll]] for (uint j = 0u; j < WNT; j++)
             acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
     for (uint s = 0u; s < nsteps; s++) {
         stage(s * BK, row0, col0, nblocks);
         barrier();
         if (warp < NWARP) {
-            // A fragments: [M-tile][K-subtile]. s_a is [M, K/2] f16vec2 -> K-subtile kc lands at pair
-            // offset kc*(T/2) and the row stride is SA_STRIDE pairs; RowMajor.
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[RM][2];
-            [[unroll]] for (uint i = 0u; i < RM; i++)
-                [[unroll]] for (uint kc = 0u; kc < 2u; kc++)
-                    coopMatLoad(ma[i][kc], s_a, (warp * RM + i) * T * SA_STRIDE + kc * (T / 2u), SA_STRIDE,
-                                gl_CooperativeMatrixLayoutRowMajor);
-            // Load the RN B-fragments for one K-subtile at a time and reuse the registers across the two
-            // K-subtiles. Halves the peak live B-fragment count (RN vs 2*RN) so the 16 f32 accumulators
-            // fit in registers without a scratch spill; math is identical (the two K-subtiles accumulate
-            // into acc in sequence rather than after a joint load). s_b is the transposed weight [N, K/2]
-            // f16vec2; ColumnMajor presents it as the [K, N] B fragment, K-subtile kc at pair kc*(T/2).
+            // Per K-subtile: load this warp's WMT A row-tiles once, then stream the WNT B col-tiles one at
+            // a time (one live B), reusing each across the WMT rows. s_a is [M, K/2] RowMajor; s_b is the
+            // transposed weight [N, K/2] presented ColumnMajor; K-subtile kc lands at pair kc*(T/2).
             [[unroll]] for (uint kc = 0u; kc < 2u; kc++) {
-                [[unroll]] for (uint j = 0u; j < RN; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[WMT];
+                [[unroll]] for (uint i = 0u; i < WMT; i++)
+                    coopMatLoad(ma[i], s_a, (warp_r * WMT + i) * T * SA_STRIDE + kc * (T / 2u), SA_STRIDE,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint j = 0u; j < WNT; j++) {
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
-                    coopMatLoad(mb, s_b, (j * T) * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
+                    coopMatLoad(mb, s_b, (warp_c * WNT + j) * T * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
                                 gl_CooperativeMatrixLayoutColumnMajor);
-                    [[unroll]] for (uint i = 0u; i < RM; i++)
-                        acc[i][j] = coopMatMulAdd(ma[i][kc], mb, acc[i][j]);
+                    [[unroll]] for (uint i = 0u; i < WMT; i++)
+                        acc[i][j] = coopMatMulAdd(ma[i], mb, acc[i][j]);
                 }
             }
         }
@@ -197,10 +205,10 @@ void main() {
     }
 
     if (warp < NWARP) {
-        [[unroll]] for (uint i = 0u; i < RM; i++) {
-            uint orow = row0 + (warp * RM + i) * T;
-            [[unroll]] for (uint j = 0u; j < RN; j++) {
-                uint ocol = col0 + j * T;
+        [[unroll]] for (uint i = 0u; i < WMT; i++) {
+            uint orow = row0 + (warp_r * WMT + i) * T;
+            [[unroll]] for (uint j = 0u; j < WNT; j++) {
+                uint ocol = col0 + (warp_c * WNT + j) * T;
                 if (orow < mcount && ocol < nout)
                     coopMatStore(acc[i][j], y, orow * nout + ocol, nout,
                                  gl_CooperativeMatrixLayoutRowMajor);
