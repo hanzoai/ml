@@ -603,6 +603,67 @@ mod tests {
         gate::<CpuRuntime>(&c, 2, 1, 512, 512, 128, true, 32, "prefill 512 causal MHA d128");
     }
 
+    /// The f16 cooperative-matrix arm, EXECUTED on RADV (Vulkan/wgpu), matched against the materialized
+    /// two-pass reference across the same production shape space as the CPU oracle. `flash_attn_run`
+    /// derives `Target::Vulkan` from `WgpuRuntime` and launches the WHOLE grid at once (one workgroup
+    /// per (batch,head,query-tile)) -- the production launch, not the CPU oracle's cube-by-cube walk
+    /// (real GPU SharedMemory is per-workgroup, so there is no cross-cube aliasing to sidestep). Gate is
+    /// the f16-tensor-core tolerance (~1e-3..1e-2 scale-relative for the chained f16 QK + f16 PV), not
+    /// the scalar arm's ~1e-7. This is the on-GPU gate that the CPU oracle cannot give (cubecl-cpu
+    /// rejects every CoopMma op); it validates the ColMajor-K -> Kᵀ fragment layout, the PV store
+    /// stride, the partial-tile zero-pad on ragged seq, and the f16 QK/PV precision, all on real silicon.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn flash_coopmat_matches_ref_on_vulkan() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        let mut fails = 0usize;
+        // RADV gfx1151's coopmat runs at subgroupSize=64 (VkPhysicalDeviceCooperativeMatrixPropertiesKHR),
+        // so the plane (workgroup lane count) MUST be 64 -- a 32-lane launch feeds the 16x16 f16 fragment
+        // only half its lanes, and the output tile past ~query-row 1 is undefined (decode, seq_q=1, reads
+        // only row 0, so it hides the bug; multi-row prefill exposes it). mmq_q4k / sdpa_blk bake 64 too.
+        let plane = 64usize;
+        let mut gate_gpu = |nh: usize, nkv: usize, sq: usize, sk: usize, d: usize, causal: bool, tag: &str| {
+            let q = rnd(nh * sq * d, 0x1234_5678);
+            let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
+            let v = rnd(nkv * sk * d, 0x0FED_CBA9);
+            // Whole-grid Vulkan launch (Target::of(WgpuRuntime) = Vulkan -> the coopmat arm).
+            let got = flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, plane);
+            let want = sdpa_ref(&q, &k, &v, nh, nkv, sq, sk, d, causal);
+            let rel = scale_rel(&got, &want);
+            let nonfin = got.iter().filter(|x| !x.is_finite()).count();
+            // On failure, localize the first disagreeing element (row-major [nh, sq, d]) -- a fragment
+            // layout / mask / OOB bug shows up as a clean row or column boundary.
+            let where_ = if rel < 2e-3 {
+                String::new()
+            } else {
+                got.iter().zip(&want).enumerate()
+                    .find(|(_, (g, w))| (**g - **w).abs() > 1e-2 || !g.is_finite())
+                    .map(|(i, (g, w))| {
+                        let (h, rem) = (i / (sq * d), i % (sq * d));
+                        format!(" first-bad@[h{h},q{},d{}] got={g:.3e} want={w:.3e}", rem / d, rem % d)
+                    })
+                    .unwrap_or_default()
+            };
+            eprintln!("[flash-vk {tag}] nh{nh}/nkv{nkv} sq{sq} sk{sk} d{d} causal{causal} scale_rel={rel:.2e} nonfinite={nonfin}{where_}");
+            if !(rel < 2e-2) { fails += 1; }
+        };
+        // The same 10 shapes as the CPU oracle `flash_matches_materialized_ref_on_cpu`: decode (ragged
+        // kv 1/17), decode aligned/long GQA, prefill causal + non-causal, GQA and MHA, single + multi
+        // query-tile, the ragged-tail sq40, and the 512x512 d128. d in {32,64,128}; every one on RADV.
+        gate_gpu(4, 2, 1, 1, 32, false, "decode kv1");
+        gate_gpu(4, 2, 1, 17, 32, false, "decode kv17 (ragged tail)");
+        gate_gpu(4, 2, 1, 128, 32, false, "decode kv128");
+        gate_gpu(8, 2, 1, 512, 64, false, "decode kv512 GQA4");
+        gate_gpu(4, 2, 16, 128, 32, true, "prefill qt1 causal GQA2");
+        gate_gpu(4, 2, 16, 128, 32, false, "prefill qt1 noncausal GQA2");
+        gate_gpu(4, 4, 16, 64, 64, true, "prefill qt1 MHA causal d64");
+        gate_gpu(4, 2, 48, 48, 32, true, "prefill 3-tile causal GQA2 (aligned)");
+        gate_gpu(6, 3, 40, 40, 64, true, "prefill causal GQA2 tail sq40 d64");
+        gate_gpu(2, 1, 512, 512, 128, true, "prefill 512 causal MHA d128");
+        assert_eq!(fails, 0, "flash coopmat: {fails} shape(s) exceeded 2e-2 vs materialized sdpa_ref");
+    }
+
     /// The production surface (`flash_attn_run`, which derives the island tag from the runtime) resolves
     /// to the scalar oracle on CPU with no caller naming a target -- and matches the materialized ref.
     /// The cmma accelerated arm is never forced onto CPU: cubecl-cpu rejects every CoopMma op, so the
