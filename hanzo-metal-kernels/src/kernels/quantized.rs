@@ -136,8 +136,9 @@ pub fn call_quantized_matmul_mv_t_offset(
             (nth0, nth1, align)
         }
         GgmlDType::Q4K => {
+            // 2 simdgroups (64 threads) so kernel_mul_mv_q4_K runs ggml N_SG=2 x N_R0=2.
             let nth0 = 4;
-            let nth1 = 8;
+            let nth1 = 16;
             let align = 4;
             (nth0, nth1, align)
         }
@@ -148,9 +149,10 @@ pub fn call_quantized_matmul_mv_t_offset(
             (nth0, nth1, align)
         }
         GgmlDType::Q6K => {
+            // 2 simdgroups x N_R0=2 rows/threadgroup (ggml N_SG_Q6_K=2, N_R0_Q6_K=2).
             let nth0 = 2;
             let nth1 = 32;
-            let align = 2;
+            let align = 4;
             (nth0, nth1, align)
         }
         GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K => {
