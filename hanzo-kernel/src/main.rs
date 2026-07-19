@@ -671,7 +671,7 @@ fn main() {
             let q = vec![0.1f32; 2 * 16 * 128];
             let k = vec![0.1f32; 1 * 32 * 128];
             let v = k.clone();
-            hanzo_kernel::flash::flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, 2, 1, 16, 32, 32, 128, true, 64)
+            hanzo_kernel::flash::flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, 2, 1, 16, 32, 32, 128, true)
         });
         match r {
             Ok(_) => println!("flash dump: dispatch succeeded (coopmat adapter) -- .spv emitted"),
