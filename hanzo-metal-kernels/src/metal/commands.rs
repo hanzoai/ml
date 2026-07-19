@@ -8,14 +8,61 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
 const DEFAULT_METAL_COMPUTE_PER_BUFFER: usize = 50;
+
+/// GPU occupancy telemetry, gated by `METAL_PROFILE_GPU`. Each committed command buffer reports its
+/// own on-GPU interval (`GPUEndTime - GPUStartTime`) from a completion handler; the totals are read
+/// and reset at each host sync point (`flush_and_wait{,_current}`) — one report per decode token /
+/// per prefill forward. Comparing accumulated GPU-busy time to the host wall of the same window
+/// separates GPU-bound work from host/orchestration bubbles (the Metal analog of VK_PROFILE_GPU).
+struct GpuProfile {
+    busy_ns: AtomicU64,
+    buffers: AtomicUsize,
+    dispatches: AtomicUsize,
+    window_start: Mutex<Instant>,
+}
+
+impl GpuProfile {
+    fn new() -> Self {
+        Self {
+            busy_ns: AtomicU64::new(0),
+            buffers: AtomicUsize::new(0),
+            dispatches: AtomicUsize::new(0),
+            window_start: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn report_and_reset(&self, phase: &str) {
+        let disp = self.dispatches.swap(0, Ordering::Relaxed);
+        let busy_ms = self.busy_ns.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        let buffers = self.buffers.swap(0, Ordering::Relaxed);
+        let wall_ms = {
+            let mut ws = self.window_start.lock().unwrap();
+            let w = ws.elapsed().as_secs_f64() * 1e3;
+            *ws = Instant::now();
+            w
+        };
+        if disp == 0 {
+            return;
+        }
+        let busy_pct = if wall_ms > 0.0 {
+            busy_ms / wall_ms * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[MTL_GPU] {phase} busy={busy_ms:.3}ms wall={wall_ms:.3}ms busy%={busy_pct:.0} buffers={buffers} disp={disp}"
+        );
+    }
+}
 
 fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, MetalKernelError> {
     command_queue.commandBuffer().map(CommandBuffer::new).ok_or(
@@ -117,6 +164,9 @@ pub struct Commands {
     /// Global cross-encoder output map. Maps buffer pointer to the fence of the last encoder
     /// that wrote it, enabling cross-command-buffer ordering for HazardTrackingModeUntracked.
     prev_ce_outputs: PrevCeOutputs,
+    /// `METAL_PROFILE_GPU` GPU-occupancy telemetry (no-op unless the env var is set).
+    profile: bool,
+    prof: Arc<GpuProfile>,
 }
 
 unsafe impl Send for Commands {}
@@ -146,12 +196,17 @@ impl Commands {
             compute_per_buffer,
             device,
             prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
+            profile: std::env::var("METAL_PROFILE_GPU").is_ok(),
+            prof: Arc::new(GpuProfile::new()),
         })
     }
 
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
+        if self.profile {
+            self.prof.dispatches.fetch_add(1, Ordering::Relaxed);
+        }
         let flush = count >= self.compute_per_buffer;
 
         if flush {
@@ -184,6 +239,9 @@ impl Commands {
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
+        if self.profile {
+            self.prof.dispatches.fetch_add(1, Ordering::Relaxed);
+        }
         let flush = count >= self.compute_per_buffer;
 
         if flush {
@@ -252,6 +310,10 @@ impl Commands {
 
         self.prev_ce_outputs.lock()?.clear();
 
+        if self.profile {
+            self.prof.report_and_reset("flush");
+        }
+
         Ok(())
     }
 
@@ -271,6 +333,9 @@ impl Commands {
             state
                 .in_flight
                 .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
+        }
+        if self.profile {
+            self.prof.report_and_reset("token");
         }
         Ok(())
     }
@@ -294,6 +359,24 @@ impl Commands {
 
         match state.current.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
+                if self.profile {
+                    let prof = Arc::clone(&self.prof);
+                    let block =
+                        RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                            let cb = unsafe { cb.as_ref() };
+                            let dt = cb.GPUEndTime() - cb.GPUStartTime();
+                            if dt > 0.0 {
+                                prof.busy_ns.fetch_add((dt * 1e9) as u64, Ordering::Relaxed);
+                            }
+                            prof.buffers.fetch_add(1, Ordering::Relaxed);
+                        });
+                    unsafe {
+                        state
+                            .current
+                            .as_ref()
+                            .addCompletedHandler(RcBlock::as_ptr(&block));
+                    }
+                }
                 state.current.commit();
             }
             _ => {}
