@@ -26,15 +26,38 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : enable
 
+// Tunable schedule (the autotune genome). Each knob is `#ifndef`-defaulted to the shipped value so a
+// no-`-D` compile is byte-identical to the committed SPIR-V (the tuner's byte-identical gate); the
+// tuner overrides them with `glslc -DHK_*` to compile a variant. RM/RN/NWARP set the accumulator tile
+// geometry (BM = NWARP*RM*T rows, BN = RN*T cols, WG = NWARP*64 lanes); HK_PAD is the LDS
+// anti-bank-aliasing stride pad. HK_WG is derived (NWARP*64) but named separately because a layout
+// qualifier needs a bare literal. BK stays 32 (the Q4_K sub-block width the decode below is written
+// against) and single-buffering stays fixed -- both are refuted knobs, carried only as autotune priors
+// (deny-list), never realized here.
+#ifndef HK_RM
+#define HK_RM 2u
+#endif
+#ifndef HK_RN
+#define HK_RN 8u
+#endif
+#ifndef HK_NWARP
+#define HK_NWARP 4u
+#endif
+#ifndef HK_WG
+#define HK_WG 256
+#endif
+#ifndef HK_PAD
+#define HK_PAD 4u
+#endif
 const uint T = 16u;             // cooperative-matrix tile edge
-const uint RM = 2u;             // row tiles per warp
-const uint RN = 8u;             // column tiles per warp (BN = 128)
-const uint NWARP = 4u;          // subgroups per workgroup; wave64 => WG/64 == NWARP
+const uint RM = HK_RM;          // row tiles per warp
+const uint RN = HK_RN;          // column tiles per warp (BN = 128)
+const uint NWARP = HK_NWARP;    // subgroups per workgroup; wave64 => WG/64 == NWARP
 const uint BM = NWARP * RM * T; // 128
 const uint BN = RN * T;         // 128
 const uint BK = 32u;            // one Q4_K sub-block per K-step
 const uint WG = NWARP * 64u;    // 256
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = HK_WG, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly  buffer W { uint  w[]; };   // Q4_K blocks, 36 u32 / 256-block
 layout(set = 0, binding = 1) readonly  buffer X { float x[]; };   // activations, row-major [M, k]
@@ -49,8 +72,8 @@ const uint BLK_U32 = 36u;
 // same bank set, throttling the loads that feed the matrix cores; +4 breaks the aliasing -- llama's
 // mul_mm.comp uses the same SHMEM_STRIDE = BK/2 + 4). s_a holds activations [M, K/2]; s_b holds the
 // transposed weight [N, K/2].
-const uint SA_STRIDE = BK / 2u + 4u;      // 20 pairs
-const uint SB_STRIDE = BK / 2u + 4u;      // 20 pairs
+const uint SA_STRIDE = BK / 2u + HK_PAD;      // 20 pairs
+const uint SB_STRIDE = BK / 2u + HK_PAD;      // 20 pairs
 shared f16vec2 s_a[BM * SA_STRIDE];       // [M=128, K/2=16(pad20)] row-major, single-buffered
 shared f16vec2 s_b[BN * SB_STRIDE];       // [N=128, K/2=16(pad20)] row-major (transposed W), single
 
