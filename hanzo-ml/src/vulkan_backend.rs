@@ -103,7 +103,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // q(0), k(1), v(2), out(3), scale(4), meta(5)=[seq_q,seq_k,n_kv_groups,causal].
         "sdpa_blk" => include_bytes!("vulkan/spv/sdpa_blk.spv"),
         // DSL flash attention on the cooperative-matrix path (hanzo-kernel flash::flash_attn, d=128
-        // plane=32 BR=BC=16 baked): tiled online softmax where BOTH matmuls (Q@Kᵀ, P@V) run as f16
+        // plane=64 BR=BC=16 baked): tiled online softmax where BOTH matmuls (Q@Kᵀ, P@V) run as f16
         // 16x16x16 coopmat (OpCooperativeMatrixMulAddKHR, f16 A/B -> f32 acc, subgroup scope). One
         // workgroup (cube) computes one (batch,head,query-tile) of 16 rows; the whole grid launches at
         // once (meta[8]=cube_base=0). GQA-native, causal-optional, runtime seq_q/seq_k via meta.
@@ -2500,7 +2500,7 @@ impl VulkanDevice {
             0u32, // cube_base = 0: dispatch the whole grid (production launch)
         ])?;
         let bufs = [q.buffer, k.buffer, v.buffer, out.buffer, scale.buffer, meta.buffer];
-        // Grid = one cube per (batch, head, query-tile); BR=16 query rows per tile. plane=32 (LocalSize).
+        // Grid = one cube per (batch, head, query-tile); BR=16 query rows per tile. plane=64 (LocalSize).
         let cubes = (b * n_heads * seq_q.div_ceil(16)) as u32;
         self.dispatch_outs("flash_attn_dsl", &bufs, &[3], &[], (cubes, 1, 1))?;
         Ok(out)
@@ -7467,7 +7467,7 @@ mod dsl_dispatch_proof {
         assert!(worst < 1e-4, "sdpa_blk DSL diverged from CPU: scale_rel={worst:.3e}");
     }
 
-    // The committed DSL flash-attention coopmat .spv (`flash_attn_dsl`, d=128 plane=32 BR=BC=16)
+    // The committed DSL flash-attention coopmat .spv (`flash_attn_dsl`, d=128 plane=64 BR=BC=16)
     // dispatched through ml's own VulkanDevice. Both matmuls (Q@Kᵀ, P@V) run on the f16 16x16x16
     // cooperative-matrix path (OpCooperativeMatrixMulAddKHR, f16 A/B -> f32 acc, subgroup scope), so
     // the gate is the f16-tensor-core tolerance (~1e-3..1e-2 scale-relative), NOT the scalar arm's
