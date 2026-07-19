@@ -110,6 +110,32 @@ template <typename T>
     output[dst_idx] = input[src_idx];
 }
 
+// Coalesced copy of a strided source whose innermost dimension is contiguous into a
+// contiguous destination, expressed over three dimensions. Unlike the generic strided
+// copy (one full multi-dimensional modulo/divide per element in get_strided_index), each
+// thread derives its source offset from the grid position directly (three fused multiply-
+// adds, no division). The innermost dim maps to grid x so adjacent lanes read/write
+// contiguous addresses. This is the natural extension of copy2d to a batched-transpose
+// layout (e.g. contiguous(x.transpose(1, 2))), whose block stride is non-uniform across
+// the outer axis and therefore cannot be expressed as a single copy2d.
+template <typename T>
+[[kernel]] void copy3d(
+    constant int64_t &d0,
+    constant int64_t &d1,
+    constant int64_t &d2,
+    constant int64_t &s0,
+    constant int64_t &s1,
+    constant int64_t &s2,
+    device const T *input,
+    device T *output,
+    uint3 idx [[thread_position_in_grid]]
+) {
+    if (idx.x >= (uint)d2 || idx.y >= (uint)d1 || idx.z >= (uint)d0) return;
+    int64_t src_idx = (int64_t)idx.z * s0 + (int64_t)idx.y * s1 + (int64_t)idx.x * s2;
+    int64_t dst_idx = ((int64_t)idx.z * d1 + (int64_t)idx.y) * d2 + (int64_t)idx.x;
+    output[dst_idx] = input[src_idx];
+}
+
 // Unary functions
 template <typename T> METAL_FUNC T erf(T in){
     // constants
@@ -220,6 +246,9 @@ define_unary_op(utanh, precise::tanh(x));
 #define init_copy2d(tname, t)  \
     init_kernel("copy2d_" #tname, copy2d, t)
 
+#define init_copy3d(tname, t)  \
+    init_kernel("copy3d_" #tname, copy3d, t)
+
 #define init_const_set(tname, t)                    \
     init_kernel("const_set_" #tname, const_set, t)  \
     init_kernel("const_set_" #tname "_strided", const_set_strided, t)
@@ -250,6 +279,8 @@ init_unary_float(tanh, utanh);
 // Initialize copy2d kernels
 init_copy2d(f32, float);
 init_copy2d(f16, half);
+init_copy3d(f32, float);
+init_copy3d(f16, half);
 
 // Initialize const_set kernels
 init_const_set(f32, float);
@@ -257,6 +288,7 @@ init_const_set(f16, half);
 
 #if defined(__HAVE_BFLOAT__)
 init_copy2d(bf16, bfloat);
+init_copy3d(bf16, bfloat);
 init_const_set(bf16, bfloat);
 #endif
 
@@ -266,6 +298,8 @@ init_unary(copy, uid, u32, uint32_t);
 
 init_copy2d(u8, uint8_t);
 init_copy2d(u32, uint32_t);
+init_copy3d(u8, uint8_t);
+init_copy3d(u32, uint32_t);
 
 init_const_set(u8, uint8_t);
 init_const_set(u32, uint32_t);
@@ -273,8 +307,11 @@ init_const_set(u32, uint32_t);
 #if __METAL_VERSION__ >= 220
 init_unary(copy, uid, i64, int64_t);
 init_copy2d(i64, int64_t);
+init_copy3d(i64, int64_t);
 init_const_set(i64, int64_t);
 #endif
 
 init_copy2d(i32, int32_t);
 init_copy2d(i16, int16_t);
+init_copy3d(i32, int32_t);
+init_copy3d(i16, int16_t);
