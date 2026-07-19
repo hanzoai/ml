@@ -1155,6 +1155,26 @@ struct Sdpa {
     do_causal: bool,
 }
 
+// Flash-decoding for the Vulkan decode attention (cached; the decode path re-enters vulkan_fwd once
+// per layer per token). Default ON -- the split-K kernel fills the GPU vs the one-workgroup-per-head
+// sdpa_blk (256 VGPR / min occupancy). VK_SDPA_SPLIT_OFF=1 reverts for A/B; matches vk_sdpa_graph.
+#[cfg(feature = "vulkan")]
+fn vk_sdpa_split() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("VK_SDPA_SPLIT_OFF").map(|v| v == "0").unwrap_or(true))
+}
+#[cfg(feature = "vulkan")]
+fn vk_sdpa_nsplit() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VK_SDPA_NSPLIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(8)
+    })
+}
+
 impl hanzo_ml::CustomOp3 for Sdpa {
     fn name(&self) -> &'static str {
         "metal-sdpa"
@@ -1219,10 +1239,19 @@ impl hanzo_ml::CustomOp3 for Sdpa {
             hanzo_ml::bail!("sdpa_blk vulkan: k/v need matching strides, head_dim contiguous, offset 0");
         }
         let dev = q.device().clone();
-        let out = dev.sdpa_blk_vk(
-            q, k, v, b, h, hkv, sq, l, d, self.scale, self.do_causal,
-            ks[0], ks[1], ks[2],
-        )?;
+        // Flash-decoding A/B (VK_SDPA_SPLIT=1): the split-K occupancy fix vs the one-workgroup-per-head
+        // sdpa_blk. n_split via VK_SDPA_NSPLIT (default 4). Eager path only; the graph path is separate.
+        let out = if vk_sdpa_split() {
+            dev.sdpa_decode_split_vk(
+                q, k, v, b, h, hkv, sq, l, d, self.scale, vk_sdpa_nsplit(),
+                ks[0], ks[1], ks[2],
+            )?
+        } else {
+            dev.sdpa_blk_vk(
+                q, k, v, b, h, hkv, sq, l, d, self.scale, self.do_causal,
+                ks[0], ks[1], ks[2],
+            )?
+        };
         Ok((out, Shape::from_dims(&[b, h, sq, d])))
     }
 

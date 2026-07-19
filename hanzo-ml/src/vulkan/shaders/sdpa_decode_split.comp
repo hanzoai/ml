@@ -1,0 +1,73 @@
+#version 450
+// Flash-decoding phase 1 (single-query decode attention, seq_q==1). The lone decode query launches only
+// b*n_heads workgroups under the one-workgroup-per-(head) kernels, leaving most CUs idle and each
+// workgroup memory-latency-bound with no sibling waves to hide it. This splits the KV sequence across
+// `n_split` workgroups per (batch, head) -- grid (b*n_heads, n_split) -- so the GPU fills (16 heads ->
+// 16*n_split workgroups) and per-CU occupancy hides the KV-read latency. Each workgroup is ONE wave64
+// subgroup: lane owns head_dim slots {t, t+64} (head_dim 128), subgroupAdd reduces the q.k dot with no
+// LDS and no acc[] register array, so VGPR pressure is a handful (vs the 256-VGPR one-query kernel) and
+// many waves co-reside per CU. Online (flash) softmax over this split's key slice yields a partial
+// (acc, m, l) written to scratch; sdpa_decode_reduce combines the n_split partials. GQA-native strided
+// KV (no repeat_kv, no per-layer cache copy). Non-causal: a decode query attends the whole cache.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly  buffer Q  { float q[]; };
+layout(set = 0, binding = 1) readonly  buffer K  { float k[]; };
+layout(set = 0, binding = 2) readonly  buffer V  { float v[]; };
+layout(set = 0, binding = 3) writeonly buffer PA { float pacc[]; }; // [rows*n_split*D], un-normalized acc
+layout(set = 0, binding = 4) writeonly buffer PM { float pm[]; };   // [rows*n_split], running max
+layout(set = 0, binding = 5) writeonly buffer PL { float pl[]; };   // [rows*n_split], running denom
+// seq_k rides an SSBO (not the push constant) so a captured decode graph -- whose command buffer bakes
+// push constants once -- can advance the attended span in place per replay. Layout matches VkGraphAttn:
+// [seq_q, seq_k, ...]; only meta[1] (seq_k) is read here.
+layout(set = 0, binding = 6) readonly buffer META { uint meta[]; };
+layout(push_constant) uniform Pc {
+    uint H; uint Hkv; uint D; float scale; uint n_split;
+    uint kv_batch_stride; uint kv_head_stride; uint key_stride;
+};
+
+void main() {
+    uint row = gl_WorkGroupID.x;   // (b, head) flattened as b*H + h
+    uint split = gl_WorkGroupID.y; // 0..n_split-1
+    uint b = row / H;
+    uint h = row - b * H;
+    uint kvh = h / (H / Hkv);
+    uint t = gl_LocalInvocationID.x; // lane 0..63
+    uint L = meta[1];                // attended key count (seq_k), advanced per graph replay
+
+    uint q_base = row * D;                                  // q is [b,H,1,D] contiguous
+    uint kv_base = b * kv_batch_stride + kvh * kv_head_stride;
+
+    // This split's contiguous key range [k0, k1).
+    uint per = (L + n_split - 1u) / n_split;
+    uint k0 = split * per;
+    uint k1 = min(k0 + per, L);
+
+    uint d0 = t, d1 = t + 64u;
+    bool h0 = d0 < D, h1 = d1 < D;
+    float q0 = h0 ? q[q_base + d0] : 0.0;
+    float q1 = h1 ? q[q_base + d1] : 0.0;
+
+    float m = -1e30, l = 0.0, a0 = 0.0, a1 = 0.0;
+    for (uint j = k0; j < k1; j++) {
+        uint kb = kv_base + j * key_stride;
+        float part = q0 * (h0 ? k[kb + d0] : 0.0) + q1 * (h1 ? k[kb + d1] : 0.0);
+        float score = subgroupAdd(part) * scale;
+        float mn = max(m, score);
+        float corr = exp(m - mn);
+        float p = exp(score - mn);
+        l = l * corr + p;
+        a0 = a0 * corr + p * (h0 ? v[kb + d0] : 0.0);
+        a1 = a1 * corr + p * (h1 ? v[kb + d1] : 0.0);
+        m = mn;
+    }
+
+    uint pbase = (row * n_split + split) * D;
+    if (h0) { pacc[pbase + d0] = a0; }
+    if (h1) { pacc[pbase + d1] = a1; }
+    if (t == 0u) {
+        pm[row * n_split + split] = m;
+        pl[row * n_split + split] = l;
+    }
+}
