@@ -1503,17 +1503,28 @@ pub fn matvec_q8_dp4a_i8_run<R: Runtime>(
 // layout. This is the production-swap-shaped kernel (vs the synthetic-layout dp4a benchmark below).
 // ============================================================================================
 
-// fp16 bits (low 16 of `h`) -> f32. Bit-exact for the normal + zero fp16 domain (Q8_0 block scales are
-// always a normal positive fp16 = amax/127); exp bias fixup 15->127 is +112<<10 = 0x1C000, mant<<13.
+// fp16 bits (low 16 of `h`) -> f32, bit-exact over the FULL fp16 domain including SUBNORMALS (Fabian
+// Giesen's half_to_float). Q4_K/Q6_K block d/dmin scales are frequently subnormal fp16 (small scales),
+// which the old normal-only exp fixup (`mag + 0x1C000`) decoded wrong; the resulting per-weight decode
+// error, amplified by the near-cancellation of the affine dp4a sum (sub-block partials are hundreds of
+// x the output), garbled qwen3 decode. Renormalize subnormals via one f32 subtract of the magic bias.
 #[device]
 fn f16lo_to_f32(h: u32) -> f32 {
-    let sign = (h & 0x8000) << 16;
-    let mag = h & 0x7FFF;
-    let mut bits = sign;
-    if mag != 0 {
-        bits = sign | ((mag + 0x1C000) << 13);
+    let magic = 113u32 << 23; // 2^-14 in f32 bits, the subnormal renormalization bias
+    let shifted_exp = 0x7C00u32 << 13; // fp16 exponent mask, shifted into f32 position
+    let mut o = (h & 0x7FFF) << 13; // exponent + mantissa, shifted to f32
+    let exp = shifted_exp & o;
+    o += (127u32 - 15) << 23; // rebias fp16 exp (15) to f32 exp (127)
+    if exp == shifted_exp {
+        o += (128u32 - 16) << 23; // Inf/NaN: extra exp adjust
     }
-    f32::reinterpret(bits)
+    if exp == 0u32 {
+        o += 1u32 << 23; // Zero/subnormal: extra exp adjust, then renormalize
+        let f = f32::reinterpret(o) - f32::reinterpret(magic);
+        o = u32::reinterpret(f);
+    }
+    o = o | ((h & 0x8000) << 16); // sign
+    f32::reinterpret(o)
 }
 
 // signed 8-bit lane `p` in {0,8,16,24} of `word` as a float, sign-extended (b in 0..255 -> b-256 if b>=128).
