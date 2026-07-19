@@ -582,10 +582,28 @@ pub enum Verdict {
 /// dispatch. `measure` is the EXPENSIVE tier: it runs the survivor on the device and returns SUSTAINED
 /// milliseconds (lower is better) -- warmed past the boost window, because a burst number is a lie for a
 /// throttling part. The search only ever `measure`s a config that `static_check` passed.
+///
+/// # `measure` MUST hold the deployment regime, not a warm microbench
+///
+/// `measure` is the oracle the whole search trusts; if it measures the wrong regime every winner is a
+/// lie, and a lying oracle is worse than no tuner. The failure mode is concrete and recorded: a single-
+/// tile microbench reuses one weight, so after the first iteration that weight is served from cache and
+/// the kernel runs at its isolated COMPUTE ceiling -- where an occupancy knob (more subgroups) looks like
+/// a win. The deployment never sees that ceiling: decode streams every weight cache-cold from GTT
+/// (bandwidth-bound) and prefill drains a barrier between dispatches (utilization-slaved DVFS downclock),
+/// and BOTH impose an occupancy-INDEPENDENT floor the extra occupancy cannot lift (it changes occupancy,
+/// not bytes moved or dispatch count). So `measure` MUST hold the config in its deployment memory regime
+/// -- stream the weights cache-cold from a working set past the last-level cache, evicted between timed
+/// iterations, not a cache-resident single tile. A warm oracle once scored an over-occupied coopmat
+/// schedule +24% that measured flat in-engine; the golden gate `cold_oracle_scores_nwarp8_flat` is the
+/// committed regression on exactly this, and `hanzo-ml`'s `CoopmatEval` is the on-device realization
+/// (a weight bank sized past the MALL, streamed pipelined so the GTT link stays saturated).
 pub trait Evaluator {
     /// Free tier. Called first for every distinct config.
     fn static_check(&self, cfg: &Config) -> Verdict;
-    /// Expensive tier. Called only on configs that passed `static_check`. Returns sustained ms.
+    /// Expensive tier. Called only on configs that passed `static_check`. Returns sustained ms measured
+    /// in the config's DEPLOYMENT memory regime (cold-weight-streamed past the cache), never a cache-warm
+    /// single tile -- see the trait note; a warm number crowns occupancy wins the deployment never sees.
     fn measure(&self, cfg: &Config, iters: usize) -> f64;
 }
 
