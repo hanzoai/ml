@@ -8,10 +8,14 @@
 //!
 //! Multi-fidelity, as the search demands: the FREE static tier compiles the variant and reads its RADV
 //! shader stats, rejecting a register-spilling or over-LDS schedule before it costs a dispatch; the
-//! EXPENSIVE tier bit-exact-checks the survivor against the dp4a oracle and times it SUSTAINED (warmed,
-//! back-to-back, so the integrated GPU's utilization-slaved clock is at its steady state -- a burst
-//! number is a lie for this part). The refutation log is encoded as the space's deny-list, so the hunt
-//! never spends a dispatch re-disproving a knob a prior hunt already killed (BK=64, BN=64, double-buffer).
+//! EXPENSIVE tier bit-exact-checks the survivor against the dp4a oracle and times it COLD -- rotating a
+//! weight bank larger than the GPU's last-level cache so every timed GEMM streams its weight cold from
+//! GTT, isolated by a synchronize (the barrier-drained regime the real forward pays). A single reused
+//! tile fits the cache and measures on-chip occupancy the deployment never sees; that warm oracle is the
+//! campaign's #1 scar -- it crowned NWARP=8 as a +24% win that measured flat in-engine (refutation #27).
+//! The [`cold_oracle_agrees_with_in_engine`] test is the committed gate on this fitness. The refutation
+//! log is encoded as the space's deny-list, so the hunt never spends a dispatch re-disproving a knob a
+//! prior hunt already killed (BK=64, BN=64, double-buffer).
 
 use super::*;
 use crate::backend::BackendDevice;
@@ -32,6 +36,10 @@ const COMMITTED_SPV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vulkan/spv
 const LDS_BUDGET: usize = 32 * 1024;
 /// coopmat tile edge (hardware 16x16x16; not a knob).
 const TILE: i64 = 16;
+/// Cold-stream timing passes per fitness eval; the minimum is taken. The integrated GPU's clock is
+/// utilization-slaved and drifts across a hunt, so one pass ranks by the clock a config happened to catch;
+/// the min over a few passes is the least-drift-polluted time, making configs measured apart comparable.
+const MEASURE_REPEATS: usize = 3;
 /// Correctness gate: coopmat rounds weight+activation to f16, dp4a rounds the activation to int8, so the
 /// two agree only to a scale-relative f16 bound accumulated over k (same as `q4k_coopmat_matches_dp4a`).
 const GATE: f32 = 2e-2;
@@ -196,14 +204,16 @@ fn rand_tag() -> u64 {
 
 // --- the evaluator -------------------------------------------------------------------------------
 
-/// The two-tier fitness for the coopmat genome over a fixed shape. Holds the resident weight, activation,
-/// and dp4a oracle so every variant is checked and timed against the same ground truth. Interior
-/// mutability because [`Evaluator`] is `&self`: the compiled bytes cached from the static tier feed the
-/// GPU tier, and a last-installed marker avoids rebuilding the pipeline between the two.
+/// The two-tier fitness for the coopmat genome over a fixed shape. Holds the resident cold-weight bank,
+/// activation, and dp4a oracle so every variant is checked and timed against the same ground truth. The
+/// timing tier rotates the whole bank (cold-weight streaming); `bank[0]` is the correctness weight the
+/// oracle was computed from. Interior mutability because [`Evaluator`] is `&self`: the compiled bytes
+/// cached from the static tier feed the GPU tier, and a last-installed marker avoids rebuilding the
+/// pipeline between the two.
 struct CoopmatEval<'a> {
     dev: &'a VulkanDevice,
     space: &'a Space,
-    wq: &'a VulkanStorage,
+    bank: &'a [VulkanStorage],
     xh: &'a VulkanStorage,
     oracle: &'a [f32],
     maxref: f32,
@@ -231,7 +241,26 @@ impl<'a> CoopmatEval<'a> {
     }
 
     fn run_once(&self) -> crate::Result<Vec<f32>> {
-        self.dev.matmul_q4k_coopmat_variant(self.wq, self.xh, self.m, self.n, self.k)?.to_vec_f32()
+        self.dev.matmul_q4k_coopmat_variant(&self.bank[0], self.xh, self.m, self.n, self.k)?.to_vec_f32()
+    }
+
+    /// One cold-weight-streaming, GTT-saturated timing pass over the installed variant: rotate the whole
+    /// >2xMALL bank so every GEMM reads its weight COLD from GTT, PIPELINED (no per-dispatch sync) so
+    /// consecutive GEMMs overlap and keep the GTT link saturated -- the memory-bandwidth-bound regime the
+    /// real prefill runs in. A warmup of two full rotations drives the utilization-slaved clock to its
+    /// steady high state (still cold per-tile: rotation guarantees eviction) before the timed window.
+    fn cold_pipe_ms(&self, iters: usize) -> f64 {
+        let nb = self.bank.len();
+        for i in 0..(2 * nb) {
+            let _ = self.dev.matmul_q4k_coopmat_variant(&self.bank[i % nb], self.xh, self.m, self.n, self.k);
+        }
+        let _ = self.dev.synchronize();
+        let t = std::time::Instant::now();
+        for i in 0..iters {
+            let _ = self.dev.matmul_q4k_coopmat_variant(&self.bank[i % nb], self.xh, self.m, self.n, self.k);
+        }
+        let _ = self.dev.synchronize();
+        t.elapsed().as_secs_f64() * 1e3 / iters as f64
     }
 }
 
@@ -252,7 +281,7 @@ impl<'a> Evaluator for CoopmatEval<'a> {
         // Build the pipeline once and read its RADV stats; reject a spilling schedule before any timing.
         if self.shaderstats {
             self.install(cfg);
-            let (res, text) = capture_stderr(|| self.dev.matmul_q4k_coopmat_variant(self.wq, self.xh, self.m, self.n, self.k));
+            let (res, text) = capture_stderr(|| self.dev.matmul_q4k_coopmat_variant(&self.bank[0], self.xh, self.m, self.n, self.k));
             let _ = self.dev.synchronize();
             if res.is_ok() {
                 let st = parse_stats(&text);
@@ -284,47 +313,86 @@ impl<'a> Evaluator for CoopmatEval<'a> {
             eprintln!("[hunt] {} DIVERGED scale_rel={rel:.2e} > {GATE:.0e}", cfg.name(self.space));
             return f64::INFINITY;
         }
-        // Sustained: warm past the boost window (keep the GPU busy so the utilization-slaved clock rises),
-        // then time a back-to-back run. Same harness shape as mmq_q4k_coopmat_vs_dp4a_prefill_ab.
-        for _ in 0..10 {
-            let _ = self.dev.matmul_q4k_coopmat_variant(self.wq, self.xh, self.m, self.n, self.k);
-        }
-        let _ = self.dev.synchronize();
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            let _ = self.dev.matmul_q4k_coopmat_variant(self.wq, self.xh, self.m, self.n, self.k);
-        }
-        let _ = self.dev.synchronize();
-        t.elapsed().as_secs_f64() * 1e3 / iters as f64
+        // COLD-WEIGHT-STREAMING, GTT-SATURATED fitness -- the campaign's #1 scar made a gate. A single
+        // reused tile fits the 32 MB MALL and is served warm after iter 1, measuring on-chip occupancy the
+        // deployment never sees -- that is why the warm winner NWARP=8 scored +24% but was flat in-engine.
+        // [`cold_pipe_ms`] instead streams cold weights through a saturated GTT link, the memory-bandwidth-
+        // bound regime the real prefill runs in, where extra occupancy (NWARP 4->8) converts to nothing so
+        // the oracle correctly does NOT crown NWARP=8. Take the MINIMUM over several passes: the integrated
+        // GPU's clock is utilization-slaved and drifts across a long hunt, so a single pass ranks configs by
+        // whatever clock they caught (a false +24% for a config measured hot). The minimum is each config's
+        // least-drift-polluted cold-stream time, making configs measured minutes apart comparable. The
+        // whole-forward DVFS downclock is still not reproducible in a busy microbench, so a genuine winner
+        // must be confirmed in-engine before it changes a default.
+        (0..MEASURE_REPEATS).map(|_| self.cold_pipe_ms(iters)).fold(f64::INFINITY, f64::min)
     }
 }
 
-/// Build a resident Q4_K weight, an activation, and the dp4a oracle (the trusted int8 path) for `shape`.
-fn build_inputs(dev: &VulkanDevice, m: usize, n: usize, k: usize) -> (VulkanStorage, VulkanStorage, Vec<f32>, f32) {
+/// The gfx1151 last-level ("MALL"/Infinity) cache is 32 MB (rocminfo L3). A weight working-set that fits
+/// it is served warm after the first touch -- so a single reused tile measures on-chip occupancy, not the
+/// cold GTT weight stream the real forward pays. The cold oracle sizes its bank to exceed this.
+const MALL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bytes of one Q4_K weight tile of `n` rows x `k` cols (n*(k/256) blocks of 144 B).
+fn tile_bytes(n: usize, k: usize) -> usize {
+    n * (k / 256) * std::mem::size_of::<BlockQ4K>()
+}
+
+/// Build one resident Q4_K weight tile (`n` rows x `k` cols) from `seed`. Distinct seeds give distinct
+/// device buffers at distinct addresses, so a bank of them does not alias in cache. Real Q4_K blocks
+/// (valid f16 d/dmin) -- random bytes would seed Inf/NaN f16 scales.
+fn build_weight(dev: &VulkanDevice, seed: u64, n: usize, k: usize) -> VulkanStorage {
     let nb = k / 256;
-    let mut s = 0x0BADC0DE_CAFEF00Du64;
+    let mut s = seed | 1;
     let mut next = || {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
         s
     };
-    // Real Q4_K blocks (valid f16 d/dmin) -- random bytes would seed Inf/NaN f16 scales.
     let mut blocks: Vec<BlockQ4K> = (0..n * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
     for r in 0..n {
         let rowf: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
         BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
     }
-    let wq_bytes: &[u8] =
+    let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, blocks.len() * std::mem::size_of::<BlockQ4K>()) };
-    let wq = dev.upload_qweight(wq_bytes).unwrap();
+    dev.upload_qweight(bytes).unwrap()
+}
+
+/// A cold-weight bank: enough distinct tiles that rotating through them evicts each before its next use,
+/// so every timed GEMM reads its weight COLD from GTT (the deployment regime). Sized past 2x the MALL so
+/// the tiles touched between two uses of any one tile (>= MALL) guarantee its eviction; >= 4 tiles minimum
+/// so a short rotation still cycles cold.
+fn build_bank(dev: &VulkanDevice, n: usize, k: usize) -> Vec<VulkanStorage> {
+    let n_tiles = ((2 * MALL_BYTES).div_ceil(tile_bytes(n, k)) + 1).max(4);
+    (0..n_tiles).map(|i| build_weight(dev, 0xC01D_0000u64.wrapping_add(i as u64).wrapping_mul(0x9E3779B1), n, k)).collect()
+}
+
+/// Build the cold-weight bank (whose `bank[0]` doubles as the correctness weight), an activation, and the
+/// dp4a oracle (the trusted int8 path) computed on `bank[0]`. The bank exceeds the MALL so the timing tier
+/// streams cold weights; the oracle anchors the bit-exact gate folded into fitness.
+fn build_bank_and_oracle(
+    dev: &VulkanDevice,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> (Vec<VulkanStorage>, VulkanStorage, Vec<f32>, f32) {
+    let bank = build_bank(dev, n, k);
+    let mut s = 0x1234_5678_9ABC_DEF0u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
     let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
     let xh = dev.upload_f32(&x).unwrap();
     unsafe { std::env::set_var("VK_Q4K_COOPMAT_OFF", "1") };
-    let oracle = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+    let oracle = dev.matmul_q4k_gpu(&bank[0], &xh, m, n, k).unwrap().to_vec_f32().unwrap();
     unsafe { std::env::remove_var("VK_Q4K_COOPMAT_OFF") };
     let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
-    (wq, xh, oracle, maxref)
+    (bank, xh, oracle, maxref)
 }
 
 #[cfg(test)]
@@ -393,7 +461,14 @@ mod tests {
             return;
         }
         let (m, n, k) = (512usize, 11008usize, 2048usize); // ffn gate/up -- the dominant coopmat shape
-        let (wq, xh, oracle, maxref) = build_inputs(&dev, m, n, k);
+        let (bank, xh, oracle, maxref) = build_bank_and_oracle(&dev, m, n, k);
+        eprintln!(
+            "[hunt] cold bank: {} tiles x {} MB = {} MB (MALL {} MB) -- timing streams cold weights",
+            bank.len(),
+            tile_bytes(n, k) >> 20,
+            (bank.len() * tile_bytes(n, k)) >> 20,
+            MALL_BYTES >> 20
+        );
         let space = coopmat_space();
         let feasible = space.enumerate().len();
         let tmp = std::env::temp_dir().join(format!("hk-coopmat-hunt-{}", std::process::id()));
@@ -402,7 +477,7 @@ mod tests {
         let eval = CoopmatEval {
             dev: &dev,
             space: &space,
-            wq: &wq,
+            bank: &bank,
             xh: &xh,
             oracle: &oracle,
             maxref,
@@ -472,5 +547,95 @@ mod tests {
         // The hunt must crown a real, bit-exact winner.
         assert!(report.best_ms.is_finite(), "no measurable winner");
         assert!(eval.worst_rel.get() < GATE, "a measured variant diverged from the oracle");
+    }
+
+    /// THE ACCEPTANCE GATE for the fitness oracle (GPU; runs whenever a coopmat device is present, skips
+    /// gracefully otherwise). The cold oracle must make the DEPLOYMENT decision on the warm hunt's winner
+    /// `NWARP=8,RM=1` vs the shipped incumbent `NWARP=4,RM=2`: DO NOT crown NWARP=8. The CTO measured that
+    /// variant in-engine at coopmat op 181 ms UNCHANGED / pp512 1750.4 vs 1745.5 = flat (refutation #27),
+    /// while the old WARM microbench crowned it a +24% win. The cold-pipelined oracle streams cold weights
+    /// through a saturated GTT (the memory-bandwidth-bound regime the real prefill runs in) and scores
+    /// NWARP=8 at ~-10% -- i.e. NOT a win, so a hunt keeps the incumbent, matching the in-engine action.
+    /// (An isolated per-dispatch-synchronized loop instead spuriously credits NWARP=8's occupancy ~+11% at
+    /// an unsaturated link; the on-chip DVFS downclock of the whole forward is not reproducible in a busy
+    /// microbench, so a real winner must still be in-engine-confirmed.) If this ever scores NWARP=8 a win
+    /// past the band, the oracle has regressed to a warm/unsaturated regime and no winner it produces can be
+    /// trusted to change a default. Encodes the golden negative-control as a committed assertion.
+    #[test]
+    fn cold_oracle_agrees_with_in_engine() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[cold-oracle] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        if dev.coopmat_info().is_none() {
+            eprintln!("[cold-oracle] no coopmat; skipping");
+            return;
+        }
+        let (m, n, k) = (512usize, 11008usize, 2048usize); // ffn gate/up -- the shape refutation #27 measured
+        let (bank, xh, oracle, maxref) = build_bank_and_oracle(&dev, m, n, k);
+        let space = coopmat_space();
+        let tmp = std::env::temp_dir().join(format!("hk-cold-oracle-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let eval = CoopmatEval {
+            dev: &dev,
+            space: &space,
+            bank: &bank,
+            xh: &xh,
+            oracle: &oracle,
+            maxref,
+            m,
+            n,
+            k,
+            tmp: tmp.clone(),
+            shaderstats: false,
+            compiled: RefCell::new(HashMap::new()),
+            installed: RefCell::new(None),
+            worst_rel: Cell::new(0.0),
+        };
+        assert!(
+            bank.len() * tile_bytes(n, k) > 2 * MALL_BYTES,
+            "cold bank {} MB must exceed 2x the {} MB MALL to guarantee eviction",
+            (bank.len() * tile_bytes(n, k)) >> 20,
+            MALL_BYTES >> 20
+        );
+
+        let incumbent_cfg = incumbent(&space); // NWARP=4,RM=2 -- the shipped default
+        let warm_winner = space.config(&[("NWARP", 8), ("RM", 1), ("RN", 8), ("PAD", 4), ("BK", 32), ("DBUF", 0)]);
+        // Both must reach the GPU tier (compile + pass static) for the comparison to be meaningful.
+        for cfg in [&incumbent_cfg, &warm_winner] {
+            match eval.static_check(cfg) {
+                Verdict::Pass => {}
+                Verdict::Reject(why) => panic!("golden config {} statically rejected: {why}", cfg.name(&space)),
+            }
+        }
+        // measure() already takes the min over MEASURE_REPEATS cold-stream passes (drift-resistant), so one
+        // call per config is the honest fitness -- exactly what the hunt uses.
+        let ms_inc = eval.measure(&incumbent_cfg, 30);
+        let ms_warm = eval.measure(&warm_winner, 30);
+        let delta = (ms_inc - ms_warm) / ms_inc * 100.0; // + => NWARP=8 scored faster (the illusion to reject)
+        eprintln!(
+            "[cold-oracle] {m}x{n}x{k}  incumbent {} = {ms_inc:.3} ms | warm-winner {} = {ms_warm:.3} ms | delta {delta:+.1}%  (warm microbench crowned it +24%; cold-pipe scores it NOT-a-win, matching in-engine flat)",
+            incumbent_cfg.name(&space),
+            warm_winner.name(&space)
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert!(ms_inc.is_finite() && ms_warm.is_finite(), "a golden config failed to measure");
+        assert!(eval.worst_rel.get() < GATE, "a golden variant diverged from the oracle (scale_rel {:.2e})", eval.worst_rel.get());
+        // The cold-pipelined (saturated) oracle scores NWARP=8 at ~-10% (NOT a win) -- it makes the same
+        // decision as in-engine (keep the incumbent). The warm microbench inflated it to +17-24%, and an
+        // isolated per-dispatch-synchronized loop credits it ~+11%; both would wrongly crown NWARP=8. The
+        // 6% ceiling passes the saturated-cold verdict with margin while failing every regime that crowns
+        // NWARP=8 -- exceed it and the oracle has regressed to a warm or unsaturated fitness.
+        const CROWN_CEILING: f64 = 6.0;
+        assert!(
+            delta < CROWN_CEILING,
+            "cold oracle scored the warm winner NWARP=8/RM=1 a {delta:+.1}% win over the incumbent -- the \
+             ORACLE regressed to a warm/unsaturated regime (in-engine measured this pair flat, refutation \
+             #27; the saturated cold-pipe oracle scores it ~-10%). Fix the cold-stream fitness."
+        );
     }
 }
