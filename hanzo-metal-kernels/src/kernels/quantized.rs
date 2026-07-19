@@ -67,9 +67,10 @@ pub fn call_quantized_matmul_mv_t(
     rhs: &Buffer,
     dst_offset: usize,
     dst: &Buffer,
+    src1_bf16: bool,
 ) -> Result<(), MetalKernelError> {
     call_quantized_matmul_mv_t_offset(
-        device, ep, kernels, dtype, dims, lhs, lhs_offset, rhs, 0, dst_offset, dst,
+        device, ep, kernels, dtype, dims, lhs, lhs_offset, rhs, 0, dst_offset, dst, src1_bf16,
     )
 }
 
@@ -90,6 +91,7 @@ pub fn call_quantized_matmul_mv_t_offset(
     rhs_offset: usize,
     dst_offset: usize,
     dst: &Buffer,
+    src1_bf16: bool,
 ) -> Result<(), MetalKernelError> {
     // Everything is in reverse
     let ne00 = k as i64;
@@ -190,7 +192,21 @@ pub fn call_quantized_matmul_mv_t_offset(
         height: nth1,
         depth: 1,
     };
-    let name = match dtype {
+    // A bf16 activation (src1) + bf16 dst skips the bf16<->f32 round-trip GgufMatMul otherwise wraps
+    // around the projection. Only Q4_K/Q6_K carry a bf16-native matvec (the two K-quants Q4_K_M uses);
+    // any other dtype must reach here with an f32 activation.
+    let name = if src1_bf16 {
+        match dtype {
+            GgmlDType::Q4K => "kernel_mul_mv_q4_K_bf16",
+            GgmlDType::Q6K => "kernel_mul_mv_q6_K_bf16",
+            other => {
+                return Err(MetalKernelError::LoadFunctionError(format!(
+                    "bf16 activation matvec unsupported for {other:?}"
+                )))
+            }
+        }
+    } else {
+        match dtype {
         GgmlDType::Q4_0 => "kernel_mul_mv_q4_0_f32",
         GgmlDType::Q4_1 => "kernel_mul_mv_q4_1_f32",
         GgmlDType::Q5_0 => "kernel_mul_mv_q5_0_f32",
@@ -215,6 +231,7 @@ pub fn call_quantized_matmul_mv_t_offset(
         GgmlDType::IQ1_M => "kernel_mul_mv_iq1_m_f32",
         GgmlDType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
         GgmlDType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
+        }
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
