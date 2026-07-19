@@ -74,6 +74,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q5k_sg" => spv!("mul_mat_vec_q5k_sg"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
         "mul_mat_vec_q6k_sg" => spv!("mul_mat_vec_q6k_sg"),
+        "mul_mat_vec_q6k_cm" => spv!("mul_mat_vec_q6k_cm"),
         "mul_mat_vec_q2k" => spv!("mul_mat_vec_q2k"),
         "mul_mat_vec_q3k" => spv!("mul_mat_vec_q3k"),
         "mul_mat_vec_iq4xs" => spv!("mul_mat_vec_iq4xs"),
@@ -2548,7 +2549,20 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(nout)?;
         let push = push_u32(&[nout as u32, k as u32, woff as u32]);
-        if self.inner.subgroup_matvec {
+        if self.inner.subgroup_matvec && std::env::var_os("VK_Q6K_CM_OFF").is_none() {
+            // Coalesced multi-thread kernel: THREADS_PER_BLOCK=16 threads cooperate on one super-block
+            // (adjacent threads read adjacent u32 weight words = coalesced), Q6K_CM_ROWS rows per
+            // workgroup amortise the activation loads. The memory-BW lever for Q6_K decode; bit-identical
+            // to mul_mat_vec_q6k_sg. VK_Q6K_CM_OFF reverts to the per-row subgroup kernel for the A/B.
+            // Q6K_CM_ROWS MUST equal the shader's `NR` constant.
+            const Q6K_CM_ROWS: u32 = 2;
+            self.dispatch(
+                "mul_mat_vec_q6k_cm",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(Q6K_CM_ROWS), 1, 1),
+            )?;
+        } else if self.inner.subgroup_matvec {
             // Subgroup-reduced kernel (one subgroup per output row, fused subgroupAdd); bit-identical
             // decode to the scalar mul_mat_vec_q6k. See matvec_q4k_gpu_off for the dispatch geometry.
             let rows_per_wg = (WG1D / self.inner.subgroup_size).max(1);
@@ -7196,6 +7210,58 @@ mod dsl_dispatch_proof {
         let rel = maxerr / maxref.max(1e-30);
         eprintln!("[moe-q6k-blk] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (DSL blk spv via ml dispatch + split repack)");
         assert!(rel < 1e-3, "moe q6k blk DSL diverged from CPU: scale_rel={rel:.3e}");
+    }
+
+    /// The coalesced multi-thread Q6_K decode matvec (`mul_mat_vec_q6k_cm`) agrees with a CPU f32 oracle
+    /// (BlockQ6K::to_float + dense matvec) across the live decode shapes: lm_head-like (few super-blocks
+    /// per row), ffn_down-like (k=11008), an odd `nout` (exercises the ROWS_PER_WG row guard) and
+    /// `nblocks < ITS` (k=256, exercises the block-slot guard). Both operands are f32 through the same
+    /// decode, so agreement is to f32 rounding (~1e-6); a structural decode/index bug lands orders out.
+    #[test]
+    fn q6k_cm_decode_matches_oracle() {
+        use crate::quantized::k_quants::{BlockQ6K, GgmlType};
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[q6k-cm] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        for &(nout, k) in &[(256usize, 2048usize), (2048, 11008), (151, 512), (300, 256)] {
+            let nb = k / 256;
+            let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
+            let mut blocks: Vec<BlockQ6K> =
+                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut wdeq = vec![0f32; nout * k];
+            for r in 0..nout {
+                let rowf: Vec<f32> = (0..k).map(|i| gen_w(r, i)).collect();
+                BlockQ6K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+                BlockQ6K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * k..(r + 1) * k]);
+            }
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    blocks.as_ptr() as *const u8,
+                    blocks.len() * std::mem::size_of::<BlockQ6K>(),
+                )
+            };
+            let x: Vec<f32> = (0..k).map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0).collect();
+            let mut cpu = vec![0f32; nout];
+            for r in 0..nout {
+                let mut acc = 0f32;
+                for i in 0..k {
+                    acc += wdeq[r * k + i] * x[i];
+                }
+                cpu[r] = acc;
+            }
+            let wq = dev.quantize_q6k(bytes, nout, k).unwrap();
+            let got = dev.matvec_q6k(&wq, &x, nout, k).unwrap();
+            let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let maxerr =
+                got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let rel = maxerr / maxref.max(1e-30);
+            eprintln!("[q6k-cm] {nout}x{k}  scale_rel={rel:.2e}");
+            assert!(rel < 1e-3, "q6k_cm diverged from CPU: {nout}x{k} scale_rel={rel:.3e}");
+        }
     }
 
     // dp4a twin of the Q6_K proof: same split bank and shape, dispatched through
