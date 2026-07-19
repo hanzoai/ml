@@ -435,9 +435,9 @@ pub fn flash_attn_cubes(b: usize, n_heads: usize, seq_q: usize) -> usize {
 }
 
 /// Host launch: `q`/`out` are `[b, n_heads, seq_q, d]`, `k`/`v` are `[b, n_kv, kv_seq_pad, d]` read as
-/// `[b, n_kv, seq_k, d]` (the padded KV cache). GQA `n_kv_groups = n_heads / n_kv`. `plane` = threads
-/// per cube (one hardware plane). One cube computes one `(batch, head, query-tile)`. Production dispatches
-/// the whole grid at once (`cube_base = 0`).
+/// `[b, n_kv, seq_k, d]` (the padded KV cache). GQA `n_kv_groups = n_heads / n_kv`. The plane (threads
+/// per cube) is derived from the device (`plane_size_max`). One cube computes one `(batch, head,
+/// query-tile)`. Production dispatches the whole grid at once (`cube_base = 0`).
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_run<R: Runtime>(
     client: &ComputeClient<R>,
@@ -452,8 +452,16 @@ pub fn flash_attn_run<R: Runtime>(
     kv_seq_pad: usize,
     d: usize,
     causal: bool,
-    plane: usize,
 ) -> Vec<f32> {
+    // The plane (threads per cube) is one hardware plane: 32 on a CUDA/NVIDIA warp, 64 on a RADV
+    // subgroup. A cooperative-matrix op is plane-scoped -- the 16x16 fragment is spread over every lane
+    // of the plane -- so the block must be exactly one plane wide. Deriving it from the device is the one
+    // portable value (same rule as `mmq_q8_wmma`); a baked constant is right on at most one backend and
+    // mispartitions the fragment on the others. `.max(BR)` floors the scalar CPU simulator, which reports
+    // plane_size_max = 1 (no SIMD) yet still needs `br` logical lanes: the online-softmax pass assigns
+    // query-row r to lane r, so a plane below `br` leaves rows >= plane with divide-by-zero (l = 0) ->
+    // inf. Real GPU planes are 32/64 >= br = 16, so the floor is a no-op there.
+    let plane = (client.properties().hardware.plane_size_max as usize).max(BR);
     let cubes = flash_attn_cubes(b, n_heads, seq_q);
     let target = Target::of(client);
     flash_attn_launch(client, q, k, v, b, n_heads, n_kv, seq_q, seq_k, kv_seq_pad, d, causal, plane, 0, cubes, target)
@@ -618,17 +626,16 @@ mod tests {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
         let c = WgpuRuntime::client(&WgpuDevice::default());
         let mut fails = 0usize;
-        // RADV gfx1151's coopmat runs at subgroupSize=64 (VkPhysicalDeviceCooperativeMatrixPropertiesKHR),
-        // so the plane (workgroup lane count) MUST be 64 -- a 32-lane launch feeds the 16x16 f16 fragment
-        // only half its lanes, and the output tile past ~query-row 1 is undefined (decode, seq_q=1, reads
-        // only row 0, so it hides the bug; multi-row prefill exposes it). mmq_q4k / sdpa_blk bake 64 too.
-        let plane = 64usize;
+        // `flash_attn_run` derives the plane from the device. RADV gfx1151's coopmat runs at
+        // subgroupSize=64 (VkPhysicalDeviceCooperativeMatrixPropertiesKHR), so the whole-grid launch is
+        // one 64-lane workgroup per cube -- a 32-lane launch would feed the 16x16 f16 fragment only half
+        // its lanes and leave the output tile past query-row 1 undefined. mmq_q4k / sdpa_blk derive it too.
         let mut gate_gpu = |nh: usize, nkv: usize, sq: usize, sk: usize, d: usize, causal: bool, tag: &str| {
             let q = rnd(nh * sq * d, 0x1234_5678);
             let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
             let v = rnd(nkv * sk * d, 0x0FED_CBA9);
             // Whole-grid Vulkan launch (Target::of(WgpuRuntime) = Vulkan -> the coopmat arm).
-            let got = flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, plane);
+            let got = flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal);
             let want = sdpa_ref(&q, &k, &v, nh, nkv, sq, sk, d, causal);
             let rel = scale_rel(&got, &want);
             let nonfin = got.iter().filter(|x| !x.is_finite()).count();
@@ -679,7 +686,7 @@ mod tests {
         let q = rnd(nh * sq * d, 0x2222_3333);
         let k = rnd(nkv * sk * d, 0x4444_5555);
         let v = rnd(nkv * sk * d, 0x6666_7777);
-        let got = flash_attn_run::<CpuRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, true, 32);
+        let got = flash_attn_run::<CpuRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, true);
         let want = sdpa_ref(&q, &k, &v, nh, nkv, sq, sk, d, true);
         let rel = scale_rel(&got, &want);
         eprintln!("[flash production] scalar-on-cpu scale_rel={rel:.2e}");
@@ -693,23 +700,23 @@ mod tests {
     /// zero-pad on ragged seq, and the f16 QK/PV precision -- all on real NVIDIA silicon (~2-3e-4
     /// scale-relative, the chained-f16 tensor-core tolerance, not the scalar arm's ~1e-7).
     ///
-    /// Plane = 64. MEASURED finding, not assumed: `plane` is the workgroup lane count, and on CUDA a
-    /// WMMA fragment is WARP-scoped -- 32 lanes, a hardware constant independent of the block size (proven
-    /// from the generated kernel: the `nvcuda::wmma` 16x16x16 fragments are byte-identical between the
-    /// plane=32 and plane=64 lowerings, with no warp-index guard). A 64-lane launch therefore runs 2
-    /// warps that each compute the identical fragment and store identical results -- bit-correct, and
-    /// measured FASTER than 32 (the f16-staging and softmax-epilogue loops parallelize across 2x lanes,
-    /// outweighing the redundant second-warp mma). plane=32 is equally correct on CUDA but STARVES RADV
-    /// coopmat (subgroupSize=64). So 64 is the one portable coopmat plane for CUDA and Vulkan alike:
-    /// there is no CUDA-inverse of the RADV "half the lanes" bug, because a coopmat fragment is
-    /// subgroup-sized (variable) whereas a WMMA fragment is warp-sized (fixed). The agreement assertion
-    /// below pins CUDA-correct-at-both-planes, guarding any future warp/subgroup-scope regression.
+    /// `flash_attn_run` derives the plane from the device, so this loop validates at the true CUDA
+    /// production plane (`plane_size_max` = 32, one warp per 16x16x16 WMMA fragment -- no redundant
+    /// lanes). A WMMA fragment is WARP-scoped (32, fixed); a RADV coopmat fragment is SUBGROUP-scoped
+    /// (64). There is therefore no single portable plane CONSTANT -- the device width IS the value,
+    /// which is why `flash_attn_run` derives it rather than baking one. Baking 64 (the RADV width) is
+    /// only accidentally correct on CUDA -- it runs 2 redundant warps that recompute the identical
+    /// warp-scoped fragment -- and would MISPARTITION a 32-lane NVIDIA-Vulkan coopmat, whose fragment is
+    /// subgroup-sized. The plane-agree block below pins that CUDA stays warp-scoped (plane 32 == plane 64
+    /// byte-for-byte), guarding any future change that makes the coopmat op block- rather than
+    /// warp/subgroup-scoped (which would leave half the 64-lane output tile undefined).
     #[cfg(feature = "cuda")]
     #[test]
     fn flash_coopmat_matches_ref_on_cuda() {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
         let c = CudaRuntime::client(&CudaDevice::default());
-        let plane = 64usize; // portable coopmat plane: correct on CUDA WMMA and RADV coopmat; see doc.
+        // The device plane the production surface derives (measured: 32 on this GB10 warp).
+        eprintln!("[flash-cuda] device plane_size_max={}", c.properties().hardware.plane_size_max);
         let shapes: [(usize, usize, usize, usize, usize, bool, &str); 10] = [
             (4, 2, 1, 1, 32, false, "decode kv1"),
             (4, 2, 1, 17, 32, false, "decode kv17 (ragged tail)"),
@@ -727,7 +734,7 @@ mod tests {
             let q = rnd(nh * sq * d, 0x1234_5678);
             let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
             let v = rnd(nkv * sk * d, 0x0FED_CBA9);
-            let got = flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, plane);
+            let got = flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal);
             let want = sdpa_ref(&q, &k, &v, nh, nkv, sq, sk, d, causal);
             let rel = scale_rel(&got, &want);
             let nonfin = got.iter().filter(|x| !x.is_finite()).count();
@@ -758,8 +765,9 @@ mod tests {
             let q = rnd(nh * sq * d, 0x1234_5678);
             let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
             let v = rnd(nkv * sk * d, 0x0FED_CBA9);
-            let p32 = flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, 32);
-            let p64 = flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, 64);
+            let cubes = flash_attn_cubes(1, nh, sq);
+            let p32 = flash_attn_launch::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, 32, 0, cubes, Target::of(&c));
+            let p64 = flash_attn_launch::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, 64, 0, cubes, Target::of(&c));
             let agree = scale_rel(&p32, &p64);
             eprintln!("[flash-cuda plane-agree {tag}] scale_rel(p32,p64)={agree:.2e}");
             assert!(agree < 1e-4, "CUDA plane 32 vs 64 diverged ({agree}) -- coopmat no longer warp-scoped");
