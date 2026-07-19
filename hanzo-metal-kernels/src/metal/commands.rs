@@ -28,15 +28,23 @@ struct GpuProfile {
     buffers: AtomicUsize,
     dispatches: AtomicUsize,
     window_start: Mutex<Instant>,
+    /// Per-kernel GPU-time attribution for `METAL_PROFILE_OPS`: name -> (total_ns, count),
+    /// accumulated across the whole run (never reset) so lagging completion handlers land
+    /// in a later report rather than smearing a per-token snapshot. Under this mode each
+    /// command buffer holds a single dispatch, so its GPU interval belongs to one kernel.
+    ops: Mutex<HashMap<Arc<str>, (u64, u64)>>,
+    ops_mode: bool,
 }
 
 impl GpuProfile {
-    fn new() -> Self {
+    fn new(ops_mode: bool) -> Self {
         Self {
             busy_ns: AtomicU64::new(0),
             buffers: AtomicUsize::new(0),
             dispatches: AtomicUsize::new(0),
             window_start: Mutex::new(Instant::now()),
+            ops: Mutex::new(HashMap::new()),
+            ops_mode,
         }
     }
 
@@ -61,6 +69,29 @@ impl GpuProfile {
         eprintln!(
             "[MTL_GPU] {phase} busy={busy_ms:.3}ms wall={wall_ms:.3}ms busy%={busy_pct:.0} buffers={buffers} disp={disp}"
         );
+        if self.ops_mode {
+            self.report_ops();
+        }
+    }
+
+    /// Dump the cumulative per-kernel GPU-time breakdown, sorted by total time. `count` is the
+    /// number of dispatches attributed to each kernel across the run (high count => decode-phase
+    /// matvec, low count => a single prefill forward's GEMM/glue) — rank by measured time, never count.
+    fn report_ops(&self) {
+        let ops = self.ops.lock().unwrap();
+        let mut rows: Vec<(Arc<str>, u64, u64)> =
+            ops.iter().map(|(k, (ns, c))| (k.clone(), *ns, *c)).collect();
+        drop(ops);
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let total_ns: u64 = rows.iter().map(|r| r.1).sum();
+        let total_ms = total_ns as f64 / 1e6;
+        eprintln!("[MTL_OPS] cumulative total={total_ms:.2}ms across {} kernels:", rows.len());
+        for (name, ns, count) in rows.iter().take(24) {
+            let ms = *ns as f64 / 1e6;
+            let pct = if total_ns > 0 { *ns as f64 / total_ns as f64 * 100.0 } else { 0.0 };
+            let avg_us = if *count > 0 { *ns as f64 / *count as f64 / 1e3 } else { 0.0 };
+            eprintln!("[MTL_OPS]   {ms:8.2}ms {pct:5.1}%  n={count:<5} avg={avg_us:7.2}us  {name}");
+        }
     }
 }
 
@@ -177,9 +208,18 @@ impl Commands {
         command_queue: CommandQueue,
         residency_set: &ResidencySet,
     ) -> Result<Self, MetalKernelError> {
-        let compute_per_buffer = match std::env::var("METAL_COMPUTE_PER_BUFFER") {
-            Ok(val) => val.parse().unwrap_or(DEFAULT_METAL_COMPUTE_PER_BUFFER),
-            _ => DEFAULT_METAL_COMPUTE_PER_BUFFER,
+        let profile_ops = std::env::var("METAL_PROFILE_OPS").is_ok();
+        let profile = profile_ops || std::env::var("METAL_PROFILE_GPU").is_ok();
+        // Per-op attribution needs one dispatch per command buffer so each buffer's GPU interval
+        // belongs to a single kernel; the queue is FIFO so the next buffer's fence wait is already
+        // satisfied and the interval measures clean kernel time, not a stall.
+        let compute_per_buffer = if profile_ops {
+            1
+        } else {
+            match std::env::var("METAL_COMPUTE_PER_BUFFER") {
+                Ok(val) => val.parse().unwrap_or(DEFAULT_METAL_COMPUTE_PER_BUFFER),
+                _ => DEFAULT_METAL_COMPUTE_PER_BUFFER,
+            }
         };
 
         if let Some(raw) = residency_set.raw() {
@@ -196,8 +236,8 @@ impl Commands {
             compute_per_buffer,
             device,
             prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
-            profile: std::env::var("METAL_PROFILE_GPU").is_ok(),
-            prof: Arc::new(GpuProfile::new()),
+            profile,
+            prof: Arc::new(GpuProfile::new(profile_ops)),
         })
     }
 
@@ -353,6 +393,20 @@ impl Commands {
         state: &mut EntryState,
         reset_to: usize,
     ) -> Result<(), MetalKernelError> {
+        // Read the kernel name off the encoder before it is consumed by end_encoding. In ops mode
+        // this buffer holds one dispatch, so the name attributes the buffer's whole GPU interval.
+        let op_name: Option<Arc<str>> = if self.prof.ops_mode {
+            Some(
+                state
+                    .current_encoder
+                    .as_ref()
+                    .and_then(|e| e.state.lock().unwrap().op_name.clone())
+                    .unwrap_or_else(|| Arc::from("(blit/unnamed)")),
+            )
+        } else {
+            None
+        };
+
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
@@ -366,7 +420,14 @@ impl Commands {
                             let cb = unsafe { cb.as_ref() };
                             let dt = cb.GPUEndTime() - cb.GPUStartTime();
                             if dt > 0.0 {
-                                prof.busy_ns.fetch_add((dt * 1e9) as u64, Ordering::Relaxed);
+                                let ns = (dt * 1e9) as u64;
+                                prof.busy_ns.fetch_add(ns, Ordering::Relaxed);
+                                if let Some(name) = &op_name {
+                                    let mut ops = prof.ops.lock().unwrap();
+                                    let e = ops.entry(name.clone()).or_insert((0, 0));
+                                    e.0 += ns;
+                                    e.1 += 1;
+                                }
                             }
                             prof.buffers.fetch_add(1, Ordering::Relaxed);
                         });
