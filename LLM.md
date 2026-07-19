@@ -109,6 +109,27 @@ not needed for the CUDA runtime.
   IN THE LIBRARY (i8); the f16 result is recorded here as the positive that makes a hand-rolled DSL
   flash-attn viable. Build/run: `cd hanzo-kernel && cargo run --release --features cuda --bin mmq-check`.
 
+## Vulkan DECODE: coalesced Q6_K matvec (0.11.72)
+Decode is GTT-bandwidth-bound on the gfx1151 UMA APU: each weight tensor is read once, cache-cold, per token,
+so the lever is achieved weight-stream bandwidth (coalescing + full lane utilisation), not ALU. Per-op GPU
+profiling (VK_PROFILE_GPU) on zen-eco-4b Q4_K_M decode showed the Q6_K matvec (`mul_mat_vec_q6k_sg`) at ~126
+GB/s = 62% of the 204 GB/s d2d peak (vs the Q4_K dp4a matvec already at ~169 = 83%). Root cause read from the
+shader: `mul_mat_vec_q6k_sg` ran ONE subgroup per output row with each lane streaming a WHOLE 212-byte
+super-block -- adjacent lanes 212 B apart (uncoalesced), and any row with fewer super-blocks than the subgroup
+is wide left most lanes idle (e.g. lm_head, k=2048 -> 8 of 64 lanes). **THE FIX -- `mul_mat_vec_q6k_cm`**: the
+coalesced multi-thread decode matvec, structured like llama.cpp's `mul_mat_vec_q6_k` -- THREADS_PER_BLOCK=16
+threads cooperate on one super-block (adjacent threads read adjacent u32 weight words = coalesced 32-byte
+bursts), ROWS_PER_WG=2 output rows per workgroup amortise the activation loads, subgroup-add reduce. Our padded
+212-byte Q6_K block is byte-identical to ggml's block_q6_K (+2 pad), so the decode is ported near-verbatim over
+the raw-u32 binding (a_block_base = woff/53 handles the MoE offset). Kernel op 4.9 -> 2.9 ms (avg 133 -> 79 us),
+~126 -> ~206 GB/s (at peak); decode 44.7 -> 49.8 t/s (+11.4%) on the honest bench, prefill unchanged (1741).
+Bit-exact gate `q6k_cm_decode_matches_oracle` (scale_rel <=6e-6 vs BlockQ6K::to_float across lm_head-like,
+ffn_down-like, odd nout, nblocks<ITS). Default when the device has subgroup arithmetic; VK_Q6K_CM_OFF reverts
+to `mul_mat_vec_q6k_sg` for the A/B. Q6K_CM_ROWS (host) MUST equal the shader's `NR`. After this fix the
+aggregate weight-matvec BW (~178 GB/s) is near llama's implied ~180; the remaining decode gap to llama is the
+~4.7 ms/token CPU tail (the record-once/replay decode command-graph exists + is test-proven but is NOT wired
+into the live forward) plus the Q4_K matvec's residual ~17% below peak.
+
 ## Vulkan PREFILL: the Q6_K lever, the roofline method, the refuted levers, the coalescing frontier (0.11.64-66)
 GROUND TRUTH first (the premise in every stale note was wrong): on evo/gfx1151, `llama-bench` pp512 = 2459 t/s
 vs ours 212 for zen-eco-4b Q4_K_M, SAME box -- an 11.6x prefill gap, not the old "995"/"10x". Decode already
