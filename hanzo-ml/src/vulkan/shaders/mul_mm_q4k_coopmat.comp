@@ -184,13 +184,13 @@ void main() {
             // into acc in sequence rather than after a joint load). s_b is the transposed weight [N, K/2]
             // f16vec2; ColumnMajor presents it as the [K, N] B fragment, K-subtile kc at pair kc*(T/2).
             [[unroll]] for (uint kc = 0u; kc < 2u; kc++) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[RN];
-                [[unroll]] for (uint j = 0u; j < RN; j++)
-                    coopMatLoad(mb[j], s_b, (j * T) * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
+                [[unroll]] for (uint j = 0u; j < RN; j++) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+                    coopMatLoad(mb, s_b, (j * T) * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
                                 gl_CooperativeMatrixLayoutColumnMajor);
-                [[unroll]] for (uint i = 0u; i < RM; i++)
-                    [[unroll]] for (uint j = 0u; j < RN; j++)
-                        acc[i][j] = coopMatMulAdd(ma[i][kc], mb[j], acc[i][j]);
+                    [[unroll]] for (uint i = 0u; i < RM; i++)
+                        acc[i][j] = coopMatMulAdd(ma[i][kc], mb, acc[i][j]);
+                }
             }
         }
         barrier();
