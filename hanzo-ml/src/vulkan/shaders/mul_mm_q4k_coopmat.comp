@@ -115,8 +115,17 @@ void stage(uint koff, uint row0, uint col0, uint nblocks) {
     uint blk = koff / QK_K;
     uint sub = (koff / BK) & 7u;               // 0..7 within the 256-superblock (BK == 32)
     uint c = sub >> 1u;
-    bool lo = (sub & 1u) == 0u;
-    for (uint col = tid; col < BN; col += WG) {
+    uint shift = ((sub & 1u) == 0u) ? 0u : 4u; // low or high nibble of every byte
+    // Weight decode: ALL WG lanes participate, two lanes per column (BN=128, WG=256), each decoding 4 of
+    // the 8 q-words (16 of the sub-block's 32 nibbles). The prior one-lane-per-column form left half the
+    // workgroup idle through the (dominant) decode phase; a prefill Q4_K GEMM is compute/feed-bound (the
+    // weight streams from GTT well below DRAM peak), so decode ALU competes with the matrix cores and
+    // spreading it across all lanes shortens the K-step. Nibble extraction is vectorised: one mask over
+    // the whole 32-bit q-word yields four nibbles, split into a vec4 -- no per-nibble branch. The stored
+    // f16 values are bit-identical to the one-lane form (same mask, same affine, same layout).
+    for (uint idx = tid; idx < BN * 2u; idx += WG) {
+        uint col = idx >> 1u;
+        uint u0 = (idx & 1u) * 4u;             // this lane's q-word half: words 0..3 or 4..7
         uint n = col0 + col;
         if (n < nout) {
             uint base = woff + n * nblocks * BLK_U32 + blk * BLK_U32;
@@ -125,27 +134,23 @@ void stage(uint koff, uint row0, uint col0, uint nblocks) {
             uint sm = get_scale_min_k4(base, sub);
             float ds = d * float(sm >> 8u);
             float ms = dmin * float(sm & 0xFFu);
-            // Decode the sub-block's 32 nibbles into 16 f16vec2 pairs of adjacent k, one 32-bit store each.
-            [[unroll]] for (uint u = 0u; u < 8u; u++) {
-                uint qword = w[base + 4u + c * 8u + u];
-                uint b0 = (qword >>  0u) & 0xFFu;
-                uint b1 = (qword >>  8u) & 0xFFu;
-                uint b2 = (qword >> 16u) & 0xFFu;
-                uint b3 = (qword >> 24u) & 0xFFu;
-                uint q0 = lo ? (b0 & 0x0Fu) : (b0 >> 4u);
-                uint q1 = lo ? (b1 & 0x0Fu) : (b1 >> 4u);
-                uint q2 = lo ? (b2 & 0x0Fu) : (b2 >> 4u);
-                uint q3 = lo ? (b3 & 0x0Fu) : (b3 >> 4u);
-                float16_t v0 = float16_t(ds * float(q0) - ms);
-                float16_t v1 = float16_t(ds * float(q1) - ms);
-                float16_t v2 = float16_t(ds * float(q2) - ms);
-                float16_t v3 = float16_t(ds * float(q3) - ms);
-                s_b[col * SB_STRIDE + u * 2u]      = f16vec2(v0, v1);
-                s_b[col * SB_STRIDE + u * 2u + 1u] = f16vec2(v2, v3);
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint qword = w[base + 4u + c * 8u + u0 + u];
+                uint q4 = (qword >> shift) & 0x0F0F0F0Fu;   // four nibbles, one mask
+                float q0 = float( q4         & 0xFFu);
+                float q1 = float((q4 >>  8u) & 0xFFu);
+                float q2 = float((q4 >> 16u) & 0xFFu);
+                float q3 = float((q4 >> 24u) & 0xFFu);
+                uint p = (u0 + u) * 2u;
+                s_b[col * SB_STRIDE + p]      = f16vec2(float16_t(ds * q0 - ms), float16_t(ds * q1 - ms));
+                s_b[col * SB_STRIDE + p + 1u] = f16vec2(float16_t(ds * q2 - ms), float16_t(ds * q3 - ms));
             }
         } else {
-            [[unroll]] for (uint kp = 0u; kp < BK / 2u; kp++)
-                s_b[col * SB_STRIDE + kp] = f16vec2(0.0);
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint p = (u0 + u) * 2u;
+                s_b[col * SB_STRIDE + p]      = f16vec2(0.0);
+                s_b[col * SB_STRIDE + p + 1u] = f16vec2(0.0);
+            }
         }
     }
 }
