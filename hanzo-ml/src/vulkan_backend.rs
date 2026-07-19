@@ -70,6 +70,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mm_q6k_coopmat" => spv!("mul_mm_q6k_coopmat"),
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q4k_sg" => spv!("mul_mat_vec_q4k_sg"),
+        "mul_mat_vec_q4k_cm" => spv!("mul_mat_vec_q4k_cm"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
         "mul_mat_vec_q5k_sg" => spv!("mul_mat_vec_q5k_sg"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
@@ -1248,7 +1249,27 @@ impl VulkanDevice {
             crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        // DEFAULT Q4_K decode path where the device has int8 dot-product: quantize the activation to
+        // DEFAULT Q4_K decode path where the device advertises subgroup arithmetic: the coalesced
+        // multi-thread f32 matvec (mul_mat_vec_q4k_cm). TPB=16 threads cooperate on one super-block,
+        // adjacent threads reading adjacent qs u32 words (a coalesced 64-byte burst); Q4K_CM_ROWS rows
+        // per workgroup amortise the shared activation load; the per-row partial reduces with a subgroup
+        // add. The memory-BW lever for decode on this bandwidth-bound UMA APU -- the Q4_K analogue of
+        // mul_mat_vec_q6k_cm, and it reads x directly so the dp4a path's per-matvec q8 activation
+        // quantize dispatch drops. Decode is bit-identical to BlockQ4K::to_float; unpackHalf2x16 decodes
+        // the f16 d/dmin so subnormal scales stay exact. VK_Q4K_CM_OFF reverts to the dp4a block kernel
+        // for the A/B. Q4K_CM_ROWS MUST equal the shader's `NR` constant.
+        if self.inner.subgroup_matvec && std::env::var_os("VK_Q4K_CM_OFF").is_none() {
+            const Q4K_CM_ROWS: u32 = 2;
+            let push = push_u32(&[nout as u32, k as u32, woff as u32]);
+            self.dispatch(
+                "mul_mat_vec_q4k_cm",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).div_ceil(Q4K_CM_ROWS), 1, 1),
+            )?;
+            return Ok(out);
+        }
+        // dp4a Q4_K decode where the device has int8 dot-product: quantize the activation to
         // q8_1 once, then dp4a the Q4_K codes against it -- Vulkan decode was matvec-compute-bound and
         // int8 dp4a is the lever (the scalar f32 decode+MAC per weight was the wall). The COLUMN dp4a
         // (one thread/output-row, 64 rows/workgroup) is the optimum: 1.8x over the scalar matvec on
@@ -7489,7 +7510,12 @@ mod dsl_dispatch_proof {
             *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
         }
         let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
-        let block = dev.matvec_q4k(&wq, &x, nout, k).unwrap(); // production default = block kernel
+        // The coalesced CM kernel is the production default; this gate specifically guards the dp4a
+        // BLOCK kernel's manual f16 decode, so force it. The CM kernel's subnormal decode (via
+        // unpackHalf2x16) is gated separately by q4k_cm_decode_matches_oracle.
+        unsafe { std::env::set_var("VK_Q4K_CM_OFF", "1") };
+        let block = dev.matvec_q4k(&wq, &x, nout, k).unwrap();
+        unsafe { std::env::remove_var("VK_Q4K_CM_OFF") };
         let rel = block.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
         eprintln!("[q4k-subnormal] block kernel vs CPU, subnormal-scale super-blocks: rel={rel:.3e}");
         assert!(rel < 2e-2, "block dp4a mis-decodes subnormal fp16 scales: {rel:.3e} (f16lo_to_f32 regression)");
@@ -7850,6 +7876,62 @@ mod dsl_dispatch_proof {
             let rel = maxerr / maxref.max(1e-30);
             eprintln!("[q6k-cm] {nout}x{k}  scale_rel={rel:.2e}");
             assert!(rel < 1e-3, "q6k_cm diverged from CPU: {nout}x{k} scale_rel={rel:.3e}");
+        }
+    }
+
+    /// The coalesced multi-thread Q4_K decode matvec (`mul_mat_vec_q4k_cm`) agrees with a CPU f32 oracle
+    /// (BlockQ4K::to_float + dense matvec) across the live zen-eco/qwen2 decode shapes: attn q/o
+    /// (2048x2048), ffn gate/up (11008x2048), ffn down (2048x11008), kv (256x2048), an odd `nout`
+    /// (exercises the NR row guard) and nblocks < ITS (k=256, block-slot guard). One shape drives d/dmin
+    /// into the subnormal fp16 range (every 3rd super-block) to gate the unpackHalf2x16 decode. Both
+    /// operands are f32 through the same decode, so agreement is to f32 rounding; a structural
+    /// decode/index bug or a mis-decoded subnormal scale lands orders of magnitude out.
+    #[test]
+    fn q4k_cm_decode_matches_oracle() {
+        use crate::quantized::k_quants::{BlockQ4K, GgmlType};
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[q4k-cm] no vulkan device ({e}); skipping"); return; }
+        };
+        for &(nout, k, subnormal) in &[
+            (256usize, 2048usize, false),
+            (11008, 2048, false),
+            (2048, 11008, false),
+            (256, 2048, false),
+            (151, 512, false),
+            (300, 256, false),
+            (512, 2560, true),
+        ] {
+            let nb = k / 256;
+            let gen_w = |row: usize, i: usize| {
+                let base = (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
+                // every 3rd super-block: tiny range -> subnormal fp16 d/dmin.
+                let amp = if subnormal && (i / 256) % 3 == 0 { 1.5e-5 } else { 1.0 };
+                base * amp
+            };
+            let mut blocks: Vec<BlockQ4K> =
+                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut wdeq = vec![0f32; nout * k];
+            for r in 0..nout {
+                let rowf: Vec<f32> = (0..k).map(|i| gen_w(r, i)).collect();
+                BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+                BlockQ4K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * k..(r + 1) * k]);
+            }
+            let u32s: &[u32] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36)
+            };
+            let wq = dev.upload_u32(u32s).unwrap();
+            let x: Vec<f32> = (0..k).map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0).collect();
+            let mut cpu = vec![0f32; nout];
+            for (r, c) in cpu.iter_mut().enumerate() {
+                *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
+            }
+            let got = dev.matvec_q4k(&wq, &x, nout, k).unwrap(); // production default = CM kernel
+            let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+            let maxerr = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let rel = maxerr / maxref;
+            eprintln!("[q4k-cm] {nout}x{k} subnormal={subnormal} scale_rel={rel:.2e}");
+            assert!(rel < 1e-3, "q4k_cm diverged from CPU: {nout}x{k} scale_rel={rel:.3e}");
         }
     }
 
