@@ -1,0 +1,37 @@
+#version 450
+// Flash-decoding phase 2: combine the `n_split` per-(head) partials produced by sdpa_decode_split into
+// the final attention output. One workgroup (one wave64 subgroup) per (batch, head); lane owns head_dim
+// slots {t, t+64}. First pass finds the global running-max across splits, second rescales each split's
+// (l, acc) by exp(m_split - m_global) and sums, then normalizes. Empty splits (L < n_split) carry
+// m=-1e30, l=0 and contribute exactly zero. Numerically identical to a single-pass online softmax.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly  buffer PA { float pacc[]; }; // [rows*n_split*D]
+layout(set = 0, binding = 1) readonly  buffer PM { float pm[]; };   // [rows*n_split]
+layout(set = 0, binding = 2) readonly  buffer PL { float pl[]; };   // [rows*n_split]
+layout(set = 0, binding = 3) writeonly buffer O  { float o[]; };    // [rows*D]
+layout(push_constant) uniform Pc { uint D; uint n_split; };
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint d0 = t, d1 = t + 64u;
+    bool h0 = d0 < D, h1 = d1 < D;
+
+    float mg = -1e30;
+    for (uint s = 0u; s < n_split; s++) {
+        mg = max(mg, pm[row * n_split + s]);
+    }
+    float lg = 0.0, a0 = 0.0, a1 = 0.0;
+    for (uint s = 0u; s < n_split; s++) {
+        float w = exp(pm[row * n_split + s] - mg);
+        lg += pl[row * n_split + s] * w;
+        uint pbase = (row * n_split + s) * D;
+        if (h0) { a0 += w * pacc[pbase + d0]; }
+        if (h1) { a1 += w * pacc[pbase + d1]; }
+    }
+    float inv = 1.0 / lg;
+    uint obase = row * D;
+    if (h0) { o[obase + d0] = a0 * inv; }
+    if (h1) { o[obase + d1] = a1 * inv; }
+}
