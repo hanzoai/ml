@@ -48,6 +48,9 @@ hanzo-ug = { workspace = true, optional = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 criterion = { workspace = true }
+# Evolutionary autotuner (Space / Evolution / Evaluator). Test-only; `default-features = false` keeps
+# cubecl's runtime backends out of the ml test build -- only the schedule-search algebra is used.
+hanzo-kernel = { path = "../hanzo-kernel", default-features = false }
 
 [features]
 default = []
