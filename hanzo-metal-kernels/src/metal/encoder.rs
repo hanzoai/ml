@@ -30,6 +30,10 @@ pub struct EncoderState {
     pub all_inputs: HashSet<usize>,
     /// All outputs seen this encoder session (registered in global map at end_encoding).
     pub all_outputs: HashSet<usize>,
+    /// Name of the last pipeline set on this encoder, for per-op GPU-time attribution
+    /// (`METAL_PROFILE_OPS`). Under that mode each command buffer holds a single dispatch,
+    /// so this names the one kernel the buffer's GPU interval belongs to.
+    pub op_name: Option<Arc<str>>,
 }
 
 impl EncoderState {
@@ -42,6 +46,7 @@ impl EncoderState {
             needs_barrier: false,
             all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
+            op_name: None,
         }
     }
 }
@@ -160,6 +165,7 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_compute_pipeline_state(&self, pipeline: &ComputePipeline) {
+        self.state.lock().unwrap().op_name = Some(pipeline.name_arc());
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
 
@@ -196,6 +202,7 @@ impl ComputeCommandEncoder {
 
     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
         use MTLComputeCommandEncoder as _;
+        self.state.lock().unwrap().op_name = Some(pipeline.name_arc());
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
 

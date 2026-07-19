@@ -43,6 +43,13 @@ pub struct Function {
     raw: Retained<ProtocolObject<dyn MTLFunction>>,
 }
 
+impl Function {
+    /// The kernel function's name, carried onto the pipeline for per-op GPU-time attribution.
+    pub fn name(&self) -> String {
+        self.raw.name().to_string()
+    }
+}
+
 impl AsRef<ProtocolObject<dyn MTLFunction>> for Function {
     fn as_ref(&self) -> &ProtocolObject<dyn MTLFunction> {
         &self.raw
