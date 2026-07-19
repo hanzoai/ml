@@ -102,6 +102,12 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         // it collapses the copy2d+bmm+softmax+bmm decode-attention chain to ONE dispatch. Bindings:
         // q(0), k(1), v(2), out(3), scale(4), meta(5)=[seq_q,seq_k,n_kv_groups,causal].
         "sdpa_blk" => include_bytes!("vulkan/spv/sdpa_blk.spv"),
+        // Flash-decoding (seq_q==1): split the KV sequence across n_split workgroups per (batch,head) so
+        // the lone decode query fills the GPU, then combine the partials. Register-light wave64-subgroup
+        // (lane owns head_dim {t,t+64}, subgroupAdd dot) -- high occupancy vs sdpa_blk's 256-VGPR path.
+        // Phase 1 bindings: q,k,v,pacc,pm,pl; phase 2: pacc,pm,pl,out. Shapes ride the push constant.
+        "sdpa_decode_split" => spv!("sdpa_decode_split"),
+        "sdpa_decode_reduce" => spv!("sdpa_decode_reduce"),
         // DSL f32 GEMV (hanzo-kernel quant::gemv, nt=128): out[n]=W[n,k]@x[k], one workgroup/output row,
         // threads tree-reduce over k. Replaces the tiled GEMM for m==1 (the MoE router gate), where the
         // 64x64-tile GEMM runs ~2 occupancy-starved workgroups. Bindings: w(0), x(1), out(2), meta(3)=[k].
@@ -511,6 +517,14 @@ impl Drop for VkGraph {
 pub struct VkGraphAttn {
     scale: VulkanStorage,
     meta: VulkanStorage,
+    // Host copies of the fixed decode-attention geometry, so the flash-decoding graph variant
+    // ([`VulkanDevice::sdpa_decode_split_vk_graph`]) can build its push constants without reading them
+    // back off the `meta` SSBO. All constant for the graph's life; only `meta[1]` (seq_k) advances.
+    n_kv: usize,
+    softmax_scale: f32,
+    kv_batch_stride: usize,
+    kv_head_stride: usize,
+    key_stride: usize,
 }
 
 // Safety: the contained storages' handles are only touched under the device locks (build/replay) or
@@ -526,6 +540,23 @@ impl VkGraphAttn {
     /// The shared attention-meta SSBO (binding 5 of `sdpa_blk`). `meta[1]` (seq_k) advances per replay.
     pub fn meta(&self) -> &VulkanStorage {
         &self.meta
+    }
+
+    /// Fixed decode-attention geometry for the flash-decoding graph variant (`sdpa_decode_split_vk_graph`).
+    pub fn n_kv(&self) -> usize {
+        self.n_kv
+    }
+    pub fn softmax_scale(&self) -> f32 {
+        self.softmax_scale
+    }
+    pub fn kv_batch_stride(&self) -> usize {
+        self.kv_batch_stride
+    }
+    pub fn kv_head_stride(&self) -> usize {
+        self.kv_head_stride
+    }
+    pub fn key_stride(&self) -> usize {
+        self.key_stride
     }
 
     /// Refresh the attended key count in place before a replay. A captured decode graph binds the FULL
@@ -2441,6 +2472,134 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// Flash-decoding SDPA (seq_q==1): the occupancy fix for [`Self::sdpa_blk_vk`]. That kernel launches
+    /// one workgroup per (batch,head) -- only `b*n_heads` (=16 for a 16-head model) workgroups for the
+    /// lone decode query, at 256 VGPR (min occupancy), so most CUs idle and the KV-read latency is
+    /// unhidden. This splits the KV sequence across `n_split` workgroups per (batch,head) (grid
+    /// `(rows, n_split)`), each a register-light wave64 subgroup, then a reduce dispatch combines the
+    /// per-split flash partials. Same GQA-native strided KV read as `sdpa_blk_vk`; `causal` is unused
+    /// (a decode query attends the whole cache). Bit-exact with `sdpa_blk_vk` up to reduction-order f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa_decode_split_vk(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        b: usize,
+        n_heads: usize,
+        n_kv: usize,
+        seq_q: usize,
+        seq_k: usize,
+        d: usize,
+        softmax_scale: f32,
+        n_split: usize,
+        kv_batch_stride: usize,
+        kv_head_stride: usize,
+        key_stride: usize,
+    ) -> Result<VulkanStorage> {
+        let rows = b * n_heads * seq_q;
+        if q.count < rows * d {
+            crate::bail!("sdpa_decode_split_vk: q count {} < rows*d {}", q.count, rows * d);
+        }
+        let kv_max = (b.saturating_sub(1)) * kv_batch_stride
+            + (n_kv.saturating_sub(1)) * kv_head_stride
+            + (seq_k.saturating_sub(1)) * key_stride
+            + d;
+        if k.count < kv_max || v.count < kv_max {
+            crate::bail!("sdpa_decode_split_vk: k/v count < strided extent {kv_max}");
+        }
+        let nsplit = n_split.max(1);
+        let out = self.alloc_f32(rows * d)?;
+        // Per-split partials (un-normalized acc, running max, running denom). Transient: they park in the
+        // BufPool `pending` list and reclaim post-fence, so they stay live for the whole deferred batch.
+        let pacc = self.alloc_f32(rows * nsplit * d)?;
+        let pm = self.alloc_f32(rows * nsplit)?;
+        let pl = self.alloc_f32(rows * nsplit)?;
+        // seq_k rides an SSBO (VkGraphAttn `meta` layout [seq_q, seq_k, ...]); the shader reads meta[1].
+        let meta = self.upload_u32(&[seq_q as u32, seq_k as u32])?;
+        // Phase 1 push matches sdpa_decode_split.comp: H,Hkv,D,scale,n_split,kv strides (seq_k is in meta).
+        let mut p1 = Vec::with_capacity(32);
+        for x in [n_heads as u32, n_kv as u32, d as u32] {
+            p1.extend_from_slice(&x.to_le_bytes());
+        }
+        p1.extend_from_slice(&softmax_scale.to_le_bytes());
+        for x in [
+            nsplit as u32,
+            kv_batch_stride as u32,
+            kv_head_stride as u32,
+            key_stride as u32,
+        ] {
+            p1.extend_from_slice(&x.to_le_bytes());
+        }
+        let bufs1 = [q.buffer, k.buffer, v.buffer, pacc.buffer, pm.buffer, pl.buffer, meta.buffer];
+        self.dispatch_outs(
+            "sdpa_decode_split",
+            &bufs1,
+            &[3, 4, 5],
+            &p1,
+            (rows as u32, nsplit as u32, 1),
+        )?;
+        // Phase 2 push: D, n_split.
+        let mut p2 = Vec::with_capacity(8);
+        p2.extend_from_slice(&(d as u32).to_le_bytes());
+        p2.extend_from_slice(&(nsplit as u32).to_le_bytes());
+        let bufs2 = [pacc.buffer, pm.buffer, pl.buffer, out.buffer];
+        self.dispatch_outs("sdpa_decode_reduce", &bufs2, &[3], &p2, (rows as u32, 1, 1))?;
+        Ok(out)
+    }
+
+    /// Command-graph variant of [`Self::sdpa_decode_split_vk`]: the flash-decoding kernels with a
+    /// CALLER-OWNED stable `out` and `meta` (the shared [`VkGraphAttn`] buffers, `meta[1]`=seq_k advanced
+    /// per replay), matching how [`Self::sdpa_blk_vk_graph`] runs under capture. The per-split partials
+    /// are allocated fresh here; during capture the BufPool reserves every intermediate the forward
+    /// touches, so their handles stay stable for the graph's life (same mechanism as the per-layer `out`).
+    /// Writes `out` in place; `seq_q`==1. Bit-exact with `sdpa_decode_split_vk` (same .spv).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa_decode_split_vk_graph(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        out: &VulkanStorage,
+        meta: &VulkanStorage,
+        b: usize,
+        n_heads: usize,
+        n_kv: usize,
+        d: usize,
+        softmax_scale: f32,
+        n_split: usize,
+        kv_batch_stride: usize,
+        kv_head_stride: usize,
+        key_stride: usize,
+    ) -> Result<()> {
+        let rows = b * n_heads; // decode: seq_q == 1
+        let nsplit = n_split.max(1);
+        let pacc = self.alloc_f32(rows * nsplit * d)?;
+        let pm = self.alloc_f32(rows * nsplit)?;
+        let pl = self.alloc_f32(rows * nsplit)?;
+        let mut p1 = Vec::with_capacity(32);
+        for x in [n_heads as u32, n_kv as u32, d as u32] {
+            p1.extend_from_slice(&x.to_le_bytes());
+        }
+        p1.extend_from_slice(&softmax_scale.to_le_bytes());
+        for x in [
+            nsplit as u32,
+            kv_batch_stride as u32,
+            kv_head_stride as u32,
+            key_stride as u32,
+        ] {
+            p1.extend_from_slice(&x.to_le_bytes());
+        }
+        let bufs1 = [q.buffer, k.buffer, v.buffer, pacc.buffer, pm.buffer, pl.buffer, meta.buffer];
+        self.dispatch_outs("sdpa_decode_split", &bufs1, &[3, 4, 5], &p1, (rows as u32, nsplit as u32, 1))?;
+        let mut p2 = Vec::with_capacity(8);
+        p2.extend_from_slice(&(d as u32).to_le_bytes());
+        p2.extend_from_slice(&(nsplit as u32).to_le_bytes());
+        let bufs2 = [pacc.buffer, pm.buffer, pl.buffer, out.buffer];
+        self.dispatch_outs("sdpa_decode_reduce", &bufs2, &[3], &p2, (rows as u32, 1, 1))?;
+        Ok(())
+    }
+
     /// Command-graph variant of [`Self::sdpa_blk_vk`]: the same `sdpa_blk` .spv, but `out`, `scale`
     /// and `meta` are CALLER-OWNED STABLE buffers instead of freshly allocated/uploaded each call.
     /// The kernel reads the attended key count from `meta[1]` (seq_k), so a captured decode graph
@@ -2497,7 +2656,15 @@ impl VulkanDevice {
             key_stride as u32,
         ])?;
         let scale = self.upload_f32(&[softmax_scale])?;
-        Ok(VkGraphAttn { scale, meta })
+        Ok(VkGraphAttn {
+            scale,
+            meta,
+            n_kv,
+            softmax_scale,
+            kv_batch_stride,
+            kv_head_stride,
+            key_stride,
+        })
     }
 
     /// Q6_K matrix-vector: `y[nout] = Wq * x[k]` where `Wq` came from [`quantize_q6k`]. Reads weights
@@ -7400,6 +7567,78 @@ mod dsl_dispatch_proof {
         }
         eprintln!("[sdpa-blk] h{H}kv{KV} q{SQ} k{SK} d{D} x8-batched  scale_rel={worst:.2e}  (DSL flash-SDPA spv via ml dispatch, pooled scale/meta, no sync crutch)");
         assert!(worst < 1e-4, "sdpa_blk DSL diverged from CPU: scale_rel={worst:.3e}");
+    }
+
+    /// Flash-decoding (`sdpa_decode_split_vk`) matches the same two-pass softmax CPU oracle as
+    /// `sdpa_blk_vk`, across GQA ratios, split counts, and a ragged seq_k (empty trailing splits).
+    /// Register-light wave64 subgroup + KV-split phase 1, flash-combine phase 2 -- numerically identical
+    /// to a single-pass online softmax up to f32 reduction order. This is the correctness gate for the
+    /// decode-attention occupancy fix; the perf A/B lives in CI benches, not here.
+    #[test]
+    fn sdpa_decode_split_matches_oracle() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[sdpa-split] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        const D: usize = 128;
+        let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
+        // CPU reference: two-pass softmax(QKᵀ·scale)V, GQA (head h -> kv head h/(H/KV)), non-causal.
+        let cpu_ref = |h_n: usize, kv_n: usize, sk: usize, q: &[f32], k: &[f32], v: &[f32]| {
+            let scale = 1.0f32 / (D as f32).sqrt();
+            let groups = h_n / kv_n;
+            let mut cpu = vec![0f32; h_n * D];
+            for h in 0..h_n {
+                let kv = h / groups;
+                let qb = h * D;
+                let sc: Vec<f32> = (0..sk)
+                    .map(|kk| (0..D).map(|dd| q[qb + dd] * k[(kv * sk + kk) * D + dd]).sum::<f32>() * scale)
+                    .collect();
+                let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
+                let sum: f32 = ex.iter().sum();
+                for dd in 0..D {
+                    cpu[qb + dd] = (0..sk).map(|kk| ex[kk] / sum * v[(kv * sk + kk) * D + dd]).sum();
+                }
+            }
+            cpu
+        };
+        // (H, KV, SK, n_split) cases: zen-eco decode (16/2), the 32/8 GQA shape, and a ragged seq_k
+        // (SK=13 with n_split=8 leaves trailing splits empty -> must contribute exactly zero).
+        let cases = [
+            (16usize, 2usize, 512usize, 1usize),
+            (16, 2, 512, 2),
+            (16, 2, 512, 4),
+            (16, 2, 512, 8),
+            (32, 8, 2048, 8),
+            (16, 2, 13, 8),
+        ];
+        let scale = 1.0f32 / (D as f32).sqrt();
+        let mut worst = 0f32;
+        for (h_n, kv_n, sk, nsplit) in cases {
+            let q: Vec<f32> = (0..h_n * D).map(|idx| gen(1, idx)).collect();
+            let k: Vec<f32> = (0..kv_n * sk * D).map(|idx| gen(2, idx)).collect();
+            let v: Vec<f32> = (0..kv_n * sk * D).map(|idx| gen(3, idx)).collect();
+            let cpu = cpu_ref(h_n, kv_n, sk, &q, &k, &v);
+            let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+            let qs = dev.upload_f32(&q).unwrap();
+            let ks = dev.upload_f32(&k).unwrap();
+            let vs = dev.upload_f32(&v).unwrap();
+            let out = dev
+                .sdpa_decode_split_vk(
+                    &qs, &ks, &vs, 1, h_n, kv_n, 1, sk, D, scale, nsplit,
+                    kv_n * sk * D, sk * D, D,
+                )
+                .unwrap();
+            let got = out.to_vec_f32().unwrap();
+            let err = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let rel = err / maxref;
+            eprintln!("[sdpa-split] h{h_n}kv{kv_n} k{sk} nsplit{nsplit}  scale_rel={rel:.2e}");
+            worst = worst.max(rel);
+        }
+        assert!(worst < 1e-4, "sdpa_decode_split diverged from CPU: scale_rel={worst:.3e}");
     }
 
     /// The affine Q4_K PREFILL MMQ .spv (mmq_q4k, coopmat/tensor-core) dispatches through ml's own
