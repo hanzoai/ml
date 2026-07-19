@@ -77,6 +77,13 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
                 out.extend_from_slice(&[0u8, 0, 0, 0, 0, 0xC0, 0, 0x20]);
             }
         }
+        // K-quants: quantize random f32 (candle's CPU quantizer) to valid blocks, then reuse the
+        // identical bytes on both devices. block_q4_K = 144 B, block_q6_K = 210 B.
+        GgmlDType::Q4K | GgmlDType::Q6K => {
+            let w: Vec<f32> = (0..nblk * be).map(|i| pseudo(i) * 0.5).collect();
+            let t = Tensor::from_vec(w, (nout, k), &Device::Cpu).unwrap();
+            return QTensor::quantize(&t, dtype).unwrap().data().unwrap().into_owned();
+        }
         _ => panic!("synth: {dtype:?} is not a wired Metal i-quant type"),
     }
     out
@@ -238,6 +245,14 @@ fn metal_matvec_iq4xs_matches_cpu() {
 #[test]
 fn metal_matvec_iq4nl_matches_cpu() {
     check(GgmlDType::IQ4_NL);
+}
+#[test]
+fn metal_matvec_q4k_matches_cpu() {
+    check(GgmlDType::Q4K);
+}
+#[test]
+fn metal_matvec_q6k_matches_cpu() {
+    check(GgmlDType::Q6K);
 }
 
 // ---- DEQUANT round-trip bit-exactness (upload/readback) ----
