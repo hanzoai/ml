@@ -311,6 +311,11 @@ struct VkInner {
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
     // kernel name -> built pipeline. &'static str keys: kernel names are compile-time literals.
     pipelines: Mutex<HashMap<&'static str, CachedPipeline>>,
+    // Autotune scratch: an uncommitted `mul_mm_q4k_coopmat` variant (raw SPIR-V, plus its BM/BN tile
+    // geometry for the dispatch grid), so the evolutionary tuner can bench a genome through the real
+    // dispatch path before it is committed. Empty in every production build -- consulted only under the
+    // dedicated `__coopmat_variant` pipeline name, which nothing else dispatches.
+    coopmat_variant: Mutex<Option<(Vec<u8>, u32, u32)>>,
     // Persistent per-dispatch Vulkan objects (command pool/buffer, fence, descriptor pool),
     // reset and reused each dispatch instead of created+destroyed. The whole submit path is
     // serialized through this Mutex (ops are sequential per tensor graph anyway), which both
@@ -1486,6 +1491,56 @@ impl VulkanDevice {
         k: usize,
     ) -> Result<VulkanStorage> {
         self.matmul_q4k_gpu_off(wq, x, m, nout, k, 0)
+    }
+
+    /// Install an uncommitted `mul_mm_q4k_coopmat` variant (raw SPIR-V plus its BM/BN tile geometry) for
+    /// the evolutionary autotuner to bench through the real dispatch path before it is committed. Evicts
+    /// and destroys any previously installed variant's cached pipeline first -- the bench synchronizes
+    /// between variants so the device is idle and the destroy is safe. Tuner/test-only; nothing
+    /// dispatches this pipeline name in a production build.
+    #[cfg(test)]
+    pub(crate) fn install_coopmat_variant(&self, spv: &[u8], bm: u32, bn: u32) {
+        if let Some(old) = self.inner.pipelines.lock().unwrap().remove("__coopmat_variant") {
+            unsafe {
+                let dev = self.dev();
+                dev.destroy_pipeline(old.pipeline, None);
+                dev.destroy_pipeline_layout(old.layout, None);
+                dev.destroy_descriptor_set_layout(old.set_layout, None);
+            }
+        }
+        *self.inner.coopmat_variant.lock().unwrap() = Some((spv.to_vec(), bm, bn));
+    }
+
+    /// Run the installed coopmat variant as a Q4_K prefill matmul `y[m,nout] = x[m,k] * W[nout,k]`.
+    /// Mirrors the committed coopmat branch of [`matmul_q4k_gpu`] exactly but for the grid divisors --
+    /// BM/BN come from the installed variant, not the fixed 128 -- so a genome with a different tile is
+    /// dispatched correctly.
+    #[cfg(test)]
+    pub(crate) fn matmul_q4k_coopmat_variant(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        m: usize,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        let (bm, bn) = self
+            .inner
+            .coopmat_variant
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, bm, bn)| (*bm, *bn))
+            .ok_or_else(|| Error::Msg("vulkan: no coopmat variant installed".into()))?;
+        let out = self.alloc_f32(m * nout)?;
+        let push = push_u32(&[0, m as u32, nout as u32, k as u32, 0u32]);
+        self.dispatch(
+            "__coopmat_variant",
+            &[wq.buffer, x.buffer, out.buffer],
+            &push,
+            ((nout as u32).div_ceil(bn), (m as u32).div_ceil(bm), 1),
+        )?;
+        Ok(out)
     }
 
     /// Q4_K prefill matmul into a slice of `wq` starting at `woff` u32 words. `woff == 0` is
@@ -3856,7 +3911,15 @@ impl VulkanDevice {
                     None,
                 )
                 .map_err(vkerr)?;
-            let spv_bytes = kernel_spv(name)?;
+            // The autotuner's uncommitted variant is served from the registry under one dedicated name;
+            // every other name loads its committed module. Cloned only on the (rare) cache miss.
+            let variant_bytes = (name == "__coopmat_variant")
+                .then(|| self.inner.coopmat_variant.lock().unwrap().as_ref().map(|(b, _, _)| b.clone()))
+                .flatten();
+            let spv_bytes: &[u8] = match &variant_bytes {
+                Some(b) => b,
+                None => kernel_spv(name)?,
+            };
             let spv = ash::util::read_spv(&mut std::io::Cursor::new(spv_bytes))
                 .map_err(|e| Error::Msg(format!("vulkan: bad SPIR-V `{name}`: {e}")))?;
             let module = dev
@@ -4987,6 +5050,7 @@ impl BackendDevice for VulkanDevice {
                 peak_bw_gbps: std::sync::atomic::AtomicU32::new(0),
                 push_descriptor,
                 pipelines: Mutex::new(HashMap::new()),
+                coopmat_variant: Mutex::new(None),
                 submitter,
                 bufpool: Mutex::new(BufPool::default()),
                 coopmat,
@@ -6627,6 +6691,13 @@ impl BackendStorage for VulkanStorage {
         }
     }
 }
+
+// Evolutionary autotuner hunt over the Q4_K coopmat prefill genome. A child of this module (so it
+// reaches the pub(crate)/private dispatch surface) that reuses the hanzo-kernel `tune` evolutionary
+// search as a dev-dependency. Test/tuner-only.
+#[cfg(test)]
+#[path = "coopmat_hunt.rs"]
+mod coopmat_hunt;
 
 #[cfg(test)]
 mod dsl_dispatch_proof {
