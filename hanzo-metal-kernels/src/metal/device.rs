@@ -122,7 +122,7 @@ impl Device {
             .as_ref()
             .newComputePipelineStateWithFunction_error(function.as_ref())
             .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
-        Ok(ComputePipeline::new(raw))
+        Ok(ComputePipeline::new(raw, &function.name()))
     }
 
     pub fn new_command_queue(&self) -> Result<CommandQueue, MetalKernelError> {
