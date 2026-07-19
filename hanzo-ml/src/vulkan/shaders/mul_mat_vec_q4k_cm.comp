@@ -1,0 +1,118 @@
+#version 450
+// Coalesced multi-thread Q4_K matrix-vector product: y[n] = sum_k W[n,k]*x[k], W stored as GGUF Q4_K
+// super-blocks (256 weights / 144 bytes = 36 u32: d(f16) dmin(f16) scales[12] qs[128]).
+//
+// The Q4_K analogue of mul_mat_vec_q6k_cm: the coalesced-load, cooperative-thread decode matvec (the
+// memory-BW lever for decode on the gfx1151 UMA APU). A fixed group of TPB=16 threads cooperate on ONE
+// super-block, each thread owning a fixed 16-weight sub-position and reading two adjacent qs u32 words
+// (adjacent threads read adjacent words = a coalesced 64-byte burst) instead of one thread streaming a
+// whole 144-byte block strided from its neighbours (uncoalesced). ROWS_PER_WG rows amortise the shared
+// activation loads. Per-row partials reduce with a subgroup add plus a small shared-memory sum across
+// subgroups. Affine decode d*sc[j]*q - dmin*m[j] with get_scale_min_k4, bit-identical to
+// mul_mat_vec_q4k / BlockQ4K::to_float; unpackHalf2x16 decodes d/dmin so subnormal fp16 scales are
+// exact. Dispatched when the device advertises subgroup ARITHMETIC (gated host-side); VK_Q4K_CM_OFF
+// falls back to the dp4a block kernel.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint   w[]; };  // Q4_K blocks, 36 u32 / 256-block
+layout(set = 0, binding = 1) readonly buffer X { float  x[]; };  // activation vector, length k
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };  // output, length nout
+// woff: u32 offset into w[] where this weight matrix starts (0 for a plain 2D weight; e*n*(k/256)*36
+// to select expert e of a resident MoE bank). k is a multiple of 256.
+layout(push_constant) uniform Pc { uint nout; uint k; uint woff; };
+
+const uint BLK_U32 = 36u;                             // Q4_K block: 144 bytes / 4
+const uint TPB = 16u;                                 // threads cooperating on one super-block
+const uint ITS = gl_WorkGroupSize.x / TPB;            // super-blocks processed in parallel per workgroup
+const uint NR  = 2u;                                  // output rows per workgroup (llama rm_kq on RDNA)
+const uint MAX_SG = 8u;                               // >= workgroup_size / min_subgroup_size
+
+shared float sh[NR][MAX_SG];
+
+// get_scale_min_k4 (llama.cpp) from the 12 packed scale bytes at u32 base b+1. `j` is 0..7.
+uint sbyte(uint b, uint i) { return (w[b + 1u + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu; }
+uint q4k_sc(uint b, uint j) {
+    if (j < 4u) return sbyte(b, j) & 63u;
+    return (sbyte(b, j + 4u) & 15u) | ((sbyte(b, j - 4u) >> 6u) << 4u);
+}
+uint q4k_m(uint b, uint j) {
+    if (j < 4u) return sbyte(b, j + 4u) & 63u;
+    return (sbyte(b, j + 4u) >> 4u) | ((sbyte(b, j) >> 6u) << 4u);
+}
+
+void main() {
+    uint first_row = NR * gl_WorkGroupID.x;
+    uint nblocks = k / 256u;
+
+    uint tid  = gl_LocalInvocationID.x;
+    uint itid = tid & 15u;          // 0..15: sub-position within a super-block
+    uint ix   = tid >> 4u;          // 0..ITS-1: which super-block slot this thread group owns
+    uint hg = itid >> 3u;         // 0 or 1: which 64-weight pair-group (hg) (sub-blocks {0,1,4,5} or {2,3,6,7})
+    uint q    = (itid & 7u) << 2u;  // 0,4,...,28: first of this thread's 4 weights inside each sub-block
+    uint qw   = itid;               // qs u32 word index (low group); high group at qw+16
+
+    // The four sub-blocks this thread owns and the activation base offset (within the 256-weight block)
+    // of each: sub-block 2h at h*64+q, 2h+1 at h*64+32+q, 4+2h at 128+h*64+q, 5+2h at 128+h*64+32+q.
+    uint j0 = 2u * hg, j1 = j0 + 1u, j2 = 4u + 2u * hg, j3 = j2 + 1u;
+    uint ya = hg * 64u + q;
+    uint yb = ya + 32u;
+    uint yc = 128u + hg * 64u + q;
+    uint yd = yc + 32u;
+
+    float acc[NR];
+    [[unroll]] for (uint n = 0u; n < NR; n++) acc[n] = 0.0;
+
+    [[unroll]] for (uint n = 0u; n < NR; n++) {
+        uint row = first_row + n;
+        if (row >= nout) break;
+        uint rowbase = woff + row * nblocks * BLK_U32;
+        for (uint blk = ix; blk < nblocks; blk += ITS) {
+            uint b = rowbase + blk * BLK_U32;
+            vec2 dm = unpackHalf2x16(w[b]);   // (d, dmin) -- hardware f16, subnormal-exact
+            float d = dm.x, dmin = dm.y;
+
+            uint wlo = w[b + 4u + qw];         // sub-blocks j0 (low nibble), j1 (high nibble)
+            uint whi = w[b + 4u + qw + 16u];   // sub-blocks j2 (low nibble), j3 (high nibble)
+            uint n0 = wlo & 0x0F0F0F0Fu;
+            uint n1 = (wlo >> 4u) & 0x0F0F0F0Fu;
+            uint n2 = whi & 0x0F0F0F0Fu;
+            uint n3 = (whi >> 4u) & 0x0F0F0F0Fu;
+
+            float dj0 = d * float(q4k_sc(b, j0)), mj0 = dmin * float(q4k_m(b, j0));
+            float dj1 = d * float(q4k_sc(b, j1)), mj1 = dmin * float(q4k_m(b, j1));
+            float dj2 = d * float(q4k_sc(b, j2)), mj2 = dmin * float(q4k_m(b, j2));
+            float dj3 = d * float(q4k_sc(b, j3)), mj3 = dmin * float(q4k_m(b, j3));
+
+            uint yblk = blk * 256u;
+            [[unroll]] for (uint l = 0u; l < 4u; l++) {
+                uint sh8 = l * 8u;
+                acc[n] = fma(fma(dj0, float((n0 >> sh8) & 0xFFu), -mj0), x[yblk + ya + l], acc[n]);
+                acc[n] = fma(fma(dj1, float((n1 >> sh8) & 0xFFu), -mj1), x[yblk + yb + l], acc[n]);
+                acc[n] = fma(fma(dj2, float((n2 >> sh8) & 0xFFu), -mj2), x[yblk + yc + l], acc[n]);
+                acc[n] = fma(fma(dj3, float((n3 >> sh8) & 0xFFu), -mj3), x[yblk + yd + l], acc[n]);
+            }
+        }
+    }
+
+    uint nsg  = gl_NumSubgroups;
+    uint sgid = gl_SubgroupID;
+    [[unroll]] for (uint n = 0u; n < NR; n++) {
+        float v = subgroupAdd(acc[n]);
+        if (subgroupElect()) sh[n][sgid] = v;
+    }
+    barrier();
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0u; n < NR; n++) {
+            uint row = first_row + n;
+            if (row >= nout) continue;
+            float t = 0.0;
+            for (uint s = 0u; s < nsg; s++) t += sh[n][s];
+            y[row] = t;
+        }
+    }
+}
