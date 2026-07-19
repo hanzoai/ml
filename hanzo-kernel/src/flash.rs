@@ -685,4 +685,85 @@ mod tests {
         eprintln!("[flash production] scalar-on-cpu scale_rel={rel:.2e}");
         assert!(rel < 2e-3, "production run on cpu: scale_rel {rel}");
     }
+
+    /// The f16 cooperative-matrix arm, EXECUTED on CUDA (GB10, sm_121) where `cmma` lowers to
+    /// `nvcuda::wmma`, matched against the materialized two-pass reference across the same 10 production
+    /// shapes as the CPU oracle and the Vulkan gate. This validates the 4th (and last untested) backend
+    /// of `flash_attn`: the ColMajor-K -> Kᵀ WMMA fragment layout, the PV store stride, the partial-tile
+    /// zero-pad on ragged seq, and the f16 QK/PV precision -- all on real NVIDIA silicon (~2-3e-4
+    /// scale-relative, the chained-f16 tensor-core tolerance, not the scalar arm's ~1e-7).
+    ///
+    /// Plane = 64. MEASURED finding, not assumed: `plane` is the workgroup lane count, and on CUDA a
+    /// WMMA fragment is WARP-scoped -- 32 lanes, a hardware constant independent of the block size (proven
+    /// from the generated kernel: the `nvcuda::wmma` 16x16x16 fragments are byte-identical between the
+    /// plane=32 and plane=64 lowerings, with no warp-index guard). A 64-lane launch therefore runs 2
+    /// warps that each compute the identical fragment and store identical results -- bit-correct, and
+    /// measured FASTER than 32 (the f16-staging and softmax-epilogue loops parallelize across 2x lanes,
+    /// outweighing the redundant second-warp mma). plane=32 is equally correct on CUDA but STARVES RADV
+    /// coopmat (subgroupSize=64). So 64 is the one portable coopmat plane for CUDA and Vulkan alike:
+    /// there is no CUDA-inverse of the RADV "half the lanes" bug, because a coopmat fragment is
+    /// subgroup-sized (variable) whereas a WMMA fragment is warp-sized (fixed). The agreement assertion
+    /// below pins CUDA-correct-at-both-planes, guarding any future warp/subgroup-scope regression.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn flash_coopmat_matches_ref_on_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        let c = CudaRuntime::client(&CudaDevice::default());
+        let plane = 64usize; // portable coopmat plane: correct on CUDA WMMA and RADV coopmat; see doc.
+        let shapes: [(usize, usize, usize, usize, usize, bool, &str); 10] = [
+            (4, 2, 1, 1, 32, false, "decode kv1"),
+            (4, 2, 1, 17, 32, false, "decode kv17 (ragged tail)"),
+            (4, 2, 1, 128, 32, false, "decode kv128"),
+            (8, 2, 1, 512, 64, false, "decode kv512 GQA4"),
+            (4, 2, 16, 128, 32, true, "prefill qt1 causal GQA2"),
+            (4, 2, 16, 128, 32, false, "prefill qt1 noncausal GQA2"),
+            (4, 4, 16, 64, 64, true, "prefill qt1 MHA causal d64"),
+            (4, 2, 48, 48, 32, true, "prefill 3-tile causal GQA2 (aligned)"),
+            (6, 3, 40, 40, 64, true, "prefill causal GQA2 tail sq40 d64"),
+            (2, 1, 512, 512, 128, true, "prefill 512 causal MHA d128"),
+        ];
+        let mut fails = 0usize;
+        for (nh, nkv, sq, sk, d, causal, tag) in shapes {
+            let q = rnd(nh * sq * d, 0x1234_5678);
+            let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
+            let v = rnd(nkv * sk * d, 0x0FED_CBA9);
+            let got = flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, plane);
+            let want = sdpa_ref(&q, &k, &v, nh, nkv, sq, sk, d, causal);
+            let rel = scale_rel(&got, &want);
+            let nonfin = got.iter().filter(|x| !x.is_finite()).count();
+            let where_ = if rel < 2e-3 {
+                String::new()
+            } else {
+                got.iter().zip(&want).enumerate()
+                    .find(|(_, (g, w))| (**g - **w).abs() > 1e-2 || !g.is_finite())
+                    .map(|(i, (g, w))| {
+                        let (h, rem) = (i / (sq * d), i % (sq * d));
+                        format!(" first-bad@[h{h},q{},d{}] got={g:.3e} want={w:.3e}", rem / d, rem % d)
+                    })
+                    .unwrap_or_default()
+            };
+            eprintln!("[flash-cuda {tag}] nh{nh}/nkv{nkv} sq{sq} sk{sk} d{d} causal{causal} scale_rel={rel:.2e} nonfinite={nonfin}{where_}");
+            if !(rel < 2e-2) { fails += 1; }
+        }
+        assert_eq!(fails, 0, "flash coopmat CUDA: {fails} shape(s) exceeded 2e-2 vs materialized sdpa_ref");
+
+        // Portability regression guard: CUDA must agree at plane=32 and plane=64. The extra warp at
+        // plane=64 is redundant, not wrong (warp-scoped WMMA); a future change making the coopmat op
+        // subgroup/block-scoped would diverge these massively (half the output tile undefined).
+        for (nh, nkv, sq, sk, d, causal, tag) in [
+            (4usize, 2usize, 16usize, 128usize, 32usize, true, "prefill causal"),
+            (8, 2, 1, 512, 64, false, "decode kv512"),
+            (2, 1, 512, 512, 128, true, "prefill 512 d128"),
+        ] {
+            let q = rnd(nh * sq * d, 0x1234_5678);
+            let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
+            let v = rnd(nkv * sk * d, 0x0FED_CBA9);
+            let p32 = flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, 32);
+            let p64 = flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, 64);
+            let agree = scale_rel(&p32, &p64);
+            eprintln!("[flash-cuda plane-agree {tag}] scale_rel(p32,p64)={agree:.2e}");
+            assert!(agree < 1e-4, "CUDA plane 32 vs 64 diverged ({agree}) -- coopmat no longer warp-scoped");
+        }
+    }
+
 }
