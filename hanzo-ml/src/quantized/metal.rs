@@ -345,10 +345,24 @@ impl QMetalStorage {
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
-        let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
+        let kdtype: hanzo_metal_kernels::GgmlDType = self.dtype.try_into()?;
+        // bf16-native prefill: a bf16 activation against a K-quant with a bf16 mm (Q4_K/Q6_K) reads
+        // src1 and writes dst in bf16 directly, so the bf16<->f32 round-trip GgufMatMul wraps around
+        // the projection disappears -- the multi-token twin of the bf16 decode matvec in `fwd_mv`.
+        // The simdgroup math is identical to the f32 mm (src1 is widened to f32 on stage); only the
+        // I/O dtype changes, so f32 models and unsupported quants are unaffected.
+        let src1_bf16 = storage.dtype() == DType::BF16
+            && matches!(
+                kdtype,
+                hanzo_metal_kernels::GgmlDType::Q4K | hanzo_metal_kernels::GgmlDType::Q6K
+            );
+        let out_dtype = if src1_bf16 { DType::BF16 } else { DType::F32 };
+        let dst = device.new_buffer(dst_shape.elem_count(), out_dtype, "qmatmul")?;
         let encoder = device.command_encoder()?;
 
-        assert_eq!(storage.dtype(), DType::F32);
+        if !src1_bf16 {
+            assert_eq!(storage.dtype(), DType::F32);
+        }
 
         if self_shape.rank() > 4 {
             crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())
@@ -376,7 +390,7 @@ impl QMetalStorage {
             device.device(),
             &encoder,
             device.kernels(),
-            self.dtype.try_into()?,
+            kdtype,
             src0_l.dims(),
             &src0_stride,
             &self.buffer,
@@ -384,18 +398,19 @@ impl QMetalStorage {
             &src1_l
                 .stride()
                 .iter()
-                .map(|x| x * DType::F32.size_in_bytes())
+                .map(|x| x * storage.dtype().size_in_bytes())
                 .collect::<Vec<_>>(),
             storage.buffer(),
             src1_l.start_offset() * storage.dtype().size_in_bytes(),
             dst_shape.dims(),
             0,
             &dst,
+            src1_bf16,
         )
         .map_err(MetalError::from)?;
 
         let dst_storage =
-            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), out_dtype);
         Ok((dst_storage, dst_shape))
     }
 
@@ -475,6 +490,7 @@ impl QMetalStorage {
                 &[1, 1, m, n],
                 0,
                 &dst,
+                false,
             )
             .map_err(MetalError::from)?;
         }
