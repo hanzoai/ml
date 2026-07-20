@@ -325,6 +325,78 @@ fn metal_matvec_q6k_bf16_matches_f32() {
     check_bf16_matches_f32_rounded(GgmlDType::Q6K);
 }
 
+// A bf16 activation with m>1 rows routes `fwd` to the bf16-native mm GEMM (kernel_mul_mm_q*_K_bf16:
+// bf16 src1/dst, f32 accumulation, simdgroup math identical to the f32 mm because src1 is widened to
+// f32 on stage). It must be BIT-IDENTICAL to the f32 mm run on the SAME bf16-rounded activation and
+// rounded to bf16 -- exactly what GgufMatMul's f32 fallback computes around the projection. Two shapes
+// cover a full-tile case and one with a partial 32-col tile + partial 64-row tile (the edge store).
+fn check_bf16_mm_matches_f32_rounded(dtype: GgmlDType) {
+    let dev = match Device::new_metal(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip bf16 mm {dtype:?}: no Metal device ({e})");
+            return;
+        }
+    };
+    for &(m, nout, k) in &[(32usize, 512usize, 2048usize), (40, 576, 2048)] {
+        let raw = synth(dtype, nout, k);
+        let q = QTensor::new(QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(), (nout, k))
+            .unwrap();
+        let matmul = QMatMul::from_qtensor(q).unwrap();
+        let x_host: Vec<f32> = (0..m * k).map(|i| pseudo(i + 2_000_003)).collect();
+        let x_bf16 = Tensor::from_vec(x_host, (m, k), &dev)
+            .unwrap()
+            .to_dtype(hanzo_ml::DType::BF16)
+            .unwrap();
+        let x_f32 = x_bf16.to_dtype(hanzo_ml::DType::F32).unwrap();
+
+        let y_bf16 = matmul.forward(&x_bf16).unwrap();
+        assert_eq!(
+            y_bf16.dtype(),
+            hanzo_ml::DType::BF16,
+            "{dtype:?} bf16 mm activation did not take the bf16-native mm"
+        );
+        let y_bf16: Vec<f32> = y_bf16
+            .to_dtype(hanzo_ml::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let y_ref: Vec<f32> = matmul
+            .forward(&x_f32)
+            .unwrap()
+            .to_dtype(hanzo_ml::DType::BF16)
+            .unwrap()
+            .to_dtype(hanzo_ml::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut max_abs = 0f32;
+        let mut max_ref = 0f32;
+        for (a, b) in y_bf16.iter().zip(&y_ref) {
+            max_abs = max_abs.max((a - b).abs());
+            max_ref = max_ref.max(b.abs());
+        }
+        let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+        println!("bf16-mm {dtype:?} [{m}x{nout}x{k}]: max_abs={max_abs:.3e} scale-rel={rel:.3e}");
+        assert_eq!(
+            max_abs, 0.0,
+            "{dtype:?} [{m}x{nout}x{k}] bf16 mm not bit-identical to f32-then-round-bf16: {max_abs:.3e}"
+        );
+    }
+}
+#[test]
+fn metal_mm_q4k_bf16_matches_f32() {
+    check_bf16_mm_matches_f32_rounded(GgmlDType::Q4K);
+}
+#[test]
+fn metal_mm_q6k_bf16_matches_f32() {
+    check_bf16_mm_matches_f32_rounded(GgmlDType::Q6K);
+}
+
 // ---- DEQUANT round-trip bit-exactness (upload/readback) ----
 #[test]
 fn metal_dequant_iq1s_bit_exact() {

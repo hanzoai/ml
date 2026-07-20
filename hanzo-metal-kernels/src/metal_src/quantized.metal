@@ -7116,11 +7116,98 @@ kernel void kernel_get_rows_i32(
 #define SG_MAT_SIZE 64 // simdgroup matrix is of shape 8x8
 #define SG_MAT_ROW 8
 
+// Write the f32 simdgroup accumulators of one 64x32 output tile to a float destination. Full tiles
+// store straight from the simdgroup registers; edge tiles stage through threadgroup memory so no
+// lane writes outside the matrix. This is the original kernel_mul_mm epilogue, lifted verbatim into
+// an overload so the f32 path is byte-identical and a bfloat overload can share the call site.
+static inline void mm_store_result(
+        device float * dst,
+        thread simdgroup_float8x8 * mc,
+        threadgroup uchar * shared_memory,
+        uint r0, uint r1, uint im,
+        int64_t ne0, int64_t ne1,
+        uint sgitg, uint tiitg,
+        short n_rows, short n_cols) {
+    if ((r0 + 1) * BLOCK_SIZE_M <= ne0 && (r1 + 1) * BLOCK_SIZE_N <= ne1) {
+        device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg &  1)) \
+                               + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8 * (i%4) + 8 * ne0 * (i/4), ne0);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float * temp_str = ((threadgroup float *) shared_memory) \
+                                      + 32 * (sgitg&1) + (16 * (sgitg>>1))*BLOCK_SIZE_M;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*BLOCK_SIZE_M*(i/4), BLOCK_SIZE_M);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < n_cols; j += BLOCK_SIZE_N) {
+                device float  * D  = dst + (r0*BLOCK_SIZE_M) + (r1*BLOCK_SIZE_N + j)*ne0 + im*ne1*ne0;
+                device float4 * D4 = (device float4 *) D;
+                threadgroup float  * C  = temp_str + (j*BLOCK_SIZE_M);
+                threadgroup float4 * C4 = (threadgroup float4 *) C;
+                int i = 0;
+                for (; i < n_rows/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+                i *= 4;
+                for (; i < n_rows; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}
+
+// bfloat destination: `simdgroup_store` has no float8x8 -> bfloat converting store, so every tile
+// (full or edge) stages the f32 accumulators through threadgroup memory and narrows to bfloat on
+// the way out. Narrowing the same f32 accumulator that the f32 path writes, then rounding to bfloat,
+// matches the f32-store-then-cast_f32_bf16 result the GgufMatMul round-trip produces.
+static inline void mm_store_result(
+        device bfloat * dst,
+        thread simdgroup_float8x8 * mc,
+        threadgroup uchar * shared_memory,
+        uint r0, uint r1, uint im,
+        int64_t ne0, int64_t ne1,
+        uint sgitg, uint tiitg,
+        short n_rows, short n_cols) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float * temp_str = ((threadgroup float *) shared_memory) \
+                                  + 32 * (sgitg&1) + (16 * (sgitg>>1))*BLOCK_SIZE_M;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*BLOCK_SIZE_M*(i/4), BLOCK_SIZE_M);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        for (int j = tiitg; j < n_cols; j += BLOCK_SIZE_N) {
+            device bfloat  * D  = dst + (r0*BLOCK_SIZE_M) + (r1*BLOCK_SIZE_N + j)*ne0 + im*ne1*ne0;
+            device bfloat4 * D4 = (device bfloat4 *) D;
+            threadgroup float  * C  = temp_str + (j*BLOCK_SIZE_M);
+            threadgroup float4 * C4 = (threadgroup float4 *) C;
+            int i = 0;
+            for (; i < n_rows/4; i++) {
+                *(D4 + i) = bfloat4(*(C4 + i));
+            }
+            i *= 4;
+            for (; i < n_rows; i++) {
+                *(D + i) = (bfloat) *(C + i);
+            }
+        }
+    }
+}
+
 // each block_q contains 16*nl weights
-template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
+// SRC1/DST default to float so every existing `kernel_mul_mm_*_f32` instantiation is unchanged. The
+// bf16-native prefill instantiations set SRC1=DST=bfloat: src1 is read as bfloat and widened to f32
+// on stage (so the simdgroup math is identical to the f32 path), and the f32 accumulator is narrowed
+// to bfloat on store -- removing the bf16<->f32 activation round-trip GgufMatMul otherwise wraps
+// around the projection, and halving the src1 read + dst write traffic.
+template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &), typename SRC1 = float, typename DST = float>
 kernel void kernel_mul_mm(device const  uchar * src0,
                           device const  uchar * src1,
-                          device        float * dst,
+                          device        DST   * dst,
                           constant    int64_t & ne00,
                           constant    int64_t & ne02,
                           constant   uint64_t & nb01,
@@ -7172,7 +7259,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
     ushort offset1 = il/nl;
 
     device const block_q * x = (device const block_q *)(src0 + (r0*BLOCK_SIZE_M + thread_row)*nb01 + offset0) + offset1;
-    device const float   * y = (device const float   *)(src1
+    device const SRC1    * y = (device const SRC1    *)(src1
         + nb13 * i13
         + nb12 * i12
         + nb11 * (r1 * BLOCK_SIZE_N + thread_col)
@@ -7191,7 +7278,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
             +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
         }
 
-        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = *((device float2x4 *) y);
+        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = float2x4(*((device matrix<SRC1, 2, 4> *) y));
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + (2+nl-1)/nl : x;
@@ -7225,43 +7312,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
         }
     }
 
-    if ((r0 + 1) * BLOCK_SIZE_M <= ne0 && (r1 + 1) * BLOCK_SIZE_N <= ne1) {
-        device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg &  1)) \
-                               + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], C + 8 * (i%4) + 8 * ne0 * (i/4), ne0);
-        }
-    } else {
-        // block is smaller than 64x32, we should avoid writing data outside of the matrix
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        threadgroup float * temp_str = ((threadgroup float *) shared_memory) \
-                                      + 32 * (sgitg&1) + (16 * (sgitg>>1))*BLOCK_SIZE_M;
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*BLOCK_SIZE_M*(i/4), BLOCK_SIZE_M);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (sgitg == 0) {
-            for (int j = tiitg; j < n_cols; j += BLOCK_SIZE_N) {
-                device float  * D  = dst + (r0*BLOCK_SIZE_M) + (r1*BLOCK_SIZE_N + j)*ne0 + im*ne1*ne0;
-                device float4 * D4 = (device float4 *) D;
-
-                threadgroup float  * C  = temp_str + (j*BLOCK_SIZE_M);
-                threadgroup float4 * C4 = (threadgroup float4 *) C;
-
-                int i = 0;
-                for (; i < n_rows/4; i++) {
-                    *(D4 + i) = *(C4 + i);
-                }
-
-                i *= 4;
-                for (; i < n_rows; i++) {
-                    *(D + i) = *(C + i);
-                }
-            }
-        }
-    }
+    mm_store_result(dst, mc, shared_memory, r0, r1, im, ne0, ne1, sgitg, tiitg, n_rows, n_cols);
 }
 
 // same as kernel_mul_mm_impl, but src1 and dst are accessed via indices stored in rowids
@@ -7527,6 +7578,15 @@ template [[host_name("kernel_mul_mm_iq1_s_f32")]]   kernel mat_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_iq1_m_f32")]]   kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m>;
 template [[host_name("kernel_mul_mm_iq4_nl_f32")]]  kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl>;
 template [[host_name("kernel_mul_mm_iq4_xs_f32")]]  kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
+
+// bf16-native prefill GEMM: bfloat src1 (widened to f32 on stage; simdgroup math identical to _f32)
+// and bfloat dst. Weights stay half + dequantize_q*_K, so numerics track the _f32 path within the
+// bfloat store rounding. Only Q4_K/Q6_K -- the two K-quants a Q4_K_M model carries.
+#if defined(__HAVE_BFLOAT__)
+typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, bfloat, bfloat>) mat_mm_bf16_t;
+template [[host_name("kernel_mul_mm_q4_K_bf16")]]   kernel mat_mm_bf16_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, bfloat, bfloat>;
+template [[host_name("kernel_mul_mm_q6_K_bf16")]]   kernel mat_mm_bf16_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, bfloat, bfloat>;
+#endif
 
 //
 // indirect matrix-matrix multiplication
