@@ -22,6 +22,15 @@ macro_rules! spv {
 
 // kernel name -> SPIR-V bytes. Matches the contract ABI (inputs-then-output buffers, one push block).
 fn kernel_spv(name: &str) -> Result<&'static [u8]> {
+    // Dev shader override: with VK_SHADER_DIR=<dir> set, load <dir>/<name>.spv instead of the embedded
+    // bytes when that file exists. Lets a kernel be re-benched by recompiling one .spv (glslc, ~ms) and
+    // re-running the engine -- no hanzo-ml recompile. Bytes are leaked (shaders load once at device init).
+    if let Some(dir) = std::env::var_os("VK_SHADER_DIR") {
+        let path = std::path::Path::new(&dir).join(format!("{name}.spv"));
+        if let Ok(bytes) = std::fs::read(&path) {
+            return Ok(Box::leak(bytes.into_boxed_slice()));
+        }
+    }
     let b: &'static [u8] = match name {
         "add" => spv!("add"),
         "sub" => spv!("sub"),
