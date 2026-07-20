@@ -293,6 +293,7 @@ pub fn call_quantized_matmul_mm_t(
     dst_shape: &[usize],
     dst_offset: usize,
     dst: &Buffer,
+    src1_bf16: bool,
 ) -> Result<(), MetalKernelError> {
     call_quantized_matmul_mm_t_offset(
         device,
@@ -310,6 +311,7 @@ pub fn call_quantized_matmul_mm_t(
         dst_shape,
         dst_offset,
         dst,
+        src1_bf16,
     )
 }
 
@@ -332,6 +334,7 @@ pub fn call_quantized_matmul_mm_t_offset(
     dst_shape: &[usize],
     dst_offset: usize,
     dst: &Buffer,
+    src1_bf16: bool,
 ) -> Result<(), MetalKernelError> {
     // Everything is in reverse
     let ne00 = src0_shape[src0_shape.len() - 1] as i64;
@@ -367,7 +370,21 @@ pub fn call_quantized_matmul_mm_t_offset(
         height: 1,
         depth: 1,
     };
-    let name = match dtype {
+    // bf16-native prefill: a bf16 activation (src1) + bf16 dst reads/writes bf16 directly, dropping
+    // the bf16<->f32 round-trip GgufMatMul otherwise wraps around the projection. Only Q4_K/Q6_K
+    // (the two K-quants a Q4_K_M model carries) have a bf16 mm; the simdgroup math is identical to
+    // the _f32 kernel (src1 is widened to f32 on stage), so this is the mm twin of the bf16 matvec.
+    let name = if src1_bf16 {
+        match dtype {
+            GgmlDType::Q4K => "kernel_mul_mm_q4_K_bf16",
+            GgmlDType::Q6K => "kernel_mul_mm_q6_K_bf16",
+            _ => Err(MetalKernelError::UnsupportedDTypeForOp(
+                "non-Q4K/Q6K",
+                "bf16 qmatmul mm",
+            ))?,
+        }
+    } else {
+        match dtype {
         GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f32",
         GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f32",
         GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f32",
@@ -392,6 +409,7 @@ pub fn call_quantized_matmul_mm_t_offset(
         GgmlDType::IQ4_XS => "kernel_mul_mm_iq4_xs_f32",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
+        }
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
