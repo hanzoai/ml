@@ -89,89 +89,96 @@ void stage(uint koff, uint row0, uint col0, uint nblocks) {
     uint qh_shift = 2u * quad;
     uint QL0 = 64u * hh + (quad & 1u) * 32u;    // ql byte base at kk=0
     uint QH0 = 128u + 32u * hh;                 // qh byte base at kk=0
-    for (uint col = tid; col < BN; col += WG) {
+    // ALL WG lanes participate, two lanes per column (BN=128, WG=256), each decoding 4 of the 8 q-words.
+    // The Q6_K coopmat op is dequant-ALU-bound (ql-nibble + qh-2bit combine per value), so decode ALU --
+    // not LDS feed -- gates it; vectorise the extraction (mask each 32-bit ql/qh word once for four lanes)
+    // and split the lanes across the whole workgroup. QL0/QH0 are 4-aligned so a K-step's ql and qh bytes
+    // are 8 contiguous u32 each; word wi covers kk in [4*wi,4*wi+4), never crossing the 16-wide sub-block
+    // boundary, so the scale is constant (dsc0 wi<4, dsc1 wi>=4). Stored f16 values are bit-identical to
+    // the per-byte form (same nibble+2bit assembly, same affine, same layout).
+    for (uint idx = tid; idx < BN * 2u; idx += WG) {
+        uint col = idx >> 1u;
+        uint w0 = (idx & 1u) * 4u;             // this lane's q-word half: words 0..3 or 4..7
         uint n = col0 + col;
         if (n < nout) {
             uint base = woff + n * nblocks * BLK_U32 + blk * BLK_U32;
             float d = float(unpackHalf2x16(w[base + D_U32]).x);
             float dsc0 = d * float(byte_s(base, SC_BYTE + s0));        // scale for kk 0..15
             float dsc1 = d * float(byte_s(base, SC_BYTE + s0 + 1u));   // scale for kk 16..31
-            // WORD-load the ql/qh planes (llama's qword decode): QL0/QH0 are 4-aligned, so the 32 ql
-            // bytes and 32 qh bytes of this K-step are 8 contiguous u32 each. Load one ql word + one qh
-            // word per 4 k-values (vs a per-byte load), then extract the 4 lanes from registers -- fewer
-            // global loads and less register pressure than the per-element path. Each word covers kk in
-            // [4*wi, 4*wi+4), which never straddles the 16-wide sub-block boundary, so the scale is
-            // constant across the word: dsc0 for wi<4, dsc1 for wi>=4. Pair 2*wi holds (kk,kk+1).
             uint qlwb = base + (QL0 >> 2u);
             uint qhwb = base + (QH0 >> 2u);
-            [[unroll]] for (uint wi = 0u; wi < 8u; wi++) {
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint wi = w0 + u;
                 uint qlw = w[qlwb + wi];
                 uint qhw = w[qhwb + wi];
                 float dsc = (wi < 4u) ? dsc0 : dsc1;
-                float16_t v[4];
-                [[unroll]] for (uint b = 0u; b < 4u; b++) {
-                    uint qlb = (qlw >> (b * 8u)) & 0xFFu;
-                    uint qhb = (qhw >> (b * 8u)) & 0xFFu;
-                    uint nib = use_high ? (qlb >> 4u) : (qlb & 0x0Fu);
-                    uint hi  = ((qhb >> qh_shift) & 3u) << 4u;
-                    int q6 = int(nib | hi) - 32;
-                    v[b] = float16_t(dsc * float(q6));
-                }
-                s_b[col * SB_STRIDE + 2u * wi]      = f16vec2(v[0], v[1]);
-                s_b[col * SB_STRIDE + 2u * wi + 1u] = f16vec2(v[2], v[3]);
+                uint nib4 = use_high ? ((qlw >> 4u) & 0x0F0F0F0Fu) : (qlw & 0x0F0F0F0Fu);
+                uint hi4  = ((qhw >> qh_shift) & 0x03030303u) << 4u;
+                uint q6x4 = nib4 | hi4;                 // four 6-bit codes, one per byte
+                float q0 = float(int( q6x4         & 0xFFu) - 32);
+                float q1 = float(int((q6x4 >>  8u) & 0xFFu) - 32);
+                float q2 = float(int((q6x4 >> 16u) & 0xFFu) - 32);
+                float q3 = float(int((q6x4 >> 24u) & 0xFFu) - 32);
+                s_b[col * SB_STRIDE + 2u * wi]      = f16vec2(float16_t(dsc * q0), float16_t(dsc * q1));
+                s_b[col * SB_STRIDE + 2u * wi + 1u] = f16vec2(float16_t(dsc * q2), float16_t(dsc * q3));
             }
         } else {
-            [[unroll]] for (uint kp = 0u; kp < BK / 2u; kp++)
-                s_b[col * SB_STRIDE + kp] = f16vec2(0.0);
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint wi = w0 + u;
+                s_b[col * SB_STRIDE + 2u * wi]      = f16vec2(0.0);
+                s_b[col * SB_STRIDE + 2u * wi + 1u] = f16vec2(0.0);
+            }
         }
     }
 }
+
+// Square 2x2 warp grid (see mul_mm_q4k_coopmat.comp): each of the four warps owns a WMT*T x WNT*T (64x64)
+// region so they split BOTH s_a rows and s_b columns two ways -- halving the redundant cold-weight s_b LDS
+// reads vs a wide 4x1 stacking. WMT*WNT == RM*RN accumulators.
+const uint WMT = 4u;
+const uint WNT = 4u;
+const uint WGR = BM / (WMT * T);               // warp-grid rows (2)
 
 void main() {
     uint nblocks = k / QK_K;
     uint row0 = gl_WorkGroupID.y * BM;
     uint col0 = gl_WorkGroupID.x * BN;
     uint warp = gl_SubgroupID;                 // 0..NWARP-1 on wave64
+    uint warp_r = warp % WGR;                   // 0..1
+    uint warp_c = warp / WGR;                   // 0..1
     uint nsteps = k / BK;
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[RM][RN];
-    [[unroll]] for (uint i = 0u; i < RM; i++)
-        [[unroll]] for (uint j = 0u; j < RN; j++)
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[WMT][WNT];
+    [[unroll]] for (uint i = 0u; i < WMT; i++)
+        [[unroll]] for (uint j = 0u; j < WNT; j++)
             acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
     for (uint s = 0u; s < nsteps; s++) {
         stage(s * BK, row0, col0, nblocks);
         barrier();
         if (warp < NWARP) {
-            // A fragments: [M-tile][K-subtile]. s_a is [M, K/2] f16vec2 -> K-subtile kc lands at pair
-            // offset kc*(T/2) and the row stride is SA_STRIDE pairs; RowMajor.
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[RM][2];
-            [[unroll]] for (uint i = 0u; i < RM; i++)
-                [[unroll]] for (uint kc = 0u; kc < 2u; kc++)
-                    coopMatLoad(ma[i][kc], s_a, (warp * RM + i) * T * SA_STRIDE + kc * (T / 2u), SA_STRIDE,
-                                gl_CooperativeMatrixLayoutRowMajor);
-            // Load the RN B-fragments for one K-subtile at a time and reuse the registers across the two
-            // K-subtiles: halves the peak live B-fragment count (RN vs 2*RN) so the 16 f32 accumulators
-            // fit without a scratch spill. s_b is the transposed weight [N, K/2] f16vec2; ColumnMajor
-            // presents it as the [K, N] B fragment, K-subtile kc at pair kc*(T/2).
             [[unroll]] for (uint kc = 0u; kc < 2u; kc++) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[RN];
-                [[unroll]] for (uint j = 0u; j < RN; j++)
-                    coopMatLoad(mb[j], s_b, (j * T) * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[WMT];
+                [[unroll]] for (uint i = 0u; i < WMT; i++)
+                    coopMatLoad(ma[i], s_a, (warp_r * WMT + i) * T * SA_STRIDE + kc * (T / 2u), SA_STRIDE,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint j = 0u; j < WNT; j++) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+                    coopMatLoad(mb, s_b, (warp_c * WNT + j) * T * SB_STRIDE + kc * (T / 2u), SB_STRIDE,
                                 gl_CooperativeMatrixLayoutColumnMajor);
-                [[unroll]] for (uint i = 0u; i < RM; i++)
-                    [[unroll]] for (uint j = 0u; j < RN; j++)
-                        acc[i][j] = coopMatMulAdd(ma[i][kc], mb[j], acc[i][j]);
+                    [[unroll]] for (uint i = 0u; i < WMT; i++)
+                        acc[i][j] = coopMatMulAdd(ma[i], mb, acc[i][j]);
+                }
             }
         }
         barrier();
     }
 
     if (warp < NWARP) {
-        [[unroll]] for (uint i = 0u; i < RM; i++) {
-            uint orow = row0 + (warp * RM + i) * T;
-            [[unroll]] for (uint j = 0u; j < RN; j++) {
-                uint ocol = col0 + j * T;
+        [[unroll]] for (uint i = 0u; i < WMT; i++) {
+            uint orow = row0 + (warp_r * WMT + i) * T;
+            [[unroll]] for (uint j = 0u; j < WNT; j++) {
+                uint ocol = col0 + (warp_c * WNT + j) * T;
                 if (orow < mcount && ocol < nout)
                     coopMatStore(acc[i][j], y, orow * nout + ocol, nout,
                                  gl_CooperativeMatrixLayoutRowMajor);
