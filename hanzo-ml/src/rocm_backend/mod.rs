@@ -3024,6 +3024,127 @@ impl RocmStorage {
         }
     }
 
+    /// Fused flash-attention DECODE: single query per head (`Lq == 1`) attending the whole KV cache.
+    /// `q` is contiguous `[B, Hq, 1, D]`; `k`/`v` are the KV cache read IN PLACE via their (batch,
+    /// head, seq) strides (innermost head-dim contiguous), so there is no repeat_kv copy and no
+    /// whole-cache `.contiguous()`. GQA via `Hq % Hkv`, `D == 128`, f16/bf16. One block per (batch,
+    /// q_head); f32 online softmax. Output `[B, Hq, 1, D]` matches eager naive_sdpa within f16 rounding.
+    pub fn flash_attn_decode(
+        &self,
+        q_layout: &Layout,
+        k: &RocmStorage,
+        k_layout: &Layout,
+        v: &RocmStorage,
+        v_layout: &Layout,
+        scale: f32,
+    ) -> Result<Self> {
+        use hanzo_rocm_kernels::kernel::{FlashKernel, KernelSource};
+        const FD_DH: usize = 128;
+        let q = self;
+        if !q_layout.is_contiguous() {
+            crate::bail!("flash_attn_decode requires contiguous q");
+        }
+        let (b, hq, lq, d) = q_layout.shape().dims4()?;
+        let (kb, hkv, lk, kd) = k_layout.shape().dims4()?;
+        let (vb, vhkv, vlk, vd) = v_layout.shape().dims4()?;
+        if lq != 1 {
+            crate::bail!("flash_attn_decode requires q seq len 1, got {lq}");
+        }
+        if d != FD_DH || kd != FD_DH || vd != FD_DH {
+            crate::bail!("flash_attn_decode requires head_dim {FD_DH}, got q={d} k={kd} v={vd}");
+        }
+        if (kb, vb, vhkv, vlk) != (b, b, hkv, lk) {
+            crate::bail!(
+                "flash_attn_decode q/k/v batch/kv-head/kv-len mismatch {k_layout:?} {v_layout:?}"
+            );
+        }
+        if hkv == 0 || hq % hkv != 0 {
+            crate::bail!("flash_attn_decode requires Hq % Hkv == 0, got Hq={hq} Hkv={hkv}");
+        }
+        let ks = k_layout.stride();
+        let vs = v_layout.stride();
+        if ks[3] != 1 || vs[3] != 1 {
+            crate::bail!("flash_attn_decode requires innermost (head-dim) stride 1");
+        }
+        let device = self.device.clone();
+        let o_el = b * hq * d; // lq == 1
+        let (b_i, hq_i, hkv_i, lk_i) = (b as i32, hq as i32, hkv as i32, lk as i32);
+        let (kb_s, kh_s, kl_s) = (ks[0] as i64, ks[1] as i64, ks[2] as i64);
+        let (vb_s, vh_s, vl_s) = (vs[0] as i64, vs[1] as i64, vs[2] as i64);
+        const BLOCK: u32 = 128;
+        let grid = rocm_rs::hip::Dim3 {
+            x: hq as u32,
+            y: b as u32,
+            z: 1,
+        };
+        let block = rocm_rs::hip::Dim3::from(BLOCK);
+        let q_off = q_layout.start_offset();
+        let k_off = k_layout.start_offset();
+        let v_off = v_layout.start_offset();
+
+        macro_rules! launch_decode {
+            ($variant:ident, $ty:ty, $func:literal) => {{
+                let q_mem = match &q.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => unreachable!(),
+                };
+                let k_mem = match &k.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => crate::bail!("flash_attn_decode: k dtype must match q dtype"),
+                };
+                let v_mem = match &v.slice {
+                    RocmStorageSlice::$variant(m) => m,
+                    _ => crate::bail!("flash_attn_decode: v dtype must match q dtype"),
+                };
+                let o_out = device.alloc::<$ty>(o_el)?;
+                let q_ptr = unsafe { q_mem.offset_ptr(q_off) };
+                let k_ptr = unsafe { k_mem.offset_ptr(k_off) };
+                let v_ptr = unsafe { v_mem.offset_ptr(v_off) };
+                let o_ptr = o_out.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        &device,
+                        FlashKernel::NAME,
+                        FlashKernel::CODE,
+                        $func,
+                        grid,
+                        block,
+                        &mut [
+                            &b_i as *const i32 as *mut std::ffi::c_void,
+                            &hq_i as *const i32 as *mut std::ffi::c_void,
+                            &hkv_i as *const i32 as *mut std::ffi::c_void,
+                            &lk_i as *const i32 as *mut std::ffi::c_void,
+                            &scale as *const f32 as *mut std::ffi::c_void,
+                            (&q_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&k_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            &kb_s as *const i64 as *mut std::ffi::c_void,
+                            &kh_s as *const i64 as *mut std::ffi::c_void,
+                            &kl_s as *const i64 as *mut std::ffi::c_void,
+                            (&v_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            &vb_s as *const i64 as *mut std::ffi::c_void,
+                            &vh_s as *const i64 as *mut std::ffi::c_void,
+                            &vl_s as *const i64 as *mut std::ffi::c_void,
+                            (&o_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+                Ok(Self {
+                    slice: RocmStorageSlice::$variant(o_out),
+                    device: device.clone(),
+                })
+            }};
+        }
+
+        match &q.slice {
+            RocmStorageSlice::F16(_) => launch_decode!(F16, f16, "flash_decode_f16"),
+            RocmStorageSlice::BF16(_) => launch_decode!(BF16, bf16, "flash_decode_bf16"),
+            other => crate::bail!(
+                "flash_attn_decode unsupported dtype {:?} (f16/bf16 only)",
+                other.dtype()
+            ),
+        }
+    }
+
     /// Fused softmax over the last dim (max-subtract-exp-sum-div, f32 accumulation), replacing the
     /// composite that ran 5 ops + 2 casts. One warp per row (32 lanes along threadIdx.y); the
     /// reduction is a warp shuffle (no shared memory). Reuses the ReduceKernel `softmax_{...}`.
@@ -5221,6 +5342,191 @@ mod dsl_norm_bench {
                 );
             }
             println!("[add_rmsnorm f16 bit-exact] {rows}x{n} OK");
+        }
+    }
+}
+
+/// Fused flash-attention DECODE kernel vs an independent f64 eager reference (scale-relative gate).
+/// Covers GQA ratios, non-multiple-of-tile sequence lengths, and the STRIDED KV-cache layout the
+/// decode fast-path relies on (seq stride reflecting a padded max_len). This is the correctness gate
+/// for `rocm_decode_attn` -- the shared attention path across every model.
+#[cfg(all(test, feature = "rocm"))]
+mod flash_decode_test {
+    use super::*;
+    use half::f16;
+
+    fn rnd(n: usize, seed: u64) -> Vec<f16> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                f16::from_f32(((s % 2000) as f32 / 1000.0 - 1.0) * 0.5)
+            })
+            .collect()
+    }
+
+    // f64 eager SDPA reference from the f16-rounded inputs (GQA): scores = scale*(Q.K), softmax, .V.
+    fn ref_out(
+        qf: &[f16],
+        kf: &[f16],
+        vf: &[f16],
+        b: usize,
+        hq: usize,
+        hkv: usize,
+        l: usize,
+        d: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let gqa = hq / hkv;
+        let mut out = vec![0f32; b * hq * d];
+        for bi in 0..b {
+            for qh in 0..hq {
+                let kvh = qh / gqa;
+                let mut sc = vec![0f64; l];
+                let mut mx = f64::NEG_INFINITY;
+                for (j, scj) in sc.iter_mut().enumerate() {
+                    let mut s = 0f64;
+                    for t in 0..d {
+                        s += qf[(bi * hq + qh) * d + t].to_f64()
+                            * kf[((bi * hkv + kvh) * l + j) * d + t].to_f64();
+                    }
+                    *scj = s * scale as f64;
+                    if *scj > mx {
+                        mx = *scj;
+                    }
+                }
+                let mut den = 0f64;
+                for scj in sc.iter_mut() {
+                    *scj = (*scj - mx).exp();
+                    den += *scj;
+                }
+                for t in 0..d {
+                    let mut acc = 0f64;
+                    for (j, &p) in sc.iter().enumerate() {
+                        acc += p * vf[((bi * hkv + kvh) * l + j) * d + t].to_f64();
+                    }
+                    out[(bi * hq + qh) * d + t] = (acc / den) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    fn max_rel(want: &[f32], got: &[f32]) -> f32 {
+        let mut maxabs = 0f32;
+        let mut maxref = 1e-6f32;
+        for i in 0..want.len() {
+            maxabs = maxabs.max((want[i] - got[i]).abs());
+            maxref = maxref.max(want[i].abs());
+        }
+        maxabs / maxref
+    }
+
+    // Pad the contiguous [b,hkv,l,d] KV to [b,hkv,maxl,d] so the layout's seq stride reflects maxl
+    // (the real decode-cache shape) -- exercises the kernel's strided read.
+    fn pad_seq(kf: &[f16], b: usize, hkv: usize, l: usize, d: usize, maxl: usize) -> Vec<f16> {
+        let mut out = vec![f16::ZERO; b * hkv * maxl * d];
+        for bi in 0..b {
+            for h in 0..hkv {
+                for j in 0..l {
+                    for t in 0..d {
+                        out[((bi * hkv + h) * maxl + j) * d + t] =
+                            kf[((bi * hkv + h) * l + j) * d + t];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        device: &RocmDevice,
+        qf: &[f16],
+        kf: &[f16],
+        vf: &[f16],
+        b: usize,
+        hq: usize,
+        hkv: usize,
+        l: usize,
+        d: usize,
+        scale: f32,
+        maxl: Option<usize>,
+    ) -> Vec<f32> {
+        let q_st = RocmStorage {
+            slice: RocmStorageSlice::F16(device.clone_htod(qf).unwrap()),
+            device: device.clone(),
+        };
+        let k_st = RocmStorage {
+            slice: RocmStorageSlice::F16(device.clone_htod(kf).unwrap()),
+            device: device.clone(),
+        };
+        let v_st = RocmStorage {
+            slice: RocmStorageSlice::F16(device.clone_htod(vf).unwrap()),
+            device: device.clone(),
+        };
+        let q_l = Layout::contiguous((b, hq, 1, d));
+        let (k_l, v_l) = match maxl {
+            None => (
+                Layout::contiguous((b, hkv, l, d)),
+                Layout::contiguous((b, hkv, l, d)),
+            ),
+            Some(ml) => {
+                let st = vec![hkv * ml * d, ml * d, d, 1];
+                (
+                    Layout::new((b, hkv, l, d).into(), st.clone(), 0),
+                    Layout::new((b, hkv, l, d).into(), st, 0),
+                )
+            }
+        };
+        let out = q_st
+            .flash_attn_decode(&q_l, &k_st, &k_l, &v_st, &v_l, scale)
+            .unwrap();
+        let om = match out.slice {
+            RocmStorageSlice::F16(m) => m,
+            _ => panic!("expected f16 out"),
+        };
+        device
+            .clone_dtoh(&om)
+            .unwrap()
+            .iter()
+            .map(|x: &f16| x.to_f32())
+            .collect()
+    }
+
+    #[test]
+    fn flash_decode_matches_eager() {
+        let device = RocmDevice::new(0).unwrap();
+        let d = 128usize;
+        // (B, Hq, Hkv, L): MHA, GQA 4:1 and 8:1, tile-boundary and multi-tile L, batch>1.
+        for &(b, hq, hkv, l) in &[
+            (1, 8, 8, 64),
+            (1, 8, 2, 100),
+            (2, 16, 4, 37),
+            (1, 4, 4, 256),
+            (1, 14, 2, 200),
+            (1, 16, 16, 300),
+        ] {
+            let scale = 1.0f32 / (d as f32).sqrt();
+            let qf = rnd(b * hq * d, 0x11 + b as u64 * 7 + hq as u64);
+            let kf = rnd(b * hkv * l * d, 0x22 + l as u64 * 3 + hkv as u64);
+            let vf = rnd(b * hkv * l * d, 0x33 + l as u64 + hkv as u64 * 5);
+            let want = ref_out(&qf, &kf, &vf, b, hq, hkv, l, d, scale);
+
+            let got = run(&device, &qf, &kf, &vf, b, hq, hkv, l, d, scale, None);
+            let rel = max_rel(&want, &got);
+            println!("[flash_decode] B{b} Hq{hq} Hkv{hkv} L{l} contiguous rel={rel:.2e}");
+            assert!(rel < 1e-2, "flash_decode contiguous rel {rel} at {b}/{hq}/{hkv}/{l}");
+
+            let maxl = l + 17;
+            let kf_p = pad_seq(&kf, b, hkv, l, d, maxl);
+            let vf_p = pad_seq(&vf, b, hkv, l, d, maxl);
+            let got_s = run(&device, &qf, &kf_p, &vf_p, b, hq, hkv, l, d, scale, Some(maxl));
+            let rel_s = max_rel(&want, &got_s);
+            println!("[flash_decode] B{b} Hq{hq} Hkv{hkv} L{l} strided(maxl={maxl}) rel={rel_s:.2e}");
+            assert!(rel_s < 1e-2, "flash_decode strided rel {rel_s} at {b}/{hq}/{hkv}/{l}");
         }
     }
 }

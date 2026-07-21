@@ -6,7 +6,7 @@ use hanzo_ml::Tensor;
 
 pub use cpu_flash::flash_attn;
 pub use cpu_flash::varlen::flash_attn_varlen_cpu;
-pub use rocm::rocm_flash_attn;
+pub use rocm::{rocm_flash_attn, rocm_flash_attn_decode};
 pub use varlen::flash_attn_varlen_unfused;
 
 #[derive(Debug, Clone, Default)]
