@@ -34,7 +34,8 @@ jobs:
           # bottom-up: leaf kernels + ug + flash-attn-build, then hanzo-ml, then nn, then flash-attn
           fail=0
           for c in hanzo-kernels hanzo-metal-kernels hanzo-rocm-kernels hanzo-ug \
-                   hanzo-flash-attn-build hanzo-ml hanzo-nn hanzo-flash-attn; do
+                   hanzo-flash-attn-build hanzo-ml hanzo-nn hanzo-flash-attn \
+                   hanzo-flash-attn-v3; do
             if [ -d "$c" ]; then
               echo "::group::publish $c"
               out=$( cd "$c" && cargo publish --no-verify 2>&1 ); rc=$?
