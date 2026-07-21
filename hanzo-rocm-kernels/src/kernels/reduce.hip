@@ -409,8 +409,12 @@ __device__ void add_rmsnorm(const T * x, const T * residual, T * sum_out, T * ds
     float tmp = 0.0f;
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
-        const float s = (float)(x[i]) + (float)(residual[i]);
-        sum_out[i] = (T)s;
+        // Store the sum rounded to T, then reduce over the ROUNDED value reloaded from sum_out. This
+        // makes the fused kernel bit-identical to a separate `x + residual` (which rounds to T) followed
+        // by `rmsnorm` (which squares the stored T): for T=f32 the round is exact; for T=f16 it matches
+        // the elementwise-add + rmsnorm_f16 fallback exactly, so decode output is unperturbed.
+        sum_out[i] = (T)((float)(x[i]) + (float)(residual[i]));
+        const float s = (float)(sum_out[i]);
         tmp += s * s;
     }
 
@@ -434,14 +438,12 @@ __device__ void add_rmsnorm(const T * x, const T * residual, T * sum_out, T * ds
     if (alpha == nullptr) {
         for (int col = tid; col < ncols; col += block_size) {
             const int i = row*ncols + col;
-            const float s = (float)(x[i]) + (float)(residual[i]);
-            dst[i] = (T)(scale * s);
+            dst[i] = (T)(scale * (float)(sum_out[i]));
         }
     } else {
         for (int col = tid; col < ncols; col += block_size) {
             const int i = row*ncols + col;
-            const float s = (float)(x[i]) + (float)(residual[i]);
-            dst[i] = (T)(scale * s * (float)(alpha[col]));
+            dst[i] = (T)(scale * (float)(sum_out[i]) * (float)(alpha[col]));
         }
     }
 }
@@ -739,6 +741,10 @@ extern "C" __global__ void softmax_f16(const __half *src, __half *dst, const int
 extern "C" __global__ void rmsnorm_f16(const __half *src, __half *dst, const __half *alpha, const int n_cols, const int block_size, const float eps) {
     rmsnorm<__half>(src, dst, alpha, n_cols, block_size, eps);
 }
+
+// Fused residual-add + rmsnorm for the F16 decode residual stream (the generic template is dtype-agnostic
+// via float casts; __half qualifies). Bit-identical to a separate badd_f16 + rmsnorm_f16.
+ADD_RMSNORM_OP(__half, add_rmsnorm_f16)
 
 // Rope for F16 (the `rope` template is dtype-generic via float casts; __half qualifies).
 ROPE_OP(__half, rope_f16)

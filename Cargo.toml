@@ -47,7 +47,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 rocm-rs = { package = "hanzo-rocm", version = "0.5.2", default-features = false, features = ["macros"] }
-hanzo-rocm-kernels = { path = "./hanzo-rocm-kernels", version = "0.11.33" }
+hanzo-rocm-kernels = { path = "./hanzo-rocm-kernels", version = "0.11.34" }
 ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
