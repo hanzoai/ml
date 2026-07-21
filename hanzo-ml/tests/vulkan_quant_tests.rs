@@ -778,14 +778,15 @@ fn prefill_case(
 fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
     let Some(dev) = gpu() else { return Ok(()) };
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Q4_K prefill defaults to int8 dp4a-2D (q8_1 activation quant, ~0.4%); force the exact column path
-    // so this exact-vs-CPU check validates the prefill math. The dp4a-2D path is gated by
-    // vulkan_q4k_dp4a2d_matches_default. (Q5_K/Q6_K still exercise the GEMM/dequant-fallback split.)
+    // Q4_K and Q6_K prefill default to the f16 coopmat GEMM (~1% f16 rounding); force the exact column
+    // path for BOTH so this f64-reference check validates the prefill DECODE math to ~1e-3. The coopmat
+    // paths are gated separately (vulkan_q4k_coopmat_matches_default; the inline [q6k-tiled] gate), the
+    // Q4_K dp4a-2D tile by vulkan_q4k_dp4a2d_matches_default. Q4_0/Q8_0/Q5_K have no coopmat path.
     std::env::set_var("VK_Q4K_LEGACY", "1");
-    // M straddles the host MAX_M=8 tiling AND the per-dtype GEMM gate (Q5_K/Q6_K: 64, else 128):
-    // 5/8/17 hit the native GEMM for every dtype; 100 hits the GEMM for Q4_0/Q8_0/Q4_K but the dequant
-    // fallback for Q5_K/Q6_K (exercising the split); 200 (> both gates) is the dequant path for all.
-    // BOTH prefill paths are thus validated against the same f64 reference.
+    std::env::set_var("VK_Q6K_LEGACY", "1");
+    // M straddles the host MAX_M=8 tiling and the Q5_K GEMM/dequant-fallback gate (64): 5/8/17 hit the
+    // native GEMM, 100 the GEMM for Q4_0/Q8_0 and the dequant fallback for Q5_K, 200 the dequant path.
+    // Both prefill paths are thus validated against the same f64 reference.
     // (nout, k) with k divisible by 256 so all five dtypes share the same shapes.
     for &m in &[5usize, 8, 17, 100, 200] {
         for &(nout, k) in &[(2048usize, 2048usize), (4096, 2048), (512, 256)] {
@@ -810,6 +811,7 @@ fn vulkan_qmatmul_prefill_matches_cpu() -> hanzo_ml::Result<()> {
         }
     }
     std::env::remove_var("VK_Q4K_LEGACY");
+    std::env::remove_var("VK_Q6K_LEGACY");
     Ok(())
 }
 
@@ -1152,17 +1154,20 @@ fn vulkan_q4k_coopmat_matches_default() -> hanzo_ml::Result<()> {
         eprintln!("[vulkan_quant_tests] no coopmat; skipping coopmat gate");
         return Ok(());
     }
+    // Ragged m (not a multiple of 16) must match too: the coopmat GEMM is the default for dense
+    // m>1 and pads its output rows up to a 16-multiple, so every real prompt length runs it. The
+    // 17/31/33/127/129 rows exercise the partial trailing tile that the row-padding covers.
     for &(nout, k) in &[(512usize, 256usize), (2048, 2048), (256, 4096), (320, 1024)] {
-        for &m in &[2usize, 16, 17, 64, 512] {
+        for &m in &[2usize, 16, 17, 31, 33, 64, 127, 129, 512] {
             let (raw, _, _) = weight_bytes(GgmlDType::Q4K, nout, k)?;
             let wq = vk.upload_qweight(&raw)?;
             let x: Vec<f32> = (0..m * k).map(|i| pseudo(i + 17)).collect();
             std::env::set_var("VK_Q4K_LEGACY", "1");
             let y_ref = vk.matmul_q4k(&wq, &x, m, nout, k)?;
             std::env::remove_var("VK_Q4K_LEGACY");
-            std::env::set_var("VK_Q4K_COOPMAT", "1");
+            // Default path (no A/B override) is the coopmat GEMM for dense m>1.
+            std::env::remove_var("VK_Q4K_COOPMAT_OFF");
             let y_cm = vk.matmul_q4k(&wq, &x, m, nout, k)?;
-            std::env::remove_var("VK_Q4K_COOPMAT");
             let mut max_abs = 0f32;
             let mut max_ref = 0f32;
             for (a, b) in y_ref.iter().zip(y_cm.iter()) {
