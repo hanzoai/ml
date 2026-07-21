@@ -294,6 +294,7 @@ pub fn call_quantized_matmul_mm_t(
     dst_offset: usize,
     dst: &Buffer,
     src1_bf16: bool,
+    src1_half: bool,
 ) -> Result<(), MetalKernelError> {
     call_quantized_matmul_mm_t_offset(
         device,
@@ -312,6 +313,7 @@ pub fn call_quantized_matmul_mm_t(
         dst_offset,
         dst,
         src1_bf16,
+        src1_half,
     )
 }
 
@@ -335,6 +337,7 @@ pub fn call_quantized_matmul_mm_t_offset(
     dst_offset: usize,
     dst: &Buffer,
     src1_bf16: bool,
+    src1_half: bool,
 ) -> Result<(), MetalKernelError> {
     // Everything is in reverse
     let ne00 = src0_shape[src0_shape.len() - 1] as i64;
@@ -374,10 +377,16 @@ pub fn call_quantized_matmul_mm_t_offset(
     // the bf16<->f32 round-trip GgufMatMul otherwise wraps around the projection. Only Q4_K/Q6_K
     // (the two K-quants a Q4_K_M model carries) have a bf16 mm; the simdgroup math is identical to
     // the _f32 kernel (src1 is widened to f32 on stage), so this is the mm twin of the bf16 matvec.
+    // `src1_half` selects the fp16-matmul variant: the activation tile is staged as half so the outer
+    // product runs at the GPU's half-precision simdgroup rate (~2x); the weight tile is half in both,
+    // so this trades a small precision cost (half products) for the faster matmul. The caller (ml
+    // `fwd`) gates it on an opt-in flag; the default bf16 path stays the f32-tile bit-exact kernel.
     let name = if src1_bf16 {
-        match dtype {
-            GgmlDType::Q4K => "kernel_mul_mm_q4_K_bf16",
-            GgmlDType::Q6K => "kernel_mul_mm_q6_K_bf16",
+        match (dtype, src1_half) {
+            (GgmlDType::Q4K, false) => "kernel_mul_mm_q4_K_bf16",
+            (GgmlDType::Q6K, false) => "kernel_mul_mm_q6_K_bf16",
+            (GgmlDType::Q4K, true) => "kernel_mul_mm_q4_K_bf16_half",
+            (GgmlDType::Q6K, true) => "kernel_mul_mm_q6_K_bf16_half",
             _ => Err(MetalKernelError::UnsupportedDTypeForOp(
                 "non-Q4K/Q6K",
                 "bf16 qmatmul mm",
