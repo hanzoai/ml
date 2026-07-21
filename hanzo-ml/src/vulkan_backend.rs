@@ -325,6 +325,13 @@ struct VkInner {
     // denominator for the %-of-peak column. f32 stored as bits in an atomic so &self stays shared.
     roofline: bool,
     peak_bw_gbps: std::sync::atomic::AtomicU32,
+    // Max workgroups (Σ grid x·y·z) recorded into one command buffer before an automatic flush, so a
+    // single queue submission stays well under the GPU driver's ring lockup timeout (RADV/amdgpu
+    // default 2 s). BATCH_CAP bounds the descriptor budget by dispatch COUNT; this bounds SUBMISSION
+    // TIME by dispatched work, which is what a long (2k+ token) prefill overruns -- its per-op counts
+    // are unchanged from a short prefill, but each attention/matmul dispatch does O(seq²)/O(seq) more
+    // work. Initialized from WORK_CAP / VK_WORK_CAP; `set_work_cap` retunes it (0 disables the bound).
+    work_cap: std::sync::atomic::AtomicU64,
     // VK_KHR_push_descriptor device fns, present iff the driver advertises the extension (native
     // AMD/NV; typically absent on WSL/Dozen). When set, `dispatch` pushes buffer handles inline
     // into the command buffer via `vkCmdPushDescriptorSetKHR` instead of allocating + updating +
@@ -364,6 +371,16 @@ struct Submitter {
     recording: bool,
     // Dispatches recorded into `cmd` since it was begun (bounded by BATCH_CAP).
     n: u32,
+    // Total workgroups (Σ grid x·y·z) recorded into `cmd` since it was begun. A cheap record-time
+    // proxy for the batch's on-GPU runtime: workgroups are the unit the GPU schedules onto CUs, and
+    // for the matmul/attention kernels that dominate a prefill they scale with the problem size, so
+    // this tracks the O(seq²) attention blow-up that makes a long prefill's single submission overrun
+    // the driver ring timeout. Bounded by `work_cap` (see the flush in `dispatch_outs`).
+    work: u64,
+    // Cumulative queue submissions (one per flush), never reset. A decode/short-prefill forward is one
+    // submission; a long prefill is several once the work bound splits it. Read via `submit_count` so a
+    // test can assert the split without racing a process-global counter (each device owns its Submitter).
+    submits: u64,
     // Hazard tracking for selective barriers. Holds the output buffers written by dispatches
     // recorded since the last memory barrier in the current command buffer. A new dispatch needs
     // a barrier only if it READS a buffer in this set (a genuine read-after-write on data produced
@@ -4297,6 +4314,7 @@ impl VulkanDevice {
                     .map_err(vkerr)?;
                 s.recording = true;
                 s.n = 0;
+                s.work = 0;
                 s.written_since_barrier.clear();
                 s.record_ns = 0;
                 s.barriers = 0;
@@ -4460,15 +4478,24 @@ impl VulkanDevice {
                 }
             }
             s.n += 1;
+            s.work += u64::from(groups.0) * u64::from(groups.1) * u64::from(groups.2);
             if profile {
                 if let Some(t0) = rec_t0 {
                     s.record_ns += t0.elapsed().as_nanos();
                 }
             }
-            // Bound the descriptor-set budget: a forward longer than BATCH_CAP ops just flushes
-            // a handful of times instead of once. Never mid-capture: a graph must record whole into
-            // one command buffer (a partial submit would tear the replayable forward in two).
-            if s.n >= BATCH_CAP && !s.capturing {
+            // Flush when EITHER bound trips: BATCH_CAP caps the descriptor-set budget (dispatch
+            // COUNT); work_cap caps the SUBMISSION TIME (dispatched workgroups) so a single queue
+            // submission stays under the driver ring timeout. The count bound alone doesn't help a
+            // long prefill -- its op count matches a short one, but each op does O(seq²)/O(seq) more
+            // work, so only the work bound splits its one oversized submission into safe pieces.
+            // Never mid-capture: a graph must record whole into one command buffer (a partial submit
+            // would tear the replayable forward in two). Cross-batch ordering after a flush is the
+            // queue_submit + fence wait, so splitting here is bit-identical to one big submission.
+            if (s.n >= BATCH_CAP
+                || s.work >= self.inner.work_cap.load(std::sync::atomic::Ordering::Relaxed))
+                && !s.capturing
+            {
                 flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period, self.inner.roofline, f32::from_bits(self.inner.peak_bw_gbps.load(std::sync::atomic::Ordering::Relaxed)))?;
                 drop(s);
                 self.reclaim();
@@ -4489,6 +4516,21 @@ impl VulkanDevice {
         }
         self.reclaim();
         Ok(())
+    }
+
+    /// Retune the per-submission workgroup bound (see [`WORK_CAP`]). `0` disables the bound, restoring
+    /// the single-submission-per-forward path. Used for A/B tuning and by the long-prefill test.
+    pub fn set_work_cap(&self, cap: u64) {
+        let cap = if cap == 0 { u64::MAX } else { cap };
+        self.inner
+            .work_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Cumulative queue submissions on this device (one per flush). A forward that stays under both
+    /// bounds submits once; a long prefill submits several times once the work bound splits it.
+    pub fn submit_count(&self) -> u64 {
+        self.inner.submitter.lock().unwrap().submits
     }
 
     /// Begin capturing every subsequent dispatch into a dedicated, re-submittable command buffer --
@@ -4793,6 +4835,18 @@ fn vkerr(e: vk::Result) -> Error {
 // (or a few times), turning hundreds of per-op fence stalls into a handful.
 const BATCH_CAP: u32 = 4096;
 
+// Max workgroups (Σ grid x·y·z) recorded into one command buffer before an automatic flush, so one
+// queue submission's on-GPU runtime stays well under the driver ring lockup timeout (RADV/amdgpu
+// default 2 s) AND its live intermediates are reclaimed+reused every few layers instead of held for
+// the whole forward. Where BATCH_CAP bounds dispatch COUNT (descriptor budget), this bounds dispatched
+// WORK: a long prefill's op count matches a short one, but each attention/matmul dispatch does
+// O(seq²)/O(seq) more work, so only a work bound splits its one oversized submission -- and caps the
+// peak-live buffer footprint that otherwise grows with seq. A decode / short-prefill forward stays
+// well under it (no measurable fast-path cost); a 2k-4k-token prefill crosses it into ring-safe pieces.
+// Calibrated on gfx1151 for a submission an order of magnitude under the ring timeout with margin for
+// slower per-workgroup kernels and GPU contention. VK_WORK_CAP overrides it (0 disables the bound).
+const WORK_CAP: u64 = 12_000_000;
+
 // Per-flush buffer-pool fresh-alloc vs reuse tally (printed under VK_PROFILE). Fresh allocations go
 // through the amdgpu kernel driver (bo_alloc) and their memory traffic contends with in-flight GPU
 // GEMMs on a UMA APU; a rising `pool_fresh` is the signature of the idle-pool cap evicting a working
@@ -4873,6 +4927,7 @@ fn flush_locked(
             wait_ms = t.elapsed().as_secs_f64() * 1e3;
         }
     }
+    s.submits += 1;
     if profile {
         // One line per submitted batch. On decode this is ~one batch per token, so this is the
         // per-token GPU breakdown: `dispatch` = ops recorded, `barriers` = memory barriers emitted
@@ -4881,9 +4936,10 @@ fn flush_locked(
         let hit = POOL_HIT.swap(0, std::sync::atomic::Ordering::Relaxed);
         let fresh_mb = POOL_FRESH_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
         eprintln!(
-            "[VK_PROFILE] flush: dispatch={n} barriers={barriers} \
+            "[VK_PROFILE] flush: dispatch={n} workgroups={work} barriers={barriers} \
              record={record_ms:.3}ms submit={submit_ms:.3}ms fence_wait={wait_ms:.3}ms \
              pool_fresh={fresh} pool_hit={hit} fresh_mb={fresh_mb:.1}",
+            work = s.work,
         );
     }
     if gpu_profile && !s.op_names.is_empty() {
@@ -5266,6 +5322,8 @@ impl BackendDevice for VulkanDevice {
                 dpool,
                 recording: false,
                 n: 0,
+                work: 0,
+                submits: 0,
                 written_since_barrier: std::collections::HashSet::new(),
                 record_ns: 0,
                 barriers: 0,
@@ -5301,6 +5359,15 @@ impl BackendDevice for VulkanDevice {
                     && timestamp_period > 0.0
                     && std::env::var("VK_PROFILE_GPU").map(|v| v != "0").unwrap_or(false));
 
+            // Per-submission workgroup bound: caps one queue submission's on-GPU runtime under the
+            // driver ring timeout so a long prefill can't hang the GPU. VK_WORK_CAP overrides the
+            // calibrated default; 0 disables the bound (restores the pre-fix single-submission path).
+            let work_cap = std::env::var("VK_WORK_CAP")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|v| if v == 0 { u64::MAX } else { v })
+                .unwrap_or(WORK_CAP);
+
             let inner = VkInner {
                 _entry: entry,
                 instance,
@@ -5321,6 +5388,7 @@ impl BackendDevice for VulkanDevice {
                 timestamp_period,
                 roofline,
                 peak_bw_gbps: std::sync::atomic::AtomicU32::new(0),
+                work_cap: std::sync::atomic::AtomicU64::new(work_cap),
                 push_descriptor,
                 pipelines: Mutex::new(HashMap::new()),
                 coopmat_variant: Mutex::new(None),
@@ -8223,6 +8291,116 @@ mod dsl_dispatch_proof {
         }
         eprintln!("[sdpa-blk] h{H}kv{KV} q{SQ} k{SK} d{D} x8-batched  scale_rel={worst:.2e}  (DSL flash-SDPA spv via ml dispatch, pooled scale/meta, no sync crutch)");
         assert!(worst < 1e-4, "sdpa_blk DSL diverged from CPU: scale_rel={worst:.3e}");
+    }
+
+    // Long-prefill ring-timeout guard. A 2k+ token prefill records a whole forward's dispatches into
+    // ONE queue submission whose on-GPU runtime (attention is O(seq²)) overruns the RADV/amdgpu ring
+    // lockup timeout -> "context is lost". The work bound (`work_cap`) splits that single submission
+    // into ring-timeout-safe pieces. This drives a 2048-query attention repeated for a forward's depth
+    // and asserts: cap-disabled submits the whole chain ONCE (the pre-fix hang shape), the bound splits
+    // it into MANY submissions, and splitting is BIT-IDENTICAL and matches a CPU softmax oracle. Small
+    // per-call context (SK) + a few checked query rows keep the oracle cheap; the split is exercised in
+    // full. The GPU-reset repro itself lives in the engine prefill bench, not this always-on unit test.
+    #[test]
+    fn long_prefill_work_cap_bounds_submissions_bit_exact() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[work-cap] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        const H: usize = 8;
+        const KV: usize = 2;
+        const SQ: usize = 2048; // a 2048-token prefill chunk: one query row per token
+        const SK: usize = 256;
+        const D: usize = 128;
+        const LAYERS: usize = 32; // stand-in for a deep forward's attention dispatch count
+        const QCHK: usize = 8; // oracle only the first few query rows (all queries are uniform)
+        let scale = 1.0f32 / (D as f32).sqrt();
+        let groups = H / KV;
+        let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
+        let q: Vec<f32> = (0..H * SQ * D).map(|i| gen(1, i)).collect();
+        let k: Vec<f32> = (0..KV * SK * D).map(|i| gen(2, i)).collect();
+        let v: Vec<f32> = (0..KV * SK * D).map(|i| gen(3, i)).collect();
+        // CPU reference: two-pass softmax(QKᵀ·scale)V, GQA (head h -> kv head h/(H/KV)), non-causal,
+        // for the first QCHK query rows of every head.
+        let mut cpu = vec![0f32; H * QCHK * D];
+        for h in 0..H {
+            let kv = h / groups;
+            for qp in 0..QCHK {
+                let qb = (h * SQ + qp) * D;
+                let sc: Vec<f32> = (0..SK)
+                    .map(|kk| (0..D).map(|dd| q[qb + dd] * k[(kv * SK + kk) * D + dd]).sum::<f32>() * scale)
+                    .collect();
+                let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
+                let sum: f32 = ex.iter().sum();
+                let ob = (h * QCHK + qp) * D;
+                for dd in 0..D {
+                    cpu[ob + dd] = (0..SK).map(|kk| ex[kk] / sum * v[(kv * SK + kk) * D + dd]).sum();
+                }
+            }
+        }
+        let qs = dev.upload_f32(&q).unwrap();
+        let ks = dev.upload_f32(&k).unwrap();
+        let vs = dev.upload_f32(&v).unwrap();
+        // One "forward": LAYERS independent sdpa dispatches recorded before the single readback flush.
+        let run = |dev: &VulkanDevice| -> (u64, Vec<f32>) {
+            let before = dev.submit_count();
+            let mut last = None;
+            for _ in 0..LAYERS {
+                last = Some(
+                    dev.sdpa_blk_vk(&qs, &ks, &vs, 1, H, KV, SQ, SK, D, scale, false, KV * SK * D, SK * D, D)
+                        .unwrap(),
+                );
+            }
+            let out = last.unwrap().to_vec_f32().unwrap();
+            (dev.submit_count() - before, out)
+        };
+        // GPU out is [H, SQ, D]; pull the first QCHK query rows of each head to match the oracle layout.
+        let extract = |out: &[f32]| -> Vec<f32> {
+            let mut r = vec![0f32; H * QCHK * D];
+            for h in 0..H {
+                for qp in 0..QCHK {
+                    for dd in 0..D {
+                        r[(h * QCHK + qp) * D + dd] = out[(h * SQ + qp) * D + dd];
+                    }
+                }
+            }
+            r
+        };
+        let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+        let relerr = |got: &[f32]| {
+            got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref
+        };
+
+        // Pre-fix shape: the whole forward is ONE submission (at 2k+ tokens this overruns the ring timeout).
+        dev.set_work_cap(0);
+        let (uncapped_submits, out_uncapped) = run(&dev);
+        let got_uncapped = extract(&out_uncapped);
+
+        // Fixed: the work bound splits that forward into several ring-timeout-safe submissions.
+        let per_call = (H * SQ) as u64; // workgroups per sdpa dispatch
+        dev.set_work_cap(per_call * 4); // flush roughly every 4 dispatches
+        let (capped_submits, out_capped) = run(&dev);
+        let got_capped = extract(&out_capped);
+
+        eprintln!(
+            "[work-cap] SQ{SQ} SK{SK} H{H} x{LAYERS}  submits uncapped={uncapped_submits} capped={capped_submits}  \
+             relerr uncapped={:.2e} capped={:.2e}",
+            relerr(&got_uncapped),
+            relerr(&got_capped),
+        );
+
+        assert_eq!(uncapped_submits, 1, "cap disabled must submit the whole forward once");
+        assert!(capped_submits > 1, "work cap must split the forward into multiple submissions");
+        assert!(
+            capped_submits >= (LAYERS as u64) / 4 - 1,
+            "work cap under-split the forward: {capped_submits} submissions"
+        );
+        assert_eq!(got_capped, got_uncapped, "splitting the submission changed the result");
+        assert!(relerr(&got_capped) < 1e-4, "sdpa diverged from CPU: scale_rel={:.3e}", relerr(&got_capped));
     }
 
     /// Flash-decoding (`sdpa_decode_split_vk`) matches the same two-pass softmax CPU oracle as
