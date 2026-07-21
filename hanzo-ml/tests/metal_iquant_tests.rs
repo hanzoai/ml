@@ -397,6 +397,148 @@ fn metal_mm_q6k_bf16_matches_f32() {
     check_bf16_mm_matches_f32_rounded(GgmlDType::Q6K);
 }
 
+// fp16-matmul prefill accuracy bound. `kernel_mul_mm_q*_K_bf16_half` stages the activation tile as
+// half so the outer product runs at the GPU's half rate (~2x). It is NOT bit-exact to the f32-tile
+// `_bf16` kernel (half products round differently), so instead of max_abs==0 we bound the
+// scale-relative deviation max|half - f32tile| / max|f32tile|. The f32-tile path (`QMatMul::forward`
+// on a bf16 activation) is the reference -- itself proven bit-exact to CPU by
+// `metal_mm_q*k_bf16_matches_f32` above. Driving the half kernel directly (src1_half = true) keeps
+// the accuracy gate on the KERNEL, orthogonal to the `HANZO_METAL_MM_F16` routing policy, and avoids
+// mutating a process-global env flag from a parallel test. A wrong stride here diverges loudly (the
+// two kernels see the same weights + activation), so this also guards the direct invocation.
+fn check_bf16_half_mm_bounded(dtype: GgmlDType) {
+    let dev = match Device::new_metal(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip bf16-half mm {dtype:?}: no Metal device ({e})");
+            return;
+        }
+    };
+    let mdev = dev.as_metal_device().unwrap();
+    let ts = dtype.type_size();
+    let bs = dtype.block_size();
+    let mut worst = 0f32;
+    for &(m, nout, k) in &[(32usize, 512usize, 2048usize), (40, 576, 2048)] {
+        let raw = synth(dtype, nout, k);
+        let x_host: Vec<f32> = (0..m * k).map(|i| pseudo(i + 2_000_003)).collect();
+        let x_bf16 = Tensor::from_vec(x_host, (m, k), &dev)
+            .unwrap()
+            .to_dtype(hanzo_ml::DType::BF16)
+            .unwrap();
+
+        // reference: f32-tile bf16 mm (the shipped, CPU-validated path)
+        let q_ref = QTensor::new(
+            QStorage::from_data(Cow::Owned(raw.clone()), &dev, dtype).unwrap(),
+            (nout, k),
+        )
+        .unwrap();
+        let y_ref: Vec<f32> = QMatMul::from_qtensor(q_ref)
+            .unwrap()
+            .forward(&x_bf16)
+            .unwrap()
+            .to_dtype(hanzo_ml::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        // half-tile bf16 mm: call the kernel directly on the same weights + activation
+        let qstore = QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap();
+        let wbuf = match &qstore {
+            QStorage::Metal(qms) => qms.buffer(),
+            _ => unreachable!("metal test on non-metal QStorage"),
+        };
+        let (xstore, _xl) = x_bf16.storage_and_layout();
+        let abuf = match &*xstore {
+            hanzo_ml::Storage::Metal(ms) => ms.buffer(),
+            _ => unreachable!("bf16 activation not on metal"),
+        };
+        let dst = mdev
+            .new_buffer(m * nout, hanzo_ml::DType::BF16, "bf16_half_test")
+            .unwrap();
+
+        let kdt: hanzo_metal_kernels::GgmlDType = dtype.try_into().unwrap();
+        // strides mirror `fwd`: weight [1,1,nout,k] byte strides = elem * type_size/block_size;
+        // activation [1,1,m,k] byte strides = elem * 2 (bf16). dst passed as [m, nout].
+        let src0_shape = [1usize, 1, nout, k];
+        let src0_stride: Vec<usize> = [nout * k, nout * k, k, 1]
+            .iter()
+            .map(|x| (*x as f32 * (ts as f32 / bs as f32)) as usize)
+            .collect();
+        let src1_shape = [1usize, 1, m, k];
+        let src1_stride: Vec<usize> = [m * k, m * k, k, 1].iter().map(|x| x * 2).collect();
+        let dst_shape = [m, nout];
+        {
+            let enc = mdev.command_encoder().unwrap();
+            hanzo_metal_kernels::call_quantized_matmul_mm_t(
+                mdev.device(),
+                &enc,
+                mdev.kernels(),
+                kdt,
+                &src0_shape,
+                &src0_stride,
+                wbuf,
+                &src1_shape,
+                &src1_stride,
+                abuf,
+                0,
+                &dst_shape,
+                0,
+                &dst,
+                true, // src1_bf16
+                true, // src1_half -> kernel_mul_mm_q*_K_bf16_half
+            )
+            .unwrap();
+        }
+        mdev.flush_and_wait_current().unwrap();
+        let y_half: Vec<f32> = Tensor::from_storage(
+            hanzo_ml::Storage::Metal(hanzo_ml::MetalStorage::new(
+                dst,
+                mdev.clone(),
+                m * nout,
+                hanzo_ml::DType::BF16,
+            )),
+            (m, nout),
+            hanzo_ml::op::BackpropOp::none(),
+            false,
+        )
+        .to_dtype(hanzo_ml::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        let mut max_abs = 0f32;
+        let mut max_ref = 0f32;
+        for (a, b) in y_half.iter().zip(&y_ref) {
+            max_abs = max_abs.max((a - b).abs());
+            max_ref = max_ref.max(b.abs());
+        }
+        let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+        worst = worst.max(rel);
+        println!(
+            "bf16-half-mm {dtype:?} [{m}x{nout}x{k}]: max_abs={max_abs:.3e} max_ref={max_ref:.3e} scale-rel={rel:.3e}"
+        );
+        // fp16 products vs f32 tile: bounded, small. Empirically << 1e-2 (see printed value); the
+        // gate catches a broken kernel (garbage output spikes scale-rel to O(1)) or a lost 2x.
+        assert!(
+            rel < 1e-2,
+            "{dtype:?} [{m}x{nout}x{k}] bf16-half mm scale-relative error {rel:.3e} exceeds 1e-2 -- fp16 matmul diverged from the f32-tile path"
+        );
+    }
+    println!("bf16-half-mm {dtype:?} worst scale-rel over shapes = {worst:.3e}");
+}
+#[test]
+fn metal_mm_q4k_bf16_half_bounded() {
+    check_bf16_half_mm_bounded(GgmlDType::Q4K);
+}
+#[test]
+fn metal_mm_q6k_bf16_half_bounded() {
+    check_bf16_half_mm_bounded(GgmlDType::Q6K);
+}
+
 // ---- DEQUANT round-trip bit-exactness (upload/readback) ----
 #[test]
 fn metal_dequant_iq1s_bit_exact() {
