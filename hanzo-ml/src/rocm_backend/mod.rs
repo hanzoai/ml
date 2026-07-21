@@ -2386,9 +2386,10 @@ impl RocmStorage {
     }
 
     /// Fused residual-add + rmsnorm: returns (sum = x + residual, normed = rmsnorm(sum) * alpha) in
-    /// ONE launch (vs a separate add then rmsnorm). f32 only -- the F32 residual/norm stream this
-    /// targets; other dtypes fall back to add + `rms_norm` at the op layer. Bit-identical to that
-    /// fallback (same f32 add, same sum-of-squares reduction order).
+    /// ONE launch (vs a separate add then rmsnorm). F32 (prefill/router stream) and F16 (the decode
+    /// residual stream); other dtypes fall back to add + `rms_norm` at the op layer. Bit-identical to
+    /// that fallback: the sum is stored rounded to the tensor dtype and the sum-of-squares reduces over
+    /// that rounded value, matching a separate `add` (rounds to dtype) then `rmsnorm` (squares stored).
     pub fn add_rms_norm(
         &self,
         x_layout: &Layout,
@@ -2417,61 +2418,82 @@ impl RocmStorage {
         let x_off = x_layout.start_offset();
         let r_off = residual_layout.start_offset();
         let alpha_off = alpha_layout.start_offset();
-        let (x_mem, r_mem, alpha_mem) = match (&x.slice, &residual.slice, &alpha.slice) {
-            (RocmStorageSlice::F32(xm), RocmStorageSlice::F32(rm), RocmStorageSlice::F32(am)) => {
-                (xm, rm, am)
-            }
-            _ => crate::bail!(
-                "add_rms_norm: f32 inputs required (x={:?} residual={:?} alpha={:?})",
-                x.slice.dtype(),
-                residual.slice.dtype(),
-                alpha.slice.dtype()
-            ),
-        };
         // DSL collapse Phase 2 (ROCm): the DSL `add_rmsnorm_blk` twin is bit-exact but benches ~84-92%
         // of this incumbent (same reason as `rms_norm`); below the >=97% gate, so the hand-written
         // kernel STAYS. See `dsl_norm_bench::add_rms_norm_dsl_vs_incumbent`.
         let n_cols = last_dim as i32;
         let block_size: i32 = if last_dim < 1024 { 32 } else { 1024 };
-        let sum = device.alloc::<f32>(elem_count)?;
-        let out = device.alloc::<f32>(elem_count)?;
-        let x_ptr = unsafe { x_mem.offset_ptr(x_off) };
-        let r_ptr = unsafe { r_mem.offset_ptr(r_off) };
-        let alpha_ptr = unsafe { alpha_mem.offset_ptr(alpha_off) };
-        let sum_ptr = sum.as_ptr();
-        let out_ptr = out.as_ptr();
         let grid = rocm_rs::hip::Dim3::from(n_rows);
         let block = rocm_rs::hip::Dim3::from(block_size as u32);
-        unsafe {
-            launch_kernel(
-                &device,
-                ReduceKernel::NAME,
-                ReduceKernel::CODE,
-                "add_rmsnorm_f32",
-                grid,
-                block,
-                &mut [
-                    (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    (&r_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    (&sum_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    (&alpha_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    &n_cols as *const i32 as *mut std::ffi::c_void,
-                    &block_size as *const i32 as *mut std::ffi::c_void,
-                    &eps as *const f32 as *mut std::ffi::c_void,
-                ],
-            )?;
+
+        macro_rules! launch_add_rmsnorm {
+            ($variant:ident, $ty:ty, $func:literal) => {{
+                let (x_mem, r_mem, alpha_mem) = match (&x.slice, &residual.slice, &alpha.slice) {
+                    (
+                        RocmStorageSlice::$variant(xm),
+                        RocmStorageSlice::$variant(rm),
+                        RocmStorageSlice::$variant(am),
+                    ) => (xm, rm, am),
+                    _ => unreachable!(),
+                };
+                let sum = device.alloc::<$ty>(elem_count)?;
+                let out = device.alloc::<$ty>(elem_count)?;
+                let x_ptr = unsafe { x_mem.offset_ptr(x_off) };
+                let r_ptr = unsafe { r_mem.offset_ptr(r_off) };
+                let alpha_ptr = unsafe { alpha_mem.offset_ptr(alpha_off) };
+                let sum_ptr = sum.as_ptr();
+                let out_ptr = out.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        &device,
+                        ReduceKernel::NAME,
+                        ReduceKernel::CODE,
+                        $func,
+                        grid,
+                        block,
+                        &mut [
+                            (&x_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&r_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&sum_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&alpha_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            &n_cols as *const i32 as *mut std::ffi::c_void,
+                            &block_size as *const i32 as *mut std::ffi::c_void,
+                            &eps as *const f32 as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+                Ok((
+                    Self {
+                        slice: RocmStorageSlice::$variant(sum),
+                        device: device.clone(),
+                    },
+                    Self {
+                        slice: RocmStorageSlice::$variant(out),
+                        device: device.clone(),
+                    },
+                ))
+            }};
         }
-        Ok((
-            Self {
-                slice: RocmStorageSlice::F32(sum),
-                device: device.clone(),
-            },
-            Self {
-                slice: RocmStorageSlice::F32(out),
-                device,
-            },
-        ))
+
+        match (&x.slice, &residual.slice, &alpha.slice) {
+            (
+                RocmStorageSlice::F32(_),
+                RocmStorageSlice::F32(_),
+                RocmStorageSlice::F32(_),
+            ) => launch_add_rmsnorm!(F32, f32, "add_rmsnorm_f32"),
+            (
+                RocmStorageSlice::F16(_),
+                RocmStorageSlice::F16(_),
+                RocmStorageSlice::F16(_),
+            ) => launch_add_rmsnorm!(F16, f16, "add_rmsnorm_f16"),
+            _ => crate::bail!(
+                "add_rms_norm: inputs must all be F32 or all F16 (x={:?} residual={:?} alpha={:?})",
+                x.slice.dtype(),
+                residual.slice.dtype(),
+                alpha.slice.dtype()
+            ),
+        }
     }
 
     /// Fused rotary embedding (GPT-NeoX half-rotation), replacing the ~7-op `rope_slow` composite.
@@ -5098,6 +5120,107 @@ mod dsl_norm_bench {
                     100.0 * inc_us / dsl_us
                 );
             }
+        }
+    }
+
+    /// COHERENCE GATE (decode residual stream): the fused `add_rmsnorm_f16` must be BIT-IDENTICAL to a
+    /// separate elementwise add (`badd_f16`, which rounds `x+residual` to f16) followed by `rmsnorm_f16`
+    /// (which squares the stored f16). If these agree bit-for-bit, wiring `forward_of_sum` to the fused
+    /// F16 kernel changes only launch count -- never model output -- so qwen2/qwen3 decode stays coherent.
+    #[test]
+    fn add_rmsnorm_f16_bit_identical_to_separate() {
+        let device = RocmDevice::new(0).unwrap();
+        for &(rows, n) in &[(1usize, 4096usize), (7, 4096), (1, 5120), (512, 2560), (33, 2560)] {
+            let xf = rnd(rows * n, 0x51 + rows as u64 * 7 + n as u64);
+            let rf = rnd(rows * n, 0xC0DE + rows as u64 + n as u64 * 3);
+            let af = rnd(n, 0xA1 + n as u64);
+            let x16: Vec<f16> = xf.iter().map(|&v| f16::from_f32(v)).collect();
+            let r16: Vec<f16> = rf.iter().map(|&v| f16::from_f32(v)).collect();
+            let a16: Vec<f16> = af.iter().map(|&v| f16::from_f32(v)).collect();
+            // Reference sum = (half)((float)x + (float)residual), byte-for-byte the badd_f16 kernel.
+            let sum_ref: Vec<f16> = (0..rows * n)
+                .map(|i| f16::from_f32(x16[i].to_f32() + r16[i].to_f32()))
+                .collect();
+
+            let x_dev = device.clone_htod(&x16).unwrap();
+            let r_dev = device.clone_htod(&r16).unwrap();
+            let a_dev = device.clone_htod(&a16).unwrap();
+            let sum_ref_dev = device.clone_htod(&sum_ref).unwrap();
+            let sum_fused = device.alloc::<f16>(rows * n).unwrap();
+            let dst_fused = device.alloc::<f16>(rows * n).unwrap();
+            let dst_ref = device.alloc::<f16>(rows * n).unwrap();
+
+            let n_cols = n as i32;
+            let block_size: i32 = if n < 1024 { 32 } else { 1024 };
+            let grid = rocm_rs::hip::Dim3 { x: rows as u32, y: 1, z: 1 };
+            let block = rocm_rs::hip::Dim3::from(block_size as u32);
+            let (xp, rp, ap, srp) = (
+                x_dev.as_ptr(),
+                r_dev.as_ptr(),
+                a_dev.as_ptr(),
+                sum_ref_dev.as_ptr(),
+            );
+            let (sfp, dfp, drp) = (sum_fused.as_ptr(), dst_fused.as_ptr(), dst_ref.as_ptr());
+
+            // fused add_rmsnorm_f16(x, residual, sum_out, dst, alpha, n_cols, block_size, eps)
+            unsafe {
+                launch_kernel(
+                    &device,
+                    ReduceKernel::NAME,
+                    ReduceKernel::CODE,
+                    "add_rmsnorm_f16",
+                    grid,
+                    block,
+                    &mut [
+                        ptr(&xp),
+                        ptr(&rp),
+                        ptr(&sfp),
+                        ptr(&dfp),
+                        ptr(&ap),
+                        &n_cols as *const i32 as *mut std::ffi::c_void,
+                        &block_size as *const i32 as *mut std::ffi::c_void,
+                        &EPS as *const f32 as *mut std::ffi::c_void,
+                    ],
+                )
+                .unwrap();
+            }
+            // separate rmsnorm_f16(sum_ref, dst, alpha, n_cols, block_size, eps)
+            unsafe {
+                launch_kernel(
+                    &device,
+                    ReduceKernel::NAME,
+                    ReduceKernel::CODE,
+                    "rmsnorm_f16",
+                    grid,
+                    block,
+                    &mut [
+                        ptr(&srp),
+                        ptr(&drp),
+                        ptr(&ap),
+                        &n_cols as *const i32 as *mut std::ffi::c_void,
+                        &block_size as *const i32 as *mut std::ffi::c_void,
+                        &EPS as *const f32 as *mut std::ffi::c_void,
+                    ],
+                )
+                .unwrap();
+            }
+
+            let sum_got = device.clone_dtoh(&sum_fused).unwrap();
+            let dst_got = device.clone_dtoh(&dst_fused).unwrap();
+            let dst_want = device.clone_dtoh(&dst_ref).unwrap();
+            for i in 0..rows * n {
+                assert_eq!(
+                    sum_got[i].to_bits(),
+                    sum_ref[i].to_bits(),
+                    "add_rmsnorm_f16 sum bit mismatch at {rows}x{n}[{i}]"
+                );
+                assert_eq!(
+                    dst_got[i].to_bits(),
+                    dst_want[i].to_bits(),
+                    "add_rmsnorm_f16 normed bit mismatch at {rows}x{n}[{i}]"
+                );
+            }
+            println!("[add_rmsnorm f16 bit-exact] {rows}x{n} OK");
         }
     }
 }
