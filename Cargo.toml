@@ -6,6 +6,7 @@
 members = [
     "hanzo-3d",
     "hanzo-datasets",
+    "hanzo-flash-attn-v3",
     "hanzo-ml",
     "hanzo-ml-examples",
     "hanzo-ml-pyo3",
@@ -20,7 +21,7 @@ members = [
 exclude = [
     "hanzo-ml-book",
     "hanzo-flash-attn",
-    "hanzo-flash-attn-v3",
+    "hanzo-flash-attn-build",
     "hanzo-kernel",
     "hanzo-kernel-macros",
     "hanzo-kernels",
@@ -57,7 +58,7 @@ chrono = "0.4"
 hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.85" }
 hanzo-datasets = { path = "./hanzo-datasets", version = "0.11.8" }
 hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.11.34" }
-hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.11.8" }
+hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.11.9" }
 hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.36" }
 hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.44" }
 hanzo-nn = { path = "./hanzo-nn", version = "0.11.33" }
