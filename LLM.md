@@ -109,6 +109,35 @@ not needed for the CUDA runtime.
   IN THE LIBRARY (i8); the f16 result is recorded here as the positive that makes a hand-rolled DSL
   flash-attn viable. Build/run: `cd hanzo-kernel && cargo run --release --features cuda --bin mmq-check`.
 
+## ROCm qmmq Q4_K/Q5_K min-bias precompute (0.11.88 / hanzo-rocm-kernels 0.11.36)
+The int8-WMMA prefill GEMM (`qmmq_core<WTYPE>`, quant.hip) carries an asymmetric min-bias for the
+sub-block-min k-quants (Q4_K/Q5_K): `out -= dmin_w * m_g * d_x * sum_k(q_x)`. The `d_x` (per-32-block
+activation scale) factor was recomputed inside the per-output GEMM inner loop, one multiply per output
+element per K-block. It is now folded ONCE per activation block at quantize time: `quantize_q8_1` stores
+`xs = d_x * sum(q_x)` (f32, llama block_q8_1 `s`) instead of the raw int sum, so the epilogue reads
+`acc -= xs * (dmin*m)` -- one multiply, the `d_x` hoisted out of the hot loop. `xs` changes i32->f32
+across the quantize kernels, `qmmq_core`, the `DEFINE_QMMQ`/MoE launchers, and the rocm_backend binding.
+Bit-exact by construction: `__half2float(dh) * (float)qsum` is exactly the product the old epilogue formed
+from the stored f16 scale, so per-block bias terms are IEEE-identical. Verified on evo (gfx1151) Qwen3-4B
+Q4_K_M greedy decode: output byte-identical pre/post (401 chars). rocprofv3 SQ_INSTS_VALU per dispatch:
+`qmmq_q4k_f16` -6.6% (asymmetric, the target), `qmmq_q6k_f16` +0.01% (symmetric control, `!SYMM` elides --
+unchanged as required). Symmetric weights (Q8_0/Q4_0/Q6_K/IQ4_XS/TQ2_0) never touch `xs`. Decode matvec
+(rows==1, `matvec_quant`) is a different kernel and is untouched.
+
+## Vulkan int8 per-token KV-quant paged attention (0.11.88, opt-in)
+Symmetric per-token int8 KV cache (KIVI / KVQuant): each cached per-head K/V vector is quantized to signed
+int8 with one f32 scale (`scale = amax/127`), codes packed 4-per-u32 with a co-located scale word, so a
+token vector is self-describing and paged by slot. Two Vulkan kernels: `reshape_and_cache_q8` (amax reduce
+-> scale -> pack on write) and `paged_attn_q8` (dequantize-on-read `code * token_scale`, same online-softmax
+structure as `paged_attn`). Engine-side `PagedCacheType::Int8` allocates the cache as `DType::U32` with a
+token-major `[num_blocks, num_kv_heads, block_size, head_size/4 + 1]` layout; the Vulkan paged-attn backend
+routes U32 -> the `*_q8` kernels. Opt-in via `--pa-cache-type int8`; default Auto is byte-unchanged. The
+backend-agnostic CPU reference/oracle lives in `hanzo-paged-attn::quant` (engine) with 6 tests (bounded
+reconstruction `<= 1/254`, channel-outlier, near-zero-cancellation, all-zero-exact, packing, endpoint).
+Verified on evo (gfx1151, RADV): U32 cache active, no fallback; int8 decode argmax-identical to f16 at 128
+greedy tokens and coherent + information-faithful (exact 12-item ordered recall) at 256. Value: 4x smaller
+KV footprint / longer context; decode t/s neutral (KV read is a fraction of the bandwidth-bound decode).
+
 ## Vulkan DECODE: coalesced Q6_K matvec (0.11.72)
 Decode is GTT-bandwidth-bound on the gfx1151 UMA APU: each weight tensor is read once, cache-cold, per token,
 so the lever is achieved weight-stream bandwidth (coalescing + full lane utilisation), not ALU. Per-op GPU

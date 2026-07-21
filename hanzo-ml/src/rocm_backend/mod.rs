@@ -1723,7 +1723,9 @@ impl RocmDevice {
         let nblk = k / 32;
         let xq = self.alloc::<u8>(m * k)?;
         let xd = self.alloc::<f16>(m * nblk)?;
-        let xs = self.alloc::<i32>(m * nblk)?;
+        // xs = d_x * sum(q_x) per 32-block (f32; llama block_q8_1 `s`) -- the activation scale is folded
+        // into the sum so the qmmq asymmetric min-bias costs one multiply per output element, not two.
+        let xs = self.alloc::<f32>(m * nblk)?;
         let xq_ptr = xq.as_ptr();
         let xd_ptr = xd.as_ptr();
         let xs_ptr = xs.as_ptr();
@@ -1760,7 +1762,7 @@ impl RocmDevice {
                 device: self.clone(),
             },
             RocmStorage {
-                slice: RocmStorageSlice::I32(xs),
+                slice: RocmStorageSlice::F32(xs),
                 device: self.clone(),
             },
         ))
@@ -1802,7 +1804,7 @@ impl RocmDevice {
         // Dummy 1-elem xs for the symmetric path (the kernel's asym branch elides, so it is never
         // dereferenced; we just need a non-null device pointer to bind to the kernel parameter).
         let xs_dummy = if xs_opt.is_none() {
-            Some(self.alloc::<i32>(1)?)
+            Some(self.alloc::<f32>(1)?)
         } else {
             None
         };
@@ -1816,8 +1818,8 @@ impl RocmDevice {
         };
         let xs_ptr = match (&xs_opt, &xs_dummy) {
             (Some(xs), _) => match &xs.slice {
-                RocmStorageSlice::I32(s) => s.as_ptr(),
-                _ => crate::bail!("qmmq_quant: xs must be i32"),
+                RocmStorageSlice::F32(s) => s.as_ptr(),
+                _ => crate::bail!("qmmq_quant: xs must be f32"),
             },
             (None, Some(d)) => d.as_ptr(),
             _ => unreachable!(),
@@ -1985,7 +1987,7 @@ impl RocmDevice {
             (xq, xd, Some(xs))
         };
         let xs_dummy = if xs_opt.is_none() {
-            Some(self.alloc::<i32>(1)?)
+            Some(self.alloc::<f32>(1)?)
         } else {
             None
         };
@@ -1999,8 +2001,8 @@ impl RocmDevice {
         };
         let xs_ptr = match (&xs_opt, &xs_dummy) {
             (Some(xs), _) => match &xs.slice {
-                RocmStorageSlice::I32(s) => s.as_ptr(),
-                _ => crate::bail!("moe_qmmq_quant: xs must be i32"),
+                RocmStorageSlice::F32(s) => s.as_ptr(),
+                _ => crate::bail!("moe_qmmq_quant: xs must be f32"),
             },
             (None, Some(d)) => d.as_ptr(),
             _ => unreachable!(),

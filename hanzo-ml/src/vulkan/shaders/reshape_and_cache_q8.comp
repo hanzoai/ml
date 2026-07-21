@@ -1,0 +1,98 @@
+#version 450
+// reshape_and_cache (int8, Vulkan compute). Symmetric per-token int8 quantization of the new
+// per-token K/V vectors into the paged KV cache (KIVI / KVQuant per-token grouping). One
+// workgroup per (token, head): reduce amax over head_size, scale = amax/127, then pack the
+// head_size int8 codes (4 per u32, little-endian lane) followed by one u32 holding the f32
+// scale bit pattern. This mirrors hanzo_paged_attn::quant (the CPU oracle) and reuses the
+// quantize_act_q8 packing convention, so codes are compatible across the engine.
+//
+// Quantized cache (K and V), u32 buffer, logical layout:
+//   [num_blocks, num_kv_heads, block_size, words_per_token]   words_per_token = head_size/4 + 1
+// so a token's per-head vector is contiguous: head_size/4 code words then 1 scale word.
+//
+// key/value inputs: [num_tokens, num_kv_heads, head_size] f32, row stride key_stride/value_stride.
+// slot_mapping: [num_tokens] u32, PAD = 0xFFFFFFFF meaning "skip" (mirrors the f32 writer).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer K  { float key[]; };
+layout(set = 0, binding = 1) readonly buffer V  { float value[]; };
+layout(set = 0, binding = 2)          buffer KC { uint key_cache[]; };
+layout(set = 0, binding = 3)          buffer VC { uint value_cache[]; };
+layout(set = 0, binding = 4) readonly buffer SM { uint slot_mapping[]; };
+
+layout(push_constant) uniform Pc {
+    uint key_stride;    // f32 elems between consecutive tokens in `key`
+    uint value_stride;  // f32 elems between consecutive tokens in `value`
+    uint num_kv_heads;
+    uint head_size;
+    uint block_size;
+};
+
+const uint  PAD_SLOT = 0xFFFFFFFFu;
+const float QMAX = 127.0;
+const uint  WG = 128u;
+shared float s_red[WG];
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    uint head_idx  = gl_WorkGroupID.y;
+    uint tid       = gl_LocalInvocationID.x;
+
+    uint slot = slot_mapping[token_idx];
+    if (slot == PAD_SLOT) { return; }
+
+    uint block_idx = slot / block_size;
+    uint block_off = slot % block_size;
+    uint hs4 = head_size / 4u;            // code words per token vector
+    uint wpt = hs4 + 1u;                  // + scale word
+    uint head_stride  = block_size * wpt;
+    uint block_stride = num_kv_heads * head_stride;
+    uint dst_base = block_idx * block_stride + head_idx * head_stride + block_off * wpt;
+
+    uint k_src = token_idx * key_stride + head_idx * head_size;
+    uint v_src = token_idx * value_stride + head_idx * head_size;
+
+    // ---- KEY: amax reduce -> scale -> pack ----
+    float lmax = 0.0;
+    for (uint d = tid; d < head_size; d += WG) { lmax = max(lmax, abs(key[k_src + d])); }
+    s_red[tid] = lmax;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) { s_red[tid] = max(s_red[tid], s_red[tid + s]); }
+        barrier();
+    }
+    float amax = s_red[0];
+    float inv = amax > 0.0 ? QMAX / amax : 0.0;
+    for (uint w = tid; w < hs4; w += WG) {
+        uint word = 0u;
+        for (uint l = 0u; l < 4u; l++) {
+            int q = clamp(int(round(key[k_src + w * 4u + l] * inv)), -127, 127);
+            word |= (uint(q) & 0xFFu) << (l * 8u);
+        }
+        key_cache[dst_base + w] = word;
+    }
+    if (tid == 0u) { key_cache[dst_base + hs4] = floatBitsToUint(amax > 0.0 ? amax / QMAX : 1.0); }
+    barrier();  // reuse s_red for the value reduce
+
+    // ---- VALUE: amax reduce -> scale -> pack ----
+    lmax = 0.0;
+    for (uint d = tid; d < head_size; d += WG) { lmax = max(lmax, abs(value[v_src + d])); }
+    s_red[tid] = lmax;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) { s_red[tid] = max(s_red[tid], s_red[tid + s]); }
+        barrier();
+    }
+    amax = s_red[0];
+    inv = amax > 0.0 ? QMAX / amax : 0.0;
+    for (uint w = tid; w < hs4; w += WG) {
+        uint word = 0u;
+        for (uint l = 0u; l < 4u; l++) {
+            int q = clamp(int(round(value[v_src + w * 4u + l] * inv)), -127, 127);
+            word |= (uint(q) & 0xFFu) << (l * 8u);
+        }
+        value_cache[dst_base + w] = word;
+    }
+    if (tid == 0u) { value_cache[dst_base + hs4] = floatBitsToUint(amax > 0.0 ? amax / QMAX : 1.0); }
+}
