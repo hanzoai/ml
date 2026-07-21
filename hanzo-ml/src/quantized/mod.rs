@@ -2492,6 +2492,22 @@ fn vulkan_prefill_gemm_max_rows(dtype: GgmlDType) -> usize {
     }
 }
 
+// The native quant matvec/matmul kernels read the activation from the storage buffer base; they take
+// no per-tensor start_offset. A tensor narrowed out of a larger buffer (e.g. extract_logits' last-row
+// slice: `x.narrow(1, seq_len-1, 1)`) is `is_contiguous()` yet carries a non-zero start_offset because
+// its size-1 leading dims mask the stride mismatch -- so `contiguous()` returns it as a view and the
+// kernel would read the WRONG rows (position 0 instead of the narrowed one). Materialize a genuine
+// offset-0 buffer before the storage reaches the kernel.
+#[cfg(feature = "vulkan")]
+fn vulkan_act_offset0(xs: &Tensor) -> Result<Tensor> {
+    let xs = xs.contiguous()?;
+    if xs.layout().start_offset() == 0 {
+        Ok(xs)
+    } else {
+        xs.force_contiguous()
+    }
+}
+
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
@@ -2643,7 +2659,7 @@ impl crate::Module for QMatMul {
                 if rows == 1 {
                     // Decode: weights stay quantized in VRAM; the matching native-GGML quant matvec
                     // runs straight out of the block format (no dequant, no copy).
-                    let xs = xs.contiguous()?;
+                    let xs = vulkan_act_offset0(xs)?;
                     let d = match xs.device() {
                         Device::Vulkan(d) => d,
                         _ => crate::bail!("VulkanQuant input not on vulkan"),
@@ -2696,7 +2712,7 @@ impl crate::Module for QMatMul {
                     // the dequant path below. Same block layout + decode as the decode matvec above;
                     // one matmul_q*_gpu per native dtype. Leading batch dims flatten into M.
                     let m = rows;
-                    let xs = xs.contiguous()?;
+                    let xs = vulkan_act_offset0(xs)?;
                     let d = match xs.device() {
                         Device::Vulkan(d) => d,
                         _ => crate::bail!("VulkanQuant input not on vulkan"),
