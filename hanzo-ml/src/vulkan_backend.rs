@@ -211,6 +211,8 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "gdn_gating" => spv!("gdn_gating"),
         "paged_attn" => spv!("paged_attn"),
         "reshape_and_cache" => spv!("reshape_and_cache"),
+        "paged_attn_q8" => spv!("paged_attn_q8"),
+        "reshape_and_cache_q8" => spv!("reshape_and_cache_q8"),
         "dsl_mul" => include_bytes!("vulkan/spv/dsl_mul.spv"),
         "dsl_matvec" => include_bytes!("vulkan/spv/dsl_matvec.spv"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
@@ -2123,6 +2125,77 @@ impl VulkanDevice {
             &[2, 3],
             &push,
             (p.num_tokens as u32, 1, 1),
+        )?;
+        Ok(())
+    }
+
+    /// PagedAttention decode over an int8-packed KV cache (KIVI / KVQuant per-token). Same math as
+    /// [`Self::paged_attention_vk`] but K/V are dequantized on read (`code * per-token-scale`); the
+    /// caches are u32 buffers holding `head_size/4` code words + 1 scale word per token vector
+    /// (see `src/vulkan/shaders/paged_attn_q8.comp`). Strides are computed in-shader from
+    /// head_size/block_size/num_kv_heads, so no cache strides are passed. Output is fresh f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_attention_q8_vk(&self, p: &PagedAttnArgs<'_>) -> Result<VulkanStorage> {
+        if p.head_size as u64 > 256 {
+            crate::bail!("vulkan paged_attn_q8: head_size {} > 256", p.head_size);
+        }
+        let out = self.alloc_f32(p.num_seqs * p.num_heads * p.head_size)?;
+        // push: 7 u32 then 1 f32 (scale), std430 scalar packing (matches paged_attn_q8.comp Pc).
+        let mut push = push_u32(&[
+            p.num_kv_heads as u32,
+            p.num_heads as u32,
+            p.head_size as u32,
+            p.block_size as u32,
+            p.max_num_blocks_per_seq as u32,
+            p.q_stride as u32,
+            p.max_context_len as u32,
+        ]);
+        push.extend_from_slice(&p.scale.to_ne_bytes());
+        let bufs = [
+            p.q.buffer,
+            p.key_cache.buffer,
+            p.value_cache.buffer,
+            p.block_tables.buffer,
+            p.context_lens.buffer,
+            out.buffer,
+        ];
+        self.dispatch_out(
+            "paged_attn_q8",
+            &bufs,
+            5,
+            &push,
+            (p.num_heads as u32, p.num_seqs as u32, 1),
+        )?;
+        Ok(out)
+    }
+
+    /// Write new per-token K/V into the int8-packed paged cache: symmetric per-token quantization
+    /// (amax/127, clamp to +-127), codes packed 4-per-u32 with a co-located f32 scale word. One
+    /// workgroup per (token, kv-head). See `src/vulkan/shaders/reshape_and_cache_q8.comp`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reshape_and_cache_q8_vk(&self, p: &ReshapeCacheArgs<'_>) -> Result<()> {
+        // push: key_stride, value_stride, num_kv_heads, head_size, block_size (matches Pc).
+        let push = push_u32(&[
+            p.key_stride as u32,
+            p.value_stride as u32,
+            p.num_heads as u32, // the write path carries kv heads in `num_heads`
+            p.head_size as u32,
+            p.block_size as u32,
+        ]);
+        let bufs = [
+            p.key.buffer,
+            p.value.buffer,
+            p.key_cache.buffer,
+            p.value_cache.buffer,
+            p.slot_mapping.buffer,
+        ];
+        // grid: (token, kv-head); kernel writes bindings 2 (key_cache) and 3 (value_cache).
+        self.dispatch_multi_out(
+            "reshape_and_cache_q8",
+            &bufs,
+            &[2, 3],
+            &push,
+            (p.num_tokens as u32, p.num_heads as u32, 1),
         )?;
         Ok(())
     }
