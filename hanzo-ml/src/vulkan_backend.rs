@@ -1636,31 +1636,34 @@ impl VulkanDevice {
         if x.count < m * k {
             crate::bail!("matmul_q4k_gpu: x count {} < m*k {}", x.count, m * k);
         }
-        let out = self.alloc_f32(m * nout)?;
-        // Q4_K prefill path selection. DEFAULT for dense prefill (woff==0, m>1): the best available 2D
-        // tile -- mul_mm_q4k_tiled_dp4a (int8 dp4a, 9.35x over the column kernel) where the device has
-        // int_dot8, else the universal f32 mul_mm_q4k_tiled (2.06x). Both stage weight+activation in LDS
-        // and reuse across the 64x64 output tile. MoE banks (woff!=0), m==1, and VK_Q4K_LEGACY
-        // fall to the column-per-invocation mul_mat_q4k. The per-kernel env vars
-        // (VK_Q4K_{DP4A,TILED2D,LEGACY}) force one path for the A/B gates.
+        // Q4_K prefill path selection. DEFAULT for dense prefill (woff==0, m>1): the f16 coopmat
+        // matrix-core GEMM (mul_mm_q4k_coopmat), the llama-Vulkan-parity path. MoE banks (woff!=0),
+        // m==1, and VK_Q4K_LEGACY fall to the column-per-invocation mul_mat_q4k. The dp4a/2d tiles
+        // stay reachable via the per-kernel A/B env vars (VK_Q4K_{DP4A,TILED2D,COOPMAT_OFF,LEGACY}).
         let legacy = std::env::var_os("VK_Q4K_LEGACY").is_some();
         let force_dp4a = std::env::var_os("VK_Q4K_DP4A").is_some();
         let force_2d = std::env::var_os("VK_Q4K_TILED2D").is_some();
         // L4 coopmat (matrix cores) -- decode the Q4_K weight to f16 LDS tiles + coopMatMulAdd, the
-        // llama-parity path (llama-Vulkan uses KHR_coopmat for Q4_K prefill on this device). Default for
-        // dense (woff==0) rows>1 Q4_K on any coopmat device: the block-amortized decode + 128x128 tile
-        // measures ~1.9x the dp4a tile at the real projection shapes and is f16-bit-exact vs dp4a. The
-        // 16-tile store is aligned, so it needs m,nout multiples of 16 (k is always a Q4_K 256-multiple);
-        // ragged shapes fall through to the dp4a tile, which guards edges per element. VK_Q4K_COOPMAT_OFF
-        // forces the dp4a path for the A/B gate.
-        if !legacy
+        // llama-parity path (llama-Vulkan uses KHR_coopmat for Q4_K prefill on this device). The 16x16
+        // store writes whole tiles, so the output rows are padded up to a 16-multiple (nout already is
+        // one for every projection): the trailing <16 scratch rows are fed by stage()'s zero-padded
+        // activation and never read back (`count` stays m*nout). This is what lets a ragged token count
+        // -- m % 16 != 0, i.e. nearly every real prompt -- take the coopmat path instead of falling
+        // through to the ~1.6x slower dp4a tile. llama's mul_mm.comp reaches the same result by
+        // bounds-checking each partial-tile element; padding the allocation is that store with no
+        // divergent path. VK_Q4K_COOPMAT_OFF (and the dp4a/2d/legacy A-B gates) force the older tiles.
+        let coopmat_path = !legacy
+            && !force_dp4a
+            && !force_2d
             && self.inner.coopmat
             && woff == 0
             && m > 1
-            && m % 16 == 0
             && nout % 16 == 0
-            && std::env::var_os("VK_Q4K_COOPMAT_OFF").is_none()
-        {
+            && std::env::var_os("VK_Q4K_COOPMAT_OFF").is_none();
+        let m_alloc = if coopmat_path { m.next_multiple_of(16) } else { m };
+        let mut out = self.alloc_f32(m_alloc * nout)?;
+        out.count = m * nout;
+        if coopmat_path {
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
             // grid: BN=128 cols/wg, BM=128 rows/wg (must match the shader's BM/BN).
             self.dispatch(
@@ -1812,26 +1815,29 @@ impl VulkanDevice {
         if x.count < m * k {
             crate::bail!("matmul_q6k_gpu: x count {} < m*k {}", x.count, m * k);
         }
-        let out = self.alloc_f32(m * nout)?;
-        // Dense prefill (m>1) on an int_dot8 device: the 2D int8-dp4a tile stages weight+activation in
-        // LDS and reuses across the 64x64 output tile -- the Q6_K twin of mul_mm_q4k_tiled_dp4a. Q6_K is
-        // symmetric (no min), so it needs only xq/xs, not xsum. MoE banks (woff!=0), m==1, and the
-        // VK_Q6K_LEGACY escape hatch fall to the column-per-invocation mul_mat_q6k.
+        // Q6_K prefill path selection. DEFAULT for dense prefill (woff==0, m>1): the f16 coopmat
+        // matrix-core GEMM (mul_mm_q6k_coopmat), the llama-Vulkan-parity path. MoE banks (woff!=0),
+        // m==1, and VK_Q6K_LEGACY fall to the column-per-invocation mul_mat_q6k; the int8-dp4a tile
+        // stays reachable via VK_Q6K_COOPMAT_OFF for the A/B gate.
         let legacy = std::env::var_os("VK_Q6K_LEGACY").is_some();
         // f16 coopmat (matrix cores) -- decode the Q6_K weight to f16 LDS tiles + coopMatMulAdd, the
-        // llama-parity path (llama-Vulkan runs Q6_K prefill on KHR_coopmat at ~13.7k GFLOP/s vs the dp4a
-        // tile's ~4k here). Default for dense (woff==0) rows>1 Q6_K on any coopmat device: the 128x128
-        // block-amortized decode is f16-bit-exact vs the column kernel. The 16-tile store needs m,nout
-        // multiples of 16 (k is always a Q6_K 256-multiple); ragged shapes and MoE banks (woff!=0) fall
-        // through to the dp4a tile, which guards edges per element. VK_Q6K_COOPMAT_OFF forces dp4a for A/B.
-        if !legacy
+        // llama-parity path (llama-Vulkan runs Q6_K prefill on KHR_coopmat). The 16x16 store writes
+        // whole tiles, so the output rows are padded up to a 16-multiple (nout already is one for every
+        // projection): the trailing <16 scratch rows are fed by stage()'s zero-padded activation and
+        // never read back (`count` stays m*nout). This lets a ragged token count (m % 16 != 0, nearly
+        // every real prompt) take the coopmat path instead of the ~1.6x slower dp4a tile -- the same
+        // result as llama's per-element partial-tile store, with no divergent path. VK_Q6K_COOPMAT_OFF
+        // forces the dp4a tile for the A/B gate.
+        let coopmat_path = !legacy
             && self.inner.coopmat
             && woff == 0
             && m > 1
-            && m % 16 == 0
             && nout % 16 == 0
-            && std::env::var_os("VK_Q6K_COOPMAT_OFF").is_none()
-        {
+            && std::env::var_os("VK_Q6K_COOPMAT_OFF").is_none();
+        let m_alloc = if coopmat_path { m.next_multiple_of(16) } else { m };
+        let mut out = self.alloc_f32(m_alloc * nout)?;
+        out.count = m * nout;
+        if coopmat_path {
             let push = push_u32(&[0, m as u32, nout as u32, k as u32, woff as u32]);
             // grid: BN=128 cols/wg, BM=128 rows/wg (must match the shader's BM/BN).
             self.dispatch(
@@ -8805,7 +8811,7 @@ mod dsl_dispatch_proof {
     /// the only divergence is the q8 activation quantization the dp4a path adds. Also times both at real
     /// prefill shapes when HANZO_MMQ_AB=1 (the win over the column kernel that dominates Q4_K_M prefill).
     #[test]
-    fn mul_mm_q6k_tiled_dp4a_matches_column() {
+    fn mul_mm_q6k_coopmat_and_dp4a_match_column() {
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
             Err(e) => { eprintln!("[q6k-tiled] no vulkan device ({e}); skipping"); return; }
@@ -8884,10 +8890,16 @@ mod dsl_dispatch_proof {
             unsafe { std::env::set_var("VK_Q6K_LEGACY", "1") };
             let col = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
             unsafe { std::env::remove_var("VK_Q6K_LEGACY") };
-            let got = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
-            let rel = relof(&got);
-            eprintln!("[q6k-tiled] {m}x{n}x{k}  column_vs_cpu={:.2e}  tiled_vs_cpu={:.2e}", relof(&col), rel);
-            assert!(rel < 2e-2, "Q6_K tiled dp4a {m}x{n}x{k} diverged from CPU: rel={rel:.3e}");
+            // Default path is the f16 coopmat GEMM; the ragged m (37/40/100) also exercises its
+            // output-row padding. The int8 dp4a tile stays reachable as the A/B fallback.
+            let got_cm = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            unsafe { std::env::set_var("VK_Q6K_COOPMAT_OFF", "1") };
+            let got_dp4a = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            unsafe { std::env::remove_var("VK_Q6K_COOPMAT_OFF") };
+            let (rel_cm, rel_dp4a) = (relof(&got_cm), relof(&got_dp4a));
+            eprintln!("[q6k] {m}x{n}x{k}  column_vs_cpu={:.2e}  coopmat_vs_cpu={:.2e}  dp4a_vs_cpu={:.2e}", relof(&col), rel_cm, rel_dp4a);
+            assert!(rel_cm < 2e-2, "Q6_K coopmat {m}x{n}x{k} diverged from CPU: rel={rel_cm:.3e}");
+            assert!(rel_dp4a < 2e-2, "Q6_K dp4a {m}x{n}x{k} diverged from CPU: rel={rel_dp4a:.3e}");
             if ab {
                 let iters = 20;
                 unsafe { std::env::set_var("VK_Q6K_LEGACY", "1") };
