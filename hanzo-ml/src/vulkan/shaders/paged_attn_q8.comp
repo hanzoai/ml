@@ -1,0 +1,163 @@
+#version 450
+// PagedAttention decode kernel (Vulkan compute), int8 KV cache. Same math and workgroup
+// structure as paged_attn.comp (one workgroup == one (seq, head); output = softmax(scale*Q.K^T).V)
+// but the paged KV is stored symmetric-per-token int8 (KIVI / KVQuant), so K and V are
+// dequantized on read: value = code * token_scale. The dequant is cheap ALU hidden under the 4x
+// smaller KV read (1 byte/elem vs the f32 cache's 4) -- the point of int8 KV on a
+// bandwidth-bound decode. See hanzo_paged_attn::quant for the packing/oracle.
+//
+// Quantized cache (K and V), u32 buffer:
+//   [num_blocks, num_kv_heads, block_size, words_per_token]   words_per_token = head_size/4 + 1
+//   token vector = head_size/4 code words (4 int8/word, little-endian lane) + 1 f32 scale word.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// q: [num_seqs, num_heads, head_size] f32 (single decode query per seq/head).
+layout(set = 0, binding = 0) readonly  buffer Q  { float q[]; };
+// key/value cache, int8 packed as u32 (see layout above).
+layout(set = 0, binding = 1) readonly  buffer KC { uint kc[]; };
+layout(set = 0, binding = 2) readonly  buffer VC { uint vc[]; };
+// block_tables: [num_seqs, max_num_blocks_per_seq] u32.
+layout(set = 0, binding = 3) readonly  buffer BT { uint block_tables[]; };
+// context_lens: [num_seqs] u32.
+layout(set = 0, binding = 4) readonly  buffer CL { uint context_lens[]; };
+// out: [num_seqs, num_heads, head_size] f32.
+layout(set = 0, binding = 5) writeonly buffer O  { float o[]; };
+
+layout(push_constant) uniform Pc {
+    uint num_kv_heads;
+    uint num_heads;
+    uint head_size;
+    uint block_size;
+    uint max_num_blocks_per_seq;
+    uint q_stride;              // elems between consecutive seqs in q (= num_heads*head_size)
+    uint max_context_len;
+    float scale;               // softmax scale
+};
+
+const uint MAX_HEAD_SIZE = 256u;
+const uint WG = 128u;
+shared float s_q[MAX_HEAD_SIZE];   // query vector for this (seq, head)
+shared float s_red[WG];            // reduction scratch
+shared float s_acc[MAX_HEAD_SIZE]; // output accumulator
+shared float s_wv[WG];             // per-tile softmax weight * V token-scale
+shared uint  s_pb[WG];             // per-tile physical block id
+shared uint  s_bo[WG];             // per-tile block offset
+
+// Dequantized dot(Q, K_token) for the token whose K vector starts at word `kbase`.
+// Returns sum_d s_q[d]*code_d, WITHOUT the per-token scale (caller folds it in).
+float qk_codes(uint kbase, uint hs4) {
+    float acc = 0.0;
+    for (uint w = 0u; w < hs4; w++) {
+        int word = int(kc[kbase + w]);
+        uint b = w * 4u;
+        acc += s_q[b + 0u] * float(bitfieldExtract(word, 0, 8));
+        acc += s_q[b + 1u] * float(bitfieldExtract(word, 8, 8));
+        acc += s_q[b + 2u] * float(bitfieldExtract(word, 16, 8));
+        acc += s_q[b + 3u] * float(bitfieldExtract(word, 24, 8));
+    }
+    return acc;
+}
+
+void main() {
+    uint head_idx = gl_WorkGroupID.x;
+    uint seq_idx  = gl_WorkGroupID.y;
+    uint tid      = gl_LocalInvocationID.x;
+    uint nthreads = gl_WorkGroupSize.x;
+
+    uint context_len = context_lens[seq_idx];
+    if (context_len > max_context_len) { context_len = max_context_len; }
+
+    uint num_queries_per_kv = num_heads / num_kv_heads;
+    uint kv_head_idx = head_idx / num_queries_per_kv;
+
+    uint hs4 = head_size / 4u;
+    uint wpt = hs4 + 1u;
+    uint head_stride  = block_size * wpt;
+    uint block_stride = num_kv_heads * head_stride;
+
+    // Load query for this (seq, head).
+    uint q_base = seq_idx * q_stride + head_idx * head_size;
+    for (uint i = tid; i < head_size; i += nthreads) { s_q[i] = q[q_base + i]; }
+    barrier();
+
+    uint bt_base = seq_idx * max_num_blocks_per_seq;
+
+    // Pass 1: max logit.
+    float local_max = -3.402823466e38;
+    for (uint t = tid; t < context_len; t += nthreads) {
+        uint phys_block = block_tables[bt_base + t / block_size];
+        uint block_off  = t % block_size;
+        uint kbase = phys_block * block_stride + kv_head_idx * head_stride + block_off * wpt;
+        float kscale = uintBitsToFloat(kc[kbase + hs4]);
+        float qk = scale * kscale * qk_codes(kbase, hs4);
+        local_max = max(local_max, qk);
+    }
+    s_red[tid] = local_max;
+    barrier();
+    for (uint stride = nthreads / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) { s_red[tid] = max(s_red[tid], s_red[tid + stride]); }
+        barrier();
+    }
+    float qk_max = s_red[0];
+    barrier();
+
+    // Passes 2+3 fused, tiled over context in WG chunks.
+    float exp_sum = 0.0;
+    for (uint i = tid; i < head_size; i += nthreads) { s_acc[i] = 0.0; }
+    barrier();
+
+    for (uint base = 0u; base < context_len; base += WG) {
+        uint t = base + tid;
+        float w = 0.0;
+        uint phys_block = 0u;
+        uint block_off = 0u;
+        float vscale = 0.0;
+        if (t < context_len) {
+            phys_block = block_tables[bt_base + t / block_size];
+            block_off  = t % block_size;
+            uint kbase = phys_block * block_stride + kv_head_idx * head_stride + block_off * wpt;
+            float kscale = uintBitsToFloat(kc[kbase + hs4]);
+            float qk = scale * kscale * qk_codes(kbase, hs4);
+            w = exp(qk - qk_max);
+            // V token scale lives at the same slot in the value cache.
+            uint vbase = phys_block * block_stride + kv_head_idx * head_stride + block_off * wpt;
+            vscale = uintBitsToFloat(vc[vbase + hs4]);
+        }
+        s_wv[tid] = w * vscale;   // fold weight * V-dequant-scale once per token
+        s_pb[tid] = phys_block;
+        s_bo[tid] = block_off;
+        s_red[tid] = w;
+        barrier();
+        for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+            if (tid < stride) { s_red[tid] += s_red[tid + stride]; }
+            barrier();
+        }
+        if (tid == 0u) { exp_sum += s_red[0]; }
+        barrier();
+
+        // Accumulate this tile's weighted V into s_acc, striped over head dims. V code for
+        // (token j, dim d) is lane d%4 of word d/4 in token j's vector; s_wv[j] already carries
+        // the softmax weight * that token's V scale.
+        uint tile = min(WG, context_len - base);
+        for (uint d = tid; d < head_size; d += nthreads) {
+            uint word_off = d / 4u;
+            int  lane_bit = int(d & 3u) * 8;
+            float acc = 0.0;
+            for (uint j = 0u; j < tile; j++) {
+                uint vbase = s_pb[j] * block_stride + kv_head_idx * head_stride + s_bo[j] * wpt;
+                int code = bitfieldExtract(int(vc[vbase + word_off]), lane_bit, 8);
+                acc += s_wv[j] * float(code);
+            }
+            s_acc[d] += acc;
+        }
+        barrier();
+    }
+
+    // Normalize and write.
+    if (tid == 0u) { s_red[0] = 1.0 / (exp_sum + 1e-6); }
+    barrier();
+    float inv_sum = s_red[0];
+    uint o_base = seq_idx * num_heads * head_size + head_idx * head_size;
+    for (uint i = tid; i < head_size; i += nthreads) { o[o_base + i] = s_acc[i] * inv_sum; }
+}

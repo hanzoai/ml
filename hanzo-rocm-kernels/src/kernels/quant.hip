@@ -53,9 +53,10 @@ extern "C" __global__ void quantize_q8(
 }
 
 // Q8_1-style activation quant: identical int8 `xq` + per-32-block f16 scale `xd` as `quantize_q8`
-// above, PLUS the per-32-block int8 SUM `xs[m,blk] = sum_k q(k)` (llama's block_q8_1 `s` field).
-// The sum is the bias term for ASYMMETRIC weights (Q4_K/Q5_K), where the dequant carries a per-
-// sub-block min: out -= dmin_w * m_g * d_x * sum_k(q_x). Symmetric weights never read `xs`. Keeping
+// above, PLUS the per-32-block f32 value `xs[m,blk] = d_x * sum_k q(k)` (llama's block_q8_1 `s`).
+// This is the bias term for ASYMMETRIC weights (Q4_K/Q5_K), where the dequant carries a per-sub-
+// block min: out -= dmin_w * m_g * xs. Folding d_x into the sum here (once per activation block)
+// makes the qmmq min-bias one multiply per output element. Symmetric weights never read `xs`. Keeping
 // this a SEPARATE kernel means the proven Q8_0/Q4_0 prefill (which calls `quantize_q8`) is byte-
 // unchanged; only the asymmetric launcher pays for the extra sum reduction + store.
 extern "C" __global__ void quantize_q8_1(
@@ -64,7 +65,7 @@ extern "C" __global__ void quantize_q8_1(
     const __half* __restrict__ x,
     int8_t* __restrict__ xq,
     __half* __restrict__ xd,
-    int* __restrict__ xs        // [M, K/32] per-block int8 sum (i32)
+    float* __restrict__ xs      // [M, K/32] per-block d_x*sum(q_x) (f32; llama block_q8_1 `s`)
 ) {
     const int nblk = K >> 5;
     const int wid = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -92,8 +93,14 @@ extern "C" __global__ void quantize_q8_1(
         qsum += __shfl_xor(qsum, off);
     }
     if (lane == 0) {
-        xd[(size_t)m * nblk + blk] = __float2half(a / 127.0f);
-        xs[(size_t)m * nblk + blk] = qsum;
+        const __half dh = __float2half(a / 127.0f);
+        xd[(size_t)m * nblk + blk] = dh;
+        // xs stores d_x * sum(q_x) (llama's block_q8_1 `s` field), folding the activation scale into
+        // the sum. The qmmq asymmetric min-bias then reads `xs * (dmin*m)` (one multiply) instead of
+        // `xd * sum_int * (dmin*m)` -- the `d_x` multiply is hoisted out of the per-output GEMM inner
+        // loop into this once-per-activation-block quantize. Bit-identical: __half2float(dh) is the
+        // stored xd upcast, so xs == the old (xd0 * (float)sum) the epilogue computed.
+        xs[(size_t)m * nblk + blk] = __half2float(dh) * (float)qsum;
     }
 }
 
@@ -107,7 +114,7 @@ extern "C" __global__ void quantize_q8_1_bf16(
     const hip_bfloat16* __restrict__ x,
     int8_t* __restrict__ xq,
     __half* __restrict__ xd,
-    int* __restrict__ xs
+    float* __restrict__ xs
 ) {
     const int nblk = K >> 5;
     const int wid = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -134,8 +141,14 @@ extern "C" __global__ void quantize_q8_1_bf16(
         qsum += __shfl_xor(qsum, off);
     }
     if (lane == 0) {
-        xd[(size_t)m * nblk + blk] = __float2half(a / 127.0f);
-        xs[(size_t)m * nblk + blk] = qsum;
+        const __half dh = __float2half(a / 127.0f);
+        xd[(size_t)m * nblk + blk] = dh;
+        // xs stores d_x * sum(q_x) (llama's block_q8_1 `s` field), folding the activation scale into
+        // the sum. The qmmq asymmetric min-bias then reads `xs * (dmin*m)` (one multiply) instead of
+        // `xd * sum_int * (dmin*m)` -- the `d_x` multiply is hoisted out of the per-output GEMM inner
+        // loop into this once-per-activation-block quantize. Bit-identical: __half2float(dh) is the
+        // stored xd upcast, so xs == the old (xd0 * (float)sum) the epilogue computed.
+        xs[(size_t)m * nblk + blk] = __half2float(dh) * (float)qsum;
     }
 }
 
@@ -180,7 +193,7 @@ extern "C" __global__ void quantize_q8_1_f32(
     const float* __restrict__ x,
     int8_t* __restrict__ xq,
     __half* __restrict__ xd,
-    int* __restrict__ xs
+    float* __restrict__ xs
 ) {
     const int nblk = K >> 5;
     const int wid = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -207,8 +220,14 @@ extern "C" __global__ void quantize_q8_1_f32(
         qsum += __shfl_xor(qsum, off);
     }
     if (lane == 0) {
-        xd[(size_t)m * nblk + blk] = __float2half(a / 127.0f);
-        xs[(size_t)m * nblk + blk] = qsum;
+        const __half dh = __float2half(a / 127.0f);
+        xd[(size_t)m * nblk + blk] = dh;
+        // xs stores d_x * sum(q_x) (llama's block_q8_1 `s` field), folding the activation scale into
+        // the sum. The qmmq asymmetric min-bias then reads `xs * (dmin*m)` (one multiply) instead of
+        // `xd * sum_int * (dmin*m)` -- the `d_x` multiply is hoisted out of the per-output GEMM inner
+        // loop into this once-per-activation-block quantize. Bit-identical: __half2float(dh) is the
+        // stored xd upcast, so xs == the old (xd0 * (float)sum) the epilogue computed.
+        xs[(size_t)m * nblk + blk] = __half2float(dh) * (float)qsum;
     }
 }
 
@@ -3509,7 +3528,7 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_Q8_1>(const ui
                 MROW(r, gm, mvalid);                                                            \
                 sxd[(BUF)][r] = mvalid ? __half2float(xd[(size_t)gm * nsblk32 + (BLK)]) : 0.0f;  \
                 if constexpr (!SYMM) {                                                           \
-                    sxs[(BUF)][r] = mvalid ? (float)xs[(size_t)gm * nsblk32 + (BLK)] : 0.0f;     \
+                    sxs[(BUF)][r] = mvalid ? xs[(size_t)gm * nsblk32 + (BLK)] : 0.0f;             \
                 }                                                                               \
             }                                                                                   \
         }                                                                                       \
@@ -3533,7 +3552,7 @@ __device__ __forceinline__ void qmmq_core(
     const __half* __restrict__ xd,   // [M, K/32] f16 per-32-block activation scales
     const uint8_t* __restrict__ wq,  // [N, K] weight super-blocks (MOE: [E,N,K] bank, expert-offset)
     __half* __restrict__ y,          // [M, N] (MOE: [nslots, N])
-    const int* __restrict__ xs,      // [M, K/32] i32 per-32-block activation sum (ASYM only)
+    const float* __restrict__ xs,    // [M, K/32] f32 per-block d_x*sum(q_x) (ASYM only; llama `s`)
     const int* __restrict__ slot_map = nullptr,    // MOE: [nslots] expert-sorted pos -> original slot
     const int* __restrict__ tile_expert = nullptr, // MOE: [num_row_tiles] expert id per row-tile
     const int* __restrict__ tile_pos0 = nullptr,   // MOE: [num_row_tiles] first sorted pos in tile
@@ -3638,12 +3657,14 @@ __device__ __forceinline__ void qmmq_core(
                 acc10[i] += (float)ic10[i] * xd1 * wd0;
                 acc11[i] += (float)ic11[i] * xd1 * wd1;
                 if constexpr (!SYMM) {
+                    // xs = d_x*sum(q_x) (folded at quantize), so the min-bias is ONE multiply per
+                    // element -- the d_x factor was hoisted out of this per-output inner loop.
                     const float xs0 = sxs[cur][xrow + i * 2 + (lane >> 4)];
                     const float xs1 = sxs[cur][xrow + 16 + i * 2 + (lane >> 4)];
-                    acc00[i] -= xd0 * xs0 * wm0;
-                    acc01[i] -= xd0 * xs0 * wm1;
-                    acc10[i] -= xd1 * xs1 * wm0;
-                    acc11[i] -= xd1 * xs1 * wm1;
+                    acc00[i] -= xs0 * wm0;
+                    acc01[i] -= xs0 * wm1;
+                    acc10[i] -= xs1 * wm0;
+                    acc11[i] -= xs1 * wm1;
                 }
             }
         } else {
@@ -3707,7 +3728,7 @@ __device__ __forceinline__ void qmmq_core(
         const int M, const int N, const int K, const int ncol_tiles,                             \
         const int8_t* __restrict__ xq, const __half* __restrict__ xd,                            \
         const uint8_t* __restrict__ wq, __half* __restrict__ y,                                  \
-        const int* __restrict__ xs) {                                                            \
+        const float* __restrict__ xs) {                                                          \
         qmmq_core<WTYPE>(M, N, K, ncol_tiles, xq, xd, wq, y, xs);                                 \
     }
 
@@ -3739,7 +3760,7 @@ DEFINE_QMMQ(q8_1,  WT_Q8_1)
         const int M, const int N, const int K, const int ncol_tiles,                             \
         const int8_t* __restrict__ xq, const __half* __restrict__ xd,                            \
         const uint8_t* __restrict__ wq, __half* __restrict__ y,                                  \
-        const int* __restrict__ xs, const int* __restrict__ slot_map,                            \
+        const float* __restrict__ xs, const int* __restrict__ slot_map,                          \
         const int* __restrict__ tile_expert, const int* __restrict__ tile_pos0,                  \
         const int* __restrict__ tile_nrows) {                                                    \
         qmmq_core<WTYPE, true, NW>(M, N, K, ncol_tiles, xq, xd, wq, y, xs,                        \
