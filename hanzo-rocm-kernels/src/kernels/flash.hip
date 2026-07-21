@@ -217,6 +217,107 @@ extern "C" __global__ void flash_attn_f16(
     flash_fwd_core<__half>(B, Hq, Hkv, Lq, Lk, scale, causal, q, k, v, o);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Flash-attention DECODE: single query per head (Lq==1) attending the whole KV cache. Fuses the
+// eager path's repeat_kv (cat -> copy2d) + QKᵀ bmm + f32-softmax roundtrip + P@V bmm + the per-layer
+// `.contiguous()` copy of the whole active cache into ONE dispatch. One block per (batch, q_head),
+// 128 threads (= head dim). GQA is implicit (kv_head = q_head / (Hq/Hkv)); the KV cache is read IN
+// PLACE via (batch,head,seq) strides with the innermost head-dim contiguous, so no cache copy. All
+// accumulation is f32: scores, the online (running max/sum) softmax, and the P@V accumulator, so the
+// output matches the eager naive_sdpa within f16 rounding. A decode query sees only past keys, so the
+// full cache is unmasked. Keys are streamed in FD_TILE tiles staged coalesced to LDS.
+#define FD_DH 128
+#define FD_TILE 128
+template <typename T>
+__device__ void flash_decode_core(
+    int B, int Hq, int Hkv, int Lk, float scale,
+    const T* __restrict__ q,
+    const T* __restrict__ k, long long kb_s, long long kh_s, long long kl_s,
+    const T* __restrict__ v, long long vb_s, long long vh_s, long long vl_s,
+    T* __restrict__ o)
+{
+    const int gqa = Hq / Hkv;
+    const int qh = blockIdx.x;          // query head
+    const int b  = blockIdx.y;          // batch
+    const int kvh = qh / gqa;           // GQA-mapped kv head (no repeat_kv)
+    const int t = threadIdx.x;          // 0..127, doubles as key index (scores) then dim index (output)
+
+    __shared__ _Float16 sQ[FD_DH];
+    __shared__ _Float16 sK[FD_TILE * FD_DH];
+    __shared__ float sP[FD_TILE];       // tile probabilities
+    __shared__ float sred[FD_TILE];     // block-reduction scratch
+
+    sQ[t] = (_Float16) fa_ld(q, ((size_t)(b * Hq + qh)) * FD_DH + t);
+
+    const size_t kbase = (size_t)b * (size_t)kb_s + (size_t)kvh * (size_t)kh_s;
+    const size_t vbase = (size_t)b * (size_t)vb_s + (size_t)kvh * (size_t)vh_s;
+
+    float m_run = -1e30f, l_run = 0.0f, o_acc = 0.0f;   // running max, running sum, this thread's O[dim=t]
+    __syncthreads();
+
+    for (int k0 = 0; k0 < Lk; k0 += FD_TILE) {
+        const int tile = min(FD_TILE, Lk - k0);
+        // Coalesced tile load: sK[r][c] = K[batch, kv_head, k0+r, c]  (c = head dim, contiguous).
+        for (int i = t; i < FD_TILE * FD_DH; i += FD_TILE) {
+            const int r = i / FD_DH, c = i % FD_DH;
+            sK[i] = (r < tile) ? (_Float16) fa_ld(k, kbase + (size_t)(k0 + r) * (size_t)kl_s + c) : (_Float16)0;
+        }
+        __syncthreads();
+
+        // score[key=t] = scale * (Q . K[t])
+        float score = -1e30f;
+        if (t < tile) {
+            float s = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < FD_DH; ++d) s += (float)sQ[d] * (float)sK[t * FD_DH + d];
+            score = s * scale;
+        }
+        // block max
+        sred[t] = score; __syncthreads();
+        for (int s = FD_TILE / 2; s > 0; s >>= 1) { if (t < s) sred[t] = fmaxf(sred[t], sred[t + s]); __syncthreads(); }
+        const float tmax = sred[0]; __syncthreads();
+
+        const float m_new = fmaxf(m_run, tmax);
+        const float corr = __expf(m_run - m_new);
+        const float p = (t < tile) ? __expf(score - m_new) : 0.0f;
+        sP[t] = p;
+        // block sum of p
+        sred[t] = p; __syncthreads();
+        for (int s = FD_TILE / 2; s > 0; s >>= 1) { if (t < s) sred[t] += sred[t + s]; __syncthreads(); }
+        l_run = l_run * corr + sred[0];
+        m_run = m_new;
+        __syncthreads();   // sP fully written + sred consumed before the O accumulation / next tile
+
+        // O[dim=t] = O*corr + sum_j p[j] * V[k0+j][t]   (V read coalesced across threads at fixed j)
+        float acc = o_acc * corr;
+        for (int j = 0; j < tile; ++j)
+            acc += sP[j] * (float) fa_ld(v, vbase + (size_t)(k0 + j) * (size_t)vl_s + t);
+        o_acc = acc;
+        __syncthreads();   // before the next tile overwrites sK/sP
+    }
+
+    const float out = (l_run > 0.0f) ? o_acc / l_run : 0.0f;
+    fa_st(o, ((size_t)(b * Hq + qh)) * FD_DH + t, out);
+}
+
+extern "C" __global__ void flash_decode_f16(
+    int B, int Hq, int Hkv, int Lk, float scale,
+    const __half* q,
+    const __half* k, long long kb_s, long long kh_s, long long kl_s,
+    const __half* v, long long vb_s, long long vh_s, long long vl_s,
+    __half* o) {
+    flash_decode_core<__half>(B, Hq, Hkv, Lk, scale, q, k, kb_s, kh_s, kl_s, v, vb_s, vh_s, vl_s, o);
+}
+
+extern "C" __global__ void flash_decode_bf16(
+    int B, int Hq, int Hkv, int Lk, float scale,
+    const __hip_bfloat16* q,
+    const __hip_bfloat16* k, long long kb_s, long long kh_s, long long kl_s,
+    const __hip_bfloat16* v, long long vb_s, long long vh_s, long long vl_s,
+    __hip_bfloat16* o) {
+    flash_decode_core<__hip_bfloat16>(B, Hq, Hkv, Lk, scale, q, k, kb_s, kh_s, kl_s, v, vb_s, vh_s, vl_s, o);
+}
+
 extern "C" __global__ void flash_attn_bf16(
     int B, int Hq, int Hkv, int Lq, int Lk, float scale, int causal,
     const __hip_bfloat16* q, const __hip_bfloat16* k, const __hip_bfloat16* v, __hip_bfloat16* o) {
