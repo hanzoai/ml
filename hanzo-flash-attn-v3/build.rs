@@ -1,124 +1,213 @@
-// build.rs
-
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-// Copyright (c) 2024 Michael Feil
-// adapted from https://github.com/huggingface/hanzo-flash-attn-v1 , Oliver Dehaene
-// adapted further in 2025 by Eric Buehler for hanzo-ml repo.
+// build.rs — FlashAttention-3 (Hopper) kernel compilation, hard arch-gated.
 //
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-use anyhow::anyhow;
-use cudaforge::{KernelBuilder, Result};
-use std::path::PathBuf;
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+//
+// FlashAttention-3 (Shah et al., arXiv:2407.08608) uses Hopper-only hardware
+// (warp-specialized producer/consumer, TMA, wgmma, GEMM<->softmax pingpong), so
+// its kernels are compiled ONLY for `sm_90a`.
+//
+// Arch gate — the single safety property of this crate:
+//   * The kernels are built only when the `cuda` cargo feature is set. Without
+//     it this script returns immediately, nothing is compiled or linked, and
+//     `src/lib.rs` is a pure-Rust stub. Every non-datacenter target (sm_121 /
+//     GB10, ROCm, Metal, Vulkan, CPU) is therefore untouched.
+//   * When enabled, the kernels are cross-compiled for `sm_90a` regardless of
+//     the build host's own GPU: `nvcc -gencode arch=compute_90a,code=sm_90a`
+//     emits Hopper SASS on any CUDA host, so a datacenter binary can be built
+//     anywhere. The host compute capability is never consulted.
 
-const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-const KERNEL_FILES: &[&str] = &[
-    "flash_api.cu",
-    "flash_fwd_hdim512_bf16_gqa16_sm90.cu",
-    "flash_fwd_hdim512_bf16_gqa2_sm90.cu",
-    "flash_fwd_hdim512_bf16_gqa32_sm90.cu",
-    "flash_fwd_hdim512_bf16_gqa4_sm90.cu",
-    "flash_fwd_hdim512_bf16_gqa8_sm90.cu",
-    "flash_fwd_hdim512_bf16_sm90.cu",
-    "flash_fwd_hdim512_fp16_gqa16_sm90.cu",
-    "flash_fwd_hdim512_fp16_gqa2_sm90.cu",
-    "flash_fwd_hdim512_fp16_gqa32_sm90.cu",
-    "flash_fwd_hdim512_fp16_gqa4_sm90.cu",
-    "flash_fwd_hdim512_fp16_gqa8_sm90.cu",
-    "flash_fwd_hdim512_fp16_sm90.cu",
-];
+use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 
+/// CUTLASS / CuTe revision the sm_90 kernels are written against. Fetched
+/// on-demand (or taken from `CUTLASS_DIR`) by `hanzo-flash-attn-build`.
 const CUTLASS_COMMIT: &str = "4c42f73fdab5787e3bb57717f35a8cb1b3c0dc6d";
 
 fn main() -> Result<()> {
-    // Telling Cargo that if any of these files changes, rebuild.
     println!("cargo:rerun-if-changed=build.rs");
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let is_target_msvc = target.contains("msvc");
+
+    // Arch gate: no `cuda` feature -> no kernels, crate is a stub.
+    if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
+        return Ok(());
+    }
+
+    println!("cargo:rerun-if-env-changed=FLASH_ATTN_V3_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=FLASH_ATTN_V3_NVCC_JOBS");
+    println!("cargo:rerun-if-env-changed=FLASH_ATTN_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
-    println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
 
-    for file in KERNEL_FILES {
-        println!("cargo:rerun-if-changed=hkernel/{file}");
-    }
-    println!("cargo:rerun-if-changed=kernels/**.h");
-    println!("cargo:rerun-if-changed=kernels/**.hpp");
-    println!("cargo:rerun-if-changed=kernels/**.cpp");
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let hkernel = manifest.join("hkernel");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
-    // You can optionally allow an environment variable to cache the compiled artifacts.
-    // If not found, we compile into the standard OUT_DIR.
+    // Optional persistent cache dir for the (slow) kernel objects.
     let build_dir = match std::env::var("FLASH_ATTN_BUILD_DIR") {
+        Ok(d) => PathBuf::from(d)
+            .canonicalize()
+            .with_context(|| "FLASH_ATTN_BUILD_DIR does not exist")?,
         Err(_) => out_dir.clone(),
-        Ok(build_dir) => {
-            let path = PathBuf::from(build_dir);
-            path.canonicalize()
-                .map_err(|_| {
-                    anyhow!(
-                        "Directory doesn't exist: {} (the current directory is {})",
-                        path.display(),
-                        std::env::current_dir().unwrap().display()
-                    )
-                })
-                .expect("Unable to obtain build dir!")
-        }
     };
+    std::fs::create_dir_all(&build_dir)?;
 
-    let kernels: Vec<PathBuf> = KERNEL_FILES
-        .iter()
-        .map(|f| PathBuf::from("hkernel").join(f))
-        .collect();
-
-    let mut builder = KernelBuilder::new()
-        .source_files(kernels)
-        .out_dir(&build_dir)
-        .with_cutlass(Some(CUTLASS_COMMIT)) // ✅ Auto-fetch and include CUTLASS from GitHub
-        .arg("-std=c++17")
-        .arg("-O3")
-        .arg("-U__CUDA_NO_HALF_OPERATORS__")
-        .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
-        .arg("-U__CUDA_NO_BFLOAT16_OPERATORS__")
-        .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
-        .arg("-U__CUDA_NO_BFLOAT162_OPERATORS__")
-        .arg("-U__CUDA_NO_BFLOAT162_CONVERSIONS__")
-        .arg("-D_USE_MATH_DEFINES")
-        .args(["--default-stream", "per-thread"])
-        .arg("--expt-relaxed-constexpr")
-        .arg("--expt-extended-lambda")
-        .arg("--use_fast_math")
-        .arg("--ptxas-options=-v")
-        .arg("--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage")
-        .arg("--verbose")
-        .thread_percentage(0.5); // Use up to 50% of available threads
-
-    if !is_target_msvc {
-        builder = builder.arg("-Xcompiler").arg("-fPIC");
+    // Kernel sources = every `.cu` in hkernel/ (flash_api.cu + the instantiation
+    // files). Globbing keeps this in lockstep with the directory: adding an
+    // hdim/dtype means dropping in the `.cu`, not editing a list here.
+    let mut sources: Vec<PathBuf> = Vec::new();
+    let mut newest_header = std::time::UNIX_EPOCH;
+    for entry in std::fs::read_dir(&hkernel)? {
+        let path = entry?.path();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("cu") => {
+                println!(
+                    "cargo:rerun-if-changed=hkernel/{}",
+                    path.file_name().unwrap().to_string_lossy()
+                );
+                sources.push(path);
+            }
+            Some("h") | Some("hpp") | Some("cuh") => {
+                println!(
+                    "cargo:rerun-if-changed=hkernel/{}",
+                    path.file_name().unwrap().to_string_lossy()
+                );
+                newest_header = newest_header.max(mtime(&path));
+            }
+            _ => {}
+        }
+    }
+    sources.sort();
+    if sources.is_empty() {
+        bail!("no .cu kernel sources found in {}", hkernel.display());
     }
 
-    let compute_cap = builder.get_compute_cap().unwrap_or(80);
-    assert!(compute_cap >= 90, "Compute capability must be >=90 (90a)");
+    // CUTLASS include tree (env `CUTLASS_DIR`, cache, or download).
+    let cutlass = hanzo_flash_attn_build::fetch_cutlass(&out_dir, CUTLASS_COMMIT)?;
+    let cutlass_inc = hanzo_flash_attn_build::cutlass_include_arg(&cutlass);
 
-    if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
-        builder = builder.arg("--compiler-options");
-        builder = builder.arg(cuda_nvcc_flags_env);
+    let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
+    // Datacenter arch. `90a` (Hopper) is the only architecture these kernels
+    // support; overridable for future datacenter parts once ported.
+    let arch = std::env::var("FLASH_ATTN_V3_CUDA_ARCH").unwrap_or_else(|_| "90a".to_string());
+    let gencode = format!("arch=compute_{arch},code=sm_{arch}");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_msvc = target.contains("msvc");
+    let hkernel_inc = format!("-I{}", hkernel.display());
+
+    let jobs: usize = std::env::var("FLASH_ATTN_V3_NVCC_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs.max(1))
+        .build()
+        .context("failed to build nvcc thread pool")?;
+
+    let objects: Result<Vec<PathBuf>> = pool.install(|| {
+        sources
+            .par_iter()
+            .map(|src| {
+                let stem = src.file_name().unwrap().to_string_lossy();
+                let obj = build_dir.join(format!("{stem}.sm{arch}.o"));
+                // Skip when a cached object is newer than its source and every header.
+                if obj.exists() && mtime(&obj) >= mtime(src).max(newest_header) {
+                    return Ok(obj);
+                }
+                let mut cmd = Command::new(&nvcc);
+                cmd.arg("-c")
+                    .arg(src)
+                    .arg("-o")
+                    .arg(&obj)
+                    // Force-include the CUDA-13 compat shim before any CUTLASS header.
+                    .arg("-include")
+                    .arg(hkernel.join("cuda_compat.h"))
+                    .arg("-gencode")
+                    .arg(&gencode)
+                    .arg("-std=c++17")
+                    .arg("-O3")
+                    .arg(&cutlass_inc)
+                    .arg(&hkernel_inc)
+                    .arg("-U__CUDA_NO_HALF_OPERATORS__")
+                    .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+                    .arg("-U__CUDA_NO_BFLOAT16_OPERATORS__")
+                    .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+                    .arg("-U__CUDA_NO_BFLOAT162_OPERATORS__")
+                    .arg("-U__CUDA_NO_BFLOAT162_CONVERSIONS__")
+                    .arg("-D_USE_MATH_DEFINES")
+                    .args(["--default-stream", "per-thread"])
+                    .arg("--expt-relaxed-constexpr")
+                    .arg("--expt-extended-lambda")
+                    .arg("--use_fast_math");
+                if !is_msvc {
+                    cmd.arg("-Xcompiler").arg("-fPIC");
+                }
+                let status = cmd
+                    .status()
+                    .with_context(|| format!("failed to spawn nvcc for {stem}"))?;
+                if !status.success() {
+                    bail!("nvcc failed to compile {stem} for sm_{arch}");
+                }
+                Ok(obj)
+            })
+            .collect()
+    });
+    let objects = objects?;
+
+    // Archive the objects into one static lib.
+    let lib = build_dir.join("libflashattentionv3.a");
+    let _ = std::fs::remove_file(&lib);
+    let mut ar = Command::new(std::env::var("AR").unwrap_or_else(|_| "ar".to_string()));
+    ar.arg("crus").arg(&lib).args(&objects);
+    if !ar.status().context("failed to spawn ar")?.success() {
+        bail!("ar failed to archive FA3 objects");
     }
-    // Our final library name
-    let out_file = build_dir.join("libflashattentionv3.a");
-    builder.build_lib(out_file)?;
 
-    // Finally, instruct cargo to link your library
-    println!("cargo:rustc-link-search={}", build_dir.display());
+    println!("cargo:rustc-link-search=native={}", build_dir.display());
     println!("cargo:rustc-link-lib=static=flashattentionv3");
-
-    // Link required system libs
+    // The kernels reference the CUDA runtime (cudaFuncSetAttribute, cudaGetDevice…).
+    if let Some(libdir) = cuda_lib_dir(&nvcc) {
+        println!("cargo:rustc-link-search=native={}", libdir.display());
+    }
     println!("cargo:rustc-link-lib=dylib=cudart");
-    if !is_target_msvc {
+    if !is_msvc {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
-
     Ok(())
+}
+
+fn mtime(p: &Path) -> std::time::SystemTime {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// Resolve the CUDA runtime library directory from `CUDA_HOME`/`CUDA_PATH`, else
+/// from the nvcc location (`<toolkit>/bin/nvcc` -> `<toolkit>/lib64`).
+fn cuda_lib_dir(nvcc: &str) -> Option<PathBuf> {
+    for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"] {
+        if let Ok(root) = std::env::var(var) {
+            let lib = PathBuf::from(root).join("lib64");
+            if lib.is_dir() {
+                return Some(lib);
+            }
+        }
+    }
+    let nvcc_path = which(nvcc)?;
+    let lib = nvcc_path.parent()?.parent()?.join("lib64");
+    lib.is_dir().then_some(lib)
+}
+
+fn which(bin: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(bin);
+    if p.is_absolute() {
+        return Some(p);
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(bin))
+            .find(|c| c.is_file())
+    })
 }
