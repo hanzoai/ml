@@ -1,0 +1,85 @@
+#version 450
+// Ragged-shape NT coopmat matmul: C(m x n, f32) = A(m x k, f16) * W(n x k, f16)^T, operands zero-padded
+// to a 16-aligned grid (a16[b,m16,k16], b16 = W padded to [b,n16,k16]) so full 16x16 tiles load in
+// bounds. The B fragment loads W column-major (stride k16) -- no transpose copy -- and the store is the
+// same bounds-checked direct write to the real [b,m,n] as bmm_coopmat_rb_pad (interior tiles direct,
+// boundary tiles bounce through shared). This is the NT twin used by attention QKᵀ (naive_sdpa's k.t()).
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer A { float16_t a[]; };
+layout(set = 0, binding = 1) readonly  buffer B { float16_t b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float     c[]; };
+layout(push_constant) uniform Pc { uint batch; uint m16; uint k16; uint n16; uint m; uint n; };
+
+const uint T = 16u;
+const uint RM = 4u;
+const uint RN = 4u;
+
+shared float edge[T * T];
+
+void main() {
+    if (gl_SubgroupID != 0u) {
+        return;
+    }
+    uint bt = gl_WorkGroupID.z;
+    uint trow0 = gl_WorkGroupID.y * RM;
+    uint tcol0 = gl_WorkGroupID.x * RN;
+    uint ao = bt * m16 * k16;
+    uint bo = bt * k16 * n16; // W is [b,n16,k16]; k16*n16 == n16*k16
+    uint co = bt * m * n;
+    uint mt = m16 / T;
+    uint nt = n16 / T;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[RM][RN];
+    [[unroll]] for (uint i = 0u; i < RM; i++)
+        [[unroll]] for (uint j = 0u; j < RN; j++)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint ktiles = k16 / T;
+    for (uint kt = 0u; kt < ktiles; kt++) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[RM];
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[RN];
+        [[unroll]] for (uint i = 0u; i < RM; i++)
+            if (trow0 + i < mt)
+                coopMatLoad(ma[i], a, ao + (trow0 + i) * T * k16 + kt * T, k16, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint j = 0u; j < RN; j++)
+            if (tcol0 + j < nt)
+                coopMatLoad(mb[j], b, bo + (tcol0 + j) * T * k16 + kt * T, k16, gl_CooperativeMatrixLayoutColumnMajor);
+        [[unroll]] for (uint i = 0u; i < RM; i++)
+            [[unroll]] for (uint j = 0u; j < RN; j++)
+                if (trow0 + i < mt && tcol0 + j < nt)
+                    acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+    }
+
+    [[unroll]] for (uint i = 0u; i < RM; i++) {
+        [[unroll]] for (uint j = 0u; j < RN; j++) {
+            uint row0 = (trow0 + i) * T;
+            uint col0 = (tcol0 + j) * T;
+            if (trow0 + i >= mt || tcol0 + j >= nt || row0 >= m || col0 >= n) {
+                continue;
+            }
+            if (row0 + T <= m && col0 + T <= n) {
+                coopMatStore(acc[i][j], c, co + row0 * n + col0, n, gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                coopMatStore(acc[i][j], edge, 0u, T, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                uint rmax = min(T, m - row0);
+                uint cmax = min(T, n - col0);
+                for (uint e = gl_SubgroupInvocationID; e < rmax * cmax; e += gl_SubgroupSize) {
+                    uint r = e / cmax;
+                    uint cc = e - r * cmax;
+                    c[co + (row0 + r) * n + (col0 + cc)] = edge[r * T + cc];
+                }
+                subgroupBarrier();
+            }
+        }
+    }
+}

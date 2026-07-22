@@ -1,0 +1,91 @@
+#version 450
+// Register-blocked coopmat matmul for RAGGED m/n/k: C(m x n, f32) = A(m x k, f16) * B(k x n, f16).
+// The operands arrive ZERO-PADDED to a 16-aligned tile grid (a16[b,m16,k16], b16[b,k16,n16] from
+// cast_f2h_pad), so every coopMatLoad reads a full 16x16 tile in-bounds and the padding contributes 0
+// to each dot product. The STORE writes the exact [b,m,n] result directly -- no padded out buffer, no
+// separate readback pass (which, over the O(seq^2) attention QK output, cost more than the coopmat
+// GEMM saved vs the fp32 fallback). Interior 16x16 output tiles coopMatStore straight to out; the
+// boundary tiles (partial rows/cols where m or n is not a multiple of 16) bounce the fragment through
+// shared and write only the valid elements. Push carries both the padded grid dims (m16/k16/n16) and
+// the real output dims (m/n). Subgroup-scoped barriers: only subgroup 0 works, so a workgroup barrier
+// would deadlock the early-returned subgroups on a 32-lane device.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer A { float16_t a[]; };
+layout(set = 0, binding = 1) readonly  buffer B { float16_t b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float     c[]; };
+layout(push_constant) uniform Pc { uint batch; uint m16; uint k16; uint n16; uint m; uint n; };
+
+const uint T = 16u;
+const uint RM = 4u;
+const uint RN = 4u;
+
+shared float edge[T * T]; // one edge tile at a time (subgroup 0 collective)
+
+void main() {
+    if (gl_SubgroupID != 0u) {
+        return; // only subgroup 0 works this workgroup's RM x RN tile grid
+    }
+    uint bt = gl_WorkGroupID.z;
+    uint trow0 = gl_WorkGroupID.y * RM;
+    uint tcol0 = gl_WorkGroupID.x * RN;
+    uint ao = bt * m16 * k16;
+    uint bo = bt * k16 * n16;
+    uint co = bt * m * n; // output is the real [b,m,n], not the padded grid
+    uint mt = m16 / T;
+    uint nt = n16 / T;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[RM][RN];
+    [[unroll]] for (uint i = 0u; i < RM; i++)
+        [[unroll]] for (uint j = 0u; j < RN; j++)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint ktiles = k16 / T;
+    for (uint kt = 0u; kt < ktiles; kt++) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[RM];
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[RN];
+        [[unroll]] for (uint i = 0u; i < RM; i++)
+            if (trow0 + i < mt)
+                coopMatLoad(ma[i], a, ao + (trow0 + i) * T * k16 + kt * T, k16, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint j = 0u; j < RN; j++)
+            if (tcol0 + j < nt)
+                coopMatLoad(mb[j], b, bo + (kt * T) * n16 + (tcol0 + j) * T, n16, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint i = 0u; i < RM; i++)
+            [[unroll]] for (uint j = 0u; j < RN; j++)
+                if (trow0 + i < mt && tcol0 + j < nt)
+                    acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+    }
+
+    [[unroll]] for (uint i = 0u; i < RM; i++) {
+        [[unroll]] for (uint j = 0u; j < RN; j++) {
+            uint row0 = (trow0 + i) * T;
+            uint col0 = (tcol0 + j) * T;
+            // Tiles outside the padded grid, or entirely in the pad region, hold no valid output.
+            if (trow0 + i >= mt || tcol0 + j >= nt || row0 >= m || col0 >= n) {
+                continue;
+            }
+            if (row0 + T <= m && col0 + T <= n) {
+                coopMatStore(acc[i][j], c, co + row0 * n + col0, n, gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                coopMatStore(acc[i][j], edge, 0u, T, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                uint rmax = min(T, m - row0);
+                uint cmax = min(T, n - col0);
+                for (uint e = gl_SubgroupInvocationID; e < rmax * cmax; e += gl_SubgroupSize) {
+                    uint r = e / cmax;
+                    uint cc = e - r * cmax;
+                    c[co + (row0 + r) * n + (col0 + cc)] = edge[r * T + cc];
+                }
+                subgroupBarrier();
+            }
+        }
+    }
+}
