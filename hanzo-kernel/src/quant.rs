@@ -731,7 +731,7 @@ pub fn matvec_q4k_f32_blk<F: Float>(
     wq: &Array<u32>,   // packed Q4_K, 36 u32/superblock
     x: &Array<F>,      // activation, f32 [k]
     out: &mut Array<F>,
-    meta: &Array<u32>, // [k]
+    meta: &Array<u32>, // [k, nout]
     #[comptime] nt: usize, // threads cooperating on one row's k (the workgroup-width axis)
     #[comptime] nr: usize, // output rows per workgroup (the row tile)
 ) {
@@ -742,8 +742,8 @@ pub fn matvec_q4k_f32_blk<F: Float>(
     let nsub = k / 32;
     let per = (nsub + nt - 1) / nt;
     let row0 = wgid * nr;
-    let nout = out.len();
-    let mut acc = Array::<F>::new(nr);
+    let nout = meta[1] as usize; // nout from meta (not out.len()): keeps the kernel free of any
+    let mut acc = Array::<F>::new(nr); // runtime .len(), so the cubecl info buffer strips for ml dispatch
     #[unroll]
     for n in 0..nr {
         acc[n] = F::new(0.0);
@@ -823,7 +823,7 @@ pub fn matvec_q4k_f32_blk_run<R: Runtime>(
     let packed = pack_q4k(wqs, wsc, wd, wdm);
     let wh = client.create_from_slice(u32::as_bytes(&packed));
     let xh = client.create_from_slice(f32::as_bytes(x));
-    let meta = client.create_from_slice(u32::as_bytes(&[k as u32]));
+    let meta = client.create_from_slice(u32::as_bytes(&[k as u32, nout as u32]));
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; nout]));
     let grid = (nout as u32).div_ceil(nr as u32); // one workgroup per nr output rows
     unsafe {
@@ -911,7 +911,7 @@ impl<'a, R: Runtime> MatvecQ4kF32Eval<'a, R> {
         let banks: Vec<Handle> =
             (0..nbanks.max(1)).map(|_| client.create_from_slice(u32::as_bytes(&packed))).collect();
         let xh = client.create_from_slice(f32::as_bytes(x));
-        let meta = client.create_from_slice(u32::as_bytes(&[k as u32]));
+        let meta = client.create_from_slice(u32::as_bytes(&[k as u32, rows as u32]));
         let outh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
         let oracle = matvec_q4k_ref(wqs, wsc, wd, wdm, x, rows, k);
         let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
