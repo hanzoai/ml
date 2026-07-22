@@ -55,7 +55,10 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "bmm_coopmat" => spv!("bmm_coopmat"),
         "bmm_coopmat_rb" => spv!("bmm_coopmat_rb"),
         "bmm_coopmat_rb_nt" => spv!("bmm_coopmat_rb_nt"),
+        "bmm_coopmat_rb_pad" => spv!("bmm_coopmat_rb_pad"),
+        "bmm_coopmat_rb_nt_pad" => spv!("bmm_coopmat_rb_nt_pad"),
         "cast_f2h" => spv!("cast_f2h"),
+        "cast_f2h_pad" => spv!("cast_f2h_pad"),
         "cast_h2f" => spv!("cast_h2f"),
         "mul_mat_vec_q8" => spv!("mul_mat_vec_q8"),
         "mul_mat_vec_q8_sg" => spv!("mul_mat_vec_q8_sg"),
@@ -6955,6 +6958,50 @@ impl BackendStorage for VulkanStorage {
             return Ok(out);
         }
 
+        // Ragged matrix-core path: the aligned branch above needs m, n and k all multiples of 16, which
+        // every real prompt's attention QKᵀ/·V misses (m/n/k are the sequence length). Pad each dim up to
+        // 16 into ZERO-filled f16 scratch so the coopmat loads read full tiles, then the *_pad kernel
+        // bounds-checks the STORE and writes the exact [b,m,n] result directly: interior 16x16 tiles
+        // coopMatStore straight to out, boundary tiles bounce a fragment through shared and write only the
+        // valid elements. No padded output buffer and no readback pass -- a readback over the O(seq²) QK
+        // output costs more than the coopmat GEMM saves vs the fp32 bmm_reg fallback. cast_f2h_pad places
+        // each ragged operand into its tile grid (a flat cast would misplace batch b·h > 1).
+        let (m16, n16, k16) = (m.next_multiple_of(16), n.next_multiple_of(16), k.next_multiple_of(16));
+        let pad_scratch =
+            ((b * m16 * k16 * 2) as u64).saturating_add((b * k16 * n16 * 2) as u64);
+        if self.device.inner.cm_use
+            && matches!(self.device.coopmat_info(), Some((16, 16, 16)))
+            && self.device.scratch_fits(pad_scratch)
+        {
+            let (a16, a16_mem, a16_hv, a16_bytes) = self.device.alloc_f16(b * m16 * k16)?;
+            let (b16, b16_mem, b16_hv, b16_bytes) = self.device.alloc_f16(b * k16 * n16)?;
+            self.device.dispatch(
+                "cast_f2h_pad",
+                &[lc_buf, a16],
+                &push_u32(&[b as u32, m as u32, k as u32, m16 as u32, k16 as u32]),
+                Self::groups_1d(b * m16 * k16),
+            )?;
+            // B operand's [outer,inner] follows the NT layout: non-nt B[b,k,n] -> [b,k16,n16]; nt reads
+            // the natural weight W[b,n,k] (transposed in-kernel) -> [b,n16,k16] (same element count).
+            let (bd0, bd1, bd0_pad, bd1_pad) = if nt { (n, k, n16, k16) } else { (k, n, k16, n16) };
+            self.device.dispatch(
+                "cast_f2h_pad",
+                &[rc_buf, b16],
+                &push_u32(&[b as u32, bd0 as u32, bd1 as u32, bd0_pad as u32, bd1_pad as u32]),
+                Self::groups_1d(b * k16 * n16),
+            )?;
+            // Push {batch, m16, k16, n16, m, n}: padded dims drive the loads/tile grid, real m/n drive the
+            // bounds-checked store into the real [b,m,n] output. Only `out` (binding 2) is written.
+            let pushp = push_u32(&[b as u32, m16 as u32, k16 as u32, n16 as u32, m as u32, n as u32]);
+            let groups = ((n16 / 16) as u32).div_ceil(4);
+            let groups = (groups, ((m16 / 16) as u32).div_ceil(4), b as u32);
+            let kernel = if nt { "bmm_coopmat_rb_nt_pad" } else { "bmm_coopmat_rb_pad" };
+            self.device.dispatch(kernel, &[a16, b16, out.buffer], &pushp, groups)?;
+            self.device.free_scratch(a16_bytes, a16, a16_mem, a16_hv);
+            self.device.free_scratch(b16_bytes, b16, b16_mem, b16_hv);
+            return Ok(out);
+        }
+
         // Register-blocked fp32 tiled GEMM (64x64 tile, 4x4 per thread); NT variant reads W[n,k].
         let groups = ((n as u32).div_ceil(64), (m as u32).div_ceil(64), b as u32);
         let kernel = if nt { "bmm_reg_nt" } else { "bmm_reg" };
@@ -9510,5 +9557,77 @@ mod dsl_dispatch_proof {
             worst < 1e-4,
             "graph-replayed sdpa diverged from eager span attention: scale_rel={worst:.3e}"
         );
+    }
+
+    // Ragged batched matmul on the matrix cores: m/n/k not multiples of 16 (every real prompt's
+    // attention QKᵀ/·V) must hit the coopmat pad path (bmm_coopmat_rb_pad / _nt_pad, bounds-checked
+    // direct store, no readback), not the ~2x-slower fp32 bmm_reg. Covers the NON-NT layout (contiguous
+    // rhs [b,k,n]) and the NT layout (attention QKᵀ: a transposed K view [b,d,seq] with strides
+    // [seq*d,1,d] -- the exact case naive_sdpa builds via k.t()), plus an aligned control (fast flat
+    // path, unchanged) and ragged-k PV. Batch b>1 exercises the per-batch strided placement a flat cast
+    // would corrupt, and boundary tiles (m,n not %16) exercise the shared-bounce edge store. Scale-
+    // relative tolerance: f16 operand rounding (coopmat accumulates f32) over a k-length sum.
+    #[test]
+    fn bmm_coopmat_ragged_matches_cpu() {
+        let dev = match crate::Device::new_vulkan(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[bmm-ragged] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        let cpu = crate::Device::Cpu;
+        let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
+        // (b, m, n, k, nt, tag)
+        let cases = [
+            (2usize, 17usize, 19usize, 33usize, false, "ragged mnk non-nt"),
+            (3, 16, 16, 16, false, "aligned control (flat path)"),
+            (2, 31, 500, 128, true, "ragged QKᵀ nt (m,n ragged, k=128)"),
+            (2, 500, 128, 500, false, "ragged PV (m,k ragged, n=128)"),
+        ];
+        for (b, m, n, k, nt, tag) in cases {
+            let adata: Vec<f32> = (0..b * m * k).map(|i| gen(1, i)).collect();
+            let a = crate::Tensor::from_vec(adata.clone(), (b, m, k), &dev).unwrap();
+            let (rhs, rdata) = if nt {
+                let wdata: Vec<f32> = (0..b * n * k).map(|i| gen(2, i)).collect();
+                let w = crate::Tensor::from_vec(wdata.clone(), (b, n, k), &dev).unwrap();
+                (w.transpose(1, 2).unwrap(), wdata)
+            } else {
+                let bdata: Vec<f32> = (0..b * k * n).map(|i| gen(2, i)).collect();
+                (crate::Tensor::from_vec(bdata.clone(), (b, k, n), &dev).unwrap(), bdata)
+            };
+            let got = a
+                .matmul(&rhs)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let rhs_at = |bi: usize, kk: usize, c: usize| -> f32 {
+                if nt {
+                    rdata[(bi * n + c) * k + kk]
+                } else {
+                    rdata[(bi * k + kk) * n + c]
+                }
+            };
+            let mut refv = vec![0f32; b * m * n];
+            for bi in 0..b {
+                for r in 0..m {
+                    for c in 0..n {
+                        let mut s = 0f32;
+                        for kk in 0..k {
+                            s += adata[(bi * m + r) * k + kk] * rhs_at(bi, kk, c);
+                        }
+                        refv[(bi * m + r) * n + c] = s;
+                    }
+                }
+            }
+            let maxref = refv.iter().fold(0f32, |mx, &v| mx.max(v.abs())).max(1e-30);
+            let worst = got.iter().zip(&refv).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / maxref;
+            eprintln!("[bmm-ragged {tag}] b{b} m{m} n{n} k{k} nt{nt}  scale_rel={worst:.2e}");
+            assert!(worst < 2e-2, "bmm ragged {tag} diverged from CPU: scale_rel={worst:.3e}");
+        }
     }
 }
