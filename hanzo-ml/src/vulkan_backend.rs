@@ -83,6 +83,11 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_q4k" => spv!("mul_mat_vec_q4k"),
         "mul_mat_vec_q4k_sg" => spv!("mul_mat_vec_q4k_sg"),
         "mul_mat_vec_q4k_cm" => spv!("mul_mat_vec_q4k_cm"),
+        // DSL twin of mul_mat_vec_q4k_cm (hanzo-kernel quant::matvec_q4k_f32_blk, nt=64 nr=1): the
+        // f32-direct cooperative Q4_K decode matvec, lowered from the DSL. Bindings wq(0) x(1) out(2)
+        // meta(3)=[k]; k and nout are runtime so ONE .spv serves every dense shape. VK_Q4K_DSL routes
+        // dense decode through it for the in-engine A/B against the hand mul_mat_vec_q4k_cm.
+        "matvec_q4k_f32_blk" => include_bytes!("vulkan/spv/matvec_q4k_f32_blk.spv"),
         "mul_mat_vec_q5k" => spv!("mul_mat_vec_q5k"),
         "mul_mat_vec_q5k_sg" => spv!("mul_mat_vec_q5k_sg"),
         "mul_mat_vec_q6k" => spv!("mul_mat_vec_q6k"),
@@ -1294,8 +1299,9 @@ impl VulkanDevice {
             crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        // DEFAULT Q4_K decode path where the device advertises subgroup arithmetic: the coalesced
-        // multi-thread f32 matvec (mul_mat_vec_q4k_cm). TPB=16 threads cooperate on one super-block,
+        // Resident-MoE-bank Q4_K decode (woff != 0) + the VK_Q4K_DSL_OFF regression fallback + the
+        // bit-exact oracle for the DSL twin above: the coalesced multi-thread f32 matvec
+        // (mul_mat_vec_q4k_cm). TPB=16 threads cooperate on one super-block,
         // adjacent threads reading adjacent qs u32 words (a coalesced 64-byte burst); Q4K_CM_ROWS rows
         // per workgroup amortise the shared activation load; the per-row partial reduces with a subgroup
         // add. The memory-BW lever for decode on this bandwidth-bound UMA APU -- the Q4_K analogue of
@@ -1303,6 +1309,30 @@ impl VulkanDevice {
         // quantize dispatch drops. Decode is bit-identical to BlockQ4K::to_float; unpackHalf2x16 decodes
         // the f16 d/dmin so subnormal scales stay exact. VK_Q4K_CM_OFF reverts to the dp4a block kernel
         // for the A/B. Q4K_CM_ROWS MUST equal the shader's `NR` constant.
+        // Large dense Q4_K decode: the DSL f32-direct coalesced plane_sum matvec (hanzo-kernel
+        // matvec_q4k_f32_blk), the DSL twin of mul_mat_vec_q4k_cm lowered from ONE Rust source. Its
+        // Vulkan island arm mirrors the hand kernel's structure -- 16 threads per super-block reading
+        // ADJACENT qs words (coalesced burst), ITS super-blocks in parallel, plane_sum (subgroupAdd)
+        // reduction, no shared-mem tree. Reads x as f32 (no quantize) with k and nout in a meta buffer
+        // (cubecl has no push constants); grid = nout workgroups (nr=1 baked).
+        // The DSL twin earns the live path only where it MEASURES >= hand (campaign migration
+        // criterion): cold in-engine A/B on evo gfx1151 -- DSL/hand 1.022x at the dominant 6144-row
+        // shape (FFN gate/up, the bulk of the Q4_K bytes) but 0.947x @ 2048 and 0.871x @ 1024, where the
+        // plane_sum reduction's fixed cost outweighs the tiny matvec. So route large dense shapes to the
+        // DSL and keep hand for small ones -- the (device,shape) autotuner is the eventual owner of this
+        // split; Q4K_DSL_MIN_ROWS is the measured crossover until it lands. VK_Q4K_DSL_OFF forces hand.
+        // Dense only; the resident-MoE-bank case (woff != 0) stays on hand.
+        const Q4K_DSL_MIN_ROWS: usize = 4096;
+        if woff == 0
+            && nout >= Q4K_DSL_MIN_ROWS
+            && self.inner.subgroup_matvec
+            && std::env::var_os("VK_Q4K_DSL_OFF").is_none()
+        {
+            let meta = self.upload_u32(&[k as u32, nout as u32])?;
+            let bufs = [wq.buffer, x.buffer, out.buffer, meta.buffer];
+            self.dispatch_out("matvec_q4k_f32_blk", &bufs, 2, &[], (nout as u32, 1, 1))?;
+            return Ok(out);
+        }
         if self.inner.subgroup_matvec && std::env::var_os("VK_Q4K_CM_OFF").is_none() {
             const Q4K_CM_ROWS: u32 = 2;
             let push = push_u32(&[nout as u32, k as u32, woff as u32]);
@@ -8272,6 +8302,85 @@ mod dsl_dispatch_proof {
             let rel = maxerr / maxref;
             eprintln!("[q4k-cm] {nout}x{k} subnormal={subnormal} scale_rel={rel:.2e}");
             assert!(rel < 1e-3, "q4k_cm diverged from CPU: {nout}x{k} scale_rel={rel:.3e}");
+        }
+    }
+
+    /// Cold in-engine A/B: the DSL f32-direct twin (`matvec_q4k_f32_blk`, routed by VK_Q4K_DSL) vs the
+    /// shipped hand kernel (`mul_mat_vec_q4k_cm`), BOTH through the production `dev.matvec_q4k` dispatch
+    /// at the live dense Qwen3-1.7B decode shapes, bank-rotated so each timed dispatch reads weight the
+    /// 32 MB MALL has evicted. Both are gated bit-exact against the same CPU oracle. `dev.matvec_q4k`
+    /// uploads x + reads back per call, an overhead identical for both arms, so the DSL/hand ratio is
+    /// the honest in-engine sign (the precise cold kernel GB/s is the matvec-check f32sweep + dp4a
+    /// anchor). HANZO_Q4K_AB=1 arms it; run in a quiet window only (wall-clock timing).
+    #[test]
+    fn q4k_dsl_vs_hand_cm_ab() {
+        if std::env::var_os("HANZO_Q4K_AB").is_none() {
+            eprintln!("[q4k-ab] set HANZO_Q4K_AB=1 to run the cold A/B (skipped)");
+            return;
+        }
+        use crate::quantized::k_quants::{BlockQ4K, GgmlType};
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[q4k-ab] no vulkan device ({e}); skipping"); return; }
+        };
+        eprintln!("== cold in-engine A/B: DSL matvec_q4k_f32_blk vs hand mul_mat_vec_q4k_cm (dev.matvec_q4k) ==");
+        for &(nout, k) in &[(6144usize, 2048usize), (2048, 2048), (1024, 2048)] {
+            let nb = k / 256;
+            let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
+            let mut blocks: Vec<BlockQ4K> =
+                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut wdeq = vec![0f32; nout * k];
+            for r in 0..nout {
+                let rowf: Vec<f32> = (0..k).map(|i| gen_w(r, i)).collect();
+                BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
+                BlockQ4K::to_float(&blocks[r * nb..(r + 1) * nb], &mut wdeq[r * k..(r + 1) * k]);
+            }
+            let u32s: &[u32] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36)
+            };
+            let wbytes = nout * (k / 256) * 144;
+            let nbanks = (64 * 1024 * 1024 / wbytes + 1).max(6);
+            let banks: Vec<_> = (0..nbanks).map(|_| dev.upload_u32(u32s).unwrap()).collect();
+            let x: Vec<f32> = (0..k).map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0).collect();
+            let mut cpu = vec![0f32; nout];
+            for (r, c) in cpu.iter_mut().enumerate() {
+                *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
+            }
+            let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+            let rel_of = |got: &[f32]| {
+                got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref
+            };
+            let meas = |dsl: bool| -> (f64, f32) {
+                if dsl {
+                    unsafe { std::env::remove_var("VK_Q4K_DSL_OFF") };
+                } else {
+                    unsafe { std::env::set_var("VK_Q4K_DSL_OFF", "1") };
+                }
+                let rel = rel_of(&dev.matvec_q4k(&banks[0], &x, nout, k).unwrap());
+                for i in 0..(2 * nbanks) {
+                    let _ = dev.matvec_q4k(&banks[i % nbanks], &x, nout, k).unwrap();
+                }
+                let mut best = f64::INFINITY;
+                for _ in 0..8 {
+                    let t = std::time::Instant::now();
+                    for i in 0..nbanks {
+                        let _ = dev.matvec_q4k(&banks[i % nbanks], &x, nout, k).unwrap();
+                    }
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3 / nbanks as f64);
+                }
+                (best, rel)
+            };
+            let (hand_ms, hand_rel) = meas(false);
+            let (dsl_ms, dsl_rel) = meas(true);
+            unsafe { std::env::remove_var("VK_Q4K_DSL_OFF") };
+            let hand_g = wbytes as f64 / (hand_ms * 1e6);
+            let dsl_g = wbytes as f64 / (dsl_ms * 1e6);
+            eprintln!(
+                "  {nout}x{k}: hand CM {hand_ms:.4}ms {hand_g:.0} GB/s (rel {hand_rel:.1e}) | DSL {dsl_ms:.4}ms {dsl_g:.0} GB/s (rel {dsl_rel:.1e}) | DSL/hand {:.3}x",
+                dsl_g / hand_g
+            );
+            assert!(hand_rel < 1e-3, "hand CM diverged from oracle: {hand_rel:.2e}");
+            assert!(dsl_rel < 1e-3, "DSL f32 diverged from oracle: {dsl_rel:.2e}");
         }
     }
 
