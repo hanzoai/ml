@@ -734,82 +734,157 @@ pub fn matvec_q4k_f32_blk<F: Float>(
     meta: &Array<u32>, // [k, nout]
     #[comptime] nt: usize, // threads cooperating on one row's k (the workgroup-width axis)
     #[comptime] nr: usize, // output rows per workgroup (the row tile)
+    #[comptime] tgt: Target, // island scrutinee: Vulkan takes the coalesced plane_sum idiom
 ) {
-    let wgid = CUBE_POS as usize;
     let t = UNIT_POS as usize;
     let k = meta[0] as usize;
-    let nb = k / 256;
-    let nsub = k / 32;
-    let per = (nsub + nt - 1) / nt;
-    let row0 = wgid * nr;
-    let nout = meta[1] as usize; // nout from meta (not out.len()): keeps the kernel free of any
-    let mut acc = Array::<F>::new(nr); // runtime .len(), so the cubecl info buffer strips for ml dispatch
-    #[unroll]
-    for n in 0..nr {
-        acc[n] = F::new(0.0);
-    }
-    for j in 0..per {
-        let sb = j * nt + t; // sub-block (0..nsub) this thread contracts on this pass
-        if sb < nsub {
-            let sup = sb / 8; // superblock
-            let jloc = sb % 8; // sub-block within the superblock (0..7)
-            let shift = ((jloc % 2) * 4) as u32; // low (even sub-block) or high (odd) nibble
-            let cwoff = 4 + (jloc / 2) * 8; // qs u32 base within a superblock for this sub-block
-            let xbase = sup * 256 + (jloc / 2) * 64 + (jloc % 2) * 32; // activation base of the 32 weights
+    let nblocks = k / 256;
+    let nout = meta[1] as usize; // nout from meta (not out.len()): the cubecl info buffer strips for ml dispatch
+    let row0 = CUBE_POS as usize * nr;
+    island! {
+        // Vulkan: the DSL twin of the hand mul_mat_vec_q4k_cm (nt = plane = 64). 16 threads cooperate
+        // on ONE super-block reading ADJACENT qs u32 words (thread itid reads word 4+itid, coalesced
+        // 64-byte burst) while ITS = nt/16 super-blocks stream in parallel; the per-row partial reduces
+        // with `plane_sum` (subgroupAdd) -- no shared memory, no tree barriers. Each thread owns a
+        // 16-weight sub-position (4 sub-blocks x 4 bytes) so the 16 threads cover all 8 sub-blocks and
+        // the 32 qs words (4+itid, 4+itid+16) exactly once. Requires nt = the hardware plane size.
+        vulkan => {
+            let its = nt / 16;
+            let itid = t & 15;
+            let ix = t / 16;
+            let hg = itid / 8; // 0/1 pair-group -> sub-blocks {0,1,4,5} or {2,3,6,7}
+            let qq = (itid & 7) * 4; // 0,4,..,28: first of this thread's 4 weights in each sub-block
+            let qw = itid; // qs u32 word (low group); high group at qw+16
+            let j0 = 2 * hg;
+            let j1 = j0 + 1;
+            let j2 = 4 + 2 * hg;
+            let j3 = j2 + 1;
+            let ya = hg * 64 + qq;
+            let yb = ya + 32;
+            let yc = 128 + hg * 64 + qq;
+            let yd = yc + 32;
+            let mut acc = Array::<F>::new(nr);
+            #[unroll]
+            for n in 0..nr {
+                acc[n] = F::new(0.0);
+            }
             #[unroll]
             for n in 0..nr {
                 let row = row0 + n;
                 if row < nout {
-                    let bb = (row * nb + sup) * 36; // packed superblock base
-                    let d = F::cast_from(f16lo_to_f32(wq[bb]));
-                    let dmin = F::cast_from(f16lo_to_f32(wq[bb] >> 16));
-                    let dj = d * F::cast_from(q4k_sc(wq, bb + 1, jloc));
-                    let mj = dmin * F::cast_from(q4k_m(wq, bb + 1, jloc));
-                    let cw = bb + cwoff;
-                    let mut sdot = F::new(0.0);
-                    let mut sx = F::new(0.0);
-                    #[unroll]
-                    for g in 0..8usize {
-                        let word = (wq[cw + g] >> shift) & 0x0F0F0F0F;
-                        let xb = xbase + g * 4;
-                        let x0 = x[xb];
-                        let x1 = x[xb + 1];
-                        let x2 = x[xb + 2];
-                        let x3 = x[xb + 3];
-                        sdot += F::cast_from(word & 0xFF) * x0
-                            + F::cast_from((word >> 8) & 0xFF) * x1
-                            + F::cast_from((word >> 16) & 0xFF) * x2
-                            + F::cast_from((word >> 24) & 0xFF) * x3;
-                        sx += x0 + x1 + x2 + x3;
+                    let rowbase = row * nblocks * 36;
+                    let mut blk = ix;
+                    while blk < nblocks {
+                        let b = rowbase + blk * 36;
+                        let d = F::cast_from(f16lo_to_f32(wq[b]));
+                        let dmin = F::cast_from(f16lo_to_f32(wq[b] >> 16));
+                        let wlo = wq[b + 4 + qw]; // sub-blocks j0 (low nibble), j1 (high nibble)
+                        let whi = wq[b + 4 + qw + 16]; // sub-blocks j2 (low), j3 (high)
+                        let dj0 = d * F::cast_from(q4k_sc(wq, b + 1, j0));
+                        let mj0 = dmin * F::cast_from(q4k_m(wq, b + 1, j0));
+                        let dj1 = d * F::cast_from(q4k_sc(wq, b + 1, j1));
+                        let mj1 = dmin * F::cast_from(q4k_m(wq, b + 1, j1));
+                        let dj2 = d * F::cast_from(q4k_sc(wq, b + 1, j2));
+                        let mj2 = dmin * F::cast_from(q4k_m(wq, b + 1, j2));
+                        let dj3 = d * F::cast_from(q4k_sc(wq, b + 1, j3));
+                        let mj3 = dmin * F::cast_from(q4k_m(wq, b + 1, j3));
+                        let yblk = blk * 256;
+                        #[unroll]
+                        for l in 0..4usize {
+                            let s8 = (l * 8) as u32;
+                            acc[n] += (dj0 * F::cast_from((wlo >> s8) & 0x0F) - mj0) * x[yblk + ya + l];
+                            acc[n] += (dj1 * F::cast_from((wlo >> (s8 + 4)) & 0x0F) - mj1) * x[yblk + yb + l];
+                            acc[n] += (dj2 * F::cast_from((whi >> s8) & 0x0F) - mj2) * x[yblk + yc + l];
+                            acc[n] += (dj3 * F::cast_from((whi >> (s8 + 4)) & 0x0F) - mj3) * x[yblk + yd + l];
+                        }
+                        blk += its;
                     }
-                    // Affine decode folded over the sub-block: sum (dj*q - mj)*x = dj*sum(q*x) - mj*sum(x).
-                    acc[n] += dj * sdot - mj * sx;
+                }
+            }
+            // Plane reduction (one plane per row): sums all nt lanes' partials with no shared memory.
+            #[unroll]
+            for n in 0..nr {
+                let total = plane_sum(acc[n]);
+                if t == 0 {
+                    let row = row0 + n;
+                    if row < nout {
+                        out[row] = total;
+                    }
                 }
             }
         }
-    }
-    // Per-row tree reduction of the nt partials through shared memory (nr sequential passes; both small).
-    let mut smem = SharedMemory::<F>::new(nt);
-    #[unroll]
-    for n in 0..nr {
-        smem[t] = acc[n];
-        sync_cube();
-        let mut stride = CUBE_DIM / 2;
-        while stride > 0 {
-            if UNIT_POS < stride {
-                let v = smem[(UNIT_POS + stride) as usize];
-                smem[t] += v;
+        // CPU oracle + non-Vulkan GPUs: `nt` threads split the row's sub-blocks (ceil+guard, so nt may
+        // exceed nsub), each accumulating its slice, then a shared-memory tree reduce. Works for any nt.
+        default => {
+            let nsub = k / 32;
+            let per = (nsub + nt - 1) / nt;
+            let mut acc = Array::<F>::new(nr);
+            #[unroll]
+            for n in 0..nr {
+                acc[n] = F::new(0.0);
             }
-            sync_cube();
-            stride /= 2;
-        }
-        if t == 0 {
-            let row = row0 + n;
-            if row < nout {
-                out[row] = smem[0];
+            for j in 0..per {
+                let sb = j * nt + t;
+                if sb < nsub {
+                    let sup = sb / 8;
+                    let jloc = sb % 8;
+                    let shift = ((jloc % 2) * 4) as u32;
+                    let cwoff = 4 + (jloc / 2) * 8;
+                    let xbase = sup * 256 + (jloc / 2) * 64 + (jloc % 2) * 32;
+                    #[unroll]
+                    for n in 0..nr {
+                        let row = row0 + n;
+                        if row < nout {
+                            let bb = (row * nblocks + sup) * 36;
+                            let d = F::cast_from(f16lo_to_f32(wq[bb]));
+                            let dmin = F::cast_from(f16lo_to_f32(wq[bb] >> 16));
+                            let dj = d * F::cast_from(q4k_sc(wq, bb + 1, jloc));
+                            let mj = dmin * F::cast_from(q4k_m(wq, bb + 1, jloc));
+                            let cw = bb + cwoff;
+                            let mut sdot = F::new(0.0);
+                            let mut sx = F::new(0.0);
+                            #[unroll]
+                            for g in 0..8usize {
+                                let word = (wq[cw + g] >> shift) & 0x0F0F0F0F;
+                                let xb = xbase + g * 4;
+                                let x0 = x[xb];
+                                let x1 = x[xb + 1];
+                                let x2 = x[xb + 2];
+                                let x3 = x[xb + 3];
+                                sdot += F::cast_from(word & 0xFF) * x0
+                                    + F::cast_from((word >> 8) & 0xFF) * x1
+                                    + F::cast_from((word >> 16) & 0xFF) * x2
+                                    + F::cast_from((word >> 24) & 0xFF) * x3;
+                                sx += x0 + x1 + x2 + x3;
+                            }
+                            acc[n] += dj * sdot - mj * sx;
+                        }
+                    }
+                }
+            }
+            let mut smem = SharedMemory::<F>::new(nt);
+            #[unroll]
+            for n in 0..nr {
+                smem[t] = acc[n];
+                sync_cube();
+                let mut stride = CUBE_DIM / 2;
+                while stride > 0 {
+                    if UNIT_POS < stride {
+                        let v = smem[(UNIT_POS + stride) as usize];
+                        smem[t] += v;
+                    }
+                    sync_cube();
+                    stride /= 2;
+                }
+                if t == 0 {
+                    let row = row0 + n;
+                    if row < nout {
+                        out[row] = smem[0];
+                    }
+                }
+                sync_cube();
             }
         }
-        sync_cube();
     }
 }
 
@@ -832,9 +907,10 @@ pub fn matvec_q4k_f32_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(wh.clone(), packed.len()),
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(oh.clone(), nout),
-            ArrayArg::from_raw_parts(meta.clone(), 1),
+            ArrayArg::from_raw_parts(meta.clone(), 2),
             nt,
             nr,
+            Target::of(client),
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -953,9 +1029,10 @@ impl<'a, R: Runtime> MatvecQ4kF32Eval<'a, R> {
                 ArrayArg::from_raw_parts(bank.clone(), self.packed_len),
                 ArrayArg::from_raw_parts(self.xh.clone(), self.x_len),
                 ArrayArg::from_raw_parts(self.outh.clone(), self.rows),
-                ArrayArg::from_raw_parts(self.meta.clone(), 1),
+                ArrayArg::from_raw_parts(self.meta.clone(), 2),
                 nt,
                 nr,
+                Target::of(self.client),
             );
         }
     }
