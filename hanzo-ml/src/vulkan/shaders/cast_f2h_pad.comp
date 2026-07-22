@@ -1,0 +1,30 @@
+#version 450
+// f32 -> f16 cast with row/col ZERO-PADDING to a 16-aligned tile grid. Reads a contiguous f32
+// [b, d0, d1] source and writes a contiguous f16 [b, D0, D1] destination (D0 >= d0, D1 >= d1,
+// both multiples of 16), placing src[bi, r, c] at dst[bi, r, c] for r < d0 && c < d1 and 0
+// elsewhere. One invocation per DESTINATION element writes the whole padded buffer (valid cast +
+// zero pad) in a single dispatch, so the cooperative-matrix GEMM can load full 16x16 tiles from a
+// ragged operand without an out-of-bounds read and the padding contributes 0 to every dot product.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly  buffer In  { float     src[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float16_t dst[]; };
+layout(push_constant) uniform Pc { uint b; uint d0; uint d1; uint D0; uint D1; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = b * D0 * D1;
+    if (gid >= total) {
+        return;
+    }
+    uint plane = D0 * D1;
+    uint bi = gid / plane;
+    uint rem = gid - bi * plane;
+    uint r = rem / D1;
+    uint c = rem - r * D1;
+    if (r < d0 && c < d1) {
+        dst[gid] = float16_t(src[bi * d0 * d1 + r * d1 + c]);
+    } else {
+        dst[gid] = float16_t(0.0);
+    }
+}
