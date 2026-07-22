@@ -925,3 +925,66 @@ fn metal_moe_decode_iquant_throughput() {
         "GPU decode ({gpu:.1} us) is not faster than CPU fallback ({cpu_us:.1} us) -- kernel not offloading"
     );
 }
+
+// fwd()-LEVEL routing guard for the dense-weight gate. `fwd` sends dense F16/BF16/F32 weights at m>1 to
+// the prefill GEMM, NOT the dense matvec (`kernel_mul_mv_impl` reads the wrapper's zero src0/src1 byte
+// strides AND grids only ne01/align rows -> silently wrong at m>1). This forwards a real F16 QMatMul
+// with a 4-row activation and checks it against a CPU reference of the SAME f16-rounded weights: if the
+// `dense_weight` gate is ever removed, F16 m=4 diverges here. Complements the wrapper-level GEMM test in
+// hanzo-metal-kernels (which drives call_quantized_matmul_mm_t directly and would NOT catch a gate loss).
+#[test]
+fn metal_fwd_f16_weight_m4_routes_correctly() {
+    let dev = match Device::new_metal(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no Metal device ({e})");
+            return;
+        }
+    };
+    let cpu = Device::Cpu;
+    let (nout, k, m) = (48usize, 128usize, 4usize);
+    let w_host: Vec<f32> = (0..nout * k).map(pseudo).collect();
+    let w_t = Tensor::from_vec(w_host, (nout, k), &cpu).unwrap();
+    // Reference weights: the f16-rounded values (quantize to F16 == cast, then dequantize on the CPU).
+    let w_deq: Vec<f32> = QTensor::quantize(&w_t, GgmlDType::F16)
+        .unwrap()
+        .dequantize(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let q_metal = QTensor::quantize_onto(&w_t, GgmlDType::F16, &dev).unwrap();
+    let matmul = QMatMul::from_qtensor(q_metal).unwrap();
+
+    let x_host: Vec<f32> = (0..m * k).map(|i| pseudo(i + 5_000_011)).collect();
+    let x = Tensor::from_vec(x_host.clone(), (m, k), &dev).unwrap();
+    let y: Vec<f32> = matmul
+        .forward(&x)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(y.len(), m * nout);
+
+    // A broken dense matvec at m>1 aliases the activation columns, making rows 0 and 1 identical.
+    assert_ne!(
+        &y[0..nout],
+        &y[nout..2 * nout],
+        "F16 fwd m>1 aliased activation rows 0 and 1 -- dense_weight gate lost?"
+    );
+    for i in 0..m {
+        for n in 0..nout {
+            let mut r = 0f64;
+            for j in 0..k {
+                r += x_host[i * k + j] as f64 * w_deq[n * k + j] as f64;
+            }
+            let g = y[i * nout + n] as f64;
+            assert!(
+                (g - r).abs() < 0.15,
+                "F16 fwd m={m} mismatch at [{i},{n}]: got {g} exp {r}"
+            );
+        }
+    }
+}
