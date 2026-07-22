@@ -1500,6 +1500,306 @@ pub fn mmq_q4k_wmma_tile_run<R: Runtime>(
     (out, ms)
 }
 
+// ================================================================================================
+// f16-dequant COOPMAT Q4_K GEMM -- the DSL twin of the hand `mul_mm_q4k_coopmat`.
+//
+// Same algorithm as the hand shader (NOT the int8 MMQ above): decode Q4_K to f16 with the affine scale
+// FOLDED into the f16 weight (d*sc*q - dmin*m), round the activation to f16, and contract on the f16
+// matrix cores. Because the scale is folded before the contraction, the accumulator sums across ALL K
+// and can stay in registers -- a `Sequence<cmma::Matrix>` of rm*rn f32 accumulators held across the K
+// loop, exactly the hand kernel's `coopmat acc[WMT][WNT]`. That register residency is what lets an f16
+// coopmat tile reach 128x128 with few warps, unlike the int8 kernel whose per-32-block scale forces the
+// i32 fragment through a shared scratch every step. Comptime tile: wm x wn warp grid, rm x rn per-warp
+// register tile (BM = wm*rm*16, BN = wn*rn*16). One island: the cmma arm is the matrix-core contraction;
+// the `default` arm is the scalar f16 oracle the CPU runtime runs (bit-exact to the cmma arm by
+// construction, both rounding the same operands to f16 and accumulating in f32). m,n multiples of 16.
+// ================================================================================================
+
+/// f16-dequant register-blocked coopmat Q4_K GEMM. Grid = (n/BN, m/BM); block = nwarp planes.
+#[kernel(targets(cuda, rocm, vulkan, metal, cpu), unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_coopmat_tile<F: Float>(
+    x: &Array<F>,     // activation [m, k], row-major
+    wqs: &Array<u32>, // packed Q4_K qs: 32 u32 / super-block
+    wsc: &Array<u32>, // packed Q4_K scales: 3 u32 / super-block
+    wd: &Array<F>,    // d per super-block   [n * k/256]
+    wdm: &Array<F>,   // dmin per super-block [n * k/256]
+    out: &mut Array<F>,
+    #[comptime] m: usize,
+    #[comptime] n: usize,
+    #[comptime] k: usize,
+    #[comptime] wm: usize,
+    #[comptime] wn: usize,
+    #[comptime] rm: usize,
+    #[comptime] rn: usize,
+    #[comptime] plane: usize,
+    #[comptime] target: Target,
+) {
+    let nwarp = wm * wn;
+    let bm = wm * rm * 16;
+    let bn = wn * rn * 16;
+    let tid = UNIT_POS as usize;
+    let warp = tid / plane;
+    let lane = tid % plane;
+    let warp_m = warp / wn;
+    let warp_n = warp % wn;
+    let mrow0 = CUBE_POS_Y as usize * bm;
+    let ncol0 = CUBE_POS_X as usize * bn;
+    let kb_count = k / 32;
+    let nsb = k / 256;
+    let nthread = nwarp * plane;
+    let per = 256 / plane;
+    let a_iters = (bm * 32 + nthread - 1) / nthread;
+    let b_iters = (bn * 32 + nthread - 1) / nthread;
+
+    island! {
+        // Accelerated: f16 x f16 -> f32 on the matrix cores, rm*rn accumulators held across K.
+        cuda | rocm | vulkan | metal => {
+            let mut sa = SharedMemory::<half::f16>::new(bm * 32);
+            let mut sb = SharedMemory::<half::f16>::new(bn * 32);
+            let mut acc = Sequence::<cmma::Matrix<F>>::new();
+            #[unroll]
+            for _i in 0..(rm * rn) {
+                acc.push(cmma::Matrix::<F>::from_value(
+                    cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0),
+                ));
+            }
+            for kb in 0..kb_count {
+                let k0 = kb * 32;
+                for i in 0..a_iters {
+                    let idx = tid + i * nthread;
+                    if idx < bm * 32 {
+                        let arow = mrow0 + idx / 32;
+                        let mut v = F::new(0.0);
+                        if arow < m {
+                            v = x[arow * k + k0 + idx % 32];
+                        }
+                        sa[idx] = half::f16::cast_from(v);
+                    }
+                }
+                let is = kb % 8;
+                let g = is / 2;
+                let sbk = kb / 8;
+                let shift = 4u32 * (is % 2) as u32;
+                for i in 0..b_iters {
+                    let idx = tid + i * nthread;
+                    if idx < bn * 32 {
+                        let nrow = ncol0 + idx / 32;
+                        let qi = idx % 32;
+                        let mut wv = F::new(0.0);
+                        if nrow < n {
+                            let blk = nrow * nsb + sbk;
+                            let ds = wd[blk] * F::cast_from(q4k_sc(wsc, blk * 3, is));
+                            let ms = wdm[blk] * F::cast_from(q4k_m(wsc, blk * 3, is));
+                            let qb = q4k_byte(wqs, blk * 32, g * 32 + qi);
+                            let nib = (qb >> shift) & 15;
+                            wv = ds * F::cast_from(nib) - ms;
+                        }
+                        sb[idx] = half::f16::cast_from(wv);
+                    }
+                }
+                sync_cube();
+                // Two cmma per 32-block (the K-subtile halves at column 0 and 16).
+                #[unroll]
+                for kc in 0..2usize {
+                    #[unroll]
+                    for im in 0..rm {
+                        let sm = warp_m * rm + im;
+                        let ma = cmma::Matrix::<half::f16>::from_slice(
+                            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+                            &sa.slice(sm * 512 + kc * 16, bm * 32), 32,
+                        );
+                        #[unroll]
+                        for jn in 0..rn {
+                            let sn = warp_n * rn + jn;
+                            let mb = cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
+                                &sb.slice(sn * 512 + kc * 16, bn * 32), 32,
+                            );
+                            let c = acc.index(im * rn + jn);
+                            cmma::execute::<half::f16, half::f16, F, F>(&ma, &mb, c, c);
+                        }
+                    }
+                }
+                sync_cube();
+            }
+            #[unroll]
+            for im in 0..rm {
+                #[unroll]
+                for jn in 0..rn {
+                    let sm = warp_m * rm + im;
+                    let sn = warp_n * rn + jn;
+                    let orow = mrow0 + sm * 16;
+                    let ocol = ncol0 + sn * 16;
+                    if orow < m && ocol < n {
+                        cmma::store(
+                            &mut out.slice_mut(orow * n + ocol, out.len()),
+                            acc.index(im * rn + jn),
+                            n as u32,
+                            cmma::MatrixLayout::RowMajor,
+                        );
+                    }
+                }
+            }
+        }
+        // NORMATIVE oracle: the identical f16-rounded contraction as scalar MACs, f32 accumulate. The CPU
+        // runtime runs this arm, so it is the bit-exact gate for the tiling + f16 dequant + accumulation.
+        default => {
+            let mut sa = SharedMemory::<half::f16>::new(bm * 32);
+            let mut sb = SharedMemory::<half::f16>::new(bn * 32);
+            let mut acc = Array::<F>::new(rm * rn * per);
+            for a in 0..(rm * rn * per) {
+                acc[a] = F::new(0.0);
+            }
+            for kb in 0..kb_count {
+                let k0 = kb * 32;
+                for i in 0..a_iters {
+                    let idx = tid + i * nthread;
+                    if idx < bm * 32 {
+                        let arow = mrow0 + idx / 32;
+                        let mut v = F::new(0.0);
+                        if arow < m {
+                            v = x[arow * k + k0 + idx % 32];
+                        }
+                        sa[idx] = half::f16::cast_from(v);
+                    }
+                }
+                let is = kb % 8;
+                let g = is / 2;
+                let sbk = kb / 8;
+                let shift = 4u32 * (is % 2) as u32;
+                for i in 0..b_iters {
+                    let idx = tid + i * nthread;
+                    if idx < bn * 32 {
+                        let nrow = ncol0 + idx / 32;
+                        let qi = idx % 32;
+                        let mut wv = F::new(0.0);
+                        if nrow < n {
+                            let blk = nrow * nsb + sbk;
+                            let ds = wd[blk] * F::cast_from(q4k_sc(wsc, blk * 3, is));
+                            let ms = wdm[blk] * F::cast_from(q4k_m(wsc, blk * 3, is));
+                            let qb = q4k_byte(wqs, blk * 32, g * 32 + qi);
+                            let nib = (qb >> shift) & 15;
+                            wv = ds * F::cast_from(nib) - ms;
+                        }
+                        sb[idx] = half::f16::cast_from(wv);
+                    }
+                }
+                sync_cube();
+                #[unroll]
+                for im in 0..rm {
+                    #[unroll]
+                    for jn in 0..rn {
+                        let sm = warp_m * rm + im;
+                        let sn = warp_n * rn + jn;
+                        for e in 0..per {
+                            let p = lane * per + e;
+                            let smm = p / 16;
+                            let snn = p % 16;
+                            let mut s = F::new(0.0);
+                            for l in 0..32 {
+                                s += F::cast_from(sa[(sm * 16 + smm) * 32 + l])
+                                    * F::cast_from(sb[(sn * 16 + snn) * 32 + l]);
+                            }
+                            acc[(im * rn + jn) * per + e] += s;
+                        }
+                    }
+                }
+                sync_cube();
+            }
+            #[unroll]
+            for im in 0..rm {
+                #[unroll]
+                for jn in 0..rn {
+                    let sm = warp_m * rm + im;
+                    let sn = warp_n * rn + jn;
+                    for e in 0..per {
+                        let p = lane * per + e;
+                        let orow = mrow0 + sm * 16 + p / 16;
+                        let ocol = ncol0 + sn * 16 + p % 16;
+                        if orow < m && ocol < n {
+                            out[orow * n + ocol] = acc[(im * rn + jn) * per + e];
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+/// f32 full-precision reference for the f16 coopmat twin: out[m,n] = sum_k x[m,k]*(d*sc*q - dmin*m),
+/// the true (non-int8-quantized) Q4_K matmul the f16 kernel approximates. The kernel matches this to an
+/// f16-rounding tolerance (both operands round to f16), the same gate the hand `mul_mm_q4k_coopmat` uses.
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_f16_ref(
+    x: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], m: usize, n: usize, k: usize,
+) -> Vec<f32> {
+    let kb = k / 32;
+    let nsb = k / 256;
+    let mut out = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for b in 0..kb {
+                let is = b % 8;
+                let g = is / 2;
+                let blk = j * nsb + b / 8;
+                let dd = wd[blk] * cpu_q4k_sc(wsc, blk * 3, is) as f32;
+                let mm = wdm[blk] * cpu_q4k_m(wsc, blk * 3, is) as f32;
+                for qi in 0..32 {
+                    let qbyte = cpu_q4k_byte(wqs, blk * 32, g * 32 + qi);
+                    let nib = ((qbyte >> (4 * (is % 2))) & 15) as f32;
+                    acc += x[i * k + b * 32 + qi] * (dd * nib - mm);
+                }
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    out
+}
+
+/// Host launch for the f16 coopmat Q4_K twin. `iters` amortizes a kernel-only bench; returns (out, ms).
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_coopmat_tile_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
+    m: usize, n: usize, k: usize, wm: usize, wn: usize, rm: usize, rn: usize, iters: usize,
+) -> (Vec<f32>, f64) {
+    let target = Target::of(client);
+    let plane = client.properties().hardware.plane_size_max as usize;
+    let bm = wm * rm * 16;
+    let bn = wn * rn * 16;
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let wqsh = client.create_from_slice(u32::as_bytes(wqs));
+    let wsch = client.create_from_slice(u32::as_bytes(wsc));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let wdmh = client.create_from_slice(f32::as_bytes(wdm));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; m * n]));
+    let grid = Grid::Static(n.div_ceil(bn) as u32, m.div_ceil(bm) as u32, 1);
+    let block = Block::new_1d((wm * wn * plane) as u32);
+    let launch = |c: &ComputeClient<R>| unsafe {
+        mmq_q4k_coopmat_tile::launch_unchecked::<f32, R>(
+            c, grid.clone(), block,
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(wqsh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(wsch.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(wdmh.clone(), wdm.len()),
+            ArrayArg::from_raw_parts(oh.clone(), m * n),
+            m, n, k, wm, wn, rm, rn, plane, target,
+        );
+    };
+    launch(client);
+    let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
+    for _ in 0..3 { launch(client); }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters { launch(client); }
+    let _ = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    (out, ms)
+}
+
 // --- autotuner: search the {WM x WN x RM x RN} tile per (device, m, n, k) ------------------------
 //
 // The DSL sibling of hanzo-ml's `coopmat_hunt` (which tunes the hand `mul_mm_q4k_coopmat` via glslc -D),
@@ -1813,6 +2113,211 @@ pub fn mmq_q4k_autokernel<R: Runtime>(
     (out, name)
 }
 
+// --- autotuner for the f16 coopmat twin -- the SAME {WM x WN x RM x RN} Space, a different kernel ------
+//
+// Reuses `mmq_q4k_space` and the tile helpers; only the fitness differs (it dispatches the f16 kernel,
+// gates against the full-precision f32 reference at an f16 tolerance, and drops the int8 kernel's ci
+// scratch from the LDS budget). Two evaluators over one Space is the matvec crate's pattern (Dp4a +
+// Q4kF32). This is the DSL side of the CTO's board: the autotuned f16 coopmat GEMM vs hand mul_mm_q4k_coopmat.
+
+/// LDS bytes for the f16 coopmat tile: sa[BM*32] + sb[BN*32], f16 (2 B) each. No i32 fragment scratch --
+/// the scale is folded into the f16 weight so the accumulator stays in registers, which is exactly why
+/// this tile reaches 128x128 where the int8 kernel's ci+accumulator scratch cannot.
+fn mmq_coopmat_lds_bytes(c: &Config, s: &Space) -> usize {
+    let (bm, bn, _) = mmq_geom(c, s);
+    (bm * 32 + bn * 32) * 2
+}
+
+/// Cold-weight-streamed, f16-tolerance-gated fitness for the f16 coopmat twin over [`mmq_q4k_space`].
+/// Same discipline as [`MmqQ4kEval`]; the activation is f32 (the f16 twin rounds it), the oracle is the
+/// full-precision [`mmq_q4k_f16_ref`], and the static tier uses the smaller f16-tile LDS budget.
+pub struct CoopmatF16Eval<'a, R: Runtime> {
+    client: &'a ComputeClient<R>,
+    space: &'a Space,
+    banks: Vec<Handle>, // resident Q4_K `wqs` copies; banks[0] is the oracle weight
+    xh: Handle,
+    wsch: Handle,
+    wdh: Handle,
+    wdmh: Handle,
+    outh: Handle,
+    wqs_len: usize,
+    x_len: usize,
+    wsc_len: usize,
+    wd_len: usize,
+    wdm_len: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    plane: usize,
+    lds_budget: usize,
+    reg_budget: usize,
+    oracle: Vec<f32>,
+    maxref: f32,
+    repeats: usize,
+    worst_rel: std::cell::Cell<f32>,
+}
+
+impl<'a, R: Runtime> CoopmatF16Eval<'a, R> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: &'a ComputeClient<R>,
+        space: &'a Space,
+        wqs_banks: &[Vec<u32>],
+        x: &[f32],
+        wsc: &[u32],
+        wd: &[f32],
+        wdm: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        repeats: usize,
+    ) -> Self {
+        assert!(!wqs_banks.is_empty(), "CoopmatF16Eval needs at least one weight bank");
+        let banks: Vec<Handle> =
+            wqs_banks.iter().map(|w| client.create_from_slice(u32::as_bytes(w))).collect();
+        let xh = client.create_from_slice(f32::as_bytes(x));
+        let wsch = client.create_from_slice(u32::as_bytes(wsc));
+        let wdh = client.create_from_slice(f32::as_bytes(wd));
+        let wdmh = client.create_from_slice(f32::as_bytes(wdm));
+        let outh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; m * n]));
+        let oracle = mmq_q4k_f16_ref(x, &wqs_banks[0], wsc, wd, wdm, m, n, k);
+        let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+        let plane = client.properties().hardware.plane_size_max as usize;
+        Self {
+            client, space, banks, xh, wsch, wdh, wdmh, outh,
+            wqs_len: wqs_banks[0].len(), x_len: x.len(), wsc_len: wsc.len(), wd_len: wd.len(), wdm_len: wdm.len(),
+            m, n, k, plane, lds_budget: 48 * 1024, reg_budget: 16, oracle, maxref, repeats,
+            worst_rel: std::cell::Cell::new(0.0),
+        }
+    }
+
+    pub fn space(&self) -> &Space {
+        self.space
+    }
+    pub fn worst_rel(&self) -> f32 {
+        self.worst_rel.get()
+    }
+
+    fn dispatch(&self, bank: &Handle, wm: usize, wn: usize, rm: usize, rn: usize) {
+        let bm = wm * rm * 16;
+        let bn = wn * rn * 16;
+        let grid = Grid::Static(self.n.div_ceil(bn) as u32, self.m.div_ceil(bm) as u32, 1);
+        let block = Block::new_1d((wm * wn * self.plane) as u32);
+        let target = Target::of(self.client);
+        unsafe {
+            mmq_q4k_coopmat_tile::launch_unchecked::<f32, R>(
+                self.client, grid, block,
+                ArrayArg::from_raw_parts(self.xh.clone(), self.x_len),
+                ArrayArg::from_raw_parts(bank.clone(), self.wqs_len),
+                ArrayArg::from_raw_parts(self.wsch.clone(), self.wsc_len),
+                ArrayArg::from_raw_parts(self.wdh.clone(), self.wd_len),
+                ArrayArg::from_raw_parts(self.wdmh.clone(), self.wdm_len),
+                ArrayArg::from_raw_parts(self.outh.clone(), self.m * self.n),
+                self.m, self.n, self.k, wm, wn, rm, rn, self.plane, target,
+            );
+        }
+    }
+
+    fn read_out(&self) -> Vec<f32> {
+        f32::from_bytes(&self.client.read_one_unchecked(self.outh.clone())).to_vec()
+    }
+}
+
+impl<'a, R: Runtime> Evaluator for CoopmatF16Eval<'a, R> {
+    fn static_check(&self, cfg: &Config) -> Verdict {
+        let (bm, bn, nwarp) = mmq_geom(cfg, self.space);
+        let wg = nwarp * self.plane;
+        if wg > 1024 {
+            return Verdict::Reject(format!("workgroup width {wg} = nwarp {nwarp} x plane {} > 1024", self.plane));
+        }
+        let lds = mmq_coopmat_lds_bytes(cfg, self.space);
+        if lds > self.lds_budget {
+            return Verdict::Reject(format!("LDS {}KB (BM {bm} x BN {bn}) > {}KB budget", lds / 1024, self.lds_budget / 1024));
+        }
+        let (_wm, _wn, rm, rn) = mmq_tile_cfg(cfg, self.space);
+        let frags = rm * rn;
+        if frags > self.reg_budget {
+            return Verdict::Reject(format!("register tile {frags} fragments/warp (rm {rm} x rn {rn}) > {} budget", self.reg_budget));
+        }
+        Verdict::Pass
+    }
+
+    fn measure(&self, cfg: &Config, iters: usize) -> f64 {
+        let (wm, wn, rm, rn) = mmq_tile_cfg(cfg, self.space);
+        self.dispatch(&self.banks[0], wm, wn, rm, rn);
+        let got = self.read_out();
+        let rel = got.iter().zip(&self.oracle).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / self.maxref;
+        self.worst_rel.set(self.worst_rel.get().max(rel));
+        // f16-rounding tolerance (both operands round to f16), the hand coopmat gate class.
+        if rel > 5e-2 {
+            return f64::INFINITY;
+        }
+        let nb = self.banks.len();
+        for i in 0..(2 * nb) {
+            self.dispatch(&self.banks[i % nb], wm, wn, rm, rn);
+        }
+        let _ = self.read_out();
+        (0..self.repeats)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                for i in 0..iters {
+                    self.dispatch(&self.banks[i % nb], wm, wn, rm, rn);
+                }
+                let _ = self.read_out();
+                t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// Search [`mmq_q4k_space`] on `eval` for the fastest f16-coopmat tile at this `(device, m, n, k)`,
+/// caching the winner. The DSL side of the coopmat prefill board; the winner replays via the same cache.
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_coopmat_hunt<R: Runtime>(
+    tuner: &Tuner,
+    device: &str,
+    m: usize,
+    n: usize,
+    k: usize,
+    eval: &CoopmatF16Eval<R>,
+    evo: &Evolution,
+    seed: u64,
+) -> Evolved {
+    tuner.evolve(device, "mmq_q4k_coopmat", &format!("m={m},n={n},k={k}"), eval.space(), eval, evo, seed)
+}
+
+/// Autotuned-default dispatch for the f16 coopmat twin: consult the persisted per-(device,m,n,k) tuned
+/// genome and launch that tile, else the incumbent. The one-source, auto-optimized coopmat prefill path.
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_coopmat_autokernel<R: Runtime>(
+    client: &ComputeClient<R>,
+    tuner: &Tuner,
+    x: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
+    m: usize, n: usize, k: usize,
+) -> (Vec<f32>, String) {
+    let device = crate::tune::device_id(client);
+    let space = mmq_q4k_space();
+    let key = format!("m={m},n={n},k={k}");
+    let (wm, wn, rm, rn, name) = match tuner.cached_winner(&device, "mmq_q4k_coopmat", &key) {
+        Some(w) => match space.parse(&w) {
+            Some(cfg) => {
+                let (a, b, c, d) = mmq_tile_cfg(&cfg, &space);
+                (a, b, c, d, w)
+            }
+            None => {
+                let (a, b, c, d) = mmq_q4k_incumbent();
+                (a, b, c, d, "incumbent".to_string())
+            }
+        },
+        None => {
+            let (a, b, c, d) = mmq_q4k_incumbent();
+            (a, b, c, d, "incumbent".to_string())
+        }
+    };
+    let (out, _ms) = mmq_q4k_coopmat_tile_run(client, x, wqs, wsc, wd, wdm, m, n, k, wm, wn, rm, rn, 1);
+    (out, name)
+}
+
 #[cfg(all(test, feature = "cpu"))]
 mod tests {
     use super::*;
@@ -1945,6 +2450,92 @@ mod tests {
                 assert!(rel < 1e-6, "tile wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}");
             }
         }
+    }
+
+    /// The f16-dequant coopmat twin (`mmq_q4k_coopmat_tile`, the DSL structural match of the hand
+    /// `mul_mm_q4k_coopmat`) agrees with the full-precision f32 reference to an f16-rounding tolerance,
+    /// across the warp-grid x register-tile axes INCLUDING the hand kernel's own 128x128 tile
+    /// (wm=2,wn=2,rm=4,rn=4). Proves the DSL reaches the hand tile geometry with the register-resident
+    /// `Sequence<cmma::Matrix>` accumulator held across K -- the structure whose feasibility the int8
+    /// kernel could not express. Each shape is m=BM, n=BN (grid 1x1, one cube: CPU shared-memory safe).
+    #[test]
+    fn mmq_q4k_coopmat_tile_matches_f16_ref_on_cpu() {
+        let client = cpu_client();
+        for (wm, wn, rm, rn) in [(1, 1, 1, 1), (2, 2, 1, 1), (1, 1, 2, 2), (2, 2, 2, 2), (2, 2, 4, 4)] {
+            let bm = wm * rm * 16;
+            let bn = wn * rn * 16;
+            for k in [256usize, 512] {
+                let (_xq, _xs, _xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(bm, bn, k);
+                // f32 activation in [-1,1]; the f16 twin rounds it to f16 (unlike the int8 MMQ path).
+                let mut s = 0x1234_5678_9ABC_DEF0u64;
+                let x: Vec<f32> = (0..bm * k)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s % 2000) as f32 / 1000.0 - 1.0
+                    })
+                    .collect();
+                let (got, _) = mmq_q4k_coopmat_tile_run::<CpuRuntime>(
+                    &client, &x, &wqs, &wsc, &wd, &wdm, bm, bn, k, wm, wn, rm, rn, 1,
+                );
+                let want = mmq_q4k_f16_ref(&x, &wqs, &wsc, &wd, &wdm, bm, bn, k);
+                let rel = rel_to_max(&got, &want);
+                eprintln!("[f16 coopmat] wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}");
+                assert!(rel < 5e-2, "f16 coopmat wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}");
+            }
+        }
+    }
+
+    /// The f16-coopmat tile SEARCH on the CPU runtime: the same GA over the same Space as the int8 hunt,
+    /// with the f16 evaluator (f32 activation, full-precision oracle, f16 tolerance). Proves the autotuner
+    /// drives the f16 twin -- the DSL side of the coopmat prefill board -- end to end offline.
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn mmq_q4k_coopmat_space_search_cpu() {
+        let (m, n, k) = (16usize, 16usize, 256usize);
+        let (_xq, _xs, _xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
+        let mut s = 0xABCD_1234u64;
+        let x: Vec<f32> = (0..m * k)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % 2000) as f32 / 1000.0 - 1.0
+            })
+            .collect();
+        let mut wqs2 = wqs.clone();
+        for (i, v) in wqs2.iter_mut().enumerate() {
+            *v ^= 0x9E37_79B1u32.wrapping_mul(i as u32 + 1);
+        }
+        let banks = vec![wqs.clone(), wqs2];
+        let space = mmq_q4k_space();
+        let client = cpu_client();
+        let eval = CoopmatF16Eval::new(&client, &space, &banks, &x, &wsc, &wd, &wdm, m, n, k, 1);
+        let dir = std::env::temp_dir().join(format!(
+            "hk-coopmat-hunt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let tuner = Tuner::new(&dir);
+        let evo = Evolution::new().population(8).generations(3).measure_iters(1);
+
+        let r = mmq_q4k_coopmat_hunt(&tuner, "cpu", m, n, k, &eval, &evo, 0xC0FFEE);
+        assert!(!r.from_cache, "first hunt must not be a cache hit");
+        let rep = r.report.as_ref().expect("a miss carries the evidence trail");
+        assert!(rep.best_ms.is_finite(), "no measurable winner");
+        let win = space.parse(&r.winner).expect("winner is a valid config name");
+        assert!(space.feasible(&win), "winner {} is infeasible", r.winner);
+        assert!(eval.worst_rel() < 5e-2, "a measured tile diverged from the oracle: {:.2e}", eval.worst_rel());
+        eprintln!(
+            "[coopmat f16 hunt CPU] winner={} evaluated={} measured={} rejected={} worst_rel={:.2e}",
+            r.winner, rep.evaluated, rep.measured.len(), rep.rejected.len(), eval.worst_rel()
+        );
+
+        let r2 = mmq_q4k_coopmat_hunt(&tuner, "cpu", m, n, k, &eval, &evo, 0xC0FFEE);
+        assert!(r2.from_cache && r2.report.is_none(), "second hunt must hit the cache");
+        assert_eq!(r2.winner, r.winner, "cache returned a different winner");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The full {WM x WN x RM x RN} tile SEARCH on the CPU runtime: build the space + a cold-stream
