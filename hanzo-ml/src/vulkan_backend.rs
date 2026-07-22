@@ -1309,15 +1309,25 @@ impl VulkanDevice {
         // quantize dispatch drops. Decode is bit-identical to BlockQ4K::to_float; unpackHalf2x16 decodes
         // the f16 d/dmin so subnormal scales stay exact. VK_Q4K_CM_OFF reverts to the dp4a block kernel
         // for the A/B. Q4K_CM_ROWS MUST equal the shader's `NR` constant.
-        // DEFAULT dense Q4_K decode: the DSL f32-direct coalesced plane_sum matvec (hanzo-kernel
+        // Large dense Q4_K decode: the DSL f32-direct coalesced plane_sum matvec (hanzo-kernel
         // matvec_q4k_f32_blk), the DSL twin of mul_mat_vec_q4k_cm lowered from ONE Rust source. Its
         // Vulkan island arm mirrors the hand kernel's structure -- 16 threads per super-block reading
         // ADJACENT qs words (coalesced burst), ITS super-blocks in parallel, plane_sum (subgroupAdd)
-        // reduction, no shared-mem tree -- and measures at parity, bit-exact to the Q4_K oracle. Reads x
-        // as f32 (no quantize) with k and nout in a meta buffer (cubecl has no push constants); grid =
-        // nout workgroups (nr=1 baked). VK_Q4K_DSL_OFF falls to the hand kernel below (the bit-exact
-        // oracle + regression route). Dense only; the resident-MoE-bank case (woff != 0) stays on hand.
-        if woff == 0 && self.inner.subgroup_matvec && std::env::var_os("VK_Q4K_DSL_OFF").is_none() {
+        // reduction, no shared-mem tree. Reads x as f32 (no quantize) with k and nout in a meta buffer
+        // (cubecl has no push constants); grid = nout workgroups (nr=1 baked).
+        // The DSL twin earns the live path only where it MEASURES >= hand (campaign migration
+        // criterion): cold in-engine A/B on evo gfx1151 -- DSL/hand 1.022x at the dominant 6144-row
+        // shape (FFN gate/up, the bulk of the Q4_K bytes) but 0.947x @ 2048 and 0.871x @ 1024, where the
+        // plane_sum reduction's fixed cost outweighs the tiny matvec. So route large dense shapes to the
+        // DSL and keep hand for small ones -- the (device,shape) autotuner is the eventual owner of this
+        // split; Q4K_DSL_MIN_ROWS is the measured crossover until it lands. VK_Q4K_DSL_OFF forces hand.
+        // Dense only; the resident-MoE-bank case (woff != 0) stays on hand.
+        const Q4K_DSL_MIN_ROWS: usize = 4096;
+        if woff == 0
+            && nout >= Q4K_DSL_MIN_ROWS
+            && self.inner.subgroup_matvec
+            && std::env::var_os("VK_Q4K_DSL_OFF").is_none()
+        {
             let meta = self.upload_u32(&[k as u32, nout as u32])?;
             let bufs = [wq.buffer, x.buffer, out.buffer, meta.buffer];
             self.dispatch_out("matvec_q4k_f32_blk", &bufs, 2, &[], (nout as u32, 1, 1))?;
