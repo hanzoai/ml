@@ -8746,6 +8746,102 @@ mod dsl_dispatch_proof {
         bench(32, 8, 512, 512, true, 30, "prefill 512x512 causal GQA4 (32h)");
     }
 
+    // Crossover: the optimized DSL flash (`flash_attn_dsl`) vs the engine's NAIVE prefill attention --
+    // the REAL pp4096-cliff baseline, not `sdpa_blk`. Naive is the exact chain `(q@kᵀ)*scale -> softmax
+    // -> @v` lowers to on Vulkan: cast q,k,v -> f16; `bmm_coopmat_rb_nt` (Q@Kᵀ -> scores[h,sq,sk] f32,
+    // the O(sq·sk) materialization that overflows the 32 MB MALL at pp4096 -> GTT thrash = the cliff);
+    // `softmax_rows` over sk; cast probs -> f16; `bmm_coopmat_rb` (probs@V -> ctx[h,sq,d]). MHA (h==hkv)
+    // so both sides move the same FLOPs with no repeat_kv. Flash never materializes scores. Reports
+    // flash/naive at pp512/2048/4096, non-causal (pure kernel efficiency, both full work) and causal
+    // (flash's diagonal early-exit halves its key tiles; naive materializes fully either way). Isolated
+    // dispatch+flush per timing, so no cross-op ring pressure. Wall time is valid ONLY on a QUIET box;
+    // run with VK_PROFILE_GPU=1 for contention-robust per-op [VK_GPU] times. Benchmark, not a gate;
+    // run explicitly (`--ignored`). Reports, never asserts speed.
+    #[test]
+    #[ignore]
+    fn flash_vs_naive_prefill_ab() {
+        const D: usize = 128;
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("[flash-naive] no vulkan device ({e}); skipping"); return; }
+        };
+        let g1d = |n: usize| ((n as u32).div_ceil(64), 1u32, 1u32); // WG1D == 64
+        let d4 = |x: usize| ((x / 16) as u32).div_ceil(4); // coopmat 16-tiles, 4 tiles/workgroup
+        let bench = |h: usize, sq: usize, sk: usize, iters: usize, tag: &str| {
+            let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
+            let q: Vec<f32> = (0..h * sq * D).map(|i| gen(1, i)).collect();
+            let k: Vec<f32> = (0..h * sk * D).map(|i| gen(2, i)).collect();
+            let v: Vec<f32> = (0..h * sk * D).map(|i| gen(3, i)).collect();
+            let scale = 1.0f32 / (D as f32).sqrt();
+            let qs = dev.upload_f32(&q).unwrap();
+            let ks = dev.upload_f32(&k).unwrap();
+            let vs = dev.upload_f32(&v).unwrap();
+
+            // Flash side: pre-allocated out + meta, whole-grid dispatch (one cube per (head,16-query-tile)).
+            let out_f = dev.alloc_f32(h * sq * D).unwrap();
+            let scl = dev.upload_f32(&[scale]).unwrap();
+            // Ring-safe timing: flush after EVERY submission so no single submission exceeds the ~10s
+            // ring timeout (a long pp4096 kernel batched N-deep would device-lost the SHARED GPU). One
+            // iteration = one submission; per-dispatch flush cost is negligible vs the multi-ms kernels.
+            let time_it = |run: &mut dyn FnMut()| -> f64 {
+                for _ in 0..2 { run(); dev.flush().unwrap(); }
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters { run(); dev.flush().unwrap(); }
+                t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+            };
+            let flash_ms = |causal: bool| -> f64 {
+                let cf = if causal { 1u32 } else { 0 };
+                let meta = dev.upload_u32(&[sq as u32, sk as u32, h as u32, h as u32, cf,
+                    (h * sk * D) as u32, (sk * D) as u32, D as u32, 0]).unwrap();
+                let bufs = [qs.buffer, ks.buffer, vs.buffer, out_f.buffer, scl.buffer, meta.buffer];
+                let g = ((h * sq.div_ceil(16)) as u32, 1u32, 1u32);
+                time_it(&mut || { dev.dispatch_outs("flash_attn_dsl", &bufs, &[3], &[], g).unwrap(); })
+            };
+
+            // Naive side: the materializing bmm+softmax+bmm chain, f16 scratch reused across iters.
+            let scores = dev.alloc_f32(h * sq * sk).unwrap();
+            let probs = dev.alloc_f32(h * sq * sk).unwrap();
+            let ctx = dev.alloc_f32(h * sq * D).unwrap();
+            let ndb = dev.upload_u32(&[sk as u32]).unwrap();
+            let (q16, q16m, q16h, q16b) = dev.alloc_f16(h * sq * D).unwrap();
+            let (k16, k16m, k16h, k16b) = dev.alloc_f16(h * sk * D).unwrap();
+            let (v16, v16m, v16h, v16b) = dev.alloc_f16(h * sk * D).unwrap();
+            let (p16, p16m, p16h, p16b) = dev.alloc_f16(h * sq * sk).unwrap();
+            let mut naive_once = || {
+                dev.dispatch("cast_f2h", &[qs.buffer, q16], &push_u32(&[(h * sq * D) as u32]), g1d(h * sq * D)).unwrap();
+                dev.dispatch("cast_f2h", &[ks.buffer, k16], &push_u32(&[(h * sk * D) as u32]), g1d(h * sk * D)).unwrap();
+                dev.dispatch("cast_f2h", &[vs.buffer, v16], &push_u32(&[(h * sk * D) as u32]), g1d(h * sk * D)).unwrap();
+                // scores[h,sq,sk] = Q @ Kᵀ (NT reads K as [n=sk, k=D]); push [b,m,k,n]=[h,sq,D,sk].
+                dev.dispatch("bmm_coopmat_rb_nt", &[q16, k16, scores.buffer],
+                    &push_u32(&[h as u32, sq as u32, D as u32, sk as u32]), (d4(sk), d4(sq), h as u32)).unwrap();
+                // softmax over sk (reads+writes the whole [h*sq*sk] materialization -- the cliff).
+                dev.dispatch_out("softmax_rows", &[scores.buffer, probs.buffer, ndb.buffer], 1, &[], ((h * sq) as u32, 1, 1)).unwrap();
+                dev.dispatch("cast_f2h", &[probs.buffer, p16], &push_u32(&[(h * sq * sk) as u32]), g1d(h * sq * sk)).unwrap();
+                // ctx[h,sq,D] = probs @ V; push [b,m,k,n]=[h,sq,sk,D].
+                dev.dispatch("bmm_coopmat_rb", &[p16, v16, ctx.buffer],
+                    &push_u32(&[h as u32, sq as u32, sk as u32, D as u32]), (d4(D), d4(sq), h as u32)).unwrap();
+            };
+            let naive_ms = time_it(&mut naive_once);
+            let f_nc = flash_ms(false);
+            let f_c = flash_ms(true);
+            eprintln!(
+                "[flash-vs-naive {tag}] h{h} sq{sq} sk{sk} d{D}  naive={naive_ms:.3}ms  flash_nc={f_nc:.3}ms ({:.2}x)  flash_causal={f_c:.3}ms ({:.2}x)",
+                naive_ms / f_nc, naive_ms / f_c,
+            );
+            dev.free_scratch(q16b, q16, q16m, q16h);
+            dev.free_scratch(k16b, k16, k16m, k16h);
+            dev.free_scratch(v16b, v16, v16m, v16h);
+            dev.free_scratch(p16b, p16, p16m, p16h);
+        };
+        // Fixed h=8 scaling curve so flash/naive is not confounded by head count. Naive scores grow
+        // 8 MB (MALL-resident) -> 32 MB -> 128 MB -> 512 MB (deep GTT); flash never materializes. Per-iter
+        // flush keeps each submission ring-safe (flash pp4096 h8 is one ~50 ms dispatch, well under 10 s).
+        bench(8, 512, 512, 30, "pp512 h8");
+        bench(8, 1024, 1024, 20, "pp1024 h8");
+        bench(8, 2048, 2048, 8, "pp2048 h8");
+        bench(8, 4096, 4096, 4, "pp4096 h8");
+    }
+
     /// The affine Q4_K PREFILL MMQ .spv (mmq_q4k, coopmat/tensor-core) dispatches through ml's own
     /// Vulkan path and matches a CPU affine-GEMM reference. Proves the codegen seam end-to-end for the
     /// prefill kernel: the committed .spv's baked shape (n=2048,k=2048), the binding order
