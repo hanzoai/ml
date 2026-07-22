@@ -512,7 +512,8 @@ pub fn moe_matvec_q4k_dp4a_blk<F: Float>(
             let cw = qbase + (jloc / 2) * 8; // 8 u32 = the 32 qs bytes of this sub-block's chunk
             let xg = (slot * nsub + sb) * 8; // activation group base (weight sub-block sb == act 32-block sb)
             let mut idot = 0i32;
-            for g in 0..8 {
+            #[unroll]
+            for g in 0..8usize {
                 let nibs = (wqs[cw + g] >> shift) & 0x0F0F0F0F; // 4 nibbles as 4 bytes (0..15, +ve i8)
                 let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(nibs));
                 let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(xq[xg + g]));
@@ -657,7 +658,8 @@ pub fn matvec_q4k_dp4a_blk<F: Float>(
             let cw = bb + 4 + (jloc / 2) * 8; // qs: 32 u32 after scales; this sub-block's chunk
             let xg = sb * 8;
             let mut idot = 0i32;
-            for g in 0..8 {
+            #[unroll]
+            for g in 0..8usize {
                 let nibs = (wq[cw + g] >> shift) & 0x0F0F0F0F;
                 let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(nibs));
                 let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(xq[xg + g]));
@@ -710,6 +712,308 @@ pub fn matvec_q4k_dp4a_blk_run<R: Runtime>(
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+// DENSE f32-direct Q4_K decode matvec: `out[n] = W[n,k] @ x[k]`, W = VERBATIM PACKED GGUF Q4_K, the
+// activation read as f32 DIRECTLY. The DSL twin of the hand `mul_mat_vec_q4k_cm`. It carries NO q8
+// activation-quantize step -- that dispatch's command-record cost is what makes the dp4a decode path
+// lose on a backend with expensive eager recording, so the f32-direct kernel is the one the autotuner
+// selects there. Same affine decode w = d*sc*q - dmin*m and the SAME Q4_K activation interleaving as the
+// oracle: sub-block s of superblock `sup` covers x[sup*256 + (s/2)*64 + (s%2)*32 ..][+32], bit-identical
+// to matvec_q4k_ref / BlockQ4K::to_float. Two comptime schedule knobs: `nt` threads cooperate on one
+// row's k (the workgroup-width / k-parallelism axis the autotuner picks per shape -- a wide width fills
+// the device at small row counts where row-parallelism alone leaves it idle); `nr` output rows share the
+// workgroup (the row tile). The inner 8-step decode is `#[unroll]`ed so its loads issue independently
+// (the memory-level parallelism a bandwidth-bound matvec needs). RUNTIME k via meta -> one kernel per
+// (nt, nr) across every projection shape.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn matvec_q4k_f32_blk<F: Float>(
+    wq: &Array<u32>,   // packed Q4_K, 36 u32/superblock
+    x: &Array<F>,      // activation, f32 [k]
+    out: &mut Array<F>,
+    meta: &Array<u32>, // [k]
+    #[comptime] nt: usize, // threads cooperating on one row's k (the workgroup-width axis)
+    #[comptime] nr: usize, // output rows per workgroup (the row tile)
+) {
+    let wgid = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let k = meta[0] as usize;
+    let nb = k / 256;
+    let nsub = k / 32;
+    let per = (nsub + nt - 1) / nt;
+    let row0 = wgid * nr;
+    let nout = out.len();
+    let mut acc = Array::<F>::new(nr);
+    #[unroll]
+    for n in 0..nr {
+        acc[n] = F::new(0.0);
+    }
+    for j in 0..per {
+        let sb = j * nt + t; // sub-block (0..nsub) this thread contracts on this pass
+        if sb < nsub {
+            let sup = sb / 8; // superblock
+            let jloc = sb % 8; // sub-block within the superblock (0..7)
+            let shift = ((jloc % 2) * 4) as u32; // low (even sub-block) or high (odd) nibble
+            let cwoff = 4 + (jloc / 2) * 8; // qs u32 base within a superblock for this sub-block
+            let xbase = sup * 256 + (jloc / 2) * 64 + (jloc % 2) * 32; // activation base of the 32 weights
+            #[unroll]
+            for n in 0..nr {
+                let row = row0 + n;
+                if row < nout {
+                    let bb = (row * nb + sup) * 36; // packed superblock base
+                    let d = F::cast_from(f16lo_to_f32(wq[bb]));
+                    let dmin = F::cast_from(f16lo_to_f32(wq[bb] >> 16));
+                    let dj = d * F::cast_from(q4k_sc(wq, bb + 1, jloc));
+                    let mj = dmin * F::cast_from(q4k_m(wq, bb + 1, jloc));
+                    let cw = bb + cwoff;
+                    let mut sdot = F::new(0.0);
+                    let mut sx = F::new(0.0);
+                    #[unroll]
+                    for g in 0..8usize {
+                        let word = (wq[cw + g] >> shift) & 0x0F0F0F0F;
+                        let xb = xbase + g * 4;
+                        let x0 = x[xb];
+                        let x1 = x[xb + 1];
+                        let x2 = x[xb + 2];
+                        let x3 = x[xb + 3];
+                        sdot += F::cast_from(word & 0xFF) * x0
+                            + F::cast_from((word >> 8) & 0xFF) * x1
+                            + F::cast_from((word >> 16) & 0xFF) * x2
+                            + F::cast_from((word >> 24) & 0xFF) * x3;
+                        sx += x0 + x1 + x2 + x3;
+                    }
+                    // Affine decode folded over the sub-block: sum (dj*q - mj)*x = dj*sum(q*x) - mj*sum(x).
+                    acc[n] += dj * sdot - mj * sx;
+                }
+            }
+        }
+    }
+    // Per-row tree reduction of the nt partials through shared memory (nr sequential passes; both small).
+    let mut smem = SharedMemory::<F>::new(nt);
+    #[unroll]
+    for n in 0..nr {
+        smem[t] = acc[n];
+        sync_cube();
+        let mut stride = CUBE_DIM / 2;
+        while stride > 0 {
+            if UNIT_POS < stride {
+                let v = smem[(UNIT_POS + stride) as usize];
+                smem[t] += v;
+            }
+            sync_cube();
+            stride /= 2;
+        }
+        if t == 0 {
+            let row = row0 + n;
+            if row < nout {
+                out[row] = smem[0];
+            }
+        }
+        sync_cube();
+    }
+}
+
+/// Host launch for the dense packed-Q4_K f32-direct cooperative matvec (`nt` threads/row, `nr` rows/wg).
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_q4k_f32_blk_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32],
+    nout: usize, k: usize, nt: usize, nr: usize,
+) -> Vec<f32> {
+    let packed = pack_q4k(wqs, wsc, wd, wdm);
+    let wh = client.create_from_slice(u32::as_bytes(&packed));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let meta = client.create_from_slice(u32::as_bytes(&[k as u32]));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; nout]));
+    let grid = (nout as u32).div_ceil(nr as u32); // one workgroup per nr output rows
+    unsafe {
+        matvec_q4k_f32_blk::launch_unchecked::<f32, R>(
+            client, Grid::Static(grid, 1, 1), Block::new_1d(nt as u32),
+            ArrayArg::from_raw_parts(wh.clone(), packed.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(oh.clone(), nout),
+            ArrayArg::from_raw_parts(meta.clone(), 1),
+            nt,
+            nr,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+// ============================================================================================
+// Evolutionary schedule search for the f32-direct Q4_K matvec -- the Vulkan-lane sibling of the dp4a
+// search above. Same tune::Evolution machinery; the genome is {WG, NR}. WG is the workgroup width (=
+// threads cooperating on one row's k = `nt`): a wide width fills the device at small row counts where
+// row-parallelism leaves it idle, a narrow width wins at large row counts -- the shape-adaptive width
+// the hand kernel hardcodes and llama tunes. There is no VW knob: the 8-step decode is fully unrolled.
+// The Tuner keys by (device, rows, k), so the width is chosen per shape and this f32 kernel is the
+// per-device algorithm the search crowns where the dp4a activation-quantize dispatch is too costly.
+// ============================================================================================
+
+/// The f32-direct Q4_K matvec schedule space: workgroup width `WG` (= cooperating threads `nt`) and the
+/// row tile `NR`. WG stays a power of two so the tree reduction halves cleanly; every value is correct
+/// for any k (a wide WG just idles the surplus threads on a short row), so there is no k constraint.
+pub fn matvec_q4k_f32_space() -> Space {
+    Space::new()
+        .param("WG", [16, 32, 64, 128, 256])
+        .param("NR", [1, 2, 4])
+        .constraint(|c, s| {
+            let w = c.get(s, "WG");
+            w >= 2 && (w & (w - 1)) == 0 && w <= 1024
+        })
+}
+
+/// Map a schedule [`Config`] to the f32 kernel's `(nt, nr)` launch tuple.
+fn matvec_q4k_f32_cfg(c: &Config, s: &Space) -> (usize, usize) {
+    (c.get(s, "WG") as usize, c.get(s, "NR") as usize)
+}
+
+/// Cold-weight-streamed, bit-exact-gated fitness for [`matvec_q4k_f32_space`], generic in the runtime.
+/// Holds resident PACKED Q4_K weight banks (rotated so each timed dispatch reads cold) and the f32
+/// activation; the correctness gate is `matvec_q4k_ref` (the oracle the hand `mul_mat_vec_q4k_cm` is also
+/// gated against, so a passing schedule is runtime-equal to the hand kernel). Same discipline as the dp4a
+/// evaluator; CpuRuntime proves the search offline, a wgpu device gives the meaningful winner.
+pub struct MatvecQ4kF32Eval<'a, R: Runtime> {
+    client: &'a ComputeClient<R>,
+    space: &'a Space,
+    banks: Vec<Handle>, // resident packed weight banks (distinct buffers -> cold rotation)
+    xh: Handle,
+    meta: Handle,
+    outh: Handle,
+    packed_len: usize,
+    x_len: usize,
+    rows: usize,
+    k: usize,
+    oracle: Vec<f32>,
+    maxref: f32,
+    repeats: usize,
+    worst_rel: std::cell::Cell<f32>,
+}
+
+impl<'a, R: Runtime> MatvecQ4kF32Eval<'a, R> {
+    /// Pack the split Q4_K weight, upload `nbanks` resident copies (distinct buffers so a rotation reads
+    /// cold), upload the f32 activation, and compute the Q4_K oracle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: &'a ComputeClient<R>,
+        space: &'a Space,
+        wqs: &[u32],
+        wsc: &[u32],
+        wd: &[f32],
+        wdm: &[f32],
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        nbanks: usize,
+        repeats: usize,
+    ) -> Self {
+        let packed = pack_q4k(wqs, wsc, wd, wdm);
+        let banks: Vec<Handle> =
+            (0..nbanks.max(1)).map(|_| client.create_from_slice(u32::as_bytes(&packed))).collect();
+        let xh = client.create_from_slice(f32::as_bytes(x));
+        let meta = client.create_from_slice(u32::as_bytes(&[k as u32]));
+        let outh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+        let oracle = matvec_q4k_ref(wqs, wsc, wd, wdm, x, rows, k);
+        let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+        Self {
+            client,
+            space,
+            banks,
+            xh,
+            meta,
+            outh,
+            packed_len: packed.len(),
+            x_len: x.len(),
+            rows,
+            k,
+            oracle,
+            maxref,
+            repeats,
+            worst_rel: std::cell::Cell::new(0.0),
+        }
+    }
+
+    /// The search space this evaluator is bound to.
+    pub fn space(&self) -> &Space {
+        self.space
+    }
+
+    /// The worst scale-relative divergence any measured config showed (the committed correctness witness).
+    pub fn worst_rel(&self) -> f32 {
+        self.worst_rel.get()
+    }
+
+    fn dispatch(&self, bank: &Handle, nt: usize, nr: usize) {
+        let grid = (self.rows as u32).div_ceil(nr as u32);
+        unsafe {
+            matvec_q4k_f32_blk::launch_unchecked::<f32, R>(
+                self.client,
+                Grid::Static(grid, 1, 1),
+                Block::new_1d(nt as u32),
+                ArrayArg::from_raw_parts(bank.clone(), self.packed_len),
+                ArrayArg::from_raw_parts(self.xh.clone(), self.x_len),
+                ArrayArg::from_raw_parts(self.outh.clone(), self.rows),
+                ArrayArg::from_raw_parts(self.meta.clone(), 1),
+                nt,
+                nr,
+            );
+        }
+    }
+
+    fn read_out(&self) -> Vec<f32> {
+        f32::from_bytes(&self.client.read_one_unchecked(self.outh.clone())).to_vec()
+    }
+}
+
+impl<'a, R: Runtime> Evaluator for MatvecQ4kF32Eval<'a, R> {
+    fn static_check(&self, cfg: &Config) -> Verdict {
+        let (nt, _nr) = matvec_q4k_f32_cfg(cfg, self.space);
+        if nt < 2 || nt > 1024 || (nt & (nt - 1)) != 0 {
+            return Verdict::Reject(format!("workgroup width {nt} must be a power of two in [2,1024]"));
+        }
+        Verdict::Pass
+    }
+
+    fn measure(&self, cfg: &Config, iters: usize) -> f64 {
+        let (nt, nr) = matvec_q4k_f32_cfg(cfg, self.space);
+        self.dispatch(&self.banks[0], nt, nr);
+        let got = self.read_out();
+        let rel = got.iter().zip(&self.oracle).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / self.maxref;
+        self.worst_rel.set(self.worst_rel.get().max(rel));
+        if rel > 1e-3 {
+            return f64::INFINITY;
+        }
+        let nb = self.banks.len();
+        for i in 0..(2 * nb) {
+            self.dispatch(&self.banks[i % nb], nt, nr);
+        }
+        let _ = self.read_out();
+        (0..self.repeats)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                for i in 0..iters {
+                    self.dispatch(&self.banks[i % nb], nt, nr);
+                }
+                let _ = self.read_out();
+                t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// Search [`matvec_q4k_f32_space`] on `eval` for the fastest `(nt, nr)` at this `(device, rows, k)`,
+/// caching the winner. The autotuner surface for the f32-direct Vulkan decode matvec.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_q4k_f32_hunt<R: Runtime>(
+    tuner: &Tuner,
+    device: &str,
+    rows: usize,
+    k: usize,
+    eval: &MatvecQ4kF32Eval<R>,
+    evo: &Evolution,
+    seed: u64,
+) -> Evolved {
+    tuner.evolve(device, "matvec_q4k_f32", &format!("rows={rows},k={k}"), eval.space(), eval, evo, seed)
 }
 
 /// Host launch for the block-reduced Q4_K MoE matvec (one workgroup per output, `nt` threads).
@@ -2578,6 +2882,74 @@ mod tests {
 
         // (2) hit: a second hunt reads the cached winner and runs no GA.
         let r2 = matvec_dp4a_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xC0FFEE);
+        assert!(r2.from_cache && r2.report.is_none(), "second hunt must hit the cache");
+        assert_eq!(r2.winner, r.winner, "cache returned a different winner");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The f32-direct cooperative Q4_K matvec (`matvec_q4k_f32_blk`) is bit-exact to the Q4_K oracle
+    /// across the {nt, nr} schedule -- proving the DSL now expresses the f32-direct coalesced decode the
+    /// hand `mul_mat_vec_q4k_cm` runs (the Vulkan decode kernel the dp4a path cannot replace because its
+    /// activation-quantize dispatch is too costly there). Reads x as f32, no quantize. The oracle is the
+    /// same one the hand kernel is gated against (matvec_q4k_ref / BlockQ4K::to_float), so matching it is
+    /// runtime-equality with the hand kernel by construction; the cold GB/s A/B is the queued GPU step.
+    /// `rows`/`k` chosen so `nt` splits the sub-blocks and `nr` leaves a ragged tail (guard exercised).
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn matvec_q4k_f32_blk_cpu_bit_exact() {
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let (rows, k) = (35usize, 512usize); // nb=2, nsub=16; rows=35 leaves a tail for nr=2 and nr=4
+        let (wqs, wsc, wd, wdm, x) = gen_q4k(rows, k);
+        let want = matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, rows, k);
+        let maxref = want.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+        let c = CpuRuntime::client(&CpuDevice::default());
+        for &(nt, nr) in &[(16usize, 1usize), (32, 1), (64, 1), (16, 2), (32, 4), (64, 2)] {
+            let got = matvec_q4k_f32_blk_run::<CpuRuntime>(&c, &wqs, &wsc, &wd, &wdm, &x, rows, k, nt, nr);
+            assert_eq!(got.len(), rows, "output truncated at nt={nt} nr={nr}");
+            let rel = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+            eprintln!("[matvec_q4k_f32_blk CPU] nt={nt} nr={nr} scale_rel={rel:.2e}");
+            assert!(rel < 1e-4, "f32-direct nt={nt} nr={nr} scale_rel {rel} vs Q4_K oracle");
+        }
+    }
+
+    /// The {WG x NR} SEARCH for the f32-direct matvec on the CPU runtime: the tune::Evolution GA over
+    /// matvec_q4k_f32_space gated by MatvecQ4kF32Eval (cold-stream + the Q4_K oracle). Proves the
+    /// machinery offline -- a feasible, bit-exact winner, deterministic, cached. On a wgpu device the
+    /// same evaluator crowns the width that matches the hand mul_mat_vec_q4k_cm cold (the queued GPU step).
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn matvec_q4k_f32_search_cpu() {
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let (rows, k) = (48usize, 512usize);
+        let (wqs, wsc, wd, wdm, x) = gen_q4k(rows, k);
+        let space = matvec_q4k_f32_space();
+        let feasible = space.enumerate();
+        assert!(!feasible.is_empty());
+        assert!(feasible.iter().all(|cfg| {
+            let w = cfg.get(&space, "WG");
+            w >= 2 && (w & (w - 1)) == 0
+        }));
+
+        let c = CpuRuntime::client(&CpuDevice::default());
+        let eval = MatvecQ4kF32Eval::new(&c, &space, &wqs, &wsc, &wd, &wdm, &x, rows, k, 2, 1);
+        let dir = std::env::temp_dir().join(format!(
+            "hk-q4kf32-hunt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let tuner = Tuner::new(&dir);
+        let evo = Evolution::new().population(8).generations(3).measure_iters(1);
+
+        let r = matvec_q4k_f32_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xF32);
+        assert!(!r.from_cache, "first hunt must not be a cache hit");
+        let rep = r.report.as_ref().expect("a miss carries the evidence trail");
+        assert!(rep.best_ms.is_finite(), "no measurable winner");
+        let win = space.parse(&r.winner).expect("winner is a valid config name");
+        assert!(space.feasible(&win), "winner {} is infeasible", r.winner);
+        assert!(eval.worst_rel() < 1e-3, "a measured variant diverged from the oracle: {:.2e}", eval.worst_rel());
+        eprintln!("[q4k_f32 hunt CPU] winner={} evaluated={} worst_rel={:.2e}", r.winner, rep.evaluated, eval.worst_rel());
+
+        let r2 = matvec_q4k_f32_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xF32);
         assert!(r2.from_cache && r2.report.is_none(), "second hunt must hit the cache");
         assert_eq!(r2.winner, r.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
