@@ -99,6 +99,11 @@ pub fn call_quantized_matmul_mv_t_offset(
     let ne02 = b as i64;
     let ne03 = 1i64;
 
+    // NB: these src0/src1 byte strides are 0 -- correct for the quantized matvec families, which index
+    // src0 by ne01+block counts and src1 by r1*ne10 in element units. The dense F16/BF16/F32 family
+    // (`kernel_mul_mv_impl`) DOES read them (and also mis-grids its rows), so callers must not route m>1
+    // dense-weight matmuls here; `fwd` gates the batched route to the quantized families. Full dense
+    // support (real strides + row-grid fix) is a follow-up.
     let nb00 = 0i64;
     let nb01 = 0i64;
     let nb02 = 0i64;
