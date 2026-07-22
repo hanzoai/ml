@@ -1299,8 +1299,9 @@ impl VulkanDevice {
             crate::bail!("matvec_q4k_gpu: x count {} < k {k}", x.count);
         }
         let out = self.alloc_f32(nout)?;
-        // DEFAULT Q4_K decode path where the device advertises subgroup arithmetic: the coalesced
-        // multi-thread f32 matvec (mul_mat_vec_q4k_cm). TPB=16 threads cooperate on one super-block,
+        // Resident-MoE-bank Q4_K decode (woff != 0) + the VK_Q4K_DSL_OFF regression fallback + the
+        // bit-exact oracle for the DSL twin above: the coalesced multi-thread f32 matvec
+        // (mul_mat_vec_q4k_cm). TPB=16 threads cooperate on one super-block,
         // adjacent threads reading adjacent qs u32 words (a coalesced 64-byte burst); Q4K_CM_ROWS rows
         // per workgroup amortise the shared activation load; the per-row partial reduces with a subgroup
         // add. The memory-BW lever for decode on this bandwidth-bound UMA APU -- the Q4_K analogue of
@@ -1308,12 +1309,15 @@ impl VulkanDevice {
         // quantize dispatch drops. Decode is bit-identical to BlockQ4K::to_float; unpackHalf2x16 decodes
         // the f16 d/dmin so subnormal scales stay exact. VK_Q4K_CM_OFF reverts to the dp4a block kernel
         // for the A/B. Q4K_CM_ROWS MUST equal the shader's `NR` constant.
-        // A/B ONLY (VK_Q4K_DSL): route dense (woff==0) Q4_K decode through the DSL f32-direct twin
-        // matvec_q4k_f32_blk to measure it in-engine against the hand mul_mat_vec_q4k_cm below. The
-        // DSL kernel reads x as f32 (no quantize) and carries k in a meta buffer (cubecl has no push
-        // constants); grid = nout workgroups (nr=1). Not a shipped default -- the collapse-to-one-path
-        // decision follows the measured cold in-engine t/s.
-        if woff == 0 && self.inner.subgroup_matvec && std::env::var_os("VK_Q4K_DSL").is_some() {
+        // DEFAULT dense Q4_K decode: the DSL f32-direct coalesced plane_sum matvec (hanzo-kernel
+        // matvec_q4k_f32_blk), the DSL twin of mul_mat_vec_q4k_cm lowered from ONE Rust source. Its
+        // Vulkan island arm mirrors the hand kernel's structure -- 16 threads per super-block reading
+        // ADJACENT qs words (coalesced burst), ITS super-blocks in parallel, plane_sum (subgroupAdd)
+        // reduction, no shared-mem tree -- and measures at parity, bit-exact to the Q4_K oracle. Reads x
+        // as f32 (no quantize) with k and nout in a meta buffer (cubecl has no push constants); grid =
+        // nout workgroups (nr=1 baked). VK_Q4K_DSL_OFF falls to the hand kernel below (the bit-exact
+        // oracle + regression route). Dense only; the resident-MoE-bank case (woff != 0) stays on hand.
+        if woff == 0 && self.inner.subgroup_matvec && std::env::var_os("VK_Q4K_DSL_OFF").is_none() {
             let meta = self.upload_u32(&[k as u32, nout as u32])?;
             let bufs = [wq.buffer, x.buffer, out.buffer, meta.buffer];
             self.dispatch_out("matvec_q4k_f32_blk", &bufs, 2, &[], (nout as u32, 1, 1))?;
@@ -8338,9 +8342,9 @@ mod dsl_dispatch_proof {
             };
             let meas = |dsl: bool| -> (f64, f32) {
                 if dsl {
-                    unsafe { std::env::set_var("VK_Q4K_DSL", "1") };
+                    unsafe { std::env::remove_var("VK_Q4K_DSL_OFF") };
                 } else {
-                    unsafe { std::env::remove_var("VK_Q4K_DSL") };
+                    unsafe { std::env::set_var("VK_Q4K_DSL_OFF", "1") };
                 }
                 let rel = rel_of(&dev.matvec_q4k(&banks[0], &x, nout, k).unwrap());
                 for i in 0..(2 * nbanks) {
@@ -8358,7 +8362,7 @@ mod dsl_dispatch_proof {
             };
             let (hand_ms, hand_rel) = meas(false);
             let (dsl_ms, dsl_rel) = meas(true);
-            unsafe { std::env::remove_var("VK_Q4K_DSL") };
+            unsafe { std::env::remove_var("VK_Q4K_DSL_OFF") };
             let hand_g = wbytes as f64 / (hand_ms * 1e6);
             let dsl_g = wbytes as f64 / (dsl_ms * 1e6);
             eprintln!(
