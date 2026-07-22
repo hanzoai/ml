@@ -29,7 +29,11 @@ use half::f16;
 
 /// Query rows per workgroup tile (one cooperative-matrix row dimension).
 pub const BR: usize = 16;
-/// Key columns streamed per online-softmax step (one cooperative-matrix col dimension).
+/// Key columns streamed per online-softmax step. Parameterized: `BC` is contracted in `BC/16`
+/// cooperative-matrix col fragments (the `cg`/`kc` loops in the QK/PV arms), so it is a tunable knob,
+/// not baked structure. `BC = 16` (one fragment) is the default: on a shared-memory-tight target,
+/// widening to 32 doubles the score/K/V/P shared tiles and trades workgroup occupancy for K/V-stage
+/// amortization -- an occupancy loss that is not worth it on an LDS-tight APU. Tune per target.
 pub const BC: usize = 16;
 
 /// Tiled flash attention. Grid = one cube per `(batch, head, query-tile)`; block = one plane of `plane`
@@ -83,11 +87,15 @@ pub fn flash_attn<F: Float>(
     let q_head_base = ((b_i * n_heads + h) * seq_q) * d; // q/out are [b, n_heads, seq_q, d] contiguous
     let kvbase = b_i * kv_batch_stride + kv * kv_head_stride; // k/v read in place at their real strides
 
-    // Per-lane element partitions of the two shared tiles.
+    // Per-lane element partitions of the shared tiles.
     let per_s = br * bc / plane; // score-tile elements this lane owns
     let per_o = br * d / plane; // output-tile elements this lane owns
+    let per_q = br * d / plane; // Q-tile elements this lane owns (staged once, below)
 
-    // Shared state: score/prob tile [br, bc], output accumulator [br, d], and per-row (m, l, rescale).
+    // Shared state: query tile [br, d] (staged ONCE), score/prob tile [br, bc], output accumulator
+    // [br, d], and per-row (m, l, rescale). `qsh` is the f16 Q the coopmat arms read every key tile;
+    // the default (CPU-oracle) arm reads Q from global directly and never touches it.
+    let mut qsh = SharedMemory::<f16>::new(br * d);
     let mut sf = SharedMemory::<F>::new(br * bc);
     let mut of = SharedMemory::<F>::new(br * d);
     let mut mf = SharedMemory::<F>::new(br);
@@ -102,10 +110,34 @@ pub fn flash_attn<F: Float>(
         mf[lane] = F::new(-3.4e38);
         lf[lane] = F::new(0.0);
     }
+
+    // Stage Q[br, d] from global f32 to f16 shared ONCE, before the key loop (llama Qf,
+    // flash_attn_cm1.comp:87). Ragged query rows (qpos >= seq_q) stage 0. The coopmat arms below read
+    // this every key tile; hoisting it out of the loop removes the per-tile Q re-stage that capped the
+    // kernel at 0.38 TFLOP/s. Inert for the CPU oracle (its default arm reads Q from global).
+    for e in 0..per_q {
+        let idx = lane * per_q + e;
+        let r = idx / d;
+        let dd = idx % d;
+        let qpos = qt * br + r;
+        let val = if qpos < seq_q { q[q_head_base + qpos * d + dd] } else { F::new(0.0) };
+        qsh[idx] = f16::cast_from(val);
+    }
     sync_cube();
 
+    // Causal early-exit: a key tile whose first key (j*bc) already exceeds this query tile's last row
+    // (qt*br + br - 1) is entirely above the causal diagonal -> every score is -inf -> P = 0 and the
+    // running (m, l, O) are unchanged (a mathematical no-op). Bounding the loop to the diagonal tile is
+    // therefore bit-exact and drops ~half the key tiles on causal prefill -- llama's masked-block skip
+    // (flash_attn_cm1.comp:146), expressed directly since our causality is computed inline, not masked.
     let n_jt = (seq_k + bc - 1) / bc;
-    for j in 0..n_jt {
+    let n_jt_eff = if causal == 1 {
+        let bound = (qt * br + br - 1) / bc + 1;
+        if bound < n_jt { bound } else { n_jt }
+    } else {
+        n_jt
+    };
+    for j in 0..n_jt_eff {
         // ---- Q@Kᵀ: fill the [br, bc] score tile. Out-of-range / causally-masked entries -> -inf. ----
         island! {
             // Accelerated: f16 cooperative-matrix. Stage Q[br,d]/K[bc,d] tiles to f16 shared (bounds
@@ -115,18 +147,9 @@ pub fn flash_attn<F: Float>(
             // OpCooperativeMatrixMulAddKHR (SPIR-V), one 16x16x16 fragment. Metal composes it from 8x8
             // (its simdgroup_matrix caps at 8x8x8) in the sibling `metal =>` arm below.
             cuda | rocm | vulkan => {
-                let mut qsh = SharedMemory::<f16>::new(br * d);
+                // Q is already in `qsh` (staged once, above). Stage only this key tile's K[bc,d].
                 let mut ksh = SharedMemory::<f16>::new(bc * d);
-                let per_q = br * d / plane;
                 let per_k = bc * d / plane;
-                for e in 0..per_q {
-                    let idx = lane * per_q + e;
-                    let r = idx / d;
-                    let dd = idx % d;
-                    let qpos = qt * br + r;
-                    let val = if qpos < seq_q { q[q_head_base + qpos * d + dd] } else { F::new(0.0) };
-                    qsh[idx] = f16::cast_from(val);
-                }
                 for e in 0..per_k {
                     let idx = lane * per_k + e;
                     let c = idx / d;
@@ -136,21 +159,27 @@ pub fn flash_attn<F: Float>(
                     ksh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
-                let cacc = cmma::Matrix::<F>::from_value(
-                    cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0),
-                );
-                for dk in 0..d / 16usize {
-                    let a = cmma::Matrix::<f16>::from_slice(
-                        cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-                        &qsh.to_slice().slice(dk * 16usize, br * d), d as u32,
+                // The bc score columns split into bc/16 cooperative-matrix col-groups. Each accumulates
+                // C[br,16] = Q @ Kᵀ over d/16 contraction chunks (K ColMajor -> Kᵀ, `mmq_q8_wmma`'s W
+                // layout), then stores to sf columns [cg*16, cg*16+16). Bc=32 amortizes the K stage +
+                // barrier over twice the keys per online-softmax step (llama base Bc=32).
+                for cg in 0..bc / 16usize {
+                    let cacc = cmma::Matrix::<F>::from_value(
+                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0),
                     );
-                    let b = cmma::Matrix::<f16>::from_slice(
-                        cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
-                        &ksh.to_slice().slice(dk * 16usize, bc * d), d as u32,
-                    );
-                    cmma::execute::<f16, f16, F, F>(&a, &b, &cacc, &cacc);
+                    for dk in 0..d / 16usize {
+                        let a = cmma::Matrix::<f16>::from_slice(
+                            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+                            &qsh.to_slice().slice(dk * 16usize, br * d), d as u32,
+                        );
+                        let b = cmma::Matrix::<f16>::from_slice(
+                            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
+                            &ksh.to_slice().slice(cg * 16usize * d + dk * 16usize, bc * d), d as u32,
+                        );
+                        cmma::execute::<f16, f16, F, F>(&a, &b, &cacc, &cacc);
+                    }
+                    cmma::store(&mut sf.to_slice_mut().slice_mut(cg * 16usize, br * bc), &cacc, bc as u32, cmma::MatrixLayout::RowMajor);
                 }
-                cmma::store(&mut sf.to_slice_mut(), &cacc, bc as u32, cmma::MatrixLayout::RowMajor);
                 sync_cube();
                 for e in 0..per_s {
                     let idx = lane * per_s + e;
@@ -172,18 +201,9 @@ pub fn flash_attn<F: Float>(
             // 8x8-probe-proven transpose mechanic). Every load reads inside the zero-padded staged tile,
             // so ragged seq is handled at staging exactly as the 16x16 arm -- no OOB direct-slice read.
             metal => {
-                let mut qsh = SharedMemory::<f16>::new(br * d);
+                // Q is already in `qsh` (staged once, above). Stage only this key tile's K[bc,d].
                 let mut ksh = SharedMemory::<f16>::new(bc * d);
-                let per_q = br * d / plane;
                 let per_k = bc * d / plane;
-                for e in 0..per_q {
-                    let idx = lane * per_q + e;
-                    let r = idx / d;
-                    let dd = idx % d;
-                    let qpos = qt * br + r;
-                    let val = if qpos < seq_q { q[q_head_base + qpos * d + dd] } else { F::new(0.0) };
-                    qsh[idx] = f16::cast_from(val);
-                }
                 for e in 0..per_k {
                     let idx = lane * per_k + e;
                     let c = idx / d;
@@ -318,19 +338,24 @@ pub fn flash_attn<F: Float>(
                     vsh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
+                // O_tile[br,d] = P @ V. The d output columns split into d/16 groups; each accumulates
+                // over the bc/16 contraction chunks of the key dimension (P[br,kc*16..] @ V[kc*16..,dn*16..]),
+                // then stores O_tile columns [dn*16, dn*16+16). Bc=32 -> two contraction chunks per group.
                 for dn in 0..d / 16usize {
                     let cacc = cmma::Matrix::<F>::from_value(
                         cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0),
                     );
-                    let a = cmma::Matrix::<f16>::from_slice(
-                        cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-                        &psh.to_slice().slice(0, br * bc), bc as u32,
-                    );
-                    let b = cmma::Matrix::<f16>::from_slice(
-                        cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-                        &vsh.to_slice().slice(dn * 16usize, bc * d), d as u32,
-                    );
-                    cmma::execute::<f16, f16, F, F>(&a, &b, &cacc, &cacc);
+                    for kc in 0..bc / 16usize {
+                        let a = cmma::Matrix::<f16>::from_slice(
+                            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+                            &psh.to_slice().slice(kc * 16usize, br * bc), bc as u32,
+                        );
+                        let b = cmma::Matrix::<f16>::from_slice(
+                            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+                            &vsh.to_slice().slice(kc * 16usize * d + dn * 16usize, bc * d), d as u32,
+                        );
+                        cmma::execute::<f16, f16, F, F>(&a, &b, &cacc, &cacc);
+                    }
                     cmma::store(&mut ovt.to_slice_mut().slice_mut(dn * 16usize, br * d), &cacc, d as u32, cmma::MatrixLayout::RowMajor);
                 }
                 sync_cube();
