@@ -5,7 +5,8 @@
 //! and the int8-dp4a fast path (`Line<i8>.dot`) follow the identical shape with more bit-twiddling.
 
 use crate::prelude::*;
-use crate::tune::Tuned;
+use crate::tune::{Config, Evaluator, Evolution, Evolved, Space, Tuned, Tuner, Verdict};
+use cubecl::server::Handle;
 
 /// Q8_0 block size (weights per scale).
 pub const QK8_0: usize = 32;
@@ -1818,9 +1819,18 @@ pub fn matvec_q8_dp4a_blk_run<R: Runtime>(
 // every `vw`, so all variants are byte-identical to each other and match the CPU oracle within f32 reorder.
 // ============================================================================================
 
-/// Autotuned dp4a matvec source. `vw` = groups processed per unrolled step (the ILP / "vector width"
-/// knob); the cube dim is the host's knob. `out[row] = sum_g wd[g/8] * dot(wq_g, xq_g)`, `g` ascending.
-/// Packed int8 weights (`Vector<i8,4>`, 4 bytes/group) -> `.dot` lowers to dp4a / OpSDot.
+/// Autotuned dp4a matvec source. TWO orthogonal schedule knobs, both comptime so cubecl monomorphizes a
+/// distinct kernel per tuple (the tuner picks the tuple per device+shape):
+///   * `vw` -- groups processed per unrolled step (the ILP / "vector width" knob): more independent
+///     loads+dp4a in flight per iteration, the memory-level-parallelism a bandwidth-bound matvec needs.
+///   * `nr` -- output ROWS this thread owns. The weight stream is per-row, but the activation group
+///     `xq[g]` is loaded ONCE per `g` and reused across all `nr` rows -- the row-tile amortisation
+///     llama's `mul_mat_vec` spends as `NUM_ROWS` and our hand `mul_mat_vec_q4k_cm` as `NR=2`. The DSL
+///     matvec lacked this dimension; exposing it lets the autotuner reach the hand/llama schedule.
+/// `out[row] = sum_g wd[g/8] * dot(wq_g, xq_g)`, `g` ascending. Packed int8 weights (`Vector<i8,4>`,
+/// 4 bytes/group) -> `.dot` lowers to dp4a / OpSDot. Per-row accumulation order is independent of `nr`
+/// and `vw`, so every schedule is byte-identical to the `nr=1` single-row source (and `nr=1` is exactly
+/// that source): the knobs move the schedule, never the numerics.
 #[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn matvec_q8_dp4a_tuned<F: Float>(
     wq: &Array<Vector<i8, Const<4>>>,
@@ -1829,30 +1839,47 @@ pub fn matvec_q8_dp4a_tuned<F: Float>(
     out: &mut Array<F>,
     #[comptime] k: usize,
     #[comptime] vw: usize, // groups per unrolled step (ILP / vector width); ng = k/4 must be a multiple
+    #[comptime] nr: usize, // output rows this thread owns (activation-reuse row tile; llama NUM_ROWS)
 ) {
-    let row = ABSOLUTE_POS;
-    if row < out.len() {
-        let ng = k / 4;
-        let wbase = row * ng;
-        let dbase = row * (k / 32);
-        let mut acc = F::new(0.0);
-        let steps = ng / vw;
-        for s in 0..steps {
+    let nout = out.len();
+    let ng = k / 4;
+    let nb = k / 32;
+    let row0 = ABSOLUTE_POS * nr; // this thread owns rows [row0, row0 + nr)
+    // One running accumulator per owned row. The activation group loaded per `g` feeds all `nr` rows.
+    let mut acc = Array::<F>::new(nr);
+    #[unroll]
+    for n in 0..nr {
+        acc[n] = F::new(0.0);
+    }
+    let steps = ng / vw;
+    for s in 0..steps {
+        #[unroll]
+        for j in 0..vw {
+            let g = s * vw + j;
+            let xi = Vector::<i32, Const<4>>::cast_from(xq[g]); // ONE activation load, reused nr times
             #[unroll]
-            for j in 0..vw {
-                let g = s * vw + j;
-                let wi = Vector::<i32, Const<4>>::cast_from(wq[wbase + g]);
-                let xi = Vector::<i32, Const<4>>::cast_from(xq[g]);
-                acc += wd[dbase + g / 8] * F::cast_from(wi.dot(xi));
+            for n in 0..nr {
+                let row = row0 + n;
+                if row < nout {
+                    let wi = Vector::<i32, Const<4>>::cast_from(wq[row * ng + g]);
+                    acc[n] += wd[row * nb + g / 8] * F::cast_from(wi.dot(xi));
+                }
             }
         }
-        out[row] = acc;
+    }
+    #[unroll]
+    for n in 0..nr {
+        let row = row0 + n;
+        if row < nout {
+            out[row] = acc[n];
+        }
     }
 }
 
 /// Kernel-only bench for one `(vw, block)` schedule; returns `(output, ms/dispatch)` -- the
 /// [`crate::tune::Variant`] contract (`iters == 1` on a cache hit, many iters when tuning). Weights +
 /// activation are real int8 (`&[i8]`), 4 bytes/group.
+#[allow(clippy::too_many_arguments)]
 pub fn matvec_q8_dp4a_tuned_bench<R: Runtime>(
     client: &ComputeClient<R>,
     wq: &[i8],
@@ -1862,13 +1889,15 @@ pub fn matvec_q8_dp4a_tuned_bench<R: Runtime>(
     k: usize,
     vw: usize,
     block: u32,
+    nr: usize,
     iters: usize,
 ) -> (Vec<f32>, f64) {
     let wqh = client.create_from_slice(i8::as_bytes(wq));
     let xqh = client.create_from_slice(i8::as_bytes(xq));
     let wdh = client.create_from_slice(f32::as_bytes(wd));
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
-    let grid = (rows as u32).div_ceil(block);
+    // Each thread owns nr rows, so the grid covers ceil(rows/nr) threads.
+    let grid = (rows as u32).div_ceil(nr as u32).div_ceil(block);
     let ng = k / 4;
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8_dp4a_tuned::launch_unchecked::<f32, R>(
@@ -1881,6 +1910,7 @@ pub fn matvec_q8_dp4a_tuned_bench<R: Runtime>(
             ArrayArg::from_raw_parts(oh.clone(), rows),
             k,
             vw,
+            nr,
         );
     };
     for _ in 0..3 {
@@ -1907,10 +1937,10 @@ pub fn matvec_q8_dp4a_tuned_set<'a, R: Runtime>(
     k: usize,
 ) -> Tuned<'a, Vec<f32>> {
     Tuned::new("matvec_q8_dp4a", format!("rows={rows},k={k}"))
-        .variant("b64_v1", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 1, 64, it))
-        .variant("b64_v4", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 4, 64, it))
-        .variant("b128_v2", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 2, 128, it))
-        .variant("b256_v8", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 8, 256, it))
+        .variant("b64_v1", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 1, 64, 1, it))
+        .variant("b64_v4", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 4, 64, 1, it))
+        .variant("b128_v2", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 2, 128, 1, it))
+        .variant("b256_v8", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 8, 256, 1, it))
 }
 
 /// Autotuned dp4a matvec: tune (or read the cache) over the schedule knobs and run the winner. ONE
@@ -1924,6 +1954,209 @@ pub fn matvec_q8_dp4a_autotuned<R: Runtime>(
     k: usize,
 ) -> Vec<f32> {
     matvec_q8_dp4a_tuned_set(client, wq, xq, wd, rows, k).run(client)
+}
+
+// ============================================================================================
+// Evolutionary schedule SEARCH for the dp4a matvec. `matvec_q8_dp4a_tuned_set` above enumerates a
+// curated 4-point `Tuned`; this searches the FULL {WG x VW x NR} schedule product with the
+// `tune::Evolution` GA and a multi-fidelity, cold-weight-streamed `Evaluator` -- the same machinery
+// hanzo-ml's coopmat hunt runs on the prefill GEMM, here generic over the runtime.
+//
+// WG (the workgroup width / `local_size_x`) is the load-bearing axis: our hand `mul_mat_vec_q4k_cm`
+// HARDCODES 64, but the memory-bandwidth-optimal width is shape-dependent -- at small row counts a
+// wider group (llama's DMMV_WG_SIZE_LARGE) fills the device that row-parallelism alone leaves idle,
+// and at large row counts the narrow group wins. Because the `Tuner` keys a winner by (device, op,
+// `rows=..,k=..`), the search resolves BOTH the shape-adaptive width AND the per-backend algorithm
+// choice for free: on a discrete-launch backend (ROCm) the dp4a path is the fast decode kernel; on a
+// backend where the extra activation-quantize dispatch is expensive (Vulkan eager record) the f32
+// direct kernel wins, and the per-device cache records whichever the cold oracle measures faster.
+// ============================================================================================
+
+/// The dp4a-matvec schedule space: workgroup width `WG` (= `local_size_x`), ILP/unroll `VW`, and the
+/// activation-reuse row tile `NR`. The ONE definition of the searchable schedule; the Tuner keys its
+/// winner by `(device, rows, k)`, so a wide WG is selected exactly at the shapes that need it. The only
+/// hard constraint is bit-exactness: `ng = k/4` must be an exact multiple of `VW` (else `steps = ng/vw`
+/// would drop the tail group), and `WG` must be a legal workgroup width.
+pub fn matvec_dp4a_space(k: usize) -> Space {
+    let ng = (k / 4) as i64;
+    Space::new()
+        .param("WG", [64, 128, 256])
+        .param("VW", [1, 2, 4, 8])
+        .param("NR", [1, 2, 4])
+        .constraint(move |c, s| ng % c.get(s, "VW") == 0)
+        .constraint(|c, s| {
+            let wg = c.get(s, "WG");
+            wg > 0 && wg <= 1024
+        })
+}
+
+/// Map a schedule [`Config`] to the kernel's `(block, vw, nr)` launch tuple.
+fn dp4a_cfg(c: &Config, s: &Space) -> (u32, usize, usize) {
+    (c.get(s, "WG") as u32, c.get(s, "VW") as usize, c.get(s, "NR") as usize)
+}
+
+/// A cold-weight-streaming, bit-exact-gated fitness over [`matvec_dp4a_space`], generic in the runtime.
+/// Holds RESIDENT device buffers (uploaded once) so the timing tier streams weights with no re-upload,
+/// and rotates a bank of distinct weights so each dispatch reads its weight COLD -- the bandwidth-bound
+/// regime decode runs in, and the guard against the campaign's #1 scar (a warm single-tile microbench
+/// crowns an occupancy/width knob the deployment never sees). The correctness gate is folded into
+/// fitness: a schedule that diverges from the scalar-dp4a oracle is infinitely slow, so it can never
+/// win. `CpuRuntime` exercises the whole search offline (machinery + bit-exactness); the same type on a
+/// wgpu device gives the meaningful winner.
+pub struct MatvecDp4aEval<'a, R: Runtime> {
+    client: &'a ComputeClient<R>,
+    space: &'a Space,
+    banks: Vec<Handle>, // resident weight buffers; banks[0] is the weight the oracle was computed from
+    xqh: Handle,
+    wdh: Handle,
+    outh: Handle,
+    wd_len: usize,
+    rows: usize,
+    k: usize,
+    oracle: Vec<f32>,
+    maxref: f32,
+    repeats: usize,
+    worst_rel: std::cell::Cell<f32>,
+}
+
+impl<'a, R: Runtime> MatvecDp4aEval<'a, R> {
+    /// Upload the weight banks (each `rows*k` int8; distinct data so a rotation reads cold), the shared
+    /// activation `xq` and scales `wd`, and an output buffer; compute the scalar-dp4a oracle on `banks[0]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: &'a ComputeClient<R>,
+        space: &'a Space,
+        weight_banks: &[Vec<i8>],
+        xq: &[i8],
+        wd: &[f32],
+        rows: usize,
+        k: usize,
+        repeats: usize,
+    ) -> Self {
+        assert!(!weight_banks.is_empty(), "MatvecDp4aEval needs at least one weight bank");
+        let banks: Vec<Handle> =
+            weight_banks.iter().map(|w| client.create_from_slice(i8::as_bytes(w))).collect();
+        let xqh = client.create_from_slice(i8::as_bytes(xq));
+        let wdh = client.create_from_slice(f32::as_bytes(wd));
+        let outh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+        let wq32: Vec<i32> = weight_banks[0].iter().map(|&v| v as i32).collect();
+        let xq32: Vec<i32> = xq.iter().map(|&v| v as i32).collect();
+        let oracle = matvec_q8_dp4a_ref(&wq32, &xq32, wd, rows, k);
+        let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+        Self {
+            client,
+            space,
+            banks,
+            xqh,
+            wdh,
+            outh,
+            wd_len: wd.len(),
+            rows,
+            k,
+            oracle,
+            maxref,
+            repeats,
+            worst_rel: std::cell::Cell::new(0.0),
+        }
+    }
+
+    /// The search space this evaluator is bound to (so a hunt and its fitness never disagree on the genome).
+    pub fn space(&self) -> &Space {
+        self.space
+    }
+
+    /// The worst scale-relative divergence any measured config showed (the committed correctness witness).
+    pub fn worst_rel(&self) -> f32 {
+        self.worst_rel.get()
+    }
+
+    /// One dispatch of a resident weight `bank` through the `(block, vw, nr)` schedule -- no upload.
+    fn dispatch(&self, bank: &Handle, block: u32, vw: usize, nr: usize) {
+        let ng = self.k / 4;
+        let grid = (self.rows as u32).div_ceil(nr as u32).div_ceil(block);
+        unsafe {
+            matvec_q8_dp4a_tuned::launch_unchecked::<f32, R>(
+                self.client,
+                Grid::Static(grid, 1, 1),
+                Block::new_1d(block),
+                ArrayArg::from_raw_parts(bank.clone(), self.rows * ng),
+                ArrayArg::from_raw_parts(self.xqh.clone(), ng),
+                ArrayArg::from_raw_parts(self.wdh.clone(), self.wd_len),
+                ArrayArg::from_raw_parts(self.outh.clone(), self.rows),
+                self.k,
+                vw,
+                nr,
+            );
+        }
+    }
+
+    fn read_out(&self) -> Vec<f32> {
+        f32::from_bytes(&self.client.read_one_unchecked(self.outh.clone())).to_vec()
+    }
+}
+
+impl<'a, R: Runtime> Evaluator for MatvecDp4aEval<'a, R> {
+    fn static_check(&self, cfg: &Config) -> Verdict {
+        let (block, vw, _nr) = dp4a_cfg(cfg, self.space);
+        let ng = self.k / 4;
+        // Free tier: reject a schedule the source cannot express bit-exactly before spending a dispatch.
+        // (cubecl lowers per launch, so unlike glslc there is no cheap register read here; the Space's
+        // feasibility already pruned the grid -- this is the belt-and-braces divisibility/width gate.)
+        if vw == 0 || ng % vw != 0 {
+            return Verdict::Reject(format!("ng={ng} not a multiple of vw={vw}"));
+        }
+        if block == 0 || block > 1024 {
+            return Verdict::Reject(format!("illegal workgroup width {block}"));
+        }
+        Verdict::Pass
+    }
+
+    fn measure(&self, cfg: &Config, iters: usize) -> f64 {
+        let (block, vw, nr) = dp4a_cfg(cfg, self.space);
+        // Correctness gate on bank[0] vs the scalar-dp4a oracle (scale-relative: per-element relative
+        // error explodes on near-zero cancellation, so gate on max|Δ|/max|ref|).
+        self.dispatch(&self.banks[0], block, vw, nr);
+        let got = self.read_out();
+        let rel = got.iter().zip(&self.oracle).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / self.maxref;
+        self.worst_rel.set(self.worst_rel.get().max(rel));
+        if rel > 2e-3 {
+            return f64::INFINITY;
+        }
+        // Cold-weight-streamed timing: warm the utilisation-slaved clock, then time `iters` dispatches
+        // rotating the whole bank so every read is cold, and take the MINIMUM over a few passes (the
+        // least-drift-polluted time). The trailing read_out drains the queue -- the sync point.
+        let nb = self.banks.len();
+        for i in 0..(2 * nb) {
+            self.dispatch(&self.banks[i % nb], block, vw, nr);
+        }
+        let _ = self.read_out();
+        (0..self.repeats)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                for i in 0..iters {
+                    self.dispatch(&self.banks[i % nb], block, vw, nr);
+                }
+                let _ = self.read_out();
+                t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// Search [`matvec_dp4a_space`] on `eval` for the fastest schedule at this `(device, rows, k)`, caching
+/// the winner in the shared autotune TSV. The production upgrade from the curated 4-variant `Tuned` set
+/// to the full {WG x VW x NR} search; the winner replays through the same cache on the next call.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_dp4a_hunt<R: Runtime>(
+    tuner: &Tuner,
+    device: &str,
+    rows: usize,
+    k: usize,
+    eval: &MatvecDp4aEval<R>,
+    evo: &Evolution,
+    seed: u64,
+) -> Evolved {
+    tuner.evolve(device, "matvec_q8_dp4a", &format!("rows={rows},k={k}"), eval.space(), eval, evo, seed)
 }
 
 // ============================================================================================
@@ -2216,18 +2449,28 @@ mod tests {
         let want = matvec_q8_dp4a_ref(&wq32, &xq32, &wd, rows, k);
         let c = CpuRuntime::client(&CpuDevice::default());
 
-        // (1) schedule-invariance + oracle agreement.
+        // (1) schedule-invariance + oracle agreement. The WG/VW/NR knobs move the schedule, never the
+        // numerics: every config -- including the NR>1 row tiles (each thread owns nr rows, activation
+        // reused) -- is byte-identical to the nr=1 single-row source. rows=48 is a multiple of every nr.
         let mut ref_bits: Option<Vec<u32>> = None;
-        for &(vw, block) in &[(1usize, 64u32), (4, 64), (2, 128), (8, 256)] {
-            let (got, _ms) = matvec_q8_dp4a_tuned_bench::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k, vw, block, 1);
+        for &(vw, block, nr) in &[
+            (1usize, 64u32, 1usize),
+            (4, 64, 1),
+            (2, 128, 1),
+            (8, 256, 1),
+            (1, 64, 2),
+            (4, 128, 2),
+            (2, 256, 4),
+        ] {
+            let (got, _ms) = matvec_q8_dp4a_tuned_bench::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k, vw, block, nr, 1);
             let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
             match &ref_bits {
                 None => ref_bits = Some(gbits),
-                Some(rb) => assert_eq!(&gbits, rb, "vw={vw} block={block} not byte-identical to b64_v1"),
+                Some(rb) => assert_eq!(&gbits, rb, "wg={block} vw={vw} nr={nr} not byte-identical to b64_v1_r1"),
             }
             let rel = max_rel(&want, &got);
-            eprintln!("[matvec_q8_dp4a_tuned CPU] vw={vw} block={block} max_rel={rel:.2e}");
-            assert!(rel < 2e-3, "dp4a tuned vw={vw} block={block} max_rel {rel} vs oracle");
+            eprintln!("[matvec_q8_dp4a_tuned CPU] wg={block} vw={vw} nr={nr} max_rel={rel:.2e}");
+            assert!(rel < 2e-3, "dp4a tuned wg={block} vw={vw} nr={nr} max_rel {rel} vs oracle");
         }
 
         // (2) select + cache against an isolated temp tuner.
@@ -2245,6 +2488,98 @@ mod tests {
         let p2 = matvec_q8_dp4a_tuned_set::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k).pick_with(&tuner, "cpu");
         assert!(p2.from_cache && p2.benched == 0, "second call must hit the cache and skip timing");
         assert_eq!(p2.winner, p.winner, "cache returned a different winner");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The NR row-tile guards the ragged tail: when the row count is NOT a multiple of `nr`, the last
+    /// thread owns fewer than `nr` real rows and must skip the out-of-range ones (no OOB weight read, no
+    /// stray store). rows=49 leaves a tail for both nr=2 and nr=4 -- every schedule still matches the
+    /// oracle exactly and stays byte-identical to nr=1 (the guard changes which thread does a row, never
+    /// the value or which rows exist).
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn matvec_dp4a_nr_ragged_cpu() {
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let (rows, k) = (49usize, 256usize); // 49 % 2 and 49 % 4 both leave a tail on the last thread
+        let (wq, xq, wd) = gen_dp4a(rows, k);
+        let wq32: Vec<i32> = wq.iter().map(|&v| v as i32).collect();
+        let xq32: Vec<i32> = xq.iter().map(|&v| v as i32).collect();
+        let want = matvec_q8_dp4a_ref(&wq32, &xq32, &wd, rows, k);
+        let c = CpuRuntime::client(&CpuDevice::default());
+        let mut ref_bits: Option<Vec<u32>> = None;
+        for &(vw, block, nr) in &[(2usize, 64u32, 1usize), (2, 64, 2), (2, 128, 4), (4, 256, 4)] {
+            let (got, _ms) = matvec_q8_dp4a_tuned_bench::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k, vw, block, nr, 1);
+            assert_eq!(got.len(), rows, "output truncated at nr={nr}");
+            let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            match &ref_bits {
+                None => ref_bits = Some(gbits),
+                Some(rb) => assert_eq!(&gbits, rb, "ragged nr={nr} not byte-identical to nr=1"),
+            }
+            assert!(max_rel(&want, &got) < 2e-3, "ragged nr={nr} diverged from the oracle");
+        }
+    }
+
+    /// The full {WG x VW x NR} SEARCH on the CPU runtime: build the space + a cold-stream evaluator and
+    /// run the `tune::Evolution` GA. Proves the machinery end to end offline (no GPU) -- the hunt crowns
+    /// a bit-exact, feasible winner deterministically, records it, and a second hunt reads the cache
+    /// without re-running the GA. On a wgpu device the SAME evaluator makes the winner meaningful (the
+    /// width/tile that matches the hand/llama kernel); CPU schedules are near-equivalent so the winner
+    /// here is arbitrary-but-stable -- the point under test is the search + the correctness gate.
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn matvec_dp4a_space_search_cpu() {
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let (rows, k) = (64usize, 256usize); // ng = 64, a multiple of every VW in the space
+        let (_, xq, wd) = gen_dp4a(rows, k);
+        // Three distinct weight banks so the cold rotation reads different data on each dispatch.
+        let banks: Vec<Vec<i8>> = (0..3)
+            .map(|b| {
+                let mut s = 0x51ED_2701u64.wrapping_add(b).wrapping_mul(0x9E37_79B1) | 1;
+                (0..rows * k)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s % 251) as i8
+                    })
+                    .collect()
+            })
+            .collect();
+        let space = matvec_dp4a_space(k);
+
+        // The space is exactly the feasible {WG x VW x NR} product: only VW dividing ng, only legal widths.
+        let feasible = space.enumerate();
+        assert!(!feasible.is_empty(), "empty feasible space");
+        assert!(feasible.iter().all(|cfg| (k / 4) % (cfg.get(&space, "VW") as usize) == 0));
+        assert!(feasible.iter().all(|cfg| {
+            let w = cfg.get(&space, "WG");
+            w > 0 && w <= 1024
+        }));
+
+        let c = CpuRuntime::client(&CpuDevice::default());
+        let eval = MatvecDp4aEval::new(&c, &space, &banks, &xq, &wd, rows, k, 1);
+        let dir = std::env::temp_dir().join(format!(
+            "hk-dp4a-hunt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let tuner = Tuner::new(&dir);
+        let evo = Evolution::new().population(8).generations(3).measure_iters(1);
+
+        // (1) miss: the hunt runs, crowns a feasible bit-exact winner, and records it.
+        let r = matvec_dp4a_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xC0FFEE);
+        assert!(!r.from_cache, "first hunt must not be a cache hit");
+        let rep = r.report.as_ref().expect("a miss carries the evidence trail");
+        assert!(rep.best_ms.is_finite(), "no measurable winner");
+        let win = space.parse(&r.winner).expect("winner is a valid config name");
+        assert!(space.feasible(&win), "winner {} is infeasible", r.winner);
+        assert!(eval.worst_rel() < 2e-3, "a measured variant diverged from the oracle: {:.2e}", eval.worst_rel());
+        eprintln!("[dp4a hunt CPU] winner={} evaluated={} worst_rel={:.2e}", r.winner, rep.evaluated, eval.worst_rel());
+
+        // (2) hit: a second hunt reads the cached winner and runs no GA.
+        let r2 = matvec_dp4a_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xC0FFEE);
+        assert!(r2.from_cache && r2.report.is_none(), "second hunt must hit the cache");
+        assert_eq!(r2.winner, r.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
     }
 
