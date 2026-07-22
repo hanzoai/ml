@@ -15,6 +15,22 @@ fn metal_mm_f16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("HANZO_METAL_MM_F16").is_some())
 }
 
+/// Largest batch (`m`) routed to the batched matvec instead of the prefill GEMM in `fwd`. Below this
+/// the matvec wins (weights stream once, reused across the m columns in cache); above it the GEMM's
+/// tile-fill weight-reuse wins. MEASURED matvec/GEMM crossover on the K-quant decode weights (dbc M4
+/// Max, Qwen3-1.7B-Q4_K_M): matvec 150 t/s at m=5, a TIE at m=9 (114 = 114 t/s), GEMM ahead by m=13.
+/// Default 8 is the safe side of the tie. Do NOT raise this without re-measuring -- above the crossover
+/// the GEMM is faster; `HANZO_METAL_MATVEC_MAX` overrides it for that re-measurement.
+fn metal_matvec_max() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("HANZO_METAL_MATVEC_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
 pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
@@ -294,24 +310,26 @@ impl QMetalStorage {
         let out_dtype = if src1_bf16 { DType::BF16 } else { DType::F32 };
         let dst = device.new_buffer(dst_shape.elem_count(), out_dtype, "qmatmul")?;
         let encoder = device.command_encoder()?;
-        // In some cases it would be better to use the mm variant, though it has its drawbacks
-        // around memory alignment.
-        for batch_id in 0..m {
-            hanzo_metal_kernels::call_quantized_matmul_mv_t(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                kdtype,
-                (1, 1, n, k),
-                storage.buffer(),
-                (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
-                &self.buffer,
-                batch_id * n * out_dtype.size_in_bytes(),
-                &dst,
-                src1_bf16,
-            )
-            .map_err(MetalError::from)?;
-        }
+        // Single batched matvec: the m activation columns dispatch as one grid (grid height = ne11 = m),
+        // so the weight row-block each threadgroup streams is reused across the m columns in cache --
+        // the ggml small-batch decode path. Replaces a per-column dispatch loop that re-streamed the
+        // full weights m times (which is why the >1-row path historically fell to the prefill GEMM).
+        // m == 1 is the decode fast path, byte-identical to the loop's single iteration; the kernel
+        // places column r1 at element offset r1*n (dst) / r1*k (activation), matching the old offsets.
+        hanzo_metal_kernels::call_quantized_matmul_mv_t(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            kdtype,
+            (1, m, n, k),
+            storage.buffer(),
+            layout.start_offset() * storage.dtype().size_in_bytes(),
+            &self.buffer,
+            0,
+            &dst,
+            src1_bf16,
+        )
+        .map_err(MetalError::from)?;
         let dst_storage =
             crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), out_dtype);
         Ok((dst_storage, dst_shape))
@@ -345,7 +363,25 @@ impl QMetalStorage {
             )
         }
 
-        if src_shape.dim(D::Minus2)? == 1 {
+        // Small batches (the spec-decode verify's gamma+1 tokens, short ragged prefills) run the batched
+        // matvec: weights stream once and reuse across the m columns in cache, vs the prefill GEMM whose
+        // K-quant tiling is built for ~512-row prefill and wastes most of the tile on a handful of rows
+        // (~6x the per-matmul cost, measured on the spec-decode verify). Threshold = measured matvec/GEMM
+        // crossover; HANZO_METAL_MATVEC_MAX overrides for re-measurement.
+        //
+        // ONLY the quantized weight families take this route. Their matvec kernels index src0/src1 in
+        // block/element units, so `call_quantized_matmul_mv_t`'s zero byte-strides are correct and rows
+        // grid fully. A dense F16/BF16/F32 weight instead hits `kernel_mul_mv_impl`, which reads those
+        // (zero) byte strides AND grids only ne01/align rows -- silently wrong at m>1. Dense weights stay
+        // on the prefill GEMM (correct). Full dense-matvec support (real strides + row grid) is a follow-up.
+        let mv_kdtype: hanzo_metal_kernels::GgmlDType = self.dtype.try_into()?;
+        let dense_weight = matches!(
+            mv_kdtype,
+            hanzo_metal_kernels::GgmlDType::F16
+                | hanzo_metal_kernels::GgmlDType::BF16
+                | hanzo_metal_kernels::GgmlDType::F32
+        );
+        if !dense_weight && src_shape.dim(D::Minus2)? <= metal_matvec_max() {
             return self.fwd_mv(self_shape, storage, layout);
         }
 
