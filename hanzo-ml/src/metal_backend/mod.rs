@@ -2268,6 +2268,64 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     slice.to_vec()
 }
 
+/// Resolve a committed DSL (cubecl) MSL artifact by kernel name -- the Metal twin of
+/// `vulkan_backend::kernel_spv`. A `#[kernel]` authored once in hanzo-kernel is lowered to MSL by
+/// cubecl-cpp's metal dialect (extracted via tools/dsl/msl_extract.sh) and committed under
+/// src/metal/dsl/<name>.metal as human-diffable text. This is the single place mapping a kernel name to
+/// its artifact; cubecl names the Metal entry point after the kernel (no "main" rename, unlike the
+/// SPIR-V seam), so `name` is BOTH the registry key and the Metal function name.
+pub fn kernel_msl(name: &str) -> Result<&'static str> {
+    let src: &'static str = match name {
+        "rms_norm_blk_f_f32" => include_str!("../metal/dsl/rms_norm_blk.metal"),
+        _ => {
+            return Err(
+                MetalError::Message(format!("no committed DSL MSL artifact for '{name}'")).into(),
+            )
+        }
+    };
+    Ok(src)
+}
+
+impl MetalDevice {
+    /// Dispatch a committed DSL kernel through ml's native Metal encoder -- the reusable seam every
+    /// migrated `#[kernel]` shares, mirroring the per-kernel `.spv` dispatch on Vulkan. Resolves the MSL
+    /// by name, compiles it through the SAME pipeline hand kernels use (`compile_msl`, driver-cached),
+    /// binds `data` in cubecl's buffer convention (indices `0..N-1`; `out_index` takes the write hazard
+    /// via `set_output_buffer`, the rest read via `set_input_buffer`), then binds the trailing
+    /// `constant info_st& info [[buffer(N)]]` populated from `static_meta` (cubecl's array-length
+    /// metadata, which Metal keeps `constant` where Vulkan could strip it). Records the dispatch only --
+    /// the caller drives `wait_until_completed`, so DSL work batches with the surrounding op stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_dsl(
+        &self,
+        name: &str,
+        data: &[&Buffer],
+        out_index: usize,
+        static_meta: &[u32],
+        grid: objc2_metal::MTLSize,
+        threadgroup: objc2_metal::MTLSize,
+    ) -> Result<()> {
+        let msl = format!("#include <metal_stdlib>\n{}", kernel_msl(name)?);
+        let pl = self.compile_msl(name, &msl)?;
+        let info = self.new_buffer_with_data(static_meta)?;
+        {
+            let enc = self.command_encoder()?;
+            let e = enc.as_ref();
+            e.set_compute_pipeline_state(&pl);
+            for (i, b) in data.iter().enumerate() {
+                if i == out_index {
+                    e.set_output_buffer(i, Some(*b), 0);
+                } else {
+                    e.set_input_buffer(i, Some(*b), 0);
+                }
+            }
+            e.set_input_buffer(data.len(), Some(&*info), 0);
+            e.dispatch_thread_groups(grid, threadgroup);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod dsl_metal_dispatch {
     use super::*;
@@ -2345,5 +2403,49 @@ mod dsl_metal_dispatch {
         }
         eprintln!("[rms_norm_blk DSL-via-ml-Metal] rows={rows} n={n} max_rel={mr:.2e}");
         assert!(mr < 2e-3, "DSL rms_norm_blk metal dispatch max_rel {mr}");
+    }
+
+    // The seam PRIMITIVE: resolve rms_norm_blk by name via `kernel_msl` and dispatch it through the
+    // reusable `MetalDevice::dispatch_dsl` (compile + bind data 0..N-1 + populate the info_st buffer at
+    // N), instead of open-coding compile+encode. Proves the registry -> native-dispatch wiring end to
+    // end -- the single path every migrated kernel reuses. Same shape + tolerance as the open-coded twin.
+    #[test]
+    fn dsl_seam_dispatch_via_registry() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let (rows, n, eps) = (37usize, 128usize, 1e-5f32);
+        let x: Vec<f32> = (0..rows * n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 5) as f32 * 0.1).collect();
+        let want = rms_ref(&x, &w, rows, n, eps);
+
+        let xb = md.new_buffer_with_data(&x).unwrap();
+        let wb = md.new_buffer_with_data(&w).unwrap();
+        let ob = md.new_buffer_with_data(&vec![0f32; rows * n]).unwrap();
+        let eb = md.new_buffer_with_data(&[eps][..]).unwrap();
+        let ndb = md.new_buffer_with_data(&[n as u32][..]).unwrap();
+        // rms_norm_blk binds 0=x 1=w 2=out 3=eps 4=n ; info_st (element lengths) trails at buffer 5.
+        let grid = objc2_metal::MTLSize { width: rows, height: 1, depth: 1 };
+        let tg = objc2_metal::MTLSize { width: n, height: 1, depth: 1 };
+        md.dispatch_dsl(
+            "rms_norm_blk_f_f32",
+            &[&*xb, &*wb, &*ob, &*eb, &*ndb],
+            2,
+            &[0u32; 10],
+            grid,
+            tg,
+        )
+        .unwrap();
+        md.wait_until_completed().unwrap();
+
+        let got: Vec<f32> = read_to_vec(&*ob, rows * n);
+        let mr = want
+            .iter()
+            .zip(&got)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs() / a.abs().max(1e-4)));
+        eprintln!("[dsl_seam dispatch_dsl] rms_norm_blk rows={rows} n={n} max_rel={mr:.2e}");
+        assert!(mr < 2e-3, "seam dispatch_dsl rms_norm_blk max_rel {mr}");
     }
 }
