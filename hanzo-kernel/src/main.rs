@@ -14,7 +14,7 @@ use hanzo_kernel::quant::{
     moe_route, moe_route_ref, moe_route_run, gemv, gemv_run,
     moe_matvec_q4k_dp4a_blk, moe_matvec_q4k_dp4a_blk_run, quant_act_q8_cpu,
     moe_matvec_q6k_dp4a_blk, moe_matvec_q6k_dp4a_blk_run,
-    matvec_q4k_dp4a_blk, matvec_q4k_dp4a_blk_run, pack_q4k, QK8_0,
+    matvec_q4k_dp4a_blk, matvec_q4k_dp4a_blk_run, matvec_q4k_f32_blk_run, pack_q4k, QK8_0,
 };
 use std::time::Instant;
 use hanzo_kernel::norm::rms_norm_run;
@@ -653,6 +653,20 @@ fn main() {
         return;
     }
 
+    // `matvec-check dumpf32`: emit ONLY the f32-direct Q4_K decode matvec .spv (matvec_q4k_f32_blk) at
+    // the schedule the cold sweep crowned (nt=64, nr=1). k and nout are runtime (meta[0] / out.len()),
+    // so this ONE .spv serves every dense Q4_K decode shape. CUBECL_DEBUG_SPIRV=<dir> writes the raw
+    // artifact; spv_to_ml.sh renames the entry point to `main` for ml's VulkanDevice::dispatch.
+    #[cfg(all(feature = "vulkan", feature = "spirv-dump"))]
+    if std::env::args().any(|a| a == "dumpf32") {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        let (wqs, wsc, wd, wdm, x) = gen_q4k(2048, 2048);
+        let _ = matvec_q4k_f32_blk_run::<WgpuRuntime>(&c, &wqs, &wsc, &wd, &wdm, &x, 2048, 2048, 64, 1);
+        println!("dumpf32: matvec_q4k_f32_blk nt=64 nr=1 dispatched -- .spv emitted");
+        return;
+    }
+
     // `matvec-check dump-flash`: emit ONLY the flash-attention .spv (isolated from the dp4a/mmq dumps
     // above, which need extensions a software adapter lacks). The flash kernel's cmma island lowers to
     // OpCooperativeMatrixMulAddKHR; the .spv is written by cubecl at codegen, BEFORE the driver validates
@@ -696,6 +710,109 @@ fn main() {
             for nt in [32usize, 64, 128, 256] {
                 check_matvec_q4k_dp4a_blk::<WgpuRuntime>("VK/cold", &c, nout, k, nt);
             }
+        }
+        return;
+    }
+
+    // `matvec-check f32sweep`: cold GB/s sweep of the f32-direct Q4_K decode matvec (DSL
+    // matvec_q4k_f32_blk) over its {WG x NR} schedule at the live dense Q4_K decode shapes
+    // (Qwen3-1.7B: ffn_gate/up nout=6144, attn_q/o nout=2048, attn_k nout=1024; k=2048). Uses the
+    // bank-rotated, bit-exact-gated MatvecQ4kF32Eval so each timed dispatch reads a weight bank the
+    // 32 MB MALL has already evicted -- the real per-token decode regime, not the warm small-shape
+    // benches. Names the fastest (nt, nr) per shape (the width the engine dispatch selects by row
+    // count) and its cold weight-bandwidth -- the screen that decides whether the DSL twin is worth
+    // the in-engine A/B against the hand mul_mat_vec_q4k_cm.
+    #[cfg(feature = "vulkan")]
+    if std::env::args().any(|a| a == "f32sweep") {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use hanzo_kernel::quant::{matvec_q4k_f32_space, MatvecQ4kF32Eval};
+        use hanzo_kernel::tune::Evaluator;
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        println!("== cold f32-direct Q4_K matvec sweep (DSL matvec_q4k_f32_blk), bank-rotated >> 32 MB MALL ==");
+        let space = matvec_q4k_f32_space();
+        for (nout, k) in [(6144usize, 2048usize), (2048, 2048), (1024, 2048)] {
+            let wbytes = nout * (k / 256) * 144;
+            let nbanks = (64 * 1024 * 1024 / wbytes + 1).max(6); // footprint >= 64 MB (2x MALL)
+            let (wqs, wsc, wd, wdm, x) = gen_q4k(nout, k);
+            let eval = MatvecQ4kF32Eval::new(&c, &space, &wqs, &wsc, &wd, &wdm, &x, nout, k, nbanks, 6);
+            println!(
+                "-- {nout}x{k}  ({} MB/bank x {nbanks} banks = {} MB cold footprint) --",
+                wbytes / (1024 * 1024),
+                nbanks * wbytes / (1024 * 1024)
+            );
+            let mut best = (f64::INFINITY, 0usize, 0usize, 0f64);
+            for cfg in space.enumerate() {
+                let nt = cfg.get(&space, "WG") as usize;
+                let nr = cfg.get(&space, "NR") as usize;
+                let ms = eval.measure(&cfg, nbanks); // iters = nbanks: one cold pass over all banks
+                if !ms.is_finite() {
+                    println!("   nt={nt:<3} nr={nr}  REJECT (diverged from Q4_K oracle)");
+                    continue;
+                }
+                let gbps = wbytes as f64 / (ms * 1e6);
+                println!("   nt={nt:<3} nr={nr}  {ms:.4} ms  {gbps:.0} GB/s");
+                if ms < best.0 {
+                    best = (ms, nt, nr, gbps);
+                }
+            }
+            println!(
+                "   >> BEST f32  {nout}x{k}: nt={} nr={}  {:.4} ms  {:.0} GB/s  (worst_rel {:.2e})",
+                best.1, best.2, best.0, best.3, eval.worst_rel()
+            );
+            // dp4a-block anchor at the same shape + same cold bank-rotation: the DSL twin of the OTHER
+            // shipped decode kernel. The hand mul_mat_vec_q4k_cm shipped +14.9% over the dp4a block
+            // in-engine, so the f32/dp4a ratio here calibrates the f32 twin against the hand CM without
+            // the microbench-vs-engine harness gap (both DSL kernels run through the same wgpu path).
+            use cubecl::server::Handle;
+            let packed = pack_q4k(&wqs, &wsc, &wd, &wdm);
+            let (xq, xs, xsum) = quant_act_q8_cpu(&x, 1, k);
+            let dbanks: Vec<Handle> =
+                (0..nbanks).map(|_| c.create_from_slice(u32::as_bytes(&packed))).collect();
+            let xqh = c.create_from_slice(u32::as_bytes(&xq));
+            let xsh = c.create_from_slice(f32::as_bytes(&xs));
+            let xsumh = c.create_from_slice(f32::as_bytes(&xsum));
+            let dmeta = c.create_from_slice(u32::as_bytes(&[k as u32]));
+            let doh = c.create_from_slice(f32::as_bytes(&vec![0.0f32; nout]));
+            let dp4a = |nt: usize, bank: &Handle| unsafe {
+                matvec_q4k_dp4a_blk::launch_unchecked::<f32, WgpuRuntime>(
+                    &c,
+                    Grid::Static(nout as u32, 1, 1),
+                    Block::new_1d(nt as u32),
+                    ArrayArg::from_raw_parts(bank.clone(), packed.len()),
+                    ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+                    ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+                    ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
+                    ArrayArg::from_raw_parts(doh.clone(), nout),
+                    ArrayArg::from_raw_parts(dmeta.clone(), 1),
+                    nt,
+                );
+            };
+            let mut dbest = (f64::INFINITY, 0usize);
+            for nt in [32usize, 64, 128] {
+                for i in 0..(2 * nbanks) {
+                    dp4a(nt, &dbanks[i % nbanks]);
+                }
+                let _ = c.read_one_unchecked(doh.clone());
+                let mut m = f64::INFINITY;
+                for _ in 0..6 {
+                    let t = std::time::Instant::now();
+                    for i in 0..nbanks {
+                        dp4a(nt, &dbanks[i % nbanks]);
+                    }
+                    let _ = c.read_one_unchecked(doh.clone());
+                    m = m.min(t.elapsed().as_secs_f64() * 1e3 / nbanks as f64);
+                }
+                let g = wbytes as f64 / (m * 1e6);
+                println!("   dp4a nt={nt:<3}       {m:.4} ms  {g:.0} GB/s");
+                if m < dbest.0 {
+                    dbest = (m, nt);
+                }
+            }
+            let dg = wbytes as f64 / (dbest.0 * 1e6);
+            println!(
+                "   >> dp4a BEST {nout}x{k}: nt={}  {:.4} ms  {:.0} GB/s  ||  f32/dp4a = {:.2}x  (needs >= 1.15x to match hand CM)",
+                dbest.1, dbest.0, dg, best.3 / dg
+            );
         }
         return;
     }
