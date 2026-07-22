@@ -2655,6 +2655,17 @@ impl crate::Module for QMatMul {
                 n,
                 k,
             } => {
+                // The activation can reach us on a different device than the weight -- e.g. a
+                // CPU-resident prompt activation on the prefill path -- so place it on the weight's
+                // Vulkan device rather than refusing. A no-op when it is already there, so the hot
+                // decode path is unchanged; every sub-path below then sees a Vulkan input.
+                let vdev = qtensor.device();
+                let xs_on_vdev = if xs.device().same_device(&vdev) {
+                    None
+                } else {
+                    Some(xs.to_device(&vdev)?)
+                };
+                let xs = xs_on_vdev.as_ref().unwrap_or(xs);
                 let rows: usize = xs.elem_count() / *k;
                 if rows == 1 {
                     // Decode: weights stay quantized in VRAM; the matching native-GGML quant matvec
@@ -2776,6 +2787,16 @@ impl crate::Module for QMatMul {
                 n,
                 k,
             } => {
+                // Same device coercion as the Vulkan arm: a CPU-resident prompt activation on the
+                // prefill path is placed on the weight's Wgpu device rather than refused. A no-op
+                // when it is already there, so the hot decode path is unchanged.
+                let vdev = qtensor.device();
+                let xs_on_vdev = if xs.device().same_device(&vdev) {
+                    None
+                } else {
+                    Some(xs.to_device(&vdev)?)
+                };
+                let xs = xs_on_vdev.as_ref().unwrap_or(xs);
                 let rows: usize = xs.elem_count() / *k;
                 if rows == 1 {
                     // Decode: weights stay quantized in VRAM; the matching native-GGML quant matvec
