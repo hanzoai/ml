@@ -48,3 +48,8 @@ required-features = ["vulkan"]
 [[bin]]
 name = "mmq-check"
 path = "src/mmq_check.rs"
+
+[[bin]]
+name = "flash-metal-check"
+path = "src/flash_metal_check.rs"
+required-features = ["metal"]
