@@ -2418,3 +2418,84 @@ fn commands_concurrent_acquisition() {
 
     commands.wait_until_completed().unwrap();
 }
+
+#[test]
+fn quantized_matmul_mm_f16_weight_m4_matches_reference() {
+    // A dense F16/BF16/F32 weight at m>1 must go through the prefill GEMM, NOT the dense matvec
+    // (`kernel_mul_mv_impl` reads src0/src1 byte strides -- 0 in `call_quantized_matmul_mv_t` -- and
+    // grids only ne01/align rows, so its m>1 output is silently wrong). `fwd` routes dense weights at
+    // m>1 to this GEMM; the test pins that the GEMM path is correct at m=4. This is the non-K-quant m>1
+    // class the Q4_K_M lossless gate could not reach (K-quants index by block/element and ignore nb*).
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let (m, n, k) = (4usize, 48usize, 128usize);
+    let mut r = rng();
+    let weight: Vec<f16> = (0..n * k)
+        .map(|_| f16::from_f32(r.random_range(-1f32..1f32)))
+        .collect();
+    let act: Vec<f32> = (0..m * k).map(|_| r.random_range(-1f32..1f32)).collect();
+    let w_buf = new_buffer(&device, &weight);
+    let a_buf = new_buffer(&device, &act);
+    let dst = new_buffer(&device, &vec![0f32; m * n]);
+
+    // Byte strides as `fwd` builds them: src0 (weight) contiguous [1,1,n,k] f16 (2 B); src1 (activation)
+    // contiguous [1,1,m,k] f32 (4 B). dst is [1,1,m,n].
+    let s0 = [1usize, 1, n, k];
+    let s0_stride = [n * k * 2, n * k * 2, k * 2, 2];
+    let s1 = [1usize, 1, m, k];
+    let s1_stride = [m * k * 4, m * k * 4, k * 4, 4];
+    let dshape = [1usize, 1, m, n];
+    call_quantized_matmul_mm_t(
+        &device,
+        &encoder,
+        &kernels,
+        GgmlDType::F16,
+        &s0,
+        &s0_stride,
+        &w_buf,
+        &s1,
+        &s1_stride,
+        &a_buf,
+        0,
+        &dshape,
+        0,
+        &dst,
+        false,
+        false,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    let got: Vec<f32> = read_to_vec(&dst, m * n);
+
+    // CPU reference over the exact f16 weight values.
+    let mut exp = vec![0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut s = 0f32;
+            for c in 0..k {
+                s += act[i * k + c] * weight[j * k + c].to_f32();
+            }
+            exp[i * n + j] = s;
+        }
+    }
+    // A row/column aliasing regression would make activation rows 0 and 1 produce identical outputs.
+    assert_ne!(
+        &got[0..n],
+        &got[n..2 * n],
+        "F16 GEMM aliased rows 0 and 1"
+    );
+    for idx in 0..m * n {
+        assert!(
+            (got[idx] - exp[idx]).abs() < 0.15,
+            "F16 weight GEMM m={m} mismatch at [{},{}]: got {} exp {}",
+            idx / n,
+            idx % n,
+            got[idx],
+            exp[idx]
+        );
+    }
+}
