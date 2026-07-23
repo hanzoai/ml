@@ -919,6 +919,13 @@ fn main() {
         check_q4k::<CudaRuntime>("CUDA", &c, rows, k);
         check_dp4a::<CudaRuntime>("CUDA", &c, rows, k, true);
         check_rms::<CudaRuntime>("CUDA", &c, rows, k);
+        // Cold decode BW: warm 4096^2 (16 MB) is L2-resident and overstates BW; 8192^2 = 64 MB of
+        // int8 weights >> GB10 L2 -> the real per-token decode regime. check_dp4a sweeps the blk nt
+        // schedule internally -- the launch-schedule lever the CUDA autotuner owns. (The GGUF-Q4_K
+        // packed path matvec_q4k_dp4a_blk does NOT compile under cubecl-cpp 0.10 CUDA: it lowers a
+        // constant bitcast to reinterpret_cast<float const&>(temporary), an invalid lvalue -- so the
+        // cold probe uses the q8-packed twin, which shares the block-reduce schedule.)
+        check_dp4a::<CudaRuntime>("CUDA/big", &c, 8192, 8192, true);
     }
     #[cfg(feature = "rocm")]
     {
