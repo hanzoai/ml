@@ -13,6 +13,7 @@ members = [
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
     "hanzo-nn",
+    "hanzo-research",
     "hanzo-train",
     "hanzo-training",
     "hanzo-transformers",
