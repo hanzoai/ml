@@ -2,8 +2,9 @@
 //!
 //! Record and query R&D evidence from Rust: the ONE way hanzo-ml / hanzo-engine kernel
 //! benchmarks self-log to the unified cloud research plane (`/v1/research`, HIP-0512).
-//! The Rust peer of `hanzo_research` (Python) — identical verbs, identical wire records,
-//! so every language accrues into one evidence corpus.
+//! The Rust peer of `hanzo_research` (Python) — identical verbs. Records are semantically
+//! identical across languages (the server keys on `(project, id = kind:subject:task)`), so
+//! every language accrues into one evidence corpus regardless of JSON serialization.
 //!
 //! ```no_run
 //! use hanzo_research::{Research, Verdict};
@@ -31,6 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +63,9 @@ pub const DEFAULT_LIBS: &[&str] = &[
 const DEFAULT_BASE: &str = "https://api.hanzo.ai";
 const NARRATIVE_WINDOW: usize = 10;
 const TIMEOUT: Duration = Duration::from_secs(120);
+/// Response-body cap (8 MiB): a hostile or broken server cannot stream an unbounded body to
+/// OOM the client. Parity with the Go/C++ ports.
+const MAX_RESPONSE_BYTES: u64 = 8 << 20;
 
 /// The crate's result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -172,7 +177,13 @@ impl Research {
             repo.to_string()
         };
         let names: &[&str] = if libs.is_empty() { DEFAULT_LIBS } else { libs };
-        let agent = ureq::AgentBuilder::new().timeout(TIMEOUT).build();
+        // Never follow redirects: a /v1/research endpoint has no legitimate redirect, so
+        // refusing them removes any SSRF/cross-host bounce surface. (ureq already strips the
+        // Authorization header across hosts; this closes the redirect entirely.)
+        let agent = ureq::AgentBuilder::new()
+            .timeout(TIMEOUT)
+            .redirects(0)
+            .build();
         Research {
             inner: Arc::new(Inner {
                 git: provenance::git_state(&repo),
@@ -287,13 +298,13 @@ impl Research {
             .auth(self.inner.agent.post(&url))
             .set("Content-Type", "application/json")
             .send_bytes(&bytes)?;
-        Ok(serde_json::from_reader(resp.into_reader())?)
+        read_json(resp)
     }
 
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = format!("{}{path}", self.inner.base);
         let resp = self.auth(self.inner.agent.get(&url)).call()?;
-        Ok(serde_json::from_reader(resp.into_reader())?)
+        read_json(resp)
     }
 
     /// The git sha of this experiment's last recorded run, for the since-narrative.
@@ -465,8 +476,8 @@ impl Experiment {
 
     /// Post the run in-flight exactly once, capturing the commit narrative since its last
     /// recorded run. Called at the top of every entry method, so the in-flight record is
-    /// stamped with the frame (hypothesis/predict) but before any log — byte-identical to
-    /// the Python running post. Marks started only on success, so a failed post retries.
+    /// stamped with the frame (hypothesis/predict) but before any log — the same in-flight
+    /// record the Python SDK posts. Marks started only on success, so a failed post retries.
     fn start(&mut self) -> Result<()> {
         if self.started {
             return Ok(());
@@ -565,8 +576,9 @@ impl Outcome {
 
 // ── wire records (the exact shape every language's SDK produces) ─────────────────────────
 
-/// One experiment version on the wire. Field order mirrors the Python SDK; JSON object
-/// identity is order-independent, so records are indistinguishable across languages.
+/// One experiment version on the wire. Field order mirrors the Python SDK for readability;
+/// JSON objects are unordered and the server keys on (project, id), so records are
+/// semantically identical across languages regardless of serialization.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExperimentRecord {
     pub id: String,
@@ -714,6 +726,23 @@ pub struct KindTotal {
 
 // ── helpers ──────────────────────────────────────────────────────────────────────────────
 
+/// Deserialize a JSON response body under a hard size cap, so a hostile server cannot stream
+/// an unbounded body to OOM the client. Reads one byte past the cap to detect an overflow
+/// rather than silently truncating.
+fn read_json<T: serde::de::DeserializeOwned>(resp: ureq::Response) -> Result<T> {
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "research: response exceeds size cap",
+        )));
+    }
+    Ok(serde_json::from_slice(&buf)?)
+}
+
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Lowercase hex sha256 of the bytes — the client-side integrity hash the server verifies.
@@ -822,7 +851,7 @@ mod tests {
     #[test]
     fn running_post_has_empty_log_and_no_verdict() {
         // The in-flight record carries the frame (hypothesis/predict) but no verdict and
-        // an empty log — byte-identical to the Python running post.
+        // an empty log — the same in-flight record the Python SDK posts.
         let mut e = pinned();
         e.hypothesis = "H".into();
         e.predict = "P".into();
