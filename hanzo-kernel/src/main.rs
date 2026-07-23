@@ -906,9 +906,33 @@ fn main() {
         let c = WgpuRuntime::client(&WgpuDevice::default());
         check::<WgpuRuntime>("METAL", &c, rows, k);
         check_q4k::<WgpuRuntime>("METAL", &c, rows, k);
-        // Same Qwen3-30B-A3B-shaped MoE decode the Vulkan block gates on, so the DSL's expert-gather is
-        // proven on Metal too and the two backends are compared on identical shapes.
+        // Full Qwen3 decode board on cubecl-Metal: same shapes the Vulkan branch gates on, so the DSL's
+        // decode kernels are proven bit-exact on Metal and the two backends compare on identical shapes.
+        // This branch is ALSO the MSL-dump source (CUBECL_DEBUG_LOG=1) for the ml-encoder DSL-vs-hand
+        // board (metal_dsl_board): running each #[kernel] here emits its cubecl MSL to the log.
+        // RMSNorm (norm column): decode single row + prefill/batch.
+        check_rms::<WgpuRuntime>("METAL", &c, 1, 4096);
+        check_rms::<WgpuRuntime>("METAL", &c, 512, 4096);
+        // Router gate GEMV (fp32 Linear): n=128 experts, k=2048 hidden (Qwen3-30B-A3B), sweep nt.
+        check_gemv::<WgpuRuntime>("METAL", &c, 128, 2048, 32);
+        check_gemv::<WgpuRuntime>("METAL", &c, 128, 2048, 64);
+        check_gemv::<WgpuRuntime>("METAL", &c, 128, 2048, 128);
+        check_gemv::<WgpuRuntime>("METAL", &c, 128, 2048, 256);
+        // Fused top-k router (128 experts, top-8): decode batch + prefill batch.
+        check_moe_route::<WgpuRuntime>("METAL", &c, 8, 128, 8, 128);
+        check_moe_route::<WgpuRuntime>("METAL", &c, 512, 128, 8, 128);
+        // NB: check_sdpa_blk is omitted here -- cubecl 0.10 errors in its Metal client.profile
+        // timing path for sdpa_blk (execution error during profiling); the kernel itself is bit-exact
+        // (see flash-metal-check for the device-timestamped attention A/B). Tracked as a next-step.
+        // NB: check_matvec_q4k_dp4a_blk (DENSE int8 dp4a matvec) is omitted -- it panics in wgpu
+        // (worker-thread abort -> zero output, scale_rel 1.0) on cubecl 0.10 Metal, though the MoE dp4a
+        // twin below dispatches fine. Root-cause is a next-step; the f32-direct + naive Q4_K paths cover
+        // dense decode on Metal meanwhile.
+        // MoE expert matvec (gate/up n=768, down n=2048): naive + block + dp4a variants.
         check_moe_q4k::<WgpuRuntime>("METAL", &c, 128, 768, 8, 2048);
+        check_moe_q4k_blk::<WgpuRuntime>("METAL", &c, 128, 768, 8, 2048, 64);
+        check_moe_q4k_dp4a_blk::<WgpuRuntime>("METAL", &c, 128, 768, 8, 2048, 64);
+        check_moe_q6k::<WgpuRuntime>("METAL", &c, 128, 768, 8, 2048);
         check_dp4a::<WgpuRuntime>("METAL", &c, rows, k, true);
     }
     #[cfg(feature = "cuda")]
