@@ -2449,3 +2449,138 @@ mod dsl_metal_dispatch {
         assert!(mr < 2e-3, "seam dispatch_dsl rms_norm_blk max_rel {mr}");
     }
 }
+
+// The DSL-vs-hand decode board: a committed DSL (cubecl) kernel raced against its shipped hand-written
+// Metal twin, on the SAME device through ml's real encoder, at live decode + batch shapes. The arm
+// gates the DSL output bit-exact against a CPU oracle (scale-relative: max|Δ| / max|ref|, the
+// signed-affine-safe metric) and reports the DSL/hand wall-clock ratio (best-of-N, pipelines
+// pre-compiled outside the timing loop so neither arm pays library-compile cost -- `dispatch_dsl`
+// recompiles per call, which would measure codegen not kernel). Timing is wall-clock, so it is only
+// meaningful on a quiet GPU; correctness always runs, the ratio is a sign not a spec. A DSL arm earns
+// the production path only where it MEASURES >= hand here.
+//
+// This module holds the NORM arm (the DSL twin ml commits as `rms_norm_blk.metal`). The compute-heavy
+// arms are measured at the cubecl layer by the sibling hanzo-kernel Metal binaries, whose device-
+// timestamp numbers (not wall clock) are the honest source there:
+//   - f16 8x8 simdgroup_matrix flash + the raw `cmma8` probe  -> `flash-metal-check` (probe8|cmma|bench)
+//   - quant matvec (q8 / Q4_K / dp4a-blk / MoE), bit-exact + GB/s -> `matvec-check` (metal feature)
+// int8 tensor cores are impossible on Apple silicon: `simdgroup_matrix` is float-only and 8x8x8 only,
+// so the int8 `cmma::execute::<i8,i8,i32,i32>` 16x16x16 MMQ GEMM has no Metal lowering -- the Metal MMA
+// arm is necessarily the f16 one above.
+#[cfg(test)]
+mod metal_dsl_board {
+    use super::*;
+    use crate::Device;
+
+    // Scale-relative divergence: max|Δ| / max|ref|. Per-element relative error explodes on near-zero
+    // cancellation (false failures on affine/signed outputs); the scale-relative form is the correct gate.
+    fn scale_rel(want: &[f32], got: &[f32]) -> f32 {
+        let maxref = want.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+        got.iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / maxref
+    }
+
+    // Best-of-`iters` wall-clock ms for one dispatch: `encode` records the op, then the device is
+    // committed + waited. Warmup absorbs first-call pipeline compile + allocation so the timed body is
+    // steady-state kernel + submit only -- the identical overhead each arm pays, so the ratio is honest.
+    fn best_ms(md: &MetalDevice, iters: usize, warmup: usize, mut encode: impl FnMut()) -> f64 {
+        for _ in 0..warmup {
+            encode();
+            md.wait_until_completed().unwrap();
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..iters {
+            let t = std::time::Instant::now();
+            encode();
+            md.wait_until_completed().unwrap();
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        best
+    }
+
+    fn rms_ref(x: &[f32], w: &[f32], rows: usize, n: usize, eps: f32) -> Vec<f32> {
+        let mut o = vec![0f32; rows * n];
+        for r in 0..rows {
+            let b = r * n;
+            let ss: f32 = (0..n).map(|i| x[b + i] * x[b + i]).sum();
+            let d = (ss / n as f32 + eps).sqrt();
+            for i in 0..n {
+                o[b + i] = x[b + i] / d * w[i];
+            }
+        }
+        o
+    }
+
+    // NORM arm: DSL `rms_norm_blk_f_f32` (threadgroup-per-row, shared-mem tree reduction, fixed 128
+    // threads -- its committed MSL statically sizes the reduction scratch at 128 floats) vs the hand
+    // `rmsnorm_f32` (candle/llama reduce.metal, up to 1024 threads/row). Both f32, same rows x n.
+    #[test]
+    fn board_rms_norm() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let msl = format!(
+            "#include <metal_stdlib>\n{}",
+            include_str!("../metal/dsl/rms_norm_blk.metal")
+        );
+        let pl = md.compile_msl("rms_norm_blk_f_f32", &msl).unwrap();
+        let eps = 1e-5f32;
+        eprintln!("[board rms_norm] shape        hand_ms    dsl_ms   dsl/hand   dsl_rel  hand_rel");
+        for &(rows, n) in &[(1usize, 4096usize), (512, 4096), (1, 5120), (512, 5120)] {
+            let x: Vec<f32> = (0..rows * n).map(|i| ((i % 251) as f32 - 125.0) * 0.01).collect();
+            let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 7) as f32 * 0.05).collect();
+            let want = rms_ref(&x, &w, rows, n, eps);
+
+            let xb = md.new_buffer_with_data(&x).unwrap();
+            let wb = md.new_buffer_with_data(&w).unwrap();
+            let ob_dsl = md.new_buffer_with_data(&vec![0f32; rows * n]).unwrap();
+            let ob_hand = md.new_buffer_with_data(&vec![0f32; rows * n]).unwrap();
+            let eb = md.new_buffer_with_data(&[eps][..]).unwrap();
+            let ndb = md.new_buffer_with_data(&[n as u32][..]).unwrap();
+            let ib = md.new_buffer_with_data(&[0u32; 10][..]).unwrap();
+
+            let grid = objc2_metal::MTLSize { width: rows, height: 1, depth: 1 };
+            let tg = objc2_metal::MTLSize { width: 128, height: 1, depth: 1 };
+            let enc_dsl = || {
+                let enc = md.command_encoder().unwrap();
+                let e = enc.as_ref();
+                e.set_compute_pipeline_state(&pl);
+                e.set_input_buffer(0, Some(&*xb), 0);
+                e.set_input_buffer(1, Some(&*wb), 0);
+                e.set_output_buffer(2, Some(&*ob_dsl), 0);
+                e.set_input_buffer(3, Some(&*eb), 0);
+                e.set_input_buffer(4, Some(&*ndb), 0);
+                e.set_input_buffer(5, Some(&*ib), 0);
+                e.dispatch_thread_groups(grid, tg);
+            };
+            let enc_hand = || {
+                let enc = md.command_encoder().unwrap();
+                hanzo_metal_kernels::call_rms_norm(
+                    &md.device, &enc, &md.kernels, "rmsnorm_f32", rows * n, n, eps, &xb, 0, &wb, 0,
+                    &ob_hand,
+                )
+                .unwrap();
+            };
+
+            enc_dsl();
+            md.wait_until_completed().unwrap();
+            let dsl_rel = scale_rel(&want, &read_to_vec(&ob_dsl, rows * n));
+            enc_hand();
+            md.wait_until_completed().unwrap();
+            let hand_rel = scale_rel(&want, &read_to_vec(&ob_hand, rows * n));
+
+            let hand_ms = best_ms(md, 60, 5, enc_hand);
+            let dsl_ms = best_ms(md, 60, 5, enc_dsl);
+            eprintln!(
+                "[board rms_norm] {rows:>4}x{n:<5}  {hand_ms:8.4}  {dsl_ms:8.4}   {:.3}x   {dsl_rel:.1e}  {hand_rel:.1e}",
+                dsl_ms / hand_ms
+            );
+            assert!(dsl_rel < 2e-3, "DSL rms_norm not bit-exact at {rows}x{n}: {dsl_rel}");
+        }
+    }
+}
