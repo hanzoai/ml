@@ -56,16 +56,26 @@ pub fn git_state(repo: &str) -> Git {
 /// last recorded run's sha when known (`<since>..HEAD`), else the last `window` commits.
 /// Research self-documents as a side effect of running: commit normally, nothing extra.
 pub fn commit_narrative(repo: &str, since_sha: &str, window: usize) -> Vec<String> {
-    let raw = if since_sha.is_empty() {
-        git(repo, &["log", &format!("-{window}"), "--format=%s"])
-    } else {
+    // since_sha can arrive from a server response and reaches `git log <since>..HEAD`; only a
+    // git object id (hex) is accepted, so it can never be read as a flag or a path — anything
+    // else falls back to the recent window. Parity with the C++ port.
+    let raw = if is_object_id(since_sha) {
         git(repo, &["log", &format!("{since_sha}..HEAD"), "--format=%s"])
+    } else {
+        git(repo, &["log", &format!("-{window}"), "--format=%s"])
     };
     raw.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// True when `s` is a git object id — hex only, 1..=64 chars (sha1=40, sha256=64). Gating a
+/// server-supplied `since` to hex means it can never be read as a git flag (a leading `-`)
+/// or a path (`/`), which closes the arg-injection.
+fn is_object_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// `{crate: version}` resolved from the repo's `Cargo.lock`, for the named crates that
@@ -169,5 +179,20 @@ version = "1.7.92"
         // A crate asked for but absent is simply skipped (no panic, no empty entry).
         let miss = lib_versions_from_lock(lock, &["does-not-exist"]);
         assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn since_must_be_a_git_object_id() {
+        // A real object id drives `<since>..HEAD`.
+        assert!(is_object_id("abc123"));
+        assert!(is_object_id(&"a".repeat(40))); // sha1
+        assert!(is_object_id(&"F".repeat(64))); // sha256
+                                                // Anything else falls back to the window — no git flag/path can be injected.
+        assert!(!is_object_id("")); // empty
+        assert!(!is_object_id("--output=/tmp/pwned")); // flag injection
+        assert!(!is_object_id("HEAD~5")); // ~ not hex
+        assert!(!is_object_id("../etc")); // path chars
+        assert!(!is_object_id("a b")); // whitespace
+        assert!(!is_object_id(&"a".repeat(65))); // too long
     }
 }
