@@ -9133,6 +9133,14 @@ mod dsl_dispatch_proof {
     /// overhead cancels in the ratio -- this same-harness ratio is the go/no-go for routing coopmat
     /// into matmul_q4k_gpu_off (a cache-warm ratio, NOT an absolute in-engine number). Gated on
     /// HANZO_MMQ_AB=1 so it never runs in normal CI.
+    ///
+    /// Measured on gfx1151/RADV as the sole GPU workload: the DSL i8 coopmat arm (`mmq_q4k_rt`) runs
+    /// 0.51-0.78x of the dp4a hand tile across the ffn/attn projection shapes (only the tiny n=256
+    /// edge wins, 1.50x) and ~0.12-0.18x of the shipped f16 coopmat default (`mul_mm_q4k_coopmat`,
+    /// ~18-20 TF vs the i8 path's ~2.2-3.3 TF). The int8 matrix-core path does not reach f16
+    /// matrix-core throughput on this device, so the DSL MMQ stays dormant and the hand f16 coopmat
+    /// keeps the live prefill path. Re-run when the DSL grows an f16-accumulate MMQ; int8 alone
+    /// will not close this.
     #[test]
     fn mmq_q4k_coopmat_vs_dp4a_prefill_ab() {
         if std::env::var_os("HANZO_MMQ_AB").is_none() {
