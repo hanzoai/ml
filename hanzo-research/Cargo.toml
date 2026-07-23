@@ -1,0 +1,19 @@
+[package]
+name = "hanzo-research"
+version = "0.1.0"
+edition = "2021"
+description = "Record and query R&D evidence from Rust — the /v1/research client of the Hanzo ML stack."
+repository = "https://github.com/hanzoai/ml"
+keywords = ["benchmark", "provenance", "research", "machine-learning"]
+categories = ["science", "api-bindings"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { version = "2.12", features = ["tls", "gzip"] }
+base64 = "0.22"
+sha2 = "0.10"
+
+[lints]
+workspace = true
