@@ -5,10 +5,13 @@
 [![docs.rs](https://img.shields.io/docsrs/hanzo-ml?style=flat-square&color=black)](https://docs.rs/hanzo-ml)
 [![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-black?style=flat-square)](https://github.com/hanzoai/ml)
 
-Hanzo ML is a fast, multi-backend tensor and machine-learning framework for Rust with a focus on
-performance (GPU-accelerated) and ease of use — the compute substrate behind [Hanzo](https://hanzo.ai)
-inference. Derived from `candle` and rebuilt for the Hanzo stack, it adds optimizations for Edge AI,
-quantization, multimodal workloads, and NVIDIA GB10 / DGX Spark unified memory.
+**Fast, multi-backend tensor & ML for Rust — CPU · CUDA · Metal · ROCm · Vulkan, with quantization built in.**
+
+Hanzo ML is a lightweight, memory-safe machine-learning framework for Rust, tuned for performance and
+built for real deployment — the compute core beneath [Hanzo](https://hanzo.ai) inference. Rebuilt for the
+Hanzo stack with optimizations for Edge AI, quantization, multimodal workloads, and NVIDIA GB10 / DGX
+Spark unified memory. It's the canonical Rust implementation of the Hanzo compute substrate: one core,
+every backend, from a browser tab to a datacenter GPU.
 
 ## Key Features
 
@@ -181,14 +184,14 @@ And then head over to
 - [`optimisers`](https://github.com/KGrewal1/optimisers): A collection of optimisers
   including SGD with momentum, AdaGrad, AdaDelta, AdaMax, NAdam, RAdam, and RMSprop.
 - [`hanzo-ml-vllm`](https://github.com/hanzoai/hanzo-ml-vllm): Efficient platform for inference and
-  serving local LLMs including an OpenAI compatible API server.
+  serving local LLMs, with a built-in `/v1` HTTP inference server.
 - [`hanzo-ml-ext`](https://github.com/mokeyish/hanzo-ml-ext): An extension library to ML that provides PyTorch functions not currently available in ML.
 - [`hanzo-ml-coursera-ml`](https://github.com/vishpat/hanzo-ml-coursera-ml): Implementation of ML algorithms from Coursera's [Machine Learning Specialization](https://www.coursera.org/specializations/machine-learning-introduction) course.
 - [`kalosm`](https://github.com/floneum/floneum/tree/master/interfaces/kalosm): A multi-modal meta-framework in Rust for interfacing with local pre-trained models with support for controlled generation, custom samplers, in-memory vector databases, audio transcription, and more.
 - [`hanzo-ml-sampling`](https://github.com/hanzoai/hanzo-ml-sampling): Sampling techniques for ML.
 - [`gpt-from-scratch-rs`](https://github.com/jeroenvlek/gpt-from-scratch-rs): A port of Andrej Karpathy's _Let's build GPT_ tutorial on YouTube showcasing the ML API on a toy problem.
 - [`hanzo-ml-einops`](https://github.com/tomsanbear/hanzo-ml-einops): A pure rust implementation of the python [einops](https://github.com/arogozhnikov/einops) library.
-- [`atoma-infer`](https://github.com/atoma-network/atoma-infer): A Rust library for fast inference at scale, leveraging FlashAttention2 for efficient attention computation, PagedAttention for efficient KV-cache memory management, and multi-GPU support. It is OpenAI api compatible.
+- [`atoma-infer`](https://github.com/atoma-network/atoma-infer): A Rust library for fast inference at scale, leveraging FlashAttention2 for efficient attention computation, PagedAttention for efficient KV-cache memory management, and multi-GPU support. It exposes a `/v1` HTTP inference API.
 - [`llms-from-scratch-rs`](https://github.com/nerdai/llms-from-scratch-rs): A comprehensive Rust translation of the code from Sebastian Raschka's Build an LLM from Scratch book.
 
 If you have an addition to this list, please submit a pull request.
@@ -426,3 +429,9 @@ If you encounter an error like this one `called `Result::unwrap()` on an `Err` v
 `c:\Windows\System32\nvcuda.dll` -> `cuda.dll`
 `c:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\cublas64_12.dll` -> `cublas.dll`
 `c:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\curand64_10.dll` -> `curand.dll`
+
+## Hanzo — the Open AI Cloud
+
+Open source · every language · on-chain settlement. [hanzo.ai](https://hanzo.ai) · [docs.hanzo.ai](https://docs.hanzo.ai)
+
+**SDKs in every language** — [Python](https://github.com/hanzoai/python-sdk) (flagship) · [TypeScript](https://github.com/hanzo-js/sdk) · [Go](https://github.com/hanzo-go/sdk) · [Rust](https://github.com/hanzo-rs/sdk) · [C++](https://github.com/hanzo-cpp/sdk) · [Swift](https://github.com/hanzo-swift/sdk) · [Kotlin](https://github.com/hanzo-kt/sdk) · [umbrella](https://github.com/hanzoai/sdk)
