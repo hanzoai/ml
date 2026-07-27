@@ -1,27 +1,32 @@
 [package]
 name = "hanzo-flash-attn-v3"
-version = "0.11.8"
+version = "0.11.9"
 edition = "2021"
 
-description = "FlashAttention-3 (Hopper/sm90) layer for the Hanzo ML framework."
+description = "FlashAttention-3 (Hopper sm_90a) attention kernels for the Hanzo ML stack — arch-gated behind the `cuda` feature; a no-op stub on every other target."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "BSD-3-Clause OR Apache-2.0"
 readme = "README.md"
-exclude = ["cutlass/docs/**", "cutlass/test/**", "cutlass/examples/**", "cutlass/tools/**", "cutlass/media/**"]
+
+[features]
+default = []
+# Compiles the FA3 Hopper kernels (for `sm_90a`) and enables the CUDA-backed
+# attention entry points. OFF by default: without it `build.rs` does nothing and
+# the crate is a pure-Rust stub, so ROCm / Metal / Vulkan / CPU / non-Hopper CUDA
+# builds are unaffected.
+cuda = ["dep:half", "hanzo-ml/cuda"]
 
 [dependencies]
-hanzo-ml = { path = "../hanzo-ml", features = ["cuda"], package = "hanzo-ml", version = "0.11.8" }
-half = { version = "2.3.1", features = ["num-traits"] }
+hanzo-ml = { workspace = true }
+half = { workspace = true, optional = true }
 
 [build-dependencies]
-anyhow = { version = "1", features = ["backtrace"] }
-num_cpus = "1.15.0"
-rayon = "1.7.0"
-cudaforge = "0.1"
+anyhow = { workspace = true }
+rayon = { workspace = true }
+hanzo-flash-attn-build = { path = "../hanzo-flash-attn-build", version = "0.11.8" }
 
 [dev-dependencies]
-anyhow = { version = "1", features = ["backtrace"] }
-hanzo-nn = { path = "../hanzo-nn", features = ["cuda"] }
+anyhow = { workspace = true }
 rstest = "0.23"
