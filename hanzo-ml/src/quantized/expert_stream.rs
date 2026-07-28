@@ -694,7 +694,12 @@ mod tests {
 
     /// Apply the swap policy to a pinned set exactly as `repin` does (cold slot -> hot expert),
     /// minus the disk I/O, so we can assert on convergence and the swap cap in isolation.
-    fn simulate(heat: &[u32], pinned: &mut Vec<u32>, max_swaps: usize) -> usize {
+    // `&mut [u32]`, not `&mut Vec<u32>`: this only writes through an index and
+    // hands the buffer to tier_pick_swap, which already takes `&[u32]`. It never
+    // grows or shrinks, so requiring a Vec asked callers for a capability the
+    // body does not use (clippy::ptr_arg). Call sites are unchanged — `&mut vec`
+    // derefs to `&mut [_]`.
+    fn simulate(heat: &[u32], pinned: &mut [u32], max_swaps: usize) -> usize {
         let mut swaps = 0;
         while swaps < max_swaps {
             match tier_pick_swap(heat, pinned) {
