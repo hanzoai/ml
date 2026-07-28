@@ -4,13 +4,12 @@
 # GitHub.com ignores .hanzo/, so this file is inert on GitHub and only runs on the
 # native forge -- zero effect on the GitHub CI lane.
 #
-# Ported verbatim -- no `self-hosted` labels to rewrite here. The `fmt`/`clippy`
-# jobs run on `hanzo-build-linux-amd64` (the git-runner maps that label). The
-# `check`/`test` matrix uses GitHub-hosted labels: `ubuntu-latest`/`ubuntu-24.04`
-# are mapped by the git-runner; `windows-latest`, `macOS-latest` and
-# `ubuntu-24.04-arm` need their own git-runner labels / host daemons registered,
-# or those legs queue on the native forge (a runner-provisioning step, not a
-# workflow change).
+# `fmt`/`clippy` run on `hanzo-build-linux-amd64`; `check`/`test` run on the
+# ubuntu labels the git-runner maps. The windows/macOS/arm legs were REMOVED
+# rather than left to queue: this forge registers no runner for them, and an
+# unrunnable leg does not fail, it queues forever and holds the whole run in a
+# non-terminal state. Restoring that coverage is a runner-provisioning step —
+# register the daemons, then re-add the labels here.
 on:
   push:
     branches:
@@ -34,23 +33,36 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04, windows-latest, macOS-latest, ubuntu-24.04-arm]
+      # Scoped to labels this forge ACTUALLY serves. The fleet advertises
+      # ubuntu-latest, ubuntu-22.04, ubuntu-24.04 and hanzo-build-linux-amd64
+      # (plus the three GPU labels); it has no windows-latest, macOS-latest or
+      # ubuntu-24.04-arm runner.
+      #
+      # A leg with no runner does not fail — it QUEUES, indefinitely. Measured on
+      # run 6254: 5 jobs completed success and 5 sat queued forever, so the RUN
+      # never reached a terminal state and this repo reported "running" in
+      # perpetuity. Every job that could execute was already green; the only
+      # thing keeping ml off the board was legs nothing can pick up.
+      #
+      # This is the native-forge copy (.hanzo/workflows is scanned first;
+      # GitHub.com ignores it), so narrowing here costs no GitHub coverage —
+      # and there is no .github/workflows/rust-ci.yml to diverge from; the
+      # header's reference to one is stale.
+      #
+      # Windows/macOS/arm coverage returns by REGISTERING those runners, not by
+      # re-adding the labels. Until then, claiming to test them was a claim the
+      # forge could not honour.
+        os: [ubuntu-latest, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Remove cargo config (macOS ring crate fix)
-        if: runner.os == 'macOS'
-        run: rm -f .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Run macos with metal
-        if: matrix.os == 'macOS-latest'
-        run: cargo check --workspace --features metal
 
       - name: Run normal cpu
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
+        if: matrix.os == 'ubuntu-latest'
         run: cargo check --workspace
 
       - name: Run with avx2
@@ -59,18 +71,15 @@ jobs:
           export RUSTFLAGS="-C target-feature=avx2"
           cargo check --workspace
 
-      - name: Run with arm neon
-        if: matrix.os == 'ubuntu-24.04-arm'
-        run: |
-          export RUSTFLAGS="-C target-feature=neon"
-          cargo check --workspace
 
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
+        # Same reason as the check matrix above: no windows/macOS runner exists,
+        # and a leg with no runner queues forever rather than failing.
+        os: [ubuntu-latest]
     steps:
       # Best-effort, and it must stay best-effort: it reclaims space, it does not
       # gate correctness. As written it FAILED the whole matrix leg —
@@ -107,9 +116,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Remove cargo config (macOS ring crate fix)
-        if: runner.os == 'macOS'
-        run: rm -f .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
       - name: Install lld (Linux only)
         if: runner.os == 'Linux'
@@ -140,12 +146,6 @@ jobs:
         if: runner.os == 'Linux'
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C debuginfo=line-tables-only"
-          CARGO_INCREMENTAL: "0"
-        run: cargo test --workspace
-      - name: Run tests (Windows & macOS)
-        if: runner.os != 'Linux'
-        env:
-          RUSTFLAGS: "-C debuginfo=line-tables-only"
           CARGO_INCREMENTAL: "0"
         run: cargo test --workspace
 
