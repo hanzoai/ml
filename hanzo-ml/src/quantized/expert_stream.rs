@@ -537,7 +537,9 @@ fn load_and_pin(banks: &[Arc<ExpertStreamBank>], cap: usize) -> usize {
             continue;
         };
         let mut rows = rows.clone();
-        rows.sort_by(|a, c| c.1.cmp(&a.1));
+        // Descending by count. `Reverse` rather than swapping the operands, which is
+        // what clippy's sort_by_key lint asks for and reads as the intent.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
         for (eid, _) in rows.into_iter().take(pin_budget) {
             if eid as usize >= b.n_experts {
                 continue;
