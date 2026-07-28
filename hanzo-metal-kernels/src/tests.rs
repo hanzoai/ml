@@ -2483,11 +2483,7 @@ fn quantized_matmul_mm_f16_weight_m4_matches_reference() {
         }
     }
     // A row/column aliasing regression would make activation rows 0 and 1 produce identical outputs.
-    assert_ne!(
-        &got[0..n],
-        &got[n..2 * n],
-        "F16 GEMM aliased rows 0 and 1"
-    );
+    assert_ne!(&got[0..n], &got[n..2 * n], "F16 GEMM aliased rows 0 and 1");
     for idx in 0..m * n {
         assert!(
             (got[idx] - exp[idx]).abs() < 0.15,

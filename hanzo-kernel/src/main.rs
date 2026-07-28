@@ -4,32 +4,46 @@
 //! compiled GPU backend, matches the CPU oracle bit-exactly, and reports per-backend throughput -- the
 //! perf gate that decides whether a hand-tuned kernel can be retired for its DSL twin.
 
+use hanzo_kernel::attn::{sdpa_blk, sdpa_blk_run, sdpa_ref};
+use hanzo_kernel::norm::rms_norm_run;
 use hanzo_kernel::prelude::*;
 use hanzo_kernel::quant::{
-    gen_moe_q4k, gen_moe_q6k, gen_q4k, gen_q8_0_packed, matvec_q4k_bench, matvec_q4k_ref, matvec_q4k_run,
-    matvec_q8_0_packed_ref, matvec_q8_0_packed_run, matvec_q8_0_packed_sg_run, matvec_q8_bench, matvec_q8_dp4a_blk_run,
-    matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref, matvec_q8_ref, matvec_q8_run,
-    moe_matvec_q4k_bench, moe_matvec_q4k_blk_bench, moe_matvec_q4k_blk_run, moe_matvec_q4k_ref, moe_matvec_q4k_run,
-    moe_matvec_q6k_bench, moe_matvec_q6k_blk_bench, moe_matvec_q6k_blk_run, moe_matvec_q6k_ref, moe_matvec_q6k_run,
-    moe_route, moe_route_ref, moe_route_run, gemv, gemv_run,
-    moe_matvec_q4k_dp4a_blk, moe_matvec_q4k_dp4a_blk_run, quant_act_q8_cpu,
-    moe_matvec_q6k_dp4a_blk, moe_matvec_q6k_dp4a_blk_run,
-    matvec_q4k_dp4a_blk, matvec_q4k_dp4a_blk_run, matvec_q4k_f32_blk_run, pack_q4k, QK8_0,
+    gemv, gemv_run, gen_moe_q4k, gen_moe_q6k, gen_q4k, gen_q8_0_packed, matvec_q4k_bench,
+    matvec_q4k_dp4a_blk, matvec_q4k_dp4a_blk_run, matvec_q4k_f32_blk_run, matvec_q4k_ref,
+    matvec_q4k_run, matvec_q8_0_packed_ref, matvec_q8_0_packed_run, matvec_q8_0_packed_sg_run,
+    matvec_q8_bench, matvec_q8_dp4a_blk_run, matvec_q8_dp4a_i8_run, matvec_q8_dp4a_ref,
+    matvec_q8_ref, matvec_q8_run, moe_matvec_q4k_bench, moe_matvec_q4k_blk_bench,
+    moe_matvec_q4k_blk_run, moe_matvec_q4k_dp4a_blk, moe_matvec_q4k_dp4a_blk_run,
+    moe_matvec_q4k_ref, moe_matvec_q4k_run, moe_matvec_q6k_bench, moe_matvec_q6k_blk_bench,
+    moe_matvec_q6k_blk_run, moe_matvec_q6k_dp4a_blk, moe_matvec_q6k_dp4a_blk_run,
+    moe_matvec_q6k_ref, moe_matvec_q6k_run, moe_route, moe_route_ref, moe_route_run, pack_q4k,
+    quant_act_q8_cpu, QK8_0,
 };
 use std::time::Instant;
-use hanzo_kernel::norm::rms_norm_run;
-use hanzo_kernel::attn::{sdpa_blk, sdpa_blk_run, sdpa_ref};
 
 // dp4a matvec parity: i8-packed one-thread-per-row (portable) vs block-per-row (coalesced reads +
 // shared-mem reduction, the bandwidth-bound winner). GB/s is on REAL int8 bytes (rows*k) so it
 // compares fairly to the hand-tuned dp4a (~166 GB/s; gfx1151 DRAM roofline ~256, MALL cache ~32MB).
 // `coop` gates the block kernels: cubecl-cpu has no cooperative thread-blocks, so they run GPU-only.
-fn check_dp4a<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize, coop: bool) {
+fn check_dp4a<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    rows: usize,
+    k: usize,
+    coop: bool,
+) {
     let mut s = 0x9E3779B9_7F4A7C15u64;
-    let mut nxt = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let mut nxt = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
     let wq8: Vec<i8> = (0..rows * k).map(|_| (nxt() % 255) as i8).collect();
     let xq8: Vec<i8> = (0..k).map(|_| (nxt() % 255) as i8).collect();
-    let wd: Vec<f32> = (0..rows * k / 32).map(|_| (nxt() % 1000) as f32 / 8000.0 + 0.01).collect();
+    let wd: Vec<f32> = (0..rows * k / 32)
+        .map(|_| (nxt() % 1000) as f32 / 8000.0 + 0.01)
+        .collect();
     let wq32: Vec<i32> = wq8.iter().map(|&x| x as i32).collect();
     let xq32: Vec<i32> = xq8.iter().map(|&x| x as i32).collect();
     let reference = matvec_q8_dp4a_ref(&wq32, &xq32, &wd, rows, k);
@@ -39,15 +53,31 @@ fn check_dp4a<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k:
         let rel = max_rel(&reference, &out);
         println!(
             "[{:<7}] dp4a/{:<6} {}x{}  max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
-            name, tag, rows, k, rel,
-            if rel < 2e-2 { "MATCH ✓" } else { "MISMATCH ✗" },
-            ms, real_bytes / (ms * 1e6), flop / (ms * 1e6)
+            name,
+            tag,
+            rows,
+            k,
+            rel,
+            if rel < 2e-2 {
+                "MATCH ✓"
+            } else {
+                "MISMATCH ✗"
+            },
+            ms,
+            real_bytes / (ms * 1e6),
+            flop / (ms * 1e6)
         );
     };
-    report("i8pack", matvec_q8_dp4a_i8_run(client, &wq8, &xq8, &wd, rows, k, 50));
+    report(
+        "i8pack",
+        matvec_q8_dp4a_i8_run(client, &wq8, &xq8, &wd, rows, k, 50),
+    );
     if coop {
         for nt in [64usize, 128, 256] {
-            report(&format!("blk{nt}"), matvec_q8_dp4a_blk_run(client, &wq8, &xq8, &wd, rows, k, nt, 50));
+            report(
+                &format!("blk{nt}"),
+                matvec_q8_dp4a_blk_run(client, &wq8, &xq8, &wd, rows, k, nt, 50),
+            );
         }
     }
 }
@@ -83,15 +113,28 @@ fn check_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: 
     let gflops = 2.0 * rows as f64 * k as f64 / (ms * 1e6);
     println!(
         "[{:<7}] Q4_K   {}x{}  max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
-        name, rows, k, rel,
-        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        name,
+        rows,
+        k,
+        rel,
+        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" },
+        ms,
+        gbps,
+        gflops
     );
 }
 
 // Q4_K indexed-MoE matvec: the DSL expert-gather kernel. Bit-exact gate + kernel-only weight BW on
 // the REAL Q4_K footprint of the routed rows (slots*n rows x 144 B/superblock). This is the DSL twin
 // the hand-rolled moe_matvec_q4k shader is gated against before it can be retired to an oracle.
-fn check_moe_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize) {
+fn check_moe_q4k<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    e: usize,
+    n: usize,
+    slots: usize,
+    k: usize,
+) {
     let (wqs, wsc, wd, wdm, x, ids) = gen_moe_q4k(e, n, slots, k);
     let reference = moe_matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
     let got = moe_matvec_q4k_run::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
@@ -104,8 +147,16 @@ fn check_moe_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n:
     let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
     println!(
         "[{:<7}] MoEQ4K E{} {}x{}x{}  max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
-        name, e, slots, n, k, rel,
-        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        name,
+        e,
+        slots,
+        n,
+        k,
+        rel,
+        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" },
+        ms,
+        gbps,
+        gflops
     );
 }
 
@@ -114,7 +165,13 @@ fn check_moe_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n:
 // Dense dp4a Q4_K matvec (block-reduce) vs the f32 oracle. The decode-perf fix for the attention
 // projections that the prefill dp4a GEMM runs 1-thread-per-row. Kernel-only GB/s on the real 144 B/
 // superblock weight footprint -- directly comparable to the scalar/prefill dp4a paths.
-fn check_matvec_q4k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, nout: usize, k: usize, nt: usize) {
+fn check_matvec_q4k_dp4a_blk<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    nout: usize,
+    k: usize,
+    nt: usize,
+) {
     let (wqs, wsc, wd, wdm, x) = gen_q4k(nout, k);
     let reference = matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, nout, k);
     let got = matvec_q4k_dp4a_blk_run::<R>(client, &wqs, &wsc, &wd, &wdm, &x, nout, k, nt);
@@ -130,7 +187,9 @@ fn check_matvec_q4k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, 
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; nout]));
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q4k_dp4a_blk::launch_unchecked::<f32, R>(
-            c, Grid::Static(nout as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static(nout as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(wh.clone(), packed.len()),
             ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
@@ -140,26 +199,46 @@ fn check_matvec_q4k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, 
             nt,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t0 = Instant::now();
-    for _ in 0..100 { launch(client); }
+    for _ in 0..100 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let ms = t0.elapsed().as_secs_f64() * 1e3 / 100.0;
     let gbps = (nout * (k / 256) * 144) as f64 / (ms * 1e6);
     println!(
         "[{:<7}] Q4Kdp4a {}x{} nt={:<3} scale_rel={:.2e}  {}  {:.4} ms  {:.0} GB/s",
-        name, nout, k, nt, srel, if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps
+        name,
+        nout,
+        k,
+        nt,
+        srel,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        ms,
+        gbps
     );
 }
 
-fn check_moe_q4k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
+fn check_moe_q4k_blk<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    e: usize,
+    n: usize,
+    slots: usize,
+    k: usize,
+    nt: usize,
+) {
     let (wqs, wsc, wd, wdm, x, ids) = gen_moe_q4k(e, n, slots, k);
     let reference = moe_matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
     let got = moe_matvec_q4k_blk_run::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k, nt);
     let srel = scalerel(&reference, &got);
     let ok = srel < 1e-3;
-    let ms = moe_matvec_q4k_blk_bench::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k, nt, 50);
+    let ms =
+        moe_matvec_q4k_blk_bench::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k, nt, 50);
     let wbytes = slots * n * (k / 256) * 144;
     let gbps = wbytes as f64 / (ms * 1e6);
     let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
@@ -174,10 +253,19 @@ fn check_moe_q4k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize
 // gate is looser (scale_rel < 1e-2 -- the ~0.5-1% activation quant error, same tolerance as the dense
 // dp4a path). Kernel-only GB/s on the real Q4_K weight footprint (144 B/superblock) -- the same bytes
 // the f32 block kernel reads, so GB/s is directly comparable (dp4a wins on ALU, not bandwidth).
-fn check_moe_q4k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
+fn check_moe_q4k_dp4a_blk<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    e: usize,
+    n: usize,
+    slots: usize,
+    k: usize,
+    nt: usize,
+) {
     let (wqs, wsc, wd, wdm, x, ids) = gen_moe_q4k(e, n, slots, k);
     let reference = moe_matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
-    let got = moe_matvec_q4k_dp4a_blk_run::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k, nt);
+    let got =
+        moe_matvec_q4k_dp4a_blk_run::<R>(client, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k, nt);
     let srel = scalerel(&reference, &got);
     let ok = srel < 1e-2;
     // Kernel-only throughput: pre-quantize + upload once, loop the dispatch (one sync).
@@ -193,7 +281,9 @@ fn check_moe_q4k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: 
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
     let launch = |c: &ComputeClient<R>| unsafe {
         moe_matvec_q4k_dp4a_blk::launch_unchecked::<f32, R>(
-            c, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static((slots * n) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -203,13 +293,19 @@ fn check_moe_q4k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: 
             ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k, nt,
+            n,
+            k,
+            nt,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t0 = Instant::now();
-    for _ in 0..50 { launch(client); }
+    for _ in 0..50 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let ms = t0.elapsed().as_secs_f64() * 1e3 / 50.0;
     let gbps = (slots * n * (k / 256) * 144) as f64 / (ms * 1e6);
@@ -223,7 +319,14 @@ fn check_moe_q4k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: 
 
 // Q6_K indexed-MoE matvec: the DSL twin of moe_matvec_q6k.comp. Bit-exact gate + kernel-only weight
 // BW on the real Q6_K footprint of the routed rows (slots*n rows x 210 B/superblock).
-fn check_moe_q6k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize) {
+fn check_moe_q6k<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    e: usize,
+    n: usize,
+    slots: usize,
+    k: usize,
+) {
     let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
     let reference = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
     let got = moe_matvec_q6k_run::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
@@ -235,8 +338,16 @@ fn check_moe_q6k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n:
     let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
     println!(
         "[{:<7}] MoEQ6K E{} {}x{}x{}  scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
-        name, e, slots, n, k, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        name,
+        e,
+        slots,
+        n,
+        k,
+        srel,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        ms,
+        gbps,
+        gflops
     );
 }
 
@@ -244,10 +355,19 @@ fn check_moe_q6k<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n:
 // dp4a Q6_K MoE parity + throughput, the Q6_K twin of `check_moe_q4k_dp4a_blk`. Same 1e-2 scale-relative
 // gate: the q8 activation is the only approximation, so a decode bug (nibble, 2-bit field, scale half,
 // word alignment) lands orders of magnitude outside it. Q6_K is 210 bytes/superblock, not Q4_K's 144.
-fn check_moe_q6k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
+fn check_moe_q6k_dp4a_blk<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    e: usize,
+    n: usize,
+    slots: usize,
+    k: usize,
+    nt: usize,
+) {
     let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
     let reference = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
-    let got = moe_matvec_q6k_dp4a_blk_run::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, nt);
+    let got =
+        moe_matvec_q6k_dp4a_blk_run::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, nt);
     let srel = scalerel(&reference, &got);
     let ok = srel < 1e-2;
     let (xq, xs, _) = quant_act_q8_cpu(&x, slots, k);
@@ -261,7 +381,9 @@ fn check_moe_q6k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: 
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
     let launch = |c: &ComputeClient<R>| unsafe {
         moe_matvec_q6k_dp4a_blk::launch_unchecked::<f32, R>(
-            c, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static((slots * n) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
             ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
@@ -270,13 +392,19 @@ fn check_moe_q6k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: 
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k, nt,
+            n,
+            k,
+            nt,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t0 = Instant::now();
-    for _ in 0..50 { launch(client); }
+    for _ in 0..50 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let ms = t0.elapsed().as_secs_f64() * 1e3 / 50.0;
     let gbps = (slots * n * (k / 256) * 210) as f64 / (ms * 1e6);
@@ -288,13 +416,22 @@ fn check_moe_q6k_dp4a_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: 
     );
 }
 
-fn check_moe_q6k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize, n: usize, slots: usize, k: usize, nt: usize) {
+fn check_moe_q6k_blk<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    e: usize,
+    n: usize,
+    slots: usize,
+    k: usize,
+    nt: usize,
+) {
     let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
     let reference = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
     let got = moe_matvec_q6k_blk_run::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, nt);
     let srel = scalerel(&reference, &got);
     let ok = srel < 1e-3;
-    let ms = moe_matvec_q6k_blk_bench::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, nt, 50);
+    let ms =
+        moe_matvec_q6k_blk_bench::<R>(client, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k, nt, 50);
     let wbytes = slots * n * (k / 256) * 210;
     let gbps = wbytes as f64 / (ms * 1e6);
     let gflops = 2.0 * (slots * n) as f64 * k as f64 / (ms * 1e6);
@@ -305,11 +442,25 @@ fn check_moe_q6k_blk<R: Runtime>(name: &str, client: &ComputeClient<R>, e: usize
     );
 }
 
-fn check_moe_route<R: Runtime>(name: &str, client: &ComputeClient<R>, ntok: usize, n_experts: usize, topk: usize, nt: usize) {
+fn check_moe_route<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    ntok: usize,
+    n_experts: usize,
+    topk: usize,
+    nt: usize,
+) {
     // Deterministic router logits [ntok, n_experts].
     let mut s = 0x9E3779B97F4A7C15u64;
-    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-    let logits: Vec<f32> = (0..ntok * n_experts).map(|_| (next() % 4000) as f32 / 1000.0 - 2.0).collect();
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let logits: Vec<f32> = (0..ntok * n_experts)
+        .map(|_| (next() % 4000) as f32 / 1000.0 - 2.0)
+        .collect();
     let (ids_ref, w_ref) = moe_route_ref(&logits, ntok, n_experts, topk);
     let (ids_got, w_got) = moe_route_run::<R>(client, &logits, ntok, n_experts, topk, nt);
     // Weights are the correctness contract (scale-exact). A per-token SET difference is a top-k
@@ -318,9 +469,13 @@ fn check_moe_route<R: Runtime>(name: &str, client: &ComputeClient<R>, ntok: usiz
     // non-determinism as llama's unstable Vulkan sort. Count ties; pass on the weights.
     let mut ties = 0usize;
     for tok in 0..ntok {
-        let mut a: Vec<u32> = ids_ref[tok * topk..(tok + 1) * topk].to_vec(); a.sort_unstable();
-        let mut b: Vec<u32> = ids_got[tok * topk..(tok + 1) * topk].to_vec(); b.sort_unstable();
-        if a != b { ties += 1; }
+        let mut a: Vec<u32> = ids_ref[tok * topk..(tok + 1) * topk].to_vec();
+        a.sort_unstable();
+        let mut b: Vec<u32> = ids_got[tok * topk..(tok + 1) * topk].to_vec();
+        b.sort_unstable();
+        if a != b {
+            ties += 1;
+        }
     }
     let wrel = scalerel(&w_ref, &w_got);
     let ok = wrel < 1e-4;
@@ -330,23 +485,39 @@ fn check_moe_route<R: Runtime>(name: &str, client: &ComputeClient<R>, ntok: usiz
     let wh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; ntok * topk]));
     let launch = |c: &ComputeClient<R>| unsafe {
         moe_route::launch_unchecked::<f32, R>(
-            c, Grid::Static(ntok as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static(ntok as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(lh.clone(), logits.len()),
             ArrayArg::from_raw_parts(ih.clone(), ntok * topk),
             ArrayArg::from_raw_parts(wh.clone(), ntok * topk),
-            n_experts, topk, nt,
+            n_experts,
+            topk,
+            nt,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(ih.clone());
     let t0 = std::time::Instant::now();
-    for _ in 0..200 { launch(client); }
+    for _ in 0..200 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(ih.clone());
     let ms = t0.elapsed().as_secs_f64() * 1e3 / 200.0;
     println!(
         "[{:<7}] MoERoute ntok={} E{} topk={} nt={:<3} w_rel={:.2e} ties={}/{}  {}  {:.4} ms/batch",
-        name, ntok, n_experts, topk, nt, wrel, ties, ntok,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms
+        name,
+        ntok,
+        n_experts,
+        topk,
+        nt,
+        wrel,
+        ties,
+        ntok,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        ms
     );
 }
 
@@ -357,11 +528,24 @@ fn check_moe_route<R: Runtime>(name: &str, client: &ComputeClient<R>, ntok: usiz
 // (no repeat_kv copy). GB/s on the KV bytes actually streamed: n_heads * seq_k * 2d * 4 (Q reread is
 // tiny). Decode shape: seq_q=1, causal=false (the single query attends the whole cache).
 fn check_sdpa_blk<R: Runtime>(
-    name: &str, client: &ComputeClient<R>,
-    n_heads: usize, n_kv: usize, seq_q: usize, seq_k: usize, kv_seq_pad: usize, d: usize, causal: bool, nt: usize,
+    name: &str,
+    client: &ComputeClient<R>,
+    n_heads: usize,
+    n_kv: usize,
+    seq_q: usize,
+    seq_k: usize,
+    kv_seq_pad: usize,
+    d: usize,
+    causal: bool,
+    nt: usize,
 ) {
     let mut s = 0x2545F4914F6CDD1Du64;
-    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
     let mut rnd = |_| (next() % 2000) as f32 / 1000.0 - 1.0;
     let q: Vec<f32> = (0..n_heads * seq_q * d).map(&mut rnd).collect();
     // Packed k/v [n_kv, seq_k, d] for the CPU oracle.
@@ -381,7 +565,9 @@ fn check_sdpa_blk<R: Runtime>(
     };
     let kp = pad(&k);
     let vp = pad(&v);
-    let got = sdpa_blk_run::<R>(client, &q, &kp, &vp, n_heads, n_kv, seq_q, seq_k, kv_seq_pad, d, causal, nt);
+    let got = sdpa_blk_run::<R>(
+        client, &q, &kp, &vp, n_heads, n_kv, seq_q, seq_k, kv_seq_pad, d, causal, nt,
+    );
     // scale-relative (normalized by max output magnitude): the honest metric for attention. Per-element
     // max_rel explodes on near-zero outputs (softmax-weighted sums of ±V cancel to ~0; flash vs two-pass
     // differ only in fp summation ORDER, ~1e-6, amplified by that cancellation's condition number).
@@ -391,8 +577,14 @@ fn check_sdpa_blk<R: Runtime>(
     // Kernel-only throughput (fixed buffers, 200 dispatches, one sync). Uses the padded strided buffers.
     let scale = 1.0f32 / (d as f32).sqrt();
     let meta = [
-        seq_q as u32, seq_k as u32, n_heads as u32, n_kv as u32, causal as u32,
-        (n_kv * kv_seq_pad * d) as u32, (kv_seq_pad * d) as u32, d as u32,
+        seq_q as u32,
+        seq_k as u32,
+        n_heads as u32,
+        n_kv as u32,
+        causal as u32,
+        (n_kv * kv_seq_pad * d) as u32,
+        (kv_seq_pad * d) as u32,
+        d as u32,
     ];
     let qh = client.create_from_slice(f32::as_bytes(&q));
     let kh = client.create_from_slice(f32::as_bytes(&kp));
@@ -402,20 +594,27 @@ fn check_sdpa_blk<R: Runtime>(
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n_heads * seq_q * d]));
     let launch = |c: &ComputeClient<R>| unsafe {
         sdpa_blk::launch_unchecked::<f32, R>(
-            c, Grid::Static((n_heads * seq_q) as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static((n_heads * seq_q) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qh.clone(), q.len()),
             ArrayArg::from_raw_parts(kh.clone(), kp.len()),
             ArrayArg::from_raw_parts(vh.clone(), vp.len()),
             ArrayArg::from_raw_parts(oh.clone(), n_heads * seq_q * d),
             ArrayArg::from_raw_parts(sh.clone(), 1),
             ArrayArg::from_raw_parts(mh.clone(), 8),
-            d, nt,
+            d,
+            nt,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t0 = Instant::now();
-    for _ in 0..200 { launch(client); }
+    for _ in 0..200 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let ms = t0.elapsed().as_secs_f64() * 1e3 / 200.0;
     let kv_bytes = (n_heads * seq_k * 2 * d * 4) as f64; // Q@K + P@V both stream the GQA-expanded KV
@@ -432,10 +631,21 @@ fn check_sdpa_blk<R: Runtime>(
 // weight bytes (n*k*4) -- the router reads 2MB fp32 (128x4096) every layer.
 fn check_gemv<R: Runtime>(name: &str, client: &ComputeClient<R>, n: usize, k: usize, nt: usize) {
     let mut s = 0x9E3779B97F4A7C15u64;
-    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-    let w: Vec<f32> = (0..n * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
-    let x: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
-    let want: Vec<f32> = (0..n).map(|r| (0..k).map(|i| w[r * k + i] * x[i]).sum()).collect();
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let w: Vec<f32> = (0..n * k)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
+    let x: Vec<f32> = (0..k)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
+    let want: Vec<f32> = (0..n)
+        .map(|r| (0..k).map(|i| w[r * k + i] * x[i]).sum())
+        .collect();
     let got = gemv_run::<R>(client, &w, &x, n, k, nt);
     let rel = scalerel(&want, &got);
     let ok = rel < 1e-4;
@@ -445,7 +655,9 @@ fn check_gemv<R: Runtime>(name: &str, client: &ComputeClient<R>, n: usize, k: us
     let mh = client.create_from_slice(u32::as_bytes(&[k as u32]));
     let launch = |c: &ComputeClient<R>| unsafe {
         gemv::launch_unchecked::<f32, R>(
-            c, Grid::Static(n as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static(n as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(wh.clone(), w.len()),
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(oh.clone(), n),
@@ -453,16 +665,27 @@ fn check_gemv<R: Runtime>(name: &str, client: &ComputeClient<R>, n: usize, k: us
             nt,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t0 = Instant::now();
-    for _ in 0..200 { launch(client); }
+    for _ in 0..200 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let ms = t0.elapsed().as_secs_f64() * 1e3 / 200.0;
     let gbs = (n * k * 4) as f64 / (ms * 1e-3) / 1e9;
     println!(
         "[{:<7}] GEMV {}x{} nt={:<3} scale_rel={:.2e}  {}  {:.4} ms  {:.0} GB/s",
-        name, n, k, nt, rel, if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbs
+        name,
+        n,
+        k,
+        nt,
+        rel,
+        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        ms,
+        gbs
     );
 }
 
@@ -473,30 +696,58 @@ fn check_mmq_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize, n:
     use hanzo_kernel::mmq::{gen_mmq_q4k, mmq_q4k_ref, mmq_q4k_wmma_blk_run};
     let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
     let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
-    let (got, ms) = mmq_q4k_wmma_blk_run::<R>(client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 50);
+    let (got, ms) =
+        mmq_q4k_wmma_blk_run::<R>(client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 50);
     let rel = maxabs_over_max(&got, &want);
     let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
     println!(
         "[{:<7}] MMQ-Q4K {}x{}x{}  rel={:.2e}  {}  {:.3} ms  {:.0} GFLOP/s",
-        name, m, n, k, rel,
-        if rel < 1e-2 { "COOPMAT ✓" } else { "MISMATCH ✗" }, ms, gflops
+        name,
+        m,
+        n,
+        k,
+        rel,
+        if rel < 1e-2 {
+            "COOPMAT ✓"
+        } else {
+            "MISMATCH ✗"
+        },
+        ms,
+        gflops
     );
 }
 
 /// Runtime-dims twin: same affine oracle, but n/k arrive in a meta SSBO so ONE .spv serves any shape.
 /// The dump shape is irrelevant to the .spv (dims are runtime) -- validating at a real multi-N-block
 /// shape (n=4096 = 64 N-blocks) is the proof the CPU oracle can't give (its barrier desyncs multi-cube).
-fn check_mmq_q4k_rt<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize, n: usize, k: usize) {
+fn check_mmq_q4k_rt<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
     use hanzo_kernel::mmq::{gen_mmq_q4k, mmq_q4k_ref, mmq_q4k_wmma_rt_run};
     let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
     let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
-    let (got, ms) = mmq_q4k_wmma_rt_run::<R>(client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 50);
+    let (got, ms) =
+        mmq_q4k_wmma_rt_run::<R>(client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 50);
     let rel = maxabs_over_max(&got, &want);
     let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
     println!(
         "[{:<7}] MMQ-Q4K-RT {}x{}x{}  rel={:.2e}  {}  {:.3} ms  {:.0} GFLOP/s",
-        name, m, n, k, rel,
-        if rel < 1e-2 { "COOPMAT ✓" } else { "MISMATCH ✗" }, ms, gflops
+        name,
+        m,
+        n,
+        k,
+        rel,
+        if rel < 1e-2 {
+            "COOPMAT ✓"
+        } else {
+            "MISMATCH ✗"
+        },
+        ms,
+        gflops
     );
 }
 
@@ -505,7 +756,13 @@ fn check_mmq_q4k_rt<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize,
 /// uneven (the tail case the grid's worst-case `cap` and the in-kernel early-exit have to survive),
 /// while a token's `topk` experts stay distinct -- the invariant that makes `cap = t` exact.
 fn check_mmq_q4k_id<R: Runtime>(
-    name: &str, client: &ComputeClient<R>, t: usize, topk: usize, n_experts: usize, n: usize, k: usize,
+    name: &str,
+    client: &ComputeClient<R>,
+    t: usize,
+    topk: usize,
+    n_experts: usize,
+    n: usize,
+    k: usize,
 ) {
     use hanzo_kernel::mmq::{gen_mmq_q4k, mmq_q4k_id_ref, mmq_q4k_id_run};
     let nslots = t * topk;
@@ -517,15 +774,41 @@ fn check_mmq_q4k_id<R: Runtime>(
         .collect();
     let want = mmq_q4k_id_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, &ids, nslots, n, k);
     let (got, ms) = mmq_q4k_id_run::<R>(
-        client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, &ids, nslots, n_experts, t, n, k,
-        ((nslots / n_experts).div_ceil(32)).max(1), 50,
+        client,
+        &xq,
+        &xs,
+        &xsum,
+        &wqs,
+        &wsc,
+        &wd,
+        &wdm,
+        &ids,
+        nslots,
+        n_experts,
+        t,
+        n,
+        k,
+        ((nslots / n_experts).div_ceil(32)).max(1),
+        50,
     );
     let rel = maxabs_over_max(&got, &want);
     let gflops = 2.0 * nslots as f64 * n as f64 * k as f64 / (ms * 1e6);
     println!(
         "[{:<7}] MMQ-Q4K-ID t={} topk={} E={} {}x{}  rel={:.2e}  {}  {:.3} ms  {:.0} GFLOP/s",
-        name, t, topk, n_experts, n, k, rel,
-        if rel < 1e-2 { "COOPMAT ✓" } else { "MISMATCH ✗" }, ms, gflops
+        name,
+        t,
+        topk,
+        n_experts,
+        n,
+        k,
+        rel,
+        if rel < 1e-2 {
+            "COOPMAT ✓"
+        } else {
+            "MISMATCH ✗"
+        },
+        ms,
+        gflops
     );
 }
 
@@ -548,9 +831,13 @@ fn gen(rows: usize, k: usize) -> (Vec<f32>, Vec<i32>, Vec<f32>) {
         s ^= s << 17;
         s
     };
-    let wd: Vec<f32> = (0..rows * nb).map(|_| (next() % 1000) as f32 / 8000.0 + 0.01).collect();
+    let wd: Vec<f32> = (0..rows * nb)
+        .map(|_| (next() % 1000) as f32 / 8000.0 + 0.01)
+        .collect();
     let wq: Vec<i32> = (0..rows * k).map(|_| (next() % 255) as i32 - 127).collect();
-    let x: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     (wd, wq, x)
 }
 
@@ -566,7 +853,13 @@ fn max_rel(a: &[f32], b: &[f32]) -> f32 {
 
 // Q8_0 PACKED: the production-layout matvec (9 u32/block, in-kernel fp16+int8 decode). Bit-exact vs
 // the CPU oracle + real weight-bandwidth (packed bytes = rows * k/32 * 34, the true Q8_0 footprint).
-fn check_q8_0_packed<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize, nt: usize) {
+fn check_q8_0_packed<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    rows: usize,
+    k: usize,
+    nt: usize,
+) {
     let (w, x) = gen_q8_0_packed(rows, k);
     let reference = matvec_q8_0_packed_ref(&w, &x, rows, k);
     let (out, ms) = matvec_q8_0_packed_run::<R>(client, &w, &x, rows, k, nt, 50);
@@ -576,14 +869,31 @@ fn check_q8_0_packed<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: us
     let gflops = 2.0 * rows as f64 * k as f64 / (ms * 1e6);
     println!(
         "[{:<7}] Q8_0pk {}x{} nt={:<3} max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
-        name, rows, k, nt, rel,
-        if rel < 3e-3 { "BIT-EXACT ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        name,
+        rows,
+        k,
+        nt,
+        rel,
+        if rel < 3e-3 {
+            "BIT-EXACT ✓"
+        } else {
+            "MISMATCH ✗"
+        },
+        ms,
+        gbps,
+        gflops
     );
 }
 
 // Subgroup (plane_sum, no shared-mem) Q8_0 packed matvec -- mirrors production mul_mat_vec_q8_sg.
 // nt MUST be the hardware plane size; a wrong plane size drops cross-plane partials -> bit-exact catches it.
-fn check_q8_0_packed_sg<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usize, nt: usize) {
+fn check_q8_0_packed_sg<R: Runtime>(
+    name: &str,
+    client: &ComputeClient<R>,
+    rows: usize,
+    k: usize,
+    nt: usize,
+) {
     let (w, x) = gen_q8_0_packed(rows, k);
     let reference = matvec_q8_0_packed_ref(&w, &x, rows, k);
     let (out, ms) = matvec_q8_0_packed_sg_run::<R>(client, &w, &x, rows, k, nt, 50);
@@ -592,8 +902,18 @@ fn check_q8_0_packed_sg<R: Runtime>(name: &str, client: &ComputeClient<R>, rows:
     let gbps = wbytes as f64 / (ms * 1e6);
     println!(
         "[{:<7}] Q8_0sg {}x{} nt={:<3} max_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s",
-        name, rows, k, nt, rel,
-        if rel < 3e-3 { "BIT-EXACT ✓" } else { "MISMATCH ✗ (plane!=nt?)" }, ms, gbps
+        name,
+        rows,
+        k,
+        nt,
+        rel,
+        if rel < 3e-3 {
+            "BIT-EXACT ✓"
+        } else {
+            "MISMATCH ✗ (plane!=nt?)"
+        },
+        ms,
+        gbps
     );
 }
 
@@ -602,8 +922,8 @@ fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usiz
     let reference = matvec_q8_ref(&wd, &wq, &x, rows, k);
     let got = matvec_q8_run::<R>(client, &wd, &wq, &x, rows, k);
     let rel = max_rel(&reference, &got);
-    let ok = rel < 3e-3;  // real decode bugs are >>1e-2; f32 reorder over K terms is ~K*eps
-    // warm + timed loop for a rough throughput number (GFLOP: 2 * rows * k)
+    let ok = rel < 3e-3; // real decode bugs are >>1e-2; f32 reorder over K terms is ~K*eps
+                         // warm + timed loop for a rough throughput number (GFLOP: 2 * rows * k)
     for _ in 0..2 {
         let _ = matvec_q8_run::<R>(client, &wd, &wq, &x, rows, k);
     }
@@ -618,7 +938,17 @@ fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usiz
     let gbps = (wd.len() * 4 + wq.len() * 4) as f64 / (ms * 1e6); // weight bytes / time = effective BW
     println!(
         "[{:<7}] matvec {}x{}  max_rel={:.2e}  {}  {:.3} ms/dispatch  {:.0} GB/s (weight BW)",
-        name, rows, k, rel, if ok { "MATCH ✓ (f32-reorder tol)" } else { "MISMATCH ✗" }, ms, gbps
+        name,
+        rows,
+        k,
+        rel,
+        if ok {
+            "MATCH ✓ (f32-reorder tol)"
+        } else {
+            "MISMATCH ✗"
+        },
+        ms,
+        gbps
     );
 }
 
@@ -626,23 +956,45 @@ fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usiz
 // oracle. Proves the norm op family dispatches bit-exact on each compiled backend (norm column).
 fn check_rms<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, n: usize) {
     let mut s = 0x1234_5678_9ABC_DEF1u64;
-    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-    let x: Vec<f32> = (0..rows * n).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
-    let w: Vec<f32> = (0..n).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let x: Vec<f32> = (0..rows * n)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
+    let w: Vec<f32> = (0..n)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     let eps = 1e-6f32;
     let mut reference = vec![0f32; rows * n];
     for r in 0..rows {
         let base = r * n;
         let mut ss = 0f32;
-        for i in 0..n { let v = x[base + i]; ss += v * v; }
+        for i in 0..n {
+            let v = x[base + i];
+            ss += v * v;
+        }
         let denom = (ss / n as f32 + eps).sqrt();
-        for i in 0..n { reference[base + i] = x[base + i] / denom * w[i]; }
+        for i in 0..n {
+            reference[base + i] = x[base + i] / denom * w[i];
+        }
     }
     let got = rms_norm_run::<R>(client, &x, &w, rows, n, eps);
     let rel = max_rel(&reference, &got);
     println!(
         "[{:<7}] rmsnorm {}x{}  max_rel={:.2e}  {}",
-        name, rows, n, rel, if rel < 3e-3 { "MATCH ✓" } else { "MISMATCH ✗" }
+        name,
+        rows,
+        n,
+        rel,
+        if rel < 3e-3 {
+            "MATCH ✓"
+        } else {
+            "MISMATCH ✗"
+        }
     );
 }
 
@@ -679,8 +1031,8 @@ fn main() {
         check_gemv::<WgpuRuntime>("VK/dump", &c, 128, 4096, 128); // router gate GEMV: nt128
         check_mmq_q4k::<WgpuRuntime>("VK/dump", &c, 32, 2048, 2048); // Q4_K affine prefill MMQ (n=2048,k=2048)
         check_mmq_q4k_rt::<WgpuRuntime>("VK/dump", &c, 32, 2048, 2048); // runtime-dims MMQ: ONE .spv, any shape
-        // Expert-indexed MMQ + its slot grouping: the MoE PREFILL twin of the matvec above. Runtime
-        // n/k/cap, so ONE .spv serves every expert shape; the small dump shape only has to lower.
+                                                                        // Expert-indexed MMQ + its slot grouping: the MoE PREFILL twin of the matvec above. Runtime
+                                                                        // n/k/cap, so ONE .spv serves every expert shape; the small dump shape only has to lower.
         check_mmq_q4k_id::<WgpuRuntime>("VK/dump", &c, 32, 8, 16, 768, 2048);
         return;
     }
@@ -694,7 +1046,8 @@ fn main() {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
         let c = WgpuRuntime::client(&WgpuDevice::default());
         let (wqs, wsc, wd, wdm, x) = gen_q4k(2048, 2048);
-        let _ = matvec_q4k_f32_blk_run::<WgpuRuntime>(&c, &wqs, &wsc, &wd, &wdm, &x, 2048, 2048, 64, 1);
+        let _ =
+            matvec_q4k_f32_blk_run::<WgpuRuntime>(&c, &wqs, &wsc, &wd, &wdm, &x, 2048, 2048, 64, 1);
         println!("dumpf32: matvec_q4k_f32_blk nt=64 nr=1 dispatched -- .spv emitted");
         return;
     }
@@ -717,7 +1070,9 @@ fn main() {
             let q = vec![0.1f32; 2 * 16 * 128];
             let k = vec![0.1f32; 1 * 32 * 128];
             let v = k.clone();
-            hanzo_kernel::flash::flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, 2, 1, 16, 32, 32, 128, true)
+            hanzo_kernel::flash::flash_attn_run::<WgpuRuntime>(
+                &c, &q, &k, &v, 1, 2, 1, 16, 32, 32, 128, true,
+            )
         });
         match r {
             Ok(_) => println!("flash dump: dispatch succeeded (coopmat adapter) -- .spv emitted"),
@@ -766,7 +1121,8 @@ fn main() {
             let wbytes = nout * (k / 256) * 144;
             let nbanks = (64 * 1024 * 1024 / wbytes + 1).max(6); // footprint >= 64 MB (2x MALL)
             let (wqs, wsc, wd, wdm, x) = gen_q4k(nout, k);
-            let eval = MatvecQ4kF32Eval::new(&c, &space, &wqs, &wsc, &wd, &wdm, &x, nout, k, nbanks, 6);
+            let eval =
+                MatvecQ4kF32Eval::new(&c, &space, &wqs, &wsc, &wd, &wdm, &x, nout, k, nbanks, 6);
             println!(
                 "-- {nout}x{k}  ({} MB/bank x {nbanks} banks = {} MB cold footprint) --",
                 wbytes / (1024 * 1024),
@@ -789,7 +1145,11 @@ fn main() {
             }
             println!(
                 "   >> BEST f32  {nout}x{k}: nt={} nr={}  {:.4} ms  {:.0} GB/s  (worst_rel {:.2e})",
-                best.1, best.2, best.0, best.3, eval.worst_rel()
+                best.1,
+                best.2,
+                best.0,
+                best.3,
+                eval.worst_rel()
             );
             // dp4a-block anchor at the same shape + same cold bank-rotation: the DSL twin of the OTHER
             // shipped decode kernel. The hand mul_mat_vec_q4k_cm shipped +14.9% over the dp4a block
@@ -798,8 +1158,9 @@ fn main() {
             use cubecl::server::Handle;
             let packed = pack_q4k(&wqs, &wsc, &wd, &wdm);
             let (xq, xs, xsum) = quant_act_q8_cpu(&x, 1, k);
-            let dbanks: Vec<Handle> =
-                (0..nbanks).map(|_| c.create_from_slice(u32::as_bytes(&packed))).collect();
+            let dbanks: Vec<Handle> = (0..nbanks)
+                .map(|_| c.create_from_slice(u32::as_bytes(&packed)))
+                .collect();
             let xqh = c.create_from_slice(u32::as_bytes(&xq));
             let xsh = c.create_from_slice(f32::as_bytes(&xs));
             let xsumh = c.create_from_slice(f32::as_bytes(&xsum));
@@ -849,7 +1210,9 @@ fn main() {
         return;
     }
 
-    println!("hanzo-kernel :: one #[device] matvec_q8 source, lowered per backend, gated bit-exact\n");
+    println!(
+        "hanzo-kernel :: one #[device] matvec_q8 source, lowered per backend, gated bit-exact\n"
+    );
 
     #[cfg(feature = "cpu")]
     {
@@ -916,7 +1279,7 @@ fn main() {
         check_sdpa_blk::<WgpuRuntime>("VK/attn", &c, 32, 8, 1, 2048, 2048, 128, false, 64); // packed
         check_sdpa_blk::<WgpuRuntime>("VK/strd", &c, 32, 8, 1, 2048, 4096, 128, false, 64); // STRIDED: k/v in a 4096-cache, read in place
         check_sdpa_blk::<WgpuRuntime>("VK/attn", &c, 32, 8, 1, 4096, 4096, 128, false, 64); // packed
-        // Prefill (causal) generality check at a modest square shape.
+                                                                                            // Prefill (causal) generality check at a modest square shape.
         check_sdpa_blk::<WgpuRuntime>("VK/pref", &c, 32, 8, 128, 128, 128, 128, true, 64);
         // MoE router gate GEMV (n=128 experts, k=4096 hidden): the fp32 Linear the tiled GEMM starves.
         check_gemv::<WgpuRuntime>("VK/gemv", &c, 128, 4096, 32);
@@ -927,7 +1290,7 @@ fn main() {
         check_dp4a::<WgpuRuntime>("VK/big", &c, 8192, 8192, true); // 67MB weights: cache-busting BW
         check_q8_0_packed::<WgpuRuntime>("VULKAN", &c, rows, k, 64);
         check_q8_0_packed::<WgpuRuntime>("VK/big", &c, 8192, 8192, 128); // cache-busting Q8_0 BW
-        // subgroup variant: nt MUST equal the hardware plane size (bit-exact fails otherwise). Try 32/64.
+                                                                         // subgroup variant: nt MUST equal the hardware plane size (bit-exact fails otherwise). Try 32/64.
         check_q8_0_packed_sg::<WgpuRuntime>("VK/sg32", &c, rows, k, 32);
         check_q8_0_packed_sg::<WgpuRuntime>("VK/sg64", &c, rows, k, 64);
         check_q8_0_packed_sg::<WgpuRuntime>("VK/sgBIG", &c, 8192, 8192, 32);

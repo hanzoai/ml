@@ -742,7 +742,15 @@ mod bufpool_key_invariant {
             u64::MAX,
             "size-class bucketing corrupts inference: keys must be exact at every size"
         );
-        for bytes in [4u64, 64 * 1024, 64 * 1024 + 1, 100_000, 1 << 20, (1 << 20) + 7, 1 << 30] {
+        for bytes in [
+            4u64,
+            64 * 1024,
+            64 * 1024 + 1,
+            100_000,
+            1 << 20,
+            (1 << 20) + 7,
+            1 << 30,
+        ] {
             assert_eq!(
                 pool_bucket(bytes),
                 bytes,
@@ -1370,7 +1378,14 @@ impl VulkanDevice {
             // dense_q4k_block_real_qwen3_weight_repro.)
             if woff == 0 && std::env::var_os("VK_DP4A_BLK_OFF").is_none() {
                 let meta = self.upload_u32(&[k as u32])?;
-                let bufs = [wq.buffer, xq.buffer, xs.buffer, xsum.buffer, out.buffer, meta.buffer];
+                let bufs = [
+                    wq.buffer,
+                    xq.buffer,
+                    xs.buffer,
+                    xsum.buffer,
+                    out.buffer,
+                    meta.buffer,
+                ];
                 self.dispatch_out("matvec_q4k_dp4a_blk", &bufs, 4, &[], (nout as u32, 1, 1))?;
                 return Ok(out);
             }
@@ -1634,7 +1649,13 @@ impl VulkanDevice {
     /// dispatches this pipeline name in a production build.
     #[cfg(test)]
     pub(crate) fn install_coopmat_variant(&self, spv: &[u8], bm: u32, bn: u32) {
-        if let Some(old) = self.inner.pipelines.lock().unwrap().remove("__coopmat_variant") {
+        if let Some(old) = self
+            .inner
+            .pipelines
+            .lock()
+            .unwrap()
+            .remove("__coopmat_variant")
+        {
             unsafe {
                 let dev = self.dev();
                 dev.destroy_pipeline(old.pipeline, None);
@@ -1720,7 +1741,11 @@ impl VulkanDevice {
             && m > 1
             && nout % 16 == 0
             && std::env::var_os("VK_Q4K_COOPMAT_OFF").is_none();
-        let m_alloc = if coopmat_path { m.next_multiple_of(16) } else { m };
+        let m_alloc = if coopmat_path {
+            m.next_multiple_of(16)
+        } else {
+            m
+        };
         let mut out = self.alloc_f32(m_alloc * nout)?;
         out.count = m * nout;
         if coopmat_path {
@@ -1894,7 +1919,11 @@ impl VulkanDevice {
             && m > 1
             && nout % 16 == 0
             && std::env::var_os("VK_Q6K_COOPMAT_OFF").is_none();
-        let m_alloc = if coopmat_path { m.next_multiple_of(16) } else { m };
+        let m_alloc = if coopmat_path {
+            m.next_multiple_of(16)
+        } else {
+            m
+        };
         let mut out = self.alloc_f32(m_alloc * nout)?;
         out.count = m * nout;
         if coopmat_path {
@@ -2413,7 +2442,10 @@ impl VulkanDevice {
         let nblk = rows * nb;
         let want = nblk * 144;
         if data.len() != want {
-            crate::bail!("quantize_q4k_split: data len {} != {rows}*{nb}*144 = {want}", data.len());
+            crate::bail!(
+                "quantize_q4k_split: data len {} != {rows}*{nb}*144 = {want}",
+                data.len()
+            );
         }
         let mut qs = vec![0u32; nblk * 32];
         let mut sc = vec![0u32; nblk * 3];
@@ -2424,11 +2456,16 @@ impl VulkanDevice {
             let src = &data[blk * 144..blk * 144 + 144];
             d[blk] = rd16(&src[0..2]);
             dm[blk] = rd16(&src[2..4]);
-            let scb: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(sc[blk * 3..blk * 3 + 3].as_mut_ptr() as *mut u8, 12) };
+            let scb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(sc[blk * 3..blk * 3 + 3].as_mut_ptr() as *mut u8, 12)
+            };
             scb.copy_from_slice(&src[4..16]);
-            let qsb: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(qs[blk * 32..blk * 32 + 32].as_mut_ptr() as *mut u8, 128) };
+            let qsb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    qs[blk * 32..blk * 32 + 32].as_mut_ptr() as *mut u8,
+                    128,
+                )
+            };
             qsb.copy_from_slice(&src[16..144]);
         }
         Ok(MoeBankSplit(vec![
@@ -2451,7 +2488,10 @@ impl VulkanDevice {
         let nblk = rows * nb;
         let want = nblk * 210;
         if data.len() != want {
-            crate::bail!("quantize_q6k_split: data len {} != {rows}*{nb}*210 = {want}", data.len());
+            crate::bail!(
+                "quantize_q6k_split: data len {} != {rows}*{nb}*210 = {want}",
+                data.len()
+            );
         }
         let mut ql = vec![0u32; nblk * 32];
         let mut qh = vec![0u32; nblk * 16];
@@ -2459,14 +2499,23 @@ impl VulkanDevice {
         let mut d = vec![0f32; nblk];
         for blk in 0..nblk {
             let src = &data[blk * 210..blk * 210 + 210];
-            let qlb: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(ql[blk * 32..blk * 32 + 32].as_mut_ptr() as *mut u8, 128) };
+            let qlb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    ql[blk * 32..blk * 32 + 32].as_mut_ptr() as *mut u8,
+                    128,
+                )
+            };
             qlb.copy_from_slice(&src[0..128]);
-            let qhb: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(qh[blk * 16..blk * 16 + 16].as_mut_ptr() as *mut u8, 64) };
+            let qhb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    qh[blk * 16..blk * 16 + 16].as_mut_ptr() as *mut u8,
+                    64,
+                )
+            };
             qhb.copy_from_slice(&src[128..192]);
-            let scb: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(sc[blk * 4..blk * 4 + 4].as_mut_ptr() as *mut u8, 16) };
+            let scb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(sc[blk * 4..blk * 4 + 4].as_mut_ptr() as *mut u8, 16)
+            };
             scb.copy_from_slice(&src[192..208]);
             d[blk] = half::f16::from_bits(u16::from_le_bytes([src[208], src[209]])).to_f32();
         }
@@ -2494,10 +2543,17 @@ impl VulkanDevice {
         k: usize,
     ) -> Result<VulkanStorage> {
         if x.count < nrows * k {
-            crate::bail!("moe_matvec_blk_gpu: x count {} < nrows*k {}", x.count, nrows * k);
+            crate::bail!(
+                "moe_matvec_blk_gpu: x count {} < nrows*k {}",
+                x.count,
+                nrows * k
+            );
         }
         if ids.count < nrows {
-            crate::bail!("moe_matvec_blk_gpu: ids count {} < nrows {nrows}", ids.count);
+            crate::bail!(
+                "moe_matvec_blk_gpu: ids count {} < nrows {nrows}",
+                ids.count
+            );
         }
         let out = self.alloc_f32(nrows * n)?;
         let mut bufs: Vec<vk::Buffer> = bank.0.iter().map(|s| s.buffer).collect();
@@ -2536,10 +2592,17 @@ impl VulkanDevice {
         k: usize,
     ) -> Result<VulkanStorage> {
         if x.count < nrows * k {
-            crate::bail!("moe_matvec_blk_dp4a_gpu: x count {} < nrows*k {}", x.count, nrows * k);
+            crate::bail!(
+                "moe_matvec_blk_dp4a_gpu: x count {} < nrows*k {}",
+                x.count,
+                nrows * k
+            );
         }
         if ids.count < nrows {
-            crate::bail!("moe_matvec_blk_dp4a_gpu: ids count {} < nrows {nrows}", ids.count);
+            crate::bail!(
+                "moe_matvec_blk_dp4a_gpu: ids count {} < nrows {nrows}",
+                ids.count
+            );
         }
         let (xq, xs, xsum) = self.quantize_act_q8(x, nrows, k)?;
         self.moe_matvec_blk_dp4a_pre_gpu(kernel, with_xsum, bank, &xq, &xs, &xsum, ids, nrows, n)
@@ -2625,7 +2688,12 @@ impl VulkanDevice {
         }
         bufs.push(out.buffer);
         bufs.push(meta.buffer);
-        self.dispatch("mmq_q4k_rt", &bufs, &[], (n.div_ceil(64) as u32, m.div_ceil(32) as u32, 1))?;
+        self.dispatch(
+            "mmq_q4k_rt",
+            &bufs,
+            &[],
+            (n.div_ceil(64) as u32, m.div_ceil(32) as u32, 1),
+        )?;
         Ok(out)
     }
 
@@ -2654,7 +2722,9 @@ impl VulkanDevice {
         k: usize,
     ) -> Result<VulkanStorage> {
         let (counts, rows) = self.moe_expert_rows_vk(ids, nslots, n_experts, cap)?;
-        self.mmq_q4k_id_pre_gpu(bank, xq, xs, xsum, &rows, &counts, nslots, n_experts, cap, n, k)
+        self.mmq_q4k_id_pre_gpu(
+            bank, xq, xs, xsum, &rows, &counts, nslots, n_experts, cap, n, k,
+        )
     }
 
     /// Group the routed slots by expert: returns `(counts[n_experts], rows[n_experts * cap])`, the
@@ -2669,7 +2739,10 @@ impl VulkanDevice {
         cap: usize,
     ) -> Result<(VulkanStorage, VulkanStorage)> {
         if ids.count < nslots {
-            crate::bail!("moe_expert_rows_vk: ids count {} < nslots {nslots}", ids.count);
+            crate::bail!(
+                "moe_expert_rows_vk: ids count {} < nslots {nslots}",
+                ids.count
+            );
         }
         let counts = self.alloc_u32(n_experts)?;
         let rows = self.alloc_u32(n_experts * cap)?;
@@ -2741,7 +2814,11 @@ impl VulkanDevice {
         topk: usize,
     ) -> Result<(VulkanStorage, VulkanStorage)> {
         if logits.count < ntok * n_experts {
-            crate::bail!("moe_route_vk: logits count {} < ntok*n_experts {}", logits.count, ntok * n_experts);
+            crate::bail!(
+                "moe_route_vk: logits count {} < ntok*n_experts {}",
+                logits.count,
+                ntok * n_experts
+            );
         }
         let ids = self.alloc_u32(ntok * topk)?;
         let w = self.alloc_f32(ntok * topk)?;
@@ -2779,7 +2856,11 @@ impl VulkanDevice {
         key_stride: usize,
     ) -> Result<VulkanStorage> {
         if q.count < b * n_heads * seq_q * d {
-            crate::bail!("sdpa_blk_vk: q count {} < b*n_heads*seq_q*d {}", q.count, b * n_heads * seq_q * d);
+            crate::bail!(
+                "sdpa_blk_vk: q count {} < b*n_heads*seq_q*d {}",
+                q.count,
+                b * n_heads * seq_q * d
+            );
         }
         // k/v may be a strided view into a larger cache; bound-check against the furthest element read
         // (last batch, last kv head, last key) rather than a packed size.
@@ -2796,13 +2877,32 @@ impl VulkanDevice {
         // live for the whole deferred batch that runs this dispatch.
         let scale = self.upload_f32(&[softmax_scale])?;
         let meta = self.upload_u32(&[
-            seq_q as u32, seq_k as u32, n_heads as u32, n_kv as u32, causal as u32,
-            kv_batch_stride as u32, kv_head_stride as u32, key_stride as u32,
+            seq_q as u32,
+            seq_k as u32,
+            n_heads as u32,
+            n_kv as u32,
+            causal as u32,
+            kv_batch_stride as u32,
+            kv_head_stride as u32,
+            key_stride as u32,
         ])?;
         // Bindings match kernel param order: q(0) k(1) v(2) out(3) scale(4) meta(5). One workgroup per
         // (batch,head,query); nt=64 (LocalSize) baked into the .spv. Only `out` (binding 3) is written.
-        let bufs = [q.buffer, k.buffer, v.buffer, out.buffer, scale.buffer, meta.buffer];
-        self.dispatch_outs("sdpa_blk", &bufs, &[3], &[], ((b * n_heads * seq_q) as u32, 1, 1))?;
+        let bufs = [
+            q.buffer,
+            k.buffer,
+            v.buffer,
+            out.buffer,
+            scale.buffer,
+            meta.buffer,
+        ];
+        self.dispatch_outs(
+            "sdpa_blk",
+            &bufs,
+            &[3],
+            &[],
+            ((b * n_heads * seq_q) as u32, 1, 1),
+        )?;
         Ok(out)
     }
 
@@ -2833,7 +2933,11 @@ impl VulkanDevice {
     ) -> Result<VulkanStorage> {
         let rows = b * n_heads * seq_q;
         if q.count < rows * d {
-            crate::bail!("sdpa_decode_split_vk: q count {} < rows*d {}", q.count, rows * d);
+            crate::bail!(
+                "sdpa_decode_split_vk: q count {} < rows*d {}",
+                q.count,
+                rows * d
+            );
         }
         let kv_max = (b.saturating_sub(1)) * kv_batch_stride
             + (n_kv.saturating_sub(1)) * kv_head_stride
@@ -2865,7 +2969,15 @@ impl VulkanDevice {
         ] {
             p1.extend_from_slice(&x.to_le_bytes());
         }
-        let bufs1 = [q.buffer, k.buffer, v.buffer, pacc.buffer, pm.buffer, pl.buffer, meta.buffer];
+        let bufs1 = [
+            q.buffer,
+            k.buffer,
+            v.buffer,
+            pacc.buffer,
+            pm.buffer,
+            pl.buffer,
+            meta.buffer,
+        ];
         self.dispatch_outs(
             "sdpa_decode_split",
             &bufs1,
@@ -2915,7 +3027,11 @@ impl VulkanDevice {
             crate::bail!("flash_attn_dsl_vk: committed .spv is baked d=128, got {d}");
         }
         if q.count < b * n_heads * seq_q * d {
-            crate::bail!("flash_attn_dsl_vk: q count {} < b*n_heads*seq_q*d {}", q.count, b * n_heads * seq_q * d);
+            crate::bail!(
+                "flash_attn_dsl_vk: q count {} < b*n_heads*seq_q*d {}",
+                q.count,
+                b * n_heads * seq_q * d
+            );
         }
         // k/v may be a strided view into a larger cache; bound-check the furthest element read.
         let kv_max = (b.saturating_sub(1)) * kv_batch_stride
@@ -2928,11 +3044,24 @@ impl VulkanDevice {
         let out = self.alloc_f32(b * n_heads * seq_q * d)?;
         let scale = self.upload_f32(&[softmax_scale])?;
         let meta = self.upload_u32(&[
-            seq_q as u32, seq_k as u32, n_heads as u32, n_kv as u32, causal as u32,
-            kv_batch_stride as u32, kv_head_stride as u32, key_stride as u32,
+            seq_q as u32,
+            seq_k as u32,
+            n_heads as u32,
+            n_kv as u32,
+            causal as u32,
+            kv_batch_stride as u32,
+            kv_head_stride as u32,
+            key_stride as u32,
             0u32, // cube_base = 0: dispatch the whole grid (production launch)
         ])?;
-        let bufs = [q.buffer, k.buffer, v.buffer, out.buffer, scale.buffer, meta.buffer];
+        let bufs = [
+            q.buffer,
+            k.buffer,
+            v.buffer,
+            out.buffer,
+            scale.buffer,
+            meta.buffer,
+        ];
         // Grid = one cube per (batch, head, query-tile); BR=16 query rows per tile. plane=64 (LocalSize).
         let cubes = (b * n_heads * seq_q.div_ceil(16)) as u32;
         self.dispatch_outs("flash_attn_dsl", &bufs, &[3], &[], (cubes, 1, 1))?;
@@ -2981,8 +3110,22 @@ impl VulkanDevice {
         ] {
             p1.extend_from_slice(&x.to_le_bytes());
         }
-        let bufs1 = [q.buffer, k.buffer, v.buffer, pacc.buffer, pm.buffer, pl.buffer, meta.buffer];
-        self.dispatch_outs("sdpa_decode_split", &bufs1, &[3, 4, 5], &p1, (rows as u32, nsplit as u32, 1))?;
+        let bufs1 = [
+            q.buffer,
+            k.buffer,
+            v.buffer,
+            pacc.buffer,
+            pm.buffer,
+            pl.buffer,
+            meta.buffer,
+        ];
+        self.dispatch_outs(
+            "sdpa_decode_split",
+            &bufs1,
+            &[3, 4, 5],
+            &p1,
+            (rows as u32, nsplit as u32, 1),
+        )?;
         let mut p2 = Vec::with_capacity(8);
         p2.extend_from_slice(&(d as u32).to_le_bytes());
         p2.extend_from_slice(&(nsplit as u32).to_le_bytes());
@@ -3013,8 +3156,21 @@ impl VulkanDevice {
         n_heads: usize,
         seq_q: usize,
     ) -> Result<()> {
-        let bufs = [q.buffer, k.buffer, v.buffer, out.buffer, scale.buffer, meta.buffer];
-        self.dispatch_outs("sdpa_blk", &bufs, &[3], &[], ((b * n_heads * seq_q) as u32, 1, 1))
+        let bufs = [
+            q.buffer,
+            k.buffer,
+            v.buffer,
+            out.buffer,
+            scale.buffer,
+            meta.buffer,
+        ];
+        self.dispatch_outs(
+            "sdpa_blk",
+            &bufs,
+            &[3],
+            &[],
+            ((b * n_heads * seq_q) as u32, 1, 1),
+        )
     }
 
     /// Build the shared [`VkGraphAttn`] buffers a decode command-graph binds for every layer's
@@ -4154,21 +4310,28 @@ impl VulkanDevice {
             return;
         };
         unsafe {
-            if self.copy_buffer_blocking(a.buffer, 0, b.buffer, 0, bytes).is_err() {
+            if self
+                .copy_buffer_blocking(a.buffer, 0, b.buffer, 0, bytes)
+                .is_err()
+            {
                 return;
             }
             let iters = 5u32;
             let t0 = std::time::Instant::now();
             for _ in 0..iters {
-                if self.copy_buffer_blocking(a.buffer, 0, b.buffer, 0, bytes).is_err() {
+                if self
+                    .copy_buffer_blocking(a.buffer, 0, b.buffer, 0, bytes)
+                    .is_err()
+                {
                     return;
                 }
             }
             let secs = t0.elapsed().as_secs_f64();
             let gbps = (2.0 * bytes as f64 * iters as f64) / 1e9 / secs.max(1e-9);
-            self.inner
-                .peak_bw_gbps
-                .store((gbps as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+            self.inner.peak_bw_gbps.store(
+                (gbps as f32).to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -4417,7 +4580,14 @@ impl VulkanDevice {
             // The autotuner's uncommitted variant is served from the registry under one dedicated name;
             // every other name loads its committed module. Cloned only on the (rare) cache miss.
             let variant_bytes = (name == "__coopmat_variant")
-                .then(|| self.inner.coopmat_variant.lock().unwrap().as_ref().map(|(b, _, _)| b.clone()))
+                .then(|| {
+                    self.inner
+                        .coopmat_variant
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|(b, _, _)| b.clone())
+                })
                 .flatten();
             let spv_bytes: &[u8] = match &variant_bytes {
                 Some(b) => b,
@@ -4536,12 +4706,7 @@ impl VulkanDevice {
                     // query 0; each dispatch then stamps at op_names.len()+1 so consecutive deltas
                     // are per-op GPU durations.
                     dev.cmd_reset_query_pool(s.cmd, s.qpool, 0, BATCH_CAP + 1);
-                    dev.cmd_write_timestamp(
-                        s.cmd,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        s.qpool,
-                        0,
-                    );
+                    dev.cmd_write_timestamp(s.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, s.qpool, 0);
                     s.op_names.clear();
                     s.op_push.clear();
                 }
@@ -4672,7 +4837,12 @@ impl VulkanDevice {
                     for (i, w) in p5.iter_mut().enumerate() {
                         let o = i * 4;
                         if push.len() >= o + 4 {
-                            *w = u32::from_le_bytes([push[o], push[o + 1], push[o + 2], push[o + 3]]);
+                            *w = u32::from_le_bytes([
+                                push[o],
+                                push[o + 1],
+                                push[o + 2],
+                                push[o + 3],
+                            ]);
                         }
                     }
                     s.op_push.push(p5);
@@ -4706,10 +4876,27 @@ impl VulkanDevice {
             // would tear the replayable forward in two). Cross-batch ordering after a flush is the
             // queue_submit + fence wait, so splitting here is bit-identical to one big submission.
             if (s.n >= BATCH_CAP
-                || s.work >= self.inner.work_cap.load(std::sync::atomic::Ordering::Relaxed))
+                || s.work
+                    >= self
+                        .inner
+                        .work_cap
+                        .load(std::sync::atomic::Ordering::Relaxed))
                 && !s.capturing
             {
-                flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period, self.inner.roofline, f32::from_bits(self.inner.peak_bw_gbps.load(std::sync::atomic::Ordering::Relaxed)))?;
+                flush_locked(
+                    dev,
+                    queue,
+                    &mut s,
+                    profile,
+                    self.inner.gpu_profile,
+                    self.inner.timestamp_period,
+                    self.inner.roofline,
+                    f32::from_bits(
+                        self.inner
+                            .peak_bw_gbps
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    ),
+                )?;
                 drop(s);
                 self.reclaim();
             }
@@ -4725,7 +4912,20 @@ impl VulkanDevice {
         let profile = self.inner.profile;
         {
             let mut s = self.inner.submitter.lock().unwrap();
-            flush_locked(dev, queue, &mut s, profile, self.inner.gpu_profile, self.inner.timestamp_period, self.inner.roofline, f32::from_bits(self.inner.peak_bw_gbps.load(std::sync::atomic::Ordering::Relaxed)))?;
+            flush_locked(
+                dev,
+                queue,
+                &mut s,
+                profile,
+                self.inner.gpu_profile,
+                self.inner.timestamp_period,
+                self.inner.roofline,
+                f32::from_bits(
+                    self.inner
+                        .peak_bw_gbps
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
+            )?;
         }
         self.reclaim();
         Ok(())
@@ -4914,7 +5114,10 @@ impl VulkanDevice {
     // destroyed, so a generous value on a big-memory box merely retains the reusable working set.
     fn pool_free_cap(&self) -> u64 {
         // Explicit override (GiB) for A/B measurement and constrained deployments.
-        if let Some(gb) = std::env::var("HANZO_VK_POOL_CAP_GB").ok().and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(gb) = std::env::var("HANZO_VK_POOL_CAP_GB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
             return gb * 1024 * 1024 * 1024;
         }
         let mp = &self.inner.mem_props;
@@ -5085,9 +5288,9 @@ fn roofline_model(name: &str, p: &[u32; 5]) -> (u64, u64, u64) {
     let (blk, act, bm, bn): (u64, u64, u64, u64) = match name {
         "mul_mm_q4k_coopmat" => (144, 4, 128, 128), // f16 coopmat, x is f32
         "mul_mm_q4k_tiled_dp4a" => (144, 1, 64, 64), // int8-dp4a tile, x quantized to q8
-        "mul_mm_q4k_tiled" => (144, 4, 64, 64),      // f32 tile
+        "mul_mm_q4k_tiled" => (144, 4, 64, 64),     // f32 tile
         "mul_mm_q6k_tiled_dp4a" => (212, 1, 64, 64), // Q6_K block padded to 212 B
-        "mul_mm_q6k_coopmat" => (212, 4, 128, 128),  // Q6_K f16 coopmat, x is f32
+        "mul_mm_q6k_coopmat" => (212, 4, 128, 128), // Q6_K f16 coopmat, x is f32
         _ => return (0, 0, 0),
     };
     let blocks = k.div_ceil(256);
@@ -5201,8 +5404,10 @@ fn flush_locked(
                 // `tbytes` = all global traffic (weight + activation + output); `flops` = 2*m*n*k.
                 // A kernel far below BOTH peak-BW and peak-FLOP is occupancy/latency-bound, not
                 // bandwidth- or compute-bound -- that distinction is the whole point of this table.
-                let mut ragg: std::collections::HashMap<&'static str, (u32, u128, u128, u128, u128)> =
-                    std::collections::HashMap::new();
+                let mut ragg: std::collections::HashMap<
+                    &'static str,
+                    (u32, u128, u128, u128, u128),
+                > = std::collections::HashMap::new();
                 for (i, &nm) in s.op_names.iter().enumerate() {
                     let dt = ts[i + 1].saturating_sub(ts[i]);
                     let ns = (dt as f64 * timestamp_period as f64) as u128;
@@ -5226,7 +5431,11 @@ fn flush_locked(
                     let w_gbps = *wb as f64 / 1e9 / secs.max(1e-12);
                     let t_gbps = *tb as f64 / 1e9 / secs.max(1e-12);
                     let gflops = *fl as f64 / 1e9 / secs.max(1e-12);
-                    let pct = if peak_bw_gbps > 0.0 { w_gbps / peak_bw_gbps as f64 * 100.0 } else { 0.0 };
+                    let pct = if peak_bw_gbps > 0.0 {
+                        w_gbps / peak_bw_gbps as f64 * 100.0
+                    } else {
+                        0.0
+                    };
                     eprintln!(
                         "[VK_ROOF]   {:<24} n={:<4} {:>7.2}ms  wt={:>6.1}GB/s({:>4.1}% peak)  tot={:>6.1}GB/s  {:>7.0}GFLOP/s",
                         nm, c, *ns as f64 / 1e6, w_gbps, pct, t_gbps, gflops,
@@ -5566,11 +5775,15 @@ impl BackendDevice for VulkanDevice {
             // adds the per-kernel achieved-rate table + the one-shot peak-BW measurement below.
             let roofline = ts_supported
                 && timestamp_period > 0.0
-                && std::env::var("VK_ROOFLINE").map(|v| v != "0").unwrap_or(false);
+                && std::env::var("VK_ROOFLINE")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
             let gpu_profile = roofline
                 || (ts_supported
                     && timestamp_period > 0.0
-                    && std::env::var("VK_PROFILE_GPU").map(|v| v != "0").unwrap_or(false));
+                    && std::env::var("VK_PROFILE_GPU")
+                        .map(|v| v != "0")
+                        .unwrap_or(false));
 
             // Per-submission workgroup bound: caps one queue submission's on-GPU runtime under the
             // driver ring timeout so a long prefill can't hang the GPU. VK_WORK_CAP overrides the
@@ -5641,7 +5854,13 @@ impl BackendDevice for VulkanDevice {
         // across the f32/u32 storage reprs (f16/bf16 live as f32, u8/i64/i32 as u32), so one fill with
         // 0 bits serves every dtype. Deferred like every other op -- a later CPU readback flushes first.
         match dtype {
-            DType::F32 | DType::F16 | DType::BF16 | DType::U32 | DType::U8 | DType::I64 | DType::I32 => {}
+            DType::F32
+            | DType::F16
+            | DType::BF16
+            | DType::U32
+            | DType::U8
+            | DType::I64
+            | DType::I32 => {}
             _ => crate::bail!("vulkan: only f32/u32/f16/bf16/u8/i64/i32 supported, got {dtype:?}"),
         }
         let s = unsafe { self.alloc_uninit(shape, dtype)? };
@@ -5849,7 +6068,11 @@ impl VulkanStorage {
         }
         let n = layout.shape().elem_count();
         if self.device.inner.profile && n >= 1_000_000 {
-            eprintln!("[VK_CONTIG] dims={:?} strides={:?} n={n}", layout.dims(), layout.stride());
+            eprintln!(
+                "[VK_CONTIG] dims={:?} strides={:?} n={n}",
+                layout.dims(),
+                layout.stride()
+            );
         }
         let out = self.device.alloc_f32(n)?;
         let strides = layout.stride();
@@ -6896,11 +7119,11 @@ impl BackendStorage for VulkanStorage {
             b
         };
         let _ = &idk; // keep the materialized ids alive until the dispatch is recorded
-        // Only materialize the source contiguous when it ISN'T already packed at offset 0. The kernel
-        // gathers whole `right`-sized rows by their leading index, so a source that is already
-        // contiguous is read directly -- a blind `contiguous()` here copied the WHOLE source every call
-        // (e.g. the [max_pos=262144, 64] RoPE cos/sin cache, 67MB, materialized twice per layer just to
-        // gather one position -- 62% of decode GPU time). Non-contiguous sources still get one copy.
+                      // Only materialize the source contiguous when it ISN'T already packed at offset 0. The kernel
+                      // gathers whole `right`-sized rows by their leading index, so a source that is already
+                      // contiguous is read directly -- a blind `contiguous()` here copied the WHOLE source every call
+                      // (e.g. the [max_pos=262144, 64] RoPE cos/sin cache, 67MB, materialized twice per layer just to
+                      // gather one position -- 62% of decode GPU time). Non-contiguous sources still get one copy.
         let mut srck = None;
         let src_buf = if l.is_contiguous() && l.start_offset() == 0 {
             self.buffer
@@ -7103,9 +7326,12 @@ impl BackendStorage for VulkanStorage {
         // valid elements. No padded output buffer and no readback pass -- a readback over the O(seq²) QK
         // output costs more than the coopmat GEMM saves vs the fp32 bmm_reg fallback. cast_f2h_pad places
         // each ragged operand into its tile grid (a flat cast would misplace batch b·h > 1).
-        let (m16, n16, k16) = (m.next_multiple_of(16), n.next_multiple_of(16), k.next_multiple_of(16));
-        let pad_scratch =
-            ((b * m16 * k16 * 2) as u64).saturating_add((b * k16 * n16 * 2) as u64);
+        let (m16, n16, k16) = (
+            m.next_multiple_of(16),
+            n.next_multiple_of(16),
+            k.next_multiple_of(16),
+        );
+        let pad_scratch = ((b * m16 * k16 * 2) as u64).saturating_add((b * k16 * n16 * 2) as u64);
         if self.device.inner.cm_use
             && matches!(self.device.coopmat_info(), Some((16, 16, 16)))
             && self.device.scratch_fits(pad_scratch)
@@ -7120,20 +7346,37 @@ impl BackendStorage for VulkanStorage {
             )?;
             // B operand's [outer,inner] follows the NT layout: non-nt B[b,k,n] -> [b,k16,n16]; nt reads
             // the natural weight W[b,n,k] (transposed in-kernel) -> [b,n16,k16] (same element count).
-            let (bd0, bd1, bd0_pad, bd1_pad) = if nt { (n, k, n16, k16) } else { (k, n, k16, n16) };
+            let (bd0, bd1, bd0_pad, bd1_pad) = if nt {
+                (n, k, n16, k16)
+            } else {
+                (k, n, k16, n16)
+            };
             self.device.dispatch(
                 "cast_f2h_pad",
                 &[rc_buf, b16],
-                &push_u32(&[b as u32, bd0 as u32, bd1 as u32, bd0_pad as u32, bd1_pad as u32]),
+                &push_u32(&[
+                    b as u32,
+                    bd0 as u32,
+                    bd1 as u32,
+                    bd0_pad as u32,
+                    bd1_pad as u32,
+                ]),
                 Self::groups_1d(b * k16 * n16),
             )?;
             // Push {batch, m16, k16, n16, m, n}: padded dims drive the loads/tile grid, real m/n drive the
             // bounds-checked store into the real [b,m,n] output. Only `out` (binding 2) is written.
-            let pushp = push_u32(&[b as u32, m16 as u32, k16 as u32, n16 as u32, m as u32, n as u32]);
+            let pushp = push_u32(&[
+                b as u32, m16 as u32, k16 as u32, n16 as u32, m as u32, n as u32,
+            ]);
             let groups = ((n16 / 16) as u32).div_ceil(4);
             let groups = (groups, ((m16 / 16) as u32).div_ceil(4), b as u32);
-            let kernel = if nt { "bmm_coopmat_rb_nt_pad" } else { "bmm_coopmat_rb_pad" };
-            self.device.dispatch(kernel, &[a16, b16, out.buffer], &pushp, groups)?;
+            let kernel = if nt {
+                "bmm_coopmat_rb_nt_pad"
+            } else {
+                "bmm_coopmat_rb_pad"
+            };
+            self.device
+                .dispatch(kernel, &[a16, b16, out.buffer], &pushp, groups)?;
             self.device.free_scratch(a16_bytes, a16, a16_mem, a16_hv);
             self.device.free_scratch(b16_bytes, b16, b16_mem, b16_hv);
             return Ok(out);
@@ -7310,14 +7553,21 @@ mod dsl_dispatch_proof {
         unsafe {
             let entry = match ash::Entry::load() {
                 Ok(e) => e,
-                Err(e) => { eprintln!("[cm-probe] no vulkan loader ({e}); skipping"); return; }
+                Err(e) => {
+                    eprintln!("[cm-probe] no vulkan loader ({e}); skipping");
+                    return;
+                }
             };
             let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
-            let instance = match entry
-                .create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)
-            {
+            let instance = match entry.create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app),
+                None,
+            ) {
                 Ok(i) => i,
-                Err(e) => { eprintln!("[cm-probe] no instance ({e}); skipping"); return; }
+                Err(e) => {
+                    eprintln!("[cm-probe] no instance ({e}); skipping");
+                    return;
+                }
             };
             let ct = |c: vk::ComponentTypeKHR| -> &'static str {
                 match c {
@@ -7332,11 +7582,17 @@ mod dsl_dispatch_proof {
             };
             for pd in instance.enumerate_physical_devices().unwrap_or_default() {
                 let p = instance.get_physical_device_properties(pd);
-                let name = CStr::from_ptr(p.device_name.as_ptr()).to_string_lossy().into_owned();
-                if p.device_type == vk::PhysicalDeviceType::CPU || name.to_lowercase().contains("llvmpipe") {
+                let name = CStr::from_ptr(p.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
+                if p.device_type == vk::PhysicalDeviceType::CPU
+                    || name.to_lowercase().contains("llvmpipe")
+                {
                     continue;
                 }
-                let exts = instance.enumerate_device_extension_properties(pd).unwrap_or_default();
+                let exts = instance
+                    .enumerate_device_extension_properties(pd)
+                    .unwrap_or_default();
                 let has_cm = exts.iter().any(|e| {
                     CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::cooperative_matrix::NAME
                 });
@@ -7345,7 +7601,9 @@ mod dsl_dispatch_proof {
                     continue;
                 }
                 let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
-                let props = cm.get_physical_device_cooperative_matrix_properties(pd).unwrap_or_default();
+                let props = cm
+                    .get_physical_device_cooperative_matrix_properties(pd)
+                    .unwrap_or_default();
                 eprintln!("[cm-probe] {name}: {} coopmat configs", props.len());
                 let mut has_f16acc = false;
                 let mut has_f32acc = false;
@@ -7366,11 +7624,24 @@ mod dsl_dispatch_proof {
                     has_f32acc |= f32acc;
                     eprintln!(
                         "[cm-probe]   {}x{}x{} A={} B={} C={} D={} scope={}{}{}",
-                        cfg.m_size, cfg.n_size, cfg.k_size,
-                        ct(cfg.a_type), ct(cfg.b_type), ct(cfg.c_type), ct(cfg.result_type),
+                        cfg.m_size,
+                        cfg.n_size,
+                        cfg.k_size,
+                        ct(cfg.a_type),
+                        ct(cfg.b_type),
+                        ct(cfg.c_type),
+                        ct(cfg.result_type),
                         cfg.scope.as_raw(),
-                        if f16acc { "  <- f16-acc 16x16x16 subgroup" } else { "" },
-                        if f32acc { "  <- f32-acc 16x16x16 subgroup" } else { "" },
+                        if f16acc {
+                            "  <- f16-acc 16x16x16 subgroup"
+                        } else {
+                            ""
+                        },
+                        if f32acc {
+                            "  <- f32-acc 16x16x16 subgroup"
+                        } else {
+                            ""
+                        },
                     );
                 }
                 eprintln!("[cm-probe] {name}: f16acc_16x16x16_subgroup={has_f16acc} f32acc_16x16x16_subgroup={has_f32acc}");
@@ -7649,7 +7920,12 @@ mod dsl_dispatch_proof {
             let xs = dev.upload_f32(&x).unwrap();
             let ws = dev.upload_f32(&w).unwrap();
             let got = xs
-                .rms_norm(&Layout::contiguous((rows, M)), &ws, &Layout::contiguous(M), EPS)
+                .rms_norm(
+                    &Layout::contiguous((rows, M)),
+                    &ws,
+                    &Layout::contiguous(M),
+                    EPS,
+                )
                 .unwrap()
                 .to_vec_f32()
                 .unwrap();
@@ -7659,7 +7935,10 @@ mod dsl_dispatch_proof {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             eprintln!("[qwen3-qknorm] rms_norm {tag} {rows}x{M} maxerr={maxerr:.3e}");
-            assert!(maxerr < 1e-4, "rms_norm {tag} {rows}x{M} diverged: {maxerr:.3e}");
+            assert!(
+                maxerr < 1e-4,
+                "rms_norm {tag} {rows}x{M} diverged: {maxerr:.3e}"
+            );
         }
 
         // (2) NeoX rope at decode (t=1) and prefill (t=8) shapes, both 2D [t,d/2] and 3D [b,t,d/2].
@@ -7743,7 +8022,12 @@ mod dsl_dispatch_proof {
             let cs = dev.upload_f32(&cos2d).unwrap();
             let ss = dev.upload_f32(&sin2d).unwrap();
             let normed_gpu = xs
-                .rms_norm(&Layout::contiguous((b * h * t, D)), &ws, &Layout::contiguous(D), EPS)
+                .rms_norm(
+                    &Layout::contiguous((b * h * t, D)),
+                    &ws,
+                    &Layout::contiguous(D),
+                    EPS,
+                )
                 .unwrap();
             let got = normed_gpu
                 .rope(
@@ -7790,8 +8074,9 @@ mod dsl_dispatch_proof {
             (2048, 2048),
         ] {
             let nb = k / 256;
-            let mut blocks: Vec<BlockQ4K> =
-                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut blocks: Vec<BlockQ4K> = (0..nout * nb)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
             let mut wdeq = vec![0f32; nout * k];
             for r in 0..nout {
                 let rowf: Vec<f32> = (0..k).map(|i| gen_w(r, i)).collect();
@@ -7818,7 +8103,10 @@ mod dsl_dispatch_proof {
             let got = dev.matvec_q4k(&wq, &x, nout, k).unwrap(); // production default = column dp4a
             let rdef = rel(&got);
             eprintln!("[q4k-decode] default nout={nout} k={k} rel={rdef:.3e}");
-            assert!(rdef < 2e-2, "default dense q4k decode diverged nout={nout} k={k}: {rdef:.3e}");
+            assert!(
+                rdef < 2e-2,
+                "default dense q4k decode diverged nout={nout} k={k}: {rdef:.3e}"
+            );
         }
     }
 
@@ -7843,8 +8131,9 @@ mod dsl_dispatch_proof {
         // Build a (nout,k) packed Q4_K weight + its CPU dequant, upload it, upload x, return (wq, x, cpu).
         let build = |seed: usize, nout: usize, k: usize| {
             let nb = k / 256;
-            let mut blocks: Vec<BlockQ4K> =
-                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut blocks: Vec<BlockQ4K> = (0..nout * nb)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
             let mut wdeq = vec![0f32; nout * k];
             for r in 0..nout {
                 let rowf: Vec<f32> = (0..k).map(|i| gen_w(seed, r, i)).collect();
@@ -7871,15 +8160,27 @@ mod dsl_dispatch_proof {
         // (the engine allocates one fresh meta per q/k/v/o Q4_K matvec) -- stresses pool/meta churn.
         let mut outs: Vec<(&str, VulkanStorage, &Vec<f32>)> = Vec::new();
         for _ in 0..80 {
-            outs.push(("a", dev.matvec_q4k_gpu(&wq_a, &xa, 1024, 2560).unwrap(), &cpu_a));
-            outs.push(("b", dev.matvec_q4k_gpu(&wq_b, &xb, 1024, 4096).unwrap(), &cpu_b));
+            outs.push((
+                "a",
+                dev.matvec_q4k_gpu(&wq_a, &xa, 1024, 2560).unwrap(),
+                &cpu_a,
+            ));
+            outs.push((
+                "b",
+                dev.matvec_q4k_gpu(&wq_b, &xb, 1024, 4096).unwrap(),
+                &cpu_b,
+            ));
         }
         // Read now (first readback flushes+fences the whole batch).
         let mut worst = 0f32;
         for (tag, out, cpu) in &outs {
             let got = out.to_vec_f32().unwrap();
             let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
-            let rel = got.iter().zip(cpu.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+            let rel = got
+                .iter()
+                .zip(cpu.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
                 / maxref;
             if rel > 5e-3 {
                 eprintln!("[q4k-blk-batch] {tag} DIVERGED rel={rel:.3e}");
@@ -7887,7 +8188,10 @@ mod dsl_dispatch_proof {
             worst = worst.max(rel);
         }
         eprintln!("[q4k-decode-batch] 160 interleaved k=2560/4096 dispatches, no sync: worst_rel={worst:.3e}");
-        assert!(worst < 2e-2, "batched dense q4k decode diverged: {worst:.3e}");
+        assert!(
+            worst < 2e-2,
+            "batched dense q4k decode diverged: {worst:.3e}"
+        );
     }
 
     // Gates the shipped default (column dp4a) when the activation is produced by rms_norm IN THE SAME
@@ -7909,8 +8213,9 @@ mod dsl_dispatch_proof {
         };
         let nb = K / 256;
         let gen_w = |row: usize, i: usize| (((row * 13 + i * 7) % 1000) as f32) / 500.0 - 1.0;
-        let mut blocks: Vec<BlockQ4K> =
-            (0..NOUT * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut blocks: Vec<BlockQ4K> = (0..NOUT * nb)
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
         let mut wdeq = vec![0f32; NOUT * K];
         for r in 0..NOUT {
             let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
@@ -7921,8 +8226,12 @@ mod dsl_dispatch_proof {
             unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36) };
         let wq = dev.upload_u32(u32s).unwrap();
         // Pre-norm input + rms weight; CPU computes act = rms_norm then q = W @ act.
-        let pre: Vec<f32> = (0..K).map(|i| (((i * 17 + 5) % 800) as f32) / 400.0 - 1.0).collect();
-        let nw: Vec<f32> = (0..K).map(|i| 0.9 + (((i * 3) % 100) as f32) / 500.0).collect();
+        let pre: Vec<f32> = (0..K)
+            .map(|i| (((i * 17 + 5) % 800) as f32) / 400.0 - 1.0)
+            .collect();
+        let nw: Vec<f32> = (0..K)
+            .map(|i| 0.9 + (((i * 3) % 100) as f32) / 500.0)
+            .collect();
         let ss: f32 = pre.iter().map(|v| v * v).sum();
         let denom = (ss / K as f32 + EPS).sqrt();
         let act: Vec<f32> = (0..K).map(|i| pre[i] / denom * nw[i]).collect();
@@ -7934,13 +8243,28 @@ mod dsl_dispatch_proof {
         let pres = dev.upload_f32(&pre).unwrap();
         let nws = dev.upload_f32(&nw).unwrap();
         let actg = pres
-            .rms_norm(&Layout::contiguous((1, K)), &nws, &Layout::contiguous(K), EPS)
+            .rms_norm(
+                &Layout::contiguous((1, K)),
+                &nws,
+                &Layout::contiguous(K),
+                EPS,
+            )
             .unwrap();
         let out = dev.matvec_q4k_gpu(&wq, &actg, NOUT, K).unwrap();
         let got = out.to_vec_f32().unwrap();
-        let rel = got.iter().zip(&cpu_q).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
-        eprintln!("[q4k-blk-inbatch] q_proj k={K} nout={NOUT} (act from in-batch rms_norm) rel={rel:.3e}");
-        assert!(rel < 2e-2, "block dp4a with in-batch activation diverged: {rel:.3e}");
+        let rel = got
+            .iter()
+            .zip(&cpu_q)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / maxref;
+        eprintln!(
+            "[q4k-blk-inbatch] q_proj k={K} nout={NOUT} (act from in-batch rms_norm) rel={rel:.3e}"
+        );
+        assert!(
+            rel < 2e-2,
+            "block dp4a with in-batch activation diverged: {rel:.3e}"
+        );
     }
 
     // Regression for the f16lo_to_f32 SUBNORMAL bug that garbled qwen3 Vulkan decode: build a Q4_K
@@ -7964,8 +8288,9 @@ mod dsl_dispatch_proof {
         let (nout, k) = (512usize, 2560usize); // multi-pass; mixes normal- and subnormal-scale blocks
         let nb = k / 256;
         let gen = |r: usize, i: usize| (((r * 13 + i * 7) % 1000) as f32) / 500.0 - 1.0;
-        let mut blocks: Vec<BlockQ4K> =
-            (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut blocks: Vec<BlockQ4K> = (0..nout * nb)
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
         let mut wdeq = vec![0f32; nout * k];
         for r in 0..nout {
             let rowf: Vec<f32> = (0..k)
@@ -7981,7 +8306,9 @@ mod dsl_dispatch_proof {
         let u32s: &[u32] =
             unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36) };
         let wq = dev.upload_u32(u32s).unwrap();
-        let x: Vec<f32> = (0..k).map(|i| (((i * 17 + 5) % 800) as f32) / 400.0 - 1.0).collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| (((i * 17 + 5) % 800) as f32) / 400.0 - 1.0)
+            .collect();
         let mut cpu = vec![0f32; nout];
         for (r, c) in cpu.iter_mut().enumerate() {
             *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
@@ -7993,9 +8320,19 @@ mod dsl_dispatch_proof {
         unsafe { std::env::set_var("VK_Q4K_CM_OFF", "1") };
         let block = dev.matvec_q4k(&wq, &x, nout, k).unwrap();
         unsafe { std::env::remove_var("VK_Q4K_CM_OFF") };
-        let rel = block.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
-        eprintln!("[q4k-subnormal] block kernel vs CPU, subnormal-scale super-blocks: rel={rel:.3e}");
-        assert!(rel < 2e-2, "block dp4a mis-decodes subnormal fp16 scales: {rel:.3e} (f16lo_to_f32 regression)");
+        let rel = block
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / maxref;
+        eprintln!(
+            "[q4k-subnormal] block kernel vs CPU, subnormal-scale super-blocks: rel={rel:.3e}"
+        );
+        assert!(
+            rel < 2e-2,
+            "block dp4a mis-decodes subnormal fp16 scales: {rel:.3e} (f16lo_to_f32 regression)"
+        );
     }
 
     // The production `add_rmsnorm` method dispatches the DSL block-per-row fused kernel
@@ -8192,7 +8529,9 @@ mod dsl_dispatch_proof {
         let nb = K / 256;
         let gen_w = |row: usize, i: usize| (((row * 13 + i * 7) % 1000) as f32) / 500.0 - 1.0;
         // Quantize each weight row to Q4_K, and dequantize it back for the CPU reference.
-        let mut blocks: Vec<BlockQ4K> = (0..rows * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut blocks: Vec<BlockQ4K> = (0..rows * nb)
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
         let mut wdeq = vec![0f32; rows * K];
         for r in 0..rows {
             let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
@@ -8235,7 +8574,10 @@ mod dsl_dispatch_proof {
             .fold(0f32, f32::max);
         let rel = maxerr / maxref.max(1e-30);
         eprintln!("[moe-q4k-blk] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (DSL blk spv via ml dispatch + split repack)");
-        assert!(rel < 1e-3, "moe q4k blk DSL diverged from CPU: scale_rel={rel:.3e}");
+        assert!(
+            rel < 1e-3,
+            "moe q4k blk DSL diverged from CPU: scale_rel={rel:.3e}"
+        );
     }
 
     // Twin of the Q4_K proof for the committed `moe_matvec_q6k_blk_dn` .spv (down shape n=2048 k=768):
@@ -8258,7 +8600,9 @@ mod dsl_dispatch_proof {
         let rows = E * N;
         let nb = K / 256;
         let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
-        let mut blocks: Vec<BlockQ6K> = (0..rows * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut blocks: Vec<BlockQ6K> = (0..rows * nb)
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
         let mut wdeq = vec![0f32; rows * K];
         for r in 0..rows {
             let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
@@ -8301,7 +8645,10 @@ mod dsl_dispatch_proof {
             .fold(0f32, f32::max);
         let rel = maxerr / maxref.max(1e-30);
         eprintln!("[moe-q6k-blk] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (DSL blk spv via ml dispatch + split repack)");
-        assert!(rel < 1e-3, "moe q6k blk DSL diverged from CPU: scale_rel={rel:.3e}");
+        assert!(
+            rel < 1e-3,
+            "moe q6k blk DSL diverged from CPU: scale_rel={rel:.3e}"
+        );
     }
 
     /// The coalesced multi-thread Q6_K decode matvec (`mul_mat_vec_q6k_cm`) agrees with a CPU f32 oracle
@@ -8322,8 +8669,9 @@ mod dsl_dispatch_proof {
         for &(nout, k) in &[(256usize, 2048usize), (2048, 11008), (151, 512), (300, 256)] {
             let nb = k / 256;
             let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
-            let mut blocks: Vec<BlockQ6K> =
-                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut blocks: Vec<BlockQ6K> = (0..nout * nb)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
             let mut wdeq = vec![0f32; nout * k];
             for r in 0..nout {
                 let rowf: Vec<f32> = (0..k).map(|i| gen_w(r, i)).collect();
@@ -8336,7 +8684,9 @@ mod dsl_dispatch_proof {
                     blocks.len() * std::mem::size_of::<BlockQ6K>(),
                 )
             };
-            let x: Vec<f32> = (0..k).map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0).collect();
+            let x: Vec<f32> = (0..k)
+                .map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0)
+                .collect();
             let mut cpu = vec![0f32; nout];
             for r in 0..nout {
                 let mut acc = 0f32;
@@ -8348,11 +8698,17 @@ mod dsl_dispatch_proof {
             let wq = dev.quantize_q6k(bytes, nout, k).unwrap();
             let got = dev.matvec_q6k(&wq, &x, nout, k).unwrap();
             let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs()));
-            let maxerr =
-                got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let maxerr = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             let rel = maxerr / maxref.max(1e-30);
             eprintln!("[q6k-cm] {nout}x{k}  scale_rel={rel:.2e}");
-            assert!(rel < 1e-3, "q6k_cm diverged from CPU: {nout}x{k} scale_rel={rel:.3e}");
+            assert!(
+                rel < 1e-3,
+                "q6k_cm diverged from CPU: {nout}x{k} scale_rel={rel:.3e}"
+            );
         }
     }
 
@@ -8368,7 +8724,10 @@ mod dsl_dispatch_proof {
         use crate::quantized::k_quants::{BlockQ4K, GgmlType};
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[q4k-cm] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[q4k-cm] no vulkan device ({e}); skipping");
+                return;
+            }
         };
         for &(nout, k, subnormal) in &[
             (256usize, 2048usize, false),
@@ -8383,11 +8742,16 @@ mod dsl_dispatch_proof {
             let gen_w = |row: usize, i: usize| {
                 let base = (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
                 // every 3rd super-block: tiny range -> subnormal fp16 d/dmin.
-                let amp = if subnormal && (i / 256) % 3 == 0 { 1.5e-5 } else { 1.0 };
+                let amp = if subnormal && (i / 256) % 3 == 0 {
+                    1.5e-5
+                } else {
+                    1.0
+                };
                 base * amp
             };
-            let mut blocks: Vec<BlockQ4K> =
-                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut blocks: Vec<BlockQ4K> = (0..nout * nb)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
             let mut wdeq = vec![0f32; nout * k];
             for r in 0..nout {
                 let rowf: Vec<f32> = (0..k).map(|i| gen_w(r, i)).collect();
@@ -8398,17 +8762,26 @@ mod dsl_dispatch_proof {
                 std::slice::from_raw_parts(blocks.as_ptr() as *const u32, blocks.len() * 36)
             };
             let wq = dev.upload_u32(u32s).unwrap();
-            let x: Vec<f32> = (0..k).map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0).collect();
+            let x: Vec<f32> = (0..k)
+                .map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0)
+                .collect();
             let mut cpu = vec![0f32; nout];
             for (r, c) in cpu.iter_mut().enumerate() {
                 *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
             }
             let got = dev.matvec_q4k(&wq, &x, nout, k).unwrap(); // production default = CM kernel
             let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
-            let maxerr = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let maxerr = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             let rel = maxerr / maxref;
             eprintln!("[q4k-cm] {nout}x{k} subnormal={subnormal} scale_rel={rel:.2e}");
-            assert!(rel < 1e-3, "q4k_cm diverged from CPU: {nout}x{k} scale_rel={rel:.3e}");
+            assert!(
+                rel < 1e-3,
+                "q4k_cm diverged from CPU: {nout}x{k} scale_rel={rel:.3e}"
+            );
         }
     }
 
@@ -8428,14 +8801,18 @@ mod dsl_dispatch_proof {
         use crate::quantized::k_quants::{BlockQ4K, GgmlType};
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[q4k-ab] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[q4k-ab] no vulkan device ({e}); skipping");
+                return;
+            }
         };
         eprintln!("== cold in-engine A/B: DSL matvec_q4k_f32_blk vs hand mul_mat_vec_q4k_cm (dev.matvec_q4k) ==");
         for &(nout, k) in &[(6144usize, 2048usize), (2048, 2048), (1024, 2048)] {
             let nb = k / 256;
             let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
-            let mut blocks: Vec<BlockQ4K> =
-                (0..nout * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut blocks: Vec<BlockQ4K> = (0..nout * nb)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
             let mut wdeq = vec![0f32; nout * k];
             for r in 0..nout {
                 let rowf: Vec<f32> = (0..k).map(|i| gen_w(r, i)).collect();
@@ -8448,14 +8825,20 @@ mod dsl_dispatch_proof {
             let wbytes = nout * (k / 256) * 144;
             let nbanks = (64 * 1024 * 1024 / wbytes + 1).max(6);
             let banks: Vec<_> = (0..nbanks).map(|_| dev.upload_u32(u32s).unwrap()).collect();
-            let x: Vec<f32> = (0..k).map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0).collect();
+            let x: Vec<f32> = (0..k)
+                .map(|i| (((i * 19 + 3) % 700) as f32) / 350.0 - 1.0)
+                .collect();
             let mut cpu = vec![0f32; nout];
             for (r, c) in cpu.iter_mut().enumerate() {
                 *c = (0..k).map(|i| wdeq[r * k + i] * x[i]).sum();
             }
             let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
             let rel_of = |got: &[f32]| {
-                got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref
+                got.iter()
+                    .zip(&cpu)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max)
+                    / maxref
             };
             let meas = |dsl: bool| -> (f64, f32) {
                 if dsl {
@@ -8486,8 +8869,14 @@ mod dsl_dispatch_proof {
                 "  {nout}x{k}: hand CM {hand_ms:.4}ms {hand_g:.0} GB/s (rel {hand_rel:.1e}) | DSL {dsl_ms:.4}ms {dsl_g:.0} GB/s (rel {dsl_rel:.1e}) | DSL/hand {:.3}x",
                 dsl_g / hand_g
             );
-            assert!(hand_rel < 1e-3, "hand CM diverged from oracle: {hand_rel:.2e}");
-            assert!(dsl_rel < 1e-3, "DSL f32 diverged from oracle: {dsl_rel:.2e}");
+            assert!(
+                hand_rel < 1e-3,
+                "hand CM diverged from oracle: {hand_rel:.2e}"
+            );
+            assert!(
+                dsl_rel < 1e-3,
+                "DSL f32 diverged from oracle: {dsl_rel:.2e}"
+            );
         }
     }
 
@@ -8518,7 +8907,9 @@ mod dsl_dispatch_proof {
         let rows = E * N;
         let nb = K / 256;
         let gen_w = |row: usize, i: usize| (((row * 11 + i * 5) % 900) as f32) / 450.0 - 1.0;
-        let mut blocks: Vec<BlockQ6K> = (0..rows * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut blocks: Vec<BlockQ6K> = (0..rows * nb)
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
         let mut wdeq = vec![0f32; rows * K];
         for r in 0..rows {
             let rowf: Vec<f32> = (0..K).map(|i| gen_w(r, i)).collect();
@@ -8550,7 +8941,16 @@ mod dsl_dispatch_proof {
         let xs = dev.upload_f32(&x).unwrap();
         let ids_buf = dev.upload_ids(&ids).unwrap();
         let y = dev
-            .moe_matvec_blk_dp4a_gpu("moe_matvec_q6k_dp4a_blk_dn", false, &bank, &xs, &ids_buf, NROWS, N, K)
+            .moe_matvec_blk_dp4a_gpu(
+                "moe_matvec_q6k_dp4a_blk_dn",
+                false,
+                &bank,
+                &xs,
+                &ids_buf,
+                NROWS,
+                N,
+                K,
+            )
             .unwrap();
         let got = y.to_vec_f32().unwrap();
         let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs()));
@@ -8561,7 +8961,10 @@ mod dsl_dispatch_proof {
             .fold(0f32, f32::max);
         let rel = maxerr / maxref.max(1e-30);
         eprintln!("[moe-q6k-dp4a] E{E} {NROWS}x{N}x{K}  scale_rel={rel:.2e}  (dp4a spv via ml dispatch, no-xsum binding set)");
-        assert!(rel < 1e-2, "moe q6k dp4a DSL diverged from CPU: scale_rel={rel:.3e}");
+        assert!(
+            rel < 1e-2,
+            "moe q6k dp4a DSL diverged from CPU: scale_rel={rel:.3e}"
+        );
     }
 
     // The committed DSL flash-SDPA .spv (`sdpa_blk`, d=128 nt=64) dispatched through ml's own
@@ -8597,13 +9000,20 @@ mod dsl_dispatch_proof {
             for qp in 0..SQ {
                 let qb = (h * SQ + qp) * D;
                 let sc: Vec<f32> = (0..SK)
-                    .map(|kk| (0..D).map(|dd| q[qb + dd] * k[(kv * SK + kk) * D + dd]).sum::<f32>() * scale)
+                    .map(|kk| {
+                        (0..D)
+                            .map(|dd| q[qb + dd] * k[(kv * SK + kk) * D + dd])
+                            .sum::<f32>()
+                            * scale
+                    })
                     .collect();
                 let m = sc.iter().cloned().fold(f32::MIN, f32::max);
                 let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
                 let sum: f32 = ex.iter().sum();
                 for dd in 0..D {
-                    cpu[qb + dd] = (0..SK).map(|kk| ex[kk] / sum * v[(kv * SK + kk) * D + dd]).sum();
+                    cpu[qb + dd] = (0..SK)
+                        .map(|kk| ex[kk] / sum * v[(kv * SK + kk) * D + dd])
+                        .sum();
                 }
             }
         }
@@ -8614,19 +9024,41 @@ mod dsl_dispatch_proof {
         for _ in 0..8 {
             // Packed k/v: batch stride KV*SK*D, kv-head stride SK*D, key stride D.
             outs.push(
-                dev.sdpa_blk_vk(&qs, &ks, &vs, 1, H, KV, SQ, SK, D, scale, false, KV * SK * D, SK * D, D)
-                    .unwrap(),
+                dev.sdpa_blk_vk(
+                    &qs,
+                    &ks,
+                    &vs,
+                    1,
+                    H,
+                    KV,
+                    SQ,
+                    SK,
+                    D,
+                    scale,
+                    false,
+                    KV * SK * D,
+                    SK * D,
+                    D,
+                )
+                .unwrap(),
             );
         }
         let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
         let mut worst = 0f32;
         for out in &outs {
             let got = out.to_vec_f32().unwrap();
-            let err = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let err = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             worst = worst.max(err / maxref);
         }
         eprintln!("[sdpa-blk] h{H}kv{KV} q{SQ} k{SK} d{D} x8-batched  scale_rel={worst:.2e}  (DSL flash-SDPA spv via ml dispatch, pooled scale/meta, no sync crutch)");
-        assert!(worst < 1e-4, "sdpa_blk DSL diverged from CPU: scale_rel={worst:.3e}");
+        assert!(
+            worst < 1e-4,
+            "sdpa_blk DSL diverged from CPU: scale_rel={worst:.3e}"
+        );
     }
 
     // Long-prefill ring-timeout guard. A 2k+ token prefill records a whole forward's dispatches into
@@ -8667,14 +9099,21 @@ mod dsl_dispatch_proof {
             for qp in 0..QCHK {
                 let qb = (h * SQ + qp) * D;
                 let sc: Vec<f32> = (0..SK)
-                    .map(|kk| (0..D).map(|dd| q[qb + dd] * k[(kv * SK + kk) * D + dd]).sum::<f32>() * scale)
+                    .map(|kk| {
+                        (0..D)
+                            .map(|dd| q[qb + dd] * k[(kv * SK + kk) * D + dd])
+                            .sum::<f32>()
+                            * scale
+                    })
                     .collect();
                 let m = sc.iter().cloned().fold(f32::MIN, f32::max);
                 let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
                 let sum: f32 = ex.iter().sum();
                 let ob = (h * QCHK + qp) * D;
                 for dd in 0..D {
-                    cpu[ob + dd] = (0..SK).map(|kk| ex[kk] / sum * v[(kv * SK + kk) * D + dd]).sum();
+                    cpu[ob + dd] = (0..SK)
+                        .map(|kk| ex[kk] / sum * v[(kv * SK + kk) * D + dd])
+                        .sum();
                 }
             }
         }
@@ -8687,8 +9126,23 @@ mod dsl_dispatch_proof {
             let mut last = None;
             for _ in 0..LAYERS {
                 last = Some(
-                    dev.sdpa_blk_vk(&qs, &ks, &vs, 1, H, KV, SQ, SK, D, scale, false, KV * SK * D, SK * D, D)
-                        .unwrap(),
+                    dev.sdpa_blk_vk(
+                        &qs,
+                        &ks,
+                        &vs,
+                        1,
+                        H,
+                        KV,
+                        SQ,
+                        SK,
+                        D,
+                        scale,
+                        false,
+                        KV * SK * D,
+                        SK * D,
+                        D,
+                    )
+                    .unwrap(),
                 );
             }
             let out = last.unwrap().to_vec_f32().unwrap();
@@ -8708,7 +9162,11 @@ mod dsl_dispatch_proof {
         };
         let maxref = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
         let relerr = |got: &[f32]| {
-            got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref
+            got.iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+                / maxref
         };
 
         // Pre-fix shape: the whole forward is ONE submission (at 2k+ tokens this overruns the ring timeout).
@@ -8729,14 +9187,27 @@ mod dsl_dispatch_proof {
             relerr(&got_capped),
         );
 
-        assert_eq!(uncapped_submits, 1, "cap disabled must submit the whole forward once");
-        assert!(capped_submits > 1, "work cap must split the forward into multiple submissions");
+        assert_eq!(
+            uncapped_submits, 1,
+            "cap disabled must submit the whole forward once"
+        );
+        assert!(
+            capped_submits > 1,
+            "work cap must split the forward into multiple submissions"
+        );
         assert!(
             capped_submits >= (LAYERS as u64) / 4 - 1,
             "work cap under-split the forward: {capped_submits} submissions"
         );
-        assert_eq!(got_capped, got_uncapped, "splitting the submission changed the result");
-        assert!(relerr(&got_capped) < 1e-4, "sdpa diverged from CPU: scale_rel={:.3e}", relerr(&got_capped));
+        assert_eq!(
+            got_capped, got_uncapped,
+            "splitting the submission changed the result"
+        );
+        assert!(
+            relerr(&got_capped) < 1e-4,
+            "sdpa diverged from CPU: scale_rel={:.3e}",
+            relerr(&got_capped)
+        );
     }
 
     /// Flash-decoding (`sdpa_decode_split_vk`) matches the same two-pass softmax CPU oracle as
@@ -8764,13 +9235,20 @@ mod dsl_dispatch_proof {
                 let kv = h / groups;
                 let qb = h * D;
                 let sc: Vec<f32> = (0..sk)
-                    .map(|kk| (0..D).map(|dd| q[qb + dd] * k[(kv * sk + kk) * D + dd]).sum::<f32>() * scale)
+                    .map(|kk| {
+                        (0..D)
+                            .map(|dd| q[qb + dd] * k[(kv * sk + kk) * D + dd])
+                            .sum::<f32>()
+                            * scale
+                    })
                     .collect();
                 let m = sc.iter().cloned().fold(f32::MIN, f32::max);
                 let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
                 let sum: f32 = ex.iter().sum();
                 for dd in 0..D {
-                    cpu[qb + dd] = (0..sk).map(|kk| ex[kk] / sum * v[(kv * sk + kk) * D + dd]).sum();
+                    cpu[qb + dd] = (0..sk)
+                        .map(|kk| ex[kk] / sum * v[(kv * sk + kk) * D + dd])
+                        .sum();
                 }
             }
             cpu
@@ -8798,17 +9276,36 @@ mod dsl_dispatch_proof {
             let vs = dev.upload_f32(&v).unwrap();
             let out = dev
                 .sdpa_decode_split_vk(
-                    &qs, &ks, &vs, 1, h_n, kv_n, 1, sk, D, scale, nsplit,
-                    kv_n * sk * D, sk * D, D,
+                    &qs,
+                    &ks,
+                    &vs,
+                    1,
+                    h_n,
+                    kv_n,
+                    1,
+                    sk,
+                    D,
+                    scale,
+                    nsplit,
+                    kv_n * sk * D,
+                    sk * D,
+                    D,
                 )
                 .unwrap();
             let got = out.to_vec_f32().unwrap();
-            let err = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let err = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             let rel = err / maxref;
             eprintln!("[sdpa-split] h{h_n}kv{kv_n} k{sk} nsplit{nsplit}  scale_rel={rel:.2e}");
             worst = worst.max(rel);
         }
-        assert!(worst < 1e-4, "sdpa_decode_split diverged from CPU: scale_rel={worst:.3e}");
+        assert!(
+            worst < 1e-4,
+            "sdpa_decode_split diverged from CPU: scale_rel={worst:.3e}"
+        );
     }
 
     // The committed DSL flash-attention coopmat .spv (`flash_attn_dsl`, d=128 plane=64 BR=BC=16)
@@ -8839,8 +9336,15 @@ mod dsl_dispatch_proof {
         // Two-pass materialized softmax(QKᵀ·scale + causal_mask)V over PACKED k/v [n_kv, seq_k, d],
         // GQA (head h reads kv head h/(n_heads/n_kv)). The normative reference the online-softmax
         // coopmat flash must match. causal masks key kk > query qp (both 0-based within the call).
-        let flash_ref = |q: &[f32], k: &[f32], v: &[f32],
-                         nh: usize, nkv: usize, sq: usize, sk: usize, causal: bool| -> Vec<f32> {
+        let flash_ref = |q: &[f32],
+                         k: &[f32],
+                         v: &[f32],
+                         nh: usize,
+                         nkv: usize,
+                         sq: usize,
+                         sk: usize,
+                         causal: bool|
+         -> Vec<f32> {
             let scale = 1.0f32 / (D as f32).sqrt();
             let groups = nh / nkv;
             let mut out = vec![0f32; nh * sq * D];
@@ -8853,13 +9357,18 @@ mod dsl_dispatch_proof {
                         if causal && kk > qp {
                             continue;
                         }
-                        sc[kk] = (0..D).map(|dd| q[qb + dd] * k[(kv * sk + kk) * D + dd]).sum::<f32>() * scale;
+                        sc[kk] = (0..D)
+                            .map(|dd| q[qb + dd] * k[(kv * sk + kk) * D + dd])
+                            .sum::<f32>()
+                            * scale;
                     }
                     let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
                     let sum: f32 = ex.iter().sum();
                     for dd in 0..D {
-                        out[qb + dd] = (0..sk).map(|kk| ex[kk] / sum * v[(kv * sk + kk) * D + dd]).sum();
+                        out[qb + dd] = (0..sk)
+                            .map(|kk| ex[kk] / sum * v[(kv * sk + kk) * D + dd])
+                            .sum();
                     }
                 }
             }
@@ -8878,14 +9387,35 @@ mod dsl_dispatch_proof {
             let ks = dev.upload_f32(&k).unwrap();
             let vs = dev.upload_f32(&v).unwrap();
             let out = dev
-                .flash_attn_dsl_vk(&qs, &ks, &vs, 1, nh, nkv, sq, sk, D, scale, causal, nkv * sk * D, sk * D, D)
+                .flash_attn_dsl_vk(
+                    &qs,
+                    &ks,
+                    &vs,
+                    1,
+                    nh,
+                    nkv,
+                    sq,
+                    sk,
+                    D,
+                    scale,
+                    causal,
+                    nkv * sk * D,
+                    sk * D,
+                    D,
+                )
                 .unwrap();
             let got = out.to_vec_f32().unwrap();
             let maxref = want.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-30);
-            let maxd = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let maxd = got
+                .iter()
+                .zip(&want)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
             let rel = maxd / maxref;
             eprintln!("[flash-dsl {tag}] nh{nh}/nkv{nkv} sq{sq} sk{sk} d{D} causal{causal}  scale_rel={rel:.2e}");
-            assert!(rel < 2e-2, "flash coopmat {tag}: scale_rel {rel:.3e} exceeds 2e-2 vs materialized ref");
+            assert!(
+                rel < 2e-2,
+                "flash coopmat {tag}: scale_rel {rel:.3e} exceeds 2e-2 vs materialized ref"
+            );
         };
         // decode (seq_q=1, non-causal, the single query attends the whole cache), ragged key counts.
         run(4, 2, 1, 1, false, "decode kv1");
@@ -8896,7 +9426,14 @@ mod dsl_dispatch_proof {
         // prefill (causal): aligned single tile, aligned 3-tile, ragged query tile (16+16+8), 512x512.
         run(4, 2, 16, 128, true, "prefill sq16 causal");
         run(4, 2, 48, 48, true, "prefill sq48 causal (aligned 3-tile)");
-        run(4, 2, 40, 40, true, "prefill sq40 causal (ragged query tile)");
+        run(
+            4,
+            2,
+            40,
+            40,
+            true,
+            "prefill sq40 causal (ragged query tile)",
+        );
         run(2, 1, 512, 512, true, "prefill 512x512 causal MHA");
     }
 
@@ -8913,9 +9450,18 @@ mod dsl_dispatch_proof {
         const D: usize = 128;
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[flash-ab] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[flash-ab] no vulkan device ({e}); skipping");
+                return;
+            }
         };
-        let bench = |nh: usize, nkv: usize, sq: usize, sk: usize, causal: bool, iters: usize, tag: &str| {
+        let bench = |nh: usize,
+                     nkv: usize,
+                     sq: usize,
+                     sk: usize,
+                     causal: bool,
+                     iters: usize,
+                     tag: &str| {
             let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
             let q: Vec<f32> = (0..nh * sq * D).map(|i| gen(1, i)).collect();
             let k: Vec<f32> = (0..nkv * sk * D).map(|i| gen(2, i)).collect();
@@ -8927,25 +9473,53 @@ mod dsl_dispatch_proof {
             let vs = dev.upload_f32(&v).unwrap();
             let out = dev.alloc_f32(nh * sq * D).unwrap();
             let scl = dev.upload_f32(&[scale]).unwrap();
-            let m8: Vec<u32> = vec![sq as u32, sk as u32, nh as u32, nkv as u32, causal as u32, kbs as u32, khs as u32, ks_ as u32];
+            let m8: Vec<u32> = vec![
+                sq as u32,
+                sk as u32,
+                nh as u32,
+                nkv as u32,
+                causal as u32,
+                kbs as u32,
+                khs as u32,
+                ks_ as u32,
+            ];
             let mut m9 = m8.clone();
             m9.push(0); // cube_base
             let meta_blk = dev.upload_u32(&m8).unwrap();
             let meta_flash = dev.upload_u32(&m9).unwrap();
-            let bufs_blk = [qs.buffer, ks.buffer, vs.buffer, out.buffer, scl.buffer, meta_blk.buffer];
-            let bufs_flash = [qs.buffer, ks.buffer, vs.buffer, out.buffer, scl.buffer, meta_flash.buffer];
+            let bufs_blk = [
+                qs.buffer,
+                ks.buffer,
+                vs.buffer,
+                out.buffer,
+                scl.buffer,
+                meta_blk.buffer,
+            ];
+            let bufs_flash = [
+                qs.buffer,
+                ks.buffer,
+                vs.buffer,
+                out.buffer,
+                scl.buffer,
+                meta_flash.buffer,
+            ];
             let g_blk = ((nh * sq) as u32, 1u32, 1u32);
             let g_flash = ((nh * sq.div_ceil(16)) as u32, 1u32, 1u32);
             // Time N same-kernel dispatches in one batch, one flush. Pre-allocated buffers => kernel +
             // record only. Both kernels pay the identical harness cost, so the ratio is honest.
-            let time_one = |name: &'static str, bufs: &[vk::Buffer], groups: (u32, u32, u32)| -> f64 {
-                for _ in 0..8 { dev.dispatch_outs(name, bufs, &[3], &[], groups).unwrap(); }
-                dev.flush().unwrap();
-                let t0 = std::time::Instant::now();
-                for _ in 0..iters { dev.dispatch_outs(name, bufs, &[3], &[], groups).unwrap(); }
-                dev.flush().unwrap();
-                t0.elapsed().as_secs_f64() * 1e3 / iters as f64
-            };
+            let time_one =
+                |name: &'static str, bufs: &[vk::Buffer], groups: (u32, u32, u32)| -> f64 {
+                    for _ in 0..8 {
+                        dev.dispatch_outs(name, bufs, &[3], &[], groups).unwrap();
+                    }
+                    dev.flush().unwrap();
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        dev.dispatch_outs(name, bufs, &[3], &[], groups).unwrap();
+                    }
+                    dev.flush().unwrap();
+                    t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+                };
             let ms_flash = time_one("flash_attn_dsl", &bufs_flash, g_flash);
             let ms_blk = time_one("sdpa_blk", &bufs_blk, g_blk);
             eprintln!(
@@ -8956,10 +9530,26 @@ mod dsl_dispatch_proof {
         // Decode (seq_q=1, the single query attends the whole cache): flash computes a 16-row tile for
         // 1 real query (15/16 wasted) -- sdpa_blk is purpose-built here. Prefill (causal, seq_q=seq_k):
         // flash's coopmat QK/PV amortize over 16 queries/tile -- the regime the tensor-core path targets.
-        bench(32, 8, 1, 2048, false, 200, "decode kv2048 GQA4 (production)");
+        bench(
+            32,
+            8,
+            1,
+            2048,
+            false,
+            200,
+            "decode kv2048 GQA4 (production)",
+        );
         bench(32, 8, 1, 512, false, 200, "decode kv512 GQA4");
         bench(8, 2, 512, 512, true, 50, "prefill 512x512 causal GQA4");
-        bench(32, 8, 512, 512, true, 30, "prefill 512x512 causal GQA4 (32h)");
+        bench(
+            32,
+            8,
+            512,
+            512,
+            true,
+            30,
+            "prefill 512x512 causal GQA4 (32h)",
+        );
     }
 
     // Crossover: the optimized DSL flash (`flash_attn_dsl`) vs the engine's NAIVE prefill attention --
@@ -8979,7 +9569,10 @@ mod dsl_dispatch_proof {
         const D: usize = 128;
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[flash-naive] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[flash-naive] no vulkan device ({e}); skipping");
+                return;
+            }
         };
         let g1d = |n: usize| ((n as u32).div_ceil(64), 1u32, 1u32); // WG1D == 64
         let d4 = |x: usize| ((x / 16) as u32).div_ceil(4); // coopmat 16-tiles, 4 tiles/workgroup
@@ -9000,18 +9593,45 @@ mod dsl_dispatch_proof {
             // ring timeout (a long pp4096 kernel batched N-deep would device-lost the SHARED GPU). One
             // iteration = one submission; per-dispatch flush cost is negligible vs the multi-ms kernels.
             let time_it = |run: &mut dyn FnMut()| -> f64 {
-                for _ in 0..2 { run(); dev.flush().unwrap(); }
+                for _ in 0..2 {
+                    run();
+                    dev.flush().unwrap();
+                }
                 let t0 = std::time::Instant::now();
-                for _ in 0..iters { run(); dev.flush().unwrap(); }
+                for _ in 0..iters {
+                    run();
+                    dev.flush().unwrap();
+                }
                 t0.elapsed().as_secs_f64() * 1e3 / iters as f64
             };
             let flash_ms = |causal: bool| -> f64 {
                 let cf = if causal { 1u32 } else { 0 };
-                let meta = dev.upload_u32(&[sq as u32, sk as u32, h as u32, h as u32, cf,
-                    (h * sk * D) as u32, (sk * D) as u32, D as u32, 0]).unwrap();
-                let bufs = [qs.buffer, ks.buffer, vs.buffer, out_f.buffer, scl.buffer, meta.buffer];
+                let meta = dev
+                    .upload_u32(&[
+                        sq as u32,
+                        sk as u32,
+                        h as u32,
+                        h as u32,
+                        cf,
+                        (h * sk * D) as u32,
+                        (sk * D) as u32,
+                        D as u32,
+                        0,
+                    ])
+                    .unwrap();
+                let bufs = [
+                    qs.buffer,
+                    ks.buffer,
+                    vs.buffer,
+                    out_f.buffer,
+                    scl.buffer,
+                    meta.buffer,
+                ];
                 let g = ((h * sq.div_ceil(16)) as u32, 1u32, 1u32);
-                time_it(&mut || { dev.dispatch_outs("flash_attn_dsl", &bufs, &[3], &[], g).unwrap(); })
+                time_it(&mut || {
+                    dev.dispatch_outs("flash_attn_dsl", &bufs, &[3], &[], g)
+                        .unwrap();
+                })
             };
 
             // Naive side: the materializing bmm+softmax+bmm chain, f16 scratch reused across iters.
@@ -9024,18 +9644,59 @@ mod dsl_dispatch_proof {
             let (v16, v16m, v16h, v16b) = dev.alloc_f16(h * sk * D).unwrap();
             let (p16, p16m, p16h, p16b) = dev.alloc_f16(h * sq * sk).unwrap();
             let mut naive_once = || {
-                dev.dispatch("cast_f2h", &[qs.buffer, q16], &push_u32(&[(h * sq * D) as u32]), g1d(h * sq * D)).unwrap();
-                dev.dispatch("cast_f2h", &[ks.buffer, k16], &push_u32(&[(h * sk * D) as u32]), g1d(h * sk * D)).unwrap();
-                dev.dispatch("cast_f2h", &[vs.buffer, v16], &push_u32(&[(h * sk * D) as u32]), g1d(h * sk * D)).unwrap();
+                dev.dispatch(
+                    "cast_f2h",
+                    &[qs.buffer, q16],
+                    &push_u32(&[(h * sq * D) as u32]),
+                    g1d(h * sq * D),
+                )
+                .unwrap();
+                dev.dispatch(
+                    "cast_f2h",
+                    &[ks.buffer, k16],
+                    &push_u32(&[(h * sk * D) as u32]),
+                    g1d(h * sk * D),
+                )
+                .unwrap();
+                dev.dispatch(
+                    "cast_f2h",
+                    &[vs.buffer, v16],
+                    &push_u32(&[(h * sk * D) as u32]),
+                    g1d(h * sk * D),
+                )
+                .unwrap();
                 // scores[h,sq,sk] = Q @ Kᵀ (NT reads K as [n=sk, k=D]); push [b,m,k,n]=[h,sq,D,sk].
-                dev.dispatch("bmm_coopmat_rb_nt", &[q16, k16, scores.buffer],
-                    &push_u32(&[h as u32, sq as u32, D as u32, sk as u32]), (d4(sk), d4(sq), h as u32)).unwrap();
+                dev.dispatch(
+                    "bmm_coopmat_rb_nt",
+                    &[q16, k16, scores.buffer],
+                    &push_u32(&[h as u32, sq as u32, D as u32, sk as u32]),
+                    (d4(sk), d4(sq), h as u32),
+                )
+                .unwrap();
                 // softmax over sk (reads+writes the whole [h*sq*sk] materialization -- the cliff).
-                dev.dispatch_out("softmax_rows", &[scores.buffer, probs.buffer, ndb.buffer], 1, &[], ((h * sq) as u32, 1, 1)).unwrap();
-                dev.dispatch("cast_f2h", &[probs.buffer, p16], &push_u32(&[(h * sq * sk) as u32]), g1d(h * sq * sk)).unwrap();
+                dev.dispatch_out(
+                    "softmax_rows",
+                    &[scores.buffer, probs.buffer, ndb.buffer],
+                    1,
+                    &[],
+                    ((h * sq) as u32, 1, 1),
+                )
+                .unwrap();
+                dev.dispatch(
+                    "cast_f2h",
+                    &[probs.buffer, p16],
+                    &push_u32(&[(h * sq * sk) as u32]),
+                    g1d(h * sq * sk),
+                )
+                .unwrap();
                 // ctx[h,sq,D] = probs @ V; push [b,m,k,n]=[h,sq,sk,D].
-                dev.dispatch("bmm_coopmat_rb", &[p16, v16, ctx.buffer],
-                    &push_u32(&[h as u32, sq as u32, sk as u32, D as u32]), (d4(D), d4(sq), h as u32)).unwrap();
+                dev.dispatch(
+                    "bmm_coopmat_rb",
+                    &[p16, v16, ctx.buffer],
+                    &push_u32(&[h as u32, sq as u32, sk as u32, D as u32]),
+                    (d4(D), d4(sq), h as u32),
+                )
+                .unwrap();
             };
             let naive_ms = time_it(&mut naive_once);
             let f_nc = flash_ms(false);
@@ -9086,12 +9747,20 @@ mod dsl_dispatch_proof {
             s ^= s << 17;
             s
         };
-        let xq: Vec<i8> = (0..M * K).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
+        let xq: Vec<i8> = (0..M * K)
+            .map(|_| ((next() % 255) as i64 - 127) as i8)
+            .collect();
         let wqs: Vec<u32> = (0..N * nsb * 32).map(|_| next() as u32).collect();
         let wsc: Vec<u32> = (0..N * nsb * 3).map(|_| next() as u32).collect();
-        let wd: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 20000.0 + 0.002).collect();
-        let wdm: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 40000.0).collect();
-        let xs: Vec<f32> = (0..M * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+        let wd: Vec<f32> = (0..N * nsb)
+            .map(|_| (next() % 1000) as f32 / 20000.0 + 0.002)
+            .collect();
+        let wdm: Vec<f32> = (0..N * nsb)
+            .map(|_| (next() % 1000) as f32 / 40000.0)
+            .collect();
+        let xs: Vec<f32> = (0..M * kb)
+            .map(|_| (next() % 1000) as f32 / 50000.0 + 0.002)
+            .collect();
         // xsum = xs*Sum(xq): the dequantized block sum quantize_act_q8 emits (so the offset term
         // carries xs and the epilogue applies xs only to the dot).
         let mut xsum = vec![0f32; M * kb];
@@ -9107,10 +9776,18 @@ mod dsl_dispatch_proof {
         // CPU reference: affine MMQ with the same in-place Q4_K decode.
         let byte = |a: &[u32], base: usize, i: usize| (a[base + i / 4] >> (8 * (i % 4))) & 255;
         let sc_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
-            if j < 4 { byte(wsc, sb, j) & 63 } else { (byte(wsc, sb, j + 4) & 15) | ((byte(wsc, sb, j - 4) >> 6) << 4) }
+            if j < 4 {
+                byte(wsc, sb, j) & 63
+            } else {
+                (byte(wsc, sb, j + 4) & 15) | ((byte(wsc, sb, j - 4) >> 6) << 4)
+            }
         };
         let m_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
-            if j < 4 { byte(wsc, sb, j + 4) & 63 } else { (byte(wsc, sb, j + 4) >> 4) | ((byte(wsc, sb, j) >> 6) << 4) }
+            if j < 4 {
+                byte(wsc, sb, j + 4) & 63
+            } else {
+                (byte(wsc, sb, j + 4) >> 4) | ((byte(wsc, sb, j) >> 6) << 4)
+            }
         };
         let mut want = vec![0f32; M * N];
         for i in 0..M {
@@ -9148,9 +9825,17 @@ mod dsl_dispatch_proof {
         let out = dev.mmq_q4k_gpu(&xqh, &xsh, &xsumh, &bank, M, N).unwrap();
         let got = out.to_vec_f32().unwrap();
         let maxref = want.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
-        let rel = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+        let rel = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / maxref;
         eprintln!("[mmq-q4k] {M}x{N}x{K} scale_rel={rel:.2e}  (affine Q4_K coopmat PREFILL spv via ml dispatch)");
-        assert!(rel < 1e-3, "mmq_q4k prefill DSL diverged from CPU: scale_rel={rel:.3e}");
+        assert!(
+            rel < 1e-3,
+            "mmq_q4k prefill DSL diverged from CPU: scale_rel={rel:.3e}"
+        );
     }
 
     /// The RUNTIME-DIMS twin (`mmq_q4k_rt`, m/n/k via meta SSBO) dispatches through ml at a shape the
@@ -9172,27 +9857,50 @@ mod dsl_dispatch_proof {
         let kb = K / 32;
         let nsb = K / 256;
         let mut s = 0x9E3779B97F4A7C15u64;
-        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-        let xq: Vec<i8> = (0..M * K).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let xq: Vec<i8> = (0..M * K)
+            .map(|_| ((next() % 255) as i64 - 127) as i8)
+            .collect();
         let wqs: Vec<u32> = (0..N * nsb * 32).map(|_| next() as u32).collect();
         let wsc: Vec<u32> = (0..N * nsb * 3).map(|_| next() as u32).collect();
-        let wd: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 20000.0 + 0.002).collect();
-        let wdm: Vec<f32> = (0..N * nsb).map(|_| (next() % 1000) as f32 / 40000.0).collect();
-        let xs: Vec<f32> = (0..M * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+        let wd: Vec<f32> = (0..N * nsb)
+            .map(|_| (next() % 1000) as f32 / 20000.0 + 0.002)
+            .collect();
+        let wdm: Vec<f32> = (0..N * nsb)
+            .map(|_| (next() % 1000) as f32 / 40000.0)
+            .collect();
+        let xs: Vec<f32> = (0..M * kb)
+            .map(|_| (next() % 1000) as f32 / 50000.0 + 0.002)
+            .collect();
         let mut xsum = vec![0f32; M * kb];
         for i in 0..M {
             for b in 0..kb {
                 let mut acc = 0i32;
-                for l in 0..32 { acc += xq[i * K + b * 32 + l] as i32; }
+                for l in 0..32 {
+                    acc += xq[i * K + b * 32 + l] as i32;
+                }
                 xsum[i * kb + b] = xs[i * kb + b] * acc as f32;
             }
         }
         let byte = |a: &[u32], base: usize, i: usize| (a[base + i / 4] >> (8 * (i % 4))) & 255;
         let sc_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
-            if j < 4 { byte(wsc, sb, j) & 63 } else { (byte(wsc, sb, j + 4) & 15) | ((byte(wsc, sb, j - 4) >> 6) << 4) }
+            if j < 4 {
+                byte(wsc, sb, j) & 63
+            } else {
+                (byte(wsc, sb, j + 4) & 15) | ((byte(wsc, sb, j - 4) >> 6) << 4)
+            }
         };
         let m_of = |wsc: &[u32], sb: usize, j: usize| -> u32 {
-            if j < 4 { byte(wsc, sb, j + 4) & 63 } else { (byte(wsc, sb, j + 4) >> 4) | ((byte(wsc, sb, j) >> 6) << 4) }
+            if j < 4 {
+                byte(wsc, sb, j + 4) & 63
+            } else {
+                (byte(wsc, sb, j + 4) >> 4) | ((byte(wsc, sb, j) >> 6) << 4)
+            }
         };
         let mut want = vec![0f32; M * N];
         for i in 0..M {
@@ -9226,12 +9934,22 @@ mod dsl_dispatch_proof {
             dev.upload_f32(&wd).unwrap(),
             dev.upload_f32(&wdm).unwrap(),
         ]);
-        let out = dev.mmq_q4k_rt_gpu(&xqh, &xsh, &xsumh, &bank, M, N, K).unwrap();
+        let out = dev
+            .mmq_q4k_rt_gpu(&xqh, &xsh, &xsumh, &bank, M, N, K)
+            .unwrap();
         let got = out.to_vec_f32().unwrap();
         let maxref = want.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
-        let rel = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+        let rel = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / maxref;
         eprintln!("[mmq-q4k-rt] {M}x{N}x{K} multi-block+tail scale_rel={rel:.2e}  (runtime-dims coopmat MMQ via ml, one .spv)");
-        assert!(rel < 1e-3, "mmq_q4k_rt prefill DSL diverged from CPU: scale_rel={rel:.3e}");
+        assert!(
+            rel < 1e-3,
+            "mmq_q4k_rt prefill DSL diverged from CPU: scale_rel={rel:.3e}"
+        );
     }
 
     /// A/B: coopmat runtime-dims MMQ (`mmq_q4k_rt`) vs the shipping dp4a-tiled prefill GEMM
@@ -9255,10 +9973,18 @@ mod dsl_dispatch_proof {
         }
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[mmq-ab] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[mmq-ab] no vulkan device ({e}); skipping");
+                return;
+            }
         };
         let mut s = 0xD1B54A32D192ED03u64;
-        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
         // (m, n, k): prefill batch m=512. First the real zen-eco-4b/qwen2 Q4_K projection shapes
         // (all k=2048: ffn gate/up, attn q/o, attn kv), then larger llama/GLM shapes.
         let shapes = [
@@ -9269,39 +9995,55 @@ mod dsl_dispatch_proof {
             (512, 11008, 4096),
             (512, 4096, 11008),
         ];
-        eprintln!("[mmq-ab] coopmat mmq_q4k_rt vs dp4a mul_mm_q4k_tiled_dp4a (same weight, same harness)");
+        eprintln!(
+            "[mmq-ab] coopmat mmq_q4k_rt vs dp4a mul_mm_q4k_tiled_dp4a (same weight, same harness)"
+        );
         for (m, n, k) in shapes {
             let nb = k / 256;
             let bytes: Vec<u8> = (0..n * nb * 144).map(|_| next() as u8).collect();
             let wq = dev.upload_qweight(&bytes).unwrap();
             let bank = dev.quantize_q4k_split(&bytes, n, k).unwrap();
-            let x: Vec<f32> = (0..m * k).map(|_| (next() % 1000) as f32 / 500.0 - 1.0).collect();
+            let x: Vec<f32> = (0..m * k)
+                .map(|_| (next() % 1000) as f32 / 500.0 - 1.0)
+                .collect();
             let xh = dev.upload_f32(&x).unwrap();
             let (xq, xs, xsum) = dev.quantize_act_q8(&xh, m, k).unwrap();
             let iters = 30;
             // dp4a: force the mul_mm_q4k_tiled_dp4a tile (coopmat is now the default for aligned Q4_K).
             unsafe { std::env::set_var("VK_Q4K_COOPMAT_OFF", "1") };
-            for _ in 0..3 { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
+            for _ in 0..3 {
+                let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap();
+            }
             dev.synchronize().unwrap();
             let t = std::time::Instant::now();
-            for _ in 0..iters { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
+            for _ in 0..iters {
+                let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap();
+            }
             dev.synchronize().unwrap();
             let dp4a_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
             unsafe { std::env::remove_var("VK_Q4K_COOPMAT_OFF") };
             // coopmat (candidate): runtime-dims MMQ over the split bank.
-            for _ in 0..3 { let _ = dev.mmq_q4k_rt_gpu(&xq, &xs, &xsum, &bank, m, n, k).unwrap(); }
+            for _ in 0..3 {
+                let _ = dev.mmq_q4k_rt_gpu(&xq, &xs, &xsum, &bank, m, n, k).unwrap();
+            }
             dev.synchronize().unwrap();
             let t = std::time::Instant::now();
-            for _ in 0..iters { let _ = dev.mmq_q4k_rt_gpu(&xq, &xs, &xsum, &bank, m, n, k).unwrap(); }
+            for _ in 0..iters {
+                let _ = dev.mmq_q4k_rt_gpu(&xq, &xs, &xsum, &bank, m, n, k).unwrap();
+            }
             dev.synchronize().unwrap();
             let coop_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
             // f16 coopmat (llama-parity path): dequant Q4_K weight -> f16 LDS + coopMatMulAdd f16->f32.
             // This is what llama's Vulkan (KHR_coopmat, mul_mm.comp COOPMAT) uses on RADV. Env-forced.
             unsafe { std::env::set_var("VK_Q4K_COOPMAT", "1") };
-            for _ in 0..3 { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
+            for _ in 0..3 {
+                let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap();
+            }
             dev.synchronize().unwrap();
             let t = std::time::Instant::now();
-            for _ in 0..iters { let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap(); }
+            for _ in 0..iters {
+                let _ = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap();
+            }
             dev.synchronize().unwrap();
             let f16c_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
             unsafe { std::env::remove_var("VK_Q4K_COOPMAT") };
@@ -9322,26 +10064,59 @@ mod dsl_dispatch_proof {
     fn q4k_dp4a_bm_variants_match() {
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[q4k-bm] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[q4k-bm] no vulkan device ({e}); skipping");
+                return;
+            }
         };
-        if !dev.inner.int_dot8 { eprintln!("[q4k-bm] no int_dot8; skipping"); return; }
+        if !dev.inner.int_dot8 {
+            eprintln!("[q4k-bm] no int_dot8; skipping");
+            return;
+        }
         let mut s = 0x1234_5678_9ABC_DEF0u64;
-        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-        for (m, n, k) in [(200usize, 256usize, 512usize), (300, 128, 256), (512, 320, 768)] {
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for (m, n, k) in [
+            (200usize, 256usize, 512usize),
+            (300, 128, 256),
+            (512, 320, 768),
+        ] {
             let nblk = n * (k / 256);
             let wq_bytes: Vec<u8> = (0..nblk * 144).map(|_| next() as u8).collect(); // random Q4_K blocks
             let wq = dev.upload_qweight(&wq_bytes).unwrap();
-            let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let x: Vec<f32> = (0..m * k)
+                .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
             let xh = dev.upload_f32(&x).unwrap();
-            let base = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let base = dev
+                .matmul_q4k_gpu(&wq, &xh, m, n, k)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
             let maxref = base.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
             for bm in ["128", "256"] {
                 unsafe { std::env::set_var("VK_Q4K_BM", bm) };
-                let got = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+                let got = dev
+                    .matmul_q4k_gpu(&wq, &xh, m, n, k)
+                    .unwrap()
+                    .to_vec_f32()
+                    .unwrap();
                 unsafe { std::env::remove_var("VK_Q4K_BM") };
-                let rel = got.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+                let rel = got
+                    .iter()
+                    .zip(&base)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max)
+                    / maxref;
                 eprintln!("[q4k-bm] {m}x{n}x{k} BM={bm} vs BM64 rel={rel:.2e}");
-                assert!(rel < 1e-5, "Q4_K dp4a BM={bm} {m}x{n}x{k} diverged from BM64: rel={rel:.3e}");
+                assert!(
+                    rel < 1e-5,
+                    "Q4_K dp4a BM={bm} {m}x{n}x{k} diverged from BM64: rel={rel:.3e}"
+                );
             }
         }
     }
@@ -9355,42 +10130,76 @@ mod dsl_dispatch_proof {
     fn q4k_coopmat_matches_dp4a() {
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[q4k-coop] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[q4k-coop] no vulkan device ({e}); skipping");
+                return;
+            }
         };
-        if dev.coopmat_info().is_none() { eprintln!("[q4k-coop] no coopmat; skipping"); return; }
+        if dev.coopmat_info().is_none() {
+            eprintln!("[q4k-coop] no coopmat; skipping");
+            return;
+        }
         use crate::quantized::k_quants::{BlockQ4K, GgmlType};
         let mut s = 0x0BADC0DE_CAFEF00Du64;
-        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
         for (m, n, k) in [
-            (512usize, 11008usize, 2048usize),  // ffn gate/up
-            (512, 2048, 2048),                   // attn q/o proj
-            (512, 256, 2048),                    // attn k/v proj
-            (512, 2048, 11008),                  // ffn_down
-            (64, 64, 512),                       // small
-            (128, 512, 768),                     // non-square edge tiles
+            (512usize, 11008usize, 2048usize), // ffn gate/up
+            (512, 2048, 2048),                 // attn q/o proj
+            (512, 256, 2048),                  // attn k/v proj
+            (512, 2048, 11008),                // ffn_down
+            (64, 64, 512),                     // small
+            (128, 512, 768),                   // non-square edge tiles
         ] {
             let nb = k / 256;
             // Real Q4_K weights (valid f16 d/dmin) -- random bytes would seed Inf/NaN f16 scales.
-            let mut blocks: Vec<BlockQ4K> = (0..n * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let mut blocks: Vec<BlockQ4K> =
+                (0..n * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
             for r in 0..n {
-                let rowf: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+                let rowf: Vec<f32> = (0..k)
+                    .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+                    .collect();
                 BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
             }
             let wq_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8,
-                    blocks.len() * std::mem::size_of::<BlockQ4K>())
+                std::slice::from_raw_parts(
+                    blocks.as_ptr() as *const u8,
+                    blocks.len() * std::mem::size_of::<BlockQ4K>(),
+                )
             };
             let wq = dev.upload_qweight(wq_bytes).unwrap();
-            let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let x: Vec<f32> = (0..m * k)
+                .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
             let xh = dev.upload_f32(&x).unwrap();
             unsafe { std::env::set_var("VK_Q4K_COOPMAT_OFF", "1") };
-            let base = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let base = dev
+                .matmul_q4k_gpu(&wq, &xh, m, n, k)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
             unsafe { std::env::remove_var("VK_Q4K_COOPMAT_OFF") };
             let maxref = base.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
-            let got = dev.matmul_q4k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
-            let rel = got.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+            let got = dev
+                .matmul_q4k_gpu(&wq, &xh, m, n, k)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+            let rel = got
+                .iter()
+                .zip(&base)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+                / maxref;
             eprintln!("[q4k-coop] {m}x{n}x{k} coopmat vs dp4a scale_rel={rel:.2e}");
-            assert!(rel < 2e-2, "Q4_K coopmat {m}x{n}x{k} diverged from dp4a: scale_rel={rel:.3e}");
+            assert!(
+                rel < 2e-2,
+                "Q4_K coopmat {m}x{n}x{k} diverged from dp4a: scale_rel={rel:.3e}"
+            );
         }
     }
 
@@ -9401,27 +10210,51 @@ mod dsl_dispatch_proof {
     fn q6k_tiled_controlled() {
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[q6k-ctrl] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[q6k-ctrl] no vulkan device ({e}); skipping");
+                return;
+            }
         };
-        if !dev.inner.int_dot8 { eprintln!("[q6k-ctrl] no int_dot8; skipping"); return; }
+        if !dev.inner.int_dot8 {
+            eprintln!("[q6k-ctrl] no int_dot8; skipping");
+            return;
+        }
         let (m, n, k) = (5usize, 3usize, 256usize);
         let nblk = n * (k / 256);
         let dbits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
         let mut blocks = vec![0u8; nblk * 210];
         for blk in 0..nblk {
             let b = &mut blocks[blk * 210..blk * 210 + 210];
-            for e in b[0..128].iter_mut() { *e = 0x11; }   // ql: both nibbles = 1
-            for e in b[128..192].iter_mut() { *e = 0xAA; }  // qh: all 2-bit fields = 0b10
-            for e in b[192..208].iter_mut() { *e = 0x01; }  // scales = 1
-            b[208] = dbits[0]; b[209] = dbits[1];           // d = 1.0
+            for e in b[0..128].iter_mut() {
+                *e = 0x11;
+            } // ql: both nibbles = 1
+            for e in b[128..192].iter_mut() {
+                *e = 0xAA;
+            } // qh: all 2-bit fields = 0b10
+            for e in b[192..208].iter_mut() {
+                *e = 0x01;
+            } // scales = 1
+            b[208] = dbits[0];
+            b[209] = dbits[1]; // d = 1.0
         }
         let wq = dev.quantize_q6k(&blocks, n, k).unwrap();
         let x = vec![1.0f32; m * k];
         let xh = dev.upload_f32(&x).unwrap();
-        let got = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
-        let worst = got.iter().map(|&v| (v - k as f32).abs()).fold(0f32, f32::max);
+        let got = dev
+            .matmul_q6k_gpu(&wq, &xh, m, n, k)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let worst = got
+            .iter()
+            .map(|&v| (v - k as f32).abs())
+            .fold(0f32, f32::max);
         eprintln!("[q6k-ctrl] {m}x{n}x{k} uniform q6=1: got[0..3]={:?} expect {k}, worst_abs_err={worst:.3}", &got[0..3.min(got.len())]);
-        assert!(worst < 0.5, "Q6_K tiled controlled: got {:?} expect {k} (worst {worst})", &got[0..got.len().min(6)]);
+        assert!(
+            worst < 0.5,
+            "Q6_K tiled controlled: got {:?} expect {k} (worst {worst})",
+            &got[0..got.len().min(6)]
+        );
     }
 
     /// The tiled int8-dp4a Q6_K prefill matmul (mul_mm_q6k_tiled_dp4a) agrees with the trusted column
@@ -9432,17 +10265,30 @@ mod dsl_dispatch_proof {
     fn mul_mm_q6k_coopmat_and_dp4a_match_column() {
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[q6k-tiled] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[q6k-tiled] no vulkan device ({e}); skipping");
+                return;
+            }
         };
         if !dev.inner.int_dot8 {
             eprintln!("[q6k-tiled] device lacks int_dot8; skipping");
             return;
         }
         let mut s = 0x2545F4914F6CDD1Du64;
-        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
         let ab = std::env::var_os("HANZO_MMQ_AB").is_some();
         let shapes: &[(usize, usize, usize)] = if ab {
-            &[(37, 64, 256), (512, 2048, 768), (512, 768, 2048), (512, 4096, 4096)]
+            &[
+                (37, 64, 256),
+                (512, 2048, 768),
+                (512, 768, 2048),
+                (512, 4096, 4096),
+            ]
         } else {
             &[(37, 64, 256), (40, 200, 512), (100, 256, 768)]
         };
@@ -9455,13 +10301,19 @@ mod dsl_dispatch_proof {
             let mut blocks = vec![0u8; nblk * 210];
             for blk in 0..nblk {
                 let b = &mut blocks[blk * 210..blk * 210 + 210];
-                for e in b[0..192].iter_mut() { *e = next() as u8; }          // ql[128] + qh[64]
-                for e in b[192..208].iter_mut() { *e = ((next() % 15) as i64 - 7) as u8; } // scales i8
+                for e in b[0..192].iter_mut() {
+                    *e = next() as u8;
+                } // ql[128] + qh[64]
+                for e in b[192..208].iter_mut() {
+                    *e = ((next() % 15) as i64 - 7) as u8;
+                } // scales i8
                 b[208] = dbits[0];
                 b[209] = dbits[1];
             }
             let wq = dev.quantize_q6k(&blocks, n, k).unwrap();
-            let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let x: Vec<f32> = (0..m * k)
+                .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
             let xh = dev.upload_f32(&x).unwrap();
             // CPU oracle: decode Q6_K exactly (mirrors mul_mat_q6k) into dense f32, matmul with f32 x.
             let nblocks = k / 256;
@@ -9497,41 +10349,73 @@ mod dsl_dispatch_proof {
             for mm in 0..m {
                 for nn in 0..n {
                     let mut acc = 0f32;
-                    for kk in 0..k { acc += x[mm * k + kk] * wf[nn * k + kk]; }
+                    for kk in 0..k {
+                        acc += x[mm * k + kk] * wf[nn * k + kk];
+                    }
                     want[mm * n + nn] = acc;
                 }
             }
             let relof = |g: &[f32]| -> f32 {
                 let maxref = want.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
-                g.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref
+                g.iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max)
+                    / maxref
             };
             unsafe { std::env::set_var("VK_Q6K_LEGACY", "1") };
-            let col = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let col = dev
+                .matmul_q6k_gpu(&wq, &xh, m, n, k)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
             unsafe { std::env::remove_var("VK_Q6K_LEGACY") };
             // Default path is the f16 coopmat GEMM; the ragged m (37/40/100) also exercises its
             // output-row padding. The int8 dp4a tile stays reachable as the A/B fallback.
-            let got_cm = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let got_cm = dev
+                .matmul_q6k_gpu(&wq, &xh, m, n, k)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
             unsafe { std::env::set_var("VK_Q6K_COOPMAT_OFF", "1") };
-            let got_dp4a = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let got_dp4a = dev
+                .matmul_q6k_gpu(&wq, &xh, m, n, k)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
             unsafe { std::env::remove_var("VK_Q6K_COOPMAT_OFF") };
             let (rel_cm, rel_dp4a) = (relof(&got_cm), relof(&got_dp4a));
             eprintln!("[q6k] {m}x{n}x{k}  column_vs_cpu={:.2e}  coopmat_vs_cpu={:.2e}  dp4a_vs_cpu={:.2e}", relof(&col), rel_cm, rel_dp4a);
-            assert!(rel_cm < 2e-2, "Q6_K coopmat {m}x{n}x{k} diverged from CPU: rel={rel_cm:.3e}");
-            assert!(rel_dp4a < 2e-2, "Q6_K dp4a {m}x{n}x{k} diverged from CPU: rel={rel_dp4a:.3e}");
+            assert!(
+                rel_cm < 2e-2,
+                "Q6_K coopmat {m}x{n}x{k} diverged from CPU: rel={rel_cm:.3e}"
+            );
+            assert!(
+                rel_dp4a < 2e-2,
+                "Q6_K dp4a {m}x{n}x{k} diverged from CPU: rel={rel_dp4a:.3e}"
+            );
             if ab {
                 let iters = 20;
                 unsafe { std::env::set_var("VK_Q6K_LEGACY", "1") };
-                for _ in 0..3 { let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap(); }
+                for _ in 0..3 {
+                    let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap();
+                }
                 dev.synchronize().unwrap();
                 let t = std::time::Instant::now();
-                for _ in 0..iters { let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap(); }
+                for _ in 0..iters {
+                    let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap();
+                }
                 dev.synchronize().unwrap();
                 let col_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
                 unsafe { std::env::remove_var("VK_Q6K_LEGACY") };
-                for _ in 0..3 { let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap(); }
+                for _ in 0..3 {
+                    let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap();
+                }
                 dev.synchronize().unwrap();
                 let t = std::time::Instant::now();
-                for _ in 0..iters { let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap(); }
+                for _ in 0..iters {
+                    let _ = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap();
+                }
                 dev.synchronize().unwrap();
                 let til_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
                 eprintln!(
@@ -9552,27 +10436,51 @@ mod dsl_dispatch_proof {
     fn q6k_coopmat_controlled() {
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[q6k-coop-ctrl] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[q6k-coop-ctrl] no vulkan device ({e}); skipping");
+                return;
+            }
         };
-        if dev.coopmat_info().is_none() { eprintln!("[q6k-coop-ctrl] no coopmat; skipping"); return; }
+        if dev.coopmat_info().is_none() {
+            eprintln!("[q6k-coop-ctrl] no coopmat; skipping");
+            return;
+        }
         let (m, n, k) = (16usize, 16usize, 512usize); // m,n % 16 => coopmat arm; k spans 2 super-blocks
         let nblk = n * (k / 256);
         let dbits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
         let mut blocks = vec![0u8; nblk * 210];
         for blk in 0..nblk {
             let b = &mut blocks[blk * 210..blk * 210 + 210];
-            for e in b[0..128].iter_mut() { *e = 0x11; }    // ql: both nibbles = 1
-            for e in b[128..192].iter_mut() { *e = 0xAA; }  // qh: all 2-bit fields = 0b10
-            for e in b[192..208].iter_mut() { *e = 0x01; }  // scales = 1
-            b[208] = dbits[0]; b[209] = dbits[1];           // d = 1.0
+            for e in b[0..128].iter_mut() {
+                *e = 0x11;
+            } // ql: both nibbles = 1
+            for e in b[128..192].iter_mut() {
+                *e = 0xAA;
+            } // qh: all 2-bit fields = 0b10
+            for e in b[192..208].iter_mut() {
+                *e = 0x01;
+            } // scales = 1
+            b[208] = dbits[0];
+            b[209] = dbits[1]; // d = 1.0
         }
         let wq = dev.quantize_q6k(&blocks, n, k).unwrap();
         let x = vec![1.0f32; m * k];
         let xh = dev.upload_f32(&x).unwrap();
-        let got = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
-        let worst = got.iter().map(|&v| (v - k as f32).abs()).fold(0f32, f32::max);
+        let got = dev
+            .matmul_q6k_gpu(&wq, &xh, m, n, k)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let worst = got
+            .iter()
+            .map(|&v| (v - k as f32).abs())
+            .fold(0f32, f32::max);
         eprintln!("[q6k-coop-ctrl] {m}x{n}x{k} uniform q6=1: got[0..3]={:?} expect {k}, worst_abs_err={worst:.3}", &got[0..3.min(got.len())]);
-        assert!(worst < 0.5, "Q6_K coopmat controlled: got {:?} expect {k} (worst {worst})", &got[0..got.len().min(6)]);
+        assert!(
+            worst < 0.5,
+            "Q6_K coopmat controlled: got {:?} expect {k} (worst {worst})",
+            &got[0..got.len().min(6)]
+        );
     }
 
     /// The f16 coopmat Q6_K prefill matmul (mul_mm_q6k_coopmat) agrees with a CPU f32 oracle (decode
@@ -9584,31 +10492,48 @@ mod dsl_dispatch_proof {
     fn q6k_coopmat_matches_column() {
         let dev = match VulkanDevice::new(0) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[q6k-coop] no vulkan device ({e}); skipping"); return; }
+            Err(e) => {
+                eprintln!("[q6k-coop] no vulkan device ({e}); skipping");
+                return;
+            }
         };
-        if dev.coopmat_info().is_none() { eprintln!("[q6k-coop] no coopmat; skipping"); return; }
+        if dev.coopmat_info().is_none() {
+            eprintln!("[q6k-coop] no coopmat; skipping");
+            return;
+        }
         let mut s = 0x51C6C0DEF00DBEEFu64;
-        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
         for (m, n, k) in [
             (512usize, 2048usize, 768usize), // ffn gate/up-ish
-            (512, 768, 2048),                 // ffn_down (Q6_K in Q4_K_M)
-            (512, 4096, 4096),                // square
-            (512, 256, 2048),                 // attn kv proj
-            (64, 64, 512),                     // small
-            (128, 512, 768),                   // non-square edge tiles
+            (512, 768, 2048),                // ffn_down (Q6_K in Q4_K_M)
+            (512, 4096, 4096),               // square
+            (512, 256, 2048),                // attn kv proj
+            (64, 64, 512),                   // small
+            (128, 512, 768),                 // non-square edge tiles
         ] {
             let nblk = n * (k / 256);
             let dbits = half::f16::from_f32(0.1).to_bits().to_le_bytes();
             let mut blocks = vec![0u8; nblk * 210];
             for blk in 0..nblk {
                 let b = &mut blocks[blk * 210..blk * 210 + 210];
-                for e in b[0..192].iter_mut() { *e = next() as u8; }                    // ql[128] + qh[64]
-                for e in b[192..208].iter_mut() { *e = ((next() % 15) as i64 - 7) as u8; } // scales i8
+                for e in b[0..192].iter_mut() {
+                    *e = next() as u8;
+                } // ql[128] + qh[64]
+                for e in b[192..208].iter_mut() {
+                    *e = ((next() % 15) as i64 - 7) as u8;
+                } // scales i8
                 b[208] = dbits[0];
                 b[209] = dbits[1];
             }
             let wq = dev.quantize_q6k(&blocks, n, k).unwrap();
-            let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let x: Vec<f32> = (0..m * k)
+                .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
             let xh = dev.upload_f32(&x).unwrap();
             // CPU oracle: decode Q6_K exactly (mirrors mul_mat_q6k) into dense f32, matmul with f32 x.
             let nblocks = k / 256;
@@ -9644,21 +10569,41 @@ mod dsl_dispatch_proof {
             for mm in 0..m {
                 for nn in 0..n {
                     let mut acc = 0f32;
-                    for kk in 0..k { acc += x[mm * k + kk] * wf[nn * k + kk]; }
+                    for kk in 0..k {
+                        acc += x[mm * k + kk] * wf[nn * k + kk];
+                    }
                     want[mm * n + nn] = acc;
                 }
             }
             let relof = |g: &[f32]| -> f32 {
                 let maxref = want.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
-                g.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref
+                g.iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max)
+                    / maxref
             };
             unsafe { std::env::set_var("VK_Q6K_LEGACY", "1") }; // column kernel reference
-            let col = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+            let col = dev
+                .matmul_q6k_gpu(&wq, &xh, m, n, k)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
             unsafe { std::env::remove_var("VK_Q6K_LEGACY") };
-            let got = dev.matmul_q6k_gpu(&wq, &xh, m, n, k).unwrap().to_vec_f32().unwrap(); // coopmat default
+            let got = dev
+                .matmul_q6k_gpu(&wq, &xh, m, n, k)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap(); // coopmat default
             let rel = relof(&got);
-            eprintln!("[q6k-coop] {m}x{n}x{k} coopmat_vs_cpu={rel:.2e} column_vs_cpu={:.2e}", relof(&col));
-            assert!(rel < 2e-2, "Q6_K coopmat {m}x{n}x{k} diverged from CPU: scale_rel={rel:.3e}");
+            eprintln!(
+                "[q6k-coop] {m}x{n}x{k} coopmat_vs_cpu={rel:.2e} column_vs_cpu={:.2e}",
+                relof(&col)
+            );
+            assert!(
+                rel < 2e-2,
+                "Q6_K coopmat {m}x{n}x{k} diverged from CPU: scale_rel={rel:.3e}"
+            );
         }
     }
 
@@ -9683,7 +10628,9 @@ mod dsl_dispatch_proof {
             }
         };
         if dev.inner.push_descriptor.is_none() {
-            eprintln!("[graph-proof] no VK_KHR_push_descriptor (capture path unsupported); skipping");
+            eprintln!(
+                "[graph-proof] no VK_KHR_push_descriptor (capture path unsupported); skipping"
+            );
             return;
         }
         // Distinct data per token so any stale slot is detectable.
@@ -9814,15 +10761,19 @@ mod dsl_dispatch_proof {
                 let qb = h * D;
                 let sc: Vec<f32> = (0..seq_k)
                     .map(|kk| {
-                        (0..D).map(|dd| q[qb + dd] * kf[(kv * CAP + kk) * D + dd]).sum::<f32>() * scale
+                        (0..D)
+                            .map(|dd| q[qb + dd] * kf[(kv * CAP + kk) * D + dd])
+                            .sum::<f32>()
+                            * scale
                     })
                     .collect();
                 let m = sc.iter().cloned().fold(f32::MIN, f32::max);
                 let ex: Vec<f32> = sc.iter().map(|s| (s - m).exp()).collect();
                 let sum: f32 = ex.iter().sum();
                 for dd in 0..D {
-                    out[qb + dd] =
-                        (0..seq_k).map(|kk| ex[kk] / sum * vf[(kv * CAP + kk) * D + dd]).sum();
+                    out[qb + dd] = (0..seq_k)
+                        .map(|kk| ex[kk] / sum * vf[(kv * CAP + kk) * D + dd])
+                        .sum();
                 }
             }
             out
@@ -9859,8 +10810,13 @@ mod dsl_dispatch_proof {
         let mut worst = 0f32;
         for &seq_k in &[1usize, 3, 5, 8] {
             unsafe {
-                dev.write_u32(meta.buffer, meta.memory, meta.host_visible, &[1, seq_k as u32])
-                    .unwrap();
+                dev.write_u32(
+                    meta.buffer,
+                    meta.memory,
+                    meta.host_visible,
+                    &[1, seq_k as u32],
+                )
+                .unwrap();
             }
             graph.replay().unwrap();
             let got = out.to_vec_f32().unwrap();
@@ -9900,7 +10856,14 @@ mod dsl_dispatch_proof {
         let gen = |seed: usize, i: usize| (((seed * 13 + i * 7) % 2000) as f32) / 1000.0 - 1.0;
         // (b, m, n, k, nt, tag)
         let cases = [
-            (2usize, 17usize, 19usize, 33usize, false, "ragged mnk non-nt"),
+            (
+                2usize,
+                17usize,
+                19usize,
+                33usize,
+                false,
+                "ragged mnk non-nt",
+            ),
             (3, 16, 16, 16, false, "aligned control (flat path)"),
             (2, 31, 500, 128, true, "ragged QKᵀ nt (m,n ragged, k=128)"),
             (2, 500, 128, 500, false, "ragged PV (m,k ragged, n=128)"),
@@ -9914,7 +10877,10 @@ mod dsl_dispatch_proof {
                 (w.transpose(1, 2).unwrap(), wdata)
             } else {
                 let bdata: Vec<f32> = (0..b * k * n).map(|i| gen(2, i)).collect();
-                (crate::Tensor::from_vec(bdata.clone(), (b, k, n), &dev).unwrap(), bdata)
+                (
+                    crate::Tensor::from_vec(bdata.clone(), (b, k, n), &dev).unwrap(),
+                    bdata,
+                )
             };
             let got = a
                 .matmul(&rhs)
@@ -9945,9 +10911,17 @@ mod dsl_dispatch_proof {
                 }
             }
             let maxref = refv.iter().fold(0f32, |mx, &v| mx.max(v.abs())).max(1e-30);
-            let worst = got.iter().zip(&refv).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / maxref;
+            let worst = got
+                .iter()
+                .zip(&refv)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+                / maxref;
             eprintln!("[bmm-ragged {tag}] b{b} m{m} n{n} k{k} nt{nt}  scale_rel={worst:.2e}");
-            assert!(worst < 2e-2, "bmm ragged {tag} diverged from CPU: scale_rel={worst:.3e}");
+            assert!(
+                worst < 2e-2,
+                "bmm ragged {tag} diverged from CPU: scale_rel={worst:.3e}"
+            );
         }
     }
 }

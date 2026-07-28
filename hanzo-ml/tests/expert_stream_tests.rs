@@ -39,7 +39,11 @@ fn routing(dev: &Device) -> Result<(Tensor, Tensor)> {
     Ok((x, ids))
 }
 
-fn stream_qtensor(path: &std::path::Path, expert_bytes: usize, name: &str) -> Result<(QTensor, std::sync::Arc<ExpertStreamBank>)> {
+fn stream_qtensor(
+    path: &std::path::Path,
+    expert_bytes: usize,
+    name: &str,
+) -> Result<(QTensor, std::sync::Arc<ExpertStreamBank>)> {
     let bank = ExpertStreamBank::open(
         name.to_string(),
         path,
@@ -60,7 +64,10 @@ fn streamed_moe_is_bit_exact_vs_resident() -> Result<()> {
     let (x, ids) = routing(&dev)?;
 
     // Resident path via QStorage::Cpu -> the generic `_` arm.
-    let yr = resident.indexed_moe_forward(&x, &ids)?.flatten_all()?.to_vec1::<f32>()?;
+    let yr = resident
+        .indexed_moe_forward(&x, &ids)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
 
     // Streaming path via read_stream (the loader seam) -> the `Stream` arm.
     let info = TensorInfo {
@@ -69,7 +76,10 @@ fn streamed_moe_is_bit_exact_vs_resident() -> Result<()> {
         offset: 0,
     };
     let streamed = info.read_stream(&path, 0, "blk.0.ffn_gate_exps.weight")?;
-    let ys = streamed.indexed_moe_forward(&x, &ids)?.flatten_all()?.to_vec1::<f32>()?;
+    let ys = streamed
+        .indexed_moe_forward(&x, &ids)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
 
     assert_eq!(yr.len(), ys.len());
     for (i, (a, b)) in yr.iter().zip(ys.iter()).enumerate() {
@@ -87,14 +97,20 @@ fn streamed_moe_is_bit_exact_vs_resident() -> Result<()> {
 fn lru_cap_bounds_resident_and_stays_bit_exact() -> Result<()> {
     let (dev, resident, path, expert_bytes) = fixture()?;
     let (x, ids) = routing(&dev)?;
-    let yr = resident.indexed_moe_forward(&x, &ids)?.flatten_all()?.to_vec1::<f32>()?;
+    let yr = resident
+        .indexed_moe_forward(&x, &ids)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
 
     let (qt, bank) = stream_qtensor(&path, expert_bytes, "cap.bank")?;
     bank.set_cap(1); // pathologically small: at most 1 non-pinned expert resident
 
     // Two forwards touch all E experts repeatedly; the cache must never exceed the cap...
     for _ in 0..3 {
-        let ys = qt.indexed_moe_forward(&x, &ids)?.flatten_all()?.to_vec1::<f32>()?;
+        let ys = qt
+            .indexed_moe_forward(&x, &ids)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         // ...and correctness must be independent of the cap (streamed == resident every time).
         for (a, b) in yr.iter().zip(ys.iter()) {
             assert_eq!(a.to_bits(), b.to_bits());
@@ -104,7 +120,10 @@ fn lru_cap_bounds_resident_and_stays_bit_exact() -> Result<()> {
     assert_eq!(pinned, 0);
     assert_eq!(cap, 1);
     assert!(cached <= 1, "LRU held {cached} experts, cap was 1");
-    assert!(bank.resident_bytes() <= expert_bytes, "resident exceeded 1 expert");
+    assert!(
+        bank.resident_bytes() <= expert_bytes,
+        "resident exceeded 1 expert"
+    );
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
@@ -124,7 +143,10 @@ fn pinned_expert_is_a_hit_and_survives_eviction() -> Result<()> {
         let _ = qt.indexed_moe_forward(&x, &ids)?;
     }
     let (pinned_before, _c, _cap, hits_before, _m) = bank.stats();
-    assert_eq!(pinned_before, 1, "expert 3 should stay pinned through eviction");
+    assert_eq!(
+        pinned_before, 1,
+        "expert 3 should stay pinned through eviction"
+    );
 
     // Fetching the pinned expert is a cache HIT (no disk read), regardless of LRU pressure.
     let _ = bank.fetch(3)?;

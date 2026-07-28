@@ -78,12 +78,16 @@ impl Parse for Args {
             if key == "targets" {
                 let content;
                 syn::parenthesized!(content in input);
-                let list: Punctuated<Ident, Token![,]> = content.parse_terminated(Ident::parse, Token![,])?;
+                let list: Punctuated<Ident, Token![,]> =
+                    content.parse_terminated(Ident::parse, Token![,])?;
                 targets.extend(list);
             } else if key == "unchecked" {
                 unchecked = true;
             } else {
-                return Err(syn::Error::new(key.span(), "expected `targets(...)` or `unchecked`"));
+                return Err(syn::Error::new(
+                    key.span(),
+                    "expected `targets(...)` or `unchecked`",
+                ));
             }
             if input.peek(Token![,]) {
                 let _: Token![,] = input.parse()?;
@@ -107,15 +111,24 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     for t in &args.targets {
         if !TARGETS.iter().any(|k| t == k) {
-            return syn::Error::new(t.span(), format!("unknown target `{t}`; valid targets: {}", TARGETS.join(", ")))
-                .to_compile_error()
-                .into();
+            return syn::Error::new(
+                t.span(),
+                format!(
+                    "unknown target `{t}`; valid targets: {}",
+                    TARGETS.join(", ")
+                ),
+            )
+            .to_compile_error()
+            .into();
         }
     }
 
     // Lower `island! { ... }` regions to a comptime `match` over the kernel's `Target` param BEFORE
     // the engine attribute runs (cubecl rejects unknown body macros, so this must happen here).
-    let mut rewrite = IslandRewrite { target: find_target_param(&func), error: None };
+    let mut rewrite = IslandRewrite {
+        target: find_target_param(&func),
+        error: None,
+    };
     rewrite.visit_item_fn_mut(&mut func);
     if let Some(err) = rewrite.error {
         return err.to_compile_error().into();
@@ -270,7 +283,10 @@ fn expand_island(target: &Ident, tokens: TokenStream2) -> syn::Result<Expr> {
         match arm.selector {
             Selector::Default => {
                 if default_body.is_some() {
-                    return Err(syn::Error::new(Span::call_site(), "island! has more than one `default` arm"));
+                    return Err(syn::Error::new(
+                        Span::call_site(),
+                        "island! has more than one `default` arm",
+                    ));
                 }
                 default_body = Some(arm.body);
             }
@@ -281,10 +297,19 @@ fn expand_island(target: &Ident, tokens: TokenStream2) -> syn::Result<Expr> {
                         .find(|(name, _)| t == name)
                         .map(|(_, variant)| *variant)
                         .ok_or_else(|| {
-                            syn::Error::new(t.span(), format!("unknown island target `{t}`; valid: {}", island_target_names()))
+                            syn::Error::new(
+                                t.span(),
+                                format!(
+                                    "unknown island target `{t}`; valid: {}",
+                                    island_target_names()
+                                ),
+                            )
                         })?;
                     if bodies.iter().any(|(v, _)| *v == variant) {
-                        return Err(syn::Error::new(t.span(), format!("island target `{t}` is listed twice")));
+                        return Err(syn::Error::new(
+                            t.span(),
+                            format!("island target `{t}` is listed twice"),
+                        ));
                     }
                     bodies.push((variant, arm.body.clone()));
                 }
@@ -303,7 +328,11 @@ fn expand_island(target: &Ident, tokens: TokenStream2) -> syn::Result<Expr> {
     // variant provably resolves to `default`.
     let match_arms = ISLAND_TARGETS.iter().map(|(_, variant)| {
         let v = Ident::new(variant, Span::call_site());
-        let body = bodies.iter().find(|(name, _)| name == variant).map(|(_, b)| b).unwrap_or(&default_body);
+        let body = bodies
+            .iter()
+            .find(|(name, _)| name == variant)
+            .map(|(_, b)| b)
+            .unwrap_or(&default_body);
         quote! { Target::#v => #body }
     });
 
@@ -311,5 +340,9 @@ fn expand_island(target: &Ident, tokens: TokenStream2) -> syn::Result<Expr> {
 }
 
 fn island_target_names() -> String {
-    ISLAND_TARGETS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+    ISLAND_TARGETS
+        .iter()
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(", ")
 }

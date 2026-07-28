@@ -57,7 +57,11 @@ fn bench_shape(dev: &Device, dtype: GgmlDType, m: usize, k: usize, n: usize, ite
         .expect("to metal");
     let us = time_forward(&qm, &x, dev, iters);
     let gflops = (2.0 * m as f64 * n as f64 * k as f64) / (us * 1e-6) / 1e9;
-    let path = if m == 1 { "mul_mv (decode)" } else { "mul_mm (prefill)" };
+    let path = if m == 1 {
+        "mul_mv (decode)"
+    } else {
+        "mul_mm (prefill)"
+    };
     eprintln!("{dtype:?} m={m:<4} k={k} n={n}: {us:8.1} us/launch  {gflops:8.1} GFLOP/s  [{path}]");
 }
 

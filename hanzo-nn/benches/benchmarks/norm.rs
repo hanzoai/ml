@@ -1,7 +1,7 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
+use criterion::{criterion_group, Criterion, Throughput};
 use hanzo_ml::{DType, Device, Module, Tensor};
 use hanzo_nn::{LayerNorm, RmsNorm};
-use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 use std::time::Instant;
 
