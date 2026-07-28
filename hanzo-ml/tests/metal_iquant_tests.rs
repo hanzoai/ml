@@ -82,7 +82,11 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
         GgmlDType::Q4K | GgmlDType::Q6K => {
             let w: Vec<f32> = (0..nblk * be).map(|i| pseudo(i) * 0.5).collect();
             let t = Tensor::from_vec(w, (nout, k), &Device::Cpu).unwrap();
-            return QTensor::quantize(&t, dtype).unwrap().data().unwrap().into_owned();
+            return QTensor::quantize(&t, dtype)
+                .unwrap()
+                .data()
+                .unwrap()
+                .into_owned();
         }
         _ => panic!("synth: {dtype:?} is not a wired Metal i-quant type"),
     }
@@ -269,8 +273,11 @@ fn check_bf16_matches_f32_rounded(dtype: GgmlDType) {
     };
     for &(nout, k) in &[(512usize, 2048usize), (768, 4096)] {
         let raw = synth(dtype, nout, k);
-        let q = QTensor::new(QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(), (nout, k))
-            .unwrap();
+        let q = QTensor::new(
+            QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(),
+            (nout, k),
+        )
+        .unwrap();
         let matmul = QMatMul::from_qtensor(q).unwrap();
         let x_host: Vec<f32> = (0..k).map(|i| pseudo(i + 1_000_003)).collect();
         // The activation as the model carries it: bf16. Upcast is exact, so the f32 path sees the
@@ -340,8 +347,11 @@ fn check_bf16_mm_matches_f32_rounded(dtype: GgmlDType) {
     };
     for &(m, nout, k) in &[(32usize, 512usize, 2048usize), (40, 576, 2048)] {
         let raw = synth(dtype, nout, k);
-        let q = QTensor::new(QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(), (nout, k))
-            .unwrap();
+        let q = QTensor::new(
+            QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(),
+            (nout, k),
+        )
+        .unwrap();
         let matmul = QMatMul::from_qtensor(q).unwrap();
         let x_host: Vec<f32> = (0..m * k).map(|i| pseudo(i + 2_000_003)).collect();
         let x_bf16 = Tensor::from_vec(x_host, (m, k), &dev)
@@ -380,7 +390,11 @@ fn check_bf16_mm_matches_f32_rounded(dtype: GgmlDType) {
             max_abs = max_abs.max((a - b).abs());
             max_ref = max_ref.max(b.abs());
         }
-        let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+        let rel = if max_ref > 0.0 {
+            max_abs / max_ref
+        } else {
+            max_abs
+        };
         println!("bf16-mm {dtype:?} [{m}x{nout}x{k}]: max_abs={max_abs:.3e} scale-rel={rel:.3e}");
         assert_eq!(
             max_abs, 0.0,
@@ -516,7 +530,11 @@ fn check_bf16_half_mm_bounded(dtype: GgmlDType) {
             max_abs = max_abs.max((a - b).abs());
             max_ref = max_ref.max(b.abs());
         }
-        let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+        let rel = if max_ref > 0.0 {
+            max_abs / max_ref
+        } else {
+            max_abs
+        };
         worst = worst.max(rel);
         println!(
             "bf16-half-mm {dtype:?} [{m}x{nout}x{k}]: max_abs={max_abs:.3e} max_ref={max_ref:.3e} scale-rel={rel:.3e}"
@@ -735,7 +753,15 @@ fn metal_moe_prefill_iquant_matches_cpu() {
     // (dtype, E, n, k, t, topk, per_slot). E=2/t=40 => 40 rows/expert = 2 column tiles (BN=32); t=33
     // => 2 token tiles; per_slot exercises the down-proj [t,topk,k] input. IQ1_S primary + IQ2/IQ3.
     let cases = [
-        (GgmlDType::IQ1_S, 2usize, 256usize, 2048usize, 40usize, 2usize, false),
+        (
+            GgmlDType::IQ1_S,
+            2usize,
+            256usize,
+            2048usize,
+            40usize,
+            2usize,
+            false,
+        ),
         (GgmlDType::IQ1_S, 8, 256, 2048, 16, 2, true),
         (GgmlDType::IQ2_XXS, 4, 256, 2048, 33, 2, false),
         (GgmlDType::IQ3_S, 4, 512, 4096, 16, 2, false),
@@ -777,7 +803,14 @@ fn metal_moe_decode_iquant_matches_cpu() {
     // shared gate/up input (per_slot=false, s=1) and the per-slot down input (per_slot=true, s=topk)
     // routing layouts; attn-proj k=2048 and ffn k=4096; topk 6/8 (>1 slot/token, distinct experts).
     let cases = [
-        (GgmlDType::IQ1_S, 16usize, 256usize, 2048usize, 8usize, false),
+        (
+            GgmlDType::IQ1_S,
+            16usize,
+            256usize,
+            2048usize,
+            8usize,
+            false,
+        ),
         (GgmlDType::IQ1_S, 16, 512, 4096, 8, true),
         (GgmlDType::IQ2_XXS, 12, 256, 2048, 6, false),
         (GgmlDType::IQ2_S, 8, 256, 2048, 6, true),
@@ -871,7 +904,10 @@ fn metal_moe_decode_iquant_throughput() {
     // vec_dot), while the Metal kernel dots the RAW f32 activation -- the Metal path is the MORE precise
     // one (f64-exact at ~2e-7 in metal_moe_decode_iquant_matches_cpu). So GPU and CPU agree only to the
     // CPU's own activation-quant floor; this is a liveness sanity, not the correctness gate.
-    assert!(mrel < 1.5e-2, "GPU decode disagrees with CPU beyond the q8 floor: rel={mrel:.3e}");
+    assert!(
+        mrel < 1.5e-2,
+        "GPU decode disagrees with CPU beyond the q8 floor: rel={mrel:.3e}"
+    );
 
     let time_it = |run: &dyn Fn() -> Vec<f32>, iters: usize| -> f64 {
         let _ = run(); // warm

@@ -4,18 +4,25 @@
 # GitHub.com ignores .hanzo/, so this file is inert on GitHub and only runs on the
 # native forge -- zero effect on the GitHub CI lane.
 #
-# Ported verbatim -- no `self-hosted` labels to rewrite here. The `fmt`/`clippy`
-# jobs run on `hanzo-build-linux-amd64` (the git-runner maps that label). The
-# `check`/`test` matrix uses GitHub-hosted labels: `ubuntu-latest`/`ubuntu-24.04`
-# are mapped by the git-runner; `windows-latest`, `macOS-latest` and
-# `ubuntu-24.04-arm` need their own git-runner labels / host daemons registered,
-# or those legs queue on the native forge (a runner-provisioning step, not a
-# workflow change).
+# `fmt`/`clippy` run on `hanzo-build-linux-amd64`; `check`/`test` run on the
+# ubuntu labels the git-runner maps. The windows/macOS/arm legs were REMOVED
+# rather than left to queue: this forge registers no runner for them, and an
+# unrunnable leg does not fail, it queues forever and holds the whole run in a
+# non-terminal state. Restoring that coverage is a runner-provisioning step —
+# register the daemons, then re-add the labels here.
 on:
   push:
     branches:
       - main
   pull_request:
+  # The other three workflows here (gpu-tests, maturin, publish) all declare
+  # this; rust-ci was the only one that could not be re-run on demand. That
+  # matters on this repo specifically: it is a forge MIRROR, so commits usually
+  # arrive by a mirror pull rather than a push, and a pull fires no push event —
+  # fmt/clippy/test then simply never run on the new head, and the last result
+  # shown is whatever some older push left behind. `POST /actions/workflows/
+  # rust-ci.yml/dispatches` answered 422 for exactly this reason.
+  workflow_dispatch:
 
 name: Continuous integration
 
@@ -26,23 +33,36 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04, windows-latest, macOS-latest, ubuntu-24.04-arm]
+      # Scoped to labels this forge ACTUALLY serves. The fleet advertises
+      # ubuntu-latest, ubuntu-22.04, ubuntu-24.04 and hanzo-build-linux-amd64
+      # (plus the three GPU labels); it has no windows-latest, macOS-latest or
+      # ubuntu-24.04-arm runner.
+      #
+      # A leg with no runner does not fail — it QUEUES, indefinitely. Measured on
+      # run 6254: 5 jobs completed success and 5 sat queued forever, so the RUN
+      # never reached a terminal state and this repo reported "running" in
+      # perpetuity. Every job that could execute was already green; the only
+      # thing keeping ml off the board was legs nothing can pick up.
+      #
+      # This is the native-forge copy (.hanzo/workflows is scanned first;
+      # GitHub.com ignores it), so narrowing here costs no GitHub coverage —
+      # and there is no .github/workflows/rust-ci.yml to diverge from; the
+      # header's reference to one is stale.
+      #
+      # Windows/macOS/arm coverage returns by REGISTERING those runners, not by
+      # re-adding the labels. Until then, claiming to test them was a claim the
+      # forge could not honour.
+        os: [ubuntu-latest, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Remove cargo config (macOS ring crate fix)
-        if: runner.os == 'macOS'
-        run: rm -f .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Run macos with metal
-        if: matrix.os == 'macOS-latest'
-        run: cargo check --workspace --features metal
 
       - name: Run normal cpu
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
+        if: matrix.os == 'ubuntu-latest'
         run: cargo check --workspace
 
       - name: Run with avx2
@@ -51,45 +71,82 @@ jobs:
           export RUSTFLAGS="-C target-feature=avx2"
           cargo check --workspace
 
-      - name: Run with arm neon
-        if: matrix.os == 'ubuntu-24.04-arm'
-        run: |
-          export RUSTFLAGS="-C target-feature=neon"
-          cargo check --workspace
 
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
+        # Same reason as the check matrix above: no windows/macOS runner exists,
+        # and a leg with no runner queues forever rather than failing.
+        os: [ubuntu-latest]
     steps:
+      # Best-effort, and it must stay best-effort: it reclaims space, it does not
+      # gate correctness. As written it FAILED the whole matrix leg —
+      #
+      #   rm: cannot remove '/opt/hostedtoolcache': Device or resource busy
+      #   ❌ Failure - Main Free disk space (Linux)   exitcode '1'
+      #
+      # — and because the shell runs with `-e`, that first rm aborted the step and
+      # every later step was skipped, so checkout never ran and the job reported a
+      # failure that had nothing to do with the code.
+      #
+      # Two things are wrong with the original on a self-hosted runner:
+      #
+      #  - /opt/hostedtoolcache is RUNNER_TOOL_CACHE, a MOUNT inside the act
+      #    container, so removing it is impossible (EBUSY) rather than merely
+      #    unnecessary. Emptying it would be worse than useless: the cache is
+      #    shared with other jobs on the same runner, so this would sabotage them
+      #    to reclaim space we do not need. It is left alone deliberately.
+      #  - The other three paths are GitHub-hosted-image idioms. Our runners are
+      #    not that image, so they simply do not exist here.
+      #
+      # And the premise no longer holds anyway: the runner has ~66G free of 98G.
+      # Kept rather than deleted so the step still does its job on a GitHub-hosted
+      # runner, where those directories are real and space is genuinely tight.
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
+          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc; do
+            [ -e "$d" ] && sudo rm -rf "$d" || true
+          done
           df -h
+        continue-on-error: true
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Remove cargo config (macOS ring crate fix)
-        if: runner.os == 'macOS'
-        run: rm -f .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
       - name: Install lld (Linux only)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y lld
+      # `cargo test --workspace` is the heaviest thing this repo does. `check`
+      # passes on the same runner because it stops before codegen; test runs full
+      # LLVM codegen AND a link for every crate in a workspace that includes the
+      # wasm examples, hanzo-3d, tensor-tools and the pyo3 bindings. It was dying
+      # mid-`Compiling tensor-tools` — log ending with no error, no test result
+      # and no cleanup block, which is a killed process, not a failing test.
+      #
+      # Cargo parallelism is ALREADY bounded to 4 by the runner (runner.envs in
+      # universe infra/k8s/git-runner/config.yaml), so the peak is per-rustc, not
+      # a count of them. These two cut what each one costs:
+      #
+      #   debuginfo=line-tables-only  full debug info is one of the largest
+      #     consumers in codegen, and worse at link time — lld holds the debug
+      #     sections in memory. line-tables-only keeps FILE AND LINE NUMBERS in
+      #     panic backtraces, which is the part a CI failure actually needs, and
+      #     drops the variable/type DWARF nobody reads from a log.
+      #   CARGO_INCREMENTAL=0  incremental compilation buys nothing here — every
+      #     run starts from a cold target dir, so it only adds memory and disk.
+      #
+      # Neither changes which tests run or what they assert. If the job still
+      # dies mid-compile after this, the ceiling is genuinely too low for this
+      # workspace and it is a capacity decision, not a flag.
       - name: Run tests (with lld on Linux)
         if: runner.os == 'Linux'
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
-        run: cargo test --workspace
-      - name: Run tests (Windows & macOS)
-        if: runner.os != 'Linux'
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C debuginfo=line-tables-only"
+          CARGO_INCREMENTAL: "0"
         run: cargo test --workspace
 
   fmt:

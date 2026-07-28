@@ -53,8 +53,14 @@ fn vulkan_qmatmul_narrowed_activation_matches_cpu() -> hanzo_ml::Result<()> {
     let x_vk = Tensor::from_vec(x_host, (1, s, h), &dev)?;
 
     // One Q4_K weight, identical bytes on both devices.
-    let wq_t = Tensor::from_vec((0..h * h).map(|i| pseudo(i + 101) * 0.1).collect(), (h, h), &cpu)?;
-    let raw = QTensor::quantize(&wq_t, GgmlDType::Q4K)?.data()?.into_owned();
+    let wq_t = Tensor::from_vec(
+        (0..h * h).map(|i| pseudo(i + 101) * 0.1).collect(),
+        (h, h),
+        &cpu,
+    )?;
+    let raw = QTensor::quantize(&wq_t, GgmlDType::Q4K)?
+        .data()?
+        .into_owned();
     let mk = |dev: &Device| -> hanzo_ml::Result<QMatMul> {
         let qs = QStorage::from_data(std::borrow::Cow::Owned(raw.clone()), dev, GgmlDType::Q4K)?;
         QMatMul::from_arc(Arc::new(QTensor::new(qs, (h, h))?))
@@ -68,7 +74,12 @@ fn vulkan_qmatmul_narrowed_activation_matches_cpu() -> hanzo_ml::Result<()> {
         (h, h),
     )?
     .dequantize(&cpu)?;
-    let reference = to_host(&x_cpu.narrow(1, s - 1, 1)?.reshape((1, h))?.matmul(&wdeq.t()?)?)?;
+    let reference = to_host(
+        &x_cpu
+            .narrow(1, s - 1, 1)?
+            .reshape((1, h))?
+            .matmul(&wdeq.t()?)?,
+    )?;
 
     // The exact shape the LM head sees on the prefill path: narrow the last position (non-zero storage
     // offset (S-1)*H), then run the m=1 quant matmul.

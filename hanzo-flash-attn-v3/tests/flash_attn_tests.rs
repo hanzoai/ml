@@ -84,7 +84,9 @@ fn rel_err(a: &Tensor, b: &Tensor) -> Result<f32> {
 fn randish(b: usize, s: usize, h: usize, d: usize, dt: DType, dev: &Device) -> Result<Tensor> {
     // Deterministic, well-conditioned inputs in [-0.5, 0.5).
     let n = b * s * h * d;
-    let data: Vec<f32> = (0..n).map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0 - 0.5).collect();
+    let data: Vec<f32> = (0..n)
+        .map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0 - 0.5)
+        .collect();
     Ok(Tensor::from_vec(data, (b, s, h, d), dev)?.to_dtype(dt)?)
 }
 
@@ -107,7 +109,10 @@ fn fa3_matches_oracle(
     let want = oracle(&q, &k, &v, scale, causal)?;
     let err = rel_err(&got, &want)?;
     let tol = if dtype == DType::BF16 { 3e-2 } else { 8e-3 };
-    assert!(err < tol, "hdim={head_dim} dtype={dtype:?} causal={causal}: rel_err {err} >= {tol}");
+    assert!(
+        err < tol,
+        "hdim={head_dim} dtype={dtype:?} causal={causal}: rel_err {err} >= {tol}"
+    );
     Ok(())
 }
 

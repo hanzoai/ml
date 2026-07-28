@@ -350,7 +350,11 @@ pub fn gdn_gating_ref(
         let head = idx % num_heads;
         beta[idx] = 1.0 / (1.0 + (-b[idx]).exp());
         let softplus = (1.0 + (a[idx] + dt_bias[head]).exp()).ln();
-        let coeff = if neg_exp_a_log { a_log[head] } else { -(a_log[head].exp()) };
+        let coeff = if neg_exp_a_log {
+            a_log[head]
+        } else {
+            -(a_log[head].exp())
+        };
         g[idx] = coeff * softplus;
     }
     (beta, g)
@@ -441,14 +445,18 @@ mod tests {
         let c = CpuRuntime::client(&CpuDevice::default());
         // (batch, conv_dim, seq_len). conv_dim = key_dim*2 + value_dim for the model; k=4 always.
         // Includes seq_len < k (pure left-pad) and seq_len >> k (steady state).
-        for &(batch, conv_dim, seq_len) in &[(1usize, 512usize, 48usize), (1, 64, 3), (2, 128, 32)] {
+        for &(batch, conv_dim, seq_len) in &[(1usize, 512usize, 48usize), (1, 64, 3), (2, 128, 32)]
+        {
             let x = rnd(batch * conv_dim * seq_len, 0x1111 + conv_dim as u64);
             let w = rnd(conv_dim * 4, 0x2222 + seq_len as u64);
             let got = gdn_conv1d_run::<CpuRuntime>(&c, &x, &w, batch, conv_dim, seq_len, 4);
             let want = gdn_conv1d_ref(&x, &w, batch, conv_dim, seq_len, 4);
             let rel = max_rel(&want, &got);
             eprintln!("[gdn_conv1d CPU] b{batch} c{conv_dim} s{seq_len} k4 max_rel={rel:.2e}");
-            assert!(rel < 2e-3, "gdn_conv1d b{batch} c{conv_dim} s{seq_len} max_rel {rel}");
+            assert!(
+                rel < 2e-3,
+                "gdn_conv1d b{batch} c{conv_dim} s{seq_len} max_rel {rel}"
+            );
         }
     }
 
@@ -468,8 +476,13 @@ mod tests {
             let (gb, gg) = gdn_gating_run::<CpuRuntime>(&c, &b, &a, &a_log, &dt_bias, num_heads);
             let (wb, wg) = gdn_gating_ref(&b, &a, &a_log, &dt_bias, num_heads, false);
             let (rb, rg) = (max_rel(&wb, &gb), max_rel(&wg, &gg));
-            eprintln!("[gdn_gating CPU] h{num_heads} tok{tokens}  beta_rel={rb:.2e} g_rel={rg:.2e}");
-            assert!(rb < 2e-3 && rg < 2e-3, "gdn_gating h{num_heads} beta={rb} g={rg}");
+            eprintln!(
+                "[gdn_gating CPU] h{num_heads} tok{tokens}  beta_rel={rb:.2e} g_rel={rg:.2e}"
+            );
+            assert!(
+                rb < 2e-3 && rg < 2e-3,
+                "gdn_gating h{num_heads} beta={rb} g={rg}"
+            );
         }
     }
 
@@ -497,12 +510,19 @@ mod tests {
             let k = rnd(bh * seq * k_dim, 0x7002 + seq as u64);
             let v = rnd(bh * seq * v_dim, 0x7003 + v_dim as u64);
             // g < 0 (decay in (0,1]); beta in [0,1] -- the physical GDN gate ranges.
-            let g: Vec<f32> = rnd(bh * seq, 0x7004).iter().map(|x| x * 0.5 - 0.5).collect();
-            let beta: Vec<f32> = rnd(bh * seq, 0x7005).iter().map(|x| (x + 1.0) * 0.5).collect();
+            let g: Vec<f32> = rnd(bh * seq, 0x7004)
+                .iter()
+                .map(|x| x * 0.5 - 0.5)
+                .collect();
+            let beta: Vec<f32> = rnd(bh * seq, 0x7005)
+                .iter()
+                .map(|x| (x + 1.0) * 0.5)
+                .collect();
             let state0 = rnd(bh * k_dim * v_dim, 0x7006);
 
-            let (got_out, got_state) =
-                gdn_scan_run::<CpuRuntime>(&c, &q, &k, &v, &g, &beta, &state0, bh, seq, k_dim, v_dim);
+            let (got_out, got_state) = gdn_scan_run::<CpuRuntime>(
+                &c, &q, &k, &v, &g, &beta, &state0, bh, seq, k_dim, v_dim,
+            );
             let mut ref_state = state0.clone();
             let want_out =
                 gdn_scan_ref(&q, &k, &v, &g, &beta, &mut ref_state, bh, seq, k_dim, v_dim);
@@ -511,7 +531,10 @@ mod tests {
             eprintln!(
                 "[gdn_scan CPU] bh{bh} s{seq} k{k_dim} v{v_dim}  out_rel={ro:.2e} state_rel={rs:.2e}"
             );
-            assert!(ro < 2e-3 && rs < 2e-3, "gdn_scan bh{bh} s{seq} out={ro} state={rs}");
+            assert!(
+                ro < 2e-3 && rs < 2e-3,
+                "gdn_scan bh{bh} s{seq} out={ro} state={rs}"
+            );
         }
     }
 }

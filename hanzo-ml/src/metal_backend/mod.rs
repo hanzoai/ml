@@ -29,7 +29,10 @@ pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffse
 /// both the contiguous destination index and the source offset of every element. Returns
 /// `(d0, d1, d2, s0, s1, s2)` (left-padded with unit dims) when at most three non-unit dims
 /// remain and the innermost is contiguous; `None` otherwise (caller keeps the generic path).
-fn reduce_copy3d(dims: &[usize], strides: &[usize]) -> Option<(usize, usize, usize, usize, usize, usize)> {
+fn reduce_copy3d(
+    dims: &[usize],
+    strides: &[usize],
+) -> Option<(usize, usize, usize, usize, usize, usize)> {
     let mut kept: Vec<(usize, usize)> = dims
         .iter()
         .zip(strides.iter())
@@ -45,7 +48,9 @@ fn reduce_copy3d(dims: &[usize], strides: &[usize]) -> Option<(usize, usize, usi
     while kept.len() < 3 {
         kept.insert(0, (1, 0));
     }
-    Some((kept[0].0, kept[1].0, kept[2].0, kept[0].1, kept[1].1, kept[2].1))
+    Some((
+        kept[0].0, kept[1].0, kept[2].0, kept[0].1, kept[1].1, kept[2].1,
+    ))
 }
 /// Simple way to catch lock error without
 /// depending on T
@@ -1844,9 +1849,7 @@ impl BackendStorage for MetalStorage {
                     // avoiding the per-element multi-dimensional index divide of the generic
                     // strided kernel. Drop unit dims; usable when at most three non-unit dims
                     // remain with a contiguous innermost dim.
-                    if let Some((d0, d1, d2, s0, s1, s2)) =
-                        reduce_copy3d(src_l.dims(), strides)
-                    {
+                    if let Some((d0, d1, d2, s0, s1, s2)) = reduce_copy3d(src_l.dims(), strides) {
                         return self.copy3d(
                             dst,
                             d0,
@@ -2417,7 +2420,9 @@ mod dsl_metal_dispatch {
             _ => panic!("not a metal device"),
         };
         let (rows, n, eps) = (37usize, 128usize, 1e-5f32);
-        let x: Vec<f32> = (0..rows * n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.1)
+            .collect();
         let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 5) as f32 * 0.1).collect();
         let want = rms_ref(&x, &w, rows, n, eps);
 
@@ -2427,8 +2432,16 @@ mod dsl_metal_dispatch {
         let eb = md.new_buffer_with_data(&[eps][..]).unwrap();
         let ndb = md.new_buffer_with_data(&[n as u32][..]).unwrap();
         // rms_norm_blk binds 0=x 1=w 2=out 3=eps 4=n ; info_st (element lengths) trails at buffer 5.
-        let grid = objc2_metal::MTLSize { width: rows, height: 1, depth: 1 };
-        let tg = objc2_metal::MTLSize { width: n, height: 1, depth: 1 };
+        let grid = objc2_metal::MTLSize {
+            width: rows,
+            height: 1,
+            depth: 1,
+        };
+        let tg = objc2_metal::MTLSize {
+            width: n,
+            height: 1,
+            depth: 1,
+        };
         md.dispatch_dsl(
             "rms_norm_blk_f_f32",
             &[&*xb, &*wb, &*ob, &*eb, &*ndb],
@@ -2532,7 +2545,9 @@ mod metal_dsl_board {
         let eps = 1e-5f32;
         eprintln!("[board rms_norm] shape        hand_ms    dsl_ms   dsl/hand   dsl_rel  hand_rel");
         for &(rows, n) in &[(1usize, 4096usize), (512, 4096), (1, 5120), (512, 5120)] {
-            let x: Vec<f32> = (0..rows * n).map(|i| ((i % 251) as f32 - 125.0) * 0.01).collect();
+            let x: Vec<f32> = (0..rows * n)
+                .map(|i| ((i % 251) as f32 - 125.0) * 0.01)
+                .collect();
             let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 7) as f32 * 0.05).collect();
             let want = rms_ref(&x, &w, rows, n, eps);
 
@@ -2544,8 +2559,16 @@ mod metal_dsl_board {
             let ndb = md.new_buffer_with_data(&[n as u32][..]).unwrap();
             let ib = md.new_buffer_with_data(&[0u32; 10][..]).unwrap();
 
-            let grid = objc2_metal::MTLSize { width: rows, height: 1, depth: 1 };
-            let tg = objc2_metal::MTLSize { width: 128, height: 1, depth: 1 };
+            let grid = objc2_metal::MTLSize {
+                width: rows,
+                height: 1,
+                depth: 1,
+            };
+            let tg = objc2_metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            };
             let enc_dsl = || {
                 let enc = md.command_encoder().unwrap();
                 let e = enc.as_ref();
@@ -2561,7 +2584,17 @@ mod metal_dsl_board {
             let enc_hand = || {
                 let enc = md.command_encoder().unwrap();
                 hanzo_metal_kernels::call_rms_norm(
-                    &md.device, &enc, &md.kernels, "rmsnorm_f32", rows * n, n, eps, &xb, 0, &wb, 0,
+                    &md.device,
+                    &enc,
+                    &md.kernels,
+                    "rmsnorm_f32",
+                    rows * n,
+                    n,
+                    eps,
+                    &xb,
+                    0,
+                    &wb,
+                    0,
                     &ob_hand,
                 )
                 .unwrap();
@@ -2580,7 +2613,10 @@ mod metal_dsl_board {
                 "[board rms_norm] {rows:>4}x{n:<5}  {hand_ms:8.4}  {dsl_ms:8.4}   {:.3}x   {dsl_rel:.1e}  {hand_rel:.1e}",
                 dsl_ms / hand_ms
             );
-            assert!(dsl_rel < 2e-3, "DSL rms_norm not bit-exact at {rows}x{n}: {dsl_rel}");
+            assert!(
+                dsl_rel < 2e-3,
+                "DSL rms_norm not bit-exact at {rows}x{n}: {dsl_rel}"
+            );
         }
     }
 }

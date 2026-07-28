@@ -466,7 +466,12 @@ pub fn finalize() {
     if banks.is_empty() {
         return;
     }
-    let expert_bytes = banks.iter().map(|b| b.expert_bytes).max().unwrap_or(1).max(1);
+    let expert_bytes = banks
+        .iter()
+        .map(|b| b.expert_bytes)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let n_banks = banks.len() as u64;
 
     // STREAM_EXPERTS_RAM_GB forces the cache budget; otherwise size from live MemAvailable.
@@ -532,7 +537,9 @@ fn load_and_pin(banks: &[Arc<ExpertStreamBank>], cap: usize) -> usize {
             continue;
         };
         let mut rows = rows.clone();
-        rows.sort_by(|a, c| c.1.cmp(&a.1));
+        // Descending by count. `Reverse` rather than swapping the operands, which is
+        // what clippy's sort_by_key lint asks for and reads as the intent.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
         for (eid, _) in rows.into_iter().take(pin_budget) {
             if eid as usize >= b.n_experts {
                 continue;
@@ -663,7 +670,10 @@ fn mem_available_bytes() -> u64 {
         if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
             for line in text.lines() {
                 if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                    if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok())
+                    if let Some(kb) = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
                     {
                         return kb.saturating_mul(1024);
                     }
@@ -684,7 +694,12 @@ mod tests {
 
     /// Apply the swap policy to a pinned set exactly as `repin` does (cold slot -> hot expert),
     /// minus the disk I/O, so we can assert on convergence and the swap cap in isolation.
-    fn simulate(heat: &[u32], pinned: &mut Vec<u32>, max_swaps: usize) -> usize {
+    // `&mut [u32]`, not `&mut Vec<u32>`: this only writes through an index and
+    // hands the buffer to tier_pick_swap, which already takes `&[u32]`. It never
+    // grows or shrinks, so requiring a Vec asked callers for a capability the
+    // body does not use (clippy::ptr_arg). Call sites are unchanged — `&mut vec`
+    // derefs to `&mut [_]`.
+    fn simulate(heat: &[u32], pinned: &mut [u32], max_swaps: usize) -> usize {
         let mut swaps = 0;
         while swaps < max_swaps {
             match tier_pick_swap(heat, pinned) {
@@ -769,7 +784,11 @@ mod tests {
         let swaps = simulate(&heat, &mut pinned, REPIN_MAX_SWAPS);
         assert_eq!(swaps, 2, "exactly the two hot experts get pinned");
         pinned.sort_unstable();
-        assert_eq!(pinned, vec![0, 1], "hot-set converged to the two hottest experts");
+        assert_eq!(
+            pinned,
+            vec![0, 1],
+            "hot-set converged to the two hottest experts"
+        );
         // A second pass over the same (now settled) heat is a no-op: stable, no ping-pong.
         assert_eq!(simulate(&heat, &mut pinned, REPIN_MAX_SWAPS), 0);
     }

@@ -31,6 +31,67 @@ jobs:
         if: matrix.backend == 'metal'
         run: rm -f .cargo/config.toml
       - uses: ./.github/actions/gpu-guard
+      # CAPABILITY check, deliberately separate from gpu-guard (which is about
+      # CONTENTION — whether the GPU is already busy). This asks a different
+      # question: is this host actually able to build this backend at all?
+      #
+      # It exists because both failing arms spent minutes compiling before saying
+      # something that had nothing to do with the code:
+      #
+      #   metal  error: `objc2` only works on Apple platforms. Pass
+      #                 `--target aarch64-apple-darwin` or similar
+      #   rocm   include/hip.h:8:10: fatal error: 'hip/hip_runtime_api.h'
+      #                 file not found  (bindgen, at COMPILE time)
+      #
+      # Both read as broken source. Neither is: the `metal` label is answered by
+      # a host reporting aarch64-unknown-linux-gnu, and the rocm host has no HIP
+      # headers on the include path. Failing in the first seconds, naming the
+      # host and the remedy, is the difference between "the build is broken" and
+      # "this runner is not provisioned for this backend".
+      - name: Backend preflight
+        shell: bash
+        run: |
+          set -uo pipefail
+          os="$(uname -s)"; arch="$(uname -m)"
+          echo "host: ${os}/${arch}  backend: ${{ matrix.backend }}"
+
+          case "${{ matrix.backend }}" in
+            metal)
+              # objc2 and the Metal crates cannot cross-compile from Linux, so a
+              # non-Darwin host can never build this arm however healthy the GPU is.
+              if [ "$os" != "Darwin" ]; then
+                echo "::error::the 'metal' label is served by a ${os}/${arch} host, but Metal only builds on macOS."
+                echo "::error::register the dbc runner NATIVELY on macOS — a runner started inside the Linux VM on that Mac reports aarch64-unknown-linux-gnu and objc2 refuses to compile."
+                exit 1
+              fi
+              ;;
+            rocm)
+              # bindgen needs the HIP HEADERS at compile time. The existing
+              # LD_LIBRARY_PATH export below covers the runtime loader only, and
+              # for the same underlying reason: a systemd-launched runner does not
+              # inherit the interactive profile. Point clang at the headers here.
+              root=""
+              for c in "${ROCM_PATH:-}" "${HIP_PATH:-}" /opt/rocm; do
+                [ -n "$c" ] && [ -r "$c/include/hip/hip_runtime_api.h" ] && { root="$c"; break; }
+              done
+              if [ -z "$root" ]; then
+                echo "::error::hip/hip_runtime_api.h not found under ROCM_PATH, HIP_PATH or /opt/rocm on this host — install the ROCm dev headers (not just the runtime) or set ROCM_PATH."
+                exit 1
+              fi
+              echo "found HIP headers under ${root}"
+              {
+                echo "ROCM_PATH=${root}"
+                echo "HIP_PATH=${root}"
+                echo "BINDGEN_EXTRA_CLANG_ARGS=-I${root}/include ${BINDGEN_EXTRA_CLANG_ARGS:-}"
+              } >> "$GITHUB_ENV"
+              ;;
+            cuda)
+              command -v nvcc >/dev/null 2>&1 || [ -d /usr/local/cuda/include ] || {
+                echo "::error::no nvcc and no /usr/local/cuda/include on this host — the CUDA toolkit is not installed."; exit 1; }
+              ;;
+          esac
+          echo "preflight ok"
+
       - uses: dtolnay/rust-toolchain@stable
       - name: Test (${{ matrix.backend }})
         # The rocm test binary dynamically links libamdhip64.so.7 (ROCm 7.x) at run time. /opt/rocm/lib
@@ -40,6 +101,6 @@ jobs:
         # binary loads; it is a no-op on cuda/metal (the dir is absent and the loader ignores it).
         run: |
           if [ "${{ matrix.backend }}" = "rocm" ]; then
-            export LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+            export LD_LIBRARY_PATH="${ROCM_PATH:-/opt/rocm}/lib:${LD_LIBRARY_PATH:-}"
           fi
           cargo test -p hanzo-ml --features ${{ matrix.backend }} -- --test-threads 1

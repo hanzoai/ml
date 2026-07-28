@@ -45,8 +45,15 @@ fn bench_shape<R: Runtime>(
     let cubes = flash_attn_cubes(1, nh, sq) as u32;
     let scale = 1.0f32 / (d as f32).sqrt();
     let meta = [
-        sq as u32, sk as u32, nh as u32, nkv as u32, causal as u32,
-        (nkv * sk * d) as u32, (sk * d) as u32, d as u32, 0u32,
+        sq as u32,
+        sk as u32,
+        nh as u32,
+        nkv as u32,
+        causal as u32,
+        (nkv * sk * d) as u32,
+        (sk * d) as u32,
+        d as u32,
+        0u32,
     ];
     let qh = mc.create_from_slice(f32::as_bytes(&q));
     let kh = mc.create_from_slice(f32::as_bytes(&k));
@@ -69,7 +76,11 @@ fn bench_shape<R: Runtime>(
             ArrayArg::from_raw_parts(oh.clone(), ol),
             ArrayArg::from_raw_parts(sh.clone(), 1),
             ArrayArg::from_raw_parts(mh.clone(), 9),
-            d, BR, BC, plane, target,
+            d,
+            BR,
+            BC,
+            plane,
+            target,
         );
     };
     for _ in 0..20 {
@@ -77,7 +88,16 @@ fn bench_shape<R: Runtime>(
     }
     let _ = mc.read_one_unchecked(oh.clone()); // barrier: pipeline compiled + caches warm
     let iters = 100u32;
-    let (_, prof) = mc.profile(|| for _ in 0..iters { one(mc); }, "flash").unwrap();
+    let (_, prof) = mc
+        .profile(
+            || {
+                for _ in 0..iters {
+                    one(mc);
+                }
+            },
+            "flash",
+        )
+        .unwrap();
     let method = format!("{}", prof.timing_method());
     let ticks = cubecl::future::block_on(prof.resolve());
     (ticks.duration().as_nanos() as f64 / iters as f64, method)
@@ -100,16 +120,38 @@ pub fn cmma8<F: Float>(a: &Array<F>, b: &Array<F>, out: &mut Array<F>) {
     }
     sync_cube();
     let cacc = cmma::Matrix::<F>::from_value(
-        cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, F::new(0.0),
+        cmma::MatrixIdent::Accumulator,
+        8usize,
+        8usize,
+        8usize,
+        cmma::MatrixLayout::Undefined,
+        F::new(0.0),
     );
     let am = cmma::Matrix::<f16>::from_slice(
-        cmma::MatrixIdent::A, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor, &ash.to_slice().slice(0usize, 64usize), 8u32,
+        cmma::MatrixIdent::A,
+        8usize,
+        8usize,
+        8usize,
+        cmma::MatrixLayout::RowMajor,
+        &ash.to_slice().slice(0usize, 64usize),
+        8u32,
     );
     let bm = cmma::Matrix::<f16>::from_slice(
-        cmma::MatrixIdent::B, 8usize, 8usize, 8usize, cmma::MatrixLayout::ColMajor, &bsh.to_slice().slice(0usize, 64usize), 8u32,
+        cmma::MatrixIdent::B,
+        8usize,
+        8usize,
+        8usize,
+        cmma::MatrixLayout::ColMajor,
+        &bsh.to_slice().slice(0usize, 64usize),
+        8u32,
     );
     cmma::execute::<f16, f16, F, F>(&am, &bm, &cacc, &cacc);
-    cmma::store(&mut out.to_slice_mut(), &cacc, 8u32, cmma::MatrixLayout::RowMajor);
+    cmma::store(
+        &mut out.to_slice_mut(),
+        &cacc,
+        8u32,
+        cmma::MatrixLayout::RowMajor,
+    );
 }
 
 /// Run the 8x8 cmma probe on Metal and gate C = A @ Bᵀ vs a scalar f32 oracle (scale-relative, f16).
@@ -145,8 +187,14 @@ fn probe8<R: Runtime>(mc: &ComputeClient<R>) {
     match got {
         Ok(g) => {
             let refmax = want.iter().fold(0.0f32, |a, x| a.max(x.abs())).max(1e-6);
-            let maxd = g.iter().zip(&want).fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
-            eprintln!("[cmma8 probe] C=A@Bᵀ (B loaded ColMajor) 8x8x8 f16 -> f32   scale_rel={:.2e}", maxd / refmax);
+            let maxd = g
+                .iter()
+                .zip(&want)
+                .fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
+            eprintln!(
+                "[cmma8 probe] C=A@Bᵀ (B loaded ColMajor) 8x8x8 f16 -> f32   scale_rel={:.2e}",
+                maxd / refmax
+            );
             eprintln!("[cmma8 probe] got[0..4]  = {:?}", &g[0..4]);
             eprintln!("[cmma8 probe] want[0..4] = {:?}", &want[0..4]);
         }
@@ -170,7 +218,10 @@ fn rnd(n: usize, seed: u64) -> Vec<f32> {
 /// Scale-relative error `max|Δ| / max|ref|` -- correct gate for online softmax vs materialized ref.
 fn scale_rel(got: &[f32], want: &[f32]) -> f32 {
     let refmax = want.iter().fold(0.0f32, |a, x| a.max(x.abs())).max(1e-6);
-    let maxd = got.iter().zip(want).fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
+    let maxd = got
+        .iter()
+        .zip(want)
+        .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
     maxd / refmax
 }
 
@@ -201,7 +252,9 @@ fn gate<R: Runtime>(
 
     // FULL grid on the Metal GPU, cube_base = 0, all cubes in one dispatch (the production launch).
     let got = catch_unwind(AssertUnwindSafe(|| {
-        flash_attn_launch::<R>(mc, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, plane, 0, cubes, target)
+        flash_attn_launch::<R>(
+            mc, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, plane, 0, cubes, target,
+        )
     }));
 
     let rel_ref = match got {
@@ -236,7 +289,10 @@ fn main() {
     }
     if mode == "bench" {
         eprintln!("=== flash-metal-check :: warm GPU A/B -- flash cmma(8x8) vs flash scalar, SAME wgpu<msl> path ===");
-        eprintln!("runtime = {:?}   (device timestamps; buffers reused, only dispatch loop timed)\n", WgpuRuntime::name(&mc));
+        eprintln!(
+            "runtime = {:?}   (device timestamps; buffers reused, only dispatch loop timed)\n",
+            WgpuRuntime::name(&mc)
+        );
         // Same 10 shapes as the correctness gate.
         let shapes: [(&str, usize, usize, usize, usize, usize, bool); 10] = [
             ("decode kv1", 4, 2, 1, 1, 32, false),
@@ -250,11 +306,21 @@ fn main() {
             ("prefill causal tail sq40 d64", 6, 3, 40, 40, 64, true),
             ("prefill 512 causal MHA d128", 2, 1, 512, 512, 128, true),
         ];
-        eprintln!("{:<34} {:>13} {:>13} {:>11}   {}", "case", "cmma us", "scalar us", "cmma speedup", "timing");
+        eprintln!(
+            "{:<34} {:>13} {:>13} {:>11}   {}",
+            "case", "cmma us", "scalar us", "cmma speedup", "timing"
+        );
         for (tag, nh, nkv, sq, sk, d, causal) in shapes {
             let (c, mth) = bench_shape(&mc, Target::Metal, nh, nkv, sq, sk, d, causal, 32);
             let (s, _) = bench_shape(&mc, Target::Cpu, nh, nkv, sq, sk, d, causal, 32);
-            eprintln!("{:<34} {:>13.3} {:>13.3} {:>10.2}x   {}", tag, c / 1e3, s / 1e3, s / c, mth);
+            eprintln!(
+                "{:<34} {:>13.3} {:>13.3} {:>10.2}x   {}",
+                tag,
+                c / 1e3,
+                s / 1e3,
+                s / c,
+                mth
+            );
         }
         return;
     }
@@ -270,15 +336,103 @@ fn main() {
     // The EXACT 10 shapes from flash_matches_materialized_ref_on_cpu.
     let rows = vec![
         gate(&mc, target, 4, 2, 1, 1, 32, false, 32, "decode kv1"),
-        gate(&mc, target, 4, 2, 1, 17, 32, false, 32, "decode kv17 (tail)"),
+        gate(
+            &mc,
+            target,
+            4,
+            2,
+            1,
+            17,
+            32,
+            false,
+            32,
+            "decode kv17 (tail)",
+        ),
         gate(&mc, target, 4, 2, 1, 128, 32, false, 32, "decode kv128"),
-        gate(&mc, target, 8, 2, 1, 512, 64, false, 32, "decode kv512 GQA4"),
-        gate(&mc, target, 4, 2, 16, 128, 32, true, 32, "prefill qt1 causal GQA2"),
-        gate(&mc, target, 4, 2, 16, 128, 32, false, 32, "prefill qt1 noncausal GQA2"),
-        gate(&mc, target, 4, 4, 16, 64, 64, true, 32, "prefill qt1 MHA causal d64"),
-        gate(&mc, target, 4, 2, 48, 48, 32, true, 32, "prefill 3-tile causal GQA2 (aligned)"),
-        gate(&mc, target, 6, 3, 40, 40, 64, true, 32, "prefill causal GQA2 tail sq40 d64"),
-        gate(&mc, target, 2, 1, 512, 512, 128, true, 32, "prefill 512 causal MHA d128"),
+        gate(
+            &mc,
+            target,
+            8,
+            2,
+            1,
+            512,
+            64,
+            false,
+            32,
+            "decode kv512 GQA4",
+        ),
+        gate(
+            &mc,
+            target,
+            4,
+            2,
+            16,
+            128,
+            32,
+            true,
+            32,
+            "prefill qt1 causal GQA2",
+        ),
+        gate(
+            &mc,
+            target,
+            4,
+            2,
+            16,
+            128,
+            32,
+            false,
+            32,
+            "prefill qt1 noncausal GQA2",
+        ),
+        gate(
+            &mc,
+            target,
+            4,
+            4,
+            16,
+            64,
+            64,
+            true,
+            32,
+            "prefill qt1 MHA causal d64",
+        ),
+        gate(
+            &mc,
+            target,
+            4,
+            2,
+            48,
+            48,
+            32,
+            true,
+            32,
+            "prefill 3-tile causal GQA2 (aligned)",
+        ),
+        gate(
+            &mc,
+            target,
+            6,
+            3,
+            40,
+            40,
+            64,
+            true,
+            32,
+            "prefill causal GQA2 tail sq40 d64",
+        ),
+        gate(
+            &mc,
+            target,
+            2,
+            1,
+            512,
+            512,
+            128,
+            true,
+            32,
+            "prefill 512 causal MHA d128",
+        ),
     ];
 
     eprintln!("{:<40} {:<40} {:>10}", "case", "shape", "rel_ref");
@@ -301,7 +455,10 @@ fn main() {
             }
             Err(e) => {
                 let short: String = e.lines().next().unwrap_or("").chars().take(90).collect();
-                eprintln!("{:<40} {:<40} {:>10}   PANIC(main): {}", r.tag, r.shape, "ERR", short);
+                eprintln!(
+                    "{:<40} {:<40} {:>10}   PANIC(main): {}",
+                    r.tag, r.shape, "ERR", short
+                );
             }
         }
     }

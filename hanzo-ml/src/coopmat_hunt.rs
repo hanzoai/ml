@@ -27,8 +27,14 @@ use std::path::Path;
 use std::process::Command;
 
 /// The templatized shader (source of truth) and its committed SPIR-V (the byte-identical anchor).
-const SHADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vulkan/shaders/mul_mm_q4k_coopmat.comp");
-const COMMITTED_SPV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vulkan/spv/mul_mm_q4k_coopmat.spv");
+const SHADER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/vulkan/shaders/mul_mm_q4k_coopmat.comp"
+);
+const COMMITTED_SPV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/vulkan/spv/mul_mm_q4k_coopmat.spv"
+);
 
 /// LDS ceiling (bytes) above which occupancy drops below the single-buffer incumbent's. The 0.11.71
 /// single-buffer win measured 20 KB -> 8 subgroups and 40 KB (double buffer) -> 6; 32 KB is the honest
@@ -73,7 +79,14 @@ fn coopmat_space() -> Space {
 
 /// The shipped 0.11.71 single-buffer coopmat default (the A/B baseline the hunt is judged against).
 fn incumbent(space: &Space) -> Config {
-    space.config(&[("NWARP", 4), ("RM", 2), ("RN", 8), ("PAD", 4), ("BK", 32), ("DBUF", 0)])
+    space.config(&[
+        ("NWARP", 4),
+        ("RM", 2),
+        ("RN", 8),
+        ("PAD", 4),
+        ("BK", 32),
+        ("DBUF", 0),
+    ])
 }
 
 /// Derived tile geometry `(BM, BN, WG)` for a config.
@@ -118,7 +131,13 @@ fn compile(c: &Config, s: &Space, out: &Path) -> std::result::Result<Vec<u8>, St
         .map_err(|e| format!("glslc spawn: {e}"))?;
     if !o.status.success() {
         let msg = String::from_utf8_lossy(&o.stderr);
-        return Err(format!("glslc: {}", msg.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()));
+        return Err(format!(
+            "glslc: {}",
+            msg.lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+        ));
     }
     std::fs::read(out).map_err(|e| format!("read spv: {e}"))
 }
@@ -151,7 +170,11 @@ fn find_num(text: &str, key: &str) -> Option<u32> {
     for line in text.lines() {
         let l = line.to_ascii_lowercase();
         if l.contains(key) {
-            let n: String = l.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+            let n: String = l
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             if let Ok(v) = n.parse() {
                 return Some(v);
             }
@@ -179,7 +202,11 @@ fn parse_stats(text: &str) -> Stats {
 /// module is test-gated so this never ships.
 fn capture_stderr<R>(f: impl FnOnce() -> R) -> (R, String) {
     use std::os::unix::io::AsRawFd;
-    let path = std::env::temp_dir().join(format!("hk-shaderstats-{}-{}.txt", std::process::id(), rand_tag()));
+    let path = std::env::temp_dir().join(format!(
+        "hk-shaderstats-{}-{}.txt",
+        std::process::id(),
+        rand_tag()
+    ));
     let Ok(file) = std::fs::File::create(&path) else {
         return (f(), String::new());
     };
@@ -199,7 +226,10 @@ fn capture_stderr<R>(f: impl FnOnce() -> R) -> (R, String) {
 }
 
 fn rand_tag() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 // --- the evaluator -------------------------------------------------------------------------------
@@ -234,14 +264,18 @@ impl<'a> CoopmatEval<'a> {
             return;
         }
         let map = self.compiled.borrow();
-        let (spv, bm, bn) = map.get(cfg).expect("install: config must be compiled in the static tier first");
+        let (spv, bm, bn) = map
+            .get(cfg)
+            .expect("install: config must be compiled in the static tier first");
         self.dev.install_coopmat_variant(spv, *bm, *bn);
         drop(map);
         *self.installed.borrow_mut() = Some(cfg.clone());
     }
 
     fn run_once(&self) -> crate::Result<Vec<f32>> {
-        self.dev.matmul_q4k_coopmat_variant(&self.bank[0], self.xh, self.m, self.n, self.k)?.to_vec_f32()
+        self.dev
+            .matmul_q4k_coopmat_variant(&self.bank[0], self.xh, self.m, self.n, self.k)?
+            .to_vec_f32()
     }
 
     /// One cold-weight-streaming, GTT-saturated timing pass over the installed variant: rotate the whole
@@ -252,12 +286,24 @@ impl<'a> CoopmatEval<'a> {
     fn cold_pipe_ms(&self, iters: usize) -> f64 {
         let nb = self.bank.len();
         for i in 0..(2 * nb) {
-            let _ = self.dev.matmul_q4k_coopmat_variant(&self.bank[i % nb], self.xh, self.m, self.n, self.k);
+            let _ = self.dev.matmul_q4k_coopmat_variant(
+                &self.bank[i % nb],
+                self.xh,
+                self.m,
+                self.n,
+                self.k,
+            );
         }
         let _ = self.dev.synchronize();
         let t = std::time::Instant::now();
         for i in 0..iters {
-            let _ = self.dev.matmul_q4k_coopmat_variant(&self.bank[i % nb], self.xh, self.m, self.n, self.k);
+            let _ = self.dev.matmul_q4k_coopmat_variant(
+                &self.bank[i % nb],
+                self.xh,
+                self.m,
+                self.n,
+                self.k,
+            );
         }
         let _ = self.dev.synchronize();
         t.elapsed().as_secs_f64() * 1e3 / iters as f64
@@ -269,19 +315,28 @@ impl<'a> Evaluator for CoopmatEval<'a> {
         let (bm, bn, _) = geom(cfg, self.space);
         let lds = lds_bytes(cfg, self.space);
         if lds > LDS_BUDGET {
-            return Verdict::Reject(format!("LDS {}KB > {}KB budget (occupancy)", lds / 1024, LDS_BUDGET / 1024));
+            return Verdict::Reject(format!(
+                "LDS {}KB > {}KB budget (occupancy)",
+                lds / 1024,
+                LDS_BUDGET / 1024
+            ));
         }
         let out = self.tmp.join("variant.spv");
         let spv = match compile(cfg, self.space, &out) {
             Ok(b) => b,
             Err(e) => return Verdict::Reject(e),
         };
-        self.compiled.borrow_mut().insert(cfg.clone(), (spv, bm, bn));
+        self.compiled
+            .borrow_mut()
+            .insert(cfg.clone(), (spv, bm, bn));
 
         // Build the pipeline once and read its RADV stats; reject a spilling schedule before any timing.
         if self.shaderstats {
             self.install(cfg);
-            let (res, text) = capture_stderr(|| self.dev.matmul_q4k_coopmat_variant(&self.bank[0], self.xh, self.m, self.n, self.k));
+            let (res, text) = capture_stderr(|| {
+                self.dev
+                    .matmul_q4k_coopmat_variant(&self.bank[0], self.xh, self.m, self.n, self.k)
+            });
             let _ = self.dev.synchronize();
             if res.is_ok() {
                 let st = parse_stats(&text);
@@ -307,10 +362,18 @@ impl<'a> Evaluator for CoopmatEval<'a> {
                 return f64::INFINITY;
             }
         };
-        let rel = got.iter().zip(self.oracle).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / self.maxref;
+        let rel = got
+            .iter()
+            .zip(self.oracle)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / self.maxref;
         self.worst_rel.set(self.worst_rel.get().max(rel));
         if rel > GATE {
-            eprintln!("[hunt] {} DIVERGED scale_rel={rel:.2e} > {GATE:.0e}", cfg.name(self.space));
+            eprintln!(
+                "[hunt] {} DIVERGED scale_rel={rel:.2e} > {GATE:.0e}",
+                cfg.name(self.space)
+            );
             return f64::INFINITY;
         }
         // COLD-WEIGHT-STREAMING, GTT-SATURATED fitness -- the campaign's #1 scar made a gate. A single
@@ -324,7 +387,9 @@ impl<'a> Evaluator for CoopmatEval<'a> {
         // least-drift-polluted cold-stream time, making configs measured minutes apart comparable. The
         // whole-forward DVFS downclock is still not reproducible in a busy microbench, so a genuine winner
         // must be confirmed in-engine before it changes a default.
-        (0..MEASURE_REPEATS).map(|_| self.cold_pipe_ms(iters)).fold(f64::INFINITY, f64::min)
+        (0..MEASURE_REPEATS)
+            .map(|_| self.cold_pipe_ms(iters))
+            .fold(f64::INFINITY, f64::min)
     }
 }
 
@@ -352,11 +417,17 @@ fn build_weight(dev: &VulkanDevice, seed: u64, n: usize, k: usize) -> VulkanStor
     };
     let mut blocks: Vec<BlockQ4K> = (0..n * nb).map(|_| unsafe { std::mem::zeroed() }).collect();
     for r in 0..n {
-        let rowf: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+        let rowf: Vec<f32> = (0..k)
+            .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+            .collect();
         BlockQ4K::from_float(&rowf, &mut blocks[r * nb..(r + 1) * nb]);
     }
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, blocks.len() * std::mem::size_of::<BlockQ4K>()) };
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            blocks.as_ptr() as *const u8,
+            blocks.len() * std::mem::size_of::<BlockQ4K>(),
+        )
+    };
     dev.upload_qweight(bytes).unwrap()
 }
 
@@ -366,7 +437,18 @@ fn build_weight(dev: &VulkanDevice, seed: u64, n: usize, k: usize) -> VulkanStor
 /// so a short rotation still cycles cold.
 fn build_bank(dev: &VulkanDevice, n: usize, k: usize) -> Vec<VulkanStorage> {
     let n_tiles = ((2 * MALL_BYTES).div_ceil(tile_bytes(n, k)) + 1).max(4);
-    (0..n_tiles).map(|i| build_weight(dev, 0xC01D_0000u64.wrapping_add(i as u64).wrapping_mul(0x9E3779B1), n, k)).collect()
+    (0..n_tiles)
+        .map(|i| {
+            build_weight(
+                dev,
+                0xC01D_0000u64
+                    .wrapping_add(i as u64)
+                    .wrapping_mul(0x9E3779B1),
+                n,
+                k,
+            )
+        })
+        .collect()
 }
 
 /// Build the cold-weight bank (whose `bank[0]` doubles as the correctness weight), an activation, and the
@@ -386,10 +468,16 @@ fn build_bank_and_oracle(
         s ^= s << 17;
         s
     };
-    let x: Vec<f32> = (0..m * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let x: Vec<f32> = (0..m * k)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     let xh = dev.upload_f32(&x).unwrap();
     unsafe { std::env::set_var("VK_Q4K_COOPMAT_OFF", "1") };
-    let oracle = dev.matmul_q4k_gpu(&bank[0], &xh, m, n, k).unwrap().to_vec_f32().unwrap();
+    let oracle = dev
+        .matmul_q4k_gpu(&bank[0], &xh, m, n, k)
+        .unwrap()
+        .to_vec_f32()
+        .unwrap();
     unsafe { std::env::remove_var("VK_Q4K_COOPMAT_OFF") };
     let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
     (bank, xh, oracle, maxref)
@@ -419,17 +507,28 @@ mod tests {
                 Err(e) => fails.push((c.name(&space), e)),
             }
         }
-        eprintln!("[coopmat-sweep] {} feasible configs; {ok} compiled, {} failed", configs.len(), fails.len());
+        eprintln!(
+            "[coopmat-sweep] {} feasible configs; {ok} compiled, {} failed",
+            configs.len(),
+            fails.len()
+        );
         for (nm, e) in &fails {
             eprintln!("  FAIL {nm}: {e}");
         }
-        assert!(fails.is_empty(), "{} genome configs failed to compile", fails.len());
+        assert!(
+            fails.is_empty(),
+            "{} genome configs failed to compile",
+            fails.len()
+        );
 
         // Incumbent -D compile == committed SPIR-V (the byte-identical anchor).
         let inc = incumbent(&space);
         let inc_spv = compile(&inc, &space, &tmp.join("inc.spv")).unwrap();
         let committed = std::fs::read(COMMITTED_SPV).expect("read committed spv");
-        assert_eq!(inc_spv, committed, "incumbent -D realization diverged from the committed SPIR-V");
+        assert_eq!(
+            inc_spv, committed,
+            "incumbent -D realization diverged from the committed SPIR-V"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -502,7 +601,10 @@ mod tests {
             .elitism(2)
             .measure_iters(30)
             .seed_config(inc.clone());
-        let seed = std::env::var("HANZO_HUNT_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0xC0FFEEu64);
+        let seed = std::env::var("HANZO_HUNT_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0xC0FFEEu64);
 
         let report = evo.hunt(&space, &eval, seed);
 
@@ -521,16 +623,26 @@ mod tests {
         eprintln!("--- measured (sustained ms, fastest first) ---");
         for (nm, ms) in &report.measured {
             let gf = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
-            let tag = if *nm == inc.name(&space) { "  <-- incumbent" } else { "" };
+            let tag = if *nm == inc.name(&space) {
+                "  <-- incumbent"
+            } else {
+                ""
+            };
             eprintln!("  {ms:8.3} ms   {gf:7.0} GF/s   {nm}{tag}");
         }
-        let inc_ms = report.measured.iter().find(|(nm, _)| *nm == inc.name(&space)).map(|(_, ms)| *ms);
+        let inc_ms = report
+            .measured
+            .iter()
+            .find(|(nm, _)| *nm == inc.name(&space))
+            .map(|(_, ms)| *ms);
         eprintln!(
             "--- WINNER {} @ {:.3} ms  vs incumbent {} @ {} ---",
             report.best_name,
             report.best_ms,
             inc.name(&space),
-            inc_ms.map(|v| format!("{v:.3} ms")).unwrap_or_else(|| "n/a".into())
+            inc_ms
+                .map(|v| format!("{v:.3} ms"))
+                .unwrap_or_else(|| "n/a".into())
         );
         if let Some(iv) = inc_ms {
             let delta = (iv - report.best_ms) / iv * 100.0;
@@ -540,13 +652,19 @@ mod tests {
                 eprintln!("--- RESULT: WINNER beats incumbent by {delta:.1}% (RE-VERIFY IN-ENGINE before shipping) ---");
             }
         }
-        eprintln!("worst correctness scale_rel over the hunt: {:.2e} (gate {GATE:.0e})", eval.worst_rel.get());
+        eprintln!(
+            "worst correctness scale_rel over the hunt: {:.2e} (gate {GATE:.0e})",
+            eval.worst_rel.get()
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
 
         // The hunt must crown a real, bit-exact winner.
         assert!(report.best_ms.is_finite(), "no measurable winner");
-        assert!(eval.worst_rel.get() < GATE, "a measured variant diverged from the oracle");
+        assert!(
+            eval.worst_rel.get() < GATE,
+            "a measured variant diverged from the oracle"
+        );
     }
 
     /// THE ACCEPTANCE GATE for the fitness oracle (GPU; runs whenever a coopmat device is present, skips
@@ -603,12 +721,22 @@ mod tests {
         );
 
         let incumbent_cfg = incumbent(&space); // NWARP=4,RM=2 -- the shipped default
-        let warm_winner = space.config(&[("NWARP", 8), ("RM", 1), ("RN", 8), ("PAD", 4), ("BK", 32), ("DBUF", 0)]);
+        let warm_winner = space.config(&[
+            ("NWARP", 8),
+            ("RM", 1),
+            ("RN", 8),
+            ("PAD", 4),
+            ("BK", 32),
+            ("DBUF", 0),
+        ]);
         // Both must reach the GPU tier (compile + pass static) for the comparison to be meaningful.
         for cfg in [&incumbent_cfg, &warm_winner] {
             match eval.static_check(cfg) {
                 Verdict::Pass => {}
-                Verdict::Reject(why) => panic!("golden config {} statically rejected: {why}", cfg.name(&space)),
+                Verdict::Reject(why) => panic!(
+                    "golden config {} statically rejected: {why}",
+                    cfg.name(&space)
+                ),
             }
         }
         // measure() already takes the min over MEASURE_REPEATS cold-stream passes (drift-resistant), so one
@@ -623,8 +751,15 @@ mod tests {
         );
         std::fs::remove_dir_all(&tmp).ok();
 
-        assert!(ms_inc.is_finite() && ms_warm.is_finite(), "a golden config failed to measure");
-        assert!(eval.worst_rel.get() < GATE, "a golden variant diverged from the oracle (scale_rel {:.2e})", eval.worst_rel.get());
+        assert!(
+            ms_inc.is_finite() && ms_warm.is_finite(),
+            "a golden config failed to measure"
+        );
+        assert!(
+            eval.worst_rel.get() < GATE,
+            "a golden variant diverged from the oracle (scale_rel {:.2e})",
+            eval.worst_rel.get()
+        );
         // The cold-pipelined (saturated) oracle scores NWARP=8 at ~-10% (NOT a win) -- it makes the same
         // decision as in-engine (keep the incumbent). The warm microbench inflated it to +17-24%, and an
         // isolated per-dispatch-synchronized loop credits it ~+11%; both would wrongly crown NWARP=8. The
