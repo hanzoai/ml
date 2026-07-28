@@ -114,13 +114,39 @@ jobs:
       - name: Install lld (Linux only)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y lld
+      # `cargo test --workspace` is the heaviest thing this repo does. `check`
+      # passes on the same runner because it stops before codegen; test runs full
+      # LLVM codegen AND a link for every crate in a workspace that includes the
+      # wasm examples, hanzo-3d, tensor-tools and the pyo3 bindings. It was dying
+      # mid-`Compiling tensor-tools` — log ending with no error, no test result
+      # and no cleanup block, which is a killed process, not a failing test.
+      #
+      # Cargo parallelism is ALREADY bounded to 4 by the runner (runner.envs in
+      # universe infra/k8s/git-runner/config.yaml), so the peak is per-rustc, not
+      # a count of them. These two cut what each one costs:
+      #
+      #   debuginfo=line-tables-only  full debug info is one of the largest
+      #     consumers in codegen, and worse at link time — lld holds the debug
+      #     sections in memory. line-tables-only keeps FILE AND LINE NUMBERS in
+      #     panic backtraces, which is the part a CI failure actually needs, and
+      #     drops the variable/type DWARF nobody reads from a log.
+      #   CARGO_INCREMENTAL=0  incremental compilation buys nothing here — every
+      #     run starts from a cold target dir, so it only adds memory and disk.
+      #
+      # Neither changes which tests run or what they assert. If the job still
+      # dies mid-compile after this, the ceiling is genuinely too low for this
+      # workspace and it is a capacity decision, not a flag.
       - name: Run tests (with lld on Linux)
         if: runner.os == 'Linux'
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C debuginfo=line-tables-only"
+          CARGO_INCREMENTAL: "0"
         run: cargo test --workspace
       - name: Run tests (Windows & macOS)
         if: runner.os != 'Linux'
+        env:
+          RUSTFLAGS: "-C debuginfo=line-tables-only"
+          CARGO_INCREMENTAL: "0"
         run: cargo test --workspace
 
   fmt:
