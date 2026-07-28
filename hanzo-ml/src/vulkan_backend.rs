@@ -153,6 +153,14 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mmq_q4k" => include_bytes!("vulkan/spv/mmq_q4k.spv"),
         // Runtime-dims twin: m/n/k ride a meta SSBO (binding 8) so ONE .spv serves every prefill shape.
         "mmq_q4k_rt" => include_bytes!("vulkan/spv/mmq_q4k_rt.spv"),
+        // MoE PREFILL: the expert-indexed twin of mmq_q4k_rt (hanzo-kernel mmq::mmq_q4k_id). Expert on
+        // grid.z, weight base expert*n rows into the split bank, A-tile gathered through the expert's
+        // slot list and the result scattered back to the slot's own output row -- so each expert weight
+        // is read ONCE per prefill instead of once per routed token. `moe_expert_rows` builds that slot
+        // list (counts + per-expert ascending slot indices) from the router ids. Both take runtime
+        // n/k/cap via a meta SSBO, so ONE .spv each serves every MoE shape.
+        "mmq_q4k_id" => include_bytes!("vulkan/spv/mmq_q4k_id.spv"),
+        "moe_expert_rows" => include_bytes!("vulkan/spv/moe_expert_rows.spv"),
         // DENSE dp4a Q4_K matvec (block-reduce, one workgroup/output row, nt=64): reads the verbatim
         // packed weight; the m=1 decode fix for the attention projections that the prefill dp4a GEMM
         // (mul_mat_q4k_dp4a, 1-thread/row) starves. Bindings: wq(packed), xq, xs, xsum, out, meta=[k].
@@ -2621,6 +2629,105 @@ impl VulkanDevice {
         Ok(out)
     }
 
+    /// MoE PREFILL matmul on the matrix cores: `out[s, j] = sum_k W[ids[s], j, k] * x[s, k]` for every
+    /// routed slot `s`, reading the per-expert slice from the same resident split bank the decode
+    /// matvec uses. Groups the slots by expert (`moe_expert_rows`) and runs ONE `mmq_q4k_id` GEMM over
+    /// (n-tiles, cap-tiles, experts), so an expert's weight is streamed once and amortised over all of
+    /// its tokens instead of re-streamed per slot -- the prefill twin of `moe_matvec_blk_dp4a_pre_gpu`,
+    /// and the Vulkan arm of the `t > 1` grouping CUDA/ROCm/Metal already run.
+    ///
+    /// `cap` bounds rows-per-expert and MUST be >= the token count: a token's top-k experts are
+    /// distinct, so an expert claims at most one slot per token. The activation is q8-quantized once
+    /// by the caller (gate and up share it), exactly as the decode path does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmq_q4k_id_gpu(
+        &self,
+        bank: &MoeBankSplit,
+        xq: &VulkanStorage,
+        xs: &VulkanStorage,
+        xsum: &VulkanStorage,
+        ids: &VulkanStorage,
+        nslots: usize,
+        n_experts: usize,
+        cap: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        let (counts, rows) = self.moe_expert_rows_vk(ids, nslots, n_experts, cap)?;
+        self.mmq_q4k_id_pre_gpu(bank, xq, xs, xsum, &rows, &counts, nslots, n_experts, cap, n, k)
+    }
+
+    /// Group the routed slots by expert: returns `(counts[n_experts], rows[n_experts * cap])`, the
+    /// per-expert ascending slot lists [`Self::mmq_q4k_id_pre_gpu`] gathers and scatters through.
+    /// Split out because the routing is the SAME for gate and up within a layer -- they share one
+    /// grouping the way they already share one q8 activation quantize.
+    pub fn moe_expert_rows_vk(
+        &self,
+        ids: &VulkanStorage,
+        nslots: usize,
+        n_experts: usize,
+        cap: usize,
+    ) -> Result<(VulkanStorage, VulkanStorage)> {
+        if ids.count < nslots {
+            crate::bail!("moe_expert_rows_vk: ids count {} < nslots {nslots}", ids.count);
+        }
+        let counts = self.alloc_u32(n_experts)?;
+        let rows = self.alloc_u32(n_experts * cap)?;
+        let meta = self.upload_u32(&[nslots as u32, n_experts as u32, cap as u32])?;
+        self.dispatch_outs(
+            "moe_expert_rows",
+            &[ids.buffer, counts.buffer, rows.buffer, meta.buffer],
+            &[1, 2],
+            &[],
+            (1, 1, 1),
+        )?;
+        Ok((counts, rows))
+    }
+
+    /// [`Self::mmq_q4k_id_gpu`] against an ALREADY grouped routing. Gate and up read the same routed
+    /// token and the same expert assignment, so the caller groups once and dispatches twice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmq_q4k_id_pre_gpu(
+        &self,
+        bank: &MoeBankSplit,
+        xq: &VulkanStorage,
+        xs: &VulkanStorage,
+        xsum: &VulkanStorage,
+        rows: &VulkanStorage,
+        counts: &VulkanStorage,
+        nslots: usize,
+        n_experts: usize,
+        cap: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        let out = self.alloc_f32(nslots * n)?;
+        let meta = self.upload_u32(&[n as u32, k as u32, cap as u32])?;
+        let mut bufs = vec![xq.buffer, xs.buffer, xsum.buffer];
+        for s in &bank.0 {
+            bufs.push(s.buffer); // wqs, wsc, wd, wdm
+        }
+        bufs.push(rows.buffer);
+        bufs.push(counts.buffer);
+        bufs.push(out.buffer);
+        bufs.push(meta.buffer);
+        // Size the m-tile axis for the WORST-CASE expert load (`cap` rows), as llama's mul_mat_id
+        // does. Sizing it for the average instead was MEASURED SLOWER (in-engine GPU time for this
+        // kernel 775 -> 924 ms): expert loads are uneven, so a short grid makes the heaviest expert's
+        // workgroup walk its tiles serially while the dispatch waits on it, and that costs more than
+        // the extra tiles cost -- they read one `counts` entry and exit before any barrier. The kernel
+        // grid-strides regardless, so this stays a pure throughput knob and never a correctness one.
+        let ytiles = cap.div_ceil(32);
+        self.dispatch_out(
+            "mmq_q4k_id",
+            &bufs,
+            9,
+            &[],
+            (n.div_ceil(64) as u32, ytiles as u32, n_experts as u32),
+        )?;
+        Ok(out)
+    }
+
     /// Fused MoE top-k router: `logits[ntok, n_experts]` -> (ids[ntok, topk] u32, weights[ntok, topk]
     /// f32), softmax + top-k + renormalize in ONE kernel (the DSL `moe_route` .spv, one workgroup per
     /// token). Replaces the generic softmax_last_dim + sort_last_dim + narrow + gather + norm op-chain
@@ -4475,13 +4582,13 @@ impl VulkanDevice {
             // these, so they must outlive the update/push call below.) Built on the stack into a
             // fixed array — never a heap Vec — because this is the decode hot path: hundreds of
             // dispatches x N layers re-recorded every token, where a per-dispatch Vec alloc+free for
-            // both `infos` and `writes` was pure CPU churn the GPU then stalled on. MAX_BINDINGS (10)
-            // comfortably covers the widest kernel (4 buffers: where_cond/index_select); only the
-            // first `nb = bufs.len()` entries are populated and passed on, and the debug_assert
-            // above (kernel binding-count drift) plus the one here pin the bound, so it can never be
-            // exceeded in a correct build. The arrays live for the rest of this unsafe block,
-            // satisfying the borrows the push/update calls hold on them.
-            const MAX_BINDINGS: usize = 10;
+            // both `infos` and `writes` was pure CPU churn the GPU then stalled on. MAX_BINDINGS (12)
+            // covers the widest kernel: `mmq_q4k_id` binds 11 (xq, xs, xsum, the four split-bank
+            // arrays, rows, counts, out, meta). Only the first `nb = bufs.len()` entries are populated
+            // and passed on, and the debug_assert above (kernel binding-count drift) plus the one here
+            // pin the bound, so it can never be exceeded in a correct build. The arrays live for the
+            // rest of this unsafe block, satisfying the borrows the push/update calls hold on them.
+            const MAX_BINDINGS: usize = 12;
             let nb = bufs.len();
             debug_assert!(
                 nb <= MAX_BINDINGS,
@@ -5404,12 +5511,12 @@ impl BackendDevice for VulkanDevice {
                 )
                 .map_err(vkerr)?;
             // Sized for a whole batch: one descriptor set per recorded dispatch (up to
-            // BATCH_CAP), each binding up to MAX_BINDINGS (10) storage buffers. The widest kernels
-            // are the GDN mixers (gdn_recurrence/gdn_chunked bind 7: q,k,v,g,beta,state,out); sizing
-            // at 4 starved the pool on the legacy (non-push-descriptor: Dozen/WSL) allocate-set path,
-            // which drew STORAGE_BUFFER descriptors here and hit OUT_OF_POOL_MEMORY. MAX_BINDINGS
-            // matches the per-dispatch bind cap in `dispatch_outs`, so no kernel can exceed it.
-            const MAX_BINDINGS: u32 = 10;
+            // BATCH_CAP), each binding up to MAX_BINDINGS (12) storage buffers. The widest kernel is
+            // the expert-indexed prefill MMQ (`mmq_q4k_id` binds 11); sizing at 4 starved the pool on
+            // the legacy (non-push-descriptor: Dozen/WSL) allocate-set path, which drew
+            // STORAGE_BUFFER descriptors here and hit OUT_OF_POOL_MEMORY. MAX_BINDINGS matches the
+            // per-dispatch bind cap in `dispatch_outs`, so no kernel can exceed it.
+            const MAX_BINDINGS: u32 = 12;
             let dpool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(BATCH_CAP * MAX_BINDINGS)];
