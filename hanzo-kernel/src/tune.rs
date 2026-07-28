@@ -60,7 +60,10 @@ pub struct Variant<'a, T> {
 impl<'a, T> Variant<'a, T> {
     /// Build a variant from its name and a `|iters| -> (output, ms)` launcher.
     pub fn new(name: &'static str, f: impl Fn(usize) -> (T, f64) + 'a) -> Self {
-        Variant { name, f: Box::new(f) }
+        Variant {
+            name,
+            f: Box::new(f),
+        }
     }
 }
 
@@ -110,12 +113,18 @@ pub struct Tuner {
 impl Tuner {
     /// A tuner rooted at `cache_root` (the parent of `hanzo-kernel/autotune/`).
     pub fn new(cache_root: impl Into<PathBuf>) -> Self {
-        Tuner { cache_root: cache_root.into(), inner: Mutex::new(Inner::default()) }
+        Tuner {
+            cache_root: cache_root.into(),
+            inner: Mutex::new(Inner::default()),
+        }
     }
 
     /// The on-disk file for a device's winners.
     fn device_file(&self, device: &str) -> PathBuf {
-        self.cache_root.join("hanzo-kernel").join("autotune").join(format!("{}.tsv", sanitize(device)))
+        self.cache_root
+            .join("hanzo-kernel")
+            .join("autotune")
+            .join(format!("{}.tsv", sanitize(device)))
     }
 
     /// Select (and cache) the fastest variant for `(device, op, key)`.
@@ -126,17 +135,38 @@ impl Tuner {
     ///
     /// If a cached winner name is no longer among the variants (the set changed), it is treated as a
     /// miss and re-tuned.
-    pub fn select<T>(&self, device: &str, op: &str, key: &str, variants: Vec<Variant<'_, T>>) -> Pick<T> {
-        assert!(!variants.is_empty(), "tune::select needs at least one variant");
+    pub fn select<T>(
+        &self,
+        device: &str,
+        op: &str,
+        key: &str,
+        variants: Vec<Variant<'_, T>>,
+    ) -> Pick<T> {
+        assert!(
+            !variants.is_empty(),
+            "tune::select needs at least one variant"
+        );
         self.ensure_loaded(device);
 
         let ck = (device.to_string(), op.to_string(), key.to_string());
-        let cached = self.inner.lock().expect("tuner cache poisoned").winners.get(&ck).cloned();
+        let cached = self
+            .inner
+            .lock()
+            .expect("tuner cache poisoned")
+            .winners
+            .get(&ck)
+            .cloned();
 
         if let Some(winner) = cached {
             if let Some(v) = variants.iter().find(|v| v.name == winner) {
                 let (output, _ms) = (v.f)(1);
-                return Pick { output, winner, from_cache: true, benched: 0, timings: Vec::new() };
+                return Pick {
+                    output,
+                    winner,
+                    from_cache: true,
+                    benched: 0,
+                    timings: Vec::new(),
+                };
             }
             // Winner name not in the current set -> the variant set changed; fall through and re-tune.
         }
@@ -159,7 +189,13 @@ impl Tuner {
 
         self.record(device, op, key, &winner);
         timings.sort_by(|a, b| a.1.total_cmp(&b.1));
-        Pick { output, winner, from_cache: false, benched: variants.len(), timings }
+        Pick {
+            output,
+            winner,
+            from_cache: false,
+            benched: variants.len(),
+            timings,
+        }
     }
 
     /// Merge a device's on-disk winners into memory exactly once.
@@ -182,9 +218,10 @@ impl Tuner {
     fn record(&self, device: &str, op: &str, key: &str, winner: &str) {
         {
             let mut inner = self.inner.lock().expect("tuner cache poisoned");
-            inner
-                .winners
-                .insert((device.to_string(), op.to_string(), key.to_string()), winner.to_string());
+            inner.winners.insert(
+                (device.to_string(), op.to_string(), key.to_string()),
+                winner.to_string(),
+            );
         }
         append_device_file(&self.device_file(device), op, key, winner);
     }
@@ -234,12 +271,28 @@ pub fn device_id<R: Runtime>(_client: &ComputeClient<R>) -> String {
 // --- disk helpers (TSV, std-only) -----------------------------------------------------------
 
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// A TSV cell may not contain a tab or newline; collapse any to a space so a line always round-trips.
 fn cell(s: &str) -> String {
-    s.chars().map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c }).collect()
+    s.chars()
+        .map(|c| {
+            if c == '\t' || c == '\n' || c == '\r' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 fn read_device_file(path: &Path) -> Vec<(String, String, String)> {
@@ -254,7 +307,9 @@ fn read_device_file(path: &Path) -> Vec<(String, String, String)> {
             map.insert((op.to_string(), key.to_string()), winner.to_string());
         }
     }
-    map.into_iter().map(|((op, key), winner)| (op, key, winner)).collect()
+    map.into_iter()
+        .map(|((op, key), winner)| (op, key, winner))
+        .collect()
 }
 
 fn append_device_file(path: &Path, op: &str, key: &str, winner: &str) {
@@ -262,7 +317,11 @@ fn append_device_file(path: &Path, op: &str, key: &str, winner: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{}\t{}\t{}", cell(op), cell(key), cell(winner));
     }
 }
@@ -290,7 +349,11 @@ pub struct Tuned<'a, T> {
 impl<'a, T> Tuned<'a, T> {
     /// Start a variant set for op `op` at shape-class `key`.
     pub fn new(op: &'static str, key: impl Into<String>) -> Self {
-        Tuned { op, key: key.into(), variants: Vec::new() }
+        Tuned {
+            op,
+            key: key.into(),
+            variants: Vec::new(),
+        }
     }
 
     /// Add a named schedule variant. `f(iters) -> (output, ms)` is the crate's `*_bench` shape.
@@ -392,7 +455,9 @@ pub struct Config {
 impl Config {
     /// The value chosen for `name` (panics if `name` is not a parameter of `space` -- a program bug).
     pub fn get(&self, space: &Space, name: &str) -> i64 {
-        let i = space.index(name).unwrap_or_else(|| panic!("no param `{name}` in space"));
+        let i = space
+            .index(name)
+            .unwrap_or_else(|| panic!("no param `{name}` in space"));
         self.vals[i]
     }
     /// Canonical name `"P1=v1,P2=v2,..."` in Space order. Stable -- it is the [`Tuner`] cache value and
@@ -435,7 +500,11 @@ pub struct Space {
 
 impl Default for Space {
     fn default() -> Self {
-        Space { params: Vec::new(), constraints: Vec::new(), denies: Vec::new() }
+        Space {
+            params: Vec::new(),
+            constraints: Vec::new(),
+            denies: Vec::new(),
+        }
     }
 }
 
@@ -447,7 +516,10 @@ impl Space {
 
     /// Add a parameter and its discrete value set.
     pub fn param(mut self, name: &'static str, values: impl IntoIterator<Item = i64>) -> Self {
-        self.params.push(Param { name, values: values.into_iter().collect() });
+        self.params.push(Param {
+            name,
+            values: values.into_iter().collect(),
+        });
         self
     }
 
@@ -480,11 +552,16 @@ impl Space {
         let mut vals = vec![i64::MIN; self.params.len()];
         let mut set = vec![false; self.params.len()];
         for (name, v) in assignments {
-            let i = self.index(name).unwrap_or_else(|| panic!("no param `{name}`"));
+            let i = self
+                .index(name)
+                .unwrap_or_else(|| panic!("no param `{name}`"));
             vals[i] = *v;
             set[i] = true;
         }
-        assert!(set.iter().all(|&b| b), "config() must assign every parameter");
+        assert!(
+            set.iter().all(|&b| b),
+            "config() must assign every parameter"
+        );
         Config { vals }
     }
 
@@ -512,7 +589,9 @@ impl Space {
     /// Is `c` denied by a negative prior?
     pub fn denied(&self, c: &Config) -> bool {
         self.denies.iter().any(|entry| {
-            entry.iter().all(|(name, val)| self.index(name).is_some_and(|i| c.vals[i] == *val))
+            entry
+                .iter()
+                .all(|(name, val)| self.index(name).is_some_and(|i| c.vals[i] == *val))
         })
     }
 
@@ -521,7 +600,12 @@ impl Space {
         if c.vals.len() != self.params.len() {
             return false;
         }
-        if !self.params.iter().zip(&c.vals).all(|(p, v)| p.values.contains(v)) {
+        if !self
+            .params
+            .iter()
+            .zip(&c.vals)
+            .all(|(p, v)| p.values.contains(v))
+        {
             return false;
         }
         if self.denied(c) {
@@ -534,7 +618,9 @@ impl Space {
     /// the exhaustive baseline a hunt is judged against (and lets a tiny genome be compile-swept offline);
     /// it is exponential in arity, so it is a diagnostic, not the search itself.
     pub fn enumerate(&self) -> Vec<Config> {
-        let mut out = vec![Config { vals: Vec::with_capacity(self.params.len()) }];
+        let mut out = vec![Config {
+            vals: Vec::with_capacity(self.params.len()),
+        }];
         for p in &self.params {
             let mut next = Vec::with_capacity(out.len() * p.values.len());
             for base in &out {
@@ -554,7 +640,11 @@ impl Space {
     /// `None` (a heavily-constrained space). Deterministic in `rng`.
     pub fn random(&self, rng: &mut Rng, tries: usize) -> Option<Config> {
         for _ in 0..tries {
-            let vals = self.params.iter().map(|p| p.values[rng.below(p.values.len())]).collect();
+            let vals = self
+                .params
+                .iter()
+                .map(|p| p.values[rng.below(p.values.len())])
+                .collect();
             let c = Config { vals };
             if self.feasible(&c) {
                 return Some(c);
@@ -709,10 +799,16 @@ impl Evolution {
 
     /// Compare two evaluated configs by fitness, breaking ties by name so the ordering (and therefore
     /// the winner and the whole trajectory) is deterministic.
-    fn cmp_fit(space: &Space, memo: &HashMap<Config, Cell>, a: &Config, b: &Config) -> std::cmp::Ordering {
+    fn cmp_fit(
+        space: &Space,
+        memo: &HashMap<Config, Cell>,
+        a: &Config,
+        b: &Config,
+    ) -> std::cmp::Ordering {
         let fa = memo[a].fitness;
         let fb = memo[b].fitness;
-        fa.total_cmp(&fb).then_with(|| a.name(space).cmp(&b.name(space)))
+        fa.total_cmp(&fb)
+            .then_with(|| a.name(space).cmp(&b.name(space)))
     }
 
     /// Evaluate one config through the two tiers, memoized. Records first-seen order for a deterministic
@@ -728,10 +824,18 @@ impl Evolution {
             return cell.fitness;
         }
         let cell = match eval.static_check(c) {
-            Verdict::Reject(reason) => Cell { fitness: f64::INFINITY, ms: None, reason: Some(reason) },
+            Verdict::Reject(reason) => Cell {
+                fitness: f64::INFINITY,
+                ms: None,
+                reason: Some(reason),
+            },
             Verdict::Pass => {
                 let ms = eval.measure(c, self.measure_iters);
-                Cell { fitness: ms, ms: Some(ms), reason: None }
+                Cell {
+                    fitness: ms,
+                    ms: Some(ms),
+                    reason: None,
+                }
             }
         };
         let f = cell.fitness;
@@ -741,7 +845,13 @@ impl Evolution {
     }
 
     /// Tournament selection: sample `tournament` population members and return the fittest.
-    fn select<'p>(&self, space: &Space, memo: &HashMap<Config, Cell>, pop: &'p [Config], rng: &mut Rng) -> &'p Config {
+    fn select<'p>(
+        &self,
+        space: &Space,
+        memo: &HashMap<Config, Cell>,
+        pop: &'p [Config],
+        rng: &mut Rng,
+    ) -> &'p Config {
         let mut best = &pop[rng.below(pop.len())];
         for _ in 1..self.tournament {
             let c = &pop[rng.below(pop.len())];
@@ -810,7 +920,7 @@ impl Evolution {
             fill_tries += 1;
             match space.random(&mut rng, 256) {
                 Some(c) if seen.insert(c.clone()) => population.push(c),
-                Some(_) => {} // duplicate, retry
+                Some(_) => {}  // duplicate, retry
                 None => break, // domain infeasible/exhausted
             }
         }
@@ -929,13 +1039,21 @@ impl Tuner {
     ) -> Evolved {
         if let Some(w) = self.cached_winner(device, op, key) {
             if space.parse(&w).is_some() {
-                return Evolved { winner: w, from_cache: true, report: None };
+                return Evolved {
+                    winner: w,
+                    from_cache: true,
+                    report: None,
+                };
             }
             // Stale cache (space changed): fall through and re-hunt.
         }
         let report = evo.hunt(space, eval, seed);
         self.record(device, op, key, &report.best_name);
-        Evolved { winner: report.best_name.clone(), from_cache: false, report: Some(report) }
+        Evolved {
+            winner: report.best_name.clone(),
+            from_cache: false,
+            report: Some(report),
+        }
     }
 }
 
@@ -987,7 +1105,10 @@ mod tests {
         assert_eq!(p.benched, 3);
 
         // A changed variant set (winner "fast" absent) re-tunes rather than trusting a stale name.
-        let shrunk = vec![Variant::new("slow", |_it| (10u32, 9.0)), Variant::new("mid", |_it| (30u32, 2.0))];
+        let shrunk = vec![
+            Variant::new("slow", |_it| (10u32, 9.0)),
+            Variant::new("mid", |_it| (30u32, 2.0)),
+        ];
         let p = t2.select("cpu", "op", "s1", shrunk);
         assert!(!p.from_cache);
         assert_eq!(p.winner, "mid");
@@ -1010,8 +1131,16 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("matvec".to_string(), "rows=8,k=64".to_string(), "b128_v2".to_string()),
-                ("rms_norm".to_string(), "rows=8,n=4".to_string(), "b256_r1".to_string()),
+                (
+                    "matvec".to_string(),
+                    "rows=8,k=64".to_string(),
+                    "b128_v2".to_string()
+                ),
+                (
+                    "rms_norm".to_string(),
+                    "rows=8,n=4".to_string(),
+                    "b256_r1".to_string()
+                ),
             ]
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1021,7 +1150,10 @@ mod tests {
     #[test]
     fn device_file_path_is_xdg_shaped() {
         let t = Tuner::new("/x/y");
-        assert_eq!(t.device_file("Cuda::Runtime").to_str().unwrap(), "/x/y/hanzo-kernel/autotune/Cuda__Runtime.tsv");
+        assert_eq!(
+            t.device_file("Cuda::Runtime").to_str().unwrap(),
+            "/x/y/hanzo-kernel/autotune/Cuda__Runtime.tsv"
+        );
     }
 
     // --- evolutionary search ------------------------------------------------------------------
@@ -1049,11 +1181,18 @@ mod tests {
     }
 
     fn grid3() -> Space {
-        Space::new().param("a", 0..=9).param("b", 0..=9).param("c", 0..=9)
+        Space::new()
+            .param("a", 0..=9)
+            .param("b", 0..=9)
+            .param("c", 0..=9)
     }
 
     /// Brute-force argmin over the grid subject to a predicate (the oracle the GA must match).
-    fn brute_argmin(space: &Space, eval: &Deceptive, keep: impl Fn(&Config) -> bool) -> (Config, f64) {
+    fn brute_argmin(
+        space: &Space,
+        eval: &Deceptive,
+        keep: impl Fn(&Config) -> bool,
+    ) -> (Config, f64) {
         let mut best: Option<(Config, f64)> = None;
         for a in 0..=9 {
             for b in 0..=9 {
@@ -1087,15 +1226,28 @@ mod tests {
         assert_eq!(opt.name(&space), "a=7,b=2,c=5"); // the narrow global well
         let local_ms = eval.measure(&space.config(&[("a", 2), ("b", 7), ("c", 4)]), 1); // the deceptive trap
 
-        let evo = Evolution::new().population(28).generations(22).tournament(3).mutation(0.35).elitism(2);
+        let evo = Evolution::new()
+            .population(28)
+            .generations(22)
+            .tournament(3)
+            .mutation(0.35)
+            .elitism(2);
 
         // Converges to the GLOBAL optimum (exact ms), escaping the deceptive local well...
         let r = evo.hunt(&space, &eval, 0xC0FFEE);
-        assert_eq!(r.best_name, "a=7,b=2,c=5", "GA trapped in the local well; best={}", r.best_name);
+        assert_eq!(
+            r.best_name, "a=7,b=2,c=5",
+            "GA trapped in the local well; best={}",
+            r.best_name
+        );
         assert!((r.best_ms - opt_ms).abs() < 1e-9);
         assert!(r.best_ms < local_ms - 1.0, "did not escape the local trap");
         // ...as a real search, not an enumeration of all 1000 points.
-        assert!(r.evaluated < 700, "evaluated {} of 1000 -- not searching", r.evaluated);
+        assert!(
+            r.evaluated < 700,
+            "evaluated {} of 1000 -- not searching",
+            r.evaluated
+        );
         assert_eq!(r.rejected.len(), 0); // this landscape rejects nothing
 
         // Deterministic under seed: same seed => identical winner, footprint, and full timing trail.
@@ -1109,8 +1261,14 @@ mod tests {
         // minority of seeds -- which is exactly why the production hunt multi-seeds and keeps the best;
         // no single run is trusted. We assert the rate, not every seed.
         let seeds: [u64; 10] = [1, 42, 7777, 0xABCDEF, 0xC0FFEE, 2, 3, 99, 12345, 0xDEADBEEF];
-        let hits = seeds.iter().filter(|&&s| evo.hunt(&space, &eval, s).best_name == "a=7,b=2,c=5").count();
-        assert!(hits >= 8, "only {hits}/10 seeds reached the global optimum -- escape not systematic");
+        let hits = seeds
+            .iter()
+            .filter(|&&s| evo.hunt(&space, &eval, s).best_name == "a=7,b=2,c=5")
+            .count();
+        assert!(
+            hits >= 8,
+            "only {hits}/10 seeds reached the global optimum -- escape not systematic"
+        );
     }
 
     #[test]
@@ -1138,11 +1296,28 @@ mod tests {
         // the denied plane.
         let (_opt, opt_ms) = brute_argmin(&space, &eval, |c| c.get(&space, "a") != 7);
         let local_ms = eval.measure(&space.config(&[("a", 2), ("b", 7), ("c", 4)]), 1);
-        let evo = Evolution::new().population(28).generations(22).tournament(3).mutation(0.35).elitism(2);
+        let evo = Evolution::new()
+            .population(28)
+            .generations(22)
+            .tournament(3)
+            .mutation(0.35)
+            .elitism(2);
         let r = evo.hunt(&space, &eval, 99);
-        assert!(space.feasible(&r.best) && r.best.get(&space, "a") != 7, "best is denied: {}", r.best_name);
-        assert!(r.best_ms < local_ms - 0.1, "did not escape the deceptive well: best_ms={}", r.best_ms);
-        assert!(r.best_ms <= opt_ms + 2.0, "best far from the admissible optimum: {}", r.best_ms);
+        assert!(
+            space.feasible(&r.best) && r.best.get(&space, "a") != 7,
+            "best is denied: {}",
+            r.best_name
+        );
+        assert!(
+            r.best_ms < local_ms - 0.1,
+            "did not escape the deceptive well: best_ms={}",
+            r.best_ms
+        );
+        assert!(
+            r.best_ms <= opt_ms + 2.0,
+            "best far from the admissible optimum: {}",
+            r.best_ms
+        );
         // The hard contract: not one evaluated config touched the denied plane.
         for (name, _) in r.measured.iter() {
             let c = space.parse(name).unwrap();
@@ -1167,7 +1342,10 @@ mod tests {
         }
         fn measure(&self, c: &Config, _iters: usize) -> f64 {
             let sum = c.get(self.space, "a") + c.get(self.space, "b") + c.get(self.space, "c");
-            assert!(sum <= 20, "measure() ran on a statically-rejected config: sum={sum}");
+            assert!(
+                sum <= 20,
+                "measure() ran on a statically-rejected config: sum={sum}"
+            );
             *self.measured.borrow_mut() += 1;
             // Fitness pulls toward the boundary so the search actively probes near the rejected region.
             -(sum as f64)
@@ -1177,8 +1355,14 @@ mod tests {
     #[test]
     fn evo_multi_fidelity_gates_the_gpu_tier() {
         let space = grid3();
-        let eval = Gated { space: &space, measured: std::cell::RefCell::new(0) };
-        let evo = Evolution::new().population(24).generations(15).mutation(0.35);
+        let eval = Gated {
+            space: &space,
+            measured: std::cell::RefCell::new(0),
+        };
+        let evo = Evolution::new()
+            .population(24)
+            .generations(15)
+            .mutation(0.35);
         let r = evo.hunt(&space, &eval, 2024);
 
         // Some configs were pruned for free (the space has many sum>20 points), and the winner is a
@@ -1186,7 +1370,10 @@ mod tests {
         assert!(!r.rejected.is_empty(), "nothing was statically rejected");
         assert!(r.rejected.iter().all(|(_, why)| why.contains("spill")));
         assert!(r.best_ms.is_finite());
-        assert_eq!(r.best_ms, -20.0, "winner should sit on the sum==20 boundary");
+        assert_eq!(
+            r.best_ms, -20.0,
+            "winner should sit on the sum==20 boundary"
+        );
         // measured count == GPU-tier calls == the length of the measured trail.
         assert_eq!(*eval.measured.borrow(), r.measured.len());
         // measured and rejected are disjoint and together are the whole footprint.
@@ -1195,7 +1382,9 @@ mod tests {
 
     #[test]
     fn space_name_parse_round_trips() {
-        let space = Space::new().param("NWARP", [2, 4, 8]).param("RM", [1, 2, 4]);
+        let space = Space::new()
+            .param("NWARP", [2, 4, 8])
+            .param("RM", [1, 2, 4]);
         let c = space.config(&[("NWARP", 4), ("RM", 2)]);
         assert_eq!(c.name(&space), "NWARP=4,RM=2");
         assert_eq!(space.parse("NWARP=4,RM=2").as_ref(), Some(&c));
@@ -1214,7 +1403,7 @@ mod tests {
         let all = space.enumerate();
         assert!(all.iter().all(|c| space.feasible(c)));
         assert!(all.iter().all(|c| c.get(&space, "a") != 2)); // deny honoured
-        // a=1 -> b in {1,2,3}; a=3 -> b in {1}; a=2 denied. = 4.
+                                                              // a=1 -> b in {1,2,3}; a=3 -> b in {1}; a=2 denied. = 4.
         assert_eq!(all.len(), 4);
     }
 
@@ -1237,7 +1426,10 @@ mod tests {
     fn tuner_evolve_caches_and_skips_the_hunt() {
         let dir = tmp_dir("evolve");
         let space = Space::new().param("a", 0..=4).param("b", 0..=4);
-        let eval = Bowl { space: &space, calls: std::cell::RefCell::new(0) };
+        let eval = Bowl {
+            space: &space,
+            calls: std::cell::RefCell::new(0),
+        };
         let evo = Evolution::new().population(8).generations(5);
 
         // First call misses: a hunt runs, records the winner, and spends GPU-tier calls.
@@ -1254,7 +1446,11 @@ mod tests {
         assert!(r2.from_cache);
         assert!(r2.report.is_none());
         assert_eq!(r2.winner, r1.winner);
-        assert_eq!(*eval.calls.borrow(), after_first, "cache hit still ran the hunt");
+        assert_eq!(
+            *eval.calls.borrow(),
+            after_first,
+            "cache hit still ran the hunt"
+        );
 
         // A fresh tuner over the same dir reloads the winner from disk and still skips.
         let t2 = Tuner::new(&dir);
@@ -1271,7 +1467,10 @@ mod tests {
             "hanzo-kernel-tune-{tag}-{}-{}",
             std::process::id(),
             // a per-call nonce so repeated runs don't collide
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
         p

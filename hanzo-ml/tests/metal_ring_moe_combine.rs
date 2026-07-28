@@ -48,8 +48,12 @@ fn metal_moe_combine_mixed_dtype_matches_cpu() {
     let Some(dev) = metal() else { return };
     let (t, topk, n) = (4usize, 8usize, 512usize);
 
-    let ys_f32: Vec<f32> = (0..t * topk * n).map(|i| ((i % 23) as f32) * 0.1 - 1.0).collect();
-    let scores_f32: Vec<f32> = (0..t * topk).map(|i| ((i % 7) as f32 + 1.0) / 28.0).collect();
+    let ys_f32: Vec<f32> = (0..t * topk * n)
+        .map(|i| ((i % 23) as f32) * 0.1 - 1.0)
+        .collect();
+    let scores_f32: Vec<f32> = (0..t * topk)
+        .map(|i| ((i % 7) as f32 + 1.0) / 28.0)
+        .collect();
     let want = combine_ref(&ys_f32, &scores_f32, t, topk, n);
 
     // scores are always f32 out of moe_route; ys carries the compute dtype.
@@ -63,13 +67,23 @@ fn metal_moe_combine_mixed_dtype_matches_cpu() {
             .unwrap_or_else(|e| panic!("moe_combine failed for ys={ys_dtype:?}: {e}"));
         assert_eq!(got.dims(), &[t, n], "shape for {ys_dtype:?}");
         assert_eq!(got.dtype(), ys_dtype, "output dtype must follow ys");
-        let got = got.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = got
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let tol = match ys_dtype {
             DType::F32 => 1e-5,
             DType::F16 => 3e-2,
             _ => 2e-1,
         };
-        let maxerr = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let maxerr = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(maxerr <= tol, "ys={ys_dtype:?} maxerr {maxerr} > {tol}");
         eprintln!("moe_combine ys={ys_dtype:?} OK maxerr={maxerr:.3e}");
     }
@@ -99,7 +113,8 @@ fn tensor_to_f32(xs: &Tensor) -> Result<Vec<f32>> {
 }
 
 fn send(stream: &mut TcpStream, v: &[f32]) {
-    let raw = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
+    let raw =
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
     stream.write_all(raw).unwrap();
     stream.flush().unwrap();
 }
@@ -128,7 +143,10 @@ fn metal_rank_exchanges_activation_over_socket() {
         sock.set_nodelay(true).unwrap();
         let v = recv(&mut sock, n);
         // recv_left: upload f32 -> Metal -> cast to a GPU compute dtype.
-        let h = Tensor::from_vec(v, (rows, cols), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+        let h = Tensor::from_vec(v, (rows, cols), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
         // send_right: Metal -> host f32 readback (identity round-trip).
         let f = tensor_to_f32(&h).unwrap();
         send(&mut sock, &f);
@@ -136,7 +154,8 @@ fn metal_rank_exchanges_activation_over_socket() {
 
     let mut sock = TcpStream::connect(addr).unwrap();
     sock.set_nodelay(true).unwrap();
-    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     send(&mut sock, &payload);
     let got = recv(&mut sock, n);
     worker.join().unwrap();

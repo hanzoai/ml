@@ -1161,7 +1161,11 @@ struct Sdpa {
 #[cfg(feature = "vulkan")]
 fn vk_sdpa_split() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("VK_SDPA_SPLIT_OFF").map(|v| v == "0").unwrap_or(true))
+    *S.get_or_init(|| {
+        std::env::var("VK_SDPA_SPLIT_OFF")
+            .map(|v| v == "0")
+            .unwrap_or(true)
+    })
 }
 #[cfg(feature = "vulkan")]
 fn vk_sdpa_nsplit() -> usize {
@@ -1236,20 +1240,46 @@ impl hanzo_ml::CustomOp3 for Sdpa {
         let ks = k_l.stride();
         let vs = v_l.stride();
         if k_l.start_offset() != 0 || v_l.start_offset() != 0 || ks != vs || ks[3] != 1 {
-            hanzo_ml::bail!("sdpa_blk vulkan: k/v need matching strides, head_dim contiguous, offset 0");
+            hanzo_ml::bail!(
+                "sdpa_blk vulkan: k/v need matching strides, head_dim contiguous, offset 0"
+            );
         }
         let dev = q.device().clone();
         // Flash-decoding A/B (VK_SDPA_SPLIT=1): the split-K occupancy fix vs the one-workgroup-per-head
         // sdpa_blk. n_split via VK_SDPA_NSPLIT (default 4). Eager path only; the graph path is separate.
         let out = if vk_sdpa_split() {
             dev.sdpa_decode_split_vk(
-                q, k, v, b, h, hkv, sq, l, d, self.scale, vk_sdpa_nsplit(),
-                ks[0], ks[1], ks[2],
+                q,
+                k,
+                v,
+                b,
+                h,
+                hkv,
+                sq,
+                l,
+                d,
+                self.scale,
+                vk_sdpa_nsplit(),
+                ks[0],
+                ks[1],
+                ks[2],
             )?
         } else {
             dev.sdpa_blk_vk(
-                q, k, v, b, h, hkv, sq, l, d, self.scale, self.do_causal,
-                ks[0], ks[1], ks[2],
+                q,
+                k,
+                v,
+                b,
+                h,
+                hkv,
+                sq,
+                l,
+                d,
+                self.scale,
+                self.do_causal,
+                ks[0],
+                ks[1],
+                ks[2],
             )?
         };
         Ok((out, Shape::from_dims(&[b, h, sq, d])))

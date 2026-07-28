@@ -50,8 +50,8 @@ pub fn rms_norm_blk<F: Float>(
     x: &Array<F>,
     w: &Array<F>,
     out: &mut Array<F>,
-    eps: &Array<f32>,      // f32 regardless of F -- the reduction + scale are f32 (see below)
-    ndim: &Array<u32>,     // ndim[0] = n; runtime so the kernel is dim-agnostic
+    eps: &Array<f32>, // f32 regardless of F -- the reduction + scale are f32 (see below)
+    ndim: &Array<u32>, // ndim[0] = n; runtime so the kernel is dim-agnostic
     #[comptime] nt: usize, // threads per block (one block per row); shared-mem size
     #[comptime] tgt: Target, // island scrutinee: picks the block-reduction idiom per backend
 ) {
@@ -129,9 +129,9 @@ pub fn add_rmsnorm_blk<F: Float>(
     alpha: &Array<F>,
     s_out: &mut Array<F>,
     y: &mut Array<F>,
-    eps: &Array<f32>,      // f32 regardless of F (see `rms_norm_blk`)
-    ndim: &Array<u32>,     // ndim[0] = n; runtime so the kernel is dim-agnostic
-    #[comptime] nt: usize, // threads per block (one block per row); shared-mem size
+    eps: &Array<f32>,        // f32 regardless of F (see `rms_norm_blk`)
+    ndim: &Array<u32>,       // ndim[0] = n; runtime so the kernel is dim-agnostic
+    #[comptime] nt: usize,   // threads per block (one block per row); shared-mem size
     #[comptime] tgt: Target, // island scrutinee (see `rms_norm_blk`)
 ) {
     // Same f32-internal reduce/scale as `rms_norm_blk`: sum in f32, cast F only at load/store. The
@@ -449,7 +449,14 @@ pub fn add_rmsnorm_blk_run<R: Runtime>(
 }
 
 /// CPU oracle for LayerNorm.
-pub fn layer_norm_ref(x: &[f32], w: &[f32], b: &[f32], rows: usize, n: usize, eps: f32) -> Vec<f32> {
+pub fn layer_norm_ref(
+    x: &[f32],
+    w: &[f32],
+    b: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * n];
     for row in 0..rows {
         let base = row * n;
@@ -558,10 +565,18 @@ pub fn rms_norm_tuned_set<'a, R: Runtime>(
     eps: f32,
 ) -> Tuned<'a, Vec<f32>> {
     Tuned::new("rms_norm", format!("rows={rows},n={n}"))
-        .variant("b64_r1", move |it| rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 64, it))
-        .variant("b128_r1", move |it| rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 128, it))
-        .variant("b256_r1", move |it| rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 256, it))
-        .variant("b64_r2", move |it| rms_norm_tuned_bench(client, x, w, rows, n, eps, 2, 64, it))
+        .variant("b64_r1", move |it| {
+            rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 64, it)
+        })
+        .variant("b128_r1", move |it| {
+            rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 128, it)
+        })
+        .variant("b256_r1", move |it| {
+            rms_norm_tuned_bench(client, x, w, rows, n, eps, 1, 256, it)
+        })
+        .variant("b64_r2", move |it| {
+            rms_norm_tuned_bench(client, x, w, rows, n, eps, 2, 64, it)
+        })
 }
 
 /// Autotuned RMSNorm: tune (or read the cache) over the schedule knobs and run the winner. ONE source,
@@ -652,25 +667,46 @@ mod tests {
 
         // (1) each of the 4 schedules is byte-identical to the oracle (same left-fold, same order).
         for &(rpt, block) in &[(1usize, 64u32), (1, 128), (1, 256), (2, 64)] {
-            let (got, _ms) = rms_norm_tuned_bench::<CpuRuntime>(&c, &x, &w, rows, n, EPS, rpt, block, 1);
+            let (got, _ms) =
+                rms_norm_tuned_bench::<CpuRuntime>(&c, &x, &w, rows, n, EPS, rpt, block, 1);
             let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(gbits, wbits, "rms_norm_tuned rpt={rpt} block={block} not bit-exact vs oracle");
+            assert_eq!(
+                gbits, wbits,
+                "rms_norm_tuned rpt={rpt} block={block} not bit-exact vs oracle"
+            );
         }
 
         // (2) select + cache, against an isolated temp tuner (no env, no globals).
         let dir = std::env::temp_dir().join(format!(
             "hk-tune-rms-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let tuner = Tuner::new(&dir);
         let p = rms_norm_tuned_set::<CpuRuntime>(&c, &x, &w, rows, n, EPS).pick_with(&tuner, "cpu");
-        assert!(!p.from_cache && p.benched == 4, "first call must benchmark all 4 variants");
-        assert_eq!(p.output.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), wbits, "winner not bit-exact");
-        eprintln!("[rms_norm autotune CPU] winner={} timings={:?}", p.winner, p.timings);
+        assert!(
+            !p.from_cache && p.benched == 4,
+            "first call must benchmark all 4 variants"
+        );
+        assert_eq!(
+            p.output.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            wbits,
+            "winner not bit-exact"
+        );
+        eprintln!(
+            "[rms_norm autotune CPU] winner={} timings={:?}",
+            p.winner, p.timings
+        );
 
-        let p2 = rms_norm_tuned_set::<CpuRuntime>(&c, &x, &w, rows, n, EPS).pick_with(&tuner, "cpu");
-        assert!(p2.from_cache && p2.benched == 0, "second call must hit the cache and skip timing");
+        let p2 =
+            rms_norm_tuned_set::<CpuRuntime>(&c, &x, &w, rows, n, EPS).pick_with(&tuner, "cpu");
+        assert!(
+            p2.from_cache && p2.benched == 0,
+            "second call must hit the cache and skip timing"
+        );
         assert_eq!(p2.winner, p.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -732,14 +768,23 @@ mod tests {
                 .collect()
         };
         // 4096^2 cache-busting + dim-agnostic shapes (n%nt!=0, n<nt)
-        for &(rows, n, nt) in &[(4096usize, 4096usize, 256usize), (11, 130, 256), (11, 1536, 256), (7, 3072, 256)] {
+        for &(rows, n, nt) in &[
+            (4096usize, 4096usize, 256usize),
+            (11, 130, 256),
+            (11, 1536, 256),
+            (7, 3072, 256),
+        ] {
             let (x, alpha, _) = data(rows, n);
             let res = gen_res(rows, n);
             let (ws, wy) = add_rmsnorm_ref(&x, &res, &alpha, rows, n, EPS);
-            let (gs, gy) = add_rmsnorm_blk_run::<WgpuRuntime>(&c, &x, &res, &alpha, rows, n, EPS, nt);
+            let (gs, gy) =
+                add_rmsnorm_blk_run::<WgpuRuntime>(&c, &x, &res, &alpha, rows, n, EPS, nt);
             let (rs, ry) = (max_rel(&ws, &gs), max_rel(&wy, &gy));
             eprintln!("[add_rmsnorm_blk VULKAN] {rows}x{n} nt={nt}  s_rel={rs:.2e} y_rel={ry:.2e}");
-            assert!(rs < 2e-3 && ry < 2e-3, "add_rmsnorm {rows}x{n} s={rs} y={ry}");
+            assert!(
+                rs < 2e-3 && ry < 2e-3,
+                "add_rmsnorm {rows}x{n} s={rs} y={ry}"
+            );
         }
     }
 
@@ -753,7 +798,14 @@ mod tests {
     fn rms_norm_blk_rocm_bit_exact() {
         use cubecl::hip::{AmdDevice, HipRuntime};
         let c = HipRuntime::client(&AmdDevice::default());
-        for &(rows, n) in &[(1usize, 4096usize), (512, 4096), (1, 5120), (512, 5120), (11, 130), (7, 3072)] {
+        for &(rows, n) in &[
+            (1usize, 4096usize),
+            (512, 4096),
+            (1, 5120),
+            (512, 5120),
+            (11, 130),
+            (7, 3072),
+        ] {
             let (x, w, _) = data(rows, n);
             let want = rms_norm_ref(&x, &w, rows, n, EPS);
             let got = rms_norm_blk_run::<f32, HipRuntime>(&c, &x, &w, rows, n, EPS, 1024);
@@ -797,14 +849,25 @@ mod tests {
                 })
                 .collect()
         };
-        for &(rows, n) in &[(1usize, 4096usize), (512, 4096), (1, 5120), (512, 5120), (11, 130), (7, 3072)] {
+        for &(rows, n) in &[
+            (1usize, 4096usize),
+            (512, 4096),
+            (1, 5120),
+            (512, 5120),
+            (11, 130),
+            (7, 3072),
+        ] {
             let (x, alpha, _) = data(rows, n);
             let res = gen_res(rows, n);
             let (ws, wy) = add_rmsnorm_ref(&x, &res, &alpha, rows, n, EPS);
-            let (gs, gy) = add_rmsnorm_blk_run::<HipRuntime>(&c, &x, &res, &alpha, rows, n, EPS, 1024);
+            let (gs, gy) =
+                add_rmsnorm_blk_run::<HipRuntime>(&c, &x, &res, &alpha, rows, n, EPS, 1024);
             let (rs, ry) = (max_rel(&ws, &gs), max_rel(&wy, &gy));
             eprintln!("[add_rmsnorm_blk ROCM] {rows}x{n} nt=1024  s_rel={rs:.2e} y_rel={ry:.2e}");
-            assert!(rs < 2e-3 && ry < 2e-3, "add_rmsnorm_blk ROCm {rows}x{n} s={rs} y={ry}");
+            assert!(
+                rs < 2e-3 && ry < 2e-3,
+                "add_rmsnorm_blk ROCm {rows}x{n} s={rs} y={ry}"
+            );
         }
     }
 
@@ -821,7 +884,9 @@ mod tests {
         let rr = max_rel(&rms_norm_ref(&x, &w, rows, n, EPS), &r);
         let lr = max_rel(&layer_norm_ref(&x, &w, &b, rows, n, EPS), &l);
         let br = max_rel(&rms_norm_ref(&x, &w, rows, n, EPS), &blk);
-        eprintln!("[rms_norm METAL] {rr:.2e}  [layer_norm METAL] {lr:.2e}  [rms_norm_blk METAL] {br:.2e}");
+        eprintln!(
+            "[rms_norm METAL] {rr:.2e}  [layer_norm METAL] {lr:.2e}  [rms_norm_blk METAL] {br:.2e}"
+        );
         assert!(rr < 2e-3 && lr < 2e-3 && br < 2e-3);
     }
 }

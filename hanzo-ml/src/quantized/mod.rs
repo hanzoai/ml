@@ -430,7 +430,9 @@ impl QStorage {
                 Ok(Cow::from(data))
             }
             QStorage::Stream(_) => {
-                crate::bail!("streaming expert bank is not resident; consume it via indexed_moe_forward")
+                crate::bail!(
+                    "streaming expert bank is not resident; consume it via indexed_moe_forward"
+                )
             }
         }
     }
@@ -1090,10 +1092,7 @@ impl QTensor {
     // Resident wgpu MoE expert bank (twin of `vulkan_moe_bank`). The wgpu MoE shaders byte-address
     // the raw GGML bytes for every native type, so one upload path covers Q4_0/Q8_0/Q4K.
     #[cfg(feature = "wgpu")]
-    fn wgpu_moe_bank(
-        &self,
-        dev: &crate::WgpuDevice,
-    ) -> Result<std::sync::Arc<crate::WgpuStorage>> {
+    fn wgpu_moe_bank(&self, dev: &crate::WgpuDevice) -> Result<std::sync::Arc<crate::WgpuStorage>> {
         let bank = self.data()?;
         cache_or_upload(&self.banks.wgpu, bank.as_ref(), |b| dev.upload_qweight(b))
     }
@@ -1259,7 +1258,10 @@ impl QTensor {
                 // selects topk over exactly `e_cnt` logits, so ids are in-range by construction (the old
                 // host-side OOB scan was the round-trip's only excuse).
                 let dt = self.storage.dtype();
-                let ids_u32 = ids.reshape((nrows,))?.to_dtype(crate::DType::U32)?.contiguous()?;
+                let ids_u32 = ids
+                    .reshape((nrows,))?
+                    .to_dtype(crate::DType::U32)?
+                    .contiguous()?;
                 let y = {
                     let (store, _) = x_flat.storage_and_layout();
                     let xv = match &*store {
@@ -1279,19 +1281,44 @@ impl QTensor {
                     match vk_moe_blk_dp4a_kernel(dt, n, k).filter(|_| vk_dev.has_int_dot8()) {
                         Some((blk, with_xsum)) => {
                             let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
-                            vk_dev.moe_matvec_blk_dp4a_gpu(blk, with_xsum, bank.as_ref(), xv, ids_v, nrows, n, k)?
+                            vk_dev.moe_matvec_blk_dp4a_gpu(
+                                blk,
+                                with_xsum,
+                                bank.as_ref(),
+                                xv,
+                                ids_v,
+                                nrows,
+                                n,
+                                k,
+                            )?
                         }
                         None => match vk_moe_blk_kernel(dt, n, k) {
-                        Some(blk) => {
-                            let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
-                            vk_dev.moe_matvec_blk_gpu(blk, bank.as_ref(), xv, ids_v, nrows, n, k)?
-                        }
-                        None => {
-                            // Guarded by `vk_moe_kernel(..).is_some()`, so the packed kernel is present.
-                            let kernel = vk_moe_kernel(dt).unwrap();
-                            let wbank = self.vulkan_moe_bank(vk_dev, e_cnt, n, k)?;
-                            vk_dev.moe_matvec_gpu(kernel, wbank.as_ref(), xv, ids_v, nrows, n, k)?
-                        }
+                            Some(blk) => {
+                                let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
+                                vk_dev.moe_matvec_blk_gpu(
+                                    blk,
+                                    bank.as_ref(),
+                                    xv,
+                                    ids_v,
+                                    nrows,
+                                    n,
+                                    k,
+                                )?
+                            }
+                            None => {
+                                // Guarded by `vk_moe_kernel(..).is_some()`, so the packed kernel is present.
+                                let kernel = vk_moe_kernel(dt).unwrap();
+                                let wbank = self.vulkan_moe_bank(vk_dev, e_cnt, n, k)?;
+                                vk_dev.moe_matvec_gpu(
+                                    kernel,
+                                    wbank.as_ref(),
+                                    xv,
+                                    ids_v,
+                                    nrows,
+                                    n,
+                                    k,
+                                )?
+                            }
                         },
                     }
                 };
@@ -1636,7 +1663,8 @@ fn vk_moe_blk_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<&'static str> 
 // per-32 q8 sums (`xsum`; Q4_K folds dmin against them) or derives its own half-block sums in-register
 // (Q6_K's −32 fold needs per-16 sums, which per-32 xsum cannot express).
 fn vk_moe_blk_dp4a_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<(&'static str, bool)> {
-    if std::env::var_os("VK_MOE_PACKED").is_some() || std::env::var_os("VK_MOE_DP4A_OFF").is_some() {
+    if std::env::var_os("VK_MOE_PACKED").is_some() || std::env::var_os("VK_MOE_DP4A_OFF").is_some()
+    {
         return None;
     }
     match (dt, n, k) {
@@ -1954,11 +1982,14 @@ pub fn moe_gate_up(
                                 .reshape((nrows, k))?
                                 .to_dtype(DType::F32)?
                                 .contiguous()?;
-                            let ids_u32 = ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
+                            let ids_u32 =
+                                ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
                             let (xstore, _) = x_flat.storage_and_layout();
                             let xv = match &*xstore {
                                 Storage::Vulkan(v) => v,
-                                _ => crate::bail!("moe_gate_up: x not on vulkan after contiguous()"),
+                                _ => {
+                                    crate::bail!("moe_gate_up: x not on vulkan after contiguous()")
+                                }
                             };
                             let (idstore, _) = ids_u32.storage_and_layout();
                             let idv = match &*idstore {
@@ -1971,10 +2002,26 @@ pub fn moe_gate_up(
                             let ubank = uq.vulkan_moe_bank_split(dev, e_cnt, n, k)?;
                             let out_dtype = x.dtype();
                             let gy = dev.moe_matvec_blk_dp4a_pre_gpu(
-                                blk, with_xsum, gbank.as_ref(), &xq, &xs, &xsum, idv, nrows, n,
+                                blk,
+                                with_xsum,
+                                gbank.as_ref(),
+                                &xq,
+                                &xs,
+                                &xsum,
+                                idv,
+                                nrows,
+                                n,
                             )?;
                             let uy = dev.moe_matvec_blk_dp4a_pre_gpu(
-                                blk, with_xsum, ubank.as_ref(), &xq, &xs, &xsum, idv, nrows, n,
+                                blk,
+                                with_xsum,
+                                ubank.as_ref(),
+                                &xq,
+                                &xs,
+                                &xsum,
+                                idv,
+                                nrows,
+                                n,
                             )?;
                             let shape = |o| -> Result<Tensor> {
                                 crate::tensor::from_storage(

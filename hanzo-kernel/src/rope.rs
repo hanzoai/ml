@@ -93,14 +93,25 @@ pub fn rope_run<R: Runtime>(
 }
 
 /// CPU oracle for RoPE (both styles), the reference the DSL kernel is gated against.
-pub fn rope_ref(x: &[f32], cos: &[f32], sin: &[f32], rows: usize, d: usize, interleaved: bool) -> Vec<f32> {
+pub fn rope_ref(
+    x: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    rows: usize,
+    d: usize,
+    interleaved: bool,
+) -> Vec<f32> {
     let d2 = d / 2;
     let mut out = vec![0.0f32; rows * d];
     for row in 0..rows {
         let (xb, cb) = (row * d, row * d2);
         for j in 0..d2 {
             let (c, s) = (cos[cb + j], sin[cb + j]);
-            let (ai, bi) = if interleaved { (xb + 2 * j, xb + 2 * j + 1) } else { (xb + j, xb + j + d2) };
+            let (ai, bi) = if interleaved {
+                (xb + 2 * j, xb + 2 * j + 1)
+            } else {
+                (xb + j, xb + j + d2)
+            };
             let (a, b) = (x[ai], x[bi]);
             out[ai] = a * c - b * s;
             out[bi] = a * s + b * c;
@@ -142,7 +153,10 @@ mod tests {
     }
 
     fn max_rel(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs() / x.abs().max(1e-6)).fold(0.0, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs() / x.abs().max(1e-6))
+            .fold(0.0, f32::max)
     }
 
     fn run_style<R: Runtime>(c: &ComputeClient<R>, interleaved: bool, tag: &str) {

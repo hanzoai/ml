@@ -41,7 +41,10 @@ fn main() {
         }
         let v: Value = serde_json::from_str(&body).unwrap();
         let exp = &v["experiments"][0];
-        println!("\nPOST {path}   status={}  value={}", exp["status"], exp["value"]);
+        println!(
+            "\nPOST {path}   status={}  value={}",
+            exp["status"], exp["value"]
+        );
         println!("{}", serde_json::to_string_pretty(exp).unwrap());
     }
     println!("\nThe complete record's verdict is a first-class, durable REFUTATION,");

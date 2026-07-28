@@ -208,7 +208,10 @@ impl TensorInfo {
     ) -> Result<QTensor> {
         let dims = self.shape.dims();
         if dims.len() != 3 {
-            crate::bail!("read_stream: expected a rank-3 expert bank, got shape {:?}", self.shape)
+            crate::bail!(
+                "read_stream: expected a rank-3 expert bank, got shape {:?}",
+                self.shape
+            )
         }
         let (n_experts, n, k) = (dims[0], dims[1], dims[2]);
         let block_size = self.ggml_dtype.block_size();

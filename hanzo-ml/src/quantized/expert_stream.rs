@@ -466,7 +466,12 @@ pub fn finalize() {
     if banks.is_empty() {
         return;
     }
-    let expert_bytes = banks.iter().map(|b| b.expert_bytes).max().unwrap_or(1).max(1);
+    let expert_bytes = banks
+        .iter()
+        .map(|b| b.expert_bytes)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let n_banks = banks.len() as u64;
 
     // STREAM_EXPERTS_RAM_GB forces the cache budget; otherwise size from live MemAvailable.
@@ -663,7 +668,10 @@ fn mem_available_bytes() -> u64 {
         if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
             for line in text.lines() {
                 if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                    if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok())
+                    if let Some(kb) = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
                     {
                         return kb.saturating_mul(1024);
                     }
@@ -769,7 +777,11 @@ mod tests {
         let swaps = simulate(&heat, &mut pinned, REPIN_MAX_SWAPS);
         assert_eq!(swaps, 2, "exactly the two hot experts get pinned");
         pinned.sort_unstable();
-        assert_eq!(pinned, vec![0, 1], "hot-set converged to the two hottest experts");
+        assert_eq!(
+            pinned,
+            vec![0, 1],
+            "hot-set converged to the two hottest experts"
+        );
         // A second pass over the same (now settled) heat is a no-op: stable, no ping-pong.
         assert_eq!(simulate(&heat, &mut pinned, REPIN_MAX_SWAPS), 0);
     }
