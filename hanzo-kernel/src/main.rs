@@ -500,6 +500,35 @@ fn check_mmq_q4k_rt<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize,
     );
 }
 
+/// Expert-indexed Q4_K MMQ at a MoE prefill shape: `t` tokens x `topk` routed slots over `n_experts`
+/// experts. Routing is a deterministic stride so every expert is hit and the per-expert row counts are
+/// uneven (the tail case the grid's worst-case `cap` and the in-kernel early-exit have to survive),
+/// while a token's `topk` experts stay distinct -- the invariant that makes `cap = t` exact.
+fn check_mmq_q4k_id<R: Runtime>(
+    name: &str, client: &ComputeClient<R>, t: usize, topk: usize, n_experts: usize, n: usize, k: usize,
+) {
+    use hanzo_kernel::mmq::{gen_mmq_q4k, mmq_q4k_id_ref, mmq_q4k_id_run};
+    let nslots = t * topk;
+    let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(nslots, n_experts * n, k);
+    // Consecutive `j` off a quadratic per-token base: distinct within a token (so `cap = t` holds)
+    // and unevenly spread across experts (so counts differ and partial tiles are exercised).
+    let ids: Vec<u32> = (0..t)
+        .flat_map(|tok| (0..topk).map(move |j| ((tok * tok + j) % n_experts) as u32))
+        .collect();
+    let want = mmq_q4k_id_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, &ids, nslots, n, k);
+    let (got, ms) = mmq_q4k_id_run::<R>(
+        client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, &ids, nslots, n_experts, t, n, k,
+        ((nslots / n_experts).div_ceil(32)).max(1), 50,
+    );
+    let rel = maxabs_over_max(&got, &want);
+    let gflops = 2.0 * nslots as f64 * n as f64 * k as f64 / (ms * 1e6);
+    println!(
+        "[{:<7}] MMQ-Q4K-ID t={} topk={} E={} {}x{}  rel={:.2e}  {}  {:.3} ms  {:.0} GFLOP/s",
+        name, t, topk, n_experts, n, k, rel,
+        if rel < 1e-2 { "COOPMAT ✓" } else { "MISMATCH ✗" }, ms, gflops
+    );
+}
+
 fn maxabs_over_max(got: &[f32], want: &[f32]) -> f32 {
     let mut d = 0f32;
     let mut r = 1e-9f32;
@@ -650,6 +679,9 @@ fn main() {
         check_gemv::<WgpuRuntime>("VK/dump", &c, 128, 4096, 128); // router gate GEMV: nt128
         check_mmq_q4k::<WgpuRuntime>("VK/dump", &c, 32, 2048, 2048); // Q4_K affine prefill MMQ (n=2048,k=2048)
         check_mmq_q4k_rt::<WgpuRuntime>("VK/dump", &c, 32, 2048, 2048); // runtime-dims MMQ: ONE .spv, any shape
+        // Expert-indexed MMQ + its slot grouping: the MoE PREFILL twin of the matvec above. Runtime
+        // n/k/cap, so ONE .spv serves every expert shape; the small dump shape only has to lower.
+        check_mmq_q4k_id::<WgpuRuntime>("VK/dump", &c, 32, 8, 16, 768, 2048);
         return;
     }
 
