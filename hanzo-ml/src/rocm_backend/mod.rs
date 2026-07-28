@@ -2479,16 +2479,12 @@ impl RocmStorage {
         }
 
         match (&x.slice, &residual.slice, &alpha.slice) {
-            (
-                RocmStorageSlice::F32(_),
-                RocmStorageSlice::F32(_),
-                RocmStorageSlice::F32(_),
-            ) => launch_add_rmsnorm!(F32, f32, "add_rmsnorm_f32"),
-            (
-                RocmStorageSlice::F16(_),
-                RocmStorageSlice::F16(_),
-                RocmStorageSlice::F16(_),
-            ) => launch_add_rmsnorm!(F16, f16, "add_rmsnorm_f16"),
+            (RocmStorageSlice::F32(_), RocmStorageSlice::F32(_), RocmStorageSlice::F32(_)) => {
+                launch_add_rmsnorm!(F32, f32, "add_rmsnorm_f32")
+            }
+            (RocmStorageSlice::F16(_), RocmStorageSlice::F16(_), RocmStorageSlice::F16(_)) => {
+                launch_add_rmsnorm!(F16, f16, "add_rmsnorm_f16")
+            }
             _ => crate::bail!(
                 "add_rms_norm: inputs must all be F32 or all F16 (x={:?} residual={:?} alpha={:?})",
                 x.slice.dtype(),
@@ -5253,7 +5249,13 @@ mod dsl_norm_bench {
     #[test]
     fn add_rmsnorm_f16_bit_identical_to_separate() {
         let device = RocmDevice::new(0).unwrap();
-        for &(rows, n) in &[(1usize, 4096usize), (7, 4096), (1, 5120), (512, 2560), (33, 2560)] {
+        for &(rows, n) in &[
+            (1usize, 4096usize),
+            (7, 4096),
+            (1, 5120),
+            (512, 2560),
+            (33, 2560),
+        ] {
             let xf = rnd(rows * n, 0x51 + rows as u64 * 7 + n as u64);
             let rf = rnd(rows * n, 0xC0DE + rows as u64 + n as u64 * 3);
             let af = rnd(n, 0xA1 + n as u64);
@@ -5275,7 +5277,11 @@ mod dsl_norm_bench {
 
             let n_cols = n as i32;
             let block_size: i32 = if n < 1024 { 32 } else { 1024 };
-            let grid = rocm_rs::hip::Dim3 { x: rows as u32, y: 1, z: 1 };
+            let grid = rocm_rs::hip::Dim3 {
+                x: rows as u32,
+                y: 1,
+                z: 1,
+            };
             let block = rocm_rs::hip::Dim3::from(block_size as u32);
             let (xp, rp, ap, srp) = (
                 x_dev.as_ptr(),
@@ -5520,15 +5526,35 @@ mod flash_decode_test {
             let got = run(&device, &qf, &kf, &vf, b, hq, hkv, l, d, scale, None);
             let rel = max_rel(&want, &got);
             println!("[flash_decode] B{b} Hq{hq} Hkv{hkv} L{l} contiguous rel={rel:.2e}");
-            assert!(rel < 1e-2, "flash_decode contiguous rel {rel} at {b}/{hq}/{hkv}/{l}");
+            assert!(
+                rel < 1e-2,
+                "flash_decode contiguous rel {rel} at {b}/{hq}/{hkv}/{l}"
+            );
 
             let maxl = l + 17;
             let kf_p = pad_seq(&kf, b, hkv, l, d, maxl);
             let vf_p = pad_seq(&vf, b, hkv, l, d, maxl);
-            let got_s = run(&device, &qf, &kf_p, &vf_p, b, hq, hkv, l, d, scale, Some(maxl));
+            let got_s = run(
+                &device,
+                &qf,
+                &kf_p,
+                &vf_p,
+                b,
+                hq,
+                hkv,
+                l,
+                d,
+                scale,
+                Some(maxl),
+            );
             let rel_s = max_rel(&want, &got_s);
-            println!("[flash_decode] B{b} Hq{hq} Hkv{hkv} L{l} strided(maxl={maxl}) rel={rel_s:.2e}");
-            assert!(rel_s < 1e-2, "flash_decode strided rel {rel_s} at {b}/{hq}/{hkv}/{l}");
+            println!(
+                "[flash_decode] B{b} Hq{hq} Hkv{hkv} L{l} strided(maxl={maxl}) rel={rel_s:.2e}"
+            );
+            assert!(
+                rel_s < 1e-2,
+                "flash_decode strided rel {rel_s} at {b}/{hq}/{hkv}/{l}"
+            );
         }
     }
 }

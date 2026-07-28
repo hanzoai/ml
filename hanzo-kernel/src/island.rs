@@ -259,14 +259,29 @@ mod tests {
         let (wq, xq, wd) = gen_island(rows, k);
 
         // The oracle: the `default` arm (CPU is tagged Cpu -> default), and the plain-Rust reference.
-        let default = matvec_island_run_with::<CpuRuntime>(&client, &wq, &xq, &wd, rows, k, Target::Cpu);
+        let default =
+            matvec_island_run_with::<CpuRuntime>(&client, &wq, &xq, &wd, rows, k, Target::Cpu);
         let reference = matvec_island_ref(&wq, &xq, &wd, rows, k);
-        assert_eq!(bits(&default), bits(&reference), "default arm != plain-Rust oracle");
+        assert_eq!(
+            bits(&default),
+            bits(&reference),
+            "default arm != plain-Rust oracle"
+        );
 
         // Every accelerated arm, executed on the CPU runtime, must equal the oracle byte-for-byte.
-        for accel in [Target::Cuda, Target::Rocm, Target::Metal, Target::Vulkan, Target::WebGpu] {
+        for accel in [
+            Target::Cuda,
+            Target::Rocm,
+            Target::Metal,
+            Target::Vulkan,
+            Target::WebGpu,
+        ] {
             let out = matvec_island_run_with::<CpuRuntime>(&client, &wq, &xq, &wd, rows, k, accel);
-            assert_eq!(bits(&out), bits(&default), "island arm {accel:?} diverged from default");
+            assert_eq!(
+                bits(&out),
+                bits(&default),
+                "island arm {accel:?} diverged from default"
+            );
         }
     }
 

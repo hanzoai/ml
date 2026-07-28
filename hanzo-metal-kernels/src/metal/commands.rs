@@ -79,17 +79,30 @@ impl GpuProfile {
     /// matvec, low count => a single prefill forward's GEMM/glue) — rank by measured time, never count.
     fn report_ops(&self) {
         let ops = self.ops.lock().unwrap();
-        let mut rows: Vec<(Arc<str>, u64, u64)> =
-            ops.iter().map(|(k, (ns, c))| (k.clone(), *ns, *c)).collect();
+        let mut rows: Vec<(Arc<str>, u64, u64)> = ops
+            .iter()
+            .map(|(k, (ns, c))| (k.clone(), *ns, *c))
+            .collect();
         drop(ops);
         rows.sort_by(|a, b| b.1.cmp(&a.1));
         let total_ns: u64 = rows.iter().map(|r| r.1).sum();
         let total_ms = total_ns as f64 / 1e6;
-        eprintln!("[MTL_OPS] cumulative total={total_ms:.2}ms across {} kernels:", rows.len());
+        eprintln!(
+            "[MTL_OPS] cumulative total={total_ms:.2}ms across {} kernels:",
+            rows.len()
+        );
         for (name, ns, count) in rows.iter().take(24) {
             let ms = *ns as f64 / 1e6;
-            let pct = if total_ns > 0 { *ns as f64 / total_ns as f64 * 100.0 } else { 0.0 };
-            let avg_us = if *count > 0 { *ns as f64 / *count as f64 / 1e3 } else { 0.0 };
+            let pct = if total_ns > 0 {
+                *ns as f64 / total_ns as f64 * 100.0
+            } else {
+                0.0
+            };
+            let avg_us = if *count > 0 {
+                *ns as f64 / *count as f64 / 1e3
+            } else {
+                0.0
+            };
             eprintln!("[MTL_OPS]   {ms:8.2}ms {pct:5.1}%  n={count:<5} avg={avg_us:7.2}us  {name}");
         }
     }

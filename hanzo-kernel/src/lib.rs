@@ -32,9 +32,9 @@ pub mod engine {
 /// `Array`, `Float`, `Line` are kept: they are already the simple, accurate word for the thing.
 pub mod prelude {
     pub use cubecl::prelude::*;
-    pub use hanzo_kernel_macros::{device, kernel};
     pub use cubecl::CubeCount as Grid;
     pub use cubecl::CubeDim as Block;
+    pub use hanzo_kernel_macros::{device, kernel};
     // The intrinsic-island tag. `#[kernel]` rewrites `island! { ... }` into a comptime match over a
     // `Target` param, so `Target` must be in scope wherever islands are authored — the prelude carries
     // it exactly like `Array`/`Float`, the one import a kernel source needs.
@@ -54,15 +54,15 @@ pub use cubecl;
 
 pub mod tune;
 
-pub mod quant;
 pub mod mmq;
+pub mod quant;
 
+pub mod attn;
+pub mod dag;
+pub mod fuse;
+pub mod gdn;
 pub mod island;
 pub mod norm;
-pub mod rope;
-pub mod attn;
-pub mod gdn;
-pub mod fuse;
-pub mod dag;
 pub mod place;
+pub mod rope;
 pub mod route;

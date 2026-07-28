@@ -762,7 +762,9 @@ fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => {
                 out.push('%');
                 out.push(HEX[(b >> 4) as usize].to_ascii_uppercase() as char);
@@ -785,7 +787,7 @@ mod tests {
         let client = Research::new("http://127.0.0.1:1", "", "proj", ".", &[]);
         let mut e = client.experiment("kernel-perf", "matvec", "vulkan/6144");
         drop(client); // release the other Arc ref so the inner is uniquely owned here
-        // Pin the constant provenance the record embeds.
+                      // Pin the constant provenance the record embeds.
         let inner = Arc::get_mut(&mut e.client.inner).unwrap();
         inner.git = Git {
             git_sha: "abc123".into(),
@@ -806,8 +808,14 @@ mod tests {
 
     #[test]
     fn verdict_serializes_lowercase() {
-        assert_eq!(serde_json::to_value(Verdict::Refuted).unwrap(), json!("refuted"));
-        assert_eq!(serde_json::to_value(Verdict::Proven).unwrap(), json!("proven"));
+        assert_eq!(
+            serde_json::to_value(Verdict::Refuted).unwrap(),
+            json!("refuted")
+        );
+        assert_eq!(
+            serde_json::to_value(Verdict::Proven).unwrap(),
+            json!("proven")
+        );
         assert_eq!(
             serde_json::to_value(Verdict::Inconclusive).unwrap(),
             json!("inconclusive")
