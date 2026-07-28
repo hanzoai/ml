@@ -35,9 +35,14 @@ jobs:
           # CAPTURE a non-zero rc and let the already-uploaded->skip logic run. Without this, the first
           # already-published crate (e.g. hanzo-kernels) aborts the whole loop before reaching hanzo-ml.
           set +e
-          # bottom-up: leaf kernels + ug + flash-attn-build, then hanzo-ml, then nn, then flash-attn
+          # bottom-up: macros, then the kernel DSL, then leaf kernels + ug + flash-attn-build,
+          # then hanzo-ml, then nn, then flash-attn.
+          # hanzo-kernel (singular, the DSL) is NOT hanzo-kernels (plural, the CUDA kernels).
+          # Only the plural was listed here, so the DSL never published from CI and drifted to
+          # 0.2.20 on crates.io against 0.2.39 in tree. Both names belong in this loop.
           fail=0
-          for c in hanzo-kernels hanzo-metal-kernels hanzo-rocm-kernels hanzo-ug \
+          for c in hanzo-kernel-macros hanzo-kernel \
+                   hanzo-kernels hanzo-metal-kernels hanzo-rocm-kernels hanzo-ug \
                    hanzo-flash-attn-build hanzo-ml hanzo-nn hanzo-flash-attn \
                    hanzo-flash-attn-v3; do
             if [ -d "$c" ]; then
