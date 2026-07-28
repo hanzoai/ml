@@ -87,6 +87,16 @@ struct ResidentBanks {
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
+    // Every field of ResidentBanks is gated on rocm/vulkan/wgpu, so with none of
+    // them enabled it is an empty struct and this field is genuinely never read —
+    // which is what clippy reports on a default-feature build. It IS read on any
+    // accelerator build (see the cache_or_upload calls below), so the allowance is
+    // scoped to exactly the configuration where the field is dead rather than
+    // silencing the lint everywhere.
+    #[cfg_attr(
+        not(any(feature = "rocm", feature = "vulkan", feature = "wgpu")),
+        allow(dead_code)
+    )]
     banks: ResidentBanks,
 }
 
@@ -1662,6 +1672,10 @@ fn vk_moe_blk_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<&'static str> 
 // f32 path for an A/B. The bool is the kernel's activation-binding contract: whether it binds the
 // per-32 q8 sums (`xsum`; Q4_K folds dmin against them) or derives its own half-block sums in-register
 // (Q6_K's −32 fold needs per-16 sums, which per-32 xsum cannot express).
+// Gated exactly like its sibling vk_moe_blk_kernel above. Both call sites are
+// inside `#[cfg(feature = "vulkan")]` blocks, so without the feature this compiled
+// with no callers and clippy correctly called it dead.
+#[cfg(feature = "vulkan")]
 fn vk_moe_blk_dp4a_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<(&'static str, bool)> {
     if std::env::var_os("VK_MOE_PACKED").is_some() || std::env::var_os("VK_MOE_DP4A_OFF").is_some()
     {
