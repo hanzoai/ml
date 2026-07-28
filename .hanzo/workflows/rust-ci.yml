@@ -72,14 +72,37 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
     steps:
+      # Best-effort, and it must stay best-effort: it reclaims space, it does not
+      # gate correctness. As written it FAILED the whole matrix leg —
+      #
+      #   rm: cannot remove '/opt/hostedtoolcache': Device or resource busy
+      #   ❌ Failure - Main Free disk space (Linux)   exitcode '1'
+      #
+      # — and because the shell runs with `-e`, that first rm aborted the step and
+      # every later step was skipped, so checkout never ran and the job reported a
+      # failure that had nothing to do with the code.
+      #
+      # Two things are wrong with the original on a self-hosted runner:
+      #
+      #  - /opt/hostedtoolcache is RUNNER_TOOL_CACHE, a MOUNT inside the act
+      #    container, so removing it is impossible (EBUSY) rather than merely
+      #    unnecessary. Emptying it would be worse than useless: the cache is
+      #    shared with other jobs on the same runner, so this would sabotage them
+      #    to reclaim space we do not need. It is left alone deliberately.
+      #  - The other three paths are GitHub-hosted-image idioms. Our runners are
+      #    not that image, so they simply do not exist here.
+      #
+      # And the premise no longer holds anyway: the runner has ~66G free of 98G.
+      # Kept rather than deleted so the step still does its job on a GitHub-hosted
+      # runner, where those directories are real and space is genuinely tight.
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
+          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc; do
+            [ -e "$d" ] && sudo rm -rf "$d" || true
+          done
           df -h
+        continue-on-error: true
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
