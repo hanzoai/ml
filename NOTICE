@@ -95,3 +95,71 @@ Changes from upstream candle in this fork:
   Hanzo/zen model hubs.
 - Dependency and layout changes: cudarc pinned at 0.19.4; an orphaned duplicate
   crate cluster is excluded from the workspace build.
+
+LICENSE METADATA CORRECTION (2026-08-03)
+
+Between 2026-01-16 and 2026-08-03 the crate manifests in this repository
+declared a license that upstream candle never granted, and that this repository
+did not ship the text of. This section records that, because published crate
+metadata is immutable and old versions still carry it.
+
+What happened:
+
+- Commit 216fae85 (2026-01-16) changed 24 manifests from "MIT OR Apache-2.0" to
+  "BSD-3-Clause OR Apache-2.0" and added a LICENSE-BSD file. candle is licensed
+  "MIT OR Apache-2.0" and offers no BSD-3-Clause option, so BSD-3-Clause was
+  never ours to offer over candle-derived code.
+- Commit 16fabaed (2026-07-02) deleted LICENSE-BSD as "stray" but did not touch
+  a single manifest. From that date the repository offered BSD-3-Clause in 27
+  manifests while shipping no BSD license text at all.
+- Meanwhile LICENSE-MIT, LICENSE-APACHE and this NOTICE all correctly said
+  "MIT OR Apache-2.0". The license files and the manifests disagreed for
+  nearly seven months, and the license files are the ones that govern.
+
+What was corrected on 2026-08-03: every affected manifest now declares
+"MIT OR Apache-2.0", matching LICENSE-MIT and LICENSE-APACHE. That is 27
+manifests -- 24 that said "BSD-3-Clause OR Apache-2.0", plus hanzo-kernel,
+hanzo-kernel-macros and hanzo-3d, which said "BSD-3-Clause" alone. Those three
+are first-party Hanzo work rather than candle-derived, so the choice of license
+was ours to make; they are aligned here so that every crate offers what the
+repository actually ships.
+
+hanzo-bindgen-cuda is deliberately left at "MIT". It is a fork of bindgen_cuda
+by Nicolas Patry (https://github.com/Narsil/bindgen_cuda), which is MIT
+upstream, and its manifest already retains his authorship. Changing it would
+have relicensed a third party's work.
+
+Published versions are NOT being yanked. 191 published versions across 12
+crates on crates.io carry the incorrect SPDX, measured against the crates.io
+API on 2026-08-03:
+
+    hanzo-ml 87, hanzo-kernel 22, hanzo-kernels 19, hanzo-metal-kernels 17,
+    hanzo-nn 15, hanzo-flash-attn 10, hanzo-ug 9, hanzo-transformers 4,
+    hanzo-datasets 3, hanzo-onnx 2, hanzo-kernel-macros 2, hanzo-3d 1
+
+Of those, 25 versions -- all of hanzo-kernel, hanzo-kernel-macros and hanzo-3d
+-- were published as "BSD-3-Clause" alone, with no Apache-2.0 fallback. The
+remaining 166 were published as "BSD-3-Clause OR Apache-2.0", so an Apache-2.0
+grant was at least always available for them.
+
+Two crates are unaffected and were already correct: tensor-tools (11 versions,
+"MIT OR Apache-2.0", inherited from the workspace) and hanzo-bindgen-cuda
+(1 version, "MIT", matching its own upstream).
+
+crates.io metadata is immutable per
+version, so the label on those releases cannot be edited; yanking them would
+break every downstream consumer in order to correct a label. The LICENSE files
+distributed inside each of those crates are, and always were, LICENSE-MIT and
+LICENSE-APACHE, and those are what actually grant rights. Anyone auditing an
+older release should read the license files in the package rather than the
+crates.io metadata field.
+
+Open item, not resolved here: the root LICENSE file is not upstream's. candle
+ships no /LICENSE (only LICENSE-MIT and LICENSE-APACHE), and this file was
+added by commit 225e590f (2026-02-14). It is a modified Apache-2.0 text -- the
+APPENDIX is replaced with a single "Copyright 2024 Hanzo AI Inc" line and
+several sentences are reworded. Because it is the only file named LICENSE, it
+is the one GitHub reads, so this repository is reported as Apache-2.0 rather
+than dual-licensed. It has been left untouched pending a decision, since
+altering a file named LICENSE is a licensing determination rather than a
+metadata fix.
