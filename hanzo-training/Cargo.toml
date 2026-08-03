@@ -6,7 +6,7 @@ description = "Training framework for Hanzo ML models on zen-agentic-dataset"
 repository = "https://github.com/hanzoai/ml"
 keywords = ["machine-learning", "training", "transformer", "llm"]
 categories = ["science", "algorithms"]
-license = "BSD-3-Clause OR Apache-2.0"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]

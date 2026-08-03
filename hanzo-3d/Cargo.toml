@@ -2,7 +2,7 @@
 name = "hanzo-3d"
 version = "0.1.0"
 edition = "2021"
-license = "BSD-3-Clause"
+license = "MIT OR Apache-2.0"
 description = "3D representations, geometry, and mesh/point-cloud I/O for the Hanzo generative-3D stack (Pixal3D / TRELLIS / TripoSR)."
 repository = "https://github.com/hanzoai/ml"
 
