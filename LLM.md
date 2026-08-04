@@ -10,7 +10,7 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
 - Crate `hanzo-ml` (crates.io) · docs at docs.rs/hanzo-ml.
 
 ## Install / run
-- Core: `cargo add hanzo-ml-core` (`Tensor`/`Device`); add `hanzo-nn` to build models.
+- Core: `cargo add hanzo-ml` (`Tensor`/`Device`); add `hanzo-nn` to build models.
 - GPU: `--features cuda` (+ `cudnn`), or `metal` / `rocm` / `vulkan`.
 - Examples: `cargo run --example quantized --release` (see `hanzo-ml-examples/`).
 
@@ -20,6 +20,26 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
 - `hanzo-transformers/` — model implementations.
 - `hanzo-kernels/`, `hanzo-flash-attn/` — CUDA kernels & FlashAttention v2.
 - `hanzo-onnx/`, `hanzo-datasets/`, `hanzo-ml-wasm-examples/`.
+
+## Releasing
+- Registry is **crates.io**, owner `zeekay`. There is no Hanzo cargo registry: no
+  `[registries]` in `.cargo/config.toml`, no `publish = [...]` allow-list, and the
+  sibling Rust repo (`hanzoai/engine`) publishes the same way.
+- **Each crate carries its own version and moves by a patch bump from the version it
+  last released.** Crates change at different rates, so their numbers differ — that
+  is information, not drift. Never renumber a crate to match another.
+- `scripts/publish-order` is the release set: every crate that does not say
+  `publish = false`, topologically sorted. `publish = false` is the one way to keep a
+  crate off the registry (examples, demos, the book, the PyPI extension module, and
+  `tensor-tools`, whose crates.io name belongs to the upstream candle author).
+- Publishing is CI's job: push a `N.N.N` tag to the forge and `.hanzo/workflows/publish.yml`
+  walks that order with `cargo publish --no-verify` (GPU build scripts can't run on
+  crates.io builders). The tag names the release event; the manifests name the artifacts.
+  Re-running is safe — a crate already at its manifest version is skipped.
+- Run a crate's own tests before its version moves. ROCm needs
+  `LD_LIBRARY_PATH=/opt/rocm/core-7.13/lib` — `libhiprtc.so.7` lives there, not in
+  `/opt/rocm/lib`, so `cargo test -p hanzo-kernel --features rocm` otherwise dies at
+  load time with the test binary already built.
 
 ## Brand rules (enforce in all docs)
 - Hanzo is the **Open AI Cloud / full AI SDK** — never an "LLM gateway", never

@@ -1,5 +1,7 @@
 [package]
 name = "hanzo-ml-wasm-tests"
+# Not published: a test harness, not a library.
+publish = false
 version = "0.11.8"
 edition = "2021"
 description = "WASM tests for hanzo"
