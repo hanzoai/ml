@@ -8,6 +8,7 @@ members = [
     "hanzo-3d",
     "hanzo-datasets",
     "hanzo-flash-attn-v3",
+    "hanzo-learn",
     "hanzo-ml",
     "hanzo-ml-examples",
     "hanzo-ml-pyo3",
