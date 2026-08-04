@@ -124,6 +124,13 @@ are first-party Hanzo work rather than candle-derived, so the choice of license
 was ours to make; they are aligned here so that every crate offers what the
 repository actually ships.
 
+A 28th manifest, hanzo-ml-wasm-tests, declared no license at all. It is a
+workspace member without `publish = false`, so it was one `cargo publish` away
+from going out unlicensed; it has never been published (crates.io has no such
+crate). It now declares "MIT OR Apache-2.0" like the rest. Every manifest in
+the repository now carries a license field, and hanzo-bindgen-cuda's "MIT" is
+the only value that differs -- deliberately, for the reason below.
+
 hanzo-bindgen-cuda is deliberately left at "MIT". It is a fork of bindgen_cuda
 by Nicolas Patry (https://github.com/Narsil/bindgen_cuda), which is MIT
 upstream, and its manifest already retains his authorship. Changing it would

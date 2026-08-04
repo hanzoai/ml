@@ -3,6 +3,7 @@ name = "hanzo-ml-wasm-tests"
 version = "0.11.8"
 edition = "2021"
 description = "WASM tests for hanzo"
+license = "MIT OR Apache-2.0"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 
