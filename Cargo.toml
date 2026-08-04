@@ -1,8 +1,9 @@
 [workspace]
-# Only the hanzo-* crates are workspace members. The legacy hanzo-ml-* crates are an orphaned
-# duplicate cluster (no hanzo crate depends on them); keeping them out of the build drops the
-# `hanzo-ml` name from the workspace and resolves the hanzo-ml-pyo3 vs hanzo-ml-pyo3 `links="python"`
-# conflict. The dirs remain on disk for now and can be deleted in a follow-up.
+# `exclude` holds the crates that cannot BE members: the kernel crates carry their own
+# `links=` build scripts, and hanzo-ml-book/hanzo-ug are not libraries. Everything else is a
+# member, so `cargo test --workspace` and `cargo clippy --workspace` gate it. hanzo-onnx was
+# excluded and therefore never built, tested or linted by CI — 64 op tests behind a lock nothing
+# turned. It is a member; the `check`/`test`/`clippy` jobs install protoc for its build script.
 members = [
     "hanzo-3d",
     "hanzo-datasets",
@@ -13,6 +14,7 @@ members = [
     "hanzo-ml-wasm-examples/*",
     "hanzo-ml-wasm-tests",
     "hanzo-nn",
+    "hanzo-onnx",
     "hanzo-research",
     "hanzo-train",
     "hanzo-training",
@@ -28,12 +30,6 @@ exclude = [
     "hanzo-kernels",
     "hanzo-metal-kernels",
     "hanzo-rocm-kernels",
-    "hanzo-onnx",
-    "hanzo-flash-attn",
-    "hanzo-kernels",
-    "hanzo-metal-kernels",
-    "hanzo-ml-book",
-    "hanzo-onnx",
     "hanzo-ug",
 ]
 resolver = "2"

@@ -59,7 +59,18 @@ jobs:
         with:
           python-version: "3.13"
       - uses: dtolnay/rust-toolchain@stable
-
+      # hanzo-onnx's build script runs prost-build, which shells out to protoc;
+      # prost-build 0.14 does not vendor one. apt rather than a marketplace action
+      # for the same reason the clippy job apt-installs its C toolchain: these are
+      # self-hosted runners, and a step that downloads a release from a third-party
+      # host is a network dependency on every run.
+      - name: Install protoc (hanzo-onnx build script)
+        run: |
+          if ! command -v protoc >/dev/null; then
+            (sudo apt-get update && sudo apt-get install -y protobuf-compiler) \
+              || (apt-get update && apt-get install -y protobuf-compiler)
+          fi
+          protoc --version
 
       - name: Run normal cpu
         if: matrix.os == 'ubuntu-latest'
@@ -117,9 +128,11 @@ jobs:
         with:
           python-version: "3.13"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install lld (Linux only)
+      - name: Install lld and protoc (Linux only)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
+        run: |
+          sudo apt-get update && sudo apt-get install -y lld protobuf-compiler
+          protoc --version
       # `cargo test --workspace` is the heaviest thing this repo does. `check`
       # passes on the same runner because it stops before codegen; test runs full
       # LLVM codegen AND a link for every crate in a workspace that includes the
@@ -164,12 +177,17 @@ jobs:
     runs-on: hanzo-build-linux-amd64
     steps:
       - uses: actions/checkout@v6
-      - name: Install C toolchain (runner image ships without cc)
+      - name: Install C toolchain and protoc (runner image ships without cc)
         run: |
           if ! command -v cc >/dev/null || ! command -v pkg-config >/dev/null; then
             (sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev) \
               || (apt-get update && apt-get install -y build-essential pkg-config libssl-dev)
           fi
+          if ! command -v protoc >/dev/null; then
+            (sudo apt-get update && sudo apt-get install -y protobuf-compiler) \
+              || (apt-get update && apt-get install -y protobuf-compiler)
+          fi
+          protoc --version
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
