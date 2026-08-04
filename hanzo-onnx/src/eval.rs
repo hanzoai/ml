@@ -1542,7 +1542,7 @@ fn simple_eval_(
                 }
 
                 // Insert the split outputs into the values map
-                for (output, slice) in node.output.iter().zip(outputs.into_iter()) {
+                for (output, slice) in node.output.iter().zip(outputs) {
                     values.insert(output.clone(), slice);
                 }
             }
@@ -1982,7 +1982,13 @@ fn simple_eval_(
                 )?;
 
                 let mut lstm_state = hanzo_nn::rnn::LSTMState::new(h, c);
-                let mut h_acc = if node.output.first().map(String::as_str).unwrap_or("") != "" {
+                let mut h_acc = if !node
+                    .output
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     Some(vec![])
                 } else {
                     None
@@ -2276,7 +2282,7 @@ fn simple_eval_(
             }
             "HardSwish" => {
                 let input = get(&node.input[0])?;
-                let hard_sigmoid = hanzo_nn::ops::hard_sigmoid(&input)?;
+                let hard_sigmoid = hanzo_nn::ops::hard_sigmoid(input)?;
                 let output = input * hard_sigmoid;
                 values.insert(node.output[0].clone(), output?);
             }
@@ -2418,7 +2424,7 @@ fn simple_eval_(
                 let _updates_shape = updates.dims();
 
                 // Last dimension of indices represents the depth of indexing
-                let k = indices_shape.last().unwrap().clone();
+                let k = *indices_shape.last().unwrap();
 
                 if k > data.rank() {
                     bail!("ScatterND expects k (indices.shape[-1]) to be at most the rank of data");
@@ -2541,7 +2547,7 @@ fn simple_eval_(
                         }
                         // The spec's other reductions are mul, min and max. `"none" | _`
                         // routed them here, so a graph asking for one got the `none`
-                        // answer -- an overwrite where a reduction was requested, with no
+                        // answer — an overwrite where a reduction was requested, with no
                         // error. Refusing is the only honest answer until they exist.
                         reduction => {
                             bail!("ScatterND reduction {reduction} is not supported")
