@@ -3,7 +3,7 @@ name = "hanzo-kernel-macros"
 version = "0.1.1"
 edition = "2021"
 description = "The #[kernel(targets(...))] attribute for hanzo-kernel: one Rust fn, declared backends, scoped intrinsic islands."
-license = "BSD-3-Clause"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/hanzoai/ml"
 
 [lib]

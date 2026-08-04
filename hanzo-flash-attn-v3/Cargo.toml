@@ -7,7 +7,7 @@ description = "FlashAttention-3 (Hopper sm_90a) attention kernels for the Hanzo 
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
-license = "BSD-3-Clause OR Apache-2.0"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [features]
