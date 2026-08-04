@@ -51,8 +51,18 @@ metal = ["hanzo-ml/metal", "hanzo-nn/metal"]
 # wandb = ["dep:wandb"]  # Commented out for now
 ug = ["dep:hanzo-ug", "hanzo-ml/ug"]
 
+# The binary is named for its crate, not for a verb it cannot perform. `hanzo-train`
+# is the `hanzo-train` crate's binary — the DSpark draft trainer that reaches
+# hanzo_nn::AdamW and writes an engine-loadable checkpoint. Two `[[bin]]` targets
+# with one name both uplift to `target/<profile>/hanzo-train`, so whichever linked
+# last decided whether `cargo build --workspace` left you a trainer or a CLI whose
+# `train` subcommand refuses (see src/model.rs::unwired). One name, one artifact.
+#
+# What this binary can do is READ and WRITE a training config (`validate`,
+# `template`); `train` refuses until the config-driven path is wired to
+# hanzo-transformers. The connected training path in this crate is `grpo`.
 [[bin]]
-name = "hanzo-train"
+name = "hanzo-training"
 path = "src/bin/train.rs"
 
 [[bin]]
