@@ -1,5 +1,7 @@
 [package]
 name = "hanzo-ml-wasm-example-llama2"
+# Not published: browser demo programs, built and tested in-tree only.
+publish = false
 version = "0.11.8"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
