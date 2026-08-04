@@ -796,7 +796,7 @@ mod tests {
     #[cfg(feature = "rocm")]
     #[test]
     fn rms_norm_blk_rocm_bit_exact() {
-        use cubecl::hip::{AmdDevice, HipRuntime};
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
         let c = HipRuntime::client(&AmdDevice::default());
         for &(rows, n) in &[
             (1usize, 4096usize),
@@ -836,7 +836,7 @@ mod tests {
     #[cfg(feature = "rocm")]
     #[test]
     fn add_rmsnorm_blk_rocm_bit_exact() {
-        use cubecl::hip::{AmdDevice, HipRuntime};
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
         let c = HipRuntime::client(&AmdDevice::default());
         let gen_res = |rows: usize, n: usize| -> Vec<f32> {
             let mut s = 0x9E3779B9_7F4A7C15u64;

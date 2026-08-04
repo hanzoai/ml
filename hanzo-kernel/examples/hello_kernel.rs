@@ -1,55 +1,114 @@
-//! The whole thesis in one file: write a kernel once, run it, get the right answer.
+//! The whole thesis in one file: write a kernel ONCE, run it on every accelerator, get the right answer.
 //!
-//!   cargo run --example hello_kernel                              # CPU
-//!   cargo run --example hello_kernel --features vulkan            # + Vulkan (add the GPU block below)
+//!   cargo run --release --example hello_kernel                  # CPU oracle only
+//!   cargo run --release --example hello_kernel --features rocm   # + AMD ROCm/HIP
+//!   cargo run --release --example hello_kernel --features cuda   # + NVIDIA CUDA
+//!   cargo run --release --example hello_kernel --features metal  # + Apple Metal
+//!   cargo run --release --example hello_kernel --features vulkan # + Vulkan (SPIR-V)
 //!
-//! `rms_norm` below is the exact kernel that ships as a live DSL kernel in the Hanzo ML engine,
-//! where it replaced a hand-written GLSL shader and runs 10.6x faster. Here it runs on the CPU
-//! reference runtime -- the same source that lowers to CUDA / Metal / Vulkan / WebGPU unchanged.
+//! `rms_norm` is a PRODUCTION DSL kernel that lives in `hanzo_kernel::norm`, where it replaced a
+//! hand-written GLSL shader. This example does not restate its body -- it IMPORTS it. So there is
+//! exactly ONE `rms_norm` source in the repo, and every backend below lowers those same bytes.
+//!
+//! The inputs are generated deterministically, so the printed checksum is comparable ACROSS boxes:
+//! the same number on an AMD APU, an NVIDIA GPU and an Apple GPU is the falsifiable claim that one
+//! source computed one answer on three architectures.
 
-use hanzo_kernel::cubecl::cpu::{CpuDevice, CpuRuntime};
+use hanzo_kernel::norm::{rms_norm_ref, rms_norm_run};
 use hanzo_kernel::prelude::*;
 
-#[kernel(targets(cuda, metal, vulkan, webgpu, cpu))]
-fn rms_norm<F: Float>(x: &Array<F>, w: &Array<F>, out: &mut Array<F>, #[comptime] n: usize) {
-    let row = ABSOLUTE_POS;
-    if row < out.len() / n {
-        let base = row * n;
-        let mut ss = F::new(0.0);
-        for i in 0..n {
-            let v = x[base + i];
-            ss += v * v;
-        }
-        let denom = (ss / F::cast_from(n) + F::new(1e-6)).sqrt();
-        for i in 0..n {
-            out[base + i] = x[base + i] / denom * w[i];
-        }
-    }
+/// Shape and epsilon are fixed so every box runs the identical problem.
+const ROWS: usize = 37;
+const N: usize = 128;
+const EPS: f32 = 1e-5;
+
+/// Deterministic inputs (xorshift64) -- identical bytes on every box, no RNG seeding to get wrong.
+fn data() -> (Vec<f32>, Vec<f32>) {
+    let mut s = 0x2545F491_4F6CDD1Du64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s % 2000) as f32 / 1000.0 - 1.0
+    };
+    let x = (0..ROWS * N).map(|_| next()).collect();
+    let w = (0..N).map(|_| next() * 0.5 + 1.0).collect();
+    (x, w)
+}
+
+fn max_rel(want: &[f32], got: &[f32]) -> f32 {
+    want.iter()
+        .zip(got)
+        .map(|(a, b)| (a - b).abs() / a.abs().max(1e-6))
+        .fold(0.0, f32::max)
+}
+
+/// The whole proof, over ANY runtime. `Target::of` reports which backend the DSL lowered to, so the
+/// output names the architecture it actually ran on rather than the one we hoped for.
+fn run<R: Runtime>(client: &ComputeClient<R>) -> bool {
+    let (x, w) = data();
+    let got = rms_norm_run::<R>(client, &x, &w, ROWS, N, EPS);
+    let want = rms_norm_ref(&x, &w, ROWS, N, EPS);
+
+    let rel = max_rel(&want, &got);
+    let ok = rel < 2e-3;
+    // f64 accumulation so the checksum reflects the kernel's output, not the summation order.
+    let checksum: f64 = got.iter().map(|&v| v as f64).sum();
+
+    println!(
+        "target={:?}  runtime={}  {}x{}",
+        Target::of(client),
+        R::name(client),
+        ROWS,
+        N
+    );
+    println!("  out[0..4]    = {:?}", &got[..4]);
+    println!("  oracle[0..4] = {:?}", &want[..4]);
+    println!(
+        "  checksum     = {checksum:.6}   max_rel = {rel:.3e}   {}",
+        if ok { "MATCH" } else { "MISMATCH" }
+    );
+    ok
 }
 
 fn main() {
-    let client = CpuRuntime::client(&CpuDevice::default());
+    let mut ran = 0usize;
+    let mut ok = true;
 
-    let (rows, n) = (2u32, 4usize);
-    let x = vec![1.0f32, 2.0, 3.0, 4.0, 2.0, 2.0, 2.0, 2.0];
-    let w = vec![1.0f32; n];
+    // The CPU runtime is the oracle target: every `island!` resolves to its normative `default` arm,
+    // so it is the reference every accelerator below is compared against.
+    #[cfg(feature = "cpu")]
+    {
+        use hanzo_kernel::cubecl::cpu::{CpuDevice, CpuRuntime};
+        ok &= run::<CpuRuntime>(&CpuRuntime::client(&CpuDevice::default()));
+        ran += 1;
+    }
+    #[cfg(feature = "rocm")]
+    {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        ok &= run::<HipRuntime>(&HipRuntime::client(&AmdDevice::default()));
+        ran += 1;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use hanzo_kernel::cubecl::cuda::{CudaDevice, CudaRuntime};
+        ok &= run::<CudaRuntime>(&CudaRuntime::client(&CudaDevice::default()));
+        ran += 1;
+    }
+    // Metal and Vulkan are both the wgpu runtime; the feature picks the backend it compiles to, and
+    // `Target::of` reports which one ("wgpu<msl>" vs "wgpu<spirv>") rather than us asserting it.
+    #[cfg(any(feature = "metal", feature = "vulkan"))]
+    {
+        use hanzo_kernel::cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        ok &= run::<WgpuRuntime>(&WgpuRuntime::client(&WgpuDevice::default()));
+        ran += 1;
+    }
 
-    let xh = client.create_from_slice(f32::as_bytes(&x));
-    let wh = client.create_from_slice(f32::as_bytes(&w));
-    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; x.len()]));
-
-    rms_norm::launch::<f32, CpuRuntime>(
-        &client,
-        Grid::Static(1, 1, 1),
-        Block::new_1d(rows),
-        unsafe { ArrayArg::from_raw_parts(xh.clone(), x.len()) },
-        unsafe { ArrayArg::from_raw_parts(wh.clone(), w.len()) },
-        unsafe { ArrayArg::from_raw_parts(oh.clone(), x.len()) },
-        n,
+    println!(
+        "\n{ran} backend(s) ran from ONE kernel source: {}",
+        if ok { "all MATCH" } else { "MISMATCH" }
     );
-
-    let bytes = client.read_one_unchecked(oh);
-    let out = f32::from_bytes(&bytes);
-    println!("rms_norm(one source, CPU) = {out:?}");
-    println!("expected                  = [0.365, 0.730, 1.095, 1.461, 1.0, 1.0, 1.0, 1.0]");
+    if !ok {
+        std::process::exit(1);
+    }
 }
