@@ -116,8 +116,10 @@ def run_native_metal_training():
         print("Falling back to PyTorch Metal training...")
         return False
 
+    # --config is hanzo-training's CLI. hanzo-train is a different package (the DSpark
+    # draft trainer, driven by --cache-dir/--init/--out) and does not accept --config.
     cmd = [
-        "cargo", "run", "--release", "--bin", "hanzo-train", "--",
+        "cargo", "run", "--release", "--bin", "hanzo-training", "--",
         "--config", config_path,
         "--output", "./models/zen-coder-4b-native"
     ]
