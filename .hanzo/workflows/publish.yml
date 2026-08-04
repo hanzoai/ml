@@ -45,8 +45,18 @@ jobs:
           # against 0.2.39 in tree before anyone noticed. scripts/publish-order derives both the set
           # and the order from the manifests: a crate is published because it exists, and
           # `publish = false` is the one way to opt out.
+          #
+          # Derive the order in its own step and REQUIRE it to be non-empty. Inlined as
+          # `for c in $(scripts/publish-order)` a failing script yields an empty word list, the
+          # loop body never runs, and the job goes green having published nothing -- the silent
+          # no-op is worse than the drift it replaced.
+          order=$( scripts/publish-order ); rc=$?
+          if [ "$rc" -ne 0 ] || [ -z "$order" ]; then
+            echo "::error::could not derive the publish order (scripts/publish-order rc=$rc)"; exit 1
+          fi
+          echo "publishing $(echo "$order" | wc -l) crates in dependency order:"; echo "$order"
           fail=0
-          for c in $(scripts/publish-order); do
+          for c in $order; do
             echo "::group::publish $c"
             out=$( cd "$c" && cargo publish --no-verify 2>&1 ); rc=$?
             echo "$out"
