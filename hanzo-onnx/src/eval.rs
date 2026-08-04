@@ -2527,7 +2527,7 @@ fn simple_eval_(
                                 flat_output = flat_output.slice_scatter(&new_value, 0, flat_idx)?;
                             }
                         }
-                        "none" | _ => {
+                        "none" => {
                             if update_element_shape.is_empty() {
                                 flat_output = flat_output.slice_scatter(
                                     &update_slice.unsqueeze(0)?,
@@ -2538,6 +2538,13 @@ fn simple_eval_(
                                 flat_output =
                                     flat_output.slice_scatter(&update_slice, 0, flat_idx)?;
                             }
+                        }
+                        // The spec's other reductions are mul, min and max. `"none" | _`
+                        // routed them here, so a graph asking for one got the `none`
+                        // answer -- an overwrite where a reduction was requested, with no
+                        // error. Refusing is the only honest answer until they exist.
+                        reduction => {
+                            bail!("ScatterND reduction {reduction} is not supported")
                         }
                     }
                 }
