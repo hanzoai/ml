@@ -1,14 +1,18 @@
 name: Publish crates
 
-# Native (Hanzo Git) copy of .github/workflows/publish.yml. The fork scans
-# .hanzo/workflows FIRST; GitHub.com ignores .hanzo/, so this is inert on GitHub
-# and only runs on the native forge. Ported verbatim -- runs on the mapped
-# `hanzo-build-linux-amd64` label, no `self-hosted` label to rewrite.
+# The one publish workflow. It runs only on the native forge -- the fork scans
+# .hanzo/workflows first and GitHub.com ignores .hanzo/ entirely -- on the mapped
+# `hanzo-build-linux-amd64` label.
 #
-# Publishes the hanzo-* candle-fork crates to crates.io in dependency order on a
-# version tag (e.g. `0.11.4`). GPU build scripts can't run on crates.io builders,
-# so we publish with --no-verify (downstream consumers build with their own SDK).
-# Requires repo secret CARGO_REGISTRY_TOKEN (a crates.io API token).
+# Publishes the hanzo-* crates to crates.io in dependency order on a version tag
+# (e.g. `0.11.4`). GPU build scripts can't run on crates.io builders, so we publish
+# with --no-verify (downstream consumers build against their own SDK).
+# Requires repo secret CARGO_REGISTRY_TOKEN (a crates.io API token, from KMS).
+#
+# Each crate carries its own version, so the tag names the release event and the
+# manifests name the artifacts. Re-running a tag is safe: a crate already on the
+# registry at its manifest version reports "already uploaded" and is skipped, so
+# this publishes exactly the crates whose version moved since the last run.
 on:
   push:
     tags:
@@ -35,28 +39,24 @@ jobs:
           # CAPTURE a non-zero rc and let the already-uploaded->skip logic run. Without this, the first
           # already-published crate (e.g. hanzo-kernels) aborts the whole loop before reaching hanzo-ml.
           set +e
-          # bottom-up: macros, then the kernel DSL, then leaf kernels + ug + flash-attn-build,
-          # then hanzo-ml, then nn, then flash-attn.
-          # hanzo-kernel (singular, the DSL) is NOT hanzo-kernels (plural, the CUDA kernels).
-          # Only the plural was listed here, so the DSL never published from CI and drifted to
-          # 0.2.20 on crates.io against 0.2.39 in tree. Both names belong in this loop.
+          # This list used to be written out by hand, and hanzo-kernel (singular, the kernel DSL)
+          # was missing from it -- only hanzo-kernels (plural, the CUDA kernels) was there. A crate
+          # absent from this loop never reaches the registry, so it drifted to 0.2.20 on crates.io
+          # against 0.2.39 in tree before anyone noticed. scripts/publish-order derives both the set
+          # and the order from the manifests: a crate is published because it exists, and
+          # `publish = false` is the one way to opt out.
           fail=0
-          for c in hanzo-kernel-macros hanzo-kernel \
-                   hanzo-kernels hanzo-metal-kernels hanzo-rocm-kernels hanzo-ug \
-                   hanzo-flash-attn-build hanzo-ml hanzo-nn hanzo-flash-attn \
-                   hanzo-flash-attn-v3; do
-            if [ -d "$c" ]; then
-              echo "::group::publish $c"
-              out=$( cd "$c" && cargo publish --no-verify 2>&1 ); rc=$?
-              echo "$out"
-              if [ "$rc" -ne 0 ]; then
-                if echo "$out" | grep -qiE 'already (uploaded|exists)|is already uploaded'; then
-                  echo "::warning::$c already at this version -- skipping"
-                else
-                  echo "::error::$c publish FAILED"; fail=1
-                fi
+          for c in $(scripts/publish-order); do
+            echo "::group::publish $c"
+            out=$( cd "$c" && cargo publish --no-verify 2>&1 ); rc=$?
+            echo "$out"
+            if [ "$rc" -ne 0 ]; then
+              if echo "$out" | grep -qiE 'already (uploaded|exists)|is already uploaded'; then
+                echo "::warning::$c already at this version -- skipping"
+              else
+                echo "::error::$c publish FAILED"; fail=1
               fi
-              echo "::endgroup::"
             fi
+            echo "::endgroup::"
           done
           exit "$fail"
