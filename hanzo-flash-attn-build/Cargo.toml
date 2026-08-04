@@ -13,7 +13,7 @@ description = "Build-time helper that fetches and resolves the pinned NVIDIA CUT
 repository = "https://github.com/hanzoai/ml"
 keywords = ["cuda", "cutlass", "flash-attention", "build"]
 categories = ["development-tools::build-utils"]
-license = "BSD-3-Clause OR Apache-2.0"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "hanzo_flash_attn_build"
