@@ -1,0 +1,36 @@
+[package]
+name = "hanzo-learn"
+# A new crate opens at 0.1.0. Versioning and publication belong to the release track.
+version = "0.1.0"
+edition.workspace = true
+description = "Statistical learning as values: fit is a transformation, a model is a value, predict is a query."
+repository.workspace = true
+license.workspace = true
+keywords = ["machine-learning", "regression", "statistics"]
+categories = ["science"]
+
+[dependencies]
+sha2 = "0.10"
+rayon = { workspace = true }
+
+[dev-dependencies]
+# `float_roundtrip` is NOT optional here, it is what makes the oracle an oracle.
+# serde_json's default parser takes a fast path that is accurate to about one ulp: it reads
+# the fixture literal 1.5442159175872803 back as 1.5442159175872805. Every bit-identity
+# assertion in `tests/sklearn.rs` — split thresholds, scaler statistics, the local outlier
+# factor — would then be comparing a correct value against a corrupted one, and the failure
+# looks exactly like an arithmetic bug in the estimator. Measured, not assumed; see the
+# note on `reals` in tests/sklearn.rs.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "learn"
+harness = false
+
+# The workspace's lint decisions rather than a second set of this crate's own — every other
+# member opts in the same way. It matters here for `needless_range_loop`, allowed there for
+# parallel-array indexing, which is what the Newton step's Hessian accumulation does: one
+# index reads the working weights AND the design row.
+[lints]
+workspace = true
