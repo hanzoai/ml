@@ -13,6 +13,15 @@
 //! Nothing else in this crate draws random numbers, so this is the only place the choice of
 //! generator is visible, and no fit is at the mercy of it.
 //!
+//! # Where the claim is checked
+//!
+//! `tests/fixture/stream.json` holds `numpy`'s own draws — bounded ones either side of the
+//! 32-bit boundary, permutations, subsamples, and two calls off a single generator — and
+//! `the_generator_matches_numpys_stream_draw_for_draw` asserts every one of them exactly.
+//! It has to be there for any of this to be pinned: every other fixture in the suite is a
+//! closed form that consumes no random numbers at all, so a modulus in place of the
+//! rejection below would leave the whole of the rest of the suite green.
+//!
 //! # What this is not
 //!
 //! Not for anything that must be unpredictable. MT19937's state is recoverable from its
@@ -20,8 +29,8 @@
 //! wanted here. Keys, tokens and nonces come from the platform generator.
 //!
 //! Clean-room from the published algorithm (Matsumoto and Nishimura 1998) and `numpy`'s
-//! documented legacy seeding and bounded-draw behaviour, verified against fixtures its own
-//! implementation produced.
+//! documented legacy seeding and bounded-draw behaviour, verified against fixtures `numpy`
+//! itself produced.
 
 /// Degree of the recurrence: how many words of state.
 const N: usize = 624;
