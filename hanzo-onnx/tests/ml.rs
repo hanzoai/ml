@@ -22,6 +22,7 @@
 //! record a fixture whose export does not already reproduce its own library.
 
 use hanzo_ml::{Device, Result, Tensor};
+use hanzo_onnx::onnx::{attribute_proto::AttributeType, AttributeProto};
 use hanzo_onnx::{Domain, Key, Labels, Table, Text, Value};
 use std::collections::HashMap;
 
@@ -448,5 +449,151 @@ fn a_text_label_survives_as_text() -> Result<()> {
     );
     // And the tensor plane refuses it rather than reinterpreting the bytes.
     assert!(out["output_label"].tensor().is_err());
+    Ok(())
+}
+
+/// One attribute, in each of the three kinds a classical operator reads, so a hand-built
+/// node is written as the attribute list it is.
+fn ints(name: &str, values: &[i64]) -> AttributeProto {
+    AttributeProto {
+        name: name.to_string(),
+        r#type: AttributeType::Ints.into(),
+        ints: values.to_vec(),
+        ..Default::default()
+    }
+}
+
+fn floats(name: &str, values: &[f32]) -> AttributeProto {
+    AttributeProto {
+        name: name.to_string(),
+        r#type: AttributeType::Floats.into(),
+        floats: values.to_vec(),
+        ..Default::default()
+    }
+}
+
+fn strings(name: &str, values: &[&str]) -> AttributeProto {
+    AttributeProto {
+        name: name.to_string(),
+        r#type: AttributeType::Strings.into(),
+        strings: values.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        ..Default::default()
+    }
+}
+
+/// A one-node `ai.onnx.ml` graph reading `x` and reporting a classifier's two outputs.
+fn classifier(op: &str, attribute: Vec<AttributeProto>) -> hanzo_onnx::onnx::ModelProto {
+    use hanzo_onnx::onnx;
+    let named = |name: &str| onnx::ValueInfoProto {
+        name: name.to_string(),
+        ..Default::default()
+    };
+    onnx::ModelProto {
+        graph: Some(onnx::GraphProto {
+            node: vec![onnx::NodeProto {
+                domain: "ai.onnx.ml".to_string(),
+                op_type: op.to_string(),
+                name: "n0".to_string(),
+                input: vec!["x".to_string()],
+                output: vec!["label".to_string(), "scores".to_string()],
+                attribute,
+                ..Default::default()
+            }],
+            output: vec![named("label"), named("scores")],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A classifier declares its classes in `classlabels_int64s`/`classlabels_ints` or in
+/// `classlabels_strings`, and EVERY width downstream is that count: the score matrix has
+/// one column per class, and `SVMClassifier`'s decision values one per class PAIR,
+/// `n(n - 1)/2`. A count of zero is not a small model, it is an arithmetic impossibility
+/// — `chunks(0)` panics, and `0 * (0 - 1) / 2` underflows — so a file that declares none
+/// must be refused where the count is READ, which is the one place all four readers
+/// share. onnxruntime refuses the same models.
+///
+/// Every node below is otherwise COMPLETE: each array a fitted classifier carries is
+/// present and mutually consistent, so the label count is the only thing that can stop
+/// it and the refusal under test is the one being reached. Take the check out of
+/// `labels()` and this test does not fail, it PANICS — which is the whole point of it.
+#[test]
+fn a_classifier_with_no_labels_is_an_error_not_a_panic() -> Result<()> {
+    // A single leaf carrying no weight: the whole ensemble, valid, with a width taken
+    // from the class count alone.
+    let tree = || {
+        vec![
+            ints("nodes_treeids", &[0]),
+            ints("nodes_nodeids", &[0]),
+            ints("nodes_featureids", &[0]),
+            floats("nodes_values", &[0.0]),
+            ints("nodes_truenodeids", &[0]),
+            ints("nodes_falsenodeids", &[0]),
+            strings("nodes_modes", &["LEAF"]),
+            ints("class_ids", &[]),
+            ints("class_treeids", &[]),
+            ints("class_nodeids", &[]),
+            floats("class_weights", &[]),
+        ]
+    };
+    // One weight row per class, of which there are none.
+    let linear = || vec![floats("coefficients", &[])];
+    let x = Tensor::from_slice(&[1f32, 2.0], (1, 2), &Device::Cpu)?;
+
+    for (op, spelling, complete) in [
+        (
+            "TreeEnsembleClassifier",
+            "classlabels_int64s",
+            tree() as Vec<AttributeProto>,
+        ),
+        ("LinearClassifier", "classlabels_ints", linear()),
+        ("SVMClassifier", "classlabels_ints", linear()),
+        ("ZipMap", "classlabels_int64s", vec![]),
+    ] {
+        // Absent, and present but empty. An exporter writes the second when a fit went
+        // wrong; a hand-edited file carries either.
+        for labels in [
+            vec![],
+            vec![ints(spelling, &[]), strings("classlabels_strings", &[])],
+        ] {
+            let mut attribute = complete.clone();
+            attribute.extend(labels);
+            let inputs = HashMap::from([("x".to_string(), x.clone())]);
+            let err = hanzo_onnx::simple_eval(&classifier(op, attribute), inputs)
+                .expect_err("a classifier with no classes must not be run");
+            let msg = err.to_string();
+            for named in [op, spelling, "classlabels_strings", "no class labels"] {
+                assert!(msg.contains(named), "{op}: {msg}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `LinearClassifier` and `SVMClassifier` refuse ONE class as well, because the machine
+/// under each of them is a comparison BETWEEN classes — a widened complement, a
+/// one-against-one pair vote — and neither is defined for a single one.
+///
+/// These two checks need a case of their own: [`labels()`] refuses zero before they are
+/// reached, so the count they see is never below one from any other test, and both could
+/// be deleted with nothing going red. Each node here carries the two coefficients a
+/// one-class model would need, so the class count is again the only fault.
+#[test]
+fn a_classifier_with_one_class_is_refused_by_the_two_that_compare() -> Result<()> {
+    let x = Tensor::from_slice(&[1f32, 2.0], (1, 2), &Device::Cpu)?;
+    for op in ["LinearClassifier", "SVMClassifier"] {
+        let attribute = vec![
+            floats("coefficients", &[1.0, 1.0]),
+            ints("classlabels_ints", &[7]),
+        ];
+        let inputs = HashMap::from([("x".to_string(), x.clone())]);
+        let err = hanzo_onnx::simple_eval(&classifier(op, attribute), inputs)
+            .expect_err("a classifier with one class must not be run");
+        let msg = err.to_string();
+        for named in [op, "1 class labels"] {
+            assert!(msg.contains(named), "{op}: {msg}");
+        }
+    }
     Ok(())
 }
