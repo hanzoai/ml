@@ -201,16 +201,23 @@ pub fn stratified(labels: &[Class], folds: usize, order: Order) -> Result<Vec<Sp
         allocation[position % folds][c] += 1;
     }
 
+    // ONE generator for the whole loop, as scikit-learn has: the shuffle of the second
+    // class's fold assignment CONTINUES the stream the first class left off. Re-seeding per
+    // class would draw the first class's numbers again for every class, which is a
+    // different plan — a reproducible one, and one no scikit-learn run produces.
+    let mut rng = match order {
+        Order::Sequential => None,
+        Order::Shuffled(seed) => Some(crate::twister::Twister::seed(seed)),
+    };
+
     // For each class, the fold each of its members goes to, in row order.
     let mut assigned = vec![0usize; n];
     for c in 0..classes {
         let mut fold_of_member: Vec<usize> = (0..folds)
             .flat_map(|f| std::iter::repeat_n(f, allocation[f][c]))
             .collect();
-        if let Order::Shuffled(seed) = order {
-            // Seeded per class exactly as scikit-learn does it: one generator walks the
-            // classes in order, so the streams are consumed in the same sequence.
-            crate::twister::Twister::seed(seed).shuffle(&mut fold_of_member);
+        if let Some(rng) = rng.as_mut() {
+            rng.shuffle(&mut fold_of_member);
         }
         let mut next = 0usize;
         for i in 0..n {
