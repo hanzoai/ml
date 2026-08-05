@@ -264,10 +264,21 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
     match DataType::try_from(t.data_type) {
         Ok(DataType::Int32) => {
             if t.int32_data.is_empty() {
-                let len = t.raw_data.len() / 4;
-                let data: &[i32] =
-                    unsafe { std::slice::from_raw_parts(t.raw_data.as_ptr() as *const i32, len) };
-                let data = data.iter().map(|v| *v as i64).collect::<Vec<_>>();
+                // `raw_data` is a `Vec<u8>`, whose buffer is aligned for BYTES: casting its
+                // pointer to `*const i32` is undefined behaviour on the three quarters of
+                // allocations that are not 4-byte aligned, and the bytes come from a file.
+                // ONNX writes `raw_data` little-endian, so four bytes at a time is what it
+                // means — and is safe.
+                let data: Vec<i64> = t
+                    .raw_data
+                    .chunks_exact(4)
+                    .map(|four| {
+                        i64::from(i32::from_le_bytes(
+                            four.try_into().expect("chunks_exact(4) yields four bytes"),
+                        ))
+                    })
+                    .collect();
+                let len = data.len();
                 Tensor::from_vec(data, len, &Device::Cpu)
             } else {
                 let data = t.int32_data.iter().map(|v| *v as i64).collect::<Vec<_>>();

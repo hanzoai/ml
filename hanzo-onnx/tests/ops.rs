@@ -7248,3 +7248,56 @@ fn test_one_hot() -> Result<()> {
 
     Ok(())
 }
+
+/// An `int32` initializer is read four bytes at a time, not by reinterpreting the buffer.
+///
+/// `raw_data` is a `Vec<u8>`, whose allocation is aligned for BYTES. Casting its pointer to
+/// `*const i32` — which this reader used to do — is undefined behaviour on every allocation
+/// that does not happen to be 4-byte aligned, and the bytes come from a FILE, so nothing
+/// about the model says which those are. ONNX writes `raw_data` little-endian, so four
+/// bytes at a time is both what it means and what is defined. A length that is not a
+/// multiple of four keeps its earlier reading — trailing bytes are not a value — rather
+/// than becoming a read past the end.
+#[test]
+fn test_int32_initializer_from_raw_data() -> Result<()> {
+    let read = |raw: Vec<u8>| -> Result<Vec<i64>> {
+        let model = create_model_proto_with_graph(Some(GraphProto {
+            node: vec![NodeProto {
+                op_type: "Identity".to_string(),
+                input: vec![INPUT_X.to_string()],
+                output: vec![OUTPUT_Z.to_string()],
+                ..Default::default()
+            }],
+            initializer: vec![TensorProto {
+                name: INPUT_X.to_string(),
+                data_type: DataType::Int32.into(),
+                dims: vec![3],
+                raw_data: raw,
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: OUTPUT_Z.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        let out = simple_eval(&model, HashMap::new())?;
+        let z = out.get(OUTPUT_Z).expect("the graph declares one output");
+        assert_eq!(z.dtype(), DType::I64);
+        z.flatten_all()?.to_vec1::<i64>()
+    };
+
+    let whole: Vec<u8> = [1i32, -2, 300000]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(read(whole.clone())?, vec![1i64, -2, 300000]);
+
+    // Three values and a stray byte: the stray byte is not a fourth value.
+    let mut ragged = whole;
+    ragged.push(7);
+    assert_eq!(read(ragged)?, vec![1i64, -2, 300000]);
+
+    assert_eq!(read(vec![])?, Vec::<i64>::new());
+    Ok(())
+}
