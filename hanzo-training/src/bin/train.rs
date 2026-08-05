@@ -95,13 +95,21 @@ async fn main() -> Result<()> {
             dataset,
             output,
             resume,
-        }) => train_command(config, dataset, output, resume).await,
+        }) => train_command(config, dataset, output, &cli.device, cli.multi_gpu, resume).await,
         Some(Commands::Validate { config }) => validate_command(config).await,
         Some(Commands::Template { output, template }) => template_command(output, template).await,
         None => {
             // Legacy mode - use global args
             if let Some(config) = cli.config {
-                train_command(&config, &cli.dataset, &cli.output, &None).await
+                train_command(
+                    &config,
+                    &cli.dataset,
+                    &cli.output,
+                    &cli.device,
+                    cli.multi_gpu,
+                    &None,
+                )
+                .await
             } else {
                 eprintln!("Error: Configuration file required");
                 std::process::exit(1);
@@ -110,32 +118,60 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn train_command(
-    config_path: &PathBuf,
+/// Apply CLI overrides to a loaded config, or refuse the flags that name a
+/// capability the trainer does not have. Accepting a flag and silently ignoring
+/// it reports a setting that never took effect. `--dataset` and `--device` are
+/// genuinely applied (load_dataset and setup_device read them); `--output` and
+/// `--multi-gpu` refuse until the trainer is wired to honor them.
+fn apply_cli_overrides(
+    config: &mut TrainingConfig,
     dataset_override: &Option<PathBuf>,
     output_override: &Option<PathBuf>,
-    resume_from: &Option<PathBuf>,
+    device_override: &Option<String>,
+    multi_gpu: bool,
 ) -> Result<()> {
-    info!("Loading configuration from {}", config_path.display());
-    let mut config = TrainingConfig::from_file(config_path)?;
-
-    // Apply overrides
     if let Some(dataset_path) = dataset_override {
         config.dataset.path = dataset_path.to_string_lossy().to_string();
         info!("Overriding dataset path: {}", config.dataset.path);
     }
 
-    if let Some(_output_path) = output_override {
-        // Store output path in logging config for now
-        if config.logging.is_none() {
-            config.logging = Some(hanzo_training::LoggingConfig {
-                wandb: None,
-                tensorboard: Some(true),
-                console_level: Some("info".to_string()),
-                file_logging: None,
-            });
-        }
+    if let Some(device) = device_override {
+        config.training.device = Some(device.clone());
+        info!("Overriding device: {}", device);
     }
+
+    if output_override.is_some() {
+        anyhow::bail!(
+            "--output is not implemented: the trainer writes checkpoints to \
+             ./checkpoint-step-<n> and has no wired output directory to honor."
+        );
+    }
+
+    if multi_gpu {
+        anyhow::bail!("--multi-gpu is not implemented: setup_device selects a single device only.");
+    }
+
+    Ok(())
+}
+
+async fn train_command(
+    config_path: &PathBuf,
+    dataset_override: &Option<PathBuf>,
+    output_override: &Option<PathBuf>,
+    device_override: &Option<String>,
+    multi_gpu: bool,
+    resume_from: &Option<PathBuf>,
+) -> Result<()> {
+    info!("Loading configuration from {}", config_path.display());
+    let mut config = TrainingConfig::from_file(config_path)?;
+
+    apply_cli_overrides(
+        &mut config,
+        dataset_override,
+        output_override,
+        device_override,
+        multi_gpu,
+    )?;
 
     // Validate configuration
     config.validate()?;
@@ -194,6 +230,24 @@ async fn validate_command(config_path: &PathBuf) -> Result<()> {
             lora.r, lora.alpha
         ),
         _ => println!("  LoRA: not configured"),
+    }
+
+    // The optimizer wrapper carries only the learning rate. The optimizer kind,
+    // weight decay, scheduler and warmup are parsed and validated, but no step
+    // honors them (OptimizerWrapper::new discards everything else — see
+    // optimizer.rs). Report them as read, not as applied — matching LoRA.
+    println!(
+        "  Optimizer: {:?} — NOT APPLIED: OptimizerWrapper carries only the learning rate",
+        config.training.optimizer
+    );
+    if let Some(weight_decay) = config.training.weight_decay {
+        println!("  Weight decay: {weight_decay} — NOT APPLIED");
+    }
+    if let Some(scheduler) = &config.training.scheduler {
+        println!("  Scheduler: {scheduler:?} — NOT APPLIED: no scheduler is implemented");
+    }
+    if let Some(warmup_steps) = config.training.warmup_steps {
+        println!("  Warmup steps: {warmup_steps} — NOT APPLIED");
     }
 
     Ok(())
@@ -357,4 +411,61 @@ fn create_identity_template() -> TrainingConfig {
     }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_override_is_applied() {
+        let mut config = TrainingConfig::default();
+        apply_cli_overrides(
+            &mut config,
+            &None,
+            &None,
+            &Some("cuda:1".to_string()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(config.training.device.as_deref(), Some("cuda:1"));
+    }
+
+    #[test]
+    fn dataset_override_is_applied() {
+        let mut config = TrainingConfig::default();
+        apply_cli_overrides(
+            &mut config,
+            &Some(PathBuf::from("/data/set.jsonl")),
+            &None,
+            &None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(config.dataset.path, "/data/set.jsonl");
+    }
+
+    #[test]
+    fn output_flag_is_refused_not_ignored() {
+        // Accepting --output and ignoring the path is the lie; it must refuse
+        // until the trainer has a wired output directory.
+        let mut config = TrainingConfig::default();
+        let err = apply_cli_overrides(
+            &mut config,
+            &None,
+            &Some(PathBuf::from("/tmp/out")),
+            &None,
+            false,
+        )
+        .expect_err("--output must refuse, not be silently accepted");
+        assert!(err.to_string().contains("not implemented"));
+    }
+
+    #[test]
+    fn multi_gpu_flag_is_refused_not_ignored() {
+        let mut config = TrainingConfig::default();
+        let err = apply_cli_overrides(&mut config, &None, &None, &None, true)
+            .expect_err("--multi-gpu must refuse, not be silently accepted");
+        assert!(err.to_string().contains("not implemented"));
+    }
 }

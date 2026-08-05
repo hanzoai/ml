@@ -38,7 +38,9 @@ pub(crate) fn unwired<T>(what: &str) -> Result<T> {
 /// Construction refuses — see [`unwired`]. The type is kept so the shape of what
 /// a wired implementation must provide stays visible: weights on `device`, a
 /// differentiable [`TrainableModel::forward`], and parameters the optimizer can
-/// reach.
+/// reach. The fields are documentary — every entry point refuses before any of
+/// them is read — hence `allow(dead_code)`.
+#[allow(dead_code)]
 pub struct ModelWrapper {
     model_type: String,
     device: Device,
@@ -69,20 +71,55 @@ impl TrainableModel for ModelWrapper {
         vec![]
     }
 
-    fn save(&self, path: &std::path::Path) -> Result<()> {
-        std::fs::create_dir_all(path)?;
+    /// Refuses: there are no weights to serialize. It previously created the
+    /// directory and wrote a `model_config.json` (model type + device) — a
+    /// checkpoint on disk with exit status zero for a model that never trained.
+    /// A wired model writes safetensors of real `Var`s here.
+    fn save(&self, _path: &std::path::Path) -> Result<()> {
+        unwired("saving a checkpoint")
+    }
+}
 
-        // Save model metadata
-        let metadata = serde_json::json!({
-            "model_type": self.model_type,
-            "device": format!("{:?}", self.device),
-        });
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        std::fs::write(
-            path.join("model_config.json"),
-            serde_json::to_string_pretty(&metadata)?,
-        )?;
+    #[test]
+    fn new_refuses() {
+        let config = ModelConfig {
+            name: "x".to_string(),
+            architecture: "transformer".to_string(),
+            checkpoint: None,
+            max_seq_length: 8,
+            vocab_size: None,
+            hidden_size: None,
+            num_layers: None,
+            num_heads: None,
+            custom_config: None,
+        };
+        let err = ModelWrapper::new(&config, Device::Cpu)
+            .err()
+            .expect("ModelWrapper::new must refuse: it holds no weights");
+        assert!(err.to_string().contains("not connected to a model"));
+    }
 
-        Ok(())
+    #[test]
+    fn save_refuses_and_writes_nothing() {
+        // new() refuses, so build the wrapper directly to reach save(). A
+        // weightless model must not leave a checkpoint on disk.
+        let wrapper = ModelWrapper {
+            model_type: "test".to_string(),
+            device: Device::Cpu,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("checkpoint");
+        let err = wrapper
+            .save(&dir)
+            .expect_err("save must refuse for a weightless model");
+        assert!(err.to_string().contains("not connected to a model"));
+        assert!(
+            !dir.exists(),
+            "save must not create the checkpoint directory"
+        );
     }
 }

@@ -65,9 +65,12 @@ impl BasicDataset {
         self.samples.push(sample);
     }
 
-    pub fn load<P: AsRef<Path>>(_path: P, config: &DatasetConfig) -> Result<Self> {
-        // Placeholder implementation
-        Ok(BasicDataset::new(config.name.clone()))
+    /// Refuses: this never read `path`. It returned an empty dataset named after
+    /// the config, which the trainer then reported as "Loaded dataset with 0
+    /// samples" and trained on. A loader that reads nothing must not report
+    /// success. `JsonlDataset::load` is the reader that genuinely parses a file.
+    pub fn load<P: AsRef<Path>>(_path: P, _config: &DatasetConfig) -> Result<Self> {
+        crate::model::unwired("loading a basic dataset")
     }
 }
 
@@ -97,18 +100,13 @@ pub struct ZenAgenticDataset {
 }
 
 impl ZenAgenticDataset {
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let dataset = BasicDataset::new("zen-agentic".to_string());
-
-        // Load from zen-agentic-dataset directory
-        let path = path.as_ref();
-        if path.exists() {
-            // Load training samples from the dataset
-            // This would typically load from the actual zen-agentic-dataset format
-            log::info!("Loading Zen Agentic Dataset from {:?}", path);
-        }
-
-        Ok(Self { dataset })
+    /// Refuses: this logged "Loading …" and returned an empty dataset. The
+    /// zen-agentic format is not parsed here, so the trainer would have reported
+    /// "Loaded dataset with 0 samples" and trained on nothing. A wired loader
+    /// reads the dataset through `hanzo-datasets` (already a workspace
+    /// dependency) and errors when it finds no samples.
+    pub fn load<P: AsRef<Path>>(_path: P) -> Result<Self> {
+        crate::model::unwired("loading the zen-agentic dataset")
     }
 }
 
@@ -136,13 +134,11 @@ pub struct ZenIdentityDataset {
 }
 
 impl ZenIdentityDataset {
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let dataset = BasicDataset::new("zen-identity".to_string());
-
-        // Load identity training data
-        log::info!("Loading Zen Identity Dataset from {:?}", path.as_ref());
-
-        Ok(Self { dataset })
+    /// Refuses, for the same reason as [`ZenAgenticDataset::load`]: it logged a
+    /// "Loading …" line and returned an empty dataset without reading the
+    /// identity data.
+    pub fn load<P: AsRef<Path>>(_path: P) -> Result<Self> {
+        crate::model::unwired("loading the zen-identity dataset")
     }
 }
 
@@ -201,6 +197,15 @@ impl JsonlDataset {
             }
         }
 
+        if dataset.samples.is_empty() {
+            anyhow::bail!(
+                "hanzo-training: the JSONL dataset at {:?} yielded no samples \
+                 (file empty, or every line failed to parse as {{\"input\":..,\"output\":..}}); \
+                 a training run needs at least one sample.",
+                path.as_ref()
+            );
+        }
+
         log::info!(
             "Loaded {} samples from JSONL dataset",
             dataset.samples.len()
@@ -225,5 +230,82 @@ impl Dataset for JsonlDataset {
 
     fn iter(&self) -> Box<dyn Iterator<Item = &TrainingSample> + '_> {
         self.dataset.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn input_ids_refuses_without_a_tokenizer() {
+        // Pins the tokenization refusal: without a real tokenizer there are no
+        // ids to build a tensor from. This must fail rather than fall back to
+        // `chars() as u32`, which are not the ids any embedding table expects.
+        let sample = TrainingSample {
+            input: "hello".to_string(),
+            output: "world".to_string(),
+        };
+        let err = sample
+            .input_ids(&hanzo_ml::Device::Cpu)
+            .expect_err("input_ids must refuse: this crate has no tokenizer");
+        assert!(
+            err.to_string().contains("not connected to a model"),
+            "expected the unwired refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn zen_agentic_load_refuses() {
+        let err = ZenAgenticDataset::load("/does/not/matter")
+            .err()
+            .expect("the zen-agentic loader is unwired and must refuse");
+        assert!(err.to_string().contains("not connected to a model"));
+    }
+
+    #[test]
+    fn zen_identity_load_refuses() {
+        let err = ZenIdentityDataset::load("/does/not/matter")
+            .err()
+            .expect("the zen-identity loader is unwired and must refuse");
+        assert!(err.to_string().contains("not connected to a model"));
+    }
+
+    #[test]
+    fn basic_load_refuses() {
+        let config = DatasetConfig {
+            name: "basic".to_string(),
+            path: "/does/not/matter".to_string(),
+            format: "jsonl".to_string(),
+        };
+        let err = BasicDataset::load("/does/not/matter", &config)
+            .err()
+            .expect("the basic loader is unwired and must refuse");
+        assert!(err.to_string().contains("not connected to a model"));
+    }
+
+    #[test]
+    fn jsonl_load_errors_on_empty_file() {
+        // A reader that parses a real file must still refuse zero samples rather
+        // than hand back an empty dataset the trainer would run on.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "   ").unwrap();
+        let err = JsonlDataset::load(file.path())
+            .err()
+            .expect("an empty JSONL dataset must error, not return Ok");
+        assert!(
+            err.to_string().contains("no samples"),
+            "expected the empty-dataset error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn jsonl_load_reads_samples() {
+        // The happy path stays green: a real line loads and reports its count.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{{\"input\":\"a\",\"output\":\"b\"}}").unwrap();
+        let dataset = JsonlDataset::load(file.path()).unwrap();
+        assert_eq!(dataset.len(), 1);
     }
 }

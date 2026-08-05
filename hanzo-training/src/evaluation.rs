@@ -123,7 +123,18 @@ impl BenchmarkRunner {
         self.benchmarks.push(benchmark);
     }
 
+    /// Refuses on an empty runner: an overall score is the mean of the
+    /// benchmarks that ran, and the mean of zero measurements is not `0.0` — it
+    /// is undefined. Returning `Ok(overall_score: 0.0)` here reported a
+    /// measurement that never happened.
     pub fn run_all(&self) -> Result<EvaluationResult> {
+        if self.benchmarks.is_empty() {
+            anyhow::bail!(
+                "hanzo-training: BenchmarkRunner has no benchmarks, so there is nothing to \
+                 score. Add a benchmark with add_benchmark before calling run_all."
+            );
+        }
+
         let mut benchmark_results = HashMap::new();
         let mut total_score = 0.0;
 
@@ -133,11 +144,7 @@ impl BenchmarkRunner {
             benchmark_results.insert(benchmark.name().to_string(), result);
         }
 
-        let overall_score = if self.benchmarks.is_empty() {
-            0.0
-        } else {
-            total_score / self.benchmarks.len() as f64
-        };
+        let overall_score = total_score / self.benchmarks.len() as f64;
 
         let timestamp = chrono::Utc::now().to_rfc3339();
 
@@ -155,5 +162,32 @@ impl Default for BenchmarkRunner {
         runner.add_benchmark(Box::new(PerplexityBenchmark::new()));
         runner.add_benchmark(Box::new(AccuracyBenchmark::new()));
         runner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_all_refuses_with_no_benchmarks() {
+        // An empty runner has measured nothing; it must not report a score.
+        let runner = BenchmarkRunner::new();
+        let err = runner
+            .run_all()
+            .expect_err("run_all must refuse when no benchmarks were added");
+        assert!(
+            err.to_string().contains("no benchmarks"),
+            "expected the empty-runner refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_all_propagates_a_benchmark_refusal() {
+        // The default runner carries the perplexity and accuracy benchmarks,
+        // both of which refuse (no model, no dataset). run_all must surface that
+        // refusal, not average it away.
+        let runner = BenchmarkRunner::default();
+        assert!(runner.run_all().is_err());
     }
 }
