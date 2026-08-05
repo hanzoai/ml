@@ -226,6 +226,63 @@ def estimator(name, about, est, target, convert, oracle, tolerance=1e-5):
     return model
 
 
+def disputed(name, about, model, oracle, label, probability, classes, tolerance=1e-5):
+    """Record the fitted library's answer for a graph onnxruntime reads DIFFERENTLY.
+
+    [`record`] takes the output shapes from onnxruntime and refuses a fixture whose export
+    does not reproduce its library. That is the right default: a disagreement is almost
+    always the fixture's fault. It is not always — onnxruntime picks a binary tree
+    ensemble's label by comparing the RAW score against 0.5, before `post_transform` runs,
+    so on an all-positive-weight model whose margins lie in (0, 0.5] it reports class 0 for
+    rows whose probability is above a half, contradicting its own score matrix and the
+    library that fitted the model. There the library is the only oracle, and this records
+    it without asking onnxruntime anything.
+    """
+    feeds = {model.graph.input[0].name: PROBE}
+    out = outputs(model)
+    scores = np.asarray(probability, np.float32)
+    expect = [
+        (out[0], data(np.ravel(label))),
+        (out[1], data(scores, keys=classes) if table(model, 1) else data(scores)),
+    ]
+    fixture(name, about, oracle, list(feeds.items()), expect, tolerance)
+
+
+def binary_positive(name, model, est):
+    """Refuse to write a `disputed` fixture unless the export IS the disputed case.
+
+    Four conditions make it one, and every one of them is what the fixture pins: one score
+    column under two labels, `LOGISTIC`, every leaf weight non-negative, and margins inside
+    (0, 0.5] — the window where onnxruntime's raw-score threshold and the sigmoid disagree
+    about which side of a half the row is on. Without the last two this fixture would pass
+    against a reading that never looks at the weights, which is how the branch it exists
+    for came to be pinned by nothing.
+    """
+    node = next(n for n in model.graph.node if n.op_type == "TreeEnsembleClassifier")
+    a = {at.name: helper.get_attribute_value(at) for at in node.attribute}
+    weights = np.asarray(a["class_weights"], np.float64)
+    ids = {int(i) for i in a["class_ids"]}
+    post = a.get("post_transform", b"NONE")
+    post = post.decode() if isinstance(post, bytes) else post
+    margin = np.ravel(est.predict(PROBE, output_margin=True)).astype(np.float64)
+    for what, ok in [
+        (f"two class labels, got {len(a['classlabels_int64s'])}",
+         len(a["classlabels_int64s"]) == 2),
+        (f"one distinct class id, got {sorted(ids)}", len(ids) == 1),
+        (f"post_transform LOGISTIC, got {post}", post == "LOGISTIC"),
+        (f"every leaf weight >= 0, got a minimum of {weights.min():+.6f}", (weights >= 0).all()),
+        (f"margins in (0, 0.5], got {np.round(margin, 6).tolist()}",
+         bool(((margin > 0) & (margin <= 0.5)).all())),
+    ]:
+        if not ok:
+            raise SystemExit(f"{name}: this fixture needs {what}")
+    # The reading this evaluator implements, in numpy: sigmoid of the one score, then the
+    # complement. If THAT does not reproduce the library, the fixture is wrong about the
+    # model rather than about onnxruntime.
+    p = 1.0 / (1.0 + np.exp(-margin))
+    agrees(name, "probability", np.stack([1.0 - p, p], 1), est.predict_proba(PROBE), 1e-5)
+
+
 def sk(est):
     return to_onnx(est, X[:1])
 
@@ -371,6 +428,36 @@ estimator(
     ml,
     f"{XGB} XGBClassifier.predict_proba, binary",
 )
+
+# The binary case again, on the branch the two fixtures above cannot reach. `xgb_bin` and
+# `lgbm_bin` both happen to fit at least one NEGATIVE leaf weight, so the widening rule
+# they exercise is the mixed-sign one; the all-positive branch — where onnxruntime picks the
+# label from the raw score and gets it wrong — was pinned by nothing.
+#
+# Making every leaf weight positive takes a target the four features cannot explain: with
+# the negatives scattered at random, no split isolates them, so every leaf keeps a positive
+# residual and therefore a positive weight. `base_score=0.5` puts the margin intercept at
+# zero and a small learning rate over three stumps keeps the total margin under a half,
+# which is the window where the two readings disagree about the label.
+_noise = np.random.default_rng(SEED)
+_scattered = np.ones(len(y), np.int64)
+_scattered[_noise.permutation(len(y))[: len(y) // 10]] = 0
+_positive = xgboost.XGBClassifier(
+    n_estimators=3, max_depth=1, learning_rate=0.1, base_score=0.5, random_state=SEED
+).fit(X, _scattered)
+_positive_model = save("xgb_bin_positive", ml(_positive))
+binary_positive("xgb_bin_positive", _positive_model, _positive)
+disputed(
+    "xgb_bin_positive",
+    "XGBoost binary with every leaf weight positive: the label is the argmax of [1 - p, p]",
+    _positive_model,
+    f"{XGB} XGBClassifier.predict/.predict_proba — NOT onnxruntime, which reports the other "
+    f"class for these rows",
+    _positive.predict(PROBE),
+    _positive.predict_proba(PROBE),
+    _positive.classes_,
+)
+
 estimator(
     "xgb_reg",
     "XGBoost regression through TreeEnsembleRegressor",
@@ -580,6 +667,31 @@ probe(
     {"X": ONE},
     CLF,
 )
+probe(
+    "argmax_tie",
+    "a tie between two classes goes to the LOWER class index, not the later one",
+    helper.make_node(
+        "TreeEnsembleClassifier",
+        ["X"],
+        ["L", "S"],
+        domain="ai.onnx.ml",
+        nodes_treeids=[0, 0, 0],
+        nodes_nodeids=[0, 1, 2],
+        nodes_featureids=[0, 0, 0],
+        nodes_values=[0.5, 0.0, 0.0],
+        nodes_modes=["BRANCH_LEQ", "LEAF", "LEAF"],
+        nodes_truenodeids=[1, 0, 0],
+        nodes_falsenodeids=[2, 0, 0],
+        class_treeids=[0, 0, 0, 0],
+        class_nodeids=[1, 1, 2, 2],
+        class_ids=[0, 2, 1, 2],
+        class_weights=[0.5, 0.5, 0.25, 0.75],
+        classlabels_int64s=[0, 1, 2],
+        post_transform="NONE",
+    ),
+    {"X": ONE},
+    CLF,
+)
 
 
 def regressor(aggregate, base=None):
@@ -613,6 +725,46 @@ for aggregate in ["SUM", "AVERAGE", "MIN", "MAX"]:
         {"X": ONE},
         [("Y", F)],
     )
+
+def nan_tree(mode, missing):
+    """One stump under `mode`, whose yes leaf is 1 and no leaf is 2, fed a NaN."""
+    return helper.make_node(
+        "TreeEnsembleRegressor",
+        ["X"],
+        ["Y"],
+        domain="ai.onnx.ml",
+        nodes_treeids=[0, 0, 0],
+        nodes_nodeids=[0, 1, 2],
+        nodes_featureids=[0, 0, 0],
+        nodes_values=[0.5, 0.0, 0.0],
+        nodes_modes=[mode, "LEAF", "LEAF"],
+        nodes_truenodeids=[1, 0, 0],
+        nodes_falsenodeids=[2, 0, 0],
+        nodes_missing_value_tracks_true=[missing, 0, 0],
+        target_treeids=[0, 0],
+        target_nodeids=[1, 2],
+        target_ids=[0, 0],
+        target_weights=[1.0, 2.0],
+        n_targets=1,
+    )
+
+
+NAN = np.array([[np.nan]], np.float32)
+
+probe(
+    "branch_neq_nan",
+    "NaN != threshold is TRUE, so BRANCH_NEQ takes the yes branch on a missing feature",
+    nan_tree("BRANCH_NEQ", 0),
+    {"X": NAN},
+    [("Y", F)],
+)
+probe(
+    "branch_leq_nan",
+    "every other comparison is false on a NaN, so the missing-value flag decides alone",
+    nan_tree("BRANCH_LEQ", 1),
+    {"X": NAN},
+    [("Y", F)],
+)
 probe(
     "aggregate_average_base",
     "base_values is added AFTER the division, so 100 + 11/2 and not (100 + 11)/2",
@@ -669,6 +821,20 @@ probe(
     ),
     {"X": np.array([[0, 1, 0], [0, 2, 3]], np.float32)},
     [("Y", F)],
+)
+probe(
+    "impute_int",
+    "an int64 column is imputed in int64: 2^53 + 1 does not survive the float plane",
+    helper.make_node(
+        "Imputer",
+        ["X"],
+        ["Y"],
+        domain="ai.onnx.ml",
+        imputed_value_int64s=[10, 20, 30],
+        replaced_value_int64=-1,
+    ),
+    {"X": np.array([[-1, 1, 9007199254740993], [0, -1, 3]], np.int64)},
+    [("Y", I)],
 )
 probe(
     "binarize",
@@ -744,6 +910,21 @@ probe(
     ),
     {"X": np.array([2.5, 1.5, 9.0], np.float32)},
     [("Y", F)],
+)
+probe(
+    "encode_duplicate",
+    "a key listed twice is answered from its FIRST position, the order a table is read in",
+    helper.make_node(
+        "LabelEncoder",
+        ["X"],
+        ["Y"],
+        domain="ai.onnx.ml",
+        keys_strings=["a", "a", "b"],
+        values_int64s=[1, 2, 3],
+        default_int64=-1,
+    ),
+    {"X": np.array(["a", "b", "zz"], object)},
+    [("Y", I)],
 )
 probe(
     "map_text_to_int",
