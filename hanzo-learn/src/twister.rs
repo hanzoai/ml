@@ -83,12 +83,36 @@ impl Twister {
         self.at = 0;
     }
 
-    /// A word in `0..=most`, by masked rejection — `numpy`'s bounded draw.
+    /// Two words as one draw, HIGH WORD FIRST — `numpy`'s 64-bit draw from this generator.
+    ///
+    /// The order is the entire content of the function. Swapping it leaves a generator that
+    /// is still uniform and still reproducible, and that disagrees with `numpy` on every
+    /// draw wide enough to need two words.
+    fn next_pair(&mut self) -> u64 {
+        let high = self.next_word() as u64;
+        let low = self.next_word() as u64;
+        (high << 32) | low
+    }
+
+    /// A value in `0..=most`, by masked rejection — `numpy`'s bounded draw.
     ///
     /// Rejection and not a modulus. A modulus would be faster and would bias the low
     /// values, and it would put this stream permanently out of step with `numpy`'s, which
     /// is the one property the type exists to have.
-    pub fn below(&mut self, most: u32) -> u32 {
+    ///
+    /// # Two widths, because `numpy` has two
+    ///
+    /// `numpy`'s `random_interval` takes ONE word when the bound fits in one and a PAIR
+    /// when it does not, so the width of the bound decides how many words leave the stream.
+    /// A single-width version of this is not a simplification of it: from the first bound
+    /// that crosses `u32::MAX` it is a different stream, and every draw after that
+    /// disagrees. The boundary is `most <= u32::MAX` — a bound of exactly `u32::MAX` still
+    /// takes one word, and one more takes two.
+    ///
+    /// The bound is a `u64` for the same reason. A `u32` bound would not merely refuse
+    /// large arguments, it would silently truncate them: shuffling `2³² + 5` rows would
+    /// draw positions in `0..=4`.
+    pub fn below(&mut self, most: u64) -> u64 {
         if most == 0 {
             return 0;
         }
@@ -98,8 +122,14 @@ impl Twister {
         mask |= mask >> 4;
         mask |= mask >> 8;
         mask |= mask >> 16;
+        mask |= mask >> 32;
         loop {
-            let v = self.next_word() & mask;
+            let drawn = if most <= u32::MAX as u64 {
+                self.next_word() as u64
+            } else {
+                self.next_pair()
+            };
+            let v = drawn & mask;
             if v <= most {
                 return v;
             }
@@ -122,7 +152,7 @@ impl Twister {
     /// each step drawing a position in `0..=i`.
     pub fn shuffle<T>(&mut self, values: &mut [T]) {
         for i in (1..values.len()).rev() {
-            let j = self.below(i as u32) as usize;
+            let j = self.below(i as u64) as usize;
             values.swap(i, j);
         }
     }
@@ -164,7 +194,7 @@ impl Twister {
                 out.push(*moved.get(&0).unwrap_or(&0));
                 break;
             }
-            let j = self.below(i as u32) as usize;
+            let j = self.below(i as u64) as usize;
             let vi = *moved.get(&i).unwrap_or(&i);
             let vj = *moved.get(&j).unwrap_or(&j);
             moved.insert(i, vj);
@@ -215,6 +245,76 @@ mod tests {
         }
         assert!(low && high);
         assert_eq!(t.below(0), 0);
+    }
+
+    /// The width of the draw is decided by the BOUND, not by the type of the argument, and
+    /// `u32::MAX` is the last bound that costs one word.
+    ///
+    /// Asserted as a word COUNT rather than as values, because the count is the property:
+    /// a version that took a pair either side of the boundary would still return numbers in
+    /// range, and would still be uniform, while standing one word away from `numpy` for the
+    /// rest of the stream.
+    #[test]
+    fn the_bound_decides_whether_a_draw_costs_one_word_or_two() {
+        let spent = |most: u64| {
+            let mut t = Twister::seed(1);
+            t.next_word(); // past the first twist, so `at` counts words within the block
+            let before = t.at;
+            t.below(most);
+            t.at - before
+        };
+        // A bound of the form 2^k - 1 is all mask, so nothing is ever rejected and the
+        // words spent are exactly the words one draw needs.
+        assert_eq!(spent(255), 1);
+        assert_eq!(
+            spent(u32::MAX as u64),
+            1,
+            "the widest bound that costs one word"
+        );
+        assert_eq!(spent((1 << 33) - 1), 2, "past it, a draw is a pair");
+        assert_eq!(spent(u64::MAX >> 1), 2);
+        // The first bound over the boundary rejects about half its attempts, so the count
+        // is not fixed — but every attempt is a PAIR, so it is even, and never one.
+        let crossed = spent(1 << 32);
+        assert!(
+            crossed >= 2 && crossed % 2 == 0,
+            "a bound of 2^32 spent {crossed} words, so it did not draw pairs"
+        );
+    }
+
+    /// A bound above `2^32` draws over the whole of it, not over a truncation of it.
+    ///
+    /// Narrowing this bound to 32 bits leaves `most = 4`, so the narrowed version can only
+    /// ever answer `0..=4`. The bar is therefore that the draws REACH — over 64 of them,
+    /// a correct draw fails to pass halfway once in `2^64` seeds, and a truncated one
+    /// cannot pass at all.
+    #[test]
+    fn a_bound_above_thirty_two_bits_is_not_truncated() {
+        let most = (1u64 << 32) + 4;
+        let mut t = Twister::seed(0);
+        let drawn: Vec<u64> = (0..64).map(|_| t.below(most)).collect();
+        assert!(drawn.iter().all(|&v| v <= most));
+        assert!(
+            drawn.iter().copied().max().unwrap() > u32::MAX as u64 / 2,
+            "every draw landed in the handful of values a 32-bit bound would leave: {drawn:?}"
+        );
+    }
+
+    /// A partial choice of a design too large to permute is still a choose OF IT.
+    #[test]
+    fn a_choice_of_a_design_larger_than_four_billion_rows_spans_it() {
+        let n = (1usize << 32) + 5;
+        let picked = Twister::seed(0).choose(n, 32);
+        assert_eq!(picked.len(), 32);
+        assert!(picked.iter().all(|&v| v < n));
+        let mut sorted = picked.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 32, "a choice repeated a row");
+        assert!(
+            picked.iter().copied().max().unwrap() > u32::MAX as usize / 2,
+            "the row indices collapsed into the low ones: {picked:?}"
+        );
     }
 
     /// `numpy.random.RandomState(seed).random_sample(k)`, to the last bit. Two seeds,

@@ -145,7 +145,7 @@ fn split(
     if rows.len() <= 1 || depth >= limit {
         return leaf(nodes);
     }
-    let feature = rng.below(x.p() as u32 - 1) as usize;
+    let feature = rng.below(x.p() as u64 - 1) as usize;
     let (low, high) = rows.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &i| {
         let v = x.at(i, feature);
         (lo.min(v), hi.max(v))
