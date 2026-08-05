@@ -166,6 +166,16 @@ impl Twister {
 
     /// `take` distinct values from `0..n`, in `take` draws and `O(take)` space.
     ///
+    /// # Why the name is `subsample` and not `choice`
+    ///
+    /// The name states the VALUE: a uniform `take`-subset of `0..n`, drawn without
+    /// replacement. It deliberately does not borrow `numpy`'s `choice(n, take,
+    /// replace=False)`, which returns the FIRST `take` entries of a permutation where this
+    /// returns the LAST `take`, reversed. Both are uniform subsets, so wherever a subsample
+    /// is what is wanted the two are interchangeable — but they are different POSITIONS IN
+    /// THE STREAM, and in a module whose whole thesis is that a name here means `numpy`'s
+    /// bits, a name that implied `choice` would be a lie about which draws were made.
+    ///
     /// # Why this is not `permutation(n)` truncated, and why it can exist at all
     ///
     /// Subsampling 256 rows out of 10⁶ by shuffling all 10⁶ costs a million swaps and eight
@@ -181,8 +191,8 @@ impl Twister {
     /// never materialised; only the ones a swap actually touched are remembered.
     ///
     /// Identical draws to `permutation(n)`, so the two agree: this is the tail of that
-    /// permutation, reversed, and `a_partial_choice_is_the_tail_of_the_whole_shuffle` pins it.
-    pub fn choose(&mut self, n: usize, take: usize) -> Vec<usize> {
+    /// permutation, reversed, and `a_subsample_is_the_tail_of_the_whole_shuffle` pins it.
+    pub fn subsample(&mut self, n: usize, take: usize) -> Vec<usize> {
         let take = take.min(n);
         // Only positions a swap disturbed. Everything else still holds its own index.
         let mut moved: std::collections::HashMap<usize, usize> =
@@ -300,17 +310,17 @@ mod tests {
         );
     }
 
-    /// A partial choice of a design too large to permute is still a choose OF IT.
+    /// A subsample of a design too large to permute is still a subsample OF IT.
     #[test]
-    fn a_choice_of_a_design_larger_than_four_billion_rows_spans_it() {
+    fn a_subsample_of_a_design_larger_than_four_billion_rows_spans_it() {
         let n = (1usize << 32) + 5;
-        let picked = Twister::seed(0).choose(n, 32);
+        let picked = Twister::seed(0).subsample(n, 32);
         assert_eq!(picked.len(), 32);
         assert!(picked.iter().all(|&v| v < n));
         let mut sorted = picked.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 32, "a choice repeated a row");
+        assert_eq!(sorted.len(), 32, "a subsample repeated a row");
         assert!(
             picked.iter().copied().max().unwrap() > u32::MAX as usize / 2,
             "the row indices collapsed into the low ones: {picked:?}"
@@ -354,39 +364,39 @@ mod tests {
         }
     }
 
-    /// The partial choice IS the tail of the whole shuffle, which is what makes it a
-    /// uniform subsample rather than merely a cheap one.
+    /// The subsample IS the tail of the whole shuffle, which is what makes it a uniform
+    /// subsample rather than merely a cheap one.
     #[test]
-    fn a_partial_choice_is_the_tail_of_the_whole_shuffle() {
+    fn a_subsample_is_the_tail_of_the_whole_shuffle() {
         for n in [1usize, 2, 5, 40, 1000] {
             let whole = Twister::seed(9).permutation(n);
             for take in [1usize, 2, 7, 40] {
                 if take > n {
                     continue;
                 }
-                let part = Twister::seed(9).choose(n, take);
+                let part = Twister::seed(9).subsample(n, take);
                 let want: Vec<usize> = whole[n - take..].iter().rev().cloned().collect();
                 assert_eq!(part, want, "n={n} take={take}");
             }
             // Asking for everything reproduces the whole shuffle, reversed.
-            let all = Twister::seed(9).choose(n, n);
+            let all = Twister::seed(9).subsample(n, n);
             let want: Vec<usize> = whole.iter().rev().cloned().collect();
             assert_eq!(all, want, "n={n} take=n");
         }
     }
 
     #[test]
-    fn a_partial_choice_is_distinct_and_in_range() {
+    fn a_subsample_is_distinct_and_in_range() {
         let mut t = Twister::seed(4);
-        let picked = t.choose(1_000_000, 256);
+        let picked = t.subsample(1_000_000, 256);
         assert_eq!(picked.len(), 256);
         assert!(picked.iter().all(|&v| v < 1_000_000));
         let mut sorted = picked.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 256, "a choice repeated a row");
+        assert_eq!(sorted.len(), 256, "a subsample repeated a row");
         // Clamped, not an error, and not a panic on the boundary.
-        assert_eq!(t.choose(3, 10).len(), 3);
+        assert_eq!(t.subsample(3, 10).len(), 3);
     }
 
     #[test]
