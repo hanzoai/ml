@@ -165,6 +165,14 @@ const FIXTURES: &[Fixture] = &[
         expect: &[("label", Data::Ints { dims: &[2], values: &[0i64, 1i64] }), ("probabilities", Data::Reals { dims: &[2, 2], values: &[0.86179322f32, 0.138206765f32, 0.267071187f32, 0.732928813f32] })],
     },
     Fixture {
+        name: "xgb_bin_positive",
+        about: "XGBoost binary with every leaf weight positive: the label is the argmax of [1 - p, p]",
+        oracle: "xgboost 3.4.0 XGBClassifier.predict/.predict_proba — NOT onnxruntime, which reports the other class for these rows",
+        tolerance: 1e-05f32,
+        inputs: &[("X", Data::Reals { dims: &[2, 4], values: &[5.0999999f32, 3.5f32, 1.39999998f32, 0.200000003f32, 6.9000001f32, 3.20000005f32, 5.69999981f32, 2.29999995f32] })],
+        expect: &[("label", Data::Ints { dims: &[2], values: &[1i64, 1i64] }), ("probabilities", Data::Reals { dims: &[2, 2], values: &[0.380504727f32, 0.619495273f32, 0.41778326f32, 0.58221674f32] })],
+    },
+    Fixture {
         name: "xgb_reg",
         about: "XGBoost regression through TreeEnsembleRegressor",
         oracle: "xgboost 3.4.0 XGBRegressor.predict",
@@ -269,6 +277,14 @@ const FIXTURES: &[Fixture] = &[
         expect: &[("L", Data::Ints { dims: &[2], values: &[0i64, 0i64] }), ("S", Data::Reals { dims: &[2, 3], values: &[0.25f32, 0.0f32, 0.0f32, 0.75f32, 0.0f32, 0.0f32] })],
     },
     Fixture {
+        name: "argmax_tie",
+        about: "a tie between two classes goes to the LOWER class index, not the later one",
+        oracle: "onnxruntime 1.28.0",
+        tolerance: 1e-05f32,
+        inputs: &[("X", Data::Reals { dims: &[2, 1], values: &[0.0f32, 1.0f32] })],
+        expect: &[("L", Data::Ints { dims: &[2], values: &[0i64, 2i64] }), ("S", Data::Reals { dims: &[2, 3], values: &[0.5f32, 0.0f32, 0.5f32, 0.0f32, 0.25f32, 0.75f32] })],
+    },
+    Fixture {
         name: "aggregate_sum",
         about: "two stumps with leaves 1/3 and 10/30 combined by SUM",
         oracle: "onnxruntime 1.28.0",
@@ -299,6 +315,22 @@ const FIXTURES: &[Fixture] = &[
         tolerance: 1e-05f32,
         inputs: &[("X", Data::Reals { dims: &[2, 1], values: &[0.0f32, 1.0f32] })],
         expect: &[("Y", Data::Reals { dims: &[2, 1], values: &[10.0f32, 30.0f32] })],
+    },
+    Fixture {
+        name: "branch_neq_nan",
+        about: "NaN != threshold is TRUE, so BRANCH_NEQ takes the yes branch on a missing feature",
+        oracle: "onnxruntime 1.28.0",
+        tolerance: 1e-05f32,
+        inputs: &[("X", Data::Reals { dims: &[1, 1], values: &[f32::NAN] })],
+        expect: &[("Y", Data::Reals { dims: &[1, 1], values: &[1.0f32] })],
+    },
+    Fixture {
+        name: "branch_leq_nan",
+        about: "every other comparison is false on a NaN, so the missing-value flag decides alone",
+        oracle: "onnxruntime 1.28.0",
+        tolerance: 1e-05f32,
+        inputs: &[("X", Data::Reals { dims: &[1, 1], values: &[f32::NAN] })],
+        expect: &[("Y", Data::Reals { dims: &[1, 1], values: &[1.0f32] })],
     },
     Fixture {
         name: "aggregate_average_base",
@@ -347,6 +379,14 @@ const FIXTURES: &[Fixture] = &[
         tolerance: 1e-05f32,
         inputs: &[("X", Data::Reals { dims: &[2, 3], values: &[0.0f32, 1.0f32, 0.0f32, 0.0f32, 2.0f32, 3.0f32] })],
         expect: &[("Y", Data::Reals { dims: &[2, 3], values: &[99.0f32, 1.0f32, 99.0f32, 99.0f32, 2.0f32, 3.0f32] })],
+    },
+    Fixture {
+        name: "impute_int",
+        about: "an int64 column is imputed in int64: 2^53 + 1 does not survive the float plane",
+        oracle: "onnxruntime 1.28.0",
+        tolerance: 1e-05f32,
+        inputs: &[("X", Data::Ints { dims: &[2, 3], values: &[-1i64, 1i64, 9007199254740993i64, 0i64, -1i64, 3i64] })],
+        expect: &[("Y", Data::Ints { dims: &[2, 3], values: &[10i64, 1i64, 9007199254740993i64, 0i64, 20i64, 3i64] })],
     },
     Fixture {
         name: "binarize",
@@ -403,6 +443,14 @@ const FIXTURES: &[Fixture] = &[
         tolerance: 1e-05f32,
         inputs: &[("X", Data::Reals { dims: &[3], values: &[2.5f32, 1.5f32, 9.0f32] })],
         expect: &[("Y", Data::Reals { dims: &[3], values: &[20.0f32, 10.0f32, -1.0f32] })],
+    },
+    Fixture {
+        name: "encode_duplicate",
+        about: "a key listed twice is answered from its FIRST position, the order a table is read in",
+        oracle: "onnxruntime 1.28.0",
+        tolerance: 1e-05f32,
+        inputs: &[("X", Data::Text { dims: &[3], values: &["a", "b", "zz"] })],
+        expect: &[("Y", Data::Ints { dims: &[3], values: &[1i64, 3i64, -1i64] })],
     },
     Fixture {
         name: "map_text_to_int",
