@@ -1,12 +1,35 @@
 use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
 use crate::onnx::{self, GraphProto};
+use crate::value::Value;
 use hanzo_ml::Module;
 use hanzo_ml::{bail, DType, Device, IndexOp, Result, Tensor};
 use hanzo_nn::activation::PReLU;
 use std::collections::{HashMap, HashSet};
 
-pub type Value = Tensor;
+/// The graph's live edges: every value produced so far, under the name that names it.
+///
+/// A newtype over the map for ONE reason — `insert` takes anything that IS a value, so
+/// an operator that produces a tensor hands over a tensor and an operator that produces
+/// a table hands over a table, with no conversion written at either site. The map's
+/// element type widened from `Tensor` to [`Value`] without 87 operators having to learn
+/// about it.
+#[derive(Debug, Default)]
+struct Edges(HashMap<String, Value>);
+
+impl Edges {
+    fn insert(&mut self, name: String, value: impl Into<Value>) {
+        self.0.insert(name, value.into());
+    }
+
+    fn get(&self, name: &str) -> Option<&Value> {
+        self.0.get(name)
+    }
+
+    fn remove(&mut self, name: &str) -> Option<Value> {
+        self.0.remove(name)
+    }
+}
 
 pub fn dtype(dt: DataType) -> Option<DType> {
     match dt {
@@ -21,12 +44,43 @@ pub fn dtype(dt: DataType) -> Option<DType> {
     }
 }
 
-trait Attr {
+/// Which operator domain a node names.
+///
+/// `op_type` is only meaningful inside a domain: `ai.onnx.ml` defines a `Cast`
+/// with different semantics than the `ai.onnx` one, so a lookup keyed on
+/// `op_type` alone can silently answer with the wrong operator. `NodeProto`
+/// already carries the domain (`onnx.proto3`, `NodeProto.domain`); reading it
+/// makes that confusion unrepresentable rather than merely unlikely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Domain {
+    /// `ai.onnx` — the neural-network operator set. Exporters spell the default
+    /// domain as the empty string; `"ai.onnx"` is the same domain written out.
+    Standard,
+    /// `ai.onnx.ml` — the classical (non-neural) operator set: tree ensembles,
+    /// linear models, and the feature transforms that feed them.
+    Ml,
+}
+
+impl Domain {
+    pub fn of(node: &onnx::NodeProto) -> Result<Self> {
+        match node.domain.as_str() {
+            "" | "ai.onnx" => Ok(Self::Standard),
+            "ai.onnx.ml" => Ok(Self::Ml),
+            other => bail!(
+                "unsupported operator domain {other:?} for op_type {} in {}",
+                node.op_type,
+                node.name
+            ),
+        }
+    }
+}
+
+pub(crate) trait Attr {
     const TYPE: AttributeType;
     fn get(attr: &onnx::AttributeProto) -> Result<&Self>;
 }
 
-trait AttrOwned: Sized {
+pub(crate) trait AttrOwned: Sized {
     const TYPE: AttributeType;
     fn get(attr: &onnx::AttributeProto) -> Result<Self>;
 }
@@ -49,6 +103,13 @@ impl Attr for [i64] {
     const TYPE: AttributeType = AttributeType::Ints;
     fn get(attr: &onnx::AttributeProto) -> Result<&Self> {
         Ok(attr.ints.as_slice())
+    }
+}
+
+impl Attr for [f32] {
+    const TYPE: AttributeType = AttributeType::Floats;
+    fn get(attr: &onnx::AttributeProto) -> Result<&Self> {
+        Ok(attr.floats.as_slice())
     }
 }
 
@@ -124,7 +185,10 @@ impl AttrOwned for Tensor {
     }
 }
 
-fn get_attr_<'a>(node: &'a onnx::NodeProto, name: &str) -> Result<&'a onnx::AttributeProto> {
+pub(crate) fn get_attr_<'a>(
+    node: &'a onnx::NodeProto,
+    name: &str,
+) -> Result<&'a onnx::AttributeProto> {
     match node.attribute.iter().find(|attr| attr.name == name) {
         None => {
             bail!(
@@ -137,7 +201,10 @@ fn get_attr_<'a>(node: &'a onnx::NodeProto, name: &str) -> Result<&'a onnx::Attr
     }
 }
 
-fn get_attr<'a, T: Attr + ?Sized>(node: &'a onnx::NodeProto, name: &str) -> Result<&'a T> {
+pub(crate) fn get_attr<'a, T: Attr + ?Sized>(
+    node: &'a onnx::NodeProto,
+    name: &str,
+) -> Result<&'a T> {
     let attr = get_attr_(node, name)?;
     if attr.r#type() != T::TYPE {
         bail!(
@@ -150,7 +217,7 @@ fn get_attr<'a, T: Attr + ?Sized>(node: &'a onnx::NodeProto, name: &str) -> Resu
     T::get(attr)
 }
 
-fn get_attr_opt<'a, T: Attr + ?Sized>(
+pub(crate) fn get_attr_opt<'a, T: Attr + ?Sized>(
     node: &'a onnx::NodeProto,
     name: &str,
 ) -> Result<Option<&'a T>> {
@@ -171,7 +238,10 @@ fn get_attr_opt<'a, T: Attr + ?Sized>(
     }
 }
 
-fn get_attr_opt_owned<T: AttrOwned>(node: &onnx::NodeProto, name: &str) -> Result<Option<T>> {
+pub(crate) fn get_attr_opt_owned<T: AttrOwned>(
+    node: &onnx::NodeProto,
+    name: &str,
+) -> Result<Option<T>> {
     match node.attribute.iter().find(|attr| attr.name == name) {
         None => Ok(None),
         Some(attr) => {
@@ -236,21 +306,24 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
 // graph so as to make multiple evaluations more efficient.
 // An example upside of this would be to remove intermediary values when they are not needed
 // anymore.
-pub fn simple_eval(
+/// Run a graph.
+///
+/// `inputs` is generic over anything that IS a value, so a caller with a
+/// `HashMap<String, Tensor>` — which is every caller feeding a numeric model — passes
+/// it unchanged, and a caller with text to feed passes that.
+pub fn simple_eval<V: Into<Value>>(
     model: &onnx::ModelProto,
-    mut inputs: HashMap<String, Value>,
+    inputs: HashMap<String, V>,
 ) -> Result<HashMap<String, Value>> {
     let graph = match &model.graph {
         None => bail!("no graph defined in proto"),
         Some(graph) => graph,
     };
-    simple_eval_(graph, &mut inputs)
+    let mut values = Edges(inputs.into_iter().map(|(k, v)| (k, v.into())).collect());
+    simple_eval_(graph, &mut values)
 }
 
-fn simple_eval_(
-    graph: &onnx::GraphProto,
-    values: &mut HashMap<String, Value>,
-) -> Result<HashMap<String, Value>> {
+fn simple_eval_(graph: &onnx::GraphProto, values: &mut Edges) -> Result<HashMap<String, Value>> {
     for t in graph.initializer.iter() {
         let tensor = get_tensor(t, t.name.as_str())?;
         values.insert(t.name.to_string(), tensor);
@@ -269,48 +342,28 @@ fn simple_eval_(
             _ => continue,
         };
 
-        let tensor = match values.get(&input.name) {
-            None => bail!("missing input {}", input.name),
-            Some(tensor) => tensor,
-        };
-        let dt = match DataType::try_from(tensor_type.elem_type) {
-            Ok(dt) => match dtype(dt) {
-                Some(dt) => dt,
-                None => {
-                    bail!("unsupported 'value' data-type {dt:?} for {}", input.name)
-                }
-            },
+        let declared = match DataType::try_from(tensor_type.elem_type) {
+            Ok(dt) => dt,
             type_ => bail!("unsupported input type {type_:?}"),
         };
-        match &tensor_type.shape {
-            None => continue,
-            Some(shape) => {
-                if shape.dim.len() != tensor.rank() {
-                    bail!(
-                        "unexpected rank for {}, got {:?}, expected {:?}",
-                        input.name,
-                        shape.dim,
-                        tensor.shape()
-                    )
-                }
-                for (idx, (d, &dim)) in shape.dim.iter().zip(tensor.dims().iter()).enumerate() {
-                    match &d.value {
-                        Some(onnx::tensor_shape_proto::dimension::Value::DimValue(v)) => {
-                            if *v as usize != dim {
-                                bail!(
-                                    "unexpected dim {idx} for {}, got {:?}, expected {:?}",
-                                    input.name,
-                                    shape.dim,
-                                    tensor.shape()
-                                )
-                            }
-                        }
-                        // We do not check equality constraints for the DimParam dimensions for now.
-                        Some(onnx::tensor_shape_proto::dimension::Value::DimParam(_)) | None => (),
-                    }
-                }
+        let tensor = match values.get(&input.name) {
+            None => bail!("missing input {}", input.name),
+            // A `tensor(string)` input carries text, whose element type is not a
+            // `DType`. Its shape is checked the same way; there is no dtype to compare.
+            Some(Value::Text(text)) if declared == DataType::String => {
+                check_dims(&input.name, &tensor_type.shape, text.dims())?;
+                continue;
             }
+            Some(value) => value.tensor()?,
         };
+        let dt = match dtype(declared) {
+            Some(dt) => dt,
+            None => bail!(
+                "unsupported 'value' data-type {declared:?} for {}",
+                input.name
+            ),
+        };
+        check_dims(&input.name, &tensor_type.shape, tensor.dims())?;
         if dt != tensor.dtype() {
             bail!(
                 "unexpected dtype for {}, got {:?}, expected {dt:?}",
@@ -321,16 +374,39 @@ fn simple_eval_(
     }
     // The nodes are topologically sorted so we can just process them in order.
     for node in graph.node.iter() {
-        let get = |input_name: &str| match values.get(input_name) {
+        // `edge` is what is ON the edge; `get` is the tensor in it. Two accessors and
+        // not one, because most operators here are arithmetic and cannot mean anything
+        // over text or a table — calling `get` is how they say so, and the error names
+        // what arrived instead of failing later inside a shape check.
+        let edge = |input_name: &str| match values.get(input_name) {
             Some(value) => Ok(value),
             None => bail!("cannot find {input_name} for op '{}'", node.name),
         };
+        let get = |input_name: &str| edge(input_name)?.tensor();
         let get_opt = |i: usize| {
             node.input
                 .get(i)
                 .filter(|s: &&String| !s.is_empty())
                 .map(|s| get(s))
         };
+
+        // The domain selects the operator set; `op_type` names an operator
+        // inside it. Reading them together is what lets `ai.onnx.ml` exist
+        // alongside `ai.onnx` without either shadowing the other.
+        if Domain::of(node)? == Domain::Ml {
+            let outputs = {
+                let inputs = node
+                    .input
+                    .iter()
+                    .map(|name| edge(name).cloned())
+                    .collect::<Result<Vec<Value>>>()?;
+                crate::ml::eval(node, &inputs)?
+            };
+            for (name, value) in node.output.iter().zip(outputs) {
+                values.insert(name.clone(), value);
+            }
+            continue;
+        }
 
         // TODO: Validate node.input for each operator.
         match node.op_type.as_str() {
@@ -621,6 +697,34 @@ fn simple_eval_(
                 }
                 values.insert(node.output[0].clone(), xs);
             }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Max
+            //
+            // ONE variadic elementwise fold, four operators — Min, Max, Sum and Mean are
+            // the same shape of thing and ONNX defines them together, so `Min` no longer
+            // has an arm of its own. They arrive here through the CLASSICAL exporters
+            // rather than the neural ones: skl2onnx wraps a classical node in `ai.onnx`
+            // arithmetic, and an IsolationForest export clamps with `Max` while an SVC
+            // export adds its pairwise scores with `Sum`.
+            op @ ("Min" | "Max" | "Sum" | "Mean") => {
+                let mut inputs = node.input.iter();
+                let first = match inputs.next() {
+                    Some(name) => get(name)?.clone(),
+                    None => bail!("{op} in {} has no inputs", node.name),
+                };
+                let mut acc = first;
+                for name in inputs {
+                    let next = get(name)?;
+                    acc = match op {
+                        "Min" => acc.broadcast_minimum(next)?,
+                        "Max" => acc.broadcast_maximum(next)?,
+                        _ => acc.broadcast_add(next)?,
+                    };
+                }
+                if op == "Mean" {
+                    acc = (acc / node.input.len() as f64)?;
+                }
+                values.insert(node.output[0].clone(), acc);
+            }
             "Clip" => {
                 let xs = get(&node.input[0])?;
                 let xs = if let Some(mins) = get_opt(1) {
@@ -826,16 +930,6 @@ fn simple_eval_(
                 let output = a.log()?;
                 values.insert(node.output[0].clone(), output);
             }
-            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Min
-            "Min" => {
-                let mut output = get(&node.input[0])?.clone();
-                for input in node.input.iter() {
-                    let input = get(input)?;
-                    output = output.broadcast_minimum(input)?
-                }
-
-                values.insert(node.output[0].clone(), output);
-            }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Where
             "Where" => {
                 let cond = get(&node.input[0])?;
@@ -971,7 +1065,7 @@ fn simple_eval_(
                     .input
                     .iter()
                     .map(|n| Ok(get(n.as_str())?.clone()))
-                    .collect::<Result<Vec<Value>>>()?;
+                    .collect::<Result<Vec<Tensor>>>()?;
                 let axis: i64 = *get_attr(node, "axis")?;
                 if inputs.is_empty() {
                     bail!("empty concat")
@@ -1139,8 +1233,13 @@ fn simple_eval_(
                 values.insert(node.output[0].clone(), output);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#identity
+            //
+            // Reads the EDGE, not the tensor on it: `Identity` is defined over every
+            // ONNX type, and a real skl2onnx export of a classifier fitted on string
+            // labels puts one on a `tensor(string)` — that graph is unevaluable if
+            // this operator insists on numbers.
             "Identity" => {
-                let input = get(&node.input[0])?;
+                let input = edge(&node.input[0])?;
                 values.insert(node.output[0].clone(), input.clone());
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#if
@@ -2560,7 +2659,9 @@ fn simple_eval_(
 
                 values.insert(node.output[0].clone(), output);
             }
-            op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
+            // Named WITH its domain: `ai.onnx` and `ai.onnx.ml` both define a `Cast`,
+            // so an operator name alone does not say which operator is missing.
+            op_type => bail!("unsupported ai.onnx op_type {op_type} for op {node:?}"),
         }
     }
     graph
@@ -2571,6 +2672,37 @@ fn simple_eval_(
             Some(value) => Ok((output.name.clone(), value)),
         })
         .collect()
+}
+
+/// Check a bound value's shape against the one a graph input declares.
+///
+/// Shared by the two kinds of value a declared tensor input can carry, so a
+/// `tensor(string)` input is checked exactly as strictly as a numeric one.
+fn check_dims(name: &str, declared: &Option<onnx::TensorShapeProto>, dims: &[usize]) -> Result<()> {
+    let Some(shape) = declared else {
+        return Ok(());
+    };
+    if shape.dim.len() != dims.len() {
+        bail!(
+            "unexpected rank for {name}, got {:?}, expected {dims:?}",
+            shape.dim
+        )
+    }
+    for (idx, (d, &dim)) in shape.dim.iter().zip(dims.iter()).enumerate() {
+        match &d.value {
+            Some(onnx::tensor_shape_proto::dimension::Value::DimValue(v)) => {
+                if *v as usize != dim {
+                    bail!(
+                        "unexpected dim {idx} for {name}, got {:?}, expected {dims:?}",
+                        shape.dim
+                    )
+                }
+            }
+            // A symbolic dimension names a batch size rather than fixing one.
+            Some(onnx::tensor_shape_proto::dimension::Value::DimParam(_)) | None => (),
+        }
+    }
+    Ok(())
 }
 
 fn broadcast_shape(shape_a: &[usize], shape_b: &[usize]) -> Result<Vec<usize>> {
