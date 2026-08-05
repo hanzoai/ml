@@ -9,7 +9,7 @@ use crate::{
 };
 use hanzo_ml::Device;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Training result containing metrics and statistics
 #[derive(Debug, Clone)]
@@ -96,31 +96,30 @@ impl Trainer {
                 }
             }
 
-            // Evaluation
+            // Evaluation. A failed evaluation propagates rather than being
+            // silently skipped: a run that could not measure itself is not a
+            // run that quietly carries on.
             if let Some(eval_steps) = self.config.training.eval_steps {
                 if self.current_step.is_multiple_of(eval_steps) {
-                    if let Ok(eval_loss) = self.evaluate() {
-                        info!("Evaluation loss: {:.6}", eval_loss);
-                        if best_eval_loss.is_none() || eval_loss < best_eval_loss.unwrap() {
-                            best_eval_loss = Some(eval_loss);
-                            info!("New best evaluation loss: {:.6}", eval_loss);
-                        }
+                    let eval_loss = self.evaluate()?;
+                    info!("Evaluation loss: {:.6}", eval_loss);
+                    if best_eval_loss.is_none() || eval_loss < best_eval_loss.unwrap() {
+                        best_eval_loss = Some(eval_loss);
+                        info!("New best evaluation loss: {:.6}", eval_loss);
                     }
                 }
             }
 
-            // Save checkpoint
+            // Save checkpoint. A failed save propagates: a training run that
+            // cannot persist its checkpoint has not succeeded.
             if let Some(save_steps) = self.config.training.save_steps {
                 if self.current_step.is_multiple_of(save_steps) {
                     let checkpoint_path = std::path::PathBuf::from(format!(
                         "./checkpoint-step-{}",
                         self.current_step
                     ));
-                    if let Err(e) = self.save_checkpoint(&checkpoint_path) {
-                        warn!("Failed to save checkpoint: {}", e);
-                    } else {
-                        info!("Saved checkpoint: {}", checkpoint_path.display());
-                    }
+                    self.save_checkpoint(&checkpoint_path)?;
+                    info!("Saved checkpoint: {}", checkpoint_path.display());
                 }
             }
         }
@@ -193,27 +192,32 @@ impl Trainer {
         let mut batch_loss = 0.0;
         let mut valid_samples = 0;
 
-        // Accumulate gradients over batch
+        // Accumulate gradients over batch. A sample that cannot be fetched
+        // propagates rather than being skipped and averaged around.
         for sample_idx in start_idx..end_idx {
-            if let Ok(sample) = self.dataset.get(sample_idx) {
-                let input_tensor = sample.input_ids(&self.device)?;
-                let loss = self.model.forward(&input_tensor)?;
-                self.model.backward(&loss)?;
+            let sample = self.dataset.get(sample_idx)?;
+            let input_tensor = sample.input_ids(&self.device)?;
+            let loss = self.model.forward(&input_tensor)?;
+            self.model.backward(&loss)?;
 
-                // Extract scalar loss value (simplified)
-                let loss_val = loss.to_vec1::<f32>()?[0] as f64;
-                batch_loss += loss_val;
-                valid_samples += 1;
-            }
+            // Extract scalar loss value (simplified)
+            let loss_val = loss.to_vec1::<f32>()?[0] as f64;
+            batch_loss += loss_val;
+            valid_samples += 1;
         }
 
-        if valid_samples > 0 {
-            batch_loss /= valid_samples as f64;
-
-            // Apply gradients
-            self.optimizer.step(self.model.parameters())?;
-            self.optimizer.zero_grad(self.model.parameters())?;
+        if valid_samples == 0 {
+            anyhow::bail!(
+                "hanzo-training: training step {batch_idx} measured no samples; \
+                 refusing to report a batch loss of 0."
+            );
         }
+
+        batch_loss /= valid_samples as f64;
+
+        // Apply gradients
+        self.optimizer.step(self.model.parameters())?;
+        self.optimizer.zero_grad(self.model.parameters())?;
 
         Ok(batch_loss)
     }
@@ -229,19 +233,23 @@ impl Trainer {
         let mut valid_samples = 0;
 
         for i in 0..num_eval_samples {
-            if let Ok(sample) = self.dataset.get(i) {
-                // Forward pass only (no gradients)
-                let input_tensor = sample.input_ids(&self.device)?;
-                let loss = self.model.forward(&input_tensor)?;
-                let loss_val = loss.to_vec1::<f32>()?[0] as f64;
-                eval_loss += loss_val;
-                valid_samples += 1;
-            }
+            let sample = self.dataset.get(i)?;
+            // Forward pass only (no gradients)
+            let input_tensor = sample.input_ids(&self.device)?;
+            let loss = self.model.forward(&input_tensor)?;
+            let loss_val = loss.to_vec1::<f32>()?[0] as f64;
+            eval_loss += loss_val;
+            valid_samples += 1;
         }
 
-        if valid_samples > 0 {
-            eval_loss /= valid_samples as f64;
+        if valid_samples == 0 {
+            anyhow::bail!(
+                "hanzo-training: evaluation measured no samples (the dataset yielded none); \
+                 refusing to report an evaluation loss of 0."
+            );
         }
+
+        eval_loss /= valid_samples as f64;
 
         Ok(eval_loss)
     }
@@ -312,13 +320,81 @@ impl Trainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TrainingConfig;
+    use crate::dataset::BasicDataset;
+    use hanzo_ml::Tensor;
+    use std::io::Write;
+
+    // A stand-in model for exercising trainer control flow that never reaches a
+    // forward pass (the dataset is empty). Its compute methods refuse if called.
+    struct MockModel;
+    impl TrainableModel for MockModel {
+        fn forward(&self, _input: &Tensor) -> Result<Tensor> {
+            anyhow::bail!("mock model has no forward pass")
+        }
+        fn backward(&mut self, _loss: &Tensor) -> Result<()> {
+            anyhow::bail!("mock model has no backward pass")
+        }
+        fn parameters(&self) -> Vec<&Tensor> {
+            vec![]
+        }
+        fn save(&self, _path: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn trainer_over_empty_dataset() -> Trainer {
+        let config = TrainingConfig::default();
+        let optimizer =
+            OptimizerWrapper::new(OptimizerConfig::from_training_params(&config.training)).unwrap();
+        Trainer {
+            config,
+            model: Box::new(MockModel),
+            dataset: Box::new(BasicDataset::new("empty".to_string())),
+            optimizer: Box::new(optimizer),
+            device: Device::Cpu,
+            current_step: 0,
+            current_epoch: 0,
+        }
+    }
 
     #[test]
-    fn test_trainer_creation() {
-        let config = TrainingConfig::default();
-        // Note: This will fail without proper setup, but tests the interface
-        let result = Trainer::new(config);
-        assert!(result.is_err()); // Expected to fail in test environment
+    fn trainer_creation_refuses_at_the_unwired_model() {
+        // A real, non-empty dataset so load_dataset succeeds and the refusal
+        // this pins is load_model's — the weightless ModelWrapper. Restoring
+        // that fabrication (new returning Ok) makes Trainer::new succeed and
+        // this test fail. The old is_err() smoke test passed on a missing-file
+        // error and never reached the refusal.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{{\"input\":\"a\",\"output\":\"b\"}}").unwrap();
+
+        let mut config = TrainingConfig::default();
+        config.dataset.path = file.path().to_string_lossy().to_string();
+        config.training.device = Some("cpu".to_string());
+
+        let err = Trainer::new(config)
+            .err()
+            .expect("Trainer::new must refuse: ModelWrapper carries no weights");
+        assert!(
+            err.to_string().contains("not connected to a model"),
+            "expected the unwired-model refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_refuses_when_no_samples() {
+        let trainer = trainer_over_empty_dataset();
+        let err = trainer
+            .evaluate()
+            .expect_err("evaluate must refuse rather than report a loss of 0");
+        assert!(err.to_string().contains("measured no samples"));
+    }
+
+    #[test]
+    fn train_step_refuses_when_no_samples() {
+        let mut trainer = trainer_over_empty_dataset();
+        let err = trainer
+            .train_step(0)
+            .expect_err("train_step must refuse rather than report a loss of 0");
+        assert!(err.to_string().contains("measured no samples"));
     }
 }
