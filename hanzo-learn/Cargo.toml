@@ -23,6 +23,10 @@ rayon = { workspace = true }
 # note on `reals` in tests/sklearn.rs.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 criterion = { workspace = true }
+# The `fraud` example reads a labelled dataset off disk. The parquet crate's own record
+# reader is enough for that — no arrow — and it stays a DEV dependency: the crate itself
+# takes its data as a `Matrix`, so a file format is never part of what it links.
+parquet = { workspace = true }
 
 [[bench]]
 name = "learn"
