@@ -481,29 +481,104 @@ fn strings(name: &str, values: &[&str]) -> AttributeProto {
     }
 }
 
-/// A one-node `ai.onnx.ml` graph reading `x` and reporting a classifier's two outputs.
-fn classifier(op: &str, attribute: Vec<AttributeProto>) -> hanzo_onnx::onnx::ModelProto {
-    use hanzo_onnx::onnx;
-    let named = |name: &str| onnx::ValueInfoProto {
+fn word(name: &str, value: &str) -> AttributeProto {
+    AttributeProto {
         name: name.to_string(),
+        r#type: AttributeType::String.into(),
+        s: value.as_bytes().to_vec(),
         ..Default::default()
-    };
+    }
+}
+
+fn number(name: &str, value: f32) -> AttributeProto {
+    AttributeProto {
+        name: name.to_string(),
+        r#type: AttributeType::Float.into(),
+        f: value,
+        ..Default::default()
+    }
+}
+
+fn count(name: &str, value: i64) -> AttributeProto {
+    AttributeProto {
+        name: name.to_string(),
+        r#type: AttributeType::Int.into(),
+        i: value,
+        ..Default::default()
+    }
+}
+
+/// A one-node `ai.onnx.ml` graph over the edges named.
+fn graph(
+    op: &str,
+    inputs: &[&str],
+    outputs: &[&str],
+    attribute: Vec<AttributeProto>,
+) -> hanzo_onnx::onnx::ModelProto {
+    use hanzo_onnx::onnx;
     onnx::ModelProto {
         graph: Some(onnx::GraphProto {
             node: vec![onnx::NodeProto {
                 domain: "ai.onnx.ml".to_string(),
                 op_type: op.to_string(),
                 name: "n0".to_string(),
-                input: vec!["x".to_string()],
-                output: vec!["label".to_string(), "scores".to_string()],
+                input: inputs.iter().map(|n| n.to_string()).collect(),
+                output: outputs.iter().map(|n| n.to_string()).collect(),
                 attribute,
                 ..Default::default()
             }],
-            output: vec![named("label"), named("scores")],
+            output: outputs
+                .iter()
+                .map(|name| onnx::ValueInfoProto {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// A one-node `ai.onnx.ml` graph reading `x` and reporting a classifier's two outputs.
+fn classifier(op: &str, attribute: Vec<AttributeProto>) -> hanzo_onnx::onnx::ModelProto {
+    graph(op, &["x"], &["label", "scores"], attribute)
+}
+
+/// Run a one-input graph over one feature matrix.
+fn feed(model: &hanzo_onnx::onnx::ModelProto, x: Tensor) -> Result<HashMap<String, Value>> {
+    hanzo_onnx::simple_eval(model, HashMap::from([("x".to_string(), x)]))
+}
+
+/// The error a graph refuses this input with, or a panic naming what it answered instead.
+fn refused(model: &hanzo_onnx::onnx::ModelProto, x: Tensor) -> String {
+    match feed(model, x) {
+        Ok(out) => panic!(
+            "a malformed model must be refused, not answered with {:?}",
+            out.keys().collect::<Vec<_>>()
+        ),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Every attribute a stump-shaped `TreeEnsembleClassifier` needs, splitting feature 0 at
+/// 0.5 with `weights` on its two leaves under ONE class id — the shape XGBoost and
+/// LightGBM export a two-class model in.
+fn binary_stump(weights: [f32; 2]) -> Vec<AttributeProto> {
+    vec![
+        ints("nodes_treeids", &[0, 0, 0]),
+        ints("nodes_nodeids", &[0, 1, 2]),
+        ints("nodes_featureids", &[0, 0, 0]),
+        floats("nodes_values", &[0.5, 0.0, 0.0]),
+        ints("nodes_truenodeids", &[1, 0, 0]),
+        ints("nodes_falsenodeids", &[2, 0, 0]),
+        strings("nodes_modes", &["BRANCH_LEQ", "LEAF", "LEAF"]),
+        ints("class_treeids", &[0, 0]),
+        ints("class_nodeids", &[1, 2]),
+        ints("class_ids", &[0, 0]),
+        floats("class_weights", &weights),
+        ints("classlabels_int64s", &[0, 1]),
+    ]
 }
 
 /// A classifier declares its classes in `classlabels_int64s`/`classlabels_ints` or in
@@ -595,5 +670,170 @@ fn a_classifier_with_one_class_is_refused_by_the_two_that_compare() -> Result<()
             assert!(msg.contains(named), "{op}: {msg}");
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------
+// What a hostile file can ask for
+// ---------------------------------------------------------------------------------
+//
+// Every model below is one a fitted estimator cannot produce and an editor can: an array
+// one entry short of the length another array implies, a count written negative, a width
+// that names more memory than the file. They are here because "load the .onnx you already
+// have" means the bytes are not trusted, and because each of these USED to reach an
+// indexing panic or a silent misread rather than an error. onnxruntime refuses the same
+// files, and its message is quoted where it decided the shape of ours.
+
+/// A machine reads one dual coefficient per support vector — the regressor one each, the
+/// classifier one per decision plane — so ten vectors and one coefficient is not a small
+/// model, it is a read past the end of the array. Measured: onnxruntime refuses with
+/// "coefficients size (1) must be >= n_supports (10)".
+#[test]
+fn an_svm_with_fewer_coefficients_than_vectors_is_refused() -> Result<()> {
+    let support: Vec<f32> = (0..20).map(|i| i as f32).collect();
+    let model = graph(
+        "SVMRegressor",
+        &["x"],
+        &["y"],
+        vec![
+            word("kernel_type", "LINEAR"),
+            floats("kernel_params", &[0.0, 0.0, 0.0]),
+            floats("support_vectors", &support),
+            floats("coefficients", &[1.0]),
+            floats("rho", &[0.0]),
+        ],
+    );
+    let msg = refused(
+        &model,
+        Tensor::from_slice(&[1f32, 2.0], (1, 2), &Device::Cpu)?,
+    );
+    for named in ["SVMRegressor", "1 coefficients", "10 support vectors"] {
+        assert!(msg.contains(named), "{msg}");
+    }
+    Ok(())
+}
+
+/// A negative count is refused where it is READ, before the cast that would hide it.
+///
+/// `vectors_per_class = [-1, 5]` casts to `[2^64 - 1, 5]`, whose WRAPPING sum is 4 — which
+/// is exactly the number of support vectors the same file declares, so the count check
+/// would agree with itself and the pair scoring would then index the machine off its own
+/// arrays. `checked_add` is there for the same reason from the other side: three counts of
+/// `i64::MAX` also sum to a small number. onnxruntime refuses at the same point:
+/// "vectors_per_class[0] must be non-negative. Got -1".
+#[test]
+fn a_negative_vector_count_is_refused_before_the_cast_hides_it() -> Result<()> {
+    let support: Vec<f32> = (0..8).map(|i| i as f32).collect();
+    let svm = |labels: &[i64], counts: &[i64]| {
+        graph(
+            "SVMClassifier",
+            &["x"],
+            &["label", "scores"],
+            vec![
+                word("kernel_type", "LINEAR"),
+                floats("kernel_params", &[0.0, 0.0, 0.0]),
+                floats("support_vectors", &support),
+                floats("coefficients", &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                floats("rho", &[0.0, 0.0, 0.0]),
+                ints("classlabels_ints", labels),
+                ints("vectors_per_class", counts),
+            ],
+        )
+    };
+    let x = || Tensor::from_slice(&[1f32, 2.0], (1, 2), &Device::Cpu);
+    let msg = refused(&svm(&[0, 1], &[-1, 5]), x()?);
+    for named in ["SVMClassifier", "vectors_per_class", "-1"] {
+        assert!(msg.contains(named), "{msg}");
+    }
+    let msg = refused(&svm(&[0, 1, 2], &[i64::MAX, i64::MAX, i64::MAX]), x()?);
+    assert!(msg.contains("sums past"), "{msg}");
+    Ok(())
+}
+
+/// A softmax over ONE column is 1.0 whatever the score, so a two-class ensemble that
+/// declares one is refused BY NAME rather than answered with [0, 1] for every row.
+///
+/// onnxruntime does not answer this file either — measured, it ignores the transform and
+/// reports [1 - s, s], the same as post_transform NONE. Neither reading is the model's, so
+/// this follows PROBIT: a wrong probability is worse than a refused one.
+#[test]
+fn a_softmax_over_one_score_column_is_refused_by_name() -> Result<()> {
+    for spelling in ["SOFTMAX", "SOFTMAX_ZERO"] {
+        let mut attribute = binary_stump([0.25, 0.75]);
+        attribute.push(word("post_transform", spelling));
+        let msg = refused(
+            &classifier("TreeEnsembleClassifier", attribute),
+            Tensor::from_slice(&[0f32], (1, 1), &Device::Cpu)?,
+        );
+        for named in ["TreeEnsembleClassifier", spelling, "LOGISTIC"] {
+            assert!(msg.contains(named), "{spelling}: {msg}");
+        }
+    }
+    // The same node with the transform every binary exporter actually writes is served.
+    let mut attribute = binary_stump([0.25, 0.75]);
+    attribute.push(word("post_transform", "LOGISTIC"));
+    let out = feed(
+        &classifier("TreeEnsembleClassifier", attribute),
+        Tensor::from_slice(&[0f32], (1, 1), &Device::Cpu)?,
+    )?;
+    assert_eq!(out["label"].tensor()?.to_vec1::<i64>()?, vec![1i64]);
+    Ok(())
+}
+
+/// A position is an index, not an offset from the end: `ArrayFeatureExtractor` refuses a
+/// negative one instead of wrapping it around and answering a different question.
+/// Measured: onnxruntime says "index is out of range: Y[0] (-1) must be in [0, 3)".
+#[test]
+fn a_selected_position_is_not_an_offset_from_the_end() -> Result<()> {
+    let model = graph("ArrayFeatureExtractor", &["x", "at"], &["y"], vec![]);
+    for (position, named) in [(-1i64, "-1"), (3, "3")] {
+        let inputs = HashMap::from([
+            (
+                "x".to_string(),
+                Value::from(Tensor::from_slice(
+                    &[0f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                    (2, 3),
+                    &Device::Cpu,
+                )?),
+            ),
+            (
+                "at".to_string(),
+                Value::from(Tensor::from_slice(&[position], 1, &Device::Cpu)?),
+            ),
+        ]);
+        let err = hanzo_onnx::simple_eval(&model, inputs)
+            .expect_err("a position outside the axis must not be served");
+        let msg = err.to_string();
+        for wanted in ["ArrayFeatureExtractor", named, "[0, 3)"] {
+            assert!(msg.contains(wanted), "{position}: {msg}");
+        }
+    }
+    Ok(())
+}
+
+/// `FeatureVectorizer` pads a narrow input out to the width it declares, so its output
+/// size is a number the FILE chose and no input has to back it up: a 200-byte node can
+/// name a gibibyte. The bound is far above the widest fitted pipeline and far below an
+/// allocation that matters.
+#[test]
+fn a_declared_width_cannot_name_more_memory_than_the_file() -> Result<()> {
+    let vectorizer = |widths: &[i64]| {
+        graph(
+            "FeatureVectorizer",
+            &["x"],
+            &["y"],
+            vec![ints("inputdimensions", widths)],
+        )
+    };
+    let x = || Tensor::from_slice(&[1f32], (1, 1), &Device::Cpu);
+    let msg = refused(&vectorizer(&[1 << 30]), x()?);
+    for named in ["FeatureVectorizer", "output columns"] {
+        assert!(msg.contains(named), "{msg}");
+    }
+    let msg = refused(&vectorizer(&[-5]), x()?);
+    assert!(msg.contains("width of -5"), "{msg}");
+    // The width a real pipeline asks for is still served, padded with zeros.
+    let out = feed(&vectorizer(&[3]), x()?)?;
+    assert_eq!(out["y"].tensor()?.dims(), &[1, 3]);
     Ok(())
 }
