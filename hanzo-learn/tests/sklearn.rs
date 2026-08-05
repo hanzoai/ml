@@ -445,6 +445,24 @@ fn integers(v: &Value) -> Vec<i64> {
         .collect()
 }
 
+/// Read an array of counts, indices or draws.
+///
+/// Separate from [`integers`] because a bounded draw legitimately exceeds `i64::MAX` — the
+/// stream fixture records one at `2^63 + 6` — and reading it as a signed number would fail
+/// on the one case that exercises a mask spanning all 64 bits.
+fn naturals(v: &Value) -> Vec<u64> {
+    v.as_array()
+        .expect("array")
+        .iter()
+        .map(|x| x.as_u64().expect("unsigned integer"))
+        .collect()
+}
+
+/// Read an array of row indices.
+fn places(v: &Value) -> Vec<usize> {
+    naturals(v).into_iter().map(|i| i as usize).collect()
+}
+
 fn flat(m: &Matrix) -> Vec<f64> {
     (0..m.n()).flat_map(|i| m.row(i).to_vec()).collect()
 }
@@ -618,6 +636,97 @@ fn the_imputer_matches_scikit_learn() {
         );
         println!("impute {label}: statistic {s:e} apply {a:e}");
     }
+}
+
+/// numpy's generator itself, draw for draw.
+///
+/// Everything else in this file is a closed form — a mean, a fold boundary, a curve — and a
+/// closed form consumes no random numbers. So until this existed, the whole of `twister`
+/// was held up by nothing: a bounded draw taking a modulus instead of rejecting, or
+/// spending one word where numpy spends two, produced byte-identical fixtures and stayed
+/// green. Every assertion here is on INTEGERS and is exact; there is no tolerance to state,
+/// because a stream is either numpy's or it is a different stream.
+#[test]
+fn the_generator_matches_numpys_stream_draw_for_draw() {
+    use hanzo_learn::twister::Twister;
+    let f = fixture("stream.json");
+
+    let seed_of = |case: &Value| case["seed"].as_u64().expect("seed") as u32;
+
+    // `RandomState.randint(0, most + 1)` IS `below(most)`. The cases straddle `2^32 - 1`,
+    // where numpy stops spending one word per draw and starts spending two.
+    for case in f["bounded"].as_array().unwrap() {
+        let (seed, most) = (seed_of(case), case["most"].as_u64().unwrap());
+        let want = naturals(&case["draws"]);
+        let mut t = Twister::seed(seed);
+        let got: Vec<u64> = (0..want.len()).map(|_| t.below(most)).collect();
+        assert_eq!(got, want, "below({most}) under seed {seed}");
+    }
+
+    // The descending bounds a partial Fisher-Yates asks for, on a design too large to
+    // permute. Every one of these needs the 64-bit branch, and a 32-bit bound would answer
+    // every one of them with a number under five.
+    for case in f["descending"].as_array().unwrap() {
+        let (seed, top) = (seed_of(case), case["top"].as_u64().unwrap());
+        let want = naturals(&case["draws"]);
+        let mut t = Twister::seed(seed);
+        let got: Vec<u64> = (0..want.len() as u64)
+            .map(|step| t.below(top - step))
+            .collect();
+        assert_eq!(
+            got,
+            want,
+            "the bounds a subsample of {} rows draws under seed {seed}",
+            top + 1
+        );
+    }
+
+    for case in f["permutation"].as_array().unwrap() {
+        let (seed, n) = (seed_of(case), case["n"].as_u64().unwrap() as usize);
+        assert_eq!(
+            Twister::seed(seed).permutation(n),
+            places(&case["order"]),
+            "permutation({n}) under seed {seed}"
+        );
+    }
+
+    // A subsample against NUMPY's permutation rather than against our own, so that "our
+    // permutation is numpy's" and "our subsample is our permutation's tail" cannot hold
+    // each other up.
+    for case in f["subsample"].as_array().unwrap() {
+        let seed = seed_of(case);
+        let n = case["n"].as_u64().unwrap() as usize;
+        let take = case["take"].as_u64().unwrap() as usize;
+        assert_eq!(
+            Twister::seed(seed).subsample(n, take),
+            places(&case["rows"]),
+            "subsample({n}, {take}) under seed {seed} is not numpy's permutation reversed"
+        );
+    }
+
+    // Two calls off ONE generator. This is what catches a draw that is right in its VALUE
+    // and wrong in how many words it spent: the bounded draws still match, and the
+    // permutation that follows them does not.
+    let c = &f["composed"];
+    let mut t = Twister::seed(seed_of(c));
+    let want = naturals(&c["first"]);
+    let most = c["most"].as_u64().unwrap();
+    let got: Vec<u64> = (0..want.len()).map(|_| t.below(most)).collect();
+    assert_eq!(got, want, "the bounded draws before the permutation");
+    assert_eq!(
+        t.permutation(c["n"].as_u64().unwrap() as usize),
+        places(&c["then"]),
+        "the permutation that follows them left the stream in the wrong place"
+    );
+
+    println!(
+        "stream: {} bounded cases (both sides of 2^32), {} descending, {} permutations, \
+         {} subsamples, all exact",
+        f["bounded"].as_array().unwrap().len(),
+        f["descending"].as_array().unwrap().len(),
+        f["permutation"].as_array().unwrap().len(),
+        f["subsample"].as_array().unwrap().len(),
+    );
 }
 
 #[test]

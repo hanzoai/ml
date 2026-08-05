@@ -27,6 +27,13 @@ legitimate rather than lucky:
   Boosted trees      NOT determinstic at scikit-learn's defaults, and this is
                      the sharpest thing measured here. See DETERMINISM below.
 
+  Shuffled plans     Deterministic GIVEN A SEED, and that is the whole point:
+                     the seed names one walk of numpy's generator, so the rows
+                     held back are a function of the data and the seed. These
+                     and `stream.json` are the only fixtures that consume a
+                     random number at all — everything else is a closed form,
+                     which is why the generator went unpinned for so long.
+
 DETERMINISM — a tree fit is not a function of its data at scikit-learn's defaults.
 
   `min_samples_leaf=1` lets the recursion reach nodes holding two samples. EVERY
@@ -367,6 +374,85 @@ def prepare():
     dump("prepare.json", out)
 
 
+def stream():
+    """numpy's GENERATOR itself, pinned as indices — the thing every other fixture assumes.
+
+    Every splitter case in `prepare` used to be `shuffle=False`, and a sequential plan
+    consumes no random numbers at all. So nothing here held the generator: a bounded draw
+    that took a modulus instead of rejecting, or that consumed one word where numpy
+    consumes two, produced identical fixtures and stayed green. These pin the stream
+    itself, which is what turns "the same folds" into a claim about numpy's bits rather
+    than about our own arithmetic agreeing with itself.
+
+    `RandomState.randint(0, most + 1)` IS the bounded draw this crate calls `below(most)`.
+    Both are numpy's `random_interval`: mask up to the smallest `2^k - 1` covering the
+    bound, draw, reject anything over the bound. The WIDTH is chosen by the bound — one
+    32-bit word up to `most = 2^32 - 1`, a 64-bit pair above it — so both sides of that
+    boundary are recorded here. An implementation carrying only one branch passes on one
+    side and fails on the other, and only a fixture that crosses the boundary can say so.
+    """
+    out = {"bounded": [], "descending": [], "permutation": [], "subsample": []}
+
+    def drawn(seed, most, k):
+        r = np.random.RandomState(seed)
+        return [int(r.randint(0, most + 1, dtype=np.uint64)) for _ in range(k)]
+
+    for seed, most, k in (
+        (0, 9, 12),  # mask 15 over a bound of 9: a quarter of all attempts are rejected
+        (7, 999, 8),
+        (42, 1, 20),  # mask 1: nothing is ever rejected
+        (5, 2, 16),  # mask 3 over 2 — where a modulus and a rejection part company
+        (3, 2**32 - 1, 6),  # the widest bound that still costs ONE word
+        (3, 2**32, 6),  # one more, and numpy spends a PAIR
+        (11, 2**40 - 1, 6),
+        (2, 2**63 + 6, 6),  # a mask spanning the whole 64 bits
+    ):
+        out["bounded"].append(
+            {"seed": seed, "most": most, "draws": drawn(seed, most, k)}
+        )
+
+    # The descending bounds a partial Fisher-Yates asks for, at a size where every one of
+    # them needs the 64-bit branch. This is the exact call sequence `subsample` makes on a
+    # design of 2^32 + 5 rows, which is too large for numpy to permute but not too large
+    # for numpy to answer about one draw at a time.
+    for seed, top, take in ((0, 2**32 + 4, 6), (9, 2**33, 5)):
+        r = np.random.RandomState(seed)
+        out["descending"].append(
+            {
+                "seed": seed,
+                "top": top,
+                "draws": [int(r.randint(0, top - s + 1, dtype=np.uint64)) for s in range(take)],
+            }
+        )
+
+    for seed, n in ((0, 10), (7, 40), (12345, 257), (3, 1000), (SEED, 5)):
+        out["permutation"].append(
+            {"seed": seed, "n": n, "order": np.random.RandomState(seed).permutation(n).tolist()}
+        )
+
+    # A subsample is the LAST `take` entries of numpy's own permutation, reversed. Read off
+    # numpy here rather than off our own permutation, so the two claims — "our permutation
+    # is numpy's" and "our subsample is our permutation's tail" — cannot hold each other up.
+    for seed, n, take in ((9, 1000, 40), (4, 257, 7), (0, 16, 16)):
+        order = np.random.RandomState(seed).permutation(n)
+        out["subsample"].append(
+            {"seed": seed, "n": n, "take": take, "rows": order[n - take :][::-1].tolist()}
+        )
+
+    # Two different calls off ONE generator. This is the case that catches drawing the
+    # right VALUES from the wrong PLACE: an implementation that spent one word too many on
+    # the bounded draws still gets them all right, and then gets the permutation wrong.
+    r = np.random.RandomState(0)
+    out["composed"] = {
+        "seed": 0,
+        "most": 9,
+        "first": [int(r.randint(0, 10, dtype=np.uint64)) for _ in range(5)],
+        "n": 6,
+        "then": r.permutation(6).tolist(),
+    }
+    dump("stream.json", out)
+
+
 def measure():
     """The metrics that matter when one class is rare.
 
@@ -493,3 +579,4 @@ if __name__ == "__main__":
     prepare()
     measure()
     outlier()
+    stream()
