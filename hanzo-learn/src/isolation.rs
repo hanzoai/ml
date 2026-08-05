@@ -256,12 +256,12 @@ impl Config {
             .into_par_iter()
             .map(|k| {
                 let mut rng = Twister::seed(self.seed.wrapping_add(k as u32));
-                // `choose` and not `permutation(n).truncate(sample)`: the subsample is 256
-                // rows whatever `n` is, so drawing all of `n` would make the FIT `O(n)` per
-                // tree in both time and memory — 8 MB and a million swaps per tree at
+                // `subsample` and not `permutation(n).truncate(sample)`: the subsample is
+                // 256 rows whatever `n` is, so drawing all of `n` would make the FIT `O(n)`
+                // per tree in both time and memory — 8 MB and a million swaps per tree at
                 // n = 10⁶, on every core at once. This is what makes the cost claim in the
                 // module docs true rather than aspirational.
-                let mut rows = rng.choose(x.n(), sample);
+                let mut rows = rng.subsample(x.n(), sample);
                 Tree::grow(x, &mut rows, limit, &mut rng)
             })
             .collect();
