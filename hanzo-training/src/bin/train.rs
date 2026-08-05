@@ -183,12 +183,17 @@ async fn validate_command(config_path: &PathBuf) -> Result<()> {
     println!("  Learning rate: {}", config.training.learning_rate);
     println!("  Device: {}", config.device());
 
-    if config.is_lora_enabled() {
-        if let Some(lora) = &config.training.lora {
-            println!("  LoRA: enabled (r={}, α={})", lora.r, lora.alpha);
-        }
-    } else {
-        println!("  LoRA: disabled");
+    // `LoRAConfig` is parsed and validated, but nothing consumes it: there is no
+    // adapter layer in this crate or in hanzo-nn — `git grep -i lora` finds only
+    // this config, and DeepSeek's low-rank *attention* projections, which are an
+    // architecture, not a fine-tuning adapter. So report the config as read, and
+    // do not call it enabled.
+    match &config.training.lora {
+        Some(lora) if lora.enabled => println!(
+            "  LoRA: configured (r={}, α={}) — NOT APPLIED: no adapter is implemented",
+            lora.r, lora.alpha
+        ),
+        _ => println!("  LoRA: not configured"),
     }
 
     Ok(())

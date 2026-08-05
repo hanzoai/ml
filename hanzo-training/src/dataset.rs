@@ -22,12 +22,17 @@ pub struct TrainingSample {
 
 impl TrainingSample {
     /// Convert input text to tensor (simplified tokenization)
-    pub fn input_ids(&self, device: &hanzo_ml::Device) -> crate::Result<hanzo_ml::Tensor> {
-        // This is a simplified implementation - in practice you'd use a proper tokenizer
-        let tokens: Vec<u32> = self.input.chars().map(|c| c as u32).collect();
-
-        hanzo_ml::Tensor::new(tokens, device)
-            .map_err(|e| anyhow::anyhow!("Failed to create input tensor: {}", e))
+    /// Refuses: this crate has no tokenizer.
+    ///
+    /// This returned `self.input.chars().map(|c| c as u32)` — Unicode code points
+    /// standing in for token ids. Those are not the ids any model's embedding
+    /// table was trained against, and for a 32k-vocab model most of them are out
+    /// of range, so the tensor was wrong rather than approximate. The
+    /// `tokenizers` crate is already a workspace dependency (used by
+    /// `hanzo-datasets` and the wasm examples); a wired dataset loads the model's
+    /// own tokenizer.json through it.
+    pub fn input_ids(&self, _device: &hanzo_ml::Device) -> crate::Result<hanzo_ml::Tensor> {
+        crate::model::unwired("dataset tokenization")
     }
 }
 

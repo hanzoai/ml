@@ -60,17 +60,11 @@ impl Benchmark for PerplexityBenchmark {
         &self.name
     }
 
+    /// Refuses: [`Benchmark::run`] takes no model and no dataset, so there is
+    /// nothing here to compute a perplexity over. It previously reported the
+    /// constant 5.2 for every model and every corpus.
     fn run(&self) -> Result<BenchmarkResult> {
-        // Simplified perplexity calculation
-        let perplexity = 5.2; // Placeholder
-        let mut metrics = HashMap::new();
-        metrics.insert("perplexity".to_string(), perplexity);
-
-        Ok(BenchmarkResult {
-            score: 1.0 / perplexity, // Lower perplexity is better
-            metrics,
-            details: None,
-        })
+        crate::model::unwired("the perplexity benchmark")
     }
 
     fn description(&self) -> &str {
@@ -102,17 +96,10 @@ impl Benchmark for AccuracyBenchmark {
         &self.name
     }
 
+    /// Refuses, for the same reason as [`PerplexityBenchmark::run`]: no model and
+    /// no dataset reach it. It previously reported the constant 0.85.
     fn run(&self) -> Result<BenchmarkResult> {
-        // Simplified accuracy calculation
-        let accuracy = 0.85; // Placeholder
-        let mut metrics = HashMap::new();
-        metrics.insert("accuracy".to_string(), accuracy);
-
-        Ok(BenchmarkResult {
-            score: accuracy,
-            metrics,
-            details: None,
-        })
+        crate::model::unwired("the accuracy benchmark")
     }
 
     fn description(&self) -> &str {
