@@ -122,21 +122,39 @@ enum PostTransform {
 }
 
 impl PostTransform {
+    /// The four transforms, under the names a file spells them with. [`Self::of`] and
+    /// [`Self::spelling`] read the SAME table, so a name cannot drift from its meaning.
+    const NAMES: [(&'static str, Self); 4] = [
+        ("NONE", Self::None),
+        ("SOFTMAX", Self::Softmax),
+        ("SOFTMAX_ZERO", Self::SoftmaxZero),
+        ("LOGISTIC", Self::Logistic),
+    ];
+
     fn of(node: &onnx::NodeProto) -> Result<Self> {
-        match get_attr_opt::<str>(node, "post_transform")?.unwrap_or("NONE") {
-            "NONE" => Ok(Self::None),
-            "SOFTMAX" => Ok(Self::Softmax),
-            "SOFTMAX_ZERO" => Ok(Self::SoftmaxZero),
-            "LOGISTIC" => Ok(Self::Logistic),
+        let named = get_attr_opt::<str>(node, "post_transform")?.unwrap_or("NONE");
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == named)
+            .map(|(_, transform)| *transform)
             // PROBIT is the inverse normal CDF, which needs an erf inverse this crate
             // does not carry. Named rather than approximated: a wrong probability is
             // worse than a refused one.
-            other => bail!(
-                "unsupported post_transform {other:?} in {} ({})",
-                node.op_type,
-                node.name
-            ),
-        }
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "unsupported post_transform {named:?} in {} ({})",
+                    node.op_type, node.name
+                ))
+            })
+    }
+
+    /// How a file spells this transform, for a message that has to name it.
+    fn spelling(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, transform)| *transform == self)
+            .map(|(name, _)| *name)
+            .expect("every transform is named in NAMES")
     }
 
     fn apply(self, row: &mut [f32]) {
@@ -1000,12 +1018,28 @@ impl Machine {
                 support.len()
             );
         }
+        let vectors = support.len() / features;
+        let coefficients = get_attr::<[f32]>(node, "coefficients")?;
+        // Every support vector carries at least one dual coefficient — the regressor one
+        // each, the classifier one per decision plane — so a machine with fewer
+        // coefficients than vectors is not a small model, it is a model whose scoring
+        // loop would read past the array it was given. onnxruntime refuses the same file:
+        // "coefficients size (1) must be >= n_supports (10)".
+        if coefficients.len() < vectors {
+            bail!(
+                "{} in {}: {} coefficients for {vectors} support vectors; a machine has at \
+                 least one per vector",
+                node.op_type,
+                node.name,
+                coefficients.len()
+            );
+        }
         Ok(Self {
             kernel: Kernel::of(node)?,
-            vectors: support.len() / features,
+            vectors,
             support,
             features,
-            coefficients: get_attr::<[f32]>(node, "coefficients")?.to_vec(),
+            coefficients: coefficients.to_vec(),
             rho: get_attr_opt::<[f32]>(node, "rho")?.unwrap_or(&[]).to_vec(),
         })
     }
@@ -1083,6 +1117,12 @@ fn one_against_one(m: &Machine, kernels: &[f32], per_class: &[usize]) -> Result<
 // ---------------------------------------------------------------------------------
 // The operator table
 // ---------------------------------------------------------------------------------
+
+/// The widest row `FeatureVectorizer` will build — 16 MiB of f32 per row.
+///
+/// Its output width is the sum of an attribute, not of anything the inputs carry, so it is
+/// the one width in this domain an untrusted file can name freely.
+const MAX_WIDTH: usize = 1 << 22;
 
 /// Evaluate one `ai.onnx.ml` node. Inputs arrive resolved and positional; outputs come
 /// back positional, for the caller to bind to `node.output`.
@@ -1296,6 +1336,23 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
             };
             let ensemble = Ensemble::build(node, width, "class", fold)?;
             let post = PostTransform::of(node)?;
+            // A softmax over ONE column is 1.0 whatever the score is, so the widening
+            // below would report [0, 1] for every row and invert the label of any model
+            // whose single score is negative. onnxruntime does not answer this file
+            // either: MEASURED, it ignores the transform and reports [1 - s, s], the same
+            // as post_transform NONE. Refused by name for the reason PROBIT is — a wrong
+            // probability is worse than a refused one. Every mainstream exporter writes
+            // LOGISTIC here, or two columns.
+            if binary && matches!(post, PostTransform::Softmax | PostTransform::SoftmaxZero) {
+                bail!(
+                    "TreeEnsembleClassifier in {} has two class labels over ONE score column \
+                     with post_transform {}, which is 1.0 for every row. Re-export with \
+                     post_transform LOGISTIC, which is what a binary tree ensemble means, or \
+                     with one score column per class.",
+                    node.name,
+                    post.spelling()
+                );
+            }
             // The classifier has no aggregate_function: the specification fixes it to a
             // sum over trees, which is what every exporter relies on.
             let scores = ensemble.score(&m, post, Aggregate::Sum)?;
@@ -1373,11 +1430,23 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
                 );
             }
             let machine = Machine::of(node, m.features)?;
-            let per_class: Vec<usize> = get_attr_opt::<[i64]>(node, "vectors_per_class")?
-                .unwrap_or(&[])
-                .iter()
-                .map(|n| *n as usize)
-                .collect();
+            // Read BEFORE the cast to `usize`, which is why this is a loop and not a map:
+            // `-1 as usize` is 2^64 - 1, and a count of 2^64 - 1 beside a count of 5 sums
+            // — wrapping — to exactly the 4 support vectors the file also declares, so the
+            // equality check below would PASS and `one_against_one` would then index the
+            // machine off its own arrays. onnxruntime refuses at the same point:
+            // "vectors_per_class[0] must be non-negative. Got -1".
+            let counts = get_attr_opt::<[i64]>(node, "vectors_per_class")?.unwrap_or(&[]);
+            let mut per_class: Vec<usize> = Vec::with_capacity(counts.len());
+            for &n in counts {
+                if n < 0 {
+                    bail!(
+                        "SVMClassifier in {}: vectors_per_class declares {n} vectors for a class",
+                        node.name
+                    );
+                }
+                per_class.push(n as usize);
+            }
             let post = PostTransform::of(node)?;
 
             // With no support vectors the model is linear and `coefficients` holds one
@@ -1389,12 +1458,24 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
                 }
                 return classified(&labels, scores, m.rows, x.device());
             }
-            if per_class.iter().sum::<usize>() != machine.vectors {
+            // `checked_add`, because the sum of counts a FILE chose is not a number this
+            // process picked: two counts near `usize::MAX` wrap to a small total, and a
+            // small total is what the check below is looking for.
+            let counted = per_class
+                .iter()
+                .try_fold(0usize, |total, n| total.checked_add(*n))
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "SVMClassifier in {}: vectors_per_class sums past what a machine can \
+                         address",
+                        node.name
+                    ))
+                })?;
+            if counted != machine.vectors {
                 bail!(
-                    "SVMClassifier in {}: vectors_per_class sums to {} but there are {} \
+                    "SVMClassifier in {}: vectors_per_class sums to {counted} but there are {} \
                      support vectors",
                     node.name,
-                    per_class.iter().sum::<usize>(),
                     machine.vectors
                 );
             }
@@ -1485,17 +1566,21 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
             } else {
                 *out.last_mut().expect("rank at least 2") = wanted.len();
             }
+            // A position is an index, not an offset: there is no counting from the end
+            // here. onnxruntime refuses a negative one — "index is out of range: Y[0] (-1)
+            // must be in [0, 3)" — and wrapping it around would answer a DIFFERENT
+            // question than the file asked, silently.
             let at: Vec<usize> = wanted
                 .iter()
                 .map(|&i| {
-                    let k = if i < 0 { i + last as i64 } else { i };
-                    if k < 0 || k as usize >= last {
+                    if i < 0 || i as usize >= last {
                         bail!(
-                            "ArrayFeatureExtractor in {} selects position {i} of {last}",
+                            "ArrayFeatureExtractor in {} selects position {i}, which is not in \
+                             [0, {last})",
                             node.name
                         )
                     }
-                    Ok(k as usize)
+                    Ok(i as usize)
                 })
                 .collect::<Result<_>>()?;
             let picked: Vec<Option<usize>> = (0..dims.iter().product::<usize>() / last.max(1))
@@ -1516,10 +1601,17 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
         // declares: measured, an input narrower than its declared size is padded with
         // zeros, and a wider one is truncated.
         "FeatureVectorizer" => {
-            let widths: Vec<usize> = get_attr::<[i64]>(node, "inputdimensions")?
-                .iter()
-                .map(|n| (*n).max(0) as usize)
-                .collect();
+            let declared = get_attr::<[i64]>(node, "inputdimensions")?;
+            let mut widths: Vec<usize> = Vec::with_capacity(declared.len());
+            for &n in declared {
+                if n < 0 {
+                    bail!(
+                        "FeatureVectorizer in {}: inputdimensions declares a width of {n}",
+                        node.name
+                    );
+                }
+                widths.push(n as usize);
+            }
             if widths.len() != inputs.len() {
                 bail!(
                     "FeatureVectorizer in {} declares {} input widths for {} inputs",
@@ -1542,8 +1634,31 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
                     );
                 }
             }
-            let total: usize = widths.iter().sum();
-            let mut out = vec![0f32; rows * total];
+            // The output width comes from an ATTRIBUTE, so it is a number the file chose
+            // rather than one the data implies: a 200-byte node can name a gibibyte, and
+            // the zero-padding above means it does not need any input to back it up. The
+            // bound is orders of magnitude above the widest fitted pipeline — a
+            // one-hot-encoded text feature space reaches hundreds of thousands of columns —
+            // and the multiplication by the row count is checked for the same reason.
+            let total: usize = widths
+                .iter()
+                .try_fold(0usize, |total, w| total.checked_add(*w))
+                .filter(|total| *total <= MAX_WIDTH)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "FeatureVectorizer in {}: inputdimensions asks for more than \
+                         {MAX_WIDTH} output columns",
+                        node.name
+                    ))
+                })?;
+            let cells = rows.checked_mul(total).ok_or_else(|| {
+                Error::Msg(format!(
+                    "FeatureVectorizer in {}: {rows} rows of {total} columns is more than can be \
+                     addressed",
+                    node.name
+                ))
+            })?;
+            let mut out = vec![0f32; cells];
             for r in 0..rows {
                 let mut at = 0usize;
                 for (p, &want) in parts.iter().zip(widths.iter()) {
