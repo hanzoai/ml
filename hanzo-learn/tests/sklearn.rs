@@ -734,19 +734,38 @@ fn the_splitters_match_scikit_learn_index_for_index() {
     let f = fixture("prepare.json");
     let n = f["split"]["n"].as_u64().unwrap() as usize;
 
+    // The seeds the shuffled cases were recorded under. Two, because one seed cannot tell a
+    // generator that IS numpy's from one that happens to agree on a single stream.
+    const SEEDS: [u32; 2] = [7, 11];
+
     for share in ["0.25", "0.1", "0.333"] {
         let case = &f["split"][format!("sequential_{share}")];
         let s = split::train_test(n, share.parse().unwrap(), split::Order::Sequential).unwrap();
-        let want_train: Vec<usize> = integers(&case["train"])
-            .iter()
-            .map(|v| *v as usize)
-            .collect();
-        let want_test: Vec<usize> = integers(&case["test"])
-            .iter()
-            .map(|v| *v as usize)
-            .collect();
-        assert_eq!(s.train(), want_train.as_slice(), "train_test {share} train");
-        assert_eq!(s.test(), want_test.as_slice(), "train_test {share} test");
+        assert_eq!(
+            s.train(),
+            places(&case["train"]),
+            "train_test {share} train"
+        );
+        assert_eq!(s.test(), places(&case["test"]), "train_test {share} test");
+
+        for seed in SEEDS {
+            let case = &f["split"][format!("shuffled_{share}_{seed}")];
+            let s =
+                split::train_test(n, share.parse().unwrap(), split::Order::Shuffled(seed)).unwrap();
+            // sklearn hands these back in PERMUTATION order; a plan here is a set of rows,
+            // ascending, which `split` documents. Sorting the oracle's copy is exactly that
+            // normalisation — it reorders rows and cannot turn one set of rows into another,
+            // so the claim "the same rows were held back" is untouched by it.
+            let (mut want_train, mut want_test) = (places(&case["train"]), places(&case["test"]));
+            want_train.sort_unstable();
+            want_test.sort_unstable();
+            assert_eq!(
+                s.train(),
+                want_train,
+                "train_test {share} seed {seed} train"
+            );
+            assert_eq!(s.test(), want_test, "train_test {share} seed {seed} test");
+        }
     }
 
     for k in [3usize, 5, 7] {
@@ -754,10 +773,30 @@ fn the_splitters_match_scikit_learn_index_for_index() {
         let got = split::folds(n, k, split::Order::Sequential).unwrap();
         assert_eq!(got.len(), want.len(), "fold count");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
-            let wt: Vec<usize> = integers(&w["test"]).iter().map(|v| *v as usize).collect();
-            let wr: Vec<usize> = integers(&w["train"]).iter().map(|v| *v as usize).collect();
-            assert_eq!(g.test(), wt.as_slice(), "KFold k={k} fold {i} test");
-            assert_eq!(g.train(), wr.as_slice(), "KFold k={k} fold {i} train");
+            assert_eq!(g.test(), places(&w["test"]), "KFold k={k} fold {i} test");
+            assert_eq!(g.train(), places(&w["train"]), "KFold k={k} fold {i} train");
+        }
+
+        for seed in SEEDS {
+            let want = f["folds"][format!("shuffled_{k}_{seed}")]
+                .as_array()
+                .unwrap();
+            let got = split::folds(n, k, split::Order::Shuffled(seed)).unwrap();
+            assert_eq!(got.len(), want.len(), "shuffled fold count");
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                // KFold masks its folds back onto 0..n, so sklearn's own answer is already
+                // ascending on both sides. Exact, with nothing normalised away.
+                assert_eq!(
+                    g.test(),
+                    places(&w["test"]),
+                    "KFold k={k} seed={seed} fold {i} test"
+                );
+                assert_eq!(
+                    g.train(),
+                    places(&w["train"]),
+                    "KFold k={k} seed={seed} fold {i} train"
+                );
+            }
         }
     }
 
@@ -774,16 +813,42 @@ fn the_splitters_match_scikit_learn_index_for_index() {
         let got = split::stratified(&classes, k, split::Order::Sequential).unwrap();
         assert_eq!(got.len(), want.len(), "stratified fold count");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
-            let wt: Vec<usize> = integers(&w["test"]).iter().map(|v| *v as usize).collect();
             assert_eq!(
                 g.test(),
-                wt.as_slice(),
+                places(&w["test"]),
                 "StratifiedKFold k={k} fold {i} test — a different fold is a different \
                  experiment, so this is exact"
             );
         }
+
+        // The sharpest case here. A stratified shuffle draws once PER CLASS off ONE
+        // generator: the second class's shuffle continues the stream the first left off.
+        // Re-seeding per class is still reproducible and still balanced, and disagrees
+        // with scikit-learn on every fold.
+        for seed in SEEDS {
+            let want = f["stratified"]["folds"][format!("shuffled_{k}_{seed}")]
+                .as_array()
+                .unwrap();
+            let got = split::stratified(&classes, k, split::Order::Shuffled(seed)).unwrap();
+            assert_eq!(got.len(), want.len(), "stratified shuffled fold count");
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert_eq!(
+                    g.test(),
+                    places(&w["test"]),
+                    "StratifiedKFold k={k} seed={seed} fold {i} test"
+                );
+                assert_eq!(
+                    g.train(),
+                    places(&w["train"]),
+                    "StratifiedKFold k={k} seed={seed} fold {i} train"
+                );
+            }
+        }
     }
-    println!("splits: train_test, KFold(3,5,7), StratifiedKFold(3,5) all exact");
+    println!(
+        "splits: train_test, KFold(3,5,7), StratifiedKFold(3,5) exact, sequential and \
+         shuffled under seeds {SEEDS:?}"
+    );
 }
 
 #[test]

@@ -97,6 +97,11 @@ HERE = pathlib.Path(__file__).parent
 # so the data is reproducible from this file alone.
 SEED = 20260804
 
+# The seeds every SHUFFLED case is recorded under. Two of them, because one seed cannot
+# distinguish a generator that is numpy's from one that happens to agree on a single
+# stream — and the seed is the only input a shuffled plan has.
+SEEDS = (7, 11)
+
 
 def design(rng, n, p):
     """A design matrix from a continuous distribution.
@@ -346,16 +351,40 @@ def prepare():
     # train_test_split and the fold generators, pinned as INDICES. A
     # distributional check would pass for any shuffle; only the indices prove
     # the same rows were held back.
+    #
+    # The SHUFFLED cases carry more than the sequential ones, not less. A sequential plan
+    # is arithmetic on 0..n and never draws a random number, so on its own it says nothing
+    # about whether this crate's generator is numpy's. A shuffled plan is a whole
+    # permutation of numpy's stream read back as row indices, and it is the end-to-end
+    # form of what `stream.json` pins draw by draw.
     out["split"] = {"n": n}
     for share in (0.25, 0.1, 0.333):
         tr, te = train_test_split(np.arange(n), test_size=share, shuffle=False)
         out["split"][f"sequential_{share}"] = {"train": tr.tolist(), "test": te.tolist()}
+        for s in SEEDS:
+            # Recorded exactly as sklearn hands them over, which is in PERMUTATION order.
+            # hanzo-learn returns a plan ascending — a plan is a set of rows and not also a
+            # shuffle of them — so the assertion sorts these, and says that it does.
+            tr, te = train_test_split(
+                np.arange(n), test_size=share, shuffle=True, random_state=s
+            )
+            out["split"][f"shuffled_{share}_{s}"] = {
+                "train": tr.tolist(),
+                "test": te.tolist(),
+            }
     out["folds"] = {}
     for k in (3, 5, 7):
         out["folds"][f"sequential_{k}"] = [
             {"train": tr.tolist(), "test": te.tolist()}
             for tr, te in KFold(n_splits=k, shuffle=False).split(np.arange(n))
         ]
+        for s in SEEDS:
+            out["folds"][f"shuffled_{k}_{s}"] = [
+                {"train": tr.tolist(), "test": te.tolist()}
+                for tr, te in KFold(n_splits=k, shuffle=True, random_state=s).split(
+                    np.arange(n)
+                )
+            ]
     # Stratified on a deliberately imbalanced label — 8% positive, which is the
     # shape risk work actually has.
     y = (rng.random(n) < 0.08).astype(int)
@@ -371,6 +400,18 @@ def prepare():
             for k in (3, 5)
         },
     }
+    # The sharpest case in this file. A stratified shuffle draws once PER CLASS, and
+    # sklearn walks ONE generator across the classes: the second class's shuffle continues
+    # the stream the first one left off. An implementation that re-seeded per class is
+    # still reproducible and still balanced, and disagrees here on every fold.
+    for k in (3, 5):
+        for s in SEEDS:
+            out["stratified"]["folds"][f"shuffled_{k}_{s}"] = [
+                {"train": tr.tolist(), "test": te.tolist()}
+                for tr, te in StratifiedKFold(
+                    n_splits=k, shuffle=True, random_state=s
+                ).split(np.zeros((n, 1)), y)
+            ]
     dump("prepare.json", out)
 
 
