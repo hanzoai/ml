@@ -133,6 +133,46 @@ impl Twister {
         self.shuffle(&mut order);
         order
     }
+
+    /// `take` distinct values from `0..n`, in `take` draws and `O(take)` space.
+    ///
+    /// # Why this is not `permutation(n)` truncated, and why it can exist at all
+    ///
+    /// Subsampling 256 rows out of 10⁶ by shuffling all 10⁶ costs a million swaps and eight
+    /// megabytes to throw 999,744 of them away. Across a hundred trees on every core that is
+    /// the difference between a forest whose fit is `O(trees · sample)` and one that only
+    /// claims to be.
+    ///
+    /// It works because [`Twister::shuffle`] sweeps from the TOP: step one settles position
+    /// `n-1`, step two settles `n-2`, and a position is never touched again once settled. So
+    /// the LAST `take` entries of the shuffle are fully determined after `take` draws, while
+    /// the FIRST `take` are not determined until the sweep ends — which is why this returns
+    /// the tail and a truncation of the head could not. The positions it never reaches are
+    /// never materialised; only the ones a swap actually touched are remembered.
+    ///
+    /// Identical draws to `permutation(n)`, so the two agree: this is the tail of that
+    /// permutation, reversed, and `a_partial_choice_is_the_tail_of_the_whole_shuffle` pins it.
+    pub fn choose(&mut self, n: usize, take: usize) -> Vec<usize> {
+        let take = take.min(n);
+        // Only positions a swap disturbed. Everything else still holds its own index.
+        let mut moved: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::with_capacity(take * 2);
+        let mut out = Vec::with_capacity(take);
+        for step in 0..take {
+            let i = n - 1 - step;
+            if i == 0 {
+                out.push(*moved.get(&0).unwrap_or(&0));
+                break;
+            }
+            let j = self.below(i as u32) as usize;
+            let vi = *moved.get(&i).unwrap_or(&i);
+            let vj = *moved.get(&j).unwrap_or(&j);
+            moved.insert(i, vj);
+            moved.insert(j, vi);
+            out.push(vj);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +252,41 @@ mod tests {
             let v = t.next_real();
             assert!((0.0..1.0).contains(&v), "{v}");
         }
+    }
+
+    /// The partial choice IS the tail of the whole shuffle, which is what makes it a
+    /// uniform subsample rather than merely a cheap one.
+    #[test]
+    fn a_partial_choice_is_the_tail_of_the_whole_shuffle() {
+        for n in [1usize, 2, 5, 40, 1000] {
+            let whole = Twister::seed(9).permutation(n);
+            for take in [1usize, 2, 7, 40] {
+                if take > n {
+                    continue;
+                }
+                let part = Twister::seed(9).choose(n, take);
+                let want: Vec<usize> = whole[n - take..].iter().rev().cloned().collect();
+                assert_eq!(part, want, "n={n} take={take}");
+            }
+            // Asking for everything reproduces the whole shuffle, reversed.
+            let all = Twister::seed(9).choose(n, n);
+            let want: Vec<usize> = whole.iter().rev().cloned().collect();
+            assert_eq!(all, want, "n={n} take=n");
+        }
+    }
+
+    #[test]
+    fn a_partial_choice_is_distinct_and_in_range() {
+        let mut t = Twister::seed(4);
+        let picked = t.choose(1_000_000, 256);
+        assert_eq!(picked.len(), 256);
+        assert!(picked.iter().all(|&v| v < 1_000_000));
+        let mut sorted = picked.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 256, "a choice repeated a row");
+        // Clamped, not an error, and not a panic on the boundary.
+        assert_eq!(t.choose(3, 10).len(), 3);
     }
 
     #[test]

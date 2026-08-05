@@ -17,9 +17,13 @@
 //! frontier's insert rate) rather than only on the shape.
 //!
 //! Run with:
-//!     cargo bench -p hanzo-learn
+//!     cargo bench -p hanzo-learn --bench learn
 //! or, for a number in a hurry:
-//!     cargo bench -p hanzo-learn -- --warm-up-time 1 --measurement-time 3
+//!     cargo bench -p hanzo-learn --bench learn -- --warm-up-time 1 --measurement-time 3
+//!
+//! `--bench learn` is not optional when passing those flags: a bare `cargo bench` also runs
+//! the LIB target's built-in harness, which does not understand criterion's options and
+//! fails the whole run with `Unrecognized option: 'warm-up-time'`.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::hint::black_box;
@@ -172,14 +176,22 @@ fn splitters(c: &mut Criterion) {
             .collect();
         g.throughput(Throughput::Elements(n as u64));
         g.bench_function(format!("train_test/{name}"), |b| {
-            b.iter(|| black_box(split::train_test(black_box(n), 0.25, split::Order::Shuffled(0))))
+            b.iter(|| {
+                black_box(split::train_test(
+                    black_box(n),
+                    0.25,
+                    split::Order::Shuffled(0),
+                ))
+            })
         });
         g.bench_function(format!("kfold_5/{name}"), |b| {
             b.iter(|| black_box(split::folds(black_box(n), 5, split::Order::Shuffled(0)).unwrap()))
         });
         g.bench_function(format!("stratified_5/{name}"), |b| {
             b.iter(|| {
-                black_box(split::stratified(black_box(&classes), 5, split::Order::Shuffled(0)).unwrap())
+                black_box(
+                    split::stratified(black_box(&classes), 5, split::Order::Shuffled(0)).unwrap(),
+                )
             })
         });
     }
@@ -214,7 +226,9 @@ fn metrics(c: &mut Criterion) {
             b.iter(|| black_box(black_box(&curve).precision_recall()))
         });
         g.bench_function(format!("log_loss/{name}"), |b| {
-            b.iter(|| black_box(metric::log_loss(black_box(&truth), black_box(&probability)).unwrap()))
+            b.iter(|| {
+                black_box(metric::log_loss(black_box(&truth), black_box(&probability)).unwrap())
+            })
         });
     }
     g.finish();

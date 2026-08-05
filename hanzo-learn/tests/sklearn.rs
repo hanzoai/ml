@@ -68,7 +68,14 @@ fn reals(v: &Value) -> Vec<f64> {
 }
 
 fn rows(v: &Value) -> Matrix {
-    Matrix::rows(&v.as_array().expect("array").iter().map(reals).collect::<Vec<_>>()).unwrap()
+    Matrix::rows(
+        &v.as_array()
+            .expect("array")
+            .iter()
+            .map(reals)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
 }
 
 /// Largest absolute deviation, or a panic naming the worst position.
@@ -107,7 +114,8 @@ fn least_squares_matches_scikit_learn() {
     let data = Samples::new(x, y).unwrap();
     println!(
         "oracle {} | cond(X) = {:.4}",
-        f["oracle"]["sklearn"], f["cond"].as_f64().unwrap()
+        f["oracle"]["sklearn"],
+        f["cond"].as_f64().unwrap()
     );
 
     for (label, config) in [
@@ -193,7 +201,10 @@ fn logistic_regression_matches_scikit_learn() {
             .into_iter()
             .map(|v| v as i64)
             .collect();
-        assert_eq!(got, sklearn, "{label}: predicted classes must match exactly");
+        assert_eq!(
+            got, sklearn,
+            "{label}: predicted classes must match exactly"
+        );
 
         println!(
             "  C={c:<6} coefficients {coef:.3e}  intercept {inter:.3e}  probabilities {proba:.3e}  \
@@ -261,7 +272,10 @@ fn boosted_trees_match_scikit_learn_node_for_node() {
                 let is_leaf = left[i] < 0.0;
                 match *node {
                     tree::Node::Leaf { value: v } => {
-                        assert!(is_leaf, "{label} round {r} node {i}: ours leaf, sklearn split");
+                        assert!(
+                            is_leaf,
+                            "{label} round {r} node {i}: ours leaf, sklearn split"
+                        );
                         let d = (v - value[i]).abs();
                         assert!(
                             d <= LEAF_TOLERANCE,
@@ -276,7 +290,10 @@ fn boosted_trees_match_scikit_learn_node_for_node() {
                         left: l,
                         right: rt,
                     } => {
-                        assert!(!is_leaf, "{label} round {r} node {i}: ours split, sklearn leaf");
+                        assert!(
+                            !is_leaf,
+                            "{label} round {r} node {i}: ours split, sklearn leaf"
+                        );
                         assert_eq!(
                             fe as f64, feature[i],
                             "{label} round {r} node {i}: split feature"
@@ -286,7 +303,10 @@ fn boosted_trees_match_scikit_learn_node_for_node() {
                             "{label} round {r} node {i}: threshold must be bit-identical"
                         );
                         assert_eq!(l as f64, left[i], "{label} round {r} node {i}: left child");
-                        assert_eq!(rt as f64, right[i], "{label} round {r} node {i}: right child");
+                        assert_eq!(
+                            rt as f64, right[i],
+                            "{label} round {r} node {i}: right child"
+                        );
                     }
                 }
             }
@@ -426,13 +446,15 @@ fn integers(v: &Value) -> Vec<i64> {
 }
 
 fn flat(m: &Matrix) -> Vec<f64> {
-    (0..m.n())
-        .flat_map(|i| m.row(i).to_vec())
-        .collect()
+    (0..m.n()).flat_map(|i| m.row(i).to_vec()).collect()
 }
 
 fn flat_fixture(v: &Value) -> Vec<f64> {
-    v.as_array().expect("array").iter().flat_map(|r| reals(r)).collect()
+    v.as_array()
+        .expect("array")
+        .iter()
+        .flat_map(|r| reals(r))
+        .collect()
 }
 
 #[test]
@@ -442,12 +464,27 @@ fn the_scalers_match_scikit_learn() {
     let x_test = rows(&f["x_test"]);
 
     let s = scale::Standard::fit(&x);
-    let mean = agree("standard mean", s.centre(), &reals(&f["standard"]["mean"]), MOMENT_TOLERANCE);
-    let var = agree("standard var", s.variance(), &reals(&f["standard"]["var"]), MOMENT_TOLERANCE);
+    let mean = agree(
+        "standard mean",
+        s.centre(),
+        &reals(&f["standard"]["mean"]),
+        MOMENT_TOLERANCE,
+    );
+    let var = agree(
+        "standard var",
+        s.variance(),
+        &reals(&f["standard"]["var"]),
+        MOMENT_TOLERANCE,
+    );
     // sklearn's scale_ is 1.0 for a zero-variance column, which is the convention
     // `scale::Standard` documents; this asserts we picked THEIR convention and not merely
     // a defensible one.
-    let sc = agree("standard scale", s.scale(), &reals(&f["standard"]["scale"]), MOMENT_TOLERANCE);
+    let sc = agree(
+        "standard scale",
+        s.scale(),
+        &reals(&f["standard"]["scale"]),
+        MOMENT_TOLERANCE,
+    );
     // The tolerance on the TRANSFORM is derived, not chosen. `apply` divides by scale_, so
     // whatever the two means disagree by is amplified by 1/min(scale_). This fixture has a
     // column deliberately scaled to 1e-2, so the bound is ~100x the bound on the mean —
@@ -591,8 +628,14 @@ fn the_splitters_match_scikit_learn_index_for_index() {
     for share in ["0.25", "0.1", "0.333"] {
         let case = &f["split"][format!("sequential_{share}")];
         let s = split::train_test(n, share.parse().unwrap(), split::Order::Sequential).unwrap();
-        let want_train: Vec<usize> = integers(&case["train"]).iter().map(|v| *v as usize).collect();
-        let want_test: Vec<usize> = integers(&case["test"]).iter().map(|v| *v as usize).collect();
+        let want_train: Vec<usize> = integers(&case["train"])
+            .iter()
+            .map(|v| *v as usize)
+            .collect();
+        let want_test: Vec<usize> = integers(&case["test"])
+            .iter()
+            .map(|v| *v as usize)
+            .collect();
         assert_eq!(s.train(), want_train.as_slice(), "train_test {share} train");
         assert_eq!(s.test(), want_test.as_slice(), "train_test {share} test");
     }
@@ -644,7 +687,12 @@ fn the_imbalanced_metrics_match_scikit_learn() {
     // ROC AUC is a trapezoid sum and average precision a weighted sum, so both reach
     // sklearn through numpy's pairwise reduction: ULPS, not EXACT. The COUNTS underneath
     // them are exact, which is what the curve assertions below check.
-    let auc = agree_ulp("roc_auc", &[curve.roc_auc()], &[f["roc_auc"].as_f64().unwrap()], ULPS);
+    let auc = agree_ulp(
+        "roc_auc",
+        &[curve.roc_auc()],
+        &[f["roc_auc"].as_f64().unwrap()],
+        ULPS,
+    );
     let ap = agree_ulp(
         "average_precision — the metric that drifts when ties are handled as a trapezoid \
          instead of as a step",
@@ -672,7 +720,10 @@ fn the_imbalanced_metrics_match_scikit_learn() {
         (*want_p.last().unwrap(), *want_r.last().unwrap()),
         "the flag-nothing endpoint is ours at index 0 and sklearn's last"
     );
-    assert!(thresholds[0].is_infinite(), "our endpoint threshold is +inf");
+    assert!(
+        thresholds[0].is_infinite(),
+        "our endpoint threshold is +inf"
+    );
     let mine_p: Vec<f64> = precision[1..].iter().rev().cloned().collect();
     let mine_r: Vec<f64> = recall[1..].iter().rev().cloned().collect();
     let mine_t: Vec<f64> = thresholds[1..].iter().rev().cloned().collect();
@@ -700,7 +751,8 @@ fn the_imbalanced_metrics_match_scikit_learn() {
     );
 
     // Confusion at a threshold, in sklearn's own [[tn, fp], [fn, tp]] order.
-    for t in ["-0.5", "0", "0.2", "0.5"] {
+    // Keys exactly as `str(float)` writes them in the generator: "0.0", not "0".
+    for t in ["-0.5", "0.0", "0.2", "0.5"] {
         let want = integers(&f["confusion"][t]);
         let at = curve.at(t.parse().unwrap());
         let [tn, fp, fn_, tp] = at.matrix();
@@ -758,7 +810,12 @@ fn the_local_outlier_factor_matches_scikit_learn_exactly() {
         // The k-distance above is EXACT: a sqrt of a sum over p terms, in the same order.
         // Everything below it is a MEAN over the k neighbours, which is where numpy's
         // pairwise reduction parts company with an index-order walk — so these are in ulps.
-        let lrd = agree_ulp(&format!("lof k={k} lrd"), l.density(), &reals(&case["lrd"]), ULPS);
+        let lrd = agree_ulp(
+            &format!("lof k={k} lrd"),
+            l.density(),
+            &reals(&case["lrd"]),
+            ULPS,
+        );
         let nof = agree_ulp(
             &format!("lof k={k} negative_outlier_factor_"),
             l.factor(),
@@ -818,7 +875,10 @@ fn the_isolation_score_matches_scikit_learn_over_its_own_trees() {
     let max_samples = f["forest"]["max_samples"].as_u64().unwrap();
     let denominator = trees.len() as f64 * isolation::average_path(max_samples);
 
-    for (which, key) in [("test", "score_samples_test"), ("train", "score_samples_train")] {
+    for (which, key) in [
+        ("test", "score_samples_test"),
+        ("train", "score_samples_train"),
+    ] {
         let x = rows(&f[if which == "test" { "x_test" } else { "x" }]);
         let mut got = Vec::with_capacity(x.n());
         for i in 0..x.n() {
@@ -861,7 +921,10 @@ fn our_isolation_forest_ranks_the_same_rows_as_scikit_learns() {
     let f = fixture("outlier.json");
     let x = rows(&f["x"]);
     let x_test = rows(&f["x_test"]);
-    let forest = isolation::Config::new(100, 128, 0).unwrap().fit(&x).unwrap();
+    let forest = isolation::Config::new(100, 128, 0)
+        .unwrap()
+        .fit(&x)
+        .unwrap();
 
     // The fixture's design has its first 6 rows planted far out, and x_test's last 5.
     // Agreement is measured as the metric a risk desk would use: does our score rank the
@@ -869,11 +932,13 @@ fn our_isolation_forest_ranks_the_same_rows_as_scikit_learns() {
     for (label, data, planted) in [("train", &x, 0..6usize), ("test", &x_test, 30..35)] {
         let truth: Vec<bool> = (0..data.n()).map(|i| planted.contains(&i)).collect();
         let ours = forest.outlier(data).unwrap();
-        let theirs: Vec<f64> = reals(&f["forest"][if label == "train" {
-            "score_samples_train"
-        } else {
-            "score_samples_test"
-        }])
+        let theirs: Vec<f64> = reals(
+            &f["forest"][if label == "train" {
+                "score_samples_train"
+            } else {
+                "score_samples_test"
+            }],
+        )
         .iter()
         .map(|v| -v)
         .collect();
