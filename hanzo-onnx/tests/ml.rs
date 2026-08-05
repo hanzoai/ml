@@ -750,6 +750,98 @@ fn a_negative_vector_count_is_refused_before_the_cast_hides_it() -> Result<()> {
     Ok(())
 }
 
+/// An absent float lookup answers -0.0, which is the specification's default and
+/// onnxruntime's — MEASURED, bits 0x80000000.
+///
+/// NaN would not be a default but a poison: it is equal to nothing, so it survives every
+/// comparison downstream, and one missing optional attribute would turn a Scaler and a
+/// classifier behind it into an argmax over NaNs, which answers class 0 for every row.
+#[test]
+fn an_absent_float_lookup_answers_negative_zero() -> Result<()> {
+    let model = graph(
+        "LabelEncoder",
+        &["x"],
+        &["y"],
+        vec![
+            floats("keys_floats", &[1.5]),
+            floats("values_floats", &[10.0]),
+        ],
+    );
+    let out = feed(&model, Tensor::from_slice(&[9f32], 1, &Device::Cpu)?)?;
+    let got = out["y"].tensor()?.to_vec1::<f32>()?[0];
+    assert_eq!(
+        got.to_bits(),
+        (-0.0f32).to_bits(),
+        "an absent key answered {got:e}, not -0.0"
+    );
+    Ok(())
+}
+
+/// `Imputer` and `Binarizer` are typed `T -> T`, so an int64 column comes back int64.
+///
+/// The float plane cannot stand in for the integer one: `9007199254740993` — 2^53 + 1 —
+/// is `9007199000000000` as f32, so a key routed through it becomes a different key. The
+/// `impute_int` fixture pins the values against onnxruntime; this pins the TYPE, and pins
+/// `Binarizer`, for which onnxruntime carries no int64 kernel at all ("Could not find an
+/// implementation for Binarizer(1)") and the specification is therefore the only oracle.
+#[test]
+fn an_int64_column_keeps_its_type() -> Result<()> {
+    let column = || Tensor::from_slice(&[0i64, 2, 9007199254740993], (1, 3), &Device::Cpu);
+    let binarizer = graph("Binarizer", &["x"], &["y"], vec![number("threshold", 1.5)]);
+    let out = feed(&binarizer, column()?)?;
+    let y = out["y"].tensor()?;
+    assert_eq!(
+        y.dtype(),
+        hanzo_ml::DType::I64,
+        "Binarizer widened the type"
+    );
+    assert_eq!(y.flatten_all()?.to_vec1::<i64>()?, vec![0i64, 1, 1]);
+
+    let imputer = graph(
+        "Imputer",
+        &["x"],
+        &["y"],
+        vec![
+            ints("imputed_value_int64s", &[7]),
+            count("replaced_value_int64", 0),
+        ],
+    );
+    let out = feed(&imputer, column()?)?;
+    let y = out["y"].tensor()?;
+    assert_eq!(y.dtype(), hanzo_ml::DType::I64, "Imputer widened the type");
+    assert_eq!(
+        y.flatten_all()?.to_vec1::<i64>()?,
+        vec![7i64, 2, 9007199254740993],
+        "the imputed column did not survive the round trip"
+    );
+    Ok(())
+}
+
+/// ONNX gives `Imputer` one attribute set per plane, and the INPUT chooses which runs. A
+/// node whose values are of the other plane is refused rather than converted — measured,
+/// onnxruntime refuses both directions with "Empty value of imputed values".
+#[test]
+fn an_imputer_will_not_cross_the_two_planes_onnx_gives_it() -> Result<()> {
+    let imputer = |attribute: Vec<AttributeProto>| graph("Imputer", &["x"], &["y"], attribute);
+    let msg = refused(
+        &imputer(vec![floats("imputed_value_floats", &[7.0])]),
+        Tensor::from_slice(&[0i64, 5], (1, 2), &Device::Cpu)?,
+    );
+    for named in [
+        "tensor(int64)",
+        "imputed_value_int64s",
+        "imputed_value_floats",
+    ] {
+        assert!(msg.contains(named), "{msg}");
+    }
+    let msg = refused(
+        &imputer(vec![ints("imputed_value_int64s", &[7])]),
+        Tensor::from_slice(&[0f32, 5.0], (1, 2), &Device::Cpu)?,
+    );
+    assert!(msg.contains("imputed_value_floats"), "{msg}");
+    Ok(())
+}
+
 /// A softmax over ONE column is 1.0 whatever the score, so a two-class ensemble that
 /// declares one is refused BY NAME rather than answered with [0, 1] for every row.
 ///

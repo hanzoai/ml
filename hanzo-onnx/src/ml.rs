@@ -93,6 +93,46 @@ fn per_feature(x: &Tensor, f: impl Fn(usize, f32) -> f32) -> Result<Tensor> {
     Tensor::from_vec(data, x.dims().to_vec(), x.device())
 }
 
+/// The same map, run in the element type the input carries rather than in floats.
+///
+/// `Scaler` and `Normalizer` are typed `T -> tensor(float)` — they answer in floats
+/// whatever they are given, which is what [`per_feature`] does. `Imputer` and `Binarizer`
+/// are typed `T -> T`, and an int64 column rewritten through the float plane does not come
+/// back: `9007199254740993` as f32 is `9007199000000000`, so a key becomes a different
+/// key. ONNX gives those two operators one attribute set per plane for the same reason.
+fn per_feature_in<T: hanzo_ml::WithDType>(x: &Tensor, f: impl Fn(usize, T) -> T) -> Result<Tensor> {
+    let features = features_of(x)?;
+    let mut data = x.contiguous()?.flatten_all()?.to_vec1::<T>()?;
+    for (i, v) in data.iter_mut().enumerate() {
+        *v = f(i % features.max(1), *v);
+    }
+    Tensor::from_vec(data, x.dims().to_vec(), x.device())
+}
+
+/// One value per feature, from an attribute carrying either one value for all of them or
+/// one each.
+///
+/// `Scaler`'s `offset`/`scale` and `Imputer`'s `imputed_value_*` are the same shape of
+/// attribute, so they read it through one function and cannot disagree about which lengths
+/// are legal. Reading it out to full width here is what leaves the maps below with no
+/// branch in them.
+fn per_column<T: Copy>(
+    node: &onnx::NodeProto,
+    name: &str,
+    values: &[T],
+    features: usize,
+) -> Result<Vec<T>> {
+    match values.len() {
+        1 => Ok(vec![values[0]; features]),
+        n if n == features => Ok(values.to_vec()),
+        n => bail!(
+            "{} in {}: {name} has {n} entries for a {features}-feature row",
+            node.op_type,
+            node.name
+        ),
+    }
+}
+
 /// Rewrite every row in place, keeping the input's shape.
 ///
 /// The shape of `Normalizer`: a whole row decides its own answer.
@@ -520,13 +560,14 @@ impl Ensemble {
                             row.len()
                         ),
                     };
-                    at = if x.is_nan() {
-                        if *missing_takes_yes {
-                            *yes
-                        } else {
-                            *no
-                        }
-                    } else if test.takes_yes(x, *threshold) {
+                    // The missing-value flag is an OR with the test, not a branch taken
+                    // before it — onnxruntime's own walk is
+                    // `val CMP threshold || (missing_tracks_true && isnan(val))`. It
+                    // makes a difference for exactly one mode: `NaN != threshold` is
+                    // TRUE, so `BRANCH_NEQ` takes yes on a NaN whatever the flag says,
+                    // while the other five comparisons are all false on a NaN and leave
+                    // the flag to decide. MEASURED on all six modes against onnxruntime.
+                    at = if test.takes_yes(x, *threshold) || (x.is_nan() && *missing_takes_yes) {
                         *yes
                     } else {
                         *no
@@ -895,8 +936,14 @@ impl Mapping {
             Column::Ints(_) => {
                 Cell::Int(*get_attr_opt::<i64>(node, "default_int64")?.unwrap_or(&-1))
             }
+            // -0.0 is the specification's default and onnxruntime's: MEASURED, a float
+            // lookup with no `default_float` answers an absent key with -0.0, bits
+            // 0x80000000. NaN would be a silent poison rather than a default — it
+            // propagates through every downstream Scaler and every comparison, so one
+            // missing optional attribute would turn the whole graph into an argmax of
+            // NaNs, which reports class 0 for every row.
             Column::Reals(_) => {
-                Cell::Real(*get_attr_opt::<f32>(node, "default_float")?.unwrap_or(&f32::NAN))
+                Cell::Real(*get_attr_opt::<f32>(node, "default_float")?.unwrap_or(&-0.0))
             }
             Column::Text(_) => Cell::Text(
                 get_attr_opt::<str>(node, "default_string")?
@@ -1144,23 +1191,15 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
         // every feature.
         "Scaler" => {
             let x = numeric(0)?;
-            let offset = get_attr::<[f32]>(node, "offset")?;
-            let scale = get_attr::<[f32]>(node, "scale")?;
             let features = features_of(x)?;
-            for (name, v) in [("offset", offset), ("scale", scale)] {
-                if v.len() != 1 && v.len() != features {
-                    bail!(
-                        "Scaler in {}: {name} has {} entries for a {features}-feature row",
-                        node.name,
-                        v.len()
-                    );
-                }
-            }
-            let pick = |v: &[f32], j: usize| if v.len() == 1 { v[0] } else { v[j] };
-            Ok(vec![per_feature(x, |j, v| {
-                (v - pick(offset, j)) * pick(scale, j)
-            })?
-            .into()])
+            let read = |name: &str| -> Result<Vec<f32>> {
+                per_column(node, name, get_attr::<[f32]>(node, name)?, features)
+            };
+            let offset = read("offset")?;
+            let scale = read("scale")?;
+            Ok(vec![
+                per_feature(x, |j, v| (v - offset[j]) * scale[j])?.into()
+            ])
         }
 
         // Each row divided by its MAX, L1 or L2 norm.
@@ -1191,54 +1230,81 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
             .into()])
         }
 
-        // Y = X > threshold. Strictly greater: measured, a value EQUAL to the threshold
-        // reports 0.
+        // Y = X > threshold, in the element type X carries: ONNX types this operator
+        // `T -> T`. Strictly greater: measured, a value EQUAL to the threshold reports 0.
+        //
+        // onnxruntime carries no int64 kernel for this operator at all — measured, it
+        // answers "Could not find an implementation for Binarizer(1)" — so for an integer
+        // column the specification is the only oracle there is: 0 or 1, of the type that
+        // arrived. The comparison runs in f64, where an f32 threshold is exact.
         "Binarizer" => {
             let x = numeric(0)?;
-            let threshold = *get_attr_opt::<f32>(node, "threshold")?.unwrap_or(&0.0);
-            Ok(vec![per_feature(
-                x,
-                |_, v| {
-                    if v > threshold {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                },
-            )?
+            let threshold = f64::from(*get_attr_opt::<f32>(node, "threshold")?.unwrap_or(&0.0));
+            if x.dtype() == DType::I64 {
+                let mapped = per_feature_in::<i64>(x, |_, v| i64::from(v as f64 > threshold))?;
+                return Ok(vec![mapped.into()]);
+            }
+            Ok(vec![per_feature(x, |_, v| {
+                if f64::from(v) > threshold {
+                    1.0
+                } else {
+                    0.0
+                }
+            })?
             .into()])
         }
 
-        // Replace one value with another, per feature. `replaced_value_float` may be
-        // NaN, which is how a pipeline's missing-value marker arrives, and NaN is equal
-        // to nothing — so the comparison is a NaN test in that case rather than `==`.
+        // Replace one value with another, per feature, in the element type X carries —
+        // this operator is typed `T -> T` too.
+        //
+        // ONNX gives it one attribute set per plane: `imputed_value_floats` with
+        // `replaced_value_float`, `imputed_value_int64s` with `replaced_value_int64`. The
+        // INPUT chooses which plane runs, not whichever attribute the file happened to
+        // write, because the two are not interchangeable: `9007199254740993` imputed
+        // through the float plane comes back `9007199000000000`, a different key.
+        // Measured — onnxruntime refuses the mismatch in BOTH directions ("Empty value of
+        // imputed values") rather than converting, and so does this.
+        //
+        // `replaced_value_float` may be NaN, which is how a pipeline's missing-value
+        // marker arrives, and NaN is equal to nothing — so on the float plane the
+        // comparison is a NaN test rather than `==`. An integer column has no such value.
         "Imputer" => {
             let x = numeric(0)?;
             let features = features_of(x)?;
-            let imputed = match get_attr_opt::<[f32]>(node, "imputed_value_floats")? {
-                Some(v) if !v.is_empty() => v.to_vec(),
-                _ => match get_attr_opt::<[i64]>(node, "imputed_value_int64s")? {
-                    Some(v) if !v.is_empty() => v.iter().map(|i| *i as f32).collect(),
-                    _ => bail!(
-                        "Imputer in {} declares neither imputed_value_floats nor \
-                         imputed_value_int64s",
-                        node.name
-                    ),
-                },
-            };
-            if imputed.len() != 1 && imputed.len() != features {
-                bail!(
-                    "Imputer in {}: {} imputed values for a {features}-feature row",
-                    node.name,
-                    imputed.len()
-                );
+            if x.dtype() == DType::I64 {
+                let floats = get_attr_opt::<[f32]>(node, "imputed_value_floats")?
+                    .is_some_and(|v| !v.is_empty());
+                let values = get_attr_opt::<[i64]>(node, "imputed_value_int64s")?
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        Error::Msg(format!(
+                            "Imputer in {}: a tensor(int64) column is imputed from \
+                             imputed_value_int64s, which this node does not declare{}",
+                            node.name,
+                            if floats {
+                                " — it declares imputed_value_floats, which is the float plane's"
+                            } else {
+                                ""
+                            }
+                        ))
+                    })?;
+                let imputed = per_column(node, "imputed_value_int64s", values, features)?;
+                let replaced = *get_attr_opt::<i64>(node, "replaced_value_int64")?.unwrap_or(&0);
+                let mapped =
+                    per_feature_in::<i64>(x, |j, v| if v == replaced { imputed[j] } else { v })?;
+                return Ok(vec![mapped.into()]);
             }
-            let replaced = match get_attr_opt::<f32>(node, "replaced_value_float")? {
-                Some(v) => *v,
-                None => get_attr_opt::<i64>(node, "replaced_value_int64")?
-                    .map(|i| *i as f32)
-                    .unwrap_or(0.0),
-            };
+            let values = get_attr_opt::<[f32]>(node, "imputed_value_floats")?
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "Imputer in {}: a float column is imputed from imputed_value_floats, \
+                         which this node does not declare",
+                        node.name
+                    ))
+                })?;
+            let imputed = per_column(node, "imputed_value_floats", values, features)?;
+            let replaced = *get_attr_opt::<f32>(node, "replaced_value_float")?.unwrap_or(&0.0);
             let hit = |v: f32| {
                 if replaced.is_nan() {
                     v.is_nan()
@@ -1246,16 +1312,9 @@ pub(crate) fn eval(node: &onnx::NodeProto, inputs: &[Value]) -> Result<Vec<Value
                     v == replaced
                 }
             };
-            let pick = |j: usize| {
-                if imputed.len() == 1 {
-                    imputed[0]
-                } else {
-                    imputed[j]
-                }
-            };
             Ok(vec![per_feature(
                 x,
-                |j, v| if hit(v) { pick(j) } else { v },
+                |j, v| if hit(v) { imputed[j] } else { v },
             )?
             .into()])
         }
