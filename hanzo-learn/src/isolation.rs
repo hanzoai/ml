@@ -468,6 +468,124 @@ mod tests {
         assert!(Config::new(1, 1, 0).is_ok());
     }
 
+    /// A dozen rows the golden below is fitted on: a blob with two rows thrown far out of
+    /// it, written out so the fixture is the test and there is nothing to regenerate.
+    fn dozen() -> Matrix {
+        Matrix::new(
+            12,
+            3,
+            vec![
+                0.0, 0.0, 0.0, //
+                0.5, -0.25, 1.0, //
+                -0.5, 0.75, -1.0, //
+                1.25, 0.5, 0.25, //
+                -1.0, -1.0, 0.5, //
+                0.25, 1.5, -0.75, //
+                -0.75, 0.25, 1.25, //
+                1.0, -1.5, -0.5, //
+                0.75, 1.0, 0.0, //
+                -1.25, -0.5, 0.75, //
+                9.0, 9.5, 9.0, // planted
+                -8.5, -9.0, -8.0, // planted
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A whole small forest, pinned: the rows each tree drew, the features it cut on, and
+    /// the scores that come out.
+    ///
+    /// # What this catches that nothing else here does
+    ///
+    /// Every other test in this module asserts a PROPERTY — the planted rows score highest,
+    /// a parallel fit equals a serial one, the same seed twice is the same forest. All of
+    /// them survive a change to the subsample or to where the fit stands in `numpy`'s
+    /// stream, because a differently drawn forest still ranks the planted rows first and
+    /// still equals itself. This is the assertion that turns such a change into a diff
+    /// instead of a silence.
+    ///
+    /// The rows and the cut features are INTEGERS and are exact: they are [`Twister::below`]
+    /// draws taken from inside the fit, so they pin the stream position with no arithmetic
+    /// in between. The scores are held to 1e-12 rather than bit for bit because they run
+    /// through `ln` and `exp2`, which are the platform's and are allowed to differ in the
+    /// last bit — while ANY change to the draws moves them by about 1e-2. The bound is ten
+    /// orders of magnitude below the thing it is watching for.
+    #[test]
+    fn a_small_forest_is_pinned_to_the_rows_it_drew_and_the_scores_they_produce() {
+        let x = dozen();
+        let config = Config::new(4, 6, 7).unwrap();
+
+        // Tree `k` draws under `seed + k` and takes six of the twelve rows. Asserted here
+        // as well as through the fit, so that a divergence names which of the two moved:
+        // the subsample, or what the tree did with it.
+        let rows: Vec<Vec<usize>> = (0..config.trees() as u32)
+            .map(|k| Twister::seed(config.seed().wrapping_add(k)).subsample(x.n(), config.sample()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec![4, 9, 6, 3, 8, 11],
+                vec![3, 4, 1, 5, 2, 0],
+                vec![5, 6, 8, 10, 11, 1],
+                vec![9, 4, 0, 1, 3, 10],
+            ],
+            "the subsample moved: the forest no longer sees the rows it was pinned on"
+        );
+
+        let forest = config.fit(&x).unwrap();
+        let cuts: Vec<Vec<u32>> = forest
+            .trees
+            .iter()
+            .map(|t| {
+                t.nodes
+                    .iter()
+                    .filter_map(|n| match n {
+                        Node::Split { feature, .. } => Some(*feature),
+                        Node::Leaf { .. } => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            cuts,
+            vec![
+                vec![1, 0, 2],
+                vec![0, 1, 1, 0, 1],
+                vec![2, 0, 0],
+                vec![1, 1, 0]
+            ],
+            "the trees cut on different features: the fit stands somewhere else in the stream"
+        );
+
+        let want = [
+            0.372_731_034_830_097_73,
+            0.372_731_034_830_097_73,
+            0.429_310_566_461_950_1,
+            0.372_731_034_830_097_73,
+            0.494_478_713_209_093_3,
+            0.372_731_034_830_097_73,
+            0.463_812_914_244_604_75,
+            0.429_310_566_461_950_1,
+            0.372_731_034_830_097_73,
+            0.527_172_034_903_650_7,
+            0.562_026_932_526_294_3,
+            0.638_802_570_155_02,
+        ];
+        let got = forest.outlier(&x).unwrap();
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-12,
+                "row {i} scored {g}, pinned at {w} — a difference of {:e}",
+                (g - w).abs()
+            );
+        }
+
+        // The two planted rows are the last two. Asserted so that a golden which has been
+        // updated to whatever the new numbers are still has to be a forest that WORKS.
+        let worst_inlier = got[..10].iter().cloned().fold(f64::MIN, f64::max);
+        assert!(got[10] > worst_inlier && got[11] > worst_inlier);
+    }
+
     /// A constant column cannot be cut, so the tree must decline the split rather than
     /// draw a threshold equal to the only value there is and recurse forever.
     #[test]
