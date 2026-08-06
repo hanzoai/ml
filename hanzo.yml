@@ -1,0 +1,34 @@
+# Canonical CI/CD config for hanzoai/ml — the one file both the hanzoai/ci
+# reusable (.hanzo/workflows/cicd.yml) and platform.hanzo.ai read.
+#
+# A Cargo workspace (tensors, kernels, nn, transformers, onnx, training). It
+# publishes crates from tags and builds no image, so there is no `images:` and
+# no `deploy:` — only a gate.
+#
+# The gate is `cargo check --workspace`, which is the leg of this repo's rust-ci
+# that is green on this fleet today. Two things it needs that a bare runner does
+# not have, provisioned the same way rust-ci provisions them — apt, not a
+# marketplace action, because a self-hosted runner should not depend on a
+# third-party download every run:
+#   * protoc — hanzo-onnx's build script runs prost-build, which shells out to
+#     it; prost-build 0.14 vendors none.
+#   * a C toolchain — the runner image ships without cc/pkg-config, and the
+#     `links=`-carrying crates need one.
+#
+# Why check and not test: `cargo test --workspace` is the heaviest thing in this
+# repo and it dies mid-codegen on this fleet — killed process, no test result,
+# no error — because full LLVM codegen plus a link for every crate (wasm
+# examples, hanzo-3d, tensor-tools, the pyo3 bindings) exceeds the runner
+# ceiling. rust-ci already carries the debuginfo/incremental trims that fight
+# that, and its own note says the next step is capacity, not flags. Running it
+# here too would only add a second OOM red per push, which reports a memory
+# limit, not the code. `check` stops before codegen and still fails on every
+# type error, missing item and broken signature in all 16 members.
+test:
+  - name: build
+    run: |
+      set -e
+      command -v protoc >/dev/null || { sudo apt-get update && sudo apt-get install -y protobuf-compiler; }
+      command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev; }
+      protoc --version
+      cargo check --workspace
