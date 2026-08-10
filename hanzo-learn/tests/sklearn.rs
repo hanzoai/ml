@@ -471,7 +471,7 @@ fn flat_fixture(v: &Value) -> Vec<f64> {
     v.as_array()
         .expect("array")
         .iter()
-        .flat_map(|r| reals(r))
+        .flat_map(reals)
         .collect()
 }
 
