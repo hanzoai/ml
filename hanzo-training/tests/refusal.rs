@@ -47,6 +47,7 @@ fn assert_refusal(err: anyhow::Error, what: &str) {
 
 #[test]
 fn a_model_with_no_weights_refuses_to_be_constructed() {
+    // Not expect_err: ModelWrapper is not Debug, so the Ok side cannot be printed.
     let err = ModelWrapper::new(&model_config(), hanzo_ml::Device::Cpu)
         .err()
         .expect("ModelWrapper holds no weights and must not claim to be a model");
@@ -74,14 +75,12 @@ fn the_optimizer_refuses_a_step_it_cannot_take() {
             .expect("the wrapper itself constructs; it is the step that cannot be taken");
     let err = optimizer
         .step(vec![])
-        .err()
-        .expect("a step with no gradients must not report success");
+        .expect_err("a step with no gradients must not report success");
     assert_refusal(err, "OptimizerWrapper::step");
 
     let err = optimizer
         .zero_grad(vec![])
-        .err()
-        .expect("zeroing gradients that do not exist must not report success");
+        .expect_err("zeroing gradients that do not exist must not report success");
     assert_refusal(err, "OptimizerWrapper::zero_grad");
 }
 
@@ -89,8 +88,7 @@ fn the_optimizer_refuses_a_step_it_cannot_take() {
 fn perplexity_is_not_reported_as_5_2() {
     let err = PerplexityBenchmark::new()
         .run()
-        .err()
-        .expect("a benchmark with no model and no dataset must not report a score");
+        .expect_err("a benchmark with no model and no dataset must not report a score");
     assert_refusal(err, "PerplexityBenchmark::run");
 }
 
@@ -98,8 +96,7 @@ fn perplexity_is_not_reported_as_5_2() {
 fn accuracy_is_not_reported_as_0_85() {
     let err = AccuracyBenchmark::new()
         .run()
-        .err()
-        .expect("a benchmark with no model and no dataset must not report a score");
+        .expect_err("a benchmark with no model and no dataset must not report a score");
     assert_refusal(err, "AccuracyBenchmark::run");
 }
 

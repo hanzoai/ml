@@ -291,7 +291,7 @@ impl Curve {
     ///
     /// Fails on a negative cost, which would make flagging everything free.
     pub fn cheapest(&self, alarm: f64, miss: f64) -> Result<Operating> {
-        if !(alarm >= 0.0) || !(miss >= 0.0) || !alarm.is_finite() || !miss.is_finite() {
+        if !alarm.is_finite() || !miss.is_finite() || alarm < 0.0 || miss < 0.0 {
             return Err(Error::Config(format!(
                 "costs must be finite and not negative, not alarm {alarm} miss {miss}"
             )));
