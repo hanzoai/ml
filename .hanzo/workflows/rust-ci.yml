@@ -29,30 +29,26 @@ name: Continuous integration
 jobs:
   check:
     name: Check
-    runs-on: ${{ matrix.os }}
+    runs-on: hanzo-build-linux-amd64
     strategy:
       fail-fast: false
       matrix:
-      # Scoped to labels this forge ACTUALLY serves. The fleet advertises
-      # ubuntu-latest, ubuntu-22.04, ubuntu-24.04 and hanzo-build-linux-amd64
-      # (plus the three GPU labels); it has no windows-latest, macOS-latest or
-      # ubuntu-24.04-arm runner.
+      # The axis is the instruction set to compile for. Both legs always ran on
+      # one Linux pool; naming them after two ubuntu labels only hid that, and
+      # the labels themselves are gone. The fleet stopped advertising ubuntu-*
+      # on purpose -- it hosts ~1400 mirrored repos carrying upstream workflows
+      # that all ask for a generic label, and one unparseable upstream job took
+      # every runner down with it. universe
+      # charts/app/values/hanzo/git-runner.yaml keeps that account; the org
+      # pools are what a workflow on this plane asks for.
       #
-      # A leg with no runner does not fail — it QUEUES, indefinitely. Measured on
-      # run 6254: 5 jobs completed success and 5 sat queued forever, so the RUN
-      # never reached a terminal state and this repo reported "running" in
-      # perpetuity. Every job that could execute was already green; the only
-      # thing keeping ml off the board was legs nothing can pick up.
-      #
-      # This is the native-forge copy (.hanzo/workflows is scanned first;
-      # GitHub.com ignores it), so narrowing here costs no GitHub coverage —
-      # and there is no .github/workflows/rust-ci.yml to diverge from; the
-      # header's reference to one is stale.
+      # A leg whose label nothing serves does not fail, it QUEUES: Check and
+      # Test Suite sat unpicked while every other job in this file went green,
+      # so the run never reached a terminal state and ml never reached the board.
       #
       # Windows/macOS/arm coverage returns by REGISTERING those runners, not by
-      # re-adding the labels. Until then, claiming to test them was a claim the
-      # forge could not honour.
-        os: [ubuntu-latest, ubuntu-24.04]
+      # naming labels nothing answers.
+        cpu: [baseline, avx2]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -73,11 +69,11 @@ jobs:
           protoc --version
 
       - name: Run normal cpu
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.cpu == 'baseline'
         run: cargo check --workspace
 
       - name: Run with avx2
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.cpu == 'avx2'
         run: |
           export RUSTFLAGS="-C target-feature=avx2"
           cargo check --workspace
@@ -85,12 +81,8 @@ jobs:
 
   test:
     name: Test Suite
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        # Same reason as the check matrix above: no windows/macOS runner exists,
-        # and a leg with no runner queues forever rather than failing.
-        os: [ubuntu-latest]
+    # One leg, so the matrix that carried it was only a place to write a label.
+    runs-on: hanzo-build-linux-amd64
     steps:
       # Best-effort, and it must stay best-effort: it reclaims space, it does not
       # gate correctness. As written it FAILED the whole matrix leg —
