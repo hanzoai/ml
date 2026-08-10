@@ -200,12 +200,16 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
     let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
     let res = matmul.forward(&lhs)?;
     match device {
+        // Three rows sit under the batch-8 switch, so these are the batched matvec's numbers, not
+        // the prefill GEMM's. Same values on M1 Max and M4 Max, and each entry lands as close to
+        // the CPU row below as the GEMM's did -- the two kernels just sum a row in a different
+        // order. Re-measure this table if the switch in `quantized::metal::fwd` moves.
         Device::Metal(_) => assert_eq!(
             to_vec2_round(&res, 0)?,
             &[
-                [243659.0, -19716.0, -285444.0, -550439.0],
-                [23779.0, 21653.0, 19404.0, 18349.0],
-                [-196101.0, 63021.0, 324252.0, 587137.0]
+                [243666.0, -19714.0, -285433.0, -550453.0],
+                [23782.0, 21654.0, 19400.0, 18369.0],
+                [-196102.0, 63022.0, 324233.0, 587191.0]
             ]
         ),
         Device::Cuda(_) => assert_eq!(
@@ -273,9 +277,12 @@ fn qmm_batch(dev: &Device) -> Result<()> {
     let mm4 = rhs.forward(&lhs4)?;
     assert_eq!(mm4.shape().dims(), [12, 6]);
     let diff4 = (mm4.i(..6)? - &mm3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
-    if dev.is_cuda() {
-        // We use different fused kernels (MMVQ for batch<=8, MMQ for batch>8) on CUDA which accumulate differently than dequantize-then-matmul.
-        // This can lead to small numerical differences especially for low-bit quants.
+    // Crossing a batch of 8 changes which kernel runs, on both GPUs: CUDA swaps MMVQ for MMQ,
+    // Metal swaps the batched matvec for the prefill GEMM. The pairs reduce a row in a different
+    // order, so mm4's first six rows round differently from mm3's six even though the rows going
+    // in are the same. Below the switch the rows agree exactly -- that is what diff2 and diff3
+    // above measure, on every device. The CPU runs one kernel at every batch and stays exact here.
+    if dev.is_cuda() || dev.is_metal() {
         assert!(0. < diff4 && diff4 < 0.5)
     } else {
         assert_eq!(diff4, 0.0)

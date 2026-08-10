@@ -4663,7 +4663,7 @@ void kernel_mul_mv_q2_K_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -4850,7 +4850,7 @@ void kernel_mul_mv_q3_K_f32_impl(
         sumf1[row] = simd_sum(sumf);
     }
     if (tiisg == 0) {
-        for (int row = 0; row < 2; ++row) {
+        for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = sumf1[row];
         }
     }
@@ -5000,7 +5000,7 @@ void kernel_mul_mv_q4_K_impl(
 
     for (int row = 0; row < NR0; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (T) all_sum;
         }
     }
@@ -5206,7 +5206,7 @@ void kernel_mul_mv_q5_K_f32_impl(
 
     for (int row = 0; row < 2; ++row) {
         const float tot = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = tot;
         }
     }
@@ -5513,7 +5513,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
         }
     }
@@ -5652,7 +5652,7 @@ void kernel_mul_mv_iq2_xs_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
         }
     }
@@ -5784,7 +5784,7 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.5f;
         }
     }
@@ -5916,7 +5916,7 @@ void kernel_mul_mv_iq3_s_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -6049,7 +6049,7 @@ void kernel_mul_mv_iq2_s_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
         }
     }
@@ -6168,7 +6168,7 @@ void kernel_mul_mv_iq1_s_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -6267,7 +6267,7 @@ void kernel_mul_mv_iq1_m_f32_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -6456,7 +6456,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
 
     for (int row = 0; row < 2; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
