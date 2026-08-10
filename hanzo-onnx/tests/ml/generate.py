@@ -79,7 +79,11 @@ def real(x):
         return "f32::NAN"
     if np.isinf(x):
         return "f32::INFINITY" if x > 0 else "f32::NEG_INFINITY"
-    return f"{x:.9}f32"
+    # str() of a float32 is the shortest decimal that reads back as the same
+    # float32. Nine significant digits wrote more than the type carries -- 5.1
+    # came out as 5.0999999 -- and clippy's excessive_precision then refused the
+    # file this script had just written.
+    return f"{np.float32(x)}f32"
 
 
 def reals(v):
@@ -124,7 +128,7 @@ def fixture(name, about, oracle, inputs, expect, tolerance=1e-5):
         name: "{name}",
         about: "{about}",
         oracle: "{oracle}",
-        tolerance: {tolerance:.9}f32,
+        tolerance: {real(tolerance)},
         inputs: &[{", ".join(f'("{n}", {data(v)})' for n, v in inputs)}],
         expect: &[{", ".join(f'("{n}", {v})' for n, v in expect)}],
     }},"""
