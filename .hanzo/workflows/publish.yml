@@ -105,7 +105,12 @@ jobs:
             [ -z "$dir" ] && continue
             name=$(grep -m1 '^name = ' "$dir/Cargo.toml" | sed 's/name = "\(.*\)"/\1/')
             new=$(grep -m1 '^version = ' "$dir/Cargo.toml" | sed 's/version = "\(.*\)"/\1/')
-            old=$(curl -sf "https://crates.io/api/v1/crates/$name" 2>/dev/null \
+            # crates.io's data-access policy (https://crates.io/data-access)
+            # rejects a request with no descriptive User-Agent -- curl's
+            # default one gets a 403, not the 404 a never-published crate
+            # actually returns.
+            old=$(curl -sf -H 'User-Agent: hanzoai-ci-publish (ops@hanzo.ai)' \
+                    "https://crates.io/api/v1/crates/$name" 2>/dev/null \
                     | jq -r '.crate.max_version // "0.0.0"' 2>/dev/null || echo "0.0.0")
             newest=$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -1)
             if [ "$old" != "$new" ] && [ "$newest" = "$new" ]; then
