@@ -4,69 +4,168 @@ name: Publish crates
 # .hanzo/workflows first and GitHub.com ignores .hanzo/ entirely -- on the mapped
 # `hanzo-build-linux-amd64` label.
 #
-# Publishes the hanzo-* crates to crates.io in dependency order on a version tag
-# (e.g. `0.11.4`). GPU build scripts can't run on crates.io builders, so we publish
-# with --no-verify (downstream consumers build against their own SDK).
-# Requires repo secret CARGO_REGISTRY_TOKEN (a crates.io API token, from KMS).
+# Publishes the hanzo-* crates to crates.io in dependency order, following a
+# push to main rather than a hand-pushed tag: the tree on main is the release,
+# and the question this workflow answers is "does crates.io serve something
+# older than what's there" -- not "did someone remember to tag it."
 #
-# Each crate carries its own version, so the tag names the release event and the
-# manifests name the artifacts. Re-running a tag is safe: a crate already on the
-# registry at its manifest version reports "already uploaded" and is skipped, so
-# this publishes exactly the crates whose version moved since the last run.
+# No `paths:` filter, deliberately. A path gate guesses "did a crate move"
+# from the shape of a diff; the per-crate check below asks crates.io directly,
+# so it is right regardless of what the push touched.
+#
+# GPU build scripts can't run on crates.io's verification sandbox, so
+# `cargo publish` still runs with --no-verify (downstream consumers build
+# against their own SDK). `cargo check --workspace` below is what actually
+# proves the tree compiles -- the same command hanzo.yml already runs green
+# on this fleet, so this reuses a proven-safe check rather than inventing a
+# second one.
+#
+# Each crate carries its own version, so a push is the release event and the
+# manifests name the artifacts. Re-running is safe twice over: the ratchet
+# skips a crate whose crates.io version already matches its manifest before
+# cargo is even asked to publish it, and the historical "already uploaded"
+# catch stays as a second line of defense underneath that.
 on:
   push:
-    tags:
-      - '[0-9]+.[0-9]+.[0-9]+'
-  workflow_dispatch: {}
+    branches: [main]
+  workflow_dispatch:
+
+# Serialized, newest wins. Two runs in flight would both read crates.io
+# before either published, and the slower one would re-walk crates the
+# faster one already shipped.
+concurrency:
+  group: publish
+  cancel-in-progress: true
 
 jobs:
   publish:
-    # `cargo publish --no-verify` is a pure upload (no GPU build). Seed the
-    # crates.io token as a repo/org secret CARGO_REGISTRY_TOKEN (from KMS).
     runs-on: hanzo-build-linux-amd64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish hanzo-* crates (dependency order)
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Provision jq
+        # The runner image ships no jq, and the ratchet below reads the
+        # crates.io API with it.
         run: |
-          set -u
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is empty -- set it (from KMS) as a repo/org secret"; exit 1
+          set -e
+          command -v jq >/dev/null 2>&1 && exit 0
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 \
+            -o "$HOME/.local/bin/jq"
+          chmod +x "$HOME/.local/bin/jq"
+
+      # Build gate, on every push, not only a releasing one. Covers the 15
+      # true workspace members with the exact command + provisioning
+      # hanzo.yml's own CI already runs green (protoc for hanzo-onnx's build
+      # script, a C toolchain for the `links=`-carrying crates). It does not
+      # reach the workspace-`exclude`d kernel crates below -- they carry
+      # `links=` build scripts of their own that need a GPU toolchain this
+      # runner doesn't have, which is also why cargo publish ships them with
+      # --no-verify instead of a check no CPU runner could pass.
+      - name: cargo check --workspace
+        run: |
+          set -e
+          command -v protoc >/dev/null || { sudo apt-get update && sudo apt-get install -y protobuf-compiler; }
+          command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev; }
+          cargo check --workspace
+
+      - name: Derive the publish order
+        id: order
+        # scripts/publish-order is the one source of truth for both the set
+        # and the order -- see its own docstring for why a hand-written list
+        # once let hanzo-kernel drift silently. Require it non-empty for the
+        # same reason: a failing script must not read as "nothing to do."
+        run: |
+          set -euo pipefail
+          dirs=$(scripts/publish-order)
+          if [ -z "$dirs" ]; then
+            echo "::error::scripts/publish-order returned nothing"
+            exit 1
           fi
+          echo "publishable, dependency-first:"
+          echo "$dirs"
+          {
+            echo "dirs<<PUBLISH_ORDER_EOF"
+            echo "$dirs"
+            echo "PUBLISH_ORDER_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Is anything ahead of crates.io
+        id: ahead
+        # FORWARD ONLY, per crate. `!=` fires in both directions and a
+        # reverted manifest would walk a crate backwards on the registry;
+        # only a strictly greater local version counts. Pure metadata, no
+        # compilation, so it's safe to run for the GPU crates too.
+        run: |
+          set -euo pipefail
+          any=false
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            name=$(grep -m1 '^name = ' "$dir/Cargo.toml" | sed 's/name = "\(.*\)"/\1/')
+            new=$(grep -m1 '^version = ' "$dir/Cargo.toml" | sed 's/version = "\(.*\)"/\1/')
+            old=$(curl -sf "https://crates.io/api/v1/crates/$name" 2>/dev/null \
+                    | jq -r '.crate.max_version // "0.0.0"' 2>/dev/null || echo "0.0.0")
+            newest=$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -1)
+            if [ "$old" != "$new" ] && [ "$newest" = "$new" ]; then
+              echo "$name: crates.io has $old, tree has $new -- ahead"
+              any=true
+            fi
+          done <<< "${{ steps.order.outputs.dirs }}"
+          echo "yes=$any" >> "$GITHUB_OUTPUT"
+
+      - name: Load the publish credential from KMS
+        if: steps.ahead.outputs.yes == 'true'
+        env:
+          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
+          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
+        run: |
+          # Only the KMS machine identity lives as a forge secret; a raw
+          # CARGO_REGISTRY_TOKEN beside it would be a second place to hold
+          # one thing -- and the one that rots silently.
+          if [ -z "$KMS_CLIENT_ID" ] || [ -z "$KMS_CLIENT_SECRET" ]; then
+            echo "::error::KMS machine identity absent -- cannot pull the crates.io credential. Seed KMS_CLIENT_ID/KMS_CLIENT_SECRET as git.hanzo.ai Actions secrets (org or repo scope)." >&2
+            exit 1
+          fi
+          KMS=https://kms.hanzo.ai; ENVN=prod
+          TOKEN=$(curl -sf "$KMS/v1/kms/auth/login" -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$KMS_CLIENT_ID\",\"clientSecret\":\"$KMS_CLIENT_SECRET\"}" | jq -r .accessToken)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || { echo "::error::KMS login failed"; exit 1; }
+          URL="$KMS/v1/kms/secrets/CARGO_REGISTRY_TOKEN?env=$ENVN"
+          # No -f: under `bash -e -o pipefail` a `curl -sf` on a 404 exits 22
+          # and kills the step before any message of ours prints, which reads
+          # like a broken network. Capture the status and say it.
+          BODY=$(curl -s -w '\n%{http_code}' "$URL" -H "Authorization: Bearer $TOKEN") || true
+          CODE=$(printf '%s' "$BODY" | tail -1)
+          VAL=$(printf '%s' "$BODY" | sed '$d' | jq -r '.value // empty' 2>/dev/null || true)
+          if [ -z "$VAL" ]; then
+            echo "::error::KMS returned HTTP $CODE for $URL with no value -- seed CARGO_REGISTRY_TOKEN there, not as a forge secret." >&2
+            exit 1
+          fi
+          echo "::add-mask::$VAL"
+          echo "CARGO_REGISTRY_TOKEN=$VAL" >> "$GITHUB_ENV"
+
+      - name: Publish the crates ahead of crates.io (dependency order)
+        if: steps.ahead.outputs.yes == 'true'
+        run: |
           # GHA runs `run:` under `bash -e`; disable errexit so `out=$(cargo publish ...); rc=$?` can
           # CAPTURE a non-zero rc and let the already-uploaded->skip logic run. Without this, the first
           # already-published crate (e.g. hanzo-kernels) aborts the whole loop before reaching hanzo-ml.
           set +e
-          # This list used to be written out by hand, and hanzo-kernel (singular, the kernel DSL)
-          # was missing from it -- only hanzo-kernels (plural, the CUDA kernels) was there. A crate
-          # absent from this loop never reaches the registry, so it drifted to 0.2.20 on crates.io
-          # against 0.2.39 in tree before anyone noticed. scripts/publish-order derives both the set
-          # and the order from the manifests: a crate is published because it exists, and
-          # `publish = false` is the one way to opt out.
-          #
-          # Derive the order in its own step and REQUIRE it to be non-empty. Inlined as
-          # `for c in $(scripts/publish-order)` a failing script yields an empty word list, the
-          # loop body never runs, and the job goes green having published nothing -- the silent
-          # no-op is worse than the drift it replaced.
-          order=$( scripts/publish-order ); rc=$?
-          if [ "$rc" -ne 0 ] || [ -z "$order" ]; then
-            echo "::error::could not derive the publish order (scripts/publish-order rc=$rc)"; exit 1
-          fi
-          echo "publishing $(echo "$order" | wc -l) crates in dependency order:"; echo "$order"
           fail=0
-          for c in $order; do
-            echo "::group::publish $c"
-            out=$( cd "$c" && cargo publish --no-verify 2>&1 ); rc=$?
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            echo "::group::publish $dir"
+            out=$( cd "$dir" && cargo publish --no-verify 2>&1 ); rc=$?
             echo "$out"
             if [ "$rc" -ne 0 ]; then
               if echo "$out" | grep -qiE 'already (uploaded|exists)|is already uploaded'; then
-                echo "::warning::$c already at this version -- skipping"
+                echo "::warning::$dir already at this version -- skipping"
               else
-                echo "::error::$c publish FAILED"; fail=1
+                echo "::error::$dir publish FAILED"; fail=1
               fi
             fi
             echo "::endgroup::"
-          done
+          done <<< "${{ steps.order.outputs.dirs }}"
           exit "$fail"
