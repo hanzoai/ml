@@ -98,7 +98,10 @@ pub fn report_detect(
     let w_ratio = initial_w as f32 / w as f32;
     let h_ratio = initial_h as f32 / h as f32;
     let mut img = img.to_rgb8();
-    let font = Vec::from(include_bytes!("roboto-mono-stripped.ttf") as &[u8]);
+    // Zen Mono, byte-identical to hanzoai/font fonts/ZenMono/ttf. A rasteriser
+    // reads outlines, so this is the TTF rather than the woff2 that @hanzo/design
+    // serves to browsers; ab_glyph cannot decompress woff2.
+    let font = Vec::from(include_bytes!("ZenMono-Regular.ttf") as &[u8]);
     let font = ab_glyph::FontRef::try_from_slice(&font).map_err(hanzo_ml::Error::wrap)?;
     for (class_index, bboxes_for_class) in bboxes.iter().enumerate() {
         for b in bboxes_for_class.iter() {
