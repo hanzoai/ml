@@ -15,10 +15,11 @@
       rel="stylesheet"
       href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.8.0/build/styles/default.min.css"
     />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@hanzo/font/dist/zen.css">
     <style>
       :root {
-        --font-sans: "Zen", ui-sans-serif, system-ui, sans-serif;
-        --font-mono: "Zen Mono", ui-monospace, SFMono-Regular, monospace;
+        --font-sans: var(--font-zen-sans, ui-sans-serif), system-ui, sans-serif;
+        --font-mono: var(--font-zen-mono, ui-monospace), SFMono-Regular, monospace;
       }
       html,
       body {
