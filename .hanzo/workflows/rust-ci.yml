@@ -29,7 +29,7 @@ name: Continuous integration
 jobs:
   check:
     name: Check
-    runs-on: hanzo-build-linux-amd64
+    runs-on: [hanzo-build-linux-amd64]
     strategy:
       fail-fast: false
       matrix:
@@ -82,7 +82,7 @@ jobs:
   test:
     name: Test Suite
     # One leg, so the matrix that carried it was only a place to write a label.
-    runs-on: hanzo-build-linux-amd64
+    runs-on: [hanzo-build-linux-amd64]
     steps:
       # Best-effort, and it must stay best-effort: it reclaims space, it does not
       # gate correctness. As written it FAILED the whole matrix leg —
@@ -156,7 +156,7 @@ jobs:
 
   fmt:
     name: Rustfmt
-    runs-on: hanzo-build-linux-amd64
+    runs-on: [hanzo-build-linux-amd64]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -166,7 +166,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: hanzo-build-linux-amd64
+    runs-on: [hanzo-build-linux-amd64]
     steps:
       - uses: actions/checkout@v6
       - name: Install C toolchain and protoc (runner image ships without cc)
