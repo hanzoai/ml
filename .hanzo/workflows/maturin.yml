@@ -29,7 +29,7 @@ env:
 
 jobs:
   linux:
-    runs-on: hanzo-build-linux-amd64
+    runs-on: [hanzo-build-linux-amd64]
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +54,7 @@ jobs:
           path: ./hanzo-ml-pyo3/dist
 
   windows:
-    runs-on: windows-latest
+    runs-on: [windows-latest]
     strategy:
       matrix:
         target: [x64, x86]
@@ -83,7 +83,7 @@ jobs:
           path: ./hanzo-ml-pyo3/dist
 
   macos:
-    runs-on: macos-latest
+    runs-on: [macos-latest]
     strategy:
       matrix:
         target: [x86_64, aarch64]
@@ -111,7 +111,7 @@ jobs:
           path: ./hanzo-ml-pyo3/dist
 
   sdist:
-    runs-on: hanzo-build-linux-amd64
+    runs-on: [hanzo-build-linux-amd64]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Install Protoc
