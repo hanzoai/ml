@@ -3,7 +3,7 @@ name: PyO3-Wheels
 # Native (Hanzo Git) copy of .github/workflows/maturin.yml. The fork scans
 # .hanzo/workflows FIRST; GitHub.com ignores .hanzo/, so this is inert on GitHub
 # and only runs on the native forge. Ported verbatim -- no `self-hosted` label to
-# rewrite. The `linux`/`sdist` jobs run on the mapped `hanzo-build-linux-amd64`
+# rewrite. The `linux`/`sdist` jobs run on the mapped `linux-amd64`
 # label; the `windows`/`macos` jobs use GitHub-hosted labels that need their own
 # git-runner host daemons registered, or those legs queue on the native forge (a
 # runner-provisioning step, not a workflow change).
@@ -29,7 +29,7 @@ env:
 
 jobs:
   linux:
-    runs-on: [hanzo-build-linux-amd64]
+    runs-on: [linux-amd64]
     strategy:
       fail-fast: false
       matrix:
@@ -111,7 +111,7 @@ jobs:
           path: ./hanzo-ml-pyo3/dist
 
   sdist:
-    runs-on: [hanzo-build-linux-amd64]
+    runs-on: [linux-amd64]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Install Protoc

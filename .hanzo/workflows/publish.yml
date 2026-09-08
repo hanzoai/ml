@@ -2,7 +2,7 @@ name: Publish crates
 
 # The one publish workflow. It runs only on the native forge -- the fork scans
 # .hanzo/workflows first and GitHub.com ignores .hanzo/ entirely -- on the mapped
-# `hanzo-build-linux-amd64` label.
+# `linux-amd64` label.
 #
 # Publishes the hanzo-* crates to crates.io in dependency order, following a
 # push to main rather than a hand-pushed tag: the tree on main is the release,
@@ -39,7 +39,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: [hanzo-build-linux-amd64]
+    runs-on: [linux-amd64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
