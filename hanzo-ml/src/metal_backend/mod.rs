@@ -2856,7 +2856,9 @@ mod metal_dsl_board {
         let pl = md.compile_msl("gemv_f_f32", &msl).unwrap();
         eprintln!("[board gemv]  shape        hand_ms    dsl_ms   dsl/hand   dsl_rel  hand_rel");
         for &(n, k) in &[(128usize, 2048usize), (4096, 4096)] {
-            let w: Vec<f32> = (0..n * k).map(|i| ((i % 251) as f32 - 125.0) * 0.01).collect();
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| ((i % 251) as f32 - 125.0) * 0.01)
+                .collect();
             let x: Vec<f32> = (0..k).map(|i| ((i % 127) as f32 - 63.0) * 0.02).collect();
             // W^T [k,n] row-major for the hand GEMM's rhs (stride [n*k, n, 1]).
             let mut wt = vec![0f32; n * k];
@@ -2877,8 +2879,16 @@ mod metal_dsl_board {
             let mb = md.new_buffer_with_data(&[k as u32][..]).unwrap();
             let ib = md.new_buffer_with_data(&[0u32; 8][..]).unwrap();
 
-            let grid = objc2_metal::MTLSize { width: n, height: 1, depth: 1 };
-            let tg = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+            let grid = objc2_metal::MTLSize {
+                width: n,
+                height: 1,
+                depth: 1,
+            };
+            let tg = objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            };
             let enc_dsl = || {
                 let enc = md.command_encoder().unwrap();
                 let e = enc.as_ref();
@@ -2922,7 +2932,10 @@ mod metal_dsl_board {
                 "[board gemv]  {n:>4}x{k:<5}  {hand_ms:8.4}  {dsl_ms:8.4}   {:.3}x   {dsl_rel:.1e}  {hand_rel:.1e}",
                 dsl_ms / hand_ms
             );
-            assert!(dsl_rel < 1e-3, "DSL gemv not accurate at {n}x{k}: {dsl_rel}");
+            assert!(
+                dsl_rel < 1e-3,
+                "DSL gemv not accurate at {n}x{k}: {dsl_rel}"
+            );
         }
     }
 }
