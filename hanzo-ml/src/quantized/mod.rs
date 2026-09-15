@@ -255,7 +255,10 @@ impl QStorage {
             #[cfg(feature = "rocm")]
             Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(Cow::Borrowed(data)), d.clone())),
             #[cfg(feature = "vulkan")]
-            Device::Vulkan(d) => Ok(Self::Vulkan(dtype.from_data(Cow::Borrowed(data)), d.clone())),
+            Device::Vulkan(d) => Ok(Self::Vulkan(
+                dtype.from_data(Cow::Borrowed(data)),
+                d.clone(),
+            )),
             #[cfg(feature = "wgpu")]
             Device::Wgpu(d) => Ok(Self::Wgpu(dtype.from_data(Cow::Borrowed(data)), d.clone())),
         }
