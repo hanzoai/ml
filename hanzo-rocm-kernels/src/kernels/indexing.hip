@@ -242,6 +242,119 @@ GATHER_OP(uint8_t, uint8_t, gather_u8_u8)
 GATHER_OP(uint32_t, uint8_t, gather_u8_u32)
 GATHER_OP(int64_t, uint8_t, gather_u8_i64)
 
+// scatter: ids and inp share a shape; each ids[i] gives the `dim` coordinate written in out.
+template <typename T, typename I>
+__device__ void scatter(
+    const I *ids,
+    const T *inp,
+    T *out,
+    const size_t left_size,
+    const size_t src_dim_size,
+    const size_t dst_dim_size,
+    const size_t right_size
+) {
+    const size_t numel = left_size * right_size;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+        const size_t pre = i / right_size;
+        const size_t post = i % right_size;
+        for (unsigned int j = 0; j < src_dim_size; ++j) {
+            const size_t src_i = (pre * src_dim_size + j) * right_size + post;
+            const I idx = ids[src_i];
+            // max_value is the skip sentinel; the range test keeps index DATA, which the host
+            // cannot validate, from writing outside out.
+            if (idx < max_value<I>() && (size_t)idx < dst_dim_size) {
+                out[(pre * dst_dim_size + (size_t)idx) * right_size + post] = inp[src_i];
+            }
+        }
+    }
+}
+
+// One thread owns a whole (pre, post) column, so repeated writes to one out slot are ordered by
+// that thread and need no atomics.
+// ACC is T for native arithmetic, float for the 16-bit types which lack reliable operators.
+template <typename T, typename ACC, typename I>
+__device__ void scatter_add(
+    const I *ids,
+    const T *inp,
+    T *out,
+    const size_t left_size,
+    const size_t src_dim_size,
+    const size_t dst_dim_size,
+    const size_t right_size
+) {
+    const size_t numel = left_size * right_size;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+        const size_t pre = i / right_size;
+        const size_t post = i % right_size;
+        for (unsigned int j = 0; j < src_dim_size; ++j) {
+            const size_t src_i = (pre * src_dim_size + j) * right_size + post;
+            const I idx = ids[src_i];
+            if (idx < max_value<I>() && (size_t)idx < dst_dim_size) {
+                const size_t dst_i = (pre * dst_dim_size + (size_t)idx) * right_size + post;
+                out[dst_i] = (T)((ACC)out[dst_i] + (ACC)inp[src_i]);
+            }
+        }
+    }
+}
+
+#define SCATTER_OP(TYPENAME, INDEX_TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const INDEX_TYPENAME *ids, \
+    const TYPENAME *inp, \
+    TYPENAME *out, \
+    const size_t left_size, \
+    const size_t src_dim_size, \
+    const size_t dst_dim_size, \
+    const size_t right_size \
+) { scatter(ids, inp, out, left_size, src_dim_size, dst_dim_size, right_size); }
+
+#define SCATTER_ADD_OP(TYPENAME, ACC_TYPENAME, INDEX_TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const INDEX_TYPENAME *ids, \
+    const TYPENAME *inp, \
+    TYPENAME *out, \
+    const size_t left_size, \
+    const size_t src_dim_size, \
+    const size_t dst_dim_size, \
+    const size_t right_size \
+) { scatter_add<TYPENAME, ACC_TYPENAME>(ids, inp, out, left_size, src_dim_size, dst_dim_size, right_size); }
+
+SCATTER_OP(float, int64_t, scatter_i64_f32)
+SCATTER_OP(double, int64_t, scatter_i64_f64)
+SCATTER_OP(uint8_t, int64_t, scatter_i64_u8)
+SCATTER_OP(uint32_t, int64_t, scatter_i64_u32)
+SCATTER_OP(int64_t, int64_t, scatter_i64_i64)
+
+SCATTER_OP(float, uint32_t, scatter_u32_f32)
+SCATTER_OP(double, uint32_t, scatter_u32_f64)
+SCATTER_OP(uint8_t, uint32_t, scatter_u32_u8)
+SCATTER_OP(uint32_t, uint32_t, scatter_u32_u32)
+SCATTER_OP(int64_t, uint32_t, scatter_u32_i64)
+
+SCATTER_OP(float, uint8_t, scatter_u8_f32)
+SCATTER_OP(double, uint8_t, scatter_u8_f64)
+SCATTER_OP(uint8_t, uint8_t, scatter_u8_u8)
+SCATTER_OP(uint32_t, uint8_t, scatter_u8_u32)
+SCATTER_OP(int64_t, uint8_t, scatter_u8_i64)
+
+SCATTER_ADD_OP(float, float, int64_t, scatter_add_i64_f32)
+SCATTER_ADD_OP(double, double, int64_t, scatter_add_i64_f64)
+SCATTER_ADD_OP(uint8_t, uint8_t, int64_t, scatter_add_i64_u8)
+SCATTER_ADD_OP(uint32_t, uint32_t, int64_t, scatter_add_i64_u32)
+SCATTER_ADD_OP(int64_t, int64_t, int64_t, scatter_add_i64_i64)
+
+SCATTER_ADD_OP(float, float, uint32_t, scatter_add_u32_f32)
+SCATTER_ADD_OP(double, double, uint32_t, scatter_add_u32_f64)
+SCATTER_ADD_OP(uint8_t, uint8_t, uint32_t, scatter_add_u32_u8)
+SCATTER_ADD_OP(uint32_t, uint32_t, uint32_t, scatter_add_u32_u32)
+SCATTER_ADD_OP(int64_t, int64_t, uint32_t, scatter_add_u32_i64)
+
+SCATTER_ADD_OP(float, float, uint8_t, scatter_add_u8_f32)
+SCATTER_ADD_OP(double, double, uint8_t, scatter_add_u8_f64)
+SCATTER_ADD_OP(uint8_t, uint8_t, uint8_t, scatter_add_u8_u8)
+SCATTER_ADD_OP(uint32_t, uint32_t, uint8_t, scatter_add_u8_u32)
+SCATTER_ADD_OP(int64_t, int64_t, uint8_t, scatter_add_u8_i64)
+
 #if defined(__HIPCC__)
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -269,4 +382,20 @@ GATHER_OP(hip_bfloat16, uint8_t, gather_u8_bf16)
 GATHER_OP(__half, int64_t, gather_i64_f16)
 GATHER_OP(__half, uint32_t, gather_u32_f16)
 GATHER_OP(__half, uint8_t, gather_u8_f16)
+
+SCATTER_OP(hip_bfloat16, int64_t, scatter_i64_bf16)
+SCATTER_OP(hip_bfloat16, uint32_t, scatter_u32_bf16)
+SCATTER_OP(hip_bfloat16, uint8_t, scatter_u8_bf16)
+
+SCATTER_OP(__half, int64_t, scatter_i64_f16)
+SCATTER_OP(__half, uint32_t, scatter_u32_f16)
+SCATTER_OP(__half, uint8_t, scatter_u8_f16)
+
+SCATTER_ADD_OP(hip_bfloat16, float, int64_t, scatter_add_i64_bf16)
+SCATTER_ADD_OP(hip_bfloat16, float, uint32_t, scatter_add_u32_bf16)
+SCATTER_ADD_OP(hip_bfloat16, float, uint8_t, scatter_add_u8_bf16)
+
+SCATTER_ADD_OP(__half, float, int64_t, scatter_add_i64_f16)
+SCATTER_ADD_OP(__half, float, uint32_t, scatter_add_u32_f16)
+SCATTER_ADD_OP(__half, float, uint8_t, scatter_add_u8_f16)
 #endif

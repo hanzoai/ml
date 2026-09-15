@@ -1241,8 +1241,8 @@ impl RocmDevice {
     /// [E,n,k] is resident in VRAM (`wbank`, raw block bytes, uploaded once); `x` is the [nrows,k]
     /// routed-activation matrix (f16 or bf16); `ids[s]` is slot s's expert. For each slot the core
     /// runs on that expert's byte-slice of the bank into output row s -- each output row is written
-    /// exactly once, so there is no scatter/index_add (which ROCm lacks). Returns [nrows,n] in x's
-    /// dtype. This is the "dispatch each expert through the one core" path the decode core enables.
+    /// exactly once, so there is no scatter/index_add. Returns [nrows,n] in x's dtype. This is
+    /// the "dispatch each expert through the one core" path the decode core enables.
     pub fn moe_matvec_quant(
         &self,
         qt: RocmQuantType,
@@ -3975,6 +3975,112 @@ fn gather_typed<T: Copy + Send + Sync + WithDType + 'static>(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn scatter_typed<T: Copy + Send + Sync + 'static>(
+    kernel_root: &str,
+    ids_ptr: *mut std::ffi::c_void,
+    src_ptr: *mut std::ffi::c_void,
+    dst_ptr: *mut std::ffi::c_void,
+    left_size: usize,
+    src_dim_size: usize,
+    dst_dim_size: usize,
+    right_size: usize,
+    device: &RocmDevice,
+) -> Result<()> {
+    use hanzo_rocm_kernels::kernel::IndexingKernel;
+    let func_name = kernel_name::<T>(kernel_root);
+    let (grid, block) = launch_config(left_size * right_size);
+    unsafe {
+        launch_kernel(
+            device,
+            IndexingKernel::NAME,
+            IndexingKernel::CODE,
+            &func_name,
+            grid,
+            block,
+            &mut [
+                (&ids_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&dst_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &left_size as *const usize as *mut std::ffi::c_void,
+                &src_dim_size as *const usize as *mut std::ffi::c_void,
+                &dst_dim_size as *const usize as *mut std::ffi::c_void,
+                &right_size as *const usize as *mut std::ffi::c_void,
+            ],
+        )
+    }
+}
+
+/// Body shared by `scatter_set` and `scatter_add_set`. `root` is both the kernel-name root
+/// (the kernel is `{root}_{ids_dtype}_{dtype}`) and the op name carried in errors.
+#[allow(clippy::too_many_arguments)]
+fn scatter_apply(
+    root: &'static str,
+    dst: &mut RocmStorage,
+    dst_l: &Layout,
+    ids: &RocmStorage,
+    ids_l: &Layout,
+    src: &RocmStorage,
+    src_l: &Layout,
+    dim: usize,
+) -> Result<()> {
+    let device = dst.device.clone();
+    let src_dims = src_l.dims();
+    let left_size: usize = src_dims[..dim].iter().product();
+    let right_size: usize = src_dims[dim + 1..].iter().product();
+    let src_dim_size = src_dims[dim];
+    let dst_dim_size = dst_l.dims()[dim];
+    if left_size * right_size == 0 {
+        return Ok(());
+    }
+
+    let dst_ptr = match dst_l.contiguous_offsets() {
+        Some((o1, _)) => unsafe { dst.slice.offset_ptr(o1) },
+        None => Err(crate::Error::RequiresContiguous { op: root }.bt())?,
+    };
+    let src_ptr = match src_l.contiguous_offsets() {
+        Some((o1, _)) => unsafe { src.slice.offset_ptr(o1) },
+        None => Err(crate::Error::RequiresContiguous { op: root }.bt())?,
+    };
+    let ids_off = match ids_l.contiguous_offsets() {
+        Some((o1, _)) => o1,
+        None => Err(crate::Error::RequiresContiguous { op: root }.bt())?,
+    };
+    let (ids_suffix, ids_ptr) = match &ids.slice {
+        RocmStorageSlice::U32(s) => ("u32", unsafe { s.offset_ptr(ids_off) }),
+        RocmStorageSlice::U8(s) => ("u8", unsafe { s.offset_ptr(ids_off) }),
+        RocmStorageSlice::I64(s) => ("i64", unsafe { s.offset_ptr(ids_off) }),
+        _ => crate::bail!("{root} ids should be u8, u32, or i64"),
+    };
+    let kernel_root = format!("{root}_{ids_suffix}");
+
+    macro_rules! s {
+        ($ty:ty) => {
+            scatter_typed::<$ty>(
+                &kernel_root,
+                ids_ptr,
+                src_ptr,
+                dst_ptr,
+                left_size,
+                src_dim_size,
+                dst_dim_size,
+                right_size,
+                &device,
+            )
+        };
+    }
+    match (&dst.slice, &src.slice) {
+        (RocmStorageSlice::F32(_), RocmStorageSlice::F32(_)) => s!(f32),
+        (RocmStorageSlice::F64(_), RocmStorageSlice::F64(_)) => s!(f64),
+        (RocmStorageSlice::U8(_), RocmStorageSlice::U8(_)) => s!(u8),
+        (RocmStorageSlice::U32(_), RocmStorageSlice::U32(_)) => s!(u32),
+        (RocmStorageSlice::I64(_), RocmStorageSlice::I64(_)) => s!(i64),
+        (RocmStorageSlice::BF16(_), RocmStorageSlice::BF16(_)) => s!(bf16),
+        (RocmStorageSlice::F16(_), RocmStorageSlice::F16(_)) => s!(f16),
+        _ => crate::bail!("{root} does not support this dtype for ROCm"),
+    }
+}
+
 impl BackendStorage for RocmStorage {
     type Device = RocmDevice;
 
@@ -4488,30 +4594,26 @@ impl BackendStorage for RocmStorage {
 
     fn scatter_set(
         &mut self,
-        _l: &Layout,
-        _val: &Self,
-        _vl: &Layout,
-        _idx: &Self,
-        _il: &Layout,
-        _dim: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        Err(crate::Error::Msg(
-            "scatter_set not yet implemented for ROCm".to_string(),
-        ))
+        scatter_apply("scatter", self, l, ids, ids_l, src, src_l, dim)
     }
 
     fn scatter_add_set(
         &mut self,
-        _l: &Layout,
-        _val: &Self,
-        _vl: &Layout,
-        _idx: &Self,
-        _il: &Layout,
-        _dim: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        Err(crate::Error::Msg(
-            "scatter_add_set not yet implemented for ROCm".to_string(),
-        ))
+        scatter_apply("scatter_add", self, l, ids, ids_l, src, src_l, dim)
     }
 
     fn index_select(&self, idx: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
