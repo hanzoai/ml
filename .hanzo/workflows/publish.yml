@@ -3,7 +3,7 @@ name: Publish crates
 # Native (Hanzo Git) copy of .github/workflows/publish.yml. The fork scans
 # .hanzo/workflows FIRST; GitHub.com ignores .hanzo/, so this is inert on GitHub
 # and only runs on the native forge. Ported verbatim -- runs on the mapped
-# `hanzo-build-linux-amd64` label, no `self-hosted` label to rewrite.
+# `linux-amd64` label, no `self-hosted` label to rewrite.
 #
 # Publishes the hanzo-* candle-fork crates to crates.io in dependency order on a
 # version tag (e.g. `0.11.4`). GPU build scripts can't run on crates.io builders,
@@ -19,7 +19,7 @@ jobs:
   publish:
     # `cargo publish --no-verify` is a pure upload (no GPU build). Seed the
     # crates.io token as a repo/org secret CARGO_REGISTRY_TOKEN (from KMS).
-    runs-on: hanzo-build-linux-amd64
+    runs-on: linux-amd64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
