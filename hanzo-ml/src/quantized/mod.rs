@@ -550,7 +550,10 @@ use crate::for_each_quant;
 
 macro_rules! gen_from_u32 {
     ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
-        pub(crate) fn from_u32(u: u32) -> Result<Self> {
+        /// The dtype for a GGML type id, the inverse of [`GgmlDType::to_u32`]. Single source of
+        /// truth (generated from the `for_each_quant!` table), so a caller that delegates here
+        /// cannot drift the way a hand-written id map does.
+        pub fn from_u32(u: u32) -> Result<Self> {
             let dtype = match u {
                 0 => Self::F32,
                 1 => Self::F16,
@@ -3422,6 +3425,11 @@ mod tests {
             assert!(dtypes.contains(&dtype), "{dtype:?} has no GGML id");
         }
         for dtype in dtypes {
+            assert_eq!(
+                GgmlDType::from_u32(dtype.to_u32()).unwrap(),
+                dtype,
+                "{dtype:?} does not survive a to_u32/from_u32 round trip"
+            );
             let (size, align) = (dtype.type_size(), dtype.block_align());
             assert!(align.is_power_of_two(), "{dtype:?}: align {align}");
             assert_eq!(
