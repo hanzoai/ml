@@ -9,7 +9,7 @@
 
 - 🚀 **Native Rust Performance** - No Python overhead, maximum speed
 - 🎯 **Zero-Copy Data Loading** - Efficient memory usage with large datasets  
-- 🔥 **Multi-GPU Support** - CUDA and Metal acceleration via hanzo-ug
+- 🔥 **Multi-GPU Support** - CUDA and Metal acceleration via hanzo-ml
 - 📊 **Built-in Evaluation** - Integrated benchmarking and metrics
 - 🎛️ **Flexible Configuration** - YAML/TOML configuration files
 - 📈 **W&B Integration** - Optional Weights & Biases logging

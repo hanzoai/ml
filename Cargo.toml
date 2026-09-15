@@ -1,6 +1,6 @@
 [workspace]
 # `exclude` holds the crates that cannot BE members: the kernel crates carry their own
-# `links=` build scripts, and hanzo-ml-book/hanzo-ug are not libraries. Everything else is a
+# `links=` build scripts, and hanzo-ml-book is not a library. Everything else is a
 # member, so `cargo test --workspace` and `cargo clippy --workspace` gate it. hanzo-onnx was
 # excluded and therefore never built, tested or linted by CI — 64 op tests behind a lock nothing
 # turned. It is a member; the `check`/`test`/`clippy` jobs install protoc for its build script.
@@ -31,7 +31,6 @@ exclude = [
     "hanzo-kernels",
     "hanzo-metal-kernels",
     "hanzo-rocm-kernels",
-    "hanzo-ug",
 ]
 resolver = "2"
 
@@ -62,10 +61,9 @@ hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.44" }
 hanzo-nn = { path = "./hanzo-nn", version = "0.11.33" }
 hanzo-onnx = { path = "./hanzo-onnx", version = "0.11.8" }
 hanzo-transformers = { path = "./hanzo-transformers", version = "0.11.8" }
-hanzo-ug = { path = "./hanzo-ug", version = "0.11.33" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
-cudarc = { version = "0.19.4", features = [
+cudarc = { version = "0.19.8", features = [
     "std",
     "cublas",
     "cublaslt",
@@ -77,13 +75,15 @@ cudarc = { version = "0.19.4", features = [
     "cuda-version-from-build-system",
     "dynamic-linking",
 ], default-features = false }
-fancy-regex = "0.18.0"
+cutile = "=0.3.1"
+fancy-regex = "0.19.0"
 gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
-hf-hub = "0.5.0"
+hf-hub = { version = "1.0.0", features = ["blocking"] }
 half = { version = "2.5.0", features = [
     "num-traits",
     "use-intrinsics",
     "rand_distr",
+    "zerocopy"
 ] }
 float8 = { version = "0.7.0", features = ["num-traits", "rand_distr"] }
 hound = "3.5.1"
@@ -91,7 +91,7 @@ image = { version = "0.25.2", default-features = false, features = [
     "jpeg",
     "png",
 ] }
-imageproc = { version = "0.26.0", features = [
+imageproc = { version = "0.27.0", features = [
     "text",
 ], default-features = false }
 intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] }
@@ -101,24 +101,22 @@ log = "0.4"
 memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
 num_cpus = "1.15.0"
 num-traits = "0.2.15"
-parquet = "58"
+parquet = "59"
 rand = "0.9.0"
 rand_distr = "0.5.1"
 rayon = "1.7.0"
-safetensors = "0.7.0"
+safetensors = "0.8.0"
 serde = { version = "1.0.171", features = ["derive"] }
 serde_plain = "1.0.2"
 serde_json = "1.0.99"
 thiserror = "2"
-tokenizers = { version = "0.22.0", default-features = false }
+tokenizers = { version = "0.23.1", default-features = false }
 tracing = "0.1.37"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.7"
-ug = "0.5.0"
-ug-cuda = "0.5.0"
-ug-metal = "0.5.0"
 yoke = { version = "0.8.1", features = ["derive"] }
 zip = { version = "8.6.0", default-features = false }
+zerocopy = "0.8"
 objc2-metal = { version = "0.3.1" }
 objc2-foundation = { version = "0.3.1" }
 

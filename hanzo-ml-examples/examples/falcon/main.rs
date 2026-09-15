@@ -9,9 +9,9 @@ extern crate intel_mkl_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 use hanzo_transformers::models::falcon::{Config, Falcon};
@@ -159,11 +159,7 @@ fn main() -> Result<()> {
     let device = hanzo_ml_examples::device(args.cpu)?;
     let start = std::time::Instant::now();
     let api = Api::new()?;
-    let repo = api.repo(Repo::with_revision(
-        args.model_id,
-        RepoType::Model,
-        args.revision,
-    ));
+    let repo = api.model(args.model_id).with_revision(args.revision);
     let tokenizer_filename = repo.get("tokenizer.json")?;
     let filenames = hanzo_ml_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?;
     println!("retrieved the files in {:?}", start.elapsed());

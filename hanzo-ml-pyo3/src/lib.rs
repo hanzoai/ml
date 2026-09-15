@@ -29,7 +29,7 @@ use shape::{PyShape, PyShapeWithHole};
 mod onnx;
 
 #[derive(Clone, Debug)]
-#[pyclass(name = "Tensor")]
+#[pyclass(from_py_object, name = "Tensor")]
 /// A `hanzo` tensor.
 struct PyTensor(Tensor);
 
@@ -42,7 +42,7 @@ impl std::ops::Deref for PyTensor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[pyclass(name = "DType")]
+#[pyclass(from_py_object, name = "DType")]
 /// A `hanzo` dtype.
 struct PyDType(DType);
 
@@ -534,7 +534,6 @@ impl PyTensor {
         ))
     }
 
-    #[getter]
     /// Index a tensor.
     /// &RETURNS&: Tensor
     fn __getitem__(&self, py: Python, idx: PyObject) -> PyResult<Self> {
@@ -1226,7 +1225,7 @@ fn zeros(
 }
 
 #[derive(Debug, Clone)]
-#[pyclass(name = "QTensor")]
+#[pyclass(from_py_object, name = "QTensor")]
 /// A quantized tensor.
 struct PyQTensor(Arc<QTensor>);
 

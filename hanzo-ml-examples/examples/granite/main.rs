@@ -10,9 +10,9 @@ use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use hanzo_ml::{DType, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::io::Write;
 
 use hanzo_transformers::models::granite as model;
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
         });
         println!("loading the model weights from {model_id}");
         let revision = args.revision.unwrap_or("main".to_string());
-        let api = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+        let api = api.model(model_id).with_revision(revision);
 
         let tokenizer_filename = api.get("tokenizer.json")?;
         let config_filename = api.get("config.json")?;

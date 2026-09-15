@@ -74,8 +74,8 @@ pub fn main() -> anyhow::Result<()> {
     let model = match args.model {
         Some(model) => std::path::PathBuf::from(model),
         None => {
-            let api = hf_hub::api::sync::Api::new()?;
-            let api = api.model("lmz/hanzo-ml-sam".to_string());
+            let api = hanzo_ml_examples::hub::Api::new()?;
+            let api = api.model("lmz/hanzo-ml-sam");
             let filename = if args.use_tiny {
                 "mobile_sam-tiny-vitt.safetensors"
             } else {

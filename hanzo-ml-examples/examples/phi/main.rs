@@ -14,9 +14,9 @@ use hanzo_transformers::models::phi3::{Config as Phi3Config, Model as Phi3};
 use hanzo_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
 
 use hanzo_ml::{DType, Device, IndexOp, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 enum Model {
@@ -291,7 +291,7 @@ fn main() -> Result<()> {
             }
         }
     };
-    let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+    let repo = api.model(model_id).with_revision(revision);
     let tokenizer_filename = match args.tokenizer {
         Some(file) => std::path::PathBuf::from(file),
         None => match args.model {

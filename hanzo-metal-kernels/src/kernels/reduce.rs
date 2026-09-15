@@ -1,7 +1,8 @@
 use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
 use crate::{
-    set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Output, Source,
+    debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
+    Output, Source,
 };
 use objc2_metal::{MTLResourceUsage, MTLSize};
 
@@ -24,6 +25,10 @@ pub fn call_reduce_contiguous(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "reduce {kernel_name} length={length} out_length={out_length}"
+    );
 
     set_params!(
         encoder,
@@ -80,6 +85,10 @@ pub fn call_reduce_strided(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "reduce_strided {kernel_name} length={length} out_length={out_length}"
+    );
 
     set_params!(
         encoder,
@@ -134,6 +143,10 @@ pub fn call_last_softmax(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "softmax {kernel_name} length={length} elements={elements}"
+    );
 
     set_params!(
         encoder,
@@ -186,6 +199,10 @@ pub fn call_rms_norm(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "rms_norm {kernel_name} length={length} elements_to_sum={elements_to_sum}"
+    );
 
     set_params!(
         encoder,
@@ -243,6 +260,10 @@ pub fn call_layer_norm(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "layer_norm {kernel_name} length={length} elements_to_sum={elements_to_sum}"
+    );
 
     set_params!(
         encoder,
@@ -302,6 +323,7 @@ pub fn call_rope_i(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "rope_i {kernel_name} bh={bh} td={td}");
 
     set_params!(
         encoder,
@@ -343,6 +365,7 @@ pub fn call_rope_thd(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "rope_thd {kernel_name} b={b} t={t} h={h} d={d}");
 
     set_params!(
         encoder,
@@ -385,6 +408,7 @@ pub fn call_rope(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "rope {kernel_name} bh={bh} td={td} d={d}");
 
     set_params!(
         encoder,

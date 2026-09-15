@@ -32,7 +32,7 @@ fi
 
 # Check published crates
 echo "Checking published crates..."
-CRATES=("hanzo-ml" "hanzo-nn" "hanzo-transformers" "hanzo-datasets" "hanzo-ug")
+CRATES=("hanzo-ml" "hanzo-nn" "hanzo-transformers" "hanzo-datasets")
 for crate in "${CRATES[@]}"; do
     if cargo search "$crate" --limit 1 2>/dev/null | grep -q "0.9.2-alpha.2"; then
         echo "  $crate v0.9.2-alpha.2 published"

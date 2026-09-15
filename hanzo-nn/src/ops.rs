@@ -146,7 +146,11 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
         let dtype = storage.dtype();
         let shape = layout.shape();
         let el_count = shape.elem_count();
-        let buffer = device.new_buffer(el_count, dtype, "sigmoid")?;
+        let buffer = device
+            .new_buffer_builder()
+            .with_size_for(el_count, dtype)
+            .with_label("sigmoid")
+            .build()?;
         let encoder = device.command_encoder()?;
         encoder.set_label("sigmoid");
         let src = hanzo_metal_kernels::BufferOffset {
@@ -427,7 +431,11 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
 
         let last_dim = layout.dims()[layout.shape().rank() - 1];
         let elem_count = layout.shape().elem_count();
-        let output = device.new_buffer(elem_count, storage.dtype(), "softmax")?;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, storage.dtype())
+            .with_label("softmax")
+            .build()?;
         hanzo_metal_kernels::call_last_softmax(
             device.metal_device(),
             &encoder,
@@ -502,23 +510,50 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
             let el_count = layout.shape().elem_count();
             let dims = layout.shape().dims();
             let dim_m1 = dims[dims.len() - 1];
+            let n_rows = el_count / dim_m1;
             let mut dst = vec![T::zero(); el_count];
-            src.par_chunks(dim_m1)
-                .zip(dst.par_chunks_mut(dim_m1))
-                .for_each(|(src, dst)| {
-                    let sum2 = src
-                        .iter()
-                        .map(|&v| {
-                            let v = v.as_();
-                            v * v
-                        })
-                        .sum::<f32>();
-                    let m = (sum2 / dim_m1 as f32 + eps).sqrt();
-                    let m = T::from_f32(m).unwrap_or_else(T::nan);
-                    for ((d, s), alpha) in dst.iter_mut().zip(src.iter()).zip(alpha) {
-                        *d = *s / m * *alpha
-                    }
-                });
+
+            fn rms_row<
+                T: hanzo_ml::WithDType
+                    + num_traits::Float
+                    + num_traits::AsPrimitive<f32>
+                    + num_traits::FromPrimitive,
+            >(
+                src: &[T],
+                alpha: &[T],
+                n: usize,
+                eps: f32,
+                dst: &mut [T],
+            ) {
+                let sum2 = src
+                    .iter()
+                    .map(|&v| {
+                        let v = v.as_();
+                        v * v
+                    })
+                    .sum::<f32>();
+                let m = (sum2 / n as f32 + eps).sqrt();
+                let m = T::from_f32(m).unwrap_or_else(T::nan);
+                for ((d, s), alpha) in dst.iter_mut().zip(src.iter()).zip(alpha) {
+                    *d = *s / m * *alpha
+                }
+            }
+
+            if n_rows <= 32 {
+                let n = dim_m1;
+                for row in 0..n_rows {
+                    let src = &src[row * n..(row + 1) * n];
+                    let dst = &mut dst[row * n..(row + 1) * n];
+                    rms_row(src, alpha, n, eps, dst);
+                }
+            } else {
+                src.par_chunks(dim_m1)
+                    .zip(dst.par_chunks_mut(dim_m1))
+                    .for_each(|(src, dst)| {
+                        let n = src.len();
+                        rms_row(src, alpha, n, eps, dst);
+                    });
+            }
             let storage = hanzo_ml::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, Shape::from_dims(dims)))
         }
@@ -651,7 +686,11 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
 
         let last_dim = l1.dims()[l1.shape().rank() - 1];
         let elem_count = l1.shape().elem_count();
-        let output = device.new_buffer(elem_count, s1.dtype(), "rmsnorm")?;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, s1.dtype())
+            .with_label("rmsnorm")
+            .build()?;
         hanzo_metal_kernels::call_rms_norm(
             device.metal_device(),
             &encoder,
@@ -1025,7 +1064,11 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
 
         let last_dim = l1.dims()[l1.shape().rank() - 1];
         let elem_count = l1.shape().elem_count();
-        let output = device.new_buffer(elem_count, s1.dtype(), "layernorm")?;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, s1.dtype())
+            .with_label("layernorm")
+            .build()?;
         hanzo_metal_kernels::call_layer_norm(
             device.metal_device(),
             &encoder,
@@ -1305,7 +1348,11 @@ impl hanzo_ml::CustomOp3 for Sdpa {
         let out_shape = Shape::from_dims(&out_dims);
         let out_layout = Layout::contiguous(out_shape.clone());
 
-        let output = device.new_buffer(elem_count, q.dtype(), "sdpa_o")?;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, q.dtype())
+            .with_label("sdpa_o")
+            .build()?;
 
         // q,k must have matching emb dim
         if q_l.dim(D::Minus1)? != k_l.dim(D::Minus1)? {
@@ -1390,36 +1437,36 @@ impl hanzo_ml::CustomOp3 for Sdpa {
                     &[out_dims[out_dims.len() - 1]],
                 ]
                 .concat();
-                let intermediate = device.new_buffer(
-                    intermediate_shape.iter().product::<usize>(),
-                    DType::F32,
-                    "sdpa_2pass_intermediate",
-                )?;
+                let intermediate = device
+                    .new_buffer_builder()
+                    .with_size_for(intermediate_shape.iter().product::<usize>(), DType::F32)
+                    .with_label("sdpa_2pass_intermediate")
+                    .build()?;
                 let _ = intermediate_shape.pop().unwrap();
-                let sums = device.new_buffer(
-                    intermediate_shape.iter().product::<usize>(),
-                    DType::F32,
-                    "sdpa_2pass_sums",
-                )?;
-                let maxs = device.new_buffer(
-                    intermediate_shape.iter().product::<usize>(),
-                    DType::F32,
-                    "sdpa_2pass_maxs",
-                )?;
+                let sums = device
+                    .new_buffer_builder()
+                    .with_size_for(intermediate_shape.iter().product::<usize>(), DType::F32)
+                    .with_label("sdpa_2pass_sums")
+                    .build()?;
+                let maxs = device
+                    .new_buffer_builder()
+                    .with_size_for(intermediate_shape.iter().product::<usize>(), DType::F32)
+                    .with_label("sdpa_2pass_maxs")
+                    .build()?;
 
                 encoder.set_label("vector_attention");
                 hanzo_metal_kernels::call_sdpa_vector_2pass(
                     q.device().device(),
                     &encoder,
                     q.device().kernels(),
-                    q_l.start_offset(),
+                    q_l.start_offset() * q.dtype().size_in_bytes(),
                     q_l.dims(),
                     q.buffer(),
-                    k_l.start_offset(),
+                    k_l.start_offset() * k.dtype().size_in_bytes(),
                     k_l.dims(),
                     k_l.stride(),
                     k.buffer(),
-                    v_l.start_offset(),
+                    v_l.start_offset() * v.dtype().size_in_bytes(),
                     v_l.stride(),
                     v.buffer(),
                     &output,
@@ -1437,14 +1484,14 @@ impl hanzo_ml::CustomOp3 for Sdpa {
                     q.device().device(),
                     &encoder,
                     q.device().kernels(),
-                    q_l.start_offset(),
+                    q_l.start_offset() * q.dtype().size_in_bytes(),
                     q_l.dims(),
                     q.buffer(),
-                    k_l.start_offset(),
+                    k_l.start_offset() * k.dtype().size_in_bytes(),
                     k_l.dims(),
                     k_l.stride(),
                     k.buffer(),
-                    v_l.start_offset(),
+                    v_l.start_offset() * v.dtype().size_in_bytes(),
                     v_l.stride(),
                     v.buffer(),
                     &output,
@@ -1501,15 +1548,15 @@ impl hanzo_ml::CustomOp3 for Sdpa {
                 q.device().device(),
                 &encoder,
                 q.device().kernels(),
-                q_l.start_offset(),
+                q_l.start_offset() * q.dtype().size_in_bytes(),
                 q_l.dims(),
                 q_l.stride(),
                 q.buffer(),
-                k_l.start_offset(),
+                k_l.start_offset() * k.dtype().size_in_bytes(),
                 k_l.dims(),
                 k_l.stride(),
                 k.buffer(),
-                v_l.start_offset(),
+                v_l.start_offset() * v.dtype().size_in_bytes(),
                 v.buffer(),
                 v_l.stride(),
                 mask_type,

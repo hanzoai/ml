@@ -116,6 +116,7 @@ impl CudaDevice {
         &self,
         src: &Src,
     ) -> Result<Vec<T>> {
+        self.check_capture_copy("clone_dtoh")?;
         self.stream.clone_dtoh(src).w()
     }
 
@@ -140,6 +141,7 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        self.check_capture_copy("memcpy_dtoh")?;
         self.stream.memcpy_dtoh(src, dst).w()
     }
 
@@ -154,6 +156,19 @@ impl CudaDevice {
             return self.clone_htod_capture_cached(src);
         }
         self.stream.clone_htod(src).w()
+    }
+
+    fn check_capture_copy(&self, op: &str) -> Result<()> {
+        if cuda_graph_htod_cache_enabled() {
+            let is_capturing = self.cuda_graph_capture_active();
+            if is_capturing {
+                crate::bail!(
+                    "{op} during CUDA graph capture: host/device copies are not \
+                     permitted while capturing (use param cache for kernel parameters)"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn memcpy_htod_capture_cached<
@@ -233,7 +248,7 @@ impl CudaDevice {
     }
 }
 
-fn cuda_graph_htod_cache_enabled() -> bool {
+pub(crate) fn cuda_graph_htod_cache_enabled() -> bool {
     CUDA_GRAPH_HTOD_CACHE_DEPTH.with(|depth| depth.get() > 0)
 }
 
@@ -293,28 +308,6 @@ impl CudaDevice {
 
     pub fn is_event_tracking(&self) -> bool {
         self.context.is_event_tracking()
-    }
-
-    #[cfg(all(feature = "ug", not(target_arch = "wasm32")))]
-    pub fn compile(
-        &self,
-        func_name: &'static str,
-        kernel: hanzo_ug::lang::ssa::Kernel,
-    ) -> Result<CudaFunc> {
-        let mut buf = vec![];
-        hanzo_ug::cuda::code_gen::gen(&mut buf, func_name, &kernel)?;
-        let cuda_code = String::from_utf8(buf)?;
-        let opts = cudarc::nvrtc::CompileOptions {
-            use_fast_math: Some(true),
-            ..Default::default()
-        };
-        let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(cuda_code, opts).w()?;
-        let module = self.context.load_module(ptx).w()?;
-        let func = module.load_function(func_name).w()?;
-        Ok(CudaFunc {
-            func,
-            stream: self.stream.clone(),
-        })
     }
 
     pub fn id(&self) -> DeviceId {

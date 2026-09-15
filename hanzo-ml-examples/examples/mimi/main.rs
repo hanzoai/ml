@@ -7,9 +7,9 @@ extern crate accelerate_src;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use hanzo_ml::{DType, IndexOp, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::mimi::{Config, Model};
-use hf_hub::api::sync::Api;
 
 mod audio_io;
 
@@ -51,9 +51,7 @@ fn main() -> Result<()> {
     let device = hanzo_ml_examples::device(args.cpu)?;
     let model = match args.model {
         Some(model) => std::path::PathBuf::from(model),
-        None => Api::new()?
-            .model("kyutai/mimi".to_string())
-            .get("model.safetensors")?,
+        None => Api::new()?.model("kyutai/mimi").get("model.safetensors")?,
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model], DType::F32, &device)? };
     let config = Config::v0_1(None);

@@ -1,4 +1,4 @@
-use yew_agent::PublicWorker;
+use yew_agent::Registrable;
 fn main() {
-    hanzo_ml_wasm_example_whisper::Worker::register();
+    hanzo_ml_wasm_example_whisper::Worker::registrar().register();
 }

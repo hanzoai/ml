@@ -10,8 +10,8 @@ use hanzo_transformers::models::distilbert::{
 use anyhow::{Context, Error as E, Result};
 use clap::{Parser, ValueEnum};
 use hanzo_ml::{Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -119,9 +119,8 @@ impl Args {
         model_id: &str,
         revision: &str,
     ) -> Result<(PathBuf, PathBuf, PathBuf)> {
-        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
         let api = Api::new()?;
-        let api = api.repo(repo);
+        let api = api.model(model_id).with_revision(revision);
 
         let config = api.get("config.json")?;
         let tokenizer = api.get("tokenizer.json")?;

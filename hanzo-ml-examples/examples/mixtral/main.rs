@@ -10,10 +10,10 @@ use clap::Parser;
 use hanzo_transformers::models::mixtral::{Config, Model};
 
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 struct TextGeneration {
@@ -195,11 +195,7 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let api = Api::new()?;
-    let repo = api.repo(Repo::with_revision(
-        args.model_id,
-        RepoType::Model,
-        args.revision,
-    ));
+    let repo = api.model(args.model_id).with_revision(args.revision);
     let tokenizer_filename = match args.tokenizer_file {
         Some(file) => std::path::PathBuf::from(file),
         None => repo.get("tokenizer.json")?,

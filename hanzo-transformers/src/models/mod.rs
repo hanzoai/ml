@@ -54,6 +54,7 @@ pub mod helium;
 pub mod hiera;
 pub mod ijepa;
 pub mod jina_bert;
+pub mod lfm2;
 pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;

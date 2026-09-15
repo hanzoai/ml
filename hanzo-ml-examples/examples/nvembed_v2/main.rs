@@ -7,9 +7,9 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 use hanzo_ml::{DType, IndexOp, Shape, Tensor, D};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::nvembed_v2::model::Model;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};
 
 #[derive(Parser, Debug)]
@@ -50,7 +50,7 @@ impl Args {
         };
 
         let api = Api::new()?;
-        let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+        let repo = api.model(&model_name);
 
         let model_files = match &self.model_files {
             Some(files) => files

@@ -11,9 +11,9 @@ use hanzo_transformers::models::t5;
 use anyhow::{Error as E, Result};
 use clap::{Parser, ValueEnum};
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 const DTYPE: DType = DType::F32;
@@ -124,9 +124,8 @@ impl T5ModelBuilder {
             (None, None) => (default_model, default_revision),
         };
 
-        let repo = Repo::with_revision(model_id.clone(), RepoType::Model, revision);
         let api = Api::new()?;
-        let repo = api.repo(repo);
+        let repo = api.model(&model_id).with_revision(revision);
         let config_filename = match &args.config_file {
             None => repo.get("config.json")?,
             Some(f) => f.into(),
@@ -134,13 +133,13 @@ impl T5ModelBuilder {
         let tokenizer_filename = match &args.tokenizer_file {
             None => match args.which {
                 Which::Mt5Base => api
-                    .model("lmz/mt5-tokenizers".into())
+                    .model("lmz/mt5-tokenizers")
                     .get("mt5-base.tokenizer.json")?,
                 Which::Mt5Small => api
-                    .model("lmz/mt5-tokenizers".into())
+                    .model("lmz/mt5-tokenizers")
                     .get("mt5-small.tokenizer.json")?,
                 Which::Mt5Large => api
-                    .model("lmz/mt5-tokenizers".into())
+                    .model("lmz/mt5-tokenizers")
                     .get("mt5-large.tokenizer.json")?,
                 _ => repo.get("tokenizer.json")?,
             },

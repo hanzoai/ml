@@ -12,13 +12,14 @@ Then let's start by downloading the [model file](https://huggingface.co/bert-bas
 ```rust
 # extern crate hanzo_core;
 # extern crate hf_hub;
-use hf_hub::api::sync::Api;
-use hanzo_core::Device;
+use hf_hub::{split_id, HFClientSync};
+use hanzo_ml::Device;
 
-let api = Api::new().unwrap();
-let repo = api.model("bert-base-uncased".to_string());
+let api = HFClientSync::new().unwrap();
+let (owner, name) = split_id("bert-base-uncased");
+let repo = api.model(owner, name);
 
-let weights = repo.get("model.safetensors").unwrap();
+let weights = repo.download_file().filename("model.safetensors").send().unwrap();
 
 let weights = hanzo_core::safetensors::load(weights, &Device::Cpu);
 ```
@@ -27,14 +28,6 @@ We now have access to all the [tensors](https://huggingface.co/bert-base-uncased
 
 You can check all the names of the tensors [here](https://huggingface.co/bert-base-uncased?show_tensors=true)
 
-
-## Using async 
-
-`hf-hub` comes with an async API.
-
-```bash
-cargo add hf-hub --features tokio
-```
 
 ```rust,ignore
 # This is tested directly in examples crate because it needs external dependencies unfortunately:
@@ -51,13 +44,14 @@ Now that we have our weights, we can use them in our bert architecture:
 # extern crate hanzo_core;
 # extern crate hanzo_nn;
 # extern crate hf_hub;
-# use hf_hub::api::sync::Api;
+# use hf_hub::{split_id, HFClientSync};
 # 
-# let api = Api::new().unwrap();
-# let repo = api.model("bert-base-uncased".to_string());
+# let api = HFClientSync::new().unwrap();
+# let (owner, name) = split_id("bert-base-uncased");
+# let repo = api.model(owner, name);
 # 
-# let weights = repo.get("model.safetensors").unwrap();
-use hanzo_core::{Device, Tensor, DType};
+# let weights = repo.download_file().filename("model.safetensors").send().unwrap();
+use hanzo_ml::{Device, Tensor, DType};
 use hanzo_nn::{Linear, Module};
 
 let weights = hanzo_core::safetensors::load(weights, &Device::Cpu).unwrap();

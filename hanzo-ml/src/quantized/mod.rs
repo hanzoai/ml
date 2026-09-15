@@ -6,7 +6,7 @@ use k_quants::*;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-#[cfg(target_feature = "avx2")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod avx;
 pub mod dsv4_qat;
 mod dummy_cuda;
@@ -20,6 +20,9 @@ pub mod iq_quants;
 pub mod k_quants;
 #[cfg(feature = "metal")]
 pub mod metal;
+pub mod repack;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod repack_x86;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tokenizer;
 #[cfg(not(feature = "metal"))]
@@ -37,7 +40,10 @@ mod cuda {
     pub use super::dummy_cuda::*;
 }
 
-#[cfg(target_feature = "neon")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "arm", target_feature = "neon")
+))]
 pub mod neon;
 #[cfg(target_feature = "simd128")]
 pub mod simd128;
@@ -98,6 +104,8 @@ pub struct QTensor {
         allow(dead_code)
     )]
     banks: ResidentBanks,
+    #[allow(dead_code)]
+    repacked_qs: repack::PackedCache,
 }
 
 impl Device {
@@ -167,8 +175,9 @@ pub enum QStorage {
 
 impl QStorage {
     pub fn from_data(data: Cow<'_, [u8]>, device: &Device, dtype: GgmlDType) -> Result<Self> {
+        let data: &[u8] = &data;
         match device {
-            Device::Cpu => Ok(Self::Cpu(dtype.from_data(data))),
+            Device::Cpu => Ok(Self::Cpu(dtype.from_data(Cow::Borrowed(data)))),
             Device::Metal(d) => match dtype {
                 GgmlDType::F32 => metal::load_quantized(d, as_t_slice::<f32>(&data)),
                 GgmlDType::F16 => metal::load_quantized(d, as_t_slice::<f16>(&data)),
@@ -244,11 +253,11 @@ impl QStorage {
                 GgmlDType::Q1_0 => cuda::load_quantized(d, as_t_slice::<BlockQ1_0>(&data)),
             },
             #[cfg(feature = "rocm")]
-            Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(data), d.clone())),
+            Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(Cow::Borrowed(data)), d.clone())),
             #[cfg(feature = "vulkan")]
-            Device::Vulkan(d) => Ok(Self::Vulkan(dtype.from_data(data), d.clone())),
+            Device::Vulkan(d) => Ok(Self::Vulkan(dtype.from_data(Cow::Borrowed(data)), d.clone())),
             #[cfg(feature = "wgpu")]
-            Device::Wgpu(d) => Ok(Self::Wgpu(dtype.from_data(data), d.clone())),
+            Device::Wgpu(d) => Ok(Self::Wgpu(dtype.from_data(Cow::Borrowed(data)), d.clone())),
         }
     }
 
@@ -709,6 +718,7 @@ pub trait QuantizedType: Send + Sync {
     fn dtype(&self) -> GgmlDType;
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()>;
     fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()>;
+    fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage>;
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage>;
     fn storage_size_in_bytes(&self) -> usize;
     fn as_ptr(&self) -> *const u8;
@@ -720,12 +730,50 @@ pub trait QuantizedType: Send + Sync {
     fn size(&self) -> usize;
 }
 
+/// Dequantize the rows named by `ids` out of a `[rows, hidden]` block table.
+fn embedding_rows<T: k_quants::GgmlType>(
+    blocks: &[T],
+    ids: &[u32],
+    rows: usize,
+    hidden: usize,
+) -> Result<CpuStorage> {
+    if !hidden.is_multiple_of(T::BLCK_SIZE) {
+        crate::bail!(
+            "quantized embedding hidden size {hidden} is not divisible by block size {}",
+            T::BLCK_SIZE
+        )
+    }
+    let row_blocks = hidden / T::BLCK_SIZE;
+    if blocks.len() != rows * row_blocks {
+        crate::bail!(
+            "quantized tensor has {} blocks, expected {}",
+            blocks.len(),
+            rows * row_blocks
+        )
+    }
+    let mut out = vec![0f32; ids.len() * hidden];
+    for (out_row, &row_id) in ids.iter().enumerate() {
+        let row = row_id as usize;
+        if row >= rows {
+            crate::bail!("embedding id {row} is out of range for {rows} rows")
+        }
+        let src = &blocks[row * row_blocks..(row + 1) * row_blocks];
+        let dst = &mut out[out_row * hidden..(out_row + 1) * hidden];
+        T::to_float(src, dst);
+    }
+    Ok(CpuStorage::F32(out))
+}
+
 impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
         k_quants::matmul(mkn, lhs, self.as_slice(), dst)
     }
     fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
         k_quants::matmul_f16(mkn, lhs, self.as_slice(), dst)
+    }
+
+    fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
+        embedding_rows(self.as_slice(), ids, rows, hidden)
     }
 
     fn size(&self) -> usize {
@@ -814,6 +862,10 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for QMmap<T> {
         k_quants::matmul_f16(mkn, lhs, self.as_slice(), dst)
     }
 
+    fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
+        embedding_rows(self.as_slice(), ids, rows, hidden)
+    }
+
     fn size(&self) -> usize {
         self.n_blocks * std::mem::size_of::<T>()
     }
@@ -877,6 +929,7 @@ impl QTensor {
             storage,
             shape,
             banks: ResidentBanks::default(),
+            repacked_qs: repack::PackedCache::new(),
         }
     }
 
@@ -1037,6 +1090,61 @@ impl QTensor {
                 Ok(s)
             }
         }
+    }
+
+    pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
+        let (rows, hidden) = self.shape.dims2()?;
+        if !hidden.is_multiple_of(self.dtype().block_size()) {
+            crate::bail!(
+                "quantized embedding hidden size {hidden} is not divisible by block size {}",
+                self.dtype().block_size()
+            )
+        }
+        let mut out_shape = ids.dims().to_vec();
+        out_shape.push(hidden);
+        let device = self.device();
+        let ids = ids
+            .to_device(&device)?
+            .to_dtype(DType::U32)?
+            .flatten_all()?
+            .contiguous()?;
+        let storage = match &self.storage {
+            QStorage::Cpu(storage) => {
+                let ids = ids.to_vec1::<u32>()?;
+                Storage::Cpu(storage.embedding(&ids, rows, hidden)?)
+            }
+            QStorage::Metal(storage) => match &*ids.storage() {
+                Storage::Metal(ids_storage) => {
+                    Storage::Metal(storage.embedding(rows, hidden, ids_storage, ids.layout())?)
+                }
+                _ => unreachable!("ids were moved to the QTensor device"),
+            },
+            QStorage::Cuda(storage) => match &*ids.storage() {
+                Storage::Cuda(ids_storage) => {
+                    Storage::Cuda(storage.embedding(rows, hidden, ids_storage, ids.layout())?)
+                }
+                _ => unreachable!("ids were moved to the QTensor device"),
+            },
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(..) => return self.embedding_dequantized(&ids, out_shape),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(..) => return self.embedding_dequantized(&ids, out_shape),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(..) => return self.embedding_dequantized(&ids, out_shape),
+            QStorage::Stream(_) => {
+                crate::bail!("streaming expert bank is not resident; it has no embedding rows")
+            }
+        };
+        let none = crate::op::BackpropOp::none();
+        Ok(crate::tensor::from_storage(storage, out_shape, none, false))
+    }
+
+    /// Row gather through a dequantized table, for backends without a quantized get_rows kernel.
+    #[cfg(any(feature = "rocm", feature = "vulkan", feature = "wgpu"))]
+    fn embedding_dequantized(&self, ids: &Tensor, out_shape: Vec<usize>) -> Result<Tensor> {
+        self.dequantize(ids.device())?
+            .index_select(ids, 0)?
+            .reshape(out_shape)
     }
 
     pub fn storage_size_in_bytes(&self) -> usize {
@@ -2445,7 +2553,286 @@ impl QMatMul {
             }
         }
     }
+
+    pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::QTensor(t) => t.embedding(ids),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQuant { qtensor, .. } => qtensor.embedding(ids),
+            #[cfg(feature = "wgpu")]
+            Self::WgpuQuant { qtensor, .. } => qtensor.embedding(ids),
+            #[cfg(feature = "rocm")]
+            Self::RocmQuant { qtensor, .. } => qtensor.embedding(ids),
+            Self::Tensor(w) | Self::TensorF16(w) => {
+                let mut final_dims = ids.dims().to_vec();
+                final_dims.push(w.dim(D::Minus1)?);
+                let ids = ids.to_device(w.device())?.flatten_all()?;
+                w.index_select(&ids, 0)?.reshape(final_dims)
+            }
+        }
+    }
 }
+
+impl QTensor {
+    /// Fused m==1 matmul over same-dtype tensors sharing one lhs (e.g. qkv or gate+up in
+    /// decode): one lhs quantization and one parallel region. None when unsupported.
+    pub fn gemv_fused_shared_lhs(ts: &[&Self], lhs: &Tensor) -> Result<Option<Vec<Tensor>>> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if ts.is_empty() || !lhs.device().is_cpu() || lhs.dtype() != crate::DType::F32 {
+                return Ok(None);
+            }
+            if !lhs.is_contiguous() {
+                return Ok(None);
+            }
+            let dims = lhs.dims();
+            let Some((&k, batch)) = dims.split_last() else {
+                return Ok(None);
+            };
+            if batch.iter().product::<usize>() != 1 {
+                return Ok(None);
+            }
+            let mut ns = Vec::with_capacity(ts.len());
+            let mut parts: Vec<(&dyn QuantizedType, &repack::PackedCache)> =
+                Vec::with_capacity(ts.len());
+            for t in ts {
+                let (n, tk) = t.shape.dims2()?;
+                if tk != k {
+                    return Ok(None);
+                }
+                let QStorage::Cpu(s) = &t.storage else {
+                    return Ok(None);
+                };
+                ns.push(n);
+                parts.push((s.as_ref(), &t.repacked_qs));
+            }
+            let storage = lhs.storage();
+            let crate::Storage::Cpu(cpu) = &*storage else {
+                return Ok(None);
+            };
+            let slice = cpu.as_slice::<f32>()?;
+            let offset = lhs.layout().start_offset();
+            let slice = &slice[offset..offset + k];
+            let mut dsts: Vec<Vec<f32>> = ns.iter().map(|&n| vec![0f32; n]).collect();
+            if !repack::try_gemv_fused(k, slice, &parts, &mut dsts)? {
+                return Ok(None);
+            }
+            drop(storage);
+            let outs = dsts
+                .into_iter()
+                .zip(&ns)
+                .map(|(d, &n)| {
+                    let mut shape = dims.to_vec();
+                    *shape.last_mut().unwrap() = n;
+                    Tensor::from_vec(d, shape, &crate::Device::Cpu)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(outs))
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // the fused kernel is 512-bit only; downlevel tiers fall through to
+            // per-matmul calls which dispatch to the 256-bit kernels
+            if repack_x86::level() != Some(repack_x86::X86Level::Avx512Vnni) {
+                return Ok(None);
+            }
+            if ts.is_empty() || !lhs.device().is_cpu() || lhs.dtype() != crate::DType::F32 {
+                return Ok(None);
+            }
+            if !lhs.is_contiguous() {
+                return Ok(None);
+            }
+            let dims = lhs.dims();
+            let Some((&k, batch)) = dims.split_last() else {
+                return Ok(None);
+            };
+            let m: usize = batch.iter().product::<usize>().max(1);
+            let dtype = ts[0].dtype();
+            let mut shapes = Vec::with_capacity(ts.len());
+            for t in ts {
+                let Ok((n, tk)) = t.shape.dims2() else {
+                    return Ok(None);
+                };
+                if tk != k || t.dtype() != dtype || !repack_x86::select(dtype, n, k) {
+                    return Ok(None);
+                }
+                shapes.push(n);
+            }
+            let guard = lhs.storage();
+            let crate::Storage::Cpu(cpu) = &*guard else {
+                return Ok(None);
+            };
+            let slice = cpu.as_slice::<f32>()?;
+            let offset = lhs.layout().start_offset();
+            let lhs_data = &slice[offset..offset + m * k];
+            let lhs_q = repack_x86::quantize_lhs(lhs_data, m, k);
+            let packs: Vec<&repack_x86::PackedX86> = ts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let n = shapes[i];
+                    t.repacked_qs
+                        .x86_get_or_init(|| repack_x86::pack(dtype, t.storage_ref(), n, k))
+                })
+                .collect();
+            let parts: Vec<(&repack_x86::PackedX86, usize)> = packs
+                .iter()
+                .zip(shapes.iter())
+                .map(|(p, &n)| (*p, n))
+                .collect();
+            let mut dsts: Vec<Vec<f32>> = shapes.iter().map(|&n| vec![0f32; m * n]).collect();
+            repack_x86::gemv_fused(&parts, &lhs_q, m, k, &mut dsts);
+            drop(guard);
+            let mut out = Vec::with_capacity(ts.len());
+            let mut out_dims = dims.to_vec();
+            for (dst, &n) in dsts.into_iter().zip(shapes.iter()) {
+                *out_dims.last_mut().unwrap() = n;
+                out.push(Tensor::from_vec(
+                    dst,
+                    out_dims.clone(),
+                    &crate::Device::Cpu,
+                )?);
+            }
+            Ok(Some(out))
+        }
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let _ = (ts, lhs);
+            Ok(None)
+        }
+    }
+}
+
+impl QTensor {
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn storage_ref(&self) -> &dyn QuantizedType {
+        match &self.storage {
+            QStorage::Cpu(s) => s.as_ref(),
+            _ => unreachable!("cpu-only path"),
+        }
+    }
+
+    /// Indexed (MoE) matmul over stacked expert weights [n_experts, n_out, k]: each
+    /// (token, expert-id) pair gemvs against its expert's rows via the repacked cache.
+    /// Returns None when the layout, dtype, or device is unsupported.
+    pub fn indexed_gemv(&self, x: &Tensor, ids: &Tensor) -> Result<Option<Tensor>> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if !x.device().is_cpu()
+                || !matches!(x.dtype(), crate::DType::F32 | crate::DType::BF16)
+                || !x.is_contiguous()
+            {
+                return Ok(None);
+            }
+            let Ok((n_experts, n_out, k)) = self.shape.dims3() else {
+                return Ok(None);
+            };
+            let Ok((batch, x_t, xk)) = x.dims3() else {
+                return Ok(None);
+            };
+            let Ok((ids_b, topk)) = ids.dims2() else {
+                return Ok(None);
+            };
+            if xk != k || ids_b != batch || (x_t != 1 && x_t != topk) {
+                return Ok(None);
+            }
+            let QStorage::Cpu(storage) = &self.storage else {
+                return Ok(None);
+            };
+            let ids_v: Vec<u32> = ids
+                .to_dtype(crate::DType::U32)?
+                .flatten_all()?
+                .to_vec1::<u32>()?;
+            if ids_v.iter().any(|&e| e as usize >= n_experts) {
+                crate::bail!("expert index out of range");
+            }
+            let guard = x.storage();
+            let crate::Storage::Cpu(cpu) = &*guard else {
+                return Ok(None);
+            };
+            let offset = x.layout().start_offset();
+            let n_rows = batch * x_t;
+            let widened;
+            let lhs: &[f32] = if x.dtype() == crate::DType::BF16 {
+                let bslice = cpu.as_slice::<half::bf16>()?;
+                widened = widen_bf16(&bslice[offset..offset + n_rows * k]);
+                &widened
+            } else {
+                let slice = cpu.as_slice::<f32>()?;
+                &slice[offset..offset + n_rows * k]
+            };
+            let mut dst = vec![0f32; batch * topk * n_out];
+            let ok = repack::try_indexed_gemv(
+                storage.as_ref(),
+                &self.repacked_qs,
+                n_experts,
+                n_out,
+                k,
+                lhs,
+                n_rows,
+                &ids_v,
+                topk,
+                &mut dst,
+            )?;
+            drop(guard);
+            if !ok {
+                return Ok(None);
+            }
+            let out = Tensor::from_vec(dst, (batch, topk, n_out), &crate::Device::Cpu)?;
+            if x.dtype() == crate::DType::BF16 {
+                Ok(Some(out.to_dtype(crate::DType::BF16)?))
+            } else {
+                Ok(Some(out))
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (x, ids);
+            Ok(None)
+        }
+    }
+}
+
+fn widen_bf16(src: &[half::bf16]) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::with_capacity(src.len());
+    let out_ptr = out.as_mut_ptr() as usize;
+    let n_units = src.len().div_ceil(WIDEN_CHUNK);
+    crate::utils::barrier_pool().execute_chunked(n_units, |range| {
+        let out_ptr = out_ptr as *mut f32;
+        for unit in range {
+            let lo = unit * WIDEN_CHUNK;
+            let hi = src.len().min(lo + WIDEN_CHUNK);
+            for (i, v) in src[lo..hi].iter().enumerate() {
+                unsafe { *out_ptr.add(lo + i) = v.to_f32() };
+            }
+        }
+    });
+    // SAFETY: every element written by exactly one unit.
+    unsafe { out.set_len(src.len()) };
+    out
+}
+
+fn narrow_bf16(src: &[f32]) -> Vec<half::bf16> {
+    let mut out: Vec<half::bf16> = Vec::with_capacity(src.len());
+    let out_ptr = out.as_mut_ptr() as usize;
+    let n_units = src.len().div_ceil(WIDEN_CHUNK);
+    crate::utils::barrier_pool().execute_chunked(n_units, |range| {
+        let out_ptr = out_ptr as *mut half::bf16;
+        for unit in range {
+            let lo = unit * WIDEN_CHUNK;
+            let hi = src.len().min(lo + WIDEN_CHUNK);
+            for (i, v) in src[lo..hi].iter().enumerate() {
+                unsafe { *out_ptr.add(lo + i) = half::bf16::from_f32(*v) };
+            }
+        }
+    });
+    // SAFETY: every element written by exactly one unit.
+    unsafe { out.set_len(src.len()) };
+    out
+}
+
+const WIDEN_CHUNK: usize = 32 * 1024;
 
 impl crate::CustomOp1 for QTensor {
     fn name(&self) -> &'static str {
@@ -2492,11 +2879,20 @@ impl crate::CustomOp1 for QTensor {
                 let slice =
                     &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
                 let mut dst_storage = vec![0f32; dst_shape.elem_count()];
-                self_storage.matmul_t(
-                    (dst_shape.elem_count() / n, k, n),
+
+                let mkn = (dst_shape.elem_count() / n, k, n);
+                let used_packed = repack::try_matmul_f32(
+                    self_storage.as_ref(),
+                    &self.repacked_qs,
+                    mkn,
                     slice,
                     &mut dst_storage,
                 )?;
+                if used_packed {
+                    return Ok((crate::CpuStorage::F32(dst_storage), dst_shape));
+                }
+
+                self_storage.matmul_t(mkn, slice, &mut dst_storage)?;
                 Ok((crate::CpuStorage::F32(dst_storage), dst_shape))
             }
             DType::F16 => {
@@ -2511,7 +2907,29 @@ impl crate::CustomOp1 for QTensor {
                 )?;
                 Ok((crate::CpuStorage::F16(dst_storage), dst_shape))
             }
-            _ => crate::bail!("Expected f32/f16"),
+            DType::BF16 => {
+                // widen to f32 once and take the repacked path; output stays bf16
+                let slice = storage.as_slice::<half::bf16>()?;
+                let slice =
+                    &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
+                let lhs = widen_bf16(slice);
+                let mut dst_storage = vec![0f32; dst_shape.elem_count()];
+
+                let mkn = (dst_shape.elem_count() / n, k, n);
+                let used_packed = repack::try_matmul_f32(
+                    self_storage.as_ref(),
+                    &self.repacked_qs,
+                    mkn,
+                    &lhs,
+                    &mut dst_storage,
+                )?;
+                if !used_packed {
+                    self_storage.matmul_t(mkn, &lhs, &mut dst_storage)?;
+                }
+                let dst: Vec<half::bf16> = narrow_bf16(&dst_storage);
+                Ok((crate::CpuStorage::BF16(dst), dst_shape))
+            }
+            _ => crate::bail!("Expected f32/f16/bf16"),
         }
     }
 

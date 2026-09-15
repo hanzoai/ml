@@ -15,9 +15,9 @@ use clap::{Parser, ValueEnum};
 use cudarc::driver::safe::CudaDevice;
 use cudarc::nccl::safe::{Comm, Id};
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_transformers::generation::LogitsProcessor;
 use hanzo_transformers::models::llama::LlamaEosToks;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::io::Write;
 use std::rc::Rc;
 
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
     };
     println!("loading the model weights from {model_id}");
     let revision = args.revision.unwrap_or("main".to_string());
-    let api = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+    let api = api.model(model_id).with_revision(revision);
     let config_filename = api.get("config.json")?;
     let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
     let tokenizer_filename = api.get("tokenizer.json")?;

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use hanzo_ml::quantized::gguf_file;
 use hanzo_ml::quantized::tokenizer::TokenizerFromGguf;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hanzo_ml_examples::hub::Api;
 use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]
@@ -87,11 +87,9 @@ fn resolve_model_path(model: &str, revision: Option<String>) -> Result<PathBuf> 
     let filename = parts[2..].join("/");
 
     let api = Api::new()?;
-    let repo = Repo::with_revision(
-        repo_id,
-        RepoType::Model,
-        revision.unwrap_or_else(|| "main".to_string()),
-    );
-    let path = api.repo(repo).get(&filename)?;
+    let path = api
+        .model(repo_id)
+        .with_revision(revision.unwrap_or_else(|| "main".to_string()))
+        .get(&filename)?;
     Ok(path)
 }

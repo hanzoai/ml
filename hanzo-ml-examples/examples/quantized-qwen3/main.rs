@@ -100,7 +100,7 @@ impl Args {
         let tokenizer_path = match &self.tokenizer {
             Some(config) => std::path::PathBuf::from(config),
             None => {
-                let api = hf_hub::api::sync::Api::new()?;
+                let api = hanzo_ml_examples::hub::Api::new()?;
                 let repo = match self.which {
                     Which::W3_0_6b => "Qwen/Qwen3-0.6B",
                     Which::W3_1_7b => "Qwen/Qwen3-1.7B",
@@ -109,7 +109,7 @@ impl Args {
                     Which::W3_14b => "Qwen/Qwen3-14B",
                     Which::W3_32b => "Qwen/Qwen3-32B",
                 };
-                let api = api.model(repo.to_string());
+                let api = api.model(repo);
                 api.get("tokenizer.json")?
             }
         };
@@ -128,13 +128,8 @@ impl Args {
                     Which::W3_14b => ("unsloth/Qwen3-14B-GGUF", "Qwen3-14B-Q4_K_M.gguf", "main"),
                     Which::W3_32b => ("unsloth/Qwen3-32B-GGUF", "Qwen3-32B-Q4_K_M.gguf", "main"),
                 };
-                let api = hf_hub::api::sync::Api::new()?;
-                api.repo(hf_hub::Repo::with_revision(
-                    repo.to_string(),
-                    hf_hub::RepoType::Model,
-                    revision.to_string(),
-                ))
-                .get(filename)?
+                let api = hanzo_ml_examples::hub::Api::new()?;
+                api.model(repo).with_revision(revision).get(filename)?
             }
         };
         Ok(model_path)
@@ -239,68 +234,71 @@ fn main() -> anyhow::Result<()> {
 
     let start_prompt_processing = std::time::Instant::now();
 
-    let mut next_token = if !args.split_prompt {
-        let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, 0)?;
-        let logits = logits.squeeze(0)?;
-        logits_processor.sample(&logits)?
-    } else {
-        let mut next_token = 0;
-        for (pos, token) in tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, pos)?;
+    let (prompt_dt, sampled, dt) = device.with_context(|| -> anyhow::Result<_> {
+        let mut next_token = if !args.split_prompt {
+            let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
+            let logits = model.forward(&input, 0)?;
             let logits = logits.squeeze(0)?;
-            next_token = logits_processor.sample(&logits)?
-        }
-        next_token
-    };
-
-    let prompt_dt = start_prompt_processing.elapsed();
-
-    all_tokens.push(next_token);
-
-    if let Some(t) = tos.next_token(next_token)? {
-        print!("{t}");
-        std::io::stdout().flush()?;
-    }
-
-    let eos_token = *tos.tokenizer().get_vocab(true).get("<|im_end|>").unwrap();
-
-    let start_post_prompt = std::time::Instant::now();
-
-    let mut sampled = 0;
-    for index in 0..to_sample {
-        let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, tokens.len() + index)?;
-        let logits = logits.squeeze(0)?;
-        let logits = if args.repeat_penalty == 1. {
-            logits
+            logits_processor.sample(&logits)?
         } else {
-            let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
-            hanzo_transformers::utils::apply_repeat_penalty(
-                &logits,
-                args.repeat_penalty,
-                &all_tokens[start_at..],
-            )?
+            let mut next_token = 0;
+            for (pos, token) in tokens.iter().enumerate() {
+                let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
+                let logits = model.forward(&input, pos)?;
+                let logits = logits.squeeze(0)?;
+                next_token = logits_processor.sample(&logits)?
+            }
+            next_token
         };
-        next_token = logits_processor.sample(&logits)?;
+
+        let prompt_dt = start_prompt_processing.elapsed();
+
         all_tokens.push(next_token);
+
         if let Some(t) = tos.next_token(next_token)? {
             print!("{t}");
             std::io::stdout().flush()?;
         }
-        sampled += 1;
-        if next_token == eos_token {
-            break;
-        };
-    }
+
+        let eos_token = *tos.tokenizer().get_vocab(true).get("<|im_end|>").unwrap();
+
+        let start_post_prompt = std::time::Instant::now();
+
+        let mut sampled = 0;
+        for index in 0..to_sample {
+            let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
+            let logits = model.forward(&input, tokens.len() + index)?;
+            let logits = logits.squeeze(0)?;
+            let logits = if args.repeat_penalty == 1. {
+                logits
+            } else {
+                let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
+                hanzo_transformers::utils::apply_repeat_penalty(
+                    &logits,
+                    args.repeat_penalty,
+                    &all_tokens[start_at..],
+                )?
+            };
+            next_token = logits_processor.sample(&logits)?;
+            all_tokens.push(next_token);
+            if let Some(t) = tos.next_token(next_token)? {
+                print!("{t}");
+                std::io::stdout().flush()?;
+            }
+            sampled += 1;
+            if next_token == eos_token {
+                break;
+            };
+        }
+
+        Ok((prompt_dt, sampled, start_post_prompt.elapsed()))
+    })?;
 
     if let Some(rest) = tos.decode_rest().map_err(hanzo_ml::Error::msg)? {
         print!("{rest}");
     }
 
     std::io::stdout().flush()?;
-    let dt = start_post_prompt.elapsed();
     println!(
         "\n\n{:4} prompt tokens processed: {:.2} token/s",
         tokens.len(),

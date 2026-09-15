@@ -14,7 +14,6 @@ hanzo-ml = { workspace = true }
 hanzo-nn = { workspace = true }
 hanzo-transformers = { workspace = true }
 hanzo-datasets = { workspace = true }
-hanzo-ug = { workspace = true, optional = true }
 
 # Core dependencies
 anyhow = { workspace = true }
@@ -49,7 +48,6 @@ default = []
 cuda = ["hanzo-ml/cuda", "hanzo-nn/cuda"]
 metal = ["hanzo-ml/metal", "hanzo-nn/metal"]
 # wandb = ["dep:wandb"]  # Commented out for now
-ug = ["dep:hanzo-ug", "hanzo-ml/ug"]
 
 # The binary is named for its crate, not for a verb it cannot perform. `hanzo-train`
 # is the `hanzo-train` crate's binary — the DSpark draft trainer that reaches

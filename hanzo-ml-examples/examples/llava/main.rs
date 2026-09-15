@@ -10,12 +10,12 @@ use clap::Parser;
 use constants::*;
 use conversation::Conversation;
 use hanzo_ml::{DType, Device, IndexOp, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::llava::config::{
     HFGenerationConfig, HFLLaVAConfig, HFPreProcessorConfig,
 };
 use hanzo_transformers::models::llava::{config::LLaVAConfig, LLaVA};
-use hf_hub::api::sync::Api;
 use image_processor::{process_image, ImageProcessor};
 use std::io::Write;
 use tokenizers::Tokenizer;

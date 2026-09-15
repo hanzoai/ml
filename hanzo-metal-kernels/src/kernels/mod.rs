@@ -22,8 +22,8 @@ pub use fill::*;
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
 pub use quantized::{
-    call_quantized_matmul_mm_t, call_quantized_matmul_mm_t_offset, call_quantized_matmul_mv_t,
-    call_quantized_matmul_mv_t_offset, GgmlDType,
+    call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mm_t_offset,
+    call_quantized_matmul_mv_t, call_quantized_matmul_mv_t_offset, GgmlDType,
 };
 pub use random::*;
 pub use reduce::*;

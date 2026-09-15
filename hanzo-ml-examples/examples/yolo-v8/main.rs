@@ -299,8 +299,8 @@ impl Args {
         let path = match &self.model {
             Some(model) => std::path::PathBuf::from(model),
             None => {
-                let api = hf_hub::api::sync::Api::new()?;
-                let api = api.model("lmz/hanzo-ml-yolo-v8".to_string());
+                let api = hanzo_ml_examples::hub::Api::new()?;
+                let api = api.model("lmz/hanzo-ml-yolo-v8");
                 let size = match self.which {
                     Which::N => "n",
                     Which::S => "s",
@@ -312,7 +312,7 @@ impl Args {
                     YoloTask::Pose => "-pose",
                     YoloTask::Detect => "",
                 };
-                api.get(&format!("yolov8{size}{task}.safetensors"))?
+                api.get(format!("yolov8{size}{task}.safetensors"))?
             }
         };
         Ok(path)

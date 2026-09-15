@@ -8,8 +8,8 @@ use hanzo_transformers::models::bert::{BertModel, Config, HiddenAct, DTYPE};
 use anyhow::{Error as E, Result};
 use clap::Parser;
 use hanzo_ml::Tensor;
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer};
 
 #[derive(Parser, Debug)]
@@ -63,10 +63,9 @@ impl Args {
             (None, None) => (default_model, default_revision),
         };
 
-        let repo = Repo::with_revision(model_id, RepoType::Model, revision);
         let (config_filename, tokenizer_filename, weights_filename) = {
             let api = Api::new()?;
-            let api = api.repo(repo);
+            let api = api.model(model_id).with_revision(revision);
             let config = api.get("config.json")?;
             let tokenizer = api.get("tokenizer.json")?;
             let weights = if self.use_pth {

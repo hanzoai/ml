@@ -11,12 +11,12 @@ use anyhow::bail;
 use anyhow::{Error as E, Result};
 use clap::{ArgGroup, Parser, ValueEnum};
 use hanzo_ml::{Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::ops::softmax;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::debertav2::{Config as DebertaV2Config, DebertaV2NERModel};
 use hanzo_transformers::models::debertav2::{DebertaV2SeqClassificationModel, Id2Label};
 use hanzo_transformers::models::debertav2::{NERItem, TextClassificationItem};
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 
 enum TaskType {
@@ -114,13 +114,10 @@ impl Args {
                     (config, tokenizer, weights)
                 }
                 None => {
-                    let repo = Repo::with_revision(
-                        self.model_id.as_ref().unwrap().clone(),
-                        RepoType::Model,
-                        self.revision.clone(),
-                    );
                     let api = Api::new()?;
-                    let api = api.repo(repo);
+                    let api = api
+                        .model(self.model_id.as_ref().unwrap())
+                        .with_revision(&self.revision);
                     let config = api.get("config.json")?;
                     let tokenizer = api.get("tokenizer.json")?;
                     let weights = if self.use_pth {

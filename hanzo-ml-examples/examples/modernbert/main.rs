@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Error as E, Result};
 use clap::{Parser, ValueEnum};
 use hanzo_ml::{Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::modernbert;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer};
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -61,11 +61,7 @@ fn main() -> Result<()> {
             Model::ModernBertLarge => "answerdotai/ModernBERT-large".to_string(),
         },
     };
-    let repo = api.repo(Repo::with_revision(
-        model_id,
-        RepoType::Model,
-        args.revision,
-    ));
+    let repo = api.model(model_id).with_revision(args.revision);
 
     let tokenizer_filename = match args.tokenizer_file {
         Some(file) => std::path::PathBuf::from(file),

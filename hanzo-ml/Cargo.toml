@@ -22,8 +22,9 @@ hanzo-rocm-kernels = { workspace = true, optional = true }
 ash = { version = "0.38", optional = true }
 wgpu = { version = "22", optional = true }
 pollster = { version = "0.3", optional = true }
+cutile = { workspace = true, optional = true }
 gemm = { workspace = true }
-half = { workspace = true }
+half = { workspace = true, features = ["zerocopy"] }
 float8 = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
 libc = { workspace = true }
@@ -37,12 +38,12 @@ rayon = { workspace = true }
 safetensors = { workspace = true }
 thiserror = { workspace = true }
 yoke = { workspace = true }
+zerocopy = { workspace = true }
 zip = { workspace = true }
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokenizers = { workspace = true, features = ["onig"] }
+parking_lot = "0.12.5"
 
-[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
-hanzo-ug = { workspace = true, optional = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { workspace = true, features = ["fancy-regex"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -54,7 +55,8 @@ hanzo-kernel = { path = "../hanzo-kernel", default-features = false }
 
 [features]
 default = []
-cuda = ["cudarc", "dep:hanzo-kernels", "hanzo-ug?/cuda"]
+cuda = ["cudarc", "dep:hanzo-kernels"]
+cutile = ["cuda", "dep:cutile"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 rocm = ["dep:rocm-rs", "dep:hanzo-rocm-kernels"]
@@ -70,9 +72,8 @@ metal = [
     "dep:hanzo-metal-kernels",
     "dep:objc2-metal",
     "dep:objc2-foundation",
-    "hanzo-ug?/metal",
 ]
-ug = ["dep:hanzo-ug"]
+metal-debug-labels = ["metal", "hanzo-metal-kernels/debug-labels"]
 
 [[bench]]
 name = "bench_main"
@@ -85,6 +86,10 @@ required-features = ["metal"]
 [[example]]
 name = "cuda_basics"
 required-features = ["cuda"]
+
+[[example]]
+name = "cutile"
+required-features = ["cutile"]
 
 [lints]
 workspace = true

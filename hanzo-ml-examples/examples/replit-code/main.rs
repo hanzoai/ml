@@ -11,9 +11,9 @@ use hanzo_transformers::models::mpt::{Config, Model as M};
 use hanzo_transformers::models::quantized_mpt::Model as Q;
 
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 enum Model {
@@ -217,7 +217,7 @@ fn main() -> Result<()> {
         Some(rev) => rev.to_string(),
         None => "main".to_string(),
     };
-    let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+    let repo = api.model(model_id).with_revision(revision);
     let tokenizer_filename = match args.tokenizer {
         Some(file) => std::path::PathBuf::from(file),
         None => repo.get("tokenizer.json")?,

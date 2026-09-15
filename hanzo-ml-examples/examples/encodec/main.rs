@@ -7,9 +7,9 @@ extern crate accelerate_src;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use hanzo_ml::{DType, IndexOp, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::models::encodec::{Config, Model};
-use hf_hub::api::sync::Api;
 
 mod audio_io;
 
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     let model = match args.model {
         Some(model) => std::path::PathBuf::from(model),
         None => Api::new()?
-            .model("facebook/encodec_24khz".to_string())
+            .model("facebook/encodec_24khz")
             .get("model.safetensors")?,
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model], DType::F32, &device)? };

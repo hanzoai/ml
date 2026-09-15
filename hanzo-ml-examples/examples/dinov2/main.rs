@@ -36,8 +36,8 @@ pub fn main() -> anyhow::Result<()> {
 
     let model_file = match args.model {
         None => {
-            let api = hf_hub::api::sync::Api::new()?;
-            let api = api.model("lmz/hanzo-ml-dino-v2".into());
+            let api = hanzo_ml_examples::hub::Api::new()?;
+            let api = api.model("lmz/hanzo-ml-dino-v2");
             api.get("dinov2_vits14.safetensors")?
         }
         Some(model) => model.into(),

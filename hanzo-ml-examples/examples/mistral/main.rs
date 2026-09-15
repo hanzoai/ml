@@ -11,10 +11,10 @@ use hanzo_transformers::models::mistral::{Config, Model as Mistral};
 use hanzo_transformers::models::quantized_mistral::Model as QMistral;
 
 use hanzo_ml::{DType, Device, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_ml_examples::token_output_stream::TokenOutputStream;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 enum Model {
@@ -280,11 +280,7 @@ fn main() -> Result<()> {
             }
         }
     };
-    let repo = api.repo(Repo::with_revision(
-        model_id,
-        RepoType::Model,
-        args.revision,
-    ));
+    let repo = api.model(model_id).with_revision(args.revision);
     let tokenizer_filename = match args.tokenizer_file {
         Some(file) => std::path::PathBuf::from(file),
         None => repo.get("tokenizer.json")?,

@@ -3,7 +3,8 @@ use crate::worker::{ModelData, RunData, Worker, WorkerInput, WorkerOutput};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use yew::{html, Component, Context, Html};
-use yew_agent::{Bridge, Bridged};
+use yew_agent::worker::WorkerBridge;
+use yew_agent::Spawnable;
 
 async fn fetch_url(url: &str) -> Result<Vec<u8>, JsValue> {
     use web_sys::{Request, RequestCache, RequestInit, RequestMode, Response};
@@ -45,7 +46,7 @@ pub struct App {
     loaded: bool,
     generated: String,
     current_decode: Option<CurrentDecode>,
-    worker: Box<dyn Bridge<Worker>>,
+    worker: WorkerBridge<Worker>,
 }
 
 async fn model_data_load() -> Result<ModelData, JsValue> {
@@ -86,7 +87,7 @@ fn draw_bboxes(bboxes: Vec<Vec<crate::model::Bbox>>) -> Result<(), JsValue> {
     canvas.set_width(image_html_element.natural_width());
     canvas.set_height(image_html_element.natural_height());
     context.draw_image_with_html_image_element(&image_html_element, 0., 0.)?;
-    context.set_stroke_style(&JsValue::from("#0dff9a"));
+    context.set_stroke_style_str("#0dff9a");
     for (class_index, bboxes_for_class) in bboxes.iter().enumerate() {
         for b in bboxes_for_class.iter() {
             let name = crate::coco_classes::NAMES[class_index];
@@ -98,9 +99,9 @@ fn draw_bboxes(bboxes: Vec<Vec<crate::model::Bbox>>) -> Result<(), JsValue> {
             );
             if let Ok(metrics) = context.measure_text(name) {
                 let width = metrics.width();
-                context.set_fill_style(&"#3c8566".into());
+                context.set_fill_style_str("#3c8566");
                 context.fill_rect(b.xmin as f64 - 2., b.ymin as f64 - 12., width + 4., 14.);
-                context.set_fill_style(&"#e3fff3".into());
+                context.set_fill_style_str("#e3fff3");
                 context.fill_text(name, b.xmin as f64, b.ymin as f64 - 2.)?
             }
         }
@@ -118,7 +119,7 @@ impl Component for App {
             let link = ctx.link().clone();
             move |e| link.send_message(Self::Message::WorkerOut(e))
         };
-        let worker = Worker::bridge(std::rc::Rc::new(cb));
+        let worker = Worker::spawner().callback(cb).spawn("./worker.js");
         Self {
             status,
             generated: String::new(),

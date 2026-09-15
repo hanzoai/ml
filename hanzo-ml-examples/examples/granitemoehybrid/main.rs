@@ -10,10 +10,10 @@ use anyhow::{bail, Error as E, Result};
 use clap::Parser;
 
 use hanzo_ml::{DType, Tensor};
+use hanzo_ml_examples::hub::Api;
 use hanzo_nn::VarBuilder;
 use hanzo_transformers::generation::{LogitsProcessor, Sampling};
 use hanzo_transformers::models::granitemoehybrid as model;
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use model::{GraniteMoeHybrid, GraniteMoeHybridCache, GraniteMoeHybridConfig};
 
 use std::{io::Write, path::Path};
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
         } else {
             let api = Api::new()?;
             let revision = args.revision.clone().unwrap_or_else(|| "main".to_string());
-            let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+            let repo = api.model(model_id).with_revision(revision);
 
             let tokenizer_filename = repo.get("tokenizer.json")?;
             let config_filename = repo.get("config.json")?;
