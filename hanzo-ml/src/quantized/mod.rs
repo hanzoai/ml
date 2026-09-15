@@ -625,17 +625,18 @@ macro_rules! gen_type_size {
     };
 }
 
-macro_rules! gen_type_align {
+macro_rules! gen_block_align {
     ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
-        /// Alignment (bytes) required to reinterpret raw GGUF bytes as this dtype's block type.
-        /// The mmap loader uses it to decide whether a mapped region can be referenced no-copy
-        /// (`from_mmap`) or must fall back to an owned, naturally-aligned copy. Single source of
-        /// truth (generated from the `for_each_quant!` table), so it can't drift from `type_size`.
-        pub fn type_align(&self) -> usize {
+        /// Alignment (bytes) of this dtype's block type: the `T` that `from_data` and `from_mmap`
+        /// reinterpret the raw bytes as. A GGUF loader maps a tensor zero-copy only when its data
+        /// offset is a multiple of this, and otherwise copies into an owned, naturally aligned
+        /// buffer. Generated from the `for_each_quant!` table, so it covers every block dtype.
+        pub const fn block_align(&self) -> usize {
             use k_quants::*;
             match self {
                 Self::F32 => std::mem::align_of::<f32>(),
-                Self::F16 | Self::BF16 => std::mem::align_of::<f16>(),
+                Self::F16 => std::mem::align_of::<f16>(),
+                Self::BF16 => std::mem::align_of::<bf16>(),
                 Self::I32 => std::mem::align_of::<i32>(),
                 $( Self::$v => std::mem::align_of::<$b>(), )+
             }
@@ -675,7 +676,7 @@ impl GgmlDType {
     for_each_quant!(gen_from_data);
     for_each_quant!(gen_from_mmap);
     for_each_quant!(gen_type_size);
-    for_each_quant!(gen_type_align);
+    for_each_quant!(gen_block_align);
 
     /// The block size, i.e. the number of elements stored in each block.
     pub fn block_size(&self) -> usize {
@@ -3397,6 +3398,37 @@ impl crate::Module for QMatMul {
                 let in_dtype = xs.dtype();
                 dense_matmul(&xs.to_dtype(DType::F16)?, w)?.to_dtype(in_dtype)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GgmlDType;
+
+    #[test]
+    fn block_align_divides_type_size() {
+        // `from_u32` and `block_align` are generated from the same `for_each_quant!` table, so
+        // walking the id space visits every dtype.
+        let dtypes: Vec<GgmlDType> = (0..1024u32)
+            .filter_map(|id| GgmlDType::from_u32(id).ok())
+            .collect();
+        for dtype in [
+            GgmlDType::F32,
+            GgmlDType::BF16,
+            GgmlDType::I32,
+            GgmlDType::NVFP4,
+        ] {
+            assert!(dtypes.contains(&dtype), "{dtype:?} has no GGML id");
+        }
+        for dtype in dtypes {
+            let (size, align) = (dtype.type_size(), dtype.block_align());
+            assert!(align.is_power_of_two(), "{dtype:?}: align {align}");
+            assert_eq!(
+                size % align,
+                0,
+                "{dtype:?}: type_size {size} block_align {align}"
+            );
         }
     }
 }

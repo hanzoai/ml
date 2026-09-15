@@ -171,7 +171,7 @@ impl TensorInfo {
                 // No-copy only when the mapped region is correctly aligned for the block type
                 // (page-aligned base + 32-aligned GGUF offsets satisfy this for every real model).
                 let addr = mmap.as_ptr() as usize + start;
-                if addr.is_multiple_of(self.ggml_dtype.type_align()) {
+                if addr.is_multiple_of(self.ggml_dtype.block_align()) {
                     let storage = super::QStorage::Cpu(self.ggml_dtype.from_mmap(
                         mmap.clone(),
                         start,
