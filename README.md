@@ -29,7 +29,7 @@ Make sure that you have [`hanzo-ml`](https://github.com/hanzoai/ml/tree/main/han
 Let's see how to run a simple matrix multiplication.
 Write the following to your `myapp/src/main.rs` file:
 ```rust
-use hanzo_ml_core::{Device, Tensor};
+use hanzo_ml::{Device, Tensor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::Cpu;
@@ -174,30 +174,6 @@ And then head over to
 
 <!--- ANCHOR: useful_libraries --->
 
-## Useful External Resources
-- [`hanzo-ml-tutorial`](https://github.com/ToluClassics/hanzo-ml-tutorial): A
-  very detailed tutorial showing how to convert a PyTorch model to ML.
-- [`hanzo-ml-lora`](https://github.com/hanzoai/hanzo-ml-lora): Efficient and
-  ergonomic LoRA implementation for ML. `hanzo-ml-lora` has      
-  out-of-the-box LoRA support for many models from ML, which can be found
-  [here](https://github.com/hanzoai/hanzo-ml-lora/tree/master/hanzo-ml-lora-transformers/examples).
-- [`optimisers`](https://github.com/KGrewal1/optimisers): A collection of optimisers
-  including SGD with momentum, AdaGrad, AdaDelta, AdaMax, NAdam, RAdam, and RMSprop.
-- [`hanzo-ml-vllm`](https://github.com/hanzoai/hanzo-ml-vllm): Efficient platform for inference and
-  serving local LLMs, with a built-in `/v1` HTTP inference server.
-- [`hanzo-ml-ext`](https://github.com/mokeyish/hanzo-ml-ext): An extension library to ML that provides PyTorch functions not currently available in ML.
-- [`hanzo-ml-coursera-ml`](https://github.com/vishpat/hanzo-ml-coursera-ml): Implementation of ML algorithms from Coursera's [Machine Learning Specialization](https://www.coursera.org/specializations/machine-learning-introduction) course.
-- [`kalosm`](https://github.com/floneum/floneum/tree/master/interfaces/kalosm): A multi-modal meta-framework in Rust for interfacing with local pre-trained models with support for controlled generation, custom samplers, in-memory vector databases, audio transcription, and more.
-- [`hanzo-ml-sampling`](https://github.com/hanzoai/hanzo-ml-sampling): Sampling techniques for ML.
-- [`gpt-from-scratch-rs`](https://github.com/jeroenvlek/gpt-from-scratch-rs): A port of Andrej Karpathy's _Let's build GPT_ tutorial on YouTube showcasing the ML API on a toy problem.
-- [`hanzo-ml-einops`](https://github.com/tomsanbear/hanzo-ml-einops): A pure rust implementation of the python [einops](https://github.com/arogozhnikov/einops) library.
-- [`atoma-infer`](https://github.com/atoma-network/atoma-infer): A Rust library for fast inference at scale, leveraging FlashAttention2 for efficient attention computation, PagedAttention for efficient KV-cache memory management, and multi-GPU support. It exposes a `/v1` HTTP inference API.
-- [`llms-from-scratch-rs`](https://github.com/nerdai/llms-from-scratch-rs): A comprehensive Rust translation of the code from Sebastian Raschka's Build an LLM from Scratch book.
-
-If you have an addition to this list, please submit a pull request.
-
-<!--- ANCHOR_END: useful_libraries --->
-
 <!--- ANCHOR: features --->
 
 ## Features
@@ -206,8 +182,9 @@ If you have an addition to this list, please submit a pull request.
     - Model training.
     - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/hanzoai/ml/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/hanzo-flash-attn/src/lib.rs#L152).
 - Backends.
-    - Optimized CPU backend with optional MKL support for x86 and Accelerate for macs.
-    - CUDA backend for efficiently running on GPUs, multiple GPU distribution via NCCL.
+    - Optimized CPU backend, with MKL on x86 and Accelerate on macOS.
+    - CUDA, including unified memory on NVIDIA GB10 / DGX Spark, and multi-GPU via NCCL.
+    - Metal on Apple Silicon, ROCm on AMD, and Vulkan.
     - WASM support, run your models in a browser.
 - Included models.
     - Language Models.
@@ -262,7 +239,7 @@ If you have an addition to this list, please submit a pull request.
 <!--- ANCHOR: cheatsheet --->
 Cheatsheet:
 
-|            | Using PyTorch                            | Using ML                                                     |
+|            | Using PyTorch                            | Using Hanzo ML                                                   |
 |------------|------------------------------------------|------------------------------------------------------------------|
 | Creation   | `torch.Tensor([[1, 2], [3, 4]])`         | `Tensor::new(&[[1f32, 2.], [3., 4.]], &Device::Cpu)?`           |
 | Creation   | `torch.zeros((2, 2))`                    | `Tensor::zeros((2, 2), DType::F32, &Device::Cpu)?`               |
@@ -272,55 +249,38 @@ Cheatsheet:
 | Arithmetic | `a + b`                                  | `&a + &b`                                                        |
 | Device     | `tensor.to(device="cuda")`               | `tensor.to_device(&Device::new_cuda(0)?)?`                            |
 | Dtype      | `tensor.to(dtype=torch.float16)`         | `tensor.to_dtype(&DType::F16)?`                                  |
-| Saving     | `torch.save({"A": A}, "model.bin")`      | `hanzo::safetensors::save(&HashMap::from([("A", A)]), "model.safetensors")?` |
-| Loading    | `weights = torch.load("model.bin")`      | `hanzo::safetensors::load("model.safetensors", &device)`        |
+| Saving     | `torch.save({"A": A}, "model.bin")`      | `hanzo_ml::safetensors::save(&HashMap::from([("A", A)]), "model.safetensors")?` |
+| Loading    | `weights = torch.load("model.bin")`      | `hanzo_ml::safetensors::load("model.safetensors", &device)`        |
 
 <!--- ANCHOR_END: cheatsheet --->
 
 
 ## Structure
 
-- [hanzo-ml](./hanzo-ml): Core ops, devices, and `Tensor` struct definition
-- [hanzo-nn](./hanzo-nn/): Tools to build real models
-- [hanzo-ml-examples](./hanzo-ml-examples/): Examples of using the library in realistic settings
-- [hanzo-kernels](./hanzo-kernels/): CUDA custom kernels
-- [hanzo-datasets](./hanzo-datasets/): Datasets and data loaders.
-- [hanzo-transformers](./hanzo-transformers): transformers-related utilities.
-- [hanzo-flash-attn](./hanzo-flash-attn): Flash attention v2 layer.
-- [hanzo-onnx](./hanzo-onnx/): ONNX model evaluation.
+- [hanzo-ml](./hanzo-ml): core ops, devices, and the `Tensor` type
+- [hanzo-nn](./hanzo-nn/): layers to build real models
+- [hanzo-transformers](./hanzo-transformers): transformer building blocks
+- [hanzo-kernel](./hanzo-kernel/): the portable kernel DSL, one source lowered to every backend
+- [hanzo-kernels](./hanzo-kernels/): CUDA kernels
+- [hanzo-rocm-kernels](./hanzo-rocm-kernels/): ROCm kernels
+- [hanzo-metal-kernels](./hanzo-metal-kernels/): Metal kernels
+- [hanzo-flash-attn](./hanzo-flash-attn): flash attention v2, with v3 in [hanzo-flash-attn-v3](./hanzo-flash-attn-v3)
+- [hanzo-3d](./hanzo-3d/): 3D model support
+- [hanzo-train](./hanzo-train/) and [hanzo-training](./hanzo-training/): training loops
+- [hanzo-datasets](./hanzo-datasets/): datasets and data loaders
+- [hanzo-onnx](./hanzo-onnx/): ONNX model evaluation
+- [hanzo-ml-pyo3](./hanzo-ml-pyo3/): Python bindings
+- [hanzo-ml-examples](./hanzo-ml-examples/): the library in realistic settings
 
 ## FAQ
 
-### Why should I use ML?
+### Why Hanzo ML?
 
-<!--- ANCHOR: goals --->
+Serverless inference wants a small binary. A full framework like PyTorch is large enough that spinning
+up an instance on a cluster is slow, and Hanzo ML deploys as one lightweight binary instead.
 
-ML's core goal is to *make serverless inference possible*. Full machine learning frameworks like PyTorch
-are very large, which makes creating instances on a cluster slow. ML allows deployment of lightweight
-binaries.
-
-Secondly, ML lets you *remove Python* from production workloads. Python overhead can seriously hurt performance,
-and the [GIL](https://www.backblaze.com/blog/the-python-gil-past-present-and-future/) is a notorious source of headaches.
-
-Finally, Rust is cool! A lot of the HF ecosystem already has Rust crates, like [safetensors](https://github.com/huggingface/safetensors) and [tokenizers](https://github.com/huggingface/tokenizers).
-
-<!--- ANCHOR_END: goals --->
-
-### Other ML frameworks
-
-- [dfdx](https://github.com/coreylowman/dfdx) is a formidable crate, with shapes being included
-  in types. This prevents a lot of headaches by getting the compiler to complain about shape mismatches right off the bat.
-  However, we found that some features still require nightly, and writing code can be a bit daunting for non rust experts.
-
-  We're leveraging and contributing to other core crates for the runtime so hopefully both crates can benefit from each
-  other.
-
-- [burn](https://github.com/burn-rs/burn) is a general crate that can leverage multiple backends so you can choose the best
-  engine for your workload.
-
-- [tch-rs](https://github.com/LaurentMazare/tch-rs.git) Bindings to the torch library in Rust. Extremely versatile, but they 
-  bring in the entire torch library into the runtime. The main contributor of `tch-rs` is also involved in the development
-  of `hanzo`.
+It also takes Python out of the serving path, which removes both the interpreter overhead and the
+[GIL](https://www.backblaze.com/blog/the-python-gil-past-present-and-future/) from production.
 
 ### Common Errors
 
