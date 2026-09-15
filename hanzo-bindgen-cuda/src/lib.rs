@@ -246,11 +246,7 @@ impl Builder {
             true
         };
         let ccbin_env = std::env::var("NVCC_CCBIN");
-        let nvcc_binary = if std::path::Path::new("/usr/local/cuda/bin/nvcc").exists() {
-            "/usr/local/cuda/bin/nvcc"
-        } else {
-            "nvcc"
-        };
+        let nvcc_binary = nvcc_binary();
         if should_compile {
             cu_files
             .par_iter()
@@ -355,11 +351,8 @@ impl Builder {
         include_options.push(format!("-I{}", cuda_include_dir.display()));
 
         let ccbin_env = std::env::var("NVCC_CCBIN");
-        let nvcc_binary = if std::path::Path::new("/usr/local/cuda/bin/nvcc").exists() {
-            "/usr/local/cuda/bin/nvcc"
-        } else {
-            "nvcc"
-        };
+        let nvcc_binary = nvcc_binary();
+        println!("cargo:rerun-if-env-changed=NVCC");
         println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
         for path in &self.watch {
             println!("cargo:rerun-if-changed={}", path.display());
@@ -455,6 +448,28 @@ impl Bindings {
     }
 }
 
+/// The nvcc to compile with. `NVCC` names one explicitly; otherwise the toolkit that
+/// `cuda_include_dir` resolved supplies it, so the compiler and the headers always come from the
+/// same install. A machine whose default `/usr/local/cuda` points at another toolkit would
+/// otherwise compile 13.4 headers with a 13.0 compiler, which nvcc rejects outright.
+fn nvcc_binary() -> String {
+    if let Ok(nvcc) = std::env::var("NVCC") {
+        if !nvcc.is_empty() {
+            return nvcc;
+        }
+    }
+    if let Some(root) = cuda_include_dir() {
+        let nvcc = root.join("bin").join("nvcc");
+        if nvcc.is_file() {
+            return nvcc.display().to_string();
+        }
+    }
+    if std::path::Path::new("/usr/local/cuda/bin/nvcc").exists() {
+        return "/usr/local/cuda/bin/nvcc".to_string();
+    }
+    "nvcc".to_string()
+}
+
 fn cuda_include_dir() -> Option<PathBuf> {
     // NOTE: copied from cudarc build.rs.
     let env_vars = [
@@ -520,11 +535,7 @@ fn compute_cap() -> Result<usize, Error> {
         println!("cargo:rustc-env=CUDA_COMPUTE_CAP={cap}");
         cap
     };
-    let nvcc_binary = if std::path::Path::new("/usr/local/cuda/bin/nvcc").exists() {
-        "/usr/local/cuda/bin/nvcc"
-    } else {
-        "nvcc"
-    };
+    let nvcc_binary = nvcc_binary();
     // Grab available GPU codes from nvcc and select the highest one
     let (supported_nvcc_codes, max_nvcc_code) = {
         let out = std::process::Command::new(nvcc_binary)
