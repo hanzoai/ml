@@ -251,7 +251,7 @@ impl Builder {
             cu_files
             .par_iter()
             .map(|(cu_file, obj_file)| {
-                let mut command = std::process::Command::new(nvcc_binary);
+                let mut command = std::process::Command::new(&nvcc_binary);
                 command
                     .arg(format!("--gpu-architecture=sm_{compute_cap}"))
                     .arg("-c")
@@ -280,7 +280,7 @@ impl Builder {
             })
             .collect::<Result<(), std::io::Error>>().expect("compile files correctly");
             let obj_files = cu_files.iter().map(|c| c.1.clone()).collect::<Vec<_>>();
-            let mut command = std::process::Command::new(nvcc_binary);
+            let mut command = std::process::Command::new(&nvcc_binary);
             command
                 .arg("--lib")
                 .args([
@@ -375,7 +375,7 @@ impl Builder {
                 if ignore {
                     None
                 } else {
-                    let mut command = std::process::Command::new(nvcc_binary);
+                    let mut command = std::process::Command::new(&nvcc_binary);
                     command.arg(format!("--gpu-architecture=sm_{compute_cap}"))
                         .arg("--ptx")
                         .args(["--default-stream", "per-thread"])
@@ -538,7 +538,7 @@ fn compute_cap() -> Result<usize, Error> {
     let nvcc_binary = nvcc_binary();
     // Grab available GPU codes from nvcc and select the highest one
     let (supported_nvcc_codes, max_nvcc_code) = {
-        let out = std::process::Command::new(nvcc_binary)
+        let out = std::process::Command::new(&nvcc_binary)
                 .arg("--list-gpu-code")
                 .output()
                 .expect("`nvcc` failed. Ensure that you have CUDA installed and that `nvcc` is in your PATH.");
