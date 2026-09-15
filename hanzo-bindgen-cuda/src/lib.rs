@@ -471,8 +471,12 @@ fn nvcc_binary() -> String {
 }
 
 fn cuda_include_dir() -> Option<PathBuf> {
-    // NOTE: copied from cudarc build.rs.
+    // CUDA_HOME leads: it is how a host with several toolkits installed says which one to
+    // build against, and every other build script in the stack reads it first. Without it a
+    // machine whose /usr/local/cuda symlink points elsewhere silently compiles against the
+    // wrong headers.
     let env_vars = [
+        "CUDA_HOME",
         "CUDA_PATH",
         "CUDA_ROOT",
         "CUDA_TOOLKIT_ROOT_DIR",

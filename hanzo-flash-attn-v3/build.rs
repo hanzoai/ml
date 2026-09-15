@@ -87,7 +87,20 @@ fn main() -> Result<()> {
     let cutlass = hanzo_flash_attn_build::fetch_cutlass(&out_dir, CUTLASS_COMMIT)?;
     let cutlass_inc = hanzo_flash_attn_build::cutlass_include_arg(&cutlass);
 
-    let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
+    // NVCC names the compiler; failing that, the toolkit CUDA_HOME/CUDA_PATH/CUDA_ROOT selects
+    // supplies it, and only then PATH. The link search below takes the same root, so the compiler
+    // and the libraries it links against can never come from two different toolkits.
+    let cuda_root = ["CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"]
+        .into_iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .map(PathBuf::from)
+        .find(|root| root.join("bin").join("nvcc").is_file());
+    let nvcc = std::env::var("NVCC").unwrap_or_else(|_| {
+        cuda_root
+            .as_ref()
+            .map(|root| root.join("bin").join("nvcc").display().to_string())
+            .unwrap_or_else(|| "nvcc".to_string())
+    });
     // Datacenter arch. `90a` (Hopper) is the only architecture these kernels
     // support; overridable for future datacenter parts once ported.
     let arch = std::env::var("FLASH_ATTN_V3_CUDA_ARCH").unwrap_or_else(|_| "90a".to_string());
@@ -184,9 +197,21 @@ fn mtime(p: &Path) -> std::time::SystemTime {
         .unwrap_or(std::time::UNIX_EPOCH)
 }
 
-/// Resolve the CUDA runtime library directory from `CUDA_HOME`/`CUDA_PATH`, else
-/// from the nvcc location (`<toolkit>/bin/nvcc` -> `<toolkit>/lib64`).
+/// Resolve the CUDA runtime library directory from the compiler that will actually be used
+/// (`<toolkit>/bin/nvcc` -> `<toolkit>/lib64`), else from `CUDA_HOME`/`CUDA_PATH`/`CUDA_ROOT`.
+/// The compiler leads, so `NVCC` naming one toolkit cannot link the libraries of another.
 fn cuda_lib_dir(nvcc: &str) -> Option<PathBuf> {
+    if let Some(nvcc_path) = which(nvcc) {
+        if let Some(lib) = nvcc_path
+            .parent()
+            .and_then(|bin| bin.parent())
+            .map(|root| root.join("lib64"))
+        {
+            if lib.is_dir() {
+                return Some(lib);
+            }
+        }
+    }
     for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"] {
         if let Ok(root) = std::env::var(var) {
             let lib = PathBuf::from(root).join("lib64");
@@ -195,9 +220,7 @@ fn cuda_lib_dir(nvcc: &str) -> Option<PathBuf> {
             }
         }
     }
-    let nvcc_path = which(nvcc)?;
-    let lib = nvcc_path.parent()?.parent()?.join("lib64");
-    lib.is_dir().then_some(lib)
+    None
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
