@@ -1,6 +1,10 @@
+# Excluded from the repo workspace, so it is its own root: without this cargo walks up
+# past the repo and adopts whatever workspace sits above it.
+[workspace]
+
 [package]
 name = "hanzo-metal-kernels"
-version = "0.11.44"
+version = "0.11.45"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
