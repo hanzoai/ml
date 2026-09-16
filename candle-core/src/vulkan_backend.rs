@@ -669,3 +669,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{DType, Device, Tensor};
+
+    /// End-to-end: a candle Tensor on the Vulkan device runs affine on the GPU.
+    /// Run natively on Windows/Linux: `cargo test -p candle-core --features vulkan
+    /// vulkan_affine_gpu -- --nocapture`. Skips cleanly if no GPU adapter.
+    #[test]
+    fn vulkan_affine_gpu() {
+        let dev = match Device::new_vulkan(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no vulkan GPU ({e}); skipping");
+                return;
+            }
+        };
+        eprintln!("vulkan device: {dev:?}");
+        let n = 1024usize;
+        let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let t = Tensor::from_vec(data, n, &dev).unwrap();
+        // y = x*3 + 1, computed by the WGSL affine kernel on the GPU.
+        let y = t.affine(3.0, 1.0).unwrap();
+        let out = y.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        for (i, &v) in out.iter().enumerate() {
+            assert!((v - (i as f32 * 3.0 + 1.0)).abs() < 1e-3, "idx {i}: {v}");
+        }
+        eprintln!("GPU affine OK: out[0..4]={:?} out[1023]={}", &out[..4], out[1023]);
+    }
+}
