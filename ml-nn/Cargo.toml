@@ -1,0 +1,44 @@
+[package]
+name = "ml-nn"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+accelerate-src = { workspace = true, optional = true }
+ml = { workspace = true }
+half = { workspace = true }
+thiserror = { workspace = true }
+intel-mkl-src = { workspace = true, optional = true }
+num-traits = { workspace = true }
+rayon = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+objc2-metal = { workspace = true, optional = true }
+ml-metal-kernels = { workspace = true, optional = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+criterion = { workspace = true }
+
+[features]
+default = []
+accelerate = ["dep:accelerate-src", "ml/accelerate"]
+cuda = ["ml/cuda"]
+cudnn = ["ml/cudnn"]
+mkl = ["dep:intel-mkl-src", "ml/mkl"]
+metal = ["ml/metal", "dep:ml-metal-kernels", "dep:objc2-metal"]
+vulkan = ["ml/vulkan"]
+
+[[bench]]
+name = "bench_main"
+harness = false

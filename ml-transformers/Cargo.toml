@@ -1,0 +1,35 @@
+[package]
+name = "ml-transformers"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+accelerate-src = { workspace = true, optional = true }
+byteorder = { workspace = true }
+ml = { workspace = true }
+ml-flash-attn = { workspace = true, optional = true }
+ml-nn = { workspace = true }
+fancy-regex = { workspace = true }
+intel-mkl-src = { workspace = true, optional = true }
+num-traits = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_plain = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+accelerate = ["dep:accelerate-src", "ml/accelerate", "ml-nn/accelerate"]
+cuda = ["ml/cuda", "ml-nn/cuda"]
+cudnn = ["ml/cudnn", "ml-nn/cudnn"]
+flash-attn = ["cuda", "dep:ml-flash-attn"]
+mkl = ["dep:intel-mkl-src", "ml/mkl", "ml-nn/mkl"]
+metal = ["ml/metal", "ml-nn/metal"]

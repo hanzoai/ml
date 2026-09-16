@@ -1,0 +1,34 @@
+[package]
+name = "ml-pyo3"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[lib]
+name = "candle"
+crate-type = ["cdylib"]
+
+[dependencies]
+accelerate-src = { workspace = true, optional = true }
+ml = { workspace = true }
+ml-nn = { workspace = true }
+ml-onnx = { workspace = true, optional = true }
+half = { workspace = true }
+intel-mkl-src = { workspace = true, optional = true }
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py313"] }
+float8 = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = "0.27"
+
+[features]
+default = []
+accelerate = ["dep:accelerate-src", "ml/accelerate"]
+cuda = ["ml/cuda"]
+mkl = ["dep:intel-mkl-src", "ml/mkl"]
+onnx = ["dep:ml-onnx"]

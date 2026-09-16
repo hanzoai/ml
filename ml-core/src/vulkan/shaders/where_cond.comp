@@ -1,0 +1,16 @@
+#version 450
+// Elementwise select: outp[i] = (cond[i] != 0) ? t[i] : f[i]. All buffers length n.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly  buffer Cond { uint cond[]; };
+layout(set = 0, binding = 1) readonly  buffer T    { float t[]; };
+layout(set = 0, binding = 2) readonly  buffer F    { float f[]; };
+layout(set = 0, binding = 3) writeonly buffer Out  { float outp[]; };
+layout(push_constant) uniform Pc { uint n; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid < n) {
+        outp[gid] = (cond[gid] != 0u) ? t[gid] : f[gid];
+    }
+}
