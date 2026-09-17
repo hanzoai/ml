@@ -549,6 +549,10 @@ pub enum RocmQuantType {
     IQ1_M,
     // MXFP4 (gpt-oss): E8M0 1-byte scale + FP4 codebook, 32-elem block (decode + MoE-decode only).
     MXFP4,
+    // ROCMFP4 (ROCmFPX 100/101): UE4M3 half-scale(s) + Codebook10, 32-elem block, nibbles before
+    // the scale (decode + MoE-decode only).
+    ROCMFP4,
+    ROCMFP4_FAST,
 }
 
 impl RocmQuantType {
@@ -580,6 +584,8 @@ impl RocmQuantType {
             G::IQ1_S => Self::IQ1_S,
             G::IQ1_M => Self::IQ1_M,
             G::MXFP4 => Self::MXFP4,
+            G::ROCMFP4 => Self::ROCMFP4,
+            G::ROCMFP4_FAST => Self::ROCMFP4_FAST,
             _ => return None,
         })
     }
@@ -594,7 +600,9 @@ impl RocmQuantType {
             | Self::Q5_1
             | Self::Q8_1
             | Self::IQ4_NL
-            | Self::MXFP4 => 32,
+            | Self::MXFP4
+            | Self::ROCMFP4
+            | Self::ROCMFP4_FAST => 32,
             Self::Q4K
             | Self::Q6K
             | Self::IQ4_XS
@@ -640,6 +648,8 @@ impl RocmQuantType {
             Self::IQ1_S => 50,
             Self::IQ1_M => 56,
             Self::MXFP4 => 17,
+            Self::ROCMFP4 => 18,
+            Self::ROCMFP4_FAST => 17,
         }
     }
 
@@ -712,7 +722,9 @@ impl RocmQuantType {
             | Self::TQ1_0
             | Self::IQ1_S
             | Self::IQ1_M
-            | Self::MXFP4 => {
+            | Self::MXFP4
+            | Self::ROCMFP4
+            | Self::ROCMFP4_FAST => {
                 unreachable!("prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
             }
         }
@@ -768,7 +780,9 @@ impl RocmQuantType {
                 | Self::TQ1_0
                 | Self::IQ1_S
                 | Self::IQ1_M
-                | Self::MXFP4,
+                | Self::MXFP4
+                | Self::ROCMFP4
+                | Self::ROCMFP4_FAST,
                 _,
             ) => {
                 unreachable!("moe_prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
@@ -826,6 +840,10 @@ impl RocmQuantType {
             (Self::IQ1_M, false) => "qmatvecu_iq1_m_bf16",
             (Self::MXFP4, true) => "qmatvecu_mxfp4_f16",
             (Self::MXFP4, false) => "qmatvecu_mxfp4_bf16",
+            (Self::ROCMFP4, true) => "qmatvecu_rocmfp4_f16",
+            (Self::ROCMFP4, false) => "qmatvecu_rocmfp4_bf16",
+            (Self::ROCMFP4_FAST, true) => "qmatvecu_rocmfp4_fast_f16",
+            (Self::ROCMFP4_FAST, false) => "qmatvecu_rocmfp4_fast_bf16",
         }
     }
 
@@ -881,6 +899,10 @@ impl RocmQuantType {
             (Self::IQ1_M, false) => "moe_qmatvecu_iq1_m_bf16",
             (Self::MXFP4, true) => "moe_qmatvecu_mxfp4_f16",
             (Self::MXFP4, false) => "moe_qmatvecu_mxfp4_bf16",
+            (Self::ROCMFP4, true) => "moe_qmatvecu_rocmfp4_f16",
+            (Self::ROCMFP4, false) => "moe_qmatvecu_rocmfp4_bf16",
+            (Self::ROCMFP4_FAST, true) => "moe_qmatvecu_rocmfp4_fast_f16",
+            (Self::ROCMFP4_FAST, false) => "moe_qmatvecu_rocmfp4_fast_bf16",
         }
     }
 
