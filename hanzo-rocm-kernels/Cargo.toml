@@ -4,7 +4,7 @@
 
 [package]
 name = "hanzo-rocm-kernels"
-version = "0.11.37"
+version = "0.11.38"
 license = "MIT OR Apache-2.0"
 edition = "2021"
 
