@@ -2,7 +2,7 @@
 //!
 use crate::backend::BackendStorage;
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
-use crate::{CpuStorage, DType, Layout, Result, WithDType};
+use crate::{CpuStorage, DType, Layout, Result, Storage, Tensor, WithDType};
 use half::{bf16, f16};
 pub use hanzo_rocm_kernels as kernels;
 use hanzo_rocm_kernels::kernel::KernelSource;
