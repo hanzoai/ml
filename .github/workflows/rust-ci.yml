@@ -26,59 +26,17 @@ on:
 
 name: Continuous integration
 
+# One build per push. The test job compiles every crate the check job did, and
+# further, so the two `cargo check` legs (baseline and avx2) were the same
+# workspace compiled twice more before the build that mattered, on the one
+# runner. The avx2 leg also answered a question the test binaries answer
+# better: a runner that has avx2 runs them with it.
+#
+# The build is kept between pushes. The runner is a persistent host, so a
+# target directory outside the checkout survives the checkout's cleanup and
+# the next push recompiles what changed rather than everything. A tmpfs is
+# used when it has room, since the box's disk is slow and nearly full.
 jobs:
-  check:
-    name: Check
-    runs-on: [linux-amd64]
-    strategy:
-      fail-fast: false
-      matrix:
-      # The axis is the instruction set to compile for. Both legs always ran on
-      # one Linux pool; naming them after two ubuntu labels only hid that, and
-      # the labels themselves are gone. The fleet stopped advertising ubuntu-*
-      # on purpose -- it hosts ~1400 mirrored repos carrying upstream workflows
-      # that all ask for a generic label, and one unparseable upstream job took
-      # every runner down with it. universe
-      # charts/app/values/hanzo/git-runner.yaml keeps that account; the org
-      # pools are what a workflow on this plane asks for.
-      #
-      # A leg whose label nothing serves does not fail, it QUEUES: Check and
-      # Test Suite sat unpicked while every other job in this file went green,
-      # so the run never reached a terminal state and ml never reached the board.
-      #
-      # Windows/macOS/arm coverage returns by REGISTERING those runners, not by
-      # naming labels nothing answers.
-        cpu: [baseline, avx2]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-      - uses: dtolnay/rust-toolchain@stable
-      # hanzo-onnx's build script runs prost-build, which shells out to protoc;
-      # prost-build 0.14 does not vendor one. apt rather than a marketplace action
-      # for the same reason the clippy job apt-installs its C toolchain: these are
-      # self-hosted runners, and a step that downloads a release from a third-party
-      # host is a network dependency on every run.
-      - name: Install protoc (hanzo-onnx build script)
-        run: |
-          if ! command -v protoc >/dev/null; then
-            (sudo apt-get update && sudo apt-get install -y protobuf-compiler) \
-              || (apt-get update && apt-get install -y protobuf-compiler)
-          fi
-          protoc --version
-
-      - name: Run normal cpu
-        if: matrix.cpu == 'baseline'
-        run: cargo check --workspace
-
-      - name: Run with avx2
-        if: matrix.cpu == 'avx2'
-        run: |
-          export RUSTFLAGS="-C target-feature=avx2"
-          cargo check --workspace
-
-
   test:
     name: Test Suite
     # One leg, so the matrix that carried it was only a place to write a label.
@@ -147,11 +105,23 @@ jobs:
       # Neither changes which tests run or what they assert. If the job still
       # dies mid-compile after this, the ceiling is genuinely too low for this
       # workspace and it is a capacity decision, not a flag.
+      - name: Keep the build between pushes
+        run: |
+          free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+          if [ -d /dev/shm ] && [ "$(free_gb /dev/shm)" -ge 24 ]; then
+            dir=/dev/shm/ci-target/${GITHUB_REPOSITORY##*/}
+          else
+            dir=$HOME/.cache/ci-target/${GITHUB_REPOSITORY##*/}
+          fi
+          mkdir -p "$dir"
+          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
+          echo "target: $dir ($(du -sh "$dir" 2>/dev/null | cut -f1) warm)"
+      # debuginfo=line-tables-only keeps file and line in a panic backtrace, the
+      # part a CI failure needs, and drops the DWARF nobody reads from a log.
       - name: Run tests (with lld on Linux)
         if: runner.os == 'Linux'
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C debuginfo=line-tables-only"
-          CARGO_INCREMENTAL: "0"
         run: cargo test --workspace
 
   fmt:

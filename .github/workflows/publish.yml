@@ -4,10 +4,12 @@ name: Publish crates
 # .hanzo/workflows first and GitHub.com ignores .hanzo/ entirely -- on the mapped
 # `linux-amd64` label.
 #
-# Publishes the hanzo-* crates to crates.io in dependency order, following a
-# push to main rather than a hand-pushed tag: the tree on main is the release,
-# and the question this workflow answers is "does crates.io serve something
-# older than what's there" -- not "did someone remember to tag it."
+# Publishes the hanzo-* crates to crates.io in dependency order when a release
+# tag lands. The tree on main is the release and the tag names the commit; the
+# question this workflow answers is "does crates.io serve something older than
+# what's tagged". On every push it compiled the whole workspace once more on the
+# one runner, beside CI's own build of the same commit, for a ratchet that runs
+# in seconds and usually finds nothing to do.
 #
 # No `paths:` filter, deliberately. A path gate guesses "did a crate move"
 # from the shape of a diff; the per-crate check below asks crates.io directly,
@@ -27,7 +29,7 @@ name: Publish crates
 # catch stays as a second line of defense underneath that.
 on:
   push:
-    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 # Serialized, newest wins. Two runs in flight would both read crates.io
