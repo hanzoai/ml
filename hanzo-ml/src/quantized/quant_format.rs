@@ -202,6 +202,8 @@ macro_rules! for_each_quant {
             TQ2_0    => BlockTQ2_0    @ 35,
             NVFP4    => BlockNVFP4    @ 40,
             Q1_0     => BlockQ1_0     @ 41,
+            ROCMFP4      => BlockROCMFP4      @ 100,
+            ROCMFP4_FAST => BlockROCMFP4Fast  @ 101,
         }
     };
 }

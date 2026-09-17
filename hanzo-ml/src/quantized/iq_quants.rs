@@ -625,3 +625,166 @@ quant_format! {
         }
     },
 }
+
+// ============================================================================
+// 6. ROCMFP4 — 4-bit, 32 elems/block, UE4M3 half-scales.
+//    ROCmFPX fork (charlie12345) types: GGML_TYPE_Q4_0_ROCMFP4 = 100 (dual-scale,
+//    18 B), GGML_TYPE_Q4_0_ROCMFP4_FAST = 101 (single-scale, 17 B).
+//    Codebook10: E2M1-derived, max level retuned 12 -> 10.
+//    qs[j] = code(w_j) | code(w_j+16) << 4: low nibble uses e[0] (fast: e),
+//    high nibble uses e[1]. No bias, no secondary scale.
+// ============================================================================
+pub const QK_ROCMFP4: usize = 32;
+
+// kvalues_rocmfp4 (fork ggml-common.h Codebook10).
+const KVALUES_ROCMFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10];
+
+// HALF(e): the UE4M3 byte divided by two. 0x7f (NaN) and sign-set bytes are
+// invalid per the fork's row validator and decode to zero.
+fn rocmfp4_half_to_f32(e: u8) -> f32 {
+    if e > 0x7e {
+        return 0.0;
+    }
+    ue4m3_to_fp32(e)
+}
+
+quant_format! {
+    name: BlockROCMFP4,
+    dtype: ROCMFP4,
+    block_elems: QK_ROCMFP4,
+    byte_size: 18,
+    vec_dot: BlockQ8_0,
+    fields: {
+        qs: [u8; 16],
+        e: [u8; 2],
+    },
+    decode: |xs, ys| {
+        let k = ys.len();
+        debug_assert!(k.is_multiple_of(QK_ROCMFP4), "dequantize_row_rocmfp4: {k} % {QK_ROCMFP4} != 0");
+        let nb = k / QK_ROCMFP4;
+        for i in 0..nb {
+            let d0 = rocmfp4_half_to_f32(xs[i].e[0]);
+            let d1 = rocmfp4_half_to_f32(xs[i].e[1]);
+            for j in 0..16 {
+                let q = xs[i].qs[j];
+                ys[i * QK_ROCMFP4 + j] = KVALUES_ROCMFP4[(q & 0x0F) as usize] as f32 * d0;
+                ys[i * QK_ROCMFP4 + j + 16] = KVALUES_ROCMFP4[(q >> 4) as usize] as f32 * d1;
+            }
+        }
+    },
+}
+
+quant_format! {
+    name: BlockROCMFP4Fast,
+    dtype: ROCMFP4_FAST,
+    block_elems: QK_ROCMFP4,
+    byte_size: 17,
+    vec_dot: BlockQ8_0,
+    fields: {
+        qs: [u8; 16],
+        e: u8,
+    },
+    decode: |xs, ys| {
+        let k = ys.len();
+        debug_assert!(k.is_multiple_of(QK_ROCMFP4), "dequantize_row_rocmfp4_fast: {k} % {QK_ROCMFP4} != 0");
+        let nb = k / QK_ROCMFP4;
+        for i in 0..nb {
+            let d = rocmfp4_half_to_f32(xs[i].e);
+            for j in 0..16 {
+                let q = xs[i].qs[j];
+                ys[i * QK_ROCMFP4 + j] = KVALUES_ROCMFP4[(q & 0x0F) as usize] as f32 * d;
+                ys[i * QK_ROCMFP4 + j + 16] = KVALUES_ROCMFP4[(q >> 4) as usize] as f32 * d;
+            }
+        }
+    },
+}
+
+#[cfg(test)]
+mod rocmfp4_tests {
+    use super::*;
+    use crate::quantized::k_quants::{GgmlType, QK8_0};
+
+    // Known-answer: one dual block, one fast block, every codebook entry hit.
+    #[test]
+    fn rocmfp4_dual_matches_manual_decode() {
+        let mut b = BlockROCMFP4 { qs: [0; 16], e: [0; 2] };
+        // e0 = 0x50 (exp bits 6..3 = 10, man 0) -> ue4m3 = 2^3 = 8, half = 4.0
+        // e1 = 0x38 (exp 7, man 0) -> ue4m3 = 1, half = 0.5
+        b.e = [0x50, 0x38];
+        // qs[j]: low nibble -> code j (0..15), high -> 15..0 reversed
+        for j in 0..16 {
+            b.qs[j] = j as u8 | (((15 - j) as u8) << 4);
+        }
+        let mut ys = [0f32; 32];
+        BlockROCMFP4::to_float(std::slice::from_ref(&b), &mut ys);
+        let d0 = rocmfp4_half_to_f32(0x50);
+        let d1 = rocmfp4_half_to_f32(0x38);
+        assert!((d0 - 4.0).abs() < 1e-9, "d0 {d0}");
+        assert!((d1 - 0.5).abs() < 1e-9, "d1 {d1}");
+        for j in 0..16 {
+            assert_eq!(ys[j], KVALUES_ROCMFP4[j] as f32 * d0, "low half {j}");
+            assert_eq!(ys[j + 16], KVALUES_ROCMFP4[15 - j] as f32 * d1, "high half {j}");
+        }
+    }
+
+    #[test]
+    fn rocmfp4_fast_matches_manual_decode() {
+        let mut b = BlockROCMFP4Fast { qs: [0; 16], e: 0x20 }; // exp 4, man 0 -> ue4m3 = 1/8, half = 1/16
+        for j in 0..16 {
+            b.qs[j] = j as u8 | ((j as u8) << 4);
+        }
+        let mut ys = [0f32; 32];
+        BlockROCMFP4Fast::to_float(std::slice::from_ref(&b), &mut ys);
+        let d = rocmfp4_half_to_f32(0x20);
+        assert!((d - 0.0625).abs() < 1e-9, "d {d}");
+        for j in 0..32 {
+            assert_eq!(ys[j], KVALUES_ROCMFP4[j % 16] as f32 * d, "elem {j}");
+        }
+    }
+
+    #[test]
+    fn rocmfp4_invalid_scales_decode_zero() {
+        let b = BlockROCMFP4Fast { qs: [0x0F; 16], e: 0x7F };
+        let mut ys = [0f32; 32];
+        BlockROCMFP4Fast::to_float(std::slice::from_ref(&b), &mut ys);
+        assert!(ys.iter().all(|v| *v == 0.0));
+    }
+
+    // vec_dot: dequant-dot against a Q8_0 lhs must equal the f32 dot within
+    // Q8_0 lhs quantization error.
+    #[test]
+    fn rocmfp4_vec_dot_close_to_f32() {
+        let nb = 8;
+        let n = nb * QK_ROCMFP4;
+        let xs: Vec<BlockROCMFP4Fast> = (0..nb)
+            .map(|i| {
+                let mut b = BlockROCMFP4Fast { qs: [0; 16], e: 0 };
+                b.e = (0x30 + (i % 4) as u8);
+                for j in 0..16 {
+                    b.qs[j] = ((i * 5 + j) & 0xFF) as u8;
+                }
+                b
+            })
+            .collect();
+        let wf32: Vec<f32> = {
+            let mut v = vec![0f32; n];
+            for (i, b) in xs.iter().enumerate() {
+                BlockROCMFP4Fast::to_float(std::slice::from_ref(b), &mut v[i * QK_ROCMFP4..][..QK_ROCMFP4]);
+            }
+            v
+        };
+        let yf32: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.25 - 1.0).collect();
+        let exact: f32 = wf32.iter().zip(&yf32).map(|(a, b)| a * b).sum();
+        let ys_q8: Vec<BlockQ8_0> = {
+            let nb8 = n / QK8_0;
+            let mut v = vec![BlockQ8_0 { d: f16::from_bits(0), qs: [0; QK8_0] }; nb8];
+            for (i, b) in v.iter_mut().enumerate() {
+                BlockQ8_0::from_float(&yf32[i * QK8_0..][..QK8_0], std::slice::from_mut(b));
+            }
+            v
+        };
+        let got = BlockROCMFP4Fast::vec_dot(n, &xs, &ys_q8);
+        let err = ((got - exact).abs() / exact.abs()).min(1.0);
+        assert!(err < 2e-2, "vec_dot rel err {err} (got {got}, exact {exact})");
+    }
+}
