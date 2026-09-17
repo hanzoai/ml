@@ -3414,6 +3414,11 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_Q5_1>(const uint8_t* sb, int,
 // shifted past the extra f16 sum field). q_w = qs[k].
 template <>
 __device__ __forceinline__ v4i_ld decode_w_half<WT_Q8_1>(const uint8_t* sb, int, int half) {
+    v4i_ld v;
+    __builtin_memcpy(&v, sb + 4 + half, 16);
+    return v;
+}
+
 // ROCMFP4(_FAST): 16 nibble-pairs at byte +0 (scale-after layout, the reverse of Q4_0): low
 // nibble = k 0..15, high = k 16..31, Codebook10 LUT (not centered int4).
 template <>
@@ -3432,10 +3437,7 @@ template <>
 __device__ __forceinline__ v4i_ld decode_w_half<WT_ROCMFP4>(const uint8_t* sb, int, int half) {
     return decode_w_half<WT_ROCMFP4_FAST>(sb, 0, half);
 }
-    v4i_ld v;
-    __builtin_memcpy(&v, sb + 4 + half, 16);
-    return v;
-}
+
 
 // MAIN per-(32-block, 16-group) weight scale. `sub16` = the 16-group index within the super-block
 // (= g*2 + (half==16)). For SCALE_STEP=32 types both halves of a 32-sub-block return the same value
