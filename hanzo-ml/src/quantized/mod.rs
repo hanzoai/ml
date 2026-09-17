@@ -87,6 +87,16 @@ struct ResidentBanks {
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
+    // Every field of ResidentBanks is gated on rocm/vulkan/wgpu, so with none of
+    // them enabled it is an empty struct and this field is genuinely never read —
+    // which is what clippy reports on a default-feature build. It IS read on any
+    // accelerator build (see the cache_or_upload calls below), so the allowance is
+    // scoped to exactly the configuration where the field is dead rather than
+    // silencing the lint everywhere.
+    #[cfg_attr(
+        not(any(feature = "rocm", feature = "vulkan", feature = "wgpu")),
+        allow(dead_code)
+    )]
     banks: ResidentBanks,
 }
 
@@ -432,7 +442,9 @@ impl QStorage {
                 Ok(Cow::from(data))
             }
             QStorage::Stream(_) => {
-                crate::bail!("streaming expert bank is not resident; consume it via indexed_moe_forward")
+                crate::bail!(
+                    "streaming expert bank is not resident; consume it via indexed_moe_forward"
+                )
             }
         }
     }
@@ -1100,10 +1112,7 @@ impl QTensor {
     // Resident wgpu MoE expert bank (twin of `vulkan_moe_bank`). The wgpu MoE shaders byte-address
     // the raw GGML bytes for every native type, so one upload path covers Q4_0/Q8_0/Q4K.
     #[cfg(feature = "wgpu")]
-    fn wgpu_moe_bank(
-        &self,
-        dev: &crate::WgpuDevice,
-    ) -> Result<std::sync::Arc<crate::WgpuStorage>> {
+    fn wgpu_moe_bank(&self, dev: &crate::WgpuDevice) -> Result<std::sync::Arc<crate::WgpuStorage>> {
         let bank = self.data()?;
         cache_or_upload(&self.banks.wgpu, bank.as_ref(), |b| dev.upload_qweight(b))
     }
@@ -1269,7 +1278,10 @@ impl QTensor {
                 // selects topk over exactly `e_cnt` logits, so ids are in-range by construction (the old
                 // host-side OOB scan was the round-trip's only excuse).
                 let dt = self.storage.dtype();
-                let ids_u32 = ids.reshape((nrows,))?.to_dtype(crate::DType::U32)?.contiguous()?;
+                let ids_u32 = ids
+                    .reshape((nrows,))?
+                    .to_dtype(crate::DType::U32)?
+                    .contiguous()?;
                 let y = {
                     let (store, _) = x_flat.storage_and_layout();
                     let xv = match &*store {
@@ -1281,28 +1293,87 @@ impl QTensor {
                         Storage::Vulkan(v) => v,
                         _ => crate::bail!("vulkan MoE: ids not on vulkan after contiguous()"),
                     };
-                    // Prefer the dp4a (int8 OpSDot) block kernel when the device supports integer
-                    // dot-product and a specialized .spv exists (~1.4-1.6x the f32-decode block kernel,
-                    // within activation-quant tolerance). Else the f32 DSL block kernel (planar bank,
-                    // one workgroup/output, ~2-3x packed). Else the packed `vk_moe_kernel`. Same split
-                    // bank feeds both block paths; the dp4a path q8-quantizes the activation once.
-                    match vk_moe_blk_dp4a_kernel(dt, n, k).filter(|_| vk_dev.has_int_dot8()) {
-                        Some((blk, with_xsum)) => {
-                            let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
-                            vk_dev.moe_matvec_blk_dp4a_gpu(blk, with_xsum, bank.as_ref(), xv, ids_v, nrows, n, k)?
+                    // PREFILL (t > 1) routes to the expert-grouped MMQ on the matrix cores: each
+                    // expert's weight is streamed ONCE and amortised over all of its routed tokens,
+                    // where the per-slot matvec re-streams it per token and leaves the matrix cores
+                    // idle. Twin of the CUDA/ROCm/Metal `t > 1` arms above. DECODE (t == 1) stays on
+                    // the matvec -- one slot per expert means there is no reuse to win, and that path
+                    // already runs at the memory wall. Q4_K only: the Q6_K `_dn` half of a Q4_K_M MoE
+                    // has no MMQ kernel yet and keeps the matvec, which is correct at any token count.
+                    // VK_MOE_PREFILL_GEMM_OFF forces the matvec for the A/B.
+                    if t > 1
+                        && dt == GgmlDType::Q4K
+                        && vk_dev.has_int_dot8()
+                        && std::env::var_os("VK_MOE_PREFILL_GEMM_OFF").is_none()
+                    {
+                        let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
+                        // Gate and up share this routed activation; quantizing here keeps the q8
+                        // conversion identical to the decode matvec's, so the two paths differ only
+                        // in how the weight is streamed.
+                        let (xq, xsq, xsum) = vk_dev.quantize_act_q8(xv, nrows, k)?;
+                        // cap = t: a token's top-k experts are distinct, so an expert claims at most
+                        // one of that token's slots.
+                        vk_dev.mmq_q4k_id_gpu(
+                            bank.as_ref(),
+                            &xq,
+                            &xsq,
+                            &xsum,
+                            ids_v,
+                            nrows,
+                            e_cnt,
+                            t,
+                            n,
+                            k,
+                        )?
+                    } else {
+                        // Prefer the dp4a (int8 OpSDot) block kernel when the device supports integer
+                        // dot-product and a specialized .spv exists (~1.4-1.6x the f32-decode block kernel,
+                        // within activation-quant tolerance). Else the f32 DSL block kernel (planar bank,
+                        // one workgroup/output, ~2-3x packed). Else the packed `vk_moe_kernel`. Same split
+                        // bank feeds both block paths; the dp4a path q8-quantizes the activation once.
+                        match vk_moe_blk_dp4a_kernel(dt, n, k).filter(|_| vk_dev.has_int_dot8()) {
+                            Some((blk, with_xsum)) => {
+                                let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
+                                vk_dev.moe_matvec_blk_dp4a_gpu(
+                                    blk,
+                                    with_xsum,
+                                    bank.as_ref(),
+                                    xv,
+                                    ids_v,
+                                    nrows,
+                                    n,
+                                    k,
+                                )?
+                            }
+                            None => match vk_moe_blk_kernel(dt, n, k) {
+                                Some(blk) => {
+                                    let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
+                                    vk_dev.moe_matvec_blk_gpu(
+                                        blk,
+                                        bank.as_ref(),
+                                        xv,
+                                        ids_v,
+                                        nrows,
+                                        n,
+                                        k,
+                                    )?
+                                }
+                                None => {
+                                    // Guarded by `vk_moe_kernel(..).is_some()`, so the packed kernel is present.
+                                    let kernel = vk_moe_kernel(dt).unwrap();
+                                    let wbank = self.vulkan_moe_bank(vk_dev, e_cnt, n, k)?;
+                                    vk_dev.moe_matvec_gpu(
+                                        kernel,
+                                        wbank.as_ref(),
+                                        xv,
+                                        ids_v,
+                                        nrows,
+                                        n,
+                                        k,
+                                    )?
+                                }
+                            },
                         }
-                        None => match vk_moe_blk_kernel(dt, n, k) {
-                        Some(blk) => {
-                            let bank = self.vulkan_moe_bank_split(vk_dev, e_cnt, n, k)?;
-                            vk_dev.moe_matvec_blk_gpu(blk, bank.as_ref(), xv, ids_v, nrows, n, k)?
-                        }
-                        None => {
-                            // Guarded by `vk_moe_kernel(..).is_some()`, so the packed kernel is present.
-                            let kernel = vk_moe_kernel(dt).unwrap();
-                            let wbank = self.vulkan_moe_bank(vk_dev, e_cnt, n, k)?;
-                            vk_dev.moe_matvec_gpu(kernel, wbank.as_ref(), xv, ids_v, nrows, n, k)?
-                        }
-                        },
                     }
                 };
                 let out = crate::tensor::from_storage(
@@ -1645,8 +1716,13 @@ fn vk_moe_blk_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<&'static str> 
 // f32 path for an A/B. The bool is the kernel's activation-binding contract: whether it binds the
 // per-32 q8 sums (`xsum`; Q4_K folds dmin against them) or derives its own half-block sums in-register
 // (Q6_K's −32 fold needs per-16 sums, which per-32 xsum cannot express).
+// Gated exactly like its sibling vk_moe_blk_kernel above. Both call sites are
+// inside `#[cfg(feature = "vulkan")]` blocks, so without the feature this compiled
+// with no callers and clippy correctly called it dead.
+#[cfg(feature = "vulkan")]
 fn vk_moe_blk_dp4a_kernel(dt: GgmlDType, n: usize, k: usize) -> Option<(&'static str, bool)> {
-    if std::env::var_os("VK_MOE_PACKED").is_some() || std::env::var_os("VK_MOE_DP4A_OFF").is_some() {
+    if std::env::var_os("VK_MOE_PACKED").is_some() || std::env::var_os("VK_MOE_DP4A_OFF").is_some()
+    {
         return None;
     }
     match (dt, n, k) {
@@ -1964,28 +2040,86 @@ pub fn moe_gate_up(
                                 .reshape((nrows, k))?
                                 .to_dtype(DType::F32)?
                                 .contiguous()?;
-                            let ids_u32 = ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
+                            let ids_u32 =
+                                ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
                             let (xstore, _) = x_flat.storage_and_layout();
                             let xv = match &*xstore {
                                 Storage::Vulkan(v) => v,
-                                _ => crate::bail!("moe_gate_up: x not on vulkan after contiguous()"),
+                                _ => {
+                                    crate::bail!("moe_gate_up: x not on vulkan after contiguous()")
+                                }
                             };
                             let (idstore, _) = ids_u32.storage_and_layout();
                             let idv = match &*idstore {
                                 Storage::Vulkan(v) => v,
                                 _ => crate::bail!("moe_gate_up: ids not on vulkan"),
                             };
-                            // The one quantize both matvecs read.
+                            // The one quantize both projections read.
                             let (xq, xs, xsum) = dev.quantize_act_q8(xv, nrows, k)?;
                             let gbank = gq.vulkan_moe_bank_split(dev, e_cnt, n, k)?;
                             let ubank = uq.vulkan_moe_bank_split(dev, e_cnt, n, k)?;
                             let out_dtype = x.dtype();
-                            let gy = dev.moe_matvec_blk_dp4a_pre_gpu(
-                                blk, with_xsum, gbank.as_ref(), &xq, &xs, &xsum, idv, nrows, n,
-                            )?;
-                            let uy = dev.moe_matvec_blk_dp4a_pre_gpu(
-                                blk, with_xsum, ubank.as_ref(), &xq, &xs, &xsum, idv, nrows, n,
-                            )?;
+                            // PREFILL (t > 1): expert-grouped MMQ on the matrix cores, the same
+                            // t > 1 split `indexed_moe_forward` makes. Gate and up share the routing,
+                            // so they also share ONE grouping pass. DECODE (t == 1) keeps the matvec.
+                            let (gy, uy) = if t > 1
+                                && dt == GgmlDType::Q4K
+                                && std::env::var_os("VK_MOE_PREFILL_GEMM_OFF").is_none()
+                            {
+                                let (counts, rows) =
+                                    dev.moe_expert_rows_vk(idv, nrows, e_cnt, t)?;
+                                let gy = dev.mmq_q4k_id_pre_gpu(
+                                    gbank.as_ref(),
+                                    &xq,
+                                    &xs,
+                                    &xsum,
+                                    &rows,
+                                    &counts,
+                                    nrows,
+                                    e_cnt,
+                                    t,
+                                    n,
+                                    k,
+                                )?;
+                                let uy = dev.mmq_q4k_id_pre_gpu(
+                                    ubank.as_ref(),
+                                    &xq,
+                                    &xs,
+                                    &xsum,
+                                    &rows,
+                                    &counts,
+                                    nrows,
+                                    e_cnt,
+                                    t,
+                                    n,
+                                    k,
+                                )?;
+                                (gy, uy)
+                            } else {
+                                let gy = dev.moe_matvec_blk_dp4a_pre_gpu(
+                                    blk,
+                                    with_xsum,
+                                    gbank.as_ref(),
+                                    &xq,
+                                    &xs,
+                                    &xsum,
+                                    idv,
+                                    nrows,
+                                    n,
+                                )?;
+                                let uy = dev.moe_matvec_blk_dp4a_pre_gpu(
+                                    blk,
+                                    with_xsum,
+                                    ubank.as_ref(),
+                                    &xq,
+                                    &xs,
+                                    &xsum,
+                                    idv,
+                                    nrows,
+                                    n,
+                                )?;
+                                (gy, uy)
+                            };
                             let shape = |o| -> Result<Tensor> {
                                 crate::tensor::from_storage(
                                     Storage::Vulkan(o),

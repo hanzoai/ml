@@ -203,7 +203,13 @@ pub fn matvec_q4k<F: Float>(
 /// Host launch for the Q4_K matvec (all runtimes).
 pub fn matvec_q4k_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], rows: usize, k: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    rows: usize,
+    k: usize,
 ) -> Vec<f32> {
     let qh = client.create_from_slice(u32::as_bytes(wqs));
     let sh = client.create_from_slice(u32::as_bytes(wsc));
@@ -215,7 +221,9 @@ pub fn matvec_q4k_run<R: Runtime>(
     let grid = (rows as u32).div_ceil(block);
     unsafe {
         matvec_q4k::launch_unchecked::<f32, R>(
-            client, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -230,7 +238,14 @@ pub fn matvec_q4k_run<R: Runtime>(
 
 pub fn matvec_q4k_bench<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], rows: usize, k: usize, iters: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    rows: usize,
+    k: usize,
+    iters: usize,
 ) -> f64 {
     let qh = client.create_from_slice(u32::as_bytes(wqs));
     let sh = client.create_from_slice(u32::as_bytes(wsc));
@@ -242,7 +257,9 @@ pub fn matvec_q4k_bench<R: Runtime>(
     let grid = (rows as u32).div_ceil(block);
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q4k::launch_unchecked::<f32, R>(
-            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            c,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -252,52 +269,74 @@ pub fn matvec_q4k_bench<R: Runtime>(
             k,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     t.elapsed().as_secs_f64() * 1e3 / iters as f64
 }
 
 #[inline]
-fn cpu_byte(a: &[u32], base: usize, i: usize) -> u32 { (a[base + i / 4] >> (8 * (i % 4))) & 255 }
+fn cpu_byte(a: &[u32], base: usize, i: usize) -> u32 {
+    (a[base + i / 4] >> (8 * (i % 4))) & 255
+}
 #[inline]
 fn cpu_sc(wsc: &[u32], scbase: usize, j: usize) -> u32 {
-    if j < 4 { cpu_byte(wsc, scbase, j) & 63 }
-    else { (cpu_byte(wsc, scbase, j + 4) & 15) | ((cpu_byte(wsc, scbase, j - 4) >> 6) << 4) }
+    if j < 4 {
+        cpu_byte(wsc, scbase, j) & 63
+    } else {
+        (cpu_byte(wsc, scbase, j + 4) & 15) | ((cpu_byte(wsc, scbase, j - 4) >> 6) << 4)
+    }
 }
 #[inline]
 fn cpu_m(wsc: &[u32], scbase: usize, j: usize) -> u32 {
-    if j < 4 { cpu_byte(wsc, scbase, j + 4) & 63 }
-    else { (cpu_byte(wsc, scbase, j + 4) >> 4) | ((cpu_byte(wsc, scbase, j) >> 6) << 4) }
+    if j < 4 {
+        cpu_byte(wsc, scbase, j + 4) & 63
+    } else {
+        (cpu_byte(wsc, scbase, j + 4) >> 4) | ((cpu_byte(wsc, scbase, j) >> 6) << 4)
+    }
 }
 
 /// CPU oracle for Q4_K, same packed inputs as the kernel (bit-for-bit BlockQ4K::to_float order).
-pub fn matvec_q4k_ref(wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], rows: usize, k: usize) -> Vec<f32> {
+pub fn matvec_q4k_ref(
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    rows: usize,
+    k: usize,
+) -> Vec<f32> {
     let nb = k / 256;
-    (0..rows).map(|row| {
-        let mut acc = 0.0f32;
-        for b in 0..nb {
-            let blk = row * nb + b;
-            let (qbase, scbase) = (blk * 32, blk * 3);
-            let (d, dmin) = (wd[blk], wdm[blk]);
-            let xbase = b * 256;
-            for g in 0..4 {
-                let is = g * 2;
-                let d1 = d * cpu_sc(wsc, scbase, is) as f32;
-                let mm1 = dmin * cpu_m(wsc, scbase, is) as f32;
-                let d2 = d * cpu_sc(wsc, scbase, is + 1) as f32;
-                let mm2 = dmin * cpu_m(wsc, scbase, is + 1) as f32;
-                for qi in 0..32 {
-                    let qb = cpu_byte(wqs, qbase, g * 32 + qi);
-                    acc += (d1 * (qb & 15) as f32 - mm1) * x[xbase + g * 64 + qi];
-                    acc += (d2 * (qb >> 4) as f32 - mm2) * x[xbase + g * 64 + 32 + qi];
+    (0..rows)
+        .map(|row| {
+            let mut acc = 0.0f32;
+            for b in 0..nb {
+                let blk = row * nb + b;
+                let (qbase, scbase) = (blk * 32, blk * 3);
+                let (d, dmin) = (wd[blk], wdm[blk]);
+                let xbase = b * 256;
+                for g in 0..4 {
+                    let is = g * 2;
+                    let d1 = d * cpu_sc(wsc, scbase, is) as f32;
+                    let mm1 = dmin * cpu_m(wsc, scbase, is) as f32;
+                    let d2 = d * cpu_sc(wsc, scbase, is + 1) as f32;
+                    let mm2 = dmin * cpu_m(wsc, scbase, is + 1) as f32;
+                    for qi in 0..32 {
+                        let qb = cpu_byte(wqs, qbase, g * 32 + qi);
+                        acc += (d1 * (qb & 15) as f32 - mm1) * x[xbase + g * 64 + qi];
+                        acc += (d2 * (qb >> 4) as f32 - mm2) * x[xbase + g * 64 + 32 + qi];
+                    }
                 }
             }
-        }
-        acc
-    }).collect()
+            acc
+        })
+        .collect()
 }
 
 /// Deterministic valid Q4_K test data (packed u32 layout + f16-rounded d/dmin + activation).
@@ -305,13 +344,24 @@ pub fn gen_q4k(rows: usize, k: usize) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>
     let nb = k / 256;
     let nblk = rows * nb;
     let mut s = 0x9E3779B97F4A7C15u64;
-    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
     let wqs: Vec<u32> = (0..nblk * 32).map(|_| next() as u32).collect(); // 128 qs bytes/block
-    let wsc: Vec<u32> = (0..nblk * 3).map(|_| next() as u32).collect();  // 12 scale bytes/block
-    // f16-round d/dmin so the CPU ref (which the kernel matches) uses the true stored precision
-    let wd: Vec<f32> = (0..nblk).map(|_| half::f16::from_f32((next() % 1000) as f32 / 20000.0 + 0.002).to_f32()).collect();
-    let wdm: Vec<f32> = (0..nblk).map(|_| half::f16::from_f32((next() % 1000) as f32 / 40000.0).to_f32()).collect();
-    let x: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let wsc: Vec<u32> = (0..nblk * 3).map(|_| next() as u32).collect(); // 12 scale bytes/block
+                                                                        // f16-round d/dmin so the CPU ref (which the kernel matches) uses the true stored precision
+    let wd: Vec<f32> = (0..nblk)
+        .map(|_| half::f16::from_f32((next() % 1000) as f32 / 20000.0 + 0.002).to_f32())
+        .collect();
+    let wdm: Vec<f32> = (0..nblk)
+        .map(|_| half::f16::from_f32((next() % 1000) as f32 / 40000.0).to_f32())
+        .collect();
+    let x: Vec<f32> = (0..k)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     (wqs, wsc, wd, wdm, x)
 }
 
@@ -372,8 +422,15 @@ pub fn moe_matvec_q4k<F: Float>(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q4k_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
 ) -> Vec<f32> {
     let qh = client.create_from_slice(u32::as_bytes(wqs));
     let sh = client.create_from_slice(u32::as_bytes(wsc));
@@ -386,7 +443,9 @@ pub fn moe_matvec_q4k_run<R: Runtime>(
     let grid = ((slots * n) as u32).div_ceil(block);
     unsafe {
         moe_matvec_q4k::launch_unchecked::<f32, R>(
-            client, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -394,7 +453,8 @@ pub fn moe_matvec_q4k_run<R: Runtime>(
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k,
+            n,
+            k,
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -414,8 +474,8 @@ pub fn moe_matvec_q4k_blk<F: Float>(
     x: &Array<F>,
     ids: &Array<u32>,
     out: &mut Array<F>,
-    #[comptime] n: usize,  // comptime shape: outrow/n & nsub/nt fold to magic-multiply divides
-    #[comptime] k: usize,  // (the DSL's job -- one source fn, one fast .spv per live shape, like llama)
+    #[comptime] n: usize, // comptime shape: outrow/n & nsub/nt fold to magic-multiply divides
+    #[comptime] k: usize, // (the DSL's job -- one source fn, one fast .spv per live shape, like llama)
     #[comptime] nt: usize, // threads per output element (k/32 a multiple of nt)
 ) {
     let outrow = CUBE_POS as usize;
@@ -480,9 +540,9 @@ pub fn moe_matvec_q4k_dp4a_blk<F: Float>(
     wsc: &Array<u32>,
     wd: &Array<F>,
     wdm: &Array<F>,
-    xq: &Array<u32>,   // q8 activation, int8 packed 4/u32, [slots, k/32, 8]
-    xs: &Array<F>,     // per-32-block activation scale, [slots, k/32]
-    xsum: &Array<F>,   // per-32-block xs*Sum(xq), [slots, k/32]
+    xq: &Array<u32>, // q8 activation, int8 packed 4/u32, [slots, k/32, 8]
+    xs: &Array<F>,   // per-32-block activation scale, [slots, k/32]
+    xsum: &Array<F>, // per-32-block xs*Sum(xq), [slots, k/32]
     ids: &Array<u32>,
     out: &mut Array<F>,
     #[comptime] n: usize,
@@ -515,8 +575,12 @@ pub fn moe_matvec_q4k_dp4a_blk<F: Float>(
             #[unroll]
             for g in 0..8usize {
                 let nibs = (wqs[cw + g] >> shift) & 0x0F0F0F0F; // 4 nibbles as 4 bytes (0..15, +ve i8)
-                let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(nibs));
-                let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(xq[xg + g]));
+                let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<
+                    u32,
+                >(nibs));
+                let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<
+                    u32,
+                >(xq[xg + g]));
                 idot += wv.dot(xv); // OpSDot: 4 int8 products -> i32
             }
             let xi = slot * nsub + sb;
@@ -575,8 +639,16 @@ pub fn quant_act_q8_cpu(x: &[f32], slots: usize, k: usize) -> (Vec<u32>, Vec<f32
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q4k_dp4a_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize, nt: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
+    nt: usize,
 ) -> Vec<f32> {
     let (xq, xs, xsum) = quant_act_q8_cpu(x, slots, k);
     let qh = client.create_from_slice(u32::as_bytes(wqs));
@@ -590,7 +662,9 @@ pub fn moe_matvec_q4k_dp4a_blk_run<R: Runtime>(
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
     unsafe {
         moe_matvec_q4k_dp4a_blk::launch_unchecked::<f32, R>(
-            client, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            client,
+            Grid::Static((slots * n) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -600,7 +674,9 @@ pub fn moe_matvec_q4k_dp4a_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k, nt,
+            n,
+            k,
+            nt,
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -628,10 +704,10 @@ pub fn pack_q4k(wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32]) -> Vec<u32> {
 // the decode fix for the prefill dp4a GEMM that runs 1-thread-per-row (occupancy-starved at m=1), ~3x.
 #[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn matvec_q4k_dp4a_blk<F: Float>(
-    wq: &Array<u32>,   // packed Q4_K, 36 u32/superblock
-    xq: &Array<u32>,   // q8 activation, int8 4/u32, [k/32, 8]
-    xs: &Array<F>,     // per-32-block scale, [k/32]
-    xsum: &Array<F>,   // per-32-block xs*Sum(xq), [k/32]
+    wq: &Array<u32>, // packed Q4_K, 36 u32/superblock
+    xq: &Array<u32>, // q8 activation, int8 4/u32, [k/32, 8]
+    xs: &Array<F>,   // per-32-block scale, [k/32]
+    xsum: &Array<F>, // per-32-block xs*Sum(xq), [k/32]
     out: &mut Array<F>,
     meta: &Array<u32>, // [k]
     #[comptime] nt: usize,
@@ -661,8 +737,12 @@ pub fn matvec_q4k_dp4a_blk<F: Float>(
             #[unroll]
             for g in 0..8usize {
                 let nibs = (wq[cw + g] >> shift) & 0x0F0F0F0F;
-                let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(nibs));
-                let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(xq[xg + g]));
+                let wv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<
+                    u32,
+                >(nibs));
+                let xv = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<
+                    u32,
+                >(xq[xg + g]));
                 idot += wv.dot(xv);
             }
             partial += dj * xs[sb] * F::cast_from(idot) - mj * xsum[sb];
@@ -688,8 +768,14 @@ pub fn matvec_q4k_dp4a_blk<F: Float>(
 /// Host launch for the dense packed-Q4_K dp4a matvec (activation q8-quantized on the host for the bench).
 pub fn matvec_q4k_dp4a_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32],
-    nout: usize, k: usize, nt: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    nout: usize,
+    k: usize,
+    nt: usize,
 ) -> Vec<f32> {
     let packed = pack_q4k(wqs, wsc, wd, wdm);
     let (xq, xs, xsum) = quant_act_q8_cpu(x, 1, k);
@@ -701,7 +787,9 @@ pub fn matvec_q4k_dp4a_blk_run<R: Runtime>(
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; nout]));
     unsafe {
         matvec_q4k_dp4a_blk::launch_unchecked::<f32, R>(
-            client, Grid::Static(nout as u32, 1, 1), Block::new_1d(nt as u32),
+            client,
+            Grid::Static(nout as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(wh.clone(), packed.len()),
             ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
@@ -728,12 +816,12 @@ pub fn matvec_q4k_dp4a_blk_run<R: Runtime>(
 // (nt, nr) across every projection shape.
 #[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn matvec_q4k_f32_blk<F: Float>(
-    wq: &Array<u32>,   // packed Q4_K, 36 u32/superblock
-    x: &Array<F>,      // activation, f32 [k]
+    wq: &Array<u32>, // packed Q4_K, 36 u32/superblock
+    x: &Array<F>,    // activation, f32 [k]
     out: &mut Array<F>,
-    meta: &Array<u32>, // [k, nout]
-    #[comptime] nt: usize, // threads cooperating on one row's k (the workgroup-width axis)
-    #[comptime] nr: usize, // output rows per workgroup (the row tile)
+    meta: &Array<u32>,       // [k, nout]
+    #[comptime] nt: usize,   // threads cooperating on one row's k (the workgroup-width axis)
+    #[comptime] nr: usize,   // output rows per workgroup (the row tile)
     #[comptime] tgt: Target, // island scrutinee: Vulkan takes the coalesced plane_sum idiom
 ) {
     let t = UNIT_POS as usize;
@@ -892,8 +980,15 @@ pub fn matvec_q4k_f32_blk<F: Float>(
 #[allow(clippy::too_many_arguments)]
 pub fn matvec_q4k_f32_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32],
-    nout: usize, k: usize, nt: usize, nr: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    nout: usize,
+    k: usize,
+    nt: usize,
+    nr: usize,
 ) -> Vec<f32> {
     let packed = pack_q4k(wqs, wsc, wd, wdm);
     let wh = client.create_from_slice(u32::as_bytes(&packed));
@@ -903,7 +998,9 @@ pub fn matvec_q4k_f32_blk_run<R: Runtime>(
     let grid = (nout as u32).div_ceil(nr as u32); // one workgroup per nr output rows
     unsafe {
         matvec_q4k_f32_blk::launch_unchecked::<f32, R>(
-            client, Grid::Static(grid, 1, 1), Block::new_1d(nt as u32),
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(wh.clone(), packed.len()),
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(oh.clone(), nout),
@@ -984,8 +1081,9 @@ impl<'a, R: Runtime> MatvecQ4kF32Eval<'a, R> {
         repeats: usize,
     ) -> Self {
         let packed = pack_q4k(wqs, wsc, wd, wdm);
-        let banks: Vec<Handle> =
-            (0..nbanks.max(1)).map(|_| client.create_from_slice(u32::as_bytes(&packed))).collect();
+        let banks: Vec<Handle> = (0..nbanks.max(1))
+            .map(|_| client.create_from_slice(u32::as_bytes(&packed)))
+            .collect();
         let xh = client.create_from_slice(f32::as_bytes(x));
         let meta = client.create_from_slice(u32::as_bytes(&[k as u32, rows as u32]));
         let outh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
@@ -1046,7 +1144,9 @@ impl<'a, R: Runtime> Evaluator for MatvecQ4kF32Eval<'a, R> {
     fn static_check(&self, cfg: &Config) -> Verdict {
         let (nt, _nr) = matvec_q4k_f32_cfg(cfg, self.space);
         if nt < 2 || nt > 1024 || (nt & (nt - 1)) != 0 {
-            return Verdict::Reject(format!("workgroup width {nt} must be a power of two in [2,1024]"));
+            return Verdict::Reject(format!(
+                "workgroup width {nt} must be a power of two in [2,1024]"
+            ));
         }
         Verdict::Pass
     }
@@ -1055,7 +1155,12 @@ impl<'a, R: Runtime> Evaluator for MatvecQ4kF32Eval<'a, R> {
         let (nt, nr) = matvec_q4k_f32_cfg(cfg, self.space);
         self.dispatch(&self.banks[0], nt, nr);
         let got = self.read_out();
-        let rel = got.iter().zip(&self.oracle).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / self.maxref;
+        let rel = got
+            .iter()
+            .zip(&self.oracle)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / self.maxref;
         self.worst_rel.set(self.worst_rel.get().max(rel));
         if rel > 1e-3 {
             return f64::INFINITY;
@@ -1090,15 +1195,31 @@ pub fn matvec_q4k_f32_hunt<R: Runtime>(
     evo: &Evolution,
     seed: u64,
 ) -> Evolved {
-    tuner.evolve(device, "matvec_q4k_f32", &format!("rows={rows},k={k}"), eval.space(), eval, evo, seed)
+    tuner.evolve(
+        device,
+        "matvec_q4k_f32",
+        &format!("rows={rows},k={k}"),
+        eval.space(),
+        eval,
+        evo,
+        seed,
+    )
 }
 
 /// Host launch for the block-reduced Q4_K MoE matvec (one workgroup per output, `nt` threads).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q4k_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize, nt: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
+    nt: usize,
 ) -> Vec<f32> {
     let (qh, sh, dh, mh, xh, ih, oh) = (
         client.create_from_slice(u32::as_bytes(wqs)),
@@ -1111,7 +1232,9 @@ pub fn moe_matvec_q4k_blk_run<R: Runtime>(
     );
     unsafe {
         moe_matvec_q4k_blk::launch_unchecked::<f32, R>(
-            client, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            client,
+            Grid::Static((slots * n) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -1119,7 +1242,9 @@ pub fn moe_matvec_q4k_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k, nt,
+            n,
+            k,
+            nt,
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -1129,8 +1254,17 @@ pub fn moe_matvec_q4k_blk_run<R: Runtime>(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q4k_blk_bench<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize, nt: usize, iters: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
+    nt: usize,
+    iters: usize,
 ) -> f64 {
     let (qh, sh, dh, mh, xh, ih, oh) = (
         client.create_from_slice(u32::as_bytes(wqs)),
@@ -1143,7 +1277,9 @@ pub fn moe_matvec_q4k_blk_bench<R: Runtime>(
     );
     let launch = |c: &ComputeClient<R>| unsafe {
         moe_matvec_q4k_blk::launch_unchecked::<f32, R>(
-            c, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static((slots * n) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -1151,13 +1287,19 @@ pub fn moe_matvec_q4k_blk_bench<R: Runtime>(
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k, nt,
+            n,
+            k,
+            nt,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     t.elapsed().as_secs_f64() * 1e3 / iters as f64
 }
@@ -1166,8 +1308,16 @@ pub fn moe_matvec_q4k_blk_bench<R: Runtime>(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q4k_bench<R: Runtime>(
     client: &ComputeClient<R>,
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize, iters: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
+    iters: usize,
 ) -> f64 {
     let qh = client.create_from_slice(u32::as_bytes(wqs));
     let sh = client.create_from_slice(u32::as_bytes(wsc));
@@ -1180,7 +1330,9 @@ pub fn moe_matvec_q4k_bench<R: Runtime>(
     let grid = ((slots * n) as u32).div_ceil(block);
     let launch = |c: &ComputeClient<R>| unsafe {
         moe_matvec_q4k::launch_unchecked::<f32, R>(
-            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            c,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(qh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
             ArrayArg::from_raw_parts(dh.clone(), wd.len()),
@@ -1188,13 +1340,18 @@ pub fn moe_matvec_q4k_bench<R: Runtime>(
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k,
+            n,
+            k,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     t.elapsed().as_secs_f64() * 1e3 / iters as f64
 }
@@ -1202,8 +1359,15 @@ pub fn moe_matvec_q4k_bench<R: Runtime>(
 /// CPU oracle for the Q4_K MoE matvec (same packed inputs; BlockQ4K::to_float decode order).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q4k_ref(
-    wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize,
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
 ) -> Vec<f32> {
     let nb = k / 256;
     let mut out = vec![0.0f32; slots * n];
@@ -1238,12 +1402,23 @@ pub fn moe_matvec_q4k_ref(
 
 /// Deterministic MoE test data: a flat [E*n] Q4_K bank, `slots` activations `[slots,k]`, and a
 /// per-slot expert id in `[0,e)`. Reuses `gen_q4k` for the bank (its lone x is discarded).
-pub fn gen_moe_q4k(e: usize, n: usize, slots: usize, k: usize)
-    -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
+pub fn gen_moe_q4k(
+    e: usize,
+    n: usize,
+    slots: usize,
+    k: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
     let (wqs, wsc, wd, wdm, _x1) = gen_q4k(e * n, k);
     let mut s = 0xC2B2AE3D27D4EB4Fu64;
-    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-    let x: Vec<f32> = (0..slots * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let x: Vec<f32> = (0..slots * k)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     let ids: Vec<u32> = (0..slots).map(|_| (next() % e as u64) as u32).collect();
     (wqs, wsc, wd, wdm, x, ids)
 }
@@ -1323,8 +1498,15 @@ pub fn moe_matvec_q6k<F: Float>(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q6k_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize,
+    wql: &[u32],
+    wqh: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
 ) -> Vec<f32> {
     let qlh = client.create_from_slice(u32::as_bytes(wql));
     let qhh = client.create_from_slice(u32::as_bytes(wqh));
@@ -1337,7 +1519,9 @@ pub fn moe_matvec_q6k_run<R: Runtime>(
     let grid = ((slots * n) as u32).div_ceil(block);
     unsafe {
         moe_matvec_q6k::launch_unchecked::<f32, R>(
-            client, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
             ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
@@ -1345,7 +1529,8 @@ pub fn moe_matvec_q6k_run<R: Runtime>(
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k,
+            n,
+            k,
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -1355,8 +1540,16 @@ pub fn moe_matvec_q6k_run<R: Runtime>(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q6k_bench<R: Runtime>(
     client: &ComputeClient<R>,
-    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize, iters: usize,
+    wql: &[u32],
+    wqh: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
+    iters: usize,
 ) -> f64 {
     let qlh = client.create_from_slice(u32::as_bytes(wql));
     let qhh = client.create_from_slice(u32::as_bytes(wqh));
@@ -1369,7 +1562,9 @@ pub fn moe_matvec_q6k_bench<R: Runtime>(
     let grid = ((slots * n) as u32).div_ceil(block);
     let launch = |c: &ComputeClient<R>| unsafe {
         moe_matvec_q6k::launch_unchecked::<f32, R>(
-            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            c,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
             ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
@@ -1377,13 +1572,18 @@ pub fn moe_matvec_q6k_bench<R: Runtime>(
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k,
+            n,
+            k,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     t.elapsed().as_secs_f64() * 1e3 / iters as f64
 }
@@ -1397,8 +1597,15 @@ fn cpu_sbyte(a: &[u32], base: usize, i: usize) -> i32 {
 /// CPU oracle for the Q6_K MoE matvec (BlockQ6K::to_float decode order: weight = d * sc * (code-32)).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q6k_ref(
-    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize,
+    wql: &[u32],
+    wqh: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
 ) -> Vec<f32> {
     let nb = k / 256;
     let mut out = vec![0.0f32; slots * n];
@@ -1442,17 +1649,30 @@ pub fn moe_matvec_q6k_ref(
 }
 
 /// Deterministic Q6_K MoE test data: flat [E*n] bank (ql/qh/scales/d) + `[slots,k]` x + expert ids.
-pub fn gen_moe_q6k(e: usize, n: usize, slots: usize, k: usize)
-    -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<u32>) {
+pub fn gen_moe_q6k(
+    e: usize,
+    n: usize,
+    slots: usize,
+    k: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<u32>) {
     let nb = k / 256;
     let nblk = e * n * nb;
     let mut s = 0x27D4EB2F165667C5u64;
-    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
     let wql: Vec<u32> = (0..nblk * 32).map(|_| next() as u32).collect(); // 128 ql bytes/block
     let wqh: Vec<u32> = (0..nblk * 16).map(|_| next() as u32).collect(); // 64 qh bytes/block
-    let wsc: Vec<u32> = (0..nblk * 4).map(|_| next() as u32).collect();  // 16 scale bytes/block (i8)
-    let wd: Vec<f32> = (0..nblk).map(|_| half::f16::from_f32((next() % 1000) as f32 / 20000.0 + 0.002).to_f32()).collect();
-    let x: Vec<f32> = (0..slots * k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let wsc: Vec<u32> = (0..nblk * 4).map(|_| next() as u32).collect(); // 16 scale bytes/block (i8)
+    let wd: Vec<f32> = (0..nblk)
+        .map(|_| half::f16::from_f32((next() % 1000) as f32 / 20000.0 + 0.002).to_f32())
+        .collect();
+    let x: Vec<f32> = (0..slots * k)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     let ids: Vec<u32> = (0..slots).map(|_| (next() % e as u64) as u32).collect();
     (wql, wqh, wsc, wd, x, ids)
 }
@@ -1537,8 +1757,16 @@ pub fn moe_matvec_q6k_blk<F: Float>(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q6k_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize, nt: usize,
+    wql: &[u32],
+    wqh: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
+    nt: usize,
 ) -> Vec<f32> {
     let (qlh, qhh, sh, dh, xh, ih, oh) = (
         client.create_from_slice(u32::as_bytes(wql)),
@@ -1551,7 +1779,9 @@ pub fn moe_matvec_q6k_blk_run<R: Runtime>(
     );
     unsafe {
         moe_matvec_q6k_blk::launch_unchecked::<f32, R>(
-            client, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            client,
+            Grid::Static((slots * n) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
             ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
@@ -1559,7 +1789,9 @@ pub fn moe_matvec_q6k_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k, nt,
+            n,
+            k,
+            nt,
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -1569,8 +1801,17 @@ pub fn moe_matvec_q6k_blk_run<R: Runtime>(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q6k_blk_bench<R: Runtime>(
     client: &ComputeClient<R>,
-    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize, nt: usize, iters: usize,
+    wql: &[u32],
+    wqh: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
+    nt: usize,
+    iters: usize,
 ) -> f64 {
     let (qlh, qhh, sh, dh, xh, ih, oh) = (
         client.create_from_slice(u32::as_bytes(wql)),
@@ -1583,7 +1824,9 @@ pub fn moe_matvec_q6k_blk_bench<R: Runtime>(
     );
     let launch = |c: &ComputeClient<R>| unsafe {
         moe_matvec_q6k_blk::launch_unchecked::<f32, R>(
-            c, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static((slots * n) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
             ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
@@ -1591,13 +1834,19 @@ pub fn moe_matvec_q6k_blk_bench<R: Runtime>(
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k, nt,
+            n,
+            k,
+            nt,
         );
     };
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     t.elapsed().as_secs_f64() * 1e3 / iters as f64
 }
@@ -1716,8 +1965,16 @@ pub fn moe_matvec_q6k_dp4a_blk<F: Float>(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_matvec_q6k_dp4a_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    wql: &[u32], wqh: &[u32], wsc: &[u32], wd: &[f32], x: &[f32], ids: &[u32],
-    slots: usize, n: usize, k: usize, nt: usize,
+    wql: &[u32],
+    wqh: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    x: &[f32],
+    ids: &[u32],
+    slots: usize,
+    n: usize,
+    k: usize,
+    nt: usize,
 ) -> Vec<f32> {
     let (xq, xs, _) = quant_act_q8_cpu(x, slots, k);
     let qlh = client.create_from_slice(u32::as_bytes(wql));
@@ -1730,7 +1987,9 @@ pub fn moe_matvec_q6k_dp4a_blk_run<R: Runtime>(
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slots * n]));
     unsafe {
         moe_matvec_q6k_dp4a_blk::launch_unchecked::<f32, R>(
-            client, Grid::Static((slots * n) as u32, 1, 1), Block::new_1d(nt as u32),
+            client,
+            Grid::Static((slots * n) as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(qlh.clone(), wql.len()),
             ArrayArg::from_raw_parts(qhh.clone(), wqh.len()),
             ArrayArg::from_raw_parts(sh.clone(), wsc.len()),
@@ -1739,7 +1998,9 @@ pub fn moe_matvec_q6k_dp4a_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
             ArrayArg::from_raw_parts(ih.clone(), ids.len()),
             ArrayArg::from_raw_parts(oh.clone(), slots * n),
-            n, k, nt,
+            n,
+            k,
+            nt,
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -1774,17 +2035,26 @@ pub fn matvec_q8_dp4a<F: Float>(
 }
 
 pub fn matvec_q8_dp4a_run<R: Runtime>(
-    client: &ComputeClient<R>, wq: &[i32], xq: &[i32], wd: &[f32], rows: usize, k: usize, bench_iters: usize,
+    client: &ComputeClient<R>,
+    wq: &[i32],
+    xq: &[i32],
+    wd: &[f32],
+    rows: usize,
+    k: usize,
+    bench_iters: usize,
 ) -> (Vec<f32>, f64) {
     let wqh = client.create_from_slice(i32::as_bytes(wq));
     let xqh = client.create_from_slice(i32::as_bytes(xq));
     let wdh = client.create_from_slice(f32::as_bytes(wd));
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
-    let block = 64u32; let grid = (rows as u32).div_ceil(block);
+    let block = 64u32;
+    let grid = (rows as u32).div_ceil(block);
     let ng = k / 4;
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8_dp4a::launch_unchecked::<f32, R>(
-            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            c,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(wqh.clone(), rows * ng),
             ArrayArg::from_raw_parts(xqh.clone(), ng),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
@@ -1795,10 +2065,14 @@ pub fn matvec_q8_dp4a_run<R: Runtime>(
     launch(client);
     let bytes = client.read_one_unchecked(oh.clone());
     let out = f32::from_bytes(&bytes).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..bench_iters { launch(client); }
+    for _ in 0..bench_iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / bench_iters as f64;
     (out, ms)
@@ -1806,11 +2080,15 @@ pub fn matvec_q8_dp4a_run<R: Runtime>(
 
 pub fn matvec_q8_dp4a_ref(wq: &[i32], xq: &[i32], wd: &[f32], rows: usize, k: usize) -> Vec<f32> {
     let nb = k / 32;
-    (0..rows).map(|row| {
-        let mut acc = 0.0f32;
-        for i in 0..k { acc += wd[row * nb + i / 32] * (wq[row * k + i] * xq[i]) as f32; }
-        acc
-    }).collect()
+    (0..rows)
+        .map(|row| {
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                acc += wd[row * nb + i / 32] * (wq[row * k + i] * xq[i]) as f32;
+            }
+            acc
+        })
+        .collect()
 }
 
 // ============================================================================================
@@ -1846,17 +2124,26 @@ pub fn matvec_q8_dp4a_i8<F: Float>(
 
 /// Host for the packed-int8 dp4a matvec. Weights + activation are real int8 (`&[i8]`), 4 bytes/group.
 pub fn matvec_q8_dp4a_i8_run<R: Runtime>(
-    client: &ComputeClient<R>, wq: &[i8], xq: &[i8], wd: &[f32], rows: usize, k: usize, bench_iters: usize,
+    client: &ComputeClient<R>,
+    wq: &[i8],
+    xq: &[i8],
+    wd: &[f32],
+    rows: usize,
+    k: usize,
+    bench_iters: usize,
 ) -> (Vec<f32>, f64) {
     let wqh = client.create_from_slice(i8::as_bytes(wq));
     let xqh = client.create_from_slice(i8::as_bytes(xq));
     let wdh = client.create_from_slice(f32::as_bytes(wd));
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
-    let block = 64u32; let grid = (rows as u32).div_ceil(block);
+    let block = 64u32;
+    let grid = (rows as u32).div_ceil(block);
     let ng = k / 4;
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8_dp4a_i8::launch_unchecked::<f32, R>(
-            c, Grid::Static(grid, 1, 1), Block::new_1d(block),
+            c,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
             ArrayArg::from_raw_parts(wqh.clone(), rows * ng),
             ArrayArg::from_raw_parts(xqh.clone(), ng),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
@@ -1867,10 +2154,14 @@ pub fn matvec_q8_dp4a_i8_run<R: Runtime>(
     launch(client);
     let bytes = client.read_one_unchecked(oh.clone());
     let out = f32::from_bytes(&bytes).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..bench_iters { launch(client); }
+    for _ in 0..bench_iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / bench_iters as f64;
     (out, ms)
@@ -2057,33 +2348,48 @@ pub fn gen_q8_0_packed(rows: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
             w.push(word);
         }
     }
-    let x: Vec<f32> = (0..k).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     (w, x)
 }
 
 // Host launch + kernel-only bench for the packed-Q8_0 block matvec.
 pub fn matvec_q8_0_packed_run<R: Runtime>(
-    client: &ComputeClient<R>, w: &[u32], x: &[f32], rows: usize, k: usize, nt: usize, bench_iters: usize,
+    client: &ComputeClient<R>,
+    w: &[u32],
+    x: &[f32],
+    rows: usize,
+    k: usize,
+    nt: usize,
+    bench_iters: usize,
 ) -> (Vec<f32>, f64) {
     let wh = client.create_from_slice(u32::as_bytes(w));
     let xh = client.create_from_slice(f32::as_bytes(x));
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8_0_packed_blk::launch_unchecked::<f32, R>(
-            c, Grid::Static(rows as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static(rows as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(wh.clone(), w.len()),
             ArrayArg::from_raw_parts(xh.clone(), k),
             ArrayArg::from_raw_parts(oh.clone(), rows),
-            k, nt,
+            k,
+            nt,
         );
     };
     launch(client);
     let bytes = client.read_one_unchecked(oh.clone());
     let out = f32::from_bytes(&bytes).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..bench_iters { launch(client); }
+    for _ in 0..bench_iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let ms = t.elapsed().as_secs_f64() * 1000.0 / bench_iters as f64;
     (out, ms)
@@ -2091,27 +2397,40 @@ pub fn matvec_q8_0_packed_run<R: Runtime>(
 
 // Subgroup variant runner: block = one plane (nt = plane size). pipelined (throughput) timing.
 pub fn matvec_q8_0_packed_sg_run<R: Runtime>(
-    client: &ComputeClient<R>, w: &[u32], x: &[f32], rows: usize, k: usize, nt: usize, bench_iters: usize,
+    client: &ComputeClient<R>,
+    w: &[u32],
+    x: &[f32],
+    rows: usize,
+    k: usize,
+    nt: usize,
+    bench_iters: usize,
 ) -> (Vec<f32>, f64) {
     let wh = client.create_from_slice(u32::as_bytes(w));
     let xh = client.create_from_slice(f32::as_bytes(x));
     let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8_0_packed_sg::launch_unchecked::<f32, R>(
-            c, Grid::Static(rows as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static(rows as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(wh.clone(), w.len()),
             ArrayArg::from_raw_parts(xh.clone(), k),
             ArrayArg::from_raw_parts(oh.clone(), rows),
-            k, nt,
+            k,
+            nt,
         );
     };
     launch(client);
     let bytes = client.read_one_unchecked(oh.clone());
     let out = f32::from_bytes(&bytes).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..bench_iters { launch(client); }
+    for _ in 0..bench_iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let ms = t.elapsed().as_secs_f64() * 1000.0 / bench_iters as f64;
     (out, ms)
@@ -2157,12 +2476,21 @@ pub fn matvec_q8_dp4a_blk<F: Float>(
         sync_cube();
         stride /= 2;
     }
-    if t == 0 { out[row] = smem[0]; }
+    if t == 0 {
+        out[row] = smem[0];
+    }
 }
 
 /// Host for the block-per-row dp4a matvec. `nt` threads cooperate per row (coalesced + reduced).
 pub fn matvec_q8_dp4a_blk_run<R: Runtime>(
-    client: &ComputeClient<R>, wq: &[i8], xq: &[i8], wd: &[f32], rows: usize, k: usize, nt: usize, bench_iters: usize,
+    client: &ComputeClient<R>,
+    wq: &[i8],
+    xq: &[i8],
+    wd: &[f32],
+    rows: usize,
+    k: usize,
+    nt: usize,
+    bench_iters: usize,
 ) -> (Vec<f32>, f64) {
     let wqh = client.create_from_slice(i8::as_bytes(wq));
     let xqh = client.create_from_slice(i8::as_bytes(xq));
@@ -2171,21 +2499,28 @@ pub fn matvec_q8_dp4a_blk_run<R: Runtime>(
     let ng = k / 4;
     let launch = |c: &ComputeClient<R>| unsafe {
         matvec_q8_dp4a_blk::launch_unchecked::<f32, R>(
-            c, Grid::Static(rows as u32, 1, 1), Block::new_1d(nt as u32),
+            c,
+            Grid::Static(rows as u32, 1, 1),
+            Block::new_1d(nt as u32),
             ArrayArg::from_raw_parts(wqh.clone(), rows * ng),
             ArrayArg::from_raw_parts(xqh.clone(), ng),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
             ArrayArg::from_raw_parts(oh.clone(), rows),
-            k, nt,
+            k,
+            nt,
         );
     };
     launch(client);
     let bytes = client.read_one_unchecked(oh.clone());
     let out = f32::from_bytes(&bytes).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..bench_iters { launch(client); }
+    for _ in 0..bench_iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / bench_iters as f64;
     (out, ms)
@@ -2226,7 +2561,7 @@ pub fn matvec_q8_dp4a_tuned<F: Float>(
     let ng = k / 4;
     let nb = k / 32;
     let row0 = ABSOLUTE_POS * nr; // this thread owns rows [row0, row0 + nr)
-    // One running accumulator per owned row. The activation group loaded per `g` feeds all `nr` rows.
+                                  // One running accumulator per owned row. The activation group loaded per `g` feeds all `nr` rows.
     let mut acc = Array::<F>::new(nr);
     #[unroll]
     for n in 0..nr {
@@ -2318,10 +2653,18 @@ pub fn matvec_q8_dp4a_tuned_set<'a, R: Runtime>(
     k: usize,
 ) -> Tuned<'a, Vec<f32>> {
     Tuned::new("matvec_q8_dp4a", format!("rows={rows},k={k}"))
-        .variant("b64_v1", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 1, 64, 1, it))
-        .variant("b64_v4", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 4, 64, 1, it))
-        .variant("b128_v2", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 2, 128, 1, it))
-        .variant("b256_v8", move |it| matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 8, 256, 1, it))
+        .variant("b64_v1", move |it| {
+            matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 1, 64, 1, it)
+        })
+        .variant("b64_v4", move |it| {
+            matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 4, 64, 1, it)
+        })
+        .variant("b128_v2", move |it| {
+            matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 2, 128, 1, it)
+        })
+        .variant("b256_v8", move |it| {
+            matvec_q8_dp4a_tuned_bench(client, wq, xq, wd, rows, k, 8, 256, 1, it)
+        })
 }
 
 /// Autotuned dp4a matvec: tune (or read the cache) over the schedule knobs and run the winner. ONE
@@ -2373,7 +2716,11 @@ pub fn matvec_dp4a_space(k: usize) -> Space {
 
 /// Map a schedule [`Config`] to the kernel's `(block, vw, nr)` launch tuple.
 fn dp4a_cfg(c: &Config, s: &Space) -> (u32, usize, usize) {
-    (c.get(s, "WG") as u32, c.get(s, "VW") as usize, c.get(s, "NR") as usize)
+    (
+        c.get(s, "WG") as u32,
+        c.get(s, "VW") as usize,
+        c.get(s, "NR") as usize,
+    )
 }
 
 /// A cold-weight-streaming, bit-exact-gated fitness over [`matvec_dp4a_space`], generic in the runtime.
@@ -2414,9 +2761,14 @@ impl<'a, R: Runtime> MatvecDp4aEval<'a, R> {
         k: usize,
         repeats: usize,
     ) -> Self {
-        assert!(!weight_banks.is_empty(), "MatvecDp4aEval needs at least one weight bank");
-        let banks: Vec<Handle> =
-            weight_banks.iter().map(|w| client.create_from_slice(i8::as_bytes(w))).collect();
+        assert!(
+            !weight_banks.is_empty(),
+            "MatvecDp4aEval needs at least one weight bank"
+        );
+        let banks: Vec<Handle> = weight_banks
+            .iter()
+            .map(|w| client.create_from_slice(i8::as_bytes(w)))
+            .collect();
         let xqh = client.create_from_slice(i8::as_bytes(xq));
         let wdh = client.create_from_slice(f32::as_bytes(wd));
         let outh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
@@ -2498,7 +2850,12 @@ impl<'a, R: Runtime> Evaluator for MatvecDp4aEval<'a, R> {
         // error explodes on near-zero cancellation, so gate on max|Δ|/max|ref|).
         self.dispatch(&self.banks[0], block, vw, nr);
         let got = self.read_out();
-        let rel = got.iter().zip(&self.oracle).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / self.maxref;
+        let rel = got
+            .iter()
+            .zip(&self.oracle)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / self.maxref;
         self.worst_rel.set(self.worst_rel.get().max(rel));
         if rel > 2e-3 {
             return f64::INFINITY;
@@ -2537,7 +2894,15 @@ pub fn matvec_dp4a_hunt<R: Runtime>(
     evo: &Evolution,
     seed: u64,
 ) -> Evolved {
-    tuner.evolve(device, "matvec_q8_dp4a", &format!("rows={rows},k={k}"), eval.space(), eval, evo, seed)
+    tuner.evolve(
+        device,
+        "matvec_q8_dp4a",
+        &format!("rows={rows},k={k}"),
+        eval.space(),
+        eval,
+        evo,
+        seed,
+    )
 }
 
 // ============================================================================================
@@ -2563,7 +2928,7 @@ pub fn moe_route<F: Float>(
     let t = UNIT_POS as usize;
     let base = tok * n_experts;
     let ninf = F::new(-3.4e38); // -inf sentinel (cf. attn.rs running-max init)
-    // Maskable copy of this token's logits in shared memory (F = f32 at launch).
+                                // Maskable copy of this token's logits in shared memory (F = f32 at launch).
     let mut slog = SharedMemory::<F>::new(n_experts);
     let mut i = t;
     while i < n_experts {
@@ -2796,7 +3161,10 @@ mod tests {
     use super::*;
 
     fn max_rel(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs() / x.abs().max(1e-6)).fold(0.0, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs() / x.abs().max(1e-6))
+            .fold(0.0, f32::max)
     }
 
     /// Deterministic int8 weights/activations + per-32 scales for the dp4a tuned tests.
@@ -2810,7 +3178,9 @@ mod tests {
         };
         let wq: Vec<i8> = (0..rows * k).map(|_| (nx() % 251) as i8).collect();
         let xq: Vec<i8> = (0..k).map(|_| (nx() % 251) as i8).collect();
-        let wd: Vec<f32> = (0..rows * (k / 32)).map(|_| (nx() % 1000) as f32 / 8000.0 + 0.01).collect();
+        let wd: Vec<f32> = (0..rows * (k / 32))
+            .map(|_| (nx() % 1000) as f32 / 8000.0 + 0.01)
+            .collect();
         (wq, xq, wd)
     }
 
@@ -2843,31 +3213,56 @@ mod tests {
             (4, 128, 2),
             (2, 256, 4),
         ] {
-            let (got, _ms) = matvec_q8_dp4a_tuned_bench::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k, vw, block, nr, 1);
+            let (got, _ms) = matvec_q8_dp4a_tuned_bench::<CpuRuntime>(
+                &c, &wq, &xq, &wd, rows, k, vw, block, nr, 1,
+            );
             let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
             match &ref_bits {
                 None => ref_bits = Some(gbits),
-                Some(rb) => assert_eq!(&gbits, rb, "wg={block} vw={vw} nr={nr} not byte-identical to b64_v1_r1"),
+                Some(rb) => assert_eq!(
+                    &gbits, rb,
+                    "wg={block} vw={vw} nr={nr} not byte-identical to b64_v1_r1"
+                ),
             }
             let rel = max_rel(&want, &got);
             eprintln!("[matvec_q8_dp4a_tuned CPU] wg={block} vw={vw} nr={nr} max_rel={rel:.2e}");
-            assert!(rel < 2e-3, "dp4a tuned wg={block} vw={vw} nr={nr} max_rel {rel} vs oracle");
+            assert!(
+                rel < 2e-3,
+                "dp4a tuned wg={block} vw={vw} nr={nr} max_rel {rel} vs oracle"
+            );
         }
 
         // (2) select + cache against an isolated temp tuner.
         let dir = std::env::temp_dir().join(format!(
             "hk-tune-dp4a-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let tuner = Tuner::new(&dir);
-        let p = matvec_q8_dp4a_tuned_set::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k).pick_with(&tuner, "cpu");
-        assert!(!p.from_cache && p.benched == 4, "first call must benchmark all 4 variants");
-        assert!(max_rel(&want, &p.output) < 2e-3, "autotuned winner not within tolerance");
-        eprintln!("[matvec_q8_dp4a autotune CPU] winner={} timings={:?}", p.winner, p.timings);
+        let p = matvec_q8_dp4a_tuned_set::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k)
+            .pick_with(&tuner, "cpu");
+        assert!(
+            !p.from_cache && p.benched == 4,
+            "first call must benchmark all 4 variants"
+        );
+        assert!(
+            max_rel(&want, &p.output) < 2e-3,
+            "autotuned winner not within tolerance"
+        );
+        eprintln!(
+            "[matvec_q8_dp4a autotune CPU] winner={} timings={:?}",
+            p.winner, p.timings
+        );
 
-        let p2 = matvec_q8_dp4a_tuned_set::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k).pick_with(&tuner, "cpu");
-        assert!(p2.from_cache && p2.benched == 0, "second call must hit the cache and skip timing");
+        let p2 = matvec_q8_dp4a_tuned_set::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k)
+            .pick_with(&tuner, "cpu");
+        assert!(
+            p2.from_cache && p2.benched == 0,
+            "second call must hit the cache and skip timing"
+        );
         assert_eq!(p2.winner, p.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2888,15 +3283,25 @@ mod tests {
         let want = matvec_q8_dp4a_ref(&wq32, &xq32, &wd, rows, k);
         let c = CpuRuntime::client(&CpuDevice::default());
         let mut ref_bits: Option<Vec<u32>> = None;
-        for &(vw, block, nr) in &[(2usize, 64u32, 1usize), (2, 64, 2), (2, 128, 4), (4, 256, 4)] {
-            let (got, _ms) = matvec_q8_dp4a_tuned_bench::<CpuRuntime>(&c, &wq, &xq, &wd, rows, k, vw, block, nr, 1);
+        for &(vw, block, nr) in &[
+            (2usize, 64u32, 1usize),
+            (2, 64, 2),
+            (2, 128, 4),
+            (4, 256, 4),
+        ] {
+            let (got, _ms) = matvec_q8_dp4a_tuned_bench::<CpuRuntime>(
+                &c, &wq, &xq, &wd, rows, k, vw, block, nr, 1,
+            );
             assert_eq!(got.len(), rows, "output truncated at nr={nr}");
             let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
             match &ref_bits {
                 None => ref_bits = Some(gbits),
                 Some(rb) => assert_eq!(&gbits, rb, "ragged nr={nr} not byte-identical to nr=1"),
             }
-            assert!(max_rel(&want, &got) < 2e-3, "ragged nr={nr} diverged from the oracle");
+            assert!(
+                max_rel(&want, &got) < 2e-3,
+                "ragged nr={nr} diverged from the oracle"
+            );
         }
     }
 
@@ -2931,7 +3336,9 @@ mod tests {
         // The space is exactly the feasible {WG x VW x NR} product: only VW dividing ng, only legal widths.
         let feasible = space.enumerate();
         assert!(!feasible.is_empty(), "empty feasible space");
-        assert!(feasible.iter().all(|cfg| (k / 4) % (cfg.get(&space, "VW") as usize) == 0));
+        assert!(feasible
+            .iter()
+            .all(|cfg| (k / 4) % (cfg.get(&space, "VW") as usize) == 0));
         assert!(feasible.iter().all(|cfg| {
             let w = cfg.get(&space, "WG");
             w > 0 && w <= 1024
@@ -2942,24 +3349,47 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "hk-dp4a-hunt-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let tuner = Tuner::new(&dir);
-        let evo = Evolution::new().population(8).generations(3).measure_iters(1);
+        let evo = Evolution::new()
+            .population(8)
+            .generations(3)
+            .measure_iters(1);
 
         // (1) miss: the hunt runs, crowns a feasible bit-exact winner, and records it.
         let r = matvec_dp4a_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xC0FFEE);
         assert!(!r.from_cache, "first hunt must not be a cache hit");
-        let rep = r.report.as_ref().expect("a miss carries the evidence trail");
+        let rep = r
+            .report
+            .as_ref()
+            .expect("a miss carries the evidence trail");
         assert!(rep.best_ms.is_finite(), "no measurable winner");
-        let win = space.parse(&r.winner).expect("winner is a valid config name");
+        let win = space
+            .parse(&r.winner)
+            .expect("winner is a valid config name");
         assert!(space.feasible(&win), "winner {} is infeasible", r.winner);
-        assert!(eval.worst_rel() < 2e-3, "a measured variant diverged from the oracle: {:.2e}", eval.worst_rel());
-        eprintln!("[dp4a hunt CPU] winner={} evaluated={} worst_rel={:.2e}", r.winner, rep.evaluated, eval.worst_rel());
+        assert!(
+            eval.worst_rel() < 2e-3,
+            "a measured variant diverged from the oracle: {:.2e}",
+            eval.worst_rel()
+        );
+        eprintln!(
+            "[dp4a hunt CPU] winner={} evaluated={} worst_rel={:.2e}",
+            r.winner,
+            rep.evaluated,
+            eval.worst_rel()
+        );
 
         // (2) hit: a second hunt reads the cached winner and runs no GA.
         let r2 = matvec_dp4a_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xC0FFEE);
-        assert!(r2.from_cache && r2.report.is_none(), "second hunt must hit the cache");
+        assert!(
+            r2.from_cache && r2.report.is_none(),
+            "second hunt must hit the cache"
+        );
         assert_eq!(r2.winner, r.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2980,12 +3410,29 @@ mod tests {
         let want = matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, rows, k);
         let maxref = want.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
         let c = CpuRuntime::client(&CpuDevice::default());
-        for &(nt, nr) in &[(16usize, 1usize), (32, 1), (64, 1), (16, 2), (32, 4), (64, 2)] {
-            let got = matvec_q4k_f32_blk_run::<CpuRuntime>(&c, &wqs, &wsc, &wd, &wdm, &x, rows, k, nt, nr);
+        for &(nt, nr) in &[
+            (16usize, 1usize),
+            (32, 1),
+            (64, 1),
+            (16, 2),
+            (32, 4),
+            (64, 2),
+        ] {
+            let got = matvec_q4k_f32_blk_run::<CpuRuntime>(
+                &c, &wqs, &wsc, &wd, &wdm, &x, rows, k, nt, nr,
+            );
             assert_eq!(got.len(), rows, "output truncated at nt={nt} nr={nr}");
-            let rel = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / maxref;
+            let rel = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+                / maxref;
             eprintln!("[matvec_q4k_f32_blk CPU] nt={nt} nr={nr} scale_rel={rel:.2e}");
-            assert!(rel < 1e-4, "f32-direct nt={nt} nr={nr} scale_rel {rel} vs Q4_K oracle");
+            assert!(
+                rel < 1e-4,
+                "f32-direct nt={nt} nr={nr} scale_rel {rel} vs Q4_K oracle"
+            );
         }
     }
 
@@ -3012,22 +3459,45 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "hk-q4kf32-hunt-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let tuner = Tuner::new(&dir);
-        let evo = Evolution::new().population(8).generations(3).measure_iters(1);
+        let evo = Evolution::new()
+            .population(8)
+            .generations(3)
+            .measure_iters(1);
 
         let r = matvec_q4k_f32_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xF32);
         assert!(!r.from_cache, "first hunt must not be a cache hit");
-        let rep = r.report.as_ref().expect("a miss carries the evidence trail");
+        let rep = r
+            .report
+            .as_ref()
+            .expect("a miss carries the evidence trail");
         assert!(rep.best_ms.is_finite(), "no measurable winner");
-        let win = space.parse(&r.winner).expect("winner is a valid config name");
+        let win = space
+            .parse(&r.winner)
+            .expect("winner is a valid config name");
         assert!(space.feasible(&win), "winner {} is infeasible", r.winner);
-        assert!(eval.worst_rel() < 1e-3, "a measured variant diverged from the oracle: {:.2e}", eval.worst_rel());
-        eprintln!("[q4k_f32 hunt CPU] winner={} evaluated={} worst_rel={:.2e}", r.winner, rep.evaluated, eval.worst_rel());
+        assert!(
+            eval.worst_rel() < 1e-3,
+            "a measured variant diverged from the oracle: {:.2e}",
+            eval.worst_rel()
+        );
+        eprintln!(
+            "[q4k_f32 hunt CPU] winner={} evaluated={} worst_rel={:.2e}",
+            r.winner,
+            rep.evaluated,
+            eval.worst_rel()
+        );
 
         let r2 = matvec_q4k_f32_hunt(&tuner, "cpu", rows, k, &eval, &evo, 0xF32);
-        assert!(r2.from_cache && r2.report.is_none(), "second hunt must hit the cache");
+        assert!(
+            r2.from_cache && r2.report.is_none(),
+            "second hunt must hit the cache"
+        );
         assert_eq!(r2.winner, r.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3042,11 +3512,15 @@ mod tests {
         let (e, n, slots, k) = (8usize, 12usize, 5usize, 512usize);
         let (wqs, wsc, wd, wdm, x, ids) = gen_moe_q4k(e, n, slots, k);
         let c = CpuRuntime::client(&CpuDevice::default());
-        let got = moe_matvec_q4k_run::<CpuRuntime>(&c, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
+        let got =
+            moe_matvec_q4k_run::<CpuRuntime>(&c, &wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
         let want = moe_matvec_q4k_ref(&wqs, &wsc, &wd, &wdm, &x, &ids, slots, n, k);
         let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
         let wbits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
-        assert_eq!(gbits, wbits, "moe_matvec_q4k CPU kernel != oracle bit-exact");
+        assert_eq!(
+            gbits, wbits,
+            "moe_matvec_q4k CPU kernel != oracle bit-exact"
+        );
     }
 
     /// The Q6_K indexed-MoE matvec on the CPU runtime is byte-for-byte the plain-Rust oracle: signed
@@ -3058,10 +3532,14 @@ mod tests {
         let (e, n, slots, k) = (8usize, 12usize, 5usize, 512usize);
         let (wql, wqh, wsc, wd, x, ids) = gen_moe_q6k(e, n, slots, k);
         let c = CpuRuntime::client(&CpuDevice::default());
-        let got = moe_matvec_q6k_run::<CpuRuntime>(&c, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
+        let got =
+            moe_matvec_q6k_run::<CpuRuntime>(&c, &wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
         let want = moe_matvec_q6k_ref(&wql, &wqh, &wsc, &wd, &x, &ids, slots, n, k);
         let gbits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
         let wbits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
-        assert_eq!(gbits, wbits, "moe_matvec_q6k CPU kernel != oracle bit-exact");
+        assert_eq!(
+            gbits, wbits,
+            "moe_matvec_q6k CPU kernel != oracle bit-exact"
+        );
     }
 }

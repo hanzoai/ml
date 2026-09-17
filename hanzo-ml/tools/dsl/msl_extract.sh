@@ -31,5 +31,15 @@
 set -euo pipefail
 LOG="${CUBECL_LOG:-/tmp/cubecl.log}"; NAME="${1:-}"
 [ -f "$LOG" ] || { echo "no $LOG -- run the kernel with CUBECL_DEBUG_LOG=1 first" >&2; exit 1; }
-awk -v n="$NAME" '/#include <metal_stdlib>/{buf=""} {buf=buf $0 "\n"} /\[\[kernel\]\]/{k=1}
-  k&&/^}$/{if(n=="" || buf ~ ("void [a-z_]*" n)) {printf "%s", buf; exit} k=0}' "$LOG"
+# Emit the full kernel block by BRACE COUNTING from the signature to its matching close. (The prior
+# awk stopped at the first column-0 `}`, truncating any kernel whose body has a mid-body `}` -- e.g. a
+# loop or an `if` -- so a shared-mem reduction + store were silently dropped.) Each block starts at
+# `#include <metal_stdlib>`; the entry is `void <name>(`; count `{`/`}` from there to depth 0.
+awk -v n="$NAME" '
+  /#include <metal_stdlib>/ { buf=$0"\n"; depth=0; started=0; hit=0; next }
+  { buf=buf $0 "\n" }
+  $0 ~ ("void [A-Za-z0-9_]*" n) { hit=1 }
+  hit {
+    o=gsub(/{/,"{"); c=gsub(/}/,"}"); depth += o - c; if (o>0) started=1;
+    if (started && depth==0) { printf "%s", buf; exit }
+  }' "$LOG"

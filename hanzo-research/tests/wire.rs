@@ -105,7 +105,11 @@ fn kernel_perf_refutation_drives_the_wire() {
         "the DSL f32-direct matvec beats the hand kernel"
     );
     assert_eq!(running["meta"]["verdict"], "");
-    assert_eq!(running["meta"]["log"], json!([]), "running log empty, as in Python");
+    assert_eq!(
+        running["meta"]["log"],
+        json!([]),
+        "running log empty, as in Python"
+    );
 
     // The sealed record: the refutation is first-class + provenance auto-stamped.
     let done = &posts[1]["experiments"][0];
@@ -121,7 +125,10 @@ fn kernel_perf_refutation_drives_the_wire() {
         done["meta"]["log"][0],
         "cold in-engine A/B, evo gfx1151, quiet window, 3 runs, bit-exact 2.3e-6"
     );
-    assert_eq!(done["git_sha"], running["git_sha"], "provenance consistent across versions");
+    assert_eq!(
+        done["git_sha"], running["git_sha"],
+        "provenance consistent across versions"
+    );
     assert!(done["lib_versions"].is_object());
     assert!(done["meta"]["host"]["hostname"].is_string());
 }
@@ -131,9 +138,12 @@ fn benchmark_attempts_then_finish_computes_the_score() {
     let (base, rx) = mock();
     let r = Research::new(&base, "test-key", "enso-bench", "", &[]);
 
-    let mut b = r.experiment("benchmark", "grok-4.5", "gpqa_diamond").n_total(2);
+    let mut b = r
+        .experiment("benchmark", "grok-4.5", "gpqa_diamond")
+        .n_total(2);
     b.record("q1", "grok-4.5", Outcome::correct("A")).unwrap();
-    b.record("q2", "grok-4.5", Outcome::wrong("B", "C")).unwrap();
+    b.record("q2", "grok-4.5", Outcome::wrong("B", "C"))
+        .unwrap();
     b.finish(None).unwrap(); // value computed from attempts: 1 of 2 -> 50.0
 
     // GET(since) + running POST + 2 attempt POSTs + complete POST.
@@ -151,7 +161,10 @@ fn benchmark_attempts_then_finish_computes_the_score() {
     assert_eq!(exp["n"], 2);
 
     // The first attempt post carried the item under the experiment's task/benchmark.
-    let first_attempt = posts.iter().find(|p| !p["attempts"].as_array().unwrap().is_empty()).unwrap();
+    let first_attempt = posts
+        .iter()
+        .find(|p| !p["attempts"].as_array().unwrap().is_empty())
+        .unwrap();
     assert_eq!(first_attempt["attempts"][0]["benchmark"], "gpqa_diamond");
     assert_eq!(first_attempt["attempts"][0]["source"], "hanzo-measured");
 }

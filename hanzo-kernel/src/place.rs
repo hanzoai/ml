@@ -49,7 +49,9 @@ pub struct Place {
 /// of the pool around them.
 impl FromIterator<(Expert, Device)> for Place {
     fn from_iter<I: IntoIterator<Item = (Expert, Device)>>(pins: I) -> Place {
-        Place { at: pins.into_iter().collect() }
+        Place {
+            at: pins.into_iter().collect(),
+        }
     }
 }
 
@@ -104,7 +106,10 @@ impl Place {
 
         for (e, need) in order {
             // `min_by_key(Reverse)` is the most room that still fits, first-listed device winning a tie.
-            let room = free.iter_mut().filter(|(_, left)| *left >= need).min_by_key(|(_, left)| Reverse(*left));
+            let room = free
+                .iter_mut()
+                .filter(|(_, left)| *left >= need)
+                .min_by_key(|(_, left)| Reverse(*left));
             let Some(slot) = room else {
                 return Err(Error::Unplaceable { expert: e, need });
             };
@@ -119,7 +124,11 @@ impl Place {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// A device is declared more than it holds.
-    Over { device: Device, need: u64, have: u64 },
+    Over {
+        device: Device,
+        need: u64,
+        have: u64,
+    },
     /// An expert fits on no device with room left.
     Unplaceable { expert: Expert, need: u64 },
 }
@@ -150,8 +159,12 @@ mod tests {
     /// A fleet shaped like the zen5 lab: two big boxes and a small one.
     const FLEET: [(Device, u64); 3] = [(Device(0), 128), (Device(1), 128), (Device(2), 64)];
     /// One expert too big to share, two that pair up, one that fills a gap.
-    const POOL: [(Expert, u64); 4] =
-        [(Expert(0), 100), (Expert(1), 40), (Expert(2), 40), (Expert(3), 10)];
+    const POOL: [(Expert, u64); 4] = [
+        (Expert(0), 100),
+        (Expert(1), 40),
+        (Expert(2), 40),
+        (Expert(3), 10),
+    ];
 
     #[test]
     fn pin_places_the_largest_expert_first_where_there_is_most_room() {
@@ -173,12 +186,17 @@ mod tests {
         let pool = [(Expert(1), 40), (Expert(4), 30)];
         assert_eq!(
             declared.clone().pin(&pool, &[(Device(2), 64)]),
-            Err(Error::Unplaceable { expert: Expert(4), need: 30 }),
+            Err(Error::Unplaceable {
+                expert: Expert(4),
+                need: 30
+            }),
             "the declared pin's 40 was not charged to D2"
         );
 
         // Given somewhere else to put it, the declaration survives the packing untouched.
-        let pi = declared.pin(&pool, &[(Device(2), 64), (Device(3), 64)]).unwrap();
+        let pi = declared
+            .pin(&pool, &[(Device(2), 64), (Device(3), 64)])
+            .unwrap();
         assert_eq!(pi.device(Expert(1)), Some(Device(2)), "declared pin moved");
         assert_eq!(pi.device(Expert(4)), Some(Device(3)));
     }
@@ -187,12 +205,19 @@ mod tests {
     fn a_pool_that_does_not_fit_is_refused_not_rounded() {
         assert_eq!(
             Place::default().pin(&[(Expert(0), 200)], &FLEET),
-            Err(Error::Unplaceable { expert: Expert(0), need: 200 })
+            Err(Error::Unplaceable {
+                expert: Expert(0),
+                need: 200
+            })
         );
         let declared: Place = [(Expert(0), Device(2))].into_iter().collect();
         assert_eq!(
             declared.pin(&[(Expert(0), 100)], &[(Device(2), 64)]),
-            Err(Error::Over { device: Device(2), need: 100, have: 64 })
+            Err(Error::Over {
+                device: Device(2),
+                need: 100,
+                have: 64
+            })
         );
     }
 
@@ -225,7 +250,12 @@ mod tests {
             );
         }
         // The pool is a set, not a sequence — listing it in another order is the same pool.
-        let shuffled = [(Expert(3), 10), (Expert(2), 40), (Expert(0), 100), (Expert(1), 40)];
+        let shuffled = [
+            (Expert(3), 10),
+            (Expert(2), 40),
+            (Expert(0), 100),
+            (Expert(1), 40),
+        ];
         assert_eq!(
             Place::default().pin(&shuffled, &FLEET).unwrap(),
             pi,
@@ -233,6 +263,10 @@ mod tests {
         );
         // And π is a function: one expert, one device, every call.
         assert_eq!(pi.device(Expert(0)), pi.device(Expert(0)));
-        assert_eq!(pi.device(Expert(9)), None, "an expert outside the pool has no address");
+        assert_eq!(
+            pi.device(Expert(9)),
+            None,
+            "an expert outside the pool has no address"
+        );
     }
 }

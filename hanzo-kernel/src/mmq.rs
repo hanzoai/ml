@@ -805,10 +805,10 @@ pub fn mmq_q4k_wmma_blk(
     xq: &Array<i8>,
     xs: &Array<f32>,
     xsum: &Array<f32>, // per-32-block xs*Sum(xq) -- the DEQUANTIZED block sum, matching quantize_act_q8
-    wqs: &Array<u32>, // packed Q4_K qs: 32 u32 (128 B) / super-block
-    wsc: &Array<u32>, // packed Q4_K scales: 3 u32 (12 B) / super-block
-    wd: &Array<f32>,  // d per super-block   [n * k/256]
-    wdm: &Array<f32>, // dmin per super-block [n * k/256]
+    wqs: &Array<u32>,  // packed Q4_K qs: 32 u32 (128 B) / super-block
+    wsc: &Array<u32>,  // packed Q4_K scales: 3 u32 (12 B) / super-block
+    wd: &Array<f32>,   // d per super-block   [n * k/256]
+    wdm: &Array<f32>,  // dmin per super-block [n * k/256]
     out: &mut Array<f32>,
     #[comptime] n: usize,
     #[comptime] k: usize,
@@ -938,8 +938,17 @@ pub fn mmq_q4k_wmma_blk(
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
     client: &ComputeClient<R>,
-    xq: &[i8], xs: &[f32], xsum: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
-    m: usize, n: usize, k: usize, iters: usize,
+    xq: &[i8],
+    xs: &[f32],
+    xsum: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    iters: usize,
 ) -> (Vec<f32>, f64) {
     let target = Target::of(client);
     let plane = client.properties().hardware.plane_size_max;
@@ -954,7 +963,9 @@ pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
     let grid = Grid::Static((n / 64) as u32, (m / 32) as u32, 1);
     let launch = |c: &ComputeClient<R>| unsafe {
         mmq_q4k_wmma_blk::launch_unchecked::<R>(
-            c, grid.clone(), Block::new_1d(8 * plane),
+            c,
+            grid.clone(),
+            Block::new_1d(8 * plane),
             ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
             ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
@@ -963,15 +974,22 @@ pub fn mmq_q4k_wmma_blk_run<R: Runtime>(
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
             ArrayArg::from_raw_parts(wdmh.clone(), wdm.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
-            n, k, plane as usize, target,
+            n,
+            k,
+            plane as usize,
+            target,
         );
     };
     launch(client);
     let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
     (out, ms)
@@ -1129,8 +1147,17 @@ pub fn mmq_q4k_wmma_rt(
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_q4k_wmma_rt_run<R: Runtime>(
     client: &ComputeClient<R>,
-    xq: &[i8], xs: &[f32], xsum: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
-    m: usize, n: usize, k: usize, iters: usize,
+    xq: &[i8],
+    xs: &[f32],
+    xsum: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    iters: usize,
 ) -> (Vec<f32>, f64) {
     let target = Target::of(client);
     let plane = client.properties().hardware.plane_size_max;
@@ -1147,7 +1174,9 @@ pub fn mmq_q4k_wmma_rt_run<R: Runtime>(
     let grid = Grid::Static(n.div_ceil(64) as u32, m.div_ceil(32) as u32, 1);
     let launch = |c: &ComputeClient<R>| unsafe {
         mmq_q4k_wmma_rt::launch_unchecked::<R>(
-            c, grid.clone(), Block::new_1d(8 * plane),
+            c,
+            grid.clone(),
+            Block::new_1d(8 * plane),
             ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
             ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
@@ -1157,36 +1186,467 @@ pub fn mmq_q4k_wmma_rt_run<R: Runtime>(
             ArrayArg::from_raw_parts(wdmh.clone(), wdm.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
             ArrayArg::from_raw_parts(mh.clone(), meta.len()),
-            plane as usize, target,
+            plane as usize,
+            target,
         );
     };
     launch(client);
     let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
     (out, ms)
 }
 
-fn cpu_q4k_byte(a: &[u32], base: usize, i: usize) -> u32 { (a[base + i / 4] >> (8 * (i % 4))) & 255 }
+// ============================================================================================
+// EXPERT-INDEXED Q4_K PREFILL MMQ -- the MoE twin of `mmq_q4k_wmma_rt`.
+//
+// A MoE prefill multiplies each routed slot by exactly ONE expert's weight matrix. Run per slot,
+// that re-reads the whole expert weight for every token that chose it and leaves the matrix cores
+// idle; grouping the slots that share an expert turns it back into a GEMM, so a weight row is read
+// once and amortised over all of that expert's tokens. Same structure as llama's `mul_mm_id` and as
+// the CUDA/ROCm/Metal `t > 1` arms already in `quantized::indexed_moe_forward`.
+//
+// Two kernels, one concern each:
+//   `moe_expert_rows` groups the routed slots by expert (counts + per-expert slot lists),
+//   `mmq_q4k_id`      is `mmq_q4k_wmma_rt` with the expert on grid.z, the weight base at
+//                     `expert * n` rows, the A-tile gathered through that slot list, and the result
+//                     scattered straight to the slot's own output row -- so no permutation of the
+//                     activation or the output is ever materialised.
+// ============================================================================================
+
+/// Group routed slots by expert. `ids[s]` is slot `s`'s expert; outputs are `counts[e]` (slots that
+/// chose `e`) and `rows[e * cap + i]` (the slot index of `e`'s `i`-th row, ascending). `cap` bounds
+/// rows-per-expert: a token's top-k experts are distinct, so an expert claims at most one slot per
+/// token and `cap = tokens` is exact.
+///
+/// One workgroup walks the slots in order because the grouping must be STABLE -- the GEMM gathers
+/// the activation and scatters the result through the same list, so any order works as long as it is
+/// the same one on both ends, and ascending slot order keeps the gather's reads sequential. The pass
+/// is O(slots) against a GEMM that is O(slots * n * k).
+#[kernel(targets(cuda, rocm, vulkan, metal, cpu), unchecked)]
+pub fn moe_expert_rows(
+    ids: &Array<u32>,
+    counts: &mut Array<u32>,
+    rows: &mut Array<u32>,
+    meta: &Array<u32>, // [nslots, n_experts, cap]
+    #[comptime] nt: usize,
+) {
+    let nslots = meta[0] as usize;
+    let ne = meta[1] as usize;
+    let cap = meta[2] as usize;
+    let tid = UNIT_POS as usize;
+    let mut i = tid;
+    while i < ne {
+        counts[i] = 0u32;
+        i += nt;
+    }
+    sync_cube();
+    if tid == 0 {
+        let mut s = 0usize;
+        while s < nslots {
+            let e = ids[s] as usize;
+            let c = counts[e] as usize;
+            // `cap` is exact for well-formed routing; the guard keeps a malformed id list from
+            // writing past the buffer, and leaves `counts` <= `cap` so the GEMM can trust it.
+            if c < cap {
+                rows[e * cap + c] = s as u32;
+                counts[e] = (c + 1) as u32;
+            }
+            s += 1;
+        }
+    }
+}
+
+/// Expert-indexed Q4_K MMQ: `out[s, j] = sum_k W[ids[s], j, k] * x[s, k]` over the packed Q4_K
+/// expert bank `[E, n, k]`, with the routed slots grouped by [`moe_expert_rows`]. Identical tiling,
+/// identical affine epilogue and identical accumulation order to [`mmq_q4k_wmma_rt`] -- the only
+/// differences are that the expert rides `grid.z`, the weight base is `expert * n` rows into the
+/// bank, and the A-tile/output rows are indirected through the expert's slot list.
+///
+/// The grid covers the worst case (`cap` rows for every expert) because the per-expert counts live
+/// only on the device; tiles past an expert's count exit before any barrier.
+#[allow(clippy::too_many_arguments)]
+#[kernel(targets(cuda, rocm, vulkan, metal, cpu), unchecked)]
+pub fn mmq_q4k_id(
+    xq: &Array<i8>,
+    xs: &Array<f32>,
+    xsum: &Array<f32>,
+    wqs: &Array<u32>,
+    wsc: &Array<u32>,
+    wd: &Array<f32>,
+    wdm: &Array<f32>,
+    rows: &Array<u32>,   // [n_experts * cap] slot index per (expert, local row)
+    counts: &Array<u32>, // [n_experts] rows assigned to each expert
+    out: &mut Array<f32>,
+    meta: &Array<u32>, // [n, k, cap]
+    #[comptime] plane: usize,
+    #[comptime] target: Target,
+) {
+    let n = meta[0] as usize;
+    let k = meta[1] as usize;
+    let cap = meta[2] as usize;
+    let expert = CUBE_POS_Z as usize;
+    let ecount = counts[expert] as usize;
+    // Grid-stride over this expert's row tiles. The caller sizes grid.y for the AVERAGE expert load
+    // (slots/experts) rather than the worst case, because sizing it for the worst case (`cap` rows on
+    // every expert) dispatches ~E times more workgroups than have rows and they all early-exit. The
+    // stride keeps that sizing a pure throughput choice: an expert with more rows than the grid
+    // covers simply loops, so ANY routing distribution stays correct.
+    let mut mtile = CUBE_POS_Y as usize;
+    let mtile_stride = CUBE_COUNT_Y as usize;
+    // (expert, mrow0, ecount) are cube-uniform, so the whole workgroup takes this branch together
+    // and the barriers inside it can never diverge.
+    while mtile * 32 < ecount {
+        let mrow0 = mtile * 32;
+        let tid = UNIT_POS as usize;
+        let warp = tid / plane;
+        let lane = tid % plane;
+        let wm = warp / 4;
+        let wn = warp % 4;
+        let ncol0 = CUBE_POS_X as usize * 64;
+        let kb_count = k / 32;
+        let nsb = k / 256;
+        let nthread = 8 * plane;
+        let per = 256 / plane;
+        let wbase = expert * n; // this expert's first weight row in the [E, n, k] bank
+
+        let mut srow = SharedMemory::<u32>::new(32usize);
+        let mut sa = SharedMemory::<i8>::new(1024usize);
+        let mut sb = SharedMemory::<i8>::new(2048usize);
+        let mut ci = SharedMemory::<i32>::new(2048usize);
+        let mut accf = SharedMemory::<f32>::new(2048usize);
+
+        // The 32 slot indices this tile owns, staged once -- every k-block re-reads them. Strided so
+        // the staging is complete for ANY block width (the CPU runtime's plane is 1, so `nthread` is
+        // well under 32 there; a fixed `tid < 32` would leave most of the list uninitialised).
+        let mut r = tid;
+        while r < 32 {
+            let lr = mrow0 + r;
+            let mut s = 0u32;
+            if lr < ecount {
+                s = rows[expert * cap + lr];
+            }
+            srow[r] = s;
+            r += nthread;
+        }
+        for e in 0usize..(2048 / nthread) {
+            accf[tid * (2048 / nthread) + e] = 0.0f32;
+        }
+        sync_cube();
+
+        for kb in 0..kb_count {
+            let k0 = kb * 32;
+            // A tile: rows past this expert's count stage as 0 so their cmma fragment is inert --
+            // only in-range rows are stored, so a padding row can never pollute a real result.
+            for i in 0usize..(1024 / nthread) {
+                let idx = tid + i * nthread;
+                let lr = mrow0 + idx / 32;
+                sa[idx] = 0i8;
+                if lr < ecount {
+                    let slot = srow[idx / 32] as usize;
+                    sa[idx] = xq[slot * k + k0 + idx % 32];
+                }
+            }
+            let is = kb % 8;
+            let g = is / 2;
+            let sbk = kb / 8;
+            for i in 0usize..(2048 / nthread) {
+                let idx = tid + i * nthread;
+                let nrow = ncol0 + idx / 32;
+                let qi = idx % 32;
+                sb[idx] = 0i8;
+                if nrow < n {
+                    let qb = q4k_byte(wqs, ((wbase + nrow) * nsb + sbk) * 32, g * 32 + qi);
+                    let nib = (qb >> (4u32 * (is % 2) as u32)) & 15;
+                    sb[idx] = i8::cast_from(nib);
+                }
+            }
+            sync_cube();
+
+            island! {
+                cuda | rocm | vulkan | metal => {
+                    let c = cmma::Matrix::<i32>::from_value(
+                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize,
+                        cmma::MatrixLayout::Undefined, 0i32,
+                    );
+                    let a0 = cmma::Matrix::<i8>::from_slice(
+                        cmma::MatrixIdent::A, 16usize, 16usize, 16usize,
+                        cmma::MatrixLayout::RowMajor, &sa.slice(wm * 512, 1024), 32,
+                    );
+                    let b0 = cmma::Matrix::<i8>::from_slice(
+                        cmma::MatrixIdent::B, 16usize, 16usize, 16usize,
+                        cmma::MatrixLayout::ColMajor, &sb.slice(wn * 512, 2048), 32,
+                    );
+                    cmma::execute::<i8, i8, i32, i32>(&a0, &b0, &c, &c);
+                    let a1 = cmma::Matrix::<i8>::from_slice(
+                        cmma::MatrixIdent::A, 16usize, 16usize, 16usize,
+                        cmma::MatrixLayout::RowMajor, &sa.slice(wm * 512 + 16, 1024), 32,
+                    );
+                    let b1 = cmma::Matrix::<i8>::from_slice(
+                        cmma::MatrixIdent::B, 16usize, 16usize, 16usize,
+                        cmma::MatrixLayout::ColMajor, &sb.slice(wn * 512 + 16, 2048), 32,
+                    );
+                    cmma::execute::<i8, i8, i32, i32>(&a1, &b1, &c, &c);
+                    cmma::store(&mut ci.slice_mut(warp * 256, warp * 256 + 256), &c, 16, cmma::MatrixLayout::RowMajor);
+                }
+                default => {
+                    for e in 0usize..per {
+                        let p = lane * per + e;
+                        let smm = p / 16;
+                        let snn = p % 16;
+                        let mut isum = 0i32;
+                        for l in 0usize..32 {
+                            isum += i32::cast_from(sa[(wm * 16 + smm) * 32 + l])
+                                * i32::cast_from(sb[(wn * 16 + snn) * 32 + l]);
+                        }
+                        ci[warp * 256 + p] = isum;
+                    }
+                }
+            };
+            sync_cube();
+
+            for e in 0usize..per {
+                let p = lane * per + e;
+                let gmm = wm * 16 + p / 16;
+                let gnn = wn * 16 + p % 16;
+                let lr = mrow0 + gmm;
+                let nrow = ncol0 + gnn;
+                if lr < ecount && nrow < n {
+                    let slot = srow[gmm] as usize;
+                    let blk = (wbase + nrow) * nsb + sbk;
+                    let scbase = blk * 3;
+                    let wdd = wd[blk] * f32::cast_from(q4k_sc(wsc, scbase, is));
+                    let wmm = wdm[blk] * f32::cast_from(q4k_m(wsc, scbase, is));
+                    let xsc = xs[slot * kb_count + kb];
+                    let xsm = xsum[slot * kb_count + kb];
+                    accf[gmm * 64 + gnn] +=
+                        xsc * wdd * f32::cast_from(ci[warp * 256 + p]) - wmm * xsm;
+                }
+            }
+            sync_cube();
+        }
+
+        for e in 0usize..per {
+            let p = lane * per + e;
+            let gmm = wm * 16 + p / 16;
+            let gnn = wn * 16 + p % 16;
+            let lr = mrow0 + gmm;
+            let nrow = ncol0 + gnn;
+            if lr < ecount && nrow < n {
+                let slot = srow[gmm] as usize;
+                out[slot * n + nrow] = accf[gmm * 64 + gnn];
+            }
+        }
+        // The next tile re-stages `srow` and re-zeroes `accf`, both of which the loop head reads, so
+        // no thread may run ahead into them while a peer is still storing this tile's output.
+        sync_cube();
+        mtile += mtile_stride;
+    }
+}
+
+/// Host launch for the slot grouping alone. Returns `(counts[n_experts], rows[n_experts * cap])`.
+pub fn moe_expert_rows_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    ids: &[u32],
+    n_experts: usize,
+    cap: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let idsh = client.create_from_slice(u32::as_bytes(ids));
+    let cntsh = client.create_from_slice(u32::as_bytes(&vec![0u32; n_experts]));
+    let rowsh = client.create_from_slice(u32::as_bytes(&vec![0u32; n_experts * cap]));
+    let meta = [ids.len() as u32, n_experts as u32, cap as u32];
+    let mh = client.create_from_slice(u32::as_bytes(&meta));
+    unsafe {
+        moe_expert_rows::launch_unchecked::<R>(
+            client,
+            Grid::Static(1, 1, 1),
+            Block::new_1d(64),
+            ArrayArg::from_raw_parts(idsh, ids.len()),
+            ArrayArg::from_raw_parts(cntsh.clone(), n_experts),
+            ArrayArg::from_raw_parts(rowsh.clone(), n_experts * cap),
+            ArrayArg::from_raw_parts(mh, meta.len()),
+            64usize,
+        );
+    }
+    let counts = u32::from_bytes(&client.read_one_unchecked(cntsh)).to_vec();
+    let rows = u32::from_bytes(&client.read_one_unchecked(rowsh)).to_vec();
+    (counts, rows)
+}
+
+/// Host launch for the expert-indexed Q4_K MMQ: group the slots, then one GEMM launch over
+/// (n-tiles, cap-tiles, experts). Returns the `[nslots, n]` output and ms/call for the GEMM.
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_id_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    xq: &[i8],
+    xs: &[f32],
+    xsum: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    ids: &[u32],
+    nslots: usize,
+    n_experts: usize,
+    cap: usize,
+    n: usize,
+    k: usize,
+    ytiles: usize,
+    iters: usize,
+) -> (Vec<f32>, f64) {
+    let target = Target::of(client);
+    let plane = client.properties().hardware.plane_size_max;
+    let xqh = client.create_from_slice(i8::as_bytes(xq));
+    let xsh = client.create_from_slice(f32::as_bytes(xs));
+    let xsumh = client.create_from_slice(f32::as_bytes(xsum));
+    let wqsh = client.create_from_slice(u32::as_bytes(wqs));
+    let wsch = client.create_from_slice(u32::as_bytes(wsc));
+    let wdh = client.create_from_slice(f32::as_bytes(wd));
+    let wdmh = client.create_from_slice(f32::as_bytes(wdm));
+    let idsh = client.create_from_slice(u32::as_bytes(ids));
+    let cntsh = client.create_from_slice(u32::as_bytes(&vec![0u32; n_experts]));
+    let rowsh = client.create_from_slice(u32::as_bytes(&vec![0u32; n_experts * cap]));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; nslots * n]));
+    let gmeta = [nslots as u32, n_experts as u32, cap as u32];
+    let gmh = client.create_from_slice(u32::as_bytes(&gmeta));
+    let meta = [n as u32, k as u32, cap as u32];
+    let mh = client.create_from_slice(u32::as_bytes(&meta));
+    unsafe {
+        moe_expert_rows::launch_unchecked::<R>(
+            client,
+            Grid::Static(1, 1, 1),
+            Block::new_1d(64),
+            ArrayArg::from_raw_parts(idsh.clone(), ids.len()),
+            ArrayArg::from_raw_parts(cntsh.clone(), n_experts),
+            ArrayArg::from_raw_parts(rowsh.clone(), n_experts * cap),
+            ArrayArg::from_raw_parts(gmh.clone(), gmeta.len()),
+            64usize,
+        );
+    }
+    // `ytiles` is a THROUGHPUT choice, not a correctness one: the kernel grid-strides over an
+    // expert's row tiles, so any value >= 1 computes every row.
+    let grid = Grid::Static(
+        n.div_ceil(64) as u32,
+        ytiles.max(1) as u32,
+        n_experts as u32,
+    );
+    let launch = |c: &ComputeClient<R>| unsafe {
+        mmq_q4k_id::launch_unchecked::<R>(
+            c,
+            grid.clone(),
+            Block::new_1d(8 * plane),
+            ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
+            ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
+            ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
+            ArrayArg::from_raw_parts(wqsh.clone(), wqs.len()),
+            ArrayArg::from_raw_parts(wsch.clone(), wsc.len()),
+            ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
+            ArrayArg::from_raw_parts(wdmh.clone(), wdm.len()),
+            ArrayArg::from_raw_parts(rowsh.clone(), n_experts * cap),
+            ArrayArg::from_raw_parts(cntsh.clone(), n_experts),
+            ArrayArg::from_raw_parts(oh.clone(), nslots * n),
+            ArrayArg::from_raw_parts(mh.clone(), meta.len()),
+            plane as usize,
+            target,
+        );
+    };
+    launch(client);
+    let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
+    for _ in 0..3 {
+        launch(client);
+    }
+    let _ = client.read_one_unchecked(oh.clone());
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(client);
+    }
+    let _ = client.read_one_unchecked(oh);
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    (out, ms)
+}
+
+/// CPU oracle for the expert-indexed MMQ: every slot multiplies by its own expert's weight block.
+#[allow(clippy::too_many_arguments)]
+pub fn mmq_q4k_id_ref(
+    xq: &[i8],
+    xs: &[f32],
+    xsum: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    ids: &[u32],
+    nslots: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    let kb = k / 32;
+    let nsb = k / 256;
+    let mut out = vec![0.0f32; nslots * n];
+    for s in 0..nslots {
+        let wbase = ids[s] as usize * n;
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for b in 0..kb {
+                let is = b % 8;
+                let g = is / 2;
+                let blk = (wbase + j) * nsb + b / 8;
+                let mut isum = 0i32;
+                for qi in 0..32 {
+                    let qbyte = cpu_q4k_byte(wqs, blk * 32, g * 32 + qi);
+                    let nib = ((qbyte >> (4 * (is % 2))) & 15) as i32;
+                    isum += xq[s * k + b * 32 + qi] as i32 * nib;
+                }
+                let dd = wd[blk] * cpu_q4k_sc(wsc, blk * 3, is) as f32;
+                let mm = wdm[blk] * cpu_q4k_m(wsc, blk * 3, is) as f32;
+                acc += xs[s * kb + b] * dd * isum as f32 - mm * xsum[s * kb + b];
+            }
+            out[s * n + j] = acc;
+        }
+    }
+    out
+}
+
+fn cpu_q4k_byte(a: &[u32], base: usize, i: usize) -> u32 {
+    (a[base + i / 4] >> (8 * (i % 4))) & 255
+}
 fn cpu_q4k_sc(wsc: &[u32], sb: usize, j: usize) -> u32 {
-    if j < 4 { cpu_q4k_byte(wsc, sb, j) & 63 }
-    else { (cpu_q4k_byte(wsc, sb, j + 4) & 15) | ((cpu_q4k_byte(wsc, sb, j - 4) >> 6) << 4) }
+    if j < 4 {
+        cpu_q4k_byte(wsc, sb, j) & 63
+    } else {
+        (cpu_q4k_byte(wsc, sb, j + 4) & 15) | ((cpu_q4k_byte(wsc, sb, j - 4) >> 6) << 4)
+    }
 }
 fn cpu_q4k_m(wsc: &[u32], sb: usize, j: usize) -> u32 {
-    if j < 4 { cpu_q4k_byte(wsc, sb, j + 4) & 63 }
-    else { (cpu_q4k_byte(wsc, sb, j + 4) >> 4) | ((cpu_q4k_byte(wsc, sb, j) >> 6) << 4) }
+    if j < 4 {
+        cpu_q4k_byte(wsc, sb, j + 4) & 63
+    } else {
+        (cpu_q4k_byte(wsc, sb, j + 4) >> 4) | ((cpu_q4k_byte(wsc, sb, j) >> 6) << 4)
+    }
 }
 
 /// CPU oracle: the exact affine MMQ math over packed Q4_K weights, decoded the same way the kernel
 /// (and BlockQ4K::to_float) does. out[m,n] = sum_kb xs*(D*<xq,q> - M*xsum), summed in f32.
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_q4k_ref(
-    xq: &[i8], xs: &[f32], xsum: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
-    m: usize, n: usize, k: usize,
+    xq: &[i8],
+    xs: &[f32],
+    xsum: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) -> Vec<f32> {
     let kb = k / 32;
     let nsb = k / 256;
@@ -1217,24 +1677,50 @@ pub fn mmq_q4k_ref(
 /// Deterministic packed-Q4_K MMQ test data: (xq, xs, xsum, wqs, wsc, wd, wdm). `xsum` is DERIVED from
 /// `xq` (sum per 32-block) so the affine correction is exact; wqs are random nibbles, wsc random 6-bit
 /// scales, d/dmin small positives -- valid inputs for the get_scale_min_k4 decode.
-pub fn gen_mmq_q4k(m: usize, n: usize, k: usize)
-    -> (Vec<i8>, Vec<f32>, Vec<f32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>) {
+pub fn gen_mmq_q4k(
+    m: usize,
+    n: usize,
+    k: usize,
+) -> (
+    Vec<i8>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<u32>,
+    Vec<u32>,
+    Vec<f32>,
+    Vec<f32>,
+) {
     let kb = k / 32;
     let nsb = k / 256;
     let mut s = 0x243F6A8885A308D3u64;
-    let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-    let xq: Vec<i8> = (0..m * k).map(|_| ((next() % 255) as i64 - 127) as i8).collect();
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let xq: Vec<i8> = (0..m * k)
+        .map(|_| ((next() % 255) as i64 - 127) as i8)
+        .collect();
     let wqs: Vec<u32> = (0..n * nsb * 32).map(|_| next() as u32).collect(); // 128 qs bytes/super-block
     let wsc: Vec<u32> = (0..n * nsb * 3).map(|_| next() as u32).collect(); //  12 scale bytes/super-block
-    let wd: Vec<f32> = (0..n * nsb).map(|_| (next() % 1000) as f32 / 20000.0 + 0.002).collect();
-    let wdm: Vec<f32> = (0..n * nsb).map(|_| (next() % 1000) as f32 / 40000.0).collect();
-    let xs: Vec<f32> = (0..m * kb).map(|_| (next() % 1000) as f32 / 50000.0 + 0.002).collect();
+    let wd: Vec<f32> = (0..n * nsb)
+        .map(|_| (next() % 1000) as f32 / 20000.0 + 0.002)
+        .collect();
+    let wdm: Vec<f32> = (0..n * nsb)
+        .map(|_| (next() % 1000) as f32 / 40000.0)
+        .collect();
+    let xs: Vec<f32> = (0..m * kb)
+        .map(|_| (next() % 1000) as f32 / 50000.0 + 0.002)
+        .collect();
     // xsum = xs*Sum(xq) per block -- the dequantized block sum, the convention quantize_act_q8 emits.
     let mut xsum = vec![0.0f32; m * kb];
     for i in 0..m {
         for b in 0..kb {
             let mut acc = 0i32;
-            for l in 0..32 { acc += xq[i * k + b * 32 + l] as i32; }
+            for l in 0..32 {
+                acc += xq[i * k + b * 32 + l] as i32;
+            }
             xsum[i * kb + b] = xs[i * kb + b] * acc as f32;
         }
     }
@@ -1458,8 +1944,21 @@ pub fn mmq_q4k_wmma_tile(
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_q4k_wmma_tile_run<R: Runtime>(
     client: &ComputeClient<R>,
-    xq: &[i8], xs: &[f32], xsum: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
-    m: usize, n: usize, k: usize, wm: usize, wn: usize, rm: usize, rn: usize, iters: usize,
+    xq: &[i8],
+    xs: &[f32],
+    xsum: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    wm: usize,
+    wn: usize,
+    rm: usize,
+    rn: usize,
+    iters: usize,
 ) -> (Vec<f32>, f64) {
     let target = Target::of(client);
     let plane = client.properties().hardware.plane_size_max as usize;
@@ -1477,7 +1976,9 @@ pub fn mmq_q4k_wmma_tile_run<R: Runtime>(
     let block = Block::new_1d((wm * wn * plane) as u32);
     let launch = |c: &ComputeClient<R>| unsafe {
         mmq_q4k_wmma_tile::launch_unchecked::<R>(
-            c, grid.clone(), block,
+            c,
+            grid.clone(),
+            block,
             ArrayArg::from_raw_parts(xqh.clone(), xq.len()),
             ArrayArg::from_raw_parts(xsh.clone(), xs.len()),
             ArrayArg::from_raw_parts(xsumh.clone(), xsum.len()),
@@ -1486,15 +1987,27 @@ pub fn mmq_q4k_wmma_tile_run<R: Runtime>(
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
             ArrayArg::from_raw_parts(wdmh.clone(), wdm.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
-            m, n, k, wm, wn, rm, rn, plane, target,
+            m,
+            n,
+            k,
+            wm,
+            wn,
+            rm,
+            rn,
+            plane,
+            target,
         );
     };
     launch(client);
     let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
     (out, ms)
@@ -1732,7 +2245,14 @@ pub fn mmq_q4k_coopmat_tile<F: Float>(
 /// f16-rounding tolerance (both operands round to f16), the same gate the hand `mul_mm_q4k_coopmat` uses.
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_q4k_f16_ref(
-    x: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32], m: usize, n: usize, k: usize,
+    x: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) -> Vec<f32> {
     let kb = k / 32;
     let nsb = k / 256;
@@ -1762,8 +2282,19 @@ pub fn mmq_q4k_f16_ref(
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_q4k_coopmat_tile_run<R: Runtime>(
     client: &ComputeClient<R>,
-    x: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
-    m: usize, n: usize, k: usize, wm: usize, wn: usize, rm: usize, rn: usize, iters: usize,
+    x: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    wm: usize,
+    wn: usize,
+    rm: usize,
+    rn: usize,
+    iters: usize,
 ) -> (Vec<f32>, f64) {
     let target = Target::of(client);
     let plane = client.properties().hardware.plane_size_max as usize;
@@ -1779,22 +2310,36 @@ pub fn mmq_q4k_coopmat_tile_run<R: Runtime>(
     let block = Block::new_1d((wm * wn * plane) as u32);
     let launch = |c: &ComputeClient<R>| unsafe {
         mmq_q4k_coopmat_tile::launch_unchecked::<f32, R>(
-            c, grid.clone(), block,
+            c,
+            grid.clone(),
+            block,
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(wqsh.clone(), wqs.len()),
             ArrayArg::from_raw_parts(wsch.clone(), wsc.len()),
             ArrayArg::from_raw_parts(wdh.clone(), wd.len()),
             ArrayArg::from_raw_parts(wdmh.clone(), wdm.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
-            m, n, k, wm, wn, rm, rn, plane, target,
+            m,
+            n,
+            k,
+            wm,
+            wn,
+            rm,
+            rn,
+            plane,
+            target,
         );
     };
     launch(client);
     let out = f32::from_bytes(&client.read_one_unchecked(oh.clone())).to_vec();
-    for _ in 0..3 { launch(client); }
+    for _ in 0..3 {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh.clone());
     let t = std::time::Instant::now();
-    for _ in 0..iters { launch(client); }
+    for _ in 0..iters {
+        launch(client);
+    }
     let _ = client.read_one_unchecked(oh);
     let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
     (out, ms)
@@ -1909,9 +2454,14 @@ impl<'a, R: Runtime> MmqQ4kEval<'a, R> {
         k: usize,
         repeats: usize,
     ) -> Self {
-        assert!(!wqs_banks.is_empty(), "MmqQ4kEval needs at least one weight bank");
-        let banks: Vec<Handle> =
-            wqs_banks.iter().map(|w| client.create_from_slice(u32::as_bytes(w))).collect();
+        assert!(
+            !wqs_banks.is_empty(),
+            "MmqQ4kEval needs at least one weight bank"
+        );
+        let banks: Vec<Handle> = wqs_banks
+            .iter()
+            .map(|w| client.create_from_slice(u32::as_bytes(w)))
+            .collect();
         let xqh = client.create_from_slice(i8::as_bytes(xq));
         let xsh = client.create_from_slice(f32::as_bytes(xs));
         let xsumh = client.create_from_slice(f32::as_bytes(xsum));
@@ -1945,7 +2495,7 @@ impl<'a, R: Runtime> MmqQ4kEval<'a, R> {
             k,
             plane,
             lds_budget: 48 * 1024, // gfx1151 LDS is 64 KB; 48 KB keeps a spare wave resident
-            reg_budget: 16,        // accumulator fragments per warp (rm*rn), the hand kernel's budget
+            reg_budget: 16, // accumulator fragments per warp (rm*rn), the hand kernel's budget
             oracle,
             maxref,
             repeats,
@@ -2005,7 +2555,10 @@ impl<'a, R: Runtime> Evaluator for MmqQ4kEval<'a, R> {
         let (bm, bn, nwarp) = mmq_geom(cfg, self.space);
         let wg = nwarp * self.plane;
         if wg > 1024 {
-            return Verdict::Reject(format!("workgroup width {wg} = nwarp {nwarp} x plane {} > 1024", self.plane));
+            return Verdict::Reject(format!(
+                "workgroup width {wg} = nwarp {nwarp} x plane {} > 1024",
+                self.plane
+            ));
         }
         let lds = mmq_lds_bytes(cfg, self.space);
         if lds > self.lds_budget {
@@ -2023,7 +2576,10 @@ impl<'a, R: Runtime> Evaluator for MmqQ4kEval<'a, R> {
         let _ = (wm, wn, bm, bn);
         let frags = rm * rn;
         if frags > self.reg_budget {
-            return Verdict::Reject(format!("register tile {frags} fragments/warp (rm {rm} x rn {rn}) > {} budget", self.reg_budget));
+            return Verdict::Reject(format!(
+                "register tile {frags} fragments/warp (rm {rm} x rn {rn}) > {} budget",
+                self.reg_budget
+            ));
         }
         Verdict::Pass
     }
@@ -2034,7 +2590,12 @@ impl<'a, R: Runtime> Evaluator for MmqQ4kEval<'a, R> {
         // zero, so a per-element relative error is a false failure; gate on max|Δ|/max|ref|).
         self.dispatch(&self.banks[0], wm, wn, rm, rn);
         let got = self.read_out();
-        let rel = got.iter().zip(&self.oracle).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / self.maxref;
+        let rel = got
+            .iter()
+            .zip(&self.oracle)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / self.maxref;
         self.worst_rel.set(self.worst_rel.get().max(rel));
         if rel > 1e-3 {
             return f64::INFINITY;
@@ -2073,7 +2634,15 @@ pub fn mmq_q4k_hunt<R: Runtime>(
     evo: &Evolution,
     seed: u64,
 ) -> Evolved {
-    tuner.evolve(device, "mmq_q4k_tile", &format!("m={m},n={n},k={k}"), eval.space(), eval, evo, seed)
+    tuner.evolve(
+        device,
+        "mmq_q4k_tile",
+        &format!("m={m},n={n},k={k}"),
+        eval.space(),
+        eval,
+        evo,
+        seed,
+    )
 }
 
 /// Autotuned-default dispatch -- the "autokernel". Consults the persisted per-(device, m, n, k) tuned
@@ -2086,8 +2655,16 @@ pub fn mmq_q4k_hunt<R: Runtime>(
 pub fn mmq_q4k_autokernel<R: Runtime>(
     client: &ComputeClient<R>,
     tuner: &Tuner,
-    xq: &[i8], xs: &[f32], xsum: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
-    m: usize, n: usize, k: usize,
+    xq: &[i8],
+    xs: &[f32],
+    xsum: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) -> (Vec<f32>, String) {
     let device = crate::tune::device_id(client);
     let space = mmq_q4k_space();
@@ -2108,8 +2685,9 @@ pub fn mmq_q4k_autokernel<R: Runtime>(
             (a, b, c, d, "incumbent".to_string())
         }
     };
-    let (out, _ms) =
-        mmq_q4k_wmma_tile_run(client, xq, xs, xsum, wqs, wsc, wd, wdm, m, n, k, wm, wn, rm, rn, 1);
+    let (out, _ms) = mmq_q4k_wmma_tile_run(
+        client, xq, xs, xsum, wqs, wsc, wd, wdm, m, n, k, wm, wn, rm, rn, 1,
+    );
     (out, name)
 }
 
@@ -2172,9 +2750,14 @@ impl<'a, R: Runtime> CoopmatF16Eval<'a, R> {
         k: usize,
         repeats: usize,
     ) -> Self {
-        assert!(!wqs_banks.is_empty(), "CoopmatF16Eval needs at least one weight bank");
-        let banks: Vec<Handle> =
-            wqs_banks.iter().map(|w| client.create_from_slice(u32::as_bytes(w))).collect();
+        assert!(
+            !wqs_banks.is_empty(),
+            "CoopmatF16Eval needs at least one weight bank"
+        );
+        let banks: Vec<Handle> = wqs_banks
+            .iter()
+            .map(|w| client.create_from_slice(u32::as_bytes(w)))
+            .collect();
         let xh = client.create_from_slice(f32::as_bytes(x));
         let wsch = client.create_from_slice(u32::as_bytes(wsc));
         let wdh = client.create_from_slice(f32::as_bytes(wd));
@@ -2184,9 +2767,28 @@ impl<'a, R: Runtime> CoopmatF16Eval<'a, R> {
         let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
         let plane = client.properties().hardware.plane_size_max as usize;
         Self {
-            client, space, banks, xh, wsch, wdh, wdmh, outh,
-            wqs_len: wqs_banks[0].len(), x_len: x.len(), wsc_len: wsc.len(), wd_len: wd.len(), wdm_len: wdm.len(),
-            m, n, k, plane, lds_budget: 48 * 1024, reg_budget: 16, oracle, maxref, repeats,
+            client,
+            space,
+            banks,
+            xh,
+            wsch,
+            wdh,
+            wdmh,
+            outh,
+            wqs_len: wqs_banks[0].len(),
+            x_len: x.len(),
+            wsc_len: wsc.len(),
+            wd_len: wd.len(),
+            wdm_len: wdm.len(),
+            m,
+            n,
+            k,
+            plane,
+            lds_budget: 48 * 1024,
+            reg_budget: 16,
+            oracle,
+            maxref,
+            repeats,
             worst_rel: std::cell::Cell::new(0.0),
         }
     }
@@ -2206,14 +2808,24 @@ impl<'a, R: Runtime> CoopmatF16Eval<'a, R> {
         let target = Target::of(self.client);
         unsafe {
             mmq_q4k_coopmat_tile::launch_unchecked::<f32, R>(
-                self.client, grid, block,
+                self.client,
+                grid,
+                block,
                 ArrayArg::from_raw_parts(self.xh.clone(), self.x_len),
                 ArrayArg::from_raw_parts(bank.clone(), self.wqs_len),
                 ArrayArg::from_raw_parts(self.wsch.clone(), self.wsc_len),
                 ArrayArg::from_raw_parts(self.wdh.clone(), self.wd_len),
                 ArrayArg::from_raw_parts(self.wdmh.clone(), self.wdm_len),
                 ArrayArg::from_raw_parts(self.outh.clone(), self.m * self.n),
-                self.m, self.n, self.k, wm, wn, rm, rn, self.plane, target,
+                self.m,
+                self.n,
+                self.k,
+                wm,
+                wn,
+                rm,
+                rn,
+                self.plane,
+                target,
             );
         }
     }
@@ -2228,16 +2840,26 @@ impl<'a, R: Runtime> Evaluator for CoopmatF16Eval<'a, R> {
         let (bm, bn, nwarp) = mmq_geom(cfg, self.space);
         let wg = nwarp * self.plane;
         if wg > 1024 {
-            return Verdict::Reject(format!("workgroup width {wg} = nwarp {nwarp} x plane {} > 1024", self.plane));
+            return Verdict::Reject(format!(
+                "workgroup width {wg} = nwarp {nwarp} x plane {} > 1024",
+                self.plane
+            ));
         }
         let lds = mmq_coopmat_lds_bytes(cfg, self.space);
         if lds > self.lds_budget {
-            return Verdict::Reject(format!("LDS {}KB (BM {bm} x BN {bn}) > {}KB budget", lds / 1024, self.lds_budget / 1024));
+            return Verdict::Reject(format!(
+                "LDS {}KB (BM {bm} x BN {bn}) > {}KB budget",
+                lds / 1024,
+                self.lds_budget / 1024
+            ));
         }
         let (_wm, _wn, rm, rn) = mmq_tile_cfg(cfg, self.space);
         let frags = rm * rn;
         if frags > self.reg_budget {
-            return Verdict::Reject(format!("register tile {frags} fragments/warp (rm {rm} x rn {rn}) > {} budget", self.reg_budget));
+            return Verdict::Reject(format!(
+                "register tile {frags} fragments/warp (rm {rm} x rn {rn}) > {} budget",
+                self.reg_budget
+            ));
         }
         Verdict::Pass
     }
@@ -2246,7 +2868,12 @@ impl<'a, R: Runtime> Evaluator for CoopmatF16Eval<'a, R> {
         let (wm, wn, rm, rn) = mmq_tile_cfg(cfg, self.space);
         self.dispatch(&self.banks[0], wm, wn, rm, rn);
         let got = self.read_out();
-        let rel = got.iter().zip(&self.oracle).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / self.maxref;
+        let rel = got
+            .iter()
+            .zip(&self.oracle)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / self.maxref;
         self.worst_rel.set(self.worst_rel.get().max(rel));
         // f16-rounding tolerance (both operands round to f16), the hand coopmat gate class.
         if rel > 5e-2 {
@@ -2283,7 +2910,15 @@ pub fn mmq_q4k_coopmat_hunt<R: Runtime>(
     evo: &Evolution,
     seed: u64,
 ) -> Evolved {
-    tuner.evolve(device, "mmq_q4k_coopmat", &format!("m={m},n={n},k={k}"), eval.space(), eval, evo, seed)
+    tuner.evolve(
+        device,
+        "mmq_q4k_coopmat",
+        &format!("m={m},n={n},k={k}"),
+        eval.space(),
+        eval,
+        evo,
+        seed,
+    )
 }
 
 /// Autotuned-default dispatch for the f16 coopmat twin: consult the persisted per-(device,m,n,k) tuned
@@ -2292,8 +2927,14 @@ pub fn mmq_q4k_coopmat_hunt<R: Runtime>(
 pub fn mmq_q4k_coopmat_autokernel<R: Runtime>(
     client: &ComputeClient<R>,
     tuner: &Tuner,
-    x: &[f32], wqs: &[u32], wsc: &[u32], wd: &[f32], wdm: &[f32],
-    m: usize, n: usize, k: usize,
+    x: &[f32],
+    wqs: &[u32],
+    wsc: &[u32],
+    wd: &[f32],
+    wdm: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) -> (Vec<f32>, String) {
     let device = crate::tune::device_id(client);
     let space = mmq_q4k_space();
@@ -2314,7 +2955,8 @@ pub fn mmq_q4k_coopmat_autokernel<R: Runtime>(
             (a, b, c, d, "incumbent".to_string())
         }
     };
-    let (out, _ms) = mmq_q4k_coopmat_tile_run(client, x, wqs, wsc, wd, wdm, m, n, k, wm, wn, rm, rn, 1);
+    let (out, _ms) =
+        mmq_q4k_coopmat_tile_run(client, x, wqs, wsc, wd, wdm, m, n, k, wm, wn, rm, rn, 1);
     (out, name)
 }
 
@@ -2349,12 +2991,24 @@ mod tests {
         for (m, n, k) in [(16usize, 16usize, 64usize), (32, 16, 128), (16, 32, 256)] {
             let (xq, xs, wq, wd) = gen_mmq(m, n, k);
             let (got, _) = mmq_q8_wmma_run_with::<CpuRuntime>(
-                &client, &xq, &xs, &wq, &wd, m, n, k, 1, Target::Cpu,
+                &client,
+                &xq,
+                &xs,
+                &wq,
+                &wd,
+                m,
+                n,
+                k,
+                1,
+                Target::Cpu,
             );
             let want = mmq_q8_ref(&xq, &xs, &wq, &wd, m, n, k);
             let gb: Vec<u32> = got.iter().map(|x| x.to_bits()).collect();
             let wb: Vec<u32> = want.iter().map(|x| x.to_bits()).collect();
-            assert_eq!(gb, wb, "MMQ {m}x{n}x{k}: default arm != mmq_q8_ref (bit-exact gate)");
+            assert_eq!(
+                gb, wb,
+                "MMQ {m}x{n}x{k}: default arm != mmq_q8_ref (bit-exact gate)"
+            );
         }
     }
 
@@ -2367,11 +3021,23 @@ mod tests {
         let (m, n, k) = (32usize, 64usize, 128usize);
         let (xq, xs, wq, wd) = gen_mmq(m, n, k);
         let (got, _) = mmq_q8_wmma_blk_run_with::<CpuRuntime>(
-            &client, &xq, &xs, &wq, &wd, m, n, k, 1, Target::Cpu,
+            &client,
+            &xq,
+            &xs,
+            &wq,
+            &wd,
+            m,
+            n,
+            k,
+            1,
+            Target::Cpu,
         );
         let want = mmq_q8_ref(&xq, &xs, &wq, &wd, m, n, k);
         let rel = rel_to_max(&got, &want);
-        assert!(rel < 1e-6, "tiled MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q8_ref");
+        assert!(
+            rel < 1e-6,
+            "tiled MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q8_ref"
+        );
     }
 
     /// The AFFINE Q4_K MMQ agrees with `mmq_q4k_ref` through the same cmma/staging path. This is the
@@ -2388,7 +3054,10 @@ mod tests {
             );
             let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
             let rel = rel_to_max(&got, &want);
-            assert!(rel < 1e-6, "affine Q4_K MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_ref");
+            assert!(
+                rel < 1e-6,
+                "affine Q4_K MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_ref"
+            );
         }
     }
 
@@ -2402,14 +3071,160 @@ mod tests {
     #[test]
     fn mmq_q4k_rt_matches_ref_with_tails_on_cpu() {
         let client = cpu_client();
-        for (m, n, k) in [(32usize, 64usize, 256usize), (32, 64, 512), (17, 64, 256), (32, 50, 256), (17, 50, 512), (1, 64, 256)] {
+        for (m, n, k) in [
+            (32usize, 64usize, 256usize),
+            (32, 64, 512),
+            (17, 64, 256),
+            (32, 50, 256),
+            (17, 50, 512),
+            (1, 64, 256),
+        ] {
             let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
             let (got, _) = mmq_q4k_wmma_rt_run::<CpuRuntime>(
                 &client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 1,
             );
             let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
             let rel = rel_to_max(&got, &want);
-            assert!(rel < 1e-6, "runtime Q4_K MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_ref");
+            assert!(
+                rel < 1e-6,
+                "runtime Q4_K MMQ {m}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_ref"
+            );
+        }
+    }
+
+    /// The slot grouping is STABLE and complete: every slot lands in exactly one expert's list, the
+    /// lists are in ascending slot order (the invariant the GEMM's gather and scatter both rely on),
+    /// and the counts sum back to the slot count.
+    #[test]
+    fn moe_expert_rows_groups_slots_stably_on_cpu() {
+        let client = cpu_client();
+        let n_experts = 5usize;
+        let cap = 8usize;
+        // Deliberately uneven: expert 3 is never chosen, expert 0 is chosen most.
+        let ids: Vec<u32> = vec![0, 2, 0, 4, 1, 0, 2, 4, 0, 1, 2, 0];
+        let (counts, rows) = moe_expert_rows_run::<CpuRuntime>(&client, &ids, n_experts, cap);
+        let mut want: Vec<Vec<u32>> = vec![Vec::new(); n_experts];
+        for (s, &e) in ids.iter().enumerate() {
+            want[e as usize].push(s as u32);
+        }
+        assert_eq!(
+            counts.iter().sum::<u32>() as usize,
+            ids.len(),
+            "counts must cover every slot"
+        );
+        for e in 0..n_experts {
+            assert_eq!(counts[e] as usize, want[e].len(), "expert {e} count");
+            let got = &rows[e * cap..e * cap + want[e].len()];
+            assert_eq!(
+                got,
+                &want[e][..],
+                "expert {e} slot list (must be ascending slot order)"
+            );
+        }
+    }
+
+    /// The expert-indexed MMQ agrees with its CPU oracle through the gather/scatter indirection, with
+    /// m and n tails. Single expert keeps the launch to ONE cube: the CPU runtime does not isolate
+    /// SharedMemory across cubes, so the multi-expert grid is gated on the GPU check
+    /// (`matvec-check`'s MMQ-Q4K-ID, scale-relative vs the same oracle).
+    #[test]
+    fn mmq_q4k_id_matches_ref_with_tails_on_cpu() {
+        let client = cpu_client();
+        for (nslots, n, k) in [
+            (32usize, 64usize, 256usize),
+            (32, 64, 512),
+            (17, 64, 256),
+            (32, 50, 256),
+            (17, 50, 512),
+            (1, 64, 256),
+        ] {
+            let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(nslots, n, k);
+            let ids = vec![0u32; nslots];
+            let (got, _) = mmq_q4k_id_run::<CpuRuntime>(
+                &client,
+                &xq,
+                &xs,
+                &xsum,
+                &wqs,
+                &wsc,
+                &wd,
+                &wdm,
+                &ids,
+                nslots,
+                1,
+                nslots,
+                n,
+                k,
+                nslots.div_ceil(32),
+                1,
+            );
+            let want = mmq_q4k_id_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, &ids, nslots, n, k);
+            let rel = rel_to_max(&got, &want);
+            assert!(
+                rel < 1e-6,
+                "expert-indexed Q4_K MMQ {nslots}x{n}x{k}: rel_to_max={rel:.3e} vs mmq_q4k_id_ref"
+            );
+        }
+    }
+
+    /// With one expert and identity routing the expert-indexed MMQ must reproduce the plain
+    /// runtime-dims MMQ exactly -- same tiles, same accumulation order, only the indirection differs.
+    /// Pins that the gather/scatter cannot silently change the arithmetic.
+    #[test]
+    fn mmq_q4k_id_is_bit_identical_to_rt_for_one_expert_on_cpu() {
+        let client = cpu_client();
+        let (m, n, k) = (32usize, 64usize, 512usize);
+        let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(m, n, k);
+        let ids = vec![0u32; m];
+        let (got, _) = mmq_q4k_id_run::<CpuRuntime>(
+            &client,
+            &xq,
+            &xs,
+            &xsum,
+            &wqs,
+            &wsc,
+            &wd,
+            &wdm,
+            &ids,
+            m,
+            1,
+            m,
+            n,
+            k,
+            m.div_ceil(32),
+            1,
+        );
+        let (want, _) = mmq_q4k_wmma_rt_run::<CpuRuntime>(
+            &client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k, 1,
+        );
+        let gb: Vec<u32> = got.iter().map(|x| x.to_bits()).collect();
+        let wb: Vec<u32> = want.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(
+            gb, wb,
+            "expert-indexed MMQ must be bit-identical to mmq_q4k_wmma_rt at E=1"
+        );
+    }
+
+    /// The m-tile grid-stride is a throughput knob, never a correctness one: an expert with more row
+    /// tiles than the grid covers must still compute every row. Launches 4 tiles' worth of rows onto a
+    /// ONE-tile grid, so the loop has to run four times to be right.
+    #[test]
+    fn mmq_q4k_id_grid_stride_covers_every_row_on_cpu() {
+        let client = cpu_client();
+        let (nslots, n, k) = (128usize, 64usize, 256usize);
+        let (xq, xs, xsum, wqs, wsc, wd, wdm) = gen_mmq_q4k(nslots, n, k);
+        let ids = vec![0u32; nslots];
+        let want = mmq_q4k_id_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, &ids, nslots, n, k);
+        for ytiles in [1usize, 2, 3, 4] {
+            let (got, _) = mmq_q4k_id_run::<CpuRuntime>(
+                &client, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, &ids, nslots, 1, nslots, n, k,
+                ytiles, 1,
+            );
+            let rel = rel_to_max(&got, &want);
+            assert!(
+                rel < 1e-6,
+                "grid-stride ytiles={ytiles}: rel_to_max={rel:.3e} vs mmq_q4k_id_ref"
+            );
         }
     }
 
@@ -2435,9 +3250,14 @@ mod tests {
     #[test]
     fn mmq_q4k_tile_matches_ref_on_cpu() {
         let client = cpu_client();
-        for (wm, wn, rm, rn) in
-            [(1, 1, 1, 1), (2, 2, 1, 1), (1, 1, 2, 2), (2, 1, 1, 2), (1, 2, 2, 1), (2, 2, 2, 2)]
-        {
+        for (wm, wn, rm, rn) in [
+            (1, 1, 1, 1),
+            (2, 2, 1, 1),
+            (1, 1, 2, 2),
+            (2, 1, 1, 2),
+            (1, 2, 2, 1),
+            (2, 2, 2, 2),
+        ] {
             let bm = wm * rm * 16;
             let bn = wn * rn * 16;
             for k in [256usize, 512] {
@@ -2447,7 +3267,10 @@ mod tests {
                 );
                 let want = mmq_q4k_ref(&xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, bm, bn, k);
                 let rel = rel_to_max(&got, &want);
-                assert!(rel < 1e-6, "tile wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}");
+                assert!(
+                    rel < 1e-6,
+                    "tile wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}"
+                );
             }
         }
     }
@@ -2461,7 +3284,13 @@ mod tests {
     #[test]
     fn mmq_q4k_coopmat_tile_matches_f16_ref_on_cpu() {
         let client = cpu_client();
-        for (wm, wn, rm, rn) in [(1, 1, 1, 1), (2, 2, 1, 1), (1, 1, 2, 2), (2, 2, 2, 2), (2, 2, 4, 4)] {
+        for (wm, wn, rm, rn) in [
+            (1, 1, 1, 1),
+            (2, 2, 1, 1),
+            (1, 1, 2, 2),
+            (2, 2, 2, 2),
+            (2, 2, 4, 4),
+        ] {
             let bm = wm * rm * 16;
             let bn = wn * rn * 16;
             for k in [256usize, 512] {
@@ -2481,8 +3310,13 @@ mod tests {
                 );
                 let want = mmq_q4k_f16_ref(&x, &wqs, &wsc, &wd, &wdm, bm, bn, k);
                 let rel = rel_to_max(&got, &want);
-                eprintln!("[f16 coopmat] wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}");
-                assert!(rel < 5e-2, "f16 coopmat wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}");
+                eprintln!(
+                    "[f16 coopmat] wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}"
+                );
+                assert!(
+                    rel < 5e-2,
+                    "f16 coopmat wm{wm} wn{wn} rm{rm} rn{rn} {bm}x{bn}x{k}: rel_to_max={rel:.3e}"
+                );
             }
         }
     }
@@ -2515,25 +3349,43 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "hk-coopmat-hunt-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let tuner = Tuner::new(&dir);
-        let evo = Evolution::new().population(8).generations(3).measure_iters(1);
+        let evo = Evolution::new()
+            .population(8)
+            .generations(3)
+            .measure_iters(1);
 
         let r = mmq_q4k_coopmat_hunt(&tuner, "cpu", m, n, k, &eval, &evo, 0xC0FFEE);
         assert!(!r.from_cache, "first hunt must not be a cache hit");
-        let rep = r.report.as_ref().expect("a miss carries the evidence trail");
+        let rep = r
+            .report
+            .as_ref()
+            .expect("a miss carries the evidence trail");
         assert!(rep.best_ms.is_finite(), "no measurable winner");
-        let win = space.parse(&r.winner).expect("winner is a valid config name");
+        let win = space
+            .parse(&r.winner)
+            .expect("winner is a valid config name");
         assert!(space.feasible(&win), "winner {} is infeasible", r.winner);
-        assert!(eval.worst_rel() < 5e-2, "a measured tile diverged from the oracle: {:.2e}", eval.worst_rel());
+        assert!(
+            eval.worst_rel() < 5e-2,
+            "a measured tile diverged from the oracle: {:.2e}",
+            eval.worst_rel()
+        );
         eprintln!(
             "[coopmat f16 hunt CPU] winner={} evaluated={} measured={} rejected={} worst_rel={:.2e}",
             r.winner, rep.evaluated, rep.measured.len(), rep.rejected.len(), eval.worst_rel()
         );
 
         let r2 = mmq_q4k_coopmat_hunt(&tuner, "cpu", m, n, k, &eval, &evo, 0xC0FFEE);
-        assert!(r2.from_cache && r2.report.is_none(), "second hunt must hit the cache");
+        assert!(
+            r2.from_cache && r2.report.is_none(),
+            "second hunt must hit the cache"
+        );
         assert_eq!(r2.winner, r.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2560,23 +3412,40 @@ mod tests {
         assert!(!feasible.is_empty(), "empty feasible space");
 
         let client = cpu_client();
-        let eval = MmqQ4kEval::new(&client, &space, &banks, &xq, &xs, &xsum, &wsc, &wd, &wdm, m, n, k, 1);
+        let eval = MmqQ4kEval::new(
+            &client, &space, &banks, &xq, &xs, &xsum, &wsc, &wd, &wdm, m, n, k, 1,
+        );
         let dir = std::env::temp_dir().join(format!(
             "hk-mmq-hunt-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let tuner = Tuner::new(&dir);
-        let evo = Evolution::new().population(8).generations(3).measure_iters(1);
+        let evo = Evolution::new()
+            .population(8)
+            .generations(3)
+            .measure_iters(1);
 
         // (1) miss: the hunt runs, crowns a feasible bit-exact winner, and records it.
         let r = mmq_q4k_hunt(&tuner, "cpu", m, n, k, &eval, &evo, 0xC0FFEE);
         assert!(!r.from_cache, "first hunt must not be a cache hit");
-        let rep = r.report.as_ref().expect("a miss carries the evidence trail");
+        let rep = r
+            .report
+            .as_ref()
+            .expect("a miss carries the evidence trail");
         assert!(rep.best_ms.is_finite(), "no measurable winner");
-        let win = space.parse(&r.winner).expect("winner is a valid config name");
+        let win = space
+            .parse(&r.winner)
+            .expect("winner is a valid config name");
         assert!(space.feasible(&win), "winner {} is infeasible", r.winner);
-        assert!(eval.worst_rel() < 1e-3, "a measured tile diverged from the oracle: {:.2e}", eval.worst_rel());
+        assert!(
+            eval.worst_rel() < 1e-3,
+            "a measured tile diverged from the oracle: {:.2e}",
+            eval.worst_rel()
+        );
         eprintln!(
             "[mmq hunt CPU] winner={} evaluated={} measured={} rejected={} worst_rel={:.2e}",
             r.winner,
@@ -2588,7 +3457,10 @@ mod tests {
 
         // (2) hit: a second hunt reads the cached winner and runs no GA.
         let r2 = mmq_q4k_hunt(&tuner, "cpu", m, n, k, &eval, &evo, 0xC0FFEE);
-        assert!(r2.from_cache && r2.report.is_none(), "second hunt must hit the cache");
+        assert!(
+            r2.from_cache && r2.report.is_none(),
+            "second hunt must hit the cache"
+        );
         assert_eq!(r2.winner, r.winner, "cache returned a different winner");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2609,30 +3481,62 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "hk-mmq-auto-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
 
         // (1) cold cache: the autokernel falls back to the incumbent tile, bit-exact.
         let tuner = Tuner::new(&dir);
-        let (out0, name0) =
-            mmq_q4k_autokernel(&client, &tuner, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
-        assert_eq!(name0, "incumbent", "a cold cache must serve the incumbent tile");
-        assert!(rel_to_max(&out0, &want) < 1e-6, "incumbent tile diverged from the oracle");
+        let (out0, name0) = mmq_q4k_autokernel(
+            &client, &tuner, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k,
+        );
+        assert_eq!(
+            name0, "incumbent",
+            "a cold cache must serve the incumbent tile"
+        );
+        assert!(
+            rel_to_max(&out0, &want) < 1e-6,
+            "incumbent tile diverged from the oracle"
+        );
 
         // (2) after a hunt populates the cache, the autokernel prefers the tuned winner over the default.
         let space = mmq_q4k_space();
         let banks = vec![wqs.clone()];
-        let eval = MmqQ4kEval::new(&client, &space, &banks, &xq, &xs, &xsum, &wsc, &wd, &wdm, m, n, k, 1);
-        let evo = Evolution::new().population(8).generations(3).measure_iters(1);
+        let eval = MmqQ4kEval::new(
+            &client, &space, &banks, &xq, &xs, &xsum, &wsc, &wd, &wdm, m, n, k, 1,
+        );
+        let evo = Evolution::new()
+            .population(8)
+            .generations(3)
+            .measure_iters(1);
         let r = mmq_q4k_hunt(&tuner, &device, m, n, k, &eval, &evo, 0xC0FFEE);
         assert!(!r.from_cache, "the seeding hunt must actually run");
-        assert!(r.report.as_ref().expect("a miss carries the trail").best_ms.is_finite(), "the seeding hunt found no measurable winner");
+        assert!(
+            r.report
+                .as_ref()
+                .expect("a miss carries the trail")
+                .best_ms
+                .is_finite(),
+            "the seeding hunt found no measurable winner"
+        );
 
-        let (out1, name1) =
-            mmq_q4k_autokernel(&client, &tuner, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k);
-        assert_eq!(name1, r.winner, "the autokernel must replay the hunted winner, not the incumbent");
-        assert_ne!(name1, "incumbent", "the tuned dispatch must differ from the cold-start label");
-        assert!(rel_to_max(&out1, &want) < 1e-6, "the tuned tile diverged from the oracle");
+        let (out1, name1) = mmq_q4k_autokernel(
+            &client, &tuner, &xq, &xs, &xsum, &wqs, &wsc, &wd, &wdm, m, n, k,
+        );
+        assert_eq!(
+            name1, r.winner,
+            "the autokernel must replay the hunted winner, not the incumbent"
+        );
+        assert_ne!(
+            name1, "incumbent",
+            "the tuned dispatch must differ from the cold-start label"
+        );
+        assert!(
+            rel_to_max(&out1, &want) < 1e-6,
+            "the tuned tile diverged from the oracle"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

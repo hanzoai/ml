@@ -34,7 +34,9 @@ pub struct Plan {
 
 impl FromIterator<Expert> for Plan {
     fn from_iter<I: IntoIterator<Item = Expert>>(hops: I) -> Plan {
-        Plan { hops: hops.into_iter().collect() }
+        Plan {
+            hops: hops.into_iter().collect(),
+        }
     }
 }
 
@@ -80,11 +82,18 @@ mod tests {
     fn applying_any_expert_is_the_same_class_a_fence_that_is_not_a_map() {
         for id in [0usize, 1, 7, 4096] {
             let _ = Expert(id); // the id never reaches the class
-            assert_eq!(expert_class(), Class::Route, "the class must not depend on which expert");
+            assert_eq!(
+                expert_class(),
+                Class::Route,
+                "the class must not depend on which expert"
+            );
         }
         assert!(Class::Route.fences(), "a Route is a fence");
         assert!(!Class::Route.is_map(), "a Route is not a Map");
-        assert!(Class::Map.is_map() && !Class::Map.fences(), "a Map still composes");
+        assert!(
+            Class::Map.is_map() && !Class::Map.fences(),
+            "a Map still composes"
+        );
     }
 
     /// The load-bearing claim: **the crossings are a property of π, not of the plan.** One plan, three
@@ -95,25 +104,41 @@ mod tests {
         let plan: Plan = [Expert(0), Expert(1), Expert(2)].into_iter().collect();
 
         // π co-locates all three: every hop is a Route, but none crosses a device.
-        let together: Place =
-            [(Expert(0), Device(0)), (Expert(1), Device(0)), (Expert(2), Device(0))]
-                .into_iter()
-                .collect();
-        assert_eq!(plan.devices(&together), Some(vec![Device(0), Device(0), Device(0)]));
-        assert_eq!(plan.crossings(&together), Some(vec![]), "co-located Routes cross nothing");
+        let together: Place = [
+            (Expert(0), Device(0)),
+            (Expert(1), Device(0)),
+            (Expert(2), Device(0)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            plan.devices(&together),
+            Some(vec![Device(0), Device(0), Device(0)])
+        );
+        assert_eq!(
+            plan.crossings(&together),
+            Some(vec![]),
+            "co-located Routes cross nothing"
+        );
 
         // π splits after the first hop: one crossing, entering hop 1.
-        let split: Place =
-            [(Expert(0), Device(0)), (Expert(1), Device(1)), (Expert(2), Device(1))]
-                .into_iter()
-                .collect();
+        let split: Place = [
+            (Expert(0), Device(0)),
+            (Expert(1), Device(1)),
+            (Expert(2), Device(1)),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(plan.crossings(&split), Some(vec![1]));
 
         // π ping-pongs D0→D1→D0: two crossings — and the plan is byte-for-byte the same object.
-        let pingpong: Place =
-            [(Expert(0), Device(0)), (Expert(1), Device(1)), (Expert(2), Device(0))]
-                .into_iter()
-                .collect();
+        let pingpong: Place = [
+            (Expert(0), Device(0)),
+            (Expert(1), Device(1)),
+            (Expert(2), Device(0)),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(plan.crossings(&pingpong), Some(vec![1, 2]));
     }
 

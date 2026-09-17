@@ -68,9 +68,11 @@ fi
 echo "Building hanzo-training with release optimizations..."
 cargo build --release --package hanzo-training --features "metal" 2>/dev/null || echo "Build failed (expected if metal feature unavailable)"
 
-if [ -f "target/release/hanzo-train" ]; then
-    echo "hanzo-train binary ready"
-    ls -lh target/release/hanzo-train
+# The package built above is hanzo-training, so its binary is target/release/hanzo-training.
+# target/release/hanzo-train belongs to the hanzo-train package (the DSpark draft trainer).
+if [ -f "target/release/hanzo-training" ]; then
+    echo "hanzo-training binary ready"
+    ls -lh target/release/hanzo-training
 fi
 
 echo "Setup complete"

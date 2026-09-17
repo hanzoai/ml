@@ -23,7 +23,7 @@ unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
             b = in(vreg) b,
             options(nostack, nomem),
         );
-        return acc;
+        acc
     }
     #[cfg(not(target_feature = "dotprod"))]
     {

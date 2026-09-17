@@ -5,8 +5,23 @@ use hanzo_onnx::onnx::tensor_proto::DataType;
 use hanzo_onnx::onnx::tensor_shape_proto::{dimension, Dimension};
 use hanzo_onnx::onnx::{type_proto, TensorProto, TensorShapeProto, TypeProto};
 use hanzo_onnx::onnx::{AttributeProto, GraphProto, ModelProto, NodeProto, ValueInfoProto};
-use hanzo_onnx::simple_eval;
 use std::collections::HashMap;
+
+/// Run a graph and read its outputs as tensors.
+///
+/// Every operator in `ai.onnx` — the domain this suite covers — is tensor-valued, so
+/// this is the whole of what the suite needs from a graph. The classical `ai.onnx.ml`
+/// operators also produce text and label/score tables, which is why the evaluator's own
+/// output is a `Value`; `tests/ml.rs` reads those.
+fn simple_eval(
+    model: &ModelProto,
+    inputs: HashMap<String, Tensor>,
+) -> Result<HashMap<String, Tensor>> {
+    hanzo_onnx::simple_eval(model, inputs)?
+        .into_iter()
+        .map(|(name, value)| Ok((name, value.into_tensor()?)))
+        .collect()
+}
 
 const INPUT_X: &str = "x";
 const INPUT_Y: &str = "y";
@@ -33,7 +48,7 @@ fn create_model_proto_with_graph(graph: Option<GraphProto>) -> ModelProto {
 fn test_evaluation_fails_without_defined_graph() -> Result<()> {
     let manual_graph = create_model_proto_with_graph(None);
     let inputs: HashMap<String, Tensor> = HashMap::new();
-    match hanzo_onnx::simple_eval(&manual_graph, inputs) {
+    match simple_eval(&manual_graph, inputs) {
         Err(err) => assert_eq!(err.to_string(), "no graph defined in proto"),
         Ok(_) => panic!("Expected an error due to undefined graph"),
     }
@@ -71,7 +86,7 @@ fn test_add_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -111,7 +126,7 @@ fn test_sub_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -151,7 +166,7 @@ fn test_mul_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -191,7 +206,7 @@ fn test_div_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -232,7 +247,7 @@ fn test_exp_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -277,7 +292,7 @@ fn test_equal_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
     inputs.insert(INPUT_Y.to_string(), Tensor::new(&[2.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -317,7 +332,7 @@ fn test_not_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), Tensor::new(&[0.], &Device::Cpu)?);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -374,7 +389,7 @@ fn test_matmul_operation() -> Result<()> {
         )?,
     );
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -439,7 +454,7 @@ fn test_reshape_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), x);
     inputs.insert(INPUT_Y.to_string(), y);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -499,7 +514,7 @@ fn test_logsoftmax_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -562,7 +577,7 @@ fn test_softmax_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -625,7 +640,7 @@ fn test_transpose_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -684,7 +699,7 @@ fn test_dropout_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -764,7 +779,7 @@ fn test_flatten_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs.clone())?;
+    let eval = simple_eval(&manual_graph, inputs.clone())?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -809,7 +824,7 @@ fn test_flatten_operation() -> Result<()> {
         quantization_annotation: vec![],
     }));
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -958,7 +973,7 @@ fn test_constant_of_shape() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(input, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -1022,7 +1037,7 @@ fn test_unsqueeze() -> Result<()> {
 
     let inputs = HashMap::from_iter([(INPUT_X.to_string(), x.clone()), (INPUT_Y.to_string(), y)]);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1149,7 +1164,7 @@ fn test_gather_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
         inputs.insert(INPUT_Y.to_string(), Tensor::new(indices, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1306,7 +1321,7 @@ fn test_gather_elements() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
         inputs.insert(INPUT_Y.to_string(), Tensor::new(indices, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1360,7 +1375,7 @@ fn test_size_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1405,7 +1420,7 @@ fn test_shape_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1467,7 +1482,7 @@ fn test_abs_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1521,7 +1536,7 @@ fn test_cos_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1569,7 +1584,7 @@ fn test_sin_operation() -> Result<()> {
     let x = Tensor::from_vec(vec![0.0f32, 1.0f32, 2.0f32, 3.0f32], &[2, 2], &Device::Cpu)?;
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
     assert_eq!(to_vec2_round(z, 4)?, [[0.0, 0.8415], [0.9093, 0.1411]]);
@@ -1618,7 +1633,7 @@ fn test_neg_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1675,7 +1690,7 @@ fn test_tanh_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1732,7 +1747,7 @@ fn test_sigmoid_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1789,17 +1804,24 @@ fn test_gelu_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
 
     let results = z.to_vec2::<f32>()?;
 
-    assert_eq!(
-        results,
-        vec![vec![0.0, 0.8413448], vec![1.9544997, 2.9959502]]
-    );
+    // Gelu is x*0.5*(1+erf(x/sqrt(2))): the value of a transcendental, so the
+    // assertion is closeness, not bit equality. Exact `assert_eq!` on these
+    // constants pinned one particular erf rounding — erf(1/sqrt(2))/2+0.5 is
+    // 0.84134474606…, whose two nearest f32 neighbours differ in the last digit,
+    // and the literal 0.8413448 was the wrong one.
+    let expect = [[0.0f32, 0.8413447], [1.9544997, 2.9959502]];
+    for (row, erow) in results.iter().zip(expect.iter()) {
+        for (o, e) in row.iter().zip(erow.iter()) {
+            assert!((o - e).abs() < 1e-5, "Got {o}, expected {e}");
+        }
+    }
 
     Ok(())
 }
@@ -1843,7 +1865,7 @@ fn test_relu_operation() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -1904,7 +1926,7 @@ fn test_prelu_operation() -> Result<()> {
     inputs.insert(INPUT_X.to_string(), x);
     inputs.insert(INPUT_Y.to_string(), y);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -2394,7 +2416,7 @@ fn test_reduce_max() -> Result<()> {
             }
         }
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -2913,7 +2935,7 @@ fn test_reduce_min() -> Result<()> {
             }
         }
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3114,7 +3136,7 @@ fn test_reduce_mean() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3168,7 +3190,7 @@ fn test_sqrt() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3310,7 +3332,7 @@ fn test_random_uniform() -> Result<()> {
             sparse_initializer: vec![],
             quantization_annotation: vec![],
         }));
-        let eval = hanzo_onnx::simple_eval(&manual_graph, HashMap::new())?;
+        let eval = simple_eval(&manual_graph, HashMap::new())?;
         assert_eq!(eval.len(), 1);
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
         let min = z
@@ -3456,7 +3478,7 @@ fn test_random_normal() -> Result<()> {
             sparse_initializer: vec![],
             quantization_annotation: vec![],
         }));
-        let eval = hanzo_onnx::simple_eval(&manual_graph, HashMap::new())?;
+        let eval = simple_eval(&manual_graph, HashMap::new())?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3526,7 +3548,7 @@ fn test_range() -> Result<()> {
         inputs.insert(INPUT_Y.to_string(), Tensor::new(limit, &Device::Cpu)?);
         inputs.insert(INPUT_A.to_string(), Tensor::new(delta, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -3587,7 +3609,7 @@ fn test_greater() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), Tensor::new(a, &Device::Cpu)?);
         inputs.insert(INPUT_Y.to_string(), Tensor::new(b, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -3648,7 +3670,7 @@ fn test_less() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), Tensor::new(a, &Device::Cpu)?);
         inputs.insert(INPUT_Y.to_string(), Tensor::new(b, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -3705,7 +3727,7 @@ fn test_log() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3770,7 +3792,7 @@ fn test_min() -> Result<()> {
         inputs.insert(INPUT_Y.to_string(), Tensor::new(b, &Device::Cpu)?);
         inputs.insert(INPUT_A.to_string(), Tensor::new(c, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3848,7 +3870,7 @@ fn test_where() -> Result<()> {
         inputs.insert(INPUT_Y.to_string(), Tensor::new(x, &Device::Cpu)?);
         inputs.insert(INPUT_A.to_string(), Tensor::new(y, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval
@@ -3921,7 +3943,7 @@ fn test_floor() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -3997,7 +4019,7 @@ fn test_ceil() -> Result<()> {
     let mut inputs: HashMap<String, Tensor> = HashMap::new();
     inputs.insert(INPUT_X.to_string(), x);
 
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
     assert_eq!(eval.len(), 1);
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -4189,7 +4211,7 @@ fn test_argmin() -> Result<()> {
         }));
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
 
         let expected = Tensor::new(expected, &Device::Cpu)?;
@@ -4371,7 +4393,7 @@ fn test_argmax() -> Result<()> {
         }));
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
 
         let expected = Tensor::new(expected, &Device::Cpu)?;
@@ -4446,7 +4468,7 @@ fn test_leakyrelu() -> Result<()> {
         }));
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), Tensor::new(data, &Device::Cpu)?);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
 
         let expected = Tensor::new(expected, &Device::Cpu)?;
@@ -4565,7 +4587,7 @@ fn test_if() -> Result<()> {
     for cond in [1u8, 0] {
         let inputs =
             HashMap::from_iter([("cond".to_string(), Tensor::full(cond, (1,), &Device::Cpu)?)]);
-        let outputs = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let outputs = simple_eval(&manual_graph, inputs)?;
         let expected = if cond != 0 { &x } else { &y };
         let Some(res) = outputs.get("res") else {
             hanzo_ml::bail!("outputs didn't contain expected key `res`: {outputs:?}");
@@ -4628,7 +4650,7 @@ fn test_pad() -> Result<()> {
     }));
 
     let inputs = HashMap::from_iter([("data".to_string(), data), ("pads".to_string(), pads)]);
-    let res = hanzo_onnx::simple_eval(&model, inputs)?;
+    let res = simple_eval(&model, inputs)?;
     let Some(actual) = res.get("output") else {
         hanzo_ml::bail!("outputs didn't contain expected key `output`: {res:?}");
     };
@@ -4685,7 +4707,7 @@ fn test_slice() -> Result<()> {
     ]
     */
 
-    let outputs = hanzo_onnx::simple_eval(
+    let outputs = simple_eval(
         &model,
         HashMap::from_iter([
             (
@@ -4749,7 +4771,7 @@ fn test_slice() -> Result<()> {
             .collect(),
         ..GraphProto::default()
     }));
-    let outputs = hanzo_onnx::simple_eval(
+    let outputs = simple_eval(
         &model,
         HashMap::from_iter([
             (
@@ -5328,140 +5350,140 @@ fn test_rnn() -> Result<()> {
     let number_directions = 1;
     let weight_ih_l0 = Tensor::from_vec::<_, f32>(
         vec![
-            0.33669036626815796,
-            0.12880940735340118,
-            0.23446236550807953,
-            0.23033303022384644,
-            -1.1228563785552979,
-            -0.18632829189300537,
-            2.2082014083862305,
-            -0.637997031211853,
-            0.46165722608566284,
-            0.2673508822917938,
-            0.5349046587944031,
-            0.809357225894928,
-            1.110290288925171,
-            -1.6897989511489868,
-            -0.9889599084854126,
+            0.336_690_37,
+            0.128_809_4,
+            0.234_462_37,
+            0.230_333_03,
+            -1.122_856_4,
+            -0.186_328_29,
+            2.208_201_4,
+            -0.637_997_03,
+            0.461_657_23,
+            0.267_350_88,
+            0.534_904_66,
+            0.809_357_2,
+            1.110_290_3,
+            -1.689_799,
+            -0.988_959_9,
         ],
         (5, 3),
         &Device::Cpu,
     )?;
     let weight_hh_l0 = Tensor::from_vec::<_, f32>(
         vec![
-            -1.3846737146377563,
-            -0.8712361454963684,
-            -0.223365917801857,
-            1.7173614501953125,
-            0.3188803195953369,
-            -0.42451897263526917,
-            0.3057209253311157,
-            -0.7745925188064575,
-            -1.5575724840164185,
-            -0.9223900437355042,
-            1.811317801475525,
-            0.16056492924690247,
-            0.36724865436553955,
-            0.17541083693504333,
-            1.3851605653762817,
-            -0.44585201144218445,
-            1.4451338052749634,
-            0.7078122496604919,
-            -1.0758858919143677,
-            0.5356546640396118,
-            1.1753677129745483,
-            0.5611738562583923,
-            -0.45274803042411804,
-            -0.771777868270874,
-            -0.1721901297569275,
+            -1.384_673_7,
+            -0.871_236_15,
+            -0.223_365_92,
+            1.717_361_5,
+            0.318_880_32,
+            -0.424_518_97,
+            0.305_720_93,
+            -0.774_592_5,
+            -1.557_572_5,
+            -0.922_390_04,
+            1.811_317_8,
+            0.160_564_93,
+            0.367_248_65,
+            0.175_410_84,
+            1.385_160_6,
+            -0.445_852,
+            1.445_133_8,
+            0.707_812_25,
+            -1.075_885_9,
+            0.535_654_66,
+            1.175_367_7,
+            0.561_173_86,
+            -0.452_748_03,
+            -0.771_777_87,
+            -0.172_190_13,
         ],
         (5, 5),
         &Device::Cpu,
     )?;
     let bias_ih_l0 = Tensor::from_vec::<_, f32>(
         vec![
-            0.9579718112945557,
-            -0.6381967663764954,
-            -1.9187371730804443,
-            -0.6441153287887573,
-            -0.6060903072357178,
+            0.957_971_8,
+            -0.638_196_77,
+            -1.918_737_2,
+            -0.644_115_3,
+            -0.606_090_3,
         ],
         (5,),
         &Device::Cpu,
     )?;
     let bias_hh_l0 = Tensor::from_vec::<_, f32>(
         vec![
-            -0.1425034999847412,
-            0.972653865814209,
-            2.0037777423858643,
-            0.6621911525726318,
-            0.5332217216491699,
+            -0.142_503_5,
+            0.972_653_87,
+            2.003_777_7,
+            0.662_191_15,
+            0.533_221_7,
         ],
         (5,),
         &Device::Cpu,
     )?;
     let input = Tensor::from_vec::<_, f32>(
         vec![
-            2.748873233795166,
-            -0.3840780258178711,
-            -1.962258219718933,
-            -0.30899786949157715,
-            -0.4268203377723694,
-            0.4503966271877289,
-            -0.0022214562632143497,
-            -0.19801591336727142,
-            1.775763750076294,
-            -1.6059082746505737,
-            0.48799338936805725,
-            -0.17943637073040009,
+            2.748_873_2,
+            -0.384_078_03,
+            -1.962_258_2,
+            -0.308_997_87,
+            -0.426_820_34,
+            0.450_396_63,
+            -0.002_221_456_3,
+            -0.198_015_91,
+            1.775_763_8,
+            -1.605_908_3,
+            0.487_993_4,
+            -0.179_436_37,
         ],
         (4, 1, 3),
         &Device::Cpu,
     )?;
     let hx = Tensor::from_vec::<_, f32>(
         vec![
-            1.4753035306930542,
-            -1.353177547454834,
-            0.16822677850723267,
-            -0.8245629668235779,
-            -0.060138583183288574,
+            1.475_303_5,
+            -1.353_177_5,
+            0.168_226_78,
+            -0.824_562_97,
+            -0.060_138_583,
         ],
         (1, 1, 5),
         &Device::Cpu,
     )?;
     let output = Tensor::from_vec::<_, f32>(
         vec![
-            -0.8023818135261536,
-            0.9590549468994141,
-            0.9999996423721313,
-            -0.9906406402587891,
-            0.9999986886978149,
-            -0.5140700936317444,
-            0.8138962388038635,
-            0.16080257296562195,
-            0.9994772672653198,
-            -0.38456836342811584,
-            0.992118239402771,
-            -0.5608834624290466,
-            -0.07238662987947464,
-            0.9196381568908691,
-            -0.9843823313713074,
-            0.5993185043334961,
-            -0.9232994914054871,
-            -0.9976708292961121,
-            -0.9960790276527405,
-            -0.973706841468811,
+            -0.802_381_8,
+            0.959_054_95,
+            0.999_999_64,
+            -0.990_640_64,
+            0.999_998_7,
+            -0.514_070_1,
+            0.813_896_24,
+            0.160_802_57,
+            0.999_477_27,
+            -0.384_568_36,
+            0.992_118_24,
+            -0.560_883_46,
+            -0.072_386_63,
+            0.919_638_16,
+            -0.984_382_33,
+            0.599_318_5,
+            -0.923_299_5,
+            -0.997_670_8,
+            -0.996_079,
+            -0.973_706_84,
         ],
         (4, 1, 5),
         &Device::Cpu,
     )?;
     let hn = Tensor::from_vec::<_, f32>(
         vec![
-            0.5993185043334961,
-            -0.9232994914054871,
-            -0.9976708292961121,
-            -0.9960790276527405,
-            -0.973706841468811,
+            0.599_318_5,
+            -0.923_299_5,
+            -0.997_670_8,
+            -0.996_079,
+            -0.973_706_84,
         ],
         (1, 1, 5),
         &Device::Cpu,
@@ -5561,7 +5583,7 @@ fn test_expand_dim_changed() -> Result<()> {
         ("data".to_string(), data),
         ("new_shape".to_string(), new_shape),
     ]);
-    let result = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let result = simple_eval(&manual_graph, inputs)?;
 
     // Retrieve and compare the result
     let expanded = result.get("expanded").expect("Output 'expanded' not found");
@@ -5631,7 +5653,7 @@ fn test_expand_dim_unchanged() -> Result<()> {
         ("data".to_string(), data),
         ("new_shape".to_string(), new_shape),
     ]);
-    let result = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let result = simple_eval(&manual_graph, inputs)?;
 
     // Retrieve and compare the result
     let expanded = result.get("expanded").expect("Output 'expanded' not found");
@@ -5664,7 +5686,7 @@ fn test_split_equal_parts_1d_opset13() -> Result<()> {
     {
         let manual_graph =
             make_split_graph_helper(&["input"], &["output_1", "output_2", "output_3"], 0);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs.clone())?;
+        let eval = simple_eval(&manual_graph, inputs.clone())?;
         assert_eq!(eval.len(), 3);
 
         let out1 = eval.get("output_1").expect("Output 'output_1' not found");
@@ -5682,7 +5704,7 @@ fn test_split_equal_parts_1d_opset13() -> Result<()> {
 
         let manual_graph =
             make_split_graph_helper(&["input", "split"], &["output_1", "output_2"], 0);
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 2);
 
         let out1 = eval.get("output_1").expect("Output 'output_1' not found");
@@ -5739,7 +5761,7 @@ fn test_reduce_sum_default_axes_keepdims() -> Result<()> {
         inputs.insert("data".to_string(), data);
         // inputs.insert("axes".to_string(), axes);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let reduced = eval.get("reduced").expect("Output 'reduced' not found");
@@ -5760,7 +5782,7 @@ fn test_reduce_sum_default_axes_keepdims() -> Result<()> {
         let mut inputs = HashMap::new();
         inputs.insert("data".to_string(), data.clone());
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let reduced = eval.get("reduced").expect("Output 'reduced' not found");
@@ -5791,7 +5813,7 @@ fn test_reduce_sum_do_not_keep_dims() -> Result<()> {
         inputs.insert("data".to_string(), data);
         inputs.insert("axes".to_string(), axes);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let reduced = eval.get("reduced").expect("Output 'reduced' not found");
@@ -5820,7 +5842,7 @@ fn test_reduce_sum_do_not_keep_dims() -> Result<()> {
         inputs.insert("data".to_string(), data.clone());
         inputs.insert("axes".to_string(), axes);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let reduced = eval.get("reduced").expect("Output 'reduced' not found");
@@ -6170,7 +6192,7 @@ fn test_xor() -> Result<()> {
             (INPUT_Y.to_string(), Tensor::new(other, &Device::Cpu)?),
         ]);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6237,7 +6259,7 @@ fn test_sign_operation() -> Result<()> {
         INPUT_X.to_string(),
         Tensor::new(vec![-2f32, -1., 0., 1., 2.], &Device::Cpu)?,
     );
-    let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+    let eval = simple_eval(&manual_graph, inputs)?;
 
     let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
     assert_eq!(
@@ -6345,7 +6367,7 @@ fn test_selu_operator() -> Result<()> {
             ..Default::default()
         }));
 
-        let expected = vec![-1.758, -1.7463, 0.0, 10.507];
+        let expected = [-1.758, -1.7463, 0.0, 10.507];
 
         let input = Tensor::from_vec(vec![-10.0f32, -5.0, 0.0, 10.0], (2, 2), &Device::Cpu)?;
         let mut inputs = HashMap::new();
@@ -6403,7 +6425,7 @@ fn test_selu_operator() -> Result<()> {
         let eval = simple_eval(&graph, inputs)?;
         let output = eval.get("output").unwrap();
         let out_vec = output.to_vec1::<f32>()?;
-        let expected = vec![-3.7927232, 0.0, 3.0];
+        let expected = [-3.7927232, 0.0, 3.0];
 
         for (o, e) in out_vec.iter().zip(expected.iter()) {
             assert!((o - e).abs() < 1e-5, "Got {o}, expected {e}");
@@ -6471,7 +6493,7 @@ fn test_hard_swish() -> hanzo_ml::Result<()> {
         let output = outputs.get(OUTPUT_Z).expect("missing output Z");
         let output_vec = output.to_vec1::<f32>()?;
 
-        let expected = vec![0.0, 0.0, 0.0, 1.6666666, 3.0, 5.0];
+        let expected = [0.0, 0.0, 0.0, 1.6666666, 3.0, 5.0];
 
         for (i, (got, exp)) in output_vec.iter().zip(expected.iter()).enumerate() {
             let diff = (got - exp).abs();
@@ -6508,7 +6530,7 @@ fn test_hard_swish() -> hanzo_ml::Result<()> {
         let output = outputs.get(OUTPUT_Z).expect("missing output Z");
         let output_vec = output.to_vec1::<f32>()?;
 
-        let expected = vec![0.0, -0.33333334, 0.0, 1.6666667, 4.0];
+        let expected = [0.0, -0.33333334, 0.0, 1.6666667, 4.0];
 
         for (i, (got, exp)) in output_vec.iter().zip(expected.iter()).enumerate() {
             let diff = (got - exp).abs();
@@ -6594,7 +6616,7 @@ fn test_scatternd_operation() -> Result<()> {
         inputs.insert(INPUT_Y.to_string(), Tensor::new(indices, &Device::Cpu)?);
         inputs.insert(INPUT_A.to_string(), Tensor::new(updates, &Device::Cpu)?);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6656,7 +6678,7 @@ fn test_trilu_operation() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), x);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6722,7 +6744,7 @@ fn test_trilu_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), x);
         inputs.insert(INPUT_Y.to_string(), k);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6778,7 +6800,7 @@ fn test_trilu_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), x);
         inputs.insert(INPUT_Y.to_string(), k);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6853,7 +6875,7 @@ fn test_trilu_operation() -> Result<()> {
         let mut inputs: HashMap<String, Tensor> = HashMap::new();
         inputs.insert(INPUT_X.to_string(), x);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -6932,7 +6954,7 @@ fn test_trilu_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), x);
         inputs.insert(INPUT_Y.to_string(), k);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -7010,7 +7032,7 @@ fn test_trilu_operation() -> Result<()> {
         inputs.insert(INPUT_X.to_string(), x);
         inputs.insert(INPUT_Y.to_string(), k);
 
-        let eval = hanzo_onnx::simple_eval(&manual_graph, inputs)?;
+        let eval = simple_eval(&manual_graph, inputs)?;
         assert_eq!(eval.len(), 1);
 
         let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
@@ -7224,5 +7246,58 @@ fn test_one_hot() -> Result<()> {
         assert_eq!(y.dims(), &[3, 12]);
     }
 
+    Ok(())
+}
+
+/// An `int32` initializer is read four bytes at a time, not by reinterpreting the buffer.
+///
+/// `raw_data` is a `Vec<u8>`, whose allocation is aligned for BYTES. Casting its pointer to
+/// `*const i32` — which this reader used to do — is undefined behaviour on every allocation
+/// that does not happen to be 4-byte aligned, and the bytes come from a FILE, so nothing
+/// about the model says which those are. ONNX writes `raw_data` little-endian, so four
+/// bytes at a time is both what it means and what is defined. A length that is not a
+/// multiple of four keeps its earlier reading — trailing bytes are not a value — rather
+/// than becoming a read past the end.
+#[test]
+fn test_int32_initializer_from_raw_data() -> Result<()> {
+    let read = |raw: Vec<u8>| -> Result<Vec<i64>> {
+        let model = create_model_proto_with_graph(Some(GraphProto {
+            node: vec![NodeProto {
+                op_type: "Identity".to_string(),
+                input: vec![INPUT_X.to_string()],
+                output: vec![OUTPUT_Z.to_string()],
+                ..Default::default()
+            }],
+            initializer: vec![TensorProto {
+                name: INPUT_X.to_string(),
+                data_type: DataType::Int32.into(),
+                dims: vec![3],
+                raw_data: raw,
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: OUTPUT_Z.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        let out = simple_eval(&model, HashMap::new())?;
+        let z = out.get(OUTPUT_Z).expect("the graph declares one output");
+        assert_eq!(z.dtype(), DType::I64);
+        z.flatten_all()?.to_vec1::<i64>()
+    };
+
+    let whole: Vec<u8> = [1i32, -2, 300000]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(read(whole.clone())?, vec![1i64, -2, 300000]);
+
+    // Three values and a stray byte: the stray byte is not a fourth value.
+    let mut ragged = whole;
+    ragged.push(7);
+    assert_eq!(read(ragged)?, vec![1i64, -2, 300000]);
+
+    assert_eq!(read(vec![])?, Vec::<i64>::new());
     Ok(())
 }

@@ -1269,8 +1269,8 @@ impl RocmDevice {
     /// [E,n,k] is resident in VRAM (`wbank`, raw block bytes, uploaded once); `x` is the [nrows,k]
     /// routed-activation matrix (f16 or bf16); `ids[s]` is slot s's expert. For each slot the core
     /// runs on that expert's byte-slice of the bank into output row s -- each output row is written
-    /// exactly once, so there is no scatter/index_add (which ROCm lacks). Returns [nrows,n] in x's
-    /// dtype. This is the "dispatch each expert through the one core" path the decode core enables.
+    /// exactly once, so there is no scatter/index_add. Returns [nrows,n] in x's dtype. This is
+    /// the "dispatch each expert through the one core" path the decode core enables.
     pub fn moe_matvec_quant(
         &self,
         qt: RocmQuantType,
@@ -2507,16 +2507,12 @@ impl RocmStorage {
         }
 
         match (&x.slice, &residual.slice, &alpha.slice) {
-            (
-                RocmStorageSlice::F32(_),
-                RocmStorageSlice::F32(_),
-                RocmStorageSlice::F32(_),
-            ) => launch_add_rmsnorm!(F32, f32, "add_rmsnorm_f32"),
-            (
-                RocmStorageSlice::F16(_),
-                RocmStorageSlice::F16(_),
-                RocmStorageSlice::F16(_),
-            ) => launch_add_rmsnorm!(F16, f16, "add_rmsnorm_f16"),
+            (RocmStorageSlice::F32(_), RocmStorageSlice::F32(_), RocmStorageSlice::F32(_)) => {
+                launch_add_rmsnorm!(F32, f32, "add_rmsnorm_f32")
+            }
+            (RocmStorageSlice::F16(_), RocmStorageSlice::F16(_), RocmStorageSlice::F16(_)) => {
+                launch_add_rmsnorm!(F16, f16, "add_rmsnorm_f16")
+            }
             _ => crate::bail!(
                 "add_rms_norm: inputs must all be F32 or all F16 (x={:?} residual={:?} alpha={:?})",
                 x.slice.dtype(),
@@ -4007,6 +4003,112 @@ fn gather_typed<T: Copy + Send + Sync + WithDType + 'static>(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn scatter_typed<T: Copy + Send + Sync + 'static>(
+    kernel_root: &str,
+    ids_ptr: *mut std::ffi::c_void,
+    src_ptr: *mut std::ffi::c_void,
+    dst_ptr: *mut std::ffi::c_void,
+    left_size: usize,
+    src_dim_size: usize,
+    dst_dim_size: usize,
+    right_size: usize,
+    device: &RocmDevice,
+) -> Result<()> {
+    use hanzo_rocm_kernels::kernel::IndexingKernel;
+    let func_name = kernel_name::<T>(kernel_root);
+    let (grid, block) = launch_config(left_size * right_size);
+    unsafe {
+        launch_kernel(
+            device,
+            IndexingKernel::NAME,
+            IndexingKernel::CODE,
+            &func_name,
+            grid,
+            block,
+            &mut [
+                (&ids_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&dst_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &left_size as *const usize as *mut std::ffi::c_void,
+                &src_dim_size as *const usize as *mut std::ffi::c_void,
+                &dst_dim_size as *const usize as *mut std::ffi::c_void,
+                &right_size as *const usize as *mut std::ffi::c_void,
+            ],
+        )
+    }
+}
+
+/// Body shared by `scatter_set` and `scatter_add_set`. `root` is both the kernel-name root
+/// (the kernel is `{root}_{ids_dtype}_{dtype}`) and the op name carried in errors.
+#[allow(clippy::too_many_arguments)]
+fn scatter_apply(
+    root: &'static str,
+    dst: &mut RocmStorage,
+    dst_l: &Layout,
+    ids: &RocmStorage,
+    ids_l: &Layout,
+    src: &RocmStorage,
+    src_l: &Layout,
+    dim: usize,
+) -> Result<()> {
+    let device = dst.device.clone();
+    let src_dims = src_l.dims();
+    let left_size: usize = src_dims[..dim].iter().product();
+    let right_size: usize = src_dims[dim + 1..].iter().product();
+    let src_dim_size = src_dims[dim];
+    let dst_dim_size = dst_l.dims()[dim];
+    if left_size * right_size == 0 {
+        return Ok(());
+    }
+
+    let dst_ptr = match dst_l.contiguous_offsets() {
+        Some((o1, _)) => unsafe { dst.slice.offset_ptr(o1) },
+        None => Err(crate::Error::RequiresContiguous { op: root }.bt())?,
+    };
+    let src_ptr = match src_l.contiguous_offsets() {
+        Some((o1, _)) => unsafe { src.slice.offset_ptr(o1) },
+        None => Err(crate::Error::RequiresContiguous { op: root }.bt())?,
+    };
+    let ids_off = match ids_l.contiguous_offsets() {
+        Some((o1, _)) => o1,
+        None => Err(crate::Error::RequiresContiguous { op: root }.bt())?,
+    };
+    let (ids_suffix, ids_ptr) = match &ids.slice {
+        RocmStorageSlice::U32(s) => ("u32", unsafe { s.offset_ptr(ids_off) }),
+        RocmStorageSlice::U8(s) => ("u8", unsafe { s.offset_ptr(ids_off) }),
+        RocmStorageSlice::I64(s) => ("i64", unsafe { s.offset_ptr(ids_off) }),
+        _ => crate::bail!("{root} ids should be u8, u32, or i64"),
+    };
+    let kernel_root = format!("{root}_{ids_suffix}");
+
+    macro_rules! s {
+        ($ty:ty) => {
+            scatter_typed::<$ty>(
+                &kernel_root,
+                ids_ptr,
+                src_ptr,
+                dst_ptr,
+                left_size,
+                src_dim_size,
+                dst_dim_size,
+                right_size,
+                &device,
+            )
+        };
+    }
+    match (&dst.slice, &src.slice) {
+        (RocmStorageSlice::F32(_), RocmStorageSlice::F32(_)) => s!(f32),
+        (RocmStorageSlice::F64(_), RocmStorageSlice::F64(_)) => s!(f64),
+        (RocmStorageSlice::U8(_), RocmStorageSlice::U8(_)) => s!(u8),
+        (RocmStorageSlice::U32(_), RocmStorageSlice::U32(_)) => s!(u32),
+        (RocmStorageSlice::I64(_), RocmStorageSlice::I64(_)) => s!(i64),
+        (RocmStorageSlice::BF16(_), RocmStorageSlice::BF16(_)) => s!(bf16),
+        (RocmStorageSlice::F16(_), RocmStorageSlice::F16(_)) => s!(f16),
+        _ => crate::bail!("{root} does not support this dtype for ROCm"),
+    }
+}
+
 impl BackendStorage for RocmStorage {
     type Device = RocmDevice;
 
@@ -4520,30 +4622,26 @@ impl BackendStorage for RocmStorage {
 
     fn scatter_set(
         &mut self,
-        _l: &Layout,
-        _val: &Self,
-        _vl: &Layout,
-        _idx: &Self,
-        _il: &Layout,
-        _dim: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        Err(crate::Error::Msg(
-            "scatter_set not yet implemented for ROCm".to_string(),
-        ))
+        scatter_apply("scatter", self, l, ids, ids_l, src, src_l, dim)
     }
 
     fn scatter_add_set(
         &mut self,
-        _l: &Layout,
-        _val: &Self,
-        _vl: &Layout,
-        _idx: &Self,
-        _il: &Layout,
-        _dim: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        Err(crate::Error::Msg(
-            "scatter_add_set not yet implemented for ROCm".to_string(),
-        ))
+        scatter_apply("scatter_add", self, l, ids, ids_l, src, src_l, dim)
     }
 
     fn index_select(&self, idx: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
@@ -5281,7 +5379,13 @@ mod dsl_norm_bench {
     #[test]
     fn add_rmsnorm_f16_bit_identical_to_separate() {
         let device = RocmDevice::new(0).unwrap();
-        for &(rows, n) in &[(1usize, 4096usize), (7, 4096), (1, 5120), (512, 2560), (33, 2560)] {
+        for &(rows, n) in &[
+            (1usize, 4096usize),
+            (7, 4096),
+            (1, 5120),
+            (512, 2560),
+            (33, 2560),
+        ] {
             let xf = rnd(rows * n, 0x51 + rows as u64 * 7 + n as u64);
             let rf = rnd(rows * n, 0xC0DE + rows as u64 + n as u64 * 3);
             let af = rnd(n, 0xA1 + n as u64);
@@ -5303,7 +5407,11 @@ mod dsl_norm_bench {
 
             let n_cols = n as i32;
             let block_size: i32 = if n < 1024 { 32 } else { 1024 };
-            let grid = rocm_rs::hip::Dim3 { x: rows as u32, y: 1, z: 1 };
+            let grid = rocm_rs::hip::Dim3 {
+                x: rows as u32,
+                y: 1,
+                z: 1,
+            };
             let block = rocm_rs::hip::Dim3::from(block_size as u32);
             let (xp, rp, ap, srp) = (
                 x_dev.as_ptr(),
@@ -5548,15 +5656,35 @@ mod flash_decode_test {
             let got = run(&device, &qf, &kf, &vf, b, hq, hkv, l, d, scale, None);
             let rel = max_rel(&want, &got);
             println!("[flash_decode] B{b} Hq{hq} Hkv{hkv} L{l} contiguous rel={rel:.2e}");
-            assert!(rel < 1e-2, "flash_decode contiguous rel {rel} at {b}/{hq}/{hkv}/{l}");
+            assert!(
+                rel < 1e-2,
+                "flash_decode contiguous rel {rel} at {b}/{hq}/{hkv}/{l}"
+            );
 
             let maxl = l + 17;
             let kf_p = pad_seq(&kf, b, hkv, l, d, maxl);
             let vf_p = pad_seq(&vf, b, hkv, l, d, maxl);
-            let got_s = run(&device, &qf, &kf_p, &vf_p, b, hq, hkv, l, d, scale, Some(maxl));
+            let got_s = run(
+                &device,
+                &qf,
+                &kf_p,
+                &vf_p,
+                b,
+                hq,
+                hkv,
+                l,
+                d,
+                scale,
+                Some(maxl),
+            );
             let rel_s = max_rel(&want, &got_s);
-            println!("[flash_decode] B{b} Hq{hq} Hkv{hkv} L{l} strided(maxl={maxl}) rel={rel_s:.2e}");
-            assert!(rel_s < 1e-2, "flash_decode strided rel {rel_s} at {b}/{hq}/{hkv}/{l}");
+            println!(
+                "[flash_decode] B{b} Hq{hq} Hkv{hkv} L{l} strided(maxl={maxl}) rel={rel_s:.2e}"
+            );
+            assert!(
+                rel_s < 1e-2,
+                "flash_decode strided rel {rel_s} at {b}/{hq}/{hkv}/{l}"
+            );
         }
     }
 }

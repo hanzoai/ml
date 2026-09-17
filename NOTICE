@@ -95,3 +95,21 @@ Changes from upstream candle in this fork:
   Hanzo/zen model hubs.
 - Dependency and layout changes: cudarc pinned at 0.19.4; an orphaned duplicate
   crate cluster is excluded from the workspace build.
+- Added hanzo-learn (statistical learning: least squares, logistic regression,
+  gradient boosted regression trees).
+
+hanzo-learn and scikit-learn
+----------------------------
+
+hanzo-learn is a CLEAN-ROOM implementation. Its algorithms come from the published
+literature (Householder 1958; Breiman, Friedman, Olshen & Stone 1984; Friedman 2001)
+and no scikit-learn source code or documentation text is reproduced in it.
+
+scikit-learn (https://scikit-learn.org, BSD-3-Clause) is used as a TEST ORACLE: the
+fixtures under hanzo-learn/tests/fixture/ hold numerical results produced by running
+it (version recorded in each fixture), and hanzo-learn's own results are asserted
+against them. The generator that produced them is committed beside them.
+
+Because no scikit-learn code is included or distributed here, its BSD-3-Clause notice
+is not carried. If any scikit-learn code or docstring is ever incorporated, that
+attribution must be added to this file at the same time.

@@ -65,7 +65,7 @@ fn metal_copy3d_transpose_bit_exact() {
         check(&dev, &[1, 512, 8, 128], 1, 2, dtype); // -> [1,8,512,128]  K/V cache append
         check(&dev, &[1, 512, 32, 128], 1, 2, dtype); // -> [1,32,512,128] q RoPE contiguous
         check(&dev, &[1, 32, 512, 128], 1, 2, dtype); // -> [1,512,32,128] attn-output reshape
-        // Odd small shape (index-math corner cases):
+                                                      // Odd small shape (index-math corner cases):
         check(&dev, &[1, 5, 3, 7], 1, 2, dtype);
         // Pure 3D transpose (no unit dim to drop):
         check(&dev, &[4, 6, 8], 0, 1, dtype);

@@ -120,7 +120,11 @@ pub fn flash_attn<F: Float>(
         let r = idx / d;
         let dd = idx % d;
         let qpos = qt * br + r;
-        let val = if qpos < seq_q { q[q_head_base + qpos * d + dd] } else { F::new(0.0) };
+        let val = if qpos < seq_q {
+            q[q_head_base + qpos * d + dd]
+        } else {
+            F::new(0.0)
+        };
         qsh[idx] = f16::cast_from(val);
     }
     sync_cube();
@@ -133,7 +137,11 @@ pub fn flash_attn<F: Float>(
     let n_jt = (seq_k + bc - 1) / bc;
     let n_jt_eff = if causal == 1 {
         let bound = (qt * br + br - 1) / bc + 1;
-        if bound < n_jt { bound } else { n_jt }
+        if bound < n_jt {
+            bound
+        } else {
+            n_jt
+        }
     } else {
         n_jt
     };
@@ -489,7 +497,10 @@ pub fn flash_attn_run<R: Runtime>(
     let plane = (client.properties().hardware.plane_size_max as usize).max(BR);
     let cubes = flash_attn_cubes(b, n_heads, seq_q);
     let target = Target::of(client);
-    flash_attn_launch(client, q, k, v, b, n_heads, n_kv, seq_q, seq_k, kv_seq_pad, d, causal, plane, 0, cubes, target)
+    flash_attn_launch(
+        client, q, k, v, b, n_heads, n_kv, seq_q, seq_k, kv_seq_pad, d, causal, plane, 0, cubes,
+        target,
+    )
 }
 
 /// The launch primitive, with an explicit `cube_base` offset, `cube_count`, and island `target`.
@@ -575,7 +586,10 @@ mod tests {
     /// cancellation and produces false failures (PHILOSOPHY: signed/affine -> scale-relative).
     fn scale_rel(got: &[f32], want: &[f32]) -> f32 {
         let refmax = want.iter().fold(0.0f32, |a, x| a.max(x.abs())).max(1e-6);
-        let maxd = got.iter().zip(want).fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
+        let maxd = got
+            .iter()
+            .zip(want)
+            .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
         maxd / refmax
     }
 
@@ -603,7 +617,24 @@ mod tests {
         let ncubes = flash_attn_cubes(1, nh, sq);
         let mut got = vec![0.0f32; nh * sq * d];
         for n in 0..ncubes {
-            let part = flash_attn_launch::<R>(c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, plane, n, 1, Target::Cpu);
+            let part = flash_attn_launch::<R>(
+                c,
+                &q,
+                &k,
+                &v,
+                1,
+                nh,
+                nkv,
+                sq,
+                sk,
+                sk,
+                d,
+                causal,
+                plane,
+                n,
+                1,
+                Target::Cpu,
+            );
             for (g, p) in got.iter_mut().zip(&part) {
                 *g += *p;
             }
@@ -611,7 +642,10 @@ mod tests {
         let want = sdpa_ref(&q, &k, &v, nh, nkv, sq, sk, d, causal);
         let rel = scale_rel(&got, &want);
         eprintln!("[flash {tag}] nh{nh}/nkv{nkv} sq{sq} sk{sk} d{d} causal{causal} plane{plane} cubes{ncubes} scale_rel={rel:.2e}");
-        assert!(rel < 2e-3, "flash {tag}: scale_rel {rel} exceeds 2e-3 vs materialized sdpa_ref");
+        assert!(
+            rel < 2e-3,
+            "flash {tag}: scale_rel {rel} exceeds 2e-3 vs materialized sdpa_ref"
+        );
     }
 
     /// The scalar (default) arm, on the CPU runtime, is the online-softmax flash and matches the
@@ -629,11 +663,51 @@ mod tests {
         gate::<CpuRuntime>(&c, 8, 2, 1, 512, 64, false, 32, "decode kv512 GQA4");
         // prefill: causal + non-causal, single and multiple query-tiles, GQA and MHA, d in {32,64,128}.
         gate::<CpuRuntime>(&c, 4, 2, 16, 128, 32, true, 32, "prefill qt1 causal GQA2");
-        gate::<CpuRuntime>(&c, 4, 2, 16, 128, 32, false, 32, "prefill qt1 noncausal GQA2");
+        gate::<CpuRuntime>(
+            &c,
+            4,
+            2,
+            16,
+            128,
+            32,
+            false,
+            32,
+            "prefill qt1 noncausal GQA2",
+        );
         gate::<CpuRuntime>(&c, 4, 4, 16, 64, 64, true, 32, "prefill qt1 MHA causal d64");
-        gate::<CpuRuntime>(&c, 4, 2, 48, 48, 32, true, 32, "prefill 3-tile causal GQA2 (aligned)");
-        gate::<CpuRuntime>(&c, 6, 3, 40, 40, 64, true, 32, "prefill causal GQA2 tail sq40 d64");
-        gate::<CpuRuntime>(&c, 2, 1, 512, 512, 128, true, 32, "prefill 512 causal MHA d128");
+        gate::<CpuRuntime>(
+            &c,
+            4,
+            2,
+            48,
+            48,
+            32,
+            true,
+            32,
+            "prefill 3-tile causal GQA2 (aligned)",
+        );
+        gate::<CpuRuntime>(
+            &c,
+            6,
+            3,
+            40,
+            40,
+            64,
+            true,
+            32,
+            "prefill causal GQA2 tail sq40 d64",
+        );
+        gate::<CpuRuntime>(
+            &c,
+            2,
+            1,
+            512,
+            512,
+            128,
+            true,
+            32,
+            "prefill 512 causal MHA d128",
+        );
     }
 
     /// The f16 cooperative-matrix arm, EXECUTED on RADV (Vulkan/wgpu), matched against the materialized
@@ -655,12 +729,19 @@ mod tests {
         // subgroupSize=64 (VkPhysicalDeviceCooperativeMatrixPropertiesKHR), so the whole-grid launch is
         // one 64-lane workgroup per cube -- a 32-lane launch would feed the 16x16 f16 fragment only half
         // its lanes and leave the output tile past query-row 1 undefined. mmq_q4k / sdpa_blk derive it too.
-        let mut gate_gpu = |nh: usize, nkv: usize, sq: usize, sk: usize, d: usize, causal: bool, tag: &str| {
+        let mut gate_gpu = |nh: usize,
+                            nkv: usize,
+                            sq: usize,
+                            sk: usize,
+                            d: usize,
+                            causal: bool,
+                            tag: &str| {
             let q = rnd(nh * sq * d, 0x1234_5678);
             let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
             let v = rnd(nkv * sk * d, 0x0FED_CBA9);
             // Whole-grid Vulkan launch (Target::of(WgpuRuntime) = Vulkan -> the coopmat arm).
-            let got = flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal);
+            let got =
+                flash_attn_run::<WgpuRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal);
             let want = sdpa_ref(&q, &k, &v, nh, nkv, sq, sk, d, causal);
             let rel = scale_rel(&got, &want);
             let nonfin = got.iter().filter(|x| !x.is_finite()).count();
@@ -669,16 +750,24 @@ mod tests {
             let where_ = if rel < 2e-3 {
                 String::new()
             } else {
-                got.iter().zip(&want).enumerate()
+                got.iter()
+                    .zip(&want)
+                    .enumerate()
                     .find(|(_, (g, w))| (**g - **w).abs() > 1e-2 || !g.is_finite())
                     .map(|(i, (g, w))| {
                         let (h, rem) = (i / (sq * d), i % (sq * d));
-                        format!(" first-bad@[h{h},q{},d{}] got={g:.3e} want={w:.3e}", rem / d, rem % d)
+                        format!(
+                            " first-bad@[h{h},q{},d{}] got={g:.3e} want={w:.3e}",
+                            rem / d,
+                            rem % d
+                        )
                     })
                     .unwrap_or_default()
             };
             eprintln!("[flash-vk {tag}] nh{nh}/nkv{nkv} sq{sq} sk{sk} d{d} causal{causal} scale_rel={rel:.2e} nonfinite={nonfin}{where_}");
-            if !(rel < 2e-2) { fails += 1; }
+            if !(rel < 2e-2) {
+                fails += 1;
+            }
         };
         // The same 10 shapes as the CPU oracle `flash_matches_materialized_ref_on_cpu`: decode (ragged
         // kv 1/17), decode aligned/long GQA, prefill causal + non-causal, GQA and MHA, single + multi
@@ -690,10 +779,21 @@ mod tests {
         gate_gpu(4, 2, 16, 128, 32, true, "prefill qt1 causal GQA2");
         gate_gpu(4, 2, 16, 128, 32, false, "prefill qt1 noncausal GQA2");
         gate_gpu(4, 4, 16, 64, 64, true, "prefill qt1 MHA causal d64");
-        gate_gpu(4, 2, 48, 48, 32, true, "prefill 3-tile causal GQA2 (aligned)");
+        gate_gpu(
+            4,
+            2,
+            48,
+            48,
+            32,
+            true,
+            "prefill 3-tile causal GQA2 (aligned)",
+        );
         gate_gpu(6, 3, 40, 40, 64, true, "prefill causal GQA2 tail sq40 d64");
         gate_gpu(2, 1, 512, 512, 128, true, "prefill 512 causal MHA d128");
-        assert_eq!(fails, 0, "flash coopmat: {fails} shape(s) exceeded 2e-2 vs materialized sdpa_ref");
+        assert_eq!(
+            fails, 0,
+            "flash coopmat: {fails} shape(s) exceeded 2e-2 vs materialized sdpa_ref"
+        );
     }
 
     /// The production surface (`flash_attn_run`, which derives the island tag from the runtime) resolves
@@ -741,7 +841,10 @@ mod tests {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
         let c = CudaRuntime::client(&CudaDevice::default());
         // The device plane the production surface derives (measured: 32 on this GB10 warp).
-        eprintln!("[flash-cuda] device plane_size_max={}", c.properties().hardware.plane_size_max);
+        eprintln!(
+            "[flash-cuda] device plane_size_max={}",
+            c.properties().hardware.plane_size_max
+        );
         let shapes: [(usize, usize, usize, usize, usize, bool, &str); 10] = [
             (4, 2, 1, 1, 32, false, "decode kv1"),
             (4, 2, 1, 17, 32, false, "decode kv17 (ragged tail)"),
@@ -750,7 +853,15 @@ mod tests {
             (4, 2, 16, 128, 32, true, "prefill qt1 causal GQA2"),
             (4, 2, 16, 128, 32, false, "prefill qt1 noncausal GQA2"),
             (4, 4, 16, 64, 64, true, "prefill qt1 MHA causal d64"),
-            (4, 2, 48, 48, 32, true, "prefill 3-tile causal GQA2 (aligned)"),
+            (
+                4,
+                2,
+                48,
+                48,
+                32,
+                true,
+                "prefill 3-tile causal GQA2 (aligned)",
+            ),
             (6, 3, 40, 40, 64, true, "prefill causal GQA2 tail sq40 d64"),
             (2, 1, 512, 512, 128, true, "prefill 512 causal MHA d128"),
         ];
@@ -759,31 +870,51 @@ mod tests {
             let q = rnd(nh * sq * d, 0x1234_5678);
             let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
             let v = rnd(nkv * sk * d, 0x0FED_CBA9);
-            let got = flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal);
+            let got =
+                flash_attn_run::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal);
             let want = sdpa_ref(&q, &k, &v, nh, nkv, sq, sk, d, causal);
             let rel = scale_rel(&got, &want);
             let nonfin = got.iter().filter(|x| !x.is_finite()).count();
             let where_ = if rel < 2e-3 {
                 String::new()
             } else {
-                got.iter().zip(&want).enumerate()
+                got.iter()
+                    .zip(&want)
+                    .enumerate()
                     .find(|(_, (g, w))| (**g - **w).abs() > 1e-2 || !g.is_finite())
                     .map(|(i, (g, w))| {
                         let (h, rem) = (i / (sq * d), i % (sq * d));
-                        format!(" first-bad@[h{h},q{},d{}] got={g:.3e} want={w:.3e}", rem / d, rem % d)
+                        format!(
+                            " first-bad@[h{h},q{},d{}] got={g:.3e} want={w:.3e}",
+                            rem / d,
+                            rem % d
+                        )
                     })
                     .unwrap_or_default()
             };
             eprintln!("[flash-cuda {tag}] nh{nh}/nkv{nkv} sq{sq} sk{sk} d{d} causal{causal} scale_rel={rel:.2e} nonfinite={nonfin}{where_}");
-            if !(rel < 2e-2) { fails += 1; }
+            if !(rel < 2e-2) {
+                fails += 1;
+            }
         }
-        assert_eq!(fails, 0, "flash coopmat CUDA: {fails} shape(s) exceeded 2e-2 vs materialized sdpa_ref");
+        assert_eq!(
+            fails, 0,
+            "flash coopmat CUDA: {fails} shape(s) exceeded 2e-2 vs materialized sdpa_ref"
+        );
 
         // Portability regression guard: CUDA must agree at plane=32 and plane=64. The extra warp at
         // plane=64 is redundant, not wrong (warp-scoped WMMA); a future change making the coopmat op
         // subgroup/block-scoped would diverge these massively (half the output tile undefined).
         for (nh, nkv, sq, sk, d, causal, tag) in [
-            (4usize, 2usize, 16usize, 128usize, 32usize, true, "prefill causal"),
+            (
+                4usize,
+                2usize,
+                16usize,
+                128usize,
+                32usize,
+                true,
+                "prefill causal",
+            ),
             (8, 2, 1, 512, 64, false, "decode kv512"),
             (2, 1, 512, 512, 128, true, "prefill 512 d128"),
         ] {
@@ -791,12 +922,48 @@ mod tests {
             let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
             let v = rnd(nkv * sk * d, 0x0FED_CBA9);
             let cubes = flash_attn_cubes(1, nh, sq);
-            let p32 = flash_attn_launch::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, 32, 0, cubes, Target::of(&c));
-            let p64 = flash_attn_launch::<CudaRuntime>(&c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, 64, 0, cubes, Target::of(&c));
+            let p32 = flash_attn_launch::<CudaRuntime>(
+                &c,
+                &q,
+                &k,
+                &v,
+                1,
+                nh,
+                nkv,
+                sq,
+                sk,
+                sk,
+                d,
+                causal,
+                32,
+                0,
+                cubes,
+                Target::of(&c),
+            );
+            let p64 = flash_attn_launch::<CudaRuntime>(
+                &c,
+                &q,
+                &k,
+                &v,
+                1,
+                nh,
+                nkv,
+                sq,
+                sk,
+                sk,
+                d,
+                causal,
+                64,
+                0,
+                cubes,
+                Target::of(&c),
+            );
             let agree = scale_rel(&p32, &p64);
             eprintln!("[flash-cuda plane-agree {tag}] scale_rel(p32,p64)={agree:.2e}");
-            assert!(agree < 1e-4, "CUDA plane 32 vs 64 diverged ({agree}) -- coopmat no longer warp-scoped");
+            assert!(
+                agree < 1e-4,
+                "CUDA plane 32 vs 64 diverged ({agree}) -- coopmat no longer warp-scoped"
+            );
         }
     }
-
 }

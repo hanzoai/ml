@@ -1,87 +1,162 @@
+# Native (Hanzo Git) copy of .github/workflows/rust-ci.yml. The Hanzo Git fork
+# scans .hanzo/workflows FIRST
+# (GIT__actions__WORKFLOW_DIRS=.hanzo/workflows,.github/workflows,.gitea/workflows);
+# GitHub.com ignores .hanzo/, so this file is inert on GitHub and only runs on the
+# native forge -- zero effect on the GitHub CI lane.
+#
+# `fmt`/`clippy` run on `linux-amd64`; `check`/`test` run on the
+# ubuntu labels the git-runner maps. The windows/macOS/arm legs were REMOVED
+# rather than left to queue: this forge registers no runner for them, and an
+# unrunnable leg does not fail, it queues forever and holds the whole run in a
+# non-terminal state. Restoring that coverage is a runner-provisioning step —
+# register the daemons, then re-add the labels here.
 on:
   push:
     branches:
       - main
   pull_request:
+  # The other three workflows here (gpu-tests, maturin, publish) all declare
+  # this; rust-ci was the only one that could not be re-run on demand. That
+  # matters on this repo specifically: it is a forge MIRROR, so commits usually
+  # arrive by a mirror pull rather than a push, and a pull fires no push event —
+  # fmt/clippy/test then simply never run on the new head, and the last result
+  # shown is whatever some older push left behind. `POST /actions/workflows/
+  # rust-ci.yml/dispatches` answered 422 for exactly this reason.
+  workflow_dispatch:
 
 name: Continuous integration
 
 jobs:
   check:
     name: Check
-    runs-on: ${{ matrix.os }}
+    runs-on: [linux-amd64]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04, windows-latest, macOS-latest, ubuntu-24.04-arm]
+      # The axis is the instruction set to compile for. Both legs always ran on
+      # one Linux pool; naming them after two ubuntu labels only hid that, and
+      # the labels themselves are gone. The fleet stopped advertising ubuntu-*
+      # on purpose -- it hosts ~1400 mirrored repos carrying upstream workflows
+      # that all ask for a generic label, and one unparseable upstream job took
+      # every runner down with it. universe
+      # charts/app/values/hanzo/git-runner.yaml keeps that account; the org
+      # pools are what a workflow on this plane asks for.
+      #
+      # A leg whose label nothing serves does not fail, it QUEUES: Check and
+      # Test Suite sat unpicked while every other job in this file went green,
+      # so the run never reached a terminal state and ml never reached the board.
+      #
+      # Windows/macOS/arm coverage returns by REGISTERING those runners, not by
+      # naming labels nothing answers.
+        cpu: [baseline, avx2]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Remove cargo config (macOS ring crate fix)
-        if: runner.os == 'macOS'
-        run: rm -f .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Run macos with metal
-        if: matrix.os == 'macOS-latest' 
-        run: cargo check --workspace --features metal
+      # hanzo-onnx's build script runs prost-build, which shells out to protoc;
+      # prost-build 0.14 does not vendor one. apt rather than a marketplace action
+      # for the same reason the clippy job apt-installs its C toolchain: these are
+      # self-hosted runners, and a step that downloads a release from a third-party
+      # host is a network dependency on every run.
+      - name: Install protoc (hanzo-onnx build script)
+        run: |
+          if ! command -v protoc >/dev/null; then
+            (sudo apt-get update && sudo apt-get install -y protobuf-compiler) \
+              || (apt-get update && apt-get install -y protobuf-compiler)
+          fi
+          protoc --version
 
       - name: Run normal cpu
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
+        if: matrix.cpu == 'baseline'
         run: cargo check --workspace
 
       - name: Run with avx2
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.cpu == 'avx2'
         run: |
           export RUSTFLAGS="-C target-feature=avx2"
-          cargo check --workspace 
+          cargo check --workspace
 
-      - name: Run with arm neon
-        if: matrix.os == 'ubuntu-24.04-arm'
-        run: |
-          export RUSTFLAGS="-C target-feature=neon"
-          cargo check --workspace 
 
   test:
     name: Test Suite
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
+    # One leg, so the matrix that carried it was only a place to write a label.
+    runs-on: [linux-amd64]
     steps:
+      # Best-effort, and it must stay best-effort: it reclaims space, it does not
+      # gate correctness. As written it FAILED the whole matrix leg —
+      #
+      #   rm: cannot remove '/opt/hostedtoolcache': Device or resource busy
+      #   ❌ Failure - Main Free disk space (Linux)   exitcode '1'
+      #
+      # — and because the shell runs with `-e`, that first rm aborted the step and
+      # every later step was skipped, so checkout never ran and the job reported a
+      # failure that had nothing to do with the code.
+      #
+      # Two things are wrong with the original on a self-hosted runner:
+      #
+      #  - /opt/hostedtoolcache is RUNNER_TOOL_CACHE, a MOUNT inside the act
+      #    container, so removing it is impossible (EBUSY) rather than merely
+      #    unnecessary. Emptying it would be worse than useless: the cache is
+      #    shared with other jobs on the same runner, so this would sabotage them
+      #    to reclaim space we do not need. It is left alone deliberately.
+      #  - The other three paths are GitHub-hosted-image idioms. Our runners are
+      #    not that image, so they simply do not exist here.
+      #
+      # And the premise no longer holds anyway: the runner has ~66G free of 98G.
+      # Kept rather than deleted so the step still does its job on a GitHub-hosted
+      # runner, where those directories are real and space is genuinely tight.
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
+          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc; do
+            [ -e "$d" ] && sudo rm -rf "$d" || true
+          done
           df -h
+        continue-on-error: true
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Remove cargo config (macOS ring crate fix)
-        if: runner.os == 'macOS'
-        run: rm -f .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install lld (Linux only)
+      - name: Install lld and protoc (Linux only)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lld
+        run: |
+          sudo apt-get update && sudo apt-get install -y lld protobuf-compiler
+          protoc --version
+      # `cargo test --workspace` is the heaviest thing this repo does. `check`
+      # passes on the same runner because it stops before codegen; test runs full
+      # LLVM codegen AND a link for every crate in a workspace that includes the
+      # wasm examples, hanzo-3d, tensor-tools and the pyo3 bindings. It was dying
+      # mid-`Compiling tensor-tools` — log ending with no error, no test result
+      # and no cleanup block, which is a killed process, not a failing test.
+      #
+      # Cargo parallelism is ALREADY bounded to 4 by the runner (runner.envs in
+      # universe infra/k8s/git-runner/config.yaml), so the peak is per-rustc, not
+      # a count of them. These two cut what each one costs:
+      #
+      #   debuginfo=line-tables-only  full debug info is one of the largest
+      #     consumers in codegen, and worse at link time — lld holds the debug
+      #     sections in memory. line-tables-only keeps FILE AND LINE NUMBERS in
+      #     panic backtraces, which is the part a CI failure actually needs, and
+      #     drops the variable/type DWARF nobody reads from a log.
+      #   CARGO_INCREMENTAL=0  incremental compilation buys nothing here — every
+      #     run starts from a cold target dir, so it only adds memory and disk.
+      #
+      # Neither changes which tests run or what they assert. If the job still
+      # dies mid-compile after this, the ceiling is genuinely too low for this
+      # workspace and it is a capacity decision, not a flag.
       - name: Run tests (with lld on Linux)
         if: runner.os == 'Linux'
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
-        run: cargo test --workspace
-      - name: Run tests (Windows & macOS)
-        if: runner.os != 'Linux'
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C debuginfo=line-tables-only"
+          CARGO_INCREMENTAL: "0"
         run: cargo test --workspace
 
   fmt:
     name: Rustfmt
-    runs-on: linux-amd64
+    runs-on: [linux-amd64]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -91,17 +166,22 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: linux-amd64
+    runs-on: [linux-amd64]
     steps:
       - uses: actions/checkout@v6
-      - name: Install C toolchain (runner image ships without cc)
+      - name: Install C toolchain and protoc (runner image ships without cc)
         run: |
           if ! command -v cc >/dev/null || ! command -v pkg-config >/dev/null; then
             (sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev) \
               || (apt-get update && apt-get install -y build-essential pkg-config libssl-dev)
           fi
+          if ! command -v protoc >/dev/null; then
+            (sudo apt-get update && sudo apt-get install -y protobuf-compiler) \
+              || (apt-get update && apt-get install -y protobuf-compiler)
+          fi
+          protoc --version
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - run: cargo clippy --workspace --tests --examples --benches -- -D warnings
- 
+

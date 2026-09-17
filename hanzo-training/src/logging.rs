@@ -133,11 +133,15 @@ impl MultiLogger {
             }
         }
 
-        // Add W&B logger (placeholder)
+        // W&B: no client is registered here, so the config is read but not
+        // honored. Report it as configured, never as enabled — matching the LoRA
+        // treatment in bin/train.rs — so it does not claim a run is being logged.
         if let Some(wandb_config) = &config.wandb {
             if wandb_config.enabled {
-                // Placeholder for W&B integration
-                println!("W&B logging enabled for project: {}", wandb_config.project);
+                println!(
+                    "W&B: configured for project {} — NOT APPLIED: no W&B integration is implemented",
+                    wandb_config.project
+                );
             }
         }
 

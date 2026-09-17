@@ -1,5 +1,7 @@
 [package]
 name = "hanzo-train"
+# Not published: an application binary, not a library other crates depend on.
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "Native-Rust training loop for DSpark speculative-draft models (hanzo-ml autograd)."

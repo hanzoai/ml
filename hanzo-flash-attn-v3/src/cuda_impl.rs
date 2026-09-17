@@ -9,12 +9,10 @@
 
 use crate::ffi;
 
-use hanzo_ml::backend::BackendStorage;
-use hanzo_ml::cuda_backend::{
-    cudarc::driver::{DevicePtr, DevicePtrMut},
-};
-use hanzo_ml::{CpuStorage, DType, Layout, Result, Shape, Tensor};
 use half::{bf16, f16};
+use hanzo_ml::backend::BackendStorage;
+use hanzo_ml::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+use hanzo_ml::{CpuStorage, DType, Layout, Result, Shape, Tensor};
 
 fn round_multiple(x: usize, m: usize) -> usize {
     (x + m - 1) / m * m
@@ -95,11 +93,15 @@ impl FlashAttn {
             || head_size_og == 128
             || head_size_og == 64)
         {
-            hanzo_ml::bail!("only supports head dimension 64, 128, 256 and 512 (got {head_size_og})")
+            hanzo_ml::bail!(
+                "only supports head dimension 64, 128, 256 and 512 (got {head_size_og})"
+            )
         }
         if head_size_og % 8 != 0 {
             // TODO: Handle head sizes that are not a multiple of 8 via some padding.
-            hanzo_ml::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+            hanzo_ml::bail!(
+                "only supports head sizes that are a multiple of 8 (got {head_size_og})"
+            )
         }
         if num_heads % num_heads_k != 0 {
             hanzo_ml::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
@@ -523,11 +525,15 @@ impl FlashAttnVarLen {
             || head_size_og == 128
             || head_size_og == 64)
         {
-            hanzo_ml::bail!("only supports head dimension 64, 128, 256 and 512 (got {head_size_og})")
+            hanzo_ml::bail!(
+                "only supports head dimension 64, 128, 256 and 512 (got {head_size_og})"
+            )
         }
         if head_size_og % 8 != 0 {
             // TODO: Handle head sizes that are not a multiple of 8 via some padding.
-            hanzo_ml::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+            hanzo_ml::bail!(
+                "only supports head sizes that are a multiple of 8 (got {head_size_og})"
+            )
         }
         if num_heads % num_heads_k != 0 {
             hanzo_ml::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")

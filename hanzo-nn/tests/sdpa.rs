@@ -34,8 +34,8 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
-                .to_dtype(q.dtype())?;
+            let att =
+                hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
         let sdpa_output = hanzo_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
@@ -65,8 +65,8 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
-                .to_dtype(q.dtype())?;
+            let att =
+                hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
         let sdpa_output = hanzo_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
@@ -172,8 +172,8 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
-                .to_dtype(q.dtype())?;
+            let att =
+                hanzo_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
         let sdpa_output = hanzo_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;

@@ -212,9 +212,11 @@ impl Expr {
             Expr::In(id) => Expr::In(*id),
             Expr::Const(c) => Expr::Const(*c),
             Expr::Un(op, a) => Expr::Un(*op, Box::new(a.compose_cur(inner))),
-            Expr::Bin(op, a, b) => {
-                Expr::Bin(*op, Box::new(a.compose_cur(inner)), Box::new(b.compose_cur(inner)))
-            }
+            Expr::Bin(op, a, b) => Expr::Bin(
+                *op,
+                Box::new(a.compose_cur(inner)),
+                Box::new(b.compose_cur(inner)),
+            ),
         }
     }
 
@@ -328,19 +330,26 @@ impl Chain {
 
     /// Pointwise unary on the stream: `cur = op(cur)`.
     pub fn map_unary(mut self, op: UnOp) -> Chain {
-        self.steps.push(Step::Map(Expr::Un(op, Box::new(Expr::Cur))));
+        self.steps
+            .push(Step::Map(Expr::Un(op, Box::new(Expr::Cur))));
         self
     }
     /// Pointwise binary against side input `id`: `cur = op(cur, in[id])`.
     pub fn map_binary(mut self, op: BinOp, id: usize) -> Chain {
-        self.steps
-            .push(Step::Map(Expr::Bin(op, Box::new(Expr::Cur), Box::new(Expr::In(id)))));
+        self.steps.push(Step::Map(Expr::Bin(
+            op,
+            Box::new(Expr::Cur),
+            Box::new(Expr::In(id)),
+        )));
         self
     }
     /// Pointwise binary against a constant: `cur = op(cur, c)`.
     pub fn map_const(mut self, op: BinOp, c: f32) -> Chain {
-        self.steps
-            .push(Step::Map(Expr::Bin(op, Box::new(Expr::Cur), Box::new(Expr::Const(c)))));
+        self.steps.push(Step::Map(Expr::Bin(
+            op,
+            Box::new(Expr::Cur),
+            Box::new(Expr::Const(c)),
+        )));
         self
     }
     /// An arbitrary pointwise `Expr` over `Cur` + side inputs (the general Map).
@@ -427,9 +436,11 @@ fn eval_expr(e: &Expr, cur: f32, inputs: &[&[f32]], i: usize) -> f32 {
         Expr::In(id) => inputs[*id][i],
         Expr::Const(c) => *c,
         Expr::Un(op, a) => apply_un(*op, eval_expr(a, cur, inputs, i)),
-        Expr::Bin(op, a, b) => {
-            apply_bin(*op, eval_expr(a, cur, inputs, i), eval_expr(b, cur, inputs, i))
-        }
+        Expr::Bin(op, a, b) => apply_bin(
+            *op,
+            eval_expr(a, cur, inputs, i),
+            eval_expr(b, cur, inputs, i),
+        ),
     }
 }
 
@@ -611,7 +622,11 @@ pub struct Fuse<'a> {
 impl<'a> Fuse<'a> {
     /// Start a chain from a primary input array (the stream seed).
     pub fn new(primary: &'a [f32]) -> Self {
-        Fuse { primary, sides: Vec::new(), instrs: Vec::new() }
+        Fuse {
+            primary,
+            sides: Vec::new(),
+            instrs: Vec::new(),
+        }
     }
 
     fn push_bin_in(mut self, op: BinOp, rhs: &'a [f32]) -> Self {
@@ -688,7 +703,10 @@ impl<'a> Fuse<'a> {
 
     /// The compiled fused program (instructions + side-slot count). Pure — no device work.
     pub fn compile(&self) -> Program {
-        Program { instrs: self.instrs.clone(), n_sides: self.sides.len() }
+        Program {
+            instrs: self.instrs.clone(),
+            n_sides: self.sides.len(),
+        }
     }
 
     /// Evaluate the compiled chain on the host — the reference oracle (mirrors the device semantics).
@@ -714,8 +732,11 @@ impl<'a> Fuse<'a> {
         let xh = client.create_from_slice(f32::as_bytes(self.primary));
         let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n]));
 
-        let handles: Vec<_> =
-            self.sides.iter().map(|s| client.create_from_slice(f32::as_bytes(s))).collect();
+        let handles: Vec<_> = self
+            .sides
+            .iter()
+            .map(|s| client.create_from_slice(f32::as_bytes(s)))
+            .collect();
         let mut sides = SequenceArg::new();
         for h in &handles {
             sides.push(unsafe { ArrayArg::from_raw_parts(h.clone(), n) });
@@ -810,7 +831,12 @@ pub fn swiglu_naive2<R: Runtime>(client: &ComputeClient<R>, a: &[f32], b: &[f32]
 
 /// Naive `y = silu(a*b + c)`: THREE kernels, TWO materialized intermediates. Precisely the traffic the
 /// fused path removes.
-pub fn naive3_run<R: Runtime>(client: &ComputeClient<R>, a: &[f32], b: &[f32], c: &[f32]) -> Vec<f32> {
+pub fn naive3_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: &[f32],
+    b: &[f32],
+    c: &[f32],
+) -> Vec<f32> {
     let n = a.len();
     let grid = Grid::Static((n as u32).div_ceil(BLOCK), 1, 1);
     let ah = client.create_from_slice(f32::as_bytes(a));
@@ -996,7 +1022,14 @@ mod tests {
     #[test]
     fn every_unop_matches_its_reference_shape() {
         // apply_un is the single source of truth; sanity-check the non-obvious ones are finite & sane.
-        for &op in &[UnOp::Silu, UnOp::Gelu, UnOp::Sigmoid, UnOp::Rsqrt, UnOp::Exp, UnOp::Tanh] {
+        for &op in &[
+            UnOp::Silu,
+            UnOp::Gelu,
+            UnOp::Sigmoid,
+            UnOp::Rsqrt,
+            UnOp::Exp,
+            UnOp::Tanh,
+        ] {
             for x in [-2.0f32, -0.3, 0.7, 3.0] {
                 let y = apply_un(op, if op == UnOp::Rsqrt { x.abs() + 0.1 } else { x });
                 assert!(y.is_finite(), "{op:?}({x}) not finite: {y}");
@@ -1044,18 +1077,31 @@ mod tests {
         let b = xorshift_vec(n, 0x0fed_cba9_8765_4321);
 
         // (i) fused — the ergonomic builder: silu(a) * b in ONE fused_interp launch.
-        let fused = Fuse::new(&a).silu().mul(&b).run::<cubecl::cpu::CpuRuntime>(&client);
+        let fused = Fuse::new(&a)
+            .silu()
+            .mul(&b)
+            .run::<cubecl::cpu::CpuRuntime>(&client);
         // (ii) naive — silu then mul, TWO kernels, one intermediate.
         let naive = swiglu_naive2::<cubecl::cpu::CpuRuntime>(&client, &a, &b);
         // (iii) plain-Rust reference.
-        let refv: Vec<f32> =
-            a.iter().zip(&b).map(|(&x, &y)| apply_un(UnOp::Silu, x) * y).collect();
+        let refv: Vec<f32> = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| apply_un(UnOp::Silu, x) * y)
+            .collect();
 
-        assert_eq!(bits(&fused), bits(&naive), "fused (1 launch) != naive (2 launches)");
+        assert_eq!(
+            bits(&fused),
+            bits(&naive),
+            "fused (1 launch) != naive (2 launches)"
+        );
         // one comptime program, one launch:
         assert_eq!(Fuse::new(&a).silu().mul(&b).compile().instrs.len(), 2);
-        let maxerr =
-            fused.iter().zip(&refv).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+        let maxerr = fused
+            .iter()
+            .zip(&refv)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("[fuse CPU] SwiGLU tail silu(a)*b: 2 kernels -> 1; bit-exact; max|fused-ref|={maxerr:.2e}");
         assert!(maxerr < 1e-5, "reference disagreement {maxerr}");
     }
@@ -1071,7 +1117,11 @@ mod tests {
         let b = xorshift_vec(n, 0x0123_4567_89ab_cdef);
 
         // (i) fused builder: silu(a*w + b), ONE launch.
-        let fused = Fuse::new(&a).mul(&w).add(&b).silu().run::<cubecl::cpu::CpuRuntime>(&client);
+        let fused = Fuse::new(&a)
+            .mul(&w)
+            .add(&b)
+            .silu()
+            .run::<cubecl::cpu::CpuRuntime>(&client);
         // (ii) naive: a*w, +b, silu — THREE kernels, TWO intermediates.
         let naive = naive3_run::<cubecl::cpu::CpuRuntime>(&client, &a, &w, &b);
         // (iii) reference.
@@ -1080,10 +1130,18 @@ mod tests {
             .collect();
 
         assert_eq!(bits(&fused), bits(&naive), "fused (1) != naive (3)");
-        assert_eq!(Fuse::new(&a).mul(&w).add(&b).silu().compile().instrs.len(), 3);
-        let maxerr =
-            fused.iter().zip(&refv).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
-        eprintln!("[fuse CPU] 3-op silu(a*w+b): 3 kernels -> 1; bit-exact; max|fused-ref|={maxerr:.2e}");
+        assert_eq!(
+            Fuse::new(&a).mul(&w).add(&b).silu().compile().instrs.len(),
+            3
+        );
+        let maxerr = fused
+            .iter()
+            .zip(&refv)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "[fuse CPU] 3-op silu(a*w+b): 3 kernels -> 1; bit-exact; max|fused-ref|={maxerr:.2e}"
+        );
         assert!(maxerr < 1e-5, "reference disagreement {maxerr}");
     }
 
@@ -1114,8 +1172,11 @@ mod tests {
 
         let fused = chain.run::<cubecl::cpu::CpuRuntime>(&client);
         let refv = chain.eval_ref(); // host oracle over the identical program
-        let maxerr =
-            fused.iter().zip(&refv).map(|(g, r)| (g - r).abs()).fold(0.0f32, f32::max);
+        let maxerr = fused
+            .iter()
+            .zip(&refv)
+            .map(|(g, r)| (g - r).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("[fuse CPU] 7-op mixed chain: one launch; max|fused-ref|={maxerr:.2e}");
         assert!(maxerr < 1e-5, "long-chain disagreement {maxerr}");
     }

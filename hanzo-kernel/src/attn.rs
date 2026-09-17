@@ -150,7 +150,7 @@ pub fn sdpa_blk<F: Float>(
     let kv = h / (n_heads / n_kv);
     let qbase = row * d; // q is [b, n_heads, seq_q, d] contiguous
     let kvbase = b_i * kv_batch_stride + kv * kv_head_stride; // k/v read in place at their real strides
-    // Per-thread online-softmax state over this thread's strided key slice.
+                                                              // Per-thread online-softmax state over this thread's strided key slice.
     let mut m = F::new(-3.4e38);
     let mut l = F::new(0.0);
     let mut acc = Array::<F>::new(d);
@@ -443,7 +443,10 @@ mod tests {
     }
 
     fn max_rel(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs() / x.abs().max(1e-6)).fold(0.0, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs() / x.abs().max(1e-6))
+            .fold(0.0, f32::max)
     }
 
     // GQA shape: 4 query heads, 2 kv heads (groups=2), seq 24, head_dim 32.
@@ -471,7 +474,16 @@ mod tests {
     // Runtime-seq variant: seq_q/seq_k travel through the dims buffer, so one kernel serves any KV
     // length. Gated over the real production shape space: decode (seq_q=1 vs growing kv) + prefill (causal).
     #[allow(clippy::too_many_arguments)]
-    fn run_rt<R: Runtime>(c: &ComputeClient<R>, nh: usize, nkv: usize, sq: usize, sk: usize, d: usize, causal: bool, tag: &str) {
+    fn run_rt<R: Runtime>(
+        c: &ComputeClient<R>,
+        nh: usize,
+        nkv: usize,
+        sq: usize,
+        sk: usize,
+        d: usize,
+        causal: bool,
+        tag: &str,
+    ) {
         let q = rnd(nh * sq * d, 0x1234_5678);
         let k = rnd(nkv * sk * d, 0x9ABC_DEF0);
         let v = rnd(nkv * sk * d, 0x0FED_CBA9);

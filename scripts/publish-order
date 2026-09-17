@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Emit the publishable crates of this repo in dependency order, one per line.
+
+The manifests are the only source of truth. A crate is publishable unless it says
+`publish = false`; the order is a topological sort of the dependency edges that
+already exist between the manifests. Nothing here is a list to maintain by hand.
+
+That matters: the publish workflow used to carry a hand-written crate list, and
+hanzo-kernel was missing from it. A crate absent from that list is never pushed to
+the registry, so it silently drifts -- hanzo-kernel reached 0.2.41 in tree against
+0.2.20 on crates.io before anyone noticed. Deriving the list removes the failure.
+
+`cargo metadata` cannot answer this on its own: the kernel crates carry `links=`
+build scripts and so live in the workspace `exclude` list, which makes them
+invisible as workspace members while still being crates we publish.
+
+Edges come from [dependencies], [build-dependencies] and their per-target forms.
+[dev-dependencies] are deliberately excluded: cargo drops path-only dev-deps when
+it packages a crate, so they impose no publish order -- and including them would
+introduce cycles between hanzo-ml and its own downstream crates.
+"""
+
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DEP_TABLES = ("dependencies", "build-dependencies")
+
+
+def dep_names(manifest: dict):
+    """Every package this crate depends on, at build or run time, on any target."""
+    tables = [manifest.get(t, {}) for t in DEP_TABLES]
+    for target in manifest.get("target", {}).values():
+        tables += [target.get(t, {}) for t in DEP_TABLES]
+    for table in tables:
+        for key, spec in table.items():
+            # `rocm-rs = { package = "hanzo-rocm" }` -- the real name is the value.
+            yield spec.get("package", key) if isinstance(spec, dict) else key
+
+
+def main() -> int:
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "*Cargo.toml"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout.split("\0")
+
+    version, deps = {}, {}
+    for rel in filter(None, listed):
+        manifest = tomllib.loads((ROOT / rel).read_text())
+        package = manifest.get("package")
+        if not package or package.get("publish") is False:
+            continue
+        name = package["name"]
+        version[name] = Path(rel).parent.as_posix()
+        deps[name] = set(dep_names(manifest))
+
+    # Only edges inside the publishable set can constrain the order.
+    deps = {n: d & deps.keys() for n, d in deps.items()}
+
+    published, order = set(), []
+    while len(published) < len(deps):
+        ready = sorted(n for n, d in deps.items() if n not in published and d <= published)
+        if not ready:
+            stuck = sorted(deps.keys() - published)
+            print(f"error: dependency cycle among {stuck}", file=sys.stderr)
+            return 1
+        order += ready
+        published |= set(ready)
+
+    print("\n".join(version[n] for n in order))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

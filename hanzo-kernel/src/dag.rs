@@ -469,8 +469,8 @@ impl Dag {
     /// its local slot; `leaf_of_src` deduplicates live-in leaves so a source is read at most once.
     fn build_map_region(&self, region_id: usize, region_of_node: &[usize]) -> Region {
         let n = self.nodes.len();
-        let members = (0..n)
-            .filter(|&id| self.nodes[id].class().is_map() && region_of_node[id] == region_id);
+        let members =
+            (0..n).filter(|&id| self.nodes[id].class().is_map() && region_of_node[id] == region_id);
 
         let mut local: Vec<Node> = Vec::new();
         let mut live_in: Vec<ValueSrc> = Vec::new();
@@ -1271,7 +1271,11 @@ mod tests {
             }
         }
 
-        assert_eq!(bits(&fused.out), bits(&naive.out), "fused != naive (bit level)");
+        assert_eq!(
+            bits(&fused.out),
+            bits(&naive.out),
+            "fused != naive (bit level)"
+        );
         let maxerr = fused
             .out
             .iter()
@@ -1282,7 +1286,10 @@ mod tests {
             "[dag CPU] RmsNormGated rms_norm(x)*w*silu(g) (real engine gdn.rs chain): fused {} vs naive {} launches; bit-exact; max|fused-ref|={maxerr:.2e}",
             fused.launches, naive.launches
         );
-        assert!(fused.launches < naive.launches, "fusion must cut the per-layer launch count");
+        assert!(
+            fused.launches < naive.launches,
+            "fusion must cut the per-layer launch count"
+        );
         assert!(maxerr < 1e-5, "reference disagreement {maxerr}");
     }
 }

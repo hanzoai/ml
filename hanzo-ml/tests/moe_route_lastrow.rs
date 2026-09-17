@@ -86,11 +86,8 @@ fn moe_route_is_per_token_not_last_row() {
 
         // 1) Every token matches its OWN per-token top-k.
         for t in 0..ntok {
-            let want = per_token_topk_ids(
-                &logits[t * n_experts..(t + 1) * n_experts],
-                n_experts,
-                topk,
-            );
+            let want =
+                per_token_topk_ids(&logits[t * n_experts..(t + 1) * n_experts], n_experts, topk);
             let slice = &got[t * topk..(t + 1) * topk];
             assert_eq!(slice, &want[..], "token {t} routed wrong (ntok={ntok})");
         }
@@ -122,6 +119,10 @@ fn moe_route_near_tie_is_deterministic() {
     logits[4] = 1.0 - 1e-4;
     for _ in 0..16 {
         let got = route_ids(&logits, ntok, n_experts, topk);
-        assert_eq!(got, vec![3u32, 4u32], "near-tie routing must be deterministic");
+        assert_eq!(
+            got,
+            vec![3u32, 4u32],
+            "near-tie routing must be deterministic"
+        );
     }
 }

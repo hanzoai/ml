@@ -1,12 +1,14 @@
 [package]
 name = "hanzo-ml-wasm-example-yolo"
+# Not published: browser demo programs, built and tested in-tree only.
+publish = false
 version = "0.11.8"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
-license = "BSD-3-Clause OR Apache-2.0"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 hanzo-ml = { workspace = true }
