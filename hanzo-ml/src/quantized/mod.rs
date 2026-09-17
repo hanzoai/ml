@@ -251,6 +251,8 @@ impl QStorage {
                 GgmlDType::TQ2_0 => cuda::load_quantized(d, as_t_slice::<BlockTQ2_0>(&data)),
                 GgmlDType::NVFP4 => cuda::load_quantized(d, as_t_slice::<BlockNVFP4>(&data)),
                 GgmlDType::Q1_0 => cuda::load_quantized(d, as_t_slice::<BlockQ1_0>(&data)),
+                GgmlDType::ROCMFP4 => cuda::load_quantized(d, as_t_slice::<BlockROCMFP4>(&data)),
+                GgmlDType::ROCMFP4_FAST => cuda::load_quantized(d, as_t_slice::<BlockROCMFP4Fast>(&data)),
             },
             #[cfg(feature = "rocm")]
             Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(Cow::Borrowed(data)), d.clone())),
@@ -536,6 +538,11 @@ pub enum GgmlDType {
     TQ2_0,
     NVFP4,
     Q1_0,
+    // ROCmFPX fork types: 4-bit, 32 elems/block, UE4M3 half-scales (100 dual, 101 fast).
+    #[allow(non_camel_case_types)]
+    ROCMFP4,
+    #[allow(non_camel_case_types)]
+    ROCMFP4_FAST,
 }
 
 // --- Single-source-of-truth wiring (Cut 2) -----------------------------------------
@@ -700,6 +707,7 @@ impl GgmlDType {
             Self::MXFP4 => k_quants::QK_MXFP4,
             Self::Q1_0 => iq_quants::QK1_0,
             Self::NVFP4 => iq_quants::QK_NVFP4,
+            Self::ROCMFP4 | Self::ROCMFP4_FAST => iq_quants::QK_ROCMFP4,
             Self::Q2K
             | Self::Q3K
             | Self::Q4K

@@ -232,6 +232,12 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q1_0 => {
             from_raw_data::<iq_quants::BlockQ1_0>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::ROCMFP4 => {
+            from_raw_data::<iq_quants::BlockROCMFP4>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::ROCMFP4_FAST => {
+            from_raw_data::<iq_quants::BlockROCMFP4Fast>(raw_data, size_in_bytes, dims, device)
+        }
         // Raw int32 side-tables (DeepSeek-V4 `ffn_gate_tid2eid`): block size 1, i32->f32 cast.
         GgmlDType::I32 => from_raw_data::<i32>(raw_data, size_in_bytes, dims, device),
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
