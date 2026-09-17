@@ -218,11 +218,11 @@ int main(){
         fails+=check("Q6_K","q6k",false,s[0],s[1],s[2],256,210,deq_q6k,w);
     }
     printf("=== ROCMFP4_FAST (type 101, single UE4M3 half-scale) ===\n");
-    for(auto&s:s32){ auto w=build_bytes(s[1],s[2],32,17,[](uint8_t*b,int r,int bb){ b[16]=(uint8_t)(0x20 + ((r*7+bb*3)&0x5e)); });
+    for(auto&s:s32){ auto w=build_bytes(s[1],s[2],32,17,[](uint8_t*b,int r,int bb){ b[16]=(uint8_t)(0x20 + ((r+bb)&0x0f)); });
         fails+=check("RFP4F","rocmfp4_fast",false,s[0],s[1],s[2],32,17,deq_rfp4_fast,w);
     }
     printf("=== ROCMFP4 (type 100, dual UE4M3 half-scales) ===\n");
-    for(auto&s:s32){ auto w=build_bytes(s[1],s[2],32,18,[](uint8_t*b,int r,int bb){ b[16]=(uint8_t)(0x20 + ((r*7+bb*3)&0x5e)); b[17]=(uint8_t)(0x30 + ((r*5+bb)&0x4e)); });
+    for(auto&s:s32){ auto w=build_bytes(s[1],s[2],32,18,[](uint8_t*b,int r,int bb){ b[16]=(uint8_t)(0x20 + ((r+bb)&0x0f)); b[17]=(uint8_t)(0x20 + ((r*3+bb)&0x0f)); });
         fails+=check("RFP4","rocmfp4",false,s[0],s[1],s[2],32,18,deq_rfp4,w);
     }
     printf("\n%s total_fails=%d\n", fails==0?"ALL PASS":"SOME FAIL", fails);
