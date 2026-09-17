@@ -4,17 +4,6 @@ use crate::{DType, MetalDevice, MetalStorage, Result, Shape, D};
 use hanzo_metal_kernels::metal::Buffer;
 use std::sync::{Arc, OnceLock};
 
-/// Opt-in fp16-matmul prefill (`HANZO_METAL_MM_F16`). When set, a bf16-native K-quant prefill GEMM
-/// stages its activation tile as half so the outer product runs at the GPU's half-precision simdgroup
-/// rate (~2x the f32-tile rate). The weight tile is half either way and the bf16 activation widens to
-/// half exactly, so this changes the matmul rate, not the operand values -- but the half products
-/// round differently from f32, so it is not bit-exact. Off by default: the bit-exact f32-tile bf16
-/// kernel stays the shipped path; this only lifts prefill throughput for callers that opt in.
-fn metal_mm_f16_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HANZO_METAL_MM_F16").is_some())
-}
-
 /// Largest batch (`m`) routed to the batched matvec instead of the prefill GEMM in `fwd`. Below this
 /// the matvec wins (weights stream once, reused across the m columns in cache); above it the GEMM's
 /// tile-fill weight-reuse wins. MEASURED matvec/GEMM crossover on the K-quant decode weights (dbc M4
@@ -396,16 +385,13 @@ impl QMetalStorage {
         // bf16-native prefill: a bf16 activation against a K-quant with a bf16 mm (Q4_K/Q6_K) reads
         // src1 and writes dst in bf16 directly, so the bf16<->f32 round-trip GgufMatMul wraps around
         // the projection disappears -- the multi-token twin of the bf16 decode matvec in `fwd_mv`.
-        // By default the simdgroup math is identical to the f32 mm (src1 is widened to f32 on stage);
-        // only the I/O dtype changes, so f32 models and unsupported quants are unaffected. When
-        // `HANZO_METAL_MM_F16` is set, `src1_half` selects the fp16-matmul variant instead: the
-        // activation tile is staged as half so the outer product runs at the GPU's half rate (~2x).
+        // Only the I/O dtype changes; the tile math is the same either way, so f32 models and
+        // unsupported quants are unaffected.
         let src1_bf16 = storage.dtype() == DType::BF16
             && matches!(
                 kdtype,
                 hanzo_metal_kernels::GgmlDType::Q4K | hanzo_metal_kernels::GgmlDType::Q6K
             );
-        let src1_half = src1_bf16 && metal_mm_f16_enabled();
         let out_dtype = if src1_bf16 { DType::BF16 } else { DType::F32 };
         let dst = device.new_buffer(dst_shape.elem_count(), out_dtype, "qmatmul")?;
         let encoder = device.command_encoder()?;
@@ -456,7 +442,6 @@ impl QMetalStorage {
             0,
             &dst,
             src1_bf16,
-            src1_half,
         )
         .map_err(MetalError::from)?;
 
@@ -541,7 +526,6 @@ impl QMetalStorage {
                 &[1, 1, m, n],
                 0,
                 &dst,
-                false,
                 false,
             )
             .map_err(MetalError::from)?;

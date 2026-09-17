@@ -7199,21 +7199,18 @@ static inline void mm_store_result(
 }
 
 // each block_q contains 16*nl weights
-// SRC1/DST default to float so every existing `kernel_mul_mm_*_f32` instantiation is unchanged. The
-// bf16-native prefill instantiations set SRC1=DST=bfloat: src1 is read as bfloat and widened to f32
-// on stage (so the simdgroup math is identical to the f32 path), and the f32 accumulator is narrowed
-// to bfloat on store -- removing the bf16<->f32 activation round-trip GgufMatMul otherwise wraps
-// around the projection, and halving the src1 read + dst write traffic.
+// SRC1/DST select the device dtype of the activation and the result. They default to float; the
+// bf16-native prefill instantiations set SRC1=DST=bfloat, so src1 is read and dst written as bfloat
+// directly -- removing the bf16<->f32 round-trip GgufMatMul otherwise wraps around the projection,
+// and halving the src1 read + dst write traffic.
 //
-// B / simdgroup_B8x8 set the activation tile precision. They default to float (the bit-exact path:
-// the activation is widened to f32 and the outer product runs the weight tile at f32 rate). Setting
-// B=half (simdgroup_B8x8=simdgroup_half8x8) stages the activation tile as half so the outer product
-// is half x half -> f32 accumulate, which runs at the GPU's half-precision simdgroup rate (~2x). The
-// weight tile is half in both cases, and a bf16 activation widens to half exactly (bf16 mantissa fits
-// in half's), so the half tile changes the matmul rate, not the operand values -- the f32 accumulator
-// is unchanged. This is not bit-exact to the f32 tile (half products round differently), so it is a
-// caller-selected fast path.
-template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &), typename SRC1 = float, typename DST = float, typename B = float, typename simdgroup_B8x8 = simdgroup_float8x8>
+// Both tiles are half, and the accumulator is f32: the outer product is half x half -> f32, the rate
+// the Apple GPU's simdgroup matrix runs at (a float tile costs the wider threadgroup read and the
+// slower product for no extra accuracy -- the weight tile is half regardless, since it is a
+// dequantized K-quant). An f32 activation narrows on stage; a bf16 one widens exactly (8 mantissa
+// bits fit in half's 10), so only the exponent range bounds it, the same bound ggml has always
+// staged its Metal activations under.
+template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &), typename SRC1 = float, typename DST = float>
 kernel void kernel_mul_mm(device const  uchar * src0,
                           device const  uchar * src1,
                           device        DST   * dst,
@@ -7237,7 +7234,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
                           uint                  sgitg[[simdgroup_index_in_threadgroup]]) {
 
     threadgroup T     * sa = (threadgroup T     *)(shared_memory);
-    threadgroup B     * sb = (threadgroup B     *)(shared_memory + 4096);
+    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);
 
     const uint r0 = tgpig.y;
     const uint r1 = tgpig.x;
@@ -7252,7 +7249,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
     short thread_col = ((short)tiitg/THREAD_PER_COL) < n_cols ? ((short)tiitg/THREAD_PER_COL) : n_cols - 1;
 
     simdgroup_T8x8     ma[4];
-    simdgroup_B8x8     mb[2];
+    simdgroup_half8x8  mb[2];
     simdgroup_float8x8 mc[8];
 
     for (short i = 0; i < 8; i++){
@@ -7287,7 +7284,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
             +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
         }
 
-        *(threadgroup matrix<B, 2, 4> *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = matrix<B, 2, 4>(*((device matrix<SRC1, 2, 4> *) y));
+        *(threadgroup half2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = half2x4(*((device matrix<SRC1, 2, 4> *) y));
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + (2+nl-1)/nl : x;
@@ -7297,7 +7294,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
 
         // load matrices from threadgroup memory and conduct outer products
         threadgroup T     * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
-        threadgroup B     * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+        threadgroup half  * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
 
         #pragma unroll(4)
         for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
@@ -7596,14 +7593,6 @@ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_
 template [[host_name("kernel_mul_mm_q4_K_bf16")]]   kernel mat_mm_bf16_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, bfloat, bfloat>;
 template [[host_name("kernel_mul_mm_q6_K_bf16")]]   kernel mat_mm_bf16_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, bfloat, bfloat>;
 
-// fp16-matmul prefill: as _bf16 above, but the activation tile is staged as half so the outer product
-// runs at the GPU's half-precision simdgroup rate (~2x the f32-tile rate). Weights (ma) are half in
-// both, and the bf16 activation widens to half exactly, so the operand values match the _bf16 path;
-// only the matmul tile precision differs (half products round differently from f32). bf16 device
-// read/write is kept. Opt-in fast path (not bit-exact) -- the caller selects it; _bf16 stays default.
-typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, bfloat, bfloat, half, simdgroup_half8x8>) mat_mm_bf16_half_t;
-template [[host_name("kernel_mul_mm_q4_K_bf16_half")]] kernel mat_mm_bf16_half_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, bfloat, bfloat, half, simdgroup_half8x8>;
-template [[host_name("kernel_mul_mm_q6_K_bf16_half")]] kernel mat_mm_bf16_half_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, bfloat, bfloat, half, simdgroup_half8x8>;
 #endif
 
 //
