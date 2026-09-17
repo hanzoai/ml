@@ -40,17 +40,23 @@ concurrency:
 jobs:
   publish:
     runs-on: [linux-amd64]
-    # The one linux-amd64 runner shares a DRAM-less QLC drive with a production node. A
-    # workspace check writes gigabytes through that drive's journal at a few MB/s, which is
-    # enough to starve the kubelet and take the node NotReady. The build tree lives in tmpfs
-    # instead. tmpfs is RAM the node's other tenants need, so it is swept on the way in — a
-    # killed run never reaches its last step — and released on the way out.
-    env:
-      CARGO_TARGET_DIR: /dev/shm/hanzo-ml-publish-${{ github.run_id }}
     steps:
-      - name: Sweep build trees a killed run left in tmpfs
-        # Safe: the concurrency group above admits one publish run at a time.
-        run: rm -rf /dev/shm/hanzo-ml-publish-*
+      - name: Put the build tree in tmpfs when it fits
+        # Every linux-amd64 runner, host or pod, sits on the same DRAM-less QLC drive as a
+        # production node. A workspace check writes gigabytes through that drive's journal at
+        # a few MB/s, enough to starve the kubelet and take the node NotReady, so the tree
+        # goes to tmpfs — where tmpfs has room for it. tmpfs is RAM the node's other tenants
+        # need: stale trees are swept first (a killed run never reaches its last step; the
+        # concurrency group admits one publish run at a time, so nothing live is swept) and
+        # this run's tree is released at the end.
+        run: |
+          rm -rf /dev/shm/hanzo-ml-publish-*
+          free_kb=$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}')
+          if [ "${free_kb:-0}" -ge $((6 * 1024 * 1024)) ]; then
+            echo "CARGO_TARGET_DIR=/dev/shm/hanzo-ml-publish-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+          else
+            echo "::notice::/dev/shm has ${free_kb:-0} KB free; building on the runner's disk"
+          fi
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
@@ -66,6 +72,25 @@ jobs:
             -o "$HOME/.local/bin/jq"
           chmod +x "$HOME/.local/bin/jq"
 
+      - name: Provision protoc
+        # hanzo-onnx's build script needs protoc. The pod runners ship none and cannot sudo
+        # (their filesystem is nosuid), so apt-get is no way to get one; an official release
+        # unpacked under $HOME is, on any runner. A runner that already has protoc keeps it.
+        run: |
+          set -euo pipefail
+          command -v protoc >/dev/null 2>&1 && exit 0
+          case "$(uname -m)" in
+            x86_64) arch=x86_64 ;;
+            aarch64) arch=aarch_64 ;;
+            *) echo "::error::no protoc release for $(uname -m)"; exit 1 ;;
+          esac
+          version=28.3
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${version}/protoc-${version}-linux-${arch}.zip" \
+            -o "$RUNNER_TEMP/protoc.zip"
+          mkdir -p "$HOME/.local"
+          unzip -qo "$RUNNER_TEMP/protoc.zip" 'bin/protoc' 'include/*' -d "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/protoc" --version
       # Build gate, on every push, not only a releasing one. Covers the 15
       # true workspace members with the exact command + provisioning
       # hanzo.yml's own CI already runs green (protoc for hanzo-onnx's build
@@ -76,9 +101,13 @@ jobs:
       # --no-verify instead of a check no CPU runner could pass.
       - name: cargo check --workspace
         run: |
-          set -e
-          command -v protoc >/dev/null || { sudo apt-get update && sudo apt-get install -y protobuf-compiler; }
-          command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev; }
+          set -euo pipefail
+          # A missing tool is refused here rather than installed: the pod runners cannot sudo,
+          # and inside `A || { B && C; }` a failing B is exempt from errexit, so the old
+          # installers failed silently and the check died minutes later on an unrelated line.
+          for tool in protoc cc pkg-config; do
+            command -v "$tool" >/dev/null || { echo "::error::this runner has no $tool"; exit 1; }
+          done
           cargo check --workspace
 
       - name: Derive the publish order
@@ -187,4 +216,5 @@ jobs:
 
       - name: Release the build tree
         if: always()
-        run: rm -rf "$CARGO_TARGET_DIR"
+        run: |
+          if [ -n "${CARGO_TARGET_DIR:-}" ]; then rm -rf "$CARGO_TARGET_DIR"; fi
