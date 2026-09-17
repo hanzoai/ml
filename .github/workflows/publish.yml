@@ -40,7 +40,17 @@ concurrency:
 jobs:
   publish:
     runs-on: [linux-amd64]
+    # The one linux-amd64 runner shares a DRAM-less QLC drive with a production node. A
+    # workspace check writes gigabytes through that drive's journal at a few MB/s, which is
+    # enough to starve the kubelet and take the node NotReady. The build tree lives in tmpfs
+    # instead. tmpfs is RAM the node's other tenants need, so it is swept on the way in — a
+    # killed run never reaches its last step — and released on the way out.
+    env:
+      CARGO_TARGET_DIR: /dev/shm/hanzo-ml-publish-${{ github.run_id }}
     steps:
+      - name: Sweep build trees a killed run left in tmpfs
+        # Safe: the concurrency group above admits one publish run at a time.
+        run: rm -rf /dev/shm/hanzo-ml-publish-*
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
@@ -174,3 +184,7 @@ jobs:
             echo "::endgroup::"
           done <<< "${{ steps.order.outputs.dirs }}"
           exit "$fail"
+
+      - name: Release the build tree
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"
