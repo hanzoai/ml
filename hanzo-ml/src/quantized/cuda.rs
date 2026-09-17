@@ -1058,6 +1058,12 @@ impl QCudaStorage {
             GgmlDType::Q1_0 => {
                 deq::<crate::quantized::iq_quants::BlockQ1_0>(&buffer, block_len, &mut out)
             }
+            GgmlDType::ROCMFP4 => {
+                deq::<crate::quantized::iq_quants::BlockROCMFP4>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::ROCMFP4_FAST => {
+                deq::<crate::quantized::iq_quants::BlockROCMFP4Fast>(&buffer, block_len, &mut out)
+            }
         }
 
         self.device
