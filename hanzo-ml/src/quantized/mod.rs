@@ -536,7 +536,9 @@ use crate::for_each_quant;
 
 macro_rules! gen_from_u32 {
     ($($v:ident => $b:ident @ $id:literal),+ $(,)?) => {
-        pub(crate) fn from_u32(u: u32) -> Result<Self> {
+        /// Dtype for a GGML type id. Paired with `to_u32`; both generate from the
+        /// `for_each_quant!` table so callers never carry their own id map.
+        pub fn from_u32(u: u32) -> Result<Self> {
             let dtype = match u {
                 0 => Self::F32,
                 1 => Self::F16,
