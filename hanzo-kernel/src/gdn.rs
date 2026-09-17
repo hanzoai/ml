@@ -36,7 +36,7 @@ use crate::prelude::*;
 /// `x`, `out`: `[batch, conv_dim, seq_len]` row-major; `w`: `[conv_dim, k]`. `conv_dim`/`seq_len` are
 /// RUNTIME (`dims`), so one compiled kernel serves every model's conv width and any prompt length;
 /// only `k` (the kernel size, model-fixed at 4) is comptime so the tap loop unrolls.
-#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu, rocm), unchecked)]
 pub fn gdn_conv1d<F: Float>(
     x: &Array<F>,
     w: &Array<F>,
@@ -76,7 +76,7 @@ pub fn gdn_conv1d<F: Float>(
 /// `a_log` here is the RAW `A_log` (the shader convention). The GGUF `ssm_a` instead stores the
 /// precomputed `-exp(A_log)`; a caller holding that passes it as `a_log` with the sign folded, i.e.
 /// use `gdn_gating_ref`'s `neg_exp_a_log=true` path -- one op, both conventions, no second kernel.
-#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu, rocm), unchecked)]
 pub fn gdn_gating<F: Float>(
     b_in: &Array<F>,
     a_in: &Array<F>,
@@ -117,7 +117,7 @@ pub fn gdn_gating<F: Float>(
 /// Metal fused kernels expect) -- the scale is a projection-pipeline concern, kept out of the kernel.
 /// `bh`/`seq` are runtime (`dims`); `k_dim`/`v_dim` are comptime (per-head, model-fixed) so the state
 /// array sizes and the inner reductions lower cleanly.
-#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu, rocm), unchecked)]
 pub fn gdn_scan<F: Float>(
     q: &Array<F>,
     k: &Array<F>,

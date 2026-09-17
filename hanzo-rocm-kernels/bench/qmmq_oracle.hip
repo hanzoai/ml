@@ -17,7 +17,7 @@
 // HIP module API -- exactly how the Rust rocm_backend loads them. This sidesteps the host-stub gen for
 // the arch-gated WMMA kernels and tests the real shipped binary path.
 static hipModule_t g_mod;
-static hipFunction_t g_q8, g_q4k, g_q6k, g_qq8, g_qq81;
+static hipFunction_t g_q8, g_q4k, g_q6k, g_qq8, g_qq81, g_r4, g_r4f;
 
 #define HC(call) do { hipError_t e=(call); if(e!=hipSuccess){ \
   printf("HIP error %s at %s:%d\n", hipGetErrorString(e), __FILE__, __LINE__); std::exit(1);} } while(0)
@@ -80,6 +80,27 @@ static void deq_q6k(const uint8_t* b,float* o){
     }
 }
 
+// ROCMFP4 Codebook10 (kvalues_rocmfp4; E2M1-derived, max level retuned 12 -> 10).
+static const int8_t KVAL10[16] = {0,1,2,3,4,6,8,10, 0,-1,-2,-3,-4,-6,-8,-10};
+// UE4M3 byte halved, invalid bytes (0x7f..0xff) decode to zero -- matches ue4m3_to_fp32_half in
+// quant.hip and rocmfp4_half_to_f32 in iq_quants.rs.
+static float ue4m3_half_host(uint8_t x){
+    if(x > 0x7e) return 0.0f;
+    int e = x >> 3, m = x & 7;
+    float r = (e == 0) ? (float)m * 0.001953125f : (1.0f + (float)m * 0.125f) * ldexpf(1.0f, e - 7);
+    return r * 0.5f;
+}
+// type 101: qs[16] then ONE scale at byte 16 covering both halves.
+static void deq_rfp4_fast(const uint8_t* b, float* o){
+    float d = ue4m3_half_host(b[16]);
+    for(int j=0;j<16;j++){ o[j] = (float)KVAL10[b[j]&0xF]*d; o[j+16] = (float)KVAL10[b[j]>>4]*d; }
+}
+// type 100: qs[16] then TWO scales (bytes 16, 17) -- low nibble by e[0], high by e[1].
+static void deq_rfp4(const uint8_t* b, float* o){
+    float d0 = ue4m3_half_host(b[16]), d1 = ue4m3_half_host(b[17]);
+    for(int j=0;j<16;j++){ o[j] = (float)KVAL10[b[j]&0xF]*d0; o[j+16] = (float)KVAL10[b[j]>>4]*d1; }
+}
+
 // Per-32-block int8 requantization of one activation row (kernel's quantize_q8 reconstructed to f32).
 static void requant_row(const float* x,float* out,int k){
     for(int o=0;o<k;o+=32){ float amax=0; for(int j=0;j<32;j++) amax=std::max(amax,std::fabs(x[o+j]));
@@ -118,7 +139,7 @@ static int check(const char* name,const char* kern,bool asym,int m,int n,int k,i
     // launch the prefill GEMM via the module API (the real shipped code object).
     int ncol=(n+127)/128, nrow=(m+127)/128;
     unsigned gx=ncol*nrow;
-    hipFunction_t gf = !strcmp(kern,"q4k")?g_q4k : !strcmp(kern,"q6k")?g_q6k : g_q8;
+    hipFunction_t gf = !strcmp(kern,"q4k")?g_q4k : !strcmp(kern,"q6k")?g_q6k : !strcmp(kern,"rocmfp4")?g_r4 : !strcmp(kern,"rocmfp4_fast")?g_r4f : g_q8;
     {
         void* args[]={&m,&n,&k,&ncol,&d_xq,&d_xd,&d_wq,&d_y,&d_xs};
         HC(hipModuleLaunchKernel(gf,gx,1,1,512,1,1,0,0,args,nullptr));
@@ -176,6 +197,8 @@ int main(){
     HC(hipModuleGetFunction(&g_q8  ,g_mod,"qmmq_q8_0_f16"));
     HC(hipModuleGetFunction(&g_q4k ,g_mod,"qmmq_q4k_f16"));
     HC(hipModuleGetFunction(&g_q6k ,g_mod,"qmmq_q6k_f16"));
+    HC(hipModuleGetFunction(&g_r4  ,g_mod,"qmmq_rocmfp4_f16"));
+    HC(hipModuleGetFunction(&g_r4f ,g_mod,"qmmq_rocmfp4_fast_f16"));
     int fails=0;
     int s256[][3]={{200,160,256},{130,130,512},{64,256,1024},{37,320,768},{512,4096,4096}};
     int s32[][3]={{200,160,128},{130,130,256},{256,512,1024},{64,256,4096}};
@@ -193,6 +216,14 @@ int main(){
     printf("=== Q6_K (sym, per-16 signed scales) ===\n");
     for(auto&s:s256){ auto w=build_bytes(s[1],s[2],256,210,[](uint8_t*b,int r,int bb){put_d(b,208,r,bb,0.0078125f,0.00390625f,5);});
         fails+=check("Q6_K","q6k",false,s[0],s[1],s[2],256,210,deq_q6k,w);
+    }
+    printf("=== ROCMFP4_FAST (type 101, single UE4M3 half-scale) ===\n");
+    for(auto&s:s32){ auto w=build_bytes(s[1],s[2],32,17,[](uint8_t*b,int r,int bb){ b[16]=(uint8_t)(0x20 + ((r+bb)&0x0f)); });
+        fails+=check("RFP4F","rocmfp4_fast",false,s[0],s[1],s[2],32,17,deq_rfp4_fast,w);
+    }
+    printf("=== ROCMFP4 (type 100, dual UE4M3 half-scales) ===\n");
+    for(auto&s:s32){ auto w=build_bytes(s[1],s[2],32,18,[](uint8_t*b,int r,int bb){ b[16]=(uint8_t)(0x20 + ((r+bb)&0x0f)); b[17]=(uint8_t)(0x20 + ((r*3+bb)&0x0f)); });
+        fails+=check("RFP4","rocmfp4",false,s[0],s[1],s[2],32,18,deq_rfp4,w);
     }
     printf("\n%s total_fails=%d\n", fails==0?"ALL PASS":"SOME FAIL", fails);
     return fails==0?0:1;

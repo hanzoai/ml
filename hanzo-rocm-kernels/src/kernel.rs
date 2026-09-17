@@ -221,6 +221,13 @@ impl DType {
     }
 }
 
+/// GDN fused scan kernel source
+pub struct GdnKernel;
+impl KernelSource for GdnKernel {
+    const NAME: &'static str = "gdn";
+    const CODE: &'static str = include_str!("kernels/gdn.hip");
+}
+
 /// Get the dtype suffix for kernel function naming
 pub fn dtype_suffix<T: Copy + Send + Sync + 'static>() -> &'static str {
     let type_name = std::any::type_name::<T>();
