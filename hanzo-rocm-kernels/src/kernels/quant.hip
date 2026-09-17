@@ -2844,6 +2844,51 @@ __device__ __forceinline__ void qmatvec_core(
     }
 }
 
+// Dequantize a whole weight to dense on the device, by the SAME per-type decode the matvec runs.
+// `partial(blk, x, L)` is a dot over lane L's positions { e*32 + L } of one block, so a one-hot x
+// reads out one weight, exactly as the matvec would weigh it. One thread per (block, lane) writes
+// that lane's ELEMS/32 weights. A multi-row forward of a type with no native GEMM multiplies by
+// this, so the weight never visits the host.
+template <int WTYPE, typename OT>
+__device__ __forceinline__ void qdequant_core(
+    const int nblocks,
+    const uint8_t* __restrict__ wq,
+    OT* __restrict__ out
+) {
+    constexpr int WBYTES = qdw_traits<WTYPE>::BYTES;
+    constexpr int ELEMS  = qdw_traits<WTYPE>::ELEMS;
+    const size_t tid = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    const size_t b = tid >> 5;
+    const int lane = (int)(tid & 31);
+    if (b >= (size_t)nblocks) {
+        return;
+    }
+    const uint8_t* blk = wq + b * WBYTES;
+    float probe[ELEMS];
+    for (int i = 0; i < ELEMS; ++i) {
+        probe[i] = 0.0f;
+    }
+    for (int p = lane; p < ELEMS; p += 32) {
+        probe[p] = 1.0f;
+        qstore(&out[b * ELEMS + p], qdec<WTYPE>::template partial<float>(blk, probe, lane));
+        probe[p] = 0.0f;
+    }
+}
+
+#define DEFINE_QDEQUANT(NAME, WTYPE)                                                                 \
+    extern "C" __global__ void qdequant_##NAME##_f16(                                                \
+        const int nblocks, const uint8_t* __restrict__ wq, __half* __restrict__ out) {               \
+        qdequant_core<WTYPE, __half>(nblocks, wq, out);                                               \
+    }                                                                                                \
+    extern "C" __global__ void qdequant_##NAME##_bf16(                                               \
+        const int nblocks, const uint8_t* __restrict__ wq, hip_bfloat16* __restrict__ out) {         \
+        qdequant_core<WTYPE, hip_bfloat16>(nblocks, wq, out);                                         \
+    }                                                                                                \
+    extern "C" __global__ void qdequant_##NAME##_f32(                                                \
+        const int nblocks, const uint8_t* __restrict__ wq, float* __restrict__ out) {                \
+        qdequant_core<WTYPE, float>(nblocks, wq, out);                                                \
+    }
+
 // Unified per-type entry points (f16 + bf16). These REPLACE the per-quant launcher dispatch: the
 // Rust side selects the symbol by GgmlDType, every symbol is the SAME core with a different WTYPE.
 #define DEFINE_QMATVECU(NAME, WTYPE)                                                                 \
@@ -2883,6 +2928,35 @@ DEFINE_QMATVECU(iq1_m, DW_IQ1_M)
 DEFINE_QMATVECU(mxfp4,  DW_MXFP4)
 DEFINE_QMATVECU(rocmfp4,      DW_ROCMFP4)
 DEFINE_QMATVECU(rocmfp4_fast, DW_ROCMFP4_FAST)
+
+
+DEFINE_QDEQUANT(q8_0, DW_Q8_0)
+DEFINE_QDEQUANT(q4_0, DW_Q4_0)
+DEFINE_QDEQUANT(q4k, DW_Q4_K)
+DEFINE_QDEQUANT(q6k, DW_Q6_K)
+DEFINE_QDEQUANT(iq4xs, DW_IQ4_XS)
+DEFINE_QDEQUANT(tq2_0, DW_TQ2_0)
+DEFINE_QDEQUANT(q2k, DW_Q2_K)
+DEFINE_QDEQUANT(q3k, DW_Q3_K)
+DEFINE_QDEQUANT(q5k, DW_Q5_K)
+DEFINE_QDEQUANT(q4_1, DW_Q4_1)
+DEFINE_QDEQUANT(q5_0, DW_Q5_0)
+DEFINE_QDEQUANT(q5_1, DW_Q5_1)
+DEFINE_QDEQUANT(q8_1, DW_Q8_1)
+DEFINE_QDEQUANT(iq2xxs, DW_IQ2_XXS)
+DEFINE_QDEQUANT(iq2xs, DW_IQ2_XS)
+DEFINE_QDEQUANT(iq2s, DW_IQ2_S)
+DEFINE_QDEQUANT(iq3xxs, DW_IQ3_XXS)
+DEFINE_QDEQUANT(iq3s, DW_IQ3_S)
+DEFINE_QDEQUANT(iq4nl, DW_IQ4_NL)
+DEFINE_QDEQUANT(tq1_0, DW_TQ1_0)
+DEFINE_QDEQUANT(iq1_s, DW_IQ1_S)
+DEFINE_QDEQUANT(iq1_m, DW_IQ1_M)
+DEFINE_QDEQUANT(mxfp4, DW_MXFP4)
+DEFINE_QDEQUANT(rocmfp4, DW_ROCMFP4)
+DEFINE_QDEQUANT(rocmfp4_fast, DW_ROCMFP4_FAST)
+
+#undef DEFINE_QDEQUANT
 
 // THE unified indexed-MoE decode core. Same warp-per-row + lane-strided-block math as
 // `qmatvec_core`, but ALL routed slots run in ONE launch with the routed expert on grid.y:

@@ -790,6 +790,23 @@ impl RocmQuantType {
         }
     }
 
+    /// The dequantize entry point for this type and output dtype: `qdequant_core<WTYPE,OT>`. Named
+    /// from `decode_kernel`'s stem, so the two cannot disagree about what a type is called.
+    fn dequant_kernel(self, dtype: crate::DType) -> Result<String> {
+        let stem = self
+            .decode_kernel(true)
+            .strip_prefix("qmatvecu_")
+            .and_then(|name| name.strip_suffix("_f16"))
+            .ok_or_else(|| crate::Error::Msg(format!("{self:?} has no unified decode entry")))?;
+        let suffix = match dtype {
+            crate::DType::F16 => "f16",
+            crate::DType::BF16 => "bf16",
+            crate::DType::F32 => "f32",
+            other => crate::bail!("dequantize_quant({self:?}): no {other:?} output"),
+        };
+        Ok(format!("qdequant_{stem}_{suffix}"))
+    }
+
     /// The unified-core entry point name for this (type, activation-dtype) pair. EVERY one of these
     /// is `qmatvec_core<WTYPE,XT>` with a different WTYPE -- there is exactly one core.
     fn decode_kernel(self, f16: bool) -> &'static str {
@@ -1074,6 +1091,70 @@ impl RocmDevice {
     ///
     /// Accepting bf16 directly (the model's working dtype) lets the decode path skip the
     /// bf16->f32->f16 cast detour entirely: 0 cast launches per matvec instead of 3.
+    /// Dequantize `wq`, the raw GGML blocks of a weight of `elem_count` elements, to dense `dtype`
+    /// on the device, by the same per-type decode the matvec runs.
+    pub fn dequantize_quant(
+        &self,
+        qt: RocmQuantType,
+        wq: &RocmStorage,
+        elem_count: usize,
+        dtype: crate::DType,
+    ) -> Result<RocmStorage> {
+        use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
+        let elems = qt.block_elems();
+        if elem_count % elems != 0 {
+            crate::bail!("dequantize_quant({qt:?}): {elem_count} elements is not whole blocks of {elems}");
+        }
+        let nblocks = elem_count / elems;
+        let wq_ptr = match &wq.slice {
+            RocmStorageSlice::U8(m) if m.count() >= nblocks * qt.block_bytes() => m.as_ptr(),
+            RocmStorageSlice::U8(m) => crate::bail!(
+                "dequantize_quant({qt:?}): {} bytes hold fewer than {nblocks} blocks",
+                m.count()
+            ),
+            _ => crate::bail!("dequantize_quant: weights must be u8 (raw GGML block bytes)"),
+        };
+        let func = qt.dequant_kernel(dtype)?;
+        // One thread per (block, lane): 32 per block.
+        let threads = nblocks * 32;
+        let nblocks = i32::try_from(nblocks)
+            .map_err(|_| crate::Error::Msg(format!("dequantize_quant: {nblocks} blocks overflow i32")))?;
+        let grid = rocm_rs::hip::Dim3::from(threads.div_ceil(256) as u32);
+        let block = rocm_rs::hip::Dim3::from(256u32);
+
+        macro_rules! launch_dequant {
+            ($variant:ident, $ty:ty) => {{
+                let out = self.alloc::<$ty>(elem_count)?;
+                let out_ptr = out.as_ptr();
+                unsafe {
+                    launch_kernel(
+                        self,
+                        QuantKernel::NAME,
+                        QuantKernel::CODE,
+                        &func,
+                        grid,
+                        block,
+                        &mut [
+                            &nblocks as *const i32 as *mut std::ffi::c_void,
+                            (&wq_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                            (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+                Ok(RocmStorage {
+                    slice: RocmStorageSlice::$variant(out),
+                    device: self.clone(),
+                })
+            }};
+        }
+        match dtype {
+            crate::DType::F16 => launch_dequant!(F16, f16),
+            crate::DType::BF16 => launch_dequant!(BF16, bf16),
+            crate::DType::F32 => launch_dequant!(F32, f32),
+            other => crate::bail!("dequantize_quant({qt:?}): no {other:?} output"),
+        }
+    }
+
     pub fn matvec_quant(
         &self,
         qt: RocmQuantType,

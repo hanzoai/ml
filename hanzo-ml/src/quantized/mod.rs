@@ -3202,10 +3202,23 @@ impl crate::Module for QMatMul {
                         false,
                     ))
                 } else {
-                    // Unwired-type prefill: dequantize to a temporary f16 weight (freed after; a
-                    // persistent f16 copy would slow the memory-bound decode). Only reached for quants
-                    // with no `qmmq_core<WTYPE>` wired (e.g. Q5_K/MXFP4).
-                    let w = qtensor.dequantize_f16(&xs.device())?;
+                    // A type with no `qmmq_core<WTYPE>` wired (e.g. Q5_K/MXFP4/ROCMFP4): dequantize
+                    // to a temporary f16 weight and multiply by that. It is freed after, since a
+                    // persistent f16 copy would slow the memory-bound decode. The blocks are
+                    // already in VRAM and decode there; the host copy is not read.
+                    let w = match (unified_qt, xs.device()) {
+                        #[cfg(feature = "rocm")]
+                        (Some(qt), Device::Rocm(d)) => {
+                            let dense = d.dequantize_quant(qt, wq, *n * *k, DType::F16)?;
+                            crate::tensor::from_storage(
+                                crate::Storage::Rocm(dense),
+                                (*n, *k),
+                                crate::op::BackpropOp::none(),
+                                false,
+                            )
+                        }
+                        _ => qtensor.dequantize_f16(&xs.device())?,
+                    };
                     let w = match *xs.dims() {
                         [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
                         [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
