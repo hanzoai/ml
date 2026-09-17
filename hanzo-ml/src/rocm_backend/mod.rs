@@ -2367,12 +2367,12 @@ pub fn gdn_scan_rocm(
     if kd > 128 {
         crate::bail!("gdn_scan_rocm: kd {kd} exceeds 128");
     }
-    let dev = match q.storage() {
+    let dev = match &*q.storage() {
         Storage::Rocm(r) => r.device.clone(),
         _ => crate::bail!("gdn_scan_rocm: q must be ROCm"),
     };
     let ptr = |t: &Tensor| -> Result<*mut std::ffi::c_void> {
-        match t.storage() {
+        match &*t.storage() {
             Storage::Rocm(r) if matches!(r.slice, RocmStorageSlice::F32(_)) => {
                 Ok(unsafe { r.slice.offset_ptr(t.layout().start_offset()) })
             }
@@ -2386,7 +2386,7 @@ pub fn gdn_scan_rocm(
     let mut pb = ptr(beta)?;
     let mut ps = ptr(state)?;
     let out = dev.alloc::<f32>(bh * seq * vd)?;
-    let out_ptr = out.as_ptr() as *mut std::ffi::c_void;
+    let mut out_ptr = out.as_ptr() as *mut std::ffi::c_void;
     let mut bh_u = bh as u32;
     let mut seq_u = seq as u32;
     let mut kd_u = kd as u32;
@@ -2406,7 +2406,7 @@ pub fn gdn_scan_rocm(
                 &mut pg as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
                 &mut pb as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
                 &mut ps as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
-                &mut out_ptr,
+                &mut out_ptr as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
                 &mut bh_u as *mut u32 as *mut std::ffi::c_void,
                 &mut seq_u as *mut u32 as *mut std::ffi::c_void,
                 &mut kd_u as *mut u32 as *mut std::ffi::c_void,
@@ -2414,10 +2414,15 @@ pub fn gdn_scan_rocm(
             ],
         )?;
     }
-    Ok(Tensor::from_storage(RocmStorage {
-        slice: RocmStorageSlice::F32(out),
-        device: dev,
-    }))
+    Ok(crate::tensor::from_storage(
+        Storage::Rocm(RocmStorage {
+            slice: RocmStorageSlice::F32(out),
+            device: dev,
+        }),
+        (bh, seq, vd),
+        crate::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 impl RocmStorage {
