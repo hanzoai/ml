@@ -38,8 +38,10 @@ use rocm_rs::rocrand::PseudoRng;
 /// because the decode graph cache is bounded and each bucket's working set is
 /// captured exactly once.
 pub struct PoolInner {
-    /// byte-size -> free device pointers (as usize).
+    /// capacity in bytes -> free device pointers (as usize).
     free: HashMap<usize, Vec<usize>>,
+    /// Bytes held idle in `free`, kept under [`POOL_BUDGET_BYTES`].
+    pooled_bytes: usize,
     /// Number of nested in-flight hipGraph captures. While > 0, buffers
     /// allocated from this pool are reserved (leaked) on Drop instead of
     /// recycled, so a captured graph's pointers are never reused.
@@ -52,6 +54,7 @@ impl Default for PoolInner {
     fn default() -> Self {
         Self {
             free: HashMap::new(),
+            pooled_bytes: 0,
             capture_depth: 0,
             reserved: Vec::new(),
         }
@@ -62,10 +65,29 @@ pub type DevicePool = Arc<Mutex<PoolInner>>;
 
 const MAX_POOLED_PER_SIZE: usize = 64;
 
+/// Bytes the pool may hold idle. Past it a dropped buffer is freed, so a long prefill's
+/// temporaries go back to the box instead of staying resident for the life of the process.
+const POOL_BUDGET_BYTES: usize = 2 << 30;
+
+/// The bytes allocated for a request of `size` bytes: exact up to 1 MiB, where decode's buffers
+/// repeat exactly, then rounded up to an eighth of the power of two below. Buffers whose size
+/// drifts from one call to the next (a chunked prefill's growing context, prompts of different
+/// lengths) then share a class and are reused instead of each leaving a buffer behind.
+fn class_bytes(size: usize) -> usize {
+    const EXACT: usize = 1 << 20;
+    if size <= EXACT {
+        return size;
+    }
+    let step = (1usize << (usize::BITS - 1 - size.leading_zeros())) / 8;
+    size.div_ceil(step) * step
+}
+
 /// A device buffer, optionally backed by a caching pool (see [`DevicePool`]).
 pub struct SendSyncDeviceMemory<T> {
     ptr: *mut std::ffi::c_void,
-    size: usize, // bytes
+    size: usize, // bytes asked for
+    /// Bytes allocated: the pool's class for `size`, which is what the freelist is keyed by.
+    capacity: usize,
     pool: Option<DevicePool>,
     /// True when this buffer was allocated while a hipGraph capture was in
     /// flight: on Drop it is reserved (leaked) rather than recycled so the
@@ -90,6 +112,7 @@ impl<T> SendSyncDeviceMemory<T> {
             return Ok(Self {
                 ptr: std::ptr::null_mut(),
                 size: 0,
+                capacity: 0,
                 pool,
                 capture_reserved: false,
                 phantom: PhantomData,
@@ -98,30 +121,36 @@ impl<T> SendSyncDeviceMemory<T> {
         // Whether a hipGraph capture is in flight. Read under the same lock we use
         // to pop a free buffer so the decision is consistent with the pool state.
         let mut capture_reserved = false;
+        let capacity = if pool.is_some() {
+            class_bytes(size)
+        } else {
+            size
+        };
         if let Some(p) = &pool {
             if let Ok(mut inner) = p.lock() {
                 capture_reserved = inner.capture_depth > 0;
-                if let Some(v) = inner.free.get_mut(&size) {
-                    if let Some(raw) = v.pop() {
-                        return Ok(Self {
-                            ptr: raw as *mut std::ffi::c_void,
-                            size,
-                            pool: pool.clone(),
-                            capture_reserved,
-                            phantom: PhantomData,
-                        });
-                    }
+                if let Some(raw) = inner.free.get_mut(&capacity).and_then(Vec::pop) {
+                    inner.pooled_bytes -= capacity;
+                    return Ok(Self {
+                        ptr: raw as *mut std::ffi::c_void,
+                        size,
+                        capacity,
+                        pool: pool.clone(),
+                        capture_reserved,
+                        phantom: PhantomData,
+                    });
                 }
             }
         }
         let mut ptr = std::ptr::null_mut();
-        let err = unsafe { bindings::hipMalloc(&mut ptr, size) };
+        let err = unsafe { bindings::hipMalloc(&mut ptr, capacity) };
         if err != bindings::hipError_t_hipSuccess {
             return Err(HipError::new(err));
         }
         Ok(Self {
             ptr,
             size,
+            capacity,
             pool,
             capture_reserved,
             phantom: PhantomData,
@@ -138,6 +167,7 @@ impl<T> SendSyncDeviceMemory<T> {
         Self {
             ptr,
             size,
+            capacity: size,
             pool: None,
             capture_reserved: false,
             phantom: PhantomData,
@@ -274,10 +304,13 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
                     inner.reserved.push(self.ptr as usize);
                     return;
                 }
-                let v = inner.free.entry(self.size).or_default();
-                if v.len() < MAX_POOLED_PER_SIZE {
-                    v.push(self.ptr as usize);
-                    return;
+                if inner.pooled_bytes + self.capacity <= POOL_BUDGET_BYTES {
+                    let v = inner.free.entry(self.capacity).or_default();
+                    if v.len() < MAX_POOLED_PER_SIZE {
+                        v.push(self.ptr as usize);
+                        inner.pooled_bytes += self.capacity;
+                        return;
+                    }
                 }
             }
         }
@@ -376,5 +409,24 @@ impl Deref for SendSyncMIOpenHandle {
     type Target = Handle;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::class_bytes;
+
+    #[test]
+    fn a_class_is_exact_when_small_and_within_an_eighth_when_large() {
+        assert_eq!(class_bytes(4096), 4096);
+        assert_eq!(class_bytes(1 << 20), 1 << 20);
+        for size in [(1 << 20) + 1, 3_000_000, 123_456_789, (1 << 30) + 5] {
+            let class = class_bytes(size);
+            assert!(
+                class >= size && class - size <= size / 8,
+                "{size} -> {class}"
+            );
+            assert_eq!(class_bytes(class), class, "a class is its own class");
+        }
     }
 }
