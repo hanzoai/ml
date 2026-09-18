@@ -3202,7 +3202,7 @@ impl crate::Module for QMatMul {
                         false,
                     ))
                 } else {
-                    // A type with no `qmmq_core<WTYPE>` wired (e.g. Q5_K/MXFP4/ROCMFP4): dequantize
+                    // A type with no `qmmq_core<WTYPE>` wired (e.g. MXFP4): dequantize
                     // to a temporary f16 weight and multiply by that. It is freed after, since a
                     // persistent f16 copy would slow the memory-bound decode. The blocks are
                     // already in VRAM and decode there; the host copy is not read.

@@ -2479,7 +2479,6 @@ fn quantized_matmul_mm_f16_weight_m4_matches_reference() {
         0,
         &dst,
         false,
-        false,
     )
     .unwrap();
     drop(encoder);

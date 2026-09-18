@@ -3281,6 +3281,8 @@ typedef int v4i_ld __attribute__((ext_vector_type(4)));
 #define WT_Q5_0   8   // 22 B,  32 elems,  SYM legacy 5-bit.    q_w = (nib|hi<<4)-16;   scale d
 #define WT_Q5_1   9   // 24 B,  32 elems,  ASYM legacy 5-bit.   q_w = nib|hi<<4(0..31); scale d, min -m
 #define WT_Q8_1   10  // 36 B,  32 elems,  SYM 8-bit (+sum).    q_w = qs[k];        scale d
+#define WT_ROCMFP4_FAST 11  // 17 B,  32 elems, SYM codebook (LUT).  q_w = KVALUES_ROCMFP4_D[nib]; scale ue4m3_half(blk[16])
+#define WT_ROCMFP4      12  // 18 B,  32 elems, SYM dual codebook (LUT). q_w = KVALUES_ROCMFP4_D[nib]; scales ue4m3_half(blk[16..17])
 // Per-type traits: BYTES = on-disk super-block stride; SBLK_ELEMS = elems/super-block (32 or 256);
 // SYMMETRIC = no min bias; SCALE_STEP = elems per distinct weight scale (16 for Q6_K else 32).
 // Derived: SUBS = 32-blocks per super-block; NSC16 = distinct scales per 32-block (2 iff SCALE_STEP=16).
@@ -3296,6 +3298,8 @@ template <> struct wt_traits<WT_Q4_1>   { static constexpr int BYTES = 20;  stat
 template <> struct wt_traits<WT_Q5_0>   { static constexpr int BYTES = 22;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
 template <> struct wt_traits<WT_Q5_1>   { static constexpr int BYTES = 24;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = false; static constexpr int SCALE_STEP = 32; };
 template <> struct wt_traits<WT_Q8_1>   { static constexpr int BYTES = 36;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_ROCMFP4_FAST> { static constexpr int BYTES = 17; static constexpr int SBLK_ELEMS = 32; static constexpr bool SYMMETRIC = true; static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_ROCMFP4>      { static constexpr int BYTES = 18; static constexpr int SBLK_ELEMS = 32; static constexpr bool SYMMETRIC = true; static constexpr int SCALE_STEP = 16 ; };
 
 // q4k_scale_min / KVALUES_IQ4NL_D are defined above for the decode core and reused verbatim here --
 // ONE decode source per format (the prefill decode below mirrors the same bit layout as qdec<WTYPE>).
@@ -3489,6 +3493,26 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_Q8_1>(const uint8_t* sb, int,
     return v;
 }
 
+// ROCMFP4(_FAST): 16 nibble-pairs at byte +0 (scale-after layout, the reverse of Q4_0): low
+// nibble = k 0..15, high = k 16..31, Codebook10 LUT (not centered int4).
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_ROCMFP4_FAST>(const uint8_t* sb, int, int half) {
+    const uint8_t* qs = sb;
+    const int shift = (half == 0) ? 0 : 4;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) tmp[k] = KVALUES_ROCMFP4_D[(qs[k] >> shift) & 0xFu];
+    v4i_ld v;
+    __builtin_memcpy(&v, tmp, 16);
+    return v;
+}
+// Identical nibble layout; only the trailing scale bytes differ.
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_ROCMFP4>(const uint8_t* sb, int, int half) {
+    return decode_w_half<WT_ROCMFP4_FAST>(sb, 0, half);
+}
+
+
 // MAIN per-(32-block, 16-group) weight scale. `sub16` = the 16-group index within the super-block
 // (= g*2 + (half==16)). For SCALE_STEP=32 types both halves of a 32-sub-block return the same value
 // (so the merged-accumulate path scales once); for Q6_K (SCALE_STEP=16) each 16-group differs.
@@ -3548,6 +3572,14 @@ template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q5_1>(const u
 template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q8_1>(const uint8_t* sb, int) {
     return __half2float(*reinterpret_cast<const __half*>(sb));
 }
+// ROCMFP4_FAST: the UE4M3 half-scale at byte 16.
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_ROCMFP4_FAST>(const uint8_t* sb, int) {
+    return ue4m3_to_fp32_half(sb[16]);
+}
+// ROCMFP4 dual: the first-16 scale at byte 16 (SUBS=1, sub16==0).
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_ROCMFP4>(const uint8_t* sb, int) {
+    return ue4m3_to_fp32_half(sb[16]);
+}
 
 // SECONDARY per-32-sub-block weight scalar. ASYMMETRIC: dmin * m_g (the min bias scale). SYMMETRIC
 // SCALE_STEP=16 (Q6_K): the 2nd-16-group main scale of sub-block g (so the high half scales by it).
@@ -3585,6 +3617,11 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_Q5_1>(const ui
 }
 template <> __device__ __forceinline__ float decode_w_secscale<WT_Q5_0>(const uint8_t*, int) { return 0.0f; }
 template <> __device__ __forceinline__ float decode_w_secscale<WT_Q8_1>(const uint8_t*, int) { return 0.0f; }
+template <> __device__ __forceinline__ float decode_w_secscale<WT_ROCMFP4_FAST>(const uint8_t*, int) { return 0.0f; }
+// ROCMFP4 dual: the second-16 scale at byte 17.
+template <> __device__ __forceinline__ float decode_w_secscale<WT_ROCMFP4>(const uint8_t* sb, int) {
+    return ue4m3_to_fp32_half(sb[17]);
+}
 
 // Shared int8 tile row stride: 32 data bytes + 16 pad bytes = 48. The pad is 16-ALIGNED so the 32-byte
 // fragment loads (`__builtin_memcpy(&frag, &sXi[row*SROW], 32)`) lower to `ds_load_b128` (two 16-byte
@@ -3869,6 +3906,8 @@ DEFINE_QMMQ(q4_1,  WT_Q4_1)
 DEFINE_QMMQ(q5_0,  WT_Q5_0)
 DEFINE_QMMQ(q5_1,  WT_Q5_1)
 DEFINE_QMMQ(q8_1,  WT_Q8_1)
+DEFINE_QMMQ(rocmfp4_fast, WT_ROCMFP4_FAST)
+DEFINE_QMMQ(rocmfp4,      WT_ROCMFP4)
 
 #undef DEFINE_QMMQ
 
@@ -3908,6 +3947,8 @@ DEFINE_MOE_QMMQ(q4_1,  WT_Q4_1)
 DEFINE_MOE_QMMQ(q5_0,  WT_Q5_0)
 DEFINE_MOE_QMMQ(q5_1,  WT_Q5_1)
 DEFINE_MOE_QMMQ(q8_1,  WT_Q8_1)
+DEFINE_MOE_QMMQ(rocmfp4_fast, WT_ROCMFP4_FAST)
+DEFINE_MOE_QMMQ(rocmfp4,      WT_ROCMFP4)
 
 #undef DEFINE_MOE_QMMQ
 #undef DEFINE_MOE_QMMQ_NW
@@ -3927,4 +3968,6 @@ DEFINE_MOE_QMMQ(q8_1,  WT_Q8_1)
 #undef WT_Q5_0
 #undef WT_Q5_1
 #undef WT_Q8_1
+#undef WT_ROCMFP4_FAST
+#undef WT_ROCMFP4
 #endif

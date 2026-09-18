@@ -2,7 +2,7 @@
 //!
 use crate::backend::BackendStorage;
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
-use crate::{CpuStorage, DType, Layout, Result, WithDType};
+use crate::{CpuStorage, DType, Layout, Result, Storage, Tensor, WithDType};
 use half::{bf16, f16};
 pub use hanzo_rocm_kernels as kernels;
 use hanzo_rocm_kernels::kernel::KernelSource;
@@ -692,6 +692,8 @@ impl RocmQuantType {
                 | Self::Q5_0
                 | Self::Q5_1
                 | Self::Q8_1
+                | Self::ROCMFP4
+                | Self::ROCMFP4_FAST
         )
     }
 
@@ -711,6 +713,8 @@ impl RocmQuantType {
             Self::Q5_0 => "qmmq_q5_0_f16",
             Self::Q5_1 => "qmmq_q5_1_f16",
             Self::Q8_1 => "qmmq_q8_1_f16",
+            Self::ROCMFP4 => "qmmq_rocmfp4_f16",
+            Self::ROCMFP4_FAST => "qmmq_rocmfp4_fast_f16",
             Self::Q2K
             | Self::Q3K
             | Self::IQ2_XXS
@@ -787,6 +791,12 @@ impl RocmQuantType {
             ) => {
                 unreachable!("moe_prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
             }
+            (Self::ROCMFP4, 128) => "moe_qmmq_rocmfp4_f16",
+            (Self::ROCMFP4, 64) => "moe_qmmq_rocmfp4_tm64_f16",
+            (Self::ROCMFP4, _) => "moe_qmmq_rocmfp4_tm32_f16",
+            (Self::ROCMFP4_FAST, 128) => "moe_qmmq_rocmfp4_fast_f16",
+            (Self::ROCMFP4_FAST, 64) => "moe_qmmq_rocmfp4_fast_tm64_f16",
+            (Self::ROCMFP4_FAST, _) => "moe_qmmq_rocmfp4_fast_tm32_f16",
         }
     }
 
@@ -2338,6 +2348,81 @@ unsafe fn launch_kernel_shmem(
     kernel
         .launch(grid, block, shared_mem, Some(&dev.stream), args)
         .map_err(|e| crate::Error::Msg(format!("Kernel launch failed: {}", e)))
+}
+
+/// Fused GDN gated-delta-rule scan: ONE launch, f32 end-to-end, state updated in place.
+/// q,k: [bh, seq, kd] (q pre-scaled by 1/sqrt(kd)); v: [bh, seq, vd]; g,beta: [bh, seq];
+/// state: [bh, kd, vd]; returns out: [bh, seq, vd]. All F32 ROCm tensors.
+pub fn gdn_scan_rocm(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &Tensor,
+) -> Result<Tensor> {
+    use hanzo_rocm_kernels::kernel::{GdnKernel, KernelSource};
+    let (bh, seq, kd) = q.dims3()?;
+    let vd = v.dim(2)?;
+    if kd > 128 {
+        crate::bail!("gdn_scan_rocm: kd {kd} exceeds 128");
+    }
+    let dev = match &*q.storage() {
+        Storage::Rocm(r) => r.device.clone(),
+        _ => crate::bail!("gdn_scan_rocm: q must be ROCm"),
+    };
+    let ptr = |t: &Tensor| -> Result<*mut std::ffi::c_void> {
+        match &*t.storage() {
+            Storage::Rocm(r) if matches!(r.slice, RocmStorageSlice::F32(_)) => {
+                Ok(unsafe { r.slice.offset_ptr(t.layout().start_offset()) })
+            }
+            _ => crate::bail!("gdn_scan_rocm: expected F32 ROCm storage"),
+        }
+    };
+    let mut pq = ptr(q)?;
+    let mut pk = ptr(k)?;
+    let mut pv = ptr(v)?;
+    let mut pg = ptr(g)?;
+    let mut pb = ptr(beta)?;
+    let mut ps = ptr(state)?;
+    let out = dev.alloc::<f32>(bh * seq * vd)?;
+    let mut out_ptr = out.as_ptr() as *mut std::ffi::c_void;
+    let mut bh_u = bh as u32;
+    let mut seq_u = seq as u32;
+    let mut kd_u = kd as u32;
+    let mut vd_u = vd as u32;
+    unsafe {
+        launch_kernel(
+            &dev,
+            GdnKernel::NAME,
+            GdnKernel::CODE,
+            "gdn_scan_f32",
+            rocm_rs::hip::Dim3::from((bh * vd).div_ceil(256) as u32),
+            rocm_rs::hip::Dim3::from(256),
+            &mut [
+                &mut pq as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut pk as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut pv as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut pg as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut pb as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut ps as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut out_ptr as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut bh_u as *mut u32 as *mut std::ffi::c_void,
+                &mut seq_u as *mut u32 as *mut std::ffi::c_void,
+                &mut kd_u as *mut u32 as *mut std::ffi::c_void,
+                &mut vd_u as *mut u32 as *mut std::ffi::c_void,
+            ],
+        )?;
+    }
+    Ok(crate::tensor::from_storage(
+        Storage::Rocm(RocmStorage {
+            slice: RocmStorageSlice::F32(out),
+            device: dev,
+        }),
+        (bh, seq, vd),
+        crate::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 impl RocmStorage {

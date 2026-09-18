@@ -333,10 +333,11 @@ fn metal_matvec_q6k_bf16_matches_f32() {
 }
 
 // A bf16 activation with m>1 rows routes `fwd` to the bf16-native mm GEMM (kernel_mul_mm_q*_K_bf16:
-// bf16 src1/dst, f32 accumulation, simdgroup math identical to the f32 mm because src1 is widened to
-// f32 on stage). It must be BIT-IDENTICAL to the f32 mm run on the SAME bf16-rounded activation and
-// rounded to bf16 -- exactly what GgufMatMul's f32 fallback computes around the projection. Two shapes
-// cover a full-tile case and one with a partial 32-col tile + partial 64-row tile (the edge store).
+// bf16 src1/dst, half tiles, f32 accumulation). It must be BIT-IDENTICAL to the f32 mm run on the SAME
+// bf16-rounded activation and rounded to bf16 -- exactly what GgufMatMul's f32 fallback computes around
+// the projection. Both kernels stage the same values into the same half tile (a bf16 value widens to
+// half exactly, and the f32 activation here holds bf16 values), so only the device dtype differs. Two
+// shapes cover a full-tile case and one with a partial 32-col tile + partial 64-row tile (edge store).
 fn check_bf16_mm_matches_f32_rounded(dtype: GgmlDType) {
     let dev = match Device::new_metal(0) {
         Ok(d) => d,
