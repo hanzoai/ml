@@ -99,7 +99,11 @@ fn every_wired_type_dequantizes_on_the_device_as_the_cpu_does() -> Result<()> {
 fn a_multi_row_forward_of_a_decode_only_type_matches_the_cpu() -> Result<()> {
     let gpu = Device::new_rocm(0)?;
     let (rows, cols, batch) = (96usize, 2048usize, 5usize);
-    for dtype in [GgmlDType::ROCMFP4, GgmlDType::ROCMFP4_FAST, GgmlDType::MXFP4] {
+    for dtype in [
+        GgmlDType::ROCMFP4,
+        GgmlDType::ROCMFP4_FAST,
+        GgmlDType::MXFP4,
+    ] {
         let qt = RocmQuantType::from_ggml(dtype).expect("wired");
         let mut rng = Lcg(0x0ddba11 + dtype as u64);
         let nblocks = rows * cols / qt.block_elems();
@@ -125,7 +129,10 @@ fn a_multi_row_forward_of_a_decode_only_type_matches_the_cpu() -> Result<()> {
             .map(|_| (rng.next_u8() as f32 - 127.5) / 64.0)
             .collect();
         let x_cpu = Tensor::from_vec(x, (batch, cols), &Device::Cpu)?;
-        let want = x_cpu.matmul(&reference.t()?)?.flatten_all()?.to_vec1::<f32>()?;
+        let want = x_cpu
+            .matmul(&reference.t()?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         assert!(scale > 0.0, "{dtype:?}: degenerate reference");
 

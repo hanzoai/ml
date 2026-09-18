@@ -535,7 +535,11 @@ fn run_reshape(allowzero: Option<i64>, x: Tensor, shape: Vec<i64>) -> Result<Ten
     inputs.insert(INPUT_X.to_string(), x);
     inputs.insert(INPUT_Y.to_string(), y);
     let eval = hanzo_onnx::simple_eval(&reshape_graph(allowzero), inputs)?;
-    Ok(eval.get(OUTPUT_Z).expect("Output 'z' not found").tensor()?.clone())
+    Ok(eval
+        .get(OUTPUT_Z)
+        .expect("Output 'z' not found")
+        .tensor()?
+        .clone())
 }
 
 // "Reshape" with allowzero=1: a 0 in the target shape is a literal zero-length dimension,

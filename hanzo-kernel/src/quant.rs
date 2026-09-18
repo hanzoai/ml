@@ -2926,7 +2926,7 @@ pub fn moe_route<F: Float>(
     let t = UNIT_POS as usize;
     let base = tok * n_experts;
     let ninf = F::new(-3.4e38f32); // -inf sentinel (cf. attn.rs running-max init)
-                                // Maskable copy of this token's logits in shared memory (F = f32 at launch).
+                                   // Maskable copy of this token's logits in shared memory (F = f32 at launch).
     let mut slog = SharedMemory::<F>::new(n_experts);
     let mut i = t;
     while i < n_experts {

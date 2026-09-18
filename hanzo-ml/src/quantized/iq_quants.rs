@@ -707,7 +707,10 @@ mod rocmfp4_tests {
     // Known-answer: one dual block, one fast block, every codebook entry hit.
     #[test]
     fn rocmfp4_dual_matches_manual_decode() {
-        let mut b = BlockROCMFP4 { qs: [0; 16], e: [0; 2] };
+        let mut b = BlockROCMFP4 {
+            qs: [0; 16],
+            e: [0; 2],
+        };
         // e0 = 0x50 (exp bits 6..3 = 10, man 0) -> ue4m3 = 2^3 = 8, half = 4.0
         // e1 = 0x38 (exp 7, man 0) -> ue4m3 = 1, half = 0.5
         b.e = [0x50, 0x38];
@@ -723,13 +726,20 @@ mod rocmfp4_tests {
         assert!((d1 - 0.5).abs() < 1e-9, "d1 {d1}");
         for j in 0..16 {
             assert_eq!(ys[j], KVALUES_ROCMFP4[j] as f32 * d0, "low half {j}");
-            assert_eq!(ys[j + 16], KVALUES_ROCMFP4[15 - j] as f32 * d1, "high half {j}");
+            assert_eq!(
+                ys[j + 16],
+                KVALUES_ROCMFP4[15 - j] as f32 * d1,
+                "high half {j}"
+            );
         }
     }
 
     #[test]
     fn rocmfp4_fast_matches_manual_decode() {
-        let mut b = BlockROCMFP4Fast { qs: [0; 16], e: 0x20 }; // exp 4, man 0 -> ue4m3 = 1/8, half = 1/16
+        let mut b = BlockROCMFP4Fast {
+            qs: [0; 16],
+            e: 0x20,
+        }; // exp 4, man 0 -> ue4m3 = 1/8, half = 1/16
         for j in 0..16 {
             b.qs[j] = j as u8 | ((j as u8) << 4);
         }
@@ -744,7 +754,10 @@ mod rocmfp4_tests {
 
     #[test]
     fn rocmfp4_invalid_scales_decode_zero() {
-        let b = BlockROCMFP4Fast { qs: [0x0F; 16], e: 0x7F };
+        let b = BlockROCMFP4Fast {
+            qs: [0x0F; 16],
+            e: 0x7F,
+        };
         let mut ys = [0f32; 32];
         BlockROCMFP4Fast::to_float(std::slice::from_ref(&b), &mut ys);
         assert!(ys.iter().all(|v| *v == 0.0));
@@ -769,7 +782,10 @@ mod rocmfp4_tests {
         let wf32: Vec<f32> = {
             let mut v = vec![0f32; n];
             for (i, b) in xs.iter().enumerate() {
-                BlockROCMFP4Fast::to_float(std::slice::from_ref(b), &mut v[i * QK_ROCMFP4..][..QK_ROCMFP4]);
+                BlockROCMFP4Fast::to_float(
+                    std::slice::from_ref(b),
+                    &mut v[i * QK_ROCMFP4..][..QK_ROCMFP4],
+                );
             }
             v
         };
@@ -777,7 +793,13 @@ mod rocmfp4_tests {
         let exact: f32 = wf32.iter().zip(&yf32).map(|(a, b)| a * b).sum();
         let ys_q8: Vec<BlockQ8_0> = {
             let nb8 = n / QK8_0;
-            let mut v = vec![BlockQ8_0 { d: f16::from_bits(0), qs: [0; QK8_0] }; nb8];
+            let mut v = vec![
+                BlockQ8_0 {
+                    d: f16::from_bits(0),
+                    qs: [0; QK8_0]
+                };
+                nb8
+            ];
             for (i, b) in v.iter_mut().enumerate() {
                 BlockQ8_0::from_float(&yf32[i * QK8_0..][..QK8_0], std::slice::from_mut(b));
             }
@@ -785,6 +807,9 @@ mod rocmfp4_tests {
         };
         let got = BlockROCMFP4Fast::vec_dot(n, &xs, &ys_q8);
         let err = ((got - exact).abs() / exact.abs()).min(1.0);
-        assert!(err < 2e-2, "vec_dot rel err {err} (got {got}, exact {exact})");
+        assert!(
+            err < 2e-2,
+            "vec_dot rel err {err} (got {got}, exact {exact})"
+        );
     }
 }

@@ -252,7 +252,9 @@ impl QStorage {
                 GgmlDType::NVFP4 => cuda::load_quantized(d, as_t_slice::<BlockNVFP4>(&data)),
                 GgmlDType::Q1_0 => cuda::load_quantized(d, as_t_slice::<BlockQ1_0>(&data)),
                 GgmlDType::ROCMFP4 => cuda::load_quantized(d, as_t_slice::<BlockROCMFP4>(&data)),
-                GgmlDType::ROCMFP4_FAST => cuda::load_quantized(d, as_t_slice::<BlockROCMFP4Fast>(&data)),
+                GgmlDType::ROCMFP4_FAST => {
+                    cuda::load_quantized(d, as_t_slice::<BlockROCMFP4Fast>(&data))
+                }
             },
             #[cfg(feature = "rocm")]
             Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(Cow::Borrowed(data)), d.clone())),

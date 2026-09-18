@@ -54,13 +54,16 @@ fn parity(dtype: GgmlDType, scales: usize) -> Result<()> {
     let mut rng = Lcg(0x5eed_f00d);
     let raw = blocks(&mut rng, rows, cols, scales);
 
-    let reference = qtensor_from_ggml(dtype, &raw, vec![rows, cols], &Device::Cpu)?
-        .dequantize(&Device::Cpu)?; // [rows, cols] f32
+    let reference =
+        qtensor_from_ggml(dtype, &raw, vec![rows, cols], &Device::Cpu)?.dequantize(&Device::Cpu)?; // [rows, cols] f32
     let x: Vec<f32> = (0..cols)
         .map(|_| (rng.next_u8() as f32 - 127.5) / 64.0)
         .collect();
     let x_cpu = Tensor::from_vec(x, (1, cols), &Device::Cpu)?;
-    let want = x_cpu.matmul(&reference.t()?)?.flatten_all()?.to_vec1::<f32>()?;
+    let want = x_cpu
+        .matmul(&reference.t()?)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
     assert!(scale > 0.0, "degenerate reference: every output is zero");
 

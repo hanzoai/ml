@@ -1113,7 +1113,9 @@ impl RocmDevice {
         use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
         let elems = qt.block_elems();
         if elem_count % elems != 0 {
-            crate::bail!("dequantize_quant({qt:?}): {elem_count} elements is not whole blocks of {elems}");
+            crate::bail!(
+                "dequantize_quant({qt:?}): {elem_count} elements is not whole blocks of {elems}"
+            );
         }
         let nblocks = elem_count / elems;
         let wq_ptr = match &wq.slice {
@@ -1127,8 +1129,9 @@ impl RocmDevice {
         let func = qt.dequant_kernel(dtype)?;
         // One thread per (block, lane): 32 per block.
         let threads = nblocks * 32;
-        let nblocks = i32::try_from(nblocks)
-            .map_err(|_| crate::Error::Msg(format!("dequantize_quant: {nblocks} blocks overflow i32")))?;
+        let nblocks = i32::try_from(nblocks).map_err(|_| {
+            crate::Error::Msg(format!("dequantize_quant: {nblocks} blocks overflow i32"))
+        })?;
         let grid = rocm_rs::hip::Dim3::from(threads.div_ceil(256) as u32);
         let block = rocm_rs::hip::Dim3::from(256u32);
 
