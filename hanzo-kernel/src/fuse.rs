@@ -529,7 +529,7 @@ pub struct Program {
 
 #[device]
 fn dsigmoid<F: Float>(x: F) -> F {
-    F::new(1.0) / (F::new(1.0) + (-x).exp())
+    F::new(1.0f32) / (F::new(1.0f32) + (-x).exp())
 }
 
 /// Apply one `UnOp` on the device — a comptime `match`, so only the selected branch is emitted.
@@ -537,17 +537,17 @@ fn dsigmoid<F: Float>(x: F) -> F {
 fn apply_un_dev<F: Float>(#[comptime] op: UnOp, x: F) -> F {
     match op {
         UnOp::Neg => -x,
-        UnOp::Recip => F::new(1.0) / x,
+        UnOp::Recip => F::new(1.0f32) / x,
         UnOp::Abs => x.abs(),
         UnOp::Exp => x.exp(),
         UnOp::Tanh => x.tanh(),
-        UnOp::Rsqrt => F::new(1.0) / x.sqrt(),
+        UnOp::Rsqrt => F::new(1.0f32) / x.sqrt(),
         UnOp::Sigmoid => dsigmoid::<F>(x),
         UnOp::Silu => x * dsigmoid::<F>(x),
         UnOp::Gelu => {
-            let c = F::new(0.797_884_56); // sqrt(2/pi)
-            let inner = c * (x + F::new(0.044715) * x * x * x);
-            F::new(0.5) * x * (F::new(1.0) + inner.tanh())
+            let c = F::new(0.797_884_56f32); // sqrt(2/pi)
+            let inner = c * (x + F::new(0.044715f32) * x * x * x);
+            F::new(0.5f32) * x * (F::new(1.0f32) + inner.tanh())
         }
     }
 }

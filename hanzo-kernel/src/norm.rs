@@ -20,7 +20,7 @@ pub fn rms_norm<F: Float>(
     let row = ABSOLUTE_POS;
     if row < out.len() / n {
         let base = row * n;
-        let mut ss = F::new(0.0);
+        let mut ss = F::new(0.0f32);
         for i in 0..n {
             let v = x[base + i];
             ss += v * v;
@@ -209,13 +209,13 @@ pub fn layer_norm<F: Float>(
     let row = ABSOLUTE_POS;
     if row < out.len() / n {
         let base = row * n;
-        let ninv = F::new(1.0) / F::cast_from(n as u32);
-        let mut sum = F::new(0.0);
+        let ninv = F::new(1.0f32) / F::cast_from(n as u32);
+        let mut sum = F::new(0.0f32);
         for i in 0..n {
             sum += x[base + i];
         }
         let mean = sum * ninv;
-        let mut var = F::new(0.0);
+        let mut var = F::new(0.0f32);
         for i in 0..n {
             let d = x[base + i] - mean;
             var += d * d;
@@ -496,7 +496,7 @@ pub fn rms_norm_tuned<F: Float>(
         let row = base + r;
         if row < nrows {
             let b = row * n;
-            let mut ss = F::new(0.0);
+            let mut ss = F::new(0.0f32);
             for i in 0..n {
                 let v = x[b + i];
                 ss += v * v;

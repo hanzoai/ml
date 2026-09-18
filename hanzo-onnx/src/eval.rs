@@ -271,12 +271,10 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
                 // means — and is safe.
                 let data: Vec<i64> = t
                     .raw_data
-                    .chunks_exact(4)
-                    .map(|four| {
-                        i64::from(i32::from_le_bytes(
-                            four.try_into().expect("chunks_exact(4) yields four bytes"),
-                        ))
-                    })
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|four| i64::from(i32::from_le_bytes(*four)))
                     .collect();
                 let len = data.len();
                 Tensor::from_vec(data, len, &Device::Cpu)

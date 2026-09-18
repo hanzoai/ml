@@ -68,8 +68,10 @@ impl EmbedReader {
         let mut buf = vec![0u8; count * 2];
         f.read_exact(&mut buf).map_err(io)?;
         Ok(buf
-            .chunks_exact(2)
-            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::f16::from_bits(u16::from_le_bytes(*c)))
             .collect())
     }
 

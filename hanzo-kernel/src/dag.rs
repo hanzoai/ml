@@ -650,24 +650,24 @@ impl Region {
 
 #[device]
 fn dsig<F: Float>(x: F) -> F {
-    F::new(1.0) / (F::new(1.0) + (-x).exp())
+    F::new(1.0f32) / (F::new(1.0f32) + (-x).exp())
 }
 
 #[device]
 fn un_dev<F: Float>(#[comptime] op: UnOp, x: F) -> F {
     match op {
         UnOp::Neg => -x,
-        UnOp::Recip => F::new(1.0) / x,
+        UnOp::Recip => F::new(1.0f32) / x,
         UnOp::Abs => x.abs(),
         UnOp::Exp => x.exp(),
         UnOp::Tanh => x.tanh(),
-        UnOp::Rsqrt => F::new(1.0) / x.sqrt(),
+        UnOp::Rsqrt => F::new(1.0f32) / x.sqrt(),
         UnOp::Sigmoid => dsig::<F>(x),
         UnOp::Silu => x * dsig::<F>(x),
         UnOp::Gelu => {
-            let c = F::new(0.797_884_56);
-            let inner = c * (x + F::new(0.044715) * x * x * x);
-            F::new(0.5) * x * (F::new(1.0) + inner.tanh())
+            let c = F::new(0.797_884_56f32);
+            let inner = c * (x + F::new(0.044715f32) * x * x * x);
+            F::new(0.5f32) * x * (F::new(1.0f32) + inner.tanh())
         }
     }
 }
@@ -735,8 +735,8 @@ pub fn reduce_broadcast<F: Float>(
         let row = i / n;
         let base = row * n;
         let mut acc = match red {
-            Red::Sum => F::new(0.0),
-            Red::Max => F::new(-3.4e38),
+            Red::Sum => F::new(0.0f32),
+            Red::Max => F::new(-3.4e38f32),
         };
         for j in 0..n {
             let v = x[base + j];

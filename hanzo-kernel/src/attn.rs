@@ -34,16 +34,16 @@ pub fn sdpa<F: Float>(
 
         let mut acc = Array::<F>::new(d);
         for dd in 0..d {
-            acc[dd] = F::new(0.0);
+            acc[dd] = F::new(0.0f32);
         }
-        let mut m = F::new(-3.4e38); // running max (-inf)
-        let mut l = F::new(0.0); // running denom
+        let mut m = F::new(-3.4e38f32); // running max (-inf)
+        let mut l = F::new(0.0f32); // running denom
 
         for kk in 0..seq_k {
             let masked = causal == 1 && kk > qpos;
             if !masked {
                 let kbase = kvbase + kk * d;
-                let mut score = F::new(0.0);
+                let mut score = F::new(0.0f32);
                 for dd in 0..d {
                     score += q[qbase + dd] * k[kbase + dd];
                 }
@@ -151,18 +151,18 @@ pub fn sdpa_blk<F: Float>(
     let qbase = row * d; // q is [b, n_heads, seq_q, d] contiguous
     let kvbase = b_i * kv_batch_stride + kv * kv_head_stride; // k/v read in place at their real strides
                                                               // Per-thread online-softmax state over this thread's strided key slice.
-    let mut m = F::new(-3.4e38);
-    let mut l = F::new(0.0);
+    let mut m = F::new(-3.4e38f32);
+    let mut l = F::new(0.0f32);
     let mut acc = Array::<F>::new(d);
     for dd in 0..d {
-        acc[dd] = F::new(0.0);
+        acc[dd] = F::new(0.0f32);
     }
     let mut kk = t;
     while kk < seq_k {
         let masked = causal == 1 && kk > qpos;
         if !masked {
             let kbase = kvbase + kk * key_stride;
-            let mut score = F::new(0.0);
+            let mut score = F::new(0.0f32);
             for dd in 0..d {
                 score += q[qbase + dd] * k[kbase + dd];
             }
@@ -350,16 +350,16 @@ pub fn sdpa_runtime<F: Float>(
 
         let mut acc = Array::<F>::new(d);
         for dd in 0..d {
-            acc[dd] = F::new(0.0);
+            acc[dd] = F::new(0.0f32);
         }
-        let mut m = F::new(-3.4e38); // running max (-inf)
-        let mut l = F::new(0.0); // running denom
+        let mut m = F::new(-3.4e38f32); // running max (-inf)
+        let mut l = F::new(0.0f32); // running denom
 
         for kk in 0..seq_k {
             let masked = causal == 1 && kk > qpos;
             if !masked {
                 let kbase = kvbase + kk * d;
-                let mut score = F::new(0.0);
+                let mut score = F::new(0.0f32);
                 for dd in 0..d {
                     score += q[qbase + dd] * k[kbase + dd];
                 }

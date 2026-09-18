@@ -645,8 +645,10 @@ impl WgpuStorage {
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
         let bytes = self.device.read_bytes(&self.buffer, self.count)?;
         Ok(bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_ne_bytes(*c))
             .collect())
     }
 
@@ -654,8 +656,10 @@ impl WgpuStorage {
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
         let bytes = self.device.read_bytes(&self.buffer, self.count)?;
         Ok(bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_ne_bytes(*c))
             .collect())
     }
 

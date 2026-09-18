@@ -114,7 +114,7 @@ pub fn matvec_island<F: Float>(
         let nb = k / 32;
         let wbase = row * ng;
         let dbase = row * nb;
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0f32);
         for g in 0..ng {
             // Widen the packed int8 lanes to i32 (lane-wise sign-extend) so the dot is exact.
             let w = Vector::<i32, Const<4>>::cast_from(wq[wbase + g]);

@@ -104,11 +104,11 @@ pub fn flash_attn<F: Float>(
 
     // Init the output accumulator and per-row running state.
     for e in 0..per_o {
-        of[lane * per_o + e] = F::new(0.0);
+        of[lane * per_o + e] = F::new(0.0f32);
     }
     if lane < br {
-        mf[lane] = F::new(-3.4e38);
-        lf[lane] = F::new(0.0);
+        mf[lane] = F::new(-3.4e38f32);
+        lf[lane] = F::new(0.0f32);
     }
 
     // Stage Q[br, d] from global f32 to f16 shared ONCE, before the key loop (llama Qf,
@@ -123,7 +123,7 @@ pub fn flash_attn<F: Float>(
         let val = if qpos < seq_q {
             q[q_head_base + qpos * d + dd]
         } else {
-            F::new(0.0)
+            F::new(0.0f32)
         };
         qsh[idx] = f16::cast_from(val);
     }
@@ -163,7 +163,7 @@ pub fn flash_attn<F: Float>(
                     let c = idx / d;
                     let dd = idx % d;
                     let kpos = j * bc + c;
-                    let val = if kpos < seq_k { k[kvbase + kpos * key_stride + dd] } else { F::new(0.0) };
+                    let val = if kpos < seq_k { k[kvbase + kpos * key_stride + dd] } else { F::new(0.0f32) };
                     ksh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
@@ -173,7 +173,7 @@ pub fn flash_attn<F: Float>(
                 // barrier over twice the keys per online-softmax step (llama base Bc=32).
                 for cg in 0..bc / 16usize {
                     let cacc = cmma::Matrix::<F>::from_value(
-                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0),
+                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
                     );
                     for dk in 0..d / 16usize {
                         let a = cmma::Matrix::<f16>::from_slice(
@@ -199,7 +199,7 @@ pub fn flash_attn<F: Float>(
                     if qpos < seq_q && kpos < seq_k && !masked {
                         sf[idx] = sf[idx] * sc;
                     } else {
-                        sf[idx] = F::new(-3.4e38);
+                        sf[idx] = F::new(-3.4e38f32);
                     }
                 }
             }
@@ -217,14 +217,14 @@ pub fn flash_attn<F: Float>(
                     let c = idx / d;
                     let dd = idx % d;
                     let kpos = j * bc + c;
-                    let val = if kpos < seq_k { k[kvbase + kpos * key_stride + dd] } else { F::new(0.0) };
+                    let val = if kpos < seq_k { k[kvbase + kpos * key_stride + dd] } else { F::new(0.0f32) };
                     ksh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
                 for ti in 0..br / 8usize {
                     for tj in 0..bc / 8usize {
                         let cacc = cmma::Matrix::<F>::from_value(
-                            cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, F::new(0.0),
+                            cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
                         );
                         for dk in 0..d / 8usize {
                             let a = cmma::Matrix::<f16>::from_slice(
@@ -254,7 +254,7 @@ pub fn flash_attn<F: Float>(
                     if qpos < seq_q && kpos < seq_k && !masked {
                         sf[idx] = sf[idx] * sc;
                     } else {
-                        sf[idx] = F::new(-3.4e38);
+                        sf[idx] = F::new(-3.4e38f32);
                     }
                 }
             }
@@ -271,13 +271,13 @@ pub fn flash_attn<F: Float>(
                     if qpos < seq_q && kpos < seq_k && !masked {
                         let qb = q_head_base + qpos * d;
                         let kb = kvbase + kpos * key_stride;
-                        let mut acc = F::new(0.0);
+                        let mut acc = F::new(0.0f32);
                         for dd in 0..d {
                             acc += q[qb + dd] * k[kb + dd];
                         }
                         sf[idx] = acc * sc;
                     } else {
-                        sf[idx] = F::new(-3.4e38);
+                        sf[idx] = F::new(-3.4e38f32);
                     }
                 }
             }
@@ -289,7 +289,7 @@ pub fn flash_attn<F: Float>(
             let r = lane;
             let qpos = qt * br + r;
             if qpos < seq_q {
-                let mut rowmax = F::new(-3.4e38);
+                let mut rowmax = F::new(-3.4e38f32);
                 for c in 0..bc {
                     let s = sf[r * bc + c];
                     if s > rowmax {
@@ -302,7 +302,7 @@ pub fn flash_attn<F: Float>(
                     m_new = rowmax;
                 }
                 let em = (m_old - m_new).exp();
-                let mut psum = F::new(0.0);
+                let mut psum = F::new(0.0f32);
                 for c in 0..bc {
                     let p = (sf[r * bc + c] - m_new).exp();
                     sf[r * bc + c] = p;
@@ -312,7 +312,7 @@ pub fn flash_attn<F: Float>(
                 mf[r] = m_new;
                 emf[r] = em;
             } else {
-                emf[r] = F::new(1.0);
+                emf[r] = F::new(1.0f32);
             }
         }
         sync_cube();
@@ -334,7 +334,7 @@ pub fn flash_attn<F: Float>(
                     let idx = lane * per_p + e;
                     let r = idx / bc;
                     let qpos = qt * br + r;
-                    let val = if qpos < seq_q { sf[idx] } else { F::new(0.0) };
+                    let val = if qpos < seq_q { sf[idx] } else { F::new(0.0f32) };
                     psh[idx] = f16::cast_from(val);
                 }
                 for e in 0..per_v {
@@ -342,7 +342,7 @@ pub fn flash_attn<F: Float>(
                     let c = idx / d;
                     let dd = idx % d;
                     let kpos = j * bc + c;
-                    let val = if kpos < seq_k { v[kvbase + kpos * key_stride + dd] } else { F::new(0.0) };
+                    let val = if kpos < seq_k { v[kvbase + kpos * key_stride + dd] } else { F::new(0.0f32) };
                     vsh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
@@ -351,7 +351,7 @@ pub fn flash_attn<F: Float>(
                 // then stores O_tile columns [dn*16, dn*16+16). Bc=32 -> two contraction chunks per group.
                 for dn in 0..d / 16usize {
                     let cacc = cmma::Matrix::<F>::from_value(
-                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0),
+                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
                     );
                     for kc in 0..bc / 16usize {
                         let a = cmma::Matrix::<f16>::from_slice(
@@ -387,7 +387,7 @@ pub fn flash_attn<F: Float>(
                     let idx = lane * per_p + e;
                     let r = idx / bc;
                     let qpos = qt * br + r;
-                    let val = if qpos < seq_q { sf[idx] } else { F::new(0.0) };
+                    let val = if qpos < seq_q { sf[idx] } else { F::new(0.0f32) };
                     psh[idx] = f16::cast_from(val);
                 }
                 for e in 0..per_v {
@@ -395,14 +395,14 @@ pub fn flash_attn<F: Float>(
                     let c = idx / d;
                     let dd = idx % d;
                     let kpos = j * bc + c;
-                    let val = if kpos < seq_k { v[kvbase + kpos * key_stride + dd] } else { F::new(0.0) };
+                    let val = if kpos < seq_k { v[kvbase + kpos * key_stride + dd] } else { F::new(0.0f32) };
                     vsh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
                 for ti in 0..br / 8usize {
                     for tn in 0..d / 8usize {
                         let cacc = cmma::Matrix::<F>::from_value(
-                            cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, F::new(0.0),
+                            cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
                         );
                         for k8 in 0..bc / 8usize {
                             let a = cmma::Matrix::<f16>::from_slice(

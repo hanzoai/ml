@@ -27,7 +27,7 @@ pub fn matvec_q8<F: Float>(
         let nb = k / 32;
         let wbase = row * k;
         let dbase = row * nb;
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0f32);
         for i in 0..k {
             let d = wd[dbase + i / 32];
             let q = F::cast_from(wq[wbase + i]);
@@ -173,7 +173,7 @@ pub fn matvec_q4k<F: Float>(
     let row = ABSOLUTE_POS;
     if row < out.len() {
         let nb = k / 256;
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0f32);
         for b in 0..nb {
             let blk = row * nb + b;
             let qbase = blk * 32;
@@ -390,7 +390,7 @@ pub fn moe_matvec_q4k<F: Float>(
         let wrow = ids[slot] as usize * n + r; // weight row in the flat [E*n, k] bank
         let nb = k / 256;
         let xbase = slot * k;
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0f32);
         for b in 0..nb {
             let blk = wrow * nb + b;
             let qbase = blk * 32;
@@ -487,7 +487,7 @@ pub fn moe_matvec_q4k_blk<F: Float>(
     let nsub = k / 32; // 32-weight sub-blocks per row
     let per = (nsub + nt - 1) / nt; // comptime ceil: nt (power of 2) need not divide nsub
     let xrow = slot * k;
-    let mut partial = F::new(0.0);
+    let mut partial = F::new(0.0f32);
     for j in 0..per {
         let sb = j * nt + t;
         if sb < nsub {
@@ -501,7 +501,7 @@ pub fn moe_matvec_q4k_blk<F: Float>(
             let shift = ((jloc % 2) * 4) as u32; // low nibble (even sub-block) or high (odd)
             let boff = (jloc / 2) * 32; // qs byte offset for this sub-block's chunk
             let xoff = xrow + sup * 256 + jloc * 32;
-            let mut sbsum = F::new(0.0);
+            let mut sbsum = F::new(0.0f32);
             for qi in 0..32 {
                 let nib = (byte_at(wqs, qbase, boff + qi) >> shift) & 15;
                 sbsum += (dj * F::cast_from(nib) - mj) * x[xoff + qi];
@@ -557,7 +557,7 @@ pub fn moe_matvec_q4k_dp4a_blk<F: Float>(
     let nb = k / 256;
     let nsub = k / 32;
     let per = (nsub + nt - 1) / nt;
-    let mut partial = F::new(0.0);
+    let mut partial = F::new(0.0f32);
     for j in 0..per {
         let sb = j * nt + t;
         if sb < nsub {
@@ -718,7 +718,7 @@ pub fn matvec_q4k_dp4a_blk<F: Float>(
     let nb = k / 256;
     let nsub = k / 32;
     let per = (nsub + nt - 1) / nt;
-    let mut partial = F::new(0.0);
+    let mut partial = F::new(0.0f32);
     for j in 0..per {
         let sb = j * nt + t;
         if sb < nsub {
@@ -854,7 +854,7 @@ pub fn matvec_q4k_f32_blk<F: Float>(
             let mut acc = Array::<F>::new(nr);
             #[unroll]
             for n in 0..nr {
-                acc[n] = F::new(0.0);
+                acc[n] = F::new(0.0f32);
             }
             #[unroll]
             for n in 0..nr {
@@ -909,7 +909,7 @@ pub fn matvec_q4k_f32_blk<F: Float>(
             let mut acc = Array::<F>::new(nr);
             #[unroll]
             for n in 0..nr {
-                acc[n] = F::new(0.0);
+                acc[n] = F::new(0.0f32);
             }
             for j in 0..per {
                 let sb = j * nt + t;
@@ -929,8 +929,8 @@ pub fn matvec_q4k_f32_blk<F: Float>(
                             let dj = d * F::cast_from(q4k_sc(wq, bb + 1, jloc));
                             let mj = dmin * F::cast_from(q4k_m(wq, bb + 1, jloc));
                             let cw = bb + cwoff;
-                            let mut sdot = F::new(0.0);
-                            let mut sx = F::new(0.0);
+                            let mut sdot = F::new(0.0f32);
+                            let mut sx = F::new(0.0f32);
                             #[unroll]
                             for g in 0..8usize {
                                 let word = (wq[cw + g] >> shift) & 0x0F0F0F0F;
@@ -1056,7 +1056,6 @@ pub struct MatvecQ4kF32Eval<'a, R: Runtime> {
     packed_len: usize,
     x_len: usize,
     rows: usize,
-    k: usize,
     oracle: Vec<f32>,
     maxref: f32,
     repeats: usize,
@@ -1099,7 +1098,6 @@ impl<'a, R: Runtime> MatvecQ4kF32Eval<'a, R> {
             packed_len: packed.len(),
             x_len: x.len(),
             rows,
-            k,
             oracle,
             maxref,
             repeats,
@@ -1457,7 +1455,7 @@ pub fn moe_matvec_q6k<F: Float>(
         let wrow = ids[slot] as usize * n + r;
         let nb = k / 256;
         let xbase = slot * k;
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0f32);
         for b in 0..nb {
             let blk = wrow * nb + b;
             let qlb = blk * 32; // ql: 32 u32/block
@@ -1704,7 +1702,7 @@ pub fn moe_matvec_q6k_blk<F: Float>(
     let nsub = k / 32;
     let per = (nsub + nt - 1) / nt; // comptime ceil: nt (power of 2) need not divide nsub
     let xrow = slot * k;
-    let mut partial = F::new(0.0);
+    let mut partial = F::new(0.0f32);
     for j in 0..per {
         let sb = j * nt + t;
         if sb < nsub {
@@ -1723,7 +1721,7 @@ pub fn moe_matvec_q6k_blk<F: Float>(
             let qhshift = (sub * 2) as u32; // 2-bit high field for this sub
             let scb0 = idx * 8 + sub * 2; // scale index for l<16 (is=0); +1 for l>=16
             let xoff = xrow + sup * 256 + idx * 128 + sub * 32;
-            let mut sbsum = F::new(0.0);
+            let mut sbsum = F::new(0.0f32);
             for l in 0..32 {
                 let is = l / 16;
                 let sc = sbyte_at(wsc, scbase, scb0 + is);
@@ -1889,7 +1887,7 @@ pub fn moe_matvec_q6k_dp4a_blk<F: Float>(
     let ones = Vector::<i32, Const<4>>::cast_from(Vector::<i8, Const<4>>::reinterpret::<u32>(
         0x0101_0101u32,
     ));
-    let mut partial = F::new(0.0);
+    let mut partial = F::new(0.0f32);
     for j in 0..per {
         let sb = j * nt + t;
         if sb < nsub {
@@ -2025,7 +2023,7 @@ pub fn matvec_q8_dp4a<F: Float>(
         let nb = k / 32;
         let wbase = row * ng;
         let dbase = row * nb;
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0f32);
         for g in 0..ng {
             let dp = wq[wbase + g].dot(xq[g]); // OpSDot: 4 int8*int products -> i32
             acc += wd[dbase + g / 8] * F::cast_from(dp);
@@ -2111,7 +2109,7 @@ pub fn matvec_q8_dp4a_i8<F: Float>(
         let nb = k / 32;
         let wbase = row * ng;
         let dbase = row * nb;
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0f32);
         for g in 0..ng {
             let wi = Vector::<i32, Const<4>>::cast_from(wq[wbase + g]);
             let xi = Vector::<i32, Const<4>>::cast_from(xq[g]);
@@ -2206,7 +2204,7 @@ fn i8lane<F: Float>(word: u32, p: u32) -> F {
     let b = (word >> p) & 255;
     let mut v = F::cast_from(b);
     if b >= 128 {
-        v -= F::new(256.0);
+        v -= F::new(256.0f32);
     }
     v
 }
@@ -2224,13 +2222,13 @@ pub fn matvec_q8_0_packed_blk<F: Float>(
     let nblocks = k / 32;
     let wbase = row * nblocks * 9;
     let per = nblocks / nt; // blocks per thread (nblocks a multiple of nt); bounded loop lowers clean
-    let mut partial = F::new(0.0);
+    let mut partial = F::new(0.0f32);
     for j in 0..per {
         let b = j * nt + t;
         let off = wbase + b * 9;
         let scale = F::cast_from(f16lo_to_f32(w[off]));
         let xb = b * 32;
-        let mut bsum = F::new(0.0);
+        let mut bsum = F::new(0.0f32);
         for jj in 0..8 {
             let word = w[off + 1 + jj];
             let xo = xb + jj * 4;
@@ -2275,13 +2273,13 @@ pub fn matvec_q8_0_packed_sg<F: Float>(
     let nblocks = k / 32;
     let wbase = row * nblocks * 9;
     let per = nblocks / nt;
-    let mut partial = F::new(0.0);
+    let mut partial = F::new(0.0f32);
     for j in 0..per {
         let b = j * nt + t;
         let off = wbase + b * 9;
         let scale = F::cast_from(f16lo_to_f32(w[off]));
         let xb = b * 32;
-        let mut bsum = F::new(0.0);
+        let mut bsum = F::new(0.0f32);
         for jj in 0..8 {
             let word = w[off + 1 + jj];
             let xo = xb + jj * 4;
@@ -2456,7 +2454,7 @@ pub fn matvec_q8_dp4a_blk<F: Float>(
     let ng = k / 4;
     let wbase = row * ng;
     let dbase = row * (k / 32);
-    let mut partial = F::new(0.0);
+    let mut partial = F::new(0.0f32);
     let per = ng / nt; // groups per thread (ng is a multiple of nt); bounded for-loop lowers cleanly
     for j in 0..per {
         let g = j * nt + t;
@@ -2565,7 +2563,7 @@ pub fn matvec_q8_dp4a_tuned<F: Float>(
     let mut acc = Array::<F>::new(nr);
     #[unroll]
     for n in 0..nr {
-        acc[n] = F::new(0.0);
+        acc[n] = F::new(0.0f32);
     }
     let steps = ng / vw;
     for s in 0..steps {
@@ -2927,7 +2925,7 @@ pub fn moe_route<F: Float>(
     let tok = CUBE_POS as usize;
     let t = UNIT_POS as usize;
     let base = tok * n_experts;
-    let ninf = F::new(-3.4e38); // -inf sentinel (cf. attn.rs running-max init)
+    let ninf = F::new(-3.4e38f32); // -inf sentinel (cf. attn.rs running-max init)
                                 // Maskable copy of this token's logits in shared memory (F = f32 at launch).
     let mut slog = SharedMemory::<F>::new(n_experts);
     let mut i = t;
@@ -2962,7 +2960,7 @@ pub fn moe_route<F: Float>(
     }
     let m = sred[0];
     sync_cube();
-    let mut lsum = F::new(0.0);
+    let mut lsum = F::new(0.0f32);
     let mut b = t;
     while b < n_experts {
         lsum += (slog[b] - m).exp();
@@ -2983,7 +2981,7 @@ pub fn moe_route<F: Float>(
     sync_cube();
     // top-k: `topk` passes of argmax over the masked logits (index-tracking tree reduce).
     let mut sidx = SharedMemory::<u32>::new(nt);
-    let mut wsum = F::new(0.0);
+    let mut wsum = F::new(0.0f32);
     for _r in 0..topk {
         let mut lv = ninf;
         let mut li = 0u32;
@@ -3079,7 +3077,7 @@ pub fn gemv<F: Float>(
     let t = UNIT_POS as usize;
     let k = meta[0] as usize;
     let wbase = row * k;
-    let mut acc = F::new(0.0);
+    let mut acc = F::new(0.0f32);
     let mut i = t;
     while i < k {
         acc += w[wbase + i] * x[i];

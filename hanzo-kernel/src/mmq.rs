@@ -2074,7 +2074,7 @@ pub fn mmq_q4k_coopmat_tile<F: Float>(
             #[unroll]
             for _i in 0..(rm * rn) {
                 acc.push(cmma::Matrix::<F>::from_value(
-                    cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0),
+                    cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
                 ));
             }
             for kb in 0..kb_count {
@@ -2083,7 +2083,7 @@ pub fn mmq_q4k_coopmat_tile<F: Float>(
                     let idx = tid + i * nthread;
                     if idx < bm * 32 {
                         let arow = mrow0 + idx / 32;
-                        let mut v = F::new(0.0);
+                        let mut v = F::new(0.0f32);
                         if arow < m {
                             v = x[arow * k + k0 + idx % 32];
                         }
@@ -2099,7 +2099,7 @@ pub fn mmq_q4k_coopmat_tile<F: Float>(
                     if idx < bn * 32 {
                         let nrow = ncol0 + idx / 32;
                         let qi = idx % 32;
-                        let mut wv = F::new(0.0);
+                        let mut wv = F::new(0.0f32);
                         if nrow < n {
                             let blk = nrow * nsb + sbk;
                             let ds = wd[blk] * F::cast_from(q4k_sc(wsc, blk * 3, is));
@@ -2162,7 +2162,7 @@ pub fn mmq_q4k_coopmat_tile<F: Float>(
             let mut sb = SharedMemory::<half::f16>::new(bn * 32);
             let mut acc = Array::<F>::new(rm * rn * per);
             for a in 0..(rm * rn * per) {
-                acc[a] = F::new(0.0);
+                acc[a] = F::new(0.0f32);
             }
             for kb in 0..kb_count {
                 let k0 = kb * 32;
@@ -2170,7 +2170,7 @@ pub fn mmq_q4k_coopmat_tile<F: Float>(
                     let idx = tid + i * nthread;
                     if idx < bm * 32 {
                         let arow = mrow0 + idx / 32;
-                        let mut v = F::new(0.0);
+                        let mut v = F::new(0.0f32);
                         if arow < m {
                             v = x[arow * k + k0 + idx % 32];
                         }
@@ -2186,7 +2186,7 @@ pub fn mmq_q4k_coopmat_tile<F: Float>(
                     if idx < bn * 32 {
                         let nrow = ncol0 + idx / 32;
                         let qi = idx % 32;
-                        let mut wv = F::new(0.0);
+                        let mut wv = F::new(0.0f32);
                         if nrow < n {
                             let blk = nrow * nsb + sbk;
                             let ds = wd[blk] * F::cast_from(q4k_sc(wsc, blk * 3, is));
@@ -2209,7 +2209,7 @@ pub fn mmq_q4k_coopmat_tile<F: Float>(
                             let p = lane * per + e;
                             let smm = p / 16;
                             let snn = p % 16;
-                            let mut s = F::new(0.0);
+                            let mut s = F::new(0.0f32);
                             for l in 0..32 {
                                 s += F::cast_from(sa[(sm * 16 + smm) * 32 + l])
                                     * F::cast_from(sb[(sn * 16 + snn) * 32 + l]);

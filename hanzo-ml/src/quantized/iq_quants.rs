@@ -759,7 +759,7 @@ mod rocmfp4_tests {
         let xs: Vec<BlockROCMFP4Fast> = (0..nb)
             .map(|i| {
                 let mut b = BlockROCMFP4Fast { qs: [0; 16], e: 0 };
-                b.e = (0x30 + (i % 4) as u8);
+                b.e = 0x30 + (i % 4) as u8;
                 for j in 0..16 {
                     b.qs[j] = ((i * 5 + j) & 0xFF) as u8;
                 }

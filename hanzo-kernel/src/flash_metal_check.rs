@@ -125,7 +125,7 @@ pub fn cmma8<F: Float>(a: &Array<F>, b: &Array<F>, out: &mut Array<F>) {
         8usize,
         8usize,
         cmma::MatrixLayout::Undefined,
-        F::new(0.0),
+        F::new(0.0f32),
     );
     let am = cmma::Matrix::<f16>::from_slice(
         cmma::MatrixIdent::A,

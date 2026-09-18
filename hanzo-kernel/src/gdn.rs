@@ -54,7 +54,7 @@ pub fn gdn_conv1d<F: Float>(
         let x_base = row * seq_len;
         let w_base = ch * k;
 
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0f32);
         for i in 0..k {
             // src_pos = pos - (k-1) + i; contribute only when it is in-range (causal zero-pad).
             if pos + i >= k - 1 {
@@ -63,7 +63,7 @@ pub fn gdn_conv1d<F: Float>(
             }
         }
         // SiLU (matches the shader's acc * sigmoid(acc), sigmoid = 1/(1+exp(-acc))).
-        out[x_base + pos] = acc / (F::new(1.0) + (-acc).exp());
+        out[x_base + pos] = acc / (F::new(1.0f32) + (-acc).exp());
     }
 }
 
@@ -91,8 +91,8 @@ pub fn gdn_gating<F: Float>(
         let num_heads = dims[0] as usize;
         let head = idx % num_heads;
 
-        let beta = F::new(1.0) / (F::new(1.0) + (-b_in[idx]).exp());
-        let softplus = (F::new(1.0) + (a_in[idx] + dt_bias[head]).exp()).ln();
+        let beta = F::new(1.0f32) / (F::new(1.0f32) + (-b_in[idx]).exp());
+        let softplus = (F::new(1.0f32) + (a_in[idx] + dt_bias[head]).exp()).ln();
         let g = -(a_log[head].exp()) * softplus;
 
         beta_out[idx] = beta;
@@ -153,7 +153,7 @@ pub fn gdn_scan<F: Float>(
             let v_t = v[v_bh + t * v_dim + vi];
 
             // Decay the state, then read the pre-update memory kv = Σ_j (s[j]*decay) * k_t[j].
-            let mut kv_mem = F::new(0.0);
+            let mut kv_mem = F::new(0.0f32);
             for j in 0..k_dim {
                 let sj = s[j] * decay;
                 s[j] = sj;
@@ -162,7 +162,7 @@ pub fn gdn_scan<F: Float>(
             let delta = (v_t - kv_mem) * beta_t;
 
             // Rank-1 update s[j] += k_t[j]*δ, then read out y_t = Σ_j s[j]*q_t[j] (post-update).
-            let mut y_t = F::new(0.0);
+            let mut y_t = F::new(0.0f32);
             for j in 0..k_dim {
                 let sj = s[j] + k[qk_bh + t * k_dim + j] * delta;
                 s[j] = sj;

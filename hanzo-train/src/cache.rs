@@ -153,22 +153,28 @@ impl Cache {
 
         let raw = self.read_at(r.off_input_ids, seq * 4)?;
         let input_ids: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         let attention_mask = self.read_at(r.off_attn, seq)?;
         let loss_mask = self.read_at(r.off_loss, seq)?;
 
         let hraw = self.read_at(r.off_hidden, seq * nf * h * 2)?;
         let target_hidden: Vec<f32> = hraw
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
             .collect();
 
         let lraw = self.read_at(r.off_last, seq * h * 2)?;
         let target_last_hidden: Vec<f32> = lraw
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
             .collect();
 
         Ok(Sample {
