@@ -3,6 +3,8 @@ on:
 
 name: Secret Leaks
 
+# The runner has no Docker socket, so the scanner runs as its release binary rather than the
+# container action. A push scans the commits it brought; a branch's first push scans its history.
 jobs:
   trufflehog:
     runs-on: linux-amd64
@@ -12,8 +14,11 @@ jobs:
         with:
           fetch-depth: 0
       - name: Secret Scanning
-        uses: trufflesecurity/trufflehog@6bd2d14f7a4bc1e569fa3550efa7ec632a4fa67b  # main
-        with:
-          base: ""
-          head: ${{ github.ref_name }}
-          extra_args: --results=verified,unknown
+        env:
+          VERSION: "3.97.5"
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          curl -sSfL "https://github.com/trufflesecurity/trufflehog/releases/download/v${VERSION}/trufflehog_${VERSION}_linux_amd64.tar.gz" | tar -xz -C "$RUNNER_TEMP" trufflehog
+          since=(); [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && since=(--since-commit "$BEFORE")
+          "$RUNNER_TEMP/trufflehog" git "file://$PWD" "${since[@]}" --branch "$AFTER" --results=verified,unknown --fail --no-update --github-actions
