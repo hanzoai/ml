@@ -3,6 +3,8 @@
 // over the sequence, no cross-thread communication -- the exact math of hanzo-kernel gdn_scan
 // (CPU-gated against the engine's portable scan). q arrives pre-scaled by 1/sqrt(kd).
 // Layout: q,k: [bh, seq, kd]  v,out: [bh, seq, vd]  g,beta: [bh, seq]  state: [bh, kd, vd] (in-place).
+#include <hip/hip_runtime.h>
+
 extern "C" __global__ void gdn_scan_f32(
     const float* __restrict__ q,
     const float* __restrict__ k,

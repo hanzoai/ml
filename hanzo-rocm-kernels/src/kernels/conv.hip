@@ -1,5 +1,9 @@
 // Convolution kernels for ROCm
 
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
+
 template <typename T>
 __device__ void im2col1d(
     size_t threads,
