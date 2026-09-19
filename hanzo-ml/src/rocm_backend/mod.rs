@@ -2326,7 +2326,8 @@ unsafe fn launch_kernel(
         .launch(grid, block, 0, Some(&dev.stream), args)
         .map_err(|e| {
             crate::Error::Msg(format!(
-                "Kernel launch failed: {module_name}::{func_name} grid {grid:?} block {block:?}: {e}"
+                "Kernel launch failed: {module_name}::{func_name} grid ({}, {}, {}) block ({}, {}, {}): {e}",
+                grid.x, grid.y, grid.z, block.x, block.y, block.z
             ))
         })
 }
@@ -2356,7 +2357,8 @@ unsafe fn launch_kernel_shmem(
         .launch(grid, block, shared_mem, Some(&dev.stream), args)
         .map_err(|e| {
             crate::Error::Msg(format!(
-                "Kernel launch failed: {module_name}::{func_name} grid {grid:?} block {block:?}: {e}"
+                "Kernel launch failed: {module_name}::{func_name} grid ({}, {}, {}) block ({}, {}, {}): {e}",
+                grid.x, grid.y, grid.z, block.x, block.y, block.z
             ))
         })
 }
