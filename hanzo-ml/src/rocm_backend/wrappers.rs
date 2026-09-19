@@ -81,7 +81,7 @@ const MAX_POOLED_PER_SIZE: usize = 64;
 /// Bytes the pool may hold while work is in flight. `hipFree` synchronizes the device and unpins
 /// host pages, so nothing is freed on the hot path below this: a forward's temporaries are reused
 /// layer after layer, and only past it does a dropped buffer go straight back to the driver.
-const POOL_CAP_BYTES: usize = 8 << 30;
+const POOL_CAP_BYTES: usize = 16 << 30;
 
 /// Bytes the pool keeps once a caller says the work is done ([`PoolInner::trim`]): enough for
 /// decode's small, exactly repeating buffers; a prefill's large temporaries go back to the box.
@@ -161,7 +161,15 @@ impl<T> SendSyncDeviceMemory<T> {
             }
         }
         let mut ptr = std::ptr::null_mut();
-        let err = unsafe { bindings::hipMalloc(&mut ptr, capacity) };
+        let mut err = unsafe { bindings::hipMalloc(&mut ptr, capacity) };
+        if err != bindings::hipError_t_hipSuccess {
+            // The driver is out of memory while the pool sits on idle buffers: give them all back
+            // and ask once more.
+            if let Some(p) = &pool {
+                trim_pool(p, 0);
+                err = unsafe { bindings::hipMalloc(&mut ptr, capacity) };
+            }
+        }
         if err != bindings::hipError_t_hipSuccess {
             return Err(HipError::new(err));
         }
