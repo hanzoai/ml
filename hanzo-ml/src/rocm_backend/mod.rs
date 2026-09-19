@@ -2324,7 +2324,11 @@ unsafe fn launch_kernel(
     let kernel = rocm_rs::hip::Function::from_raw(raw as _);
     kernel
         .launch(grid, block, 0, Some(&dev.stream), args)
-        .map_err(|e| crate::Error::Msg(format!("Kernel launch failed: {}", e)))
+        .map_err(|e| {
+            crate::Error::Msg(format!(
+                "Kernel launch failed: {module_name}::{func_name} grid {grid:?} block {block:?}: {e}"
+            ))
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2350,7 +2354,11 @@ unsafe fn launch_kernel_shmem(
     let kernel = rocm_rs::hip::Function::from_raw(raw as _);
     kernel
         .launch(grid, block, shared_mem, Some(&dev.stream), args)
-        .map_err(|e| crate::Error::Msg(format!("Kernel launch failed: {}", e)))
+        .map_err(|e| {
+            crate::Error::Msg(format!(
+                "Kernel launch failed: {module_name}::{func_name} grid {grid:?} block {block:?}: {e}"
+            ))
+        })
 }
 
 /// Fused GDN gated-delta-rule scan: ONE launch, f32 end-to-end, state updated in place.
