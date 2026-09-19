@@ -40,7 +40,7 @@ use rocm_rs::rocrand::PseudoRng;
 pub struct PoolInner {
     /// capacity in bytes -> free device pointers (as usize).
     free: HashMap<usize, Vec<usize>>,
-    /// Bytes held idle in `free`, kept under [`POOL_BUDGET_BYTES`].
+    /// Bytes held idle in `free`, kept under [`POOL_CAP_BYTES`].
     pooled_bytes: usize,
     /// Number of nested in-flight hipGraph captures. While > 0, buffers
     /// allocated from this pool are reserved (leaked) on Drop instead of
@@ -63,11 +63,29 @@ impl Default for PoolInner {
 
 pub type DevicePool = Arc<Mutex<PoolInner>>;
 
+/// Return the pool's idle buffers to the driver, keeping at most `keep` bytes.
+pub fn trim_pool(pool: &DevicePool, keep: usize) {
+    let freed = pool
+        .lock()
+        .map(|mut inner| inner.trim(keep))
+        .unwrap_or_default();
+    for ptr in freed {
+        unsafe {
+            let _ = bindings::hipFree(ptr as *mut std::ffi::c_void);
+        }
+    }
+}
+
 const MAX_POOLED_PER_SIZE: usize = 64;
 
-/// Bytes the pool may hold idle. Past it a dropped buffer is freed, so a long prefill's
-/// temporaries go back to the box instead of staying resident for the life of the process.
-const POOL_BUDGET_BYTES: usize = 2 << 30;
+/// Bytes the pool may hold while work is in flight. `hipFree` synchronizes the device and unpins
+/// host pages, so nothing is freed on the hot path below this: a forward's temporaries are reused
+/// layer after layer, and only past it does a dropped buffer go straight back to the driver.
+const POOL_CAP_BYTES: usize = 8 << 30;
+
+/// Bytes the pool keeps once a caller says the work is done ([`PoolInner::trim`]): enough for
+/// decode's small, exactly repeating buffers; a prefill's large temporaries go back to the box.
+pub const POOL_IDLE_BYTES: usize = 1 << 30;
 
 /// The bytes allocated for a request of `size` bytes: exact up to 1 MiB, where decode's buffers
 /// repeat exactly, then rounded up to an eighth of the power of two below. Buffers whose size
@@ -304,7 +322,7 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
                     inner.reserved.push(self.ptr as usize);
                     return;
                 }
-                if inner.pooled_bytes + self.capacity <= POOL_BUDGET_BYTES {
+                if inner.pooled_bytes + self.capacity <= POOL_CAP_BYTES {
                     let v = inner.free.entry(self.capacity).or_default();
                     if v.len() < MAX_POOLED_PER_SIZE {
                         v.push(self.ptr as usize);
@@ -321,6 +339,25 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
 }
 
 impl PoolInner {
+    /// Take buffers out of the pool, largest class first, until it holds at most `keep` bytes.
+    /// The caller frees what comes back, outside the lock: `hipFree` synchronizes.
+    fn trim(&mut self, keep: usize) -> Vec<usize> {
+        let mut classes: Vec<usize> = self.free.keys().copied().collect();
+        classes.sort_unstable_by(|a, b| b.cmp(a));
+        let mut out = Vec::new();
+        for class in classes {
+            while self.pooled_bytes > keep {
+                let Some(ptr) = self.free.get_mut(&class).and_then(Vec::pop) else {
+                    break;
+                };
+                self.pooled_bytes -= class;
+                out.push(ptr);
+            }
+        }
+        self.free.retain(|_, v| !v.is_empty());
+        out
+    }
+
     /// Enter a hipGraph capture scope: every buffer allocated from this pool
     /// while the scope is open is reserved (leaked) on Drop instead of being
     /// recycled, so the captured graph's device pointers are never reused.

@@ -764,6 +764,15 @@ impl Device {
         }
     }
 
+    /// Return memory the backend holds idle for reuse. A burst of work with large temporaries
+    /// (a prefill) calls it when done; it may synchronize the device, so not inside a forward.
+    pub fn trim(&self) {
+        #[cfg(feature = "rocm")]
+        if let Self::Rocm(d) = self {
+            d.trim();
+        }
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),

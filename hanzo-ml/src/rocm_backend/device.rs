@@ -217,6 +217,12 @@ impl RocmDevice {
         }
     }
 
+    /// Give the caching pool's idle buffers back to the driver, keeping what decode reuses.
+    /// Called when a burst of work (a prefill) is over; it synchronizes, so never mid-forward.
+    pub fn trim(&self) {
+        super::wrappers::trim_pool(&self.pool, super::wrappers::POOL_IDLE_BYTES);
+    }
+
     pub(crate) fn kernel_manager(&self) -> &std::sync::Mutex<KernelCache> {
         &self.kernel_manager
     }
