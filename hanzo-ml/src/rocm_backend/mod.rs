@@ -2322,12 +2322,15 @@ unsafe fn launch_kernel(
             .map_err(|e| crate::Error::Msg(e.to_string()))?
     };
     let kernel = rocm_rs::hip::Function::from_raw(raw as _);
+    let shape = format!(
+        "grid ({}, {}, {}) block ({}, {}, {})",
+        grid.x, grid.y, grid.z, block.x, block.y, block.z
+    );
     kernel
         .launch(grid, block, 0, Some(&dev.stream), args)
         .map_err(|e| {
             crate::Error::Msg(format!(
-                "Kernel launch failed: {module_name}::{func_name} grid ({}, {}, {}) block ({}, {}, {}): {e}",
-                grid.x, grid.y, grid.z, block.x, block.y, block.z
+                "Kernel launch failed: {module_name}::{func_name} {shape}: {e}"
             ))
         })
 }
@@ -2353,12 +2356,15 @@ unsafe fn launch_kernel_shmem(
             .map_err(|e| crate::Error::Msg(e.to_string()))?
     };
     let kernel = rocm_rs::hip::Function::from_raw(raw as _);
+    let shape = format!(
+        "grid ({}, {}, {}) block ({}, {}, {})",
+        grid.x, grid.y, grid.z, block.x, block.y, block.z
+    );
     kernel
         .launch(grid, block, shared_mem, Some(&dev.stream), args)
         .map_err(|e| {
             crate::Error::Msg(format!(
-                "Kernel launch failed: {module_name}::{func_name} grid ({}, {}, {}) block ({}, {}, {}): {e}",
-                grid.x, grid.y, grid.z, block.x, block.y, block.z
+                "Kernel launch failed: {module_name}::{func_name} {shape}: {e}"
             ))
         })
 }
