@@ -364,6 +364,121 @@ impl HybridMuonAdamW {
     }
 }
 
+/// Configuration parameters for MuonClip (Moonshot AI Kimi K2/K3 matrix optimizer).
+///
+/// Extends Muon with:
+/// 1. Consistent RMS matching across layer types to prevent gradient magnitude mismatch with AdamW.
+/// 2. QK-Clip: Clamping projection gradient norm to prevent softmax saturation and loss spikes in long-context attention.
+#[derive(Clone, Debug)]
+pub struct ParamsMuonClip {
+    pub lr: f64,
+    pub momentum: f64,
+    pub n_iterations: usize,
+    pub weight_decay: f64,
+    pub qk_clip_threshold: Option<f64>,
+    pub rms_match: bool,
+}
+
+impl Default for ParamsMuonClip {
+    fn default() -> Self {
+        Self {
+            lr: 0.02,
+            momentum: 0.95,
+            n_iterations: 5,
+            weight_decay: 0.01,
+            qk_clip_threshold: Some(30.0),
+            rms_match: true,
+        }
+    }
+}
+
+/// MuonClip optimizer based on Moonshot AI Kimi K2/K3 frontier training recipes.
+///
+/// Combines momentum orthogonalization (Newton-Schulz) with consistent RMS matching and
+/// QK-clipping to eliminate loss spikes and maintain training stability over long sequences.
+#[derive(Debug)]
+pub struct MuonClip {
+    vars: Vec<VarMuon>,
+    params: ParamsMuonClip,
+}
+
+impl Optimizer for MuonClip {
+    type Config = ParamsMuonClip;
+
+    fn new(vars: Vec<Var>, params: ParamsMuonClip) -> Result<Self> {
+        let vars = vars
+            .into_iter()
+            .filter(|var| var.dtype().is_float() && var.shape().dims().len() >= 2)
+            .map(|var| {
+                let shape = var.shape();
+                let dtype = var.dtype();
+                let device = var.device();
+                let momentum = Var::zeros(shape, dtype, device)?;
+                Ok(VarMuon { var, momentum })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { vars, params })
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.params.lr
+    }
+
+    fn set_learning_rate(&mut self, lr: f64) {
+        self.params.lr = lr;
+    }
+
+    fn step(&mut self, grads: &hanzo_ml::backprop::GradStore) -> Result<()> {
+        let lr = self.params.lr;
+        let beta = self.params.momentum;
+        let lambda = self.params.weight_decay;
+        let steps = self.params.n_iterations;
+
+        for var in self.vars.iter() {
+            let theta = &var.var;
+            let m = &var.momentum;
+            if let Some(g) = grads.get(theta) {
+                let m_decayed = m.as_tensor().affine(beta, 0.0)?;
+                let g_scaled = g.affine(1.0 - beta, 0.0)?;
+                let next_m = m_decayed.add(&g_scaled)?;
+                let mut ortho_update = newton_schulz(&next_m, steps)?;
+
+                // 1. Consistent RMS matching
+                if self.params.rms_match {
+                    let dims = theta.shape().dims();
+                    let d0 = dims[0];
+                    let d1: usize = dims[1..].iter().product();
+                    let numel = (d0 * d1) as f64;
+                    let target_rms = 1.0 / (d0.max(d1) as f64).sqrt();
+
+                    let sum_sq = ortho_update.sqr()?.sum_all()?.to_dtype(hanzo_ml::DType::F64)?.to_scalar::<f64>()?;
+                    let current_rms = (sum_sq / numel).sqrt();
+                    let scale = target_rms / (current_rms + 1e-7);
+                    ortho_update = ortho_update.affine(scale, 0.0)?;
+                }
+
+                // 2. QK-Clip: prevent loss spikes and softmax saturation
+                if let Some(clip_threshold) = self.params.qk_clip_threshold {
+                    let frob_norm = ortho_update.sqr()?.sum_all()?.sqrt()?.to_dtype(hanzo_ml::DType::F64)?.to_scalar::<f64>()?;
+                    if frob_norm > clip_threshold {
+                        let scale = clip_threshold / (frob_norm + 1e-7);
+                        ortho_update = ortho_update.affine(scale, 0.0)?;
+                    }
+                }
+
+                // 3. Update weights with decoupled decay
+                let next_theta = theta.as_tensor().affine(1.0 - lr * lambda, 0.0)?;
+                let step_update = ortho_update.affine(-lr, 0.0)?;
+                let next_theta = next_theta.add(&step_update)?;
+                m.set(&next_m)?;
+                theta.set(&next_theta)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
