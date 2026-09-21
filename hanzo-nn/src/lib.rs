@@ -59,7 +59,7 @@ pub use layer_norm::{
 };
 pub use linear::{linear, linear_b, linear_no_bias, Linear};
 pub use ops::Dropout;
-pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
+pub use optim::{newton_schulz, AdamW, HybridMuonAdamW, Muon, Optimizer, ParamsAdamW, ParamsMuon, SGD};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use sigreg::{random_directions, SigReg};

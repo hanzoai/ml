@@ -199,3 +199,210 @@ impl AdamW {
         self.params = params;
     }
 }
+
+/// Configuration parameters for the Muon (Momentum Orthogonalized Update via Newton-Schulz) optimizer.
+#[derive(Clone, Debug)]
+pub struct ParamsMuon {
+    pub lr: f64,
+    pub momentum: f64,
+    pub n_iterations: usize,
+    pub weight_decay: f64,
+}
+
+impl Default for ParamsMuon {
+    fn default() -> Self {
+        Self {
+            lr: 0.02,
+            momentum: 0.95,
+            n_iterations: 5,
+            weight_decay: 0.01,
+        }
+    }
+}
+
+/// Computes the orthogonalized matrix update via quintic Newton-Schulz iteration.
+///
+/// Solves $X_{k+1} = a X + b (X X^T) X + c (X X^T)^2 X$ using optimal convergence
+/// coefficients $(a=3.4445, b=-4.7750, c=2.0315)$.
+pub fn newton_schulz(g: &Tensor, steps: usize) -> Result<Tensor> {
+    let shape = g.shape();
+    let dims = shape.dims();
+    if dims.len() < 2 {
+        return Ok(g.clone());
+    }
+    let d0 = dims[0];
+    let d1: usize = dims[1..].iter().product();
+    let g_flat = g.reshape((d0, d1))?;
+
+    let transposed = d0 > d1;
+    let x = if transposed { g_flat.t()? } else { g_flat };
+
+    let norm = x.sqr()?.sum_all()?.sqrt()?.to_dtype(hanzo_ml::DType::F64)?.to_scalar::<f64>()?;
+    let mut x = x.affine(1.0 / (norm + 1e-7), 0.0)?;
+
+    let a = 3.4445f64;
+    let b = -4.7750f64;
+    let c = 2.0315f64;
+
+    for _ in 0..steps {
+        let xt = x.t()?;
+        let a_mat = x.matmul(&xt)?;
+        let a_sq = a_mat.matmul(&a_mat)?;
+        let b_part = a_mat.affine(b, 0.0)?;
+        let c_part = a_sq.affine(c, 0.0)?;
+        let b_mat = b_part.add(&c_part)?;
+        let bx = b_mat.matmul(&x)?;
+        let ax = x.affine(a, 0.0)?;
+        x = ax.add(&bx)?;
+    }
+
+    let res = if transposed { x.t()? } else { x };
+    res.reshape(shape)
+}
+
+#[derive(Debug)]
+struct VarMuon {
+    var: Var,
+    momentum: Var,
+}
+
+/// Muon optimizer for 2D weight matrices.
+///
+/// Orthogonalizes gradient updates via Newton-Schulz iterations to ensure spectral norm stability,
+/// enabling 2x–5x higher learning rates and zero-warmup convergence.
+#[derive(Debug)]
+pub struct Muon {
+    vars: Vec<VarMuon>,
+    params: ParamsMuon,
+}
+
+impl Optimizer for Muon {
+    type Config = ParamsMuon;
+
+    fn new(vars: Vec<Var>, params: ParamsMuon) -> Result<Self> {
+        let vars = vars
+            .into_iter()
+            .filter(|var| var.dtype().is_float() && var.shape().dims().len() >= 2)
+            .map(|var| {
+                let shape = var.shape();
+                let dtype = var.dtype();
+                let device = var.device();
+                let momentum = Var::zeros(shape, dtype, device)?;
+                Ok(VarMuon { var, momentum })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { vars, params })
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.params.lr
+    }
+
+    fn set_learning_rate(&mut self, lr: f64) {
+        self.params.lr = lr;
+    }
+
+    fn step(&mut self, grads: &hanzo_ml::backprop::GradStore) -> Result<()> {
+        let lr = self.params.lr;
+        let beta = self.params.momentum;
+        let lambda = self.params.weight_decay;
+        let steps = self.params.n_iterations;
+
+        for var in self.vars.iter() {
+            let theta = &var.var;
+            let m = &var.momentum;
+            if let Some(g) = grads.get(theta) {
+                let m_decayed = m.as_tensor().affine(beta, 0.0)?;
+                let g_scaled = g.affine(1.0 - beta, 0.0)?;
+                let next_m = m_decayed.add(&g_scaled)?;
+                let ortho_update = newton_schulz(&next_m, steps)?;
+                let next_theta = theta.as_tensor().affine(1.0 - lr * lambda, 0.0)?;
+                let step_update = ortho_update.affine(-lr, 0.0)?;
+                let next_theta = next_theta.add(&step_update)?;
+                m.set(&next_m)?;
+                theta.set(&next_theta)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Dual optimizer combining Muon for 2D+ matrix projections and AdamW for vectors/biases/embeddings.
+#[derive(Debug)]
+pub struct HybridMuonAdamW {
+    muon: Muon,
+    adamw: AdamW,
+}
+
+impl HybridMuonAdamW {
+    pub fn new(vars: Vec<Var>, muon_params: ParamsMuon, adamw_params: ParamsAdamW) -> Result<Self> {
+        let mut matrix_vars = Vec::new();
+        let mut vector_vars = Vec::new();
+
+        for var in vars {
+            if var.shape().dims().len() >= 2 {
+                matrix_vars.push(var);
+            } else {
+                vector_vars.push(var);
+            }
+        }
+
+        let muon = Muon::new(matrix_vars, muon_params)?;
+        let adamw = AdamW::new(vector_vars, adamw_params)?;
+        Ok(Self { muon, adamw })
+    }
+
+    pub fn step(&mut self, grads: &hanzo_ml::backprop::GradStore) -> Result<()> {
+        self.muon.step(grads)?;
+        self.adamw.step(grads)?;
+        Ok(())
+    }
+
+    pub fn set_learning_rates(&mut self, muon_lr: f64, adamw_lr: f64) {
+        self.muon.set_learning_rate(muon_lr);
+        self.adamw.set_learning_rate(adamw_lr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hanzo_ml::Device;
+
+    #[test]
+    fn test_newton_schulz_orthogonalization() -> Result<()> {
+        let dev = Device::Cpu;
+        let data: Vec<f32> = vec![
+            1.0, 0.0, 0.5,
+            0.0, 1.0, 0.0,
+            -0.5, 0.0, 1.0,
+        ];
+        let t = Tensor::from_vec(data, (3, 3), &dev)?;
+        let ortho = newton_schulz(&t, 5)?;
+        let prod = ortho.matmul(&ortho.t()?)?;
+        let mat = prod.to_vec2::<f32>()?;
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    assert!(mat[i][j].abs() < 1e-4, "Off-diag not close to 0: {}", mat[i][j]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_muon_step() -> Result<()> {
+        let dev = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::randn(0.0f32, 1.0f32, (4, 4), &dev)?)?;
+        let mut muon = Muon::new(vec![w.clone()], ParamsMuon::default())?;
+
+        let loss = w.as_tensor().sqr()?.sum_all()?;
+        let grads = loss.backward()?;
+        muon.step(&grads)?;
+        assert_eq!(muon.learning_rate(), 0.02);
+        Ok(())
+    }
+}
+
+

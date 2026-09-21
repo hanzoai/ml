@@ -112,6 +112,8 @@ pub enum OptimizerType {
     AdamW,
     SGD,
     RMSprop,
+    Muon,
+    HybridMuonAdamW,
 }
 
 /// Learning rate scheduler types
