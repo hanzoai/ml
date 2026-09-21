@@ -44,6 +44,7 @@ pub mod varlen_attention {
 }
 
 pub use activation::{prelu, Activation, PReLU};
+pub use attention::AttentionResiduals;
 pub use batch_norm::{batch_norm, BatchNorm, BatchNormConfig};
 pub use conv::{
     conv1d, conv1d_no_bias, conv2d, conv2d_no_bias, conv_transpose1d, conv_transpose1d_no_bias,

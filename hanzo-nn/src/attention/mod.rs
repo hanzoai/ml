@@ -1,9 +1,11 @@
+pub mod attention_residuals;
 pub mod cpu_flash;
 pub mod rocm;
 pub mod varlen;
 
 use hanzo_ml::Tensor;
 
+pub use attention_residuals::AttentionResiduals;
 pub use cpu_flash::flash_attn;
 pub use cpu_flash::varlen::flash_attn_varlen_cpu;
 pub use rocm::{rocm_flash_attn, rocm_flash_attn_decode};
