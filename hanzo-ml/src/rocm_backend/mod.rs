@@ -726,9 +726,7 @@ impl RocmQuantType {
             | Self::TQ1_0
             | Self::IQ1_S
             | Self::IQ1_M
-            | Self::MXFP4
-            | Self::ROCMFP4
-            | Self::ROCMFP4_FAST => {
+            | Self::MXFP4 => {
                 unreachable!("prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
             }
         }
@@ -784,9 +782,7 @@ impl RocmQuantType {
                 | Self::TQ1_0
                 | Self::IQ1_S
                 | Self::IQ1_M
-                | Self::MXFP4
-                | Self::ROCMFP4
-                | Self::ROCMFP4_FAST,
+                | Self::MXFP4,
                 _,
             ) => {
                 unreachable!("moe_prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
