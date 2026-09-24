@@ -23,6 +23,8 @@ pub mod metal;
 pub mod repack;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod repack_x86;
+#[cfg(feature = "rocm")]
+pub mod rocm;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tokenizer;
 #[cfg(not(feature = "metal"))]
@@ -80,8 +82,6 @@ fn as_t_slice<T>(data: &[u8]) -> &[T] {
 // later call through the `Arc<QTensor>` all consumers already hold.
 #[derive(Default)]
 struct ResidentBanks {
-    #[cfg(feature = "rocm")]
-    rocm: std::sync::OnceLock<std::sync::Arc<crate::RocmStorage>>,
     #[cfg(feature = "vulkan")]
     vulkan: std::sync::OnceLock<std::sync::Arc<crate::VulkanStorage>>,
     #[cfg(feature = "vulkan")]
@@ -124,12 +124,9 @@ impl Device {
                 Ok(QStorage::Cuda(storage))
             }
             #[cfg(feature = "rocm")]
-            Device::Rocm(d) => {
-                // Mirror Vulkan: keep quantized blocks in a CPU box + the device; QMatMul
-                // dequantizes them to a dense ROCm tensor on use.
-                let storage = dtype.cpu_zeros(elem_count);
-                Ok(QStorage::Rocm(storage, d.clone()))
-            }
+            Device::Rocm(d) => Ok(QStorage::Rocm(rocm::QRocmStorage::zeros(
+                elem_count, dtype, d,
+            )?)),
             #[cfg(feature = "vulkan")]
             Device::Vulkan(d) => {
                 // Keep quantized blocks in a CPU box + the device (same as from_data); QMatMul's
@@ -152,11 +149,10 @@ pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
-    // ROCm mirrors the Vulkan path: quantized blocks held in a CPU box + the device; QMatMul
-    // dequantizes them to a dense f32 ROCm tensor on demand (rocBLAS matmul). A native HIP quant
-    // matmul is the bandwidth-win follow-up.
+    // ROCm keeps the raw GGML blocks on the device, the bytes its quant kernels read; the host holds
+    // no copy (see `rocm::QRocmStorage`).
     #[cfg(feature = "rocm")]
-    Rocm(Box<dyn QuantizedType>, crate::RocmDevice),
+    Rocm(rocm::QRocmStorage),
     // Vulkan keeps the quantized blocks in a CPU box and dequantizes to an f32 Vulkan tensor on
     // demand (QMatMul forces dequantize for Vulkan). Lets GGUF-quantized models run on the GPU;
     // a direct quantized matmul (the Q8 kernel) is the bandwidth-win follow-up.
@@ -257,7 +253,7 @@ impl QStorage {
                 }
             },
             #[cfg(feature = "rocm")]
-            Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(Cow::Borrowed(data)), d.clone())),
+            Device::Rocm(d) => Ok(Self::Rocm(rocm::QRocmStorage::new(data, dtype, d)?)),
             #[cfg(feature = "vulkan")]
             Device::Vulkan(d) => Ok(Self::Vulkan(
                 dtype.from_data(Cow::Borrowed(data)),
@@ -274,7 +270,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
             #[cfg(feature = "rocm")]
-            QStorage::Rocm(storage, _) => storage.block_size(),
+            QStorage::Rocm(storage) => storage.block_size(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.block_size(),
             #[cfg(feature = "wgpu")]
@@ -289,7 +285,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
             #[cfg(feature = "rocm")]
-            QStorage::Rocm(storage, _) => storage.dtype(),
+            QStorage::Rocm(storage) => storage.dtype(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.dtype(),
             #[cfg(feature = "wgpu")]
@@ -304,7 +300,7 @@ impl QStorage {
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
             #[cfg(feature = "rocm")]
-            QStorage::Rocm(_storage, device) => Device::Rocm(device.clone()),
+            QStorage::Rocm(storage) => Device::Rocm(storage.device().clone()),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(_storage, device) => Device::Vulkan(device.clone()),
             #[cfg(feature = "wgpu")]
@@ -319,7 +315,7 @@ impl QStorage {
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
             #[cfg(feature = "rocm")]
-            QStorage::Rocm(storage, _) => storage.storage_size_in_bytes(),
+            QStorage::Rocm(storage) => storage.storage_size_in_bytes(),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => storage.storage_size_in_bytes(),
             #[cfg(feature = "wgpu")]
@@ -400,11 +396,13 @@ impl QStorage {
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
             #[cfg(feature = "rocm")]
-            QStorage::Rocm(storage, device) => {
-                // Dequantize on the CPU, then upload the dense f32 weights to the ROCm device.
+            QStorage::Rocm(storage) => {
+                // Dequantize on the CPU from the blocks copied back, then upload the dense weights.
                 use crate::backend::BackendDevice;
-                let cpu = storage.dequantize(elem_count)?;
-                Ok(Storage::Rocm(device.storage_from_cpu_storage(&cpu)?))
+                let cpu = storage.host()?.dequantize(elem_count)?;
+                Ok(Storage::Rocm(
+                    storage.device().storage_from_cpu_storage(&cpu)?,
+                ))
             }
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, device) => {
@@ -435,12 +433,7 @@ impl QStorage {
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
             #[cfg(feature = "rocm")]
-            QStorage::Rocm(storage, _) => {
-                let data_ptr = storage.as_ptr();
-                let size_in_bytes = storage.storage_size_in_bytes();
-                let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
-                Ok(Cow::from(data))
-            }
+            QStorage::Rocm(storage) => Ok(Cow::Owned(storage.bytes()?)),
             #[cfg(feature = "vulkan")]
             QStorage::Vulkan(storage, _) => {
                 let data_ptr = storage.as_ptr();
@@ -1172,19 +1165,7 @@ impl QTensor {
         self.storage.data()
     }
 
-    // Upload this expert bank's GGML bytes to VRAM ONCE and keep it resident, keyed by the stable
-    // (ptr,len) of the QTensor's CPU bytes. Re-uploading the multi-GB bank per token/layer would
-    // dominate decode, so the cache makes MoE bandwidth-bound on the quant matvec, not the H2D copy.
-    #[cfg(feature = "rocm")]
-    fn rocm_moe_bank(&self, dev: &crate::RocmDevice) -> Result<std::sync::Arc<crate::RocmStorage>> {
-        use crate::backend::BackendDevice;
-        let bank = self.data()?;
-        cache_or_upload(&self.banks.rocm, bank.as_ref(), |b| {
-            dev.storage_from_slice(b)
-        })
-    }
-
-    // Resident Vulkan MoE expert bank (twin of `rocm_moe_bank`). Q8_0 repacks to the 9-u32/block
+    // Resident Vulkan MoE expert bank. Q8_0 repacks to the 9-u32/block
     // layout and Q6_K to the padded 53-u32 super-block layout their MoE shaders read (mirrors the 2D
     // decode paths); Q4_0/Q4_K shaders byte-address the raw GGML bytes, so a plain upload suffices.
     #[cfg(feature = "vulkan")]
@@ -1551,9 +1532,10 @@ impl QTensor {
             // MoE-per-quant kernel; works for every wired quant). Avoids ROCm's missing index_add:
             // each routed slot writes exactly one output row, placed directly by slot index.
             #[cfg(feature = "rocm")]
-            QStorage::Rocm(_, rocm_dev)
+            QStorage::Rocm(resident)
                 if crate::RocmQuantType::from_ggml(self.storage.dtype()).is_some() =>
             {
+                let rocm_dev = resident.device();
                 let qt = crate::RocmQuantType::from_ggml(self.storage.dtype()).unwrap();
                 let out_dtype = x.dtype();
                 // e_cnt is not read: ids stay on-device and the router guarantees the bound, so the
@@ -1594,7 +1576,7 @@ impl QTensor {
                         .to_dtype(DType::F16)?
                         .contiguous()?,
                 };
-                let wbank = self.rocm_moe_bank(rocm_dev)?;
+                let wbank = resident.resident();
                 // Keep router ids ON the GPU for EVERY wired quant type and run ONE batched launch
                 // (experts on grid.y, ids read on-device). No `to_vec1` DtoH sync -- that host round-
                 // trip (3 per layer x 48 layers per token) was both the dominant WSL decode stall AND
@@ -2062,7 +2044,8 @@ pub fn moe_gate_up(
     #[cfg(feature = "rocm")]
     {
         if let (QMatMul::QTensor(gq), QMatMul::QTensor(uq)) = (gate, up) {
-            if let (QStorage::Rocm(_, dev), QStorage::Rocm(..)) = (&gq.storage, &uq.storage) {
+            if let (QStorage::Rocm(gs), QStorage::Rocm(us)) = (&gq.storage, &uq.storage) {
+                let dev = gs.device();
                 let dt = gq.storage.dtype();
                 if dt == uq.storage.dtype() {
                     if let Some(qt) = crate::RocmQuantType::from_ggml(dt) {
@@ -2087,8 +2070,8 @@ pub fn moe_gate_up(
                             let out_dtype = x.dtype();
                             let ids_u32 =
                                 ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
-                            let gwb = gq.rocm_moe_bank(dev)?;
-                            let uwb = uq.rocm_moe_bank(dev)?;
+                            let gwb = gs.resident();
+                            let uwb = us.resident();
                             let (xstore, _) = x_flat.storage_and_layout();
                             let xr = match &*xstore {
                                 Storage::Rocm(r) => r,
@@ -2363,16 +2346,15 @@ impl QMatMul {
             // qmmq_core<WTYPE>. Both cover the SAME wired spread; adding a type is one enum row + the
             // in-kernel decode, no per-quant kernel. Unwired types dequantize-to-f16 in forward().
             if let Some(qt) = crate::RocmQuantType::from_ggml(dt) {
-                if let Device::Rocm(d) = qtensor.device() {
+                if let QStorage::Rocm(resident) = &qtensor.storage {
                     if let Ok((n, k)) = qtensor.shape().dims2() {
                         let blk_ok = k % qt.block_elems() == 0;
                         if blk_ok {
-                            use crate::backend::BackendDevice;
-                            let bytes = qtensor.data()?;
-                            let wq = d.storage_from_slice(bytes.as_ref())?;
+                            // The kernels read the resident blocks; no second copy.
+                            let wq = resident.resident();
                             return Ok(Self::RocmQuant {
                                 qtensor,
-                                wq: std::sync::Arc::new(wq),
+                                wq,
                                 dtype: dt,
                                 n,
                                 k,

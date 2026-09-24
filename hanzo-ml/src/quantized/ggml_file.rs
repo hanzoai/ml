@@ -131,7 +131,7 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
         #[cfg(feature = "rocm")]
-        Device::Rocm(d) => QStorage::Rocm(Box::new(data.to_vec()), d.clone()),
+        Device::Rocm(d) => QStorage::Rocm(super::rocm::QRocmStorage::from_host(&data.to_vec(), d)?),
         #[cfg(feature = "vulkan")]
         Device::Vulkan(d) => QStorage::Vulkan(Box::new(data.to_vec()), d.clone()),
         #[cfg(feature = "wgpu")]
