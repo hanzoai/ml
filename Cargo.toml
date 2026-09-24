@@ -52,13 +52,13 @@ anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 chrono = "0.4"
 # Hanzo-renamed workspace dependencies (at version 0.10.x)
-hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.98" }
+hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.103" }
 hanzo-datasets = { path = "./hanzo-datasets", version = "0.11.9" }
 hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.11.36" }
 hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.11.10" }
 hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.37" }
 hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.45" }
-hanzo-nn = { path = "./hanzo-nn", version = "0.11.40" }
+hanzo-nn = { path = "./hanzo-nn", version = "0.11.41" }
 hanzo-onnx = { path = "./hanzo-onnx", version = "0.11.9" }
 hanzo-transformers = { path = "./hanzo-transformers", version = "0.11.10" }
 clap = { version = "4.2.4", features = ["derive"] }
