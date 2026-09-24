@@ -1757,7 +1757,7 @@ pub enum QMatMul {
 // same-size bank, so a later tensor reads an earlier one's weights. That aliased silently -- Q4_0 and
 // Q4_K are both 0.5625 bytes/weight, so their banks are byte-identical in LENGTH for a given shape,
 // and dtype was not part of the key.
-#[cfg(any(feature = "rocm", feature = "vulkan", feature = "wgpu"))]
+#[cfg(any(feature = "vulkan", feature = "wgpu"))]
 fn cache_or_upload<S>(
     slot: &std::sync::OnceLock<std::sync::Arc<S>>,
     bank: &[u8],
