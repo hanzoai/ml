@@ -1469,3 +1469,25 @@ fn vulkan_q4k_dp4a_decode_matches_scalar() {
         }
     }
 }
+
+// The logits come from the last row of the hidden state, a contiguous view that starts past the
+// beginning of its storage; the matvec must read that row, not the first.
+#[test]
+fn vulkan_row_view_projects_its_own_row() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    let (nout, k) = (1024usize, 2560usize);
+    for dt in [GgmlDType::Q6K, GgmlDType::Q8_0] {
+        let (raw, _, _) = weight_bytes(dt, nout, k)?;
+        let qs = QStorage::from_data(std::borrow::Cow::Owned(raw), &dev, dt)?;
+        let head = QMatMul::from_arc(Arc::new(QTensor::new(qs, (nout, k))?))?;
+        let h: Vec<f32> = (0..3 * k).map(|i| pseudo(i + 3)).collect();
+        let last = Tensor::from_vec(h.clone(), (1, 3, k), &dev)?
+            .narrow(1, 2, 1)?
+            .contiguous()?;
+        let alone = Tensor::from_vec(h[2 * k..].to_vec(), (1, 1, k), &dev)?;
+        let got = head.forward(&last)?.flatten_all()?.to_vec1::<f32>()?;
+        let want = head.forward(&alone)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(got, want, "{dt:?}: the view read another row");
+    }
+    Ok(())
+}

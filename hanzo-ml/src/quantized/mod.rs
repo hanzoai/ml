@@ -1240,11 +1240,13 @@ impl QTensor {
                 if t > 1 {
                     let x_f32 = x.to_dtype(crate::DType::F32)?.contiguous()?;
                     let ids_u32 = ids.to_dtype(crate::DType::U32)?.contiguous()?;
+                    let x_f32 = packed(&x_f32)?;
                     let (xs, _) = x_f32.storage_and_layout();
                     let xc = match &*xs {
                         Storage::Cuda(c) => c,
                         _ => crate::bail!("cuda i-quant MoE: x not on cuda after contiguous()"),
                     };
+                    let ids_u32 = packed(&ids_u32)?;
                     let (ids_s, _) = ids_u32.storage_and_layout();
                     let idc = match &*ids_s {
                         Storage::Cuda(c) => c,
@@ -1284,11 +1286,13 @@ impl QTensor {
                     .reshape((nrows,))?
                     .to_dtype(crate::DType::U32)?
                     .contiguous()?;
+                let x_flat = packed(&x_flat)?;
                 let (xstore, _) = x_flat.storage_and_layout();
                 let xc = match &*xstore {
                     Storage::Cuda(c) => c,
                     _ => crate::bail!("cuda i-quant MoE: x not on cuda after contiguous()"),
                 };
+                let ids_flat = packed(&ids_flat)?;
                 let (idstore, _) = ids_flat.storage_and_layout();
                 let idc = match &*idstore {
                     Storage::Cuda(c) => c,
@@ -1344,11 +1348,13 @@ impl QTensor {
                     .to_dtype(crate::DType::U32)?
                     .contiguous()?;
                 let y = {
+                    let x_flat = packed(&x_flat)?;
                     let (store, _) = x_flat.storage_and_layout();
                     let xv = match &*store {
                         Storage::Vulkan(v) => v,
                         _ => crate::bail!("vulkan MoE: x not on vulkan after contiguous()"),
                     };
+                    let ids_u32 = packed(&ids_u32)?;
                     let (ids_store, _) = ids_u32.storage_and_layout();
                     let ids_v = match &*ids_store {
                         Storage::Vulkan(v) => v,
@@ -1477,6 +1483,7 @@ impl QTensor {
                 let wbank = self.wgpu_moe_bank(wgpu_dev)?;
                 let ids_buf = wgpu_dev.upload_ids(&ids_vec)?;
                 let y = {
+                    let x_flat = packed(&x_flat)?;
                     let (store, _) = x_flat.storage_and_layout();
                     let xv = match &*store {
                         Storage::Wgpu(v) => v,
@@ -1552,11 +1559,13 @@ impl QTensor {
                     .reshape((nrows,))?
                     .to_dtype(crate::DType::U32)?
                     .contiguous()?;
+                let x_flat = packed(&x_flat)?;
                 let (store, _) = x_flat.storage_and_layout();
                 let xr = match &*store {
                     crate::Storage::Rocm(r) => r,
                     _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
                 };
+                let ids_u32 = packed(&ids_u32)?;
                 let (idstore, _) = ids_u32.storage_and_layout();
                 let idr = match &*idstore {
                     crate::Storage::Rocm(r) => r,
@@ -1722,6 +1731,18 @@ pub enum QMatMul {
 // same-size bank, so a later tensor reads an earlier one's weights. That aliased silently -- Q4_0 and
 // Q4_K are both 0.5625 bytes/weight, so their banks are byte-identical in LENGTH for a given shape,
 // and dtype was not part of the key.
+/// `t` laid out from element 0 of its own storage. The device kernels here read a raw buffer from
+/// its start, and a contiguous view can begin inside one (the last row of a batch, say); that view
+/// is copied out.
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan", feature = "wgpu"))]
+fn packed(t: &Tensor) -> Result<Tensor> {
+    if t.is_contiguous() && t.layout().start_offset() == 0 {
+        Ok(t.clone())
+    } else {
+        t.force_contiguous()
+    }
+}
+
 #[cfg(any(feature = "vulkan", feature = "wgpu"))]
 fn cache_or_upload<S>(
     slot: &std::sync::OnceLock<std::sync::Arc<S>>,
@@ -1868,11 +1889,13 @@ pub fn moe_combine(ys: &Tensor, scores: &Tensor) -> Result<Tensor> {
     if let Device::Rocm(dev) = ys.device() {
         let ys_c = ys.contiguous()?;
         let scores_c = scores.to_dtype(DType::F32)?.contiguous()?;
+        let ys_c = packed(&ys_c)?;
         let (ys_store, _) = ys_c.storage_and_layout();
         let yr = match &*ys_store {
             Storage::Rocm(r) => r,
             _ => crate::bail!("moe_combine: ys not on rocm after contiguous()"),
         };
+        let scores_c = packed(&scores_c)?;
         let (sc_store, _) = scores_c.storage_and_layout();
         let sr = match &*sc_store {
             Storage::Rocm(r) => r,
@@ -1907,6 +1930,7 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
     #[cfg(feature = "rocm")]
     if let Device::Rocm(dev) = logits.device() {
         let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
+        let logits_c = packed(&logits_c)?;
         let (lg_store, _) = logits_c.storage_and_layout();
         let lr = match &*lg_store {
             Storage::Rocm(r) => r,
@@ -1931,6 +1955,7 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
     if let Device::Cuda(cdev) = logits.device() {
         if n_experts <= 256 && topk <= 32 {
             let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
+            let logits_c = packed(&logits_c)?;
             let (lg_store, _) = logits_c.storage_and_layout();
             let lr = match &*lg_store {
                 Storage::Cuda(c) => c,
@@ -1960,6 +1985,7 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
     if let Device::Vulkan(vdev) = logits.device() {
         if norm && n_experts == 128 && topk == 8 {
             let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
+            let logits_c = packed(&logits_c)?;
             let (lg_store, _) = logits_c.storage_and_layout();
             let lv = match &*lg_store {
                 Storage::Vulkan(v) => v,
@@ -2039,11 +2065,13 @@ pub fn moe_gate_up(
                                 ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
                             let gwb = gs.resident();
                             let uwb = us.resident();
+                            let x_flat = packed(&x_flat)?;
                             let (xstore, _) = x_flat.storage_and_layout();
                             let xr = match &*xstore {
                                 Storage::Rocm(r) => r,
                                 _ => crate::bail!("moe_gate_up: x not on rocm after contiguous()"),
                             };
+                            let ids_u32 = packed(&ids_u32)?;
                             let (idstore, _) = ids_u32.storage_and_layout();
                             let idr = match &*idstore {
                                 Storage::Rocm(r) => r,
@@ -2108,6 +2136,7 @@ pub fn moe_gate_up(
                                 .contiguous()?;
                             let ids_u32 =
                                 ids.reshape((nrows,))?.to_dtype(DType::U32)?.contiguous()?;
+                            let x_flat = packed(&x_flat)?;
                             let (xstore, _) = x_flat.storage_and_layout();
                             let xv = match &*xstore {
                                 Storage::Vulkan(v) => v,
@@ -2115,6 +2144,7 @@ pub fn moe_gate_up(
                                     crate::bail!("moe_gate_up: x not on vulkan after contiguous()")
                                 }
                             };
+                            let ids_u32 = packed(&ids_u32)?;
                             let (idstore, _) = ids_u32.storage_and_layout();
                             let idv = match &*idstore {
                                 Storage::Vulkan(v) => v,
@@ -2466,11 +2496,13 @@ impl QMatMul {
                     .reshape((nrows,))?
                     .to_dtype(crate::DType::U32)?
                     .contiguous()?;
+                let x_flat = packed(&x_flat)?;
                 let (xstore, _) = x_flat.storage_and_layout();
                 let xr = match &*xstore {
                     crate::Storage::Rocm(r) => r,
                     _ => crate::bail!("rocm MoE: x not on rocm after contiguous()"),
                 };
+                let ids_u32 = packed(&ids_u32)?;
                 let (idstore, _) = ids_u32.storage_and_layout();
                 let idr = match &*idstore {
                     crate::Storage::Rocm(r) => r,
@@ -2935,11 +2967,13 @@ fn dense_matmul(xs: &Tensor, w: &Tensor) -> Result<Tensor> {
             };
             let xs1 = xs.reshape((k,))?.to_dtype(w.dtype())?.contiguous()?;
             let w = w.contiguous()?;
+            let w = packed(&w)?;
             let (wstore, _) = w.storage_and_layout();
             let wr = match &*wstore {
                 crate::Storage::Rocm(r) => r,
                 _ => crate::bail!("dense_matmul: weight not on rocm"),
             };
+            let xs1 = packed(&xs1)?;
             let (xstore, _) = xs1.storage_and_layout();
             let xr = match &*xstore {
                 crate::Storage::Rocm(r) => r,
@@ -3075,6 +3109,7 @@ impl crate::Module for QMatMul {
                         _ => crate::bail!("RocmQuant input not on rocm"),
                     };
                     let y = {
+                        let xs = packed(&xs)?;
                         let (store, _) = xs.storage_and_layout();
                         let xr = match &*store {
                             crate::Storage::Rocm(r) => r,
@@ -3114,6 +3149,7 @@ impl crate::Module for QMatMul {
                     };
                     let m = xs.elem_count() / *k;
                     let y = {
+                        let xs = packed(&xs)?;
                         let (store, _) = xs.storage_and_layout();
                         let xr = match &*store {
                             crate::Storage::Rocm(r) => r,
@@ -3193,6 +3229,7 @@ impl crate::Module for QMatMul {
                         _ => crate::bail!("VulkanQuant input not on vulkan"),
                     };
                     let y = {
+                        let xs = packed(&xs)?;
                         let (store, _) = xs.storage_and_layout();
                         let xv = match &*store {
                             crate::Storage::Vulkan(v) => v,
@@ -3246,6 +3283,7 @@ impl crate::Module for QMatMul {
                         _ => crate::bail!("VulkanQuant input not on vulkan"),
                     };
                     let y = {
+                        let xs = packed(&xs)?;
                         let (store, _) = xs.storage_and_layout();
                         let xv = match &*store {
                             crate::Storage::Vulkan(v) => v,
@@ -3324,6 +3362,7 @@ impl crate::Module for QMatMul {
                         _ => crate::bail!("WgpuQuant input not on wgpu"),
                     };
                     let y = {
+                        let xs = packed(&xs)?;
                         let (store, _) = xs.storage_and_layout();
                         let xv = match &*store {
                             crate::Storage::Wgpu(v) => v,
