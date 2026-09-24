@@ -185,3 +185,35 @@ fn q6k_vocabulary_projection_matches_the_cpu() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn an_f32_router_weight_keeps_its_precision() -> Result<()> {
+    let gpu = Device::new_rocm(0)?;
+    let mut rng = Lcg(0x60a7);
+    let (experts, k) = (512usize, 2560usize);
+    let w: Vec<f32> = (0..experts * k).map(|_| rng.unit() * 0.05).collect();
+    let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let router = QMatMul::from_qtensor(qtensor_from_ggml(
+        GgmlDType::F32,
+        &bytes,
+        vec![experts, k],
+        &gpu,
+    )?)?;
+    let reference = Tensor::from_vec(w, (experts, k), &Device::Cpu)?;
+    // A prompt and a decode step, as the router sees them: f32 activations.
+    for t in [5usize, 1] {
+        let x: Vec<f32> = (0..t * k).map(|_| rng.unit()).collect();
+        let want = Tensor::from_vec(x.clone(), (t, k), &Device::Cpu)?
+            .matmul(&reference.t()?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let got = router
+            .forward(&Tensor::from_vec(x, (t, k), &gpu)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let e = rel(&got, &want);
+        println!("f32 router t={t}: rel {e:.2e}");
+        assert!(e < 1e-5, "f32 router t={t} off by {e}");
+    }
+    Ok(())
+}
