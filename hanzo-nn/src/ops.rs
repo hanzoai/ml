@@ -134,6 +134,15 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
         Ok((dst, layout.shape().clone()))
     }
 
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &hanzo_ml::VulkanStorage,
+        layout: &Layout,
+    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
+        Ok((storage.sigmoid(layout)?, layout.shape().clone()))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
