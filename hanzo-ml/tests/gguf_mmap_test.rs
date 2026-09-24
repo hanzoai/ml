@@ -91,6 +91,14 @@ fn run() -> Result<()> {
             "{name}: dequantized values differ between resident and mmap"
         );
 
+        // A row gather out of the mapping (which first announces the rows to the kernel) returns
+        // the resident gather's rows, repeats and all.
+        let rows = t_mm.shape().dims()[0] as u32;
+        let ids = Tensor::new(&[rows - 1, 0, 1, rows - 1, 2][..], &dev)?;
+        let e_res = t_res.embedding(&ids)?.flatten_all()?.to_vec1::<f32>()?;
+        let e_mm = t_mm.embedding(&ids)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(e_res, e_mm, "{name}: embedding rows differ between resident and mmap");
+
         // (b) No-copy: the mmap tensor's bytes alias the live mapping. If `from_mmap` had fallen
         // back to `to_vec` (or copied), this pointer would be outside [base, map_end).
         let d_mm = t_mm.data()?;
