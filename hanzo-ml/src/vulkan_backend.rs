@@ -107,6 +107,9 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_iq4nl" => spv!("mul_mat_vec_iq4nl"),
         "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
         "moe_matvec_q6k" => spv!("moe_matvec_q6k"),
+        "moe_matvec_iq4nl" => spv!("moe_matvec_iq4nl"),
+        "moe_matvec_iq4xs" => spv!("moe_matvec_iq4xs"),
+        "moe_matvec_iq3s" => spv!("moe_matvec_iq3s"),
         // DSL block-reduced MoE (hanzo-kernel quant::moe_matvec_q{4,6}k_blk, lowered per live shape):
         // planar bank, one workgroup per output, shared-mem tree reduce. `_gu` = gate/up (k=2048,
         // nt=64), `_dn` = down (k=768, nt=32). ~2-3x the packed `moe_matvec_q4k` naive path on evo.
@@ -5198,7 +5201,7 @@ impl VulkanDevice {
         })
     }
 
-    fn upload_u32(&self, data: &[u32]) -> Result<VulkanStorage> {
+    pub(crate) fn upload_u32(&self, data: &[u32]) -> Result<VulkanStorage> {
         let s = self.alloc_u32(data.len())?;
         unsafe { self.write_u32(s.buffer, s.memory, s.host_visible, data)? };
         Ok(s)
