@@ -969,8 +969,15 @@ fn vulkan_moe_forward_matches_cpu() -> hanzo_ml::Result<()> {
             println!(
                 "MoE {dt:?}  E={e_cnt:3} n={n:4} k={k:4} t={t} topk={topk}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}"
             );
+            // Q4_K prefill (t > 1) runs the expert-grouped int8 GEMM, which quantizes the
+            // activation to q8 (~1e-2 here); every other case decodes exactly.
+            let tol = if dt == GgmlDType::Q4K && t > 1 {
+                5e-2
+            } else {
+                1e-3
+            };
             assert!(
-                max_abs < 1e-3,
+                max_abs < tol,
                 "MoE {dt:?} GPU/ref mismatch too large: {max_abs}"
             );
         }
