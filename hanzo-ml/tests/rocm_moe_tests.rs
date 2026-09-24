@@ -217,3 +217,37 @@ fn an_f32_router_weight_keeps_its_precision() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn a_row_view_projects_its_own_row() -> Result<()> {
+    let gpu = Device::new_rocm(0)?;
+    let mut rng = Lcg(0x1a57);
+    let (rows, k) = (1024usize, 2560usize);
+    let raw = blocks(GgmlDType::Q6K, rows * k, &mut rng);
+    let head = QMatMul::from_qtensor(qtensor_from_ggml(
+        GgmlDType::Q6K,
+        &raw,
+        vec![rows, k],
+        &gpu,
+    )?)?;
+    // A 3-token hidden state; the logits come from its last row, a contiguous view that starts
+    // two rows into the storage.
+    let h: Vec<f32> = (0..3 * k).map(|_| rng.unit()).collect();
+    for act in [DType::F16, DType::F32] {
+        let batch = Tensor::from_vec(h.clone(), (1, 3, k), &gpu)?.to_dtype(act)?;
+        let last = batch.narrow(1, 2, 1)?.contiguous()?;
+        let alone = Tensor::from_vec(h[2 * k..].to_vec(), (1, 1, k), &gpu)?.to_dtype(act)?;
+        let got = head
+            .forward(&last)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let want = head
+            .forward(&alone)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(got, want, "{act:?}: the view read another row");
+    }
+    Ok(())
+}
