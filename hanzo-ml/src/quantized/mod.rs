@@ -2362,10 +2362,13 @@ impl QMatMul {
             }
         };
         let t = if dequantize {
-            // ROCm: dequantize to f16 so the matmul hits RDNA3.5 matrix cores (WMMA). Dense f32
-            // (sgemm) has no matrix-core path on RDNA and runs ~an order of magnitude slower, and
-            // f16 also halves the resident weight memory.
-            if qtensor.device().is_rocm() {
+            // ROCm: dequantize a quantized weight to f16 so the matmul hits RDNA3.5 matrix cores
+            // (WMMA). Dense f32 (sgemm) has no matrix-core path on RDNA and runs ~an order of
+            // magnitude slower, and f16 also halves the resident weight memory. A weight the file
+            // stores as f32 or bf16 keeps that precision, as on every other backend: these are the
+            // small routers and gates, whose close logits f16 weights reorder.
+            let stored_float = matches!(qtensor.dtype(), GgmlDType::F32 | GgmlDType::BF16);
+            if qtensor.device().is_rocm() && !stored_float {
                 Self::TensorF16(qtensor.dequantize_f16(&qtensor.device())?)
             } else {
                 Self::Tensor(qtensor.dequantize(&qtensor.device())?)
@@ -3354,6 +3357,11 @@ impl crate::Module for QMatMul {
                 }
             }
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
+            // A weight kept in another dtype than the activation computes in the weight's.
+            Self::Tensor(w) if xs.dtype() != w.dtype() => {
+                let in_dtype = xs.dtype();
+                dense_matmul(&xs.to_dtype(w.dtype())?, w)?.to_dtype(in_dtype)
+            }
             Self::Tensor(w) => dense_matmul(xs, w),
             Self::TensorF16(w) => {
                 let in_dtype = xs.dtype();
