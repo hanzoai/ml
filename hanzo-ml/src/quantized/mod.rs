@@ -27,6 +27,8 @@ pub(crate) mod repack_x86;
 pub mod rocm;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tokenizer;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
 #[cfg(not(feature = "metal"))]
 mod metal {
     pub use super::dummy_metal::*;
@@ -83,8 +85,6 @@ fn as_t_slice<T>(data: &[u8]) -> &[T] {
 #[derive(Default)]
 struct ResidentBanks {
     #[cfg(feature = "vulkan")]
-    vulkan: std::sync::OnceLock<std::sync::Arc<crate::VulkanStorage>>,
-    #[cfg(feature = "vulkan")]
     vulkan_split: std::sync::OnceLock<std::sync::Arc<crate::vulkan::MoeBankSplit>>,
     #[cfg(feature = "wgpu")]
     wgpu: std::sync::OnceLock<std::sync::Arc<crate::WgpuStorage>>,
@@ -128,12 +128,9 @@ impl Device {
                 elem_count, dtype, d,
             )?)),
             #[cfg(feature = "vulkan")]
-            Device::Vulkan(d) => {
-                // Keep quantized blocks in a CPU box + the device (same as from_data); QMatMul's
-                // VulkanQuant path uploads/dequantizes them to the GPU on use.
-                let storage = dtype.cpu_zeros(elem_count);
-                Ok(QStorage::Vulkan(storage, d.clone()))
-            }
+            Device::Vulkan(d) => Ok(QStorage::Vulkan(vulkan::QVulkanStorage::zeros(
+                elem_count, dtype, d,
+            )?)),
             #[cfg(feature = "wgpu")]
             Device::Wgpu(d) => {
                 // Same as Vulkan: keep the quantized blocks in a CPU box + the device; QMatMul's
@@ -153,11 +150,10 @@ pub enum QStorage {
     // no copy (see `rocm::QRocmStorage`).
     #[cfg(feature = "rocm")]
     Rocm(rocm::QRocmStorage),
-    // Vulkan keeps the quantized blocks in a CPU box and dequantizes to an f32 Vulkan tensor on
-    // demand (QMatMul forces dequantize for Vulkan). Lets GGUF-quantized models run on the GPU;
-    // a direct quantized matmul (the Q8 kernel) is the bandwidth-win follow-up.
+    // Vulkan keeps the blocks on the device only, in the layout its kernels read (see
+    // `vulkan::QVulkanStorage`).
     #[cfg(feature = "vulkan")]
-    Vulkan(Box<dyn QuantizedType>, crate::VulkanDevice),
+    Vulkan(vulkan::QVulkanStorage),
     // wgpu mirror of the Vulkan path: quantized blocks held in a CPU box + the device. QMatMul's
     // WgpuQuant path reads the GGML bytes straight in the native quant matvec kernel (decode), or
     // dequantizes to an f32 wgpu tensor on demand.
@@ -255,10 +251,7 @@ impl QStorage {
             #[cfg(feature = "rocm")]
             Device::Rocm(d) => Ok(Self::Rocm(rocm::QRocmStorage::new(data, dtype, d)?)),
             #[cfg(feature = "vulkan")]
-            Device::Vulkan(d) => Ok(Self::Vulkan(
-                dtype.from_data(Cow::Borrowed(data)),
-                d.clone(),
-            )),
+            Device::Vulkan(d) => Ok(Self::Vulkan(vulkan::QVulkanStorage::new(data, dtype, d)?)),
             #[cfg(feature = "wgpu")]
             Device::Wgpu(d) => Ok(Self::Wgpu(dtype.from_data(Cow::Borrowed(data)), d.clone())),
         }
@@ -272,7 +265,7 @@ impl QStorage {
             #[cfg(feature = "rocm")]
             QStorage::Rocm(storage) => storage.block_size(),
             #[cfg(feature = "vulkan")]
-            QStorage::Vulkan(storage, _) => storage.block_size(),
+            QStorage::Vulkan(storage) => storage.block_size(),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(storage, _) => storage.block_size(),
             QStorage::Stream(bank) => bank.dtype().block_size(),
@@ -287,7 +280,7 @@ impl QStorage {
             #[cfg(feature = "rocm")]
             QStorage::Rocm(storage) => storage.dtype(),
             #[cfg(feature = "vulkan")]
-            QStorage::Vulkan(storage, _) => storage.dtype(),
+            QStorage::Vulkan(storage) => storage.dtype(),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(storage, _) => storage.dtype(),
             QStorage::Stream(bank) => bank.dtype(),
@@ -302,7 +295,7 @@ impl QStorage {
             #[cfg(feature = "rocm")]
             QStorage::Rocm(storage) => Device::Rocm(storage.device().clone()),
             #[cfg(feature = "vulkan")]
-            QStorage::Vulkan(_storage, device) => Device::Vulkan(device.clone()),
+            QStorage::Vulkan(storage) => Device::Vulkan(storage.device().clone()),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(_storage, device) => Device::Wgpu(device.clone()),
             QStorage::Stream(_) => Device::Cpu,
@@ -317,7 +310,7 @@ impl QStorage {
             #[cfg(feature = "rocm")]
             QStorage::Rocm(storage) => storage.storage_size_in_bytes(),
             #[cfg(feature = "vulkan")]
-            QStorage::Vulkan(storage, _) => storage.storage_size_in_bytes(),
+            QStorage::Vulkan(storage) => storage.storage_size_in_bytes(),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(storage, _) => storage.storage_size_in_bytes(),
             QStorage::Stream(bank) => bank.logical_bytes(),
@@ -405,10 +398,12 @@ impl QStorage {
                 ))
             }
             #[cfg(feature = "vulkan")]
-            QStorage::Vulkan(storage, device) => {
-                // Dequantize on the CPU, then upload the f32 weights to the GPU.
-                let cpu = storage.dequantize(elem_count)?;
-                Ok(Storage::Vulkan(device.upload_f32(cpu.as_slice::<f32>()?)?))
+            QStorage::Vulkan(storage) => {
+                // Dequantize on the CPU from the blocks copied back, then upload the f32 weights.
+                let cpu = storage.host()?.dequantize(elem_count)?;
+                Ok(Storage::Vulkan(
+                    storage.device().upload_f32(cpu.as_slice::<f32>()?)?,
+                ))
             }
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(storage, device) => {
@@ -435,12 +430,7 @@ impl QStorage {
             #[cfg(feature = "rocm")]
             QStorage::Rocm(storage) => Ok(Cow::Owned(storage.bytes()?)),
             #[cfg(feature = "vulkan")]
-            QStorage::Vulkan(storage, _) => {
-                let data_ptr = storage.as_ptr();
-                let size_in_bytes = storage.storage_size_in_bytes();
-                let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
-                Ok(Cow::from(data))
-            }
+            QStorage::Vulkan(storage) => Ok(Cow::Owned(storage.bytes()?)),
             #[cfg(feature = "wgpu")]
             QStorage::Wgpu(storage, _) => {
                 let data_ptr = storage.as_ptr();
@@ -1165,26 +1155,6 @@ impl QTensor {
         self.storage.data()
     }
 
-    // Resident Vulkan MoE expert bank. Q8_0 repacks to the 9-u32/block
-    // layout and Q6_K to the padded 53-u32 super-block layout their MoE shaders read (mirrors the 2D
-    // decode paths); Q4_0/Q4_K shaders byte-address the raw GGML bytes, so a plain upload suffices.
-    #[cfg(feature = "vulkan")]
-    fn vulkan_moe_bank(
-        &self,
-        dev: &crate::VulkanDevice,
-        e_cnt: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<std::sync::Arc<crate::VulkanStorage>> {
-        let bank = self.data()?;
-        let dt = self.storage.dtype();
-        cache_or_upload(&self.banks.vulkan, bank.as_ref(), |b| match dt {
-            GgmlDType::Q8_0 => dev.quantize_q8_blocks(b, e_cnt * n, k),
-            GgmlDType::Q6K => dev.quantize_q6k(b, e_cnt * n, k),
-            _ => dev.upload_qweight(b),
-        })
-    }
-
     // Resident PLANAR expert bank for the DSL block-reduced MoE kernels: the packed GGML bank is
     // de-interleaved into per-field device arrays once (at first sight of its CPU bytes) and reused
     // every token. Only Q4_K/Q6_K -- the dtypes with a committed `moe_matvec_q*k_blk_*` .spv.
@@ -1348,10 +1318,11 @@ impl QTensor {
             // Native Vulkan MoE: one fused grouped quant matvec dispatch reads the per-expert slice
             // out of the GGML weight bank [E, n, k] resident in VRAM and gathers by the router ids --
             // the whole expert compute runs on the GPU (no CPU expert loop; the CPU fallback below
-            // would also hit the unimplemented Vulkan index_add). Supported for Q4_0/Q8_0/Q4_K; other
-            // quant dtypes fall through to the (CPU-bound) generic path.
+            // would also hit the unimplemented Vulkan index_add). Covers the dtypes `vk_moe_kernel`
+            // names; others fall through to the (CPU-bound) generic path.
             #[cfg(feature = "vulkan")]
-            QStorage::Vulkan(_, vk_dev) if vk_moe_kernel(self.storage.dtype()).is_some() => {
+            QStorage::Vulkan(resident) if vk_moe_kernel(self.storage.dtype()).is_some() => {
+                let vk_dev = resident.device();
                 let out_dtype = x.dtype();
                 let (e_cnt, n, k) = self.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
@@ -1457,10 +1428,10 @@ impl QTensor {
                                 None => {
                                     // Guarded by `vk_moe_kernel(..).is_some()`, so the packed kernel is present.
                                     let kernel = vk_moe_kernel(dt).unwrap();
-                                    let wbank = self.vulkan_moe_bank(vk_dev, e_cnt, n, k)?;
+                                    // The resident blocks are already in the layout the kernel reads.
                                     vk_dev.moe_matvec_gpu(
                                         kernel,
-                                        wbank.as_ref(),
+                                        &resident.resident(),
                                         xv,
                                         ids_v,
                                         nrows,
@@ -1775,8 +1746,7 @@ fn cache_or_upload<S>(
 // GGML dtype -> native fused grouped quant-matvec MoE kernel name on the Vulkan backend. ONE source
 // of truth: the construction gate keeps the [E,n,k] bank quantized iff this returns Some, the
 // dispatch guard fires on Some, and the branch selects the returned kernel. `None` dtypes fall
-// through to dequantize. Q4_0/Q8_0/Q4K read the raw (or Q8_0-repacked) GGML bytes; Q6_K reads the
-// padded 53-u32 super-block layout from `quantize_q6k`.
+// through to dequantize. Each kernel reads the bank in the layout `vulkan::QVulkanStorage` holds it.
 #[cfg(feature = "vulkan")]
 fn vk_moe_kernel(dt: GgmlDType) -> Option<&'static str> {
     match dt {
@@ -1784,6 +1754,9 @@ fn vk_moe_kernel(dt: GgmlDType) -> Option<&'static str> {
         GgmlDType::Q8_0 => Some("moe_matvec_q8_0"),
         GgmlDType::Q4K => Some("moe_matvec_q4k"),
         GgmlDType::Q6K => Some("moe_matvec_q6k"),
+        GgmlDType::IQ4_NL => Some("moe_matvec_iq4nl"),
+        GgmlDType::IQ4_XS => Some("moe_matvec_iq4xs"),
+        GgmlDType::IQ3_S => Some("moe_matvec_iq3s"),
         _ => None,
     }
 }
@@ -2124,7 +2097,8 @@ pub fn moe_gate_up(
     #[cfg(feature = "vulkan")]
     if std::env::var_os("VK_MOE_GU_FUSE_OFF").is_none() {
         if let (QMatMul::QTensor(gq), QMatMul::QTensor(uq)) = (gate, up) {
-            if let (QStorage::Vulkan(_, dev), QStorage::Vulkan(..)) = (&gq.storage, &uq.storage) {
+            if let (QStorage::Vulkan(g), QStorage::Vulkan(..)) = (&gq.storage, &uq.storage) {
+                let dev = g.device();
                 let dt = gq.storage.dtype();
                 if dt == uq.storage.dtype() && dev.has_int_dot8() {
                     let (e_cnt, n, k) = gq.shape().dims3()?;
@@ -2245,9 +2219,9 @@ impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
         // Native Vulkan quantized path: keep the GGML quantized blocks in VRAM and run the matching
         // on-GPU quant matvec for decode, instead of dequantizing the whole model to f32 (4x the
-        // decode bandwidth). The kernel reads the GGML block format straight from the uploaded bytes
-        // -- no CPU dequant, no re-pack -- so this is exact w.r.t. the CPU reference. Q4_0/Q4_K need
-        // k a multiple of their block (32 / 256); Q8_0 needs a multiple of 32.
+        // decode bandwidth). The kernels decode the resident blocks (laid out once at load, see
+        // `vulkan::QVulkanStorage`), so this is exact w.r.t. the CPU reference. k must be a multiple
+        // of the dtype's block.
         #[cfg(feature = "vulkan")]
         {
             let dt = qtensor.dtype();
@@ -2272,33 +2246,15 @@ impl QMatMul {
                     | GgmlDType::IQ2_XS
             );
             if native_vk {
-                if let Device::Vulkan(d) = qtensor.device() {
+                if let QStorage::Vulkan(resident) = &qtensor.storage {
                     if let Ok((n, k)) = qtensor.shape().dims2() {
-                        let blk = dt.block_size();
-                        if k % blk == 0 {
-                            let bytes = qtensor.data()?;
-                            // Q6_K (210 B) and Q3_K (110 B) blocks are not u32-aligned; their shaders
-                            // read a padded u32 stride, so repack on upload. Q8_0 repacks to the
-                            // 9-u32/block layout that BOTH its decode (mul_mat_vec_q8) and prefill GEMM
-                            // (mul_mat_q8) read -- ONE layout, so decode + prefill + MoE all agree
-                            // (mirrors how the MoE bank repacks Q8_0). Every other native type's
-                            // shaders byte-address the raw GGML bytes directly.
-                            let wq = match dt {
-                                GgmlDType::Q6K => d.quantize_q6k(&bytes, n, k)?,
-                                GgmlDType::Q3K => d.quantize_q3k(&bytes, n, k)?,
-                                GgmlDType::Q8_0 => d.quantize_q8_blocks(&bytes, n, k)?,
-                                GgmlDType::IQ2_XXS => d.quantize_iq2xxs(&bytes, n, k)?,
-                                GgmlDType::IQ2_XS => d.quantize_iq2xs(&bytes, n, k)?,
-                                GgmlDType::IQ1_M => d.quantize_iq1m(&bytes, n, k)?,
-                                GgmlDType::IQ1_S => d.quantize_iq1s(&bytes, n, k)?,
-                                GgmlDType::IQ3_S => d.quantize_iq3s(&bytes, n, k)?,
-                                GgmlDType::IQ3_XXS => d.quantize_iq3xxs(&bytes, n, k)?,
-                                GgmlDType::IQ2_S => d.quantize_iq2s(&bytes, n, k)?,
-                                _ => d.upload_qweight(&bytes)?,
-                            };
+                        if k % dt.block_size() == 0 {
+                            // The kernels read the resident blocks, already in their layout; no
+                            // second copy.
+                            let wq = resident.resident();
                             return Ok(Self::VulkanQuant {
                                 qtensor,
-                                wq: std::sync::Arc::new(wq),
+                                wq,
                                 dtype: dt,
                                 n,
                                 k,

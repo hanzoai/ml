@@ -1,0 +1,45 @@
+#version 450
+// Fused MoE grouped quant matvec (IQ4_NL): y[s, r] = sum_k W[ids[s], r, k] * x[s, k], reading the
+// per-expert slice from a GGML IQ4_NL bank [E, n, k] in VRAM. Router gather + per-expert GEMV in one
+// dispatch; the decode is the dense `mul_mat_vec_iq4nl` one. Block = 18 bytes (f16 d, qs[16]): low nibble
+// of qs[j] -> weight j, high nibble -> weight j+16, weight = d*KV[idx] (BlockIQ4nl::to_float).
+// One invocation = one y element.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W   { uint  w[];   };  // expert bank, raw IQ4_NL bytes
+layout(set = 0, binding = 1) readonly buffer X   { float x[];   };  // [S, k] activations
+layout(set = 0, binding = 2) readonly buffer Ids { uint  ids[]; };  // [S] expert id per slot
+layout(set = 0, binding = 3) writeonly buffer Y  { float y[];   };  // [S, n] outputs
+layout(push_constant) uniform Pc { uint n; uint k; uint nrows; }; // k a multiple of 32
+
+uint rdbyte(uint bo) { return bitfieldExtract(w[bo >> 2u], int((bo & 3u) * 8u), 8); }
+float rdscale(uint bo) { return unpackHalf2x16(rdbyte(bo) | (rdbyte(bo + 1u) << 8u)).x; }
+
+// Non-uniform 4-bit codebook (kvalues_iq4nl), shared by IQ4_NL and IQ4_XS.
+const int KV[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= nrows * n) {
+        return;
+    }
+    uint s = gid / n;
+    uint r = gid - s * n;
+    uint nb = k / 32u;
+    uint rowbase = (ids[s] * n + r) * nb * 18u; // byte offset of row r of the routed expert
+    uint xbase = s * k;
+    float acc = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        uint bb = rowbase + b * 18u;
+        float d = rdscale(bb);
+        uint xb = xbase + b * 32u;
+        float blk = 0.0;
+        for (uint j = 0u; j < 16u; j++) {
+            uint q = rdbyte(bb + 2u + j);
+            blk += float(KV[q & 0x0Fu]) * x[xb + j] + float(KV[q >> 4u]) * x[xb + j + 16u];
+        }
+        acc += d * blk;
+    }
+    y[gid] = acc;
+}

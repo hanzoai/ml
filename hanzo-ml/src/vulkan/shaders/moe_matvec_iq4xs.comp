@@ -1,0 +1,53 @@
+#version 450
+// Fused MoE grouped quant matvec (IQ4_XS): y[s, r] = sum_k W[ids[s], r, k] * x[s, k], reading the
+// per-expert slice from a GGML IQ4_XS bank [E, n, k] in VRAM. Router gather + per-expert GEMV in one
+// dispatch; the decode is the dense `mul_mat_vec_iq4xs` one. Super-block = 136 bytes: d (f16), scales_h
+// (u16), scales_l[4], qs[128]. Sub-block ib: ls = scales_l nibble | (scales_h 2 bits << 4),
+// dl = d*(ls-32), weight = dl*KV[idx] (BlockIQ4xs::to_float).
+// One invocation = one y element.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W   { uint  w[];   };  // expert bank, raw IQ4_XS bytes
+layout(set = 0, binding = 1) readonly buffer X   { float x[];   };  // [S, k] activations
+layout(set = 0, binding = 2) readonly buffer Ids { uint  ids[]; };  // [S] expert id per slot
+layout(set = 0, binding = 3) writeonly buffer Y  { float y[];   };  // [S, n] outputs
+layout(push_constant) uniform Pc { uint n; uint k; uint nrows; }; // k a multiple of 256
+
+uint rdbyte(uint bo) { return bitfieldExtract(w[bo >> 2u], int((bo & 3u) * 8u), 8); }
+float rdscale(uint bo) { return unpackHalf2x16(rdbyte(bo) | (rdbyte(bo + 1u) << 8u)).x; }
+
+// Non-uniform 4-bit codebook (kvalues_iq4nl), shared by IQ4_NL and IQ4_XS.
+const int KV[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= nrows * n) {
+        return;
+    }
+    uint s = gid / n;
+    uint r = gid - s * n;
+    uint nb = k / 256u;
+    uint rowbase = (ids[s] * n + r) * nb * 136u; // byte offset of row r of the routed expert
+    uint xbase = s * k;
+    float acc = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        uint bb = rowbase + b * 136u;
+        float d = rdscale(bb);
+        uint xb = xbase + b * 256u;
+        uint scales_h = rdbyte(bb + 2u) | (rdbyte(bb + 3u) << 8u);
+        for (uint ib = 0u; ib < 8u; ib++) {
+            uint sl = rdbyte(bb + 4u + (ib >> 1u));
+            uint ls = ((sl >> (4u * (ib & 1u))) & 0x0Fu) | (((scales_h >> (2u * ib)) & 3u) << 4u);
+            uint qo = bb + 8u + ib * 16u;
+            uint xo = xb + ib * 32u;
+            float blk = 0.0;
+            for (uint j = 0u; j < 16u; j++) {
+                uint q = rdbyte(qo + j);
+                blk += float(KV[q & 0x0Fu]) * x[xo + j] + float(KV[q >> 4u]) * x[xo + j + 16u];
+            }
+            acc += d * float(int(ls) - 32) * blk;
+        }
+    }
+    y[gid] = acc;
+}

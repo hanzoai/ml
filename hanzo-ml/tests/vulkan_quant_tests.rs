@@ -829,13 +829,8 @@ fn moe_case(
     t: usize,
     topk: usize,
 ) -> hanzo_ml::Result<f32> {
-    let cpu = Device::Cpu;
-    // Expert bank [E, n, k] and its dequantized f32 (the reference weights).
-    let bank_host: Vec<f32> = (0..e_cnt * n * k).map(|i| pseudo(i) * 0.5).collect();
-    let bank_t = Tensor::from_vec(bank_host, (e_cnt, n, k), &cpu)?;
-    let q_bank = QTensor::quantize(&bank_t.reshape((e_cnt * n, k))?, dtype)?; // quantize per row
-    let bank_deq: Vec<f32> = q_bank.dequantize(&cpu)?.flatten_all()?.to_vec1::<f32>()?; // [E*n*k]
-    let bytes = q_bank.data()?.into_owned();
+    // Expert bank [E, n, k] as GGML bytes, and its dequantized f32 (the reference weights).
+    let (bytes, bank_deq, _) = weight_bytes(dtype, e_cnt * n, k)?;
 
     // Activations [t, topk, k] (per-slot inputs) and router ids [t, topk].
     let x_host: Vec<f32> = (0..t * topk * k).map(|i| pseudo(i + 11) * 0.7).collect();
@@ -961,7 +956,15 @@ fn vulkan_moe_forward_matches_cpu() -> hanzo_ml::Result<()> {
         (4, 768, 512, 1, 2), // decode-like: single token, top-2
     ];
     for &(e_cnt, n, k, t, topk) in &cases {
-        for dt in [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType::Q4K] {
+        for dt in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q8_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q6K,
+            GgmlDType::IQ4_NL,
+            GgmlDType::IQ4_XS,
+            GgmlDType::IQ3_S,
+        ] {
             let max_abs = moe_case(&dev, dt, e_cnt, n, k, t, topk)?;
             println!(
                 "MoE {dt:?}  E={e_cnt:3} n={n:4} k={k:4} t={t} topk={topk}  GPU-vs-(dequant ref) max_abs={max_abs:.3e}"
@@ -971,6 +974,51 @@ fn vulkan_moe_forward_matches_cpu() -> hanzo_ml::Result<()> {
                 "MoE {dt:?} GPU/ref mismatch too large: {max_abs}"
             );
         }
+    }
+    Ok(())
+}
+
+// A Vulkan QTensor keeps its blocks once, on the device, in its kernels' layout: `data` gives the
+// GGML bytes back unchanged, and QMatMul decodes that same copy to the CPU reference.
+#[test]
+fn vulkan_resident_blocks_round_trip_and_decode() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    let (nout, k) = (320usize, 512usize);
+    for dt in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q6K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q4_0,
+        GgmlDType::IQ3_S,
+        GgmlDType::IQ4_NL,
+        GgmlDType::IQ4_XS,
+    ] {
+        let (raw, w_deq, _) = weight_bytes(dt, nout, k)?;
+        let qs = QStorage::from_data(std::borrow::Cow::Owned(raw.clone()), &dev, dt)?;
+        let q = Arc::new(QTensor::new(qs, (nout, k))?);
+        assert_eq!(
+            q.data()?.as_ref(),
+            raw.as_slice(),
+            "{dt:?}: bytes changed on the device"
+        );
+        let x_host: Vec<f32> = (0..k).map(|i| pseudo(i + 7)).collect();
+        let y = QMatMul::from_arc(q)?
+            .forward(&Tensor::from_vec(x_host.clone(), (1, k), &dev)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let (mut sse, mut ref_sq) = (0f64, 0f64);
+        for (r, got) in y.iter().enumerate() {
+            let want: f64 = (0..k)
+                .map(|j| w_deq[r * k + j] as f64 * x_host[j] as f64)
+                .sum();
+            sse += (*got as f64 - want).powi(2);
+            ref_sq += want * want;
+        }
+        let rel = (sse / ref_sq.max(1e-18)).sqrt();
+        println!("resident {dt:?} nout={nout} k={k}  rel rms err={rel:.3e}");
+        // Decode kernels that quantize the activation to int8 land near 1e-2; a wrong layout is O(1).
+        assert!(rel < 2e-2, "{dt:?}: resident decode off by {rel}");
     }
     Ok(())
 }
