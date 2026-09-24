@@ -857,6 +857,20 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for QMmap<T> {
     }
 
     fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
+        // Rows of a table larger than the page cache are scattered pages on disk. Faulting them in
+        // one by one in the gather below costs one device round trip per row; announcing them all
+        // first (MADV_WILLNEED queues the reads and returns) overlaps those round trips. The
+        // advice is only a hint, so a refusal changes nothing but the speed.
+        #[cfg(unix)]
+        if hidden.is_multiple_of(T::BLCK_SIZE) {
+            let row_bytes = hidden / T::BLCK_SIZE * std::mem::size_of::<T>();
+            for &id in ids.iter().filter(|&&id| (id as usize) < rows) {
+                let at = self.offset + id as usize * row_bytes;
+                let _ = self
+                    .mmap
+                    .advise_range(memmap2::Advice::WillNeed, at, row_bytes);
+            }
+        }
         embedding_rows(self.as_slice(), ids, rows, hidden)
     }
 
