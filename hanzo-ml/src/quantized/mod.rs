@@ -93,16 +93,10 @@ struct ResidentBanks {
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
-    // Every field of ResidentBanks is gated on rocm/vulkan/wgpu, so with none of
-    // them enabled it is an empty struct and this field is genuinely never read —
-    // which is what clippy reports on a default-feature build. It IS read on any
-    // accelerator build (see the cache_or_upload calls below), so the allowance is
-    // scoped to exactly the configuration where the field is dead rather than
-    // silencing the lint everywhere.
-    #[cfg_attr(
-        not(any(feature = "rocm", feature = "vulkan", feature = "wgpu")),
-        allow(dead_code)
-    )]
+    // Every field of ResidentBanks is gated on vulkan/wgpu, so without them it is an
+    // empty struct and this field is never read. The allowance is scoped to exactly
+    // that configuration rather than silencing the lint everywhere.
+    #[cfg_attr(not(any(feature = "vulkan", feature = "wgpu")), allow(dead_code))]
     banks: ResidentBanks,
     #[allow(dead_code)]
     repacked_qs: repack::PackedCache,
