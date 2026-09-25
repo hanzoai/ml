@@ -2373,6 +2373,188 @@ unsafe fn launch_kernel_shmem(
         })
 }
 
+/// A contiguous F32 ROCm tensor's device pointer, at its view's start.
+fn gdn_f32_ptr(t: &Tensor, what: &str) -> Result<*mut std::ffi::c_void> {
+    if !t.is_contiguous() {
+        crate::bail!("{what}: expected a contiguous tensor");
+    }
+    match &*t.storage() {
+        Storage::Rocm(r) if matches!(r.slice, RocmStorageSlice::F32(_)) => {
+            Ok(unsafe { r.slice.offset_ptr(t.layout().start_offset()) })
+        }
+        _ => crate::bail!("{what}: expected F32 ROCm storage"),
+    }
+}
+
+/// Causal depthwise conv1d + silu over a GDN layer's q|k|v projection in one launch
+/// (`gdn_conv4_*`). `x` [batch, seq, ch] f32; `w` [ch, 4] f32; `state` [batch, ch, 4] (f16, bf16
+/// or f32) holds the last four inputs per channel and is rewritten in place; `fresh` reads it as
+/// zeros, a sequence start. Returns silu(conv) as [batch, seq, ch] f32.
+pub fn gdn_conv_rocm(x: &Tensor, w: &Tensor, state: &Tensor, fresh: bool) -> Result<Tensor> {
+    use hanzo_rocm_kernels::kernel::{GdnKernel, KernelSource};
+    let (batch, seq, ch) = x.dims3()?;
+    if w.dims() != [ch, 4] || state.dims() != [batch, ch, 4] || !state.is_contiguous() {
+        crate::bail!(
+            "gdn_conv_rocm: x {:?}, w {:?}, state {:?} (contiguous: {})",
+            x.dims(),
+            w.dims(),
+            state.dims(),
+            state.is_contiguous()
+        );
+    }
+    let mut px = gdn_f32_ptr(x, "gdn_conv_rocm x")?;
+    let mut pw = gdn_f32_ptr(w, "gdn_conv_rocm w")?;
+    let (dev, func, mut ps) = match &*state.storage() {
+        Storage::Rocm(r) => {
+            let func = match r.slice {
+                RocmStorageSlice::F32(_) => "gdn_conv4_f32",
+                RocmStorageSlice::F16(_) => "gdn_conv4_f16",
+                RocmStorageSlice::BF16(_) => "gdn_conv4_bf16",
+                _ => crate::bail!("gdn_conv_rocm: state must be f32, f16 or bf16"),
+            };
+            (r.device.clone(), func, unsafe {
+                r.slice.offset_ptr(state.layout().start_offset())
+            })
+        }
+        _ => crate::bail!("gdn_conv_rocm: state must be ROCm"),
+    };
+    let out = dev.alloc::<f32>(batch * seq * ch)?;
+    let mut po = out.as_ptr() as *mut std::ffi::c_void;
+    let (mut b_u, mut s_u, mut c_u, mut f_i) = (batch as u32, seq as u32, ch as u32, fresh as i32);
+    unsafe {
+        launch_kernel(
+            &dev,
+            GdnKernel::NAME,
+            GdnKernel::CODE,
+            func,
+            rocm_rs::hip::Dim3::from((batch * ch).div_ceil(256) as u32),
+            rocm_rs::hip::Dim3::from(256),
+            &mut [
+                &mut px as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut pw as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut ps as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut po as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut b_u as *mut u32 as *mut std::ffi::c_void,
+                &mut s_u as *mut u32 as *mut std::ffi::c_void,
+                &mut c_u as *mut u32 as *mut std::ffi::c_void,
+                &mut f_i as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )?;
+    }
+    Ok(crate::tensor::from_storage(
+        Storage::Rocm(RocmStorage {
+            slice: RocmStorageSlice::F32(out),
+            device: dev,
+        }),
+        (batch, seq, ch),
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// The gated-delta-net mixer after the conv in one launch (`gdn_mixer_d128_f32`): q and k
+/// l2-normed (v head h reads k head h mod hk, the GGUF tiled order) and q scaled by 1/sqrt(128),
+/// beta = sigmoid(b), decay = exp(a_coef * softplus(a + dt_bias)), the delta rule over `state`
+/// [batch, hv, 128, 128] f32 (updated in place), then the output's RMS norm times `norm_w` and
+/// act(z), act = sigmoid if `sigmoid_gate` else silu. `qkv` [batch, seq, 2*hk*128 + hv*128]
+/// (q | k | v); `a`, `b` [batch, seq, hv]; `z` [batch, seq, hv*128]; `a_coef`, `dt_bias` [hv];
+/// `norm_w` [128]; all f32. Returns [batch, seq, hv*128] f32.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_mixer_rocm(
+    qkv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    z: &Tensor,
+    a_coef: &Tensor,
+    dt_bias: &Tensor,
+    norm_w: &Tensor,
+    state: &Tensor,
+    hk: usize,
+    eps: f32,
+    sigmoid_gate: bool,
+) -> Result<Tensor> {
+    use hanzo_rocm_kernels::kernel::{GdnKernel, KernelSource};
+    const D: usize = 128;
+    let (batch, seq, width) = qkv.dims3()?;
+    let hv = a.dim(2)?;
+    if state.dims() != [batch, hv, D, D]
+        || width != (2 * hk + hv) * D
+        || hk == 0
+        || b.dims() != a.dims()
+        || z.dims() != [batch, seq, hv * D]
+        || a_coef.dims() != [hv]
+        || dt_bias.dims() != [hv]
+        || norm_w.dims() != [D]
+    {
+        crate::bail!(
+            "gdn_mixer_rocm: qkv {:?}, a {:?}, b {:?}, z {:?}, state {:?}, hk {hk}",
+            qkv.dims(),
+            a.dims(),
+            b.dims(),
+            z.dims(),
+            state.dims()
+        );
+    }
+    if qkv.layout().start_offset() % 4 != 0 {
+        crate::bail!("gdn_mixer_rocm: qkv must start 16-byte aligned");
+    }
+    let dev = match &*qkv.storage() {
+        Storage::Rocm(r) => r.device.clone(),
+        _ => crate::bail!("gdn_mixer_rocm: qkv must be ROCm"),
+    };
+    let mut p = [
+        gdn_f32_ptr(qkv, "gdn_mixer_rocm qkv")?,
+        gdn_f32_ptr(a, "gdn_mixer_rocm a")?,
+        gdn_f32_ptr(b, "gdn_mixer_rocm b")?,
+        gdn_f32_ptr(z, "gdn_mixer_rocm z")?,
+        gdn_f32_ptr(a_coef, "gdn_mixer_rocm a_coef")?,
+        gdn_f32_ptr(dt_bias, "gdn_mixer_rocm dt_bias")?,
+        gdn_f32_ptr(norm_w, "gdn_mixer_rocm norm_w")?,
+        gdn_f32_ptr(state, "gdn_mixer_rocm state")?,
+    ];
+    let out = dev.alloc::<f32>(batch * seq * hv * D)?;
+    let mut po = out.as_ptr() as *mut std::ffi::c_void;
+    let (mut stride, mut s_u, mut hk_u, mut hv_u) = (width as u32, seq as u32, hk as u32, hv as u32);
+    let (mut eps_f, mut sig) = (eps, sigmoid_gate as i32);
+    let [pq, pa, pb, pz, pac, pdt, pw, ps] = &mut p;
+    unsafe {
+        launch_kernel(
+            &dev,
+            GdnKernel::NAME,
+            GdnKernel::CODE,
+            "gdn_mixer_d128_f32",
+            rocm_rs::hip::Dim3::from((batch * hv) as u32),
+            rocm_rs::hip::Dim3::from(D as u32),
+            &mut [
+                pq as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut stride as *mut u32 as *mut std::ffi::c_void,
+                pa as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                pb as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                pz as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                pac as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                pdt as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                pw as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                ps as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut po as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                &mut s_u as *mut u32 as *mut std::ffi::c_void,
+                &mut hk_u as *mut u32 as *mut std::ffi::c_void,
+                &mut hv_u as *mut u32 as *mut std::ffi::c_void,
+                &mut eps_f as *mut f32 as *mut std::ffi::c_void,
+                &mut sig as *mut i32 as *mut std::ffi::c_void,
+            ],
+        )?;
+    }
+    Ok(crate::tensor::from_storage(
+        Storage::Rocm(RocmStorage {
+            slice: RocmStorageSlice::F32(out),
+            device: dev,
+        }),
+        (batch, seq, hv * D),
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 /// Fused GDN gated-delta-rule scan: ONE launch, f32 end-to-end, state updated in place.
 /// q,k: [bh, seq, kd] (q pre-scaled by 1/sqrt(kd)); v: [bh, seq, vd]; g,beta: [bh, seq];
 /// state: [bh, kd, vd]; returns out: [bh, seq, vd]. All F32 ROCm tensors.
