@@ -3354,6 +3354,14 @@ impl RocmStorage {
         }
     }
 
+    /// Elementwise `1 / (1 + e^-x)` in one launch (`usigmoid_*`, computed in f32), the kernel
+    /// behind `hanzo_nn::ops::sigmoid`.
+    pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
+        let device = self.device.clone();
+        let slice = UnaryNamed("usigmoid").map(&self.slice, &device, layout)?;
+        Ok(Self { slice, device })
+    }
+
     /// Fused softmax over the last dim (max-subtract-exp-sum-div, f32 accumulation), replacing the
     /// composite that ran 5 ops + 2 casts. One warp per row (32 lanes along threadIdx.y); the
     /// reduction is a warp shuffle (no shared memory). Reuses the ReduceKernel `softmax_{...}`.
@@ -3649,38 +3657,61 @@ impl<U: crate::op::UnaryOpT> Map1 for U {
         dev: &RocmDevice,
         layout: &Layout,
     ) -> Result<SendSyncDeviceMemory<T>> {
-        use hanzo_rocm_kernels::kernel::UnaryKernel;
-        let shape = layout.shape();
-        let elem_count = shape.elem_count();
-
-        let func_name = kernel_name::<T>(U::KERNEL);
-        let (ds, num_dims) = dims_and_strides(layout)?;
-        let output = dev.alloc::<T>(elem_count)?;
-        let (grid, block) = launch_config(elem_count);
-
-        unsafe {
-            let src_ptr = src.offset_ptr(layout.start_offset());
-            let out_ptr = output.as_ptr();
-
-            launch_kernel(
-                dev,
-                UnaryKernel::NAME,
-                UnaryKernel::CODE,
-                &func_name,
-                grid,
-                block,
-                &mut [
-                    &elem_count as *const usize as *mut std::ffi::c_void,
-                    &num_dims as *const usize as *mut std::ffi::c_void,
-                    ds.as_arg(),
-                    (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                    (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-
-        Ok(output)
+        unary_named(U::KERNEL, src, dev, layout)
     }
+}
+
+/// An elementwise kernel of `unary.hip` by its stem (`u<op>`), over any layout.
+struct UnaryNamed(&'static str);
+
+impl Map1 for UnaryNamed {
+    fn f<T: Copy + Send + Sync + 'static>(
+        &self,
+        src: &SendSyncDeviceMemory<T>,
+        dev: &RocmDevice,
+        layout: &Layout,
+    ) -> Result<SendSyncDeviceMemory<T>> {
+        unary_named(self.0, src, dev, layout)
+    }
+}
+
+fn unary_named<T: Copy + Send + Sync + 'static>(
+    stem: &str,
+    src: &SendSyncDeviceMemory<T>,
+    dev: &RocmDevice,
+    layout: &Layout,
+) -> Result<SendSyncDeviceMemory<T>> {
+    use hanzo_rocm_kernels::kernel::UnaryKernel;
+    let shape = layout.shape();
+    let elem_count = shape.elem_count();
+
+    let func_name = kernel_name::<T>(stem);
+    let (ds, num_dims) = dims_and_strides(layout)?;
+    let output = dev.alloc::<T>(elem_count)?;
+    let (grid, block) = launch_config(elem_count);
+
+    unsafe {
+        let src_ptr = src.offset_ptr(layout.start_offset());
+        let out_ptr = output.as_ptr();
+
+        launch_kernel(
+            dev,
+            UnaryKernel::NAME,
+            UnaryKernel::CODE,
+            &func_name,
+            grid,
+            block,
+            &mut [
+                &elem_count as *const usize as *mut std::ffi::c_void,
+                &num_dims as *const usize as *mut std::ffi::c_void,
+                ds.as_arg(),
+                (&src_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+            ],
+        )?;
+    }
+
+    Ok(output)
 }
 
 impl<U: crate::op::BinaryOpT> Map2 for U {
