@@ -82,6 +82,15 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
         Ok((storage, layout.shape().clone()))
     }
 
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        storage: &hanzo_ml::RocmStorage,
+        layout: &Layout,
+    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
+        Ok((storage.sigmoid(layout)?, layout.shape().clone()))
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
