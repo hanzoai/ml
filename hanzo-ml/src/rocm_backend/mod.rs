@@ -536,13 +536,14 @@ pub enum RocmQuantType {
     Q5_0,
     Q5_1,
     Q8_1,
-    // IQ2_*/IQ3_* codebook i-quants (decode + MoE-decode only; no qmmq prefill).
+    // IQ2_*/IQ3_* codebook i-quants (decode + MoE-decode; IQ3_S also has qmmq prefill).
     IQ2_XXS,
     IQ2_XS,
     IQ2_S,
     IQ3_XXS,
     IQ3_S,
-    // IQ4_NL codebook + TQ1_0 ternary-base-3 + IQ1_S/IQ1_M 1-bit (decode + MoE-decode only).
+    // IQ4_NL codebook (decode + qmmq prefill) + TQ1_0 ternary-base-3 + IQ1_S/IQ1_M 1-bit (decode +
+    // MoE-decode only).
     IQ4_NL,
     TQ1_0,
     IQ1_S,
@@ -672,12 +673,13 @@ impl RocmQuantType {
     /// dispatch site reads -- dense `forward` (rows>1) and both MoE `use_qmmq` sites -- replacing the
     /// three predicates the feature branches each invented (`prefill_capable`, two `qmmq_capable`s).
     /// Decode-capability (`from_ggml`, the bandwidth-bound lever) and prefill-capability are ORTHOGONAL:
-    /// the codebook/fractional types (IQ2_*/IQ3_*/IQ1_*/IQ4_NL/TQ1_0) and the per-16 asym/signed-scale
-    /// k-quants (Q2_K/Q3_K) are decode-native only; their rows>1 path dequantizes-to-f16 (dense) or
-    /// rides the per-slot matvec core (MoE) -- correct at any token count, just not WMMA-accelerated.
-    /// An ALLOWLIST (not a denylist) so a future decode-only type defaults to the safe dequant prefill
-    /// instead of dispatching a `qmmq_*` kernel that was never compiled. Mirrors `DEFINE_QMMQ` exactly:
-    /// the 6 base types (Q8_0/Q4_0/Q4_K/Q6_K/IQ4_XS/TQ2_0) + Q5_K/Q4_1/Q5_0/Q5_1/Q8_1.
+    /// the remaining codebook/fractional types (IQ2_*/IQ3_XXS/IQ1_*/TQ1_0/MXFP4) and the per-16
+    /// asym/signed-scale k-quants (Q2_K/Q3_K) are decode-native only; their rows>1 path
+    /// dequantizes-to-f16 (dense) or rides the per-slot matvec core (MoE) -- correct at any token
+    /// count, just not WMMA-accelerated. An ALLOWLIST (not a denylist) so a future decode-only type
+    /// defaults to the safe dequant prefill instead of dispatching a `qmmq_*` kernel that was never
+    /// compiled. Mirrors `DEFINE_QMMQ` exactly: Q8_0/Q4_0/Q4_K/Q6_K/IQ4_XS/TQ2_0/Q5_K/Q4_1/Q5_0/
+    /// Q5_1/Q8_1/ROCMFP4(_FAST)/IQ4_NL/IQ3_S.
     pub fn qmmq_capable(self) -> bool {
         matches!(
             self,
@@ -694,6 +696,8 @@ impl RocmQuantType {
                 | Self::Q8_1
                 | Self::ROCMFP4
                 | Self::ROCMFP4_FAST
+                | Self::IQ4_NL
+                | Self::IQ3_S
         )
     }
 
@@ -715,14 +719,14 @@ impl RocmQuantType {
             Self::Q8_1 => "qmmq_q8_1_f16",
             Self::ROCMFP4 => "qmmq_rocmfp4_f16",
             Self::ROCMFP4_FAST => "qmmq_rocmfp4_fast_f16",
+            Self::IQ4_NL => "qmmq_iq4nl_f16",
+            Self::IQ3_S => "qmmq_iq3s_f16",
             Self::Q2K
             | Self::Q3K
             | Self::IQ2_XXS
             | Self::IQ2_XS
             | Self::IQ2_S
             | Self::IQ3_XXS
-            | Self::IQ3_S
-            | Self::IQ4_NL
             | Self::TQ1_0
             | Self::IQ1_S
             | Self::IQ1_M
@@ -770,6 +774,12 @@ impl RocmQuantType {
             (Self::Q8_1, 128) => "moe_qmmq_q8_1_f16",
             (Self::Q8_1, 64) => "moe_qmmq_q8_1_tm64_f16",
             (Self::Q8_1, _) => "moe_qmmq_q8_1_tm32_f16",
+            (Self::IQ4_NL, 128) => "moe_qmmq_iq4nl_f16",
+            (Self::IQ4_NL, 64) => "moe_qmmq_iq4nl_tm64_f16",
+            (Self::IQ4_NL, _) => "moe_qmmq_iq4nl_tm32_f16",
+            (Self::IQ3_S, 128) => "moe_qmmq_iq3s_f16",
+            (Self::IQ3_S, 64) => "moe_qmmq_iq3s_tm64_f16",
+            (Self::IQ3_S, _) => "moe_qmmq_iq3s_tm32_f16",
             (
                 Self::Q2K
                 | Self::Q3K
@@ -777,8 +787,6 @@ impl RocmQuantType {
                 | Self::IQ2_XS
                 | Self::IQ2_S
                 | Self::IQ3_XXS
-                | Self::IQ3_S
-                | Self::IQ4_NL
                 | Self::TQ1_0
                 | Self::IQ1_S
                 | Self::IQ1_M

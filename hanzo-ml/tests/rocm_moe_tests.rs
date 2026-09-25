@@ -123,7 +123,9 @@ fn routed_experts_match_the_cpu_at_model_shapes() -> Result<()> {
         (GgmlDType::Q8_0, 16, 2560, 640, true),
     ];
     for (dtype, experts, n, k, per_slot) in cases {
-        for t in [1usize, 5] {
+        // One token takes the decode matvec; a prompt takes the expert-grouped int8 GEMM, whose
+        // tile height follows the tokens each expert gets (5 and 40 reach different tiles).
+        for t in [1usize, 5, 40] {
             for act in [DType::F16, DType::F32] {
                 let e = moe_case(&gpu, dtype, experts, n, k, t, 10, per_slot, act)?;
                 println!("{dtype:?} E={experts} n={n} k={k} t={t} {act:?}: rel {e:.2e}");
@@ -136,6 +138,37 @@ fn routed_experts_match_the_cpu_at_model_shapes() -> Result<()> {
         worst < 1e-2,
         "routed experts off by {worst} of the largest output"
     );
+    Ok(())
+}
+
+/// A prompt through a dense weight of each expert type takes the int8 GEMM; it must agree with
+/// the CPU's dequantized weights as the decode matvec does.
+#[test]
+fn a_prompt_through_an_expert_type_matches_the_cpu() -> Result<()> {
+    let gpu = Device::new_rocm(0)?;
+    let mut rng = Lcg(0x9a11);
+    let t = 37usize;
+    for (dtype, n, k) in [(GgmlDType::IQ3_S, 640, 2560), (GgmlDType::IQ4_NL, 2560, 640)] {
+        let raw = blocks(dtype, n * k, &mut rng);
+        let reference =
+            qtensor_from_ggml(dtype, &raw, vec![n, k], &Device::Cpu)?.dequantize(&Device::Cpu)?;
+        let x: Vec<f32> = (0..t * k).map(|_| rng.unit()).collect();
+        let want = Tensor::from_vec(x.clone(), (t, k), &Device::Cpu)?
+            .matmul(&reference.t()?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let w = QMatMul::from_qtensor(qtensor_from_ggml(dtype, &raw, vec![n, k], &gpu)?)?;
+        for act in [DType::F16, DType::F32] {
+            let got = w
+                .forward(&Tensor::from_vec(x.clone(), (t, k), &gpu)?.to_dtype(act)?)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let e = rel(&got, &want);
+            println!("{dtype:?} prompt {act:?}: rel {e:.2e}");
+            assert!(e < 1e-2, "{dtype:?} prompt {act:?} off by {e}");
+        }
+    }
     Ok(())
 }
 
