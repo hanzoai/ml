@@ -2889,7 +2889,7 @@ __device__ __forceinline__ void qdequant_core(
         qdequant_core<WTYPE, float>(nblocks, wq, out);                                                \
     }
 
-// Unified per-type entry points (f16 + bf16). These REPLACE the per-quant launcher dispatch: the
+// Unified per-type entry points (f16, bf16, f32). These REPLACE the per-quant launcher dispatch: the
 // Rust side selects the symbol by GgmlDType, every symbol is the SAME core with a different WTYPE.
 #define DEFINE_QMATVECU(NAME, WTYPE)                                                                 \
     extern "C" __global__ void qmatvecu_##NAME##_f16(                                                \
@@ -2901,6 +2901,11 @@ __device__ __forceinline__ void qdequant_core(
         const int nrows, const int ncols, const uint8_t* __restrict__ wq,                            \
         const hip_bfloat16* __restrict__ x, hip_bfloat16* __restrict__ y) {                          \
         qmatvec_core<WTYPE, hip_bfloat16>(nrows, ncols, wq, x, y);                                    \
+    }                                                                                                \
+    extern "C" __global__ void qmatvecu_##NAME##_f32(                                                \
+        const int nrows, const int ncols, const uint8_t* __restrict__ wq,                            \
+        const float* __restrict__ x, float* __restrict__ y) {                                        \
+        qmatvec_core<WTYPE, float>(nrows, ncols, wq, x, y);                                           \
     }
 
 DEFINE_QMATVECU(q8_0,  DW_Q8_0)
@@ -3009,7 +3014,7 @@ __device__ __forceinline__ void moe_qmatvec_core(
     }
 }
 
-// Unified per-type indexed-MoE entry points (f16 + bf16). Twin of DEFINE_QMATVECU: every symbol is
+// Unified per-type indexed-MoE entry points (f16, bf16, f32). Twin of DEFINE_QMATVECU: every symbol is
 // the SAME `moe_qmatvec_core` with a different WTYPE -- one core, one launcher table on the Rust
 // side. The Rust `moe_matvec_quant` selects the symbol by RocmQuantType + activation dtype.
 #define DEFINE_MOE_QMATVECU(NAME, WTYPE)                                                             \
@@ -3022,6 +3027,11 @@ __device__ __forceinline__ void moe_qmatvec_core(
         const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,          \
         const int* __restrict__ ids, const hip_bfloat16* __restrict__ x, hip_bfloat16* __restrict__ y) { \
         moe_qmatvec_core<WTYPE, hip_bfloat16>(n, ncols, nslots, wbank, ids, x, y);                   \
+    }                                                                                                \
+    extern "C" __global__ void moe_qmatvecu_##NAME##_f32(                                            \
+        const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,          \
+        const int* __restrict__ ids, const float* __restrict__ x, float* __restrict__ y) {          \
+        moe_qmatvec_core<WTYPE, float>(n, ncols, nslots, wbank, ids, x, y);                          \
     }
 
 DEFINE_MOE_QMATVECU(q8_0,  DW_Q8_0)

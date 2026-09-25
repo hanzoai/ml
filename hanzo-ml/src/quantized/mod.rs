@@ -1552,11 +1552,12 @@ impl QTensor {
                         .reshape((nrows, k))?
                         .to_dtype(DType::F16)?
                         .contiguous()?,
-                    DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
-                    // DECODE f32-native: dp4a experts quantize q8_1 from f32 and store f32, so an F32
-                    // routed activation stays F32 (the matvec returns F32 -> the .to_dtype(out_dtype)
-                    // below is a no-op), removing the cast pair that wrapped each gate/up/down matvec.
-                    DType::F32 if qt.dp4a_active() => x_exp.reshape((nrows, k))?.contiguous()?,
+                    // DECODE: both expert cores take f16, bf16 or f32 and store the same dtype, so
+                    // the routed activation keeps its dtype and the .to_dtype(out_dtype) below is a
+                    // no-op.
+                    DType::BF16 | DType::F16 | DType::F32 => {
+                        x_exp.reshape((nrows, k))?.contiguous()?
+                    }
                     _ => x_exp
                         .reshape((nrows, k))?
                         .to_dtype(DType::F16)?
@@ -2063,10 +2064,7 @@ pub fn moe_gate_up(
                             let nrows = t * topk;
                             let x_exp = x.broadcast_as((t, topk, k))?;
                             let x_flat = match x_exp.dtype() {
-                                DType::BF16 | DType::F16 => {
-                                    x_exp.reshape((nrows, k))?.contiguous()?
-                                }
-                                DType::F32 if qt.dp4a_active() => {
+                                DType::BF16 | DType::F16 | DType::F32 => {
                                     x_exp.reshape((nrows, k))?.contiguous()?
                                 }
                                 _ => x_exp
@@ -2492,10 +2490,12 @@ impl QMatMul {
                         .reshape((nrows, k))?
                         .to_dtype(DType::F16)?
                         .contiguous()?,
-                    DType::BF16 | DType::F16 => x_exp.reshape((nrows, k))?.contiguous()?,
-                    // DECODE f32-native dp4a: keep F32 routed activation F32 end-to-end (matvec stores
-                    // F32), eliding the cast pair around each expert matvec. See QStorage twin above.
-                    DType::F32 if qt.dp4a_active() => x_exp.reshape((nrows, k))?.contiguous()?,
+                    // DECODE: both expert cores take f16, bf16 or f32 and store the same dtype, so
+                    // the routed activation keeps its dtype and the .to_dtype(out_dtype) below is a
+                    // no-op.
+                    DType::BF16 | DType::F16 | DType::F32 => {
+                        x_exp.reshape((nrows, k))?.contiguous()?
+                    }
                     _ => x_exp
                         .reshape((nrows, k))?
                         .to_dtype(DType::F16)?
@@ -3100,22 +3100,12 @@ impl crate::Module for QMatMul {
                 let qmmq_ok = false;
                 if rows == 1 && unified_qt.is_some() {
                     // Decode: weights stay quantized in VRAM; the ONE native on-GPU quant matvec core
-                    // dequantizes per-block on-the-fly (no dense f16 copy). The matvec consumes
-                    // bf16/f16 activations directly and returns the same dtype, so the model's working
-                    // dtype (bf16) is kept end-to-end -- no bf16->f32->f16->bf16 cast detour. Only fall
-                    // back to an f16 cast for exotic input dtypes. Every wired type (symmetric 8-bit
-                    // through asymmetric super-block through sub-4-bit ternary) rides the same core.
-                    // dp4a-capable types accept the F32 residual/norm stream DIRECTLY (q8_1 quantize
-                    // from f32 + f32-store matvec), so an F32 activation stays F32 end-to-end with no
-                    // f16 bounce -- this removes the cast_f32_f16-before / cast_f16_f32-after pair that
-                    // wrapped every decode matvec. Non-dp4a (scalar) types keep the f16 cast.
-                    #[cfg(feature = "rocm")]
-                    let keep_f32 = unified_qt.map(|qt| qt.dp4a_active()).unwrap_or(false);
-                    #[cfg(not(feature = "rocm"))]
-                    let keep_f32 = false;
+                    // dequantizes per-block on-the-fly (no dense f16 copy). Both cores (dp4a and
+                    // scalar) take f16, bf16 or f32 activations and return the same dtype, so the
+                    // model's working dtype is kept end-to-end with no cast pair around the matvec.
+                    // Only an exotic input dtype is cast to f16.
                     let xs = match xs.dtype() {
-                        DType::BF16 | DType::F16 => xs.contiguous()?,
-                        DType::F32 if keep_f32 => xs.contiguous()?,
+                        DType::BF16 | DType::F16 | DType::F32 => xs.contiguous()?,
                         _ => xs.to_dtype(DType::F16)?.contiguous()?,
                     };
                     let d = match xs.device() {

@@ -804,137 +804,59 @@ impl RocmQuantType {
         }
     }
 
-    /// The dequantize entry point for this type and output dtype: `qdequant_core<WTYPE,OT>`. Named
-    /// from `decode_kernel`'s stem, so the two cannot disagree about what a type is called.
+    /// The dequantize entry point for this type and output dtype: `qdequant_core<WTYPE,OT>`.
     fn dequant_kernel(self, dtype: crate::DType) -> Result<String> {
-        let stem = self
-            .decode_kernel(true)
-            .strip_prefix("qmatvecu_")
-            .and_then(|name| name.strip_suffix("_f16"))
-            .ok_or_else(|| crate::Error::Msg(format!("{self:?} has no unified decode entry")))?;
         let suffix = match dtype {
             crate::DType::F16 => "f16",
             crate::DType::BF16 => "bf16",
             crate::DType::F32 => "f32",
             other => crate::bail!("dequantize_quant({self:?}): no {other:?} output"),
         };
-        Ok(format!("qdequant_{stem}_{suffix}"))
+        Ok(format!("qdequant_{}_{suffix}", self.stem()))
     }
 
-    /// The unified-core entry point name for this (type, activation-dtype) pair. EVERY one of these
-    /// is `qmatvec_core<WTYPE,XT>` with a different WTYPE -- there is exactly one core.
-    fn decode_kernel(self, f16: bool) -> &'static str {
-        match (self, f16) {
-            (Self::Q8_0, true) => "qmatvecu_q8_0_f16",
-            (Self::Q8_0, false) => "qmatvecu_q8_0_bf16",
-            (Self::Q4_0, true) => "qmatvecu_q4_0_f16",
-            (Self::Q4_0, false) => "qmatvecu_q4_0_bf16",
-            (Self::Q4K, true) => "qmatvecu_q4k_f16",
-            (Self::Q4K, false) => "qmatvecu_q4k_bf16",
-            (Self::Q6K, true) => "qmatvecu_q6k_f16",
-            (Self::Q6K, false) => "qmatvecu_q6k_bf16",
-            (Self::IQ4_XS, true) => "qmatvecu_iq4xs_f16",
-            (Self::IQ4_XS, false) => "qmatvecu_iq4xs_bf16",
-            (Self::TQ2_0, true) => "qmatvecu_tq2_0_f16",
-            (Self::TQ2_0, false) => "qmatvecu_tq2_0_bf16",
-            (Self::Q2K, true) => "qmatvecu_q2k_f16",
-            (Self::Q2K, false) => "qmatvecu_q2k_bf16",
-            (Self::Q3K, true) => "qmatvecu_q3k_f16",
-            (Self::Q3K, false) => "qmatvecu_q3k_bf16",
-            (Self::Q5K, true) => "qmatvecu_q5k_f16",
-            (Self::Q5K, false) => "qmatvecu_q5k_bf16",
-            (Self::Q4_1, true) => "qmatvecu_q4_1_f16",
-            (Self::Q4_1, false) => "qmatvecu_q4_1_bf16",
-            (Self::Q5_0, true) => "qmatvecu_q5_0_f16",
-            (Self::Q5_0, false) => "qmatvecu_q5_0_bf16",
-            (Self::Q5_1, true) => "qmatvecu_q5_1_f16",
-            (Self::Q5_1, false) => "qmatvecu_q5_1_bf16",
-            (Self::Q8_1, true) => "qmatvecu_q8_1_f16",
-            (Self::Q8_1, false) => "qmatvecu_q8_1_bf16",
-            (Self::IQ2_XXS, true) => "qmatvecu_iq2xxs_f16",
-            (Self::IQ2_XXS, false) => "qmatvecu_iq2xxs_bf16",
-            (Self::IQ2_XS, true) => "qmatvecu_iq2xs_f16",
-            (Self::IQ2_XS, false) => "qmatvecu_iq2xs_bf16",
-            (Self::IQ2_S, true) => "qmatvecu_iq2s_f16",
-            (Self::IQ2_S, false) => "qmatvecu_iq2s_bf16",
-            (Self::IQ3_XXS, true) => "qmatvecu_iq3xxs_f16",
-            (Self::IQ3_XXS, false) => "qmatvecu_iq3xxs_bf16",
-            (Self::IQ3_S, true) => "qmatvecu_iq3s_f16",
-            (Self::IQ3_S, false) => "qmatvecu_iq3s_bf16",
-            (Self::IQ4_NL, true) => "qmatvecu_iq4nl_f16",
-            (Self::IQ4_NL, false) => "qmatvecu_iq4nl_bf16",
-            (Self::TQ1_0, true) => "qmatvecu_tq1_0_f16",
-            (Self::TQ1_0, false) => "qmatvecu_tq1_0_bf16",
-            (Self::IQ1_S, true) => "qmatvecu_iq1_s_f16",
-            (Self::IQ1_S, false) => "qmatvecu_iq1_s_bf16",
-            (Self::IQ1_M, true) => "qmatvecu_iq1_m_f16",
-            (Self::IQ1_M, false) => "qmatvecu_iq1_m_bf16",
-            (Self::MXFP4, true) => "qmatvecu_mxfp4_f16",
-            (Self::MXFP4, false) => "qmatvecu_mxfp4_bf16",
-            (Self::ROCMFP4, true) => "qmatvecu_rocmfp4_f16",
-            (Self::ROCMFP4, false) => "qmatvecu_rocmfp4_bf16",
-            (Self::ROCMFP4_FAST, true) => "qmatvecu_rocmfp4_fast_f16",
-            (Self::ROCMFP4_FAST, false) => "qmatvecu_rocmfp4_fast_bf16",
+    /// The type's name in its per-type kernel symbols (`qmatvecu_<stem>_<act>`, `qdequant_<stem>_*`).
+    fn stem(self) -> &'static str {
+        match self {
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+            Self::Q4K => "q4k",
+            Self::Q6K => "q6k",
+            Self::IQ4_XS => "iq4xs",
+            Self::TQ2_0 => "tq2_0",
+            Self::Q2K => "q2k",
+            Self::Q3K => "q3k",
+            Self::Q5K => "q5k",
+            Self::Q4_1 => "q4_1",
+            Self::Q5_0 => "q5_0",
+            Self::Q5_1 => "q5_1",
+            Self::Q8_1 => "q8_1",
+            Self::IQ2_XXS => "iq2xxs",
+            Self::IQ2_XS => "iq2xs",
+            Self::IQ2_S => "iq2s",
+            Self::IQ3_XXS => "iq3xxs",
+            Self::IQ3_S => "iq3s",
+            Self::IQ4_NL => "iq4nl",
+            Self::TQ1_0 => "tq1_0",
+            Self::IQ1_S => "iq1_s",
+            Self::IQ1_M => "iq1_m",
+            Self::MXFP4 => "mxfp4",
+            Self::ROCMFP4 => "rocmfp4",
+            Self::ROCMFP4_FAST => "rocmfp4_fast",
         }
     }
 
-    /// The unified indexed-MoE decode entry point for this (type, activation-dtype) pair. Twin of
+    /// The unified-core entry point for this (type, activation dtype) pair. Every one of these is
+    /// `qmatvec_core<WTYPE,XT>` with a different WTYPE -- there is exactly one core.
+    fn decode_kernel(self, act: Act) -> String {
+        format!("qmatvecu_{}_{}", self.stem(), act.suffix())
+    }
+
+    /// The unified indexed-MoE decode entry point for this (type, activation dtype) pair. Twin of
     /// `decode_kernel`: every symbol is `moe_qmatvec_core<WTYPE,XT>` with a different WTYPE -- one
-    /// batched on-device-ids launch over all routed slots (experts on grid.y), capture-clean. This
-    /// REPLACES the per-expert host launch loop for the non-Q4_K types.
-    fn moe_decode_kernel(self, f16: bool) -> &'static str {
-        match (self, f16) {
-            (Self::Q8_0, true) => "moe_qmatvecu_q8_0_f16",
-            (Self::Q8_0, false) => "moe_qmatvecu_q8_0_bf16",
-            (Self::Q4_0, true) => "moe_qmatvecu_q4_0_f16",
-            (Self::Q4_0, false) => "moe_qmatvecu_q4_0_bf16",
-            (Self::Q4K, true) => "moe_qmatvecu_q4k_f16",
-            (Self::Q4K, false) => "moe_qmatvecu_q4k_bf16",
-            (Self::Q6K, true) => "moe_qmatvecu_q6k_f16",
-            (Self::Q6K, false) => "moe_qmatvecu_q6k_bf16",
-            (Self::IQ4_XS, true) => "moe_qmatvecu_iq4xs_f16",
-            (Self::IQ4_XS, false) => "moe_qmatvecu_iq4xs_bf16",
-            (Self::TQ2_0, true) => "moe_qmatvecu_tq2_0_f16",
-            (Self::TQ2_0, false) => "moe_qmatvecu_tq2_0_bf16",
-            (Self::Q2K, true) => "moe_qmatvecu_q2k_f16",
-            (Self::Q2K, false) => "moe_qmatvecu_q2k_bf16",
-            (Self::Q3K, true) => "moe_qmatvecu_q3k_f16",
-            (Self::Q3K, false) => "moe_qmatvecu_q3k_bf16",
-            (Self::Q5K, true) => "moe_qmatvecu_q5k_f16",
-            (Self::Q5K, false) => "moe_qmatvecu_q5k_bf16",
-            (Self::Q4_1, true) => "moe_qmatvecu_q4_1_f16",
-            (Self::Q4_1, false) => "moe_qmatvecu_q4_1_bf16",
-            (Self::Q5_0, true) => "moe_qmatvecu_q5_0_f16",
-            (Self::Q5_0, false) => "moe_qmatvecu_q5_0_bf16",
-            (Self::Q5_1, true) => "moe_qmatvecu_q5_1_f16",
-            (Self::Q5_1, false) => "moe_qmatvecu_q5_1_bf16",
-            (Self::Q8_1, true) => "moe_qmatvecu_q8_1_f16",
-            (Self::Q8_1, false) => "moe_qmatvecu_q8_1_bf16",
-            (Self::IQ2_XXS, true) => "moe_qmatvecu_iq2xxs_f16",
-            (Self::IQ2_XXS, false) => "moe_qmatvecu_iq2xxs_bf16",
-            (Self::IQ2_XS, true) => "moe_qmatvecu_iq2xs_f16",
-            (Self::IQ2_XS, false) => "moe_qmatvecu_iq2xs_bf16",
-            (Self::IQ2_S, true) => "moe_qmatvecu_iq2s_f16",
-            (Self::IQ2_S, false) => "moe_qmatvecu_iq2s_bf16",
-            (Self::IQ3_XXS, true) => "moe_qmatvecu_iq3xxs_f16",
-            (Self::IQ3_XXS, false) => "moe_qmatvecu_iq3xxs_bf16",
-            (Self::IQ3_S, true) => "moe_qmatvecu_iq3s_f16",
-            (Self::IQ3_S, false) => "moe_qmatvecu_iq3s_bf16",
-            (Self::IQ4_NL, true) => "moe_qmatvecu_iq4nl_f16",
-            (Self::IQ4_NL, false) => "moe_qmatvecu_iq4nl_bf16",
-            (Self::TQ1_0, true) => "moe_qmatvecu_tq1_0_f16",
-            (Self::TQ1_0, false) => "moe_qmatvecu_tq1_0_bf16",
-            (Self::IQ1_S, true) => "moe_qmatvecu_iq1_s_f16",
-            (Self::IQ1_S, false) => "moe_qmatvecu_iq1_s_bf16",
-            (Self::IQ1_M, true) => "moe_qmatvecu_iq1_m_f16",
-            (Self::IQ1_M, false) => "moe_qmatvecu_iq1_m_bf16",
-            (Self::MXFP4, true) => "moe_qmatvecu_mxfp4_f16",
-            (Self::MXFP4, false) => "moe_qmatvecu_mxfp4_bf16",
-            (Self::ROCMFP4, true) => "moe_qmatvecu_rocmfp4_f16",
-            (Self::ROCMFP4, false) => "moe_qmatvecu_rocmfp4_bf16",
-            (Self::ROCMFP4_FAST, true) => "moe_qmatvecu_rocmfp4_fast_f16",
-            (Self::ROCMFP4_FAST, false) => "moe_qmatvecu_rocmfp4_fast_bf16",
-        }
+    /// batched on-device-ids launch over all routed slots (experts on grid.y), capture-clean.
+    fn moe_decode_kernel(self, act: Act) -> String {
+        format!("moe_qmatvecu_{}_{}", self.stem(), act.suffix())
     }
 
     /// Whether this type has a faithful int8-dp4a decode (`qdp4a<WTYPE>` in quant.hip). The K-quants
@@ -1084,6 +1006,15 @@ impl Act {
         }
     }
 
+    /// The activation dtype's suffix in kernel symbols.
+    fn suffix(self) -> &'static str {
+        match self {
+            Act::F16 => "f16",
+            Act::Bf16 => "bf16",
+            Act::F32 => "f32",
+        }
+    }
+
     /// The `quantize_q8_1*` kernel that produces the q8_1 (int8 xq + f16 xd) activation from this dtype.
     fn quantize_kernel(self) -> &'static str {
         match self {
@@ -1204,8 +1135,8 @@ impl RocmDevice {
         let block = rocm_rs::hip::Dim3::from(256u32);
 
         macro_rules! launch_matvec {
-            ($variant:ident, $ty:ty, $f16:expr) => {{
-                let func = qt.decode_kernel($f16);
+            ($variant:ident, $ty:ty, $act:expr) => {{
+                let func = qt.decode_kernel($act);
                 let x_ptr = match &x.slice {
                     RocmStorageSlice::$variant(m) => m.as_ptr(),
                     _ => unreachable!(),
@@ -1217,7 +1148,7 @@ impl RocmDevice {
                         self,
                         QuantKernel::NAME,
                         QuantKernel::CODE,
-                        func,
+                        &func,
                         grid,
                         block,
                         &mut [
@@ -1237,10 +1168,11 @@ impl RocmDevice {
         }
 
         match &x.slice {
-            RocmStorageSlice::F16(_) => launch_matvec!(F16, f16, true),
-            RocmStorageSlice::BF16(_) => launch_matvec!(BF16, bf16, false),
+            RocmStorageSlice::F16(_) => launch_matvec!(F16, f16, Act::F16),
+            RocmStorageSlice::BF16(_) => launch_matvec!(BF16, bf16, Act::Bf16),
+            RocmStorageSlice::F32(_) => launch_matvec!(F32, f32, Act::F32),
             other => crate::bail!(
-                "matvec_quant: activations must be f16 or bf16, got {:?}",
+                "matvec_quant: activations must be f16, bf16 or f32, got {:?}",
                 other.dtype()
             ),
         }
@@ -1418,8 +1350,8 @@ impl RocmDevice {
         let wbank_ptr = wbank_mem.as_ptr();
 
         macro_rules! launch_moe {
-            ($variant:ident, $ty:ty, $f16:expr) => {{
-                let func = qt.moe_decode_kernel($f16);
+            ($variant:ident, $ty:ty, $act:expr) => {{
+                let func = qt.moe_decode_kernel($act);
                 let x_ptr = match &x.slice {
                     RocmStorageSlice::$variant(m) => m.as_ptr(),
                     _ => unreachable!(),
@@ -1431,7 +1363,7 @@ impl RocmDevice {
                         self,
                         QuantKernel::NAME,
                         QuantKernel::CODE,
-                        func,
+                        &func,
                         grid,
                         block,
                         &mut [
@@ -1453,10 +1385,11 @@ impl RocmDevice {
         }
 
         match &x.slice {
-            RocmStorageSlice::F16(_) => launch_moe!(F16, f16, true),
-            RocmStorageSlice::BF16(_) => launch_moe!(BF16, bf16, false),
+            RocmStorageSlice::F16(_) => launch_moe!(F16, f16, Act::F16),
+            RocmStorageSlice::BF16(_) => launch_moe!(BF16, bf16, Act::Bf16),
+            RocmStorageSlice::F32(_) => launch_moe!(F32, f32, Act::F32),
             other => crate::bail!(
-                "moe_matvec_quant: activations must be f16 or bf16, got {:?}",
+                "moe_matvec_quant: activations must be f16, bf16 or f32, got {:?}",
                 other.dtype()
             ),
         }

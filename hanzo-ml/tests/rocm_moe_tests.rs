@@ -141,14 +141,20 @@ fn routed_experts_match_the_cpu_at_model_shapes() -> Result<()> {
     Ok(())
 }
 
-/// A prompt through a dense weight of each expert type takes the int8 GEMM; it must agree with
-/// the CPU's dequantized weights as the decode matvec does.
+/// A dense weight of each type the model stores agrees with the CPU's dequantized weights for one
+/// token (the decode matvec, in the activation's own dtype) and for a prompt (the int8 GEMM).
 #[test]
-fn a_prompt_through_an_expert_type_matches_the_cpu() -> Result<()> {
+fn a_dense_weight_matches_the_cpu_for_a_token_and_a_prompt() -> Result<()> {
     let gpu = Device::new_rocm(0)?;
     let mut rng = Lcg(0x9a11);
-    let t = 37usize;
-    for (dtype, n, k) in [(GgmlDType::IQ3_S, 640, 2560), (GgmlDType::IQ4_NL, 2560, 640)] {
+    for (dtype, n, k, t) in [
+        (GgmlDType::Q8_0, 640, 2560, 1),
+        (GgmlDType::IQ3_S, 640, 2560, 1),
+        (GgmlDType::IQ4_NL, 2560, 640, 1),
+        (GgmlDType::Q8_0, 640, 2560, 37),
+        (GgmlDType::IQ3_S, 640, 2560, 37),
+        (GgmlDType::IQ4_NL, 2560, 640, 37),
+    ] {
         let raw = blocks(dtype, n * k, &mut rng);
         let reference =
             qtensor_from_ggml(dtype, &raw, vec![n, k], &Device::Cpu)?.dequantize(&Device::Cpu)?;
@@ -165,8 +171,8 @@ fn a_prompt_through_an_expert_type_matches_the_cpu() -> Result<()> {
                 .flatten_all()?
                 .to_vec1::<f32>()?;
             let e = rel(&got, &want);
-            println!("{dtype:?} prompt {act:?}: rel {e:.2e}");
-            assert!(e < 1e-2, "{dtype:?} prompt {act:?} off by {e}");
+            println!("{dtype:?} t={t} {act:?}: rel {e:.2e}");
+            assert!(e < 1e-2, "{dtype:?} t={t} {act:?} off by {e}");
         }
     }
     Ok(())
