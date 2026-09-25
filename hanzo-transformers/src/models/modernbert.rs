@@ -149,30 +149,32 @@ impl ModernBertAttention {
     }
 }
 
+/// GeGLU: `Wo(gelu(x Wgᵀ) ⊙ x Wuᵀ)`. The checkpoint packs `Wg` and `Wu` as the two row halves of
+/// one `Wi`; they are applied as two GEMMs so gelu and the product run on contiguous
+/// activations rather than on strided halves of one wide one.
 #[derive(Clone)]
 pub struct ModernBertMLP {
-    wi: Linear,
+    gate: Linear,
+    up: Linear,
     wo: Linear,
 }
 
 impl ModernBertMLP {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let wi = linear_no_bias(
-            config.hidden_size,
-            config.intermediate_size * 2,
-            vb.pp("Wi"),
-        )?;
+        let (i, d) = (config.intermediate_size, config.hidden_size);
+        let wi = vb.pp("Wi").get((2 * i, d), "weight")?;
         let wo = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))?;
-        Ok(Self { wi, wo })
+        Ok(Self {
+            gate: Linear::new(wi.narrow(0, 0, i)?, None),
+            up: Linear::new(wi.narrow(0, i, i)?, None),
+            wo,
+        })
     }
 }
 
 impl Module for ModernBertMLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = xs.apply(&self.wi)?;
-        let xs = xs.chunk(2, D::Minus1)?;
-        let xs = (&xs[0].gelu_erf()? * &xs[1])?.apply(&self.wo)?; // GeGLU
-        Ok(xs)
+        (xs.apply(&self.gate)?.gelu_erf()? * xs.apply(&self.up)?)?.apply(&self.wo)
     }
 }
 
