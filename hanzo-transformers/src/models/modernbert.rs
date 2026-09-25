@@ -8,8 +8,9 @@
 
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{
-    embedding, layer_norm_no_bias, linear, linear_no_bias, ops::softmax, Embedding, LayerNorm,
-    Linear, Module, VarBuilder,
+    embedding, layer_norm_no_bias, linear, linear_no_bias,
+    ops::{softmax, softmax_last_dim},
+    Embedding, LayerNorm, Linear, Module, VarBuilder,
 };
 use serde::Deserialize;
 
@@ -136,7 +137,7 @@ impl ModernBertAttention {
         let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
 
         let att = att.broadcast_add(attention_mask)?;
-        let att = softmax(&att, D::Minus1)?;
+        let att = softmax_last_dim(&att)?;
 
         let xs = att.matmul(&v)?;
 
@@ -210,6 +211,7 @@ impl ModernBertLayer {
         })
     }
 
+    /// `local_attention_mask` is the global mask with the sliding window already added.
     fn forward(
         &self,
         xs: &Tensor,
@@ -223,7 +225,7 @@ impl ModernBertLayer {
         }
 
         let attention_mask = if self.uses_local_attention {
-            &global_attention_mask.broadcast_add(local_attention_mask)?
+            local_attention_mask
         } else {
             global_attention_mask
         };
@@ -281,6 +283,21 @@ impl Module for ModernBertDecoder {
     }
 }
 
+/// Additive score for a masked key: the most negative finite value of `dtype`.
+///
+/// Finite, not `-inf`: a padding query whose whole sliding window is padding then attends
+/// uniformly instead of producing NaN, and NaN at a padding position still reaches every
+/// real position through a later attention's `0 * NaN`. `f32::MIN` does not fit in `F16`
+/// (it becomes `-inf`), so each dtype takes its own minimum.
+pub fn masked_value(dtype: DType) -> f64 {
+    match dtype {
+        // `f16::MIN` and `bf16::MIN`: -(2 - 2^-10) * 2^15 and -(2 - 2^-7) * 2^127.
+        DType::F16 => -65504.0,
+        DType::BF16 => -3.3895313892515355e38,
+        _ => f32::MIN as f64,
+    }
+}
+
 // Global attention mask calculated from padded token inputs
 fn prepare_4d_attention_mask(
     mask: &Tensor,
@@ -295,17 +312,18 @@ fn prepare_4d_attention_mask(
         .unsqueeze(1)?
         .unsqueeze(2)?
         .expand((bsz, 1, tgt_len, src_len))?
-        .to_dtype(dtype)?;
+        .to_dtype(DType::F32)?;
 
     let inverted_mask = (1.0 - expanded_mask)?;
 
-    (inverted_mask * f32::MIN as f64)?.to_dtype(dtype)
+    (inverted_mask * masked_value(dtype))?.to_dtype(dtype)
 }
 
 // Attention mask caused by the sliding window
 fn get_local_attention_mask(
     seq_len: usize,
     max_distance: usize,
+    dtype: DType,
     device: &Device,
 ) -> Result<Tensor> {
     let mask: Vec<_> = (0..seq_len)
@@ -319,7 +337,7 @@ fn get_local_attention_mask(
             })
         })
         .collect();
-    Tensor::from_slice(&mask, (seq_len, seq_len), device)
+    Tensor::from_slice(&mask, (seq_len, seq_len), device)?.to_dtype(dtype)
 }
 
 // ModernBERT backbone
@@ -333,16 +351,23 @@ pub struct ModernBert {
 }
 
 impl ModernBert {
+    /// Load from a `ModernBertFor*` checkpoint, where the backbone sits under `model.`.
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        Self::new(vb.pp("model"), config)
+    }
+
+    /// Load a bare backbone whose weights sit at the root of `vb`: `embeddings.*`,
+    /// `layers.*`, `final_norm.*`, as a `ModernBertModel` checkpoint stores them.
+    pub fn new(vb: VarBuilder, config: &Config) -> Result<Self> {
         let word_embeddings = embedding(
             config.vocab_size,
             config.hidden_size,
-            vb.pp("model.embeddings.tok_embeddings"),
+            vb.pp("embeddings.tok_embeddings"),
         )?;
         let norm = layer_norm_no_bias(
             config.hidden_size,
             config.layer_norm_eps,
-            vb.pp("model.embeddings.norm"),
+            vb.pp("embeddings.norm"),
         )?;
         let global_rotary_emb = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
@@ -361,7 +386,7 @@ impl ModernBert {
         for layer_id in 0..config.num_hidden_layers {
             let layer_uses_local_attention = layer_id % config.global_attn_every_n_layers != 0;
             layers.push(ModernBertLayer::load(
-                vb.pp(format!("model.layers.{layer_id}")),
+                vb.pp(format!("layers.{layer_id}")),
                 config,
                 if layer_uses_local_attention {
                     local_rotary_emb.clone()
@@ -375,7 +400,7 @@ impl ModernBert {
         let final_norm = layer_norm_no_bias(
             config.hidden_size,
             config.layer_norm_eps,
-            vb.pp("model.final_norm"),
+            vb.pp("final_norm"),
         )?;
 
         Ok(Self {
@@ -389,10 +414,12 @@ impl ModernBert {
 
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let seq_len = xs.shape().dims()[1];
+        let dtype = self.word_embeddings.embeddings().dtype();
         let global_attention_mask =
-            prepare_4d_attention_mask(mask, DType::F32, None)?.to_device(xs.device())?;
+            prepare_4d_attention_mask(mask, dtype, None)?.to_device(xs.device())?;
         let local_attention_mask =
-            get_local_attention_mask(seq_len, self.local_attention_size / 2, xs.device())?;
+            get_local_attention_mask(seq_len, self.local_attention_size / 2, dtype, xs.device())?
+                .broadcast_add(&global_attention_mask)?;
         let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
         for layer in self.layers.iter() {
             xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask)?;
