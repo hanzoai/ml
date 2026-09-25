@@ -162,7 +162,11 @@ pub struct ModernBertMLP {
 impl ModernBertMLP {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
         let (i, d) = (config.intermediate_size, config.hidden_size);
-        let wi = vb.pp("Wi").get((2 * i, d), "weight")?;
+        let wi = vb.pp("Wi").get_with_hints(
+            (2 * i, d),
+            "weight",
+            hanzo_nn::init::DEFAULT_KAIMING_NORMAL,
+        )?;
         let wo = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))?;
         Ok(Self {
             gate: Linear::new(wi.narrow(0, 0, i)?, None),
