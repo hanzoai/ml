@@ -3283,6 +3283,8 @@ typedef int v4i_ld __attribute__((ext_vector_type(4)));
 #define WT_Q8_1   10  // 36 B,  32 elems,  SYM 8-bit (+sum).    q_w = qs[k];        scale d
 #define WT_ROCMFP4_FAST 11  // 17 B,  32 elems, SYM codebook (LUT).  q_w = KVALUES_ROCMFP4_D[nib]; scale ue4m3_half(blk[16])
 #define WT_ROCMFP4      12  // 18 B,  32 elems, SYM dual codebook (LUT). q_w = KVALUES_ROCMFP4_D[nib]; scales ue4m3_half(blk[16..17])
+#define WT_IQ4_NL 13  // 18 B,  32 elems,  SYM codebook (LUT).  q_w = KVALUES[idx]; scale d
+#define WT_IQ3_S  14  // 110 B, 256 elems, SYM signed grid.     q_w = +-grid (1..15); scale d*(1+2*nib)
 // Per-type traits: BYTES = on-disk super-block stride; SBLK_ELEMS = elems/super-block (32 or 256);
 // SYMMETRIC = no min bias; SCALE_STEP = elems per distinct weight scale (16 for Q6_K else 32).
 // Derived: SUBS = 32-blocks per super-block; NSC16 = distinct scales per 32-block (2 iff SCALE_STEP=16).
@@ -3300,6 +3302,8 @@ template <> struct wt_traits<WT_Q5_1>   { static constexpr int BYTES = 24;  stat
 template <> struct wt_traits<WT_Q8_1>   { static constexpr int BYTES = 36;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
 template <> struct wt_traits<WT_ROCMFP4_FAST> { static constexpr int BYTES = 17; static constexpr int SBLK_ELEMS = 32; static constexpr bool SYMMETRIC = true; static constexpr int SCALE_STEP = 32; };
 template <> struct wt_traits<WT_ROCMFP4>      { static constexpr int BYTES = 18; static constexpr int SBLK_ELEMS = 32; static constexpr bool SYMMETRIC = true; static constexpr int SCALE_STEP = 16 ; };
+template <> struct wt_traits<WT_IQ4_NL> { static constexpr int BYTES = 18;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_IQ3_S>  { static constexpr int BYTES = 110; static constexpr int SBLK_ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
 
 // q4k_scale_min / KVALUES_IQ4NL_D are defined above for the decode core and reused verbatim here --
 // ONE decode source per format (the prefill decode below mirrors the same bit layout as qdec<WTYPE>).
@@ -3512,6 +3516,39 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_ROCMFP4>(const uint8_t* sb, i
     return decode_w_half<WT_ROCMFP4_FAST>(sb, 0, half);
 }
 
+// IQ4_NL: f16 d at byte 0, 16 nibble-pairs at +2 (the Q4_0 layout). Low nibble = k 0..15, high =
+// k 16..31, each through the IQ4_NL codebook (qdec<DW_IQ4_NL>).
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_IQ4_NL>(const uint8_t* sb, int, int half) {
+    const uint8_t* qs = sb + 2;
+    const int shift = (half == 0) ? 0 : 4;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) tmp[i] = KVALUES_IQ4NL_D[(qs[i] >> shift) & 0x0F];
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
+// IQ3_S: d@0, qs[64]@2, qh[8]@66, signs[32]@74, scales[4]@106. Sub-block g owns qs[8g..8g+8],
+// qh[g] and signs[4g..4g+4]. Element k = 8l + j reads grid entry qs[8g + 2l + j/4] (bit 8 from qh[g]
+// shifted by 8-2l-j/4), byte j%4, negated when bit j of signs[4g+l] is set (qdec<DW_IQ3_S>). The
+// grid bytes are 1..15, so the signed value is an exact int8.
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_IQ3_S>(const uint8_t* sb, int g, int half) {
+    const uint8_t* qs = sb + 2 + 8 * g;
+    const int qh = sb[66 + g];
+    const uint8_t* signs = sb + 74 + 4 * g;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int k = half + i;
+        const int l = k >> 3, j = k & 7, hi = j >> 2;
+        const int idx = (int)qs[2 * l + hi] | ((qh << (8 - 2 * l - hi)) & 256);
+        const int gv = (int)((IQ3S_GRID_D[idx] >> (8 * (j & 3))) & 0xFF);
+        tmp[i] = (int8_t)(((signs[l] >> j) & 1) ? -gv : gv);
+    }
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
 
 // MAIN per-(32-block, 16-group) weight scale. `sub16` = the 16-group index within the super-block
 // (= g*2 + (half==16)). For SCALE_STEP=32 types both halves of a 32-sub-block return the same value
@@ -3580,6 +3617,15 @@ template <> __device__ __forceinline__ float decode_w_mainscale<WT_ROCMFP4_FAST>
 template <> __device__ __forceinline__ float decode_w_mainscale<WT_ROCMFP4>(const uint8_t* sb, int) {
     return ue4m3_to_fp32_half(sb[16]);
 }
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_IQ4_NL>(const uint8_t* sb, int) {
+    return __half2float(*reinterpret_cast<const __half*>(sb));
+}
+// IQ3_S: d * (1 + 2*nib), nib the sub-block's 4-bit scale (low nibble of scales[g/2] for even g).
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_IQ3_S>(const uint8_t* sb, int sub16) {
+    const int g = sub16 >> 1;
+    const int nib = (sb[106 + (g >> 1)] >> (4 * (g & 1))) & 0xF;
+    return __half2float(*reinterpret_cast<const __half*>(sb)) * (float)(1 + 2 * nib);
+}
 
 // SECONDARY per-32-sub-block weight scalar. ASYMMETRIC: dmin * m_g (the min bias scale). SYMMETRIC
 // SCALE_STEP=16 (Q6_K): the 2nd-16-group main scale of sub-block g (so the high half scales by it).
@@ -3622,6 +3668,8 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_ROCMFP4_FAST>(
 template <> __device__ __forceinline__ float decode_w_secscale<WT_ROCMFP4>(const uint8_t* sb, int) {
     return ue4m3_to_fp32_half(sb[17]);
 }
+template <> __device__ __forceinline__ float decode_w_secscale<WT_IQ4_NL>(const uint8_t*, int) { return 0.0f; }
+template <> __device__ __forceinline__ float decode_w_secscale<WT_IQ3_S>(const uint8_t*, int) { return 0.0f; }
 
 // Shared int8 tile row stride: 32 data bytes + 16 pad bytes = 48. The pad is 16-ALIGNED so the 32-byte
 // fragment loads (`__builtin_memcpy(&frag, &sXi[row*SROW], 32)`) lower to `ds_load_b128` (two 16-byte
@@ -3908,6 +3956,8 @@ DEFINE_QMMQ(q5_1,  WT_Q5_1)
 DEFINE_QMMQ(q8_1,  WT_Q8_1)
 DEFINE_QMMQ(rocmfp4_fast, WT_ROCMFP4_FAST)
 DEFINE_QMMQ(rocmfp4,      WT_ROCMFP4)
+DEFINE_QMMQ(iq4nl, WT_IQ4_NL)
+DEFINE_QMMQ(iq3s,  WT_IQ3_S)
 
 #undef DEFINE_QMMQ
 
@@ -3949,6 +3999,8 @@ DEFINE_MOE_QMMQ(q5_1,  WT_Q5_1)
 DEFINE_MOE_QMMQ(q8_1,  WT_Q8_1)
 DEFINE_MOE_QMMQ(rocmfp4_fast, WT_ROCMFP4_FAST)
 DEFINE_MOE_QMMQ(rocmfp4,      WT_ROCMFP4)
+DEFINE_MOE_QMMQ(iq4nl, WT_IQ4_NL)
+DEFINE_MOE_QMMQ(iq3s,  WT_IQ3_S)
 
 #undef DEFINE_MOE_QMMQ
 #undef DEFINE_MOE_QMMQ_NW
@@ -3970,4 +4022,6 @@ DEFINE_MOE_QMMQ(rocmfp4,      WT_ROCMFP4)
 #undef WT_Q8_1
 #undef WT_ROCMFP4_FAST
 #undef WT_ROCMFP4
+#undef WT_IQ4_NL
+#undef WT_IQ3_S
 #endif
