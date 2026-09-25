@@ -1,6 +1,6 @@
 use crate::source::{
-    AFFINE, BINARY, CAST, CONV, FILL, GEMV, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM,
-    REDUCE, SDPA, SORT, TERNARY, UNARY,
+    AFFINE, BACKWARD, BINARY, CAST, CONV, FILL, GEMV, INDEXING, MLX_GEMM, MLX_SORT, OPTIM,
+    QUANTIZED, RANDOM, REDUCE, SDPA, SORT, TERNARY, UNARY,
 };
 use crate::utils::get_env_bool;
 use crate::{
@@ -86,6 +86,7 @@ impl Kernels {
     fn get_library_source(&self, source: Source) -> &'static str {
         match source {
             Source::Affine => AFFINE,
+            Source::Backward => BACKWARD,
             Source::Binary => BINARY,
             Source::Cast => CAST,
             Source::Conv => CONV,
@@ -94,6 +95,7 @@ impl Kernels {
             Source::Gemv => GEMV,
             Source::Indexing => INDEXING,
             Source::MlxSort => MLX_SORT,
+            Source::Optim => OPTIM,
             Source::Quantized => QUANTIZED,
             Source::Random => RANDOM,
             Source::Reduce => REDUCE,

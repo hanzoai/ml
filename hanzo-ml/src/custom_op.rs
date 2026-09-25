@@ -933,7 +933,11 @@ impl Tensor {
     ///
     /// Tensors sharing underlying storage with `self` are classified and passed as [`Src::Aliased`].
     /// Separate tensors are locked and passed as [`Src::Distinct`].
-    fn inplace_op<const N: usize, C: InplaceOpN<N>>(&self, srcs: [&Self; N], c: &C) -> Result<()> {
+    pub fn inplace_op<const N: usize, C: InplaceOpN<N>>(
+        &self,
+        srcs: [&Self; N],
+        c: &C,
+    ) -> Result<()> {
         let name = c.name();
 
         // Ensure writes cannot collide with themselves

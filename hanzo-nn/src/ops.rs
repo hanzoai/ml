@@ -464,6 +464,13 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
 
     /// `dx = y ⊙ (dy − ⟨dy, y⟩)` along the last dim, accumulated in `F32`.
     fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
+        #[cfg(feature = "metal")]
+        if fused_bwd::fits(&[res, grad_res]) {
+            // SAFETY: the kernel writes every element of `dx`.
+            let dx = unsafe { res.empty_like()? };
+            dx.inplace_op([res, grad_res], &fused_bwd::Softmax)?;
+            return Ok(Some(dx));
+        }
         let dtype = res.dtype();
         let y = res.to_dtype(DType::F32)?;
         let g = grad_res.to_dtype(DType::F32)?;
@@ -1168,6 +1175,24 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
         grad_res: &Tensor,
     ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
         let d = arg.dim(D::Minus1)?;
+        #[cfg(feature = "metal")]
+        if fused_bwd::fits(&[arg, grad_res, alpha]) {
+            let n = arg.elem_count() / d;
+            let dev = arg.device();
+            // SAFETY: the kernels write every element of `dx` and of `stats`.
+            let dx = unsafe { arg.empty_like()? };
+            let stats = unsafe { Tensor::empty((n, 2), DType::F32, dev)? };
+            let dparams = Tensor::zeros((2, d), DType::F32, dev)?;
+            dx.inplace_op(
+                [arg, grad_res, alpha, &stats, &dparams],
+                &fused_bwd::LayerNorm { eps: self.eps },
+            )?;
+            return Ok((
+                Some(dx),
+                Some(dparams.get(0)?.to_dtype(alpha.dtype())?),
+                Some(dparams.get(1)?.to_dtype(beta.dtype())?),
+            ));
+        }
         let x = arg.to_dtype(DType::F32)?.reshape(((), d))?;
         let g = grad_res.to_dtype(DType::F32)?.reshape(((), d))?;
         let a = alpha.to_dtype(DType::F32)?;
@@ -1189,6 +1214,110 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
             Some(da.to_dtype(alpha.dtype())?),
             Some(db.to_dtype(beta.dtype())?),
         ))
+    }
+}
+
+/// Fused Metal backward passes of the last-dim softmax and LayerNorm: one threadgroup per row,
+/// accumulated in F32, instead of a dozen tensor ops over the whole activation.
+#[cfg(feature = "metal")]
+mod fused_bwd {
+    use hanzo_metal_kernels::BufferOffset;
+    use hanzo_ml::backend::BackendStorage;
+    use hanzo_ml::{DType, InplaceOpN, Layout, MetalStorage, Result, Tensor};
+
+    /// Every tensor on Metal, contiguous and of one float dtype the kernels take.
+    pub fn fits(ts: &[&Tensor]) -> bool {
+        let dtype = ts[0].dtype();
+        matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+            && ts
+                .iter()
+                .all(|t| t.device().is_metal() && t.is_contiguous() && t.dtype() == dtype)
+    }
+
+    fn at<'a>(s: &'a MetalStorage, l: &Layout) -> BufferOffset<'a> {
+        BufferOffset {
+            buffer: s.buffer(),
+            offset_in_bytes: l.start_offset() * s.dtype().size_in_bytes(),
+        }
+    }
+
+    fn name(dtype: DType) -> &'static str {
+        match dtype {
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+            _ => "f32",
+        }
+    }
+
+    pub struct Softmax;
+
+    impl InplaceOpN<2> for Softmax {
+        fn name(&self) -> &'static str {
+            "softmax-bwd"
+        }
+
+        fn metal_fwd(
+            &self,
+            dx: &mut MetalStorage,
+            dxl: &Layout,
+            [(y, yl), (dy, dyl)]: [(&MetalStorage, &Layout); 2],
+        ) -> Result<()> {
+            let device = dx.device().clone();
+            let encoder = device.command_encoder()?;
+            encoder.set_label("softmax-bwd");
+            let d = *dxl.dims().last().unwrap_or(&1);
+            hanzo_metal_kernels::call_softmax_bwd(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                name(dx.dtype()),
+                dxl.shape().elem_count() / d.max(1),
+                d,
+                at(y, yl),
+                at(dy, dyl),
+                at(dx, dxl),
+            )
+            .map_err(hanzo_ml::Error::wrap)
+        }
+    }
+
+    pub struct LayerNorm {
+        pub eps: f32,
+    }
+
+    impl InplaceOpN<5> for LayerNorm {
+        fn name(&self) -> &'static str {
+            "layer-norm-bwd"
+        }
+
+        fn metal_fwd(
+            &self,
+            dx: &mut MetalStorage,
+            dxl: &Layout,
+            [(x, xl), (dy, dyl), (alpha, al), (stats, _), (dparams, _)]: [(&MetalStorage, &Layout);
+                5],
+        ) -> Result<()> {
+            let device = dx.device().clone();
+            let encoder = device.command_encoder()?;
+            encoder.set_label("layer-norm-bwd");
+            let d = *dxl.dims().last().unwrap_or(&1);
+            hanzo_metal_kernels::call_layer_norm_bwd(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                name(dx.dtype()),
+                dxl.shape().elem_count() / d.max(1),
+                d,
+                self.eps,
+                at(x, xl),
+                at(dy, dyl),
+                at(alpha, al),
+                at(dx, dxl),
+                stats.buffer(),
+                dparams.buffer(),
+            )
+            .map_err(hanzo_ml::Error::wrap)
+        }
     }
 }
 

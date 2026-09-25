@@ -148,9 +148,47 @@ fn rope(device: &Device) -> Result<()> {
     assert_close(&fused, &slow, 1e-5, "rope_thd")
 }
 
+/// Model-sized rows in bf16: the fused kernels accumulate in F32, so their gradients match the
+/// F32 composite to bf16 rounding. The row count is not a multiple of the kernel's row chunk.
+fn half_precision_rows(device: &Device) -> Result<()> {
+    let bf = |v: &Var| v.as_tensor().to_dtype(DType::BF16);
+    let (x, a, b) = (
+        var(&[3, 70, 1024], device)?,
+        var(&[1024], device)?,
+        var(&[1024], device)?,
+    );
+    let w = Tensor::randn(0f32, 1f32, (3, 70, 1024), device)?;
+    let ins = [&x, &a, &b];
+    let y = ops::layer_norm(&bf(&x)?, &bf(&a)?, &bf(&b)?, 1e-5)?.to_dtype(DType::F32)?;
+    let fused = grads(&ins, &y, &w)?;
+    let slow = grads(
+        &ins,
+        &ops::layer_norm_slow(x.as_tensor(), a.as_tensor(), b.as_tensor(), 1e-5)?,
+        &w,
+    )?;
+    for (i, (f, s)) in fused.iter().zip(&slow).enumerate() {
+        let scale = s.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        let d = max_diff(f, s)?;
+        assert!(
+            d < 2e-2 * scale.max(1.0),
+            "layer_norm bf16 input {i}: {d} (scale {scale})"
+        );
+    }
+
+    let z = var(&[4, 16, 130], device)?;
+    let w = Tensor::randn(0f32, 1f32, (4, 16, 130), device)?;
+    let y = ops::softmax_last_dim(&bf(&z)?)?.to_dtype(DType::F32)?;
+    let fused = grads(&[&z], &y, &w)?;
+    let slow = grads(&[&z], &ops::softmax(z.as_tensor(), 2)?, &w)?;
+    let d = max_diff(&fused[0], &slow[0])?;
+    assert!(d < 2e-2, "softmax bf16: {d}");
+    Ok(())
+}
+
 test_device!(softmax_last_dim, softmax_cpu, softmax_gpu, softmax_metal);
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norm_no_bias, lnnb_cpu, lnnb_gpu, lnnb_metal);
 test_device!(rms_norm, rms_cpu, rms_gpu, rms_metal);
 test_device!(silu_mul, silu_mul_cpu, silu_mul_gpu, silu_mul_metal);
 test_device!(rope, rope_cpu, rope_gpu, rope_metal);
+test_device!(half_precision_rows, half_cpu, half_gpu, half_metal);
