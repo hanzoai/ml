@@ -61,3 +61,49 @@ fn layer_norm() -> Result<()> {
 
     Ok(())
 }
+
+/// A norm loads from whatever its checkpoint holds: `weight` alone when it has no bias,
+/// `gamma`/`beta` from an old state dict, and fresh parameters from an empty VarMap.
+#[test]
+fn layer_norm_loads_each_parameter_naming() -> Result<()> {
+    use hanzo_ml::DType;
+    use hanzo_nn::{layer_norm, layer_norm_no_bias, VarBuilder, VarMap};
+    use std::collections::HashMap;
+    let dev = &Device::Cpu;
+    let w = Tensor::new(&[2f32, 2.], dev)?;
+    let b = Tensor::new(&[1f32, 1.], dev)?;
+    let x = Tensor::new(&[[1f32, 3.]], dev)?;
+
+    let only_weight = VarBuilder::from_tensors(
+        HashMap::from([("weight".into(), w.clone())]),
+        DType::F32,
+        dev,
+    );
+    let ln = layer_norm_no_bias(2, 1e-5, only_weight.clone())?;
+    assert!(ln.bias().is_none());
+    assert_eq!(
+        test_utils::to_vec2_round(&ln.forward(&x)?, 3)?,
+        [[-2.0, 2.0]]
+    );
+    assert!(
+        layer_norm(2, 1e-5, only_weight).is_err(),
+        "an affine norm needs its bias"
+    );
+
+    let old = VarBuilder::from_tensors(
+        HashMap::from([("gamma".into(), w), ("beta".into(), b)]),
+        DType::F32,
+        dev,
+    );
+    let ln = layer_norm(2, 1e-5, old)?;
+    assert_eq!(
+        test_utils::to_vec2_round(&ln.forward(&x)?, 3)?,
+        [[-1.0, 3.0]]
+    );
+
+    let vm = VarMap::new();
+    let ln = layer_norm(2, 1e-5, VarBuilder::from_varmap(&vm, DType::F32, dev))?;
+    assert_eq!(ln.weight().to_vec1::<f32>()?, [1.0, 1.0]);
+    assert_eq!(vm.all_vars().len(), 2);
+    Ok(())
+}
