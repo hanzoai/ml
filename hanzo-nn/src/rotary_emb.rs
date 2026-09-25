@@ -12,6 +12,20 @@ use rayon::prelude::*;
 struct RotaryEmbI;
 
 impl hanzo_ml::CustomOp3 for RotaryEmbI {
+    /// A rotation is orthogonal: `dx = R(−θ) dy`, the same op with `sin` negated. `cos` and
+    /// `sin` are position tables, not parameters, and get no gradient.
+    fn bwd(
+        &self,
+        _arg: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+        let dx = rope_i(&grad_res.contiguous()?, cos, &sin.neg()?)?;
+        Ok((Some(dx), None, None))
+    }
+
     fn name(&self) -> &'static str {
         "rotary-emb-int"
     }
@@ -287,7 +301,7 @@ pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if xs.device().is_rocm() {
         return rope_i_slow(xs, cos, sin);
     }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmbI)
+    xs.apply_op3(cos, sin, RotaryEmbI)
 }
 
 pub fn rope_i_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -315,6 +329,20 @@ pub fn rope_i_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 struct RotaryEmb;
 
 impl hanzo_ml::CustomOp3 for RotaryEmb {
+    /// A rotation is orthogonal: `dx = R(−θ) dy`, the same op with `sin` negated. `cos` and
+    /// `sin` are position tables, not parameters, and get no gradient.
+    fn bwd(
+        &self,
+        _arg: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+        let dx = rope(&grad_res.contiguous()?, cos, &sin.neg()?)?;
+        Ok((Some(dx), None, None))
+    }
+
     fn name(&self) -> &'static str {
         "rotary-emb"
     }
@@ -620,7 +648,7 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
             return rope_slow(xs, cos, sin);
         }
     }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
+    xs.apply_op3(cos, sin, RotaryEmb)
 }
 
 fn rotate_half(xs: &Tensor) -> Result<Tensor> {
@@ -646,6 +674,20 @@ pub fn rope_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 struct RotaryEmbThd;
 
 impl hanzo_ml::CustomOp3 for RotaryEmbThd {
+    /// A rotation is orthogonal: `dx = R(−θ) dy`, the same op with `sin` negated. `cos` and
+    /// `sin` are position tables, not parameters, and get no gradient.
+    fn bwd(
+        &self,
+        _arg: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+        let dx = rope_thd(&grad_res.contiguous()?, cos, &sin.neg()?)?;
+        Ok((Some(dx), None, None))
+    }
+
     fn name(&self) -> &'static str {
         "rotary-emb"
     }
@@ -895,5 +937,5 @@ pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         hanzo_ml::bail!("sin has to be contiguous in rope")
     }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmbThd)
+    xs.apply_op3(cos, sin, RotaryEmbThd)
 }

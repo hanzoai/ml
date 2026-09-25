@@ -461,6 +461,15 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
             hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
         Ok((newstorage, layout.shape().clone()))
     }
+
+    /// `dx = y ⊙ (dy − ⟨dy, y⟩)` along the last dim, accumulated in `F32`.
+    fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
+        let dtype = res.dtype();
+        let y = res.to_dtype(DType::F32)?;
+        let g = grad_res.to_dtype(DType::F32)?;
+        let dot = (&g * &y)?.sum_keepdim(D::Minus1)?;
+        Ok(Some((y * g.broadcast_sub(&dot)?)?.to_dtype(dtype)?))
+    }
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
@@ -473,7 +482,7 @@ pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
             return softmax(xs, D::Minus1);
         }
     }
-    xs.apply_op1_no_bwd(&SoftmaxLastDim)
+    xs.apply_op1(SoftmaxLastDim)
 }
 
 #[derive(Debug, Clone)]
@@ -719,6 +728,33 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
             hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
+
+    /// With `r = (mean(x²) + eps)^-½` and `u = dy ⊙ α`:
+    /// `dx = r (u − x r² mean(u ⊙ x))`, `dα = Σ_rows dy ⊙ x r`. Accumulated in `F32`.
+    fn bwd(
+        &self,
+        arg: &Tensor,
+        alpha: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let d = arg.dim(D::Minus1)?;
+        let x = arg.to_dtype(DType::F32)?.reshape(((), d))?;
+        let g = grad_res.to_dtype(DType::F32)?.reshape(((), d))?;
+        let a = alpha.to_dtype(DType::F32)?;
+        let r = (x.sqr()?.mean_keepdim(1)? + self.eps as f64)?
+            .sqrt()?
+            .recip()?;
+        let xr = x.broadcast_mul(&r)?;
+        let u = g.broadcast_mul(&a)?;
+        let proj = (&u * &xr)?.mean_keepdim(1)?;
+        let dx = (u - xr.broadcast_mul(&proj)?)?.broadcast_mul(&r)?;
+        let da = (g * xr)?.sum(0)?;
+        Ok((
+            Some(dx.reshape(arg.shape())?.to_dtype(arg.dtype())?),
+            Some(da.to_dtype(alpha.dtype())?),
+        ))
+    }
 }
 
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
@@ -769,7 +805,7 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             return rms_norm_slow(xs, &alpha, eps);
         }
     }
-    xs.apply_op2_no_bwd(&alpha, &RmsNorm { eps })
+    xs.apply_op2(&alpha, RmsNorm { eps })
 }
 
 // Fused SwiGLU: silu(a) * b, elementwise (both same shape). One op instead of silu + mul.
@@ -852,6 +888,26 @@ impl hanzo_ml::CustomOp2 for SiluMul {
         let out = s1.silu_mul(l1, s2, l2)?;
         Ok((out, l1.shape().clone()))
     }
+
+    /// `d gate = dy ⊙ up ⊙ σ(gate)(1 + gate(1 − σ(gate)))`, `d up = dy ⊙ silu(gate)`, in `F32`.
+    fn bwd(
+        &self,
+        gate: &Tensor,
+        up: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let a = gate.to_dtype(DType::F32)?;
+        let g = grad_res.to_dtype(DType::F32)?;
+        let s = sigmoid(&a)?;
+        let ds = (&s * ((&a * (1.0 - &s)?)? + 1.0)?)?;
+        let dgate = (&g * up.to_dtype(DType::F32)?)?.mul(&ds)?;
+        let dup = (g * (a * s)?)?;
+        Ok((
+            Some(dgate.to_dtype(gate.dtype())?),
+            Some(dup.to_dtype(up.dtype())?),
+        ))
+    }
 }
 
 /// Fused SwiGLU: `silu(gate) * up`. Falls back to the unfused tensor ops where there's no kernel.
@@ -872,7 +928,7 @@ pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
             return silu(gate)?.mul(up);
         }
     }
-    gate.apply_op2_no_bwd(up, &SiluMul)
+    gate.apply_op2(up, SiluMul)
 }
 
 #[derive(Debug, Clone)]
@@ -1099,6 +1155,41 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
             hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
+
+    /// With `x̂ = (x − μ) r`, `r = (var + eps)^-½` and `u = dy ⊙ α`:
+    /// `dx = r (u − mean(u) − x̂ mean(u ⊙ x̂))`, `dα = Σ_rows dy ⊙ x̂`, `dβ = Σ_rows dy`.
+    /// Accumulated in `F32`.
+    fn bwd(
+        &self,
+        arg: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+        let d = arg.dim(D::Minus1)?;
+        let x = arg.to_dtype(DType::F32)?.reshape(((), d))?;
+        let g = grad_res.to_dtype(DType::F32)?.reshape(((), d))?;
+        let a = alpha.to_dtype(DType::F32)?;
+        let xc = x.broadcast_sub(&x.mean_keepdim(1)?)?;
+        let r = (xc.sqr()?.mean_keepdim(1)? + self.eps as f64)?
+            .sqrt()?
+            .recip()?;
+        let xhat = xc.broadcast_mul(&r)?;
+        let u = g.broadcast_mul(&a)?;
+        let proj = (&u * &xhat)?.mean_keepdim(1)?;
+        let dx = u
+            .broadcast_sub(&u.mean_keepdim(1)?)?
+            .sub(&xhat.broadcast_mul(&proj)?)?
+            .broadcast_mul(&r)?;
+        let da = (&g * xhat)?.sum(0)?;
+        let db = g.sum(0)?;
+        Ok((
+            Some(dx.reshape(arg.shape())?.to_dtype(arg.dtype())?),
+            Some(da.to_dtype(alpha.dtype())?),
+            Some(db.to_dtype(beta.dtype())?),
+        ))
+    }
 }
 
 pub fn layer_norm_slow(x: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
@@ -1136,7 +1227,7 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
     if xs.device().is_rocm() || xs.device().is_vulkan() {
         return layer_norm_slow(xs, alpha, beta, eps);
     }
-    xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
+    xs.apply_op3(alpha, beta, LayerNorm { eps })
 }
 
 // https://pytorch.org/docs/stable/generated/torch.nn.PixelShuffle.html
