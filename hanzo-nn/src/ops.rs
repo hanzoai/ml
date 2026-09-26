@@ -216,6 +216,15 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
         Ok((new_storage, layout.shape().clone()))
     }
 
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        storage: &hanzo_ml::RocmStorage,
+        layout: &Layout,
+    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
+        Ok((storage.sigmoid(layout)?, layout.shape().clone()))
+    }
+
     fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
         // d/dx sigmoid(x) = (1 - sigmoid(x)) * sigmoid(x)
         let d_dx_sigmoid = res.ones_like()?.sub(res)?.mul(res)?;

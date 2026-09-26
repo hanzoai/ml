@@ -399,3 +399,56 @@ SCATTER_ADD_OP(__half, float, int64_t, scatter_add_i64_f16)
 SCATTER_ADD_OP(__half, float, uint32_t, scatter_add_u32_f16)
 SCATTER_ADD_OP(__half, float, uint8_t, scatter_add_u8_f16)
 #endif
+
+// index_add: out[pre, ids[j], post] += inp[pre, j, post] for a 1-D ids of src_dim_size. One thread
+// owns a whole (pre, post) column, so repeated ids are summed in order and need no atomics.
+template <typename T, typename ACC, typename I>
+__device__ void index_add(
+    const I *ids,
+    const T *inp,
+    T *out,
+    const size_t left_size,
+    const size_t src_dim_size,
+    const size_t dst_dim_size,
+    const size_t right_size
+) {
+    const size_t numel = left_size * right_size;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+        const size_t pre = i / right_size;
+        const size_t post = i % right_size;
+        for (unsigned int j = 0; j < src_dim_size; ++j) {
+            const I idx = ids[j];
+            if (idx < max_value<I>() && (size_t)idx < dst_dim_size) {
+                const size_t src_i = (pre * src_dim_size + j) * right_size + post;
+                const size_t dst_i = (pre * dst_dim_size + (size_t)idx) * right_size + post;
+                out[dst_i] = (T)((ACC)out[dst_i] + (ACC)inp[src_i]);
+            }
+        }
+    }
+}
+
+#define INDEX_ADD_OP(TYPENAME, ACC_TYPENAME, INDEX_TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const INDEX_TYPENAME *ids, \
+    const TYPENAME *inp, \
+    TYPENAME *out, \
+    const size_t left_size, \
+    const size_t src_dim_size, \
+    const size_t dst_dim_size, \
+    const size_t right_size \
+) { index_add<TYPENAME, ACC_TYPENAME>(ids, inp, out, left_size, src_dim_size, dst_dim_size, right_size); }
+
+#define INDEX_ADD_ALL(TYPENAME, ACC_TYPENAME, SUFFIX) \
+INDEX_ADD_OP(TYPENAME, ACC_TYPENAME, int64_t, index_add_i64_##SUFFIX) \
+INDEX_ADD_OP(TYPENAME, ACC_TYPENAME, uint32_t, index_add_u32_##SUFFIX) \
+INDEX_ADD_OP(TYPENAME, ACC_TYPENAME, uint8_t, index_add_u8_##SUFFIX)
+
+INDEX_ADD_ALL(float, float, f32)
+INDEX_ADD_ALL(double, double, f64)
+INDEX_ADD_ALL(uint8_t, uint8_t, u8)
+INDEX_ADD_ALL(uint32_t, uint32_t, u32)
+INDEX_ADD_ALL(int64_t, int64_t, i64)
+#if defined(__HIPCC__)
+INDEX_ADD_ALL(hip_bfloat16, float, bf16)
+INDEX_ADD_ALL(__half, float, f16)
+#endif

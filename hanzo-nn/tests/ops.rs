@@ -382,3 +382,9 @@ test_device!(
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
+
+#[cfg(feature = "rocm")]
+#[test]
+fn sigmoid_rocm() -> Result<()> {
+    sigmoid(&Device::new_rocm(0)?)
+}

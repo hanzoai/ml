@@ -159,13 +159,14 @@ impl RocmDevice {
     }
 
     pub fn alloc<T>(&self, len: usize) -> Result<SendSyncDeviceMemory<T>> {
-        SendSyncDeviceMemory::new_pooled(len, Some(self.pool.clone()))
-            .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))
+        SendSyncDeviceMemory::new_pooled(len, Some(self.pool.clone())).map_err(|e| {
+            let bytes = len * std::mem::size_of::<T>();
+            crate::Error::Msg(format!("ROCm allocation of {bytes} bytes failed: {e}")).bt()
+        })
     }
 
     pub fn alloc_zeros<T: Default + Clone>(&self, len: usize) -> Result<SendSyncDeviceMemory<T>> {
-        let mut mem = SendSyncDeviceMemory::new_pooled(len, Some(self.pool.clone()))
-            .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))?;
+        let mut mem = self.alloc::<T>(len)?;
         // Capture-safe: enqueue the zero-fill asynchronously on the device's single
         // stream. The synchronizing `hipMemset` trips hipGraph capture (HIP 906);
         // `hipMemsetAsync` is recordable, and single-stream ordering keeps the math
@@ -177,8 +178,7 @@ impl RocmDevice {
 
     pub fn clone_htod<T: Clone>(&self, src: &[T]) -> Result<SendSyncDeviceMemory<T>> {
         let count = src.len();
-        let mut dst = SendSyncDeviceMemory::new_pooled(count, Some(self.pool.clone()))
-            .map_err(|e| crate::Error::Msg(format!("Failed to allocate ROCm memory: {}", e)))?;
+        let mut dst = self.alloc::<T>(count)?;
         dst.copy_from_host(src)
             .map_err(|e| crate::Error::Msg(format!("Failed to copy host to device: {}", e)))?;
         Ok(dst)

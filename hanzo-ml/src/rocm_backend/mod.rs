@@ -3346,6 +3346,13 @@ impl RocmStorage {
         }
     }
 
+    /// σ(x) = 1 / (1 + e^−x) elementwise: the `usigmoid_{dtype}` kernel of `unary.hip`.
+    pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
+        let device = self.device.clone();
+        let slice = Named("usigmoid").map(&self.slice, &device, layout)?;
+        Ok(Self { slice, device })
+    }
+
     /// Fused softmax over the last dim (max-subtract-exp-sum-div, f32 accumulation), replacing the
     /// composite that ran 5 ops + 2 casts. One warp per row (32 lanes along threadIdx.y); the
     /// reduction is a warp shuffle (no shared memory). Reuses the ReduceKernel `softmax_{...}`.
@@ -3634,7 +3641,10 @@ pub trait Map2 {
     }
 }
 
-impl<U: crate::op::UnaryOpT> Map1 for U {
+/// A `unary.hip` kernel by its name root (`usigmoid` launches `usigmoid_{dtype}`).
+struct Named(&'static str);
+
+impl Map1 for Named {
     fn f<T: Copy + Send + Sync + 'static>(
         &self,
         src: &SendSyncDeviceMemory<T>,
@@ -3642,18 +3652,14 @@ impl<U: crate::op::UnaryOpT> Map1 for U {
         layout: &Layout,
     ) -> Result<SendSyncDeviceMemory<T>> {
         use hanzo_rocm_kernels::kernel::UnaryKernel;
-        let shape = layout.shape();
-        let elem_count = shape.elem_count();
-
-        let func_name = kernel_name::<T>(U::KERNEL);
+        let elem_count = layout.shape().elem_count();
+        let func_name = kernel_name::<T>(self.0);
         let (ds, num_dims) = dims_and_strides(layout)?;
         let output = dev.alloc::<T>(elem_count)?;
         let (grid, block) = launch_config(elem_count);
-
         unsafe {
             let src_ptr = src.offset_ptr(layout.start_offset());
             let out_ptr = output.as_ptr();
-
             launch_kernel(
                 dev,
                 UnaryKernel::NAME,
@@ -3670,8 +3676,18 @@ impl<U: crate::op::UnaryOpT> Map1 for U {
                 ],
             )?;
         }
-
         Ok(output)
+    }
+}
+
+impl<U: crate::op::UnaryOpT> Map1 for U {
+    fn f<T: Copy + Send + Sync + 'static>(
+        &self,
+        src: &SendSyncDeviceMemory<T>,
+        dev: &RocmDevice,
+        layout: &Layout,
+    ) -> Result<SendSyncDeviceMemory<T>> {
+        Named(U::KERNEL).f(src, dev, layout)
     }
 }
 
@@ -4214,8 +4230,8 @@ fn scatter_typed<T: Copy + Send + Sync + 'static>(
     }
 }
 
-/// Body shared by `scatter_set` and `scatter_add_set`. `root` is both the kernel-name root
-/// (the kernel is `{root}_{ids_dtype}_{dtype}`) and the op name carried in errors.
+/// Body shared by `scatter_set`, `scatter_add_set` and `index_add`. `root` is both the
+/// kernel-name root (the kernel is `{root}_{ids_dtype}_{dtype}`) and the op name carried in errors.
 #[allow(clippy::too_many_arguments)]
 fn scatter_apply(
     root: &'static str,
@@ -4397,10 +4413,61 @@ impl BackendStorage for RocmStorage {
         Ok(Self { slice, device })
     }
 
-    fn cmp(&self, _op: CmpOp, _rhs: &Self, _l1: &Layout, _l2: &Layout) -> Result<Self> {
-        Err(crate::Error::Msg(
-            "cmp not yet implemented for ROCm".to_string(),
-        ))
+    /// Elementwise comparison into a u8 mask: the `{eq,ne,lt,le,gt,ge}_{dtype}` kernels of
+    /// `binary.hip`, strided on both sides.
+    fn cmp(&self, op: CmpOp, rhs: &Self, l1: &Layout, l2: &Layout) -> Result<Self> {
+        use hanzo_rocm_kernels::kernel::BinaryKernel;
+        let device = self.device.clone();
+        let root = match op {
+            CmpOp::Eq => "eq",
+            CmpOp::Ne => "ne",
+            CmpOp::Lt => "lt",
+            CmpOp::Le => "le",
+            CmpOp::Gt => "gt",
+            CmpOp::Ge => "ge",
+        };
+        let suffix = match (&self.slice, &rhs.slice) {
+            (RocmStorageSlice::F32(_), RocmStorageSlice::F32(_)) => "f32",
+            (RocmStorageSlice::F64(_), RocmStorageSlice::F64(_)) => "f64",
+            (RocmStorageSlice::U8(_), RocmStorageSlice::U8(_)) => "u8",
+            (RocmStorageSlice::U32(_), RocmStorageSlice::U32(_)) => "u32",
+            (RocmStorageSlice::I64(_), RocmStorageSlice::I64(_)) => "i64",
+            (RocmStorageSlice::BF16(_), RocmStorageSlice::BF16(_)) => "bf16",
+            (RocmStorageSlice::F16(_), RocmStorageSlice::F16(_)) => "f16",
+            _ => crate::bail!("cmp does not support these dtypes for ROCm"),
+        };
+        let func_name = format!("{root}_{suffix}");
+        let elem_count = l1.shape().elem_count();
+        let (ds, num_dims) = dims_and_strides_pair(l1, l2)?;
+        let output = device.alloc::<u8>(elem_count)?;
+        if elem_count > 0 {
+            let (grid, block) = launch_config(elem_count);
+            unsafe {
+                let lhs_ptr = self.slice.offset_ptr(l1.start_offset());
+                let rhs_ptr = rhs.slice.offset_ptr(l2.start_offset());
+                let out_ptr = output.as_ptr();
+                launch_kernel(
+                    &device,
+                    BinaryKernel::NAME,
+                    BinaryKernel::CODE,
+                    &func_name,
+                    grid,
+                    block,
+                    &mut [
+                        &elem_count as *const usize as *mut std::ffi::c_void,
+                        &num_dims as *const usize as *mut std::ffi::c_void,
+                        ds.as_arg(),
+                        (&lhs_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        (&rhs_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        (&out_ptr) as *const *mut std::ffi::c_void as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+        }
+        Ok(Self {
+            slice: RocmStorageSlice::U8(output),
+            device,
+        })
     }
 
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
@@ -4972,18 +5039,24 @@ impl BackendStorage for RocmStorage {
         Ok(Self { slice, device })
     }
 
+    /// A contiguous copy of `self` with `src` added at the `ids` along `dim`: the
+    /// `index_add_{ids}_{dtype}` kernels of `indexing.hip`, which take the scatter kernels'
+    /// arguments.
     fn index_add(
         &self,
-        _l: &Layout,
-        _idx: &Self,
-        _il: &Layout,
-        _val: &Self,
-        _vl: &Layout,
-        _dim: usize,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<Self> {
-        Err(crate::Error::Msg(
-            "index_add not yet implemented for ROCm".to_string(),
-        ))
+        use crate::backend::BackendDevice;
+        let mut acc = unsafe { self.device.alloc_uninit(l.shape(), self.dtype())? };
+        self.copy_strided_src(&mut acc, 0, l)?;
+        let al = Layout::contiguous(l.shape());
+        scatter_apply("index_add", &mut acc, &al, ids, ids_l, src, src_l, dim)?;
+        Ok(acc)
     }
 
     fn matmul(

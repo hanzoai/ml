@@ -235,3 +235,62 @@ BINARY_OP_F(hip_bfloat16, bmaximum_bf16, (x > y ? x : y))
 BINARY_OP_F(__half, silu_mul_f16, ((x / (1.0f + expf(-x))) * y))
 BINARY_OP_F(hip_bfloat16, silu_mul_bf16, ((x / (1.0f + expf(-x))) * y))
 #endif
+
+// Comparisons: out[i] = 1 where lhs OP rhs, else 0, as uint8_t. Operands load as A (float for
+// the 16-bit types). OP: 0 eq, 1 ne, 2 lt, 3 le, 4 gt, 5 ge.
+template <typename T, typename A, int OP>
+__device__ void cmp_op(
+    const size_t numel,
+    const size_t num_dims,
+    const DimsStrides &ds,
+    const T *lhs,
+    const T *rhs,
+    uint8_t *out
+) {
+    const size_t *dims = ds.v;
+    const size_t *lhs_strides = ds.v + 1 * ROCM_DS_MAX;
+    const size_t *rhs_strides = ds.v + 2 * ROCM_DS_MAX;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+        unsigned int tmp_i = i;
+        unsigned int lhs_i = 0;
+        unsigned int rhs_i = 0;
+        for (int d = num_dims - 1; d >= 0; d--) {
+            unsigned int i_dim = tmp_i % dims[d];
+            lhs_i += i_dim * lhs_strides[d];
+            rhs_i += i_dim * rhs_strides[d];
+            tmp_i /= dims[d];
+        }
+        A x = (A)lhs[lhs_i];
+        A y = (A)rhs[rhs_i];
+        bool r = OP == 0 ? x == y : OP == 1 ? x != y : OP == 2 ? x < y : OP == 3 ? x <= y : OP == 4 ? x > y : x >= y;
+        out[i] = r ? 1 : 0;
+    }
+}
+
+#define CMP_OP(T, A, FN_NAME, OP) \
+extern "C" __global__ void FN_NAME( \
+    const size_t numel, \
+    const size_t num_dims, \
+    const DimsStrides ds, \
+    const T *lhs, \
+    const T *rhs, \
+    uint8_t *out \
+) { cmp_op<T, A, OP>(numel, num_dims, ds, lhs, rhs, out); }
+
+#define CMP_ALL(T, A, SUFFIX) \
+CMP_OP(T, A, eq_##SUFFIX, 0) \
+CMP_OP(T, A, ne_##SUFFIX, 1) \
+CMP_OP(T, A, lt_##SUFFIX, 2) \
+CMP_OP(T, A, le_##SUFFIX, 3) \
+CMP_OP(T, A, gt_##SUFFIX, 4) \
+CMP_OP(T, A, ge_##SUFFIX, 5)
+
+CMP_ALL(float, float, f32)
+CMP_ALL(double, double, f64)
+CMP_ALL(uint8_t, uint8_t, u8)
+CMP_ALL(uint32_t, uint32_t, u32)
+CMP_ALL(int64_t, int64_t, i64)
+#if defined(__HIPCC__)
+CMP_ALL(__half, float, f16)
+CMP_ALL(hip_bfloat16, float, bf16)
+#endif
