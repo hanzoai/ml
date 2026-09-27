@@ -174,25 +174,10 @@ impl ModernBertAttention {
         let (q, k) = self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?;
 
         let scale = (self.attention_head_size as f64).powf(-0.5);
-        let xs = if q.device().is_metal() && seq_len > 1 && !q.track_op() && !k.track_op() {
-            // inference on Metal: scores, mask, softmax and values in one fused kernel
-            let mask =
-                attention_mask.broadcast_as((b, self.num_attention_heads, seq_len, seq_len))?;
-            hanzo_nn::ops::sdpa(
-                &q,
-                &k,
-                &v.contiguous()?,
-                Some(&mask),
-                false,
-                scale as f32,
-                1.0,
-            )?
-        } else {
-            let q = (q * scale)?;
-            let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-            let att = att.broadcast_add(attention_mask)?;
-            softmax_last_dim(&att)?.matmul(&v)?
-        };
+        let q = (q * scale)?;
+        let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let att = att.broadcast_add(attention_mask)?;
+        let xs = softmax_last_dim(&att)?.matmul(&v)?;
 
         let xs = xs.transpose(1, 2)?.reshape((b, seq_len, d))?;
         let xs = xs.apply(&self.proj)?;
