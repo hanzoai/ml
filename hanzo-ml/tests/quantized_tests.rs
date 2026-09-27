@@ -1357,6 +1357,43 @@ fn quantized_matmul_q8_0_repacked_cpu() -> Result<()> {
     test_matmul(&Device::Cpu, (1, 4, 4, 256), GgmlDType::Q8_0)
 }
 
+/// The Q8_0 tiles answer as the generic Q8_0 matmul for every row count (a partial row group is
+/// zero past m) and every column count (12-column tiles and the 4-column rest).
+#[test]
+fn quantized_matmul_q8_0_tiles_match_generic_cpu() -> Result<()> {
+    let mut rng = StdRng::seed_from_u64(7);
+    for (m, n, k) in [
+        (2, 4, 32),
+        (3, 12, 64),
+        (4, 8, 32),
+        (5, 16, 96),
+        (7, 20, 256),
+        (13, 48, 768),
+        (99, 36, 768),
+    ] {
+        let lhs: Vec<f32> = (0..m * k).map(|_| rng.random::<f32>() - 0.5).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| rng.random::<f32>() - 0.5).collect();
+        let mut blocks = vec![k_quants::BlockQ8_0::zeros(); n * k / 32];
+        k_quants::BlockQ8_0::from_float(&w, &mut blocks);
+        let mut want = vec![0f32; m * n];
+        k_quants::matmul((m, k, n), &lhs, &blocks, &mut want)?;
+        let w = Tensor::from_vec(w, (n, k), &Device::Cpu)?;
+        let q =
+            quantized::QMatMul::from_qtensor(quantized::QTensor::quantize(&w, GgmlDType::Q8_0)?)?;
+        let got = q
+            .forward(&Tensor::from_vec(lhs, (m, k), &Device::Cpu)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let scale = want.iter().fold(0f32, |a, x| a.max(x.abs()));
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            if (a - b).abs() > 1e-5 * scale {
+                bail!("({m}, {n}, {k}) at {i}: generic {a}, tiled {b}")
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn quantized_matmul_q6k_repacked_cpu() -> Result<()> {
     test_matmul(&Device::Cpu, (1, 4, 8, 256), GgmlDType::Q6K)
@@ -1876,6 +1913,29 @@ fn bf16_lhs_matmul_matches_f32() -> Result<()> {
         let diff = (&y32 - &ybf)?.abs()?.max_all()?.to_scalar::<f32>()?;
         let scale = y32.abs()?.max_all()?.to_scalar::<f32>()?.max(1.0);
         assert!(diff / scale < 3e-2, "m={m}: rel diff {}", diff / scale);
+    }
+    Ok(())
+}
+
+/// A view quantizes its own elements: each half of a tensor narrowed along its rows gives the
+/// blocks that half gives on its own.
+#[test]
+fn quantize_reads_a_view_not_its_storage() -> Result<()> {
+    let dev = &Device::Cpu;
+    let w = Tensor::randn(0f32, 1.0, (8, 64), dev)?;
+    for (start, rows) in [(0, 4), (4, 4), (2, 3)] {
+        let view = quantized::QTensor::quantize(&w.narrow(0, start, rows)?, GgmlDType::Q8_0)?;
+        let alone = quantized::QTensor::quantize(
+            &w.narrow(0, start, rows)?.copy()?.force_contiguous()?,
+            GgmlDType::Q8_0,
+        )?;
+        let (a, b) = (view.dequantize(dev)?, alone.dequantize(dev)?);
+        assert_eq!(a.to_vec2::<f32>()?, b.to_vec2::<f32>()?);
+        let gap = (a - w.narrow(0, start, rows)?)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(gap < 0.05, "{start}: {gap}");
     }
     Ok(())
 }

@@ -216,6 +216,28 @@ pub(crate) struct BlockQ8Kx4 {
 #[cfg(target_arch = "aarch64")]
 const _: () = assert!(std::mem::size_of::<BlockQ8Kx4>() == 1168);
 
+/// Whether this CPU runs a multi-row matmul against `dtype` weights of `n` rows by `k` through
+/// tiled kernels over repacked blocks, rather than one dot product per output.
+pub fn tiled(dtype: super::GgmlDType, n: usize, k: usize) -> bool {
+    if !k.is_multiple_of(dtype.block_size()) {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let f = crate::cpu::features::get();
+        PackedKind::select(dtype, (4, k, n)).is_some() && (f.dotprod || f.i8mm)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        super::repack_x86::select(dtype, n, k)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (dtype, n, k);
+        false
+    }
+}
+
 pub(crate) fn try_matmul_f32(
     storage: &dyn QuantizedType,
     packed: &PackedCache,
@@ -281,7 +303,11 @@ impl PackedKind {
             GgmlDType::Q6K if n.is_multiple_of(8) && (has_dotprod_gemv || has_tiled_matmul) => {
                 Some(Self::Q6Kx8)
             }
-            GgmlDType::Q8_0 if n.is_multiple_of(4) && (has_dotprod_gemv || has_tiled_matmul) => {
+            // the Q8_0 tiles take any m: a partial row group is zero past m
+            GgmlDType::Q8_0
+                if n.is_multiple_of(4)
+                    && (has_dotprod_gemv || ((features.dotprod || features.i8mm) && m >= 2)) =>
+            {
                 Some(Self::Q8_0x4)
             }
             _ => None,
@@ -377,7 +403,8 @@ impl PackedKind {
             }
             (Self::Q8_0x4, PackedStorage::Q8_0x4(v)) => {
                 let p = sub!(v, 4, QK8_0);
-                if features.i8mm && mkn.0 >= 4 && mkn.0.is_multiple_of(4) {
+                // i8mm packs 8-byte interleaves, which only the i8mm tiles read
+                if features.i8mm && mkn.0 >= 2 {
                     unsafe { super::neon::matmul_q8_0_x4_i8mm(mkn, lhs, p, dst) }
                 } else {
                     unsafe { super::neon::matmul_q8_0_x4(mkn, lhs, p, dst) }
@@ -422,7 +449,8 @@ impl PackedKind {
             }
             #[cfg(target_arch = "aarch64")]
             (Self::Q8_0x4, PackedStorage::Q8_0x4(packed)) => {
-                if features.i8mm && mkn.0 >= 4 {
+                // i8mm packs 8-byte interleaves, which only the i8mm tiles read
+                if features.i8mm && mkn.0 >= 2 {
                     unsafe { super::neon::matmul_q8_0_x4_i8mm(mkn, lhs, packed, dst) }
                 } else {
                     unsafe { super::neon::matmul_q8_0_x4(mkn, lhs, packed, dst) }

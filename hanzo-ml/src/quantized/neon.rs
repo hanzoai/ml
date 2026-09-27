@@ -332,32 +332,79 @@ fn quantize_q8_0x4_interleaved<const BLOCK_LEN: usize>(
     row: usize,
     out: &mut [BlockQ8_0x4],
 ) {
+    quantize_q8_0x4_rows::<BLOCK_LEN>(lhs, k, row, 4, out)
+}
+
+/// Rows `row..row + rows` (at most 4) of `lhs [_, k]` as Q8_0 blocks, four rows to a block,
+/// `BLOCK_LEN` bytes of each row in turn; the rows past `rows` are zero. Each 32 values take the
+/// scale `max |x| / 127` and round half away from zero, as `BlockQ8_0::from_float` does.
+#[cfg(target_arch = "aarch64")]
+fn quantize_q8_0x4_rows<const BLOCK_LEN: usize>(
+    lhs: &[f32],
+    k: usize,
+    row: usize,
+    rows: usize,
+    out: &mut [BlockQ8_0x4],
+) {
+    debug_assert!(rows <= 4 && lhs.len() >= (row + rows) * k);
     let k_in_blocks = k / QK8_0;
-    for b in 0..k_in_blocks {
-        let mut p = BlockQ8_0x4 {
-            d: [f16::ZERO; 4],
-            qs: [0; QK8_0 * 4],
-        };
-        let mut ids = [0f32; 4];
-        for r in 0..4 {
+    for (b, p) in out.iter_mut().enumerate().take(k_in_blocks) {
+        p.d = [f16::ZERO; 4];
+        p.qs = [0; QK8_0 * 4];
+        for r in 0..rows {
             let xs = &lhs[(row + r) * k + b * QK8_0..(row + r) * k + (b + 1) * QK8_0];
-            let mut amax = 0f32;
-            for &x in xs {
-                amax = amax.max(x.abs());
-            }
-            let d = amax / ((1 << 7) - 1) as f32;
-            ids[r] = if d != 0f32 { 1. / d } else { 0. };
+            let mut q = [0i8; QK8_0];
+            // SAFETY: `xs` holds 32 f32 and `q` 32 i8; NEON is baseline on aarch64.
+            let d = unsafe {
+                let v: [float32x4_t; 8] =
+                    std::array::from_fn(|i| vld1q_f32(xs.as_ptr().add(4 * i)));
+                let mut m = vabsq_f32(v[0]);
+                for x in &v[1..] {
+                    m = vmaxq_f32(m, vabsq_f32(*x));
+                }
+                let d = vmaxvq_f32(m) / ((1 << 7) - 1) as f32;
+                let id = if d != 0f32 { 1. / d } else { 0. };
+                let n: [int16x8_t; 4] = std::array::from_fn(|i| {
+                    vcombine_s16(
+                        vqmovn_s32(vcvtaq_s32_f32(vmulq_n_f32(v[2 * i], id))),
+                        vqmovn_s32(vcvtaq_s32_f32(vmulq_n_f32(v[2 * i + 1], id))),
+                    )
+                });
+                vst1q_s8(
+                    q.as_mut_ptr(),
+                    vcombine_s8(vqmovn_s16(n[0]), vqmovn_s16(n[1])),
+                );
+                vst1q_s8(
+                    q.as_mut_ptr().add(16),
+                    vcombine_s8(vqmovn_s16(n[2]), vqmovn_s16(n[3])),
+                );
+                d
+            };
             p.d[r] = f16::from_f32(d);
-        }
-        for r in 0..4 {
-            let xs = &lhs[(row + r) * k + b * QK8_0..(row + r) * k + (b + 1) * QK8_0];
-            for (j, &x) in xs.iter().enumerate() {
-                p.qs[(j / BLOCK_LEN) * BLOCK_LEN * 4 + r * BLOCK_LEN + j % BLOCK_LEN] =
-                    (x * ids[r]).round() as i8;
+            for c in 0..QK8_0 / BLOCK_LEN {
+                let at = c * BLOCK_LEN * 4 + r * BLOCK_LEN;
+                p.qs[at..at + BLOCK_LEN].copy_from_slice(&q[c * BLOCK_LEN..(c + 1) * BLOCK_LEN]);
             }
         }
-        out[b] = p;
     }
+}
+
+/// `acc + a · b[LANE]`: SDOT by element, each lane of `acc` taking the dot of its four bytes of
+/// `a` with bytes `4·LANE..4·LANE + 4` of `b`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "dotprod")]
+unsafe fn sdot_lane<const LANE: i32>(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    let mut out = acc;
+    core::arch::asm!(
+        "sdot {out:v}.4s, {a:v}.16b, {b:v}.4b[{lane}]",
+        out = inout(vreg) out,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        lane = const LANE,
+        options(pure, nomem, nostack),
+    );
+    out
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2740,77 +2787,68 @@ pub(crate) fn matmul_q6k_x8(
     })
 }
 
+/// Rows `row..row + rows` (at most 4) by columns `col..col + 4 · G` of `dst [_, n]`: `lhs` one
+/// row group's blocks, `rhs[g]` column group `g`'s. The integer dot of each 32-value block
+/// accumulates in 4 · G independent SDOT chains, so a chain's latency hides behind the others.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
-unsafe fn store_q8_0x4_4x4(
+#[allow(clippy::too_many_arguments)]
+unsafe fn store_q8_0x4_tile<const G: usize>(
     dst: *mut f32,
     n: usize,
     row: usize,
+    rows: usize,
     col: usize,
     lhs: &[BlockQ8_0x4],
-    rhs: &[BlockQ8_0x4],
+    rhs: [&[BlockQ8_0x4]; G],
     k_in_blocks: usize,
 ) {
-    let mut sum0 = vdupq_n_f32(0.);
-    let mut sum1 = vdupq_n_f32(0.);
-    let mut sum2 = vdupq_n_f32(0.);
-    let mut sum3 = vdupq_n_f32(0.);
-
+    debug_assert!(lhs.len() >= k_in_blocks && rhs.iter().all(|r| r.len() >= k_in_blocks));
+    let mut sum = [[vdupq_n_f32(0.); G]; 4];
     for i in 0..k_in_blocks {
-        let x = &rhs[i];
-        let y = &lhs[i];
-        let bd = [
-            x.d[0].to_f32(),
-            x.d[1].to_f32(),
-            x.d[2].to_f32(),
-            x.d[3].to_f32(),
-        ];
-        let bd = vld1q_f32(bd.as_ptr());
-        let ad = [
-            y.d[0].to_f32(),
-            y.d[1].to_f32(),
-            y.d[2].to_f32(),
-            y.d[3].to_f32(),
-        ];
-
-        let mut ret0 = vdupq_n_s32(0);
-        let mut ret1 = vdupq_n_s32(0);
-        let mut ret2 = vdupq_n_s32(0);
-        let mut ret3 = vdupq_n_s32(0);
-
-        macro_rules! dot_rows {
-            ($xv:expr, $yv:expr) => {{
-                ret0 = sdot_laneq_s32::<0>(ret0, $xv, $yv);
-                ret1 = sdot_laneq_s32::<1>(ret1, $xv, $yv);
-                ret2 = sdot_laneq_s32::<2>(ret2, $xv, $yv);
-                ret3 = sdot_laneq_s32::<3>(ret3, $xv, $yv);
-            }};
+        let y = lhs.get_unchecked(i);
+        let x: [&BlockQ8_0x4; G] = std::array::from_fn(|g| rhs[g].get_unchecked(i));
+        let mut acc = [[vdupq_n_s32(0); G]; 4];
+        for step in 0..QK8_0 / 4 {
+            let yv = vld1q_s8(y.qs.as_ptr().add(16 * step));
+            for g in 0..G {
+                let xv = vld1q_s8(x[g].qs.as_ptr().add(16 * step));
+                acc[0][g] = sdot_lane::<0>(acc[0][g], xv, yv);
+                acc[1][g] = sdot_lane::<1>(acc[1][g], xv, yv);
+                acc[2][g] = sdot_lane::<2>(acc[2][g], xv, yv);
+                acc[3][g] = sdot_lane::<3>(acc[3][g], xv, yv);
+            }
         }
-
-        let y0 = vld1q_s8_x4(y.qs.as_ptr());
-        let x0 = vld1q_s8_x4(x.qs.as_ptr());
-        dot_rows!(x0.0, y0.0);
-        dot_rows!(x0.1, y0.1);
-        dot_rows!(x0.2, y0.2);
-        dot_rows!(x0.3, y0.3);
-
-        let y1 = vld1q_s8_x4(y.qs.as_ptr().add(64));
-        let x1 = vld1q_s8_x4(x.qs.as_ptr().add(64));
-        dot_rows!(x1.0, y1.0);
-        dot_rows!(x1.1, y1.1);
-        dot_rows!(x1.2, y1.2);
-        dot_rows!(x1.3, y1.3);
-
-        sum0 = vmlaq_f32(sum0, vcvtq_f32_s32(ret0), vmulq_n_f32(bd, ad[0]));
-        sum1 = vmlaq_f32(sum1, vcvtq_f32_s32(ret1), vmulq_n_f32(bd, ad[1]));
-        sum2 = vmlaq_f32(sum2, vcvtq_f32_s32(ret2), vmulq_n_f32(bd, ad[2]));
-        sum3 = vmlaq_f32(sum3, vcvtq_f32_s32(ret3), vmulq_n_f32(bd, ad[3]));
+        let ad = load_f16x4(y.d.as_ptr());
+        for g in 0..G {
+            let bd = load_f16x4(x[g].d.as_ptr());
+            sum[0][g] = vfmaq_f32(
+                sum[0][g],
+                vcvtq_f32_s32(acc[0][g]),
+                vmulq_laneq_f32::<0>(bd, ad),
+            );
+            sum[1][g] = vfmaq_f32(
+                sum[1][g],
+                vcvtq_f32_s32(acc[1][g]),
+                vmulq_laneq_f32::<1>(bd, ad),
+            );
+            sum[2][g] = vfmaq_f32(
+                sum[2][g],
+                vcvtq_f32_s32(acc[2][g]),
+                vmulq_laneq_f32::<2>(bd, ad),
+            );
+            sum[3][g] = vfmaq_f32(
+                sum[3][g],
+                vcvtq_f32_s32(acc[3][g]),
+                vmulq_laneq_f32::<3>(bd, ad),
+            );
+        }
     }
-
-    vst1q_f32(dst.add(row * n + col), sum0);
-    vst1q_f32(dst.add((row + 1) * n + col), sum1);
-    vst1q_f32(dst.add((row + 2) * n + col), sum2);
-    vst1q_f32(dst.add((row + 3) * n + col), sum3);
+    for (r, s) in sum.iter().enumerate().take(rows) {
+        for (g, v) in s.iter().enumerate() {
+            vst1q_f32(dst.add((row + r) * n + col + 4 * g), *v);
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2963,10 +3001,10 @@ pub(crate) fn matmul_q8_0_x4(
     if m == 1 {
         return matmul_q8_0_x4_gemv((m, k, n), lhs, repacked, dst);
     }
-    debug_assert!(m.is_multiple_of(4));
     let k_in_blocks = k / QK8_0;
     let n_groups = n / 4;
-    let row_groups = m / 4;
+    // the last row group is zero past row m
+    let row_groups = m.div_ceil(4);
 
     thread_local! {
         static LHS_X4_SCRATCH: std::cell::RefCell<Vec<u64>> =
@@ -2987,15 +3025,19 @@ pub(crate) fn matmul_q8_0_x4(
             )
         };
         for group in 0..row_groups {
-            quantize_q8_0x4_interleaved::<4>(
+            quantize_q8_0x4_rows::<4>(
                 lhs,
                 k,
                 group * 4,
+                (m - group * 4).min(4),
                 &mut lhs_x4[group * k_in_blocks..(group + 1) * k_in_blocks],
             );
         }
 
-        let tiles_total = row_groups * n_groups;
+        // a row group's tiles: column groups in threes (12 columns), the rest one at a time
+        let wide = n_groups / 3;
+        let per_row = wide + n_groups % 3;
+        let tiles_total = row_groups * per_row;
         let pool = crate::utils::barrier_pool();
         let lhs_ptr = lhs_x4.as_ptr() as usize;
         let repacked_ptr = repacked.as_ptr() as usize;
@@ -3005,21 +3047,44 @@ pub(crate) fn matmul_q8_0_x4(
             let lhs_ptr = lhs_ptr as *const BlockQ8_0x4;
             let repacked_ptr = repacked_ptr as *const BlockQ8_0x4;
             let dst_ptr = dst_ptr as *mut f32;
+            let group = |g: usize| unsafe {
+                std::slice::from_raw_parts(repacked_ptr.add(g * k_in_blocks), k_in_blocks)
+            };
             for tile in range {
-                let row_group = tile / n_groups;
-                let col_group = tile - row_group * n_groups;
+                let row_group = tile / per_row;
+                let t = tile - row_group * per_row;
                 let row = row_group * 4;
-                let col = col_group * 4;
+                let rows = (m - row).min(4);
                 let lhs_tile = unsafe {
                     std::slice::from_raw_parts(lhs_ptr.add(row_group * k_in_blocks), k_in_blocks)
                 };
-                let rhs_tile = unsafe {
-                    std::slice::from_raw_parts(
-                        repacked_ptr.add(col_group * k_in_blocks),
-                        k_in_blocks,
-                    )
+                unsafe {
+                    if t < wide {
+                        let g = 3 * t;
+                        store_q8_0x4_tile::<3>(
+                            dst_ptr,
+                            n,
+                            row,
+                            rows,
+                            4 * g,
+                            lhs_tile,
+                            [group(g), group(g + 1), group(g + 2)],
+                            k_in_blocks,
+                        )
+                    } else {
+                        let g = 3 * wide + t - wide;
+                        store_q8_0x4_tile::<1>(
+                            dst_ptr,
+                            n,
+                            row,
+                            rows,
+                            4 * g,
+                            lhs_tile,
+                            [group(g)],
+                            k_in_blocks,
+                        )
+                    }
                 };
-                unsafe { store_q8_0x4_4x4(dst_ptr, n, row, col, lhs_tile, rhs_tile, k_in_blocks) };
             }
         });
 
@@ -3033,6 +3098,7 @@ unsafe fn store_q8_0x4_4x4_i8mm(
     dst: *mut f32,
     n: usize,
     row: usize,
+    rows: usize,
     col: usize,
     lhs: &[BlockQ8_0x4],
     rhs: &[BlockQ8_0x4],
@@ -3089,10 +3155,9 @@ unsafe fn store_q8_0x4_4x4_i8mm(
         sum3 = vmlaq_f32(sum3, vcvtq_f32_s32(row3), vmulq_n_f32(bd, ad[3]));
     }
 
-    vst1q_f32(dst.add(row * n + col), sum0);
-    vst1q_f32(dst.add((row + 1) * n + col), sum1);
-    vst1q_f32(dst.add((row + 2) * n + col), sum2);
-    vst1q_f32(dst.add((row + 3) * n + col), sum3);
+    for (r, v) in [sum0, sum1, sum2, sum3].into_iter().enumerate().take(rows) {
+        vst1q_f32(dst.add((row + r) * n + col), v);
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3105,10 +3170,10 @@ pub(crate) fn matmul_q8_0_x4_i8mm(
 ) -> crate::Result<()> {
     debug_assert!(k.is_multiple_of(QK8_0));
     debug_assert!(n.is_multiple_of(4));
-    debug_assert!(m.is_multiple_of(4));
     let k_in_blocks = k / QK8_0;
     let n_groups = n / 4;
-    let row_groups = m / 4;
+    // the last row group is zero past row m
+    let row_groups = m.div_ceil(4);
 
     thread_local! {
         static LHS_X4_I8MM_SCRATCH: std::cell::RefCell<Vec<u64>> =
@@ -3129,10 +3194,11 @@ pub(crate) fn matmul_q8_0_x4_i8mm(
             )
         };
         for group in 0..row_groups {
-            quantize_q8_0x4_interleaved::<8>(
+            quantize_q8_0x4_rows::<8>(
                 lhs,
                 k,
                 group * 4,
+                (m - group * 4).min(4),
                 &mut lhs_x4[group * k_in_blocks..(group + 1) * k_in_blocks],
             );
         }
@@ -3160,8 +3226,18 @@ pub(crate) fn matmul_q8_0_x4_i8mm(
                         k_in_blocks,
                     )
                 };
+                let rows = (m - row).min(4);
                 unsafe {
-                    store_q8_0x4_4x4_i8mm(dst_ptr, n, row, col, lhs_tile, rhs_tile, k_in_blocks)
+                    store_q8_0x4_4x4_i8mm(
+                        dst_ptr,
+                        n,
+                        row,
+                        rows,
+                        col,
+                        lhs_tile,
+                        rhs_tile,
+                        k_in_blocks,
+                    )
                 }
             }
         });

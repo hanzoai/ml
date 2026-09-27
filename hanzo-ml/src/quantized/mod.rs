@@ -901,6 +901,12 @@ impl std::fmt::Debug for QTensor {
     }
 }
 
+/// `t` in storage of its own, exactly its elements: quantizing reads the raw storage, which for
+/// a view (a narrow, a slice at an offset) holds more than the view.
+fn own(t: Tensor) -> Result<Tensor> {
+    t.force_contiguous()
+}
+
 fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
     let dims = shape.dims();
     if dims.is_empty() {
@@ -933,11 +939,13 @@ impl QTensor {
         Ok(Self::make(storage, shape))
     }
 
+    /// `src` quantized to `dtype` blocks. A view reads its own elements: a narrow of a larger
+    /// tensor quantizes what it selects, not the storage from its start.
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+        let src = own(src.to_dtype(crate::DType::F32)?.flatten_all()?)?;
         let elem_count = shape.elem_count();
         if !elem_count.is_multiple_of(block_size) {
             crate::bail!(
@@ -969,7 +977,7 @@ impl QTensor {
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+        let src = own(src.to_dtype(crate::DType::F32)?.flatten_all()?)?;
         let elem_count = shape.elem_count();
         if !elem_count.is_multiple_of(block_size) {
             crate::bail!(
