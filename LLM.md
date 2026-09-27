@@ -20,6 +20,22 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
 - `hanzo-transformers/` — model implementations.
 - `hanzo-kernels/`, `hanzo-flash-attn/` — CUDA kernels & FlashAttention v2.
 - `hanzo-onnx/`, `hanzo-datasets/`, `hanzo-ml-wasm-examples/`.
+- `hanzo-train/` — training on hanzo-ml. `cluster`: one model across heterogeneous machines
+  (Metal, CUDA, ROCm, CPU) by local SGD with an outer Nesterov step (DiLoCo). A coordinator owns
+  the plan, θ_global in F32, the outer step and checkpoints; workers join any time, take batches
+  one at a time, send θ_local − θ_global in bf16 with error feedback; deltas sum in join order, so
+  a run equals its rounds replayed in one process (`cluster::replay`) bit for bit, and a
+  checkpoint (outer momentum and carry, merged batches, round, every worker's AdamW state)
+  resumes bit-identically. A worker that drops has its batches requeued; a round waits for no
+  one past its deadline plus `grace` (a silent member is dropped, its link shut), a join under a
+  member's name replaces it, links have keepalive and bounded reads/writes (`net::link`), and a
+  worker whose link fails joins again on its own with backoff. A model plugs in behind
+  `cluster::Model` (`vars` F32 masters, `rate` per parameter — `None` frozen, `step` over a batch
+  of row indices the caller planned); the coordinator's owner behind `cluster::Keep` (round line,
+  validation, save). `adam`: AdamW with per-parameter rates and open moments (hanzo-nn's
+  `optim::adamw` update, fused on Metal). `gpu`: free-memory floor. `dspark`: the DSpark draft on
+  the runtime (`hanzo-train fit` / `join`). Tests: `cargo test -p hanzo-train` (tiny classifier
+  and synthetic DSpark cache, all CPU). Kai (hanzoai/decision `train`) is one user.
 
 ## Releasing
 - Registry is **crates.io**, owner `zeekay`. There is no Hanzo cargo registry: no

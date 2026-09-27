@@ -159,22 +159,55 @@ pub struct Dspark {
     train_markov: bool, // when false, the Markov head is frozen (excluded from the optimizer + detached)
 }
 
+/// Parameter `name` of `vm`, F32 on `dev`. A normal init draws from a stream fixed by `seed` and
+/// the name, so every process builds the same weights (the CPU's own generator takes no seed);
+/// any other init is hanzo-nn's.
 fn tvar(
     vm: &VarMap,
     dev: &Device,
     shape: impl Into<Shape>,
     name: &str,
     init: hanzo_nn::Init,
+    seed: u64,
 ) -> Result<Tensor> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let shape = shape.into();
+    if let hanzo_nn::Init::Randn { mean, stdev } = init {
+        // FNV-1a of the name
+        let key = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+        });
+        let mut rng = StdRng::seed_from_u64(seed ^ key);
+        let xs: Vec<f32> = (0..shape.elem_count())
+            .map(|_| {
+                // Box–Muller over (0, 1] × [0, 1)
+                let (u, v) = (1.0 - rng.random::<f64>(), rng.random::<f64>());
+                let z = (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos();
+                (mean + stdev * z) as f32
+            })
+            .collect();
+        let t = Tensor::from_vec(xs, shape.clone(), dev)?;
+        vm.data()
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), Var::from_tensor(&t)?);
+    }
     vm.get(shape, name, init, DType::F32, dev)
 }
 
 impl Dspark {
-    /// Build the model: trainable weights randomly initialized, `embed_tokens`/`lm_head` loaded
-    /// FROZEN from `init_path` (keys `embed_tokens.weight`, `lm_head.weight`). `train_markov=false`
-    /// freezes the vocab×rank Markov head (excludes it from the optimizer + detaches its bias),
-    /// which removes its AdamW state — a memory lever for constrained hosts.
-    pub fn new(cfg: DsparkCfg, init_path: &Path, dev: &Device, train_markov: bool) -> Result<Self> {
+    /// Build the model: trainable weights randomly initialized from `seed` (the same in every
+    /// process), `embed_tokens`/`lm_head` loaded FROZEN from `init_path` (keys
+    /// `embed_tokens.weight`, `lm_head.weight`). `train_markov=false` freezes the vocab×rank
+    /// Markov head (excludes it from the optimizer + detaches its bias), which removes its AdamW
+    /// state — a memory lever for constrained hosts.
+    pub fn new(
+        cfg: DsparkCfg,
+        init_path: &Path,
+        dev: &Device,
+        train_markov: bool,
+        seed: u64,
+    ) -> Result<Self> {
         use hanzo_nn::Init;
         let normal = Init::Randn {
             mean: 0.0,
@@ -189,33 +222,68 @@ impl Dspark {
         let kvd = cfg.kv_heads * hd;
         let fin = cfg.n_fused() * h;
 
-        let fc = Linear::new(tvar(&vm, dev, (h, fin), "fc.weight", normal)?, None);
-        let hidden_norm = tvar(&vm, dev, h, "hidden_norm.weight", ones)?;
+        let fc = Linear::new(tvar(&vm, dev, (h, fin), "fc.weight", normal, seed)?, None);
+        let hidden_norm = tvar(&vm, dev, h, "hidden_norm.weight", ones, seed)?;
 
         let mut layers = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
             let p = |s: &str| format!("layers.{i}.{s}");
             layers.push(Layer {
                 q_proj: Linear::new(
-                    tvar(&vm, dev, (qd, h), &p("self_attn.q_proj.weight"), normal)?,
+                    tvar(
+                        &vm,
+                        dev,
+                        (qd, h),
+                        &p("self_attn.q_proj.weight"),
+                        normal,
+                        seed,
+                    )?,
                     None,
                 ),
                 k_proj: Linear::new(
-                    tvar(&vm, dev, (kvd, h), &p("self_attn.k_proj.weight"), normal)?,
+                    tvar(
+                        &vm,
+                        dev,
+                        (kvd, h),
+                        &p("self_attn.k_proj.weight"),
+                        normal,
+                        seed,
+                    )?,
                     None,
                 ),
                 v_proj: Linear::new(
-                    tvar(&vm, dev, (kvd, h), &p("self_attn.v_proj.weight"), normal)?,
+                    tvar(
+                        &vm,
+                        dev,
+                        (kvd, h),
+                        &p("self_attn.v_proj.weight"),
+                        normal,
+                        seed,
+                    )?,
                     None,
                 ),
                 o_proj: Linear::new(
-                    tvar(&vm, dev, (h, qd), &p("self_attn.o_proj.weight"), normal)?,
+                    tvar(
+                        &vm,
+                        dev,
+                        (h, qd),
+                        &p("self_attn.o_proj.weight"),
+                        normal,
+                        seed,
+                    )?,
                     None,
                 ),
-                q_norm: tvar(&vm, dev, hd, &p("self_attn.q_norm.weight"), ones)?,
-                k_norm: tvar(&vm, dev, hd, &p("self_attn.k_norm.weight"), ones)?,
-                input_ln: tvar(&vm, dev, h, &p("input_layernorm.weight"), ones)?,
-                post_ln: tvar(&vm, dev, h, &p("post_attention_layernorm.weight"), ones)?,
+                q_norm: tvar(&vm, dev, hd, &p("self_attn.q_norm.weight"), ones, seed)?,
+                k_norm: tvar(&vm, dev, hd, &p("self_attn.k_norm.weight"), ones, seed)?,
+                input_ln: tvar(&vm, dev, h, &p("input_layernorm.weight"), ones, seed)?,
+                post_ln: tvar(
+                    &vm,
+                    dev,
+                    h,
+                    &p("post_attention_layernorm.weight"),
+                    ones,
+                    seed,
+                )?,
                 gate: Linear::new(
                     tvar(
                         &vm,
@@ -223,6 +291,7 @@ impl Dspark {
                         (cfg.intermediate, h),
                         &p("mlp.gate_proj.weight"),
                         normal,
+                        seed,
                     )?,
                     None,
                 ),
@@ -233,6 +302,7 @@ impl Dspark {
                         (cfg.intermediate, h),
                         &p("mlp.up_proj.weight"),
                         normal,
+                        seed,
                     )?,
                     None,
                 ),
@@ -243,19 +313,28 @@ impl Dspark {
                         (h, cfg.intermediate),
                         &p("mlp.down_proj.weight"),
                         normal,
+                        seed,
                     )?,
                     None,
                 ),
             });
         }
 
-        let norm = tvar(&vm, dev, h, "norm.weight", Init::Const(cfg.final_norm_init))?;
+        let norm = tvar(
+            &vm,
+            dev,
+            h,
+            "norm.weight",
+            Init::Const(cfg.final_norm_init),
+            seed,
+        )?;
         let markov_w1 = tvar(
             &vm,
             dev,
             (cfg.vocab, cfg.markov_rank),
             "markov_head.markov_w1.weight",
             normal,
+            seed,
         )?;
         let markov_w2 = tvar(
             &vm,
@@ -263,6 +342,7 @@ impl Dspark {
             (cfg.vocab, cfg.markov_rank),
             "markov_head.markov_w2.weight",
             normal,
+            seed,
         )?;
 
         // FROZEN embed streamed on demand (not resident); FROZEN lm_head kept in F16 (1.05GB, vs
@@ -301,6 +381,16 @@ impl Dspark {
 
     pub fn cfg(&self) -> &DsparkCfg {
         &self.cfg
+    }
+
+    /// The parameters it trains, and the Markov head when frozen: F32 masters.
+    pub fn vars(&self) -> &VarMap {
+        &self.varmap
+    }
+
+    /// Whether the Markov head trains.
+    pub fn trains_markov(&self) -> bool {
+        self.train_markov
     }
 
     /// The trainable variables for the optimizer (everything except the frozen head/embed/confidence,

@@ -4,7 +4,10 @@ name = "hanzo-train"
 publish = false
 version.workspace = true
 edition.workspace = true
-description = "Native-Rust training loop for DSpark speculative-draft models (hanzo-ml autograd)."
+description = "Training on hanzo-ml: one model across heterogeneous machines (DiLoCo local SGD, bf16 deltas, bit-identical resume), and the DSpark draft trainer on it."
+repository.workspace = true
+keywords = ["training", "distributed", "diloco", "machine-learning"]
+categories = ["science"]
 license.workspace = true
 
 [[bin]]
@@ -16,10 +19,15 @@ name = "hanzo_train"
 path = "src/lib.rs"
 
 [dependencies]
+anyhow = { workspace = true }
 hanzo-ml = { workspace = true }
 hanzo-nn = { workspace = true }
 half = { workspace = true }
+libc = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+sha2 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
 rand = { workspace = true }
 clap = { workspace = true }

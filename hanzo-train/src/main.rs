@@ -1,200 +1,71 @@
-//! `hanzo-train` CLI: train a DSpark draft on the DeepSpec target cache and save an engine-loadable
-//! checkpoint. CPU / f32 MVP. The goal is a real, decreasing loss curve on real data + a checkpoint
-//! whose keys and shapes exactly match the engine loader.
+//! `hanzo-train` CLI: train a DSpark draft on the DeepSpec target cache on the cluster runtime
+//! ([`hanzo_train::cluster`]) and save an engine-loadable checkpoint. `fit` coordinates the run
+//! and trains in it; `join` adds a machine with its own copy of the cache and init checkpoint.
+//! The goal is a real, decreasing loss curve on real data + a checkpoint whose keys and shapes
+//! exactly match the engine loader.
 
 use std::path::PathBuf;
-use std::time::Instant;
 
-use clap::Parser;
-use hanzo_ml::{Device, Result, Tensor};
-use hanzo_nn::optim::{AdamW, Optimizer, ParamsAdamW};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use anyhow::Result;
+use clap::{Parser, Subcommand};
 
-use hanzo_train::cache::Cache;
-use hanzo_train::model::{verify_checkpoint, Dspark, DsparkCfg};
+use hanzo_train::cluster::{self, host, Model, Params};
+use hanzo_train::dspark::{self, Engine, Local, Spec, CODE};
+use hanzo_train::gpu;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "hanzo-train",
-    about = "Native-Rust DSpark draft trainer (CPU/f32 MVP)"
+    about = "Native-Rust DSpark draft trainer, on one machine or many"
 )]
-struct Args {
-    /// DeepSpec target-cache v2 directory (manifest.json + samples.idx + shard-*.bin).
-    #[arg(long)]
-    cache_dir: PathBuf,
-
-    /// Frozen embed_tokens + lm_head init safetensors (keys embed_tokens.weight, lm_head.weight).
-    #[arg(
-        long,
-        default_value = "/home/z/work/zen/hf/v4-dspark-init/embed_head.safetensors"
-    )]
-    init: PathBuf,
-
-    /// Output checkpoint directory (writes model.safetensors + config.json).
-    #[arg(long, default_value = "./dspark-mvp-ckpt")]
-    out: PathBuf,
-
-    #[arg(long, default_value_t = 100)]
-    steps: usize,
-
-    /// Decoder layers (MVP default 2; full model uses 5).
-    #[arg(long, default_value_t = 2)]
-    layers: usize,
-
-    #[arg(long, default_value_t = 4096)]
-    intermediate: usize,
-
-    #[arg(long, default_value_t = 32)]
-    heads: usize,
-
-    #[arg(long, default_value_t = 8)]
-    kv_heads: usize,
-
-    #[arg(long, default_value_t = 128)]
-    head_dim: usize,
-
-    #[arg(long, default_value_t = 129280)]
-    vocab: usize,
-
-    #[arg(long, default_value_t = 256)]
-    markov_rank: usize,
-
-    #[arg(long, default_value_t = 7)]
-    block: usize,
-
-    #[arg(long, default_value_t = 129279)]
-    mask_token_id: u32,
-
-    /// Anchors sampled per training sample.
-    #[arg(long, default_value_t = 4)]
-    num_anchors: usize,
-
-    /// Samples accumulated per optimizer step (micro-batch).
-    #[arg(long, default_value_t = 4)]
-    micro_batch: usize,
-
-    #[arg(long, default_value_t = 6e-4)]
-    lr: f64,
-
-    /// Init scale for the output-side RMSNorm (see DsparkCfg::final_norm_init). `1.0` = faithful;
-    /// a small value (e.g. 0.1) starts the loss near ln(vocab) and well-conditions training.
-    #[arg(long, default_value_t = 0.1)]
-    final_norm_init: f64,
-
-    /// Only train on samples with seq_len <= this (0 = no cap). Bounds per-step cost/memory and
-    /// keeps sequence lengths uniform for a smoother curve. The `fc` fuse dominates cost on long seqs.
-    #[arg(long, default_value_t = 0)]
-    max_seq: usize,
-
-    #[arg(long, default_value_t = 42)]
-    seed: u64,
-
-    #[arg(long, default_value_t = 5)]
-    log_every: usize,
-
-    /// Safety floor: if host MemAvailable drops below this (GB) at a step boundary, save a partial
-    /// checkpoint and stop — so this trainer can never starve a co-resident job into the OOM killer.
-    #[arg(long, default_value_t = 7.0)]
-    min_avail_gb: f64,
-
-    /// Freeze the vocab×rank Markov head (exclude it from AdamW + detach its bias). Drops ~0.8GB of
-    /// optimizer/grad memory; use on memory-constrained hosts. The head is still saved at its init.
-    #[arg(long, default_value_t = false)]
-    freeze_markov: bool,
-
-    /// Overfit a single fixed batch (same samples+anchors every step). Removes sample-to-sample
-    /// variance for a clean monotonic curve — the standard proof that the training loop learns.
-    #[arg(long, default_value_t = false)]
-    fixed_batch: bool,
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-/// Host MemAvailable in GB from /proc/meminfo; `+inf` if it can't be read (never blocks then).
-fn mem_available_gb() -> f64 {
-    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else {
-        return f64::INFINITY;
-    };
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            if let Some(kb) = rest.split_whitespace().next() {
-                if let Ok(kb) = kb.parse::<f64>() {
-                    return kb / 1024.0 / 1024.0;
-                }
-            }
-        }
-    }
-    f64::INFINITY
+// parsed once, so the size of `Fit` costs nothing
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum Cmd {
+    /// Coordinate a run on `--listen` and train in it; other machines `join` it.
+    Fit {
+        #[command(flatten)]
+        local: Local,
+        #[command(flatten)]
+        spec: Spec,
+        /// Output checkpoint directory (writes model.safetensors + config.json).
+        #[arg(long, default_value = "./dspark-mvp-ckpt")]
+        out: PathBuf,
+        /// Where workers reach the coordinator, host:port.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        listen: String,
+        /// Free memory (percent) below which training exits rather than take the machine down.
+        #[arg(long, default_value_t = 15)]
+        floor: u32,
+    },
+    /// Train as a worker of the run a `fit` coordinates at `addr`, joining again whenever the
+    /// link fails, until the run is done.
+    Join {
+        /// The coordinator, host:port.
+        addr: String,
+        #[command(flatten)]
+        local: Local,
+        /// Free memory (percent) below which training exits rather than take the machine down.
+        #[arg(long, default_value_t = 15)]
+        floor: u32,
+    },
 }
 
-fn pick_anchors(
-    loss_mask: &[u8],
-    seq: usize,
-    block: usize,
-    n: usize,
-    rng: &mut StdRng,
-) -> Vec<usize> {
-    // Candidate anchors: loss_mask[a] && loss_mask[a+1], and a+block <= seq-1 so all block targets fit.
-    if seq < block + 2 {
-        return Vec::new();
-    }
-    let mut cands: Vec<usize> = (1..=seq - block - 1)
-        .filter(|&a| loss_mask[a] != 0 && loss_mask[a + 1] != 0)
-        .collect();
-    let take = n.min(cands.len());
-    // Partial Fisher-Yates for `take` uniform picks without replacement.
-    for i in 0..take {
-        let j = i + rng.random_range(0..(cands.len() - i));
-        cands.swap(i, j);
-    }
-    cands.truncate(take);
-    cands
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let dev = Device::Cpu;
-
-    let cache = Cache::open(&args.cache_dir)?;
-    let hidden = cache.manifest.hidden_size;
-    let n_fused = cache.n_fused;
-    let target_layer_ids = cache.manifest.target_layer_ids.clone();
+fn fit(local: Local, spec: Spec, out: PathBuf, listen: &str) -> Result<()> {
+    let (run, begin, draft) = dspark::run(&spec, &local, Some(out))?;
+    let cfg = draft.model.cfg();
     println!(
-        "cache: {} samples, hidden={hidden}, n_fused={n_fused}, layer_ids={:?}",
-        cache.len(),
-        target_layer_ids
-    );
-
-    // RoPE table must cover the longest sequence (+ block) in the cache.
-    let max_seq = cache
-        .records
-        .iter()
-        .map(|r| r.seq_len as usize)
-        .max()
-        .unwrap_or(0);
-    let max_pos = max_seq + args.block + 1;
-
-    let cfg = DsparkCfg {
-        vocab: args.vocab,
-        hidden,
-        intermediate: args.intermediate,
-        layers: args.layers,
-        heads: args.heads,
-        kv_heads: args.kv_heads,
-        head_dim: args.head_dim,
-        rms_eps: 1e-6,
-        rope_theta: 1e6,
-        max_pos,
-        block: args.block,
-        mask_token_id: args.mask_token_id,
-        markov_rank: args.markov_rank,
-        target_layer_ids,
-        final_norm_init: args.final_norm_init,
-    };
-    assert_eq!(
-        cfg.heads * cfg.head_dim,
+        "cache: {} samples, hidden={}, n_fused={}, layer_ids={:?}",
+        draft.cache.len(),
         cfg.hidden,
-        "heads*head_dim must equal hidden"
+        draft.cache.n_fused,
+        cfg.target_layer_ids
     );
-
     println!(
         "model: layers={} heads={}/{} head_dim={} intermediate={} vocab={} block={} markov_rank={}",
         cfg.layers,
@@ -206,185 +77,59 @@ fn main() -> Result<()> {
         cfg.block,
         cfg.markov_rank
     );
-
-    let model = Dspark::new(cfg.clone(), &args.init, &dev, !args.freeze_markov)?;
-    let vars = model.trainable_vars();
-    let n_params: usize = vars.iter().map(|v| v.as_tensor().elem_count()).sum();
+    let params = Params::of(draft.vars(), |n| draft.rate(n).is_some());
     println!(
-        "trainable vars: {} ({} params){}",
-        vars.len(),
-        n_params,
-        if args.freeze_markov {
+        "trainable: {} tensors, {} params{}; baseline CE = ln(vocab) = {:.4}",
+        params.names.len(),
+        params.len,
+        if spec.freeze_markov {
             " [markov frozen]"
         } else {
             ""
-        }
-    );
-
-    let mut opt = AdamW::new(
-        vars,
-        ParamsAdamW {
-            lr: args.lr,
-            ..Default::default()
         },
-    )?;
-
-    // Eligible sample pool: long enough to host a full block, and within the optional seq cap.
-    let eligible: Vec<usize> = (0..cache.len())
-        .filter(|&i| {
-            let s = cache.records[i].seq_len as usize;
-            s >= cfg.block + 2 && (args.max_seq == 0 || s <= args.max_seq)
-        })
-        .collect();
-    if eligible.is_empty() {
-        hanzo_ml::bail!(
-            "no eligible samples (seq_len in [{}, {}])",
-            cfg.block + 2,
-            args.max_seq
-        );
-    }
-    println!(
-        "eligible samples: {}/{} (max_seq={})",
-        eligible.len(),
-        cache.len(),
-        args.max_seq
+        (cfg.vocab as f64).ln()
     );
-
-    let mut rng = StdRng::seed_from_u64(args.seed);
-    let ln_vocab = (cfg.vocab as f64).ln();
-
-    // Optional fixed batch (overfit): draw the samples+anchors ONCE and reuse them every step so the
-    // loss curve is variance-free — the canonical sanity check that the training loop reduces loss.
-    let fixed_plan: Option<Vec<(usize, Vec<usize>)>> = if args.fixed_batch {
-        let mut plan = Vec::new();
-        let mut guard = 0usize;
-        while plan.len() < args.micro_batch && guard < args.micro_batch * 50 {
-            guard += 1;
-            let si = eligible[rng.random_range(0..eligible.len())];
-            let s = cache.read_sample(si)?;
-            let anchors = pick_anchors(
-                &s.loss_mask,
-                s.seq_len,
-                cfg.block,
-                args.num_anchors,
-                &mut rng,
-            );
-            if !anchors.is_empty() {
-                plan.push((si, anchors));
-            }
-        }
-        let n_anch: usize = plan.iter().map(|(_, a)| a.len()).sum();
-        println!(
-            "fixed batch (overfit): {} samples, {} anchors",
-            plan.len(),
-            n_anch
-        );
-        Some(plan)
-    } else {
-        None
-    };
-
+    let report = cluster::lead(listen, run, begin, Engine { spec, local }, draft)?;
     println!(
-        "baseline CE = ln(vocab) = {:.4}\n--- training ---",
-        ln_vocab
+        "--- done: {} steps over {} rounds ---",
+        report.merged, report.rounds
     );
-
-    let t_start = Instant::now();
-    let mut tok_total = 0usize;
-    for step in 0..args.steps {
-        // Never risk the co-resident dump: bail (and save) before memory gets dangerous.
-        let avail = mem_available_gb();
-        if avail < args.min_avail_gb {
-            println!(
-                "step {step}: MemAvailable {avail:.1}GB < floor {:.1}GB — stopping to protect the host; saving partial checkpoint",
-                args.min_avail_gb
-            );
-            break;
-        }
-
-        let mut block_chunks: Vec<Tensor> = Vec::new();
-        let mut bias_chunks: Vec<Tensor> = Vec::new();
-        let mut targets: Vec<u32> = Vec::new();
-
-        // This step's (sample, anchors) list: the fixed batch, or a fresh random draw.
-        let plan: Vec<(usize, Vec<usize>)> = match &fixed_plan {
-            Some(p) => p.clone(),
-            None => {
-                let mut p = Vec::with_capacity(args.micro_batch);
-                for _ in 0..args.micro_batch {
-                    let si = eligible[rng.random_range(0..eligible.len())];
-                    let s = cache.read_sample(si)?;
-                    let anchors = pick_anchors(
-                        &s.loss_mask,
-                        s.seq_len,
-                        cfg.block,
-                        args.num_anchors,
-                        &mut rng,
-                    );
-                    if !anchors.is_empty() {
-                        p.push((si, anchors));
-                    }
-                }
-                p
-            }
-        };
-
-        for (si, anchors) in &plan {
-            let mut s = cache.read_sample(*si)?;
-            let seq = s.seq_len;
-            let th = Tensor::from_vec(
-                std::mem::take(&mut s.target_hidden),
-                (seq, n_fused * hidden),
-                &dev,
-            )?;
-            let fused = model.fuse(&th)?;
-            for &a in anchors {
-                if let Some((block, bias, tgt)) =
-                    model.draft_anchor(&fused, &s.input_ids, &s.loss_mask, a)?
-                {
-                    targets.extend_from_slice(&tgt);
-                    block_chunks.push(block);
-                    bias_chunks.push(bias);
-                }
-            }
-        }
-
-        if targets.is_empty() {
-            continue;
-        }
-        let block_refs: Vec<&Tensor> = block_chunks.iter().collect();
-        let bias_refs: Vec<&Tensor> = bias_chunks.iter().collect();
-        let block_cat = Tensor::cat(&block_refs, 0)?; // [N, hidden]
-        let bias_cat = Tensor::cat(&bias_refs, 0)?; // [N, vocab]
-        let tgt = Tensor::from_vec(targets.clone(), (targets.len(),), &dev)?;
-        // CE through the FROZEN head via surrogate backward (no [hidden, vocab] head grad formed).
-        let (loss, surrogate) = model.head_ce(&block_cat, &bias_cat, &tgt)?;
-        opt.step(&surrogate.backward()?)?;
-
-        tok_total += targets.len();
-        if step % args.log_every == 0 || step == args.steps - 1 {
-            let l = loss.to_scalar::<f32>()?;
-            let tps = tok_total as f64 / t_start.elapsed().as_secs_f64();
-            println!(
-                "step {step:>4}  loss {l:8.4}  tokens {:>5}  {:.0} tok/s  avail {:.1}GB",
-                targets.len(),
-                tps,
-                mem_available_gb()
-            );
-        }
-    }
-    let elapsed = t_start.elapsed().as_secs_f64();
-    println!(
-        "--- done: {} steps in {:.1}s, {:.0} supervised tok/s ---",
-        args.steps,
-        elapsed,
-        tok_total as f64 / elapsed
-    );
-
-    model.save(&args.out)?;
-    let ckpt = args.out.join("model.safetensors");
-    println!("saved checkpoint -> {}", ckpt.display());
-    verify_checkpoint(&ckpt, &cfg)?;
-    println!("checkpoint load-check PASSED: every engine key present with matching shape");
     Ok(())
+}
+
+fn join(addr: &str, local: Local) -> Result<()> {
+    let joined = cluster::join(cluster::resolve(addr)?, &host(), CODE, |setup| {
+        dspark::load(setup, &local)
+    })?;
+    let s = match joined {
+        Some(w) => w.run()?,
+        None => Default::default(),
+    };
+    println!(
+        "trained {} steps, {} tokens, over {} rounds and {} links",
+        s.ids.len(),
+        s.tokens,
+        s.rounds,
+        s.links
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    match Cli::parse().cmd {
+        Cmd::Fit {
+            local,
+            spec,
+            out,
+            listen,
+            floor,
+        } => {
+            gpu::guard(floor);
+            fit(local, spec, out, &listen)
+        }
+        Cmd::Join { addr, local, floor } => {
+            gpu::guard(floor);
+            join(&addr, local)
+        }
+    }
 }

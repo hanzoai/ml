@@ -266,7 +266,7 @@ Cheatsheet:
 - [hanzo-metal-kernels](./hanzo-metal-kernels/): Metal kernels
 - [hanzo-flash-attn](./hanzo-flash-attn): flash attention v2, with v3 in [hanzo-flash-attn-v3](./hanzo-flash-attn-v3)
 - [hanzo-3d](./hanzo-3d/): 3D model support
-- [hanzo-train](./hanzo-train/) and [hanzo-training](./hanzo-training/): training loops
+- [hanzo-train](./hanzo-train/): one model trained across heterogeneous machines (DiLoCo local SGD, bf16 deltas, bit-identical resume) behind a small `Model` trait, and the DSpark draft trainer on it; [hanzo-training](./hanzo-training/): config-driven training loops
 - [hanzo-datasets](./hanzo-datasets/): datasets and data loaders
 - [hanzo-onnx](./hanzo-onnx/): ONNX model evaluation
 - [hanzo-ml-pyo3](./hanzo-ml-pyo3/): Python bindings
