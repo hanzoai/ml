@@ -1,8 +1,6 @@
 [package]
 name = "hanzo-train"
-# Not published: an application binary, not a library other crates depend on.
-publish = false
-version.workspace = true
+version = "0.11.19"
 edition.workspace = true
 description = "Training on hanzo-ml: one model across heterogeneous machines (DiLoCo local SGD, bf16 deltas, bit-identical resume), and the DSpark draft trainer on it."
 repository.workspace = true
