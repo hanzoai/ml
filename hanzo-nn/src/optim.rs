@@ -165,53 +165,20 @@ impl AdamW {
         grad_scale: f64,
     ) -> Result<()> {
         self.step_t += 1;
-        let lr = self.params.lr;
-        let lambda = self.params.weight_decay;
-        let lr_lambda = lr * lambda;
-        let beta1 = self.params.beta1;
-        let beta2 = self.params.beta2;
-        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
-        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
+        let p = &self.params;
+        let u = Update {
+            lr: p.lr,
+            beta1: p.beta1,
+            beta2: p.beta2,
+            eps: p.eps,
+            weight_decay: p.weight_decay,
+            scale_m: 1f64 / (1f64 - p.beta1.powi(self.step_t as i32)),
+            scale_v: 1f64 / (1f64 - p.beta2.powi(self.step_t as i32)),
+            grad_scale,
+        };
         for var in self.vars.iter() {
-            let theta = &var.var;
-            let m = &var.first_moment;
-            let v = &var.second_moment;
-            if let Some(g) = grads.get(theta) {
-                #[cfg(feature = "metal")]
-                if fused::fits(theta, g) {
-                    let step = hanzo_metal_kernels::AdamWStep {
-                        lr: lr as f32,
-                        beta1: beta1 as f32,
-                        beta2: beta2 as f32,
-                        eps: self.params.eps as f32,
-                        weight_decay: lambda as f32,
-                        scale_m: scale_m as f32,
-                        scale_v: scale_v as f32,
-                        grad_scale: grad_scale as f32,
-                    };
-                    theta
-                        .as_tensor()
-                        .inplace_op([g, m.as_tensor(), v.as_tensor()], &fused::AdamW(step))?;
-                    continue;
-                }
-                let g = if grad_scale == 1.0 {
-                    g.clone()
-                } else {
-                    (g * grad_scale)?
-                };
-                // This involves locking 3 RWLocks per params, if the parameters are large this
-                // should not be an issue but this may be problematic with models with lots of
-                // small parameters.
-                let next_m = ((m.as_tensor() * beta1)? + (&g * (1.0 - beta1))?)?;
-                let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
-                let m_hat = (&next_m * scale_m)?;
-                let v_hat = (&next_v * scale_v)?;
-                let next_theta = (theta.as_tensor() * (1f64 - lr_lambda))?;
-                let adjusted_grad = (m_hat / (v_hat.sqrt()? + self.params.eps)?)?;
-                let next_theta = (next_theta - (adjusted_grad * lr)?)?;
-                m.set(&next_m)?;
-                v.set(&next_v)?;
-                theta.set(&next_theta)?;
+            if let Some(g) = grads.get(&var.var) {
+                adamw(&var.var, g, &var.first_moment, &var.second_moment, &u)?;
             }
         }
         Ok(())
@@ -232,6 +199,63 @@ impl AdamW {
     pub fn set_params(&mut self, params: ParamsAdamW) {
         self.params = params;
     }
+}
+
+/// One AdamW update's constants: the learning rate, betas, epsilon and decoupled weight decay,
+/// the bias corrections `1 / (1 − βᵗ)` of step `t`, and the factor every gradient is multiplied
+/// by first (clipping, loss scaling).
+#[derive(Clone, Copy, Debug)]
+pub struct Update {
+    pub lr: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub eps: f64,
+    pub weight_decay: f64,
+    pub scale_m: f64,
+    pub scale_v: f64,
+    pub grad_scale: f64,
+}
+
+/// One AdamW update of `theta` from its gradient `g` and moments `m`, `v`:
+///
+///   m ← β₁m + (1 − β₁)g,  v ← β₂v + (1 − β₂)g²,
+///   θ ← θ(1 − lr·λ) − lr · m·scale_m / (√(v·scale_v) + ε).
+///
+/// An F32 parameter on Metal is updated by one fused kernel that reads the parameter, its
+/// gradient and both moments once and writes them back once; anything else takes the tensor-op
+/// path, the same arithmetic in the same order.
+pub fn adamw(theta: &Var, g: &Tensor, m: &Var, v: &Var, u: &Update) -> Result<()> {
+    #[cfg(feature = "metal")]
+    if fused::fits(theta, g) {
+        let step = hanzo_metal_kernels::AdamWStep {
+            lr: u.lr as f32,
+            beta1: u.beta1 as f32,
+            beta2: u.beta2 as f32,
+            eps: u.eps as f32,
+            weight_decay: u.weight_decay as f32,
+            scale_m: u.scale_m as f32,
+            scale_v: u.scale_v as f32,
+            grad_scale: u.grad_scale as f32,
+        };
+        return theta
+            .as_tensor()
+            .inplace_op([g, m.as_tensor(), v.as_tensor()], &fused::AdamW(step));
+    }
+    let g = if u.grad_scale == 1.0 {
+        g.clone()
+    } else {
+        (g * u.grad_scale)?
+    };
+    let next_m = ((m.as_tensor() * u.beta1)? + (&g * (1.0 - u.beta1))?)?;
+    let next_v = ((v.as_tensor() * u.beta2)? + (g.sqr()? * (1.0 - u.beta2))?)?;
+    let m_hat = (&next_m * u.scale_m)?;
+    let v_hat = (&next_v * u.scale_v)?;
+    let next_theta = (theta.as_tensor() * (1f64 - u.lr * u.weight_decay))?;
+    let adjusted_grad = (m_hat / (v_hat.sqrt()? + u.eps)?)?;
+    let next_theta = (next_theta - (adjusted_grad * u.lr)?)?;
+    m.set(&next_m)?;
+    v.set(&next_v)?;
+    theta.set(&next_theta)
 }
 
 /// The global L2 norm of the gradients of `vars`: `sqrt(Σ‖g‖²)`, one host read. On Metal each
