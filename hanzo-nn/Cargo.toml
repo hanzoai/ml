@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-nn"
-version = "0.11.43"
+version = "0.11.44"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -16,6 +16,9 @@ gemm = { workspace = true }
 hanzo-metal-kernels = { workspace = true, optional = true }
 hanzo-kernels = { workspace = true, optional = true, features = ["cutile"] }
 half = { workspace = true }
+float8 = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
 num-traits = { workspace = true }
