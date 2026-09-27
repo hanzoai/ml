@@ -277,3 +277,63 @@ fn interleaved_kv_decode() -> Result<()> {
     let out = out.unsqueeze(0)?;
     assert_close(&out, &expected, 1e-5, "interleaved_kv_decode")
 }
+
+/// Packed attention equals the composite per sequence: rotary on queries and keys, scaled
+/// queries, a softmax over the keys within the window, the product with the values.
+#[test]
+fn packed_is_the_composite() -> Result<()> {
+    use hanzo_nn::attention::cpu_flash::packed::packed;
+    let dev = Device::Cpu;
+    let (heads, d, p) = (3, 8, 200);
+    let lens = [5usize, 1, 70, 130];
+    let t: usize = lens.iter().sum();
+    let qkv = Tensor::randn(0f32, 1.0, (t, 3 * heads * d), &dev)?;
+    let freqs: Vec<f32> = (0..p)
+        .flat_map(|i| (0..d / 2).map(move |j| i as f32 / 1000f32.powf(2. * j as f32 / d as f32)))
+        .collect();
+    let freqs = Tensor::from_vec(freqs, (p, d / 2), &dev)?;
+    let (cos, sin) = (freqs.cos()?, freqs.sin()?);
+    let scale = 0.35f32;
+    for window in [None, Some(4), Some(64)] {
+        let got = packed(&qkv, &lens, heads, window, &cos, &sin, scale)?;
+        let mut start = 0;
+        for &l in &lens {
+            // [l, 3, H, D] -> q, k, v as [1, H, l, D]
+            let x = qkv.narrow(0, start, l)?.reshape((l, 3, heads, d))?;
+            let part = |i: usize| {
+                x.narrow(1, i, 1)?
+                    .squeeze(1)?
+                    .transpose(0, 1)?
+                    .unsqueeze(0)?
+                    .contiguous()
+            };
+            let q = hanzo_nn::rotary_emb::rope(&part(0)?, &cos, &sin)?;
+            let k = hanzo_nn::rotary_emb::rope(&part(1)?, &cos, &sin)?;
+            let q = (q * scale as f64)?;
+            let mut s = q.matmul(&k.transpose(2, 3)?)?;
+            if let Some(w) = window {
+                let m: Vec<f32> = (0..l)
+                    .flat_map(|i| {
+                        (0..l).map(move |j| {
+                            if i.abs_diff(j) > w {
+                                f32::NEG_INFINITY
+                            } else {
+                                0.
+                            }
+                        })
+                    })
+                    .collect();
+                s = s.broadcast_add(&Tensor::from_vec(m, (l, l), &dev)?)?;
+            }
+            let o = hanzo_nn::ops::softmax_last_dim(&s)?.matmul(&part(2)?)?;
+            let want = o.squeeze(0)?.transpose(0, 1)?.reshape((l, heads * d))?;
+            let gap = (got.narrow(0, start, l)? - want)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(gap < 1e-5, "window {window:?}, length {l}: {gap}");
+            start += l;
+        }
+    }
+    Ok(())
+}

@@ -6,6 +6,7 @@
 //! - See modernbert in [hanzo-ml-examples](https://github.com/hanzoai/ml/tree/main/hanzo-ml-examples/) for runnable code
 //!
 
+use hanzo_ml::quantized::{repack::tiled, GgmlDType, QMatMul, QTensor};
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{
     embedding, layer_norm_no_bias, linear, linear_no_bias,
@@ -85,10 +86,43 @@ impl RotaryEmbedding {
     }
 }
 
+/// A projection's weights: dense, as trained, or quantized for inference on the CPU.
+#[derive(Clone)]
+enum Proj {
+    Dense(Linear),
+    Quant(QMatMul),
+}
+
+impl Proj {
+    /// The weights as `dtype` blocks when this CPU tiles their matmul; weights already
+    /// quantized, or it does not, stay as they are.
+    fn quantize(&self, dtype: GgmlDType) -> Result<Proj> {
+        match self {
+            Proj::Dense(l) if !tiled(dtype, l.weight().dim(0)?, l.weight().dim(1)?) => {
+                Ok(self.clone())
+            }
+            Proj::Dense(l) if l.bias().is_none() => Ok(Proj::Quant(QMatMul::from_qtensor(
+                QTensor::quantize(&l.weight().contiguous()?, dtype)?,
+            )?)),
+            Proj::Dense(_) => hanzo_ml::bail!("a projection with a bias is not quantized"),
+            Proj::Quant(_) => Ok(self.clone()),
+        }
+    }
+}
+
+impl Module for Proj {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Proj::Dense(l) => l.forward(xs),
+            Proj::Quant(q) => q.forward(xs),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ModernBertAttention {
-    qkv: Linear,
-    proj: Linear,
+    qkv: Proj,
+    proj: Proj,
     num_attention_heads: usize,
     attention_head_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
@@ -99,8 +133,16 @@ impl ModernBertAttention {
         let num_attention_heads = config.num_attention_heads;
         let attention_head_size = config.hidden_size / config.num_attention_heads;
 
-        let qkv = linear_no_bias(config.hidden_size, config.hidden_size * 3, vb.pp("Wqkv"))?;
-        let proj = linear_no_bias(config.hidden_size, config.hidden_size, vb.pp("Wo"))?;
+        let qkv = Proj::Dense(linear_no_bias(
+            config.hidden_size,
+            config.hidden_size * 3,
+            vb.pp("Wqkv"),
+        )?);
+        let proj = Proj::Dense(linear_no_bias(
+            config.hidden_size,
+            config.hidden_size,
+            vb.pp("Wo"),
+        )?);
 
         Ok(Self {
             qkv,
@@ -132,14 +174,25 @@ impl ModernBertAttention {
         let (q, k) = self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?;
 
         let scale = (self.attention_head_size as f64).powf(-0.5);
-        let q = (q * scale)?;
-
-        let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-
-        let att = att.broadcast_add(attention_mask)?;
-        let att = softmax_last_dim(&att)?;
-
-        let xs = att.matmul(&v)?;
+        let xs = if q.device().is_metal() && seq_len > 1 && !q.track_op() && !k.track_op() {
+            // inference on Metal: scores, mask, softmax and values in one fused kernel
+            let mask =
+                attention_mask.broadcast_as((b, self.num_attention_heads, seq_len, seq_len))?;
+            hanzo_nn::ops::sdpa(
+                &q,
+                &k,
+                &v.contiguous()?,
+                Some(&mask),
+                false,
+                scale as f32,
+                1.0,
+            )?
+        } else {
+            let q = (q * scale)?;
+            let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+            let att = att.broadcast_add(attention_mask)?;
+            softmax_last_dim(&att)?.matmul(&v)?
+        };
 
         let xs = xs.transpose(1, 2)?.reshape((b, seq_len, d))?;
         let xs = xs.apply(&self.proj)?;
@@ -154,9 +207,9 @@ impl ModernBertAttention {
 /// activations rather than on strided halves of one wide one.
 #[derive(Clone)]
 pub struct ModernBertMLP {
-    gate: Linear,
-    up: Linear,
-    wo: Linear,
+    gate: Proj,
+    up: Proj,
+    wo: Proj,
 }
 
 impl ModernBertMLP {
@@ -169,16 +222,16 @@ impl ModernBertMLP {
         )?;
         let wo = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))?;
         Ok(Self {
-            gate: Linear::new(wi.narrow(0, 0, i)?, None),
-            up: Linear::new(wi.narrow(0, i, i)?, None),
-            wo,
+            gate: Proj::Dense(Linear::new(wi.narrow(0, 0, i)?, None)),
+            up: Proj::Dense(Linear::new(wi.narrow(0, i, i)?, None)),
+            wo: Proj::Dense(wo),
         })
     }
 }
 
 impl Module for ModernBertMLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        (xs.apply(&self.gate)?.gelu_erf()? * xs.apply(&self.up)?)?.apply(&self.wo)
+        hanzo_nn::ops::geglu(&xs.apply(&self.gate)?, &xs.apply(&self.up)?)?.apply(&self.wo)
     }
 }
 
@@ -215,6 +268,28 @@ impl ModernBertLayer {
             mlp_norm,
             uses_local_attention,
         })
+    }
+
+    /// A packed pass through the layer: `xs [T, d]` holds sequences of `lens` tokens; a local
+    /// layer's queries read the keys within `window` of them.
+    fn packed(&self, xs: &Tensor, lens: &[usize], window: usize) -> Result<Tensor> {
+        let h = match &self.attn_norm {
+            Some(norm) => xs.apply(norm)?,
+            None => xs.clone(),
+        };
+        let a = &self.attn;
+        let att = hanzo_nn::attention::cpu_flash::packed::packed(
+            &h.apply(&a.qkv)?,
+            lens,
+            a.num_attention_heads,
+            self.uses_local_attention.then_some(window),
+            &a.rotary_emb.cos,
+            &a.rotary_emb.sin,
+            (a.attention_head_size as f64).powf(-0.5) as f32,
+        )?;
+        let xs = (att.apply(&a.proj)? + xs)?;
+        let mlp = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
+        xs + mlp
     }
 
     /// `local_attention_mask` is the global mask with the sliding window already added.
@@ -354,6 +429,8 @@ pub struct ModernBert {
     layers: Vec<ModernBertLayer>,
     final_norm: LayerNorm,
     local_attention_size: usize,
+    /// Projections quantized ([`ModernBert::quantize`]): the CPU inference pass.
+    quantized: bool,
 }
 
 impl ModernBert {
@@ -415,10 +492,82 @@ impl ModernBert {
             layers,
             final_norm,
             local_attention_size: config.local_attention,
+            quantized: false,
         })
     }
 
+    /// Every layer's projections as `dtype` blocks where this CPU tiles their matmul
+    /// ([`tiled`]), for inference on the CPU, which then runs the packed pass: each sequence's
+    /// real tokens only, attention per sequence straight from the QKV projection. The rest stays
+    /// in the weights' dtype. Training reads dense weights, so a quantized backbone has no
+    /// gradient through its projections.
+    pub fn quantize(&mut self, dtype: GgmlDType) -> Result<()> {
+        for l in &mut self.layers {
+            l.attn.qkv = l.attn.qkv.quantize(dtype)?;
+            l.attn.proj = l.attn.proj.quantize(dtype)?;
+            l.mlp.gate = l.mlp.gate.quantize(dtype)?;
+            l.mlp.up = l.mlp.up.quantize(dtype)?;
+            l.mlp.wo = l.mlp.wo.quantize(dtype)?;
+        }
+        self.quantized = true;
+        Ok(())
+    }
+
+    /// Token states `[B, L, d]` of `xs [B, L]` under its 0/1 `mask [B, L]`. A quantized backbone
+    /// on the CPU, given right-padded rows, runs the packed pass and leaves pad positions zero;
+    /// any other runs every position.
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        if self.quantized && xs.device().is_cpu() {
+            let rows = mask.to_dtype(DType::U32)?.to_vec2::<u32>()?;
+            let lens: Vec<usize> = rows
+                .iter()
+                .map(|r| r.iter().take_while(|&&m| m != 0).count())
+                .collect();
+            let right = rows
+                .iter()
+                .zip(&lens)
+                .all(|(r, &n)| r[n..].iter().all(|&m| m == 0));
+            if right {
+                return self.packed(xs, &lens);
+            }
+        }
+        self.padded(xs, mask)
+    }
+
+    /// Every sequence's first `lens` tokens packed into one: embeddings, projections and norms
+    /// over the real tokens only, attention per sequence.
+    fn packed(&self, xs: &Tensor, lens: &[usize]) -> Result<Tensor> {
+        let (b, l) = xs.dims2()?;
+        let ids = xs.to_dtype(DType::U32)?.to_vec2::<u32>()?;
+        let flat: Vec<u32> = ids
+            .iter()
+            .zip(lens)
+            .flat_map(|(r, &n)| r[..n].iter().copied())
+            .collect();
+        let t = flat.len();
+        let mut h = Tensor::from_vec(flat, t, xs.device())?
+            .apply(&self.word_embeddings)?
+            .apply(&self.norm)?;
+        let window = self.local_attention_size / 2;
+        for layer in &self.layers {
+            h = layer.packed(&h, lens, window)?;
+        }
+        let h = h.apply(&self.final_norm)?;
+        // each padded position reads its packed token, a pad the zero row past them
+        let d = h.dim(1)?;
+        let h = Tensor::cat(&[&h, &Tensor::zeros((1, d), h.dtype(), h.device())?], 0)?;
+        let mut at = Vec::with_capacity(b * l);
+        let mut next = 0u32;
+        for &n in lens {
+            at.extend(next..next + n as u32);
+            at.extend(std::iter::repeat_n(t as u32, l - n));
+            next += n as u32;
+        }
+        h.index_select(&Tensor::from_vec(at, b * l, h.device())?, 0)?
+            .reshape((b, l, d))
+    }
+
+    fn padded(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let seq_len = xs.shape().dims()[1];
         let dtype = self.word_embeddings.embeddings().dtype();
         let global_attention_mask =

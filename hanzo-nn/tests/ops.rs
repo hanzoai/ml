@@ -388,3 +388,35 @@ test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
 fn sigmoid_rocm() -> Result<()> {
     sigmoid(&Device::new_rocm(0)?)
 }
+
+/// The fused GeGLU is the composite to f32 rounding (erf within 1.5e-7 over the whole range,
+/// its tails included), and a tracked input keeps its gradient.
+#[test]
+fn geglu_is_the_composite() -> Result<()> {
+    let dev = Device::Cpu;
+    let n = 200_001;
+    let gate: Vec<f32> = (0..n)
+        .map(|i| -20.0 + 40.0 * i as f32 / (n - 1) as f32)
+        .collect();
+    let gate = Tensor::from_vec(gate, n, &dev)?;
+    let up = Tensor::randn(0f32, 1.0, n, &dev)?;
+    let fused = hanzo_nn::ops::geglu(&gate, &up)?.to_vec1::<f32>()?;
+    let composite = (gate.gelu_erf()? * &up)?.to_vec1::<f32>()?;
+    let (g, u) = (gate.to_vec1::<f32>()?, up.to_vec1::<f32>()?);
+    for i in 0..n {
+        // |Δ| ≤ ½|g|·|u|·(1.5e-7 of erf) + f32 rounding of the product
+        let bound = 0.5 * g[i].abs() * u[i].abs() * 2e-7 + composite[i].abs() * 4e-7 + 1e-30;
+        assert!(
+            (fused[i] - composite[i]).abs() <= bound,
+            "at {}: {} against {}",
+            g[i],
+            fused[i],
+            composite[i]
+        );
+    }
+    let v = hanzo_ml::Var::from_tensor(&gate)?;
+    let y = hanzo_nn::ops::geglu(v.as_tensor(), &up)?;
+    let grads = y.sum_all()?.backward()?;
+    assert!(grads.get(v.as_tensor()).is_some());
+    Ok(())
+}

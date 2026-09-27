@@ -3,6 +3,7 @@
 //! - `standard`: General-purpose with explicit mask tensor, B=1 only
 //! - `causal`: Loop-bound causal masking, B=1 only
 //! - `varlen`: Packed variable-length sequences (total_q, H, D), any batch size
+//! - `packed`: bidirectional, windowed, rotary attention straight from a packed QKV projection
 //!
 //! The top-level [`flash_attn`] function automatically dispatches:
 //! - **B=1**: single-batch kernels in `standard`/`causal` (direct slice access, zero batch overhead)
@@ -11,6 +12,7 @@
 
 pub mod causal;
 pub(crate) mod online_softmax;
+pub mod packed;
 pub mod standard;
 pub mod varlen;
 

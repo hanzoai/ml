@@ -12,6 +12,7 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 hanzo-ml = { workspace = true }
+gemm = { workspace = true }
 hanzo-metal-kernels = { workspace = true, optional = true }
 hanzo-kernels = { workspace = true, optional = true, features = ["cutile"] }
 half = { workspace = true }

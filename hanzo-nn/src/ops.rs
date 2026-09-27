@@ -488,6 +488,89 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
     }
 }
 
+/// `e^x` for `x ≤ 0`, as a polynomial the compiler vectorizes: `x = n ln 2 + r`, `|r| ≤ ln 2 / 2`,
+/// `e^r` by Cephes' `expf` polynomial, scaled by `2^n` through the exponent bits. Within 2 ulp;
+/// below −87 it is zero.
+#[inline(always)]
+fn exp_neg(x: f32) -> f32 {
+    let x = x.max(-87.0);
+    let n = (x * std::f32::consts::LOG2_E + 0.5).floor();
+    let r = x - n * 0.693_359_4 + n * 2.121_944_4e-4;
+    let p = ((((1.987_569_1e-4 * r + 1.398_199_9e-3) * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r
+        + 1.666_666_5e-1)
+        * r
+        + 0.5;
+    let y = p * r * r + r + 1.0;
+    y * f32::from_bits(((n as i32 + 127) << 23) as u32)
+}
+
+/// `gelu_erf(g) · u` with `erf` by Abramowitz and Stegun 7.1.26 (absolute error under 1.5e-7,
+/// PyTorch's vectorized CPU `erf`): `erf(z) = 1 − t (a₁ + t (a₂ + …)) e^{−z²}`,
+/// `t = 1 / (1 + p z)`, odd in `z`.
+#[inline(always)]
+fn geglu1(g: f32, u: f32) -> f32 {
+    let z = (g * std::f32::consts::FRAC_1_SQRT_2).abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * z);
+    let poly = ((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_74) * t
+        + 0.254_829_6)
+        * t;
+    let erf = (1.0 - poly * exp_neg(-z * z)).copysign(g);
+    (erf + 1.) * 0.5 * g * u
+}
+
+/// `gelu_erf(gate) · up`, elementwise, on the CPU in one parallel, vectorized pass.
+struct GeGlu;
+
+impl hanzo_ml::CustomOp2 for GeGlu {
+    fn name(&self) -> &'static str {
+        "geglu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        gate: &CpuStorage,
+        l1: &Layout,
+        up: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (CpuStorage::F32(g), CpuStorage::F32(u)) = (gate, up) else {
+            hanzo_ml::bail!("geglu: f32 only")
+        };
+        let (Some((g0, g1)), Some((u0, u1))) = (l1.contiguous_offsets(), l2.contiguous_offsets())
+        else {
+            hanzo_ml::bail!("geglu: contiguous inputs only")
+        };
+        let (g, u) = (&g[g0..g1], &u[u0..u1]);
+        let mut dst = vec![0f32; g.len()];
+        dst.par_chunks_mut(4096)
+            .zip(g.par_chunks(4096).zip(u.par_chunks(4096)))
+            .for_each(|(d, (g, u))| {
+                for ((d, &g), &u) in d.iter_mut().zip(g).zip(u) {
+                    *d = geglu1(g, u);
+                }
+            });
+        Ok((CpuStorage::F32(dst), l1.shape().clone()))
+    }
+}
+
+/// GeGLU's product, `gelu_erf(gate) · up`. On the CPU, for F32 inputs no gradient flows
+/// through, one parallel pass whose `erf` is within 1.5e-7 of the exact one; everywhere else,
+/// and wherever a gradient flows, the composite.
+pub fn geglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    let fused = gate.device().is_cpu()
+        && gate.dtype() == DType::F32
+        && up.dtype() == DType::F32
+        && gate.shape() == up.shape()
+        && gate.is_contiguous()
+        && up.is_contiguous()
+        && !gate.track_op()
+        && !up.track_op();
+    if fused {
+        return gate.apply_op2_no_bwd(up, &GeGlu);
+    }
+    gate.gelu_erf()? * up
+}
+
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
     // The fused rocm softmax kernel handles contiguous F16/F32/BF16; fall back to the unfused
     // composite for anything else so we never feed the kernel a shape/dtype it can't handle.
