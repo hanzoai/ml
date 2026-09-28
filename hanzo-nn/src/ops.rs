@@ -769,6 +769,17 @@ impl hanzo_ml::CustomOp2 for Select {
         Self::rows(x, xl, index, il)
     }
 
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        x: &hanzo_ml::RocmStorage,
+        xl: &Layout,
+        index: &hanzo_ml::RocmStorage,
+        il: &Layout,
+    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
+        Self::rows(x, xl, index, il)
+    }
+
     fn bwd(
         &self,
         x: &Tensor,
