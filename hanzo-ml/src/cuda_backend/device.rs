@@ -75,14 +75,18 @@ pub struct CudaDevice {
 
 /// Captured work that replays as one launch.
 pub struct Graph {
-    graph: cudarc::driver::CudaGraph,
+    graph: Mutex<cudarc::driver::CudaGraph>,
     launches: Arc<AtomicU64>,
 }
+
+// SAFETY: CUDA allows a graph on any thread once calls on it are serialized; the mutex does.
+unsafe impl Send for Graph {}
+unsafe impl Sync for Graph {}
 
 impl Graph {
     pub fn launch(&self) -> Result<()> {
         self.launches.fetch_add(1, Ordering::Relaxed);
-        self.graph.launch().w()
+        self.graph.lock().unwrap().launch().w()
     }
 }
 
@@ -337,7 +341,7 @@ impl CudaDevice {
         Ok((
             out,
             Graph {
-                graph,
+                graph: Mutex::new(graph),
                 launches: self.graphs.clone(),
             },
         ))
