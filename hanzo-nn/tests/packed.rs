@@ -163,3 +163,53 @@ fn packed_is_the_composite() -> Result<()> {
     }
     Ok(())
 }
+
+/// Mean device ms of the forward and of the backward at the shape hanzo-kernel's `packed` speed
+/// test times: `cargo test --features cuda --test packed -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn packed_speed() -> Result<()> {
+    let cuda = Device::new_cuda(0)?;
+    let lens: Vec<usize> = (0..32).map(|i| 64 + (i * 37) % 128).collect();
+    let heads = 12;
+    let t: usize = lens.iter().sum();
+    let hd = heads * DIM;
+    let scale = (DIM as f32).powf(-0.5);
+    let (cos, sin) = tables(256)?;
+    let mut rng = Normal(7);
+    let half = |x: &Tensor| x.to_dtype(DType::BF16)?.to_device(&cuda);
+    let qkv = half(&rng.tensor(&[t, 3 * hd], 1.0)?)?;
+    let (hcos, hsin) = (half(&cos)?, half(&sin)?);
+    let timer = cuda.timer()?.expect("CUDA has a timer");
+    let time = |iters: usize, f: &dyn Fn() -> Result<()>| -> Result<f32> {
+        for _ in 0..3 {
+            f()?;
+        }
+        timer.start()?;
+        for _ in 0..iters {
+            f()?;
+        }
+        timer.stop()?;
+        Ok(timer.elapsed()? / iters as f32)
+    };
+    for window in [None, Some(64)] {
+        let f = time(50, &|| {
+            packed(&qkv, &lens, heads, window, &hcos, &hsin, scale)?;
+            Ok(())
+        })?;
+        let x = Var::from_tensor(&qkv)?;
+        let mut b = 0f32;
+        for i in 0..23 {
+            let y = packed(x.as_tensor(), &lens, heads, window, &hcos, &hsin, scale)?;
+            cuda.synchronize()?;
+            timer.start()?;
+            y.backward()?;
+            timer.stop()?;
+            if i >= 3 {
+                b += timer.elapsed()? / 20.0;
+            }
+        }
+        println!("[packed speed .cu] tokens {t} window {window:?}: forward {f:.3} ms, backward {b:.3} ms");
+    }
+    Ok(())
+}
