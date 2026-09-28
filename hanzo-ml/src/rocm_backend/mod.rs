@@ -4303,60 +4303,27 @@ fn scatter_apply(
 impl BackendStorage for RocmStorage {
     type Device = RocmDevice;
 
-    fn try_clone(&self, layout: &Layout) -> Result<Self> {
+    fn try_clone(&self, _: &Layout) -> Result<Self> {
+        // the whole buffer: a copy keeps its source's layout, offset and strides included
         let device = self.device.clone();
-        let elem_count = layout.shape().elem_count();
+        macro_rules! whole {
+            ($variant:ident, $ty:ty, $s:expr) => {{
+                let mut dst = device.alloc::<$ty>($s.count())?;
+                dst.copy_from_device($s)?;
+                RocmStorageSlice::$variant(dst)
+            }};
+        }
         let slice = match &self.slice {
-            RocmStorageSlice::U8(s) => {
-                let mut dst = device.alloc::<u8>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::U8(dst)
-            }
-            RocmStorageSlice::U32(s) => {
-                let mut dst = device.alloc::<u32>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::U32(dst)
-            }
-            RocmStorageSlice::I16(s) => {
-                let mut dst = device.alloc::<i16>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::I16(dst)
-            }
-            RocmStorageSlice::I32(s) => {
-                let mut dst = device.alloc::<i32>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::I32(dst)
-            }
-            RocmStorageSlice::I64(s) => {
-                let mut dst = device.alloc::<i64>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::I64(dst)
-            }
-            RocmStorageSlice::BF16(s) => {
-                let mut dst = device.alloc::<bf16>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::BF16(dst)
-            }
-            RocmStorageSlice::F16(s) => {
-                let mut dst = device.alloc::<f16>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::F16(dst)
-            }
-            RocmStorageSlice::F32(s) => {
-                let mut dst = device.alloc::<f32>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::F32(dst)
-            }
-            RocmStorageSlice::F64(s) => {
-                let mut dst = device.alloc::<f64>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::F64(dst)
-            }
-            RocmStorageSlice::F8E4M3(s) => {
-                let mut dst = device.alloc::<u8>(elem_count)?;
-                dst.copy_from_device(s)?;
-                RocmStorageSlice::F8E4M3(dst)
-            }
+            RocmStorageSlice::U8(s) => whole!(U8, u8, s),
+            RocmStorageSlice::U32(s) => whole!(U32, u32, s),
+            RocmStorageSlice::I16(s) => whole!(I16, i16, s),
+            RocmStorageSlice::I32(s) => whole!(I32, i32, s),
+            RocmStorageSlice::I64(s) => whole!(I64, i64, s),
+            RocmStorageSlice::BF16(s) => whole!(BF16, bf16, s),
+            RocmStorageSlice::F16(s) => whole!(F16, f16, s),
+            RocmStorageSlice::F32(s) => whole!(F32, f32, s),
+            RocmStorageSlice::F64(s) => whole!(F64, f64, s),
+            RocmStorageSlice::F8E4M3(s) => whole!(F8E4M3, u8, s),
         };
         Ok(Self { slice, device })
     }
