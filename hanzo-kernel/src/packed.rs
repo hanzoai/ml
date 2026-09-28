@@ -1632,8 +1632,62 @@ mod tests {
         }
     }
 
-    /// Mean ms a pass on CUDA at the shared bench shape, per tile: `cargo test --features cuda
-    /// packed_speed -- --ignored --nocapture`.
+    /// Mean ms a pass at the shared bench shape per tile and key block, then the tuners' picks.
+    fn speed<R: Runtime, F: Float + CubeElement, M: Float>(
+        c: &ComputeClient<R>,
+        name: &str,
+        conv: fn(f32) -> F,
+    ) {
+        let lens = bench_lens();
+        let heads = 12;
+        let t: usize = lens.iter().sum();
+        let narrow = |v: Vec<f32>| -> Vec<F> { v.into_iter().map(conv).collect() };
+        let qkv = narrow(rnd(t * 3 * heads * D, 7, 1.0));
+        let dout = narrow(rnd(t * heads * D, 9, 1.0));
+        let (cos, sin) = tables(256);
+        let (cos, sin) = (narrow(cos), narrow(sin));
+        let scale = (D as f32).powf(-0.5);
+        let m = std::mem::size_of::<M>();
+        for window in [None, Some(64)] {
+            for (tag, tile) in TILES
+                .into_iter()
+                .filter(|(_, t)| fits(c, attend_shared(*t, m)))
+            {
+                let ms = attend_bench::<R, F, M>(
+                    c, &qkv, &cos, &sin, &lens, heads, window, scale, tile, 50,
+                );
+                eprintln!(
+                    "[packed speed {name}] tokens {t} window {window:?} forward {tag}: {ms:.3} ms"
+                );
+            }
+            let first = TILES
+                .into_iter()
+                .find(|(_, t)| fits(c, attend_shared(*t, m)))
+                .unwrap()
+                .1;
+            let (out, lse) =
+                attend_run::<R, F, M>(c, &qkv, &cos, &sin, &lens, heads, window, scale, first);
+            for (_, bc) in BACKS
+                .into_iter()
+                .filter(|(_, bc)| fits(c, attend_back_shared(*bc, m)))
+            {
+                let ms = attend_back_bench::<R, F, M>(
+                    c, &qkv, &cos, &sin, &lens, heads, window, scale, &out, &dout, &lse, bc, 20,
+                );
+                eprintln!("[packed speed {name}] tokens {t} window {window:?} backward bc {bc}: {ms:.3} ms");
+            }
+            let f = attend_tuned::<R, F, M>(c, &qkv, &cos, &sin, &lens, heads, window, scale);
+            let b = attend_back_tuned::<R, F, M>(
+                c, &qkv, &cos, &sin, &lens, heads, window, scale, &out, &dout, &lse,
+            );
+            eprintln!(
+                "[packed speed {name}] window {window:?} tuned: forward {} (cached {}), backward {} (cached {})",
+                f.winner, f.from_cache, b.winner, b.from_cache
+            );
+        }
+    }
+
+    /// `cargo test --features cuda packed_speed -- --ignored --nocapture`
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
@@ -1641,58 +1695,20 @@ mod tests {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
         use half::bf16;
         let c = CudaRuntime::client(&CudaDevice::default());
-        let lens = bench_lens();
-        let heads = 12;
-        let t: usize = lens.iter().sum();
-        let narrow = |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
-        let qkv = narrow(&rnd(t * 3 * heads * D, 7, 1.0));
-        let dout = narrow(&rnd(t * heads * D, 9, 1.0));
-        let (cos, sin) = tables(256);
-        let (cos, sin) = (narrow(&cos), narrow(&sin));
-        let scale = (D as f32).powf(-0.5);
-        for window in [None, Some(64)] {
-            for (name, tile) in TILES {
-                let ms = attend_bench::<CudaRuntime, bf16, bf16>(
-                    &c, &qkv, &cos, &sin, &lens, heads, window, scale, tile, 50,
-                );
-                eprintln!(
-                    "[packed speed cuda] tokens {t} window {window:?} forward {name}: {ms:.3} ms"
-                );
-            }
-            let (out, lse) = attend_run::<CudaRuntime, bf16, bf16>(
-                &c,
-                &qkv,
-                &cos,
-                &sin,
-                &lens,
-                heads,
-                window,
-                scale,
-                Tile { br: 64, bc: 64 },
-            );
-            for (_, bc) in BACKS
-                .into_iter()
-                .filter(|(_, bc)| fits(&c, attend_back_shared(*bc, 2)))
-            {
-                let ms = attend_back_bench::<CudaRuntime, bf16, bf16>(
-                    &c, &qkv, &cos, &sin, &lens, heads, window, scale, &out, &dout, &lse, bc, 20,
-                );
-                eprintln!(
-                    "[packed speed cuda] tokens {t} window {window:?} backward bc {bc}: {ms:.3} ms"
-                );
-            }
-            let f = attend_tuned::<CudaRuntime, bf16, bf16>(
-                &c, &qkv, &cos, &sin, &lens, heads, window, scale,
-            );
-            let b = attend_back_tuned::<CudaRuntime, bf16, bf16>(
-                &c, &qkv, &cos, &sin, &lens, heads, window, scale, &out, &dout, &lse,
-            );
-            eprintln!(
-                "[packed speed cuda] window {window:?} tuned: forward {} (cached {}), backward {} (cached {})",
-                f.winner, f.from_cache, b.winner, b.from_cache
-            );
-        }
+        speed::<CudaRuntime, bf16, bf16>(&c, "cuda", bf16::from_f32);
     }
+
+    /// `cargo test --no-default-features --features metal packed_speed -- --ignored --nocapture`
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore]
+    fn packed_speed_on_metal() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use half::f16;
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        speed::<WgpuRuntime, f32, f16>(&c, "metal", |x| x);
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn attend_is_the_composite_on_metal() {
