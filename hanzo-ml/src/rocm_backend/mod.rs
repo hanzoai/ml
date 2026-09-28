@@ -15,7 +15,7 @@ mod error;
 #[cfg(feature = "rocm-miopen")]
 mod miopen;
 mod wrappers;
-pub use device::{DeviceId, RocmDevice};
+pub use device::{DeviceId, Graph, RocmDevice, Timer};
 pub use error::{RocmError, WrapErr};
 pub use wrappers::SendSyncDeviceMemory;
 pub mod utils;
@@ -2299,8 +2299,9 @@ impl RocmDevice {
     }
 }
 
-/// Kernel and rocBLAS launches in this process.
+/// Kernel and rocBLAS launches in this process, and graph launches.
 pub(crate) static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GRAPHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 unsafe fn launch_kernel(
     dev: &RocmDevice,

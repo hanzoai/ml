@@ -773,6 +773,17 @@ impl Device {
         }
     }
 
+    /// A timer of this device's stream, where the backend has one.
+    pub fn timer(&self) -> Result<Option<Timer>> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(d) => Ok(Some(Timer::Cuda(d.timer()?))),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(d) => Ok(Some(Timer::Rocm(d.timer()?))),
+            _ => Ok(None),
+        }
+    }
+
     /// Kernel dispatches, and command buffers (Metal) or graph launches (CUDA), so far.
     pub fn counts(&self) -> Option<(u64, u64)> {
         match self {
@@ -795,6 +806,45 @@ impl Device {
             Self::Vulkan(d) => d.synchronize(),
             #[cfg(feature = "wgpu")]
             Self::Wgpu(d) => d.synchronize(),
+        }
+    }
+}
+
+/// Device events around work on a device's stream.
+#[allow(clippy::large_enum_variant)]
+pub enum Timer {
+    #[cfg(feature = "cuda")]
+    Cuda(crate::cuda_backend::Timer),
+    #[cfg(feature = "rocm")]
+    Rocm(crate::rocm_backend::Timer),
+}
+
+impl Timer {
+    pub fn start(&self) -> Result<()> {
+        match *self {
+            #[cfg(feature = "cuda")]
+            Timer::Cuda(ref t) => t.start(),
+            #[cfg(feature = "rocm")]
+            Timer::Rocm(ref t) => t.start(),
+        }
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        match *self {
+            #[cfg(feature = "cuda")]
+            Timer::Cuda(ref t) => t.stop(),
+            #[cfg(feature = "rocm")]
+            Timer::Rocm(ref t) => t.stop(),
+        }
+    }
+
+    /// Milliseconds from start to stop, waiting for stop.
+    pub fn elapsed(&self) -> Result<f32> {
+        match *self {
+            #[cfg(feature = "cuda")]
+            Timer::Cuda(ref t) => t.elapsed(),
+            #[cfg(feature = "rocm")]
+            Timer::Rocm(ref t) => t.elapsed(),
         }
     }
 }
