@@ -1139,11 +1139,11 @@ pub fn attend_back_mma<F: Float, M: Float>(
     let len = cu[seq + 1] as usize - start;
     let sc = scale[0];
 
-    let mut ks = SharedMemory::<M>::new(comptime!(bc * (d + 8)));
-    let mut vs = SharedMemory::<M>::new(comptime!(bc * (d + 8)));
-    let mut qs = SharedMemory::<M>::new(comptime!(bc * (d + 8)));
-    let mut os = SharedMemory::<M>::new(comptime!(bc * (d + 8)));
-    let mut dst = SharedMemory::<M>::new(comptime!(bc * (bc + 8)));
+    let mut ks = SharedMemory::<M>::new_aligned(comptime!(bc * (d + 8)), 16usize);
+    let mut vs = SharedMemory::<M>::new_aligned(comptime!(bc * (d + 8)), 16usize);
+    let mut qs = SharedMemory::<M>::new_aligned(comptime!(bc * (d + 8)), 16usize);
+    let mut os = SharedMemory::<M>::new_aligned(comptime!(bc * (d + 8)), 16usize);
+    let mut dst = SharedMemory::<M>::new_aligned(comptime!(bc * (bc + 8)), 16usize);
     let mut rows = SharedMemory::<f32>::new(comptime!(2 * bc));
 
     let per_k = bc * half / units;
@@ -1293,36 +1293,41 @@ pub fn attend_back_mma<F: Float, M: Float>(
                 dacc[v] = z;
             }
             #[unroll]
-            for kk in 0..kq {
-                let mut a = Array::<Vector<M, NA>>::new(va);
-                let mut av = Array::<Vector<M, NA>>::new(va);
+            for k2 in 0..comptime!(kq / 2) {
+                let at = (g * 8usize + (lane % 8u32) as usize) * dp
+                    + k2 * 32usize
+                    + (lane / 8u32) as usize * 8usize;
+                let mq = def.load_matrix::<M, NB>(
+                    &qs.to_slice().slice(at, at + 8usize),
+                    cmma::MatrixIdent::B,
+                    4usize,
+                    false,
+                );
+                let mo = def.load_matrix::<M, NB>(
+                    &os.to_slice().slice(at, at + 8usize),
+                    cmma::MatrixIdent::B,
+                    4usize,
+                    false,
+                );
                 #[unroll]
-                for v in 0..va {
-                    a[v] = ka[comptime!(kk * va + v)];
-                    av[v] = vfa[comptime!(kk * va + v)];
-                }
-                let mut bq = Array::<Vector<M, NB>>::new(vb);
-                let mut bo = Array::<Vector<M, NB>>::new(vb);
-                #[unroll]
-                for v in 0..vb {
-                    let mut rq = Vector::<M, NB>::empty();
-                    let mut ro = Vector::<M, NB>::empty();
+                for h2 in 0..2usize {
+                    let mut a = Array::<Vector<M, NA>>::new(va);
+                    let mut av = Array::<Vector<M, NA>>::new(va);
                     #[unroll]
-                    for x in 0..wb {
-                        let (row, col) = def.position_of_nth(
-                            lane,
-                            comptime!((v * wb + x) as u32),
-                            cmma::MatrixIdent::B,
-                        );
-                        let at = (g * 8usize + col as usize) * dp + kk * 16usize + row as usize;
-                        rq[x] = qs[at];
-                        ro[x] = os[at];
+                    for v in 0..va {
+                        a[v] = ka[comptime!((2 * k2 + h2) * va + v)];
+                        av[v] = vfa[comptime!((2 * k2 + h2) * va + v)];
                     }
-                    bq[v] = rq;
-                    bo[v] = ro;
+                    let mut bq = Array::<Vector<M, NB>>::new(vb);
+                    let mut bo = Array::<Vector<M, NB>>::new(vb);
+                    #[unroll]
+                    for v in 0..vb {
+                        bq[v] = mq[comptime!(h2 * vb + v)];
+                        bo[v] = mo[comptime!(h2 * vb + v)];
+                    }
+                    def.execute_inplace(&a, &bq, &mut sacc);
+                    def.execute_inplace(&av, &bo, &mut dacc);
                 }
-                def.execute_inplace(&a, &bq, &mut sacc);
-                def.execute_inplace(&av, &bo, &mut dacc);
             }
             #[unroll]
             for v in 0..vc {
@@ -1373,40 +1378,45 @@ pub fn attend_back_mma<F: Float, M: Float>(
                 ad[v] = rd;
             }
             #[unroll]
-            for n in 0..kd {
-                let mut bo = Array::<Vector<M, NB>>::new(vb);
-                let mut bq = Array::<Vector<M, NB>>::new(vb);
+            for n2 in 0..comptime!(kd / 2) {
+                let m = (lane / 8u32) as usize;
+                let at = (kk * 16usize + (m % 2usize) * 8usize + (lane % 8u32) as usize) * dp
+                    + (2usize * n2 + m / 2usize) * 8usize;
+                let mo = def.load_matrix::<M, NB>(
+                    &os.to_slice().slice(at, at + 8usize),
+                    cmma::MatrixIdent::B,
+                    4usize,
+                    true,
+                );
+                let mq = def.load_matrix::<M, NB>(
+                    &qs.to_slice().slice(at, at + 8usize),
+                    cmma::MatrixIdent::B,
+                    4usize,
+                    true,
+                );
                 #[unroll]
-                for v in 0..vb {
-                    let mut ro = Vector::<M, NB>::empty();
-                    let mut rq = Vector::<M, NB>::empty();
+                for h2 in 0..2usize {
+                    let mut bo = Array::<Vector<M, NB>>::new(vb);
+                    let mut bq = Array::<Vector<M, NB>>::new(vb);
                     #[unroll]
-                    for x in 0..wb {
-                        let (row, col) = def.position_of_nth(
-                            lane,
-                            comptime!((v * wb + x) as u32),
-                            cmma::MatrixIdent::B,
-                        );
-                        let at = (kk * 16usize + row as usize) * dp + n * 8usize + col as usize;
-                        ro[x] = os[at];
-                        rq[x] = qs[at];
+                    for v in 0..vb {
+                        bo[v] = mo[comptime!(h2 * vb + v)];
+                        bq[v] = mq[comptime!(h2 * vb + v)];
                     }
-                    bo[v] = ro;
-                    bq[v] = rq;
-                }
-                let mut av = Array::<Vector<f32, NC>>::new(vc);
-                let mut ak = Array::<Vector<f32, NC>>::new(vc);
-                #[unroll]
-                for v in 0..vc {
-                    av[v] = dv[comptime!(n * vc + v)];
-                    ak[v] = dk[comptime!(n * vc + v)];
-                }
-                def.execute_inplace(&ap, &bo, &mut av);
-                def.execute_inplace(&ad, &bq, &mut ak);
-                #[unroll]
-                for v in 0..vc {
-                    dv[comptime!(n * vc + v)] = av[v];
-                    dk[comptime!(n * vc + v)] = ak[v];
+                    let mut av = Array::<Vector<f32, NC>>::new(vc);
+                    let mut ak = Array::<Vector<f32, NC>>::new(vc);
+                    #[unroll]
+                    for v in 0..vc {
+                        av[v] = dv[comptime!((2 * n2 + h2) * vc + v)];
+                        ak[v] = dk[comptime!((2 * n2 + h2) * vc + v)];
+                    }
+                    def.execute_inplace(&ap, &bo, &mut av);
+                    def.execute_inplace(&ad, &bq, &mut ak);
+                    #[unroll]
+                    for v in 0..vc {
+                        dv[comptime!((2 * n2 + h2) * vc + v)] = av[v];
+                        dk[comptime!((2 * n2 + h2) * vc + v)] = ak[v];
+                    }
                 }
             }
         }
