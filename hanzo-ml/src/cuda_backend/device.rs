@@ -69,19 +69,17 @@ pub struct CudaDevice {
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
-    /// Kernel and cuBLAS launches on this device so far, and graph launches.
     pub(crate) launches: Arc<AtomicU64>,
     graphs: Arc<AtomicU64>,
 }
 
-/// A captured stream of work that replays as one launch ([`CudaDevice::capture`]).
+/// Captured work that replays as one launch.
 pub struct Graph {
     graph: cudarc::driver::CudaGraph,
     launches: Arc<AtomicU64>,
 }
 
 impl Graph {
-    /// Replays the captured work on the device's stream: every kernel it holds, one launch.
     pub fn launch(&self) -> Result<()> {
         self.launches.fetch_add(1, Ordering::Relaxed);
         self.graph.launch().w()
@@ -312,8 +310,7 @@ impl CudaDevice {
         self.stream.clone()
     }
 
-    /// Kernel and cuBLAS launches on this device so far, and graph launches; a call's cost is
-    /// the difference of two readings.
+    /// Kernel and cuBLAS launches so far, and graph launches.
     pub fn counts(&self) -> (u64, u64) {
         (
             self.launches.load(Ordering::Relaxed),
@@ -321,11 +318,7 @@ impl CudaDevice {
         )
     }
 
-    /// Captures the work `f` puts on this device's stream as a [`Graph`] that replays as one
-    /// launch, and gives what `f` returned: tensors whose buffers the graph writes on every
-    /// replay. `f` runs once first, uncaptured, so its kernels are compiled and every host
-    /// upload it makes is cached (a capture forbids new ones); memory the captured `f`
-    /// allocates and keeps is freed and reallocated at the same addresses on each launch.
+    /// Captures `f`'s work as a [`Graph`]; the tensors `f` returns are rewritten by every launch.
     pub fn capture<T>(&self, mut f: impl FnMut() -> Result<T>) -> Result<(T, Graph)> {
         use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
         let _cache = self.enable_cuda_graph_htod_cache();

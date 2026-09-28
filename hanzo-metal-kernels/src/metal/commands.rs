@@ -210,10 +210,8 @@ pub struct Commands {
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: usize,
-    /// Holds open ([`Commands::hold`]): while one is live no count of encoders commits the
-    /// current command buffer, so a call's dispatches ride one buffer.
+    /// Live [`Commands::hold`] guards.
     held: AtomicUsize,
-    /// Encoders (compute and blit) ever taken, and command buffers ever committed.
     dispatched: AtomicU64,
     committed: AtomicU64,
     device: Device,
@@ -418,8 +416,7 @@ impl Commands {
         Ok(())
     }
 
-    /// Encoders taken and command buffers committed since this queue was made: what a call
-    /// dispatched is the difference of two readings.
+    /// Encoders taken and command buffers committed so far.
     pub fn totals(&self) -> (u64, u64) {
         (
             self.dispatched.load(Ordering::Relaxed),
@@ -427,8 +424,7 @@ impl Commands {
         )
     }
 
-    /// Keeps the current command buffer open while the guard lives, whatever the encoder count:
-    /// a call's dispatches ride one buffer and commit at its readback or flush. Holds nest.
+    /// While the guard lives no encoder count commits the current command buffer.
     pub fn hold(&self) -> Hold<'_> {
         self.held.fetch_add(1, Ordering::Relaxed);
         Hold { commands: self }

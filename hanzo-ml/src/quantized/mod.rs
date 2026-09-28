@@ -1157,9 +1157,7 @@ impl QTensor {
         self.storage.data()
     }
 
-    /// `dst [m, n] = lhs [m, k] · Wᵀ` for this `[n, k]` weight on the CPU, written into `dst`
-    /// with no allocation: the tiled kernels over repacked blocks where this CPU has them
-    /// ([`repack::tiled`]), else a dot product per output. `m` is `lhs.len() / k`.
+    /// `dst [m, n] = lhs [m, k] · Wᵀ` for this `[n, k]` CPU weight, without allocating.
     pub fn matmul_into(&self, lhs: &[f32], dst: &mut [f32]) -> Result<()> {
         let (n, k) = self.shape.dims2()?;
         if k == 0 || lhs.len() % k != 0 {
@@ -3444,7 +3442,6 @@ impl crate::Module for QMatMul {
 mod tests {
     use super::GgmlDType;
 
-    /// `matmul_into` writes what the tensor path computes, over an allocated destination.
     #[test]
     fn matmul_into_is_the_matmul() -> crate::Result<()> {
         use crate::{Device, Module, Tensor};
