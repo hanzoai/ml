@@ -256,11 +256,7 @@ mod tests {
             / top
     }
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn row_gradients_on_cuda() {
-        use cubecl::cuda::{CudaDevice, CudaRuntime};
-        let c = CudaRuntime::client(&CudaDevice::default());
+    fn rows<R: Runtime>(c: &ComputeClient<R>, name: &str) {
         let (rows, d) = (70usize, 768usize);
         let z = rnd(rows * d, 3, 3.0);
         let dy = rnd(rows * d, 5, 1.0);
@@ -281,9 +277,9 @@ mod tests {
                 want[r * d + i] = y[r * d + i] as f64 * (dy[r * d + i] as f64 - dot);
             }
         }
-        let got = softmax_back_run::<CudaRuntime, f32>(&c, &y, &dy, d);
+        let got = softmax_back_run::<R, f32>(c, &y, &dy, d);
         let g = gap(&got, &want);
-        eprintln!("[softmax back cuda] {g:.2e}");
+        eprintln!("[softmax back {name}] {g:.2e}");
         assert!(g < 1e-5);
 
         let x = rnd(rows * d, 7, 2.0);
@@ -307,9 +303,23 @@ mod tests {
                 wdb[i] += dy[r * d + i] as f64;
             }
         }
-        let (dx, da, db) = layer_norm_back_run::<CudaRuntime, f32>(&c, &x, &dy, &alpha, eps as f32);
+        let (dx, da, db) = layer_norm_back_run::<R, f32>(c, &x, &dy, &alpha, eps as f32);
         let (gx, ga, gb) = (gap(&dx, &wdx), gap(&da, &wda), gap(&db, &wdb));
-        eprintln!("[layer norm back cuda] dx {gx:.2e}, dα {ga:.2e}, dβ {gb:.2e}");
+        eprintln!("[layer norm back {name}] dx {gx:.2e}, dα {ga:.2e}, dβ {gb:.2e}");
         assert!(gx < 1e-5 && ga < 1e-5 && gb < 1e-5);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn row_gradients_on_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        rows(&CudaRuntime::client(&CudaDevice::default()), "cuda");
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn row_gradients_on_metal() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        rows(&WgpuRuntime::client(&WgpuDevice::default()), "metal");
     }
 }

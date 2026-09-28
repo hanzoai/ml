@@ -65,8 +65,8 @@ pub fn attend<F: Float, M: Float>(
         let r = idx / half;
         let j = idx % half;
         let i = i0 + r;
-        let mut y1 = f32::new(0.0);
-        let mut y2 = f32::new(0.0);
+        let mut y1 = f32::new(0.0f32);
+        let mut y2 = f32::new(0.0f32);
         if i < len {
             let at = (start + i) * ld + h * d;
             let x1 = f32::cast_from(qkv[at + j]);
@@ -81,11 +81,11 @@ pub fn attend<F: Float, M: Float>(
     }
     let per_o = br * d / units;
     for e in 0..per_o {
-        of[u * per_o + e] = f32::new(0.0);
+        of[u * per_o + e] = f32::new(0.0f32);
     }
     if u < br {
-        row[u] = f32::new(-3.0e38);
-        row[br + u] = f32::new(0.0);
+        row[u] = f32::new(-3.0e38f32);
+        row[br + u] = f32::new(0.0f32);
     }
 
     let mut lo = len - len;
@@ -108,10 +108,10 @@ pub fn attend<F: Float, M: Float>(
             let c = idx / half;
             let jj = idx % half;
             let j = j0 + c;
-            let mut y1 = f32::new(0.0);
-            let mut y2 = f32::new(0.0);
-            let mut v1 = f32::new(0.0);
-            let mut v2 = f32::new(0.0);
+            let mut y1 = f32::new(0.0f32);
+            let mut y2 = f32::new(0.0f32);
+            let mut v1 = f32::new(0.0f32);
+            let mut v2 = f32::new(0.0f32);
             if j < len {
                 let at = (start + j) * ld + hd + h * d;
                 let x1 = f32::cast_from(qkv[at + jj]);
@@ -188,7 +188,7 @@ pub fn attend<F: Float, M: Float>(
                     let idx = u * per_s + e;
                     let r = idx / bc;
                     let c = idx % bc;
-                    let mut acc = f32::new(0.0);
+                    let mut acc = f32::new(0.0f32);
                     for k in 0..d {
                         acc += f32::cast_from(qs[r * d + k]) * f32::cast_from(ks[c * d + k]);
                     }
@@ -201,7 +201,7 @@ pub fn attend<F: Float, M: Float>(
         // the online softmax, a row per unit: masked keys weigh exactly zero
         if u < br {
             let i = i0 + u;
-            let mut top = f32::new(-3.0e38);
+            let mut top = f32::new(-3.0e38f32);
             for c in 0..bc {
                 let j = j0 + c;
                 let mut near = true;
@@ -221,14 +221,14 @@ pub fn attend<F: Float, M: Float>(
             if top > m {
                 m = top;
             }
-            if m == f32::new(-3.0e38) {
-                row[2 * br + u] = f32::new(1.0);
+            if m == f32::new(-3.0e38f32) {
+                row[2 * br + u] = f32::new(1.0f32);
                 for c in 0..bc {
-                    ps[u * bc + c] = M::cast_from(f32::new(0.0));
+                    ps[u * bc + c] = M::cast_from(f32::new(0.0f32));
                 }
             } else {
                 let em = (old - m).exp();
-                let mut sum = f32::new(0.0);
+                let mut sum = f32::new(0.0f32);
                 for c in 0..bc {
                     let j = j0 + c;
                     let mut near = true;
@@ -236,7 +236,7 @@ pub fn attend<F: Float, M: Float>(
                         let gap = if i > j { i - j } else { j - i };
                         near = gap < window;
                     }
-                    let mut w = f32::new(0.0);
+                    let mut w = f32::new(0.0f32);
                     if i < len && j < len && near {
                         w = (sf[u * bc + c] - m).exp();
                     }
@@ -363,7 +363,7 @@ pub fn delta<F: Float>(
         let t = idx / heads;
         let h = idx % heads;
         let at = (t * heads + h) * d;
-        let mut acc = f32::new(0.0);
+        let mut acc = f32::new(0.0f32);
         for k in 0..d {
             acc += f32::cast_from(out[at + k]) * f32::cast_from(dout[at + k]);
         }
@@ -431,10 +431,10 @@ pub fn attend_back<F: Float, M: Float>(
         let c = idx / half;
         let jj = idx % half;
         let j = j0 + c;
-        let mut y1 = f32::new(0.0);
-        let mut y2 = f32::new(0.0);
-        let mut v1 = f32::new(0.0);
-        let mut v2 = f32::new(0.0);
+        let mut y1 = f32::new(0.0f32);
+        let mut y2 = f32::new(0.0f32);
+        let mut v1 = f32::new(0.0f32);
+        let mut v2 = f32::new(0.0f32);
         if j < len {
             let at = (start + j) * ld + hd + h * d;
             let x1 = f32::cast_from(qkv[at + jj]);
@@ -453,8 +453,8 @@ pub fn attend_back<F: Float, M: Float>(
     }
     let per_o = bc * d / units;
     for e in 0..per_o {
-        sf[dka + u * per_o + e] = f32::new(0.0);
-        sf[dva + u * per_o + e] = f32::new(0.0);
+        sf[dka + u * per_o + e] = f32::new(0.0f32);
+        sf[dva + u * per_o + e] = f32::new(0.0f32);
     }
 
     let mut lo = len - len;
@@ -478,10 +478,10 @@ pub fn attend_back<F: Float, M: Float>(
             let r = idx / half;
             let j = idx % half;
             let i = i0 + r;
-            let mut y1 = f32::new(0.0);
-            let mut y2 = f32::new(0.0);
-            let mut o1 = f32::new(0.0);
-            let mut o2 = f32::new(0.0);
+            let mut y1 = f32::new(0.0f32);
+            let mut y2 = f32::new(0.0f32);
+            let mut o1 = f32::new(0.0f32);
+            let mut o2 = f32::new(0.0f32);
             if i < len {
                 let at = (start + i) * ld + h * d;
                 let x1 = f32::cast_from(qkv[at + j]);
@@ -501,8 +501,8 @@ pub fn attend_back<F: Float, M: Float>(
         }
         if u < bc {
             let i = i0 + u;
-            let mut l = f32::new(0.0);
-            let mut dl = f32::new(0.0);
+            let mut l = f32::new(0.0f32);
+            let mut dl = f32::new(0.0f32);
             if i < len {
                 l = lse[h * total + start + i];
                 dl = delta[h * total + start + i];
@@ -535,13 +535,37 @@ pub fn attend_back<F: Float, M: Float>(
                     cmma::store(&mut sf.to_slice_mut().slice_mut(dpt + p * 16usize * bc + g * 16usize, dpt + bc * bc), &dp, bc as u32, cmma::MatrixLayout::RowMajor);
                 }
             }
+            metal => {
+                let p = PLANE_POS as usize;
+                for ti in 0..2usize {
+                    let r0 = p * 16usize + ti * 8usize;
+                    for g in 0..bc / 8usize {
+                        let s = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, 0.0f32);
+                        let dp = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, 0.0f32);
+                        for dk in 0..d / 8usize {
+                            let a = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::A, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor,
+                                &mf.to_slice().slice(r0 * d + dk * 8usize, bc * d), d as u32);
+                            let b = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::B, 8usize, 8usize, 8usize, cmma::MatrixLayout::ColMajor,
+                                &mf.to_slice().slice(qs + g * 8usize * d + dk * 8usize, qs + bc * d), d as u32);
+                            cmma::execute::<M, M, f32, f32>(&a, &b, &s, &s);
+                            let a = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::A, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor,
+                                &mf.to_slice().slice(vs + r0 * d + dk * 8usize, vs + bc * d), d as u32);
+                            let b = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::B, 8usize, 8usize, 8usize, cmma::MatrixLayout::ColMajor,
+                                &mf.to_slice().slice(os + g * 8usize * d + dk * 8usize, os + bc * d), d as u32);
+                            cmma::execute::<M, M, f32, f32>(&a, &b, &dp, &dp);
+                        }
+                        cmma::store(&mut sf.to_slice_mut().slice_mut(r0 * bc + g * 8usize, bc * bc), &s, bc as u32, cmma::MatrixLayout::RowMajor);
+                        cmma::store(&mut sf.to_slice_mut().slice_mut(dpt + r0 * bc + g * 8usize, dpt + bc * bc), &dp, bc as u32, cmma::MatrixLayout::RowMajor);
+                    }
+                }
+            }
             default => {
                 for e in 0..per_s {
                     let idx = u * per_s + e;
                     let c = idx / bc;
                     let r = idx % bc;
-                    let mut s = f32::new(0.0);
-                    let mut dp = f32::new(0.0);
+                    let mut s = f32::new(0.0f32);
+                    let mut dp = f32::new(0.0f32);
                     for k in 0..d {
                         s += f32::cast_from(mf[c * d + k]) * f32::cast_from(mf[qs + r * d + k]);
                         dp += f32::cast_from(mf[vs + c * d + k]) * f32::cast_from(mf[os + r * d + k]);
@@ -565,8 +589,8 @@ pub fn attend_back<F: Float, M: Float>(
                 let gap = if i > j { i - j } else { j - i };
                 near = gap < window;
             }
-            let mut pv = f32::new(0.0);
-            let mut ds = f32::new(0.0);
+            let mut pv = f32::new(0.0f32);
+            let mut ds = f32::new(0.0f32);
             if i < len && j < len && near {
                 pv = (sf[idx] - sf[rows + r]).exp();
                 ds = pv * (sf[dpt + idx] - sf[rows + bc + r]);
@@ -608,6 +632,39 @@ pub fn attend_back<F: Float, M: Float>(
                     cmma::store(&mut sf.to_slice_mut().slice_mut(p * 16usize * d + dn * 16usize, bc * d), &q, d as u32, cmma::MatrixLayout::RowMajor);
                 }
             }
+            metal => {
+                let p = PLANE_POS as usize;
+                for ti in 0..2usize {
+                    let r0 = p * 16usize + ti * 8usize;
+                    for tn in 0..d / 8usize {
+                        let v = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, 0.0f32);
+                        let k = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, 0.0f32);
+                        let q = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, 0.0f32);
+                        cmma::load_with_layout(&v, &sf.to_slice().slice(dva + r0 * d + tn * 8usize, dva + bc * d), d as u32, cmma::MatrixLayout::RowMajor);
+                        cmma::load_with_layout(&k, &sf.to_slice().slice(dka + r0 * d + tn * 8usize, dka + bc * d), d as u32, cmma::MatrixLayout::RowMajor);
+                        for kc in 0..bc / 8usize {
+                            let a = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::A, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor,
+                                &mf.to_slice().slice(pm + r0 * bc + kc * 8usize, pm + bc * bc), bc as u32);
+                            let b = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::B, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor,
+                                &mf.to_slice().slice(os + kc * 8usize * d + tn * 8usize, os + bc * d), d as u32);
+                            cmma::execute::<M, M, f32, f32>(&a, &b, &v, &v);
+                            let a = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::A, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor,
+                                &mf.to_slice().slice(dm + r0 * bc + kc * 8usize, dm + bc * bc), bc as u32);
+                            let b = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::B, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor,
+                                &mf.to_slice().slice(qs + kc * 8usize * d + tn * 8usize, qs + bc * d), d as u32);
+                            cmma::execute::<M, M, f32, f32>(&a, &b, &k, &k);
+                            let a = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::A, 8usize, 8usize, 8usize, cmma::MatrixLayout::ColMajor,
+                                &mf.to_slice().slice(dm + kc * 8usize * bc + r0, dm + bc * bc), bc as u32);
+                            let b = cmma::Matrix::<M>::from_slice(cmma::MatrixIdent::B, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor,
+                                &mf.to_slice().slice(kc * 8usize * d + tn * 8usize, bc * d), d as u32);
+                            cmma::execute::<M, M, f32, f32>(&a, &b, &q, &q);
+                        }
+                        cmma::store(&mut sf.to_slice_mut().slice_mut(dva + r0 * d + tn * 8usize, dva + bc * d), &v, d as u32, cmma::MatrixLayout::RowMajor);
+                        cmma::store(&mut sf.to_slice_mut().slice_mut(dka + r0 * d + tn * 8usize, dka + bc * d), &k, d as u32, cmma::MatrixLayout::RowMajor);
+                        cmma::store(&mut sf.to_slice_mut().slice_mut(r0 * d + tn * 8usize, bc * d), &q, d as u32, cmma::MatrixLayout::RowMajor);
+                    }
+                }
+            }
             default => {
                 for e in 0..per_o {
                     let idx = u * per_o + e;
@@ -615,7 +672,7 @@ pub fn attend_back<F: Float, M: Float>(
                     let dd = idx % d;
                     let mut gv = sf[dva + idx];
                     let mut gk = sf[dka + idx];
-                    let mut gq = f32::new(0.0);
+                    let mut gq = f32::new(0.0f32);
                     for r in 0..bc {
                         gv += f32::cast_from(mf[pm + c * bc + r]) * f32::cast_from(mf[os + r * d + dd]);
                         gk += f32::cast_from(mf[dm + c * bc + r]) * f32::cast_from(mf[qs + r * d + dd]);
@@ -1137,6 +1194,251 @@ pub fn attend_ref(
     (out, lse)
 }
 
+/// The lengths the speed tests share with hanzo-nn's: 32 sequences of 64 to 191 tokens.
+pub fn bench_lens() -> Vec<usize> {
+    (0..32).map(|i| 64 + (i * 37) % 128).collect()
+}
+
+/// [`attend`] launched `iters` times on `client` after a warmup; mean ms a launch.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_bench<R: Runtime, F: Float + CubeElement, M: Float>(
+    client: &ComputeClient<R>,
+    qkv: &[F],
+    cos: &[F],
+    sin: &[F],
+    lens: &[usize],
+    heads: usize,
+    window: Option<usize>,
+    scale: f32,
+    tile: Tile,
+    iters: usize,
+) -> f64 {
+    let t: usize = lens.iter().sum();
+    let (cu, tiles) = layout(lens, tile.br);
+    let nt = (tiles.len() / 2) as u32;
+    let units = tile.br / 16 * client.properties().hardware.plane_size_max as usize;
+    let win = window.map_or(0, |w| w as u32 + 1);
+    let make = |bytes: &[u8]| client.create_from_slice(bytes);
+    let bufs = [
+        make(F::as_bytes(qkv)),
+        make(F::as_bytes(cos)),
+        make(F::as_bytes(sin)),
+        make(u32::as_bytes(&cu)),
+        make(u32::as_bytes(&tiles)),
+        make(&vec![0u8; t * heads * D * std::mem::size_of::<F>()]),
+        make(f32::as_bytes(&vec![0f32; heads * t])),
+        make(u32::as_bytes(&[heads as u32, win, t as u32, 0, 0])),
+        make(f32::as_bytes(&[scale])),
+    ];
+    let lens = [
+        qkv.len(),
+        cos.len(),
+        sin.len(),
+        cu.len(),
+        tiles.len(),
+        t * heads * D,
+        heads * t,
+        5,
+        1,
+    ];
+    let launch = || unsafe {
+        let arg = |i: usize| ArrayArg::from_raw_parts(bufs[i].clone(), lens[i]);
+        attend::launch_unchecked::<F, M, R>(
+            client,
+            Grid::Static(nt, heads as u32, 1),
+            Block::new_1d(units as u32),
+            arg(0),
+            arg(1),
+            arg(2),
+            arg(3),
+            arg(4),
+            arg(5),
+            arg(6),
+            arg(7),
+            arg(8),
+            D,
+            tile.br,
+            tile.bc,
+            units,
+            Target::of(client),
+        );
+    };
+    for _ in 0..3 {
+        launch();
+    }
+    let _ = client.read_one_unchecked(bufs[6].clone());
+    let clock = std::time::Instant::now();
+    for _ in 0..iters {
+        launch();
+    }
+    let _ = client.read_one_unchecked(bufs[6].clone());
+    clock.elapsed().as_secs_f64() * 1e3 / iters as f64
+}
+
+/// [`attend_back_run`]'s three kernels launched `iters` times after a warmup; mean ms a pass.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_back_bench<R: Runtime, F: Float + CubeElement, M: Float>(
+    client: &ComputeClient<R>,
+    qkv: &[F],
+    cos: &[F],
+    sin: &[F],
+    lens: &[usize],
+    heads: usize,
+    window: Option<usize>,
+    scale: f32,
+    out: &[F],
+    dout: &[F],
+    lse: &[f32],
+    bc: usize,
+    iters: usize,
+) -> f64 {
+    let t: usize = lens.iter().sum();
+    let (cu, tiles) = layout(lens, bc);
+    let nt = (tiles.len() / 2) as u32;
+    let pos: Vec<u32> = lens.iter().flat_map(|&l| 0..l as u32).collect();
+    let win = window.map_or(0, |w| w as u32 + 1);
+    let units = bc / 16 * client.properties().hardware.plane_size_max as usize;
+    let lead = (2 * bc * bc).max(bc * D);
+    let make = |bytes: &[u8]| client.create_from_slice(bytes);
+    let (qh, csh, snh, ch, th) = (
+        make(F::as_bytes(qkv)),
+        make(F::as_bytes(cos)),
+        make(F::as_bytes(sin)),
+        make(u32::as_bytes(&cu)),
+        make(u32::as_bytes(&tiles)),
+    );
+    let (oh, doh, lh, sh, ph) = (
+        make(F::as_bytes(out)),
+        make(F::as_bytes(dout)),
+        make(f32::as_bytes(lse)),
+        make(f32::as_bytes(&[scale])),
+        make(u32::as_bytes(&pos)),
+    );
+    let dh = make(f32::as_bytes(&vec![0f32; heads * t]));
+    let dqh = make(f32::as_bytes(&vec![0f32; t * heads * D]));
+    let gh = make(&vec![0u8; t * 3 * heads * D * std::mem::size_of::<F>()]);
+    let mh = make(u32::as_bytes(&[heads as u32, win, t as u32, 0, 0]));
+    let count = (t * heads) as u32;
+    let pairs = (t * heads * D / 2) as u32;
+    let launch = || unsafe {
+        delta::launch_unchecked::<F, R>(
+            client,
+            Grid::Static(count.div_ceil(64), 1, 1),
+            Block::new_1d(64),
+            ArrayArg::from_raw_parts(oh.clone(), out.len()),
+            ArrayArg::from_raw_parts(doh.clone(), dout.len()),
+            ArrayArg::from_raw_parts(dh.clone(), heads * t),
+            ArrayArg::from_raw_parts(mh.clone(), 5),
+            D,
+        );
+        attend_back::launch_unchecked::<F, M, R>(
+            client,
+            Grid::Static(nt, heads as u32, 1),
+            Block::new_1d(units as u32),
+            ArrayArg::from_raw_parts(qh.clone(), qkv.len()),
+            ArrayArg::from_raw_parts(csh.clone(), cos.len()),
+            ArrayArg::from_raw_parts(snh.clone(), sin.len()),
+            ArrayArg::from_raw_parts(ch.clone(), cu.len()),
+            ArrayArg::from_raw_parts(th.clone(), tiles.len()),
+            ArrayArg::from_raw_parts(doh.clone(), dout.len()),
+            ArrayArg::from_raw_parts(lh.clone(), lse.len()),
+            ArrayArg::from_raw_parts(dh.clone(), heads * t),
+            ArrayArg::from_raw_parts(dqh.clone(), t * heads * D),
+            ArrayArg::from_raw_parts(gh.clone(), t * 3 * heads * D),
+            ArrayArg::from_raw_parts(mh.clone(), 5),
+            ArrayArg::from_raw_parts(sh.clone(), 1),
+            D,
+            bc,
+            lead,
+            units,
+            Target::of(client),
+        );
+        rotate_back::launch_unchecked::<F, R>(
+            client,
+            Grid::Static(pairs.div_ceil(64), 1, 1),
+            Block::new_1d(64),
+            ArrayArg::from_raw_parts(dqh.clone(), t * heads * D),
+            ArrayArg::from_raw_parts(csh.clone(), cos.len()),
+            ArrayArg::from_raw_parts(snh.clone(), sin.len()),
+            ArrayArg::from_raw_parts(ph.clone(), t),
+            ArrayArg::from_raw_parts(gh.clone(), t * 3 * heads * D),
+            ArrayArg::from_raw_parts(mh.clone(), 5),
+            ArrayArg::from_raw_parts(sh.clone(), 1),
+            D,
+        );
+    };
+    for _ in 0..3 {
+        launch();
+    }
+    let _ = client.read_one_unchecked(dh.clone());
+    let clock = std::time::Instant::now();
+    for _ in 0..iters {
+        launch();
+    }
+    let _ = client.read_one_unchecked(dh.clone());
+    clock.elapsed().as_secs_f64() * 1e3 / iters as f64
+}
+
+/// [`attend`] at the fastest tile for `(device, shape)`, tuned once and cached ([`crate::tune`]).
+#[allow(clippy::too_many_arguments)]
+pub fn attend_tuned<R: Runtime, F: Float + CubeElement, M: Float>(
+    client: &ComputeClient<R>,
+    qkv: &[F],
+    cos: &[F],
+    sin: &[F],
+    lens: &[usize],
+    heads: usize,
+    window: Option<usize>,
+    scale: f32,
+) -> crate::tune::Pick<Tile> {
+    let t: usize = lens.iter().sum();
+    let key = format!(
+        "heads={heads},window={},tokens={},longest={}",
+        window.map_or(0, |w| w + 1),
+        t.next_power_of_two(),
+        lens.iter().max().copied().unwrap_or(0).next_power_of_two()
+    );
+    let mut tuned = crate::tune::Tuned::new("packed_attend", key);
+    let m = std::mem::size_of::<M>();
+    for (name, tile) in TILES
+        .into_iter()
+        .filter(|(_, t)| fits(client, attend_shared(*t, m)))
+    {
+        tuned = tuned.variant(name, move |iters| {
+            let ms = attend_bench::<R, F, M>(
+                client, qkv, cos, sin, lens, heads, window, scale, tile, iters,
+            );
+            (tile, ms)
+        });
+    }
+    tuned.pick(client)
+}
+
+/// Shared bytes [`attend`] takes at `tile`, its matrix operands `m` bytes each.
+pub fn attend_shared(tile: Tile, m: usize) -> usize {
+    let (br, bc) = (tile.br, tile.bc);
+    m * (br * D + 2 * bc * D + br * bc) + 4 * (br * bc + br * D + 3 * br)
+}
+
+/// Shared bytes [`attend_back`] takes at `bc`, its matrix operands `m` bytes each.
+pub fn attend_back_shared(bc: usize, m: usize) -> usize {
+    m * (4 * bc * D + 2 * bc * bc) + 4 * ((2 * bc * bc).max(bc * D) + 2 * bc * D + 2 * bc)
+}
+
+/// Whether `bytes` of shared memory fit a cube on `client`'s device.
+pub fn fits<R: Runtime>(client: &ComputeClient<R>, bytes: usize) -> bool {
+    bytes <= client.properties().hardware.max_shared_memory_size
+}
+
+/// The schedules [`attend_tuned`] times.
+pub const TILES: [(&str, Tile); 5] = [
+    ("r16_c16", Tile { br: 16, bc: 16 }),
+    ("r32_c32", Tile { br: 32, bc: 32 }),
+    ("r64_c32", Tile { br: 64, bc: 32 }),
+    ("r32_c64", Tile { br: 32, bc: 64 }),
+    ("r64_c64", Tile { br: 64, bc: 64 }),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,11 +1521,7 @@ mod tests {
         let (cos, sin) = (round(cos), round(sin));
         let scale = (D as f32).powf(-0.5);
         let narrow = |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
-        for tile in [
-            Tile { br: 16, bc: 16 },
-            Tile { br: 32, bc: 32 },
-            Tile { br: 64, bc: 64 },
-        ] {
+        for (_, tile) in TILES {
             for window in [None, Some(8), Some(64)] {
                 let (want, wlse) = attend_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale);
                 let (got, glse) = attend_run::<CudaRuntime, bf16, bf16>(
@@ -1285,6 +1583,95 @@ mod tests {
                 let r = rel(&got, &want);
                 eprintln!("[packed back cuda] bc {bc} window {window:?}: dqkv {r:.2e}");
                 assert!(r < 3e-2, "bc {bc} window {window:?}: {r}");
+            }
+        }
+    }
+    /// Mean ms a pass on CUDA at the shared bench shape, per tile: `cargo test --features cuda
+    /// packed_speed -- --ignored --nocapture`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn packed_speed_on_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        use half::bf16;
+        let c = CudaRuntime::client(&CudaDevice::default());
+        let lens = bench_lens();
+        let heads = 12;
+        let t: usize = lens.iter().sum();
+        let narrow = |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
+        let qkv = narrow(&rnd(t * 3 * heads * D, 7, 1.0));
+        let dout = narrow(&rnd(t * heads * D, 9, 1.0));
+        let (cos, sin) = tables(256);
+        let (cos, sin) = (narrow(&cos), narrow(&sin));
+        let scale = (D as f32).powf(-0.5);
+        for window in [None, Some(64)] {
+            for (name, tile) in TILES {
+                let ms = attend_bench::<CudaRuntime, bf16, bf16>(
+                    &c, &qkv, &cos, &sin, &lens, heads, window, scale, tile, 50,
+                );
+                eprintln!(
+                    "[packed speed cuda] tokens {t} window {window:?} forward {name}: {ms:.3} ms"
+                );
+            }
+            let (out, lse) = attend_run::<CudaRuntime, bf16, bf16>(
+                &c,
+                &qkv,
+                &cos,
+                &sin,
+                &lens,
+                heads,
+                window,
+                scale,
+                Tile { br: 64, bc: 64 },
+            );
+            for bc in [16usize, 32] {
+                let ms = attend_back_bench::<CudaRuntime, bf16, bf16>(
+                    &c, &qkv, &cos, &sin, &lens, heads, window, scale, &out, &dout, &lse, bc, 20,
+                );
+                eprintln!(
+                    "[packed speed cuda] tokens {t} window {window:?} backward bc {bc}: {ms:.3} ms"
+                );
+            }
+        }
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn attend_is_the_composite_on_metal() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use half::f16;
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        let t: usize = LENS.iter().sum();
+        let qkv = rnd(t * 3 * HEADS * D, 7, 1.0);
+        let dout = rnd(t * HEADS * D, 9, 1.0);
+        let (cos, sin) = tables(128);
+        let scale = (D as f32).powf(-0.5);
+        for window in [None, Some(8)] {
+            let (want, wlse) = attend_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale);
+            for (_, tile) in TILES
+                .into_iter()
+                .filter(|(_, t)| fits(&c, attend_shared(*t, 2)))
+            {
+                let (got, glse) = attend_run::<WgpuRuntime, f32, f16>(
+                    &c, &qkv, &cos, &sin, &LENS, HEADS, window, scale, tile,
+                );
+                let (r, rl) = (rel(&got, &want), rel(&glse, &wlse));
+                eprintln!("[packed metal] {tile:?} window {window:?}: out {r:.2e}, lse {rl:.2e}");
+                assert!(
+                    r < 1e-2 && rl < 1e-2,
+                    "{tile:?} window {window:?}: {r}, {rl}"
+                );
+            }
+            let grad = attend_back_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale, &dout);
+            for bc in [16usize, 32]
+                .into_iter()
+                .filter(|&b| fits(&c, attend_back_shared(b, 2)))
+            {
+                let got = attend_back_run::<WgpuRuntime, f32, f16>(
+                    &c, &qkv, &cos, &sin, &LENS, HEADS, window, scale, &want, &dout, &wlse, bc,
+                );
+                let r = rel(&got, &grad);
+                eprintln!("[packed back metal] bc {bc} window {window:?}: dqkv {r:.2e}");
+                assert!(r < 2e-2, "bc {bc} window {window:?}: {r}");
             }
         }
     }

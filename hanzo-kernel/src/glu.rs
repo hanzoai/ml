@@ -131,6 +131,13 @@ mod tests {
         check(&CpuRuntime::client(&CpuDevice::default()), "cpu");
     }
 
+    #[cfg(feature = "metal")]
+    #[test]
+    fn geglu_is_the_composite_on_metal() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        check(&WgpuRuntime::client(&WgpuDevice::default()), "metal");
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn geglu_is_the_composite_on_cuda() {

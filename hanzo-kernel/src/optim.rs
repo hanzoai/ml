@@ -178,17 +178,34 @@ mod tests {
         check(&CudaRuntime::client(&CudaDevice::default()), "cuda");
     }
 
+    fn sums<R: Runtime>(c: &ComputeClient<R>, name: &str) {
+        let x = rnd(100_003, 13);
+        let want: f64 = x.iter().map(|&v| v as f64 * v as f64).sum();
+        for blocks in [1u32, 7, 64] {
+            let got: f64 = sumsq_run(c, &x, blocks).iter().map(|&v| v as f64).sum();
+            eprintln!("[sumsq {name}] {blocks} blocks: {got} against {want}");
+            assert!((got - want).abs() <= 1e-5 * want);
+        }
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn sumsq_sums_on_cuda() {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
-        let c = CudaRuntime::client(&CudaDevice::default());
-        let x = rnd(100_003, 13);
-        let want: f64 = x.iter().map(|&v| v as f64 * v as f64).sum();
-        for blocks in [1u32, 7, 64] {
-            let got: f64 = sumsq_run(&c, &x, blocks).iter().map(|&v| v as f64).sum();
-            eprintln!("[sumsq cuda] {blocks} blocks: {got} against {want}");
-            assert!((got - want).abs() <= 1e-5 * want);
-        }
+        sums(&CudaRuntime::client(&CudaDevice::default()), "cuda");
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn sumsq_sums_on_metal() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        sums(&WgpuRuntime::client(&WgpuDevice::default()), "metal");
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn adamw_is_the_step_on_metal() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        check(&WgpuRuntime::client(&WgpuDevice::default()), "metal");
     }
 }
