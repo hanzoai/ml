@@ -323,13 +323,14 @@ impl CudaDevice {
 
     /// Captures the work `f` puts on this device's stream as a [`Graph`] that replays as one
     /// launch, and gives what `f` returned: tensors whose buffers the graph writes on every
-    /// replay. Run `f` once before capturing so every host upload it makes is cached (the
-    /// capture forbids new ones); memory `f` allocates and keeps is freed and reallocated at the
-    /// same addresses on each launch.
-    pub fn capture<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<(T, Graph)> {
+    /// replay. `f` runs once first, uncaptured, so its kernels are compiled and every host
+    /// upload it makes is cached (a capture forbids new ones); memory the captured `f`
+    /// allocates and keeps is freed and reallocated at the same addresses on each launch.
+    pub fn capture<T>(&self, mut f: impl FnMut() -> Result<T>) -> Result<(T, Graph)> {
         use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
-        self.stream.synchronize().w()?;
         let _cache = self.enable_cuda_graph_htod_cache();
+        drop(f()?);
+        self.stream.synchronize().w()?;
         self.stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .w()?;
