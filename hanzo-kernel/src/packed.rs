@@ -2537,12 +2537,9 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn attend_is_the_composite_on_cuda() {
-        use cubecl::cuda::{CudaDevice, CudaRuntime};
+    /// Every schedule `c`'s device runs against the composite in f64, bf16 in and out.
+    fn forward<R: Runtime>(c: &ComputeClient<R>, name: &str) {
         use half::bf16;
-        let c = CudaRuntime::client(&CudaDevice::default());
         let t: usize = LENS.iter().sum();
         let round = |v: Vec<f32>| -> Vec<f32> {
             v.into_iter().map(|x| bf16::from_f32(x).to_f32()).collect()
@@ -2552,11 +2549,11 @@ mod tests {
         let (cos, sin) = (round(cos), round(sin));
         let scale = (D as f32).powf(-0.5);
         let narrow = |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
-        for (_, tile) in TILES {
+        for (_, tile) in TILES.into_iter().filter(|(_, t)| usable(c, *t, 2)) {
             for window in [None, Some(8), Some(64)] {
                 let (want, wlse) = attend_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale);
-                let (got, glse) = attend_run::<CudaRuntime, bf16, bf16>(
-                    &c,
+                let (got, glse) = attend_run::<R, bf16, bf16>(
+                    c,
                     &narrow(&qkv),
                     &narrow(&cos),
                     &narrow(&sin),
@@ -2568,7 +2565,7 @@ mod tests {
                 );
                 let got: Vec<f32> = got.iter().map(|x| x.to_f32()).collect();
                 let (r, rl) = (rel(&got, &want), rel(&glse, &wlse));
-                eprintln!("[packed cuda] {tile:?} window {window:?}: out {r:.2e}, lse {rl:.2e}");
+                eprintln!("[packed {name}] {tile:?} window {window:?}: out {r:.2e}, lse {rl:.2e}");
                 assert!(
                     r < 2e-2 && rl < 1e-2,
                     "{tile:?} window {window:?}: {r}, {rl}"
@@ -2576,12 +2573,9 @@ mod tests {
             }
         }
     }
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn attend_back_is_the_gradient_on_cuda() {
-        use cubecl::cuda::{CudaDevice, CudaRuntime};
+    /// Every backward schedule `c`'s device runs against the composite's gradient in f64.
+    fn backward<R: Runtime>(c: &ComputeClient<R>, name: &str) {
         use half::bf16;
-        let c = CudaRuntime::client(&CudaDevice::default());
         let t: usize = LENS.iter().sum();
         let round = |v: Vec<f32>| -> Vec<f32> {
             v.into_iter().map(|x| bf16::from_f32(x).to_f32()).collect()
@@ -2592,12 +2586,12 @@ mod tests {
         let (cos, sin) = tables(128);
         let (cos, sin) = (round(cos), round(sin));
         let scale = (D as f32).powf(-0.5);
-        for (_, back) in BACKS.into_iter().filter(|(_, b)| usable_back(&c, *b, 2)) {
+        for (_, back) in BACKS.into_iter().filter(|(_, b)| usable_back(c, *b, 2)) {
             for window in [None, Some(8), Some(64)] {
                 let (out, lse) = attend_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale);
                 let want = attend_back_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale, &dout);
-                let got = attend_back_run::<CudaRuntime, bf16, bf16>(
-                    &c,
+                let got = attend_back_run::<R, bf16, bf16>(
+                    c,
                     &narrow(&qkv),
                     &narrow(&cos),
                     &narrow(&sin),
@@ -2612,10 +2606,49 @@ mod tests {
                 );
                 let got: Vec<f32> = got.iter().map(|x| x.to_f32()).collect();
                 let r = rel(&got, &want);
-                eprintln!("[packed back cuda] {back:?} window {window:?}: dqkv {r:.2e}");
+                eprintln!("[packed back {name}] {back:?} window {window:?}: dqkv {r:.2e}");
                 assert!(r < 3e-2, "{back:?} window {window:?}: {r}");
             }
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn attend_is_the_composite_on_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        forward(&CudaRuntime::client(&CudaDevice::default()), "cuda");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn attend_back_is_the_gradient_on_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        backward(&CudaRuntime::client(&CudaDevice::default()), "cuda");
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn attend_is_the_composite_on_rocm() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        forward(&HipRuntime::client(&AmdDevice::default()), "rocm");
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn attend_back_is_the_gradient_on_rocm() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        backward(&HipRuntime::client(&AmdDevice::default()), "rocm");
+    }
+
+    /// `cargo test --no-default-features --features rocm packed_speed -- --ignored --nocapture`
+    #[cfg(feature = "rocm")]
+    #[test]
+    #[ignore]
+    fn packed_speed_on_rocm() {
+        use half::bf16;
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        let c = HipRuntime::client(&AmdDevice::default());
+        speed::<HipRuntime, bf16, bf16>(&c, "rocm", bf16::from_f32);
     }
 
     /// Mean ms a pass at the shared bench shape per tile and key block, then the tuners' picks.

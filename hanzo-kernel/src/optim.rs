@@ -208,4 +208,18 @@ mod tests {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
         check(&WgpuRuntime::client(&WgpuDevice::default()), "metal");
     }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn adamw_is_the_step_on_rocm() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        check(&HipRuntime::client(&AmdDevice::default()), "rocm");
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn sumsq_sums_on_rocm() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        sums(&HipRuntime::client(&AmdDevice::default()), "rocm");
+    }
 }

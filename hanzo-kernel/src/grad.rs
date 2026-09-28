@@ -484,4 +484,11 @@ mod tests {
         });
         eprintln!("[small speed dsl] adamw {n}: {ms:.3} ms, sum of squares {ss:.3} ms");
     }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn row_gradients_on_rocm() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        rows(&HipRuntime::client(&AmdDevice::default()), "rocm");
+    }
 }

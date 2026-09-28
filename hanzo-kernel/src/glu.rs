@@ -144,4 +144,11 @@ mod tests {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
         check(&CudaRuntime::client(&CudaDevice::default()), "cuda");
     }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn geglu_is_the_composite_on_rocm() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        check(&HipRuntime::client(&AmdDevice::default()), "rocm");
+    }
 }
