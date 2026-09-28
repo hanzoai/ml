@@ -778,6 +778,8 @@ impl Device {
         match self {
             Self::Cuda(d) => Some(d.counts()),
             Self::Metal(d) => Some(d.counts()),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(d) => Some(d.counts()),
             _ => None,
         }
     }

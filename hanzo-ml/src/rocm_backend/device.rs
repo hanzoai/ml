@@ -78,6 +78,11 @@ fn pin_rocblas_workspace(blas: &SendSyncRocblasHandle) -> Result<()> {
 }
 
 impl RocmDevice {
+    /// Kernel and rocBLAS launches in this process so far, and graph launches (none).
+    pub fn counts(&self) -> (u64, u64) {
+        (super::LAUNCHES.load(std::sync::atomic::Ordering::Relaxed), 0)
+    }
+
     pub fn new(device_id: usize) -> Result<Self> {
         let device = HipDevice::new(device_id as i32)?;
         device.set_current()?;
