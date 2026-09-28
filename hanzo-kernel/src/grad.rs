@@ -323,39 +323,165 @@ mod tests {
         rows(&WgpuRuntime::client(&WgpuDevice::default()), "metal");
     }
 
-    /// The small training kernels 20 times each at the sizes hanzo-nn's `fused_kernels_for_profile`
-    /// runs, for a profiler's kernel times.
+    /// Mean ms a launch of each small training kernel at the sizes hanzo-nn's `fused_speed` times,
+    /// buffers resident: `cargo test --features cuda small_speed -- --ignored --nocapture`.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
-    fn kernels_for_profile_on_cuda() {
+    fn small_speed_on_cuda() {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
         use half::bf16;
-        let c = CudaRuntime::client(&CudaDevice::default());
+        type R = CudaRuntime;
+        let c = R::client(&CudaDevice::default());
         let narrow = |v: Vec<f32>| -> Vec<bf16> { v.into_iter().map(bf16::from_f32).collect() };
-        let (g, u) = (
-            narrow(rnd(8192 * 1152, 3, 2.0)),
-            narrow(rnd(8192 * 1152, 5, 1.0)),
+        let h16 = |v: Vec<f32>| c.create_from_slice(bf16::as_bytes(&narrow(v)));
+        let h32 = |v: &[f32]| c.create_from_slice(f32::as_bytes(v));
+        let hu = |v: &[u32]| c.create_from_slice(u32::as_bytes(v));
+        let sync = |c: &ComputeClient<R>| {
+            let _ = c.read_one_unchecked(c.create_from_slice(u32::as_bytes(&[0u32])));
+        };
+        let time = |f: &dyn Fn()| -> f64 {
+            for _ in 0..3 {
+                f();
+            }
+            sync(&c);
+            let clock = std::time::Instant::now();
+            for _ in 0..50 {
+                f();
+            }
+            sync(&c);
+            clock.elapsed().as_secs_f64() * 1e3 / 50.0
+        };
+        let arg = |h: &cubecl::server::Handle, n: usize| unsafe {
+            ArrayArg::from_raw_parts(h.clone(), n)
+        };
+
+        let n = 8192 * 1152;
+        let (g, u, y) = (h16(rnd(n, 3, 2.0)), h16(rnd(n, 5, 1.0)), h16(vec![0f32; n]));
+        let (dg, du) = (h16(vec![0f32; n]), h16(vec![0f32; n]));
+        let mn = hu(&[n as u32]);
+        let grid = Grid::Static((n as u32).div_ceil(256), 1, 1);
+        let fwd = time(&|| unsafe {
+            crate::glu::geglu::launch_unchecked::<bf16, R>(
+                &c,
+                grid.clone(),
+                Block::new_1d(256),
+                arg(&g, n),
+                arg(&u, n),
+                arg(&y, n),
+                arg(&mn, 1),
+            );
+        });
+        let back = time(&|| unsafe {
+            crate::glu::geglu_back::launch_unchecked::<bf16, R>(
+                &c,
+                grid.clone(),
+                Block::new_1d(256),
+                arg(&g, n),
+                arg(&u, n),
+                arg(&y, n),
+                arg(&dg, n),
+                arg(&du, n),
+                arg(&mn, 1),
+            );
+        });
+        eprintln!("[small speed dsl] geglu {n}: forward {fwd:.3} ms, backward {back:.3} ms");
+
+        let (rows, d) = (16384usize, 1024usize);
+        let (sy, sdy, sdx) = (
+            h16(rnd(rows * d, 7, 1.0)),
+            h16(rnd(rows * d, 9, 1.0)),
+            h16(vec![0f32; rows * d]),
         );
-        let (y, dy) = (
-            narrow(rnd(16384 * 1024, 7, 1.0)),
-            narrow(rnd(16384 * 1024, 9, 1.0)),
+        let md = hu(&[d as u32]);
+        let ms = time(&|| unsafe {
+            softmax_back::launch_unchecked::<bf16, R>(
+                &c,
+                Grid::Static(rows as u32, 1, 1),
+                Block::new_1d(256),
+                arg(&sy, rows * d),
+                arg(&sdy, rows * d),
+                arg(&sdx, rows * d),
+                arg(&md, 1),
+                256,
+            );
+        });
+        eprintln!("[small speed dsl] softmax backward {rows}x{d}: {ms:.3} ms");
+
+        let (rows, d) = (8192usize, 768usize);
+        let (x, dy, al) = (
+            h16(rnd(rows * d, 11, 1.0)),
+            h16(rnd(rows * d, 13, 1.0)),
+            h16(rnd(d, 17, 1.0)),
         );
-        let (x, dx) = (
-            narrow(rnd(8192 * 768, 11, 1.0)),
-            narrow(rnd(8192 * 768, 13, 1.0)),
-        );
-        let alpha = narrow(rnd(768, 17, 1.0));
+        let (dx, st) = (h16(vec![0f32; rows * d]), h32(&vec![0f32; 2 * rows]));
+        let eps = h32(&[1e-5]);
+        let chunks = rows.div_ceil(64).clamp(1, 256);
+        let per = rows.div_ceil(chunks);
+        let part = h32(&vec![0f32; chunks * 2 * d]);
+        let (md, pm) = (hu(&[d as u32]), hu(&[rows as u32, d as u32, per as u32]));
+        let ms = time(&|| unsafe {
+            layer_norm_back::launch_unchecked::<bf16, R>(
+                &c,
+                Grid::Static(rows as u32, 1, 1),
+                Block::new_1d(256),
+                arg(&x, rows * d),
+                arg(&dy, rows * d),
+                arg(&al, d),
+                arg(&dx, rows * d),
+                arg(&st, 2 * rows),
+                arg(&eps, 1),
+                arg(&md, 1),
+                256,
+            );
+            layer_norm_params::launch_unchecked::<bf16, R>(
+                &c,
+                Grid::Static((d as u32).div_ceil(256), chunks as u32, 1),
+                Block::new_1d(256),
+                arg(&x, rows * d),
+                arg(&dy, rows * d),
+                arg(&st, 2 * rows),
+                arg(&part, chunks * 2 * d),
+                arg(&pm, 3),
+            );
+        });
+        eprintln!("[small speed dsl] layer norm backward {rows}x{d}: {ms:.3} ms");
+
         let n = 768 * 2304;
-        let (w, gw, m) = (rnd(n, 19, 1.0), rnd(n, 23, 1.0), rnd(n, 29, 0.1));
-        let v: Vec<f32> = rnd(n, 31, 0.1).iter().map(|x| x * x).collect();
-        let p = [2e-5f32, 0.9, 0.98, 1e-6, 0.01, 1.9, 7.3, 1.0];
-        for _ in 0..20 {
-            crate::glu::geglu_run::<CudaRuntime, bf16>(&c, &g, &u, &g);
-            softmax_back_run::<CudaRuntime, bf16>(&c, &y, &dy, 1024);
-            layer_norm_back_run::<CudaRuntime, bf16>(&c, &x, &dx, &alpha, 1e-5);
-            crate::optim::adamw_run(&c, &w, &gw, &m, &v, p);
-            crate::optim::sumsq_run(&c, &gw, (n as u32).div_ceil(256).min(4096));
-        }
+        let (w, gw, m) = (
+            h32(&rnd(n, 19, 1.0)),
+            h32(&rnd(n, 23, 1.0)),
+            h32(&rnd(n, 29, 0.1)),
+        );
+        let v = h32(&rnd(n, 31, 0.1).iter().map(|x| x * x).collect::<Vec<_>>());
+        let p = h32(&[2e-5, 0.9, 0.98, 1e-6, 0.01, 1.9, 7.3, 1.0]);
+        let nn = hu(&[n as u32]);
+        let ms = time(&|| unsafe {
+            crate::optim::adamw::launch_unchecked::<R>(
+                &c,
+                Grid::Static((n as u32).div_ceil(256), 1, 1),
+                Block::new_1d(256),
+                arg(&w, n),
+                arg(&gw, n),
+                arg(&m, n),
+                arg(&v, n),
+                arg(&p, 8),
+                arg(&nn, 1),
+            );
+        });
+        let blocks = (n as u32).div_ceil(256).min(4096);
+        let (part, sm) = (h32(&vec![0f32; blocks as usize]), hu(&[n as u32, 0]));
+        let ss = time(&|| unsafe {
+            crate::optim::sumsq::launch_unchecked::<R>(
+                &c,
+                Grid::Static(blocks, 1, 1),
+                Block::new_1d(256),
+                arg(&gw, n),
+                arg(&part, blocks as usize),
+                arg(&sm, 2),
+                256,
+            );
+        });
+        eprintln!("[small speed dsl] adamw {n}: {ms:.3} ms, sum of squares {ss:.3} ms");
     }
 }
