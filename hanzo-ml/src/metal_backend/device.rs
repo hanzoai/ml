@@ -188,6 +188,20 @@ impl MetalDevice {
         &self.kernels
     }
 
+    /// Kernel dispatches (compute and blit encoders) and command buffers committed on this
+    /// device so far; a call's cost is the difference of two readings.
+    pub fn counts(&self) -> (u64, u64) {
+        self.commands.totals()
+    }
+
+    /// Runs `f` with its dispatches on one command buffer, whatever their count: the buffer
+    /// commits at `f`'s readback or the next flush, not every `METAL_COMPUTE_PER_BUFFER`
+    /// encoders. A call whose work is one pass pays one commit and one wait.
+    pub fn batch<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _hold = self.commands.hold();
+        f()
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }

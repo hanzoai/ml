@@ -11,6 +11,7 @@ use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
@@ -68,6 +69,23 @@ pub struct CudaDevice {
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
+    /// Kernel and cuBLAS launches on this device so far, and graph launches.
+    pub(crate) launches: Arc<AtomicU64>,
+    graphs: Arc<AtomicU64>,
+}
+
+/// A captured stream of work that replays as one launch ([`CudaDevice::capture`]).
+pub struct Graph {
+    graph: cudarc::driver::CudaGraph,
+    launches: Arc<AtomicU64>,
+}
+
+impl Graph {
+    /// Replays the captured work on the device's stream: every kernel it holds, one launch.
+    pub fn launch(&self) -> Result<()> {
+        self.launches.fetch_add(1, Ordering::Relaxed);
+        self.graph.launch().w()
+    }
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -255,6 +273,7 @@ pub(crate) fn cuda_graph_htod_cache_enabled() -> bool {
 pub struct CudaFunc {
     func: CudaFunction,
     stream: Arc<cudarc::driver::CudaStream>,
+    launches: Arc<AtomicU64>,
 }
 
 impl std::ops::Deref for CudaFunc {
@@ -283,6 +302,7 @@ macro_rules! builder_arg {
 
 impl CudaFunc {
     pub fn builder(&self) -> cudarc::driver::LaunchArgs<'_> {
+        self.launches.fetch_add(1, Ordering::Relaxed);
         self.stream.launch_builder(&self.func)
     }
 }
@@ -290,6 +310,43 @@ impl CudaFunc {
 impl CudaDevice {
     pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
         self.stream.clone()
+    }
+
+    /// Kernel and cuBLAS launches on this device so far, and graph launches; a call's cost is
+    /// the difference of two readings.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.launches.load(Ordering::Relaxed),
+            self.graphs.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Captures the work `f` puts on this device's stream as a [`Graph`] that replays as one
+    /// launch, and gives what `f` returned: tensors whose buffers the graph writes on every
+    /// replay. Run `f` once before capturing so every host upload it makes is cached (the
+    /// capture forbids new ones); memory `f` allocates and keeps is freed and reallocated at the
+    /// same addresses on each launch.
+    pub fn capture<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<(T, Graph)> {
+        use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+        self.stream.synchronize().w()?;
+        let _cache = self.enable_cuda_graph_htod_cache();
+        self.stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .w()?;
+        let out = f();
+        let graph = self
+            .stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .w();
+        let out = out?;
+        let graph = graph?.ok_or_else(|| crate::Error::Msg("capture: no work to replay".into()))?;
+        Ok((
+            out,
+            Graph {
+                graph,
+                launches: self.graphs.clone(),
+            },
+        ))
     }
 
     /// When turned on, all cuda tensors **created after calling this function** will
@@ -326,6 +383,7 @@ impl CudaDevice {
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
+                launches: self.launches.clone(),
             });
         }
         drop(ms);
@@ -336,6 +394,7 @@ impl CudaDevice {
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
+            launches: self.launches.clone(),
         })
     }
 
@@ -346,6 +405,7 @@ impl CudaDevice {
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
+                launches: self.launches.clone(),
             });
         }
         drop(ms);
@@ -356,6 +416,7 @@ impl CudaDevice {
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
+            launches: self.launches.clone(),
         })
     }
 
@@ -389,6 +450,8 @@ impl CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
+            launches: Arc::new(AtomicU64::new(0)),
+            graphs: Arc::new(AtomicU64::new(0)),
         })
     }
 }

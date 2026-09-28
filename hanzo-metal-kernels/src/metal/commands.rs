@@ -210,6 +210,12 @@ pub struct Commands {
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: usize,
+    /// Holds open ([`Commands::hold`]): while one is live no count of encoders commits the
+    /// current command buffer, so a call's dispatches ride one buffer.
+    held: AtomicUsize,
+    /// Encoders (compute and blit) ever taken, and command buffers ever committed.
+    dispatched: AtomicU64,
+    committed: AtomicU64,
     device: Device,
     /// Global cross-encoder output map. Maps buffer pointer to the fence of the last encoder
     /// that wrote it, enabling cross-command-buffer ordering for HazardTrackingModeUntracked.
@@ -253,6 +259,9 @@ impl Commands {
             compute_count: AtomicUsize::new(0),
             command_queue,
             compute_per_buffer,
+            held: AtomicUsize::new(0),
+            dispatched: AtomicU64::new(0),
+            committed: AtomicU64::new(0),
             device,
             prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
             profile,
@@ -263,10 +272,11 @@ impl Commands {
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
         if self.profile {
             self.prof.dispatches.fetch_add(1, Ordering::Relaxed);
         }
-        let flush = count >= self.compute_per_buffer;
+        let flush = count >= self.compute_per_buffer && self.held.load(Ordering::Relaxed) == 0;
 
         if flush {
             self.commit_swap_locked(&mut state_guard, 1)?;
@@ -298,10 +308,11 @@ impl Commands {
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
         if self.profile {
             self.prof.dispatches.fetch_add(1, Ordering::Relaxed);
         }
-        let flush = count >= self.compute_per_buffer;
+        let flush = count >= self.compute_per_buffer && self.held.load(Ordering::Relaxed) == 0;
 
         if flush {
             self.commit_swap_locked(&mut state_guard, 1)?;
@@ -407,6 +418,22 @@ impl Commands {
         Ok(())
     }
 
+    /// Encoders taken and command buffers committed since this queue was made: what a call
+    /// dispatched is the difference of two readings.
+    pub fn totals(&self) -> (u64, u64) {
+        (
+            self.dispatched.load(Ordering::Relaxed),
+            self.committed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Keeps the current command buffer open while the guard lives, whatever the encoder count:
+    /// a call's dispatches ride one buffer and commit at its readback or flush. Holds nest.
+    pub fn hold(&self) -> Hold<'_> {
+        self.held.fetch_add(1, Ordering::Relaxed);
+        Hold { commands: self }
+    }
+
     fn commit_swap_locked(
         &self,
         state: &mut EntryState,
@@ -458,6 +485,7 @@ impl Commands {
                     }
                 }
                 state.current.commit();
+                self.committed.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -540,6 +568,17 @@ impl Commands {
         }
 
         encoder.raw.endEncoding();
+    }
+}
+
+/// A live [`Commands::hold`].
+pub struct Hold<'a> {
+    commands: &'a Commands,
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        self.commands.held.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

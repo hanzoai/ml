@@ -773,6 +773,16 @@ impl Device {
         }
     }
 
+    /// What a device ran so far, when it counts: kernel dispatches, and command buffers
+    /// committed (Metal) or graphs launched (CUDA). The CPU counts nothing.
+    pub fn counts(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Cuda(d) => Some(d.counts()),
+            Self::Metal(d) => Some(d.counts()),
+            _ => None,
+        }
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),
