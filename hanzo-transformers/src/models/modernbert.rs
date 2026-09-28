@@ -263,7 +263,7 @@ impl ModernBertLayer {
             None => xs.clone(),
         };
         let a = &self.attn;
-        let att = hanzo_nn::attention::cpu_flash::packed::packed(
+        let att = hanzo_nn::attention::packed(
             &h.apply(&a.qkv)?,
             lens,
             a.num_attention_heads,
@@ -498,11 +498,22 @@ impl ModernBert {
         Ok(())
     }
 
-    /// Token states `[B, L, d]` of `xs [B, L]` under its 0/1 `mask [B, L]`. A quantized backbone
-    /// on the CPU, given right-padded rows, runs the packed pass and leaves pad positions zero;
-    /// any other runs every position.
+    /// Whether [`ModernBert::forward`] runs the packed pass.
+    pub fn packs(&self) -> bool {
+        let w = self.word_embeddings.embeddings();
+        let head = self
+            .layers
+            .first()
+            .map_or(0, |l| l.attn.attention_head_size);
+        match w.device() {
+            Device::Cpu => self.quantized,
+            dev => hanzo_nn::attention::packs(dev, w.dtype(), head),
+        }
+    }
+
+    /// Token states `[B, L, d]` of right-padded `xs [B, L]`; the packed pass leaves pads zero.
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        if self.quantized && xs.device().is_cpu() {
+        if self.packs() {
             let rows = mask.to_dtype(DType::U32)?.to_vec2::<u32>()?;
             let lens: Vec<usize> = rows
                 .iter()
@@ -538,18 +549,21 @@ impl ModernBert {
             h = layer.packed(&h, lens, window)?;
         }
         let h = h.apply(&self.final_norm)?;
-        // each padded position reads its packed token, a pad the zero row past them
         let d = h.dim(1)?;
         let h = Tensor::cat(&[&h, &Tensor::zeros((1, d), h.dtype(), h.device())?], 0)?;
         let mut at = Vec::with_capacity(b * l);
+        let mut back = Vec::with_capacity(t + 1);
         let mut next = 0u32;
-        for &n in lens {
+        for (row, &n) in lens.iter().enumerate() {
             at.extend(next..next + n as u32);
             at.extend(std::iter::repeat_n(t as u32, l - n));
+            back.extend((row * l) as u32..(row * l + n) as u32);
             next += n as u32;
         }
-        h.index_select(&Tensor::from_vec(at, b * l, h.device())?, 0)?
-            .reshape((b, l, d))
+        back.push((b * l) as u32);
+        let at = Tensor::from_vec(at, b * l, h.device())?;
+        let back = Tensor::from_vec(back, t + 1, h.device())?;
+        hanzo_nn::ops::select(&h, &at, &back)?.reshape((b, l, d))
     }
 
     fn padded(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {

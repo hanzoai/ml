@@ -155,10 +155,7 @@ impl Optimizer for AdamW {
 }
 
 impl AdamW {
-    /// One step with every gradient multiplied by `grad_scale` first (gradient clipping, loss
-    /// scaling). An F32 parameter on Metal is updated by one fused kernel that reads the
-    /// parameter, its gradient and both moments once and writes them back once; anything else
-    /// takes the tensor-op path.
+    /// One step with every gradient multiplied by `grad_scale` first.
     pub fn step_scaled(
         &mut self,
         grads: &hanzo_ml::backprop::GradStore,
@@ -221,13 +218,11 @@ pub struct Update {
 ///   m ← β₁m + (1 − β₁)g,  v ← β₂v + (1 − β₂)g²,
 ///   θ ← θ(1 − lr·λ) − lr · m·scale_m / (√(v·scale_v) + ε).
 ///
-/// An F32 parameter on Metal is updated by one fused kernel that reads the parameter, its
-/// gradient and both moments once and writes them back once; anything else takes the tensor-op
-/// path, the same arithmetic in the same order.
+/// One kernel for a contiguous F32 parameter on Metal or CUDA, tensor ops elsewhere.
 pub fn adamw(theta: &Var, g: &Tensor, m: &Var, v: &Var, u: &Update) -> Result<()> {
-    #[cfg(feature = "metal")]
+    #[cfg(any(feature = "metal", feature = "cuda"))]
     if fused::fits(theta, g) {
-        let step = hanzo_metal_kernels::AdamWStep {
+        let step = fused::Step {
             lr: u.lr as f32,
             beta1: u.beta1 as f32,
             beta2: u.beta2 as f32,
@@ -258,8 +253,7 @@ pub fn adamw(theta: &Var, g: &Tensor, m: &Var, v: &Var, u: &Update) -> Result<()
     theta.set(&next_theta)
 }
 
-/// The global L2 norm of the gradients of `vars`: `sqrt(Σ‖g‖²)`, one host read. On Metal each
-/// contiguous F32 gradient adds its sum of squares into one accumulator with a single kernel.
+/// The global L2 norm of the gradients of `vars`, `sqrt(Σ‖g‖²)`: one host read.
 pub fn grad_norm(grads: &hanzo_ml::backprop::GradStore, vars: &[Var]) -> Result<f64> {
     let present: Vec<&Tensor> = vars
         .iter()
@@ -268,8 +262,8 @@ pub fn grad_norm(grads: &hanzo_ml::backprop::GradStore, vars: &[Var]) -> Result<
     let Some(first) = present.first() else {
         return Ok(0.0);
     };
-    #[cfg(feature = "metal")]
-    if first.device().is_metal() {
+    #[cfg(any(feature = "metal", feature = "cuda"))]
+    if fused::on(first.device()) {
         let acc = Tensor::zeros(1, hanzo_ml::DType::F32, first.device())?;
         let mut rest = Vec::new();
         for g in &present {
@@ -293,56 +287,123 @@ pub fn grad_norm(grads: &hanzo_ml::backprop::GradStore, vars: &[Var]) -> Result<
     Ok((Tensor::stack(&sq, 0)?.sum_all()?.to_scalar::<f32>()? as f64).sqrt())
 }
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 mod fused {
-    use hanzo_metal_kernels::BufferOffset;
-    use hanzo_ml::{DType, InplaceOpN, Layout, MetalStorage, Result, Tensor};
+    use hanzo_ml::{DType, Device, InplaceOpN, Layout, Result, Tensor};
 
-    /// A parameter and its gradient the fused kernels take: F32, contiguous, on Metal.
+    #[derive(Clone, Copy)]
+    pub struct Step {
+        pub lr: f32,
+        pub beta1: f32,
+        pub beta2: f32,
+        pub eps: f32,
+        pub weight_decay: f32,
+        pub scale_m: f32,
+        pub scale_v: f32,
+        pub grad_scale: f32,
+    }
+
+    pub fn on(dev: &Device) -> bool {
+        dev.is_metal() || dev.is_cuda()
+    }
+
     pub fn fits(theta: &Tensor, g: &Tensor) -> bool {
-        theta.device().is_metal()
+        on(theta.device())
             && theta.dtype() == DType::F32
             && g.dtype() == DType::F32
             && theta.is_contiguous()
             && g.is_contiguous()
     }
 
-    fn at<'a>(s: &'a MetalStorage, l: &Layout) -> BufferOffset<'a> {
-        BufferOffset {
+    #[cfg(feature = "metal")]
+    fn at<'a>(s: &'a hanzo_ml::MetalStorage, l: &Layout) -> hanzo_metal_kernels::BufferOffset<'a> {
+        hanzo_metal_kernels::BufferOffset {
             buffer: s.buffer(),
             offset_in_bytes: l.start_offset() * DType::F32.size_in_bytes(),
         }
     }
 
-    pub struct AdamW(pub hanzo_metal_kernels::AdamWStep);
+    pub struct AdamW(pub Step);
 
     impl InplaceOpN<3> for AdamW {
         fn name(&self) -> &'static str {
             "adamw"
         }
 
+        #[cfg(feature = "metal")]
         fn metal_fwd(
             &self,
-            w: &mut MetalStorage,
+            w: &mut hanzo_ml::MetalStorage,
             wl: &Layout,
-            [(g, gl), (m, ml), (v, vl)]: [(&MetalStorage, &Layout); 3],
+            [(g, gl), (m, ml), (v, vl)]: [(&hanzo_ml::MetalStorage, &Layout); 3],
         ) -> Result<()> {
             use hanzo_ml::backend::BackendStorage;
             let device = w.device().clone();
             let encoder = device.command_encoder()?;
             encoder.set_label("adamw");
+            let s = self.0;
+            let step = hanzo_metal_kernels::AdamWStep {
+                lr: s.lr,
+                beta1: s.beta1,
+                beta2: s.beta2,
+                eps: s.eps,
+                weight_decay: s.weight_decay,
+                scale_m: s.scale_m,
+                scale_v: s.scale_v,
+                grad_scale: s.grad_scale,
+            };
             hanzo_metal_kernels::call_adamw(
                 device.metal_device(),
                 &encoder,
                 device.kernels(),
                 wl.shape().elem_count(),
-                self.0,
+                step,
                 at(w, wl),
                 at(g, gl),
                 at(m, ml),
                 at(v, vl),
             )
             .map_err(hanzo_ml::Error::wrap)
+        }
+
+        #[cfg(feature = "cuda")]
+        fn cuda_fwd(
+            &self,
+            w: &mut hanzo_ml::CudaStorage,
+            wl: &Layout,
+            [(g, gl), (m, ml), (v, vl)]: [(&hanzo_ml::CudaStorage, &Layout); 3],
+        ) -> Result<()> {
+            use hanzo_ml::backend::BackendStorage;
+            use hanzo_ml::cuda_backend::cudarc::driver::PushKernelArg;
+            use hanzo_ml::cuda_backend::{kernels, WrapErr};
+            let dev = w.device().clone();
+            let n = wl.shape().elem_count();
+            let s = self.0;
+            let func = dev.get_or_load_func("adamw_f32", &kernels::OPTIM)?;
+            let mut w = w.as_cuda_slice_mut::<f32>()?.slice_mut(wl.start_offset()..);
+            let g = g.as_cuda_slice::<f32>()?.slice(gl.start_offset()..);
+            let m = m.as_cuda_slice::<f32>()?.slice(ml.start_offset()..);
+            let v = v.as_cuda_slice::<f32>()?.slice(vl.start_offset()..);
+            let mut b = func.builder();
+            hanzo_ml::builder_arg!(
+                b,
+                n as u32,
+                s.lr,
+                s.beta1,
+                s.beta2,
+                s.eps,
+                s.weight_decay,
+                s.scale_m,
+                s.scale_v,
+                s.grad_scale
+            );
+            b.arg(&mut w);
+            b.arg(&g);
+            b.arg(&m);
+            b.arg(&v);
+            // SAFETY: ffi.
+            unsafe { b.launch(super::launch(n)) }.w()?;
+            Ok(())
         }
     }
 
@@ -353,11 +414,12 @@ mod fused {
             "sumsq"
         }
 
+        #[cfg(feature = "metal")]
         fn metal_fwd(
             &self,
-            acc: &mut MetalStorage,
+            acc: &mut hanzo_ml::MetalStorage,
             _acc_l: &Layout,
-            [(x, xl)]: [(&MetalStorage, &Layout); 1],
+            [(x, xl)]: [(&hanzo_ml::MetalStorage, &Layout); 1],
         ) -> Result<()> {
             use hanzo_ml::backend::BackendStorage;
             let device = acc.device().clone();
@@ -373,6 +435,41 @@ mod fused {
             )
             .map_err(hanzo_ml::Error::wrap)
         }
+
+        #[cfg(feature = "cuda")]
+        fn cuda_fwd(
+            &self,
+            acc: &mut hanzo_ml::CudaStorage,
+            acc_l: &Layout,
+            [(x, xl)]: [(&hanzo_ml::CudaStorage, &Layout); 1],
+        ) -> Result<()> {
+            use hanzo_ml::backend::BackendStorage;
+            use hanzo_ml::cuda_backend::cudarc::driver::PushKernelArg;
+            use hanzo_ml::cuda_backend::{kernels, WrapErr};
+            let dev = acc.device().clone();
+            let n = xl.shape().elem_count();
+            let func = dev.get_or_load_func("sumsq_f32", &kernels::OPTIM)?;
+            let mut acc = acc
+                .as_cuda_slice_mut::<f32>()?
+                .slice_mut(acc_l.start_offset()..);
+            let x = x.as_cuda_slice::<f32>()?.slice(xl.start_offset()..);
+            let mut b = func.builder();
+            hanzo_ml::builder_arg!(b, n as u32);
+            b.arg(&x);
+            b.arg(&mut acc);
+            // SAFETY: ffi.
+            unsafe { b.launch(super::launch(n)) }.w()?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn launch(n: usize) -> hanzo_ml::cuda_backend::cudarc::driver::LaunchConfig {
+    hanzo_ml::cuda_backend::cudarc::driver::LaunchConfig {
+        grid_dim: (n.div_ceil(256).clamp(1, 4096) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
     }
 }
 
@@ -447,10 +544,7 @@ struct VarMuon {
     momentum: Var,
 }
 
-/// Muon optimizer for 2D weight matrices.
-///
-/// Orthogonalizes gradient updates via Newton-Schulz iterations to ensure spectral norm stability,
-/// enabling 2x–5x higher learning rates and zero-warmup convergence.
+/// Muon for 2-D weight matrices: updates orthogonalized by Newton-Schulz iterations.
 #[derive(Debug)]
 pub struct Muon {
     vars: Vec<VarMuon>,

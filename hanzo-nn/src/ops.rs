@@ -473,7 +473,7 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
 
     /// `dx = y ⊙ (dy − ⟨dy, y⟩)` along the last dim, accumulated in `F32`.
     fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
-        #[cfg(feature = "metal")]
+        #[cfg(any(feature = "metal", feature = "cuda"))]
         if fused_bwd::fits(&[res, grad_res]) {
             // SAFETY: the kernel writes every element of `dx`.
             let dx = unsafe { res.empty_like()? };
@@ -518,7 +518,6 @@ fn geglu1(g: f32, u: f32) -> f32 {
     (erf + 1.) * 0.5 * g * u
 }
 
-/// `gelu_erf(gate) · up`, elementwise, on the CPU in one parallel, vectorized pass.
 struct GeGlu;
 
 impl hanzo_ml::CustomOp2 for GeGlu {
@@ -551,24 +550,240 @@ impl hanzo_ml::CustomOp2 for GeGlu {
             });
         Ok((CpuStorage::F32(dst), l1.shape().clone()))
     }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        gate: &hanzo_ml::CudaStorage,
+        l1: &Layout,
+        up: &hanzo_ml::CudaStorage,
+        l2: &Layout,
+    ) -> Result<(hanzo_ml::CudaStorage, Shape)> {
+        use hanzo_ml::backend::BackendStorage;
+        use hanzo_ml::cuda_backend::cudarc::driver::PushKernelArg;
+        use hanzo_ml::cuda_backend::{kernels, WrapErr};
+        let dev = gate.device().clone();
+        let n = l1.shape().elem_count();
+        let func = dev.get_or_load_func(
+            &format!("geglu_fwd_{}", glu::name(gate.dtype())),
+            &kernels::GLU,
+        )?;
+        macro_rules! run {
+            ($t:ty, $v:ident) => {{
+                let g = gate.as_cuda_slice::<$t>()?.slice(l1.start_offset()..);
+                let u = up.as_cuda_slice::<$t>()?.slice(l2.start_offset()..);
+                // SAFETY: the kernel writes every element.
+                let y = unsafe { dev.alloc::<$t>(n)? };
+                let mut b = func.builder();
+                hanzo_ml::builder_arg!(b, n);
+                b.arg(&g);
+                b.arg(&u);
+                b.arg(&y);
+                // SAFETY: ffi.
+                unsafe { b.launch(glu::launch(n)) }.w()?;
+                hanzo_ml::cuda_backend::CudaStorageSlice::$v(y)
+            }};
+        }
+        let slice = match gate.dtype() {
+            DType::F32 => run!(f32, F32),
+            DType::F16 => run!(half::f16, F16),
+            DType::BF16 => run!(half::bf16, BF16),
+            dt => hanzo_ml::bail!("geglu: no kernel for {dt:?}"),
+        };
+        Ok((
+            hanzo_ml::CudaStorage { slice, device: dev },
+            l1.shape().clone(),
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn bwd(
+        &self,
+        gate: &Tensor,
+        up: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let dy = grad_res.contiguous()?;
+        // SAFETY: the kernel writes every element of both.
+        let dg = unsafe { gate.empty_like()? };
+        let du = unsafe { gate.empty_like()? };
+        dg.inplace_op([gate, up, &dy, &du], &glu::Bwd)?;
+        Ok((Some(dg), Some(du)))
+    }
 }
 
-/// GeGLU's product, `gelu_erf(gate) · up`. On the CPU, for F32 inputs no gradient flows
-/// through, one parallel pass whose `erf` is within 1.5e-7 of the exact one; everywhere else,
-/// and wherever a gradient flows, the composite.
+/// GeGLU's product, `gelu_erf(gate) · up`.
 pub fn geglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
-    let fused = gate.device().is_cpu()
-        && gate.dtype() == DType::F32
-        && up.dtype() == DType::F32
+    let alike = gate.dtype() == up.dtype()
         && gate.shape() == up.shape()
         && gate.is_contiguous()
-        && up.is_contiguous()
+        && up.is_contiguous();
+    if alike
+        && gate.device().is_cpu()
+        && gate.dtype() == DType::F32
         && !gate.track_op()
-        && !up.track_op();
-    if fused {
+        && !up.track_op()
+    {
         return gate.apply_op2_no_bwd(up, &GeGlu);
     }
+    if alike
+        && gate.device().is_cuda()
+        && matches!(gate.dtype(), DType::F32 | DType::F16 | DType::BF16)
+    {
+        return gate.apply_op2(up, GeGlu);
+    }
     gate.gelu_erf()? * up
+}
+
+#[cfg(feature = "cuda")]
+mod glu {
+    use hanzo_ml::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use hanzo_ml::cuda_backend::{kernels, WrapErr};
+    use hanzo_ml::{CudaStorage, DType, InplaceOpN, Layout, Result};
+
+    pub fn name(dtype: DType) -> &'static str {
+        match dtype {
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+            _ => "f32",
+        }
+    }
+
+    pub fn launch(n: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (n.div_ceil(256).clamp(1, 4096) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    pub struct Bwd;
+
+    impl InplaceOpN<4> for Bwd {
+        fn name(&self) -> &'static str {
+            "geglu-bwd"
+        }
+
+        fn cuda_fwd(
+            &self,
+            dg: &mut CudaStorage,
+            dgl: &Layout,
+            [(g, gl), (u, ul), (dy, dyl), (du, dul)]: [(&CudaStorage, &Layout); 4],
+        ) -> Result<()> {
+            use hanzo_ml::backend::BackendStorage;
+            let dev = dg.device().clone();
+            let n = dgl.shape().elem_count();
+            let func =
+                dev.get_or_load_func(&format!("geglu_bwd_{}", name(dg.dtype())), &kernels::GLU)?;
+            macro_rules! run {
+                ($t:ty) => {{
+                    let mut dg = dg
+                        .as_cuda_slice_mut::<$t>()?
+                        .slice_mut(dgl.start_offset()..);
+                    let g = g.as_cuda_slice::<$t>()?.slice(gl.start_offset()..);
+                    let u = u.as_cuda_slice::<$t>()?.slice(ul.start_offset()..);
+                    let dy = dy.as_cuda_slice::<$t>()?.slice(dyl.start_offset()..);
+                    let du = du.as_cuda_slice::<$t>()?.slice(dul.start_offset()..);
+                    let mut b = func.builder();
+                    hanzo_ml::builder_arg!(b, n);
+                    b.arg(&g);
+                    b.arg(&u);
+                    b.arg(&dy);
+                    b.arg(&mut dg);
+                    b.arg(&du);
+                    // SAFETY: ffi.
+                    unsafe { b.launch(launch(n)) }.w()?;
+                }};
+            }
+            match dg.dtype() {
+                DType::F32 => run!(f32),
+                DType::F16 => run!(half::f16),
+                DType::BF16 => run!(half::bf16),
+                dt => hanzo_ml::bail!("geglu-bwd: no kernel for {dt:?}"),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `x[index]` with `dx[m] = dy[inverse[m]]`, zero where `inverse[m]` is past `dy`.
+pub fn select(x: &Tensor, index: &Tensor, inverse: &Tensor) -> Result<Tensor> {
+    x.apply_op2(
+        index,
+        Select {
+            inverse: inverse.clone(),
+        },
+    )
+}
+
+struct Select {
+    inverse: Tensor,
+}
+
+impl Select {
+    fn rows<S: hanzo_ml::backend::BackendStorage>(
+        x: &S,
+        xl: &Layout,
+        index: &S,
+        il: &Layout,
+    ) -> Result<(S, Shape)> {
+        let mut dims = xl.dims().to_vec();
+        dims[0] = il.shape().elem_count();
+        Ok((x.index_select(index, xl, il, 0)?, Shape::from_dims(&dims)))
+    }
+}
+
+impl hanzo_ml::CustomOp2 for Select {
+    fn name(&self) -> &'static str {
+        "select"
+    }
+
+    fn cpu_fwd(
+        &self,
+        x: &CpuStorage,
+        xl: &Layout,
+        index: &CpuStorage,
+        il: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        Self::rows(x, xl, index, il)
+    }
+
+    fn cuda_fwd(
+        &self,
+        x: &hanzo_ml::CudaStorage,
+        xl: &Layout,
+        index: &hanzo_ml::CudaStorage,
+        il: &Layout,
+    ) -> Result<(hanzo_ml::CudaStorage, Shape)> {
+        Self::rows(x, xl, index, il)
+    }
+
+    fn metal_fwd(
+        &self,
+        x: &hanzo_ml::MetalStorage,
+        xl: &Layout,
+        index: &hanzo_ml::MetalStorage,
+        il: &Layout,
+    ) -> Result<(hanzo_ml::MetalStorage, Shape)> {
+        Self::rows(x, xl, index, il)
+    }
+
+    fn bwd(
+        &self,
+        x: &Tensor,
+        _index: &Tensor,
+        _res: &Tensor,
+        grad: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let mut dims = grad.dims().to_vec();
+        dims[0] = 1;
+        let none = Tensor::zeros(dims, grad.dtype(), grad.device())?;
+        let dx = Tensor::cat(&[grad, &none], 0)?
+            .index_select(&self.inverse, 0)?
+            .reshape(x.shape())?;
+        Ok((Some(dx), None))
+    }
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
@@ -879,10 +1094,7 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             alpha.shape()
         )
     }
-    // The fused CustomOp2 (cpu/cuda/metal/rocm) expects alpha to live on the same device
-    // (and, for the gpu kernels, the same dtype) as xs. RmsNorm weights are frequently held
-    // on CPU / in a different dtype, which used to surface as the intermittent
-    // "device mismatch in rms-norm Cpu vs Rocm" flake. Normalize alpha up front.
+    // the kernel takes alpha on the device and in the dtype of xs
     let alpha = if alpha.device().same_device(xs.device()) {
         alpha.clone()
     } else {
@@ -1267,7 +1479,7 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
         grad_res: &Tensor,
     ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
         let d = arg.dim(D::Minus1)?;
-        #[cfg(feature = "metal")]
+        #[cfg(any(feature = "metal", feature = "cuda"))]
         if fused_bwd::fits(&[arg, grad_res, alpha]) {
             let n = arg.elem_count() / d;
             let dev = arg.device();
@@ -1309,25 +1521,24 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
     }
 }
 
-/// Fused Metal backward passes of the last-dim softmax and LayerNorm: one threadgroup per row,
-/// accumulated in F32, instead of a dozen tensor ops over the whole activation.
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 mod fused_bwd {
-    use hanzo_metal_kernels::BufferOffset;
-    use hanzo_ml::backend::BackendStorage;
-    use hanzo_ml::{DType, InplaceOpN, Layout, MetalStorage, Result, Tensor};
+    use hanzo_ml::{DType, InplaceOpN, Layout, Result, Tensor};
 
-    /// Every tensor on Metal, contiguous and of one float dtype the kernels take.
     pub fn fits(ts: &[&Tensor]) -> bool {
         let dtype = ts[0].dtype();
+        let dev = ts[0].device();
         matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+            && (dev.is_metal() || dev.is_cuda())
             && ts
                 .iter()
-                .all(|t| t.device().is_metal() && t.is_contiguous() && t.dtype() == dtype)
+                .all(|t| t.device().same_device(dev) && t.is_contiguous() && t.dtype() == dtype)
     }
 
-    fn at<'a>(s: &'a MetalStorage, l: &Layout) -> BufferOffset<'a> {
-        BufferOffset {
+    #[cfg(feature = "metal")]
+    fn at<'a>(s: &'a hanzo_ml::MetalStorage, l: &Layout) -> hanzo_metal_kernels::BufferOffset<'a> {
+        use hanzo_ml::backend::BackendStorage;
+        hanzo_metal_kernels::BufferOffset {
             buffer: s.buffer(),
             offset_in_bytes: l.start_offset() * s.dtype().size_in_bytes(),
         }
@@ -1341,6 +1552,15 @@ mod fused_bwd {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    fn rows(n: usize) -> hanzo_ml::cuda_backend::cudarc::driver::LaunchConfig {
+        hanzo_ml::cuda_backend::cudarc::driver::LaunchConfig {
+            grid_dim: (n.max(1) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
     pub struct Softmax;
 
     impl InplaceOpN<2> for Softmax {
@@ -1348,12 +1568,14 @@ mod fused_bwd {
             "softmax-bwd"
         }
 
+        #[cfg(feature = "metal")]
         fn metal_fwd(
             &self,
-            dx: &mut MetalStorage,
+            dx: &mut hanzo_ml::MetalStorage,
             dxl: &Layout,
-            [(y, yl), (dy, dyl)]: [(&MetalStorage, &Layout); 2],
+            [(y, yl), (dy, dyl)]: [(&hanzo_ml::MetalStorage, &Layout); 2],
         ) -> Result<()> {
+            use hanzo_ml::backend::BackendStorage;
             let device = dx.device().clone();
             let encoder = device.command_encoder()?;
             encoder.set_label("softmax-bwd");
@@ -1371,6 +1593,49 @@ mod fused_bwd {
             )
             .map_err(hanzo_ml::Error::wrap)
         }
+
+        #[cfg(feature = "cuda")]
+        fn cuda_fwd(
+            &self,
+            dx: &mut hanzo_ml::CudaStorage,
+            dxl: &Layout,
+            [(y, yl), (dy, dyl)]: [(&hanzo_ml::CudaStorage, &Layout); 2],
+        ) -> Result<()> {
+            use hanzo_ml::backend::BackendStorage;
+            use hanzo_ml::cuda_backend::cudarc::driver::PushKernelArg;
+            use hanzo_ml::cuda_backend::{kernels, WrapErr};
+            let dev = dx.device().clone();
+            let d = *dxl.dims().last().unwrap_or(&1);
+            let n = dxl.shape().elem_count() / d.max(1);
+            let func = dev.get_or_load_func(
+                &format!("softmax_bwd_{}", name(dx.dtype())),
+                &kernels::BACKWARD,
+            )?;
+            let cfg = rows(n);
+            macro_rules! run {
+                ($t:ty) => {{
+                    let mut dx = dx
+                        .as_cuda_slice_mut::<$t>()?
+                        .slice_mut(dxl.start_offset()..);
+                    let y = y.as_cuda_slice::<$t>()?.slice(yl.start_offset()..);
+                    let dy = dy.as_cuda_slice::<$t>()?.slice(dyl.start_offset()..);
+                    let mut b = func.builder();
+                    hanzo_ml::builder_arg!(b, d as u32);
+                    b.arg(&y);
+                    b.arg(&dy);
+                    b.arg(&mut dx);
+                    // SAFETY: ffi.
+                    unsafe { b.launch(cfg) }.w()?;
+                }};
+            }
+            match dx.dtype() {
+                DType::F32 => run!(f32),
+                DType::F16 => run!(half::f16),
+                DType::BF16 => run!(half::bf16),
+                dt => hanzo_ml::bail!("softmax-bwd: no kernel for {dt:?}"),
+            }
+            Ok(())
+        }
     }
 
     pub struct LayerNorm {
@@ -1382,13 +1647,15 @@ mod fused_bwd {
             "layer-norm-bwd"
         }
 
+        #[cfg(feature = "metal")]
         fn metal_fwd(
             &self,
-            dx: &mut MetalStorage,
+            dx: &mut hanzo_ml::MetalStorage,
             dxl: &Layout,
-            [(x, xl), (dy, dyl), (alpha, al), (stats, _), (dparams, _)]: [(&MetalStorage, &Layout);
+            [(x, xl), (dy, dyl), (alpha, al), (stats, _), (dparams, _)]: [(&hanzo_ml::MetalStorage, &Layout);
                 5],
         ) -> Result<()> {
+            use hanzo_ml::backend::BackendStorage;
             let device = dx.device().clone();
             let encoder = device.command_encoder()?;
             encoder.set_label("layer-norm-bwd");
@@ -1409,6 +1676,72 @@ mod fused_bwd {
                 dparams.buffer(),
             )
             .map_err(hanzo_ml::Error::wrap)
+        }
+
+        #[cfg(feature = "cuda")]
+        fn cuda_fwd(
+            &self,
+            dx: &mut hanzo_ml::CudaStorage,
+            dxl: &Layout,
+            [(x, xl), (dy, dyl), (alpha, al), (stats, sl), (dparams, pl)]: [(&hanzo_ml::CudaStorage, &Layout);
+                5],
+        ) -> Result<()> {
+            use hanzo_ml::backend::BackendStorage;
+            use hanzo_ml::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+            use hanzo_ml::cuda_backend::{kernels, WrapErr};
+            let dev = dx.device().clone();
+            let d = *dxl.dims().last().unwrap_or(&1);
+            let n = dxl.shape().elem_count() / d.max(1);
+            let suffix = name(dx.dtype());
+            let rows_f =
+                dev.get_or_load_func(&format!("layernorm_bwd_{suffix}"), &kernels::BACKWARD)?;
+            let params_f = dev.get_or_load_func(
+                &format!("layernorm_bwd_params_{suffix}"),
+                &kernels::BACKWARD,
+            )?;
+            let chunks = n.div_ceil(64).clamp(1, 256);
+            let per = n.div_ceil(chunks);
+            let params_cfg = LaunchConfig {
+                grid_dim: (d.div_ceil(256) as u32, chunks as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let stats = stats.as_cuda_slice::<f32>()?.slice(sl.start_offset()..);
+            let dparams = dparams.as_cuda_slice::<f32>()?.slice(pl.start_offset()..);
+            macro_rules! run {
+                ($t:ty) => {{
+                    let mut dx = dx
+                        .as_cuda_slice_mut::<$t>()?
+                        .slice_mut(dxl.start_offset()..);
+                    let x = x.as_cuda_slice::<$t>()?.slice(xl.start_offset()..);
+                    let dy = dy.as_cuda_slice::<$t>()?.slice(dyl.start_offset()..);
+                    let alpha = alpha.as_cuda_slice::<$t>()?.slice(al.start_offset()..);
+                    let mut b = rows_f.builder();
+                    hanzo_ml::builder_arg!(b, d as u32, self.eps);
+                    b.arg(&x);
+                    b.arg(&dy);
+                    b.arg(&alpha);
+                    b.arg(&mut dx);
+                    b.arg(&stats);
+                    // SAFETY: ffi.
+                    unsafe { b.launch(rows(n)) }.w()?;
+                    let mut b = params_f.builder();
+                    hanzo_ml::builder_arg!(b, n as u32, d as u32, per as u32);
+                    b.arg(&x);
+                    b.arg(&dy);
+                    b.arg(&stats);
+                    b.arg(&dparams);
+                    // SAFETY: ffi.
+                    unsafe { b.launch(params_cfg) }.w()?;
+                }};
+            }
+            match dx.dtype() {
+                DType::F32 => run!(f32),
+                DType::F16 => run!(half::f16),
+                DType::BF16 => run!(half::bf16),
+                dt => hanzo_ml::bail!("layer-norm-bwd: no kernel for {dt:?}"),
+            }
+            Ok(())
         }
     }
 }
@@ -1519,9 +1852,7 @@ struct Sdpa {
     do_causal: bool,
 }
 
-// Flash-decoding for the Vulkan decode attention (cached; the decode path re-enters vulkan_fwd once
-// per layer per token). Default ON -- the split-K kernel fills the GPU vs the one-workgroup-per-head
-// sdpa_blk (256 VGPR / min occupancy). VK_SDPA_SPLIT_OFF=1 reverts for A/B; matches vk_sdpa_graph.
+// Split-K flash decoding on Vulkan unless VK_SDPA_SPLIT_OFF is set.
 #[cfg(feature = "vulkan")]
 fn vk_sdpa_split() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1609,8 +1940,6 @@ impl hanzo_ml::CustomOp3 for Sdpa {
             );
         }
         let dev = q.device().clone();
-        // Flash-decoding A/B (VK_SDPA_SPLIT=1): the split-K occupancy fix vs the one-workgroup-per-head
-        // sdpa_blk. n_split via VK_SDPA_NSPLIT (default 4). Eager path only; the graph path is separate.
         let out = if vk_sdpa_split() {
             dev.sdpa_decode_split_vk(
                 q,

@@ -185,7 +185,39 @@ fn half_precision_rows(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn geglu(device: &Device) -> Result<()> {
+    let (g, u) = (var(&[7, 130], device)?, var(&[7, 130], device)?);
+    let w = Tensor::randn(0f32, 1f32, (7, 130), device)?;
+    let fused = grads(&[&g, &u], &ops::geglu(g.as_tensor(), u.as_tensor())?, &w)?;
+    let slow = grads(&[&g, &u], &(g.as_tensor().gelu_erf()? * u.as_tensor())?, &w)?;
+    assert_close(&fused, &slow, 1e-4, "geglu")?;
+    let bf = |v: &Var| v.as_tensor().to_dtype(DType::BF16);
+    let y = ops::geglu(&bf(&g)?, &bf(&u)?)?.to_dtype(DType::F32)?;
+    let fused = grads(&[&g, &u], &y, &w)?;
+    for (i, (f, s)) in fused.iter().zip(&slow).enumerate() {
+        let scale = s.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        let d = max_diff(f, s)?;
+        assert!(
+            d < 2e-2 * scale.max(1.0),
+            "geglu bf16 input {i}: {d} (scale {scale})"
+        );
+    }
+    Ok(())
+}
+
+fn select(device: &Device) -> Result<()> {
+    let x = var(&[6, 9], device)?;
+    let w = Tensor::randn(0f32, 1f32, (4, 9), device)?;
+    let index = Tensor::new(&[4u32, 0, 5, 2], device)?;
+    let inverse = Tensor::new(&[1u32, 4, 3, 4, 0, 2], device)?;
+    let fused = grads(&[&x], &ops::select(x.as_tensor(), &index, &inverse)?, &w)?;
+    let slow = grads(&[&x], &x.as_tensor().index_select(&index, 0)?, &w)?;
+    assert_close(&fused, &slow, 1e-7, "select")
+}
+
 test_device!(softmax_last_dim, softmax_cpu, softmax_gpu, softmax_metal);
+test_device!(geglu, geglu_cpu, geglu_gpu, geglu_metal);
+test_device!(select, select_cpu, select_gpu, select_metal);
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norm_no_bias, lnnb_cpu, lnnb_gpu, lnnb_metal);
 test_device!(rms_norm, rms_cpu, rms_gpu, rms_metal);

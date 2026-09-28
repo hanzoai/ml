@@ -1,9 +1,16 @@
-//! The fused Metal AdamW step and gradient norm equal the tensor-op path on the CPU.
-#![cfg(feature = "metal")]
+//! The fused AdamW step and gradient norm equal the tensor-op path on the CPU.
+#![cfg(any(feature = "metal", feature = "cuda"))]
 
 use hanzo_ml::{DType, Device, Result, Tensor, Var};
 use hanzo_nn::optim::{grad_norm, AdamW, ParamsAdamW};
 use hanzo_nn::Optimizer;
+
+fn gpu() -> Result<Device> {
+    #[cfg(feature = "metal")]
+    return Device::new_metal(0);
+    #[cfg(not(feature = "metal"))]
+    Device::new_cuda(0)
+}
 
 fn params() -> ParamsAdamW {
     ParamsAdamW {
@@ -32,8 +39,7 @@ fn run(dev: &Device, w0: &Tensor, c: &Tensor, steps: usize, scale: f64) -> Resul
 
 #[test]
 fn adamw_fused_matches_tensor_path() -> Result<()> {
-    let metal = Device::new_metal(0)?;
-    // an odd length: the kernel's last threadgroup is partial
+    let metal = gpu()?;
     let w0 = Tensor::randn(0f32, 1f32, (37, 129), &Device::Cpu)?;
     let c = Tensor::randn(0f32, 1f32, (37, 129), &Device::Cpu)?;
     for scale in [1.0, 0.25] {
@@ -55,7 +61,7 @@ fn adamw_fused_matches_tensor_path() -> Result<()> {
 
 #[test]
 fn grad_norm_mixes_fused_and_other_dtypes() -> Result<()> {
-    let metal = Device::new_metal(0)?;
+    let metal = gpu()?;
     let a = Var::from_tensor(&Tensor::randn(0f32, 1f32, 1000, &metal)?)?;
     let b = Var::from_tensor(&Tensor::randn(0f32, 1f32, 300, &metal)?.to_dtype(DType::BF16)?)?;
     let loss = (a.as_tensor().sum_all()? * 3.0)?
