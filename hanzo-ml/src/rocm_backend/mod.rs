@@ -15,7 +15,7 @@ mod error;
 #[cfg(feature = "rocm-miopen")]
 mod miopen;
 mod wrappers;
-pub use device::{DeviceId, RocmDevice};
+pub use device::{DeviceId, RocmDevice, Timer};
 pub use error::{RocmError, WrapErr};
 pub use wrappers::SendSyncDeviceMemory;
 pub mod utils;
