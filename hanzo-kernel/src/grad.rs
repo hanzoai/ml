@@ -322,4 +322,40 @@ mod tests {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
         rows(&WgpuRuntime::client(&WgpuDevice::default()), "metal");
     }
+
+    /// The small training kernels 20 times each at the sizes hanzo-nn's `fused_kernels_for_profile`
+    /// runs, for a profiler's kernel times.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn kernels_for_profile_on_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        use half::bf16;
+        let c = CudaRuntime::client(&CudaDevice::default());
+        let narrow = |v: Vec<f32>| -> Vec<bf16> { v.into_iter().map(bf16::from_f32).collect() };
+        let (g, u) = (
+            narrow(rnd(8192 * 1152, 3, 2.0)),
+            narrow(rnd(8192 * 1152, 5, 1.0)),
+        );
+        let (y, dy) = (
+            narrow(rnd(16384 * 1024, 7, 1.0)),
+            narrow(rnd(16384 * 1024, 9, 1.0)),
+        );
+        let (x, dx) = (
+            narrow(rnd(8192 * 768, 11, 1.0)),
+            narrow(rnd(8192 * 768, 13, 1.0)),
+        );
+        let alpha = narrow(rnd(768, 17, 1.0));
+        let n = 768 * 2304;
+        let (w, gw, m) = (rnd(n, 19, 1.0), rnd(n, 23, 1.0), rnd(n, 29, 0.1));
+        let v: Vec<f32> = rnd(n, 31, 0.1).iter().map(|x| x * x).collect();
+        let p = [2e-5f32, 0.9, 0.98, 1e-6, 0.01, 1.9, 7.3, 1.0];
+        for _ in 0..20 {
+            crate::glu::geglu_run::<CudaRuntime, bf16>(&c, &g, &u, &g);
+            softmax_back_run::<CudaRuntime, bf16>(&c, &y, &dy, 1024);
+            layer_norm_back_run::<CudaRuntime, bf16>(&c, &x, &dx, &alpha, 1e-5);
+            crate::optim::adamw_run(&c, &w, &gw, &m, &v, p);
+            crate::optim::sumsq_run(&c, &gw, (n as u32).div_ceil(256).min(4096));
+        }
+    }
 }
