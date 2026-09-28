@@ -35,6 +35,7 @@ fn assert_close(fused: &[Tensor], slow: &[Tensor], tol: f32, what: &str) -> Resu
     assert_eq!(fused.len(), slow.len());
     for (i, (a, b)) in fused.iter().zip(slow).enumerate() {
         let d = max_diff(a, b)?;
+        println!("{what}: input {i} max |Δ| {d:.2e}");
         assert!(d < tol, "{what}: input {i} gradient differs by {d}");
     }
     Ok(())
@@ -169,6 +170,7 @@ fn half_precision_rows(device: &Device) -> Result<()> {
     for (i, (f, s)) in fused.iter().zip(&slow).enumerate() {
         let scale = s.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         let d = max_diff(f, s)?;
+        println!("layer_norm bf16: input {i} max |Δ| {d:.2e} at scale {scale:.2}");
         assert!(
             d < 2e-2 * scale.max(1.0),
             "layer_norm bf16 input {i}: {d} (scale {scale})"
@@ -181,6 +183,7 @@ fn half_precision_rows(device: &Device) -> Result<()> {
     let fused = grads(&[&z], &y, &w)?;
     let slow = grads(&[&z], &ops::softmax(z.as_tensor(), 2)?, &w)?;
     let d = max_diff(&fused[0], &slow[0])?;
+    println!("softmax bf16: max |Δ| {d:.2e}");
     assert!(d < 2e-2, "softmax bf16: {d}");
     Ok(())
 }
@@ -197,6 +200,7 @@ fn geglu(device: &Device) -> Result<()> {
     for (i, (f, s)) in fused.iter().zip(&slow).enumerate() {
         let scale = s.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         let d = max_diff(f, s)?;
+        println!("geglu bf16: input {i} max |Δ| {d:.2e} at scale {scale:.2}");
         assert!(
             d < 2e-2 * scale.max(1.0),
             "geglu bf16 input {i}: {d} (scale {scale})"

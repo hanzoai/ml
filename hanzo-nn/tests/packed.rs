@@ -98,12 +98,14 @@ fn tables(p: usize) -> Result<(Tensor, Tensor)> {
     Ok((round(cos)?, round(sin)?))
 }
 
-/// `‖a − b‖ / ‖b‖`, in F32 on the CPU.
-fn gap(a: &Tensor, b: &Tensor) -> Result<f32> {
+/// `max|a − b| / max|b|` and `‖a − b‖ / ‖b‖`, in F32 on the CPU.
+fn gap(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
     let f = |t: &Tensor| t.to_dtype(DType::F32)?.to_device(&Device::Cpu);
     let (a, b) = (f(a)?, f(b)?);
+    let d = (a - &b)?;
+    let max = |t: &Tensor| -> Result<f32> { t.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>() };
     let norm = |t: &Tensor| -> Result<f32> { t.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>() };
-    Ok(norm(&(a - &b)?)? / norm(&b)?)
+    Ok((max(&d)? / max(&b)?, norm(&d)? / norm(&b)?))
 }
 
 /// The output and the gradient of `Σ y ⊙ w` with respect to `qkv`.
@@ -143,10 +145,20 @@ fn packed_is_the_composite() -> Result<()> {
         )?;
         assert_eq!(fused[0].dims(), &[t, hd]);
         for (i, what) in ["output", "gradient"].iter().enumerate() {
-            let (f, u) = (gap(&fused[i], &exact[i])?, gap(&unfused[i], &exact[i])?);
-            println!("window {window:?} {what}: fused {f:.5}, unfused {u:.5}");
-            assert!(f < 1e-2, "window {window:?} {what}: fused off by {f}");
-            assert!(f <= u, "window {window:?} {what}: fused {f}, unfused {u}");
+            let (fm, ff) = gap(&fused[i], &exact[i])?;
+            let (um, uf) = gap(&unfused[i], &exact[i])?;
+            let (dm, df) = gap(&fused[i], &unfused[i])?;
+            println!(
+                "window {window:?} {what}: against F32, fused {fm:.2e} / {ff:.2e}, unfused {um:.2e} / {uf:.2e}; fused against unfused {dm:.2e} / {df:.2e}"
+            );
+            assert!(
+                ff < 1e-2 && fm < 3e-2,
+                "window {window:?} {what}: fused off by {ff}"
+            );
+            assert!(
+                ff <= uf,
+                "window {window:?} {what}: fused {ff}, unfused {uf}"
+            );
         }
     }
     Ok(())
