@@ -69,8 +69,25 @@ pub struct CudaDevice {
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
-    /// Kernel and cuBLAS launches on this device so far.
     pub(crate) launches: Arc<AtomicU64>,
+    graphs: Arc<AtomicU64>,
+}
+
+/// Captured work that replays as one launch.
+pub struct Graph {
+    graph: Mutex<cudarc::driver::CudaGraph>,
+    launches: Arc<AtomicU64>,
+}
+
+// SAFETY: CUDA allows a graph on any thread once calls on it are serialized; the mutex does.
+unsafe impl Send for Graph {}
+unsafe impl Sync for Graph {}
+
+impl Graph {
+    pub fn launch(&self) -> Result<()> {
+        self.launches.fetch_add(1, Ordering::Relaxed);
+        self.graph.lock().unwrap().launch().w()
+    }
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -297,9 +314,37 @@ impl CudaDevice {
         self.stream.clone()
     }
 
-    /// Kernel and cuBLAS launches on this device so far.
-    pub fn launches(&self) -> u64 {
-        self.launches.load(Ordering::Relaxed)
+    /// Kernel and cuBLAS launches so far, and graph launches.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.launches.load(Ordering::Relaxed),
+            self.graphs.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Captures `f`'s work as a [`Graph`]; the tensors `f` returns are rewritten by every launch.
+    pub fn capture<T>(&self, mut f: impl FnMut() -> Result<T>) -> Result<(T, Graph)> {
+        use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+        let _cache = self.enable_cuda_graph_htod_cache();
+        drop(f()?);
+        self.stream.synchronize().w()?;
+        self.stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .w()?;
+        let out = f();
+        let graph = self
+            .stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .w();
+        let out = out?;
+        let graph = graph?.ok_or_else(|| crate::Error::Msg("capture: no work to replay".into()))?;
+        Ok((
+            out,
+            Graph {
+                graph: Mutex::new(graph),
+                launches: self.graphs.clone(),
+            },
+        ))
     }
 
     /// When turned on, all cuda tensors **created after calling this function** will
@@ -333,36 +378,44 @@ impl CudaDevice {
         let ms = self.custom_modules.read().unwrap();
         if let Some(mdl) = ms.get(module_name).as_ref() {
             let func = mdl.load_function(fn_name).w()?;
-            return Ok(self.func(func));
+            return Ok(CudaFunc {
+                func,
+                stream: self.stream.clone(),
+                launches: self.launches.clone(),
+            });
         }
         drop(ms);
         let mut ms = self.custom_modules.write().unwrap();
         let cuda_module = self.context.load_module(ptx.into()).w()?;
         ms.insert(module_name.to_string(), cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
-        Ok(self.func(func))
+        Ok(CudaFunc {
+            func,
+            stream: self.stream.clone(),
+            launches: self.launches.clone(),
+        })
     }
 
     pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<CudaFunc> {
         let ms = self.modules.read().unwrap();
         if let Some(mdl) = ms.mdls[mdl.index()].as_ref() {
             let func = mdl.load_function(fn_name).w()?;
-            return Ok(self.func(func));
+            return Ok(CudaFunc {
+                func,
+                stream: self.stream.clone(),
+                launches: self.launches.clone(),
+            });
         }
         drop(ms);
         let mut ms = self.modules.write().unwrap();
         let cuda_module = self.context.load_module(mdl.ptx().into()).w()?;
         ms.mdls[mdl.index()] = Some(cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
-        Ok(self.func(func))
-    }
-
-    fn func(&self, func: CudaFunction) -> CudaFunc {
-        CudaFunc {
+        Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
             launches: self.launches.clone(),
-        }
+        })
     }
 
     pub fn cublas_handle(&self) -> Arc<cudarc::cublas::CudaBlas> {
@@ -420,6 +473,7 @@ impl CudaDevice {
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
             launches: Arc::new(AtomicU64::new(0)),
+            graphs: Arc::new(AtomicU64::new(0)),
         })
     }
 }

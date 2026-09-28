@@ -773,10 +773,13 @@ impl Device {
         }
     }
 
-    /// Kernel and cuBLAS launches so far, on a device that counts them.
-    pub fn launches(&self) -> Option<u64> {
+    /// Kernel dispatches, and command buffers (Metal) or graph launches (CUDA), so far.
+    pub fn counts(&self) -> Option<(u64, u64)> {
         match self {
-            Self::Cuda(d) => Some(d.launches()),
+            Self::Cuda(d) => Some(d.counts()),
+            Self::Metal(d) => Some(d.counts()),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(d) => Some(d.counts()),
             _ => None,
         }
     }

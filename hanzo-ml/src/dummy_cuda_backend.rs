@@ -7,6 +7,12 @@ use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
 #[derive(Debug, Clone)]
 pub struct CudaDevice;
 
+impl CudaDevice {
+    pub fn counts(&self) -> (u64, u64) {
+        (0, 0)
+    }
+}
+
 #[derive(Debug)]
 pub struct CudaStorage;
 
@@ -19,10 +25,6 @@ macro_rules! fail {
 impl CudaDevice {
     pub fn new_with_stream(_: usize) -> Result<Self> {
         Err(Error::NotCompiledWithCudaSupport)
-    }
-
-    pub fn launches(&self) -> u64 {
-        0
     }
 }
 
