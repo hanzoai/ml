@@ -4,7 +4,7 @@
 
 [package]
 name = "hanzo-kernel"
-version = "0.2.41"
+version = "0.2.42"
 edition = "2021"
 description = "Hanzo's first-party GPU kernel DSL: one Rust source, lowered to CUDA/ROCm/Vulkan/Metal."
 license = "MIT OR Apache-2.0"
