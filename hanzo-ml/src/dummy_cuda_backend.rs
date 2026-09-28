@@ -20,6 +20,10 @@ impl CudaDevice {
     pub fn new_with_stream(_: usize) -> Result<Self> {
         Err(Error::NotCompiledWithCudaSupport)
     }
+
+    pub fn launches(&self) -> u64 {
+        0
+    }
 }
 
 impl crate::backend::BackendStorage for CudaStorage {

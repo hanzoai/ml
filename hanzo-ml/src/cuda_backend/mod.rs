@@ -2162,6 +2162,8 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let elem_count = b * m * n;
         let dev = &self.device;
+        dev.launches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let slice = match (&self.slice, &rhs.slice) {
             (CudaStorageSlice::BF16(lhs), CudaStorageSlice::BF16(rhs)) => {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);

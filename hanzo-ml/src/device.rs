@@ -773,6 +773,14 @@ impl Device {
         }
     }
 
+    /// Kernel and cuBLAS launches so far, on a device that counts them.
+    pub fn launches(&self) -> Option<u64> {
+        match self {
+            Self::Cuda(d) => Some(d.launches()),
+            _ => None,
+        }
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),
