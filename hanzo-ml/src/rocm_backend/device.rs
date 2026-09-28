@@ -77,6 +77,41 @@ fn pin_rocblas_workspace(blas: &SendSyncRocblasHandle) -> Result<()> {
     Ok(())
 }
 
+/// Captured work that replays as one launch.
+pub struct Graph {
+    graph: rocm_rs::hip::bindings::hipGraph_t,
+    exec: rocm_rs::hip::bindings::hipGraphExec_t,
+    stream: Arc<SendSyncStream>,
+    lock: Mutex<()>,
+}
+
+// SAFETY: HIP allows a graph on any thread once calls on it are serialized; `lock` does.
+unsafe impl Send for Graph {}
+unsafe impl Sync for Graph {}
+
+impl Graph {
+    pub fn launch(&self) -> crate::Result<()> {
+        use rocm_rs::hip::bindings as hip;
+        let _one = self.lock.lock().expect("graph lock");
+        super::GRAPHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let e = unsafe { hip::hipGraphLaunch(self.exec, self.stream.as_raw()) };
+        match e == hip::hipError_t_hipSuccess {
+            true => Ok(()),
+            false => Err(RocmError::from(rocm_rs::hip::Error::new(e)).into()),
+        }
+    }
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        use rocm_rs::hip::bindings as hip;
+        unsafe {
+            hip::hipGraphExecDestroy(self.exec);
+            hip::hipGraphDestroy(self.graph);
+        }
+    }
+}
+
 /// Two events that time the device work between them on the device's stream.
 pub struct Timer {
     start: rocm_rs::hip::Event,
@@ -115,9 +150,61 @@ impl RocmDevice {
         })
     }
 
-    /// Kernel and rocBLAS launches in this process so far, and graph launches (none).
+    /// Kernel and rocBLAS launches in this process so far, and graph launches.
     pub fn counts(&self) -> (u64, u64) {
-        (super::LAUNCHES.load(std::sync::atomic::Ordering::Relaxed), 0)
+        use std::sync::atomic::Ordering::Relaxed;
+        (super::LAUNCHES.load(Relaxed), super::GRAPHS.load(Relaxed))
+    }
+
+    /// Captures `f`'s work as a [`Graph`]; the tensors `f` returns are rewritten by every launch.
+    pub fn capture<T>(&self, mut f: impl FnMut() -> crate::Result<T>) -> crate::Result<(T, Graph)> {
+        use rocm_rs::hip::bindings as hip;
+        let check = |e: hip::hipError_t| -> crate::Result<()> {
+            match e == hip::hipError_t_hipSuccess {
+                true => Ok(()),
+                false => Err(RocmError::from(rocm_rs::hip::Error::new(e)).into()),
+            }
+        };
+        drop(f()?);
+        self.synchronize()?;
+        let stream = self.stream.as_raw();
+        self.begin_graph_capture_scope();
+        let begun = unsafe {
+            hip::hipStreamBeginCapture(stream, hip::hipStreamCaptureMode_hipStreamCaptureModeRelaxed)
+        };
+        let out = match begun == hip::hipError_t_hipSuccess {
+            true => f(),
+            false => Err(crate::Error::Msg("capture: not begun".into())),
+        };
+        let mut graph = std::ptr::null_mut();
+        let ended = unsafe { hip::hipStreamEndCapture(stream, &mut graph) };
+        self.end_graph_capture_scope();
+        check(begun)?;
+        let out = out?;
+        check(ended)?;
+        let mut exec = std::ptr::null_mut();
+        let made = unsafe {
+            hip::hipGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if let Err(e) = check(made) {
+            unsafe { hip::hipGraphDestroy(graph) };
+            return Err(e);
+        }
+        Ok((
+            out,
+            Graph {
+                graph,
+                exec,
+                stream: self.stream.clone(),
+                lock: Mutex::new(()),
+            },
+        ))
     }
 
     pub fn new(device_id: usize) -> Result<Self> {
