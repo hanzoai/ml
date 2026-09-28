@@ -360,6 +360,371 @@ pub fn attend<F: Float, M: Float>(
     }
 }
 
+/// [`attend`] on the register-level matrix unit (m16n8k16): a plane per 16 query rows holds its
+/// scores, probabilities and outputs in registers and reduces each row's softmax over the four
+/// lanes that share it. The accumulators of 8-key blocks `2k` and `2k + 1` are the A operand of
+/// the 16-key step `k` that follows, which is how the instruction lays out both.
+#[allow(clippy::too_many_arguments)]
+#[kernel(targets(cuda), unchecked)]
+pub fn attend_mma<F: Float, M: Float>(
+    qkv: &Array<F>,
+    cos: &Array<F>,
+    sin: &Array<F>,
+    cu: &Array<u32>,
+    tiles: &Array<u32>,
+    out: &mut Array<F>,
+    lse: &mut Array<f32>,
+    meta: &Array<u32>,
+    scale: &Array<f32>,
+    #[comptime] d: usize,
+    #[comptime] br: usize,
+    #[comptime] bc: usize,
+) {
+    let t = CUBE_POS_X as usize + meta[3] as usize;
+    let h = CUBE_POS_Y as usize + meta[4] as usize;
+    let u = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE;
+    let row0 = u / 32usize * 16usize;
+    let units = comptime!(br * 2);
+    let heads = meta[0] as usize;
+    let window = meta[1] as usize;
+    let total = meta[2] as usize;
+    let hd = heads * d;
+    let ld = 3 * hd;
+    let half = d / 2;
+    let dp = comptime!(d + 8);
+    let seq = tiles[2 * t] as usize;
+    let i0 = tiles[2 * t + 1] as usize;
+    let start = cu[seq] as usize;
+    let len = cu[seq + 1] as usize - start;
+    let sc = scale[0];
+    let low = f32::new(-3.0e38f32);
+
+    let mut qs = SharedMemory::<M>::new(br * dp);
+    let mut ks = SharedMemory::<M>::new(bc * dp);
+    let mut vs = SharedMemory::<M>::new(bc * dp);
+
+    let per_q = br * half / units;
+    for e in 0..per_q {
+        let idx = u * per_q + e;
+        let r = idx / half;
+        let j = idx % half;
+        let i = i0 + r;
+        let mut y1 = f32::new(0.0f32);
+        let mut y2 = f32::new(0.0f32);
+        if i < len {
+            let at = (start + i) * ld + h * d;
+            let x1 = f32::cast_from(qkv[at + j]);
+            let x2 = f32::cast_from(qkv[at + j + half]);
+            let c = f32::cast_from(cos[i * half + j]);
+            let s = f32::cast_from(sin[i * half + j]);
+            y1 = (x1 * c - x2 * s) * sc;
+            y2 = (x1 * s + x2 * c) * sc;
+        }
+        qs[r * dp + j] = M::cast_from(y1);
+        qs[r * dp + j + half] = M::cast_from(y2);
+    }
+    sync_cube();
+
+    let def = cmma::MmaDefinition::<M, M, f32>::new(16usize, 8usize, 16usize);
+    let wa = def.vector_size(cmma::MatrixIdent::A);
+    let wb = def.vector_size(cmma::MatrixIdent::B);
+    let wc = def.vector_size(cmma::MatrixIdent::Accumulator);
+    let size!(NA) = wa;
+    let size!(NB) = wb;
+    let size!(NC) = wc;
+    let va = def.vectors_per_lane(cmma::MatrixIdent::A);
+    let vb = def.vectors_per_lane(cmma::MatrixIdent::B);
+    let vc = def.vectors_per_lane(cmma::MatrixIdent::Accumulator);
+    let kq = comptime!(d / 16);
+    let kd = comptime!(d / 8);
+
+    let mut qa = Array::<Vector<M, NA>>::new(comptime!(kq * va));
+    #[unroll]
+    for kk in 0..kq {
+        #[unroll]
+        for v in 0..va {
+            let mut reg = Vector::<M, NA>::empty();
+            #[unroll]
+            for x in 0..wa {
+                let (row, col) =
+                    def.position_of_nth(lane, comptime!((v * wa + x) as u32), cmma::MatrixIdent::A);
+                reg[x] = qs[(row0 + row as usize) * dp + kk * 16usize + col as usize];
+            }
+            qa[comptime!(kk * va + v)] = reg;
+        }
+    }
+    // accumulator vector 0 holds row `ra`, vector 1 row `rb`
+    let (ra, _) = def.position_of_nth(lane, 0u32, cmma::MatrixIdent::Accumulator);
+    let (rb, _) = def.position_of_nth(lane, comptime!(wc as u32), cmma::MatrixIdent::Accumulator);
+    let ia = i0 + row0 + ra as usize;
+    let ib = i0 + row0 + rb as usize;
+
+    let mut o = Array::<Vector<f32, NC>>::new(comptime!(kd * vc));
+    #[unroll]
+    for n in 0..comptime!(kd * vc) {
+        let mut z = Vector::<f32, NC>::empty();
+        #[unroll]
+        for x in 0..wc {
+            z[x] = f32::new(0.0f32);
+        }
+        o[n] = z;
+    }
+    let mut ma = low;
+    let mut mb = low;
+    let mut la = f32::new(0.0f32);
+    let mut lb = f32::new(0.0f32);
+
+    let mut lo = len - len;
+    let mut hi = len;
+    if window > 0 {
+        if i0 + 1 > window {
+            lo = (i0 + 1 - window) / bc * bc;
+        }
+        if i0 + br + window - 1 < len {
+            hi = i0 + br + window - 1;
+        }
+    }
+    let spans = (hi - lo + bc - 1) / bc;
+    let per_k = bc * half / units;
+    for jt in 0..spans {
+        let j0 = lo + jt * bc;
+        sync_cube();
+        for e in 0..per_k {
+            let idx = u * per_k + e;
+            let c = idx / half;
+            let jj = idx % half;
+            let j = j0 + c;
+            let mut y1 = f32::new(0.0f32);
+            let mut y2 = f32::new(0.0f32);
+            let mut v1 = f32::new(0.0f32);
+            let mut v2 = f32::new(0.0f32);
+            if j < len {
+                let at = (start + j) * ld + hd + h * d;
+                let x1 = f32::cast_from(qkv[at + jj]);
+                let x2 = f32::cast_from(qkv[at + jj + half]);
+                let cs = f32::cast_from(cos[j * half + jj]);
+                let sn = f32::cast_from(sin[j * half + jj]);
+                y1 = x1 * cs - x2 * sn;
+                y2 = x1 * sn + x2 * cs;
+                v1 = f32::cast_from(qkv[at + hd + jj]);
+                v2 = f32::cast_from(qkv[at + hd + jj + half]);
+            }
+            ks[c * dp + jj] = M::cast_from(y1);
+            ks[c * dp + jj + half] = M::cast_from(y2);
+            vs[c * dp + jj] = M::cast_from(v1);
+            vs[c * dp + jj + half] = M::cast_from(v2);
+        }
+        sync_cube();
+
+        let mut s = Array::<Vector<f32, NC>>::new(comptime!((bc / 8) * vc));
+        let mut xa = low;
+        let mut xb = low;
+        #[unroll]
+        for g in 0..comptime!(bc / 8) {
+            let mut acc = Array::<Vector<f32, NC>>::new(vc);
+            #[unroll]
+            for v in 0..vc {
+                let mut z = Vector::<f32, NC>::empty();
+                #[unroll]
+                for x in 0..wc {
+                    z[x] = f32::new(0.0f32);
+                }
+                acc[v] = z;
+            }
+            #[unroll]
+            for kk in 0..kq {
+                let mut a = Array::<Vector<M, NA>>::new(va);
+                #[unroll]
+                for v in 0..va {
+                    a[v] = qa[comptime!(kk * va + v)];
+                }
+                let mut b = Array::<Vector<M, NB>>::new(vb);
+                #[unroll]
+                for v in 0..vb {
+                    let mut reg = Vector::<M, NB>::empty();
+                    #[unroll]
+                    for x in 0..wb {
+                        let (row, col) = def.position_of_nth(
+                            lane,
+                            comptime!((v * wb + x) as u32),
+                            cmma::MatrixIdent::B,
+                        );
+                        reg[x] = ks[(g * 8usize + col as usize) * dp + kk * 16usize + row as usize];
+                    }
+                    b[v] = reg;
+                }
+                def.execute_inplace(&a, &b, &mut acc);
+            }
+            #[unroll]
+            for v in 0..vc {
+                let mut reg = acc[v];
+                #[unroll]
+                for x in 0..wc {
+                    let (row, col) = def.position_of_nth(
+                        lane,
+                        comptime!((v * wc + x) as u32),
+                        cmma::MatrixIdent::Accumulator,
+                    );
+                    let i = i0 + row0 + row as usize;
+                    let j = j0 + g * 8usize + col as usize;
+                    let gap = if i > j { i - j } else { j - i };
+                    let mut keep = i < len && j < len;
+                    if window > 0 {
+                        keep = keep && gap < window;
+                    }
+                    reg[x] = select(keep, reg[x], low);
+                }
+                s[comptime!(g * vc + v)] = reg;
+            }
+            let sa = s[comptime!(g * vc)];
+            let sb = s[comptime!(g * vc + 1)];
+            #[unroll]
+            for x in 0..wc {
+                if sa[x] > xa {
+                    xa = sa[x];
+                }
+                if sb[x] > xb {
+                    xb = sb[x];
+                }
+            }
+        }
+        let ya = plane_shuffle_xor(xa, 1u32);
+        if ya > xa {
+            xa = ya;
+        }
+        let ya = plane_shuffle_xor(xa, 2u32);
+        if ya > xa {
+            xa = ya;
+        }
+        let yb = plane_shuffle_xor(xb, 1u32);
+        if yb > xb {
+            xb = yb;
+        }
+        let yb = plane_shuffle_xor(xb, 2u32);
+        if yb > xb {
+            xb = yb;
+        }
+        if ma > xa {
+            xa = ma;
+        }
+        if mb > xb {
+            xb = mb;
+        }
+        let ea = (ma - xa).exp();
+        let eb = (mb - xb).exp();
+        ma = xa;
+        mb = xb;
+
+        let mut pa = f32::new(0.0f32);
+        let mut pb = f32::new(0.0f32);
+        let edge = f32::new(-1.0e38f32);
+        #[unroll]
+        for g in 0..comptime!(bc / 8) {
+            let mut sa = s[comptime!(g * vc)];
+            let mut sb = s[comptime!(g * vc + 1)];
+            #[unroll]
+            for x in 0..wc {
+                let wa_ = select(sa[x] > edge, (sa[x] - ma).exp(), f32::new(0.0f32));
+                let wb_ = select(sb[x] > edge, (sb[x] - mb).exp(), f32::new(0.0f32));
+                sa[x] = wa_;
+                sb[x] = wb_;
+                pa += wa_;
+                pb += wb_;
+            }
+            s[comptime!(g * vc)] = sa;
+            s[comptime!(g * vc + 1)] = sb;
+        }
+        pa += plane_shuffle_xor(pa, 1u32);
+        pa += plane_shuffle_xor(pa, 2u32);
+        pb += plane_shuffle_xor(pb, 1u32);
+        pb += plane_shuffle_xor(pb, 2u32);
+        la = la * ea + pa;
+        lb = lb * eb + pb;
+        #[unroll]
+        for n in 0..kd {
+            let mut oa = o[comptime!(n * vc)];
+            let mut ob = o[comptime!(n * vc + 1)];
+            #[unroll]
+            for x in 0..wc {
+                oa[x] = oa[x] * ea;
+                ob[x] = ob[x] * eb;
+            }
+            o[comptime!(n * vc)] = oa;
+            o[comptime!(n * vc + 1)] = ob;
+        }
+
+        #[unroll]
+        for kk in 0..comptime!(bc / 16) {
+            let mut a = Array::<Vector<M, NA>>::new(va);
+            #[unroll]
+            for v in 0..va {
+                let src = s[comptime!((2 * kk + v / 2) * vc + v % 2)];
+                let mut reg = Vector::<M, NA>::empty();
+                #[unroll]
+                for x in 0..wa {
+                    reg[x] = M::cast_from(src[x]);
+                }
+                a[v] = reg;
+            }
+            #[unroll]
+            for n in 0..kd {
+                let mut b = Array::<Vector<M, NB>>::new(vb);
+                #[unroll]
+                for v in 0..vb {
+                    let mut reg = Vector::<M, NB>::empty();
+                    #[unroll]
+                    for x in 0..wb {
+                        let (row, col) = def.position_of_nth(
+                            lane,
+                            comptime!((v * wb + x) as u32),
+                            cmma::MatrixIdent::B,
+                        );
+                        reg[x] = vs[(kk * 16usize + row as usize) * dp + n * 8usize + col as usize];
+                    }
+                    b[v] = reg;
+                }
+                let mut acc = Array::<Vector<f32, NC>>::new(vc);
+                #[unroll]
+                for v in 0..vc {
+                    acc[v] = o[comptime!(n * vc + v)];
+                }
+                def.execute_inplace(&a, &b, &mut acc);
+                #[unroll]
+                for v in 0..vc {
+                    o[comptime!(n * vc + v)] = acc[v];
+                }
+            }
+        }
+    }
+
+    #[unroll]
+    for n in 0..kd {
+        let oa = o[comptime!(n * vc)];
+        let ob = o[comptime!(n * vc + 1)];
+        #[unroll]
+        for x in 0..wc {
+            let (_, col) =
+                def.position_of_nth(lane, comptime!(x as u32), cmma::MatrixIdent::Accumulator);
+            let at = h * d + n * 8usize + col as usize;
+            if ia < len {
+                out[(start + ia) * hd + at] = F::cast_from(oa[x] / la);
+            }
+            if ib < len {
+                out[(start + ib) * hd + at] = F::cast_from(ob[x] / lb);
+            }
+        }
+    }
+    if lane % 4u32 == 0u32 {
+        if ia < len {
+            lse[h * total + start + ia] = ma + la.ln();
+        }
+        if ib < len {
+            lse[h * total + start + ib] = mb + lb.ln();
+        }
+    }
+}
+
 /// `delta[h, t] = Σ_d dO[t, h, d] O[t, h, d]`, a unit per (token, head).
 #[kernel(targets(cuda, rocm, metal, cpu), unchecked)]
 pub fn delta<F: Float>(
@@ -762,11 +1127,13 @@ pub fn rotate_back<F: Float>(
     }
 }
 
-/// A schedule of [`attend`]: query rows per cube (16 a plane) and keys per tile.
+/// A schedule of [`attend`]: query rows per cube (16 a plane), keys per tile, and whether it runs
+/// [`attend_mma`] (CUDA).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Tile {
     pub br: usize,
     pub bc: usize,
+    pub mma: bool,
 }
 
 /// Each `br`-row tile of every sequence of `lens`, as `[sequence, first row]` pairs, and the
@@ -901,25 +1268,45 @@ fn attend_launch<R: Runtime, F: Float + CubeElement, M: Float>(
     ];
     unsafe {
         let arg = |i: usize| ArrayArg::from_raw_parts(bufs[i].clone(), lens[i]);
-        attend::launch_unchecked::<F, M, R>(
-            client,
-            Grid::Static(grid.0, grid.1, 1),
-            Block::new_1d(units as u32),
-            arg(0),
-            arg(1),
-            arg(2),
-            arg(3),
-            arg(4),
-            arg(5),
-            arg(6),
-            arg(7),
-            arg(8),
-            D,
-            tile.br,
-            tile.bc,
-            units,
-            Target::of(client),
-        );
+        if tile.mma {
+            attend_mma::launch_unchecked::<F, M, R>(
+                client,
+                Grid::Static(grid.0, grid.1, 1),
+                Block::new_1d(2 * tile.br as u32),
+                arg(0),
+                arg(1),
+                arg(2),
+                arg(3),
+                arg(4),
+                arg(5),
+                arg(6),
+                arg(7),
+                arg(8),
+                D,
+                tile.br,
+                tile.bc,
+            );
+        } else {
+            attend::launch_unchecked::<F, M, R>(
+                client,
+                Grid::Static(grid.0, grid.1, 1),
+                Block::new_1d(units as u32),
+                arg(0),
+                arg(1),
+                arg(2),
+                arg(3),
+                arg(4),
+                arg(5),
+                arg(6),
+                arg(7),
+                arg(8),
+                D,
+                tile.br,
+                tile.bc,
+                units,
+                Target::of(client),
+            );
+        }
     }
     let out = F::from_bytes(&client.read_one_unchecked(bufs[5].clone())).to_vec();
     let lse = f32::from_bytes(&client.read_one_unchecked(bufs[6].clone())).to_vec();
@@ -1256,25 +1643,45 @@ pub fn attend_bench<R: Runtime, F: Float + CubeElement, M: Float>(
     ];
     let launch = || unsafe {
         let arg = |i: usize| ArrayArg::from_raw_parts(bufs[i].clone(), lens[i]);
-        attend::launch_unchecked::<F, M, R>(
-            client,
-            Grid::Static(nt, heads as u32, 1),
-            Block::new_1d(units as u32),
-            arg(0),
-            arg(1),
-            arg(2),
-            arg(3),
-            arg(4),
-            arg(5),
-            arg(6),
-            arg(7),
-            arg(8),
-            D,
-            tile.br,
-            tile.bc,
-            units,
-            Target::of(client),
-        );
+        if tile.mma {
+            attend_mma::launch_unchecked::<F, M, R>(
+                client,
+                Grid::Static(nt, heads as u32, 1),
+                Block::new_1d(2 * tile.br as u32),
+                arg(0),
+                arg(1),
+                arg(2),
+                arg(3),
+                arg(4),
+                arg(5),
+                arg(6),
+                arg(7),
+                arg(8),
+                D,
+                tile.br,
+                tile.bc,
+            );
+        } else {
+            attend::launch_unchecked::<F, M, R>(
+                client,
+                Grid::Static(nt, heads as u32, 1),
+                Block::new_1d(units as u32),
+                arg(0),
+                arg(1),
+                arg(2),
+                arg(3),
+                arg(4),
+                arg(5),
+                arg(6),
+                arg(7),
+                arg(8),
+                D,
+                tile.br,
+                tile.bc,
+                units,
+                Target::of(client),
+            );
+        }
     };
     for _ in 0..3 {
         launch();
@@ -1413,10 +1820,7 @@ pub fn attend_tuned<R: Runtime, F: Float + CubeElement, M: Float>(
     );
     let mut tuned = crate::tune::Tuned::new("packed_attend", key);
     let m = std::mem::size_of::<M>();
-    for (name, tile) in TILES
-        .into_iter()
-        .filter(|(_, t)| fits(client, attend_shared(*t, m)))
-    {
+    for (name, tile) in TILES.into_iter().filter(|(_, t)| usable(client, *t, m)) {
         tuned = tuned.variant(name, move |iters| {
             let ms = attend_bench::<R, F, M>(
                 client, qkv, cos, sin, lens, heads, window, scale, tile, iters,
@@ -1466,10 +1870,19 @@ pub fn attend_back_tuned<R: Runtime, F: Float + CubeElement, M: Float>(
     tuned.pick(client)
 }
 
-/// Shared bytes [`attend`] takes at `tile`, its matrix operands `m` bytes each.
+/// Shared bytes [`attend`] or [`attend_mma`] takes at `tile`, its matrix operands `m` bytes each.
 pub fn attend_shared(tile: Tile, m: usize) -> usize {
     let (br, bc) = (tile.br, tile.bc);
+    if tile.mma {
+        return m * (br + 2 * bc) * (D + 8);
+    }
     m * (br * D + 2 * bc * D + br * bc) + 4 * (br * bc + br * D + 7 * br)
+}
+
+/// Whether `tile` runs on `client`'s device: its shared memory fits, and [`attend_mma`] only on
+/// CUDA.
+pub fn usable<R: Runtime>(client: &ComputeClient<R>, tile: Tile, m: usize) -> bool {
+    fits(client, attend_shared(tile, m)) && (!tile.mma || Target::of(client) == Target::Cuda)
 }
 
 /// Shared bytes [`attend_back`] takes at `bc`, its matrix operands `m` bytes each.
@@ -1483,12 +1896,71 @@ pub fn fits<R: Runtime>(client: &ComputeClient<R>, bytes: usize) -> bool {
 }
 
 /// The schedules [`attend_tuned`] times.
-pub const TILES: [(&str, Tile); 5] = [
-    ("r16_c16", Tile { br: 16, bc: 16 }),
-    ("r32_c32", Tile { br: 32, bc: 32 }),
-    ("r64_c32", Tile { br: 64, bc: 32 }),
-    ("r32_c64", Tile { br: 32, bc: 64 }),
-    ("r64_c64", Tile { br: 64, bc: 64 }),
+pub const TILES: [(&str, Tile); 8] = [
+    (
+        "r16_c16",
+        Tile {
+            br: 16,
+            bc: 16,
+            mma: false,
+        },
+    ),
+    (
+        "r32_c32",
+        Tile {
+            br: 32,
+            bc: 32,
+            mma: false,
+        },
+    ),
+    (
+        "r64_c32",
+        Tile {
+            br: 64,
+            bc: 32,
+            mma: false,
+        },
+    ),
+    (
+        "r32_c64",
+        Tile {
+            br: 32,
+            bc: 64,
+            mma: false,
+        },
+    ),
+    (
+        "r64_c64",
+        Tile {
+            br: 64,
+            bc: 64,
+            mma: false,
+        },
+    ),
+    (
+        "m64_c32",
+        Tile {
+            br: 64,
+            bc: 32,
+            mma: true,
+        },
+    ),
+    (
+        "m64_c64",
+        Tile {
+            br: 64,
+            bc: 64,
+            mma: true,
+        },
+    ),
+    (
+        "m128_c64",
+        Tile {
+            br: 128,
+            bc: 64,
+            mma: true,
+        },
+    ),
 ];
 
 /// The key blocks [`attend_back_tuned`] times.
@@ -1553,7 +2025,11 @@ mod tests {
                 HEADS,
                 window,
                 scale,
-                Tile { br: 16, bc: 16 },
+                Tile {
+                    br: 16,
+                    bc: 16,
+                    mma: false,
+                },
             );
             let (r, rl) = (rel(&got, &want), rel(&glse, &wlse));
             eprintln!("[packed cpu] window {window:?}: out {r:.2e}, lse {rl:.2e}");
@@ -1662,10 +2138,7 @@ mod tests {
         let scale = (D as f32).powf(-0.5);
         let m = std::mem::size_of::<M>();
         for window in [None, Some(64)] {
-            for (tag, tile) in TILES
-                .into_iter()
-                .filter(|(_, t)| fits(c, attend_shared(*t, m)))
-            {
+            for (tag, tile) in TILES.into_iter().filter(|(_, t)| usable(c, *t, m)) {
                 let ms = attend_bench::<R, F, M>(
                     c, &qkv, &cos, &sin, &lens, heads, window, scale, tile, 50,
                 );
@@ -1673,11 +2146,7 @@ mod tests {
                     "[packed speed {name}] tokens {t} window {window:?} forward {tag}: {ms:.3} ms"
                 );
             }
-            let first = TILES
-                .into_iter()
-                .find(|(_, t)| fits(c, attend_shared(*t, m)))
-                .unwrap()
-                .1;
+            let first = TILES.into_iter().find(|(_, t)| usable(c, *t, m)).unwrap().1;
             let (out, lse) =
                 attend_run::<R, F, M>(c, &qkv, &cos, &sin, &lens, heads, window, scale, first);
             for (_, bc) in BACKS
@@ -1735,10 +2204,7 @@ mod tests {
         let scale = (D as f32).powf(-0.5);
         for window in [None, Some(8)] {
             let (want, wlse) = attend_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale);
-            for (_, tile) in TILES
-                .into_iter()
-                .filter(|(_, t)| fits(&c, attend_shared(*t, 2)))
-            {
+            for (_, tile) in TILES.into_iter().filter(|(_, t)| usable(&c, *t, 2)) {
                 let (got, glse) = attend_run::<WgpuRuntime, f32, f16>(
                     &c, &qkv, &cos, &sin, &LENS, HEADS, window, scale, tile,
                 );
