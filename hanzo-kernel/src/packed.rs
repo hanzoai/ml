@@ -57,6 +57,11 @@ pub fn attend<F: Float, M: Float>(
     let mut ps = SharedMemory::<M>::new(br * bc);
     let mut of = SharedMemory::<f32>::new(br * d);
     let mut row = SharedMemory::<f32>::new(3 * br);
+    let mut red = SharedMemory::<f32>::new(units);
+    let q = units / br;
+    let w = bc / q;
+    let r = u % br;
+    let part = u / br;
 
     // the query tile, rotated and scaled; rows past the sequence zero
     let per_q = br * half / units;
@@ -83,9 +88,9 @@ pub fn attend<F: Float, M: Float>(
     for e in 0..per_o {
         of[u * per_o + e] = f32::new(0.0f32);
     }
-    if u < br {
-        row[u] = f32::new(-3.0e38f32);
-        row[br + u] = f32::new(0.0f32);
+    if part == 0 {
+        row[r] = f32::new(-3.0e38f32);
+        row[br + r] = f32::new(0.0f32);
     }
 
     let mut lo = len - len;
@@ -198,54 +203,64 @@ pub fn attend<F: Float, M: Float>(
         };
         sync_cube();
 
-        // the online softmax, a row per unit: masked keys weigh exactly zero
-        if u < br {
-            let i = i0 + u;
-            let mut top = f32::new(-3.0e38f32);
-            for c in 0..bc {
-                let j = j0 + c;
-                let mut near = true;
-                if window > 0 {
-                    let gap = if i > j { i - j } else { j - i };
-                    near = gap < window;
-                }
-                if i < len && j < len && near {
-                    let s = sf[u * bc + c];
-                    if s > top {
-                        top = s;
-                    }
+        // the online softmax, `q` units a row over a share of the key tile each: masked keys
+        // weigh exactly zero
+        let i = i0 + r;
+        let mut top = f32::new(-3.0e38f32);
+        for c in part * w..part * w + w {
+            let j = j0 + c;
+            let mut near = true;
+            if window > 0 {
+                let gap = if i > j { i - j } else { j - i };
+                near = gap < window;
+            }
+            if i < len && j < len && near {
+                let s = sf[r * bc + c];
+                if s > top {
+                    top = s;
                 }
             }
-            let old = row[u];
-            let mut m = old;
-            if top > m {
-                m = top;
+        }
+        red[part * br + r] = top;
+        sync_cube();
+        let old = row[r];
+        let mut m = old;
+        for k in 0..q {
+            let x = red[k * br + r];
+            if x > m {
+                m = x;
             }
+        }
+        sync_cube();
+        let mut sum = f32::new(0.0f32);
+        for c in part * w..part * w + w {
+            let j = j0 + c;
+            let mut near = true;
+            if window > 0 {
+                let gap = if i > j { i - j } else { j - i };
+                near = gap < window;
+            }
+            let mut e = f32::new(0.0f32);
+            if i < len && j < len && near && m > f32::new(-3.0e38f32) {
+                e = (sf[r * bc + c] - m).exp();
+            }
+            ps[r * bc + c] = M::cast_from(e);
+            sum += e;
+        }
+        red[part * br + r] = sum;
+        sync_cube();
+        if part == 0 {
             if m == f32::new(-3.0e38f32) {
-                row[2 * br + u] = f32::new(1.0f32);
-                for c in 0..bc {
-                    ps[u * bc + c] = M::cast_from(f32::new(0.0f32));
-                }
+                row[2 * br + r] = f32::new(1.0f32);
             } else {
                 let em = (old - m).exp();
-                let mut sum = f32::new(0.0f32);
-                for c in 0..bc {
-                    let j = j0 + c;
-                    let mut near = true;
-                    if window > 0 {
-                        let gap = if i > j { i - j } else { j - i };
-                        near = gap < window;
-                    }
-                    let mut w = f32::new(0.0f32);
-                    if i < len && j < len && near {
-                        w = (sf[u * bc + c] - m).exp();
-                    }
-                    ps[u * bc + c] = M::cast_from(w);
-                    sum += w;
+                let mut total = f32::new(0.0f32);
+                for k in 0..q {
+                    total += red[k * br + r];
                 }
-                row[br + u] = row[br + u] * em + sum;
-                row[u] = m;
-                row[2 * br + u] = em;
+                row[br + r] = row[br + r] * em + total;
+                row[r] = m;
+                row[2 * br + r] = em;
             }
         }
         sync_cube();
@@ -339,11 +354,9 @@ pub fn attend<F: Float, M: Float>(
             out[(start + i) * hd + h * d + idx % d] = F::cast_from(of[idx] / row[br + r]);
         }
     }
-    if u < br {
-        let i = i0 + u;
-        if i < len {
-            lse[h * total + start + i] = row[u] + row[br + u].ln();
-        }
+    let i = i0 + r;
+    if part == 0 && i < len {
+        lse[h * total + start + i] = row[r] + row[br + r].ln();
     }
 }
 
@@ -1456,7 +1469,7 @@ pub fn attend_back_tuned<R: Runtime, F: Float + CubeElement, M: Float>(
 /// Shared bytes [`attend`] takes at `tile`, its matrix operands `m` bytes each.
 pub fn attend_shared(tile: Tile, m: usize) -> usize {
     let (br, bc) = (tile.br, tile.bc);
-    m * (br * D + 2 * bc * D + br * bc) + 4 * (br * bc + br * D + 3 * br)
+    m * (br * D + 2 * bc * D + br * bc) + 4 * (br * bc + br * D + 7 * br)
 }
 
 /// Shared bytes [`attend_back`] takes at `bc`, its matrix operands `m` bytes each.
