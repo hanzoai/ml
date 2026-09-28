@@ -1414,6 +1414,45 @@ pub fn attend_tuned<R: Runtime, F: Float + CubeElement, M: Float>(
     tuned.pick(client)
 }
 
+/// [`attend_back_run`]'s pass at the fastest key block for `(device, shape)`, tuned once and
+/// cached ([`crate::tune`]).
+#[allow(clippy::too_many_arguments)]
+pub fn attend_back_tuned<R: Runtime, F: Float + CubeElement, M: Float>(
+    client: &ComputeClient<R>,
+    qkv: &[F],
+    cos: &[F],
+    sin: &[F],
+    lens: &[usize],
+    heads: usize,
+    window: Option<usize>,
+    scale: f32,
+    out: &[F],
+    dout: &[F],
+    lse: &[f32],
+) -> crate::tune::Pick<usize> {
+    let t: usize = lens.iter().sum();
+    let key = format!(
+        "heads={heads},window={},tokens={},longest={}",
+        window.map_or(0, |w| w + 1),
+        t.next_power_of_two(),
+        lens.iter().max().copied().unwrap_or(0).next_power_of_two()
+    );
+    let mut tuned = crate::tune::Tuned::new("packed_attend_back", key);
+    let m = std::mem::size_of::<M>();
+    for (name, bc) in BACKS
+        .into_iter()
+        .filter(|(_, bc)| fits(client, attend_back_shared(*bc, m)))
+    {
+        tuned = tuned.variant(name, move |iters| {
+            let ms = attend_back_bench::<R, F, M>(
+                client, qkv, cos, sin, lens, heads, window, scale, out, dout, lse, bc, iters,
+            );
+            (bc, ms)
+        });
+    }
+    tuned.pick(client)
+}
+
 /// Shared bytes [`attend`] takes at `tile`, its matrix operands `m` bytes each.
 pub fn attend_shared(tile: Tile, m: usize) -> usize {
     let (br, bc) = (tile.br, tile.bc);
@@ -1438,6 +1477,9 @@ pub const TILES: [(&str, Tile); 5] = [
     ("r32_c64", Tile { br: 32, bc: 64 }),
     ("r64_c64", Tile { br: 64, bc: 64 }),
 ];
+
+/// The key blocks [`attend_back_tuned`] times.
+pub const BACKS: [(&str, usize); 3] = [("c16", 16), ("c32", 32), ("c64", 64)];
 
 #[cfg(test)]
 mod tests {
@@ -1561,7 +1603,10 @@ mod tests {
         let (cos, sin) = tables(128);
         let (cos, sin) = (round(cos), round(sin));
         let scale = (D as f32).powf(-0.5);
-        for bc in [16usize, 32] {
+        for (_, bc) in BACKS
+            .into_iter()
+            .filter(|(_, bc)| fits(&c, attend_back_shared(*bc, 2)))
+        {
             for window in [None, Some(8), Some(64)] {
                 let (out, lse) = attend_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale);
                 let want = attend_back_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale, &dout);
@@ -1586,6 +1631,7 @@ mod tests {
             }
         }
     }
+
     /// Mean ms a pass on CUDA at the shared bench shape, per tile: `cargo test --features cuda
     /// packed_speed -- --ignored --nocapture`.
     #[cfg(feature = "cuda")]
@@ -1624,7 +1670,10 @@ mod tests {
                 scale,
                 Tile { br: 64, bc: 64 },
             );
-            for bc in [16usize, 32] {
+            for (_, bc) in BACKS
+                .into_iter()
+                .filter(|(_, bc)| fits(&c, attend_back_shared(*bc, 2)))
+            {
                 let ms = attend_back_bench::<CudaRuntime, bf16, bf16>(
                     &c, &qkv, &cos, &sin, &lens, heads, window, scale, &out, &dout, &lse, bc, 20,
                 );
@@ -1632,6 +1681,16 @@ mod tests {
                     "[packed speed cuda] tokens {t} window {window:?} backward bc {bc}: {ms:.3} ms"
                 );
             }
+            let f = attend_tuned::<CudaRuntime, bf16, bf16>(
+                &c, &qkv, &cos, &sin, &lens, heads, window, scale,
+            );
+            let b = attend_back_tuned::<CudaRuntime, bf16, bf16>(
+                &c, &qkv, &cos, &sin, &lens, heads, window, scale, &out, &dout, &lse,
+            );
+            eprintln!(
+                "[packed speed cuda] window {window:?} tuned: forward {} (cached {}), backward {} (cached {})",
+                f.winner, f.from_cache, b.winner, b.from_cache
+            );
         }
     }
     #[cfg(feature = "metal")]
@@ -1662,9 +1721,9 @@ mod tests {
                 );
             }
             let grad = attend_back_ref(&qkv, &cos, &sin, &LENS, HEADS, window, scale, &dout);
-            for bc in [16usize, 32]
+            for (_, bc) in BACKS
                 .into_iter()
-                .filter(|&b| fits(&c, attend_back_shared(b, 2)))
+                .filter(|(_, b)| fits(&c, attend_back_shared(*b, 2)))
             {
                 let got = attend_back_run::<WgpuRuntime, f32, f16>(
                     &c, &qkv, &cos, &sin, &LENS, HEADS, window, scale, &want, &dout, &wlse, bc,
