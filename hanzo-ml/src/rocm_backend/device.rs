@@ -77,7 +77,44 @@ fn pin_rocblas_workspace(blas: &SendSyncRocblasHandle) -> Result<()> {
     Ok(())
 }
 
+/// Two events that time the device work between them on the device's stream.
+pub struct Timer {
+    start: rocm_rs::hip::Event,
+    stop: rocm_rs::hip::Event,
+    stream: Arc<SendSyncStream>,
+}
+
+// SAFETY: HIP events are usable from any thread; callers serialize a timer's calls.
+unsafe impl Send for Timer {}
+unsafe impl Sync for Timer {}
+
+impl Timer {
+    pub fn start(&self) -> crate::Result<()> {
+        self.start.record(&self.stream).map_err(RocmError::from)?;
+        Ok(())
+    }
+
+    pub fn stop(&self) -> crate::Result<()> {
+        self.stop.record(&self.stream).map_err(RocmError::from)?;
+        Ok(())
+    }
+
+    /// Milliseconds from start to stop, waiting for stop.
+    pub fn elapsed(&self) -> crate::Result<f32> {
+        self.stop.synchronize().map_err(RocmError::from)?;
+        Ok(self.start.elapsed_time(&self.stop).map_err(RocmError::from)?)
+    }
+}
+
 impl RocmDevice {
+    pub fn timer(&self) -> crate::Result<Timer> {
+        Ok(Timer {
+            start: rocm_rs::hip::Event::new().map_err(RocmError::from)?,
+            stop: rocm_rs::hip::Event::new().map_err(RocmError::from)?,
+            stream: self.stream.clone(),
+        })
+    }
+
     /// Kernel and rocBLAS launches in this process so far, and graph launches (none).
     pub fn counts(&self) -> (u64, u64) {
         (super::LAUNCHES.load(std::sync::atomic::Ordering::Relaxed), 0)

@@ -90,6 +90,28 @@ impl Graph {
     }
 }
 
+/// Two events that time the device work between them on the device's stream.
+pub struct Timer {
+    start: cudarc::driver::CudaEvent,
+    stop: cudarc::driver::CudaEvent,
+    stream: Arc<cudarc::driver::CudaStream>,
+}
+
+impl Timer {
+    pub fn start(&self) -> Result<()> {
+        self.start.record(&self.stream).w()
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        self.stop.record(&self.stream).w()
+    }
+
+    /// Milliseconds from start to stop, waiting for stop.
+    pub fn elapsed(&self) -> Result<f32> {
+        self.start.elapsed_ms(&self.stop).w()
+    }
+}
+
 impl std::fmt::Debug for CudaDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CudaDevice({:?})", self.id)
@@ -312,6 +334,15 @@ impl CudaFunc {
 impl CudaDevice {
     pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
         self.stream.clone()
+    }
+
+    pub fn timer(&self) -> Result<Timer> {
+        use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+        Ok(Timer {
+            start: self.context.new_event(Some(CU_EVENT_DEFAULT)).w()?,
+            stop: self.context.new_event(Some(CU_EVENT_DEFAULT)).w()?,
+            stream: self.stream.clone(),
+        })
     }
 
     /// Kernel and cuBLAS launches so far, and graph launches.
