@@ -396,6 +396,43 @@ fn one_worker_matches_its_rounds_replayed() -> Result<()> {
     Ok(())
 }
 
+/// One worker, rounds far longer than the plan, a checkpoint every 5 batches over two epochs of
+/// 6: each round ends at the next checkpoint's batch, a multiple of 5 or an epoch's end, and θ
+/// is those rounds replayed, bit for bit.
+#[test]
+fn a_round_ends_at_each_checkpoint() -> Result<()> {
+    let data = Data::new(48);
+    let p = plan(data.len(), 8, 2);
+    assert_eq!((p.total(), p.ends.clone()), (12, vec![6, 12]));
+    let make = {
+        let data = data.clone();
+        move || Tiny::new(&data, false, 3e-3)
+    };
+    let init = make()?;
+    let start0 = theta(&init)?;
+    let mut cfg = Cfg::new(1.0, 0.0, 1e9);
+    cfg.every = 5;
+    let c = coordinate(&p, &init, Start::new(start0.clone(), p.total()), &cfg)?;
+    crew(&c, &["a"], make.clone())
+        .remove(0)
+        .join()
+        .expect("worker")?;
+    let report = c.join()?;
+    let rounds: Vec<Vec<usize>> = report
+        .log
+        .iter()
+        .map(|parts| parts.iter().flat_map(|x| x.1.clone()).collect())
+        .collect();
+    assert_eq!(
+        rounds,
+        [vec![0, 1, 2, 3, 4], vec![5], vec![6, 7, 8, 9], vec![10, 11]]
+    );
+    let same = replay(&report.log, &p, ADAM, 1.0, 0.0, start0.clone(), |_| make())?;
+    assert!(max(&start0, &same) > 1e-3, "training moved nothing");
+    assert_eq!(max(&report.theta, &same), 0.0);
+    Ok(())
+}
+
 /// Three workers, members before any takes a batch, one step a round, outer lr 0.7, momentum
 /// 0.9: every round holds all three, and the same rounds (who took which batch) replayed in
 /// one process with the same exchange give the same θ bit for bit, whatever order the reports

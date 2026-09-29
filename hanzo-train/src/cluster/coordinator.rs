@@ -27,7 +27,8 @@
 //! [`Keep::round`] measures: the workers' own numbers, anything measured at the new θ_global.
 //!
 //! A checkpoint (every `every` merged batches, each epoch, the end) is taken at a round
-//! boundary: [`Keep::validate`], then [`Keep::save`] (the caller's weights), then
+//! boundary, and a round hands out no batch past the next one, so it lands on its batch:
+//! [`Keep::validate`], then [`Keep::save`] (the caller's weights), then
 //! `state.safetensors`, the outer momentum, its rounding carry, the merged batches and the
 //! round; and `inner/{worker}.safetensors`, each worker's AdamW moments, step count and
 //! rounding carry, which a worker of that name gets back when it joins. A run resumed from it
@@ -279,6 +280,8 @@ struct State {
     queue: VecDeque<usize>,
     /// The first batch of the plan never handed out.
     next: usize,
+    /// The first batch the open round does not hand out: the next checkpoint's ([`stop`]).
+    stop: usize,
     merged: Vec<bool>,
     count: usize,
     /// The first unmerged batch: every epoch ending at or before it is done.
@@ -438,7 +441,7 @@ impl Shared {
         }
         let b = match s.queue.pop_front() {
             Some(b) => b,
-            None if s.next < self.limit => {
+            None if s.next < self.limit && s.next < s.stop => {
                 s.next += 1;
                 s.next - 1
             }
@@ -519,6 +522,7 @@ pub fn start(
     let state = State {
         queue: (0..next).filter(|&i| !merged[i]).collect(),
         next,
+        stop: stop(next, every.max(1), &plan.ends),
         count,
         frontier: merged.iter().position(|m| !m).unwrap_or(limit),
         merged,
@@ -864,6 +868,16 @@ fn merge(mut base: Value, more: Value) -> Value {
     base
 }
 
+/// The first batch past `next` a checkpoint falls at: the next multiple of `every`, or the
+/// end of an epoch, whichever is sooner.
+fn stop(next: usize, every: usize, ends: &[usize]) -> usize {
+    let at = (next / every).saturating_add(1).saturating_mul(every);
+    ends.iter()
+        .copied()
+        .filter(|&e| e > next)
+        .fold(at, usize::min)
+}
+
 /// Close rounds as their members report or are dropped, until the plan is merged.
 fn rounds(
     sh: &Shared,
@@ -955,6 +969,7 @@ fn rounds(
             }
             let now = Instant::now();
             s.round += 1;
+            s.stop = stop(s.next, sh.every, &sh.plan.ends);
             s.update = Arc::new(update);
             s.opened = now;
             s.deadline = now + sh.round();
