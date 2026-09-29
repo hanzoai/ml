@@ -41,14 +41,17 @@ pub fn packed(
         hanzo_ml::bail!("packed attention: contiguous inputs only");
     }
     let mut cu = Vec::with_capacity(lens.len() + 1);
+    let mut part = Vec::with_capacity(lens.len());
     let mut tiles = Vec::new();
-    let mut at = 0u32;
+    let (mut at, mut rows) = (0u32, 0u32);
     for (s, &l) in lens.iter().enumerate() {
         cu.push(at);
+        part.push(rows);
         for i0 in (0..l).step_by(TILE) {
             tiles.extend([s as u32, i0 as u32]);
         }
         at += l as u32;
+        rows += (l.div_ceil(TILE) * l) as u32;
     }
     cu.push(at);
     if tiles.is_empty() {
@@ -63,6 +66,8 @@ pub fn packed(
         total: t,
         tiles: tiles_n,
         cu: Tensor::from_vec(cu, lens.len() + 1, dev)?,
+        part: Tensor::from_vec(part, lens.len(), dev)?,
+        rows: rows as usize,
         tile: Tensor::from_vec(tiles, 2 * tiles_n, dev)?,
         lse: Mutex::new(None),
     };
@@ -77,6 +82,10 @@ struct Flash {
     tiles: usize,
     /// `[S + 1]`: each sequence's first token.
     cu: Tensor,
+    /// `[S]`: each sequence's first row of dQ's partials, one block of its rows per key tile.
+    part: Tensor,
+    /// dQ's partial rows: each sequence's rows times its key tiles.
+    rows: usize,
     /// `[NT, 2]`: each tile's sequence and first row.
     tile: Tensor,
     /// `[H, T]`: each row's log-sum-exp, from the forward for the backward.
@@ -219,9 +228,12 @@ impl InplaceOpN<5> for Flash {
         let ((cg, co), (tg, to)) = (hold(&self.cu)?, hold(&self.tile)?);
         let cu = cuda(&cg).as_cuda_slice::<u32>()?.slice(co..);
         let tile = cuda(&tg).as_cuda_slice::<u32>()?.slice(to..);
+        let (pg, po) = hold(&self.part)?;
+        let part = cuda(&pg).as_cuda_slice::<u32>()?.slice(po..);
         // SAFETY: the delta kernel writes every element.
         let delta = unsafe { dev.alloc::<f32>(h * t)? };
-        let dq = dev.alloc_zeros::<f32>(t * h * HEAD)?;
+        // each key tile's dQ into its own rows, summed in tile order: no atomics, the same bits
+        let dq = dev.alloc_zeros::<f32>(self.rows * h * HEAD)?;
 
         let f = dev.get_or_load_func("flash_delta_bf16", &kernels::ATTENTION)?;
         let mut b = f.builder();
@@ -243,6 +255,7 @@ impl InplaceOpN<5> for Flash {
         b.arg(&dout);
         b.arg(&lse);
         b.arg(&delta);
+        b.arg(&part);
         b.arg(&dq);
         b.arg(&mut dqkv);
         hanzo_ml::builder_arg!(b, t as u32);
@@ -255,6 +268,7 @@ impl InplaceOpN<5> for Flash {
         b.arg(&cos);
         b.arg(&sin);
         b.arg(&cu);
+        b.arg(&part);
         hanzo_ml::builder_arg!(
             b,
             (self.cu.elem_count() - 1) as u32,

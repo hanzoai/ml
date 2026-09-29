@@ -291,6 +291,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) flash_bwd_bf16(
     const bf16 *dout,
     const float *lse,
     const float *delta,
+    const uint32_t *part,
     float *dq,
     bf16 *dqkv,
     const uint32_t total
@@ -413,11 +414,12 @@ extern "C" __global__ void __launch_bounds__(THREADS) flash_bwd_bf16(
             if (i >= len) {
                 continue;
             }
-            float *dst = dq + (size_t)(start + i) * hd + h * D;
+            // this key tile's rows of the sequence's partials
+            float *dst = dq + ((size_t)part[seq] + (size_t)(j0 / BK) * len + i) * hd + h * D;
 #pragma unroll
             for (int nt = 0; nt < 8; nt++) {
-                atomicAdd(dst + nt * 8 + 2 * c, dqa[nt][2 * row]);
-                atomicAdd(dst + nt * 8 + 2 * c + 1, dqa[nt][2 * row + 1]);
+                dst[nt * 8 + 2 * c] = dqa[nt][2 * row];
+                dst[nt * 8 + 2 * c + 1] = dqa[nt][2 * row + 1];
             }
         }
     }
@@ -454,6 +456,7 @@ extern "C" __global__ void flash_dq_bf16(
     const bf16 *cos,
     const bf16 *sin,
     const uint32_t *cu,
+    const uint32_t *part,
     const uint32_t seqs,
     const uint32_t heads,
     const float scale,
@@ -478,8 +481,13 @@ extern "C" __global__ void flash_dq_bf16(
         }
     }
     const size_t pos = t - cu[lo];
-    const float *src = dq + (t * heads + h) * D;
-    const float x1 = src[d], x2 = src[d + HALF];
+    const size_t len = cu[lo + 1] - cu[lo];
+    float x1 = 0.f, x2 = 0.f;
+    for (size_t kt = 0; kt * BK < len; kt++) {
+        const float *src = dq + (((size_t)part[lo] + kt * len + pos) * heads + h) * D;
+        x1 += src[d];
+        x2 += src[d + HALF];
+    }
     const float cs = __bfloat162float(cos[pos * HALF + d]);
     const float sn = __bfloat162float(sin[pos * HALF + d]);
     bf16 *dst = dqkv + t * 3 * (size_t)heads * D + (size_t)h * D;

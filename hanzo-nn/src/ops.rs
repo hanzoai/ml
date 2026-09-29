@@ -1710,6 +1710,7 @@ mod fused_bwd {
                 &format!("layernorm_bwd_params_{suffix}"),
                 &kernels::BACKWARD,
             )?;
+            let sum_f = dev.get_or_load_func("layernorm_bwd_sum", &kernels::BACKWARD)?;
             let chunks = n.div_ceil(64).clamp(1, 256);
             let per = n.div_ceil(chunks);
             let params_cfg = LaunchConfig {
@@ -1719,6 +1720,9 @@ mod fused_bwd {
             };
             let stats = stats.as_cuda_slice::<f32>()?.slice(sl.start_offset()..);
             let dparams = dparams.as_cuda_slice::<f32>()?.slice(pl.start_offset()..);
+            // each row block's dγ and dβ apart, then added in block order: the same bits every run
+            // SAFETY: every row block writes all 2·d of its entries.
+            let part = unsafe { dev.alloc::<f32>(chunks * 2 * d)? };
             macro_rules! run {
                 ($t:ty) => {{
                     let mut dx = dx
@@ -1741,9 +1745,15 @@ mod fused_bwd {
                     b.arg(&x);
                     b.arg(&dy);
                     b.arg(&stats);
-                    b.arg(&dparams);
+                    b.arg(&part);
                     // SAFETY: ffi.
                     unsafe { b.launch(params_cfg) }.w()?;
+                    let mut b = sum_f.builder();
+                    hanzo_ml::builder_arg!(b, chunks as u32, (2 * d) as u32);
+                    b.arg(&part);
+                    b.arg(&dparams);
+                    // SAFETY: ffi.
+                    unsafe { b.launch(LaunchConfig::for_num_elems((2 * d) as u32)) }.w()?;
                 }};
             }
             match dx.dtype() {

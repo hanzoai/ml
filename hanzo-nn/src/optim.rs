@@ -449,16 +449,33 @@ mod fused {
             let dev = acc.device().clone();
             let n = xl.shape().elem_count();
             let func = dev.get_or_load_func("sumsq_f32", &kernels::OPTIM)?;
+            let add = dev.get_or_load_func("sumsq_add", &kernels::OPTIM)?;
             let mut acc = acc
                 .as_cuda_slice_mut::<f32>()?
                 .slice_mut(acc_l.start_offset()..);
             let x = x.as_cuda_slice::<f32>()?.slice(xl.start_offset()..);
+            // each block's sum apart, then added in block order: the same bits every run
+            let cfg = super::launch(n);
+            let blocks = cfg.grid_dim.0 as usize;
+            // SAFETY: every block writes its entry.
+            let part = unsafe { dev.alloc::<f32>(blocks)? };
             let mut b = func.builder();
             hanzo_ml::builder_arg!(b, n as u32);
             b.arg(&x);
-            b.arg(&mut acc);
+            b.arg(&part);
             // SAFETY: ffi.
-            unsafe { b.launch(super::launch(n)) }.w()?;
+            unsafe { b.launch(cfg) }.w()?;
+            let mut b = add.builder();
+            hanzo_ml::builder_arg!(b, blocks as u32);
+            b.arg(&part);
+            b.arg(&mut acc);
+            let one = hanzo_ml::cuda_backend::cudarc::driver::LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: ffi.
+            unsafe { b.launch(one) }.w()?;
             Ok(())
         }
     }

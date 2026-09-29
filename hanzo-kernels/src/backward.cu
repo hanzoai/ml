@@ -68,7 +68,7 @@ __device__ void layernorm_bwd_rows(
     }
 }
 
-// `dparams` is [dalpha, dbeta], zeroed by the caller.
+// `part` is one [dalpha, dbeta] per block of rows; `layernorm_bwd_sum` adds them in block order.
 template <typename T>
 __device__ void layernorm_bwd_params(
     const uint32_t n,
@@ -77,7 +77,7 @@ __device__ void layernorm_bwd_params(
     const T *x,
     const T *dy,
     const float *stats,
-    float *dparams
+    float *part
 ) {
     const uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= d) {
@@ -92,8 +92,26 @@ __device__ void layernorm_bwd_params(
         da += g * (static_cast<float>(x[(size_t)r * d + j]) - stats[2 * r]) * stats[2 * r + 1];
         db += g;
     }
-    atomicAdd(&dparams[j], da);
-    atomicAdd(&dparams[d + j], db);
+    part[(size_t)blockIdx.y * 2 * d + j] = da;
+    part[(size_t)blockIdx.y * 2 * d + d + j] = db;
+}
+
+// `dparams[j] += Σ_b part[b][j]` over the `blocks` row blocks, in order.
+extern "C" __global__ void layernorm_bwd_sum(
+    const uint32_t blocks,
+    const uint32_t width,
+    const float *part,
+    float *dparams
+) {
+    const uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= width) {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < blocks; b++) {
+        acc += part[(size_t)b * width + j];
+    }
+    dparams[j] += acc;
 }
 
 template <typename T>
@@ -119,8 +137,8 @@ extern "C" __global__ void layernorm_bwd_##NAME(                                
 }                                                                                              \
 extern "C" __global__ void layernorm_bwd_params_##NAME(                                       \
     const uint32_t n, const uint32_t d, const uint32_t rows_per, const T *x, const T *dy,      \
-    const float *stats, float *dparams) {                                                      \
-    layernorm_bwd_params<T>(n, d, rows_per, x, dy, stats, dparams);                            \
+    const float *stats, float *part) {                                                         \
+    layernorm_bwd_params<T>(n, d, rows_per, x, dy, stats, part);                               \
 }                                                                                              \
 extern "C" __global__ void softmax_bwd_##NAME(                                                \
     const uint32_t d, const T *y, const T *dy, T *dx) {                                        \

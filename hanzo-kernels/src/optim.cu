@@ -36,7 +36,8 @@ static __device__ __forceinline__ float wsum(float x) {
     return x;
 }
 
-extern "C" __global__ void sumsq_f32(const uint32_t n, const float *x, float *out) {
+// Each block's Σx² into `part[blockIdx.x]`; `sumsq_add` adds them in block order.
+extern "C" __global__ void sumsq_f32(const uint32_t n, const float *x, float *part) {
     __shared__ float partial[32];
     float acc = 0.0f;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
@@ -54,7 +55,30 @@ extern "C" __global__ void sumsq_f32(const uint32_t n, const float *x, float *ou
         float total = lane < warps ? partial[lane] : 0.0f;
         total = wsum(total);
         if (lane == 0) {
-            atomicAdd(out, total);
+            part[blockIdx.x] = total;
+        }
+    }
+}
+
+// `*out += Σ_b part[b]` over `blocks` partials in a fixed order: one block, a fixed tree.
+extern "C" __global__ void sumsq_add(const uint32_t blocks, const float *part, float *out) {
+    __shared__ float partial[32];
+    float acc = 0.0f;
+    for (uint32_t i = threadIdx.x; i < blocks; i += blockDim.x) {
+        acc += part[i];
+    }
+    acc = wsum(acc);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (lane == 0) {
+        partial[warp] = acc;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int warps = (blockDim.x + 31) / 32;
+        float total = lane < warps ? partial[lane] : 0.0f;
+        total = wsum(total);
+        if (lane == 0) {
+            *out += total;
         }
     }
 }
