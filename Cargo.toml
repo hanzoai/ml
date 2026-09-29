@@ -60,7 +60,7 @@ hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.39" }
 hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.46" }
 hanzo-nn = { path = "./hanzo-nn", version = "0.11.47" }
 hanzo-onnx = { path = "./hanzo-onnx", version = "0.11.9" }
-hanzo-transformers = { path = "./hanzo-transformers", version = "0.11.12" }
+hanzo-transformers = { path = "./hanzo-transformers", version = "0.11.13" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
 cudarc = { version = "0.19.8", features = [

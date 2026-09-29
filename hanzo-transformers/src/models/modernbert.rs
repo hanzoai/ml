@@ -429,9 +429,6 @@ fn get_local_attention_mask(
     Tensor::from_slice(&mask, (seq_len, seq_len), device)?.to_dtype(dtype)
 }
 
-/// What [`ModernBert::forward_with`] offers each layer's input to.
-pub type Each<'a> = dyn FnMut(usize, &Tensor, Option<&[usize]>) -> Result<Option<Tensor>> + 'a;
-
 // ModernBERT backbone
 #[derive(Clone)]
 pub struct ModernBert {
@@ -539,17 +536,6 @@ impl ModernBert {
 
     /// Token states `[B, L, d]` of right-padded `xs [B, L]`; the packed pass leaves pads zero.
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        self.forward_with(
-            xs,
-            mask,
-            &mut |_: usize, _: &Tensor, _: Option<&[usize]>| Ok(None),
-        )
-    }
-
-    /// [`ModernBert::forward`], each layer's input offered to `each(layer, x, lens)` first: what
-    /// it returns is added to that input before the layer reads it. `x` is `[B, L, d]` on the
-    /// padded pass, and on the packed pass the real tokens `[T, d]` of sequences `lens` long.
-    pub fn forward_with(&self, xs: &Tensor, mask: &Tensor, each: &mut Each<'_>) -> Result<Tensor> {
         if self.packs() {
             let rows = mask.to_dtype(DType::U32)?.to_vec2::<u32>()?;
             let lens: Vec<usize> = rows
@@ -561,24 +547,10 @@ impl ModernBert {
                 .zip(&lens)
                 .all(|(r, &n)| r[n..].iter().all(|&m| m == 0));
             if right {
-                return self.packed(xs, &lens, each);
+                return self.packed(xs, &lens);
             }
         }
-        self.padded(xs, mask, each)
-    }
-
-    /// Layer `layer`'s attention input `x` (`[.., d]`) after its pre-norm (the first layer has
-    /// none), and the layer's queries, keys and values of it before the rotary embedding.
-    pub fn project(&self, layer: usize, x: &Tensor) -> Result<(Tensor, [Tensor; 3])> {
-        let l = &self.layers[layer];
-        let h = match &l.attn_norm {
-            Some(norm) => x.apply(norm)?,
-            None => x.clone(),
-        };
-        let qkv = h.apply(&l.attn.qkv)?;
-        let d = h.dim(D::Minus1)?;
-        let part = |i: usize| qkv.narrow(D::Minus1, i * d, d);
-        Ok((h, [part(0)?, part(1)?, part(2)?]))
+        self.padded(xs, mask)
     }
 
     /// Token states `[B, L, d]` of `xs [B, L]` at positions `pos [B, L]` (u32), query `i` reading
@@ -610,14 +582,9 @@ impl ModernBert {
         h.apply(&self.final_norm)
     }
 
-    /// Encoder layers.
-    pub fn depth(&self) -> usize {
-        self.layers.len()
-    }
-
     /// Every sequence's first `lens` tokens packed into one: embeddings, projections and norms
     /// over the real tokens only, attention per sequence.
-    fn packed(&self, xs: &Tensor, lens: &[usize], each: &mut Each<'_>) -> Result<Tensor> {
+    fn packed(&self, xs: &Tensor, lens: &[usize]) -> Result<Tensor> {
         let (b, l) = xs.dims2()?;
         let ids = xs.to_dtype(DType::U32)?.to_vec2::<u32>()?;
         let flat: Vec<u32> = ids
@@ -630,10 +597,7 @@ impl ModernBert {
             .apply(&self.word_embeddings)?
             .apply(&self.norm)?;
         let window = self.local_attention_size / 2;
-        for (i, layer) in self.layers.iter().enumerate() {
-            if let Some(a) = each(i, &h, Some(lens))? {
-                h = (h + a)?;
-            }
+        for layer in &self.layers {
             h = layer.packed(&h, lens, window)?;
         }
         let h = h.apply(&self.final_norm)?;
@@ -654,7 +618,7 @@ impl ModernBert {
         hanzo_nn::ops::select(&h, &at, &back)?.reshape((b, l, d))
     }
 
-    fn padded(&self, xs: &Tensor, mask: &Tensor, each: &mut Each<'_>) -> Result<Tensor> {
+    fn padded(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let seq_len = xs.shape().dims()[1];
         let dtype = self.word_embeddings.embeddings().dtype();
         let global_attention_mask =
@@ -663,10 +627,7 @@ impl ModernBert {
             get_local_attention_mask(seq_len, self.local_attention_size / 2, dtype, xs.device())?
                 .broadcast_add(&global_attention_mask)?;
         let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            if let Some(a) = each(i, &xs, None)? {
-                xs = (xs + a)?;
-            }
+        for layer in self.layers.iter() {
             xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask, None)?;
         }
         let xs = xs.apply(&self.final_norm)?;
