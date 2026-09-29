@@ -36,6 +36,19 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   `optim::adamw` update, fused on Metal). `gpu`: free-memory floor. `dspark`: the DSpark draft on
   the runtime (`hanzo-train fit` / `join`). Tests: `cargo test -p hanzo-train` (tiny classifier
   and synthetic DSpark cache, all CPU). Kai (hanzoai/decision `train`) is one user.
+- `hanzo-research/` — the research runtime's Rust client (HIP-1334). `canonical`: RFC 8785
+  JSON (Ryū digits in ECMAScript layout, UTF-16 key order, duplicate names, NaN and inexact
+  integers refused; needs serde_json's `float_roundtrip`). `lineage`: `Purpose`, the §3.2
+  admission matrix, §3.3 `derive`, and `verify_promotion_eligibility`, a walk of the artifact
+  graph by id and parent edge reporting eight checks (bounded, present, acyclic, lineage,
+  purpose, derivation, eval, clean). `wal`: a run's log, `wal-<worker>.jsonl`, one canonical
+  line per event, hash-chained per (run, worker), fsync'd per append, locked to one writer, and
+  verified line by line on open (`read` refuses the whole log at the first bad line; `merge`
+  orders by sequence then worker). `environment`: `stamp()` for a binary's build script and
+  `build!()`/`version!()` to read it back; `Environment` measured (`of` a build, `repo` a
+  checkout). `wire`: the `/v1/research` client (`Api`: artifacts put and get, both checked
+  against the address; lineage; claims). Tests: `cargo test -p hanzo-research`. The session
+  that drafted it in the main checkout left it uncommitted; this is where it landed.
 
 ## Releasing
 - Registry is **crates.io**, owner `zeekay`. There is no Hanzo cargo registry: no

@@ -38,10 +38,21 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+pub mod canonical;
+pub mod environment;
+pub mod lineage;
 pub mod provenance;
+pub mod wal;
+pub mod wire;
+
+pub use environment::{Build, Environment};
+pub use lineage::{derive, verify_promotion_eligibility, Purpose, Report, Role};
+pub use wal::Wal;
+pub use wire::{Api, Artifact, Claim, Claiming, Stored};
+
 use provenance::{Git, Host};
+use wire::Listing;
 
 /// This crate's version, stamped into `lib_versions` so a result is pinned to the SDK
 /// that produced it.
@@ -70,13 +81,19 @@ const MAX_RESPONSE_BYTES: u64 = 8 << 20;
 /// The crate's result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A research operation failure — transport, I/O, or JSON. `ureq::Error` is boxed so the
-/// success type stays small.
+/// A research operation failure. `ureq::Error` is boxed so the success type stays small.
 #[derive(Debug)]
 pub enum Error {
+    /// The request did not complete.
     Http(Box<ureq::Error>),
     Io(std::io::Error),
     Json(serde_json::Error),
+    /// A value with no canonical JSON form.
+    Canonical(canonical::Error),
+    /// The server refused: its status and what it said.
+    Status(u16, String),
+    /// A check that did not hold.
+    Invalid(String),
 }
 
 impl fmt::Display for Error {
@@ -85,6 +102,9 @@ impl fmt::Display for Error {
             Error::Http(e) => write!(f, "research http: {e}"),
             Error::Io(e) => write!(f, "research io: {e}"),
             Error::Json(e) => write!(f, "research json: {e}"),
+            Error::Canonical(e) => write!(f, "research {e}"),
+            Error::Status(code, msg) => write!(f, "research {code}: {msg}"),
+            Error::Invalid(msg) => write!(f, "research: {msg}"),
         }
     }
 }
@@ -104,6 +124,11 @@ impl From<std::io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::Json(e)
+    }
+}
+impl From<canonical::Error> for Error {
+    fn from(e: canonical::Error) -> Self {
+        Error::Canonical(e)
     }
 }
 
@@ -249,7 +274,7 @@ impl Research {
         } else {
             format!("/v1/research/experiments?{}", q.join("&"))
         };
-        let out: Listing = self.get(&path)?;
+        let out: Listing<Record> = self.get(&path)?;
         Ok(out.data)
     }
 
@@ -274,8 +299,8 @@ impl Research {
         )
     }
 
-    /// POST a diary artifact (idempotent by sha256 content hash).
-    pub fn artifact(&self, art: &ArtifactRecord) -> Result<Stored> {
+    /// POST an artifact (idempotent by its address).
+    pub fn artifact(&self, art: &Artifact) -> Result<Stored> {
         self.post("/v1/research/artifacts", art)
     }
 
@@ -494,17 +519,32 @@ impl Experiment {
         self.client.ingest(&[self.build(status, value)], &[])
     }
 
+    /// A snapshot is `image/png`, a report `text/markdown`; either is `train` (no data parent).
     fn artifact(&self, kind: &str, bytes: &[u8]) -> Result<Stored> {
         let g = &self.client.inner.git;
-        self.client.artifact(&ArtifactRecord {
+        self.client.artifact(&Artifact {
+            sha256: canonical::sha256(bytes),
             content: base64::engine::general_purpose::STANDARD.encode(bytes),
-            sha256: sha256_hex(bytes),
             kind: kind.to_string(),
+            media_type: if kind == "snapshot" {
+                "image/png"
+            } else {
+                "text/markdown"
+            }
+            .to_string(),
+            canonicalization: "none".to_string(),
+            compression: "none".to_string(),
+            uncompressed_size: bytes.len() as u64,
+            purpose: Some(Purpose::Train),
             run_id: self.id.clone(),
             git_sha: g.git_sha.clone(),
             git_branch: g.git_branch.clone(),
             git_dirty: g.git_dirty,
             lib_versions: self.client.inner.libs.clone(),
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64),
+            ..Artifact::default()
         })
     }
 
@@ -625,19 +665,6 @@ pub struct Attempt {
     pub status: String,
 }
 
-/// A research-diary artifact — content-addressed by the server via sha256 of the bytes.
-#[derive(Debug, Clone, Serialize)]
-pub struct ArtifactRecord {
-    pub content: String,
-    pub sha256: String,
-    pub kind: String,
-    pub run_id: String,
-    pub git_sha: String,
-    pub git_branch: String,
-    pub git_dirty: bool,
-    pub lib_versions: BTreeMap<String, String>,
-}
-
 #[derive(Serialize)]
 struct IngestRequest<'a> {
     experiments: &'a [ExperimentRecord],
@@ -649,12 +676,6 @@ struct IngestRequest<'a> {
 // Read models are tolerant: `#[serde(default)]` at the container fills any field the
 // server omits, and unknown fields are ignored — so a server that adds a column, or the
 // Go ack's `_total` vs the spec's `_retained` naming, never breaks a client.
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-struct Listing {
-    data: Vec<Record>,
-}
 
 /// One stored experiment row, as returned by [`Research::query`] (the canonical view).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -687,15 +708,6 @@ pub struct Ack {
     pub attempts_ingested: u64,
     pub experiments_total: u64,
     pub attempts_total: u64,
-    pub rolled_up: bool,
-}
-
-/// The artifact acknowledgement — the server-derived content hash and whether it was new.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct Stored {
-    pub sha256: String,
-    pub created: bool,
     pub rolled_up: bool,
 }
 
@@ -744,17 +756,6 @@ fn read_json<T: serde::de::DeserializeOwned>(resp: ureq::Response) -> Result<T> 
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
-
-/// Lowercase hex sha256 of the bytes — the client-side integrity hash the server verifies.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0xf) as usize] as char);
-    }
-    out
-}
 
 /// Percent-encode a query-parameter value (RFC 3986 unreserved pass through). Defense in
 /// depth: `project`/`kind` reach the URL, so a stray separator can never split the query.
@@ -911,7 +912,7 @@ mod tests {
     fn artifact_is_content_addressed() {
         // The server hashes the bytes; the client hash must match. "hi" -> known sha256.
         assert_eq!(
-            sha256_hex(b"hi"),
+            canonical::sha256(b"hi"),
             "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
         );
         use base64::Engine as _;
