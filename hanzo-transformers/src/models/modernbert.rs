@@ -79,6 +79,18 @@ impl RotaryEmbedding {
         })
     }
 
+    /// The tables at positions `pos [B, L]` (u32): `[B, L, d/2]` each.
+    fn at(&self, pos: &Tensor) -> Result<Self> {
+        let (b, l) = pos.dims2()?;
+        let flat = pos.flatten_all()?;
+        let take =
+            |t: &Tensor| -> Result<Tensor> { t.index_select(&flat, 0)?.reshape((b, l, t.dim(1)?)) };
+        Ok(Self {
+            sin: take(&self.sin)?,
+            cos: take(&self.cos)?,
+        })
+    }
+
     fn apply_rotary_emb_qkv(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
         let q_embed = hanzo_nn::rotary_emb::rope(&q.contiguous()?, &self.cos, &self.sin)?;
         let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?;
@@ -153,7 +165,13 @@ impl ModernBertAttention {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    /// `pos [B, L]` places each token for the rotary embedding; `None` places it at its index.
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: &Tensor,
+        pos: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
         let qkv = xs
@@ -171,7 +189,10 @@ impl ModernBertAttention {
         let k = qkv.get(1)?;
         let v = qkv.get(2)?;
 
-        let (q, k) = self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?;
+        let (q, k) = match pos {
+            Some(p) => self.rotary_emb.at(p)?.apply_rotary_emb_qkv(&q, &k)?,
+            None => self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?,
+        };
 
         let scale = (self.attention_head_size as f64).powf(-0.5);
         let q = (q * scale)?;
@@ -277,12 +298,14 @@ impl ModernBertLayer {
         xs + mlp
     }
 
-    /// `local_attention_mask` is the global mask with the sliding window already added.
+    /// `local_attention_mask` is the global mask with the sliding window already added; `pos`
+    /// places the tokens for the rotary embedding.
     fn forward(
         &self,
         xs: &Tensor,
         global_attention_mask: &Tensor,
         local_attention_mask: &Tensor,
+        pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = xs.clone();
         let mut xs = xs.clone();
@@ -295,7 +318,7 @@ impl ModernBertLayer {
         } else {
             global_attention_mask
         };
-        let xs = self.attn.forward(&xs, attention_mask)?;
+        let xs = self.attn.forward(&xs, attention_mask, pos)?;
         let xs = (xs + residual)?;
         let mlp_out = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         let xs = (xs + mlp_out)?;
@@ -558,6 +581,35 @@ impl ModernBert {
         Ok((h, [part(0)?, part(1)?, part(2)?]))
     }
 
+    /// Token states `[B, L, d]` of `xs [B, L]` at positions `pos [B, L]` (u32), query `i` reading
+    /// key `j` where `allow [B, L, L]` is nonzero; a local layer reads, of those, the keys whose
+    /// position is within its window of the query's. The padded pass: tokens at the same
+    /// positions that read the same keys come out alike wherever they sit in the sequence.
+    /// `allow` lets no query read a padding key.
+    pub fn forward_masked(&self, xs: &Tensor, pos: &Tensor, allow: &Tensor) -> Result<Tensor> {
+        let dtype = self.word_embeddings.embeddings().dtype();
+        let allow = allow.to_dtype(DType::F32)?;
+        let p = pos.to_dtype(DType::F32)?;
+        let near = p
+            .unsqueeze(2)?
+            .broadcast_sub(&p.unsqueeze(1)?)?
+            .abs()?
+            .le((self.local_attention_size / 2) as f64)?
+            .to_dtype(DType::F32)?;
+        let additive = |a: &Tensor| -> Result<Tensor> {
+            ((1.0 - a)? * masked_value(dtype))?
+                .to_dtype(dtype)?
+                .unsqueeze(1)
+        };
+        let global = additive(&allow)?;
+        let local = additive(&(&allow * near)?)?;
+        let mut h = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
+        for layer in &self.layers {
+            h = layer.forward(&h, &global, &local, Some(pos))?;
+        }
+        h.apply(&self.final_norm)
+    }
+
     /// Encoder layers.
     pub fn depth(&self) -> usize {
         self.layers.len()
@@ -615,7 +667,7 @@ impl ModernBert {
             if let Some(a) = each(i, &xs, None)? {
                 xs = (xs + a)?;
             }
-            xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask)?;
+            xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask, None)?;
         }
         let xs = xs.apply(&self.final_norm)?;
         Ok(xs)

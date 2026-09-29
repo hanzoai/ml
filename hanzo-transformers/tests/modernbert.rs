@@ -187,6 +187,82 @@ fn each_layer_input_takes_what_the_hook_adds() -> Result<()> {
     Ok(())
 }
 
+/// A 2-D mask that lets every query read every real key, at each token's index, is the padded
+/// pass bit for bit.
+#[test]
+fn a_full_mask_is_the_padded_pass() -> Result<()> {
+    let dev = Device::Cpu;
+    let (bert, _vm) = backbone(&config(), &mut Normal(3), &dev)?;
+    let (ids, mask) = rows(&dev)?;
+    let (b, l) = ids.dims2()?;
+    let pos = Tensor::arange(0u32, l as u32, &dev)?
+        .unsqueeze(0)?
+        .broadcast_as((b, l))?
+        .contiguous()?;
+    let allow = mask.unsqueeze(1)?.broadcast_as((b, l, l))?.contiguous()?;
+    let keep = mask.to_dtype(DType::F32)?.unsqueeze(2)?;
+    let want = bert.forward(&ids, &mask)?.broadcast_mul(&keep)?;
+    let got = bert
+        .forward_masked(&ids, &pos, &allow)?
+        .broadcast_mul(&keep)?;
+    assert_eq!(
+        want.flatten_all()?.to_vec1::<f32>()?,
+        got.flatten_all()?.to_vec1::<f32>()?
+    );
+    Ok(())
+}
+
+/// A shared prefix and two segments that start at the same position, each reading the prefix
+/// and itself: every token's state is the same whichever segment comes first, and a segment's
+/// tokens move neither the prefix nor the other segment.
+#[test]
+fn segments_apart_are_alike_in_any_order() -> Result<()> {
+    let dev = Device::Cpu;
+    let (bert, _vm) = backbone(&config(), &mut Normal(4), &dev)?;
+    // (token, position, segment): the prefix is segment 0
+    let prefix = [(5u32, 0u32, 0u32), (6, 1, 0), (7, 2, 0), (8, 3, 0)];
+    let a = [(9u32, 4u32, 1u32), (10, 5, 1), (11, 6, 1)];
+    let b = |x: u32| [(x, 4u32, 2u32), (x + 1, 5, 2)];
+    let run = |parts: &[&[(u32, u32, u32)]]| -> Result<Vec<Vec<f32>>> {
+        let toks: Vec<(u32, u32, u32)> = parts.concat();
+        let l = toks.len();
+        let ids = Tensor::from_vec(toks.iter().map(|t| t.0).collect(), (1, l), &dev)?;
+        let pos = Tensor::from_vec(toks.iter().map(|t| t.1).collect(), (1, l), &dev)?;
+        let allow: Vec<u32> = toks
+            .iter()
+            .flat_map(|q| toks.iter().map(move |k| u32::from(k.2 == 0 || k.2 == q.2)))
+            .collect();
+        let allow = Tensor::from_vec(allow, (1, l, l), &dev)?;
+        let h = bert.forward_masked(&ids, &pos, &allow)?.squeeze(0)?;
+        let rows = h.to_vec2::<f32>()?;
+        // each token's state by (segment, position)
+        let mut out: Vec<(u32, u32, Vec<f32>)> =
+            toks.iter().zip(rows).map(|(t, r)| (t.2, t.1, r)).collect();
+        out.sort_by_key(|o| (o.0, o.1));
+        Ok(out.into_iter().map(|o| o.2).collect())
+    };
+    let close = |x: &[Vec<f32>], y: &[Vec<f32>], n: usize| {
+        for (u, v) in x[..n].iter().zip(&y[..n]) {
+            for (p, q) in u.iter().zip(v) {
+                assert!((p - q).abs() <= 1e-5 * (1.0 + p.abs()), "{p} against {q}");
+            }
+        }
+    };
+    let first = run(&[&prefix, &a, &b(12)])?;
+    let second = run(&[&prefix, &b(12), &a])?;
+    close(&first, &second, first.len());
+    // another second segment: the prefix and the first segment stay where they were
+    let other = run(&[&prefix, &a, &b(20)])?;
+    close(&first, &other, prefix.len() + a.len());
+    let moved = first[prefix.len() + a.len()]
+        .iter()
+        .zip(&other[prefix.len() + a.len()])
+        .map(|(p, q)| (p - q).abs())
+        .fold(0f32, f32::max);
+    assert!(moved > 1e-3, "{moved}");
+    Ok(())
+}
+
 /// Output and every parameter's gradient of `Σ y ⊙ w` for a backbone of `named` parameters,
 /// in `dtype` on `dev`.
 #[allow(clippy::type_complexity)]
