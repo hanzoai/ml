@@ -40,7 +40,24 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod canonical;
+pub mod lineage;
 pub mod provenance;
+pub mod wal;
+pub mod wire;
+
+pub use canonical::{canonicalize_string, canonicalize_value, rfc8785_canonicalize, rfc8785_digest};
+pub use lineage::{
+    derive_lineage_policy, verify_promotion_eligibility, ArtifactRef, Claim, ContaminationError,
+    DataPurpose, DeterminismReport, EnvironmentV1, GateSpec, LineagePolicy, PairEvidence,
+    ResearchEvent, TeacherInteraction,
+};
+pub use wal::ResearchWal;
+pub use wire::{
+    claimed, left, now, scope, token, Api, Batch, Benchmark, Comparison, Delta, Difference,
+    Listing, Measure, Run, Split, Stored,
+};
+
 use provenance::{Git, Host};
 
 /// This crate's version, stamped into `lib_versions` so a result is pinned to the SDK
@@ -65,18 +82,19 @@ const NARRATIVE_WINDOW: usize = 10;
 const TIMEOUT: Duration = Duration::from_secs(120);
 /// Response-body cap (8 MiB): a hostile or broken server cannot stream an unbounded body to
 /// OOM the client. Parity with the Go/C++ ports.
-const MAX_RESPONSE_BYTES: u64 = 8 << 20;
+pub const MAX_RESPONSE_BYTES: u64 = 8 << 20;
 
 /// The crate's result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A research operation failure — transport, I/O, or JSON. `ureq::Error` is boxed so the
-/// success type stays small.
+/// A research operation failure — transport, I/O, JSON, lineage contamination, or message.
 #[derive(Debug)]
 pub enum Error {
     Http(Box<ureq::Error>),
     Io(std::io::Error),
     Json(serde_json::Error),
+    Message(String),
+    Lineage(ContaminationError),
 }
 
 impl fmt::Display for Error {
@@ -85,6 +103,8 @@ impl fmt::Display for Error {
             Error::Http(e) => write!(f, "research http: {e}"),
             Error::Io(e) => write!(f, "research io: {e}"),
             Error::Json(e) => write!(f, "research json: {e}"),
+            Error::Message(msg) => write!(f, "research: {msg}"),
+            Error::Lineage(e) => write!(f, "research lineage: {e}"),
         }
     }
 }
@@ -104,6 +124,16 @@ impl From<std::io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::Json(e)
+    }
+}
+impl From<ContaminationError> for Error {
+    fn from(e: ContaminationError) -> Self {
+        Error::Lineage(e)
+    }
+}
+impl From<String> for Error {
+    fn from(s: String) -> Self {
+        Error::Message(s)
     }
 }
 
@@ -249,7 +279,7 @@ impl Research {
         } else {
             format!("/v1/research/experiments?{}", q.join("&"))
         };
-        let out: Listing = self.get(&path)?;
+        let out: Listing<Record> = self.get(&path)?;
         Ok(out.data)
     }
 
@@ -277,6 +307,119 @@ impl Research {
     /// POST a diary artifact (idempotent by sha256 content hash).
     pub fn artifact(&self, art: &ArtifactRecord) -> Result<Stored> {
         self.post("/v1/research/artifacts", art)
+    }
+
+    /// Upload an artifact with full provenance and transport metadata.
+    pub fn upload_artifact_with_meta(
+        &self,
+        artifact_id: &str,
+        kind: &str,
+        run_id: &str,
+        media_type: &str,
+        canonicalization: &str,
+        compression: &str,
+        bytes: &[u8],
+    ) -> Result<Stored> {
+        let content_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let sha256 = sha256_hex(bytes);
+        let g = &self.inner.git;
+
+        let record = ArtifactRecord {
+            artifact_id: artifact_id.to_string(),
+            content: content_b64,
+            sha256: sha256.clone(),
+            content_sha256: sha256,
+            media_type: media_type.to_string(),
+            canonicalization: canonicalization.to_string(),
+            compression: compression.to_string(),
+            uncompressed_size: bytes.len() as u64,
+            kind: kind.to_string(),
+            run_id: run_id.to_string(),
+            git_sha: g.git_sha.clone(),
+            git_branch: g.git_branch.clone(),
+            git_dirty: g.git_dirty,
+            lib_versions: self.inner.libs.clone(),
+        };
+        self.artifact(&record)
+    }
+
+    /// Upload an artifact's raw bytes (content-addressed on the server).
+    pub fn upload_artifact(&self, kind: &str, run_id: &str, bytes: &[u8]) -> Result<Stored> {
+        self.upload_artifact_with_meta(
+            &format!("{run_id}:{kind}"),
+            kind,
+            run_id,
+            "application/octet-stream",
+            "raw",
+            "none",
+            bytes,
+        )
+    }
+
+    /// Upload a serializable value formatted with RFC 8785 canonical JSON as a report artifact.
+    pub fn upload_json_artifact<T: Serialize>(&self, kind: &str, run_id: &str, value: &T) -> Result<Stored> {
+        let bytes = canonical::rfc8785_canonicalize(value)?;
+        self.upload_artifact_with_meta(
+            &format!("{run_id}:{kind}"),
+            kind,
+            run_id,
+            "application/json",
+            "rfc8785",
+            "none",
+            &bytes,
+        )
+    }
+
+    /// Fetch artifact bytes by content hash.
+    pub fn get_artifact(&self, sha256: &str) -> Result<Vec<u8>> {
+        let path = format!("/v1/research/artifacts/{sha256}");
+        let url = format!("{}{path}", self.inner.base);
+        let resp = self.auth(self.inner.agent.get(&url)).call()?;
+        let mut reader = resp.into_reader().take(MAX_RESPONSE_BYTES);
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body)?;
+        Ok(body)
+    }
+
+    /// Post a benchmark definition to the research catalog.
+    pub fn post_benchmark(&self, bench: &Benchmark) -> Result<Batch> {
+        self.post("/v1/research/benchmarks", bench)
+    }
+
+    /// Post an execution / run.
+    pub fn post_run(&self, run: &Run) -> Result<Batch> {
+        self.post("/v1/research/runs", run)
+    }
+
+    /// Post a batch of runs and benchmarks.
+    pub fn post_batch(&self, runs: &[Run], benchmarks: &[Benchmark]) -> Result<Batch> {
+        let body = serde_json::json!({
+            "runs": runs,
+            "benchmarks": benchmarks,
+        });
+        self.post("/v1/research/runs", &body)
+    }
+
+    /// Retrieve a run by stable id.
+    pub fn get_run(&self, id: &str) -> Result<Run> {
+        let path = format!("/v1/research/runs?id={}", encode(id));
+        let listing: Listing<Run> = self.get(&path)?;
+        listing
+            .data
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Message(format!("run {id} not found")))
+    }
+
+    /// Compare two runs.
+    pub fn compare_runs(&self, a: &str, b: &str) -> Result<Comparison> {
+        let path = format!("/v1/research/compare?a={}&b={}", encode(a), encode(b));
+        self.get(&path)
+    }
+
+    /// Verify that an artifact's lineage policy allows training. Fails closed with ContaminationError.
+    pub fn verify_lineage(&self, policy: &LineagePolicy) -> std::result::Result<(), ContaminationError> {
+        policy.assert_trainable("research_client")
     }
 
     // ── transport ────────────────────────────────────────────────────────────────────
@@ -496,9 +639,16 @@ impl Experiment {
 
     fn artifact(&self, kind: &str, bytes: &[u8]) -> Result<Stored> {
         let g = &self.client.inner.git;
+        let sha256 = sha256_hex(bytes);
         self.client.artifact(&ArtifactRecord {
+            artifact_id: format!("{}:{kind}", self.id),
             content: base64::engine::general_purpose::STANDARD.encode(bytes),
-            sha256: sha256_hex(bytes),
+            sha256: sha256.clone(),
+            content_sha256: sha256,
+            media_type: if kind == "snapshot" { "image/png".to_string() } else { "text/plain".to_string() },
+            canonicalization: "raw".to_string(),
+            compression: "none".to_string(),
+            uncompressed_size: bytes.len() as u64,
             kind: kind.to_string(),
             run_id: self.id.clone(),
             git_sha: g.git_sha.clone(),
@@ -625,11 +775,35 @@ pub struct Attempt {
     pub status: String,
 }
 
-/// A research-diary artifact — content-addressed by the server via sha256 of the bytes.
-#[derive(Debug, Clone, Serialize)]
+fn default_artifact_media_type() -> String {
+    "application/octet-stream".to_string()
+}
+
+fn default_artifact_canonicalization() -> String {
+    "raw".to_string()
+}
+
+fn default_artifact_compression() -> String {
+    "none".to_string()
+}
+
+/// A research artifact — content-addressed by the server via sha256 of the bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRecord {
+    #[serde(default)]
+    pub artifact_id: String,
     pub content: String,
     pub sha256: String,
+    #[serde(default)]
+    pub content_sha256: String,
+    #[serde(default = "default_artifact_media_type")]
+    pub media_type: String,
+    #[serde(default = "default_artifact_canonicalization")]
+    pub canonicalization: String,
+    #[serde(default = "default_artifact_compression")]
+    pub compression: String,
+    #[serde(default)]
+    pub uncompressed_size: u64,
     pub kind: String,
     pub run_id: String,
     pub git_sha: String,
@@ -650,11 +824,6 @@ struct IngestRequest<'a> {
 // server omits, and unknown fields are ignored — so a server that adds a column, or the
 // Go ack's `_total` vs the spec's `_retained` naming, never breaks a client.
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-struct Listing {
-    data: Vec<Record>,
-}
 
 /// One stored experiment row, as returned by [`Research::query`] (the canonical view).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -690,14 +859,6 @@ pub struct Ack {
     pub rolled_up: bool,
 }
 
-/// The artifact acknowledgement — the server-derived content hash and whether it was new.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct Stored {
-    pub sha256: String,
-    pub created: bool,
-    pub rolled_up: bool,
-}
 
 /// Headline aggregate (canonical + retained) plus a per-kind breakdown.
 #[derive(Debug, Clone, Default, Deserialize)]
