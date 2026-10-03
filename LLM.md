@@ -53,6 +53,22 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   layers and extended frequencies on the local ones; within `max_position_embeddings` every
   pass reads the trained tables bit for bit.
 
+## Next: synthesis as a training loop
+Capability training today is dataset → batches → optimizer → checkpoint, with curricula
+generated and scored by scripts outside it (hanzo-inc/kai's jailbreak round, 2026-10-03).
+Its pieces belong here, in this order:
+1. `hanzo-train` keeps per-example signals (loss, margin, prediction, gradient norm) instead
+   of folding them into the batch loss, and reports balanced accuracy and MCC per slice.
+2. A dataset rows can join and leave mid-run, each row carrying its provenance and its
+   factors (what a generated row varies), with weights a sampler reads.
+3. Contrast pairs as a training item: two rows and a margin on their score gap.
+4. Micro-fits with successive halving (`hanzo-train sweep`): many curricula at a tenth of a
+   run, the best continued.
+5. Gradient embeddings over a capability's parameters only, to select the generated rows
+   whose updates align with real errors.
+Generation itself (propose, mutate, verify against more than its own model) is a separate
+crate on top of these; a generator that only checks itself learns nothing new.
+
 ## Releasing
 - Registry is **crates.io**, owner `zeekay`. There is no Hanzo cargo registry: no
   `[registries]` in `.cargo/config.toml`, no `publish = [...]` allow-list, and the
