@@ -25,7 +25,7 @@ half = { workspace = true, optional = true }
 [build-dependencies]
 anyhow = { workspace = true }
 rayon = { workspace = true }
-hanzo-flash-attn-build = { path = "../hanzo-flash-attn-build", version = "0.11.8" }
+hanzo-flash-attn-build = { path = "../hanzo-flash-attn-build", version = "0.11.9" }
 
 [dev-dependencies]
 anyhow = { workspace = true }
