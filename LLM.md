@@ -37,6 +37,22 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   the runtime (`hanzo-train fit` / `join`). Tests: `cargo test -p hanzo-train` (tiny classifier
   and synthetic DSpark cache, all CPU). Kai (hanzoai/decision `train`) is one user.
 
+## Backends and models
+- **Vulkan dtypes.** Storage is F32 or U32 (BF16 is held as F32, I64 as U32). U32 reductions
+  run their own kernel (`reduce_u32.comp`; argmax/argmin take the first index on ties, as the
+  CPU does) and U32 binary ops take the CPU fallback; any other storage type in a reduction is
+  an error, never an F32 answer. `cmp`, `affine`, `powf` and unary kernels are F32 only.
+  `hanzo-ml/tests/vulkan_dtype_tests.rs` holds each against the CPU.
+- **Masked softmax on Vulkan.** A row's running max starts at `-inf` (`softmax_rows_blk.spv`),
+  so a row masked throughout is uniform, not NaN (`softmax_masked_row_is_uniform`). The same
+  `-3.4e38` start is still in the DSL (`hanzo-kernel` `dag.rs` `Red::Max`, `attn.rs`,
+  `flash.rs`, `quant.rs`) and in `sdpa_blk.spv`, `flash_attn_dsl_d128.spv` and
+  `moe_route.spv`: fix it in the DSL and regenerate, with a fully masked row in each test.
+- **ModernBert past its trained positions.** `Config::yarn(s)` gives a longer sequence YaRN
+  rotary tables (NTK-by-parts, beta 32 and 1, attention factor 0.1 ln s + 1) on the global
+  layers and extended frequencies on the local ones; within `max_position_embeddings` every
+  pass reads the trained tables bit for bit.
+
 ## Releasing
 - Registry is **crates.io**, owner `zeekay`. There is no Hanzo cargo registry: no
   `[registries]` in `.cargo/config.toml`, no `publish = [...]` allow-list, and the
@@ -48,10 +64,17 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   `publish = false`, topologically sorted. `publish = false` is the one way to keep a
   crate off the registry (examples, demos, the book, the PyPI extension module, and
   `tensor-tools`, whose crates.io name belongs to the upstream candle author).
-- Publishing is CI's job: push a `N.N.N` tag to the forge and `.hanzo/workflows/publish.yml`
-  walks that order with `cargo publish --no-verify` (GPU build scripts can't run on
-  crates.io builders). The tag names the release event; the manifests name the artifacts.
-  Re-running is safe — a crate already at its manifest version is skipped.
+- Publishing is CI's job: `.github/workflows/publish.yml`, on a `v*` tag or a manual
+  dispatch (`gh workflow run publish.yml -R hanzoai/ml --ref main`), walks that order with
+  `cargo publish --no-verify` (GPU build scripts can't run on crates.io builders). It
+  publishes a crate only when its manifest version is ahead of crates.io, so re-running is
+  safe. The token is `CARGO_REGISTRY_TOKEN` at `/@prod` in org hanzo's KMS, read as the
+  `hanzo-ci` identity (universe `kms-grants.yaml`).
+- **A crate whose source changes takes a patch bump in the same commit.** The ratchet only
+  sees versions: a crate edited at an already-published version never ships, and its
+  consumers pinning crates.io read older code than main (six crates had drifted, among them
+  `hanzo-rocm-kernels`, before 027c26d9e). Consumers pin published versions, never a git rev
+  (hanzo-inc/kai since 9b382b4).
 - Run a crate's own tests before its version moves. ROCm needs
   `LD_LIBRARY_PATH=/opt/rocm/core-7.13/lib` — `libhiprtc.so.7` lives there, not in
   `/opt/rocm/lib`, so `cargo test -p hanzo-kernel --features rocm` otherwise dies at
