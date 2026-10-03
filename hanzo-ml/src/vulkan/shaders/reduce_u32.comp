@@ -1,0 +1,28 @@
+#version 450
+// Row-wise reduction over the last dim of a row-major [rows, cols] u32 buffer, in integer arithmetic
+// (the f32 reduce kernels would read a u32's bits as a float). op, in hanzo-ml ReduceOp order:
+// 0=Sum 1=Min 2=Max 3=ArgMin 4=ArgMax. Sum wraps mod 2^32; an arg op keeps the first extreme index,
+// as the CPU backend does. One invocation per row; output u32, length rows.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly  buffer In  { uint inp[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { uint o[]; };
+layout(push_constant) uniform Pc { uint rows; uint cols; uint op; };
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= rows) { return; }
+    uint base = row * cols;
+    if (op == 0u) {
+        uint acc = 0u;
+        for (uint c = 0u; c < cols; c++) { acc += inp[base + c]; }
+        o[row] = acc;
+        return;
+    }
+    bool least = op == 1u || op == 3u;
+    uint best = inp[base];
+    uint bi = 0u;
+    for (uint c = 1u; c < cols; c++) {
+        uint v = inp[base + c];
+        if (least ? v < best : v > best) { best = v; bi = c; }
+    }
+    o[row] = op >= 3u ? bi : best;
+}

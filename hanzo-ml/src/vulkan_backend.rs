@@ -207,6 +207,7 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "reduce_min" => spv!("reduce_min"),
         "reduce_argmin" => spv!("reduce_argmin"),
         "reduce_argmax" => spv!("reduce_argmax"),
+        "reduce_u32" => spv!("reduce_u32"),
         "argsort" => spv!("argsort"),
         "gather" => spv!("gather"),
         "scatter_set" => spv!("scatter_set"),
@@ -6594,12 +6595,13 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
-        let (kernel, is_arg) = match op {
-            ReduceOp::Sum => ("reduce_sum", false),
-            ReduceOp::Max => ("reduce_max", false),
-            ReduceOp::Min => ("reduce_min", false),
-            ReduceOp::ArgMin => ("reduce_argmin", true),
-            ReduceOp::ArgMax => ("reduce_argmax", true),
+        // `code` is the op in ReduceOp order, as reduce_u32 takes it.
+        let (kernel, code, is_arg) = match op {
+            ReduceOp::Sum => ("reduce_sum", 0u32, false),
+            ReduceOp::Min => ("reduce_min", 1, false),
+            ReduceOp::Max => ("reduce_max", 2, false),
+            ReduceOp::ArgMin => ("reduce_argmin", 3, true),
+            ReduceOp::ArgMax => ("reduce_argmax", 4, true),
         };
         // Reduce over the last dim only, contiguously => rows x cols, one out per row.
         let dims = layout.dims();
@@ -6610,34 +6612,52 @@ impl BackendStorage for VulkanStorage {
         // The SPIR-V reduce kernel collapses the last (contiguous) dim into one output per row. For
         // any other single axis, permute it to the end first so the same kernel runs on the GPU; the
         // resulting row-major order matches the framework's keep-dim wrap exactly.
-        let (c, cols) = if sum_dims == [rank - 1] {
-            (self.contiguous(layout)?, dims[rank - 1])
+        let (src, cols) = if sum_dims == [rank - 1] {
+            (layout.clone(), dims[rank - 1])
         } else if sum_dims.len() == 1 {
             let d = sum_dims[0];
             let mut perm: Vec<usize> = (0..rank).filter(|&x| x != d).collect();
             perm.push(d);
-            (self.contiguous(&layout.permute(&perm)?)?, dims[d])
+            (layout.permute(&perm)?, dims[d])
         } else {
             crate::bail!(
                 "vulkan: reduce over multiple axes at once not supported (got {sum_dims:?})"
             );
         };
         let rows: usize = layout.shape().elem_count() / cols;
-        // arg-reductions return u32 indices; value reductions return f32.
-        let out = if is_arg {
-            self.device.alloc_u32(rows)?
-        } else {
-            self.device.alloc_f32(rows)?
-        };
-        let push = push_u32(&[rows as u32, cols as u32]);
-        // one invocation per row
-        self.device.dispatch(
-            kernel,
-            &[c.buffer, out.buffer],
-            &push,
-            Self::groups_1d(rows),
-        )?;
-        Ok(out)
+        let groups = Self::groups_1d(rows);
+        // The result dtype is the CPU backend's: a value reduction keeps the input's dtype, an
+        // arg-reduction gives u32 indices. u32 storage reduces in integer arithmetic by its own
+        // kernel over a bit-exact contiguous copy (contiguous_u32): the f32 kernels would read its
+        // bits as floats and answer in f32.
+        match self.dtype {
+            DType::F32 => {
+                let c = self.contiguous(&src)?;
+                let out = if is_arg {
+                    self.device.alloc_u32(rows)?
+                } else {
+                    self.device.alloc_f32(rows)?
+                };
+                let push = push_u32(&[rows as u32, cols as u32]);
+                self.device
+                    .dispatch(kernel, &[c.buffer, out.buffer], &push, groups)?;
+                Ok(out)
+            }
+            DType::U32 => {
+                let copy = if src.is_contiguous() && src.start_offset() == 0 {
+                    None
+                } else {
+                    Some(self.contiguous_u32(&src)?)
+                };
+                let buf = copy.as_ref().map_or(self.buffer, |c| c.buffer);
+                let out = self.device.alloc_u32(rows)?;
+                let push = push_u32(&[rows as u32, cols as u32, code]);
+                self.device
+                    .dispatch("reduce_u32", &[buf, out.buffer], &push, groups)?;
+                Ok(out)
+            }
+            dt => crate::bail!("vulkan: reduce_op on {dt:?} storage not supported"),
+        }
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
@@ -6765,24 +6785,32 @@ impl BackendStorage for VulkanStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        let kernel: &'static str = match B::NAME {
-            "add" => "add",
-            "sub" => "sub",
-            "mul" => "mul",
-            "div" => "div",
-            "maximum" => "maximum",
-            "minimum" => "minimum",
-            // Anything still without a SPIR-V kernel: fall back to CPU (correct, slow).
-            _ => {
-                self.device.profile_fallback(
-                    B::NAME,
-                    format_args!("binary elems={}", lhs_l.shape().elem_count()),
-                );
-                let lc = self.to_cpu_storage()?;
-                let rc = rhs.to_cpu_storage()?;
-                let r = crate::backend::BackendStorage::binary_impl::<B>(&lc, &rc, lhs_l, rhs_l)?;
-                return self.device.storage_from_cpu_storage(&r);
-            }
+        // The SPIR-V binary kernels are f32 only: on u32 storage they would read its bits as floats
+        // and answer in f32. u32 operands (ids, positions, masks: small) and any op still without
+        // a kernel fall back to the CPU (correct, slow), which answers in the operands' dtype.
+        let kernel: Option<&'static str> = match B::NAME {
+            _ if self.dtype != DType::F32 => None,
+            "add" => Some("add"),
+            "sub" => Some("sub"),
+            "mul" => Some("mul"),
+            "div" => Some("div"),
+            "maximum" => Some("maximum"),
+            "minimum" => Some("minimum"),
+            _ => None,
+        };
+        let Some(kernel) = kernel else {
+            self.device.profile_fallback(
+                B::NAME,
+                format_args!(
+                    "binary {:?} elems={}",
+                    self.dtype,
+                    lhs_l.shape().elem_count()
+                ),
+            );
+            let lc = self.to_cpu_storage()?;
+            let rc = rhs.to_cpu_storage()?;
+            let r = crate::backend::BackendStorage::binary_impl::<B>(&lc, &rc, lhs_l, rhs_l)?;
+            return self.device.storage_from_cpu_storage(&r);
         };
         // hanzo-ml pre-broadcasts both layouts to the output shape (possibly with stride-0 dims);
         // broadcast layouts aren't contiguous so contig_buf still materializes them, but
