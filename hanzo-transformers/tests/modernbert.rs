@@ -19,6 +19,7 @@ fn config() -> Config {
         global_rope_theta: 160000.,
         local_attention: 8,
         local_rope_theta: 10000.,
+        yarn: None,
         classifier_config: None,
     }
 }
@@ -238,6 +239,151 @@ fn pass(
     Ok((bert.packs(), y.to_device(&Device::Cpu)?, grads))
 }
 
+/// Right-padded rows of `seqs`' tokens and their mask.
+fn padded(seqs: &[Vec<u32>], dev: &Device) -> Result<(Tensor, Tensor)> {
+    let l = seqs.iter().map(Vec::len).max().unwrap_or(0);
+    let ids: Vec<u32> = seqs
+        .iter()
+        .flat_map(|s| s.iter().copied().chain(std::iter::repeat_n(0, l - s.len())))
+        .collect();
+    let mask: Vec<u32> = seqs
+        .iter()
+        .flat_map(|s| (0..l).map(move |t| u32::from(t < s.len())))
+        .collect();
+    Ok((
+        Tensor::from_vec(ids, (seqs.len(), l), dev)?,
+        Tensor::from_vec(mask, (seqs.len(), l), dev)?,
+    ))
+}
+
+/// `n` tokens of sequence `r`.
+fn tokens(r: usize, n: usize) -> Vec<u32> {
+    (0..n).map(|t| 1 + ((r * 13 + t * 7) % 49) as u32).collect()
+}
+
+/// Row `r` of `h [B, L, d]`, its first `n` positions, as bits.
+fn row(h: &Tensor, r: usize, n: usize) -> Result<Vec<f32>> {
+    h.get(r)?.narrow(0, 0, n)?.flatten_all()?.to_vec1::<f32>()
+}
+
+fn yarn(s: f64) -> Config {
+    Config {
+        yarn: Some(s),
+        ..config()
+    }
+}
+
+/// Within the trained positions a backbone with YaRN is the backbone without it, bit for bit,
+/// on every pass: padded, packed (F32 and Q8_0 projections) and at given positions.
+#[test]
+fn within_the_trained_positions_yarn_changes_nothing() -> Result<()> {
+    let dev = Device::Cpu;
+    let (plain, vm) = backbone(&config(), &mut Normal(5), &dev)?;
+    let long = ModernBert::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), &yarn(4.0))?;
+    // 64 is max_position_embeddings
+    let seqs = [tokens(0, 64), tokens(1, 40), tokens(2, 3)];
+    let (ids, mask) = padded(&seqs, &dev)?;
+    let bits = |t: Tensor| t.flatten_all()?.to_vec1::<f32>();
+    assert_eq!(
+        bits(plain.forward(&ids, &mask)?)?,
+        bits(long.forward(&ids, &mask)?)?
+    );
+    for dtype in [GgmlDType::F32, GgmlDType::Q8_0] {
+        let (mut p, mut l) = (plain.clone(), long.clone());
+        p.quantize(dtype)?;
+        l.quantize(dtype)?;
+        assert!(l.packs());
+        assert_eq!(
+            bits(p.forward(&ids, &mask)?)?,
+            bits(l.forward(&ids, &mask)?)?
+        );
+    }
+    let (b, n) = ids.dims2()?;
+    let pos = Tensor::arange(0u32, n as u32, &dev)?
+        .unsqueeze(0)?
+        .broadcast_as((b, n))?
+        .contiguous()?;
+    let allow = mask.unsqueeze(1)?.broadcast_as((b, n, n))?.contiguous()?;
+    assert_eq!(
+        bits(plain.forward_masked(&ids, &pos, &allow)?)?,
+        bits(long.forward_masked(&ids, &pos, &allow)?)?
+    );
+    Ok(())
+}
+
+/// Past the trained positions a sequence reads YaRN's tables: refused without them and past
+/// them; the packed pass is the padded pass and the masked pass; a short sequence beside a long
+/// one reads the trained tables, bit for bit as alone in the packed pass; and the stretch moves
+/// the long one only.
+#[test]
+fn past_the_trained_positions_a_sequence_reads_yarn() -> Result<()> {
+    let dev = Device::Cpu;
+    let (bert, vm) = backbone(&yarn(4.0), &mut Normal(6), &dev)?;
+    let at = |cfg: &Config| ModernBert::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), cfg);
+    let plain = at(&config())?;
+    // 200 tokens: past the 64 trained, within the 256 stretched
+    let seqs = [tokens(0, 200), tokens(1, 12)];
+    let (ids, mask) = padded(&seqs, &dev)?;
+    assert!(plain.forward(&ids, &mask).is_err());
+    let mut q = plain.clone();
+    q.quantize(GgmlDType::F32)?;
+    assert!(q.forward(&ids, &mask).is_err());
+
+    let keep = mask.to_dtype(DType::F32)?.unsqueeze(2)?;
+    let want = bert.forward(&ids, &mask)?.broadcast_mul(&keep)?;
+    let scale = want.abs()?.max_all()?.to_scalar::<f32>()?;
+    let mut packs = bert.clone();
+    packs.quantize(GgmlDType::F32)?;
+    let got = packs.forward(&ids, &mask)?;
+    let gap = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+    assert!(gap <= 1e-5 * scale, "packed {gap} against {scale}");
+    let (b, n) = ids.dims2()?;
+    let pos = Tensor::arange(0u32, n as u32, &dev)?
+        .unsqueeze(0)?
+        .broadcast_as((b, n))?
+        .contiguous()?;
+    let allow = mask.unsqueeze(1)?.broadcast_as((b, n, n))?.contiguous()?;
+    let masked = bert
+        .forward_masked(&ids, &pos, &allow)?
+        .broadcast_mul(&keep)?;
+    assert_eq!(
+        want.flatten_all()?.to_vec1::<f32>()?,
+        masked.flatten_all()?.to_vec1::<f32>()?
+    );
+
+    // the short sequence alone, packed, with and without YaRN: the same bits as beside the long one
+    let (one, one_mask) = padded(&seqs[1..], &dev)?;
+    let mut flat = plain.clone();
+    flat.quantize(GgmlDType::F32)?;
+    let alone = row(&packs.forward(&one, &one_mask)?, 0, 12)?;
+    assert_eq!(alone, row(&got, 1, 12)?);
+    assert_eq!(alone, row(&flat.forward(&one, &one_mask)?, 0, 12)?);
+    // padded, beside it: the trained tables to rounding
+    let near = row(&want, 1, 12)?;
+    let alone = row(&bert.forward(&one, &one_mask)?, 0, 12)?;
+    let worst = near
+        .iter()
+        .zip(&alone)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(worst <= 1e-5 * scale, "{worst}");
+
+    // another stretch moves the long sequence and not the short
+    let mut wider = at(&yarn(8.0))?;
+    wider.quantize(GgmlDType::F32)?;
+    let other = wider.forward(&ids, &mask)?;
+    assert_eq!(row(&other, 1, 12)?, row(&got, 1, 12)?);
+    let moved = (other.get(0)? - got.get(0)?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    assert!(moved > 1e-3 * scale, "{moved}");
+    // and past the stretched positions the sequence is refused
+    let (far, far_mask) = padded(&[tokens(0, 257)], &dev)?;
+    assert!(packs.forward(&far, &far_mask).is_err());
+    Ok(())
+}
+
 /// `max|a − b| / max|b|` and `‖a − b‖ / ‖b‖`.
 fn gap(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
     let d = (a - b)?;
@@ -285,5 +431,49 @@ fn the_cuda_pass_packs() -> Result<()> {
         println!("{n}: against F32, packed {fm:.2e} / {ff:.2e}, padded bf16 {um:.2e} / {uf:.2e}");
         assert!(ff <= 1.5 * uf + 2e-3, "{n}: packed {ff}, padded bf16 {uf}");
     }
+    Ok(())
+}
+
+/// A long sequence beside a short one: the packed bf16 pass on CUDA against the padded F32 pass
+/// on the CPU, no further from it than the padded bf16 pass on the CPU.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_long_sequence_packs_on_cuda() -> Result<()> {
+    let cfg = Config {
+        hidden_size: 128,
+        intermediate_size: 96,
+        ..yarn(4.0)
+    };
+    let cpu = Device::Cpu;
+    let cuda = Device::new_cuda(0)?;
+    let (_, vm) = backbone(&cfg, &mut Normal(12), &cpu)?;
+    let seqs = [tokens(0, 200), tokens(1, 12)];
+    let run = |dtype: DType, dev: &Device| -> Result<(bool, Tensor)> {
+        let vb = VarBuilder::from_tensors(
+            vm.data()
+                .lock()
+                .expect("varmap lock")
+                .iter()
+                .map(|(n, v)| Ok((n.clone(), v.as_tensor().to_dtype(dtype)?.to_device(dev)?)))
+                .collect::<Result<std::collections::HashMap<_, _>>>()?,
+            dtype,
+            dev,
+        );
+        let bert = ModernBert::new(vb, &cfg)?;
+        let (ids, mask) = padded(&seqs, dev)?;
+        let keep = mask.to_dtype(DType::F32)?.unsqueeze(2)?;
+        let y = bert
+            .forward(&ids, &mask)?
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&keep)?;
+        Ok((bert.packs(), y.to_device(&cpu)?))
+    };
+    let (_, exact) = run(DType::F32, &cpu)?;
+    let (_, unfused) = run(DType::BF16, &cpu)?;
+    let (packs, fused) = run(DType::BF16, &cuda)?;
+    assert!(packs);
+    let ((fm, ff), (um, uf)) = (gap(&fused, &exact)?, gap(&unfused, &exact)?);
+    println!("long against F32: packed {fm:.2e} / {ff:.2e}, padded bf16 {um:.2e} / {uf:.2e}");
+    assert!(ff <= 1.5 * uf + 2e-3, "packed {ff}, padded bf16 {uf}");
     Ok(())
 }

@@ -33,9 +33,24 @@ pub struct Config {
     pub global_rope_theta: f64,
     pub local_attention: usize,
     pub local_rope_theta: f64,
+    /// YaRN's stretch `s` (Peng et al. 2023, arXiv:2309.00071): a sequence longer than
+    /// `max_position_embeddings` reads its global layers' rotary tables interpolated `s` times
+    /// and its local layers' extended, to [`Config::positions`]; a sequence within
+    /// `max_position_embeddings` reads the trained tables, unchanged.
+    #[serde(default)]
+    pub yarn: Option<f64>,
     #[serde(default)]
     #[serde(flatten)]
     pub classifier_config: Option<ClassifierConfig>,
+}
+
+impl Config {
+    /// The longest sequence the backbone reads: its trained positions, times `yarn`.
+    pub fn positions(&self) -> usize {
+        self.yarn.map_or(self.max_position_embeddings, |s| {
+            (self.max_position_embeddings as f64 * s).round() as usize
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Copy, Default)]
@@ -79,6 +94,63 @@ impl RotaryEmbedding {
         })
     }
 
+    /// YaRN's tables over positions `0..n` for a stretch `s` of `original` trained positions
+    /// (Peng et al. 2023, §3.2-3.4): a frequency whose wavelength fits in `original` 32 times or
+    /// more is kept, one whose wavelength exceeds `original` is divided by `s`, the rest blended
+    /// linearly between (NTK-by-parts, β = 32, α = 1, the band's ends rounded outward); `cos` and
+    /// `sin` carry the attention factor `0.1 ln s + 1`. Angles in f64, stored in `dtype`. `s = 1`
+    /// is the trained frequencies over more positions.
+    fn yarn(
+        dtype: DType,
+        config: &Config,
+        rope_theta: f64,
+        s: f64,
+        n: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let dim = config.hidden_size / config.num_attention_heads;
+        let half = dim / 2;
+        let original = config.max_position_embeddings as f64;
+        // the frequency index whose wavelength fits in `original` `turns` times
+        let index = |turns: f64| {
+            dim as f64 * (original / (turns * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * rope_theta.ln())
+        };
+        let low = index(32.0).floor().max(0.0);
+        let high = index(1.0).ceil().min(dim as f64 - 1.0);
+        let high = if high == low { high + 0.001 } else { high };
+        let freq: Vec<f64> = (0..half)
+            .map(|i| {
+                let f = 1.0 / rope_theta.powf((2 * i) as f64 / dim as f64);
+                let ramp = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+                f / s * ramp + f * (1.0 - ramp)
+            })
+            .collect();
+        let mul = 0.1 * s.ln() + 1.0;
+        let mut cos = Vec::with_capacity(n * half);
+        let mut sin = Vec::with_capacity(n * half);
+        for p in 0..n {
+            for f in &freq {
+                let (sn, cs) = (p as f64 * f).sin_cos();
+                cos.push((cs * mul) as f32);
+                sin.push((sn * mul) as f32);
+            }
+        }
+        Ok(Self {
+            cos: Tensor::from_vec(cos, (n, half), dev)?.to_dtype(dtype)?,
+            sin: Tensor::from_vec(sin, (n, half), dev)?.to_dtype(dtype)?,
+        })
+    }
+
+    /// The trained tables followed by `long`'s: position `p` of `long` is row
+    /// `trained + p`.
+    fn join(&self, long: &RotaryEmbedding) -> Result<Self> {
+        Ok(Self {
+            cos: Tensor::cat(&[&self.cos, &long.cos], 0)?,
+            sin: Tensor::cat(&[&self.sin, &long.sin], 0)?,
+        })
+    }
+
     /// The tables at positions `pos [B, L]` (u32): `[B, L, d/2]` each.
     fn at(&self, pos: &Tensor) -> Result<Self> {
         let (b, l) = pos.dims2()?;
@@ -96,6 +168,18 @@ impl RotaryEmbedding {
         let k_embed = hanzo_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?;
         Ok((q_embed, k_embed))
     }
+}
+
+/// Where a padded pass's tokens sit for the rotary embedding.
+#[derive(Clone, Copy)]
+enum Place<'a> {
+    /// Token `i` at position `i` of the trained tables.
+    Index,
+    /// Each token at `pos [B, L]` of the trained tables.
+    At(&'a Tensor),
+    /// Each token at `pos [B, L]` of the trained tables followed by the stretched ones
+    /// ([`RotaryEmbedding::join`]).
+    Long(&'a Tensor),
 }
 
 /// A projection's weights: dense, as trained, or quantized for inference on the CPU.
@@ -138,10 +222,17 @@ struct ModernBertAttention {
     num_attention_heads: usize,
     attention_head_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
+    /// The trained tables followed by the stretched ones, with [`Config::yarn`].
+    long: Option<Arc<RotaryEmbedding>>,
 }
 
 impl ModernBertAttention {
-    fn load(vb: VarBuilder, config: &Config, rotary_emb: Arc<RotaryEmbedding>) -> Result<Self> {
+    fn load(
+        vb: VarBuilder,
+        config: &Config,
+        rotary_emb: Arc<RotaryEmbedding>,
+        long: Option<Arc<RotaryEmbedding>>,
+    ) -> Result<Self> {
         let num_attention_heads = config.num_attention_heads;
         let attention_head_size = config.hidden_size / config.num_attention_heads;
 
@@ -162,15 +253,63 @@ impl ModernBertAttention {
             num_attention_heads,
             attention_head_size,
             rotary_emb,
+            long,
         })
     }
 
-    /// `pos [B, L]` places each token for the rotary embedding; `None` places it at its index.
+    /// The stretched tables: rows `trained..` of [`ModernBertAttention::long`].
+    fn stretched(&self) -> Result<Option<(Tensor, Tensor)>> {
+        let Some(long) = &self.long else {
+            return Ok(None);
+        };
+        let trained = self.rotary_emb.cos.dim(0)?;
+        let n = long.cos.dim(0)? - trained;
+        Ok(Some((
+            long.cos.narrow(0, trained, n)?,
+            long.sin.narrow(0, trained, n)?,
+        )))
+    }
+
+    /// Packed attention over `qkv [T, 3·H·D]` (see `hanzo_nn::attention::packed`): a sequence
+    /// within the trained positions reads the trained tables, a longer one the stretched tables,
+    /// each run of consecutive sequences of one kind in one call.
+    fn packed(&self, qkv: &Tensor, lens: &[usize], window: Option<usize>) -> Result<Tensor> {
+        let (heads, scale) = (
+            self.num_attention_heads,
+            (self.attention_head_size as f64).powf(-0.5) as f32,
+        );
+        let trained = self.rotary_emb.cos.dim(0)?;
+        let stretched = self.stretched()?;
+        let tables = |long: bool| match (long, &stretched) {
+            (true, Some((c, s))) => (c, s),
+            _ => (&self.rotary_emb.cos, &self.rotary_emb.sin),
+        };
+        let runs: Vec<&[usize]> = lens
+            .chunk_by(|a, b| (*a > trained) == (*b > trained))
+            .collect();
+        if runs.len() <= 1 {
+            let (c, s) = tables(lens.iter().any(|&n| n > trained));
+            return hanzo_nn::attention::packed(qkv, lens, heads, window, c, s, scale);
+        }
+        let mut out = Vec::with_capacity(runs.len());
+        let mut at = 0;
+        for run in runs {
+            let t: usize = run.iter().sum();
+            let (c, s) = tables(run[0] > trained);
+            let part = qkv.narrow(0, at, t)?;
+            out.push(hanzo_nn::attention::packed(
+                &part, run, heads, window, c, s, scale,
+            )?);
+            at += t;
+        }
+        Tensor::cat(&out, 0)
+    }
+
     fn forward(
         &self,
         hidden_states: &Tensor,
         attention_mask: &Tensor,
-        pos: Option<&Tensor>,
+        place: Place,
     ) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
@@ -189,9 +328,13 @@ impl ModernBertAttention {
         let k = qkv.get(1)?;
         let v = qkv.get(2)?;
 
-        let (q, k) = match pos {
-            Some(p) => self.rotary_emb.at(p)?.apply_rotary_emb_qkv(&q, &k)?,
-            None => self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?,
+        let (q, k) = match place {
+            Place::Index => self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?,
+            Place::At(p) => self.rotary_emb.at(p)?.apply_rotary_emb_qkv(&q, &k)?,
+            Place::Long(p) => match &self.long {
+                Some(long) => long.at(p)?.apply_rotary_emb_qkv(&q, &k)?,
+                None => hanzo_ml::bail!("a long place without stretched tables"),
+            },
         };
 
         let scale = (self.attention_head_size as f64).powf(-0.5);
@@ -254,10 +397,10 @@ impl ModernBertLayer {
     fn load(
         vb: VarBuilder,
         config: &Config,
-        rotary_emb: Arc<RotaryEmbedding>,
+        (rotary_emb, long): (Arc<RotaryEmbedding>, Option<Arc<RotaryEmbedding>>),
         uses_local_attention: bool,
     ) -> Result<Self> {
-        let attn = ModernBertAttention::load(vb.pp("attn"), config, rotary_emb)?;
+        let attn = ModernBertAttention::load(vb.pp("attn"), config, rotary_emb, long)?;
         let mlp = ModernBertMLP::load(vb.pp("mlp"), config)?;
         let attn_norm = layer_norm_no_bias(
             config.hidden_size,
@@ -284,28 +427,24 @@ impl ModernBertLayer {
             None => xs.clone(),
         };
         let a = &self.attn;
-        let att = hanzo_nn::attention::packed(
+        let att = a.packed(
             &h.apply(&a.qkv)?,
             lens,
-            a.num_attention_heads,
             self.uses_local_attention.then_some(window),
-            &a.rotary_emb.cos,
-            &a.rotary_emb.sin,
-            (a.attention_head_size as f64).powf(-0.5) as f32,
         )?;
         let xs = (att.apply(&a.proj)? + xs)?;
         let mlp = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         xs + mlp
     }
 
-    /// `local_attention_mask` is the global mask with the sliding window already added; `pos`
+    /// `local_attention_mask` is the global mask with the sliding window already added; `place`
     /// places the tokens for the rotary embedding.
     fn forward(
         &self,
         xs: &Tensor,
         global_attention_mask: &Tensor,
         local_attention_mask: &Tensor,
-        pos: Option<&Tensor>,
+        place: Place,
     ) -> Result<Tensor> {
         let residual = xs.clone();
         let mut xs = xs.clone();
@@ -318,7 +457,7 @@ impl ModernBertLayer {
         } else {
             global_attention_mask
         };
-        let xs = self.attn.forward(&xs, attention_mask, pos)?;
+        let xs = self.attn.forward(&xs, attention_mask, place)?;
         let xs = (xs + residual)?;
         let mlp_out = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         let xs = (xs + mlp_out)?;
@@ -437,6 +576,10 @@ pub struct ModernBert {
     layers: Vec<ModernBertLayer>,
     final_norm: LayerNorm,
     local_attention_size: usize,
+    /// Positions the trained tables hold, `max_position_embeddings`.
+    trained: usize,
+    /// Whether a longer sequence reads stretched tables ([`Config::yarn`]).
+    long: bool,
     /// Projections quantized ([`ModernBert::quantize`]): the CPU inference pass.
     quantized: bool,
 }
@@ -472,6 +615,20 @@ impl ModernBert {
             config.local_rope_theta,
             vb.device(),
         )?);
+        // past the trained positions the global layers read YaRN's tables; a local layer's
+        // window spans no more than it was trained on, so it reads its own frequencies, extended
+        let long = |trained: &RotaryEmbedding, theta: f64, s: f64| -> Result<_> {
+            let n = config.positions();
+            let t = RotaryEmbedding::yarn(vb.dtype(), config, theta, s, n, vb.device())?;
+            Ok(Arc::new(trained.join(&t)?))
+        };
+        let (global_long, local_long) = match config.yarn {
+            Some(s) => (
+                Some(long(&global_rotary_emb, config.global_rope_theta, s)?),
+                Some(long(&local_rotary_emb, config.local_rope_theta, 1.0)?),
+            ),
+            None => (None, None),
+        };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_id in 0..config.num_hidden_layers {
@@ -480,9 +637,9 @@ impl ModernBert {
                 vb.pp(format!("layers.{layer_id}")),
                 config,
                 if layer_uses_local_attention {
-                    local_rotary_emb.clone()
+                    (local_rotary_emb.clone(), local_long.clone())
                 } else {
-                    global_rotary_emb.clone()
+                    (global_rotary_emb.clone(), global_long.clone())
                 },
                 layer_uses_local_attention,
             )?);
@@ -500,6 +657,8 @@ impl ModernBert {
             layers,
             final_norm,
             local_attention_size: config.local_attention,
+            trained: config.max_position_embeddings,
+            long: config.yarn.is_some(),
             quantized: false,
         })
     }
@@ -575,11 +734,40 @@ impl ModernBert {
         };
         let global = additive(&allow)?;
         let local = additive(&(&allow * near)?)?;
+        // a row placing a key some query reads past the trained positions reads the stretched
+        // tables
+        let long = match self.long {
+            true => {
+                let read = allow.max(1)?;
+                let last = (p * read)?.max(1)?.to_vec1::<f32>()?;
+                self.shifted(pos, last.iter().map(|&m| m as usize >= self.trained))?
+            }
+            false => None,
+        };
+        let place = match &long {
+            Some(p) => Place::Long(p),
+            None => Place::At(pos),
+        };
         let mut h = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
         for layer in &self.layers {
-            h = layer.forward(&h, &global, &local, Some(pos))?;
+            h = layer.forward(&h, &global, &local, place)?;
         }
         h.apply(&self.final_norm)
+    }
+
+    /// `pos [B, L]` into the trained tables followed by the stretched ones
+    /// ([`RotaryEmbedding::join`]): each long row's positions past the trained ones. `None` when
+    /// no row is long.
+    fn shifted(&self, pos: &Tensor, long: impl Iterator<Item = bool>) -> Result<Option<Tensor>> {
+        let shift: Vec<u32> = long
+            .map(|l| if l { self.trained as u32 } else { 0 })
+            .collect();
+        if shift.iter().all(|&s| s == 0) {
+            return Ok(None);
+        }
+        let n = shift.len();
+        let shift = Tensor::from_vec(shift, (n, 1), pos.device())?;
+        Ok(Some(pos.broadcast_add(&shift)?.contiguous()?))
     }
 
     /// Every sequence's first `lens` tokens packed into one: embeddings, projections and norms
@@ -626,9 +814,24 @@ impl ModernBert {
         let local_attention_mask =
             get_local_attention_mask(seq_len, self.local_attention_size / 2, dtype, xs.device())?
                 .broadcast_add(&global_attention_mask)?;
+        // a row longer than the trained positions reads the stretched tables
+        let long = match self.long && seq_len > self.trained {
+            true => {
+                let lens = mask.to_dtype(DType::U32)?.sum(1)?.to_vec1::<u32>()?;
+                let pos = Tensor::arange(0u32, seq_len as u32, xs.device())?
+                    .unsqueeze(0)?
+                    .broadcast_as((lens.len(), seq_len))?;
+                self.shifted(&pos, lens.iter().map(|&n| n as usize > self.trained))?
+            }
+            false => None,
+        };
+        let place = match &long {
+            Some(p) => Place::Long(p),
+            None => Place::Index,
+        };
         let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
         for layer in self.layers.iter() {
-            xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask, None)?;
+            xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask, place)?;
         }
         let xs = xs.apply(&self.final_norm)?;
         Ok(xs)
@@ -733,5 +936,93 @@ impl ModernBertForSequenceClassification {
             .forward(&last_hidden_state)?
             .apply(&self.classifier)?;
         Ok(xs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// mmBERT's attention geometry: 64-wide heads, θ 160000, 8,192 trained positions.
+    fn mmbert(yarn: Option<f64>) -> Config {
+        Config {
+            vocab_size: 8,
+            hidden_size: 768,
+            num_hidden_layers: 1,
+            num_attention_heads: 12,
+            intermediate_size: 8,
+            max_position_embeddings: 8192,
+            layer_norm_eps: 1e-5,
+            pad_token_id: 0,
+            global_attn_every_n_layers: 3,
+            global_rope_theta: 160000.,
+            local_attention: 128,
+            local_rope_theta: 160000.,
+            yarn,
+            classifier_config: None,
+        }
+    }
+
+    /// Each frequency of the tables at position 1, the attention factor taken out.
+    fn freqs(t: &RotaryEmbedding, mul: f64) -> Vec<f64> {
+        let sin = t.sin.get(1).unwrap().to_vec1::<f32>().unwrap();
+        sin.iter().map(|&s| (s as f64 / mul).asin()).collect()
+    }
+
+    #[test]
+    fn positions_are_the_trained_ones_stretched() {
+        assert_eq!(mmbert(None).positions(), 8192);
+        assert_eq!(mmbert(Some(4.0)).positions(), 32768);
+    }
+
+    /// For mmBERT at s = 4 the band runs from index 9 (wavelength 8192 / 32) to 20 (8192): below
+    /// it a frequency is kept, above it divided by 4; cos at position 0 is the attention factor.
+    #[test]
+    fn yarn_keeps_the_fast_frequencies_and_divides_the_slow() {
+        let cfg = mmbert(Some(4.0));
+        let mul = 0.1 * 4f64.ln() + 1.0;
+        let t = RotaryEmbedding::yarn(DType::F32, &cfg, 160000., 4.0, 32768, &Device::Cpu).unwrap();
+        assert_eq!(t.cos.dims(), &[32768, 32]);
+        let c0 = t.cos.get(0).unwrap().to_vec1::<f32>().unwrap();
+        assert!(c0.iter().all(|&c| (c as f64 - mul).abs() < 1e-6), "{c0:?}");
+        let got = freqs(&t, mul);
+        for (i, g) in got.iter().enumerate() {
+            let f = 1.0 / 160000f64.powf(2.0 * i as f64 / 64.0);
+            let r = g / f;
+            match i {
+                0..=9 => assert!((r - 1.0).abs() < 1e-4, "{i}: {r}"),
+                20.. => assert!((r - 0.25).abs() < 1e-4, "{i}: {r}"),
+                _ => assert!(r < 1.0 && r > 0.25, "{i}: {r}"),
+            }
+        }
+        // linear across the band: index 10 is 1/11 of the way from 1 to 1/4
+        let r: Vec<f64> = (0..32)
+            .map(|i| got[i] * 160000f64.powf(2.0 * i as f64 / 64.0))
+            .collect();
+        for (i, x) in r.iter().enumerate().take(20).skip(10) {
+            let want = 1.0 - 0.75 * (i as f64 - 9.0) / 11.0;
+            assert!((x - want).abs() < 1e-6, "{i}: {x} against {want}");
+        }
+    }
+
+    /// At s = 1 the tables are the trained ones over more positions: unscaled, every frequency
+    /// kept, equal to the trained tables where both have a row.
+    #[test]
+    fn yarn_at_one_is_the_trained_tables_extended() {
+        let cfg = mmbert(Some(4.0));
+        let dev = Device::Cpu;
+        let t = RotaryEmbedding::yarn(DType::F32, &cfg, 160000., 1.0, 32768, &dev).unwrap();
+        let trained = RotaryEmbedding::new(DType::F32, &cfg, 160000., &dev).unwrap();
+        let (a, b) = (
+            t.cos.narrow(0, 0, 1024).unwrap(),
+            trained.cos.narrow(0, 0, 1024).unwrap(),
+        );
+        let gap = (a - b).unwrap().abs().unwrap().max_all().unwrap();
+        assert!(gap.to_scalar::<f32>().unwrap() < 1e-4);
+        let got = freqs(&t, 1.0);
+        for (i, g) in got.iter().enumerate() {
+            let f = 1.0 / 160000f64.powf(2.0 * i as f64 / 64.0);
+            assert!((g / f - 1.0).abs() < 1e-4, "{i}");
+        }
     }
 }
