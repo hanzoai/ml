@@ -8507,6 +8507,57 @@ mod dsl_dispatch_proof {
         );
     }
 
+    // A row masked to `f32::MIN` throughout is uniform, as on the CPU: the running max starts at
+    // -inf, so it settles on `f32::MIN` and every exponent is exp(0). Rows of 16 and of 300 (more
+    // than the 256 threads of a workgroup), each all masked, half masked, and unmasked.
+    #[test]
+    fn softmax_masked_row_is_uniform() {
+        let dev = match VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[softmax-masked] no vulkan device ({e}); skipping");
+                return;
+            }
+        };
+        for m in [16usize, 300] {
+            let x: Vec<f32> = (0..3 * m)
+                .map(|idx| match (idx / m, idx % m) {
+                    (0, _) => f32::MIN,
+                    (1, i) if i % 2 == 1 => f32::MIN,
+                    (_, i) => (i % 7) as f32 / 4.0,
+                })
+                .collect();
+            let mut cpu = vec![0f32; 3 * m];
+            for (r, c) in x.chunks(m).zip(cpu.chunks_mut(m)) {
+                let mx = r.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = r.iter().map(|v| (v - mx).exp()).sum();
+                for (c, v) in c.iter_mut().zip(r) {
+                    *c = (v - mx).exp() / sum;
+                }
+            }
+            let xs = dev.upload_f32(&x).unwrap();
+            let got = xs
+                .softmax_last_dim(&Layout::contiguous((3, m)))
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+            assert!(
+                got[..m].iter().all(|&p| p == 1.0 / m as f32),
+                "m {m}: {:?}",
+                &got[..m]
+            );
+            let err = got
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                err < 1e-6,
+                "m {m}: masked softmax diverged from CPU: {err:.3e}"
+            );
+        }
+    }
+
     // The committed DSL block-reduced MoE .spv (`moe_matvec_q4k_blk_gu`, gate/up shape n=768 k=2048)
     // dispatched through the PRODUCTION path: `quantize_q4k_split` de-interleaves a real packed Q4_K
     // bank into the planar layout, `moe_matvec_blk_gpu` binds the 7 SSBOs and runs the .spv via ml's
