@@ -15,6 +15,8 @@ use hanzo_nn::{
 };
 use serde::Deserialize;
 
+pub mod adapter;
+
 use core::f32;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -311,10 +313,19 @@ impl ModernBertAttention {
         attention_mask: &Tensor,
         place: Place,
     ) -> Result<Tensor> {
+        self.forward_routed(hidden_states, attention_mask, place, None)
+    }
+
+    fn forward_routed(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: &Tensor,
+        place: Place,
+        route: Option<&adapter::Routing<'_>>,
+    ) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
-        let qkv = xs
-            .apply(&self.qkv)?
+        let qkv = adapter::project(&self.qkv, &xs, route, true)?
             .reshape((
                 b,
                 seq_len,
@@ -344,7 +355,7 @@ impl ModernBertAttention {
         let xs = softmax_last_dim(&att)?.matmul(&v)?;
 
         let xs = xs.transpose(1, 2)?.reshape((b, seq_len, d))?;
-        let xs = xs.apply(&self.proj)?;
+        let xs = adapter::project(&self.proj, &xs, route, false)?;
         let xs = xs.reshape((b, seq_len, d))?;
 
         Ok(xs)
@@ -422,17 +433,27 @@ impl ModernBertLayer {
     /// A packed pass through the layer: `xs [T, d]` holds sequences of `lens` tokens; a local
     /// layer's queries read the keys within `window` of them.
     fn packed(&self, xs: &Tensor, lens: &[usize], window: usize) -> Result<Tensor> {
+        self.packed_routed(xs, lens, window, None)
+    }
+
+    fn packed_routed(
+        &self,
+        xs: &Tensor,
+        lens: &[usize],
+        window: usize,
+        route: Option<&adapter::Routing<'_>>,
+    ) -> Result<Tensor> {
         let h = match &self.attn_norm {
             Some(norm) => xs.apply(norm)?,
             None => xs.clone(),
         };
         let a = &self.attn;
         let att = a.packed(
-            &h.apply(&a.qkv)?,
+            &adapter::project(&a.qkv, &h, route, true)?,
             lens,
             self.uses_local_attention.then_some(window),
         )?;
-        let xs = (att.apply(&a.proj)? + xs)?;
+        let xs = (adapter::project(&a.proj, &att, route, false)? + xs)?;
         let mlp = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         xs + mlp
     }
@@ -446,6 +467,17 @@ impl ModernBertLayer {
         local_attention_mask: &Tensor,
         place: Place,
     ) -> Result<Tensor> {
+        self.forward_routed(xs, global_attention_mask, local_attention_mask, place, None)
+    }
+
+    fn forward_routed(
+        &self,
+        xs: &Tensor,
+        global_attention_mask: &Tensor,
+        local_attention_mask: &Tensor,
+        place: Place,
+        route: Option<&adapter::Routing<'_>>,
+    ) -> Result<Tensor> {
         let residual = xs.clone();
         let mut xs = xs.clone();
         if let Some(norm) = &self.attn_norm {
@@ -457,7 +489,12 @@ impl ModernBertLayer {
         } else {
             global_attention_mask
         };
-        let xs = self.attn.forward(&xs, attention_mask, place)?;
+        let xs = match route {
+            Some(r) => self
+                .attn
+                .forward_routed(&xs, attention_mask, place, Some(r))?,
+            None => self.attn.forward(&xs, attention_mask, place)?,
+        };
         let xs = (xs + residual)?;
         let mlp_out = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         let xs = (xs + mlp_out)?;

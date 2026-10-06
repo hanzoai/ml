@@ -477,3 +477,110 @@ fn a_long_sequence_packs_on_cuda() -> Result<()> {
     assert!(ff <= 1.5 * uf + 2e-3, "packed {ff}, padded bf16 {uf}");
     Ok(())
 }
+
+/// A conditional adapter changes selected rows, never the other rows or the underlying model.
+#[test]
+fn routed_upper_layers_keep_none_exact_and_share_the_base() -> Result<()> {
+    use hanzo_transformers::models::modernbert::adapter::{Adapter, Layer, Lora};
+    let dev = Device::Cpu;
+    let cfg = config();
+    let (model, _vm) = backbone(&cfg, &mut Normal(77), &dev)?;
+    let (ids, mask) = rows(&dev)?;
+    let mut rng = Normal(91);
+    let mut layers = Vec::new();
+    for _ in 0..2 {
+        layers.push(Layer {
+            qkv: Some(Lora::new(
+                rng.tensor(&[4, 64], 0.1, &dev)?,
+                rng.tensor(&[192, 4], 0.1, &dev)?,
+                2.0,
+            )?),
+            output: Some(Lora::new(
+                rng.tensor(&[4, 64], 0.1, &dev)?,
+                rng.tensor(&[64, 4], 0.1, &dev)?,
+                2.0,
+            )?),
+        });
+    }
+    let bank = [Adapter { first: 1, layers }];
+    assert_eq!(bank[0].bytes(), 2 * 4 * (64 + 192 + 64 + 64) * 4);
+    let bits = |h: Tensor| -> Result<Vec<u32>> {
+        Ok(h.flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .map(|x| x.to_bits())
+            .collect())
+    };
+    // Padded F32 and packed CPU Q8_0 must both preserve the exact old none path.
+    for quantized in [false, true] {
+        let mut model = model.clone();
+        if quantized {
+            model.quantize(GgmlDType::Q8_0)?;
+        }
+        let base = model.forward(&ids, &mask)?;
+        let none = model.forward_routed(&ids, &mask, 1, &bank, |_| Ok(vec![None; 3]))?;
+        assert_eq!(bits(base.clone())?, bits(none)?);
+        let absent =
+            model.forward_routed(&ids, &mask, 1, &[], |_| panic!("absent must not route"))?;
+        assert_eq!(bits(base.clone())?, bits(absent)?);
+        let mut calls = 0;
+        let routed = model.forward_routed(&ids, &mask, 1, &bank, |pooled| {
+            calls += 1;
+            assert_eq!(pooled.dims(), &[3, 64]);
+            Ok(vec![None, Some(0), None])
+        })?;
+        assert_eq!(calls, 1);
+        for row in [0, 2] {
+            assert_eq!(bits(base.get(row)?)?, bits(routed.get(row)?)?);
+        }
+        assert_ne!(bits(base.get(1)?)?, bits(routed.get(1)?)?);
+        let again =
+            model.forward_routed(&ids, &mask, 1, &bank, |_| Ok(vec![None, Some(0), None]))?;
+        assert_eq!(bits(routed)?, bits(again)?);
+        // Unload: factors are borrowed for the call and never installed into base weights.
+        assert_eq!(bits(base)?, bits(model.forward(&ids, &mask)?)?);
+        assert!(model
+            .forward_routed(&ids, &mask, 1, &bank, |_| Ok(vec![Some(5); 3]))
+            .is_err());
+        assert!(model
+            .forward_routed(&ids, &mask, 2, &bank, |_| Ok(vec![None; 3]))
+            .is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn routed_factors_receive_gradients_without_replacing_base_weights() -> Result<()> {
+    use hanzo_ml::Var;
+    use hanzo_transformers::models::modernbert::adapter::{Adapter, Layer, Lora};
+    let dev = Device::Cpu;
+    let (model, _vm) = backbone(&config(), &mut Normal(13), &dev)?;
+    let (ids, mask) = rows(&dev)?;
+    let mut rng = Normal(29);
+    let a = Var::from_tensor(&rng.tensor(&[4, 64], 0.1, &dev)?)?;
+    let b = Var::from_tensor(&rng.tensor(&[192, 4], 0.1, &dev)?)?;
+    let bank = [Adapter {
+        first: 2,
+        layers: vec![Layer {
+            qkv: Some(Lora::new(
+                a.as_tensor().clone(),
+                b.as_tensor().clone(),
+                2.0,
+            )?),
+            output: None,
+        }],
+    }];
+    let h = model.forward_routed(&ids, &mask, 2, &bank, |_| Ok(vec![Some(0); 3]))?;
+    let loss = h.narrow(2, 0, 1)?.sqr()?.sum_all()?;
+    let grad = loss.backward()?;
+    for factor in [&a, &b] {
+        let g = grad
+            .get(factor)
+            .expect("selected factor has a gradient")
+            .abs()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert!(g.is_finite() && g > 0.0);
+    }
+    Ok(())
+}
