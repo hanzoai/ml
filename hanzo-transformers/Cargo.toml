@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-transformers"
-version = "0.11.15"
+version = "0.11.16"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -10,19 +10,19 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-accelerate-src = { workspace = true, optional = true }
-byteorder = { workspace = true }
-hanzo-ml = { workspace = true }
-hanzo-nn = { workspace = true }
-fancy-regex = { workspace = true }
-intel-mkl-src = { workspace = true, optional = true }
-num-traits = { workspace = true }
-rand = { workspace = true }
-rayon = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_plain = { workspace = true }
-tracing = { workspace = true }
+accelerate-src = { version = "0.3.2", optional = true }
+byteorder = "1.4.3"
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+hanzo-nn = { path = "../hanzo-nn", version = "0.11.48" }
+fancy-regex = "0.19.0"
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
+num-traits = "0.2.15"
+rand = "0.9.0"
+rayon = "1.7.0"
+serde = { version = "1.0.171", features = ["derive"] }
+serde_json = "1.0.99"
+serde_plain = "1.0.2"
+tracing = "0.1.37"
 
 [features]
 default = []
@@ -34,5 +34,11 @@ mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl", "hanzo-nn/mkl"]
 metal = ["hanzo-ml/metal", "hanzo-nn/metal"]
 metal-debug-labels = ["metal", "hanzo-ml/metal-debug-labels", "hanzo-nn/metal-debug-labels"]
 
-[lints]
-workspace = true
+[lints.clippy]
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"

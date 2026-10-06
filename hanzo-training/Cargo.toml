@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-training"
-version = "0.11.10"
+version = "0.11.11"
 edition = "2021"
 description = "Training framework for Hanzo ML models on zen-agentic-dataset"
 repository = "https://github.com/hanzoai/ml"
@@ -10,31 +10,31 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-hanzo-ml = { workspace = true }
-hanzo-nn = { workspace = true }
-hanzo-transformers = { workspace = true }
-hanzo-datasets = { workspace = true }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+hanzo-nn = { path = "../hanzo-nn", version = "0.11.48" }
+hanzo-transformers = { path = "../hanzo-transformers", version = "0.11.16" }
+hanzo-datasets = { path = "../hanzo-datasets", version = "0.11.10" }
 
 # Core dependencies
-anyhow = { workspace = true }
-clap = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-log = { workspace = true }
-thiserror = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
+clap = { version = "4.2.4", features = ["derive"] }
+serde = { version = "1.0.171", features = ["derive"] }
+serde_json = "1.0.99"
+log = "0.4"
+thiserror = "2"
 tokio = { version = "1.0", features = ["full"] }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Configuration
-chrono = { workspace = true }
+chrono = "0.4"
 serde_yaml = "0.9"
 toml = "0.8"
 
 # Training specific
-rand = { workspace = true }
-rayon = { workspace = true }
-safetensors = { workspace = true }
+rand = "0.9.0"
+rayon = "1.7.0"
+safetensors = "0.8.0"
 
 # Progress and metrics
 indicatif = "0.18"

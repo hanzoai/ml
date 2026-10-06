@@ -16,14 +16,14 @@ name = "hanzo"
 crate-type = ["cdylib"]
 
 [dependencies]
-accelerate-src = { workspace = true, optional = true }
-hanzo-ml = { workspace = true }
-hanzo-nn = { workspace = true }
-hanzo-onnx = { workspace = true, optional = true }
-half = { workspace = true }
-intel-mkl-src = { workspace = true, optional = true }
+accelerate-src = { version = "0.3.2", optional = true }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+hanzo-nn = { path = "../hanzo-nn", version = "0.11.48" }
+hanzo-onnx = { path = "../hanzo-onnx", version = "0.11.11", optional = true }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr", "zerocopy"] }
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
 pyo3 = { version = "0.24.1", features = ["extension-module", "abi3-py38"] }
-float8 = { workspace = true }
+float8 = { version = "0.7.0", features = ["num-traits", "rand_distr"] }
 
 [build-dependencies]
 pyo3-build-config = "0.24.1"
@@ -36,5 +36,11 @@ mkl = ["dep:intel-mkl-src", "hanzo-ml/mkl"]
 onnx = ["dep:hanzo-onnx"]
 
 
-[lints]
-workspace = true
+[lints.clippy]
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"

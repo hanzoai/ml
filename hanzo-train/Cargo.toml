@@ -1,12 +1,12 @@
 [package]
 name = "hanzo-train"
-version = "0.11.20"
-edition.workspace = true
+version = "0.11.21"
 description = "Training on hanzo-ml: one model across heterogeneous machines (DiLoCo local SGD, bf16 deltas, bit-identical resume), and the DSpark draft trainer on it."
-repository.workspace = true
 keywords = ["training", "distributed", "diloco", "machine-learning"]
 categories = ["science"]
-license.workspace = true
+edition = "2021"
+repository = "https://github.com/hanzoai/ml"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "hanzo-train"
@@ -17,15 +17,15 @@ name = "hanzo_train"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = { workspace = true }
-hanzo-ml = { workspace = true }
-hanzo-nn = { workspace = true }
-half = { workspace = true }
-libc = { workspace = true }
-rayon = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true, features = ["float_roundtrip"] }
+anyhow = { version = "1", features = ["backtrace"] }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+hanzo-nn = { path = "../hanzo-nn", version = "0.11.48" }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr", "zerocopy"] }
+libc = "0.2.147"
+rayon = "1.7.0"
+serde = { version = "1.0.171", features = ["derive"] }
+serde_json = { version = "1.0.99", features = ["float_roundtrip"] }
 sha2 = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
-rand = { workspace = true }
-clap = { workspace = true }
+rand = "0.9.0"
+clap = { version = "4.2.4", features = ["derive"] }

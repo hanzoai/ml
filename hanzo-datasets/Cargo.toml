@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-datasets"
-version = "0.11.9"
+version = "0.11.10"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -10,17 +10,23 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-byteorder = { workspace = true }
-hanzo-ml = { workspace = true }
-hanzo-nn = { workspace = true }
-hf-hub = { workspace = true}
-intel-mkl-src = { workspace = true, optional = true }
-memmap2 = { workspace = true }
-tokenizers = { workspace = true, features = ["fancy-regex"] }
-rand = { workspace = true }
-thiserror = { workspace = true }
-parquet = { workspace = true}
-image = { workspace = true }
+byteorder = "1.4.3"
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+hanzo-nn = { path = "../hanzo-nn", version = "0.11.48" }
+hf-hub = { version = "1.0.0", features = ["blocking"] }
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+rand = "0.9.0"
+thiserror = "2"
+parquet = "59"
+image = { version = "0.25.2", default-features = false, features = ["jpeg", "png"] }
 
-[lints]
-workspace = true
+[lints.clippy]
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"

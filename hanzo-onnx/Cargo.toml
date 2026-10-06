@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-onnx"
-version = "0.11.10"
+version = "0.11.11"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -9,8 +9,8 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.8" }
-hanzo-nn = { path = "../hanzo-nn", version = "0.11.8" }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+hanzo-nn = { path = "../hanzo-nn", version = "0.11.48" }
 prost = "0.14.1"
 
 [build-dependencies]

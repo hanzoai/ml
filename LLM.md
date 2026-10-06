@@ -80,6 +80,10 @@ crate on top of these; a generator that only checks itself learns nothing new.
 - Registry is **crates.io**, owner `zeekay`. There is no Hanzo cargo registry: no
   `[registries]` in `.cargo/config.toml`, no `publish = [...]` allow-list, and the
   sibling Rust repo (`hanzoai/engine`) publishes the same way.
+- **Each crate names everything itself: no workspace inheritance.** A crate's manifest holds
+  its own version, package fields, lints and every dependency spec (a sibling as `path` plus
+  the exact `version` it was published at); the root holds only `members`, `exclude`,
+  `resolver` and profiles. What a crate ships is what its own manifest says.
 - **Each crate carries its own version and moves by a patch bump from the version it
   last released.** Crates change at different rates, so their numbers differ — that
   is information, not drift. Never renumber a crate to match another.

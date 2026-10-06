@@ -1,17 +1,17 @@
 [package]
 name = "hanzo-learn"
 # A new crate opens at 0.1.0. Versioning and publication belong to the release track.
-version = "0.1.0"
-edition.workspace = true
+version = "0.1.1"
 description = "Statistical learning as values: fit is a transformation, a model is a value, predict is a query."
-repository.workspace = true
-license.workspace = true
 keywords = ["machine-learning", "regression", "statistics"]
 categories = ["science"]
+edition = "2021"
+repository = "https://github.com/hanzoai/ml"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 sha2 = "0.10"
-rayon = { workspace = true }
+rayon = "1.7.0"
 
 [dev-dependencies]
 # `float_roundtrip` is NOT optional here, it is what makes the oracle an oracle.
@@ -21,12 +21,12 @@ rayon = { workspace = true }
 # factor — would then be comparing a correct value against a corrupted one, and the failure
 # looks exactly like an arithmetic bug in the estimator. Measured, not assumed; see the
 # note on `reals` in tests/sklearn.rs.
-serde_json = { workspace = true, features = ["float_roundtrip"] }
-criterion = { workspace = true }
+serde_json = { version = "1.0.99", features = ["float_roundtrip"] }
+criterion = { version = "0.8", default-features = false }
 # The `fraud` example reads a labelled dataset off disk. The parquet crate's own record
 # reader is enough for that — no arrow — and it stays a DEV dependency: the crate itself
 # takes its data as a `Matrix`, so a file format is never part of what it links.
-parquet = { workspace = true }
+parquet = "59"
 
 [[bench]]
 name = "learn"
@@ -36,5 +36,11 @@ harness = false
 # member opts in the same way. It matters here for `needless_range_loop`, allowed there for
 # parallel-array indexing, which is what the Newton step's Hessian accumulation does: one
 # index reads the working weights AND the design row.
-[lints]
-workspace = true
+[lints.clippy]
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"

@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-nn"
-version = "0.11.47"
+version = "0.11.48"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -10,30 +10,30 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-accelerate-src = { workspace = true, optional = true }
-hanzo-ml = { workspace = true }
-gemm = { workspace = true }
-hanzo-metal-kernels = { workspace = true, optional = true }
-hanzo-kernels = { workspace = true, optional = true, features = ["cutile"] }
-half = { workspace = true }
-float8 = { workspace = true }
-memmap2 = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-intel-mkl-src = { workspace = true, optional = true }
-num-traits = { workspace = true }
-rayon = { workspace = true }
-safetensors = { workspace = true }
-serde = { workspace = true }
-objc2-metal = { workspace = true, optional = true }
-libc = { workspace = true }
+accelerate-src = { version = "0.3.2", optional = true }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
+hanzo-metal-kernels = { path = "../hanzo-metal-kernels", version = "0.11.47", optional = true }
+hanzo-kernels = { path = "../hanzo-kernels", version = "0.11.40", optional = true, features = ["cutile"] }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr", "zerocopy"] }
+float8 = { version = "0.7.0", features = ["num-traits", "rand_distr"] }
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+serde_json = "1.0.99"
+thiserror = "2"
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
+num-traits = "0.2.15"
+rayon = "1.7.0"
+safetensors = "0.8.0"
+serde = { version = "1.0.171", features = ["derive"] }
+objc2-metal = { version = "0.3.1", optional = true }
+libc = "0.2.147"
 
 [dev-dependencies]
-anyhow = { workspace = true }
-clap = { workspace = true }
-rand = { workspace = true }
-rand_distr = { workspace = true }
-criterion = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
+clap = { version = "4.2.4", features = ["derive"] }
+rand = "0.9.0"
+rand_distr = "0.5.1"
+criterion = { version = "0.8", default-features = false }
 
 [features]
 default = []
@@ -51,5 +51,11 @@ metal-debug-labels = ["metal", "hanzo-ml/metal-debug-labels"]
 name = "bench_main"
 harness = false
 
-[lints]
-workspace = true
+[lints.clippy]
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"

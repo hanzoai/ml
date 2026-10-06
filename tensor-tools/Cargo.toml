@@ -2,20 +2,26 @@
 name = "tensor-tools"
 # Not published: the crate name `tensor-tools` on crates.io belongs to the upstream candle author, not Hanzo.
 publish = false
-version.workspace = true
-edition.workspace = true
-description.workspace = true
-repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-license.workspace = true
+version = "0.11.18"
+edition = "2021"
+description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
+repository = "https://github.com/hanzoai/ml"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-anyhow = { workspace = true }
-hanzo-ml = { workspace = true }
-clap = { workspace = true }
-rayon = { workspace = true }
-safetensors = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+clap = { version = "4.2.4", features = ["derive"] }
+rayon = "1.7.0"
+safetensors = "0.8.0"
 
-[lints]
-workspace = true
+[lints.clippy]
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"

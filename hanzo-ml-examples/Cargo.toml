@@ -12,56 +12,56 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-accelerate-src = { workspace = true, optional = true }
-hanzo-ml = { workspace = true }
-hanzo-datasets = { workspace = true, optional = true }
-hanzo-nn = { workspace = true }
-hanzo-transformers = { workspace = true }
-hanzo-flash-attn = { workspace = true, optional = true }
-hanzo-onnx = { workspace = true, optional = true }
+accelerate-src = { version = "0.3.2", optional = true }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+hanzo-datasets = { path = "../hanzo-datasets", version = "0.11.10", optional = true }
+hanzo-nn = { path = "../hanzo-nn", version = "0.11.48" }
+hanzo-transformers = { path = "../hanzo-transformers", version = "0.11.16" }
+hanzo-flash-attn = { path = "../hanzo-flash-attn", version = "0.11.37", optional = true }
+hanzo-onnx = { path = "../hanzo-onnx", version = "0.11.11", optional = true }
 
 chrono = "0.4"
 csv = "1.3.0"
-cudarc = { workspace = true, optional = true }
-half = { workspace = true, optional = true }
-hf-hub = { workspace = true }
-image = { workspace = true }
-intel-mkl-src = { workspace = true, optional = true }
-num-traits = { workspace = true }
+cudarc = { version = "0.19.8", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8", "cuda-version-from-build-system", "dynamic-linking"], default-features = false, optional = true }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr", "zerocopy"], optional = true }
+hf-hub = { version = "1.0.0", features = ["blocking"] }
+image = { version = "0.25.2", default-features = false, features = ["jpeg", "png"] }
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
+num-traits = "0.2.15"
 minijinja = { version = "2", features = ["loader"] }
 palette = { version = "0.7.6", optional = true }
 enterpolation = { version = "0.3.0", optional = true }
 pyo3 = { version = "0.24.1", features = ["auto-initialize", "abi3-py38"], optional = true }
-rayon = { workspace = true }
-anyhow = { workspace = true }
+rayon = "1.7.0"
+anyhow = { version = "1", features = ["backtrace"] }
 rubato = { version = "5", optional = true }
-safetensors = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+safetensors = "0.8.0"
+serde = { version = "1.0.171", features = ["derive"] }
+serde_json = "1.0.99"
 symphonia = { version = "0.6.0", features = ["all"], optional = true }
-tokenizers = { workspace = true, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 cpal = { version = "0.18.2", optional = true }
 pdf2image = { version = "0.1.2", optional = true }
 tekken-rs = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
-byteorder = { workspace = true }
-clap = { workspace = true }
-imageproc = { workspace = true }
-memmap2 = { workspace = true }
-rand = { workspace = true }
-ab_glyph = { workspace = true }
-tracing = { workspace = true }
-tracing-chrome = { workspace = true }
-tracing-subscriber = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
+byteorder = "1.4.3"
+clap = { version = "4.2.4", features = ["derive"] }
+imageproc = { version = "0.27.0", features = ["text"], default-features = false }
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+rand = "0.9.0"
+ab_glyph = "0.2.23"
+tracing = "0.1.37"
+tracing-chrome = "0.7.1"
+tracing-subscriber = "0.3.7"
 # Necessary to disambiguate with tokio in wasm examples which are 1.28.1
 tokio = "1.48.0"
 
 [build-dependencies]
-anyhow = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
 cudaforge = { version = "0.1.2", optional = true }
-hf-hub = { workspace = true, optional = true }
+hf-hub = { version = "1.0.0", features = ["blocking"], optional = true }
 
 [features]
 default = []
@@ -167,5 +167,11 @@ required-features = ["onnx"]
 name = "colpali"
 required-features = ["pdf2image"]
 
-[lints]
-workspace = true
+[lints.clippy]
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"

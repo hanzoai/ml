@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-flash-attn-v3"
-version = "0.11.10"
+version = "0.11.11"
 edition = "2021"
 
 description = "FlashAttention-3 (Hopper sm_90a) attention kernels for the Hanzo ML stack — arch-gated behind the `cuda` feature; a no-op stub on every other target."
@@ -19,14 +19,14 @@ default = []
 cuda = ["dep:half", "hanzo-ml/cuda"]
 
 [dependencies]
-hanzo-ml = { workspace = true }
-half = { workspace = true, optional = true }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr", "zerocopy"], optional = true }
 
 [build-dependencies]
-anyhow = { workspace = true }
-rayon = { workspace = true }
-hanzo-flash-attn-build = { path = "../hanzo-flash-attn-build", version = "0.11.9" }
+anyhow = { version = "1", features = ["backtrace"] }
+rayon = "1.7.0"
+hanzo-flash-attn-build = { path = "../hanzo-flash-attn-build", version = "0.11.10" }
 
 [dev-dependencies]
-anyhow = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
 rstest = "0.23"

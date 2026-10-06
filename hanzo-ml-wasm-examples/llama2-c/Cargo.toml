@@ -11,19 +11,19 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-hanzo-ml = { workspace = true }
-hanzo-nn = { workspace = true }
-hanzo-transformers = { workspace = true }
-num-traits = { workspace = true }
-tokenizers = { workspace = true, features = ["unstable_wasm"] }
+hanzo-ml = { path = "../../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+hanzo-nn = { path = "../../hanzo-nn", version = "0.11.48" }
+hanzo-transformers = { path = "../../hanzo-transformers", version = "0.11.16" }
+num-traits = "0.2.15"
+tokenizers = { version = "0.23.1", default-features = false, features = ["unstable_wasm"] }
 
 # App crates.
-anyhow = { workspace = true }
-byteorder = { workspace = true }
-log = { workspace = true }
-rand = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
+byteorder = "1.4.3"
+log = "0.4"
+rand = "0.9.0"
+serde = { version = "1.0.171", features = ["derive"] }
+serde_json = "1.0.99"
 
 # Wasm specific crates.
 console_error_panic_hook = "0.1.7"

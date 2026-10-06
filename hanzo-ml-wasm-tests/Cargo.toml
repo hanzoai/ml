@@ -9,8 +9,8 @@ keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 
 [dependencies]
-hanzo-ml = { workspace = true }
-rand = { workspace = true }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.111" }
+rand = "0.9.0"
 getrandom = { version = "0.3", features = ["wasm_js"], default-features = false }
 
 [dev-dependencies]

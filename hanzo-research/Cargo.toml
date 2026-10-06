@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-research"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Record and query R&D evidence from Rust — the /v1/research client of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -9,13 +9,19 @@ categories = ["science", "api-bindings"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { version = "1.0.171", features = ["derive"] }
+serde_json = "1.0.99"
 ureq = { version = "2.12", features = ["tls", "gzip"] }
 base64 = "0.22"
 sha2 = "0.10"
-thiserror = { workspace = true }
-chrono = { workspace = true }
+thiserror = "2"
+chrono = "0.4"
 
-[lints]
-workspace = true
+[lints.clippy]
+explicit_counter_loop = "allow"
+unnecessary_unwrap = "allow"
+manual_checked_ops = "allow"
+needless_borrow = "allow"
+large_const_arrays = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"
