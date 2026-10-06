@@ -568,13 +568,229 @@ fn get_local_attention_mask(
     Tensor::from_slice(&mask, (seq_len, seq_len), device)?.to_dtype(dtype)
 }
 
+/// The residual stream entering layer `at`: a pass's states over its embeddings and the layers
+/// below `at`, laid out as that pass lays them out, packed or padded. [`Stack::finish`] reads it
+/// on; [`ModernBert::finish`] gives the bits [`ModernBert::forward`] gives.
+#[derive(Clone)]
+pub struct Stream {
+    h: Tensor,
+    at: usize,
+    /// Each sequence's real tokens.
+    lens: Vec<usize>,
+    form: Form,
+}
+
+#[derive(Clone)]
+enum Form {
+    /// Each sequence's real tokens one after another, `h [T, d]`, rows of `l` when unpacked.
+    Packed { l: usize },
+    /// `h [B, L, d]`, its masks, and where its tokens sit when a row reads the stretched tables.
+    Padded {
+        global: Tensor,
+        local: Tensor,
+        long: Option<Tensor>,
+    },
+}
+
+impl Stream {
+    /// The layer it enters.
+    pub fn at(&self) -> usize {
+        self.at
+    }
+
+    /// Each sequence's states `[n, d]` over its real tokens.
+    pub fn rows(&self) -> Result<Vec<Tensor>> {
+        match &self.form {
+            Form::Packed { .. } => {
+                let mut at = 0;
+                self.lens
+                    .iter()
+                    .map(|&n| {
+                        let r = self.h.narrow(0, at, n);
+                        at += n;
+                        r
+                    })
+                    .collect()
+            }
+            Form::Padded { .. } => self
+                .lens
+                .iter()
+                .enumerate()
+                .map(|(j, &n)| self.h.i((j, ..n, ..)))
+                .collect(),
+        }
+    }
+
+    /// The packed stream entering layer `at` of sequences whose states are `rows`, each `[n, d]`,
+    /// as [`Stream::rows`] gives them: what a packed pass over those sequences holds there.
+    pub fn packed(rows: &[Tensor], at: usize) -> Result<Stream> {
+        let lens = rows.iter().map(|r| r.dim(0)).collect::<Result<Vec<_>>>()?;
+        let l = lens.iter().copied().max().unwrap_or(0);
+        Ok(Stream {
+            h: Tensor::cat(rows, 0)?,
+            at,
+            lens,
+            form: Form::Packed { l },
+        })
+    }
+}
+
+/// Layers `at..` of a backbone and its final norm: the whole encoder over its embeddings when `at`
+/// is 0 ([`ModernBert`]'s own), or a top loaded apart, a copy to train say, that reads a
+/// [`Stream`] another pass made.
+#[derive(Clone)]
+pub struct Stack {
+    at: usize,
+    layers: Vec<ModernBertLayer>,
+    final_norm: LayerNorm,
+    /// Half the local window.
+    window: usize,
+}
+
+impl Stack {
+    /// Layers `at..` and the final norm of the backbone whose weights sit at the root of `vb`, as
+    /// [`ModernBert::new`] reads them.
+    pub fn new(vb: VarBuilder, config: &Config, at: usize) -> Result<Stack> {
+        let global_rotary_emb = Arc::new(RotaryEmbedding::new(
+            vb.dtype(),
+            config,
+            config.global_rope_theta,
+            vb.device(),
+        )?);
+        let local_rotary_emb = Arc::new(RotaryEmbedding::new(
+            vb.dtype(),
+            config,
+            config.local_rope_theta,
+            vb.device(),
+        )?);
+        // past the trained positions the global layers read YaRN's tables; a local layer's
+        // window spans no more than it was trained on, so it reads its own frequencies, extended
+        let long = |trained: &RotaryEmbedding, theta: f64, s: f64| -> Result<_> {
+            let n = config.positions();
+            let t = RotaryEmbedding::yarn(vb.dtype(), config, theta, s, n, vb.device())?;
+            Ok(Arc::new(trained.join(&t)?))
+        };
+        let (global_long, local_long) = match config.yarn {
+            Some(s) => (
+                Some(long(&global_rotary_emb, config.global_rope_theta, s)?),
+                Some(long(&local_rotary_emb, config.local_rope_theta, 1.0)?),
+            ),
+            None => (None, None),
+        };
+        if at > config.num_hidden_layers {
+            hanzo_ml::bail!("layer {at} of {}", config.num_hidden_layers)
+        }
+        let mut layers = Vec::with_capacity(config.num_hidden_layers - at);
+        for layer_id in at..config.num_hidden_layers {
+            let layer_uses_local_attention = layer_id % config.global_attn_every_n_layers != 0;
+            layers.push(ModernBertLayer::load(
+                vb.pp(format!("layers.{layer_id}")),
+                config,
+                if layer_uses_local_attention {
+                    (local_rotary_emb.clone(), local_long.clone())
+                } else {
+                    (global_rotary_emb.clone(), global_long.clone())
+                },
+                layer_uses_local_attention,
+            )?);
+        }
+        let final_norm = layer_norm_no_bias(
+            config.hidden_size,
+            config.layer_norm_eps,
+            vb.pp("final_norm"),
+        )?;
+        Ok(Stack {
+            at,
+            layers,
+            final_norm,
+            window: config.local_attention / 2,
+        })
+    }
+
+    /// Its first layer.
+    pub fn at(&self) -> usize {
+        self.at
+    }
+
+    /// Its projections as `dtype` blocks where this CPU tiles their matmul, as
+    /// [`ModernBert::quantize`] does.
+    pub fn quantize(&mut self, dtype: GgmlDType) -> Result<()> {
+        for l in &mut self.layers {
+            l.attn.qkv = l.attn.qkv.quantize(dtype)?;
+            l.attn.proj = l.attn.proj.quantize(dtype)?;
+            l.mlp.gate = l.mlp.gate.quantize(dtype)?;
+            l.mlp.up = l.mlp.up.quantize(dtype)?;
+            l.mlp.wo = l.mlp.wo.quantize(dtype)?;
+        }
+        Ok(())
+    }
+
+    /// `s` through its layers below layer `to`.
+    pub fn to(&self, mut s: Stream, to: usize) -> Result<Stream> {
+        if s.at < self.at || to < s.at || to > self.at + self.layers.len() {
+            hanzo_ml::bail!(
+                "a stream entering layer {} through layers {}..{to} of a stack of {}..{}",
+                s.at,
+                s.at,
+                self.at,
+                self.at + self.layers.len()
+            )
+        }
+        for layer in &self.layers[s.at - self.at..to - self.at] {
+            s.h = match &s.form {
+                Form::Packed { .. } => layer.packed(&s.h, &s.lens, self.window)?,
+                Form::Padded {
+                    global,
+                    local,
+                    long,
+                } => layer.forward(
+                    &s.h,
+                    global,
+                    local,
+                    match long {
+                        Some(p) => Place::Long(p),
+                        None => Place::Index,
+                    },
+                )?,
+            };
+        }
+        s.at = to;
+        Ok(s)
+    }
+
+    /// `s` through every layer from the one it enters and the final norm: token states
+    /// `[B, L, d]`, a packed stream's pads zero.
+    pub fn finish(&self, s: Stream) -> Result<Tensor> {
+        let s = self.to(s, self.at + self.layers.len())?;
+        let h = s.h.apply(&self.final_norm)?;
+        let Form::Packed { l } = s.form else {
+            return Ok(h);
+        };
+        let (t, d) = h.dims2()?;
+        let b = s.lens.len();
+        let h = Tensor::cat(&[&h, &Tensor::zeros((1, d), h.dtype(), h.device())?], 0)?;
+        let mut at = Vec::with_capacity(b * l);
+        let mut back = Vec::with_capacity(t + 1);
+        let mut next = 0u32;
+        for (row, &n) in s.lens.iter().enumerate() {
+            at.extend(next..next + n as u32);
+            at.extend(std::iter::repeat_n(t as u32, l - n));
+            back.extend((row * l) as u32..(row * l + n) as u32);
+            next += n as u32;
+        }
+        back.push((b * l) as u32);
+        let at = Tensor::from_vec(at, b * l, h.device())?;
+        let back = Tensor::from_vec(back, t + 1, h.device())?;
+        hanzo_nn::ops::select(&h, &at, &back)?.reshape((b, l, d))
+    }
+}
+
 // ModernBERT backbone
 #[derive(Clone)]
 pub struct ModernBert {
     word_embeddings: Embedding,
     norm: LayerNorm,
-    layers: Vec<ModernBertLayer>,
-    final_norm: LayerNorm,
+    stack: Stack,
     local_attention_size: usize,
     /// Positions the trained tables hold, `max_position_embeddings`.
     trained: usize,
@@ -603,59 +819,12 @@ impl ModernBert {
             config.layer_norm_eps,
             vb.pp("embeddings.norm"),
         )?;
-        let global_rotary_emb = Arc::new(RotaryEmbedding::new(
-            vb.dtype(),
-            config,
-            config.global_rope_theta,
-            vb.device(),
-        )?);
-        let local_rotary_emb = Arc::new(RotaryEmbedding::new(
-            vb.dtype(),
-            config,
-            config.local_rope_theta,
-            vb.device(),
-        )?);
-        // past the trained positions the global layers read YaRN's tables; a local layer's
-        // window spans no more than it was trained on, so it reads its own frequencies, extended
-        let long = |trained: &RotaryEmbedding, theta: f64, s: f64| -> Result<_> {
-            let n = config.positions();
-            let t = RotaryEmbedding::yarn(vb.dtype(), config, theta, s, n, vb.device())?;
-            Ok(Arc::new(trained.join(&t)?))
-        };
-        let (global_long, local_long) = match config.yarn {
-            Some(s) => (
-                Some(long(&global_rotary_emb, config.global_rope_theta, s)?),
-                Some(long(&local_rotary_emb, config.local_rope_theta, 1.0)?),
-            ),
-            None => (None, None),
-        };
-
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for layer_id in 0..config.num_hidden_layers {
-            let layer_uses_local_attention = layer_id % config.global_attn_every_n_layers != 0;
-            layers.push(ModernBertLayer::load(
-                vb.pp(format!("layers.{layer_id}")),
-                config,
-                if layer_uses_local_attention {
-                    (local_rotary_emb.clone(), local_long.clone())
-                } else {
-                    (global_rotary_emb.clone(), global_long.clone())
-                },
-                layer_uses_local_attention,
-            )?);
-        }
-
-        let final_norm = layer_norm_no_bias(
-            config.hidden_size,
-            config.layer_norm_eps,
-            vb.pp("final_norm"),
-        )?;
+        let stack = Stack::new(vb.clone(), config, 0)?;
 
         Ok(Self {
             word_embeddings,
             norm,
-            layers,
-            final_norm,
+            stack,
             local_attention_size: config.local_attention,
             trained: config.max_position_embeddings,
             long: config.yarn.is_some(),
@@ -669,13 +838,7 @@ impl ModernBert {
     /// in the weights' dtype. Training reads dense weights, so a quantized backbone has no
     /// gradient through its projections.
     pub fn quantize(&mut self, dtype: GgmlDType) -> Result<()> {
-        for l in &mut self.layers {
-            l.attn.qkv = l.attn.qkv.quantize(dtype)?;
-            l.attn.proj = l.attn.proj.quantize(dtype)?;
-            l.mlp.gate = l.mlp.gate.quantize(dtype)?;
-            l.mlp.up = l.mlp.up.quantize(dtype)?;
-            l.mlp.wo = l.mlp.wo.quantize(dtype)?;
-        }
+        self.stack.quantize(dtype)?;
         self.quantized = true;
         Ok(())
     }
@@ -684,6 +847,7 @@ impl ModernBert {
     pub fn packs(&self) -> bool {
         let w = self.word_embeddings.embeddings();
         let head = self
+            .stack
             .layers
             .first()
             .map_or(0, |l| l.attn.attention_head_size);
@@ -695,21 +859,43 @@ impl ModernBert {
 
     /// Token states `[B, L, d]` of right-padded `xs [B, L]`; the packed pass leaves pads zero.
     pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        if self.packs() {
-            let rows = mask.to_dtype(DType::U32)?.to_vec2::<u32>()?;
-            let lens: Vec<usize> = rows
-                .iter()
-                .map(|r| r.iter().take_while(|&&m| m != 0).count())
-                .collect();
-            let right = rows
-                .iter()
-                .zip(&lens)
-                .all(|(r, &n)| r[n..].iter().all(|&m| m == 0));
-            if right {
-                return self.packed(xs, &lens);
-            }
+        self.stack.finish(self.embed(xs, mask)?)
+    }
+
+    /// The residual stream entering layer `at` of the pass [`ModernBert::forward`] runs over
+    /// right-padded `xs [B, L]`.
+    pub fn stream(&self, xs: &Tensor, mask: &Tensor, at: usize) -> Result<Stream> {
+        self.stack.to(self.embed(xs, mask)?, at)
+    }
+
+    /// `s` through this backbone's layers below layer `to`: the stream [`ModernBert::stream`]
+    /// gives entering `to`, the same bits.
+    pub fn to(&self, s: Stream, to: usize) -> Result<Stream> {
+        self.stack.to(s, to)
+    }
+
+    /// `s` through this backbone's layers from the one it enters and its final norm: of a stream
+    /// [`ModernBert::stream`] made, the bits [`ModernBert::forward`] gives.
+    pub fn finish(&self, s: Stream) -> Result<Tensor> {
+        self.stack.finish(s)
+    }
+
+    /// The stream entering layer 0: the packed pass where this backbone packs and `xs` is
+    /// right-padded, else the padded pass.
+    fn embed(&self, xs: &Tensor, mask: &Tensor) -> Result<Stream> {
+        let rows = mask.to_dtype(DType::U32)?.to_vec2::<u32>()?;
+        let lens: Vec<usize> = rows
+            .iter()
+            .map(|r| r.iter().take_while(|&&m| m != 0).count())
+            .collect();
+        let right = rows
+            .iter()
+            .zip(&lens)
+            .all(|(r, &n)| r[n..].iter().all(|&m| m == 0));
+        match self.packs() && right {
+            true => self.packed(xs, lens),
+            false => self.padded(xs, mask, lens),
         }
-        self.padded(xs, mask)
     }
 
     /// Token states `[B, L, d]` of `xs [B, L]` at positions `pos [B, L]` (u32), query `i` reading
@@ -749,10 +935,10 @@ impl ModernBert {
             None => Place::At(pos),
         };
         let mut h = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
-        for layer in &self.layers {
+        for layer in &self.stack.layers {
             h = layer.forward(&h, &global, &local, place)?;
         }
-        h.apply(&self.final_norm)
+        h.apply(&self.stack.final_norm)
     }
 
     /// `pos [B, L]` into the trained tables followed by the stretched ones
@@ -770,50 +956,37 @@ impl ModernBert {
         Ok(Some(pos.broadcast_add(&shift)?.contiguous()?))
     }
 
-    /// Every sequence's first `lens` tokens packed into one: embeddings, projections and norms
-    /// over the real tokens only, attention per sequence.
-    fn packed(&self, xs: &Tensor, lens: &[usize]) -> Result<Tensor> {
-        let (b, l) = xs.dims2()?;
+    /// Every sequence's first `lens` tokens packed into one, embedded: its layers run their
+    /// projections and norms over the real tokens only, attention per sequence.
+    fn packed(&self, xs: &Tensor, lens: Vec<usize>) -> Result<Stream> {
+        let l = xs.dim(1)?;
         let ids = xs.to_dtype(DType::U32)?.to_vec2::<u32>()?;
         let flat: Vec<u32> = ids
             .iter()
-            .zip(lens)
+            .zip(&lens)
             .flat_map(|(r, &n)| r[..n].iter().copied())
             .collect();
         let t = flat.len();
-        let mut h = Tensor::from_vec(flat, t, xs.device())?
+        let h = Tensor::from_vec(flat, t, xs.device())?
             .apply(&self.word_embeddings)?
             .apply(&self.norm)?;
-        let window = self.local_attention_size / 2;
-        for layer in &self.layers {
-            h = layer.packed(&h, lens, window)?;
-        }
-        let h = h.apply(&self.final_norm)?;
-        let d = h.dim(1)?;
-        let h = Tensor::cat(&[&h, &Tensor::zeros((1, d), h.dtype(), h.device())?], 0)?;
-        let mut at = Vec::with_capacity(b * l);
-        let mut back = Vec::with_capacity(t + 1);
-        let mut next = 0u32;
-        for (row, &n) in lens.iter().enumerate() {
-            at.extend(next..next + n as u32);
-            at.extend(std::iter::repeat_n(t as u32, l - n));
-            back.extend((row * l) as u32..(row * l + n) as u32);
-            next += n as u32;
-        }
-        back.push((b * l) as u32);
-        let at = Tensor::from_vec(at, b * l, h.device())?;
-        let back = Tensor::from_vec(back, t + 1, h.device())?;
-        hanzo_nn::ops::select(&h, &at, &back)?.reshape((b, l, d))
+        Ok(Stream {
+            h,
+            at: 0,
+            lens,
+            form: Form::Packed { l },
+        })
     }
 
-    fn padded(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    /// `xs` embedded, with the masks and placement its layers read.
+    fn padded(&self, xs: &Tensor, mask: &Tensor, lens: Vec<usize>) -> Result<Stream> {
         let seq_len = xs.shape().dims()[1];
         let dtype = self.word_embeddings.embeddings().dtype();
-        let global_attention_mask =
+        let global =
             prepare_4d_attention_mask(mask, dtype, None)?.to_device(xs.device())?;
-        let local_attention_mask =
+        let local =
             get_local_attention_mask(seq_len, self.local_attention_size / 2, dtype, xs.device())?
-                .broadcast_add(&global_attention_mask)?;
+                .broadcast_add(&global)?;
         // a row longer than the trained positions reads the stretched tables
         let long = match self.long && seq_len > self.trained {
             true => {
@@ -825,16 +998,17 @@ impl ModernBert {
             }
             false => None,
         };
-        let place = match &long {
-            Some(p) => Place::Long(p),
-            None => Place::Index,
-        };
-        let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
-        for layer in self.layers.iter() {
-            xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask, place)?;
-        }
-        let xs = xs.apply(&self.final_norm)?;
-        Ok(xs)
+        let h = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
+        Ok(Stream {
+            h,
+            at: 0,
+            lens,
+            form: Form::Padded {
+                global,
+                local,
+                long,
+            },
+        })
     }
 }
 
@@ -961,6 +1135,105 @@ mod tests {
             yarn,
             classifier_config: None,
         }
+    }
+
+    /// A backbone of four layers 64 wide over random weights in `vm`.
+    fn small(vm: &hanzo_nn::VarMap) -> (Config, ModernBert) {
+        let cfg = Config {
+            vocab_size: 32,
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            intermediate_size: 32,
+            max_position_embeddings: 64,
+            layer_norm_eps: 1e-5,
+            pad_token_id: 0,
+            global_attn_every_n_layers: 3,
+            global_rope_theta: 160000.,
+            local_attention: 8,
+            local_rope_theta: 10000.,
+            yarn: None,
+            classifier_config: None,
+        };
+        let vb = VarBuilder::from_varmap(vm, DType::F32, &Device::Cpu);
+        let m = ModernBert::new(vb, &cfg).unwrap();
+        (cfg, m)
+    }
+
+    /// Three right-padded rows of 12, 7 and 3 tokens, and their mask.
+    fn rows() -> (Tensor, Tensor) {
+        let lens = [12usize, 7, 3];
+        let ids: Vec<u32> = lens
+            .iter()
+            .enumerate()
+            .flat_map(|(r, &n)| (0..12).map(move |i| if i < n { 1 + ((i * 7 + r * 3) % 31) as u32 } else { 0 }))
+            .collect();
+        let mask: Vec<u32> = lens.iter().flat_map(|&n| (0..12).map(move |i| (i < n) as u32)).collect();
+        let dev = Device::Cpu;
+        (
+            Tensor::from_vec(ids, (3, 12), &dev).unwrap(),
+            Tensor::from_vec(mask, (3, 12), &dev).unwrap(),
+        )
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// A stream entering any layer, finished, is the forward pass bit for bit: padded, and packed
+    /// once quantized.
+    #[test]
+    fn a_stream_finished_is_the_forward_bit_for_bit() {
+        let vm = hanzo_nn::VarMap::new();
+        let (_, mut m) = small(&vm);
+        let (xs, mask) = rows();
+        for packs in [false, true] {
+            if packs {
+                m.quantize(GgmlDType::Q8_0).unwrap();
+            }
+            assert_eq!(m.packs(), packs);
+            let want = bits(&m.forward(&xs, &mask).unwrap());
+            for at in 0..=4 {
+                let s = m.stream(&xs, &mask, at).unwrap();
+                assert_eq!(s.at(), at);
+                assert_eq!(bits(&m.finish(s).unwrap()), want, "packs {packs}, at {at}");
+                // a stream carried on from an earlier layer is the stream made there
+                let on = m.to(m.stream(&xs, &mask, at / 2).unwrap(), at).unwrap();
+                assert_eq!(bits(&m.finish(on).unwrap()), want, "packs {packs}, {} to {at}", at / 2);
+            }
+        }
+    }
+
+    /// A stack loaded apart from the same weights reads a backbone's stream as the backbone
+    /// does, and a stream's rows packed again are that stream.
+    #[test]
+    fn a_stack_loaded_apart_reads_the_stream_as_the_backbone() {
+        let vm = hanzo_nn::VarMap::new();
+        let (cfg, mut m) = small(&vm);
+        let (xs, mask) = rows();
+        for packs in [false, true] {
+            if packs {
+                m.quantize(GgmlDType::Q8_0).unwrap();
+            }
+            let want = bits(&m.forward(&xs, &mask).unwrap());
+            for at in [1, 3, 4] {
+                let vb = VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
+                let mut top = Stack::new(vb, &cfg, at).unwrap();
+                if packs {
+                    top.quantize(GgmlDType::Q8_0).unwrap();
+                }
+                let s = m.stream(&xs, &mask, at).unwrap();
+                assert_eq!(bits(&top.finish(s.clone()).unwrap()), want, "packs {packs}, at {at}");
+                // a stack below the stream's layer cannot read it
+                assert!(Stack::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg, at + 1)
+                    .map_or(true, |t| t.finish(s.clone()).is_err()));
+                if packs {
+                    let again = Stream::packed(&s.rows().unwrap(), at).unwrap();
+                    assert_eq!(bits(&top.finish(again).unwrap()), want, "repacked, at {at}");
+                }
+            }
+        }
+        assert!(Stack::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg, 5).is_err());
     }
 
     /// Each frequency of the tables at position 1, the attention factor taken out.

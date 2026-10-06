@@ -52,6 +52,13 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   rotary tables (NTK-by-parts, beta 32 and 1, attention factor 0.1 ln s + 1) on the global
   layers and extended frequencies on the local ones; within `max_position_embeddings` every
   pass reads the trained tables bit for bit.
+- **ModernBert's residual stream.** `ModernBert::stream(xs, mask, at)` stops the pass
+  `forward` runs at the input of layer `at` (`Stream`: packed or padded, as that pass lays
+  it out), and `ModernBert::finish` runs it on: `finish(stream(.., at))` is `forward` bit
+  for bit at every `at`, packed and padded. `Stack::new(vb, config, at)` loads layers `at..`
+  and the final norm apart (a trainable copy of a top, for hanzo-inc/kai's routed yes/no
+  reader), reading another pass's stream; `Stream::rows` and `Stream::packed` take a packed
+  stream apart by sequence and put it back, the same bits.
 
 ## Next: synthesis as a training loop
 Capability training today is dataset → batches → optimizer → checkpoint, with curricula
