@@ -399,15 +399,21 @@ impl ModernBertLayer {
         config: &Config,
         (rotary_emb, long): (Arc<RotaryEmbedding>, Option<Arc<RotaryEmbedding>>),
         uses_local_attention: bool,
+        layer_id: usize,
     ) -> Result<Self> {
         let attn = ModernBertAttention::load(vb.pp("attn"), config, rotary_emb, long)?;
         let mlp = ModernBertMLP::load(vb.pp("mlp"), config)?;
-        let attn_norm = layer_norm_no_bias(
-            config.hidden_size,
-            config.layer_norm_eps,
-            vb.pp("attn_norm"),
-        )
-        .ok();
+        // ModernBERT's first layer reads the embeddings, which are already normalized: no
+        // `attn_norm` (an identity). A builder that creates what it is asked for, a trainable
+        // copy over a variable map, must not make one.
+        let attn_norm = match layer_id {
+            0 => None,
+            _ => Some(layer_norm_no_bias(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("attn_norm"),
+            )?),
+        };
         let mlp_norm =
             layer_norm_no_bias(config.hidden_size, config.layer_norm_eps, vb.pp("mlp_norm"))?;
         Ok(Self {
@@ -692,6 +698,7 @@ impl Stack {
                     (global_rotary_emb.clone(), global_long.clone())
                 },
                 layer_uses_local_attention,
+                layer_id,
             )?);
         }
         let final_norm = layer_norm_no_bias(
@@ -1135,6 +1142,29 @@ mod tests {
             yarn,
             classifier_config: None,
         }
+    }
+
+    /// A copy of every layer loaded apart over a variable map holds no `layers.0.attn_norm` (the
+    /// first layer has none), so it can be filled from a checkpoint that has none and then reads
+    /// as the backbone does.
+    #[test]
+    fn the_first_layer_has_no_attention_norm() {
+        let vm = hanzo_nn::VarMap::new();
+        let (cfg, _) = small(&vm);
+        let own = hanzo_nn::VarMap::new();
+        Stack::new(VarBuilder::from_varmap(&own, DType::F32, &Device::Cpu), &cfg, 0).unwrap();
+        let names: Vec<String> = own.data().lock().unwrap().keys().cloned().collect();
+        assert!(!names.iter().any(|n| n == "layers.0.attn_norm.weight"), "{names:?}");
+        assert!(names.iter().any(|n| n == "layers.1.attn_norm.weight"));
+        // filled from the backbone's own variables, it reads its stream as the backbone does
+        let (xs, mask) = rows();
+        let m = ModernBert::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg).unwrap();
+        for (n, v) in own.data().lock().unwrap().iter() {
+            v.set(vm.data().lock().unwrap()[n].as_tensor()).unwrap();
+        }
+        let top = Stack::new(VarBuilder::from_varmap(&own, DType::F32, &Device::Cpu), &cfg, 0).unwrap();
+        let want = bits(&m.forward(&xs, &mask).unwrap());
+        assert_eq!(bits(&top.finish(m.stream(&xs, &mask, 0).unwrap()).unwrap()), want);
     }
 
     /// A backbone of four layers 64 wide over random weights in `vm`.
