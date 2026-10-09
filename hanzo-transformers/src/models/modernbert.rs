@@ -792,10 +792,33 @@ impl Stack {
     }
 }
 
+/// Rows of a token table checked at a time ([`exact_f16`]): 48 MiB of F32 at a width of 768.
+const ROWS: usize = 1 << 14;
+
+/// `w` in F16 when it is an F32 table on the CPU and F16 holds each of its values exactly, so
+/// widening a row back gives the same bits; else `None`. The check runs [`ROWS`] rows at a time.
+fn exact_f16(w: &Tensor) -> Result<Option<Tensor>> {
+    if w.dtype() != DType::F32 || !w.device().is_cpu() {
+        return Ok(None);
+    }
+    let n = w.dim(0)?;
+    for at in (0..n).step_by(ROWS) {
+        let part = w.narrow(0, at, ROWS.min(n - at))?;
+        let back = part.to_dtype(DType::F16)?.to_dtype(DType::F32)?;
+        if back.ne(&part)?.max_all()?.to_scalar::<u8>()? != 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(w.to_dtype(DType::F16)?))
+}
+
 // ModernBERT backbone
 #[derive(Clone)]
 pub struct ModernBert {
     word_embeddings: Embedding,
+    /// The backbone's dtype: its token table's as loaded, which a lookup reads in when the table
+    /// is held narrower ([`ModernBert::quantize`]).
+    dtype: DType,
     norm: LayerNorm,
     stack: Stack,
     local_attention_size: usize,
@@ -829,6 +852,7 @@ impl ModernBert {
         let stack = Stack::new(vb.clone(), config, 0)?;
 
         Ok(Self {
+            dtype: word_embeddings.embeddings().dtype(),
             word_embeddings,
             norm,
             stack,
@@ -842,12 +866,23 @@ impl ModernBert {
     /// Every layer's projections as `dtype` blocks where this CPU tiles their matmul
     /// ([`tiled`]), for inference on the CPU, which then runs the packed pass: each sequence's
     /// real tokens only, attention per sequence straight from the QKV projection. The rest stays
-    /// in the weights' dtype. Training reads dense weights, so a quantized backbone has no
-    /// gradient through its projections.
+    /// in the weights' dtype, but the token table, held in F16 where F16 holds each of its values
+    /// exactly (a table trained in F16, or frozen from one): a lookup reads its rows back in the
+    /// backbone's dtype, the same bits at half the bytes. Training reads dense weights, so a
+    /// quantized backbone has no gradient through its projections.
     pub fn quantize(&mut self, dtype: GgmlDType) -> Result<()> {
         self.stack.quantize(dtype)?;
+        if let Some(half) = exact_f16(self.word_embeddings.embeddings())? {
+            let d = half.dim(1)?;
+            self.word_embeddings = Embedding::new(half, d);
+        }
         self.quantized = true;
         Ok(())
+    }
+
+    /// `xs`'s token embeddings in the backbone's dtype.
+    fn lookup(&self, xs: &Tensor) -> Result<Tensor> {
+        xs.apply(&self.word_embeddings)?.to_dtype(self.dtype)
     }
 
     /// Whether [`ModernBert::forward`] runs the packed pass.
@@ -860,7 +895,7 @@ impl ModernBert {
             .map_or(0, |l| l.attn.attention_head_size);
         match w.device() {
             Device::Cpu => self.quantized,
-            dev => hanzo_nn::attention::packs(dev, w.dtype(), head),
+            dev => hanzo_nn::attention::packs(dev, self.dtype, head),
         }
     }
 
@@ -911,7 +946,7 @@ impl ModernBert {
     /// positions that read the same keys come out alike wherever they sit in the sequence.
     /// `allow` lets no query read a padding key.
     pub fn forward_masked(&self, xs: &Tensor, pos: &Tensor, allow: &Tensor) -> Result<Tensor> {
-        let dtype = self.word_embeddings.embeddings().dtype();
+        let dtype = self.dtype;
         let allow = allow.to_dtype(DType::F32)?;
         let p = pos.to_dtype(DType::F32)?;
         let near = p
@@ -941,7 +976,7 @@ impl ModernBert {
             Some(p) => Place::Long(p),
             None => Place::At(pos),
         };
-        let mut h = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
+        let mut h = self.lookup(xs)?.apply(&self.norm)?;
         for layer in &self.stack.layers {
             h = layer.forward(&h, &global, &local, place)?;
         }
@@ -974,8 +1009,8 @@ impl ModernBert {
             .flat_map(|(r, &n)| r[..n].iter().copied())
             .collect();
         let t = flat.len();
-        let h = Tensor::from_vec(flat, t, xs.device())?
-            .apply(&self.word_embeddings)?
+        let h = self
+            .lookup(&Tensor::from_vec(flat, t, xs.device())?)?
             .apply(&self.norm)?;
         Ok(Stream {
             h,
@@ -988,7 +1023,7 @@ impl ModernBert {
     /// `xs` embedded, with the masks and placement its layers read.
     fn padded(&self, xs: &Tensor, mask: &Tensor, lens: Vec<usize>) -> Result<Stream> {
         let seq_len = xs.shape().dims()[1];
-        let dtype = self.word_embeddings.embeddings().dtype();
+        let dtype = self.dtype;
         let global =
             prepare_4d_attention_mask(mask, dtype, None)?.to_device(xs.device())?;
         let local =
@@ -1005,7 +1040,7 @@ impl ModernBert {
             }
             false => None,
         };
-        let h = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
+        let h = self.lookup(xs)?.apply(&self.norm)?;
         Ok(Stream {
             h,
             at: 0,
@@ -1231,6 +1266,30 @@ mod tests {
                 let on = m.to(m.stream(&xs, &mask, at / 2).unwrap(), at).unwrap();
                 assert_eq!(bits(&m.finish(on).unwrap()), want, "packs {packs}, {} to {at}", at / 2);
             }
+        }
+    }
+
+    /// Quantized, a token table F16 holds exactly is held in F16 and looked up as the F32 table
+    /// was, bit for bit; one it does not hold stays F32.
+    #[test]
+    fn a_token_table_f16_holds_is_held_in_f16_and_reads_the_same_bits() {
+        let name = "embeddings.tok_embeddings.weight";
+        let (xs, _) = rows();
+        for exact in [false, true] {
+            let vm = hanzo_nn::VarMap::new();
+            let (cfg, _) = small(&vm);
+            let table = vm.data().lock().unwrap()[name].as_tensor().clone();
+            if exact {
+                let narrowed = table.to_dtype(DType::F16).unwrap().to_dtype(DType::F32).unwrap();
+                vm.data().lock().unwrap()[name].set(&narrowed).unwrap();
+            }
+            let wide = vm.data().lock().unwrap()[name].as_tensor().copy().unwrap();
+            let want = bits(&xs.apply(&Embedding::new(wide, 64)).unwrap());
+            let mut m = ModernBert::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg).unwrap();
+            m.quantize(GgmlDType::Q8_0).unwrap();
+            let held = m.word_embeddings.embeddings().dtype();
+            assert_eq!(held, if exact { DType::F16 } else { DType::F32 });
+            assert_eq!(bits(&m.lookup(&xs).unwrap()), want, "exact {exact}");
         }
     }
 
