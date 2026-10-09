@@ -771,6 +771,11 @@ impl Device {
         if let Self::Rocm(d) = self {
             d.trim();
         }
+        // a flush that fails here fails the device's next operation too, which reports it
+        #[cfg(feature = "vulkan")]
+        if let Self::Vulkan(d) = self {
+            let _ = d.trim();
+        }
     }
 
     /// A timer of this device's stream, where the backend has one.

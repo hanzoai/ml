@@ -769,6 +769,9 @@ mod bufpool_key_invariant {
 // peak working set of a forward fits well under this; it only bounds the long tail. ~12 GiB.
 const POOL_FREE_CAP_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
+// Idle bytes a trim keeps ([`VulkanDevice::trim`]): ROCm's `POOL_IDLE_BYTES`, 1 GiB.
+const TRIM_KEEP_BYTES: u64 = 1024 * 1024 * 1024;
+
 #[derive(Default)]
 struct BufPool {
     pending: Vec<(u64, PooledBuf)>,
@@ -4935,6 +4938,25 @@ impl VulkanDevice {
         Ok(())
     }
 
+    /// Give the pool's idle buffers back to the driver, keeping [`TRIM_KEEP_BYTES`]: the call a
+    /// burst of long work (a prefill, a long read) makes once it is over, as ROCm's pool trims. It
+    /// flushes and waits for the device, so never mid-forward, and does nothing while a command
+    /// graph is captured (its buffers are reserved, not pooled).
+    pub fn trim(&self) -> Result<()> {
+        if self.inner.submitter.lock().unwrap().capturing {
+            return Ok(());
+        }
+        self.flush()?;
+        unsafe { self.dev().device_wait_idle().map_err(vkerr)? };
+        self.reclaim_to(TRIM_KEEP_BYTES);
+        Ok(())
+    }
+
+    /// Bytes the pool holds idle, free for reuse.
+    pub fn pool_free_bytes(&self) -> u64 {
+        self.inner.bufpool.lock().unwrap().free_bytes
+    }
+
     /// Retune the per-submission workgroup bound (see [`WORK_CAP`]). `0` disables the bound, restoring
     /// the single-submission-per-forward path. Used for A/B tuning and by the long-prefill test.
     pub fn set_work_cap(&self, cap: u64) {
@@ -5073,6 +5095,11 @@ impl VulkanDevice {
     // is also why it's safe to actually destroy buffers here when over the cap (no in-flight work can
     // still reference a free-list entry).
     fn reclaim(&self) {
+        self.reclaim_to(self.pool_free_cap());
+    }
+
+    /// [`Self::reclaim`], destroying idle buffers until at most `cap` bytes stay free.
+    fn reclaim_to(&self, cap: u64) {
         let dev = self.dev();
         let mut pool = self.inner.bufpool.lock().unwrap();
         let pending = std::mem::take(&mut pool.pending);
@@ -5088,7 +5115,6 @@ impl VulkanDevice {
         // the amdgpu kernel driver (bo_alloc) -- pure CPU/ioctl waste on the shared memory bus that a
         // retained pool avoids. Measured on gfx1151: with a 12 GiB cap a 512-tok prefill re-allocated
         // ~1.8 GB/forward (pool_fresh>0); heap-relative it re-allocates nothing (pool_fresh==0).
-        let cap = self.pool_free_cap();
         while pool.free_bytes > cap {
             let Some(&bucket) = pool.free.keys().max() else {
                 break;

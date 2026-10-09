@@ -57,9 +57,21 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   bits an exact F32 GEMM `t · inv_freq` gave on the CPU, ROCm, Metal and CUDA
   (`f32_tables_are_the_exact_gemm_bits`). The device GEMM it replaces ran on Vulkan's fp16
   matrix cores, rounding positions past 2,048 (rows of 4,096 and 8,192 tokens read 25% and 37%
-  from the CPU's states), and in BF16 rounded positions past 256 to multiples of 8 and more.
-  `trained_tables_hold_every_position_on_every_device` holds every device's tables, F32 and
-  BF16, to the exact angles (`--features rocm|vulkan|metal|cuda`).
+  from the CPU's states), and in BF16 rounded positions past 256 (to multiples of 2 from 257,
+  more above) and the angles themselves well below 256, so every BF16 pass on every device read
+  other positions than an F32 one: a CUDA BF16 pass read 5.7%, 25% and 36% from the CPU's F32
+  states at 256, 512 and 1,000 tokens with the old tables, 1.35%, 1.2% and 3.4% with these.
+  `trained_tables_hold_every_position_on_every_device` holds every device's tables to the exact
+  angles (`--features rocm|vulkan|metal|cuda`): F32 within 1e-3 (2e-3 on CUDA, whose kernels
+  build with `--use_fast_math`), BF16 within 1e-2.
+- **Past 2^31 elements on CUDA.** A tensor of more than 2^31 elements miscomputes on CUDA with
+  no error: the whole padded F32 pass at 16,384 tokens (12 heads, 3.2e9 scores) read 56% from
+  the CPU's states. Tiles keep every score block far below it; a follow-up should refuse such a
+  tensor rather than compute it.
+- **Vulkan's pool trims.** `Device::trim` gives Vulkan's idle buffers back too
+  (`VulkanDevice::trim`, keeping 1 GiB, as ROCm's pool keeps): it flushes and waits, so between
+  forwards, never in one. Its pool otherwise keeps up to 3/5 of the heap idle (30 GiB after a
+  32,768-token pass on evo).
 - **ModernBert's long padded pass, a tile at a time.** A padded pass whose row's scores pass
   `LOGITS` (2^26, 256 MiB in F32: a row past 2,364 tokens over 12 heads) attends a tile of
   queries at a time (`Tiles`): a global tile reads every key, at most 2^26 scores over its rows;

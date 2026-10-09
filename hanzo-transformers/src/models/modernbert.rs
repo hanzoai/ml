@@ -1598,15 +1598,17 @@ mod tests {
     }
 
     /// mmBERT's trained tables (8,192 positions, 32 frequencies) on every device, in F32 and in
-    /// BF16 where the device holds it, are the sines and cosines of the exact angles to the
-    /// dtype's precision: an F32 angle is within 4.9e-4 of the exact one at 8,192, and CUDA's
-    /// sine of one reads 1.1e-3 off there. A device that rounds a position (a BF16 product, fp16
-    /// matrix cores) is off by radians past 2,048.
+    /// BF16 where the device holds it, are the sines and cosines of the exact angles: within 1e-3
+    /// in F32, whose floor is the angle's own rounding (4.9e-4 at 8,191 rad), and 2e-3 on CUDA,
+    /// whose kernels build with `--use_fast_math`, its sine 1.1e-3 off at 7,975 rad and growing
+    /// with the angle (some 4.5e-3 at 32,768, were a checkpoint trained on that many positions);
+    /// within 1e-2 in BF16. A device that rounds a position or an angle (a BF16 product, fp16
+    /// matrix cores) is off by radians.
     #[test]
     fn trained_tables_hold_every_position_on_every_device() {
         let cfg = mmbert(None);
         for dev in devices() {
-            let mut dtypes = vec![(DType::F32, 4e-3)];
+            let mut dtypes = vec![(DType::F32, if dev.is_cuda() { 2e-3 } else { 1e-3 })];
             if dev.supports_bf16() {
                 dtypes.push((DType::BF16, 1e-2));
             }
