@@ -52,6 +52,19 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   rotary tables (NTK-by-parts, beta 32 and 1, attention factor 0.1 ln s + 1) on the global
   layers and extended frequencies on the local ones; within `max_position_embeddings` every
   pass reads the trained tables bit for bit.
+- **ModernBert's long padded pass, a tile at a time.** A padded pass whose row's scores pass
+  `LOGITS` (2^26, 256 MiB in F32: a row past 2,364 tokens over 12 heads) attends a tile of
+  queries at a time (`Tiles`): a global tile reads every key, at most 2^26 scores over its rows;
+  a local tile holds 512 queries and the keys within their window. The keys' mask is
+  `[B, 1, 1, L]` and each local tile's window `[t, t + 2w]` (tiles alike share one), so no
+  `[L, L]` tensor exists; a shorter pass is the whole pass, bit for bit. Kᵀ and V are laid out
+  once a layer (Vulkan's matmul copies a strided operand per call), and the raw scores drop once
+  masked: two blocks live at once. (Dropping the masked scores too once the softmax is queued
+  grew Metal's pool past 13 GiB at 16,384 tokens.) Each stage is a TRACE span (`layer` with
+  `at`, `qkv`, `rope`, `tile` over `scores`, `mask`, `softmax`, `values`, then `join`, `proj`,
+  `mlp`), which a subscriber can meter. `tests/modernbert_memory.rs` counts a 20,480-token
+  pass's heap (no block of L x L bytes, less than one `[L, L]` F32 tensor held) and holds it to
+  the packed pass within 5e-5 of the scale.
 - **ModernBert's residual stream.** `ModernBert::stream(xs, mask, at)` stops the pass
   `forward` runs at the input of layer `at` (`Stream`: packed or padded, as that pass lays
   it out), and `ModernBert::finish` runs it on: `finish(stream(.., at))` is `forward` bit

@@ -305,14 +305,10 @@ impl ModernBertAttention {
         Tensor::cat(&out, 0)
     }
 
-    fn forward(
-        &self,
-        hidden_states: &Tensor,
-        attention_mask: &Tensor,
-        place: Place,
-    ) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, mask: Mask, place: Place) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
+        let span = tracing::span!(tracing::Level::TRACE, "qkv").entered();
         let qkv = xs
             .apply(&self.qkv)?
             .reshape((
@@ -327,7 +323,9 @@ impl ModernBertAttention {
         let q = qkv.get(0)?;
         let k = qkv.get(1)?;
         let v = qkv.get(2)?;
+        drop(span);
 
+        let span = tracing::span!(tracing::Level::TRACE, "rope").entered();
         let (q, k) = match place {
             Place::Index => self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?,
             Place::At(p) => self.rotary_emb.at(p)?.apply_rotary_emb_qkv(&q, &k)?,
@@ -339,15 +337,193 @@ impl ModernBertAttention {
 
         let scale = (self.attention_head_size as f64).powf(-0.5);
         let q = (q * scale)?;
-        let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-        let att = att.broadcast_add(attention_mask)?;
-        let xs = softmax_last_dim(&att)?.matmul(&v)?;
+        drop(span);
+        let xs = match mask {
+            Mask::Whole(attention_mask) => {
+                attend(&q, &k.transpose(D::Minus2, D::Minus1)?, &v, attention_mask)?
+            }
+            Mask::Tiled(tiles, local) => tiles.attend(&q, &k, &v, local)?,
+        };
 
+        let _span = tracing::span!(tracing::Level::TRACE, "proj").entered();
         let xs = xs.transpose(1, 2)?.reshape((b, seq_len, d))?;
         let xs = xs.apply(&self.proj)?;
         let xs = xs.reshape((b, seq_len, d))?;
 
         Ok(xs)
+    }
+}
+
+/// `softmax(q kt + mask) v` for queries `q [B, H, T, D]`, scaled, and keys `kt [B, H, D, N]`;
+/// the raw scores dropped once masked, so two `[B, H, T, N]` blocks live at once, never three.
+/// (Dropping the masked scores once the softmax is queued frees nothing more, and on Metal its
+/// pool then grew past 13 GiB at 16,384 tokens.)
+fn attend(q: &Tensor, kt: &Tensor, v: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    let _span = tracing::span!(tracing::Level::TRACE, "tile").entered();
+    let att = {
+        let _span = tracing::span!(tracing::Level::TRACE, "scores").entered();
+        q.contiguous()?.matmul(kt)?
+    };
+    let att = {
+        let _span = tracing::span!(tracing::Level::TRACE, "mask").entered();
+        let masked = att.broadcast_add(mask)?;
+        drop(att);
+        masked
+    };
+    let p = {
+        let _span = tracing::span!(tracing::Level::TRACE, "softmax").entered();
+        softmax_last_dim(&att)?
+    };
+    let _span = tracing::span!(tracing::Level::TRACE, "values").entered();
+    p.matmul(v)
+}
+
+/// Scores a row of a padded pass holds whole: 256 MiB in F32, a row of 2,364 tokens over
+/// mmBERT's 12 heads. A pass of longer rows attends a tile of queries at a time ([`Tiles`]), a
+/// tile holding at most this many scores over all its rows.
+const LOGITS: usize = 1 << 26;
+
+/// Queries a local layer's tile holds ([`Tiles`]).
+const LOCAL: usize = 512;
+
+/// What a padded pass's attention adds to its scores.
+#[derive(Clone)]
+enum Masks {
+    /// Additive `[B, 1, L, L]` masks, global and local (the sliding window added): a pass whose
+    /// rows' scores fit in [`LOGITS`], its scores whole.
+    Whole { global: Tensor, local: Tensor },
+    /// A pass of longer rows, its attention a tile of queries at a time.
+    Tiled(Tiles),
+}
+
+impl Masks {
+    /// What a global layer reads, or with `local` a local one.
+    fn of(&self, local: bool) -> Mask<'_> {
+        match self {
+            Masks::Whole { global, local: l } => Mask::Whole(if local { l } else { global }),
+            Masks::Tiled(t) => Mask::Tiled(t, local),
+        }
+    }
+}
+
+/// One layer's [`Masks`].
+#[derive(Clone, Copy)]
+enum Mask<'a> {
+    Whole(&'a Tensor),
+    /// The tiles, and whether the layer is local.
+    Tiled(&'a Tiles, bool),
+}
+
+/// A padded pass's attention a tile of queries at a time, so no `[L, L]` tensor exists: a global
+/// layer's tile reads every key, at most [`LOGITS`] scores at once; a local layer's tile reads
+/// the keys within its window of its [`LOCAL`] queries. A row's softmax runs over every key the
+/// pass would let it read, so each tile answers as its rows of the whole scores would, but for
+/// the order of the sums.
+#[derive(Clone)]
+struct Tiles {
+    /// The keys' additive mask `[B, 1, 1, L]`: a padding key holds [`masked_value`].
+    keys: Tensor,
+    /// Queries a global layer's tile holds.
+    global: usize,
+    /// A local layer's tiles.
+    local: Vec<Tile>,
+}
+
+/// A local layer's tile: queries `at..at + t`, keys `lo..lo + n`, and its window `[1, 1, t, n]`,
+/// `-inf` past it.
+#[derive(Clone)]
+struct Tile {
+    at: usize,
+    t: usize,
+    lo: usize,
+    n: usize,
+    window: Tensor,
+}
+
+impl Tiles {
+    /// The tiles of a pass whose real tokens `mask [B, L]` marks, `heads` wide, its local
+    /// layers reading `window` keys either side: a tile holds at most `logits` scores, a local one
+    /// at most `local` queries. Tiles alike in shape share one window.
+    fn new(
+        mask: &Tensor,
+        heads: usize,
+        window: usize,
+        dtype: DType,
+        (logits, local): (usize, usize),
+    ) -> Result<Tiles> {
+        let (b, l) = mask.dims2()?;
+        let dev = mask.device();
+        let keys = ((1.0 - mask.to_dtype(DType::F32)?)? * masked_value(dtype))?
+            .to_dtype(dtype)?
+            .reshape((b, 1, 1, l))?;
+        let local = local.min((logits / (b * heads * (local + 2 * window))).max(1));
+        let mut tiles: Vec<Tile> = Vec::new();
+        for at in (0..l).step_by(local) {
+            let t = local.min(l - at);
+            let lo = at.saturating_sub(window);
+            let n = (at + t + window).min(l) - lo;
+            let alike = tiles
+                .iter()
+                .find(|x| (x.at - x.lo, x.t, x.n) == (at - lo, t, n));
+            let window = match alike {
+                Some(x) => x.window.clone(),
+                None => {
+                    let far: Vec<f32> = (0..t)
+                        .flat_map(|i| {
+                            (0..n).map(move |j| match (lo + j).abs_diff(at + i) > window {
+                                true => f32::NEG_INFINITY,
+                                false => 0.,
+                            })
+                        })
+                        .collect();
+                    Tensor::from_vec(far, (1, 1, t, n), dev)?.to_dtype(dtype)?
+                }
+            };
+            tiles.push(Tile {
+                at,
+                t,
+                lo,
+                n,
+                window,
+            });
+        }
+        Ok(Tiles {
+            keys,
+            global: (logits / (b * heads * l)).clamp(1, l),
+            local: tiles,
+        })
+    }
+
+    /// [`attend`] over `q, k, v [B, H, L, D]`, `q` scaled, a tile at a time.
+    fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor, local: bool) -> Result<Tensor> {
+        let out = match local {
+            true => self
+                .local
+                .iter()
+                .map(|x| {
+                    let keys = self.keys.narrow(3, x.lo, x.n)?.contiguous()?;
+                    attend(
+                        &q.narrow(2, x.at, x.t)?,
+                        &k.narrow(2, x.lo, x.n)?.t()?.contiguous()?,
+                        &v.narrow(2, x.lo, x.n)?.contiguous()?,
+                        &x.window.broadcast_add(&keys)?,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
+            false => {
+                // laid out once a layer, not once a tile: a backend copies a strided operand
+                let (l, kt, v) = (q.dim(2)?, k.t()?.contiguous()?, v.contiguous()?);
+                (0..l)
+                    .step_by(self.global)
+                    .map(|at| {
+                        let t = self.global.min(l - at);
+                        attend(&q.narrow(2, at, t)?, &kt, &v, &self.keys)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        let _span = tracing::span!(tracing::Level::TRACE, "join").entered();
+        Tensor::cat(&out, 2)
     }
 }
 
@@ -443,28 +619,19 @@ impl ModernBertLayer {
         xs + mlp
     }
 
-    /// `local_attention_mask` is the global mask with the sliding window already added; `place`
-    /// places the tokens for the rotary embedding.
-    fn forward(
-        &self,
-        xs: &Tensor,
-        global_attention_mask: &Tensor,
-        local_attention_mask: &Tensor,
-        place: Place,
-    ) -> Result<Tensor> {
+    /// `place` places the tokens for the rotary embedding.
+    fn forward(&self, xs: &Tensor, masks: &Masks, place: Place) -> Result<Tensor> {
         let residual = xs.clone();
         let mut xs = xs.clone();
         if let Some(norm) = &self.attn_norm {
             xs = xs.apply(norm)?;
         }
 
-        let attention_mask = if self.uses_local_attention {
-            local_attention_mask
-        } else {
-            global_attention_mask
-        };
-        let xs = self.attn.forward(&xs, attention_mask, place)?;
+        let xs = self
+            .attn
+            .forward(&xs, masks.of(self.uses_local_attention), place)?;
         let xs = (xs + residual)?;
+        let _span = tracing::span!(tracing::Level::TRACE, "mlp").entered();
         let mlp_out = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         let xs = (xs + mlp_out)?;
         Ok(xs)
@@ -591,11 +758,7 @@ enum Form {
     /// Each sequence's real tokens one after another, `h [T, d]`, rows of `l` when unpacked.
     Packed { l: usize },
     /// `h [B, L, d]`, its masks, and where its tokens sit when a row reads the stretched tables.
-    Padded {
-        global: Tensor,
-        local: Tensor,
-        long: Option<Tensor>,
-    },
+    Padded { masks: Masks, long: Option<Tensor> },
 }
 
 impl Stream {
@@ -743,17 +906,13 @@ impl Stack {
                 self.at + self.layers.len()
             )
         }
-        for layer in &self.layers[s.at - self.at..to - self.at] {
+        for (at, layer) in (s.at..to).zip(&self.layers[s.at - self.at..to - self.at]) {
+            let _span = tracing::span!(tracing::Level::TRACE, "layer", at).entered();
             s.h = match &s.form {
                 Form::Packed { .. } => layer.packed(&s.h, &s.lens, self.window)?,
-                Form::Padded {
-                    global,
-                    local,
-                    long,
-                } => layer.forward(
+                Form::Padded { masks, long } => layer.forward(
                     &s.h,
-                    global,
-                    local,
+                    masks,
                     match long {
                         Some(p) => Place::Long(p),
                         None => Place::Index,
@@ -885,6 +1044,14 @@ impl ModernBert {
         xs.apply(&self.word_embeddings)?.to_dtype(self.dtype)
     }
 
+    /// Its attention heads.
+    fn heads(&self) -> usize {
+        self.stack
+            .layers
+            .first()
+            .map_or(1, |l| l.attn.num_attention_heads)
+    }
+
     /// Whether [`ModernBert::forward`] runs the packed pass.
     pub fn packs(&self) -> bool {
         let w = self.word_embeddings.embeddings();
@@ -960,8 +1127,10 @@ impl ModernBert {
                 .to_dtype(dtype)?
                 .unsqueeze(1)
         };
-        let global = additive(&allow)?;
-        let local = additive(&(&allow * near)?)?;
+        let masks = Masks::Whole {
+            global: additive(&allow)?,
+            local: additive(&(&allow * near)?)?,
+        };
         // a row placing a key some query reads past the trained positions reads the stretched
         // tables
         let long = match self.long {
@@ -978,7 +1147,7 @@ impl ModernBert {
         };
         let mut h = self.lookup(xs)?.apply(&self.norm)?;
         for layer in &self.stack.layers {
-            h = layer.forward(&h, &global, &local, place)?;
+            h = layer.forward(&h, &masks, place)?;
         }
         h.apply(&self.stack.final_norm)
     }
@@ -1020,15 +1189,32 @@ impl ModernBert {
         })
     }
 
-    /// `xs` embedded, with the masks and placement its layers read.
+    /// `xs` embedded, with the masks and placement its layers read: whole while a row's scores
+    /// fit in [`LOGITS`], as the pass always ran, and past them a tile at a time ([`Tiles`]).
     fn padded(&self, xs: &Tensor, mask: &Tensor, lens: Vec<usize>) -> Result<Stream> {
         let seq_len = xs.shape().dims()[1];
         let dtype = self.dtype;
-        let global =
-            prepare_4d_attention_mask(mask, dtype, None)?.to_device(xs.device())?;
-        let local =
-            get_local_attention_mask(seq_len, self.local_attention_size / 2, dtype, xs.device())?
+        let masks = match self.heads() * seq_len * seq_len > LOGITS {
+            true => Masks::Tiled(Tiles::new(
+                mask,
+                self.heads(),
+                self.local_attention_size / 2,
+                dtype,
+                (LOGITS, LOCAL),
+            )?),
+            false => {
+                let global =
+                    prepare_4d_attention_mask(mask, dtype, None)?.to_device(xs.device())?;
+                let local = get_local_attention_mask(
+                    seq_len,
+                    self.local_attention_size / 2,
+                    dtype,
+                    xs.device(),
+                )?
                 .broadcast_add(&global)?;
+                Masks::Whole { global, local }
+            }
+        };
         // a row longer than the trained positions reads the stretched tables
         let long = match self.long && seq_len > self.trained {
             true => {
@@ -1045,11 +1231,7 @@ impl ModernBert {
             h,
             at: 0,
             lens,
-            form: Form::Padded {
-                global,
-                local,
-                long,
-            },
+            form: Form::Padded { masks, long },
         })
     }
 }
@@ -1204,6 +1386,11 @@ mod tests {
 
     /// A backbone of four layers 64 wide over random weights in `vm`.
     fn small(vm: &hanzo_nn::VarMap) -> (Config, ModernBert) {
+        small_with(vm, None)
+    }
+
+    /// [`small`], its 64 trained positions stretched `yarn` times.
+    fn small_with(vm: &hanzo_nn::VarMap, yarn: Option<f64>) -> (Config, ModernBert) {
         let cfg = Config {
             vocab_size: 32,
             hidden_size: 64,
@@ -1217,7 +1404,7 @@ mod tests {
             global_rope_theta: 160000.,
             local_attention: 8,
             local_rope_theta: 10000.,
-            yarn: None,
+            yarn,
             classifier_config: None,
         };
         let vb = VarBuilder::from_varmap(vm, DType::F32, &Device::Cpu);
@@ -1323,6 +1510,68 @@ mod tests {
             }
         }
         assert!(Stack::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg, 5).is_err());
+    }
+
+    /// A padded pass attends a tile of queries at a time and answers as its whole scores do, but
+    /// for the order of float sums: global tiles of 7 queries and local ones of 5, so tiles end
+    /// mid-window and at the pass's edges, and one tile of each, over rows of 200, 130 and 37
+    /// tokens past the 64 trained positions, the last one's padding queries reading windows of
+    /// padding alone.
+    #[test]
+    fn a_tiled_pass_answers_as_the_whole_scores() {
+        let vm = hanzo_nn::VarMap::new();
+        let (_, m) = small_with(&vm, Some(4.0));
+        let lens = [200usize, 130, 37];
+        let l = 200;
+        let ids: Vec<u32> = lens
+            .iter()
+            .enumerate()
+            .flat_map(|(r, &n)| (0..l).map(move |i| if i < n { 1 + ((i * 7 + r * 3) % 31) as u32 } else { 0 }))
+            .collect();
+        let mask: Vec<u32> = lens.iter().flat_map(|&n| (0..l).map(move |i| (i < n) as u32)).collect();
+        let dev = Device::Cpu;
+        let xs = Tensor::from_vec(ids, (3, l), &dev).unwrap();
+        let mask = Tensor::from_vec(mask, (3, l), &dev).unwrap();
+        let s = m.embed(&xs, &mask).unwrap();
+        let Form::Padded { masks: Masks::Whole { .. }, long } = &s.form else {
+            panic!("rows of 200 tokens over 4 heads tile")
+        };
+        assert!(long.is_some());
+        let whole = m.finish(s.clone()).unwrap();
+        let tiled = |logits: usize, local: usize| {
+            let tiles = Tiles::new(&mask, 4, 4, DType::F32, (logits, local)).unwrap();
+            let shape = (tiles.global, tiles.local.len());
+            let s = Stream {
+                form: Form::Padded {
+                    masks: Masks::Tiled(tiles),
+                    long: long.clone(),
+                },
+                ..s.clone()
+            };
+            (shape, m.finish(s).unwrap())
+        };
+        for ((logits, local), shape) in [((7 * 3 * 4 * l, 5), (7, 40)), ((LOGITS, LOCAL), (l, 1))] {
+            let (got, h) = tiled(logits, local);
+            assert_eq!(got, shape);
+            let gap = (&h - &whole).unwrap().abs().unwrap().max_all().unwrap();
+            let gap = gap.to_scalar::<f32>().unwrap();
+            assert!(gap < 1e-5, "tiles {shape:?}: {gap}");
+        }
+    }
+
+    /// A pass tiles exactly when a row's scores pass [`LOGITS`]: over 4 heads, past 4,096 tokens.
+    #[test]
+    fn a_pass_tiles_past_its_scores_bound() {
+        let vm = hanzo_nn::VarMap::new();
+        let (_, m) = small(&vm);
+        for (l, tiled) in [(4096, false), (4097, true)] {
+            let xs = Tensor::ones((1, l), DType::U32, &Device::Cpu).unwrap();
+            let s = m.embed(&xs, &xs).unwrap();
+            let Form::Padded { masks, .. } = &s.form else {
+                panic!("a dense backbone runs padded")
+            };
+            assert_eq!(matches!(masks, Masks::Tiled(_)), tiled, "{l} tokens");
+        }
     }
 
     /// Each frequency of the tables at position 1, the attention factor taken out.
