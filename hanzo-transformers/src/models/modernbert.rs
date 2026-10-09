@@ -75,22 +75,25 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
+    /// The trained tables over positions `0..max_position_embeddings`: each angle `p · f` one F32
+    /// product on the host, its sine and cosine taken on the device in F32 and stored in `dtype`.
+    /// The angles are the bits an exact F32 GEMM `t · inv_freq` gives (one product, `K = 1`); a
+    /// GEMM that rounds its operands does not give them: Vulkan's fp16 matrix cores held positions
+    /// past 2,048 to steps of 2 and more, and BF16 holds integers exactly only to 256.
     fn new(dtype: DType, config: &Config, rope_theta: f64, dev: &Device) -> Result<Self> {
         let dim = config.hidden_size / config.num_attention_heads;
-        let inv_freq: Vec<_> = (0..dim)
+        let inv_freq: Vec<f32> = (0..dim)
             .step_by(2)
             .map(|i| 1f32 / rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
-        let max_seq_len = config.max_position_embeddings;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
+        let n = config.max_position_embeddings;
+        let angles: Vec<f32> = (0..n)
+            .flat_map(|p| inv_freq.iter().map(move |f| p as f32 * f))
+            .collect();
+        let freqs = Tensor::from_vec(angles, (n, inv_freq.len()), dev)?;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
         })
     }
 
@@ -441,19 +444,19 @@ struct Tile {
 }
 
 impl Tiles {
-    /// The tiles of a pass whose real tokens `mask [B, L]` marks, `heads` wide, its local
-    /// layers reading `window` keys either side: a tile holds at most `logits` scores, a local one
-    /// at most `local` queries. Tiles alike in shape share one window.
+    /// The tiles, on `dev`, of a pass whose real tokens `mask [B, L]` marks, `heads` wide, its
+    /// local layers reading `window` keys either side: a tile holds at most `logits` scores, a
+    /// local one at most `local` queries. Tiles alike in shape share one window.
     fn new(
         mask: &Tensor,
         heads: usize,
         window: usize,
         dtype: DType,
         (logits, local): (usize, usize),
+        dev: &Device,
     ) -> Result<Tiles> {
         let (b, l) = mask.dims2()?;
-        let dev = mask.device();
-        let keys = ((1.0 - mask.to_dtype(DType::F32)?)? * masked_value(dtype))?
+        let keys = ((1.0 - mask.to_device(dev)?.to_dtype(DType::F32)?)? * masked_value(dtype))?
             .to_dtype(dtype)?
             .reshape((b, 1, 1, l))?;
         let local = local.min((logits / (b * heads * (local + 2 * window))).max(1));
@@ -1201,6 +1204,7 @@ impl ModernBert {
                 self.local_attention_size / 2,
                 dtype,
                 (LOGITS, LOCAL),
+                xs.device(),
             )?),
             false => {
                 let global =
@@ -1539,7 +1543,7 @@ mod tests {
         assert!(long.is_some());
         let whole = m.finish(s.clone()).unwrap();
         let tiled = |logits: usize, local: usize| {
-            let tiles = Tiles::new(&mask, 4, 4, DType::F32, (logits, local)).unwrap();
+            let tiles = Tiles::new(&mask, 4, 4, DType::F32, (logits, local), &dev).unwrap();
             let shape = (tiles.global, tiles.local.len());
             let s = Stream {
                 form: Form::Padded {
@@ -1571,6 +1575,80 @@ mod tests {
                 panic!("a dense backbone runs padded")
             };
             assert_eq!(matches!(masks, Masks::Tiled(_)), tiled, "{l} tokens");
+        }
+    }
+
+    /// Every device this build has, the CPU first.
+    fn devices() -> Vec<Device> {
+        #[allow(unused_mut)]
+        let mut v = vec![Device::Cpu];
+        #[cfg(feature = "cuda")]
+        v.push(Device::new_cuda(0).unwrap());
+        #[cfg(feature = "metal")]
+        v.push(Device::new_metal(0).unwrap());
+        #[cfg(feature = "rocm")]
+        v.push(Device::new_rocm(0).unwrap());
+        #[cfg(feature = "vulkan")]
+        v.push(Device::new_vulkan(0).unwrap());
+        v
+    }
+
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// mmBERT's trained tables (8,192 positions, 32 frequencies) on every device, in F32 and in
+    /// BF16 where the device holds it, are the sines and cosines of the exact angles to the
+    /// dtype's precision: an F32 angle is within 4.9e-4 of the exact one at 8,192, and CUDA's
+    /// sine of one reads 1.1e-3 off there. A device that rounds a position (a BF16 product, fp16
+    /// matrix cores) is off by radians past 2,048.
+    #[test]
+    fn trained_tables_hold_every_position_on_every_device() {
+        let cfg = mmbert(None);
+        for dev in devices() {
+            let mut dtypes = vec![(DType::F32, 4e-3)];
+            if dev.supports_bf16() {
+                dtypes.push((DType::BF16, 1e-2));
+            }
+            for (dtype, tol) in dtypes {
+                let t = RotaryEmbedding::new(dtype, &cfg, 160000., &dev).unwrap();
+                let (sin, cos) = (host(&t.sin), host(&t.cos));
+                let mut worst = (0f64, 0);
+                for p in 0..8192 {
+                    for i in 0..32 {
+                        let a = p as f64 / 160000f64.powf(2.0 * i as f64 / 64.0);
+                        let e = (sin[p * 32 + i] as f64 - a.sin())
+                            .abs()
+                            .max((cos[p * 32 + i] as f64 - a.cos()).abs());
+                        if e > worst.0 {
+                            worst = (e, p);
+                        }
+                    }
+                }
+                assert!(worst.0 < tol, "{dev:?} {dtype:?}: {} at position {}", worst.0, worst.1);
+            }
+        }
+    }
+
+    /// The F32 tables are the bits the device's own GEMM `t · inv_freq` gave before the angles
+    /// moved to the host, wherever that GEMM rounds nothing: every device but Vulkan, whose
+    /// default GEMM runs on fp16 matrix cores.
+    #[test]
+    fn f32_tables_are_the_exact_gemm_bits() {
+        let cfg = mmbert(None);
+        let bits = |t: &Tensor| host(t).iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for dev in devices().into_iter().filter(|d| !d.is_vulkan()) {
+            let new = RotaryEmbedding::new(DType::F32, &cfg, 160000., &dev).unwrap();
+            let inv: Vec<f32> = (0..64)
+                .step_by(2)
+                .map(|i| 1f32 / 160000f64.powf(i as f64 / 64.0) as f32)
+                .collect();
+            let inv = Tensor::from_vec(inv, (1, 32), &dev).unwrap();
+            let t = Tensor::arange(0u32, 8192, &dev).unwrap();
+            let t = t.to_dtype(DType::F32).unwrap().reshape((8192, 1)).unwrap();
+            let f = t.matmul(&inv).unwrap();
+            assert_eq!(bits(&new.sin), bits(&f.sin().unwrap()), "{dev:?} sin");
+            assert_eq!(bits(&new.cos), bits(&f.cos().unwrap()), "{dev:?} cos");
         }
     }
 

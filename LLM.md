@@ -52,12 +52,20 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   rotary tables (NTK-by-parts, beta 32 and 1, attention factor 0.1 ln s + 1) on the global
   layers and extended frequencies on the local ones; within `max_position_embeddings` every
   pass reads the trained tables bit for bit.
+- **ModernBert's trained rotary tables take their angles from the host.** Each angle `p · f` is
+  one F32 product on the host, its sine and cosine taken on the device in F32, then cast: the
+  bits an exact F32 GEMM `t · inv_freq` gave on the CPU, ROCm, Metal and CUDA
+  (`f32_tables_are_the_exact_gemm_bits`). The device GEMM it replaces ran on Vulkan's fp16
+  matrix cores, rounding positions past 2,048 (rows of 4,096 and 8,192 tokens read 25% and 37%
+  from the CPU's states), and in BF16 rounded positions past 256 to multiples of 8 and more.
+  `trained_tables_hold_every_position_on_every_device` holds every device's tables, F32 and
+  BF16, to the exact angles (`--features rocm|vulkan|metal|cuda`).
 - **ModernBert's long padded pass, a tile at a time.** A padded pass whose row's scores pass
   `LOGITS` (2^26, 256 MiB in F32: a row past 2,364 tokens over 12 heads) attends a tile of
   queries at a time (`Tiles`): a global tile reads every key, at most 2^26 scores over its rows;
   a local tile holds 512 queries and the keys within their window. The keys' mask is
-  `[B, 1, 1, L]` and each local tile's window `[t, t + 2w]` (tiles alike share one), so no
-  `[L, L]` tensor exists; a shorter pass is the whole pass, bit for bit. Kᵀ and V are laid out
+  `[B, 1, 1, L]` and each local tile's window `[t, t + 2w]` (tiles alike share one, built on the
+  pass's device), so no `[L, L]` tensor exists; a shorter pass is the whole pass, bit for bit. Kᵀ and V are laid out
   once a layer (Vulkan's matmul copies a strided operand per call), and the raw scores drop once
   masked: two blocks live at once. (Dropping the masked scores too once the softmax is queued
   grew Metal's pool past 13 GiB at 16,384 tokens.) Each stage is a TRACE span (`layer` with
