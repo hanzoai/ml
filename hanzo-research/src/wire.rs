@@ -172,15 +172,20 @@ pub struct Delta {
     pub overlap: Option<bool>,
 }
 
+/// Two runs side by side, as `GET /v1/research/compare` answers: the two canonical runs,
+/// `blocks` (why they may not be compared, empty when nothing was found), `config` (every
+/// configuration field they differ in) and `deltas` (each metric both measured on one category).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Comparison {
+    pub a: Option<Run>,
+    pub b: Option<Run>,
     pub comparable: bool,
-    #[serde(default, deserialize_with = "list")]
+    #[serde(deserialize_with = "list")]
     pub blocks: Vec<String>,
-    #[serde(default, deserialize_with = "list")]
-    pub differences: Vec<Difference>,
-    #[serde(default, deserialize_with = "list")]
+    #[serde(deserialize_with = "list")]
+    pub config: Vec<Difference>,
+    #[serde(deserialize_with = "list")]
     pub deltas: Vec<Delta>,
 }
 
@@ -196,7 +201,7 @@ pub fn token() -> Result<String, crate::Error> {
     let out = std::process::Command::new("hanzo")
         .args(["auth", "token"])
         .output()
-        .map_err(|e| crate::Error::Io(e))?;
+        .map_err(crate::Error::Io)?;
     if !out.status.success() {
         return Err(crate::Error::Message("hanzo auth token failed".into()));
     }
@@ -337,13 +342,7 @@ impl Api {
             };
 
             match res {
-                Ok(resp) => {
-                    use std::io::Read;
-                    let mut reader = resp.into_reader().take(crate::MAX_RESPONSE_BYTES);
-                    let mut body = Vec::new();
-                    reader.read_to_end(&mut body).map_err(crate::Error::Io)?;
-                    return Ok(body);
-                }
+                Ok(resp) => return crate::read(resp),
                 Err(ureq::Error::Status(503, _)) if wait <= 8 => {
                     std::thread::sleep(std::time::Duration::from_secs(wait));
                     wait *= 2;

@@ -20,6 +20,13 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
 - `hanzo-transformers/` — model implementations.
 - `hanzo-kernels/`, `hanzo-flash-attn/` — CUDA kernels & FlashAttention v2.
 - `hanzo-onnx/`, `hanzo-datasets/`, `hanzo-ml-wasm-examples/`.
+- `hanzo-research/` — the `/v1/research` client, the Rust peer of the Python `hanzo-research`.
+  A record batch goes to its kind's route under its kind's key (`{"runs": [...]}`), the body
+  hanzo-inc/cloud `apps/research` decodes; `tests/record.rs` is a stand-in that answers as those
+  Go handlers do. Canonical JSON is RFC 8785 (numbers as ECMAScript writes the double, Ryu's
+  digits), held to the Python package's bytes and WAL by `tests/vectors/python.json` and
+  `wal.jsonl` (`tests/vectors/gen.py` regenerates them). serde_json's `float_roundtrip` is on so
+  a WAL line reads back as the double that was hashed; it unifies into every consumer's build.
 - `hanzo-train/` — training on hanzo-ml. `cluster`: one model across heterogeneous machines
   (Metal, CUDA, ROCm, CPU) by local SGD with an outer Nesterov step (DiLoCo). A coordinator owns
   the plan, θ_global in F32, the outer step and checkpoints; workers join any time, take batches

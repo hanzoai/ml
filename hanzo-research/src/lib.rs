@@ -80,9 +80,12 @@ pub const DEFAULT_LIBS: &[&str] = &[
 const DEFAULT_BASE: &str = "https://api.hanzo.ai";
 const NARRATIVE_WINDOW: usize = 10;
 const TIMEOUT: Duration = Duration::from_secs(120);
-/// Response-body cap (8 MiB): a hostile or broken server cannot stream an unbounded body to
-/// OOM the client. Parity with the Go/C++ ports.
-pub const MAX_RESPONSE_BYTES: u64 = 8 << 20;
+/// Response-body cap (64 MiB, the Python package's): a hostile or broken server cannot stream
+/// an unbounded body to OOM the client, and a body past it is refused, never truncated. The
+/// server pages no listing, so the cap is what bounds one: the hanzo org's public run listing
+/// read 1,489,873 bytes at 356 runs (2026-10-15), 4.2 KB a run, so 64 MiB holds about 16,000
+/// runs where 8 MiB held about 2,000. An artifact is at most 16 MiB (`maxArtifactBytes`).
+pub const MAX_RESPONSE_BYTES: u64 = 64 << 20;
 
 /// The crate's result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -375,29 +378,46 @@ impl Research {
         let path = format!("/v1/research/artifacts/{sha256}");
         let url = format!("{}{path}", self.inner.base);
         let resp = self.auth(self.inner.agent.get(&url)).call()?;
-        let mut reader = resp.into_reader().take(MAX_RESPONSE_BYTES);
-        let mut body = Vec::new();
-        reader.read_to_end(&mut body)?;
-        Ok(body)
+        read(resp)
     }
 
-    /// Post a benchmark definition to the research catalog.
+    /// Record one benchmark definition: `POST /v1/research/benchmarks`, `{"benchmarks": [bench]}`.
     pub fn post_benchmark(&self, bench: &Benchmark) -> Result<Batch> {
-        self.post("/v1/research/benchmarks", bench)
+        self.file("benchmarks", std::slice::from_ref(bench))
     }
 
-    /// Post an execution / run.
+    /// Record one run: `POST /v1/research/runs`, `{"runs": [run]}`.
     pub fn post_run(&self, run: &Run) -> Result<Batch> {
-        self.post("/v1/research/runs", run)
+        self.file("runs", std::slice::from_ref(run))
     }
 
-    /// Post a batch of runs and benchmarks.
-    pub fn post_batch(&self, runs: &[Run], benchmarks: &[Benchmark]) -> Result<Batch> {
-        let body = serde_json::json!({
-            "runs": runs,
-            "benchmarks": benchmarks,
-        });
-        self.post("/v1/research/runs", &body)
+    /// Record runs and the benchmarks they name, each kind at its own route, the benchmarks
+    /// first. A kind given nothing is not sent (the server refuses an empty batch with 400, and
+    /// one past 20,000 records with 413). Answers the runs' batch and the benchmarks', in the
+    /// order of the arguments, `None` for a kind not sent.
+    pub fn post_batch(
+        &self,
+        runs: &[Run],
+        benchmarks: &[Benchmark],
+    ) -> Result<(Option<Batch>, Option<Batch>)> {
+        let benchmarks = match benchmarks {
+            [] => None,
+            b => Some(self.file("benchmarks", b)?),
+        };
+        let runs = match runs {
+            [] => None,
+            r => Some(self.file("runs", r)?),
+        };
+        Ok((runs, benchmarks))
+    }
+
+    /// One batch of one kind at its route, under its kind's key (`{"runs": [...]}`): the body
+    /// `apps/research` decodes, which reads nothing else.
+    fn file<T: Serialize>(&self, kind: &str, rows: &[T]) -> Result<Batch> {
+        self.post(
+            &format!("/v1/research/{kind}"),
+            &BTreeMap::from([(kind, rows)]),
+        )
     }
 
     /// Retrieve a run by stable id.
@@ -887,21 +907,25 @@ pub struct KindTotal {
 
 // ── helpers ──────────────────────────────────────────────────────────────────────────────
 
-/// Deserialize a JSON response body under a hard size cap, so a hostile server cannot stream
-/// an unbounded body to OOM the client. Reads one byte past the cap to detect an overflow
-/// rather than silently truncating.
-fn read_json<T: serde::de::DeserializeOwned>(resp: ureq::Response) -> Result<T> {
+/// A response body under [`MAX_RESPONSE_BYTES`], the one way every call reads one. It reads
+/// one byte past the cap, so a longer body is refused rather than truncated into bytes that
+/// fail later as bad JSON or arrive as a short artifact.
+pub(crate) fn read(resp: ureq::Response) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     resp.into_reader()
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut buf)?;
     if buf.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "research: response exceeds size cap",
+        return Err(Error::Message(format!(
+            "an answer past {MAX_RESPONSE_BYTES} bytes is refused"
         )));
     }
-    Ok(serde_json::from_slice(&buf)?)
+    Ok(buf)
+}
+
+/// A JSON response body under [`MAX_RESPONSE_BYTES`].
+fn read_json<T: serde::de::DeserializeOwned>(resp: ureq::Response) -> Result<T> {
+    Ok(serde_json::from_slice(&read(resp)?)?)
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
