@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-research"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Record and query R&D evidence from Rust — the /v1/research client of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -10,10 +10,14 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 serde = { version = "1.0.171", features = ["derive"] }
-serde_json = "1.0.99"
+# float_roundtrip: a JSON number reads back as the double it was written from. The default
+# parse misses a 17-digit float by an ulp (333333333.33333329), and a WAL line read so no longer
+# hashes to what was chained.
+serde_json = { version = "1.0.99", features = ["float_roundtrip"] }
 ureq = { version = "2.12", features = ["tls", "gzip"] }
 base64 = "0.22"
 sha2 = "0.10"
+ryu = "1.0.20"
 thiserror = "2"
 chrono = "0.4"
 
