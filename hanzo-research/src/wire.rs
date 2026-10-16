@@ -1,14 +1,17 @@
-//! Wire types for the Hanzo Research Cloud API (`/v1/research`).
+//! Wire types for the Hanzo Research Cloud API (`/v1/research`, `/v1/evidence`).
 //!
-//! Provides the canonical structs matching `apps/research/record.go` in Hanzo Cloud:
+//! Provides the canonical structs matching `apps/research` in Hanzo Cloud:
 //! - Benchmark definitions, splits, and official metrics
 //! - Executions/Runs with derived completion states and measures
 //! - Content-addressed artifacts
 //! - Studies, Papers, and Comparisons
+//! - Decision records: evidence (SysML v2 elements among it), decisions holding a DDT-1.0
+//!   Decision record, evaluations holding its Evaluation Run and Kai's Decision Package, action
+//!   drafts, a person's commitments, and what read a uri
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::fmt;
 
 fn list<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
@@ -189,6 +192,216 @@ pub struct Comparison {
     pub deltas: Vec<Delta>,
 }
 
+// Decision records: evidence (`/v1/evidence`), and decisions, evaluations, actions and
+// commitments (`/v1/research/…`). Field names are camelCase, DDT's. A DDT record travels inside
+// its envelope as a JSON value, verbatim. The server fills `id`, `version`, `time`, `by`,
+// `supersedes` and a decision's `depends`; a POST leaves them out.
+
+fn zero(n: &i64) -> bool {
+    *n == 0
+}
+
+/// A link from an evidence record to another uri: `rel` is `satisfies`, `verifies`, `derives`,
+/// `supersedes`, `refines` or `dependsOn`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Link {
+    pub rel: String,
+    pub uri: String,
+}
+
+/// Where evidence comes from: `{system: "sysml", revision: <commit>}`, `{system: "ddt"}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Source {
+    pub system: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub revision: String,
+}
+
+/// An evidence record: a stable `uri`, the lowercase hex SHA-256 of its content's canonical
+/// JSON, its `kind` (`requirement`, `test`, `model`, `analysis`, `document`, `element`), its
+/// source and links. A POST of a uri the server holds under another hash files its next
+/// `version`; the same hash answers the record held.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Evidence {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub uri: String,
+    pub hash: String,
+    pub kind: String,
+    pub source: Source,
+    #[serde(deserialize_with = "list")]
+    pub links: Vec<Link>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub time: String,
+    #[serde(skip_serializing_if = "zero")]
+    pub version: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+}
+
+/// A SysML v2 model's elements in Systems Modeling API JSON, under its project and commit:
+/// `POST /v1/evidence/sysml` files each element as `sysml://<project>@<commit>#<@id>`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sysml {
+    pub project: String,
+    pub commit: String,
+    #[serde(deserialize_with = "list")]
+    pub elements: Vec<Value>,
+}
+
+/// A decision's charter: the question it answers, its scope, owner, due date and criteria.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Charter {
+    pub question: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub owner: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub due: String,
+    #[serde(deserialize_with = "list", skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<String>,
+}
+
+/// The Decision Program a decision is bound to: its id, version and hash.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Program {
+    pub id: String,
+    pub version: i64,
+    pub hash: String,
+}
+
+/// An evidence uri a record read, with the hash it read when it read one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Depend {
+    pub uri: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hash: String,
+}
+
+/// A decision record: a DDT-1.0 Decision record (`decision`), its charter and the program bound
+/// from it. A record whose `decision.id` the server holds files the next `version`, naming the
+/// one it `supersedes`; `depends` is every evidence uri the DDT record names.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Decision {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub decision: Value,
+    pub charter: Charter,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program: Option<Program>,
+    #[serde(skip_serializing_if = "zero")]
+    pub version: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub supersedes: String,
+    #[serde(deserialize_with = "list", skip_serializing_if = "Vec::is_empty")]
+    pub depends: Vec<Depend>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub time: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+}
+
+/// What a run recommends, lifted from its Decision Package: the selection, the ranking, where
+/// it flips, and the readiness ruling.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Recommendation {
+    pub selection: Option<String>,
+    #[serde(deserialize_with = "list")]
+    pub ranking: Vec<Value>,
+    #[serde(deserialize_with = "list")]
+    pub flips: Vec<Value>,
+    pub readiness: Value,
+}
+
+/// An evaluation record: a DDT Evaluation Run (`evaluationRun`), the Decision Package it hashes
+/// (`evaluationRun.outputs.hash`), its recommendation, and the evidence it read.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Evaluation {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub decision_id: String,
+    pub evaluation_run: Value,
+    pub package: Value,
+    pub recommendation: Recommendation,
+    #[serde(deserialize_with = "list")]
+    pub depends: Vec<Depend>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub time: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+}
+
+/// An action record: a DDT Action's fields (`id`, `decisionId`, `status`, `verdict`, `rule`,
+/// `description`) as written, with its assignee and who authorized it. Filed as a `DRAFT`; a
+/// person authorizing it on the server moves it to `AUTHORIZED`. This client files drafts and
+/// never authorizes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Action {
+    #[serde(flatten)]
+    pub action: Map<String, Value>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub assignee: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub authorized_by: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub authorized_at: String,
+}
+
+/// A person's commitment to a selection after an evaluation, as the server answers it. A
+/// person commits on the server; this client reads commitments and files none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Commitment {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub decision_id: String,
+    pub evaluation_id: String,
+    pub selection: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub time: String,
+}
+
+/// A record that read a uri: its id, its DDT decision id, the hash it read, and whether a
+/// newer version of the uri has been filed since.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Dependent {
+    pub id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub decision_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hash: String,
+    pub stale: bool,
+}
+
+/// `GET /v1/evidence/dependents`: the decisions and evaluations that read a uri.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Dependents {
+    #[serde(deserialize_with = "list")]
+    pub decisions: Vec<Dependent>,
+    #[serde(deserialize_with = "list")]
+    pub evaluations: Vec<Dependent>,
+}
+
 /// The token: `HANZO_API_KEY`, else what `hanzo auth token` prints.
 pub fn token() -> Result<String, crate::Error> {
     if let Some(t) = std::env::var("HANZO_API_KEY")
@@ -210,7 +423,9 @@ pub fn token() -> Result<String, crate::Error> {
         .trim()
         .to_string();
     if t.is_empty() {
-        return Err(crate::Error::Message("hanzo auth token printed nothing".into()));
+        return Err(crate::Error::Message(
+            "hanzo auth token printed nothing".into(),
+        ));
     }
     Ok(t)
 }
@@ -328,7 +543,12 @@ impl Api {
         &self.token
     }
 
-    fn call(&self, req: ureq::Request, body: Option<&[u8]>, what: &str) -> Result<Vec<u8>, crate::Error> {
+    fn call(
+        &self,
+        req: ureq::Request,
+        body: Option<&[u8]>,
+        what: &str,
+    ) -> Result<Vec<u8>, crate::Error> {
         let mut wait = 2;
         loop {
             let req = req
@@ -364,8 +584,13 @@ impl Api {
         }
     }
 
-    pub fn post<B: Serialize, R: DeserializeOwned>(&self, path: &str, body: &B) -> Result<R, crate::Error> {
-        let url = format!("{}/v1/research/{path}", self.base);
+    /// `POST /v1/<path>` with `body` as JSON, the answer read as `R`.
+    fn send<B: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<R, crate::Error> {
+        let url = format!("{}/v1/{path}", self.base);
         let bytes = serde_json::to_vec(body)?;
         let req = self
             .agent
@@ -375,8 +600,9 @@ impl Api {
         Ok(serde_json::from_slice(&resp_body)?)
     }
 
-    pub fn bytes(&self, path: &str, query: &[(&str, &str)]) -> Result<Vec<u8>, crate::Error> {
-        let mut url = format!("{}/v1/research/{path}", self.base);
+    /// `GET /v1/<path>?<query>`, the answer's bytes.
+    fn fetch(&self, path: &str, query: &[(&str, &str)]) -> Result<Vec<u8>, crate::Error> {
+        let mut url = format!("{}/v1/{path}", self.base);
         if !query.is_empty() {
             let q_str = query
                 .iter()
@@ -389,9 +615,71 @@ impl Api {
         self.call(req, None, &format!("GET {path}"))
     }
 
-    pub fn get<R: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<R, crate::Error> {
+    /// `POST /v1/research/<path>`.
+    pub fn post<B: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<R, crate::Error> {
+        self.send(&format!("research/{path}"), body)
+    }
+
+    /// `GET /v1/research/<path>`, the answer's bytes.
+    pub fn bytes(&self, path: &str, query: &[(&str, &str)]) -> Result<Vec<u8>, crate::Error> {
+        self.fetch(&format!("research/{path}"), query)
+    }
+
+    /// `GET /v1/research/<path>`.
+    pub fn get<R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<R, crate::Error> {
         let body = self.bytes(path, query)?;
         Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// File one evidence record: `POST /v1/evidence`. Answers the record as filed.
+    pub fn evidence(&self, e: &Evidence) -> Result<Evidence, crate::Error> {
+        self.send("evidence", e)
+    }
+
+    /// File a SysML v2 model's elements: `POST /v1/evidence/sysml`. Answers the records filed.
+    pub fn sysml(&self, s: &Sysml) -> Result<Vec<Evidence>, crate::Error> {
+        let filed: Listing<Evidence> = self.send("evidence/sysml", s)?;
+        Ok(filed.data)
+    }
+
+    /// A uri's evidence versions, newest first: `GET /v1/evidence?uri=`.
+    pub fn versions(&self, uri: &str) -> Result<Vec<Evidence>, crate::Error> {
+        let held: Listing<Evidence> =
+            serde_json::from_slice(&self.fetch("evidence", &[("uri", uri)])?)?;
+        Ok(held.data)
+    }
+
+    /// The decisions and evaluations that read `uri` (at `hash`, when given):
+    /// `GET /v1/evidence/dependents`.
+    pub fn dependents(&self, uri: &str, hash: Option<&str>) -> Result<Dependents, crate::Error> {
+        let mut query = vec![("uri", uri)];
+        query.extend(hash.map(|h| ("hash", h)));
+        Ok(serde_json::from_slice(
+            &self.fetch("evidence/dependents", &query)?,
+        )?)
+    }
+
+    /// File a decision record: `POST /v1/research/decisions`. Answers the record as filed.
+    pub fn decision(&self, d: &Decision) -> Result<Decision, crate::Error> {
+        self.post("decisions", d)
+    }
+
+    /// File an evaluation record: `POST /v1/research/evaluations`.
+    pub fn evaluation(&self, e: &Evaluation) -> Result<Evaluation, crate::Error> {
+        self.post("evaluations", e)
+    }
+
+    /// File an action draft: `POST /v1/research/actions`.
+    pub fn action(&self, a: &Action) -> Result<Action, crate::Error> {
+        self.post("actions", a)
     }
 
     pub fn filed(&self, b: &Batch, what: &str) -> Result<Value, crate::Error> {

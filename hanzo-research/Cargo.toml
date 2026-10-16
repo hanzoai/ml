@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-research"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Record and query R&D evidence from Rust — the /v1/research client of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"

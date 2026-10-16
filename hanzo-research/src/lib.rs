@@ -54,8 +54,9 @@ pub use lineage::{
 };
 pub use wal::ResearchWal;
 pub use wire::{
-    claimed, left, now, scope, token, Api, Batch, Benchmark, Comparison, Delta, Difference,
-    Listing, Measure, Run, Split, Stored,
+    claimed, left, now, scope, token, Action, Api, Batch, Benchmark, Charter, Commitment,
+    Comparison, Decision, Delta, Depend, Dependent, Dependents, Difference, Evaluation, Evidence,
+    Link, Listing, Measure, Program, Recommendation, Run, Source, Split, Stored, Sysml,
 };
 
 use provenance::{Git, Host};
