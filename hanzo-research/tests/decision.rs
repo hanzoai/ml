@@ -1,7 +1,8 @@
 //! Decision records on the wire: each body a POST sends carries exactly the fields the contract
 //! names for it (camelCase, DDT's; the server's own fields left out), a DDT record inside its
-//! envelope is sent as written, and each client method reaches its route under `/v1/` and reads
-//! the answer the server sends. A commitment is only read: the client files none.
+//! envelope is sent as written, and each client method reaches its route under
+//! `/v1/research/` and reads the answer the server sends. An action is authorized and a
+//! commitment made by a person on the server: the client only reads them.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -189,26 +190,15 @@ fn bodies_carry_the_contract_fields() {
     );
     assert_eq!(keys(&v["depends"][0]), set(&["uri", "hash"]));
 
-    // An action is the DDT Action's fields, as written, and nothing of the server's.
+    // An action is the DDT Action, as written, and nothing of the server's.
     let a = serde_json::to_value(action()).unwrap();
-    assert_eq!(a, draft());
+    assert_eq!(a, json!({ "action": draft() }));
     let assigned = Action {
         assignee: "z@hanzo.ai".into(),
         ..action()
     };
     let assigned = serde_json::to_value(assigned).unwrap();
-    assert_eq!(
-        keys(&assigned),
-        set(&[
-            "id",
-            "decisionId",
-            "status",
-            "verdict",
-            "rule",
-            "description",
-            "assignee"
-        ])
-    );
+    assert_eq!(keys(&assigned), set(&["action", "assignee"]));
 }
 
 #[test]
@@ -234,25 +224,45 @@ fn records_read_back_with_the_servers_fields() {
     assert_eq!(d.program, None);
 
     let a: Action = serde_json::from_value(json!({
-        "id": "RUN_KAI_08B02A2DE43C89D7/readiness", "decisionId": "DEC-SPH-0412",
-        "status": "AUTHORIZED", "verdict": "ask", "rule": "kai.missing", "description": "?",
-        "assignee": "a@hanzo.ai", "authorizedBy": "z@hanzo.ai",
-        "authorizedAt": "2026-10-16T07:00:00Z"
+        "id": "act_1", "hash": HASH,
+        "action": {"id": "RUN_KAI_08B02A2DE43C89D7/readiness", "decisionId": "DEC-SPH-0412",
+                   "status": "AUTHORIZED", "verdict": "ask", "rule": "kai.missing", "description": "?"},
+        "decisionId": "DEC-SPH-0412", "assignee": "a@hanzo.ai", "status": "AUTHORIZED",
+        "authorizedBy": "z@hanzo.ai", "authorizedAt": "2026-10-16T07:00:00Z",
+        "time": "2026-10-16T07:00:00Z", "by": "z@hanzo.ai"
     }))
     .unwrap();
+    assert_eq!((a.id.as_str(), a.hash.as_str()), ("act_1", HASH));
     assert_eq!(a.action["status"], "AUTHORIZED");
-    assert_eq!(a.authorized_by, "z@hanzo.ai");
+    assert_eq!(
+        (a.status.as_str(), a.authorized_by.as_str()),
+        ("AUTHORIZED", "z@hanzo.ai")
+    );
     assert!(!a.action.contains_key("authorizedBy"));
 
+    let v: Evaluation = serde_json::from_value(json!({
+        "id": "eval_1", "hash": HASH, "decisionId": "DEC-SPH-0412",
+        "evaluationRun": {"id": "RUN_KAI_08B02A2DE43C89D7"}, "depends": [],
+        "recommendation": {"selection": "A2",
+                           "readiness": {"decisionClassPolicyId": "DCP", "verdict": "allow"}}
+    }))
+    .unwrap();
+    assert_eq!((v.id.as_str(), v.hash.as_str()), ("eval_1", HASH));
+    assert_eq!(v.recommendation.readiness["verdict"], "allow");
+
     let c: Commitment = serde_json::from_value(json!({
-        "id": "com_1", "decisionId": "DEC-SPH-0412", "evaluationId": "evl_1",
-        "selection": "A3", "note": "after the bulletin", "by": "z@hanzo.ai",
-        "time": "2026-10-16T07:00:00Z"
+        "id": "com_1", "decisionId": "DEC-SPH-0412", "evaluationId": "eval_1",
+        "evaluationHash": HASH, "selection": "A3", "note": "after the bulletin",
+        "by": "z@hanzo.ai", "time": "2026-10-16T07:00:00Z"
     }))
     .unwrap();
     assert_eq!(
-        (c.evaluation_id.as_str(), c.selection.as_str()),
-        ("evl_1", "A3")
+        (
+            c.evaluation_id.as_str(),
+            c.evaluation_hash.as_str(),
+            c.selection.as_str()
+        ),
+        ("eval_1", HASH, "A3")
     );
 }
 
@@ -316,12 +326,12 @@ fn filed(body: &Value, id: &str) -> Value {
 fn answer(method: &str, target: &str, body: &Value) -> Value {
     let path = target.split('?').next().unwrap_or_default();
     match (method, path) {
-        ("POST", "/v1/evidence") => {
+        ("POST", "/v1/research/evidence") => {
             let mut v = filed(body, "ev_1");
             v["version"] = json!(1);
             v
         }
-        ("POST", "/v1/evidence/sysml") => {
+        ("POST", "/v1/research/evidence/sysml") => {
             let (p, c) = (&body["project"], &body["commit"]);
             let data: Vec<Value> = body["elements"]
                 .as_array()
@@ -335,13 +345,13 @@ fn answer(method: &str, target: &str, body: &Value) -> Value {
                 .collect();
             json!({ "data": data })
         }
-        ("GET", "/v1/evidence") => json!({"data": [
+        ("GET", "/v1/research/evidence") => json!({"data": [
             {"id": "ev_2", "uri": "techdata://sph/tsb/22", "hash": "b2", "kind": "document",
              "source": {"system": "techdata"}, "links": [], "version": 2},
             {"id": "ev_1", "uri": "techdata://sph/tsb/22", "hash": HASH, "kind": "document",
              "source": {"system": "techdata"}, "links": [], "version": 1}
         ]}),
-        ("GET", "/v1/evidence/dependents") => json!({
+        ("GET", "/v1/research/evidence/dependents") => json!({
             "decisions": [{"id": "dec_1", "decisionId": "DEC-SPH-0412", "stale": false}],
             "evaluations": [{"id": "evl_1", "decisionId": "DEC-SPH-0412", "hash": HASH, "stale": true}]
         }),
@@ -352,7 +362,13 @@ fn answer(method: &str, target: &str, body: &Value) -> Value {
             v
         }
         ("POST", "/v1/research/evaluations") => filed(body, "evl_1"),
-        ("POST", "/v1/research/actions") => body.clone(),
+        ("POST", "/v1/research/actions") => {
+            let mut v = filed(body, "act_1");
+            v["hash"] = json!(HASH);
+            v["status"] = json!("DRAFT");
+            v["decisionId"] = body["action"]["decisionId"].clone();
+            v
+        }
         _ => json!({"detail": "no route"}),
     }
 }
@@ -388,7 +404,16 @@ fn each_record_goes_to_its_route() {
     assert_eq!((d.id.as_str(), d.version), ("dec_1", 1));
     assert_eq!(d.decision, ddt());
     assert_eq!(api.evaluation(&evaluation()).unwrap().id, "evl_1");
-    assert_eq!(api.action(&action()).unwrap(), action());
+    let filed = api.action(&action()).unwrap();
+    assert_eq!(
+        (
+            filed.id.as_str(),
+            filed.hash.as_str(),
+            filed.status.as_str()
+        ),
+        ("act_1", HASH, "DRAFT")
+    );
+    assert_eq!(filed.action, action().action);
 
     let heard = heard.lock().unwrap();
     let targets: Vec<(&str, &str)> = heard
@@ -398,13 +423,13 @@ fn each_record_goes_to_its_route() {
     assert_eq!(
         targets,
         [
-            ("POST", "/v1/evidence"),
-            ("POST", "/v1/evidence/sysml"),
-            ("GET", "/v1/evidence?uri=techdata%3A%2F%2Fsph%2Ftsb%2F22"),
+            ("POST", "/v1/research/evidence"),
+            ("POST", "/v1/research/evidence/sysml"),
+            ("GET", "/v1/research/evidence?uri=techdata%3A%2F%2Fsph%2Ftsb%2F22"),
             (
                 "GET",
                 &*format!(
-                    "/v1/evidence/dependents?uri=techdata%3A%2F%2Fsph%2Ftsb%2F22&hash={HASH}"
+                    "/v1/research/evidence/dependents?uri=techdata%3A%2F%2Fsph%2Ftsb%2F22&hash={HASH}"
                 )
             ),
             ("POST", "/v1/research/decisions"),
@@ -417,5 +442,5 @@ fn each_record_goes_to_its_route() {
     assert_eq!(heard[1].2, serde_json::to_value(&model).unwrap());
     assert_eq!(heard[4].2, serde_json::to_value(decision()).unwrap());
     assert_eq!(heard[5].2, serde_json::to_value(evaluation()).unwrap());
-    assert_eq!(heard[6].2, draft());
+    assert_eq!(heard[6].2, json!({ "action": draft() }));
 }
