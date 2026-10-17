@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-ml"
-version = "0.11.112"
+version = "0.11.113"
 edition = "2021"
 description = "Fast multi-backend tensor & ML framework for Rust (CPU/CUDA/Metal/Vulkan/ROCm) with quantization — the compute core of the Hanzo stack."
 repository = "https://github.com/hanzoai/ml"
@@ -18,7 +18,7 @@ objc2-metal = { version = "0.3.1", optional = true }
 objc2-foundation = { version = "0.3.1", optional = true }
 cudarc = { version = "0.19.8", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8", "cuda-version-from-build-system", "dynamic-linking"], default-features = false, optional = true }
 rocm-rs = { package = "hanzo-rocm", version = "0.5.2", default-features = false, features = ["macros"], optional = true }
-hanzo-rocm-kernels = { path = "../hanzo-rocm-kernels", version = "0.11.42", optional = true }
+hanzo-rocm-kernels = { path = "../hanzo-rocm-kernels", version = "0.11.43", optional = true }
 ash = { version = "0.38", optional = true }
 wgpu = { version = "22", optional = true }
 pollster = { version = "0.3", optional = true }
