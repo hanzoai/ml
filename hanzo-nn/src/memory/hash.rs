@@ -15,7 +15,10 @@ use hanzo_ml::{bail, Result};
 
 /// `n` if prime; trial division, for the head sizes of a table.
 pub fn prime(n: u64) -> bool {
-    n > 1 && (2..).take_while(|d| d * d <= n).all(|d| n % d != 0)
+    n > 1
+        && (2..)
+            .take_while(|d| d * d <= n)
+            .all(|d| !n.is_multiple_of(d))
 }
 
 /// `count` consecutive primes from the first at or above `from`: the sizes of `count` heads.

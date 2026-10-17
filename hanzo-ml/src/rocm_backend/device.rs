@@ -137,7 +137,10 @@ impl Timer {
     /// Milliseconds from start to stop, waiting for stop.
     pub fn elapsed(&self) -> crate::Result<f32> {
         self.stop.synchronize().map_err(RocmError::from)?;
-        Ok(self.start.elapsed_time(&self.stop).map_err(RocmError::from)?)
+        Ok(self
+            .start
+            .elapsed_time(&self.stop)
+            .map_err(RocmError::from)?)
     }
 }
 
@@ -170,7 +173,10 @@ impl RocmDevice {
         let stream = self.stream.as_raw();
         self.begin_graph_capture_scope();
         let begun = unsafe {
-            hip::hipStreamBeginCapture(stream, hip::hipStreamCaptureMode_hipStreamCaptureModeRelaxed)
+            hip::hipStreamBeginCapture(
+                stream,
+                hip::hipStreamCaptureMode_hipStreamCaptureModeRelaxed,
+            )
         };
         let out = match begun == hip::hipError_t_hipSuccess {
             true => f(),

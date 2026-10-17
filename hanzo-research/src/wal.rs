@@ -39,7 +39,8 @@ impl ResearchWal {
         };
 
         let mut sequence = 0u64;
-        let mut last_event_hash = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut last_event_hash =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
 
         if wal_path.exists() {
             let file = File::open(&wal_path)?;
@@ -74,12 +75,19 @@ impl ResearchWal {
     }
 
     /// Append an event to the WAL, fsync to disk, and return the envelope.
-    pub fn append<T: Serialize>(&mut self, event_type: &str, payload: &T) -> std::io::Result<ResearchEvent> {
+    pub fn append<T: Serialize>(
+        &mut self,
+        event_type: &str,
+        payload: &T,
+    ) -> std::io::Result<ResearchEvent> {
         let json_val = serde_json::to_value(payload)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         self.sequence += 1;
-        let event_id = format!("{}-{}-{}-{}", self.run_id, self.worker_id, self.sequence, event_type);
+        let event_id = format!(
+            "{}-{}-{}-{}",
+            self.run_id, self.worker_id, self.sequence, event_type
+        );
         let created_at = now();
 
         let event = ResearchEvent::new(
@@ -149,7 +157,10 @@ mod tests {
         let payload1 = serde_json::json!({"step": 1, "loss": 1.25});
         let e1 = wal.append("step", &payload1).unwrap();
         assert_eq!(e1.sequence, 1);
-        assert_eq!(e1.previous_event_hash, "0000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(
+            e1.previous_event_hash,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
 
         let payload2 = serde_json::json!({"step": 2, "loss": 1.10});
         let e2 = wal.append("step", &payload2).unwrap();

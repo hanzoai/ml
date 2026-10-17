@@ -45,7 +45,10 @@ impl DataPurpose {
 
     /// Whether this purpose is an evaluation benchmark.
     pub fn is_eval(&self) -> bool {
-        matches!(self, DataPurpose::Dev | DataPurpose::EvalOnly | DataPurpose::SealedEval)
+        matches!(
+            self,
+            DataPurpose::Dev | DataPurpose::EvalOnly | DataPurpose::SealedEval
+        )
     }
 }
 
@@ -62,7 +65,10 @@ impl LineagePolicy {
         LineagePolicy {
             purpose,
             // EvalOnly and SealedEval can never allow derivation into training
-            derivation_allowed: if matches!(purpose, DataPurpose::EvalOnly | DataPurpose::SealedEval) {
+            derivation_allowed: if matches!(
+                purpose,
+                DataPurpose::EvalOnly | DataPurpose::SealedEval
+            ) {
                 false
             } else {
                 derivation_allowed
@@ -88,7 +94,10 @@ impl LineagePolicy {
         let effective_purpose = std::cmp::max(declared_child_purpose, max_parent_purpose);
         let effective_derivation_allowed = declared_child_derivation_allowed
             && parents.iter().all(|p| p.derivation_allowed)
-            && !matches!(effective_purpose, DataPurpose::EvalOnly | DataPurpose::SealedEval);
+            && !matches!(
+                effective_purpose,
+                DataPurpose::EvalOnly | DataPurpose::SealedEval
+            );
 
         LineagePolicy {
             purpose: effective_purpose,
@@ -122,13 +131,9 @@ pub enum ContaminationError {
         purpose: DataPurpose,
     },
     #[error("STAGE_REJECTED_CONTAMINATION: artifact {artifact_id} has derivation_allowed = false")]
-    DerivationDisallowed {
-        artifact_id: String,
-    },
+    DerivationDisallowed { artifact_id: String },
     #[error("STAGE_REJECTED_CONTAMINATION: contamination detected in stage: {message}")]
-    StageRejectedContamination {
-        message: String,
-    },
+    StageRejectedContamination { message: String },
 }
 
 fn default_media_type() -> String {
@@ -319,7 +324,11 @@ pub fn derive_lineage_policy(
     declared_child_derivation_allowed: bool,
     parents: &[&LineagePolicy],
 ) -> LineagePolicy {
-    LineagePolicy::derive(declared_child_purpose, declared_child_derivation_allowed, parents)
+    LineagePolicy::derive(
+        declared_child_purpose,
+        declared_child_derivation_allowed,
+        parents,
+    )
 }
 
 /// Validate whether an artifact or checkpoint is legally eligible for model promotion.
@@ -415,7 +424,11 @@ mod tests {
         assert!(eval_policy.assert_trainable("eval_src").is_err());
 
         // Derived child from eval parent MUST be tainted
-        let derived = LineagePolicy::derive(DataPurpose::TeacherMining, true, &[&train_policy, &eval_policy]);
+        let derived = LineagePolicy::derive(
+            DataPurpose::TeacherMining,
+            true,
+            &[&train_policy, &eval_policy],
+        );
         assert_eq!(derived.purpose, DataPurpose::EvalOnly);
         assert!(!derived.derivation_allowed);
         assert!(derived.assert_trainable("derived_from_eval").is_err());
@@ -430,31 +443,32 @@ mod tests {
     #[test]
     fn test_promotion_eligibility_acceptance_check() {
         let root_train = LineagePolicy::root(DataPurpose::Train, true);
-        let teacher_mining = LineagePolicy::derive(DataPurpose::TeacherMining, true, &[&root_train]);
-        let checkpoint_policy = LineagePolicy::derive(DataPurpose::Train, true, &[&root_train, &teacher_mining]);
+        let teacher_mining =
+            LineagePolicy::derive(DataPurpose::TeacherMining, true, &[&root_train]);
+        let checkpoint_policy =
+            LineagePolicy::derive(DataPurpose::Train, true, &[&root_train, &teacher_mining]);
 
         // Clean ancestry passes
         assert!(verify_promotion_eligibility(
             "ckpt-a10",
             &checkpoint_policy,
             &[&root_train, &teacher_mining]
-        ).is_ok());
+        )
+        .is_ok());
 
         // Tainted ancestor with derivation_allowed = false must fail
         let mut tainted_ancestor = root_train.clone();
         tainted_ancestor.derivation_allowed = false;
-        assert!(verify_promotion_eligibility(
-            "ckpt-a10",
-            &checkpoint_policy,
-            &[&tainted_ancestor]
-        ).is_err());
+        assert!(
+            verify_promotion_eligibility("ckpt-a10", &checkpoint_policy, &[&tainted_ancestor])
+                .is_err()
+        );
 
         // Tainted ancestor with EvalOnly must fail
         let eval_ancestor = LineagePolicy::root(DataPurpose::EvalOnly, false);
-        assert!(verify_promotion_eligibility(
-            "ckpt-a10",
-            &checkpoint_policy,
-            &[&eval_ancestor]
-        ).is_err());
+        assert!(
+            verify_promotion_eligibility("ckpt-a10", &checkpoint_policy, &[&eval_ancestor])
+                .is_err()
+        );
     }
 }

@@ -122,7 +122,11 @@ fn mixer_ref(
             let r = 1.0 / (y.iter().map(|x| x * x).sum::<f64>() / D as f64 + EPS).sqrt();
             for col in 0..D {
                 let zv = z[t * HV * D + h * D + col];
-                let gate = if sigmoid_gate { sigmoid(zv) } else { zv * sigmoid(zv) };
+                let gate = if sigmoid_gate {
+                    sigmoid(zv)
+                } else {
+                    zv * sigmoid(zv)
+                };
                 out[t * HV * D + h * D + col] = y[col] * r * w[col] * gate;
             }
         }
@@ -150,11 +154,18 @@ fn conv_matches_the_reference_from_a_start_and_on_a_carried_state() -> Result<()
             let xg = Tensor::from_vec(f32s(&x), (1, seq, CH), &gpu)?;
             let got = gdn_conv_rocm(&xg, &wg, &state, fresh)?;
             let e = rel(&got.flatten_all()?.to_vec1::<f32>()?, &want);
-            let s = rel(&host(&state)?.iter().map(|&v| v as f32).collect::<Vec<_>>(), &next);
+            let s = rel(
+                &host(&state)?.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                &next,
+            );
             println!("conv {state_dtype:?} seq={seq} fresh={fresh}: out {e:.2e}, state {s:.2e}");
             assert!(e < 1e-5, "conv output off by {e}");
             // An f16 state rounds what it keeps.
-            let bound = if state_dtype == DType::F16 { 1e-3 } else { 1e-6 };
+            let bound = if state_dtype == DType::F16 {
+                1e-3
+            } else {
+                1e-6
+            };
             assert!(s < bound, "conv state off by {s}");
         }
     }

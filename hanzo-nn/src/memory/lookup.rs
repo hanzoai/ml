@@ -86,7 +86,7 @@ impl Lookup {
     /// Each group of `k` consecutive slots summed: `[slots / k, dim]`. The sum runs in F32 and is
     /// rounded to `u`'s dtype once.
     pub fn pool(&self, u: &Tensor, k: usize) -> Result<Tensor> {
-        if k == 0 || self.slots.len() % k != 0 {
+        if k == 0 || !self.slots.len().is_multiple_of(k) {
             bail!("{} slots in groups of {k}", self.slots.len());
         }
         let e = self.embed(u)?;

@@ -7,7 +7,9 @@ use hanzo_ml::{DType, Device, Result, Tensor};
 #[test]
 fn sigmoid_matches_the_formula_in_every_float_dtype() -> Result<()> {
     let gpu = Device::new_rocm(0)?;
-    let x: Vec<f32> = (0..4099).map(|i| ((i * 7919) % 2001) as f32 / 125.0 - 8.0).collect();
+    let x: Vec<f32> = (0..4099)
+        .map(|i| ((i * 7919) % 2001) as f32 / 125.0 - 8.0)
+        .collect();
     for (dtype, bound) in [(DType::F32, 1e-6), (DType::F16, 1e-3), (DType::BF16, 1e-2)] {
         let xg = Tensor::from_vec(x.clone(), x.len(), &gpu)?.to_dtype(dtype)?;
         // The kernel sees the input rounded to its dtype.

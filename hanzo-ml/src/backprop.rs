@@ -483,22 +483,14 @@ impl Tensor {
                         let grad = node.eq(arg)?.to_dtype(grad.dtype())?.mul(&grad)?;
                         grads.accumulate(arg, &grad.broadcast_as(arg.dims())?)?;
                     }
-                    Op::ToDType(arg) => {
-                        grads.accumulate(arg, &grad.to_dtype(arg.dtype())?)?
-                    }
-                    Op::Copy(arg) => {
-                        grads.accumulate(arg, &grad)?
-                    }
+                    Op::ToDType(arg) => grads.accumulate(arg, &grad.to_dtype(arg.dtype())?)?,
+                    Op::Copy(arg) => grads.accumulate(arg, &grad)?,
                     Op::Affine { arg, mul, .. } => {
                         let arg_grad = grad.affine(*mul, 0.)?;
                         grads.accumulate(arg, &arg_grad)?
                     }
-                    Op::Unary(arg, UnaryOp::Log) => {
-                        grads.accumulate(arg, &(grad / arg)?)?
-                    }
-                    Op::Unary(arg, UnaryOp::Sin) => {
-                        grads.accumulate(arg, &(&grad * arg.cos())?)?
-                    }
+                    Op::Unary(arg, UnaryOp::Log) => grads.accumulate(arg, &(grad / arg)?)?,
+                    Op::Unary(arg, UnaryOp::Sin) => grads.accumulate(arg, &(&grad * arg.cos())?)?,
                     Op::Unary(arg, UnaryOp::Cos) => {
                         grads.accumulate(arg, &(&grad * arg.sin())?.neg()?)?
                     }
@@ -511,12 +503,8 @@ impl Tensor {
                         let abs_grad = arg.ge(&arg.zeros_like()?)?.where_cond(&ones, &ones.neg()?);
                         grads.accumulate(arg, &(&grad * abs_grad)?)?
                     }
-                    Op::Unary(arg, UnaryOp::Exp) => {
-                        grads.accumulate(arg, &(&grad * *node)?)?
-                    }
-                    Op::Unary(arg, UnaryOp::Neg) => {
-                        grads.accumulate(arg, &grad.neg()?)?
-                    }
+                    Op::Unary(arg, UnaryOp::Exp) => grads.accumulate(arg, &(&grad * *node)?)?,
+                    Op::Unary(arg, UnaryOp::Neg) => grads.accumulate(arg, &grad.neg()?)?,
                     Op::Unary(arg, UnaryOp::Recip) => {
                         let grad = (grad / arg.sqr()?)?;
                         grads.accumulate(arg, &grad.neg()?)?

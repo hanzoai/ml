@@ -29,7 +29,7 @@ pub struct Rows {
 impl Rows {
     /// Rows from `data` (`count × dim`, row-major).
     pub fn new(data: Vec<f32>, dim: usize) -> Result<Rows> {
-        if dim == 0 || data.len() % dim != 0 {
+        if dim == 0 || !data.len().is_multiple_of(dim) {
             bail!("{} values in rows of {dim}", data.len());
         }
         Ok(Rows {

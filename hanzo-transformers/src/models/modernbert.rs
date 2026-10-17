@@ -1373,19 +1373,36 @@ mod tests {
         let vm = hanzo_nn::VarMap::new();
         let (cfg, _) = small(&vm);
         let own = hanzo_nn::VarMap::new();
-        Stack::new(VarBuilder::from_varmap(&own, DType::F32, &Device::Cpu), &cfg, 0).unwrap();
+        Stack::new(
+            VarBuilder::from_varmap(&own, DType::F32, &Device::Cpu),
+            &cfg,
+            0,
+        )
+        .unwrap();
         let names: Vec<String> = own.data().lock().unwrap().keys().cloned().collect();
-        assert!(!names.iter().any(|n| n == "layers.0.attn_norm.weight"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "layers.0.attn_norm.weight"),
+            "{names:?}"
+        );
         assert!(names.iter().any(|n| n == "layers.1.attn_norm.weight"));
         // filled from the backbone's own variables, it reads its stream as the backbone does
         let (xs, mask) = rows();
-        let m = ModernBert::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg).unwrap();
+        let m =
+            ModernBert::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg).unwrap();
         for (n, v) in own.data().lock().unwrap().iter() {
             v.set(vm.data().lock().unwrap()[n].as_tensor()).unwrap();
         }
-        let top = Stack::new(VarBuilder::from_varmap(&own, DType::F32, &Device::Cpu), &cfg, 0).unwrap();
+        let top = Stack::new(
+            VarBuilder::from_varmap(&own, DType::F32, &Device::Cpu),
+            &cfg,
+            0,
+        )
+        .unwrap();
         let want = bits(&m.forward(&xs, &mask).unwrap());
-        assert_eq!(bits(&top.finish(m.stream(&xs, &mask, 0).unwrap()).unwrap()), want);
+        assert_eq!(
+            bits(&top.finish(m.stream(&xs, &mask, 0).unwrap()).unwrap()),
+            want
+        );
     }
 
     /// A backbone of four layers 64 wide over random weights in `vm`.
@@ -1422,9 +1439,20 @@ mod tests {
         let ids: Vec<u32> = lens
             .iter()
             .enumerate()
-            .flat_map(|(r, &n)| (0..12).map(move |i| if i < n { 1 + ((i * 7 + r * 3) % 31) as u32 } else { 0 }))
+            .flat_map(|(r, &n)| {
+                (0..12).map(move |i| {
+                    if i < n {
+                        1 + ((i * 7 + r * 3) % 31) as u32
+                    } else {
+                        0
+                    }
+                })
+            })
             .collect();
-        let mask: Vec<u32> = lens.iter().flat_map(|&n| (0..12).map(move |i| (i < n) as u32)).collect();
+        let mask: Vec<u32> = lens
+            .iter()
+            .flat_map(|&n| (0..12).map(move |i| (i < n) as u32))
+            .collect();
         let dev = Device::Cpu;
         (
             Tensor::from_vec(ids, (3, 12), &dev).unwrap(),
@@ -1433,7 +1461,13 @@ mod tests {
     }
 
     fn bits(t: &Tensor) -> Vec<u32> {
-        t.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().map(|x| x.to_bits()).collect()
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
     }
 
     /// A stream entering any layer, finished, is the forward pass bit for bit: padded, and packed
@@ -1455,7 +1489,12 @@ mod tests {
                 assert_eq!(bits(&m.finish(s).unwrap()), want, "packs {packs}, at {at}");
                 // a stream carried on from an earlier layer is the stream made there
                 let on = m.to(m.stream(&xs, &mask, at / 2).unwrap(), at).unwrap();
-                assert_eq!(bits(&m.finish(on).unwrap()), want, "packs {packs}, {} to {at}", at / 2);
+                assert_eq!(
+                    bits(&m.finish(on).unwrap()),
+                    want,
+                    "packs {packs}, {} to {at}",
+                    at / 2
+                );
             }
         }
     }
@@ -1471,12 +1510,18 @@ mod tests {
             let (cfg, _) = small(&vm);
             let table = vm.data().lock().unwrap()[name].as_tensor().clone();
             if exact {
-                let narrowed = table.to_dtype(DType::F16).unwrap().to_dtype(DType::F32).unwrap();
+                let narrowed = table
+                    .to_dtype(DType::F16)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
                 vm.data().lock().unwrap()[name].set(&narrowed).unwrap();
             }
             let wide = vm.data().lock().unwrap()[name].as_tensor().copy().unwrap();
             let want = bits(&xs.apply(&Embedding::new(wide, 64)).unwrap());
-            let mut m = ModernBert::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg).unwrap();
+            let mut m =
+                ModernBert::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg)
+                    .unwrap();
             m.quantize(GgmlDType::Q8_0).unwrap();
             let held = m.word_embeddings.embeddings().dtype();
             assert_eq!(held, if exact { DType::F16 } else { DType::F32 });
@@ -1503,17 +1548,30 @@ mod tests {
                     top.quantize(GgmlDType::Q8_0).unwrap();
                 }
                 let s = m.stream(&xs, &mask, at).unwrap();
-                assert_eq!(bits(&top.finish(s.clone()).unwrap()), want, "packs {packs}, at {at}");
+                assert_eq!(
+                    bits(&top.finish(s.clone()).unwrap()),
+                    want,
+                    "packs {packs}, at {at}"
+                );
                 // a stack below the stream's layer cannot read it
-                assert!(Stack::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg, at + 1)
-                    .map_or(true, |t| t.finish(s.clone()).is_err()));
+                assert!(Stack::new(
+                    VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu),
+                    &cfg,
+                    at + 1
+                )
+                .map_or(true, |t| t.finish(s.clone()).is_err()));
                 if packs {
                     let again = Stream::packed(&s.rows().unwrap(), at).unwrap();
                     assert_eq!(bits(&top.finish(again).unwrap()), want, "repacked, at {at}");
                 }
             }
         }
-        assert!(Stack::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &cfg, 5).is_err());
+        assert!(Stack::new(
+            VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu),
+            &cfg,
+            5
+        )
+        .is_err());
     }
 
     /// A padded pass attends a tile of queries at a time and answers as its whole scores do, but
@@ -1530,14 +1588,29 @@ mod tests {
         let ids: Vec<u32> = lens
             .iter()
             .enumerate()
-            .flat_map(|(r, &n)| (0..l).map(move |i| if i < n { 1 + ((i * 7 + r * 3) % 31) as u32 } else { 0 }))
+            .flat_map(|(r, &n)| {
+                (0..l).map(move |i| {
+                    if i < n {
+                        1 + ((i * 7 + r * 3) % 31) as u32
+                    } else {
+                        0
+                    }
+                })
+            })
             .collect();
-        let mask: Vec<u32> = lens.iter().flat_map(|&n| (0..l).map(move |i| (i < n) as u32)).collect();
+        let mask: Vec<u32> = lens
+            .iter()
+            .flat_map(|&n| (0..l).map(move |i| (i < n) as u32))
+            .collect();
         let dev = Device::Cpu;
         let xs = Tensor::from_vec(ids, (3, l), &dev).unwrap();
         let mask = Tensor::from_vec(mask, (3, l), &dev).unwrap();
         let s = m.embed(&xs, &mask).unwrap();
-        let Form::Padded { masks: Masks::Whole { .. }, long } = &s.form else {
+        let Form::Padded {
+            masks: Masks::Whole { .. },
+            long,
+        } = &s.form
+        else {
             panic!("rows of 200 tokens over 4 heads tile")
         };
         assert!(long.is_some());
@@ -1594,7 +1667,12 @@ mod tests {
     }
 
     fn host(t: &Tensor) -> Vec<f32> {
-        t.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
     }
 
     /// mmBERT's trained tables (8,192 positions, 32 frequencies) on every device, in F32 and in
@@ -1627,7 +1705,12 @@ mod tests {
                         }
                     }
                 }
-                assert!(worst.0 < tol, "{dev:?} {dtype:?}: {} at position {}", worst.0, worst.1);
+                assert!(
+                    worst.0 < tol,
+                    "{dev:?} {dtype:?}: {} at position {}",
+                    worst.0,
+                    worst.1
+                );
             }
         }
     }

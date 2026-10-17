@@ -2447,7 +2447,8 @@ pub fn gdn_mixer_rocm(
     ];
     let out = dev.alloc::<f32>(batch * seq * hv * D)?;
     let mut po = out.as_ptr() as *mut std::ffi::c_void;
-    let (mut stride, mut s_u, mut hk_u, mut hv_u) = (width as u32, seq as u32, hk as u32, hv as u32);
+    let (mut stride, mut s_u, mut hk_u, mut hv_u) =
+        (width as u32, seq as u32, hk as u32, hv as u32);
     let (mut eps_f, mut sig) = (eps, sigmoid_gate as i32);
     let [pq, pa, pb, pz, pac, pdt, pw, ps] = &mut p;
     unsafe {

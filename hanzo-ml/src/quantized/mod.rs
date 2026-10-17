@@ -1174,7 +1174,7 @@ impl QTensor {
     /// `dst [m, n] = lhs [m, k] · Wᵀ` for this `[n, k]` CPU weight, without allocating.
     pub fn matmul_into(&self, lhs: &[f32], dst: &mut [f32]) -> Result<()> {
         let (n, k) = self.shape.dims2()?;
-        if k == 0 || lhs.len() % k != 0 {
+        if k == 0 || !lhs.len().is_multiple_of(k) {
             crate::bail!("matmul_into: lhs of {} values for k {k}", lhs.len());
         }
         let m = lhs.len() / k;
@@ -1777,7 +1777,12 @@ pub enum QMatMul {
 /// `t` laid out from element 0 of its own storage. The device kernels here read a raw buffer from
 /// its start, and a contiguous view can begin inside one (the last row of a batch, say); that view
 /// is copied out.
-#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan", feature = "wgpu"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan",
+    feature = "wgpu"
+))]
 fn packed(t: &Tensor) -> Result<Tensor> {
     if t.is_contiguous() && t.layout().start_offset() == 0 {
         Ok(t.clone())

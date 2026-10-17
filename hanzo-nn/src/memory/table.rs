@@ -250,13 +250,13 @@ impl Table {
         let raw = self.row(r)?;
         match self.dtype {
             DType::F32 => {
-                for (o, b) in out.iter_mut().zip(raw.chunks_exact(4)) {
-                    *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                for (o, b) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
+                    *o = f32::from_le_bytes(*b);
                 }
             }
             DType::BF16 => {
-                for (o, b) in out.iter_mut().zip(raw.chunks_exact(2)) {
-                    *o = half::bf16::from_le_bytes([b[0], b[1]]).to_f32();
+                for (o, b) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+                    *o = half::bf16::from_le_bytes(*b).to_f32();
                 }
             }
             _ => {
@@ -296,7 +296,7 @@ impl Table {
         dtype: DType,
         per: usize,
     ) -> Result<Vec<PathBuf>> {
-        if dim == 0 || data.len() % dim != 0 || per == 0 {
+        if dim == 0 || !data.len().is_multiple_of(dim) || per == 0 {
             bail!(
                 "a table of {} values in rows of {dim}, {per} a shard",
                 data.len()

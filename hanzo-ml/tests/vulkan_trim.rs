@@ -23,10 +23,21 @@ fn a_trim_gives_the_idle_pool_back() -> Result<()> {
     }
     drop(big);
     dev.synchronize()?;
-    assert!(vk.pool_free_bytes() >= 3 << 29, "{} idle", vk.pool_free_bytes());
+    assert!(
+        vk.pool_free_bytes() >= 3 << 29,
+        "{} idle",
+        vk.pool_free_bytes()
+    );
     dev.trim();
-    assert!(vk.pool_free_bytes() <= 1 << 30, "{} idle after a trim", vk.pool_free_bytes());
+    assert!(
+        vk.pool_free_bytes() <= 1 << 30,
+        "{} idle after a trim",
+        vk.pool_free_bytes()
+    );
     let x = Tensor::arange(0f32, 8., &dev)?;
-    assert_eq!((&x + &x)?.to_vec1::<f32>()?, (0..8).map(|i| 2. * i as f32).collect::<Vec<_>>());
+    assert_eq!(
+        (&x + &x)?.to_vec1::<f32>()?,
+        (0..8).map(|i| 2. * i as f32).collect::<Vec<_>>()
+    );
     Ok(())
 }

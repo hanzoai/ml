@@ -72,9 +72,20 @@ fn a_long_row_holds_no_square_tensor() -> Result<()> {
     let ids: Vec<u32> = lens
         .iter()
         .enumerate()
-        .flat_map(|(r, &n)| (0..l).map(move |t| if t < n { 1 + ((r * 13 + t * 7) % 49) as u32 } else { 0 }))
+        .flat_map(|(r, &n)| {
+            (0..l).map(move |t| {
+                if t < n {
+                    1 + ((r * 13 + t * 7) % 49) as u32
+                } else {
+                    0
+                }
+            })
+        })
         .collect();
-    let mask: Vec<u32> = lens.iter().flat_map(|&n| (0..l).map(move |t| u32::from(t < n))).collect();
+    let mask: Vec<u32> = lens
+        .iter()
+        .flat_map(|&n| (0..l).map(move |t| u32::from(t < n)))
+        .collect();
     let ids = Tensor::from_vec(ids, (2, l), &dev)?;
     let mask = Tensor::from_vec(mask, (2, l), &dev)?;
 
@@ -84,7 +95,11 @@ fn a_long_row_holds_no_square_tensor() -> Result<()> {
     let want = bert.forward(&ids, &mask)?;
     let (peak, largest) = (PEAK.load(Relaxed) - base, LARGEST.load(Relaxed));
     // whole, a global layer's scores alone are [2, 2, L, L] in F32, 6.7 GB
-    assert!(largest < l * l, "a block of {largest} bytes, {l} x {l} is {}", l * l);
+    assert!(
+        largest < l * l,
+        "a block of {largest} bytes, {l} x {l} is {}",
+        l * l
+    );
     assert!(peak < 4 * l * l, "{peak} bytes held at once");
 
     let keep = mask.to_dtype(DType::F32)?.unsqueeze(2)?;

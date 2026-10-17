@@ -46,7 +46,9 @@ pub mod provenance;
 pub mod wal;
 pub mod wire;
 
-pub use canonical::{canonicalize_string, canonicalize_value, rfc8785_canonicalize, rfc8785_digest};
+pub use canonical::{
+    canonicalize_string, canonicalize_value, rfc8785_canonicalize, rfc8785_digest,
+};
 pub use lineage::{
     derive_lineage_policy, verify_promotion_eligibility, ArtifactRef, Claim, ContaminationError,
     DataPurpose, DeterminismReport, EnvironmentV1, GateSpec, LineagePolicy, PairEvidence,
@@ -361,7 +363,12 @@ impl Research {
     }
 
     /// Upload a serializable value formatted with RFC 8785 canonical JSON as a report artifact.
-    pub fn upload_json_artifact<T: Serialize>(&self, kind: &str, run_id: &str, value: &T) -> Result<Stored> {
+    pub fn upload_json_artifact<T: Serialize>(
+        &self,
+        kind: &str,
+        run_id: &str,
+        value: &T,
+    ) -> Result<Stored> {
         let bytes = canonical::rfc8785_canonicalize(value)?;
         self.upload_artifact_with_meta(
             &format!("{run_id}:{kind}"),
@@ -439,7 +446,10 @@ impl Research {
     }
 
     /// Verify that an artifact's lineage policy allows training. Fails closed with ContaminationError.
-    pub fn verify_lineage(&self, policy: &LineagePolicy) -> std::result::Result<(), ContaminationError> {
+    pub fn verify_lineage(
+        &self,
+        policy: &LineagePolicy,
+    ) -> std::result::Result<(), ContaminationError> {
         policy.assert_trainable("research_client")
     }
 
@@ -666,7 +676,11 @@ impl Experiment {
             content: base64::engine::general_purpose::STANDARD.encode(bytes),
             sha256: sha256.clone(),
             content_sha256: sha256,
-            media_type: if kind == "snapshot" { "image/png".to_string() } else { "text/plain".to_string() },
+            media_type: if kind == "snapshot" {
+                "image/png".to_string()
+            } else {
+                "text/plain".to_string()
+            },
             canonicalization: "raw".to_string(),
             compression: "none".to_string(),
             uncompressed_size: bytes.len() as u64,
@@ -845,7 +859,6 @@ struct IngestRequest<'a> {
 // server omits, and unknown fields are ignored — so a server that adds a column, or the
 // Go ack's `_total` vs the spec's `_retained` naming, never breaks a client.
 
-
 /// One stored experiment row, as returned by [`Research::query`] (the canonical view).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -879,7 +892,6 @@ pub struct Ack {
     pub attempts_total: u64,
     pub rolled_up: bool,
 }
-
 
 /// Headline aggregate (canonical + retained) plus a per-kind breakdown.
 #[derive(Debug, Clone, Default, Deserialize)]

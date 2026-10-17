@@ -6,8 +6,8 @@
 //! Solves the "pre-norm dilution" problem in deep transformers (48-80+ layers), enabling
 //! direct highway gradient routing from layer L back to layer 1.
 
-use hanzo_ml::{Module, Result, Tensor};
 use crate::Linear;
+use hanzo_ml::{Module, Result, Tensor};
 
 /// Depth-wise attention residual connection module.
 #[derive(Debug, Clone)]
@@ -22,7 +22,11 @@ impl AttentionResiduals {
         let q_proj = crate::linear_no_bias(hidden_dim, depth_dim, vb.pp("q_proj"))?;
         let k_proj = crate::linear_no_bias(hidden_dim, depth_dim, vb.pp("k_proj"))?;
         let scale = 1.0 / (depth_dim as f64).sqrt();
-        Ok(Self { q_proj, k_proj, scale })
+        Ok(Self {
+            q_proj,
+            k_proj,
+            scale,
+        })
     }
 
     /// Forward pass aggregating preceding layer hidden states.
@@ -42,7 +46,9 @@ impl AttentionResiduals {
         for state in states {
             let key = self.k_proj.forward(state)?;
             // Dot product along depth dimension: [B, S, 1]
-            let score = (&query * &key)?.sum_keepdim(hanzo_ml::D::Minus1)?.affine(self.scale, 0.0)?;
+            let score = (&query * &key)?
+                .sum_keepdim(hanzo_ml::D::Minus1)?
+                .affine(self.scale, 0.0)?;
             weights.push(score);
         }
 

@@ -427,8 +427,19 @@ mod tests {
         )
     }
 
-    /// A chunk over the cache equals the block-causal pass at its positions, bit for bit; one
-    /// chunk is the bidirectional pass; no key past a query's chunk is read.
+    /// The largest elementwise difference between two equally shaped outputs.
+    fn gap(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .flatten()
+            .zip(b.iter().flatten())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    }
+
+    /// A chunk over the cache equals the block-causal pass at its positions (to the last bits of
+    /// an f32 sum where two kernels compute it); one chunk is the bidirectional pass, bit for
+    /// bit; no key past a query's chunk is read.
     #[test]
     fn a_chunk_over_the_cache_is_the_chunked_pass() -> Result<()> {
         let dev = Device::Cpu;
@@ -443,10 +454,17 @@ mod tests {
             let chunks = [4usize, 7, 10];
             let full = chunked(&qkv, &[l], &[&chunks], heads, window, &cos, &sin, 0.5)?
                 .to_vec2::<f32>()?;
-            // the first chunk sees nothing past itself: equal to the pass over it alone
+            // the first chunk sees nothing past itself: equal to the pass over it alone. The two
+            // are different kernels (packed over 4 rows, chunked over 21), so they agree to the
+            // last bits of an f32 sum, not bit for bit; a key read past the chunk would be off by
+            // the size of a score.
             let head = packed(&qkv.narrow(0, 0, 4)?, &[4], heads, window, &cos, &sin, 0.5)?
                 .to_vec2::<f32>()?;
-            assert_eq!(&full[..4], &head[..]);
+            let worst = gap(&full[..4], &head);
+            assert!(
+                worst <= 1e-6,
+                "first chunk differs from its own pass by {worst}"
+            );
             let (mut k, mut v) = (vec![0f32; l * hd], vec![0f32; l * hd]);
             let mut at = 0;
             let mut grown = Vec::new();
@@ -456,7 +474,12 @@ mod tests {
                 grown.extend(out.to_vec2::<f32>()?);
                 at += c;
             }
-            assert_eq!(grown, full);
+            // the cache path (`extend`) and the block pass are different kernels too
+            let worst = gap(&grown, &full);
+            assert!(
+                worst <= 1e-6,
+                "the cache path differs from the block pass by {worst}"
+            );
         }
         // two sequences packed, chunked differently
         let qkv2 = Tensor::randn(0f32, 1., (l + 5, 3 * hd), &dev)?;
