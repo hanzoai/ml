@@ -1,0 +1,10 @@
+[package]
+name = "hanzo-active-inference"
+version = "0.1.0"
+edition = "2021"
+description = "Finite-state active inference: Bayesian filtering, expected free energy, policy posteriors and Dirichlet learning"
+repository = "https://github.com/hanzoai/ml"
+license = "MIT OR Apache-2.0"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
