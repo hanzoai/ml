@@ -5,6 +5,7 @@
 # excluded and therefore never built, tested or linted by CI — 64 op tests behind a lock nothing
 # turned. It is a member; the `check`/`test`/`clippy` jobs install protoc for its build script.
 members = [
+    "hanzo-active-inference",
     "hanzo-3d",
     "hanzo-datasets",
     "hanzo-flash-attn-v3",
