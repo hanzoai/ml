@@ -1628,7 +1628,7 @@ fn hanzo_onnx_m(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[pymodule]
-fn hanzo(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let utils = PyModule::new(py, "utils")?;
     hanzo_utils(py, &utils)?;
     m.add_submodule(&utils)?;
