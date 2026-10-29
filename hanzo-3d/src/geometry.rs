@@ -195,3 +195,114 @@ impl Camera {
         self.rot.transpose().mul_vec(cam - self.t)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_near(a: Vec3, b: Vec3) {
+        let d = (a - b).length();
+        assert!(d < 1e-5, "{a:?} vs {b:?} differ by {d}");
+    }
+
+    #[test]
+    fn vec3_arithmetic_and_products() {
+        let a = Vec3::new(1.0, 2.0, 3.0);
+        let b = Vec3::new(4.0, 5.0, 6.0);
+        assert_eq!(a + b, Vec3::new(5.0, 7.0, 9.0));
+        assert_eq!(b - a, Vec3::new(3.0, 3.0, 3.0));
+        assert_eq!(a * 2.0, Vec3::new(2.0, 4.0, 6.0));
+        assert_eq!(a.dot(b), 32.0);
+        assert_eq!(
+            Vec3::new(1.0, 0.0, 0.0).cross(Vec3::new(0.0, 1.0, 0.0)),
+            Vec3::new(0.0, 0.0, 1.0)
+        );
+        // Cross is anti-commutative and orthogonal to both operands.
+        assert_eq!(a.cross(b), Vec3::new(-3.0, 6.0, -3.0));
+        assert_eq!(b.cross(a), Vec3::new(3.0, -6.0, 3.0));
+        assert_eq!(a.cross(b).dot(a), 0.0);
+        assert_eq!(a.cross(b).dot(b), 0.0);
+    }
+
+    #[test]
+    fn vec3_length_and_normalize() {
+        assert_eq!(Vec3::new(3.0, 4.0, 0.0).length(), 5.0);
+        assert_near(
+            Vec3::new(3.0, 4.0, 0.0).normalize(),
+            Vec3::new(0.6, 0.8, 0.0),
+        );
+        // The zero vector normalizes to itself rather than NaN.
+        assert_eq!(Vec3::ZERO.normalize(), Vec3::ZERO);
+    }
+
+    #[test]
+    fn mat3_identity_and_double_transpose() {
+        let v = Vec3::new(1.0, -2.0, 3.0);
+        assert_eq!(Mat3::IDENTITY.mul_vec(v), v);
+        let m = Quat::new(0.5, 0.5, -0.5, 0.5).to_mat3();
+        assert_eq!(m.transpose().transpose(), m);
+    }
+
+    #[test]
+    fn quat_identity_is_the_identity_matrix() {
+        assert_eq!(Quat::IDENTITY.to_mat3(), Mat3::IDENTITY);
+    }
+
+    #[test]
+    fn quat_known_rotations() {
+        // 180° about x flips y and z.
+        let half_turn = Quat::new(0.0, 1.0, 0.0, 0.0).to_mat3();
+        assert_near(
+            half_turn.mul_vec(Vec3::new(0.0, 1.0, 0.0)),
+            Vec3::new(0.0, -1.0, 0.0),
+        );
+        assert_near(
+            half_turn.mul_vec(Vec3::new(0.0, 0.0, 1.0)),
+            Vec3::new(0.0, 0.0, -1.0),
+        );
+        assert_near(
+            half_turn.mul_vec(Vec3::new(1.0, 0.0, 0.0)),
+            Vec3::new(1.0, 0.0, 0.0),
+        );
+        // 90° about z takes x to y.
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let quarter_turn = Quat::new(s, 0.0, 0.0, s).to_mat3();
+        assert_near(
+            quarter_turn.mul_vec(Vec3::new(1.0, 0.0, 0.0)),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        assert_near(
+            quarter_turn.mul_vec(Vec3::new(0.0, 1.0, 0.0)),
+            Vec3::new(-1.0, 0.0, 0.0),
+        );
+    }
+
+    #[test]
+    fn quat_rotation_matrices_are_orthonormal() {
+        // (1, 2, 3, 4) / sqrt(30)
+        let m = Quat::new(0.182_574_2, 0.365_148_4, 0.547_722_6, 0.730_296_7).to_mat3();
+        for row in m.r {
+            assert!((row.length() - 1.0).abs() < 1e-5, "row {row:?} not unit");
+        }
+        assert!(m.r[0].dot(m.r[1]).abs() < 1e-5);
+        assert!(m.r[1].dot(m.r[2]).abs() < 1e-5);
+        assert!(m.r[0].dot(m.r[2]).abs() < 1e-5);
+        // For a rotation, the transpose is the inverse.
+        let v = Vec3::new(0.3, -1.2, 2.5);
+        assert_near(m.transpose().mul_vec(m.mul_vec(v)), v);
+    }
+
+    #[test]
+    fn camera_known_projection() {
+        let cam = Camera::look_forward(2.0, 2.0, 100.0, 50.0);
+        let (u, v, depth) = cam.project(Vec3::new(1.0, 2.0, 4.0));
+        assert_eq!(depth, 4.0);
+        assert_eq!(u, 100.5); // 2*1/4 + 100
+        assert_eq!(v, 51.0); // 2*2/4 + 50
+                             // A translated camera shifts depth and the projected point.
+        let mut moved = cam;
+        moved.t = Vec3::new(0.0, 0.0, -1.0);
+        let (_, _, depth2) = moved.project(Vec3::new(0.0, 0.0, 4.0));
+        assert_eq!(depth2, 3.0);
+    }
+}
