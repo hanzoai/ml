@@ -1,6 +1,6 @@
 [project]
-name = 'hanzo-nn'
-requires-python = '>=3.7'
+name = 'hanzo-ml'
+requires-python = '>=3.8'
 authors = [
     {name = 'The ML Team'},
 ]
@@ -13,8 +13,8 @@ dynamic = [
 ]
 
 [project.urls]
-Homepage = 'https://github.com/huggingface/hanzo'
-Source = 'https://github.com/huggingface/hanzo'
+Homepage = 'https://github.com/hanzoai/ml'
+Source = 'https://github.com/hanzoai/ml'
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
@@ -22,7 +22,7 @@ build-backend = "maturin"
 
 [tool.maturin]
 python-source = "py_src"
-module-name = "hanzo.hanzo"
+module-name = "hanzo_ml._native"
 bindings = 'pyo3'
 features = ["pyo3/extension-module"]
 

@@ -1,26 +1,19 @@
-## Installation 
+# Hanzo ML for Python
 
-From the `hanzo-ml-pyo3` directory, enable a virtual env where you will want the
-hanzo package to be installed then run.
+The Python bindings for the public `hanzo-ml` tensor library. Distribution: `hanzo-ml`; import: `hanzo_ml`. The extension is `hanzo_ml._native`. This library contains generic tensor operations; application model weights are separate.
 
-```bash
-maturin develop -r 
-python test.py
+Build from a checkout of hanzoai/ml:
+
+```sh
+python -m pip install maturin
+RUSTFLAGS="-C target-cpu=native" maturin build --release --manifest-path hanzo-ml-pyo3/Cargo.toml
+python -m pip install target/wheels/hanzo_ml-*.whl
 ```
 
-## Generating Stub Files for Type Hinting
-
-For type hinting support, the `hanzo-ml-pyo3` package requires `*.pyi` files. You can automatically generate these files using the `stub.py` script.
-
-### Steps:
-1. Install the package using `maturin`.
-2. Generate the stub files by running:
-   ```
-   python stub.py
-   ```
-
-### Validation:
-To ensure that the stub files match the current implementation, execute:
+```python
+import hanzo_ml as ml
+features = (ml.Tensor([10.0, 20.0, 0.0, 0.0]) / 100).values()
+print(features)
 ```
-python stub.py --check
-```
+
+Python and Rust share the same tensor implementation. The binding exposes `Tensor`, dtype constants, factory functions, and `functional` operations. Packaging changes do not publish a PyPI release automatically; use a built wheel until a release is confirmed.

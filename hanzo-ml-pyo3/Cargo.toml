@@ -2,7 +2,7 @@
 name = "hanzo-ml-pyo3"
 # Not published: a Python extension module; it ships to PyPI via maturin, not to crates.io.
 publish = false
-version = "0.11.8"
+version = "0.11.9"
 edition = "2021"
 description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -12,7 +12,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [lib]
-name = "hanzo"
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
