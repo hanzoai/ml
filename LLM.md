@@ -154,3 +154,13 @@ crate on top of these; a generator that only checks itself learns nothing new.
 - **Zen** models are our own family — don't present upstream model names as ours.
 
 Spec: `~/work/hanzo/SDK-ARCHITECTURE.md` — the canonical one-way SDK model.
+
+## Local active inference
+
+`hanzo-active-inference/` owns finite-state Bayesian filtering, variational free
+energy, exact risk/ambiguity and information-gain EFE, finite open-loop policy
+posteriors and Dirichlet A/B learning. CPU f64 values, no tensor/backend dependency.
+`cargo test -p hanzo-active-inference` holds the mathematical identities, refusal
+boundaries and learning conservation. Engine hosts consume this crate, never copy
+its math. Its README states the limits: no contingent trees, parameter epistemic
+value or global loopy graph inference. It has no execution interface.
