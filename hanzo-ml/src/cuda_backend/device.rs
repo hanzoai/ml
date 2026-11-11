@@ -630,17 +630,23 @@ impl CudaDevice {
     }
 
     fn unified_location(&self, to_device: bool) -> cuda_sys::CUmemLocation {
-        if to_device {
-            cuda_sys::CUmemLocation {
+        #[repr(C)]
+        struct RawLocation {
+            type_: cuda_sys::CUmemLocationType,
+            id: i32,
+        }
+        let raw = if to_device {
+            RawLocation {
                 type_: cuda_sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
                 id: self.context.ordinal() as i32,
             }
         } else {
-            cuda_sys::CUmemLocation {
+            RawLocation {
                 type_: cuda_sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_HOST,
                 id: 0,
             }
-        }
+        };
+        unsafe { std::mem::transmute(raw) }
     }
 
     fn mem_advise_raw(

@@ -17,7 +17,10 @@ fn test_ultrabert_parity() -> Result<()> {
     let golden_path = base_path.join("golden_out.safetensors");
 
     if !weights_path.exists() || !golden_path.exists() {
-        println!("Skipping parity test: weights or golden output not found at {:?}", base_path);
+        println!(
+            "Skipping parity test: weights or golden output not found at {:?}",
+            base_path
+        );
         return Ok(());
     }
 
@@ -30,18 +33,18 @@ fn test_ultrabert_parity() -> Result<()> {
         .map_err(|e| hanzo_ml::Error::Msg(format!("failed to parse config: {e}")))?;
 
     // Load weights
-    let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &dev)?
-    };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &dev)? };
 
     println!("Loading UltrabertModel in Rust...");
     let model = UltrabertModel::load(vb.pp("ultrabert"), &cfg)?;
 
     // Load golden inputs and outputs
     let golden_tensors = hanzo_ml::safetensors::load(&golden_path, &dev)?;
-    let input_ids = golden_tensors.get("input_ids")
+    let input_ids = golden_tensors
+        .get("input_ids")
         .ok_or_else(|| hanzo_ml::Error::Msg("missing input_ids in golden".into()))?;
-    let expected_out = golden_tensors.get("output")
+    let expected_out = golden_tensors
+        .get("output")
         .ok_or_else(|| hanzo_ml::Error::Msg("missing output in golden".into()))?;
 
     // In PyTorch, input_ids is int64, in hanzo-ml it should be u32
@@ -51,7 +54,10 @@ fn test_ultrabert_parity() -> Result<()> {
         input_ids.clone()
     };
 
-    println!("Running Rust forward pass on input_ids {:?}...", input_ids.dims());
+    println!(
+        "Running Rust forward pass on input_ids {:?}...",
+        input_ids.dims()
+    );
     let actual_out = model.forward(&input_ids, None)?;
 
     assert_eq!(actual_out.dims(), expected_out.dims());
@@ -70,6 +76,9 @@ fn test_ultrabert_parity() -> Result<()> {
         max_diff
     );
 
-    println!("UltraBERT PyTorch numerical bit parity verified successfully! (max |Δ| = {:e})", max_diff);
+    println!(
+        "UltraBERT PyTorch numerical bit parity verified successfully! (max |Δ| = {:e})",
+        max_diff
+    );
     Ok(())
 }

@@ -89,20 +89,60 @@ fn rotate(x: &[f32], out: &mut [f32], cos: &[f32], sin: &[f32], half: usize, mul
 /// `ka`) and beyond `window` of query `i` masked out first.
 #[inline]
 fn softmax(row: &mut [f32], i: usize, ka: usize, bound: usize, window: Option<usize>) {
-    for (j, x) in row.iter_mut().enumerate() {
-        let key = ka + j;
-        if key >= bound || window.is_some_and(|w| key.abs_diff(i) > w) {
-            *x = f32::NEG_INFINITY;
-        }
+    let len = row.len();
+    let (left, right) = if let Some(w) = window {
+        let l = i.saturating_sub(w).saturating_sub(ka).min(len);
+        let r = (i + w + 1).min(bound).saturating_sub(ka).min(len);
+        (l, r)
+    } else if ka + len > bound {
+        (0, bound.saturating_sub(ka).min(len))
+    } else {
+        (0, len)
+    };
+    if left >= right {
+        row.fill(f32::NAN);
+        return;
     }
-    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    row[..left].fill(0.0);
+    row[right..].fill(0.0);
+    let active = &mut row[left..right];
+    let max = active.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0f32;
-    for x in row.iter_mut() {
+    for x in active.iter_mut() {
         *x = (*x - max).exp();
         sum += *x;
     }
-    for x in row.iter_mut() {
+    for x in active.iter_mut() {
         *x /= sum;
+    }
+}
+
+/// Vectorized `e^x` for `x ≤ 0` (Cephes polynomial, within 2 ULP of `expf`), used by [`packed_dlsa`].
+#[inline(always)]
+fn exp_neg(x: f32) -> f32 {
+    let x = x.max(-87.0);
+    let n = (x * std::f32::consts::LOG2_E + 0.5).floor();
+    let r = x - n * 0.693_359_4 + n * 2.121_944_4e-4;
+    let p = ((((1.987_569_1e-4 * r + 1.398_199_9e-3) * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r
+        + 1.666_666_5e-1)
+        * r
+        + 0.5;
+    let y = p * r * r + r + 1.0;
+    y * f32::from_bits(((n as i32 + 127) << 23) as u32)
+}
+
+#[inline]
+fn softmax_unmasked_fast(row: &mut [f32]) {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0f32;
+    for x in row.iter_mut() {
+        let e = exp_neg(*x - max);
+        *x = e;
+        sum += e;
+    }
+    let inv = 1.0 / sum.max(1e-30);
+    for x in row.iter_mut() {
+        *x *= inv;
     }
 }
 
@@ -222,14 +262,20 @@ fn core(
             return;
         }
         let bound = |i: usize| chunks.map_or(l, |c| chunk_end(c[seq], i));
+        let use_vh = chunks.is_none() && l >= BLOCK;
         SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
-            let need = 2 * l * d + BLOCK * l;
+            let need = (if use_vh { 3 } else { 2 }) * l * d + BLOCK * l;
             if scratch.len() < need {
                 scratch.resize(need, 0.);
             }
             let (q, rest) = scratch.split_at_mut(l * d);
-            let (k, s) = rest.split_at_mut(l * d);
+            let (k, rest) = rest.split_at_mut(l * d);
+            let (vh, s) = if use_vh {
+                rest.split_at_mut(l * d)
+            } else {
+                (&mut [][..], rest)
+            };
             // rotate: the first half of a head against the second, by position
             for i in 0..l {
                 let row = &src[(start + i) * w3..(start + i + 1) * w3];
@@ -239,8 +285,11 @@ fn core(
                 );
                 rotate(&row[h * d..], &mut q[i * d..], cs, sn, half, scale);
                 rotate(&row[hd + h * d..], &mut k[i * d..], cs, sn, half, 1.);
+                if use_vh {
+                    vh[i * d..(i + 1) * d]
+                        .copy_from_slice(&row[2 * hd + h * d..2 * hd + (h + 1) * d]);
+                }
             }
-            let v = src[start * w3 + 2 * hd + h * d..].as_ptr();
             let mut i0 = 0;
             while i0 < l {
                 let i1 = (i0 + BLOCK).min(l);
@@ -266,21 +315,331 @@ fn core(
                 }
                 // out[i0..i1, head] = probs [bm, bn] · v[ka..kb, head]
                 unsafe {
-                    mm(
-                        (bm, d, bn),
-                        (dst as *mut f32).add((start + i0) * hd + h * d),
-                        (hd as isize, 1),
-                        s.as_ptr(),
-                        (bn as isize, 1),
-                        v.add(ka * w3),
-                        (w3 as isize, 1),
-                    )
+                    if use_vh {
+                        mm(
+                            (bm, d, bn),
+                            (dst as *mut f32).add((start + i0) * hd + h * d),
+                            (hd as isize, 1),
+                            s.as_ptr(),
+                            (bn as isize, 1),
+                            vh[ka * d..].as_ptr(),
+                            (d as isize, 1),
+                        );
+                    } else {
+                        mm(
+                            (bm, d, bn),
+                            (dst as *mut f32).add((start + i0) * hd + h * d),
+                            (hd as isize, 1),
+                            s.as_ptr(),
+                            (bn as isize, 1),
+                            src[(start + ka) * w3 + 2 * hd + h * d..].as_ptr(),
+                            (w3 as isize, 1),
+                        );
+                    }
                 };
                 i0 = i1;
             }
         });
     });
     drop((qg, cg, sg));
+    Tensor::from_vec(out, (t, hd), qkv.device())
+}
+
+/// Coalesced contiguous key spans `(ka, kb)` and total selected tokens `bn` for one 64-query block.
+#[derive(Clone, Debug)]
+struct BlockSpans {
+    spans: Vec<(usize, usize)>,
+    bn: usize,
+}
+
+/// Build per-query-block coalesced key spans for sequence of length `l` from `q_idx` and `k_idx`.
+fn build_sequence_dlsa_spans(
+    q_idx: &[f32],
+    k_idx: &[f32],
+    l: usize,
+    d_idx: usize,
+    k_budget: usize,
+    sink_tokens: usize,
+    local_window: usize,
+) -> Vec<BlockSpans> {
+    let nb = l.div_ceil(BLOCK);
+    let target_nb = k_budget.div_ceil(BLOCK).clamp(1, nb);
+    if target_nb >= nb {
+        return (0..nb)
+            .map(|_| BlockSpans {
+                spans: vec![(0, l)],
+                bn: l,
+            })
+            .collect();
+    }
+
+    // Pool q_idx and k_idx into [nb, d_idx] bucket summaries (0.5 * mean + 0.5 * absmax, L2-normalized)
+    let mut bq = vec![0f32; nb * d_idx];
+    let mut bk = vec![0f32; nb * d_idx];
+    bq.par_chunks_mut(d_idx)
+        .zip(bk.par_chunks_mut(d_idx))
+        .enumerate()
+        .for_each(|(b, (q_out, k_out))| {
+            let (t0, t1) = (b * BLOCK, ((b + 1) * BLOCK).min(l));
+            let inv = 1.0 / ((t1 - t0) as f32);
+            let mut q_max = vec![0f32; d_idx];
+            let mut k_max = vec![0f32; d_idx];
+            for t in t0..t1 {
+                let qr = &q_idx[t * d_idx..(t + 1) * d_idx];
+                let kr = &k_idx[t * d_idx..(t + 1) * d_idx];
+                for c in 0..d_idx {
+                    let (qv, kv) = (qr[c], kr[c]);
+                    q_out[c] += qv;
+                    k_out[c] += kv;
+                    if qv.abs() > q_max[c].abs() {
+                        q_max[c] = qv;
+                    }
+                    if kv.abs() > k_max[c].abs() {
+                        k_max[c] = kv;
+                    }
+                }
+            }
+            let (mut qn, mut kn) = (0f32, 0f32);
+            for c in 0..d_idx {
+                q_out[c] = 0.5 * (q_out[c] * inv) + 0.5 * q_max[c];
+                k_out[c] = 0.5 * (k_out[c] * inv) + 0.5 * k_max[c];
+                qn += q_out[c] * q_out[c];
+                kn += k_out[c] * k_out[c];
+            }
+            let q_scale = 1.0 / (qn.sqrt() + 1e-8);
+            let k_scale = 1.0 / (kn.sqrt() + 1e-8);
+            for c in 0..d_idx {
+                q_out[c] *= q_scale;
+                k_out[c] *= k_scale;
+            }
+        });
+
+    let sink_nb = sink_tokens.div_ceil(BLOCK).min(nb);
+    let local_nb = local_window.div_ceil(BLOCK);
+
+    (0..nb)
+        .into_par_iter()
+        .map(|bi| {
+            let mut forced = vec![false; nb];
+            let mut cands: Vec<(f32, usize)> = Vec::with_capacity(nb);
+            let mut sel: Vec<usize> = Vec::with_capacity(target_nb + 4);
+            for b in 0..sink_nb {
+                forced[b] = true;
+                sel.push(b);
+            }
+            let lo = bi.saturating_sub(local_nb);
+            let hi = (bi + local_nb).min(nb - 1);
+            for b in lo..=hi {
+                if !forced[b] {
+                    forced[b] = true;
+                    sel.push(b);
+                }
+            }
+            if sel.len() < target_nb {
+                let rem = target_nb - sel.len();
+                let qv = &bq[bi * d_idx..(bi + 1) * d_idx];
+                for bj in 0..nb {
+                    if !forced[bj] {
+                        let kv = &bk[bj * d_idx..(bj + 1) * d_idx];
+                        let mut dot = 0f32;
+                        for c in 0..d_idx {
+                            dot += qv[c] * kv[c];
+                        }
+                        cands.push((dot, bj));
+                    }
+                }
+                if cands.len() > rem {
+                    cands.select_nth_unstable_by(rem - 1, |a, b| {
+                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    cands.truncate(rem);
+                }
+                for &(_, bj) in &cands {
+                    sel.push(bj);
+                }
+            }
+            sel.sort_unstable();
+
+            // Coalesce adjacent buckets into contiguous token spans (ka, kb)
+            let mut spans: Vec<(usize, usize)> = Vec::with_capacity(sel.len());
+            let mut bn = 0;
+            for &b in &sel {
+                let (ka, kb) = (b * BLOCK, ((b + 1) * BLOCK).min(l));
+                bn += kb - ka;
+                if let Some(last) = spans.last_mut() {
+                    if last.1 == ka {
+                        last.1 = kb;
+                        continue;
+                    }
+                }
+                spans.push((ka, kb));
+            }
+            BlockSpans { spans, bn }
+        })
+        .collect()
+}
+
+/// Bidirectional Block-Packed Distilled Latent Sparse Attention (D-LSA) over packed sequences,
+/// F32 on the CPU.
+///
+/// Uses `gemm::gemm` over coalesced 64-token buckets per query block, preserving prefix
+/// `sink_tokens`, bilateral `local_window`, and top-$K$ retrieved buckets up to `k_budget`.
+#[allow(clippy::too_many_arguments)]
+pub fn packed_dlsa(
+    qkv: &Tensor,
+    q_idx: &Tensor,
+    k_idx: &Tensor,
+    lens: &[usize],
+    heads: usize,
+    cos: &Tensor,
+    sin: &Tensor,
+    scale: f32,
+    k_budget: usize,
+    sink_tokens: usize,
+    local_window: usize,
+) -> Result<Tensor> {
+    if lens.iter().all(|&l| l <= k_budget) {
+        return packed(qkv, lens, heads, None, cos, sin, scale);
+    }
+    let d = check(qkv, lens, heads, cos, sin)?;
+    let half = d / 2;
+    let t = qkv.dim(0)?;
+    let (tq, d_idx) = q_idx.dims2()?;
+    let (tk, d_idx_k) = k_idx.dims2()?;
+    if tq != t || tk != t || d_idx != d_idx_k {
+        hanzo_ml::bail!(
+            "packed_dlsa: q_idx {:?}, k_idx {:?} for {t} tokens",
+            q_idx.shape(),
+            k_idx.shape()
+        );
+    }
+    let w3 = 3 * heads * d;
+    let hd = heads * d;
+    let (qg, qo) = slice(qkv)?;
+    let (qig, qio) = slice(q_idx)?;
+    let (kig, kio) = slice(k_idx)?;
+    let (cg, co) = slice(cos)?;
+    let (sg, so) = slice(sin)?;
+    let (src, qi_s, ki_s, cos_s, sin_s) = (
+        &f32s(&qg)[qo..],
+        &f32s(&qig)[qio..],
+        &f32s(&kig)[kio..],
+        &f32s(&cg)[co..],
+        &f32s(&sg)[so..],
+    );
+
+    let starts: Vec<usize> = lens
+        .iter()
+        .scan(0, |s, &l| {
+            let at = *s;
+            *s += l;
+            Some(at)
+        })
+        .collect();
+
+    // Precompute bucket spans once per sequence (shared across all heads)
+    let seq_spans: Vec<Vec<BlockSpans>> = (0..lens.len())
+        .map(|seq| {
+            let (start, l) = (starts[seq], lens[seq]);
+            if l == 0 {
+                return Vec::new();
+            }
+            build_sequence_dlsa_spans(
+                &qi_s[start * d_idx..(start + l) * d_idx],
+                &ki_s[start * d_idx..(start + l) * d_idx],
+                l,
+                d_idx,
+                k_budget,
+                sink_tokens,
+                local_window,
+            )
+        })
+        .collect();
+
+    let mut out = vec![0f32; t * hd];
+    let dst = out.as_mut_ptr() as usize;
+
+    (0..lens.len() * heads).into_par_iter().for_each(|task| {
+        let (seq, h) = (task / heads, task % heads);
+        let (start, l) = (starts[seq], lens[seq]);
+        if l == 0 {
+            return;
+        }
+        let blocks = &seq_spans[seq];
+        let max_bn = blocks.iter().map(|b| b.bn).max().unwrap_or(0);
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let need = 3 * l * d + 2 * max_bn * d + BLOCK * max_bn;
+            if scratch.len() < need {
+                scratch.resize(need, 0.);
+            }
+            let (q, rest) = scratch.split_at_mut(l * d);
+            let (k, rest) = rest.split_at_mut(l * d);
+            let (vh, rest) = rest.split_at_mut(l * d);
+            let (ks, rest) = rest.split_at_mut(max_bn * d);
+            let (vs, s) = rest.split_at_mut(max_bn * d);
+
+            for i in 0..l {
+                let row = &src[(start + i) * w3..(start + i + 1) * w3];
+                let (cs, sn) = (
+                    &cos_s[i * half..(i + 1) * half],
+                    &sin_s[i * half..(i + 1) * half],
+                );
+                rotate(&row[h * d..], &mut q[i * d..], cs, sn, half, scale);
+                rotate(&row[hd + h * d..], &mut k[i * d..], cs, sn, half, 1.);
+                vh[i * d..(i + 1) * d].copy_from_slice(&row[2 * hd + h * d..2 * hd + (h + 1) * d]);
+            }
+
+            for (bi, blk) in blocks.iter().enumerate() {
+                let i0 = bi * BLOCK;
+                let i1 = (i0 + BLOCK).min(l);
+                let bm = i1 - i0;
+                let bn = blk.bn;
+
+                let (k_ptr, v_ptr) = if blk.spans.len() == 1 {
+                    let (ka, _) = blk.spans[0];
+                    (k[ka * d..].as_ptr(), vh[ka * d..].as_ptr())
+                } else {
+                    let mut off = 0;
+                    for &(ka, kb) in &blk.spans {
+                        let span_elems = (kb - ka) * d;
+                        ks[off..off + span_elems].copy_from_slice(&k[ka * d..kb * d]);
+                        vs[off..off + span_elems].copy_from_slice(&vh[ka * d..kb * d]);
+                        off += span_elems;
+                    }
+                    (ks.as_ptr(), vs.as_ptr())
+                };
+
+                unsafe {
+                    mm(
+                        (bm, bn, d),
+                        s.as_mut_ptr(),
+                        (bn as isize, 1),
+                        q[i0 * d..].as_ptr(),
+                        (d as isize, 1),
+                        k_ptr,
+                        (1, d as isize),
+                    );
+                }
+                for r in 0..bm {
+                    let row = &mut s[r * bn..(r + 1) * bn];
+                    softmax_unmasked_fast(row);
+                }
+                unsafe {
+                    mm(
+                        (bm, d, bn),
+                        (dst as *mut f32).add((start + i0) * hd + h * d),
+                        (hd as isize, 1),
+                        s.as_ptr(),
+                        (bn as isize, 1),
+                        v_ptr,
+                        (d as isize, 1),
+                    );
+                }
+            }
+        });
+    });
+    drop((qg, qig, kig, cg, sg));
     Tensor::from_vec(out, (t, hd), qkv.device())
 }
 

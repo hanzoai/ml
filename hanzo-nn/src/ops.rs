@@ -875,10 +875,10 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
                         v * v
                     })
                     .sum::<f32>();
-                let m = (sum2 / n as f32 + eps).sqrt();
-                let m = T::from_f32(m).unwrap_or_else(T::nan);
+                let inv_m = 1.0 / (sum2 / n as f32 + eps).sqrt();
+                let inv_m = T::from_f32(inv_m).unwrap_or_else(T::nan);
                 for ((d, s), alpha) in dst.iter_mut().zip(src.iter()).zip(alpha) {
-                    *d = *s / m * *alpha
+                    *d = *s * inv_m * *alpha
                 }
             }
 
@@ -1145,11 +1145,20 @@ impl hanzo_ml::CustomOp2 for SiluMul {
         s2: &CpuStorage,
         l2: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
+        #[inline(always)]
+        fn silu_mul1(g: f32, u: f32) -> f32 {
+            let e = exp_neg(-g.abs());
+            let num = if g >= 0.0 { 1.0 } else { e };
+            g * (num / (1.0 + e)) * u
+        }
+
         fn inner<
             T: hanzo_ml::WithDType
                 + num_traits::Float
                 + num_traits::AsPrimitive<f32>
-                + num_traits::FromPrimitive,
+                + num_traits::FromPrimitive
+                + Send
+                + Sync,
         >(
             a: &[T],
             la: &Layout,
@@ -1164,14 +1173,14 @@ impl hanzo_ml::CustomOp2 for SiluMul {
                 Some((o1, o2)) => &b[o1..o2],
                 None => hanzo_ml::bail!("silu-mul: b must be contiguous"),
             };
-            let dst: Vec<T> = a
-                .iter()
-                .zip(b.iter())
-                .map(|(&x, &y)| {
-                    let xf = x.as_();
-                    T::from_f32(xf / (1.0 + (-xf).exp()) * y.as_()).unwrap_or_else(T::nan)
-                })
-                .collect();
+            let mut dst = vec![T::zero(); a.len()];
+            dst.par_chunks_mut(4096)
+                .zip(a.par_chunks(4096).zip(b.par_chunks(4096)))
+                .for_each(|(d, (a, b))| {
+                    for ((d, &x), &y) in d.iter_mut().zip(a).zip(b) {
+                        *d = T::from_f32(silu_mul1(x.as_(), y.as_())).unwrap_or_else(T::nan);
+                    }
+                });
             Ok((
                 hanzo_ml::WithDType::to_cpu_storage_owned(dst),
                 Shape::from_dims(la.shape().dims()),
@@ -1180,9 +1189,25 @@ impl hanzo_ml::CustomOp2 for SiluMul {
         use hanzo_ml::backend::BackendStorage;
         use CpuStorage as C;
         match (s1, s2) {
+            (C::F32(a), C::F32(b)) => {
+                let (Some((a0, a1)), Some((b0, b1))) =
+                    (l1.contiguous_offsets(), l2.contiguous_offsets())
+                else {
+                    hanzo_ml::bail!("silu-mul: inputs must be contiguous")
+                };
+                let (a, b) = (&a[a0..a1], &b[b0..b1]);
+                let mut dst = vec![0f32; a.len()];
+                dst.par_chunks_mut(4096)
+                    .zip(a.par_chunks(4096).zip(b.par_chunks(4096)))
+                    .for_each(|(d, (a, b))| {
+                        for ((d, &g), &u) in d.iter_mut().zip(a).zip(b) {
+                            *d = silu_mul1(g, u);
+                        }
+                    });
+                Ok((CpuStorage::F32(dst), l1.shape().clone()))
+            }
             (C::BF16(a), C::BF16(b)) => inner::<half::bf16>(a, l1, b, l2),
             (C::F16(a), C::F16(b)) => inner::<half::f16>(a, l1, b, l2),
-            (C::F32(a), C::F32(b)) => inner::<f32>(a, l1, b, l2),
             _ => hanzo_ml::bail!("silu-mul: unsupported dtype {:?}", s1.dtype()),
         }
     }
