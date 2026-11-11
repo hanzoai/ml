@@ -13,8 +13,8 @@ readme = "README.md"
 accelerate-src = { version = "0.3.2", optional = true }
 hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.115" }
 gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
-hanzo-metal-kernels = { path = "../hanzo-metal-kernels", version = "0.11.47", optional = true }
-hanzo-kernels = { path = "../hanzo-kernels", version = "0.11.40", optional = true, features = ["cutile"] }
+hanzo-metal-kernels = { path = "../hanzo-metal-kernels", version = "0.11.48", optional = true }
+hanzo-kernels = { path = "../hanzo-kernels", version = "0.11.41", optional = true, features = ["cutile"] }
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr", "zerocopy"] }
 float8 = { version = "0.7.0", features = ["num-traits", "rand_distr"] }
 memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }

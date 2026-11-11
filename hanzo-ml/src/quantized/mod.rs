@@ -196,6 +196,8 @@ impl QStorage {
                 GgmlDType::IQ3_S => metal::load_quantized(d, as_t_slice::<BlockIQ3s>(&data)),
                 GgmlDType::IQ1_S => metal::load_quantized(d, as_t_slice::<BlockIQ1s>(&data)),
                 GgmlDType::IQ1_M => metal::load_quantized(d, as_t_slice::<BlockIQ1m>(&data)),
+                GgmlDType::PQ2_0 => metal::load_quantized(d, as_t_slice::<BlockPQ2_0>(&data)),
+                GgmlDType::PTQ1_0 => metal::load_quantized(d, as_t_slice::<BlockPTQ1_0>(&data)),
                 // Ternary / NVFP4 have no native Metal kernel yet (CPU-decode only).
                 other => crate::bail!("{other:?} is not supported on the Metal backend"),
             },
@@ -241,6 +243,8 @@ impl QStorage {
                 GgmlDType::ROCMFP4_FAST => {
                     cuda::load_quantized(d, as_t_slice::<BlockROCMFP4Fast>(&data))
                 }
+                GgmlDType::PQ2_0 => cuda::load_quantized(d, as_t_slice::<BlockPQ2_0>(&data)),
+                GgmlDType::PTQ1_0 => cuda::load_quantized(d, as_t_slice::<BlockPTQ1_0>(&data)),
             },
             #[cfg(feature = "rocm")]
             Device::Rocm(d) => Ok(Self::Rocm(rocm::QRocmStorage::new(data, dtype, d)?)),
@@ -522,6 +526,10 @@ pub enum GgmlDType {
     ROCMFP4,
     #[allow(non_camel_case_types)]
     ROCMFP4_FAST,
+    // Prism (Bonsai 2) ternary family: group-128, weights live in a Hadamard-rotated basis
+    // (the file's prism.hadamard section is load-required; see the engine model contract).
+    PQ2_0,
+    PTQ1_0,
 }
 
 // --- Single-source-of-truth wiring (Cut 2) -----------------------------------------
@@ -687,6 +695,8 @@ impl GgmlDType {
             Self::Q1_0 => iq_quants::QK1_0,
             Self::NVFP4 => iq_quants::QK_NVFP4,
             Self::ROCMFP4 | Self::ROCMFP4_FAST => iq_quants::QK_ROCMFP4,
+            Self::PQ2_0 => iq_quants::QK_PQ2_0,
+            Self::PTQ1_0 => iq_quants::QK_PTQ1_0,
             Self::Q2K
             | Self::Q3K
             | Self::Q4K
