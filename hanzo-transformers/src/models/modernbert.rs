@@ -219,6 +219,15 @@ impl Module for Proj {
 }
 
 #[derive(Clone)]
+pub struct ModernBertDlsaIndexer {
+    pub w_q: Linear,
+    pub w_k: Linear,
+    pub k_budget: Option<usize>,
+    pub sink_tokens: usize,
+    pub local_window: usize,
+}
+
+#[derive(Clone)]
 struct ModernBertAttention {
     qkv: Proj,
     proj: Proj,
@@ -227,6 +236,7 @@ struct ModernBertAttention {
     rotary_emb: Arc<RotaryEmbedding>,
     /// The trained tables followed by the stretched ones, with [`Config::yarn`].
     long: Option<Arc<RotaryEmbedding>>,
+    dlsa: Option<ModernBertDlsaIndexer>,
 }
 
 impl ModernBertAttention {
@@ -257,7 +267,56 @@ impl ModernBertAttention {
             attention_head_size,
             rotary_emb,
             long,
+            dlsa: None,
         })
+    }
+
+    fn set_dlsa(
+        &mut self,
+        k_budget: usize,
+        d_idx: usize,
+        sink_tokens: usize,
+        local_window: usize,
+    ) -> Result<()> {
+        let dev = self.rotary_emb.cos.device();
+        let dtype = self.rotary_emb.cos.dtype();
+        let hidden_size = self.num_attention_heads * self.attention_head_size;
+        let mut wq = vec![0f32; d_idx * hidden_size];
+        let mut wk = vec![0f32; d_idx * hidden_size];
+        let scale = (1.0 / (hidden_size as f32).sqrt()) * 0.5;
+        for r in 0..d_idx {
+            for c in 0..hidden_size {
+                let idx = r * hidden_size + c;
+                let s1 = ((idx as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407)
+                    >> 33) as f32
+                    / (u32::MAX as f32);
+                let s2 = ((idx as u64)
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493)
+                    >> 33) as f32
+                    / (u32::MAX as f32);
+                wq[idx] = (s1 * 2.0 - 1.0) * scale;
+                wk[idx] = (s2 * 2.0 - 1.0) * scale;
+            }
+        }
+        let w_q = Linear::new(
+            Tensor::from_vec(wq, (d_idx, hidden_size), dev)?.to_dtype(dtype)?,
+            None,
+        );
+        let w_k = Linear::new(
+            Tensor::from_vec(wk, (d_idx, hidden_size), dev)?.to_dtype(dtype)?,
+            None,
+        );
+        self.dlsa = Some(ModernBertDlsaIndexer {
+            w_q,
+            w_k,
+            k_budget: Some(k_budget),
+            sink_tokens,
+            local_window,
+        });
+        Ok(())
     }
 
     /// The stretched tables: rows `trained..` of [`ModernBertAttention::long`].
@@ -276,7 +335,13 @@ impl ModernBertAttention {
     /// Packed attention over `qkv [T, 3·H·D]` (see `hanzo_nn::attention::packed`): a sequence
     /// within the trained positions reads the trained tables, a longer one the stretched tables,
     /// each run of consecutive sequences of one kind in one call.
-    fn packed(&self, qkv: &Tensor, lens: &[usize], window: Option<usize>) -> Result<Tensor> {
+    fn packed(
+        &self,
+        h_in: &Tensor,
+        qkv: &Tensor,
+        lens: &[usize],
+        window: Option<usize>,
+    ) -> Result<Tensor> {
         let (heads, scale) = (
             self.num_attention_heads,
             (self.attention_head_size as f64).powf(-0.5) as f32,
@@ -287,6 +352,61 @@ impl ModernBertAttention {
             (true, Some((c, s))) => (c, s),
             _ => (&self.rotary_emb.cos, &self.rotary_emb.sin),
         };
+
+        if window.is_none() {
+            if let Some(dlsa) = &self.dlsa {
+                if let Some(k_budget) = dlsa.k_budget {
+                    if lens.iter().any(|&l| l > k_budget) && qkv.device().is_cpu() {
+                        let q_idx = h_in.apply(&dlsa.w_q)?;
+                        let k_idx = h_in.apply(&dlsa.w_k)?;
+                        let runs: Vec<&[usize]> = lens
+                            .chunk_by(|a, b| (*a > trained) == (*b > trained))
+                            .collect();
+                        if runs.len() <= 1 {
+                            let (c, s) = tables(lens.iter().any(|&n| n > trained));
+                            return hanzo_nn::attention::packed_dlsa(
+                                qkv,
+                                &q_idx,
+                                &k_idx,
+                                lens,
+                                heads,
+                                c,
+                                s,
+                                scale,
+                                k_budget,
+                                dlsa.sink_tokens,
+                                dlsa.local_window,
+                            );
+                        }
+                        let mut out = Vec::with_capacity(runs.len());
+                        let mut at = 0;
+                        for run in runs {
+                            let t: usize = run.iter().sum();
+                            let (c, s) = tables(run[0] > trained);
+                            let part = qkv.narrow(0, at, t)?;
+                            let qi_p = q_idx.narrow(0, at, t)?;
+                            let ki_p = k_idx.narrow(0, at, t)?;
+                            out.push(hanzo_nn::attention::packed_dlsa(
+                                &part,
+                                &qi_p,
+                                &ki_p,
+                                run,
+                                heads,
+                                c,
+                                s,
+                                scale,
+                                k_budget,
+                                dlsa.sink_tokens,
+                                dlsa.local_window,
+                            )?);
+                            at += t;
+                        }
+                        return Tensor::cat(&out, 0);
+                    }
+                }
+            }
+        }
+
         let runs: Vec<&[usize]> = lens
             .chunk_by(|a, b| (*a > trained) == (*b > trained))
             .collect();
@@ -341,6 +461,31 @@ impl ModernBertAttention {
         let scale = (self.attention_head_size as f64).powf(-0.5);
         let q = (q * scale)?;
         drop(span);
+
+        let is_local = matches!(mask, Mask::Tiled(_, true));
+        if !is_local {
+            if let Some(dlsa) = &self.dlsa {
+                if let Some(k_budget) = dlsa.k_budget {
+                    if seq_len > k_budget {
+                        let q_idx = xs.apply(&dlsa.w_q)?;
+                        let k_idx = xs.apply(&dlsa.w_k)?;
+                        let xs_out = hanzo_nn::attention::dlsa_batched_gpu(
+                            &q,
+                            &k,
+                            &v,
+                            &q_idx,
+                            &k_idx,
+                            k_budget,
+                            dlsa.sink_tokens,
+                            dlsa.local_window,
+                        )?;
+                        let xs_out = xs_out.transpose(1, 2)?.reshape((b, seq_len, d))?;
+                        return xs_out.apply(&self.proj)?.reshape((b, seq_len, d));
+                    }
+                }
+            }
+        }
+
         let xs = match mask {
             Mask::Whole(attention_mask) => {
                 attend(&q, &k.transpose(D::Minus2, D::Minus1)?, &v, attention_mask)?
@@ -490,6 +635,10 @@ impl Tiles {
                 window,
             });
         }
+        for x in &mut tiles {
+            let k_slice = keys.narrow(3, x.lo, x.n)?;
+            x.window = x.window.broadcast_add(&k_slice)?;
+        }
         Ok(Tiles {
             keys,
             global: (logits / (b * heads * l)).clamp(1, l),
@@ -504,12 +653,11 @@ impl Tiles {
                 .local
                 .iter()
                 .map(|x| {
-                    let keys = self.keys.narrow(3, x.lo, x.n)?.contiguous()?;
                     attend(
                         &q.narrow(2, x.at, x.t)?,
                         &k.narrow(2, x.lo, x.n)?.t()?.contiguous()?,
                         &v.narrow(2, x.lo, x.n)?.contiguous()?,
-                        &x.window.broadcast_add(&keys)?,
+                        &x.window,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -613,6 +761,7 @@ impl ModernBertLayer {
         };
         let a = &self.attn;
         let att = a.packed(
+            &h,
             &h.apply(&a.qkv)?,
             lens,
             self.uses_local_attention.then_some(window),
@@ -898,6 +1047,32 @@ impl Stack {
         Ok(())
     }
 
+    /// Attach Bidirectional D-LSA indexers to the global attention layers of this stack.
+    pub fn with_dlsa(
+        &mut self,
+        k_budget: usize,
+        d_idx: usize,
+        sink_tokens: usize,
+        keep_layer0_dense: bool,
+    ) -> Result<()> {
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            let layer_id = self.at + i;
+            if !l.uses_local_attention && !(keep_layer0_dense && layer_id == 0) {
+                l.attn.set_dlsa(k_budget, d_idx, sink_tokens, self.window)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dynamically adjust or disable (`None`) the D-LSA `k_budget` on global layers.
+    pub fn set_dlsa_k_budget(&mut self, k_budget: Option<usize>) {
+        for l in &mut self.layers {
+            if let Some(dlsa) = &mut l.attn.dlsa {
+                dlsa.k_budget = k_budget;
+            }
+        }
+    }
+
     /// `s` through its layers below layer `to`.
     pub fn to(&self, mut s: Stream, to: usize) -> Result<Stream> {
         if s.at < self.at || to < s.at || to > self.at + self.layers.len() {
@@ -988,7 +1163,7 @@ pub struct ModernBert {
     trained: usize,
     /// Whether a longer sequence reads stretched tables ([`Config::yarn`]).
     long: bool,
-    /// Projections quantized ([`ModernBert::quantize`]): the CPU inference pass.
+    /// Projections quantized ([`ModernBert::quantize`]) or packed ([`ModernBert::pack`]): the CPU inference pass.
     quantized: bool,
 }
 
@@ -1023,6 +1198,29 @@ impl ModernBert {
             long: config.yarn.is_some(),
             quantized: false,
         })
+    }
+
+    /// Enable the packed CPU inference pass (`[T, d]` unpadded sequences + `gemm::gemm` block-packed
+    /// local sliding-window attention and D-LSA) without quantizing linear projections.
+    pub fn pack(&mut self) {
+        self.quantized = true;
+    }
+
+    /// Attach Bidirectional D-LSA indexers to the global attention layers of this backbone.
+    pub fn with_dlsa(
+        &mut self,
+        k_budget: usize,
+        d_idx: usize,
+        sink_tokens: usize,
+        keep_layer0_dense: bool,
+    ) -> Result<()> {
+        self.stack
+            .with_dlsa(k_budget, d_idx, sink_tokens, keep_layer0_dense)
+    }
+
+    /// Dynamically adjust or disable (`None`) the D-LSA `k_budget` on global layers.
+    pub fn set_dlsa_k_budget(&mut self, k_budget: Option<usize>) {
+        self.stack.set_dlsa_k_budget(k_budget);
     }
 
     /// Every layer's projections as `dtype` blocks where this CPU tiles their matmul
