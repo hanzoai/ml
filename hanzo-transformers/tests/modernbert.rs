@@ -193,6 +193,7 @@ fn segments_apart_are_alike_in_any_order() -> Result<()> {
 
 /// Output and every parameter's gradient of `Σ y ⊙ w` for a backbone of `named` parameters,
 /// in `dtype` on `dev`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[allow(clippy::type_complexity)]
 fn pass(
     cfg: &Config,
@@ -385,6 +386,7 @@ fn past_the_trained_positions_a_sequence_reads_yarn() -> Result<()> {
 }
 
 /// `max|a − b| / max|b|` and `‖a − b‖ / ‖b‖`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn gap(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
     let d = (a - b)?;
     let max = |t: &Tensor| -> Result<f32> { t.abs()?.max_all()?.to_scalar::<f32>() };

@@ -28,7 +28,20 @@ test:
   - name: build
     run: |
       set -e
-      command -v protoc >/dev/null || { sudo apt-get update && sudo apt-get install -y protobuf-compiler; }
-      command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev; }
+      if ! command -v protoc >/dev/null; then
+        if sudo -n true 2>/dev/null; then
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        else
+          mkdir -p /tmp/protoc-root/lists/partial /tmp/protoc-root/cache/archives/partial
+          (cd /tmp/protoc-root && \
+           apt-get -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache -o Debug::NoLocking=1 update -qq && \
+           apt-get -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache -o Debug::NoLocking=1 download $(apt-cache -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances protobuf-compiler | grep "^\w" | grep -v -E "^(libc6|libgcc|libstdc|zlib1g|debconf)" | tr '\n' ' ') && \
+           for deb in *.deb; do dpkg -x "$deb" /tmp/protoc-root; done)
+          export PATH="/tmp/protoc-root/usr/bin:$PATH"
+          export LD_LIBRARY_PATH="/tmp/protoc-root/usr/lib/x86_64-linux-gnu:/tmp/protoc-root/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
+        fi
+      fi
       protoc --version
       cargo check --workspace
+      cargo test -p hanzo-nn --lib dlsa
+
