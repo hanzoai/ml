@@ -68,3 +68,30 @@ fn test_cuda_device_refuses_large_tensor() -> Result<()> {
     assert!(res.is_err());
     Ok(())
 }
+
+#[test]
+fn test_cuda_refuses_broadcast_to_device() -> Result<()> {
+    if !hanzo_ml::utils::cuda_is_available() {
+        return Ok(());
+    }
+    let cuda_dev = hanzo_ml::Device::new_cuda(0)?;
+    // Create a 1-element tensor on CPU, then broadcast it to > 2^31 elements
+    let cpu_t = hanzo_ml::Tensor::zeros((1, 1), hanzo_ml::DType::F32, &hanzo_ml::Device::Cpu)?;
+    let broadcasted = cpu_t.broadcast_as((16384, 16384, 12))?;
+    // Moving this broadcasted tensor to CUDA must be refused
+    let res = broadcasted.to_device(&cuda_dev);
+    assert!(res.is_err());
+    Ok(())
+}
+
+#[test]
+fn test_cuda_refuses_broadcast_as() -> Result<()> {
+    if !hanzo_ml::utils::cuda_is_available() {
+        return Ok(());
+    }
+    let cuda_dev = hanzo_ml::Device::new_cuda(0)?;
+    let cuda_t = hanzo_ml::Tensor::zeros((1, 1), hanzo_ml::DType::F32, &cuda_dev)?;
+    let res = cuda_t.broadcast_as((16384, 16384, 12));
+    assert!(res.is_err());
+    Ok(())
+}

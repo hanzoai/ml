@@ -2418,6 +2418,9 @@ impl Tensor {
 
     /// If the target device is the same as the tensor device, only a shallow copy is performed.
     pub fn to_device(&self, device: &Device) -> Result<Tensor> {
+        if device.is_cuda() {
+            crate::cuda::check_shape_elem_count(self.shape())?;
+        }
         if self.device().same_device(device) {
             Ok(self.clone())
         } else {
