@@ -95,3 +95,15 @@ fn test_cuda_refuses_broadcast_as() -> Result<()> {
     assert!(res.is_err());
     Ok(())
 }
+
+#[test]
+fn test_cuda_refuses_reshape_overflow() -> Result<()> {
+    if !hanzo_ml::utils::cuda_is_available() {
+        return Ok(());
+    }
+    let cuda_dev = hanzo_ml::Device::new_cuda(0)?;
+    let cuda_t = hanzo_ml::Tensor::zeros(0, hanzo_ml::DType::F32, &cuda_dev)?;
+    let res = cuda_t.reshape((1usize << 32, 1usize << 32));
+    assert!(res.is_err());
+    Ok(())
+}

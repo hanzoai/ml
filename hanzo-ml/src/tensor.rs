@@ -2623,6 +2623,9 @@ impl Tensor {
             }
             .bt());
         }
+        if self.device().is_cuda() {
+            crate::cuda::check_shape_elem_count(&shape)?;
+        }
         let op = BackpropOp::new1(self, Op::Reshape);
         if self.is_contiguous() {
             let tensor_ = Tensor_ {
