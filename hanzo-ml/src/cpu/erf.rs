@@ -1,4 +1,4 @@
-#![allow(clippy::excessive_precision)]
+#![allow(clippy::excessive_precision, deprecated)]
 // Code taken from https://github.com/statrs-dev/statrs
 //! Provides the [error](https://en.wikipedia.org/wiki/Error_function) and
 //! related functions
