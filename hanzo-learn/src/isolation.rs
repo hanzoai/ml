@@ -37,6 +37,7 @@ use crate::twister::Twister;
 use crate::{Error, Matrix, Outlier, Result};
 
 /// The Euler–Mascheroni constant, to the bit `numpy` carries it as `euler_gamma`.
+#[allow(clippy::approx_constant)]
 const EULER: f64 = 0.577_215_664_901_532_9;
 
 /// The expected path length to an unsuccessful search in a binary search tree over `m`
