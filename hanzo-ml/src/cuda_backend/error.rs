@@ -43,6 +43,12 @@ pub enum CudaError {
         cuda: cudarc::driver::DriverError,
         module_name: String,
     },
+
+    #[error("tensor element count {elem_count} exceeds maximum CUDA 32-bit element limit ({max_elements}); use tiled operations instead")]
+    TooManyElements {
+        elem_count: usize,
+        max_elements: usize,
+    },
 }
 
 impl From<CudaError> for crate::Error {

@@ -12,7 +12,7 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { version = "0.3.2", optional = true }
 byteorder = "1.4.3"
-hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.114" }
+hanzo-ml = { path = "../hanzo-ml", package = "hanzo-ml", version = "0.11.115" }
 hanzo-nn = { path = "../hanzo-nn", version = "0.11.50" }
 fancy-regex = "0.19.0"
 intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }

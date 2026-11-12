@@ -20,7 +20,7 @@ pub mod cutile;
 mod device;
 mod error;
 mod utils;
-pub use device::{CudaDevice, DeviceId, Graph, Timer};
+pub use device::{check_elem_count, CudaDevice, DeviceId, Graph, Timer, MAX_CUDA_ELEMENTS};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
