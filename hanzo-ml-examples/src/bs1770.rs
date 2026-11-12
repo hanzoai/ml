@@ -45,8 +45,7 @@
 //! println!("Integrated loudness: {:.1} LUFS", gated_power.loudness_lkfs());
 //! ```
 
-use std::f32;
-
+use std::f32::consts::PI;
 /// Coefficients for a 2nd-degree infinite impulse response filter.
 ///
 /// Coefficient a0 is implicitly 1.0.
@@ -76,7 +75,7 @@ impl Filter {
 
         // Formula taken from https://github.com/csteinmetz1/pyloudnorm/blob/
         // 6baa64d59b7794bc812e124438692e7fd2e65c0c/pyloudnorm/iirfilter.py#L134-L143.
-        let k = (f32::consts::PI * center_hz / sample_rate_hz).tan();
+        let k = (PI * center_hz / sample_rate_hz).tan();
         let vh = 10.0_f32.powf(gain_db / 20.0);
         let vb = vh.powf(0.499_666_78);
         let a0 = 1.0 + k / q + k * k;
@@ -103,7 +102,7 @@ impl Filter {
 
         // Formula taken from https://github.com/csteinmetz1/pyloudnorm/blob/
         // 6baa64d59b7794bc812e124438692e7fd2e65c0c/pyloudnorm/iirfilter.py#L145-L151
-        let k = (f32::consts::PI * center_hz / sample_rate_hz).tan();
+        let k = (PI * center_hz / sample_rate_hz).tan();
         Filter {
             a1: 2.0 * (k * k - 1.0) / (1.0 + k / q + k * k),
             a2: (1.0 - k / q + k * k) / (1.0 + k / q + k * k),
