@@ -43,5 +43,5 @@ test:
       fi
       protoc --version
       cargo check --workspace
-      cargo test -p hanzo-nn --lib dlsa
+      cargo test -p hanzo-nn --lib lsa
 
