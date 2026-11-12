@@ -2511,7 +2511,7 @@ impl Tensor {
     pub fn broadcast_as<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
         let shape = shape.into();
         if self.device().is_cuda() {
-            crate::cuda::check_elem_count(shape.elem_count())?;
+            crate::cuda::check_shape_elem_count(&shape)?;
         }
         let tensor_ = Tensor_ {
             id: TensorId::new(),

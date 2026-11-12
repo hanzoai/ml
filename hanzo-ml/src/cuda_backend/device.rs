@@ -52,6 +52,26 @@ pub fn check_elem_count(len: usize) -> Result<()> {
     Ok(())
 }
 
+/// Check that a shape's element count does not overflow `usize` and does not exceed `MAX_CUDA_ELEMENTS`.
+/// Returns the verified element count.
+#[inline]
+pub fn check_shape_elem_count(shape: &Shape) -> Result<usize> {
+    let mut count: usize = 1;
+    for &d in shape.dims() {
+        match count.checked_mul(d) {
+            Some(c) if c <= MAX_CUDA_ELEMENTS => count = c,
+            _ => {
+                return Err(CudaError::TooManyElements {
+                    elem_count: count.saturating_mul(d),
+                    max_elements: MAX_CUDA_ELEMENTS,
+                }
+                .into());
+            }
+        }
+    }
+    Ok(count)
+}
+
 type CudaGraphHtodCacheKey = (DeviceId, TypeId, Vec<u8>);
 type CudaGraphHtodCache = HashMap<CudaGraphHtodCacheKey, Box<dyn Any>>;
 
@@ -815,8 +835,7 @@ impl BackendDevice for CudaDevice {
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<CudaStorage> {
-        let elem_count = shape.elem_count();
-        check_elem_count(elem_count)?;
+        let elem_count = check_shape_elem_count(shape)?;
         let slice = match dtype {
             DType::U8 => {
                 let data = self.alloc_zeros::<u8>(elem_count)?;
@@ -871,8 +890,7 @@ impl BackendDevice for CudaDevice {
     }
 
     fn rand_uniform(&self, shape: &Shape, dtype: DType, lo: f64, up: f64) -> Result<CudaStorage> {
-        let elem_count = shape.elem_count();
-        check_elem_count(elem_count)?;
+        let elem_count = check_shape_elem_count(shape)?;
         let curand = self.curand.lock().unwrap();
         let slice = match dtype {
             // TODO: Add support for F16 and BF16 though this is likely to require some upstream
@@ -922,12 +940,17 @@ impl BackendDevice for CudaDevice {
     fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<CudaStorage> {
         // TODO: Add support for F16 and BF16 though this is likely to require some upstream
         // cudarc changes.
-        let elem_count = shape.elem_count();
+        let elem_count = check_shape_elem_count(shape)?;
         let curand = self.curand.lock().unwrap();
         // curand can only generate an odd number of values.
         // https://github.com/hanzoai/ml/issues/734
         let elem_count_round = if elem_count % 2 == 1 {
-            elem_count + 1
+            elem_count.checked_add(1).ok_or_else(|| {
+                crate::Error::from(CudaError::TooManyElements {
+                    elem_count: usize::MAX,
+                    max_elements: MAX_CUDA_ELEMENTS,
+                })
+            })?
         } else {
             elem_count
         };
@@ -972,8 +995,7 @@ impl BackendDevice for CudaDevice {
     }
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
-        let elem_count = shape.elem_count();
-        check_elem_count(elem_count)?;
+        let elem_count = check_shape_elem_count(shape)?;
         let slice = match dtype {
             DType::U8 => {
                 let data = self.alloc::<u8>(elem_count)?;

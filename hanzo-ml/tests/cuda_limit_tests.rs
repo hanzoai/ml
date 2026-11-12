@@ -1,4 +1,4 @@
-use hanzo_ml::cuda::{check_elem_count, MAX_CUDA_ELEMENTS};
+use hanzo_ml::cuda::{check_elem_count, check_shape_elem_count, MAX_CUDA_ELEMENTS};
 use hanzo_ml::{Result, Shape};
 
 #[test]
@@ -25,6 +25,34 @@ fn test_cuda_max_element_limit() -> Result<()> {
     let shape = Shape::from((16384, 16384, 12));
     assert_eq!(shape.elem_count(), 3_221_225_472);
     assert!(check_elem_count(shape.elem_count()).is_err());
+    assert!(check_shape_elem_count(&shape).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_cuda_shape_checked_arithmetic_overflow() -> Result<()> {
+    // Normal shape:
+    let shape = Shape::from((2, 3, 4));
+    assert_eq!(check_shape_elem_count(&shape)?, 24);
+
+    // Shape that wraps to 0 in 64-bit unchecked multiplication (Codex review case):
+    // (1usize << 32) * (1usize << 32) wraps to 0 modulo 2^64.
+    // check_shape_elem_count uses checked multiplication so it must return Err, not Ok(0).
+    let wrapping_shape = Shape::from((1usize << 32, 1usize << 32));
+    assert!(check_shape_elem_count(&wrapping_shape).is_err());
+
+    // Shape with multi-dim product exceeding usize:
+    let huge_shape = Shape::from((1usize << 40, 1usize << 30));
+    assert!(check_shape_elem_count(&huge_shape).is_err());
+
+    // Shape with single dim exceeding MAX_CUDA_ELEMENTS:
+    let single_huge_dim = Shape::from((MAX_CUDA_ELEMENTS + 1, 1));
+    assert!(check_shape_elem_count(&single_huge_dim).is_err());
+
+    // Shape exactly at the boundary:
+    let exact_boundary = Shape::from((MAX_CUDA_ELEMENTS, 1));
+    assert_eq!(check_shape_elem_count(&exact_boundary)?, MAX_CUDA_ELEMENTS);
 
     Ok(())
 }

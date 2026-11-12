@@ -20,6 +20,24 @@ pub fn check_elem_count(len: usize) -> Result<()> {
     Ok(())
 }
 
+/// Check that a shape's element count does not overflow `usize` and does not exceed `MAX_CUDA_ELEMENTS`.
+/// Returns the verified element count.
+#[inline]
+pub fn check_shape_elem_count(shape: &Shape) -> Result<usize> {
+    let mut count: usize = 1;
+    for &d in shape.dims() {
+        match count.checked_mul(d) {
+            Some(c) if c <= MAX_CUDA_ELEMENTS => count = c,
+            _ => {
+                crate::bail!(
+                    "tensor element count exceeds maximum CUDA 32-bit element limit ({MAX_CUDA_ELEMENTS}); use tiled operations instead"
+                );
+            }
+        }
+    }
+    Ok(count)
+}
+
 #[derive(Debug, Clone)]
 pub struct CudaDevice;
 
