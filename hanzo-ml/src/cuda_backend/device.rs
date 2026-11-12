@@ -56,6 +56,9 @@ pub fn check_elem_count(len: usize) -> Result<()> {
 /// Returns the verified element count.
 #[inline]
 pub fn check_shape_elem_count(shape: &Shape) -> Result<usize> {
+    if shape.dims().contains(&0) {
+        return Ok(0);
+    }
     let mut count: usize = 1;
     for &d in shape.dims() {
         match count.checked_mul(d) {

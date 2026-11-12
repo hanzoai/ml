@@ -107,3 +107,27 @@ fn test_cuda_refuses_reshape_overflow() -> Result<()> {
     assert!(res.is_err());
     Ok(())
 }
+
+#[test]
+fn test_cuda_empty_shapes_with_large_dim() -> Result<()> {
+    // Shapes containing a 0 dimension have zero elements regardless of other dimensions
+    let shape_trailing_zero = Shape::from((hanzo_ml::cuda::MAX_CUDA_ELEMENTS + 1, 0));
+    assert_eq!(
+        hanzo_ml::cuda::check_shape_elem_count(&shape_trailing_zero)?,
+        0
+    );
+
+    let shape_leading_zero = Shape::from((0, hanzo_ml::cuda::MAX_CUDA_ELEMENTS + 1));
+    assert_eq!(
+        hanzo_ml::cuda::check_shape_elem_count(&shape_leading_zero)?,
+        0
+    );
+
+    let shape_wrapping_zero = Shape::from((1usize << 32, 0, 1usize << 32));
+    assert_eq!(
+        hanzo_ml::cuda::check_shape_elem_count(&shape_wrapping_zero)?,
+        0
+    );
+
+    Ok(())
+}
