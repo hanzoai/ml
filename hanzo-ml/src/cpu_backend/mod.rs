@@ -1743,7 +1743,35 @@ fn elu<T: num_traits::Float>(v: T, alpha: T) -> T {
     }
 }
 
+#[inline]
+fn slice_as_bytes<T>(slice: &[T]) -> &[u8] {
+    let byte_len = std::mem::size_of_val(slice);
+    // SAFETY: T is a plain numerical type (u32, i32, f32, f16, bf16, etc.) with no uninitialized
+    // padding bytes. Any aligned &[T] is a valid &[u8] of length len * size_of::<T>().
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, byte_len) }
+}
+
 impl CpuStorage {
+    /// Returns the underlying storage buffer as a raw byte slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::U8(v) => v.as_slice(),
+            Self::U32(v) => slice_as_bytes(v),
+            Self::I16(v) => slice_as_bytes(v),
+            Self::I32(v) => slice_as_bytes(v),
+            Self::I64(v) => slice_as_bytes(v),
+            Self::BF16(v) => slice_as_bytes(v),
+            Self::F16(v) => slice_as_bytes(v),
+            Self::F32(v) => slice_as_bytes(v),
+            Self::F64(v) => slice_as_bytes(v),
+            Self::F8E4M3(v) => slice_as_bytes(v),
+            Self::F6E2M3(v) => v.as_slice(),
+            Self::F6E3M2(v) => v.as_slice(),
+            Self::F4(v) => v.as_slice(),
+            Self::F8E8M0(v) => v.as_slice(),
+        }
+    }
+
     pub fn as_slice<D: WithDType>(&self) -> Result<&[D]> {
         D::cpu_storage_as_slice(self)
     }

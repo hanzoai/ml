@@ -10,7 +10,7 @@
 //! `Tensor::save_safetensors` method.
 //!
 use crate::op::BackpropOp;
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageRef};
 use crate::tensor::from_storage;
 use crate::{DType, Device, Error, Result, Tensor, WithDType};
 use safetensors::tensor as st;
@@ -72,9 +72,10 @@ impl st::View for Tensor {
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        // This copies data from GPU to CPU.
-        // TODO: Avoid the unwrap here.
-        Cow::Owned(convert_back(self).unwrap())
+        match convert_back(self) {
+            Ok(data) => Cow::Owned(data),
+            Err(_) => Cow::Borrowed(&[]),
+        }
     }
 
     fn data_len(&self) -> usize {
@@ -93,9 +94,10 @@ impl st::View for &Tensor {
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        // This copies data from GPU to CPU.
-        // TODO: Avoid the unwrap here.
-        Cow::Owned(convert_back(self).unwrap())
+        match convert_back(self) {
+            Ok(data) => Cow::Owned(data),
+            Err(_) => Cow::Borrowed(&[]),
+        }
     }
 
     fn data_len(&self) -> usize {
@@ -105,10 +107,149 @@ impl st::View for &Tensor {
     }
 }
 
+/// A view of a tensor suitable for zero-copy serialization with `safetensors`.
+///
+/// For contiguous CPU tensors, `TensorView` holds a read lock guard on the underlying
+/// storage and borrows the raw bytes directly without any intermediate memory allocation
+/// or data copies. For non-contiguous or device-backed tensors, it falls back to an
+/// owned contiguous buffer.
+pub enum TensorView<'a> {
+    Cpu {
+        guard: StorageRef<'a>,
+        shape: &'a [usize],
+        dtype: st::Dtype,
+        start_byte: usize,
+        byte_len: usize,
+    },
+    Fallback {
+        data: Vec<u8>,
+        shape: &'a [usize],
+        dtype: st::Dtype,
+    },
+}
+
+impl<'a> TensorView<'a> {
+    /// Create a `TensorView` from a `Tensor`.
+    ///
+    /// If the tensor is contiguous and on CPU, this borrows the underlying buffer directly
+    /// without making any copy.
+    pub fn from_tensor(tensor: &'a Tensor) -> Result<Self> {
+        let dtype = tensor.dtype().into();
+        let shape = tensor.dims();
+        if tensor.device().is_cpu() && tensor.is_contiguous() {
+            let guard = tensor.storage();
+            if let Storage::Cpu(cpu_storage) = &*guard {
+                let bytes = cpu_storage.as_bytes();
+                let elem_size = tensor.dtype().size_in_bytes();
+                let start_offset = tensor.layout().start_offset();
+                let elem_count = tensor.elem_count();
+                let start_byte = start_offset * elem_size;
+                let byte_len = elem_count * elem_size;
+                if start_byte + byte_len <= bytes.len() {
+                    return Ok(TensorView::Cpu {
+                        guard,
+                        shape,
+                        dtype,
+                        start_byte,
+                        byte_len,
+                    });
+                }
+            }
+        }
+        let data = convert_back(tensor)?;
+        Ok(TensorView::Fallback { data, shape, dtype })
+    }
+
+    pub fn dtype(&self) -> st::Dtype {
+        match self {
+            Self::Cpu { dtype, .. } => *dtype,
+            Self::Fallback { dtype, .. } => *dtype,
+        }
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            Self::Cpu { shape, .. } => shape,
+            Self::Fallback { shape, .. } => shape,
+        }
+    }
+
+    pub fn is_borrowed(&self) -> bool {
+        matches!(self, Self::Cpu { .. })
+    }
+
+    pub fn data_len(&self) -> usize {
+        match self {
+            Self::Cpu { byte_len, .. } => *byte_len,
+            Self::Fallback { data, .. } => data.len(),
+        }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        match self {
+            Self::Cpu {
+                guard,
+                start_byte,
+                byte_len,
+                ..
+            } => {
+                if let Storage::Cpu(cpu_storage) = &**guard {
+                    let bytes = cpu_storage.as_bytes();
+                    &bytes[*start_byte..*start_byte + *byte_len]
+                } else {
+                    &[]
+                }
+            }
+            Self::Fallback { data, .. } => data.as_slice(),
+        }
+    }
+}
+
+impl<'a> st::View for TensorView<'a> {
+    fn dtype(&self) -> st::Dtype {
+        TensorView::dtype(self)
+    }
+
+    fn shape(&self) -> &[usize] {
+        TensorView::shape(self)
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(TensorView::data(self))
+    }
+
+    fn data_len(&self) -> usize {
+        TensorView::data_len(self)
+    }
+}
+
+impl<'a> st::View for &TensorView<'a> {
+    fn dtype(&self) -> st::Dtype {
+        (*self).dtype()
+    }
+
+    fn shape(&self) -> &[usize] {
+        (*self).shape()
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed((*self).data())
+    }
+
+    fn data_len(&self) -> usize {
+        (*self).data_len()
+    }
+}
+
 impl Tensor {
     pub fn save_safetensors<P: AsRef<Path>>(&self, name: &str, filename: P) -> Result<()> {
-        let data = [(name, self.clone())];
+        let view = TensorView::from_tensor(self)?;
+        let data = [(name, view)];
         Ok(st::serialize_to_file(data, None, filename.as_ref())?)
+    }
+
+    pub fn to_safetensors_view(&self) -> Result<TensorView<'_>> {
+        TensorView::from_tensor(self)
     }
 }
 
@@ -398,7 +539,18 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
 }
 
 fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {
-    // TODO: This makes an unnecessary copy when the tensor is on the cpu.
+    if tensor.device().is_cpu() && tensor.is_contiguous() {
+        let guard = tensor.storage();
+        if let Storage::Cpu(cpu_storage) = &*guard {
+            let bytes = cpu_storage.as_bytes();
+            let elem_size = tensor.dtype().size_in_bytes();
+            let start_byte = tensor.layout().start_offset() * elem_size;
+            let byte_len = tensor.elem_count() * elem_size;
+            if start_byte + byte_len <= bytes.len() {
+                return Ok(bytes[start_byte..start_byte + byte_len].to_vec());
+            }
+        }
+    }
     let tensor = tensor.flatten_all()?;
     match tensor.dtype() {
         DType::U8 => Ok(convert_back_::<u8>(tensor.to_vec1()?)),
@@ -434,7 +586,22 @@ pub fn save<K: AsRef<str> + Ord + std::fmt::Display, P: AsRef<Path>>(
     tensors: &HashMap<K, Tensor>,
     filename: P,
 ) -> Result<()> {
-    Ok(st::serialize_to_file(tensors, None, filename.as_ref())?)
+    let views: Result<HashMap<&str, TensorView<'_>>> = tensors
+        .iter()
+        .map(|(k, v)| Ok((k.as_ref(), TensorView::from_tensor(v)?)))
+        .collect();
+    Ok(st::serialize_to_file(views?, None, filename.as_ref())?)
+}
+
+/// Serialize a map of tensors into an in-memory safetensors byte buffer.
+pub fn serialize<K: AsRef<str> + Ord + std::fmt::Display>(
+    tensors: &HashMap<K, Tensor>,
+) -> Result<Vec<u8>> {
+    let views: Result<HashMap<&str, TensorView<'_>>> = tensors
+        .iter()
+        .map(|(k, v)| Ok((k.as_ref(), TensorView::from_tensor(v)?)))
+        .collect();
+    Ok(st::serialize(views?, None)?)
 }
 
 #[derive(yoke::Yokeable)]
