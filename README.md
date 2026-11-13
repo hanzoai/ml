@@ -7,6 +7,8 @@
 
 **Fast, multi-backend tensor & ML for Rust — CPU · CUDA · Metal · ROCm · Vulkan, with quantization built in.**
 
+Built on [candle](https://github.com/huggingface/candle) by Hugging Face, which is licensed MIT or Apache-2.0. See [NOTICE](NOTICE).
+
 Hanzo ML is a lightweight, memory-safe machine-learning framework for Rust, tuned for performance and
 built for real deployment — the compute core beneath [Hanzo](https://hanzo.ai) inference. Rebuilt for the
 Hanzo stack with optimizations for Edge AI, quantization, multimodal workloads, and NVIDIA GB10 / DGX
