@@ -81,9 +81,8 @@ impl st::View for Tensor {
     fn data_len(&self) -> usize {
         let bytes_per_element = self.dtype().size_in_bytes();
         if bytes_per_element == 0 {
-            if let Ok(data) = convert_back(self) {
-                return data.len();
-            }
+            let st_dtype: st::Dtype = self.dtype().into();
+            return (self.shape().elem_count() * st_dtype.bitsize()).div_ceil(8);
         }
         let n: usize = self.shape().elem_count();
         n * bytes_per_element
@@ -108,13 +107,33 @@ impl st::View for &Tensor {
     fn data_len(&self) -> usize {
         let bytes_per_element = (*self).dtype().size_in_bytes();
         if bytes_per_element == 0 {
-            if let Ok(data) = convert_back(self) {
-                return data.len();
-            }
+            let st_dtype: st::Dtype = (*self).dtype().into();
+            return (self.dims().iter().product::<usize>() * st_dtype.bitsize()).div_ceil(8);
         }
         let n: usize = self.dims().iter().product();
         n * bytes_per_element
     }
+}
+
+fn repack_sub_byte(
+    bytes: &[u8],
+    start_offset: usize,
+    elem_count: usize,
+    bits_per_elem: usize,
+) -> Vec<u8> {
+    let total_bits = elem_count * bits_per_elem;
+    let total_bytes = total_bits.div_ceil(8);
+    let mut out = vec![0u8; total_bytes];
+    let start_bit = start_offset * bits_per_elem;
+    for i in 0..total_bits {
+        let src_bit = start_bit + i;
+        if src_bit / 8 < bytes.len() {
+            let src_byte = bytes[src_bit / 8];
+            let bit_val = (src_byte >> (src_bit % 8)) & 1;
+            out[i / 8] |= bit_val << (i % 8);
+        }
+    }
+    out
 }
 
 /// A view of a tensor suitable for zero-copy serialization with `safetensors`.
@@ -144,28 +163,52 @@ impl<'a> TensorView<'a> {
     /// If the tensor is contiguous and on CPU, this borrows the underlying buffer directly
     /// without making any copy.
     pub fn from_tensor(tensor: &'a Tensor) -> Result<Self> {
-        let dtype = tensor.dtype().into();
+        let dtype: st::Dtype = tensor.dtype().into();
         let shape = tensor.dims();
         if tensor.device().is_cpu() && tensor.is_contiguous() {
             let guard = tensor.storage();
             if let Storage::Cpu(cpu_storage) = &*guard {
                 let bytes = cpu_storage.as_bytes();
                 let elem_size = tensor.dtype().size_in_bytes();
-                let (start_byte, byte_len) = if elem_size == 0 {
-                    (0, bytes.len())
+                if elem_size == 0 {
+                    let bits_per_elem = dtype.bitsize();
+                    let start_bit = tensor.layout().start_offset() * bits_per_elem;
+                    let bit_len = tensor.elem_count() * bits_per_elem;
+                    let byte_len = bit_len.div_ceil(8);
+                    if start_bit.is_multiple_of(8) {
+                        let start_byte = start_bit / 8;
+                        if start_byte + byte_len <= bytes.len() {
+                            return Ok(TensorView::Cpu {
+                                guard,
+                                shape,
+                                dtype,
+                                start_byte,
+                                byte_len,
+                            });
+                        }
+                    } else {
+                        let data = repack_sub_byte(
+                            bytes,
+                            tensor.layout().start_offset(),
+                            tensor.elem_count(),
+                            bits_per_elem,
+                        );
+                        return Ok(TensorView::Fallback { data, shape, dtype });
+                    }
                 } else {
                     let start_offset = tensor.layout().start_offset();
                     let elem_count = tensor.elem_count();
-                    (start_offset * elem_size, elem_count * elem_size)
-                };
-                if start_byte + byte_len <= bytes.len() {
-                    return Ok(TensorView::Cpu {
-                        guard,
-                        shape,
-                        dtype,
-                        start_byte,
-                        byte_len,
-                    });
+                    let start_byte = start_offset * elem_size;
+                    let byte_len = elem_count * elem_size;
+                    if start_byte + byte_len <= bytes.len() {
+                        return Ok(TensorView::Cpu {
+                            guard,
+                            shape,
+                            dtype,
+                            start_byte,
+                            byte_len,
+                        });
+                    }
                 }
             }
         }
@@ -557,15 +600,33 @@ fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {
         if let Storage::Cpu(cpu_storage) = &*guard {
             let bytes = cpu_storage.as_bytes();
             let elem_size = tensor.dtype().size_in_bytes();
-            let (start_byte, byte_len) = if elem_size == 0 {
-                (0, bytes.len())
+            if elem_size == 0 {
+                let st_dtype: st::Dtype = tensor.dtype().into();
+                let bits_per_elem = st_dtype.bitsize();
+                let start_bit = tensor.layout().start_offset() * bits_per_elem;
+                let bit_len = tensor.elem_count() * bits_per_elem;
+                let byte_len = bit_len.div_ceil(8);
+                if start_bit.is_multiple_of(8) {
+                    let start_byte = start_bit / 8;
+                    if start_byte + byte_len <= bytes.len() {
+                        return Ok(bytes[start_byte..start_byte + byte_len].to_vec());
+                    }
+                } else {
+                    return Ok(repack_sub_byte(
+                        bytes,
+                        tensor.layout().start_offset(),
+                        tensor.elem_count(),
+                        bits_per_elem,
+                    ));
+                }
             } else {
                 let start_offset = tensor.layout().start_offset();
                 let elem_count = tensor.elem_count();
-                (start_offset * elem_size, elem_count * elem_size)
-            };
-            if start_byte + byte_len <= bytes.len() {
-                return Ok(bytes[start_byte..start_byte + byte_len].to_vec());
+                let start_byte = start_offset * elem_size;
+                let byte_len = elem_count * elem_size;
+                if start_byte + byte_len <= bytes.len() {
+                    return Ok(bytes[start_byte..start_byte + byte_len].to_vec());
+                }
             }
         }
     }

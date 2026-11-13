@@ -336,6 +336,45 @@ fn test_safetensors_packed_sub_byte_dtypes() -> Result<()> {
     let reloaded_view = reloaded_f4.to_safetensors_view()?;
     assert_eq!(reloaded_view.data(), &f4_bytes);
 
+    // Narrowed F4 slice test: byte-aligned offset
+    let f4_aligned = f4_tensor.narrow(0, 0, 4)?;
+    let view_aligned = f4_aligned.to_safetensors_view()?;
+    assert!(
+        view_aligned.is_borrowed(),
+        "Aligned narrowed F4 tensor must be borrowed zero-copy"
+    );
+    assert_eq!(view_aligned.data_len(), 2);
+    assert_eq!(view_aligned.data(), &f4_bytes[0..2]);
+
+    let tmp_aligned = TmpFile::create("f4_aligned");
+    f4_aligned.save_safetensors("f4_aligned", &tmp_aligned)?;
+    let reloaded_aligned = safetensors::load(&tmp_aligned, &dev)?;
+    let reloaded_al_t = reloaded_aligned
+        .get("f4_aligned")
+        .expect("f4_aligned loaded");
+    assert_eq!(reloaded_al_t.to_safetensors_view()?.data(), &f4_bytes[0..2]);
+
+    // Narrowed F4 slice test: unaligned offset (repacked)
+    let f4_unaligned = f4_tensor.narrow(0, 1, 4)?;
+    let view_unaligned = f4_unaligned.to_safetensors_view()?;
+    assert!(
+        !view_unaligned.is_borrowed(),
+        "Unaligned narrowed F4 tensor must be repacked via fallback"
+    );
+    assert_eq!(view_unaligned.data_len(), 2);
+
+    let tmp_unaligned = TmpFile::create("f4_unaligned");
+    f4_unaligned.save_safetensors("f4_unaligned", &tmp_unaligned)?;
+    let reloaded_unaligned = safetensors::load(&tmp_unaligned, &dev)?;
+    let reloaded_un_t = reloaded_unaligned
+        .get("f4_unaligned")
+        .expect("f4_unaligned loaded");
+    assert_eq!(reloaded_un_t.to_safetensors_view()?.data_len(), 2);
+    assert_eq!(
+        reloaded_un_t.to_safetensors_view()?.data(),
+        view_unaligned.data()
+    );
+
     // 2. Test F6_E2M3 (MX6) format
     let f6_bytes = [0xABu8, 0xCD, 0xEF];
     let f6_shape = [4];
