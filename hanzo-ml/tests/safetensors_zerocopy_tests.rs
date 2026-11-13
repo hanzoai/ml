@@ -274,3 +274,90 @@ fn test_safetensors_empty_tensor() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_safetensors_packed_sub_byte_dtypes() -> Result<()> {
+    use ::safetensors::tensor as st;
+
+    struct RawView<'a> {
+        dtype: st::Dtype,
+        shape: &'a [usize],
+        data: &'a [u8],
+    }
+
+    impl<'a> st::View for RawView<'a> {
+        fn dtype(&self) -> st::Dtype {
+            self.dtype
+        }
+        fn shape(&self) -> &[usize] {
+            self.shape
+        }
+        fn data(&self) -> std::borrow::Cow<'_, [u8]> {
+            std::borrow::Cow::Borrowed(self.data)
+        }
+        fn data_len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    let dev = Device::Cpu;
+
+    // 1. Test F4 (MX4) packed format
+    let f4_bytes = [0x12u8, 0x34, 0x56, 0x78];
+    let f4_shape = [8];
+    let f4_view = RawView {
+        dtype: st::Dtype::F4,
+        shape: &f4_shape,
+        data: &f4_bytes,
+    };
+    let initial_buf = st::serialize([("f4_test", f4_view)], None).map_err(hanzo_ml::Error::from)?;
+
+    let loaded = safetensors::load_buffer(&initial_buf, &dev)?;
+    let f4_tensor = loaded.get("f4_test").expect("f4_test loaded");
+    assert_eq!(f4_tensor.dtype(), DType::F4);
+
+    let view = f4_tensor.to_safetensors_view()?;
+    assert!(
+        view.is_borrowed(),
+        "Contiguous CPU F4 tensor view must be borrowed zero-copy"
+    );
+    assert_eq!(
+        view.data_len(),
+        4,
+        "F4 view data_len must match packed byte count (4 bytes), not 0"
+    );
+    assert_eq!(view.data(), &f4_bytes);
+
+    // Save and re-load roundtrip
+    let tmp_f4 = TmpFile::create("f4");
+    f4_tensor.save_safetensors("f4_test", &tmp_f4)?;
+    let reloaded = safetensors::load(&tmp_f4, &dev)?;
+    let reloaded_f4 = reloaded.get("f4_test").expect("f4_test reloaded");
+    let reloaded_view = reloaded_f4.to_safetensors_view()?;
+    assert_eq!(reloaded_view.data(), &f4_bytes);
+
+    // 2. Test F6_E2M3 (MX6) format
+    let f6_bytes = [0xABu8, 0xCD, 0xEF];
+    let f6_shape = [4];
+    let f6_view = RawView {
+        dtype: st::Dtype::F6_E2M3,
+        shape: &f6_shape,
+        data: &f6_bytes,
+    };
+    let f6_buf = st::serialize([("f6_test", f6_view)], None).map_err(hanzo_ml::Error::from)?;
+    let loaded_f6 = safetensors::load_buffer(&f6_buf, &dev)?;
+    let f6_tensor = loaded_f6.get("f6_test").expect("f6_test loaded");
+    assert_eq!(f6_tensor.dtype(), DType::F6E2M3);
+
+    let view_f6 = f6_tensor.to_safetensors_view()?;
+    assert!(view_f6.is_borrowed());
+    assert_eq!(view_f6.data_len(), 3);
+    assert_eq!(view_f6.data(), &f6_bytes);
+
+    let serialized = safetensors::serialize(&loaded_f6)?;
+    let reloaded_f6_map = safetensors::load_buffer(&serialized, &dev)?;
+    let reloaded_f6 = reloaded_f6_map.get("f6_test").expect("reloaded f6");
+    assert_eq!(reloaded_f6.to_safetensors_view()?.data(), &f6_bytes);
+
+    Ok(())
+}

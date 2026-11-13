@@ -79,8 +79,13 @@ impl st::View for Tensor {
     }
 
     fn data_len(&self) -> usize {
-        let n: usize = self.shape().elem_count();
         let bytes_per_element = self.dtype().size_in_bytes();
+        if bytes_per_element == 0 {
+            if let Ok(data) = convert_back(self) {
+                return data.len();
+            }
+        }
+        let n: usize = self.shape().elem_count();
         n * bytes_per_element
     }
 }
@@ -101,8 +106,13 @@ impl st::View for &Tensor {
     }
 
     fn data_len(&self) -> usize {
-        let n: usize = self.dims().iter().product();
         let bytes_per_element = (*self).dtype().size_in_bytes();
+        if bytes_per_element == 0 {
+            if let Ok(data) = convert_back(self) {
+                return data.len();
+            }
+        }
+        let n: usize = self.dims().iter().product();
         n * bytes_per_element
     }
 }
@@ -141,10 +151,13 @@ impl<'a> TensorView<'a> {
             if let Storage::Cpu(cpu_storage) = &*guard {
                 let bytes = cpu_storage.as_bytes();
                 let elem_size = tensor.dtype().size_in_bytes();
-                let start_offset = tensor.layout().start_offset();
-                let elem_count = tensor.elem_count();
-                let start_byte = start_offset * elem_size;
-                let byte_len = elem_count * elem_size;
+                let (start_byte, byte_len) = if elem_size == 0 {
+                    (0, bytes.len())
+                } else {
+                    let start_offset = tensor.layout().start_offset();
+                    let elem_count = tensor.elem_count();
+                    (start_offset * elem_size, elem_count * elem_size)
+                };
                 if start_byte + byte_len <= bytes.len() {
                     return Ok(TensorView::Cpu {
                         guard,
@@ -544,8 +557,13 @@ fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {
         if let Storage::Cpu(cpu_storage) = &*guard {
             let bytes = cpu_storage.as_bytes();
             let elem_size = tensor.dtype().size_in_bytes();
-            let start_byte = tensor.layout().start_offset() * elem_size;
-            let byte_len = tensor.elem_count() * elem_size;
+            let (start_byte, byte_len) = if elem_size == 0 {
+                (0, bytes.len())
+            } else {
+                let start_offset = tensor.layout().start_offset();
+                let elem_count = tensor.elem_count();
+                (start_offset * elem_size, elem_count * elem_size)
+            };
             if start_byte + byte_len <= bytes.len() {
                 return Ok(bytes[start_byte..start_byte + byte_len].to_vec());
             }
