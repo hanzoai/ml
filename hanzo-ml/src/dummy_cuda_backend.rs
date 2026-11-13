@@ -4,6 +4,43 @@
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
 
+/// Maximum number of elements supported in a single CUDA allocation or tensor.
+/// CUDA kernel index calculations (and `LaunchConfig`) typically rely on 32-bit signed
+/// integers (`int` / `i32`). Elements beyond `i32::MAX` (2^31 - 1 = 2,147,483,647) silently
+/// overflow thread/block indexing, causing computational corruption.
+pub const MAX_CUDA_ELEMENTS: usize = i32::MAX as usize; // 2,147,483,647
+
+#[inline]
+pub fn check_elem_count(len: usize) -> Result<()> {
+    if len > MAX_CUDA_ELEMENTS {
+        crate::bail!(
+            "tensor element count {len} exceeds maximum CUDA 32-bit element limit ({MAX_CUDA_ELEMENTS}); use tiled operations instead"
+        );
+    }
+    Ok(())
+}
+
+/// Check that a shape's element count does not overflow `usize` and does not exceed `MAX_CUDA_ELEMENTS`.
+/// Returns the verified element count.
+#[inline]
+pub fn check_shape_elem_count(shape: &Shape) -> Result<usize> {
+    if shape.dims().contains(&0) {
+        return Ok(0);
+    }
+    let mut count: usize = 1;
+    for &d in shape.dims() {
+        match count.checked_mul(d) {
+            Some(c) if c <= MAX_CUDA_ELEMENTS => count = c,
+            _ => {
+                crate::bail!(
+                    "tensor element count exceeds maximum CUDA 32-bit element limit ({MAX_CUDA_ELEMENTS}); use tiled operations instead"
+                );
+            }
+        }
+    }
+    Ok(count)
+}
+
 #[derive(Debug, Clone)]
 pub struct CudaDevice;
 

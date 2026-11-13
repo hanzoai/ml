@@ -2418,6 +2418,9 @@ impl Tensor {
 
     /// If the target device is the same as the tensor device, only a shallow copy is performed.
     pub fn to_device(&self, device: &Device) -> Result<Tensor> {
+        if device.is_cuda() {
+            crate::cuda::check_shape_elem_count(self.shape())?;
+        }
         if self.device().same_device(device) {
             Ok(self.clone())
         } else {
@@ -2509,6 +2512,10 @@ impl Tensor {
     /// any value, the dimension `t_a` must be equal to `i_a` if `i_a` is different from 1. If
     /// `i_a` is equal to 1, any value can be used.
     pub fn broadcast_as<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
+        let shape = shape.into();
+        if self.device().is_cuda() {
+            crate::cuda::check_shape_elem_count(&shape)?;
+        }
         let tensor_ = Tensor_ {
             id: TensorId::new(),
             storage: self.storage.clone(),
@@ -2615,6 +2622,9 @@ impl Tensor {
                 op: "reshape",
             }
             .bt());
+        }
+        if self.device().is_cuda() {
+            crate::cuda::check_shape_elem_count(&shape)?;
         }
         let op = BackpropOp::new1(self, Op::Reshape);
         if self.is_contiguous() {

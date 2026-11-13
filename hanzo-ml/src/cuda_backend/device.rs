@@ -34,6 +34,47 @@ unsafe impl Send for CudaRng {}
 
 const CUDA_GRAPH_HTOD_CACHE_MAX_BYTES: usize = 4096;
 
+/// Maximum number of elements supported in a single CUDA allocation or tensor.
+/// CUDA kernel index calculations (and `LaunchConfig`) typically rely on 32-bit signed
+/// integers (`int` / `i32`). Elements beyond `i32::MAX` (2^31 - 1 = 2,147,483,647) silently
+/// overflow thread/block indexing, causing computational corruption.
+pub const MAX_CUDA_ELEMENTS: usize = i32::MAX as usize; // 2,147,483,647
+
+#[inline]
+pub fn check_elem_count(len: usize) -> Result<()> {
+    if len > MAX_CUDA_ELEMENTS {
+        return Err(CudaError::TooManyElements {
+            elem_count: len,
+            max_elements: MAX_CUDA_ELEMENTS,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Check that a shape's element count does not overflow `usize` and does not exceed `MAX_CUDA_ELEMENTS`.
+/// Returns the verified element count.
+#[inline]
+pub fn check_shape_elem_count(shape: &Shape) -> Result<usize> {
+    if shape.dims().contains(&0) {
+        return Ok(0);
+    }
+    let mut count: usize = 1;
+    for &d in shape.dims() {
+        match count.checked_mul(d) {
+            Some(c) if c <= MAX_CUDA_ELEMENTS => count = c,
+            _ => {
+                return Err(CudaError::TooManyElements {
+                    elem_count: count.saturating_mul(d),
+                    max_elements: MAX_CUDA_ELEMENTS,
+                }
+                .into());
+            }
+        }
+    }
+    Ok(count)
+}
+
 type CudaGraphHtodCacheKey = (DeviceId, TypeId, Vec<u8>);
 type CudaGraphHtodCache = HashMap<CudaGraphHtodCacheKey, Box<dyn Any>>;
 
@@ -124,6 +165,7 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
+        check_elem_count(len)?;
         self.stream.alloc::<T>(len).w()
     }
 
@@ -131,6 +173,7 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
+        check_elem_count(len)?;
         self.stream.alloc_zeros::<T>(len).w()
     }
 
@@ -194,6 +237,8 @@ impl CudaDevice {
         &self,
         src: &Src,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
+        let (src_slice, _sync) = unsafe { src.stream_synced_slice(&self.stream) };
+        check_elem_count(src_slice.len())?;
         if cuda_graph_htod_cache_enabled() && !src.is_empty() {
             return self.clone_htod_capture_cached(src);
         }
@@ -793,7 +838,7 @@ impl BackendDevice for CudaDevice {
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<CudaStorage> {
-        let elem_count = shape.elem_count();
+        let elem_count = check_shape_elem_count(shape)?;
         let slice = match dtype {
             DType::U8 => {
                 let data = self.alloc_zeros::<u8>(elem_count)?;
@@ -848,7 +893,7 @@ impl BackendDevice for CudaDevice {
     }
 
     fn rand_uniform(&self, shape: &Shape, dtype: DType, lo: f64, up: f64) -> Result<CudaStorage> {
-        let elem_count = shape.elem_count();
+        let elem_count = check_shape_elem_count(shape)?;
         let curand = self.curand.lock().unwrap();
         let slice = match dtype {
             // TODO: Add support for F16 and BF16 though this is likely to require some upstream
@@ -898,15 +943,21 @@ impl BackendDevice for CudaDevice {
     fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<CudaStorage> {
         // TODO: Add support for F16 and BF16 though this is likely to require some upstream
         // cudarc changes.
-        let elem_count = shape.elem_count();
+        let elem_count = check_shape_elem_count(shape)?;
         let curand = self.curand.lock().unwrap();
         // curand can only generate an odd number of values.
         // https://github.com/hanzoai/ml/issues/734
         let elem_count_round = if elem_count % 2 == 1 {
-            elem_count + 1
+            elem_count.checked_add(1).ok_or_else(|| {
+                crate::Error::from(CudaError::TooManyElements {
+                    elem_count: usize::MAX,
+                    max_elements: MAX_CUDA_ELEMENTS,
+                })
+            })?
         } else {
             elem_count
         };
+        check_elem_count(elem_count_round)?;
         let slice = match dtype {
             DType::U8
             | DType::U32
@@ -947,7 +998,7 @@ impl BackendDevice for CudaDevice {
     }
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
-        let elem_count = shape.elem_count();
+        let elem_count = check_shape_elem_count(shape)?;
         let slice = match dtype {
             DType::U8 => {
                 let data = self.alloc::<u8>(elem_count)?;
@@ -1002,6 +1053,7 @@ impl BackendDevice for CudaDevice {
     }
 
     fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
+        check_elem_count(s.len())?;
         let slice = match T::cpu_storage_ref(s) {
             CpuStorageRef::U8(storage) => {
                 let data = self.clone_htod(storage)?;
