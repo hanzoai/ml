@@ -67,11 +67,12 @@ impl Mesh {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Gaussian {
     pub position: Vec3,
-    /// Per-axis scale (log-space in the file format; linear here).
+    /// Non-negative per-axis scale in linear units; PLY stores its natural logarithm.
     pub scale: Vec3,
     pub rotation: Quat,
     /// DC (view-independent) RGB.
     pub color: [f32; 3],
+    /// Linear opacity in `[0, 1]`; PLY stores its logit.
     pub opacity: f32,
 }
 
