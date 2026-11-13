@@ -74,7 +74,7 @@ impl st::View for Tensor {
     fn data(&self) -> Cow<'_, [u8]> {
         match convert_back(self) {
             Ok(data) => Cow::Owned(data),
-            Err(_) => Cow::Borrowed(&[]),
+            Err(e) => panic!("failed to convert tensor data for safetensors view: {e}"),
         }
     }
 
@@ -100,7 +100,7 @@ impl st::View for &Tensor {
     fn data(&self) -> Cow<'_, [u8]> {
         match convert_back(self) {
             Ok(data) => Cow::Owned(data),
-            Err(_) => Cow::Borrowed(&[]),
+            Err(e) => panic!("failed to convert tensor data for safetensors view: {e}"),
         }
     }
 
@@ -665,22 +665,34 @@ pub fn save<K: AsRef<str> + Ord + std::fmt::Display, P: AsRef<Path>>(
     tensors: &HashMap<K, Tensor>,
     filename: P,
 ) -> Result<()> {
-    let views: Result<HashMap<&str, TensorView<'_>>> = tensors
-        .iter()
-        .map(|(k, v)| Ok((k.as_ref(), TensorView::from_tensor(v)?)))
-        .collect();
-    Ok(st::serialize_to_file(views?, None, filename.as_ref())?)
+    let mut views: Vec<(&str, TensorView<'_>)> = Vec::with_capacity(tensors.len());
+    let mut seen = std::collections::HashSet::with_capacity(tensors.len());
+    for (k, v) in tensors {
+        let key = k.as_ref();
+        if !seen.insert(key) {
+            crate::bail!("duplicate tensor name in safetensors save: {key}");
+        }
+        views.push((key, TensorView::from_tensor(v)?));
+    }
+    views.sort_by_key(|(k, _)| *k);
+    Ok(st::serialize_to_file(views, None, filename.as_ref())?)
 }
 
 /// Serialize a map of tensors into an in-memory safetensors byte buffer.
 pub fn serialize<K: AsRef<str> + Ord + std::fmt::Display>(
     tensors: &HashMap<K, Tensor>,
 ) -> Result<Vec<u8>> {
-    let views: Result<HashMap<&str, TensorView<'_>>> = tensors
-        .iter()
-        .map(|(k, v)| Ok((k.as_ref(), TensorView::from_tensor(v)?)))
-        .collect();
-    Ok(st::serialize(views?, None)?)
+    let mut views: Vec<(&str, TensorView<'_>)> = Vec::with_capacity(tensors.len());
+    let mut seen = std::collections::HashSet::with_capacity(tensors.len());
+    for (k, v) in tensors {
+        let key = k.as_ref();
+        if !seen.insert(key) {
+            crate::bail!("duplicate tensor name in safetensors serialize: {key}");
+        }
+        views.push((key, TensorView::from_tensor(v)?));
+    }
+    views.sort_by_key(|(k, _)| *k);
+    Ok(st::serialize(views, None)?)
 }
 
 #[derive(yoke::Yokeable)]

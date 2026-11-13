@@ -400,3 +400,44 @@ fn test_safetensors_packed_sub_byte_dtypes() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_safetensors_duplicate_keys_rejected() -> Result<()> {
+    #[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+    struct CustomKey(String, usize);
+
+    impl AsRef<str> for CustomKey {
+        fn as_ref(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl std::fmt::Display for CustomKey {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}_{}", self.0, self.1)
+        }
+    }
+
+    let dev = Device::Cpu;
+    let t1 = Tensor::arange(0.0f32, 10.0f32, &dev)?;
+    let t2 = Tensor::arange(10.0f32, 20.0f32, &dev)?;
+
+    let mut map = HashMap::new();
+    map.insert(CustomKey("weight".into(), 1), t1);
+    map.insert(CustomKey("weight".into(), 2), t2);
+
+    let res = safetensors::serialize(&map);
+    assert!(
+        res.is_err(),
+        "Serializing map with duplicate string keys must return an error"
+    );
+
+    let tmp = TmpFile::create("dup");
+    let res_save = safetensors::save(&map, &tmp);
+    assert!(
+        res_save.is_err(),
+        "Saving map with duplicate string keys must return an error"
+    );
+
+    Ok(())
+}
