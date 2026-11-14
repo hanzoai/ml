@@ -27,6 +27,9 @@
 // Ternary (base-3 / 2-bit) weight ids (match quant.hip's DW_* id space). Symmetric ternary {-1,0,1}.
 #define DW_TQ2_0   5
 #define DW_TQ1_0   19
+// Prism / Bonsai-2 128-element ternary formats: PQ2_0 ({-1,0,+1,+2}, 34B) and PTQ1_0 ({-1,0,+1} base-3, 28B).
+#define DW_PQ2_0   25
+#define DW_PTQ1_0  26
 
 // IQ1_S/IQ1_M signed-grid delta bias (iq_quants.rs:28); both 1-bit types share it.
 constexpr float IQ1S_DELTA = 0.125f;
@@ -453,17 +456,95 @@ template <> struct qdp4a<DW_TQ1_0> {
     }
 };
 
-// IQ dp4a byte strides (= on-disk super-block bytes; mirror qdw_traits::BYTES). All 256-elem.
-template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  };
-template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  };
-template <> struct qdp4a_traits<DW_IQ2_S>   { static constexpr int BYTES = 82;  };
-template <> struct qdp4a_traits<DW_IQ3_XXS> { static constexpr int BYTES = 98;  };
-template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; };
-template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  };
-template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  };
-template <> struct qdp4a_traits<DW_IQ4_XS>  { static constexpr int BYTES = 136; };
-template <> struct qdp4a_traits<DW_TQ2_0>   { static constexpr int BYTES = 66;  };
-template <> struct qdp4a_traits<DW_TQ1_0>   { static constexpr int BYTES = 54;  };
+// PQ2_0 (Prism / Bonsai-2 2-bit asymmetric ternary {-1, 0, +1, +2}, 128 elems, 34B: f16 d at +0, qs[32] at +2).
+template <> struct qdp4a<DW_PQ2_0> {
+    static constexpr int NSUB = 4;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const float d8 = __half2float(xd8[e]);
+        const uint8_t* b = blk + 2 + e * 8;
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint8_t byte = b[i];
+            const int w0 = (int)( byte       & 3) - 1;
+            const int w1 = (int)((byte >> 2) & 3) - 1;
+            const int w2 = (int)((byte >> 4) & 3) - 1;
+            const int w3 = (int)((byte >> 6) & 3) - 1;
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// PTQ1_0 base-3 unpack of ONE logical coord p in [0,128) -> ternary {-1, 0, +1}.
+// Block (28B): qs[24] at +0 (16B*5=80 + 8B*5=40), qh[2] at +24 (2B*4=8), f16 d at +26.
+__device__ __forceinline__ int ptq1_0_w(const uint8_t* __restrict__ qs, const uint8_t* __restrict__ qh, int p) {
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+    uint8_t b; int n;
+    if (p < 80)       { n = p >> 4;             b = qs[p & 15]; }
+    else if (p < 120) { const int p2 = p - 80;  n = p2 >> 3; b = qs[16 + (p2 & 7)]; }
+    else              { const int p3 = p - 120; n = p3 >> 1; b = qh[p3 & 1]; }
+    const uint16_t q = (uint16_t)(uint8_t)(b * pow3[n]);
+    return (int)((q * 3) >> 8) - 1;
+}
+
+template <> struct qdp4a<DW_PTQ1_0> {
+    static constexpr int NSUB = 4;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint8_t* qs = blk;
+        const uint8_t* qh = blk + 24;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        const int p0 = e * 32;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int w0 = ptq1_0_w(qs, qh, p0 + 4 * i + 0);
+            const int w1 = ptq1_0_w(qs, qh, p0 + 4 * i + 1);
+            const int w2 = ptq1_0_w(qs, qh, p0 + 4 * i + 2);
+            const int w3 = ptq1_0_w(qs, qh, p0 + 4 * i + 3);
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ dp4a byte strides & block sizes (= on-disk super-block bytes; mirror qdw_traits).
+template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ2_S>   { static constexpr int BYTES = 82;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ3_XXS> { static constexpr int BYTES = 98;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ4_XS>  { static constexpr int BYTES = 136; static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_TQ2_0>   { static constexpr int BYTES = 66;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_TQ1_0>   { static constexpr int BYTES = 54;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_PQ2_0>   { static constexpr int BYTES = 34;  static constexpr int ELEMS = 128; };
+template <> struct qdp4a_traits<DW_PTQ1_0>  { static constexpr int BYTES = 28;  static constexpr int ELEMS = 128; };
 
 // ---- activation -> q8 (separated int8 qs `xq` + per-32 f16 scale `xd`) ----
 extern "C" __global__ void iq_quantize_q8_f16(
@@ -578,20 +659,22 @@ extern "C" __global__ void iq_quantize_q8_f32(
 template <int WTYPE, typename XT>
 __device__ __forceinline__ void qmatvec_dp4a_core(
     const int nrows,
-    const int ncols,                  // multiple of 256
+    const int ncols,                  // multiple of WELEMS (256 or 128)
     const uint8_t* __restrict__ wq,
     const int8_t*  __restrict__ xq,   // [ncols] q8_1 int8 quants
     const __half*  __restrict__ xd,   // [ncols/32] q8_1 f16 scales
     XT* __restrict__ y
 ) {
     constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
+    constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
+    constexpr int WSUB32 = WELEMS / 32;
     const int lane = threadIdx.x & 31;
     const int rows_per_block = blockDim.x >> 5;
     const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
     if (row >= nrows) {
         return;
     }
-    const int nblocks = ncols >> 8; // ncols / 256
+    const int nblocks = ncols / WELEMS;
     const uint8_t* row_ptr = wq + (size_t)row * (size_t)nblocks * WBYTES;
 
     // Stride lanes over (super-block x sub-unit) work items, NOT whole super-blocks -- the SAME fix the
@@ -606,7 +689,7 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
         const int b = u / NSUB;
         const int sub = u - b * NSUB;
         acc += qdp4a<WTYPE>::partial(
-            row_ptr + (size_t)b * WBYTES, xq + (size_t)b * 256, xd + (size_t)b * 8, sub);
+            row_ptr + (size_t)b * WBYTES, xq + (size_t)b * WELEMS, xd + (size_t)b * WSUB32, sub);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -620,7 +703,7 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
 template <int WTYPE, typename XT>
 __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     const int n,                        // output rows per expert (weight rows)
-    const int ncols,                    // k, multiple of 256
+    const int ncols,                    // k, multiple of WELEMS (256 or 128)
     const int nslots,                   // routed slots (= nrows)
     const uint8_t* __restrict__ wbank,  // [E, n, k] blocks
     const int* __restrict__ ids,        // [nslots] expert id per slot
@@ -629,6 +712,8 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     XT* __restrict__ y                  // [nslots, n]
 ) {
     constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
+    constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
+    constexpr int WSUB32 = WELEMS / 32;
     const int s = blockIdx.y;
     if (s >= nslots) {
         return;
@@ -639,7 +724,7 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     if (row >= n) {
         return;
     }
-    const int nblocks = ncols >> 8; // ncols / 256
+    const int nblocks = ncols / WELEMS;
     const int expert = ids[s];
     const uint8_t* row_ptr = wbank + ((size_t)expert * n + row) * (size_t)nblocks * WBYTES;
     const int8_t* xq_row = xq + (size_t)s * ncols;
@@ -657,7 +742,7 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
         const int b = u / NSUB;
         const int sub = u - b * NSUB;
         acc += qdp4a<WTYPE>::partial(
-            row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * 256, xd_row + (size_t)b * 8, sub);
+            row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * WELEMS, xd_row + (size_t)b * WSUB32, sub);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -714,4 +799,110 @@ DEFINE_QMATVEC_DP4A(iq1_m,  DW_IQ1_M)
 DEFINE_QMATVEC_DP4A(iq4xs,  DW_IQ4_XS)
 DEFINE_QMATVEC_DP4A(tq2_0,  DW_TQ2_0)
 DEFINE_QMATVEC_DP4A(tq1_0,  DW_TQ1_0)
+DEFINE_QMATVEC_DP4A(pq2_0,  DW_PQ2_0)
+DEFINE_QMATVEC_DP4A(ptq1_0, DW_PTQ1_0)
+
+// ---- Native GPU dequantize + get_rows for PQ2_0 (34B, 128 elems) & PTQ1_0 (28B, 128 elems) ----
+template <typename DST_T>
+__device__ __forceinline__ void dequantize_pq2_0_impl(
+    const uint8_t* __restrict__ vx,
+    DST_T* __restrict__ y,
+    const int64_t nblocks
+) {
+    const int tid = threadIdx.x; // 0..127
+    if (tid >= 128) return;
+    for (int64_t ib = blockIdx.x; ib < nblocks; ib += gridDim.x) {
+        const uint8_t* blk = vx + (size_t)ib * 34;
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const uint8_t byte = blk[2 + (tid >> 2)];
+        const int q = (int)((byte >> ((tid & 3) * 2)) & 3) - 1;
+        qstore(&y[(size_t)ib * 128 + tid], (float)q * d);
+    }
+}
+
+template <typename DST_T>
+__device__ __forceinline__ void dequantize_ptq1_0_impl(
+    const uint8_t* __restrict__ vx,
+    DST_T* __restrict__ y,
+    const int64_t nblocks
+) {
+    const int tid = threadIdx.x; // 0..127
+    if (tid >= 128) return;
+    for (int64_t ib = blockIdx.x; ib < nblocks; ib += gridDim.x) {
+        const uint8_t* blk = vx + (size_t)ib * 28;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const int q = ptq1_0_w(blk, blk + 24, tid);
+        qstore(&y[(size_t)ib * 128 + tid], (float)q * d);
+    }
+}
+
+extern "C" __global__ void dequantize_block_pq2_0_f32(
+    const uint8_t* __restrict__ vx, float* __restrict__ y, const int64_t nblocks) {
+    dequantize_pq2_0_impl<float>(vx, y, nblocks);
+}
+
+extern "C" __global__ void dequantize_block_pq2_0_f16(
+    const uint8_t* __restrict__ vx, __half* __restrict__ y, const int64_t nblocks) {
+    dequantize_pq2_0_impl<__half>(vx, y, nblocks);
+}
+
+extern "C" __global__ void dequantize_block_ptq1_0_f32(
+    const uint8_t* __restrict__ vx, float* __restrict__ y, const int64_t nblocks) {
+    dequantize_ptq1_0_impl<float>(vx, y, nblocks);
+}
+
+extern "C" __global__ void dequantize_block_ptq1_0_f16(
+    const uint8_t* __restrict__ vx, __half* __restrict__ y, const int64_t nblocks) {
+    dequantize_ptq1_0_impl<__half>(vx, y, nblocks);
+}
+
+extern "C" __global__ void get_rows_pq2_0(
+    const uint8_t* __restrict__ src0,
+    const uint32_t* __restrict__ src1,
+    float* __restrict__ dst,
+    const int64_t ne00,
+    const size_t nb01
+) {
+    const int tid = threadIdx.x; // 0..127
+    if (tid >= 128) return;
+    const size_t i10 = (size_t)blockIdx.x;
+    const size_t i01 = (size_t)src1[i10];
+    const uint8_t* src_row = src0 + i01 * nb01;
+    float* dst_row = dst + i10 * (size_t)ne00;
+    const int64_t blocks_per_row = ne00 / 128;
+    for (int64_t ib = blockIdx.y; ib < blocks_per_row; ib += gridDim.y) {
+        const uint8_t* blk = src_row + (size_t)ib * 34;
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const uint8_t byte = blk[2 + (tid >> 2)];
+        const int q = (int)((byte >> ((tid & 3) * 2)) & 3) - 1;
+        dst_row[(size_t)ib * 128 + tid] = (float)q * d;
+    }
+}
+
+extern "C" __global__ void get_rows_ptq1_0(
+    const uint8_t* __restrict__ src0,
+    const uint32_t* __restrict__ src1,
+    float* __restrict__ dst,
+    const int64_t ne00,
+    const size_t nb01
+) {
+    const int tid = threadIdx.x; // 0..127
+    if (tid >= 128) return;
+    const size_t i10 = (size_t)blockIdx.x;
+    const size_t i01 = (size_t)src1[i10];
+    const uint8_t* src_row = src0 + i01 * nb01;
+    float* dst_row = dst + i10 * (size_t)ne00;
+    const int64_t blocks_per_row = ne00 / 128;
+    for (int64_t ib = blockIdx.y; ib < blocks_per_row; ib += gridDim.y) {
+        const uint8_t* blk = src_row + (size_t)ib * 28;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const int q = ptq1_0_w(blk, blk + 24, tid);
+        dst_row[(size_t)ib * 128 + tid] = (float)q * d;
+    }
+}
+
 

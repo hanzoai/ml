@@ -36,6 +36,8 @@ pub enum GgmlDType {
     IQ1_M,
     IQ4_NL,
     IQ4_XS,
+    PQ2_0,
+    PTQ1_0,
 }
 
 /// Threadgroup scratch (bytes) the matvec kernel stages its codebook grid into. The IQ2/IQ3 kernels
@@ -187,6 +189,8 @@ pub fn call_quantized_matmul_mv_t_offset(
         | GgmlDType::IQ1_S
         | GgmlDType::IQ1_M => (4, 16, 8),
         GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
+        GgmlDType::PQ2_0 => (4, 16, 16),
+        GgmlDType::PTQ1_0 => (4, 16, 8),
     };
     let thread_groups_count = MTLSize {
         width: divide(ne01 as usize, align),
@@ -205,6 +209,8 @@ pub fn call_quantized_matmul_mv_t_offset(
         match dtype {
             GgmlDType::Q4K => "kernel_mul_mv_q4_K_bf16",
             GgmlDType::Q6K => "kernel_mul_mv_q6_K_bf16",
+            GgmlDType::PQ2_0 => "kernel_mul_mv_pq2_0_bf16",
+            GgmlDType::PTQ1_0 => "kernel_mul_mv_ptq1_0_bf16",
             other => {
                 return Err(MetalKernelError::LoadFunctionError(format!(
                     "bf16 activation matvec unsupported for {other:?}"
@@ -237,6 +243,8 @@ pub fn call_quantized_matmul_mv_t_offset(
             GgmlDType::IQ1_M => "kernel_mul_mv_iq1_m_f32",
             GgmlDType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
             GgmlDType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
+            GgmlDType::PQ2_0 => "kernel_mul_mv_pq2_0_f32",
+            GgmlDType::PTQ1_0 => "kernel_mul_mv_ptq1_0_f32",
         }
     };
 
@@ -385,8 +393,10 @@ pub fn call_quantized_matmul_mm_t_offset(
         match dtype {
             GgmlDType::Q4K => "kernel_mul_mm_q4_K_bf16",
             GgmlDType::Q6K => "kernel_mul_mm_q6_K_bf16",
+            GgmlDType::PQ2_0 => "kernel_mul_mm_pq2_0_bf16",
+            GgmlDType::PTQ1_0 => "kernel_mul_mm_ptq1_0_bf16",
             _ => Err(MetalKernelError::UnsupportedDTypeForOp(
-                "non-Q4K/Q6K",
+                "non-Q4K/Q6K/PQ2_0/PTQ1_0",
                 "bf16 qmatmul mm",
             ))?,
         }
@@ -414,6 +424,8 @@ pub fn call_quantized_matmul_mm_t_offset(
             GgmlDType::IQ1_M => "kernel_mul_mm_iq1_m_f32",
             GgmlDType::IQ4_NL => "kernel_mul_mm_iq4_nl_f32",
             GgmlDType::IQ4_XS => "kernel_mul_mm_iq4_xs_f32",
+            GgmlDType::PQ2_0 => "kernel_mul_mm_pq2_0_f32",
+            GgmlDType::PTQ1_0 => "kernel_mul_mm_ptq1_0_f32",
             GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
             GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
         }
@@ -492,6 +504,8 @@ pub fn call_quantized_get_rows(
         GgmlDType::IQ1_M => "kernel_get_rows_iq1_m",
         GgmlDType::IQ4_NL => "kernel_get_rows_iq4_nl",
         GgmlDType::IQ4_XS => "kernel_get_rows_iq4_xs",
+        GgmlDType::PQ2_0 => "kernel_get_rows_pq2_0",
+        GgmlDType::PTQ1_0 => "kernel_get_rows_ptq1_0",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
     };
@@ -617,6 +631,8 @@ pub fn call_mul_mv_id(
         | GgmlDType::IQ1_S
         | GgmlDType::IQ1_M => (4, 16, 8),
         GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
+        GgmlDType::PQ2_0 => (4, 16, 16),
+        GgmlDType::PTQ1_0 => (4, 16, 8),
     };
 
     let name = match dtype {
@@ -641,6 +657,8 @@ pub fn call_mul_mv_id(
         GgmlDType::IQ1_M => "kernel_mul_mv_id_iq1_m_f32",
         GgmlDType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
         GgmlDType::IQ4_XS => "kernel_mul_mv_id_iq4_xs_f32",
+        GgmlDType::PQ2_0 => "kernel_mul_mv_id_pq2_0_f32",
+        GgmlDType::PTQ1_0 => "kernel_mul_mv_id_ptq1_0_f32",
         other => {
             return Err(MetalKernelError::LoadFunctionError(format!(
                 "no kernel_mul_mv_id for {other:?}"
@@ -774,6 +792,8 @@ pub fn call_mul_mm_id(
         GgmlDType::IQ1_M => "kernel_mul_mm_id_iq1_m_f32",
         GgmlDType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
         GgmlDType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_f32",
+        GgmlDType::PQ2_0 => "kernel_mul_mm_id_pq2_0_f32",
+        GgmlDType::PTQ1_0 => "kernel_mul_mm_id_ptq1_0_f32",
         other => {
             return Err(MetalKernelError::LoadFunctionError(format!(
                 "no kernel_mul_mm_id for {other:?}"

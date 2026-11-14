@@ -137,6 +137,29 @@ fn dequantize_f32(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    if matches!(dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) {
+        let kernel_name = match dtype {
+            GgmlDType::PQ2_0 => "dequantize_block_pq2_0_f32",
+            GgmlDType::PTQ1_0 => "dequantize_block_ptq1_0_f32",
+            _ => unreachable!(),
+        };
+        let nblocks = elem_count / 128;
+        let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+        let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+        if nblocks > 0 {
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (nblocks.min(65535) as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            builder.arg(&data.inner);
+            builder.arg(&dst);
+            barg!(builder, nblocks as i64);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let nb = elem_count.div_ceil(256);
     let (kernel_name, is_k, block_dim, num_blocks) = match dtype {
         GgmlDType::Q4_0 => ("dequantize_block_q4_0_f32", false, 32, nb),
@@ -197,6 +220,29 @@ fn dequantize_f16(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    if matches!(dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) {
+        let kernel_name = match dtype {
+            GgmlDType::PQ2_0 => "dequantize_block_pq2_0_f16",
+            GgmlDType::PTQ1_0 => "dequantize_block_ptq1_0_f16",
+            _ => unreachable!(),
+        };
+        let nblocks = elem_count / 128;
+        let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+        let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+        if nblocks > 0 {
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (nblocks.min(65535) as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            builder.arg(&data.inner);
+            builder.arg(&dst);
+            barg!(builder, nblocks as i64);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let nb = elem_count.div_ceil(256);
     let (kernel_name, is_k, block_dim, num_blocks) = match dtype {
         GgmlDType::Q4_0 => ("dequantize_block_q4_0_f16", false, 32, nb),
@@ -312,9 +358,16 @@ fn get_rows(
         GgmlDType::Q4K => ("get_rows_q4_K", 32, hidden / dtype.block_size(), false),
         GgmlDType::Q5K => ("get_rows_q5_K", 64, hidden / dtype.block_size(), false),
         GgmlDType::Q6K => ("get_rows_q6_K", 64, hidden / dtype.block_size(), false),
+        GgmlDType::PQ2_0 => ("get_rows_pq2_0", 128, hidden / dtype.block_size(), true),
+        GgmlDType::PTQ1_0 => ("get_rows_ptq1_0", 128, hidden / dtype.block_size(), true),
         _ => crate::bail!("unsupported dtype for CUDA quantized embedding {dtype:?}"),
     };
-    let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::QUANTIZED)?;
+    let ptx = if matches!(dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) {
+        &hanzo_kernels::IQUANT_MMVQ
+    } else {
+        &hanzo_kernels::QUANTIZED
+    };
+    let func = dev.get_or_load_func(kernel_name, ptx)?;
     let ids_len = ids.len();
     let dst = unsafe { dev.alloc::<f32>(ids_len * hidden)? };
     if ids_len == 0 {
@@ -532,6 +585,9 @@ fn iquant_dp4a_suffix(dtype: GgmlDType) -> Option<&'static str> {
         // Symmetric ternary {-1,0,1}: 2-bit (TQ2_0, clean) + base-3 (TQ1_0, scalar unpack + dp4a dot).
         GgmlDType::TQ2_0 => "tq2_0",
         GgmlDType::TQ1_0 => "tq1_0",
+        // Prism / Bonsai-2 128-elem ternary: 2-bit asymmetric {-1,0,+1,+2} (PQ2_0) + base-3 {-1,0,+1} (PTQ1_0).
+        GgmlDType::PQ2_0 => "pq2_0",
+        GgmlDType::PTQ1_0 => "ptq1_0",
         _ => return None,
     })
 }
@@ -553,10 +609,9 @@ fn mul_mat_vec_iquant_dp4a(
 ) -> Result<CudaStorage> {
     let suffix = iquant_dp4a_suffix(dtype)
         .ok_or_else(|| crate::Error::Msg(format!("no i-quant dp4a kernel for {dtype:?}")).bt())?;
-    // i-quant super-block is 256 weights (8 q8_1 sub-blocks of 32) -- ncols is always a multiple, so
-    // the activation needs no MATRIX_ROW_PADDING (the dp4a core reads exactly ncols int8 + ncols/32 f16).
-    if ncols % 256 != 0 {
-        crate::bail!("i-quant ncols {ncols} must be a multiple of 256");
+    let blk_sz = dtype.block_size();
+    if !ncols.is_multiple_of(blk_sz) {
+        crate::bail!("i-quant ncols {ncols} must be a multiple of {blk_sz}");
     }
     if b_size == 0 || b_size > 8 {
         crate::bail!("only bsize between 1 and 8 are supported, got {b_size}");
@@ -571,8 +626,8 @@ fn mul_mat_vec_iquant_dp4a(
 
     // Quantize the f32 activation -> separated (int8 `xq` [b_size, ncols], f16 scale `xd`
     // [b_size, ncols/32]). One warp per 32-block; guard `wid >= b_size*nblk32` in-kernel.
-    let mut xq = dev.alloc_zeros::<u8>(b_size * ncols)?;
-    let mut xd = dev.alloc_zeros::<f16>(b_size * nblk32)?;
+    let xq = dev.alloc_zeros::<u8>(b_size * ncols)?;
+    let xd = dev.alloc_zeros::<f16>(b_size * nblk32)?;
     {
         let func = dev.get_or_load_func("iq_quantize_q8_f32", &hanzo_kernels::IQUANT_MMVQ)?;
         let nwarp = (b_size * nblk32) as u32;
@@ -872,8 +927,9 @@ impl QCudaStorage {
         let suffix = iquant_dp4a_suffix(self.dtype).ok_or_else(|| {
             crate::Error::Msg(format!("no i-quant MoE kernel for {:?}", self.dtype)).bt()
         })?;
-        if k % 256 != 0 {
-            crate::bail!("i-quant MoE ncols {k} must be a multiple of 256");
+        let blk_sz = self.dtype.block_size();
+        if !k.is_multiple_of(blk_sz) {
+            crate::bail!("i-quant MoE ncols {k} must be a multiple of {blk_sz}");
         }
         if x_flat.len() != nrows * k {
             crate::bail!(
@@ -885,8 +941,8 @@ impl QCudaStorage {
         let nblk32 = k / 32;
 
         // Quantize the nrows routed activations -> separated (int8 xq [nrows,k], f16 scale xd [nrows,k/32]).
-        let mut xq = dev.alloc_zeros::<u8>(nrows * k)?;
-        let mut xd = dev.alloc_zeros::<f16>(nrows * nblk32)?;
+        let xq = dev.alloc_zeros::<u8>(nrows * k)?;
+        let xd = dev.alloc_zeros::<f16>(nrows * nblk32)?;
         {
             let func = dev.get_or_load_func("iq_quantize_q8_f32", &hanzo_kernels::IQUANT_MMVQ)?;
             let nwarp = (nrows * nblk32) as u32;
@@ -994,6 +1050,8 @@ impl QCudaStorage {
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
                 | GgmlDType::Q8K
+                | GgmlDType::PQ2_0
+                | GgmlDType::PTQ1_0
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -1063,6 +1121,12 @@ impl QCudaStorage {
             }
             GgmlDType::ROCMFP4_FAST => {
                 deq::<crate::quantized::iq_quants::BlockROCMFP4Fast>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::PQ2_0 => {
+                deq::<crate::quantized::iq_quants::BlockPQ2_0>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::PTQ1_0 => {
+                deq::<crate::quantized::iq_quants::BlockPTQ1_0>(&buffer, block_len, &mut out)
             }
         }
 
@@ -1213,7 +1277,45 @@ impl QCudaStorage {
             }
             .bt())?,
         };
-        get_rows(&self.data, self.dtype, hidden, &ids, self.device())
+        match self.dtype {
+            GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::BF16
+            | GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+            | GgmlDType::PQ2_0
+            | GgmlDType::PTQ1_0 => get_rows(&self.data, self.dtype, hidden, &ids, self.device()),
+            // dtypes without a get_rows kernel (i-quant, ternary, NVFP4): gather each
+            // requested row through the CPU to_float reference and upload the f32 result.
+            _ => self.embedding_dequant_rows(hidden, &ids),
+        }
+    }
+
+    fn embedding_dequant_rows(&self, hidden: usize, ids: &CudaView<u32>) -> Result<CudaStorage> {
+        let ids: Vec<u32> = self.device().clone_dtoh(ids)?;
+        let row_bytes = hidden * self.dtype.type_size() / self.dtype.block_size();
+        let table = self.data.inner.slice(..self.data.len);
+        let mut out = Vec::with_capacity(ids.len() * hidden);
+        for id in ids {
+            let lo = id as usize * row_bytes;
+            let row = table.slice(lo..lo + row_bytes);
+            let bytes: Vec<u8> = self.device().clone_dtoh(&row)?;
+            let q = self.dtype.from_data(std::borrow::Cow::Borrowed(&bytes));
+            let crate::CpuStorage::F32(v) = q.dequantize(hidden)? else {
+                crate::bail!("embedding dequant did not yield f32")
+            };
+            out.extend_from_slice(&v);
+        }
+        self.device()
+            .storage_from_cpu_storage(&crate::CpuStorage::F32(out))
     }
 
     pub fn fwd(
@@ -1727,6 +1829,8 @@ mod test {
             GgmlDType::TQ2_0,
             GgmlDType::NVFP4,
             GgmlDType::Q1_0,
+            GgmlDType::PQ2_0,
+            GgmlDType::PTQ1_0,
         ] {
             // Bounded byte pattern (<= 0x3F) so every embedded f16 scale decodes finite (no NaN/Inf), yet
             // varied. Sizing comes from the dtype so it is correct for both 256- and 32-element blocks.
@@ -1988,6 +2092,108 @@ mod test {
                 err_p <= tol,
                 "{dtype:?}: PER-SLOT decode vs oracle err {err_p} > tol {tol}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_pq2_ptq1_128blk_dp4a_dequant_and_get_rows() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let cuda_dev = crate::Device::Cuda(dev.clone());
+        // k = 384 = 3 * 128 (deliberately NOT a multiple of 256!) verifies 128-element super-block sizing.
+        let (n, k) = (6usize, 384usize);
+
+        for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0] {
+            let nbytes = (n * k / dtype.block_size()) * dtype.type_size();
+            let bytes: Vec<u8> = (0..nbytes)
+                .map(|i| (i.wrapping_mul(41).wrapping_add(7) & 0x3F) as u8)
+                .collect();
+
+            // CPU reference dequantization.
+            let qcpu = dtype.from_data(std::borrow::Cow::Borrowed(&bytes));
+            let crate::CpuStorage::F32(w_cpu) = qcpu.dequantize(n * k)? else {
+                unreachable!()
+            };
+
+            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)?
+            {
+                QStorage::Cuda(s) => s,
+                _ => unreachable!(),
+            };
+
+            // 1. Native GPU dequantize_f32 must match CPU to_float bit-for-bit.
+            let w_gpu_s = qcuda.dequantize(n * k)?;
+            let w_gpu = dev.clone_dtoh(&w_gpu_s.as_cuda_slice::<f32>()?.as_view())?;
+            for idx in 0..n * k {
+                assert_eq!(
+                    w_gpu[idx].to_bits(),
+                    w_cpu[idx].to_bits(),
+                    "{dtype:?} GPU dequantize_f32 mismatch at {idx}: gpu={} cpu={}",
+                    w_gpu[idx],
+                    w_cpu[idx]
+                );
+            }
+
+            // 2. Native GPU dequantize_f16 must match f16::from_f32(w_cpu).
+            let w_f16_s = qcuda.dequantize_f16(n * k)?;
+            let w_f16 = dev.clone_dtoh(&w_f16_s.as_cuda_slice::<f16>()?.as_view())?;
+            for idx in 0..n * k {
+                let diff = (w_f16[idx].to_f32() - w_cpu[idx]).abs();
+                assert!(
+                    diff <= 1e-3 * w_cpu[idx].abs() + 1e-5,
+                    "{dtype:?} f16 diff {diff}"
+                );
+            }
+
+            // 3. Native GPU get_rows (embedding) must match CPU rows bit-for-bit.
+            let ids_vec: Vec<u32> = vec![5, 0, 3];
+            let ids_cuda = CudaStorage::wrap_cuda_slice(dev.clone_htod(&ids_vec)?, dev.clone());
+            let ids_l = crate::Layout::contiguous(ids_vec.len());
+            let emb_s = qcuda.embedding(n, k, &ids_cuda, &ids_l)?;
+            let emb = dev.clone_dtoh(&emb_s.as_cuda_slice::<f32>()?.as_view())?;
+            for (ri, &row_id) in ids_vec.iter().enumerate() {
+                for c in 0..k {
+                    assert_eq!(
+                        emb[ri * k + c].to_bits(),
+                        w_cpu[row_id as usize * k + c].to_bits(),
+                        "{dtype:?} get_rows mismatch at row {row_id} col {c}"
+                    );
+                }
+            }
+
+            // 4. Decode (m=2, native dp4a) and prefill (m=12, native GPU dequant + cuBLAS) vs oracle.
+            for m in [2usize, 12usize] {
+                let inp: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 13 + 5) % 29) as f32 * 0.03 - 0.4)
+                    .collect();
+                let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+                let input_l = crate::Layout::contiguous((m, k));
+                let self_shape: crate::Shape = (n, k).into();
+                let (out, out_shape) = qcuda.fwd(&self_shape, &input, &input_l)?;
+                assert_eq!(out_shape.dims().to_vec(), vec![m, n]);
+                let got = dev.clone_dtoh(&out.as_cuda_slice::<f32>()?.as_view())?;
+                let mut max_abs = 0f32;
+                let mut max_err = 0f32;
+                for r in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0f32;
+                        for c in 0..k {
+                            acc += w_cpu[j * k + c] * inp[r * k + c];
+                        }
+                        max_abs = max_abs.max(acc.abs());
+                        max_err = max_err.max((got[r * n + j] - acc).abs());
+                    }
+                }
+                let tol = if m <= 8 {
+                    0.03 * max_abs + 1e-3
+                } else {
+                    1e-3 * max_abs + 1e-4
+                };
+                assert!(
+                    max_err <= tol,
+                    "{dtype:?} m={m}: max_err {max_err} > tol {tol} (max_abs {max_abs})"
+                );
+            }
         }
         Ok(())
     }

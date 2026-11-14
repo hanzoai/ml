@@ -106,6 +106,7 @@ macro_rules! quant_format {
         block_elems: $blck:expr,
         byte_size: $bytes:expr,
         vec_dot: $vecdot:ty,
+        $(vec_dot_fn: $vecdot_fn:path,)?
         fields: { $( $(#[$fmeta:meta])* $fname:ident : $fty:ty ),+ $(,)? },
         decode: |$xs:ident, $ys:ident| $decode:block $(,)?
     ) => {
@@ -138,9 +139,9 @@ macro_rules! quant_format {
                 )
             }
 
-            // No SIMD specialization for decode-only types: dequant-then-dot is the path.
+            #[inline]
             fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
-                Self::vec_dot_unopt(n, xs, ys)
+                quant_format!(@vec_dot_body Self, n, xs, ys $(, $vecdot_fn)?)
             }
 
             fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
@@ -154,6 +155,12 @@ macro_rules! quant_format {
                 $crate::quantized::quant_format::vec_dot_dequant_q8_0::<{ $blck }, Self>(xs, ys)
             }
         }
+    };
+    (@vec_dot_body $self_ty:ty, $n:ident, $xs:ident, $ys:ident) => {
+        <$self_ty>::vec_dot_unopt($n, $xs, $ys)
+    };
+    (@vec_dot_body $self_ty:ty, $n:ident, $xs:ident, $ys:ident, $vecdot_fn:path) => {
+        $vecdot_fn($n, $xs, $ys)
     };
 }
 
@@ -204,6 +211,8 @@ macro_rules! for_each_quant {
             Q1_0     => BlockQ1_0     @ 41,
             ROCMFP4      => BlockROCMFP4      @ 100,
             ROCMFP4_FAST => BlockROCMFP4Fast  @ 101,
+            PQ2_0    => BlockPQ2_0    @ 142,
+            PTQ1_0   => BlockPTQ1_0   @ 143,
         }
     };
 }
