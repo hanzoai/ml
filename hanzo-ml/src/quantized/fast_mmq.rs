@@ -511,7 +511,7 @@ pub(crate) fn indexed_moe_grouped(
     let batch = in_shape.dims()[0];
     let input_dim1 = in_shape.dims()[1];
     let nslots = idx_shape.elem_count();
-    if nslots == 0 || batch == 0 || nslots % batch != 0 {
+    if nslots == 0 || batch == 0 || !nslots.is_multiple_of(batch) {
         return Ok(None);
     }
     let topk = nslots / batch;

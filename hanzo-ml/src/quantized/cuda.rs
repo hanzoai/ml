@@ -2,7 +2,7 @@ use super::{GgmlDType, QStorage};
 use crate::quantized::k_quants::GgmlType;
 use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
-use half::f16;
+use half::{bf16, f16};
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaView, DevicePtr, PushKernelArg, SyncOnDrop};
 
@@ -292,6 +292,35 @@ fn dequantize_f16(
         builder.arg(&data.inner);
         builder.arg(&dst);
         barg!(builder, nb32 as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+    }
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+fn dequantize_bf16(
+    data: &PaddedCudaSlice,
+    dtype: GgmlDType,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let kernel_name = match dtype {
+        GgmlDType::PQ2_0 => "dequantize_block_pq2_0_bf16",
+        GgmlDType::PTQ1_0 => "dequantize_block_ptq1_0_bf16",
+        _ => crate::bail!("unsupported dtype for dequantize_bf16 {dtype:?}"),
+    };
+    let nblocks = elem_count / 128;
+    let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+    let dst = unsafe { dev.alloc::<bf16>(elem_count)? };
+    if nblocks > 0 {
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (nblocks.min(65535) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(&data.inner);
+        builder.arg(&dst);
+        barg!(builder, nblocks as i64);
         unsafe { builder.launch(cfg) }.w()?;
     }
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
@@ -613,8 +642,8 @@ fn mul_mat_vec_iquant_dp4a(
     if !ncols.is_multiple_of(blk_sz) {
         crate::bail!("i-quant ncols {ncols} must be a multiple of {blk_sz}");
     }
-    if b_size == 0 || b_size > 8 {
-        crate::bail!("only bsize between 1 and 8 are supported, got {b_size}");
+    if b_size == 0 {
+        crate::bail!("bsize must be >= 1, got {b_size}");
     }
     if y.len() != ncols * b_size {
         crate::bail!(
@@ -646,16 +675,12 @@ fn mul_mat_vec_iquant_dp4a(
         unsafe { builder.launch(cfg) }.w()?;
     }
 
-    // Decode matvec: warp-per-row, lane-strided over (super-block x sub-unit). One launch per
-    // activation row (b_size is tiny on the decode/vec path).
-    let kernel_name = format!("qmatvec_dp4a_{suffix}_f32");
-    let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
     let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
     const ROWS_PER_BLOCK: u32 = 8; // 8 warps/block
-    for bi in 0..b_size {
-        let xq_b = xq.slice(bi * ncols..(bi + 1) * ncols);
-        let xd_b = xd.slice(bi * nblk32..(bi + 1) * nblk32);
-        let dst_b = dst.slice(bi * nrows..(bi + 1) * nrows);
+    if b_size == 1 {
+        // Fast single-token decode GEMV path.
+        let kernel_name = format!("qmatvec_dp4a_{suffix}_f32");
+        let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: ((nrows as u32).div_ceil(ROWS_PER_BLOCK), 1, 1),
             block_dim: (ROWS_PER_BLOCK * WARP_SIZE as u32, 1, 1),
@@ -664,9 +689,32 @@ fn mul_mat_vec_iquant_dp4a(
         let mut builder = func.builder();
         barg!(builder, nrows as i32, ncols as i32);
         builder.arg(&data.inner);
-        builder.arg(&xq_b);
-        builder.arg(&xd_b);
-        builder.arg(&dst_b);
+        builder.arg(&xq);
+        builder.arg(&xd);
+        builder.arg(&dst);
+        unsafe { builder.launch(cfg) }.w()?;
+    } else {
+        // Batched multi-token dp4a GEMM (speculative verification & small-batch prefill):
+        // unpacks each weight block ONCE into registers per M-tile (BM=16) and accumulates
+        // across all activation rows in a single kernel launch.
+        const BM: u32 = 16;
+        let kernel_name = format!("qmatmul_dp4a_{suffix}_f32");
+        let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (
+                (nrows as u32).div_ceil(ROWS_PER_BLOCK),
+                (b_size as u32).div_ceil(BM),
+                1,
+            ),
+            block_dim: (ROWS_PER_BLOCK * WARP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        barg!(builder, nrows as i32, ncols as i32, b_size as i32);
+        builder.arg(&data.inner);
+        builder.arg(&xq);
+        builder.arg(&xd);
+        builder.arg(&dst);
         unsafe { builder.launch(cfg) }.w()?;
     }
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
@@ -783,7 +831,7 @@ fn indexed_moe_forward_fused_q8_1_input(
     // flattened [batch*topk] (1-D). batch comes from the input, which is always [batch, topk|1, k].
     let n_slots = idx_shape.elem_count();
     assert!(
-        n_slots % batch == 0,
+        n_slots.is_multiple_of(batch),
         "ids count {n_slots} not a multiple of batch {batch}"
     );
     let topk = n_slots / batch;
@@ -1364,10 +1412,23 @@ impl QCudaStorage {
                     return self.mul_mat_vec_iquant(self_shape, storage, layout);
                 }
                 // PREFILL: native int8-WMMA MMQ GEMM (qmmq) for the 7 i-quants with an MMQ kernel
-                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS, IQ1_S). Decode-only types (IQ1_M, TQ1_0/TQ2_0)
-                // have no MMQ kernel -> try_fwd returns None and they fall to the dequant dense matmul.
+                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS, IQ1_S).
                 if let Some(out) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
                     return Ok(out);
+                }
+                // Types without a WMMA MMQ kernel (PQ2_0, PTQ1_0, TQ1_0, TQ2_0, IQ1_M) use the
+                // single-launch batched qmatmul_dp4a kernel for speculative verification / small-batch
+                // prefill (b*m <= 64) and for huge vocabulary matrices (>= 64M weights) to avoid
+                // multi-GB FP32 weight dequantization.
+                let bm = match layout.shape().dims() {
+                    [b, m, _k] => b * m,
+                    [b, _k] => *b,
+                    _ => usize::MAX,
+                };
+                if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+                    && (bm <= 64 || self_shape.elem_count() >= 64 * 1024 * 1024)
+                {
+                    return self.mul_mat_vec_iquant(self_shape, storage, layout);
                 }
             }
             return self.dequantize_matmul_dense(self_shape, storage, layout);
@@ -1519,13 +1580,38 @@ impl QCudaStorage {
         if k2 != k {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
-        let data_f32 = self.dequantize(n * k)?;
-        let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
-        let out = storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?;
         let mut out_shape = layout.shape().dims().to_vec();
         out_shape.pop();
         out_shape.push(n);
-        Ok((out, out_shape.into()))
+        let out_shape_s: crate::Shape = out_shape.into();
+
+        if matches!(self.dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0)
+            && std::env::var_os("HANZO_PQ2_FP32_PREFILL").is_none()
+        {
+            let data_bf16 = dequantize_bf16(&self.data, self.dtype, n * k, &self.device)?;
+            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
+            let out_dtype = storage.dtype();
+            let (act_bf16, act_l) = if out_dtype == crate::DType::BF16 {
+                (None, layout.clone())
+            } else {
+                let converted = storage.to_dtype(layout, crate::DType::BF16)?;
+                (Some(converted), crate::Layout::contiguous(layout.shape()))
+            };
+            let act_ref = act_bf16.as_ref().unwrap_or(storage);
+            let out_bf16 = act_ref.matmul(&data_bf16, (b, m, n, k), &act_l, &rhs_l)?;
+            let out = if out_dtype == crate::DType::BF16 {
+                out_bf16
+            } else {
+                let out_l = crate::Layout::contiguous(&out_shape_s);
+                out_bf16.to_dtype(&out_l, out_dtype)?
+            };
+            return Ok((out, out_shape_s));
+        }
+
+        let data_f32 = self.dequantize(n * k)?;
+        let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
+        let out = storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?;
+        Ok((out, out_shape_s))
     }
 
     fn dequantize_matmul(
@@ -1590,6 +1676,161 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         device: device.clone(),
         dtype,
     }))
+}
+
+/// Fused CUDA Fast Walsh-Hadamard Transform (FWHT) with optional explicit sign vector.
+///
+/// Computes in a single kernel launch:
+/// - `is_inverse == false`: `((x * signs).reshape(-1, B) @ H_B) * (1 / sqrt(B))`
+/// - `is_inverse == true`:  `((x.reshape(-1, B) @ H_B) * (1 / sqrt(B))) * signs`
+///
+/// Supports `DType::F32`, `DType::F16`, and `DType::BF16` directly without intermediate FP32
+/// global-memory allocations. `block_size` must be a power of 2 in `1..=8192`.
+pub fn hadamard_fwht(
+    x: &crate::Tensor,
+    signs: Option<&crate::Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+) -> Result<crate::Tensor> {
+    if !block_size.is_power_of_two() || block_size == 0 || block_size > 8192 {
+        crate::bail!("hadamard_fwht block_size must be a power of 2 in 1..=8192, got {block_size}");
+    }
+    let orig_shape = x.shape().clone();
+    let Some(&width) = orig_shape.dims().last() else {
+        crate::bail!("hadamard_fwht expects rank >= 1");
+    };
+    if !width.is_multiple_of(block_size) {
+        crate::bail!("hadamard_fwht width {width} is not divisible by block_size {block_size}");
+    }
+    let x = x.contiguous()?;
+    let elem_count = orig_shape.elem_count();
+    let total_blocks = (elem_count / block_size) as i64;
+    if total_blocks == 0 {
+        return Ok(x);
+    }
+
+    let signs_contig = match signs {
+        Some(s) => {
+            if s.dtype() != crate::DType::F32 {
+                crate::bail!("hadamard_fwht signs must be F32, got {:?}", s.dtype());
+            }
+            if s.elem_count() != width {
+                crate::bail!(
+                    "hadamard_fwht signs len {} != width {width}",
+                    s.elem_count()
+                );
+            }
+            Some(s.contiguous()?)
+        }
+        None => None,
+    };
+
+    let (x_storage, x_layout) = x.storage_and_layout();
+    let crate::Storage::Cuda(x_cuda) = &*x_storage else {
+        crate::bail!("hadamard_fwht requires a CUDA tensor");
+    };
+    let dev = &x_cuda.device;
+    let (x_o1, x_o2) = x_layout.contiguous_offsets().ok_or_else(|| {
+        crate::Error::RequiresContiguous {
+            op: "hadamard_fwht",
+        }
+        .bt()
+    })?;
+
+    let signs_guard = signs_contig.as_ref().map(|s| s.storage_and_layout());
+    let signs_view = if let Some((s_storage, s_layout)) = signs_guard.as_ref() {
+        let crate::Storage::Cuda(s_cuda) = &**s_storage else {
+            crate::bail!("hadamard_fwht signs must be on CUDA");
+        };
+        let (s_o1, s_o2) = s_layout.contiguous_offsets().ok_or_else(|| {
+            crate::Error::RequiresContiguous {
+                op: "hadamard_fwht_signs",
+            }
+            .bt()
+        })?;
+        Some(s_cuda.as_cuda_slice::<f32>()?.slice(s_o1..s_o2))
+    } else {
+        None
+    };
+
+    let has_signs = i32::from(signs_view.is_some());
+    let is_inv = i32::from(is_inverse);
+    let b_i32 = block_size as i32;
+    let w_i32 = width as i32;
+    let grid_x = (total_blocks as u32).clamp(1, 65_535);
+    let elems_per_thread = (block_size / 1024).max(1);
+    let threads = block_size / elems_per_thread;
+    let shared_mem_bytes = if threads > 32 {
+        (block_size * std::mem::size_of::<f32>()) as u32
+    } else {
+        0
+    };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes,
+    };
+    let null_ptr = 0u64;
+
+    let out_storage = match x.dtype() {
+        crate::DType::F32 => {
+            let x_slice = x_cuda.as_cuda_slice::<f32>()?.slice(x_o1..x_o2);
+            let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+            let func = dev.get_or_load_func("hadamard_fwht_f32", &hanzo_kernels::IQUANT_MMVQ)?;
+            let mut builder = func.builder();
+            builder.arg(&x_slice);
+            if let Some(ref sv) = signs_view {
+                builder.arg(sv);
+            } else {
+                builder.arg(&null_ptr);
+            }
+            builder.arg(&dst);
+            barg!(builder, b_i32, w_i32, has_signs, is_inv, total_blocks);
+            unsafe { builder.launch(cfg) }.w()?;
+            CudaStorage::wrap_cuda_slice(dst, dev.clone())
+        }
+        crate::DType::F16 => {
+            let x_slice = x_cuda.as_cuda_slice::<f16>()?.slice(x_o1..x_o2);
+            let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+            let func = dev.get_or_load_func("hadamard_fwht_f16", &hanzo_kernels::IQUANT_MMVQ)?;
+            let mut builder = func.builder();
+            builder.arg(&x_slice);
+            if let Some(ref sv) = signs_view {
+                builder.arg(sv);
+            } else {
+                builder.arg(&null_ptr);
+            }
+            builder.arg(&dst);
+            barg!(builder, b_i32, w_i32, has_signs, is_inv, total_blocks);
+            unsafe { builder.launch(cfg) }.w()?;
+            CudaStorage::wrap_cuda_slice(dst, dev.clone())
+        }
+        crate::DType::BF16 => {
+            let x_slice = x_cuda.as_cuda_slice::<half::bf16>()?.slice(x_o1..x_o2);
+            let dst = unsafe { dev.alloc::<half::bf16>(elem_count)? };
+            let func = dev.get_or_load_func("hadamard_fwht_bf16", &hanzo_kernels::IQUANT_MMVQ)?;
+            let mut builder = func.builder();
+            builder.arg(&x_slice);
+            if let Some(ref sv) = signs_view {
+                builder.arg(sv);
+            } else {
+                builder.arg(&null_ptr);
+            }
+            builder.arg(&dst);
+            barg!(builder, b_i32, w_i32, has_signs, is_inv, total_blocks);
+            unsafe { builder.launch(cfg) }.w()?;
+            CudaStorage::wrap_cuda_slice(dst, dev.clone())
+        }
+        dt => crate::bail!("hadamard_fwht unsupported dtype {dt:?}"),
+    };
+    drop(signs_guard);
+    drop(x_storage);
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Cuda(out_storage),
+        orig_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 #[cfg(test)]
@@ -2161,8 +2402,10 @@ mod test {
                 }
             }
 
-            // 4. Decode (m=2, native dp4a) and prefill (m=12, native GPU dequant + cuBLAS) vs oracle.
-            for m in [2usize, 12usize] {
+            // 4. Decode (m=1, qmatvec_dp4a), batched verification (m=2..32, qmatmul_dp4a), and
+            //    prefill (m=128, BF16 Tensor Core GEMM via dequantize_matmul_dense) vs oracle,
+            //    plus bit-for-bit agreement between m=1 single-token GEMV and m=16 batched GEMM on every row!
+            for m in [1usize, 2, 8, 12, 16, 32, 128] {
                 let inp: Vec<f32> = (0..m * k)
                     .map(|i| ((i * 13 + 5) % 29) as f32 * 0.03 - 0.4)
                     .collect();
@@ -2184,16 +2427,171 @@ mod test {
                         max_err = max_err.max((got[r * n + j] - acc).abs());
                     }
                 }
-                let tol = if m <= 8 {
-                    0.03 * max_abs + 1e-3
-                } else {
-                    1e-3 * max_abs + 1e-4
-                };
+                let tol = 0.03 * max_abs + 1e-3;
                 assert!(
                     max_err <= tol,
                     "{dtype:?} m={m}: max_err {max_err} > tol {tol} (max_abs {max_abs})"
                 );
+
+                if m == 16 {
+                    // Verify bit-for-bit parity between batched qmatmul_dp4a (m=16) and single-token qmatvec_dp4a (m=1).
+                    for r in 0..m {
+                        let row_inp = &inp[r * k..(r + 1) * k];
+                        let row_cuda =
+                            CudaStorage::wrap_cuda_slice(dev.clone_htod(row_inp)?, dev.clone());
+                        let row_l = crate::Layout::contiguous((1usize, k));
+                        let (row_out, _) = qcuda.fwd(&self_shape, &row_cuda, &row_l)?;
+                        let row_got = dev.clone_dtoh(&row_out.as_cuda_slice::<f32>()?.as_view())?;
+                        for j in 0..n {
+                            assert_eq!(
+                                got[r * n + j].to_bits(),
+                                row_got[j].to_bits(),
+                                "{dtype:?} batched qmatmul_dp4a vs qmatvec_dp4a mismatch at row {r} col {j}: {} vs {}",
+                                got[r * n + j],
+                                row_got[j]
+                            );
+                        }
+                    }
+                }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_hadamard_fwht_matches_dense_hb() -> Result<()> {
+        let cuda_dev = crate::Device::new_cuda(0)?;
+        let b = 512usize;
+        let width = 2560usize; // 5 * 512 (Bonsai-2 4B hidden_size)
+        let rows = 6usize;
+
+        let scale = 1.0f32 / (b as f32).sqrt();
+        let mut h_data = vec![0.0f32; b * b];
+        for i in 0..b {
+            for j in 0..b {
+                h_data[i * b + j] = if (i & j).count_ones() % 2 == 0 {
+                    scale
+                } else {
+                    -scale
+                };
+            }
+        }
+        let h_b = crate::Tensor::from_vec(h_data, (b, b), &cuda_dev)?;
+        let signs_vec: Vec<f32> = (0..width)
+            .map(|i| if (i * 7 + 3) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs = crate::Tensor::from_vec(signs_vec, width, &cuda_dev)?;
+
+        let x_vec: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 19 + 11) % 97) as f32 * 0.02 - 0.9)
+            .collect();
+        let x_f32 = crate::Tensor::from_vec(x_vec, (rows, width), &cuda_dev)?;
+
+        // Forward F32 with signs
+        let ref_fwd = x_f32
+            .broadcast_mul(&signs)?
+            .reshape((rows * (width / b), b))?
+            .matmul(&h_b)?
+            .reshape((rows, width))?;
+        let got_fwd = hadamard_fwht(&x_f32, Some(&signs), b, false)?;
+        let ref_v = ref_fwd.flatten_all()?.to_vec1::<f32>()?;
+        let got_v = got_fwd.flatten_all()?.to_vec1::<f32>()?;
+        for i in 0..ref_v.len() {
+            let diff = (ref_v[i] - got_v[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "fwht fwd f32 mismatch at {i}: {} vs {}",
+                ref_v[i],
+                got_v[i]
+            );
+        }
+
+        // Inverse BF16 with signs: T^{-1}(T(x)) == x
+        let x_bf16 = x_f32.to_dtype(crate::DType::BF16)?;
+        let y_bf16 = hadamard_fwht(&x_bf16, Some(&signs), b, false)?;
+        let rec_bf16 = hadamard_fwht(&y_bf16, Some(&signs), b, true)?;
+        let x_bf16_v = x_bf16
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rec_v = rec_bf16
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for i in 0..x_bf16_v.len() {
+            let diff = (x_bf16_v[i] - rec_v[i]).abs();
+            assert!(
+                diff < 2e-2,
+                "fwht roundtrip bf16 mismatch at {i}: {} vs {}",
+                x_bf16_v[i],
+                rec_v[i]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_hadamard_fwht_4096_matches_dense_hb() -> Result<()> {
+        let cuda_dev = crate::Device::new_cuda(0)?;
+        let b = 4096usize;
+        let width = 4096usize; // Bonsai-2 9B prism.hadamard.block_size
+        let rows = 3usize;
+
+        let scale = 1.0f32 / (b as f32).sqrt();
+        let mut h_data = vec![0.0f32; b * b];
+        for i in 0..b {
+            for j in 0..b {
+                h_data[i * b + j] = if (i & j).count_ones() % 2 == 0 {
+                    scale
+                } else {
+                    -scale
+                };
+            }
+        }
+        let h_b = crate::Tensor::from_vec(h_data, (b, b), &cuda_dev)?;
+        let signs_vec: Vec<f32> = (0..width)
+            .map(|i| if (i * 7 + 3) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs = crate::Tensor::from_vec(signs_vec, width, &cuda_dev)?;
+
+        let x_vec: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 19 + 11) % 97) as f32 * 0.02 - 0.9)
+            .collect();
+        let x_f32 = crate::Tensor::from_vec(x_vec, (rows, width), &cuda_dev)?;
+
+        let ref_fwd = x_f32.broadcast_mul(&signs)?.matmul(&h_b)?;
+        let got_fwd = hadamard_fwht(&x_f32, Some(&signs), b, false)?;
+        let ref_v = ref_fwd.flatten_all()?.to_vec1::<f32>()?;
+        let got_v = got_fwd.flatten_all()?.to_vec1::<f32>()?;
+        for i in 0..ref_v.len() {
+            let diff = (ref_v[i] - got_v[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "fwht 4096 fwd f32 mismatch at {i}: {} vs {}",
+                ref_v[i],
+                got_v[i]
+            );
+        }
+
+        let x_bf16 = x_f32.to_dtype(crate::DType::BF16)?;
+        let y_bf16 = hadamard_fwht(&x_bf16, Some(&signs), b, false)?;
+        let rec_bf16 = hadamard_fwht(&y_bf16, Some(&signs), b, true)?;
+        let x_bf16_v = x_bf16
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rec_v = rec_bf16
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for i in 0..x_bf16_v.len() {
+            let diff = (x_bf16_v[i] - rec_v[i]).abs();
+            assert!(
+                diff < 3e-2,
+                "fwht 4096 roundtrip bf16 mismatch at {i}: {} vs {}",
+                x_bf16_v[i],
+                rec_v[i]
+            );
         }
         Ok(())
     }
