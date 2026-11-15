@@ -25,6 +25,7 @@
 //! portable, correctness-proven primitive that already closes the launch gap.
 
 use crate::prelude::*;
+use crate::tune::{Config, Evaluator, Space, Verdict};
 
 // ============================== 1. Causal depthwise conv1d (+ SiLU) ==============================
 
@@ -412,6 +413,387 @@ pub fn gdn_scan_ref(
         }
     }
     out
+}
+
+// ============ Lane-split scan, its schedule space and its cold-memory evaluator =================
+
+/// The gated delta-rule scan with each `(bh, v_row)` state split over `lanes` adjacent lanes of a
+/// plane. The recurrence is sequential in `t`, so the way to fill a GPU is to split the state, not
+/// the sequence: a lane keeps `k_dim / lanes` entries of its row in registers, forms its part of
+/// `S^T k`, and a `plane_shuffle_xor` butterfly sums the parts; the row is corrected and read back
+/// the same way with `q`. With `lanes == 1` this is `gdn_scan`. No shared memory and no barriers,
+/// so it lowers to every backend that has planes.
+///
+/// `vk_layout` picks how the `[k_dim, v_dim]` state sits in memory: `false` is `state[j * v_dim + vi]`
+/// (V contiguous, what `gdn_scan` and the engine allocate), `true` is `state[vi * k_dim + j]` (K
+/// contiguous, so a lane's slice is one coalesced run). Which wins is a per-device fact the tuner
+/// measures; the kernel does not guess.
+///
+/// Per-lane split and shuffle reduction follow ggml-metal's `kernel_gated_delta_net` (ggml-org/llama.cpp,
+/// MIT; as carried in PrismML-Eng/llama.cpp), expressed once here instead of per backend.
+///
+/// Layout and contracts are `gdn_scan`'s: `q`,`k` `[bh, seq, k_dim]` (q pre-scaled), `v`,`out`
+/// `[bh, seq, v_dim]`, `g`,`beta` `[bh, seq]`, `state` updated in place. `lanes` divides `k_dim`, is a
+/// power of two, and is at most the plane size; the block is a multiple of `lanes`.
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
+pub fn gdn_scan_lanes<F: Float>(
+    q: &Array<F>,
+    k: &Array<F>,
+    v: &Array<F>,
+    g: &Array<F>,
+    beta: &Array<F>,
+    state: &mut Array<F>,
+    out: &mut Array<F>,
+    dims: &Array<u32>, // [bh, seq]
+    #[comptime] k_dim: usize,
+    #[comptime] v_dim: usize,
+    #[comptime] lanes: usize,
+    #[comptime] vk_layout: bool,
+) {
+    let bh = dims[0] as usize;
+    let seq = dims[1] as usize;
+    let seg = comptime!(k_dim / lanes);
+    let lanes_u = comptime!(lanes as u32);
+    let total = bh * v_dim;
+    let group_raw = ABSOLUTE_POS / lanes;
+    let lane = ABSOLUTE_POS % lanes;
+    // Every lane of a plane runs the body (the shuffles need all partners), so out-of-range groups
+    // are clamped to a real one and only their writes are suppressed.
+    let valid = group_raw < total;
+    let mut group = group_raw;
+    if !valid {
+        group = 0usize;
+    }
+    let b = group / v_dim;
+    let vi = group % v_dim;
+    let qk_bh = b * seq * k_dim + lane * seg;
+    let v_bh = b * seq * v_dim + vi;
+    let gb_bh = b * seq;
+    let state_base = b * k_dim * v_dim;
+
+    let mut s = Array::<F>::new(seg);
+    for j in 0..seg {
+        let kj = lane * seg + j;
+        if vk_layout {
+            s[j] = state[state_base + vi * k_dim + kj];
+        } else {
+            s[j] = state[state_base + kj * v_dim + vi];
+        }
+    }
+
+    for t in 0..seq {
+        let decay = g[gb_bh + t].exp();
+        let beta_t = beta[gb_bh + t];
+        let v_t = v[v_bh + t * v_dim];
+
+        let mut kv_mem = F::new(0.0f32);
+        for j in 0..seg {
+            let sj = s[j] * decay;
+            s[j] = sj;
+            kv_mem += sj * k[qk_bh + t * k_dim + j];
+        }
+        let mut off = 1u32;
+        while off < lanes_u {
+            kv_mem += plane_shuffle_xor(kv_mem, off);
+            off *= 2;
+        }
+        let delta = (v_t - kv_mem) * beta_t;
+
+        let mut y_t = F::new(0.0f32);
+        for j in 0..seg {
+            let kj_t = k[qk_bh + t * k_dim + j];
+            let sj = s[j] + kj_t * delta;
+            s[j] = sj;
+            y_t += sj * q[qk_bh + t * k_dim + j];
+        }
+        off = 1u32;
+        while off < lanes_u {
+            y_t += plane_shuffle_xor(y_t, off);
+            off *= 2;
+        }
+        if valid && lane == 0 {
+            out[v_bh + t * v_dim] = y_t;
+        }
+    }
+
+    if valid {
+        for j in 0..seg {
+            let kj = lane * seg + j;
+            if vk_layout {
+                state[state_base + vi * k_dim + kj] = s[j];
+            } else {
+                state[state_base + kj * v_dim + vi] = s[j];
+            }
+        }
+    }
+}
+
+/// Deterministic inputs shaped like a Qwen3.5 GDN layer: unit-norm `k`, `q` pre-scaled by
+/// `1/sqrt(k_dim)`, log-decay `g` in `(-0.51, -0.01)`, write strength `beta` in `(0.1, 0.9)`.
+/// Returns `[q, k, v, g, beta, state]`.
+pub fn gdn_synth(bh: usize, seq: usize, k_dim: usize, v_dim: usize, seed: u64) -> [Vec<f32>; 6] {
+    let mut x = seed | 1;
+    let mut unit = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        ((x >> 40) as f32) / (1u32 << 24) as f32
+    };
+    let mut k: Vec<f32> = (0..bh * seq * k_dim).map(|_| unit() - 0.5).collect();
+    for row in k.chunks_mut(k_dim) {
+        let n = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        row.iter_mut().for_each(|v| *v /= n);
+    }
+    let scale = 1.0 / (k_dim as f32).sqrt();
+    let q = (0..bh * seq * k_dim)
+        .map(|_| (unit() - 0.5) * scale)
+        .collect();
+    let v = (0..bh * seq * v_dim).map(|_| unit() * 2.0 - 1.0).collect();
+    let g = (0..bh * seq).map(|_| -(0.01 + 0.5 * unit())).collect();
+    let beta = (0..bh * seq).map(|_| 0.1 + 0.8 * unit()).collect();
+    let state = (0..bh * k_dim * v_dim)
+        .map(|_| (unit() - 0.5) * 0.1)
+        .collect();
+    [q, k, v, g, beta, state]
+}
+
+/// The schedule space of [`gdn_scan_lanes`]: lanes per state row, threads per block and state layout.
+/// `lanes` must divide `k_dim` and the block; the device's plane width is checked by the evaluator.
+pub fn gdn_scan_lanes_space(k_dim: usize) -> Space {
+    Space::new()
+        .param("LANES", [1, 2, 4, 8, 16, 32])
+        .param("BLOCK", [32, 64, 128, 256])
+        .param("LAYOUT", [0, 1])
+        .constraint(move |c, s| {
+            let l = c.get(s, "LANES") as usize;
+            let b = c.get(s, "BLOCK") as usize;
+            k_dim % l == 0 && b % l == 0
+        })
+}
+
+struct GdnBank {
+    q: cubecl::server::Handle,
+    k: cubecl::server::Handle,
+    v: cubecl::server::Handle,
+    g: cubecl::server::Handle,
+    beta: cubecl::server::Handle,
+    out: cubecl::server::Handle,
+    st: [cubecl::server::Handle; 2], // the same initial state in each layout
+}
+
+/// Cold-memory, oracle-gated fitness for [`gdn_scan_lanes_space`]. Holds `nbanks` resident copies of a
+/// layer's inputs (distinct buffers, so a rotation reads cold the way a 48-layer forward does) and the
+/// state in both layouts. The first dispatch of a config runs on a fresh state and must match the CPU
+/// oracle (output and final state); only then is it timed, rotating banks.
+pub struct GdnLanesEval<'a, R: Runtime> {
+    client: &'a ComputeClient<R>,
+    space: &'a Space,
+    banks: Vec<GdnBank>,
+    st_host: [Vec<f32>; 2],
+    dims: cubecl::server::Handle,
+    shape: (usize, usize, usize, usize), // bh, seq, k_dim, v_dim
+    oracle_out: Vec<f32>,
+    oracle_state: Vec<f32>,
+    maxref: f32,
+    repeats: usize,
+    worst_rel: std::cell::Cell<f32>,
+}
+
+impl<'a, R: Runtime> GdnLanesEval<'a, R> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: &'a ComputeClient<R>,
+        space: &'a Space,
+        inputs: &[Vec<f32>; 6],
+        shape: (usize, usize, usize, usize),
+        nbanks: usize,
+        repeats: usize,
+    ) -> Self {
+        let (bh, seq, k_dim, v_dim) = shape;
+        let [q, k, v, g, beta, state] = inputs;
+        let mut vk = vec![0.0f32; state.len()];
+        for b in 0..bh {
+            for j in 0..k_dim {
+                for vi in 0..v_dim {
+                    vk[b * k_dim * v_dim + vi * k_dim + j] =
+                        state[b * k_dim * v_dim + j * v_dim + vi];
+                }
+            }
+        }
+        let up = |x: &[f32]| client.create_from_slice(f32::as_bytes(x));
+        let banks = (0..nbanks.max(1))
+            .map(|_| GdnBank {
+                q: up(q),
+                k: up(k),
+                v: up(v),
+                g: up(g),
+                beta: up(beta),
+                out: up(&vec![0.0f32; bh * seq * v_dim]),
+                st: [up(state), up(&vk)],
+            })
+            .collect();
+        let mut oracle_state = state.clone();
+        let oracle_out = gdn_scan_ref(q, k, v, g, beta, &mut oracle_state, bh, seq, k_dim, v_dim);
+        let maxref = oracle_out
+            .iter()
+            .fold(0f32, |a, &x| a.max(x.abs()))
+            .max(1e-30);
+        Self {
+            client,
+            space,
+            banks,
+            st_host: [state.clone(), vk],
+            dims: client.create_from_slice(u32::as_bytes(&[bh as u32, seq as u32])),
+            shape,
+            oracle_out,
+            oracle_state,
+            maxref,
+            repeats,
+            worst_rel: std::cell::Cell::new(0.0),
+        }
+    }
+
+    /// Worst scale-relative divergence any measured config showed (the correctness witness).
+    pub fn worst_rel(&self) -> f32 {
+        self.worst_rel.get()
+    }
+
+    pub fn nbanks(&self) -> usize {
+        self.banks.len()
+    }
+
+    fn cfg(&self, c: &Config) -> (usize, usize, bool) {
+        (
+            c.get(self.space, "LANES") as usize,
+            c.get(self.space, "BLOCK") as usize,
+            c.get(self.space, "LAYOUT") == 1,
+        )
+    }
+
+    fn dispatch(
+        &self,
+        bank: &GdnBank,
+        st: &cubecl::server::Handle,
+        lanes: usize,
+        block: usize,
+        vk: bool,
+    ) {
+        let (bh, seq, k_dim, v_dim) = self.shape;
+        let grid = ((bh * v_dim * lanes) as u32).div_ceil(block as u32);
+        unsafe {
+            gdn_scan_lanes::launch_unchecked::<f32, R>(
+                self.client,
+                Grid::Static(grid, 1, 1),
+                Block::new_1d(block as u32),
+                ArrayArg::from_raw_parts(bank.q.clone(), bh * seq * k_dim),
+                ArrayArg::from_raw_parts(bank.k.clone(), bh * seq * k_dim),
+                ArrayArg::from_raw_parts(bank.v.clone(), bh * seq * v_dim),
+                ArrayArg::from_raw_parts(bank.g.clone(), bh * seq),
+                ArrayArg::from_raw_parts(bank.beta.clone(), bh * seq),
+                ArrayArg::from_raw_parts(st.clone(), bh * k_dim * v_dim),
+                ArrayArg::from_raw_parts(bank.out.clone(), bh * seq * v_dim),
+                ArrayArg::from_raw_parts(self.dims.clone(), 2),
+                k_dim,
+                v_dim,
+                lanes,
+                vk,
+            );
+        }
+    }
+
+    fn read(&self, h: &cubecl::server::Handle) -> Vec<f32> {
+        f32::from_bytes(&self.client.read_one_unchecked(h.clone())).to_vec()
+    }
+}
+
+impl<'a, R: Runtime> Evaluator for GdnLanesEval<'a, R> {
+    fn static_check(&self, cfg: &Config) -> Verdict {
+        let (lanes, block, _) = self.cfg(cfg);
+        let hw = &self.client.properties().hardware;
+        if lanes as u32 > hw.plane_size_min {
+            return Verdict::Reject(format!(
+                "{lanes} lanes exceed the device's {}-wide plane",
+                hw.plane_size_min
+            ));
+        }
+        if block as u32 > hw.max_units_per_cube {
+            return Verdict::Reject(format!(
+                "block {block} exceeds {} units per cube",
+                hw.max_units_per_cube
+            ));
+        }
+        Verdict::Pass
+    }
+
+    fn measure(&self, cfg: &Config, iters: usize) -> f64 {
+        let (lanes, block, vk) = self.cfg(cfg);
+        let (_, _, k_dim, v_dim) = self.shape;
+        let layout = vk as usize;
+
+        // Correctness: a fresh state, one dispatch, output and final state against the oracle.
+        let fresh = self
+            .client
+            .create_from_slice(f32::as_bytes(&self.st_host[layout]));
+        self.dispatch(&self.banks[0], &fresh, lanes, block, vk);
+        let out = self.read(&self.banks[0].out);
+        let mut st = self.read(&fresh);
+        if vk {
+            let mut kv = vec![0.0f32; st.len()];
+            for b in 0..st.len() / (k_dim * v_dim) {
+                for j in 0..k_dim {
+                    for vi in 0..v_dim {
+                        kv[b * k_dim * v_dim + j * v_dim + vi] =
+                            st[b * k_dim * v_dim + vi * k_dim + j];
+                    }
+                }
+            }
+            st = kv;
+        }
+        let rel_out = out
+            .iter()
+            .zip(&self.oracle_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / self.maxref;
+        let rel_st = st
+            .iter()
+            .zip(&self.oracle_state)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let rel = rel_out.max(rel_st);
+        self.worst_rel.set(self.worst_rel.get().max(rel));
+        if !(rel <= 1e-3) {
+            return f64::INFINITY;
+        }
+
+        let nb = self.banks.len();
+        for i in 0..(2 * nb) {
+            self.dispatch(
+                &self.banks[i % nb],
+                &self.banks[i % nb].st[layout],
+                lanes,
+                block,
+                vk,
+            );
+        }
+        let _ = self.read(&self.banks[0].out);
+        (0..self.repeats)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                for i in 0..iters {
+                    self.dispatch(
+                        &self.banks[i % nb],
+                        &self.banks[i % nb].st[layout],
+                        lanes,
+                        block,
+                        vk,
+                    );
+                }
+                let _ = self.read(&self.banks[0].out);
+                t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
 }
 
 #[cfg(test)]
