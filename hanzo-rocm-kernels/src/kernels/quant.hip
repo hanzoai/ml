@@ -3085,8 +3085,66 @@ DEFINE_QDEQUANT(iq1_m, DW_IQ1_M)
 DEFINE_QDEQUANT(mxfp4, DW_MXFP4)
 DEFINE_QDEQUANT(rocmfp4, DW_ROCMFP4)
 DEFINE_QDEQUANT(rocmfp4_fast, DW_ROCMFP4_FAST)
-DEFINE_QDEQUANT(pq2_0, DW_PQ2_0)
-DEFINE_QDEQUANT(ptq1_0, DW_PTQ1_0)
+// Direct dequantizers for the Prism ternary types. The generic `qdequant_core` above decodes by dotting the
+// matvec decode against a one-hot probe vector: 128 floats of scratch zero-filled per thread and four
+// redundant block decodes per output. These read each element once and write it once, with the same
+// element order as `qdec<>::partial`, so the values are identical.
+template <typename OT>
+__device__ __forceinline__ void qdequant_pq2_0_direct(
+    const int nblocks, const uint8_t* __restrict__ wq, OT* __restrict__ out) {
+    const size_t tid = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    const size_t b = tid >> 5;
+    const int lane = (int)(tid & 31);
+    if (b >= (size_t)nblocks) {
+        return;
+    }
+    const uint8_t* blk = wq + b * 34;
+    const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+    const float d = __half2float(__ushort_as_half(d_bits));
+    const uint8_t* qs = blk + 2;
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int p = e * 32 + lane;
+        const int q = (int)((qs[p >> 2] >> ((p & 3) * 2)) & 3) - 1;
+        qstore(&out[b * 128 + p], (float)q * d);
+    }
+}
+
+template <typename OT>
+__device__ __forceinline__ void qdequant_ptq1_0_direct(
+    const int nblocks, const uint8_t* __restrict__ wq, OT* __restrict__ out) {
+    const size_t tid = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    const size_t b = tid >> 5;
+    const int lane = (int)(tid & 31);
+    if (b >= (size_t)nblocks) {
+        return;
+    }
+    const uint8_t* blk = wq + b * 28;
+    const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+    const float d = __half2float(__ushort_as_half(d_bits));
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int p = e * 32 + lane;
+        qstore(&out[b * 128 + p], (float)ptq1_0_w(blk, blk + 24, p) * d);
+    }
+}
+
+#define DEFINE_QDEQUANT_DIRECT(NAME, FN)                                                             \
+    extern "C" __global__ void qdequant_##NAME##_f16(                                                \
+        const int nblocks, const uint8_t* __restrict__ wq, __half* __restrict__ out) {               \
+        FN<__half>(nblocks, wq, out);                                                                 \
+    }                                                                                                \
+    extern "C" __global__ void qdequant_##NAME##_bf16(                                               \
+        const int nblocks, const uint8_t* __restrict__ wq, hip_bfloat16* __restrict__ out) {         \
+        FN<hip_bfloat16>(nblocks, wq, out);                                                           \
+    }                                                                                                \
+    extern "C" __global__ void qdequant_##NAME##_f32(                                                \
+        const int nblocks, const uint8_t* __restrict__ wq, float* __restrict__ out) {                \
+        FN<float>(nblocks, wq, out);                                                                  \
+    }
+
+DEFINE_QDEQUANT_DIRECT(pq2_0, qdequant_pq2_0_direct)
+DEFINE_QDEQUANT_DIRECT(ptq1_0, qdequant_ptq1_0_direct)
 
 #undef DEFINE_QDEQUANT
 
