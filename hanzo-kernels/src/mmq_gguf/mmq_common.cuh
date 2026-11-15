@@ -53,6 +53,8 @@ enum ggml_type {
     GGML_TYPE_BF16    = 30,
     GGML_TYPE_MXFP4   = 39,
     GGML_TYPE_NVFP4   = 40,
+    GGML_TYPE_PQ2_0   = 41,
+    GGML_TYPE_PTQ1_0  = 42,
 };
 
 // ============================================================
@@ -132,6 +134,12 @@ enum ggml_type {
 #define QI4_XS  (QK_K / (4 * QR4_XS))
 #define QR3_XS  4
 #define QI3_XS  (QK_K / (4 * QR3_XS))
+#define QK_PQ2_0  128
+#define QR_PQ2_0  1
+#define QI_PQ2_0  (QK_PQ2_0 / (4 * QR_PQ2_0))
+#define QK_PTQ1_0 128
+#define QR_PTQ1_0 1
+#define QI_PTQ1_0 (QK_PTQ1_0 / (4 * QR_PTQ1_0))
 
 // ============================================================
 // Block type definitions (CUDA half/half2)
@@ -190,6 +198,10 @@ typedef struct { half d; uint8_t qs[QK_K/8]; uint16_t qh[QK_K/32]; } block_iq1_s
 typedef struct { uint8_t qs[QK_K/8]; uint8_t qh[QK_K/16]; uint8_t scales[QK_K/32]; } block_iq1_m;
 typedef struct { half d; uint8_t qs[QK4_NL/2]; } block_iq4_nl;
 typedef struct { half d; uint16_t scales_h; uint8_t scales_l[QK_K/64]; uint8_t qs[QK_K/2]; } block_iq4_xs;
+typedef struct { half d; uint8_t qs[QK_PQ2_0/4]; } block_pq2_0;
+static_assert(sizeof(block_pq2_0) == 34, "wrong pq2_0 block size");
+typedef struct { uint8_t qs[24]; uint8_t qh[2]; half d; } block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == 28, "wrong ptq1_0 block size");
 
 // ============================================================
 // Architecture detection
@@ -433,6 +445,8 @@ template<> struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S>   { static constexpr in
 template<> struct ggml_cuda_type_traits<GGML_TYPE_IQ1_S>   { static constexpr int qk = QK_K;   static constexpr int qr = QR1_S;   static constexpr int qi = QI1_S; };
 template<> struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>  { static constexpr int qk = QK4_NL; static constexpr int qr = QR4_NL;  static constexpr int qi = QI4_NL; };
 template<> struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS>  { static constexpr int qk = QK_K;   static constexpr int qr = QR4_XS;  static constexpr int qi = QI4_XS; };
+template<> struct ggml_cuda_type_traits<GGML_TYPE_PQ2_0>   { static constexpr int qk = QK_PQ2_0;  static constexpr int qr = QR_PQ2_0;  static constexpr int qi = QI_PQ2_0; };
+template<> struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0>  { static constexpr int qk = QK_PTQ1_0; static constexpr int qr = QR_PTQ1_0; static constexpr int qi = QI_PTQ1_0; };
 
 // ============================================================
 // Additional macros and helpers
