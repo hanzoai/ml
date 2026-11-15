@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-ml"
-version = "0.11.117"
+version = "0.11.119"
 edition = "2021"
 description = "Fast multi-backend tensor & ML framework for Rust (CPU/CUDA/Metal/Vulkan/ROCm) with quantization — the compute core of the Hanzo stack."
 repository = "https://github.com/hanzoai/ml"
@@ -12,7 +12,7 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { version = "0.3.2", optional = true }
 byteorder = "1.4.3"
-hanzo-kernels = { path = "../hanzo-kernels", version = "0.11.42", optional = true }
+hanzo-kernels = { path = "../hanzo-kernels", version = "0.11.43", optional = true }
 hanzo-metal-kernels = { path = "../hanzo-metal-kernels", version = "0.11.48", optional = true }
 objc2-metal = { version = "0.3.1", optional = true }
 objc2-foundation = { version = "0.3.1", optional = true }
