@@ -101,6 +101,73 @@ fn upsample_nearest2d(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+fn reference_upsample_nearest2d(
+    src: &[f32],
+    shape: (usize, usize, usize, usize),
+    stride: &[usize],
+    offset: usize,
+    dst_h: usize,
+    dst_w: usize,
+) -> Vec<f32> {
+    let (b_sz, c, src_h, src_w) = shape;
+    let scale_h = src_h as f64 / dst_h as f64;
+    let scale_w = src_w as f64 / dst_w as f64;
+    let mut out = vec![0.0f32; b_sz * c * dst_h * dst_w];
+    for b in 0..b_sz {
+        for ch in 0..c {
+            for h in 0..dst_h {
+                let sh = usize::min(src_h - 1, (h as f64 * scale_h) as usize);
+                for w in 0..dst_w {
+                    let sw = usize::min(src_w - 1, (w as f64 * scale_w) as usize);
+                    let src_idx =
+                        offset + b * stride[0] + ch * stride[1] + sh * stride[2] + sw * stride[3];
+                    out[((b * c + ch) * dst_h + h) * dst_w + w] = src[src_idx];
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn upsample_nearest2d_fast_paths_match_reference_cpu() -> Result<()> {
+    let dev = &Device::Cpu;
+    // 1) Multi-batch/channel exact 2x + 3x + non-integer
+    let base = Tensor::arange(0f32, (2 * 3 * 5 * 7) as f32, dev)?.reshape((2, 3, 5, 7))?;
+    let base_vec = base.flatten_all()?.to_vec1::<f32>()?;
+    let base_l = base.layout();
+    for (dh, dw) in [(10, 14), (15, 21), (13, 11), (0, 6)] {
+        let actual = base.upsample_nearest2d(dh, dw)?;
+        assert_eq!(actual.dims(), &[2, 3, dh, dw]);
+        if dh > 0 && dw > 0 {
+            let expected = reference_upsample_nearest2d(
+                &base_vec,
+                (2, 3, 5, 7),
+                base_l.stride(),
+                base_l.start_offset(),
+                dh,
+                dw,
+            );
+            assert_eq!(actual.flatten_all()?.to_vec1::<f32>()?, expected);
+        }
+    }
+
+    // 2) Non-contiguous transposed input (stride_w != 1)
+    let trans = base.transpose(2, 3)?;
+    let t_l = trans.layout();
+    let actual_t = trans.upsample_nearest2d(14, 10)?;
+    let expected_t = reference_upsample_nearest2d(
+        &base_vec,
+        (2, 3, 7, 5),
+        t_l.stride(),
+        t_l.start_offset(),
+        14,
+        10,
+    );
+    assert_eq!(actual_t.flatten_all()?.to_vec1::<f32>()?, expected_t);
+    Ok(())
+}
+
 test_device!(avg_pool2d, avg_pool2d_cpu, avg_pool2d_gpu, avg_pool2d_metal);
 test_device!(
     avg_pool2d_pytorch,
