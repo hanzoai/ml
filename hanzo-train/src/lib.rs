@@ -12,6 +12,7 @@
 //!   expects.
 
 pub mod adam;
+pub mod agent_lightning;
 pub mod cache;
 pub mod cluster;
 pub mod dspark;
