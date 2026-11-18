@@ -66,7 +66,9 @@ fn bit_identical_roundtrip_including_signed_zeros_and_subnormals() -> Result<()>
     let carry: Vec<f32> = vec![0.0; n];
     let merged: Vec<bool> = (0..64).map(|i| i % 3 == 0).collect();
 
-    let mut w1_flat: Vec<f32> = (0..3 * n).map(|i| splitmix_f32(0xabcd_0000 + i as u64)).collect();
+    let mut w1_flat: Vec<f32> = (0..3 * n)
+        .map(|i| splitmix_f32(0xabcd_0000 + i as u64))
+        .collect();
     w1_flat[7] = -0.0f32;
     let w2_flat = w1_flat.clone();
 
@@ -208,91 +210,91 @@ fn reproducible_adacheck_benchmark_heterogeneous_vs_dense_control() -> Result<()
     let params = synthetic_params(n);
     let rounds = 5usize;
 
-    let run_regime =
-        |tag: &str, active_workers: usize, active_param_frac: f64| -> Result<(u64, u64, f64, f64)> {
-            let root = temp_dir(tag);
-            let store = AdaCheckStore::new(root.join("adacheck_store"), 4_096);
+    let run_regime = |tag: &str,
+                      active_workers: usize,
+                      active_param_frac: f64|
+     -> Result<(u64, u64, f64, f64)> {
+        let root = temp_dir(tag);
+        let store = AdaCheckStore::new(root.join("adacheck_store"), 4_096);
 
-            let mut theta: Vec<f32> = (0..n).map(|i| splitmix_f32(i as u64)).collect();
-            let mut momentum: Vec<f32> = if active_param_frac >= 0.99 {
-                (0..n).map(|i| splitmix_f32(0x1000_0000 + i as u64)).collect()
-            } else {
-                vec![0.0; n]
-            };
-            let mut carry: Vec<f32> = if active_param_frac >= 0.99 {
-                (0..n).map(|i| splitmix_f32(0x2000_0000 + i as u64)).collect()
-            } else {
-                vec![0.0; n]
-            };
-            let merged = vec![true; 128];
+        let mut theta: Vec<f32> = (0..n).map(|i| splitmix_f32(i as u64)).collect();
+        let mut momentum: Vec<f32> = if active_param_frac >= 0.99 {
+            (0..n)
+                .map(|i| splitmix_f32(0x1000_0000 + i as u64))
+                .collect()
+        } else {
+            vec![0.0; n]
+        };
+        let mut carry: Vec<f32> = if active_param_frac >= 0.99 {
+            (0..n)
+                .map(|i| splitmix_f32(0x2000_0000 + i as u64))
+                .collect()
+        } else {
+            vec![0.0; n]
+        };
+        let merged = vec![true; 128];
 
-            let mut worker_states: Vec<Vec<f32>> = (0..4)
-                .map(|w| {
-                    (0..3 * n)
-                        .map(|i| splitmix_f32(((w as u64 + 1) << 32) ^ (i as u64)))
-                        .collect()
-                })
-                .collect();
+        let mut worker_states: Vec<Vec<f32>> = (0..4)
+            .map(|w| {
+                (0..3 * n)
+                    .map(|i| splitmix_f32(((w as u64 + 1) << 32) ^ (i as u64)))
+                    .collect()
+            })
+            .collect();
 
-            let mut total_logical = 0u64;
-            let mut save_ms_sum = 0.0f64;
-            let mut restore_ms_sum = 0.0f64;
-            let active_elems = ((n as f64) * active_param_frac) as usize;
+        let mut total_logical = 0u64;
+        let mut save_ms_sum = 0.0f64;
+        let mut restore_ms_sum = 0.0f64;
+        let active_elems = ((n as f64) * active_param_frac) as usize;
 
-            for r in 1..=rounds {
-                for i in 0..active_elems {
-                    let d = (r as f32) * 1e-5 + (i as f32) * 1e-9;
-                    theta[i] += d;
-                    momentum[i] = 0.9 * momentum[i] + d;
-                    if active_param_frac >= 0.99 {
-                        carry[i] += d * 0.01;
-                    }
+        for r in 1..=rounds {
+            for i in 0..active_elems {
+                let d = (r as f32) * 1e-5 + (i as f32) * 1e-9;
+                theta[i] += d;
+                momentum[i] = 0.9 * momentum[i] + d;
+                if active_param_frac >= 0.99 {
+                    carry[i] += d * 0.01;
                 }
-                for w in 0..active_workers {
-                    for i in 0..(active_elems * 3) {
-                        worker_states[w][i] += (r as f32) * 1e-5 + (w as f32) * 1e-6;
-                    }
+            }
+            for (w, ws) in worker_states.iter_mut().enumerate().take(active_workers) {
+                for val in ws.iter_mut().take(active_elems * 3) {
+                    *val += (r as f32) * 1e-5 + (w as f32) * 1e-6;
                 }
-
-                let mut inner = HashMap::new();
-                for w in 0..4 {
-                    inner.insert(
-                        format!("worker-{w}"),
-                        Inner {
-                            t: if w < active_workers { r as u64 } else { 1 },
-                            data: Arc::new(net::pack(&worker_states[w])),
-                        },
-                    );
-                }
-
-                let ckpt_dir = root.join(format!("round_{r}"));
-                let t_save = Instant::now();
-                let st = store.save_checkpoint(
-                    &ckpt_dir,
-                    &theta,
-                    &momentum,
-                    &carry,
-                    &merged,
-                    r as u64,
-                    &inner,
-                )?;
-                save_ms_sum += t_save.elapsed().as_secs_f64() * 1_000.0;
-                total_logical += st.logical_bytes;
-
-                let (restored, rst) = store.restore_checkpoint(&ckpt_dir, &params, 128)?;
-                restore_ms_sum += rst.restore_ms;
-                assert_f32_bits_eq(&restored.theta, &theta);
             }
 
-            let physical = store.physical_blob_bytes()?;
-            let _ = fs::remove_dir_all(&root);
-            Ok((
-                total_logical,
-                physical,
-                save_ms_sum / rounds as f64,
-                restore_ms_sum / rounds as f64,
-            ))
-        };
+            let mut inner = HashMap::new();
+            for (w, ws) in worker_states.iter().enumerate().take(4) {
+                inner.insert(
+                    format!("worker-{w}"),
+                    Inner {
+                        t: if w < active_workers { r as u64 } else { 1 },
+                        data: Arc::new(net::pack(ws)),
+                    },
+                );
+            }
+
+            let ckpt_dir = root.join(format!("round_{r}"));
+            let t_save = Instant::now();
+            let st = store.save_checkpoint(
+                &ckpt_dir, &theta, &momentum, &carry, &merged, r as u64, &inner,
+            )?;
+            save_ms_sum += t_save.elapsed().as_secs_f64() * 1_000.0;
+            total_logical += st.logical_bytes;
+
+            let (restored, rst) = store.restore_checkpoint(&ckpt_dir, &params, 128)?;
+            restore_ms_sum += rst.restore_ms;
+            assert_f32_bits_eq(&restored.theta, &theta);
+        }
+
+        let physical = store.physical_blob_bytes()?;
+        let _ = fs::remove_dir_all(&root);
+        Ok((
+            total_logical,
+            physical,
+            save_ms_sum / rounds as f64,
+            restore_ms_sum / rounds as f64,
+        ))
+    };
 
     let (het_log, het_phys, het_save_ms, het_rest_ms) = run_regime("het", 2, 0.5)?;
     let (den_log, den_phys, den_save_ms, den_rest_ms) = run_regime("dense", 4, 1.0)?;
