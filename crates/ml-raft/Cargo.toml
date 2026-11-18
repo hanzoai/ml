@@ -1,0 +1,15 @@
+[package]
+name = "ml-raft"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+serde_json = "1.0"
+
+[[example]]
+name = "ml_raft_bench"
+path = "examples/bench.rs"
