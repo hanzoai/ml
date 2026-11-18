@@ -1,3 +1,4 @@
+#include <metal_stdlib>
 using namespace metal;
 
 struct info_st {
@@ -23,10 +24,9 @@ uint threadgroup_index_in_grid = (threadgroup_pos_in_grid.z * threadgroups_per_g
 threadgroup uchar dynamic_shared_mem[512];
 // Shared array size: 128, 512 bytes
 threadgroup float* shared_memory_9 = reinterpret_cast<threadgroup float*>(&dynamic_shared_mem[0]);
+float l_mut_2;
 uint l_mut_3;
 uint l_mut_11;
-uint l_mut_25;
-float l_mut_2;
 const uint l_0 = buffer_4[uint(0)];
 const uint l_1 = threadgroup_index_in_grid * l_0;
 l_mut_2 = float(0.0);
@@ -68,20 +68,20 @@ const float l_21 = l_19 / l_20;
 const float l_22 = buffer_3[uint(0)];
 const float l_23 = l_21 + l_22;
 const float l_24 = sqrt(l_23);
-l_mut_25 = thread_index_in_threadgroup;
+l_mut_11 = thread_index_in_threadgroup;
 while (true) {
-const bool l_26 = l_mut_25 < l_0;
-const bool l_27 = !l_26;
-if (l_27) {
+const bool l_25 = l_mut_11 < l_0;
+const bool l_26 = !l_25;
+if (l_26) {
 break;}
-const uint l_28 = l_1 + l_mut_25;
-const uint l_29 = l_1 + l_mut_25;
-const float l_30 = buffer_0[l_29];
-const float l_31 = l_30 / l_24;
-const float l_32 = buffer_1[l_mut_25];
-const float l_33 = l_31 * l_32;
-buffer_2[l_28] = l_33;
-l_mut_25 = l_mut_25 + total_thread_in_threadgroup;
+const uint l_27 = l_1 + l_mut_11;
+const uint l_28 = l_1 + l_mut_11;
+const float l_29 = buffer_0[l_28];
+const float l_30 = l_29 / l_24;
+const float l_31 = buffer_1[l_mut_11];
+const float l_32 = l_30 * l_31;
+buffer_2[l_27] = l_32;
+l_mut_11 = l_mut_11 + total_thread_in_threadgroup;
 }
 
 }

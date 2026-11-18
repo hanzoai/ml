@@ -329,3 +329,254 @@ impl<'a, R: Runtime> Evaluator for Pq2MatvecEval<'a, R> {
             .fold(f64::INFINITY, f64::min)
     }
 }
+
+/// Host f64 reference for direct float-activation PQ2_0 matvec (`w = d * (code - 1)`).
+pub fn pq2_0_float_ref(codes: &[u8], d: &[f32], x: &[f32], rows: usize, k: usize) -> Vec<f32> {
+    (0..rows)
+        .map(|r| {
+            let mut acc = 0.0f64;
+            for b in 0..(k / QK_PQ2_0) {
+                let scale = d[r * (k / QK_PQ2_0) + b] as f64;
+                let base = b * QK_PQ2_0;
+                let mut bacc = 0.0f64;
+                for i in 0..QK_PQ2_0 {
+                    let c = codes[r * k + base + i] as f64 - 1.0;
+                    bacc += c * x[base + i] as f64;
+                }
+                acc += scale * bacc;
+            }
+            acc as f32
+        })
+        .collect()
+}
+
+/// Multi-row simdgroup/plane PQ2_0 decode matvec (`tg128` schedule family for SIMD4 float backends
+/// such as Apple Silicon Metal where `dot(float4, float4)` outpaces emulated `dp4a`).
+///
+/// One 32-lane plane cooperates on `4` consecutive 128-weight blocks per step (`8` lanes/block,
+/// `16` weights = `1` `u32` word per lane) across `nr0` output rows simultaneously, decoding each
+/// 2-bit code via IEEE-754 binary16 exponent-25 (`as_type<f16>(0x6400 | code) - 1025.0 == code - 1`
+/// bit-exactly, zero `uitofp`, zero `floor`, zero `sumy` cancellation) and reducing across the
+/// plane with `plane_sum` (no shared memory, no barriers). Requires hardware `plane_size == 32`.
+///
+/// Launch geometry: `Block::new_2d(32, nsg as u32)` (`128` threads at `nsg = 4`),
+/// `Grid::Static(rows.div_ceil(nsg * nr0) as u32, 1, 1)`. `meta = [k, rows]`.
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
+pub fn matvec_pq2_0_plane<F: Float>(
+    wq: &Array<u32>,
+    wd: &Array<F>,
+    x: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>,
+    #[comptime] nsg: usize,
+    #[comptime] nr0: usize,
+) {
+    let lane = UNIT_POS_X as usize;
+    let sg = UNIT_POS_Y as usize;
+    let k = meta[0] as usize;
+    let nout = meta[1] as usize;
+    let nb = k / 128usize;
+    let first_row = (CUBE_POS as usize * nsg + sg) * nr0;
+
+    let ix = lane / 8usize;
+    let il = lane % 8usize;
+
+    let mut sumf = Array::<F>::new(nr0);
+    #[unroll]
+    for r in 0usize..nr0 {
+        sumf[r] = F::new(0.0f32);
+    }
+
+    if first_row < nout {
+        let mut ib = ix;
+        while ib < nb {
+            let xb = ib * 128usize + il * 16usize;
+            let mut y = Array::<F>::new(16usize);
+            #[unroll]
+            for i in 0usize..16usize {
+                y[i] = x[xb + i];
+            }
+            #[unroll]
+            for r in 0usize..nr0 {
+                let crow = if first_row + r < nout {
+                    first_row + r
+                } else {
+                    nout - 1usize
+                };
+                let d = wd[crow * nb + ib];
+                let w32 = wq[crow * (nb * 8usize) + ib * 8usize + il];
+                let mut acc = F::new(0.0f32);
+                #[unroll]
+                for i in 0usize..16usize {
+                    let c_bits = ((w32 >> ((2 * i) as u32)) & 3u32) | 0x4B00_0000u32;
+                    let w_val =
+                        F::cast_from(f32::reinterpret(c_bits) - 8_388_609.0f32);
+                    acc += w_val * y[i];
+                }
+                sumf[r] += d * acc;
+            }
+            ib += 4usize;
+        }
+    }
+
+    #[unroll]
+    for r in 0usize..nr0 {
+        let tot = plane_sum(sumf[r]);
+        if lane == 0usize && first_row + r < nout {
+            out[first_row + r] = tot;
+        }
+    }
+}
+
+/// Schedule space of [`matvec_pq2_0_plane`]: simdgroups per threadgroup (`NSG=4` -> `tg128`) and
+/// output rows per simdgroup (`NR0`).
+pub fn pq2_0_plane_space() -> Space {
+    Space::new().param("NSG", [2, 4]).param("NR0", [2, 4, 8])
+}
+
+/// Cold-weight, oracle-gated fitness for [`pq2_0_plane_space`].
+pub struct Pq2PlaneMatvecEval<'a, R: Runtime> {
+    client: &'a ComputeClient<R>,
+    space: &'a Space,
+    banks: Vec<(cubecl::server::Handle, cubecl::server::Handle)>,
+    x: cubecl::server::Handle,
+    meta: cubecl::server::Handle,
+    out: cubecl::server::Handle,
+    lens: (usize, usize, usize),
+    rows: usize,
+    oracle: Vec<f32>,
+    maxref: f32,
+    repeats: usize,
+    worst_rel: std::cell::Cell<f32>,
+}
+
+impl<'a, R: Runtime> Pq2PlaneMatvecEval<'a, R> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: &'a ComputeClient<R>,
+        space: &'a Space,
+        codes: &[u8],
+        d: &[f32],
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        nbanks: usize,
+        repeats: usize,
+    ) -> Self {
+        let (wq, wd) = pq2_0_pack(codes, d, rows, k);
+        let banks = (0..nbanks.max(1))
+            .map(|_| {
+                (
+                    client.create_from_slice(u32::as_bytes(&wq)),
+                    client.create_from_slice(f32::as_bytes(&wd)),
+                )
+            })
+            .collect();
+        let oracle = pq2_0_float_ref(codes, &wd, x, rows, k);
+        let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
+        Self {
+            client,
+            space,
+            banks,
+            x: client.create_from_slice(f32::as_bytes(x)),
+            meta: client.create_from_slice(u32::as_bytes(&[k as u32, rows as u32])),
+            out: client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows])),
+            lens: (wq.len(), wd.len(), x.len()),
+            rows,
+            oracle,
+            maxref,
+            repeats,
+            worst_rel: std::cell::Cell::new(0.0),
+        }
+    }
+
+    pub fn nbanks(&self) -> usize {
+        self.banks.len()
+    }
+
+    pub fn worst_rel(&self) -> f32 {
+        self.worst_rel.get()
+    }
+
+    fn cfg(&self, c: &Config) -> (usize, usize) {
+        (
+            c.get(self.space, "NSG") as usize,
+            c.get(self.space, "NR0") as usize,
+        )
+    }
+
+    fn dispatch(&self, bank: usize, nsg: usize, nr0: usize) {
+        let (a, b) = &self.banks[bank];
+        let grid_x = self.rows.div_ceil(nsg * nr0) as u32;
+        unsafe {
+            matvec_pq2_0_plane::launch_unchecked::<f32, R>(
+                self.client,
+                Grid::Static(grid_x, 1, 1),
+                Block::new_2d(32, nsg as u32),
+                ArrayArg::from_raw_parts(a.clone(), self.lens.0),
+                ArrayArg::from_raw_parts(b.clone(), self.lens.1),
+                ArrayArg::from_raw_parts(self.x.clone(), self.lens.2),
+                ArrayArg::from_raw_parts(self.out.clone(), self.rows),
+                ArrayArg::from_raw_parts(self.meta.clone(), 2),
+                nsg,
+                nr0,
+            );
+        }
+    }
+
+    fn read_out(&self) -> Vec<f32> {
+        f32::from_bytes(&self.client.read_one_unchecked(self.out.clone())).to_vec()
+    }
+}
+
+impl<'a, R: Runtime> Evaluator for Pq2PlaneMatvecEval<'a, R> {
+    fn static_check(&self, cfg: &Config) -> Verdict {
+        let (nsg, _) = self.cfg(cfg);
+        let hw = &self.client.properties().hardware;
+        if hw.plane_size_min != 32 || hw.plane_size_max != 32 {
+            return Verdict::Reject(format!(
+                "matvec_pq2_0_plane requires 32-lane hardware planes, got {}..{}",
+                hw.plane_size_min, hw.plane_size_max
+            ));
+        }
+        if (32 * nsg) as u32 > hw.max_units_per_cube {
+            return Verdict::Reject(format!(
+                "{} threads exceed {} units per cube",
+                32 * nsg,
+                hw.max_units_per_cube
+            ));
+        }
+        Verdict::Pass
+    }
+
+    fn measure(&self, cfg: &Config, iters: usize) -> f64 {
+        let (nsg, nr0) = self.cfg(cfg);
+        self.dispatch(0, nsg, nr0);
+        let rel = self
+            .read_out()
+            .iter()
+            .zip(&self.oracle)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / self.maxref;
+        self.worst_rel.set(self.worst_rel.get().max(rel));
+        if !(rel <= 1e-5) {
+            return f64::INFINITY;
+        }
+        let nb = self.banks.len();
+        for i in 0..(2 * nb) {
+            self.dispatch(i % nb, nsg, nr0);
+        }
+        let _ = self.read_out();
+        (0..self.repeats)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                for i in 0..iters {
+                    self.dispatch(i % nb, nsg, nr0);
+                }
+                let _ = self.read_out();
+                t.elapsed().as_secs_f64() * 1e3 / iters as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+}

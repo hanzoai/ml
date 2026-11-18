@@ -1123,13 +1123,16 @@ fn pq2_inputs(rows: usize, k: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     (codes, d, xv)
 }
 
-/// Gate: the PQ2_0 dp4a decode matvec matches the host reference (same quantized activation) across
-/// thread counts and chunkings.
+/// Gate: the PQ2_0 decode matvecs (dp4a and simdgroup plane) match the host reference across
+/// schedules and ragged row tails.
 fn check_pq2<R: Runtime>(name: &str, client: &ComputeClient<R>) {
-    use hanzo_kernel::ternary::{pq2_0_space, Pq2MatvecEval};
+    use hanzo_kernel::ternary::{
+        pq2_0_plane_space, pq2_0_space, Pq2MatvecEval, Pq2PlaneMatvecEval,
+    };
     use hanzo_kernel::tune::{Evaluator, Verdict};
     let space = pq2_0_space();
-    for (rows, k) in [(256usize, 1024usize), (384, 2048)] {
+    let pspace = pq2_0_plane_space();
+    for (rows, k) in [(256usize, 1024usize), (387, 2048)] {
         let (codes, d, x) = pq2_inputs(rows, k);
         let eval = Pq2MatvecEval::new(client, &space, &codes, &d, &x, rows, k, 2, 1);
         for (nt, chunk) in [(32, 1), (64, 2), (128, 4), (256, 1)] {
@@ -1147,25 +1150,45 @@ fn check_pq2<R: Runtime>(name: &str, client: &ComputeClient<R>) {
                 mark(ms.is_finite(), "MATCH ✓", "MISMATCH ✗")
             );
         }
+        let peval = Pq2PlaneMatvecEval::new(client, &pspace, &codes, &d, &x, rows, k, 2, 1);
+        for (nsg, nr0) in [(2, 2), (4, 2), (4, 4), (4, 8)] {
+            let cfg = pspace.config(&[("NSG", nsg), ("NR0", nr0)]);
+            if let Verdict::Reject(_) = peval.static_check(&cfg) {
+                continue;
+            }
+            let ms = peval.measure(&cfg, 2);
+            println!(
+                "[{name:<7}] PQ2_0 tg{} {rows}x{k} nr0={nr0}  max_rel={:.2e}  {}",
+                nsg * 32,
+                peval.worst_rel(),
+                mark(ms.is_finite(), "MATCH ✓", "MISMATCH ✗")
+            );
+        }
     }
 }
 
-/// `matvec-check pq2sweep`: audit the PQ2_0 decode matvec schedule on the Bonsai-2 27B layer shapes,
+/// `matvec-check pq2sweep`: audit the PQ2_0 decode matvec schedules on the Bonsai-2 27B layer shapes,
 /// cold (weight banks past the last-level cache). GB/s counts the 2.125 bits per weight actually read.
 fn pq2_sweep<R: Runtime>(label: &str, client: &ComputeClient<R>) {
-    use hanzo_kernel::ternary::{pq2_0_space, Pq2MatvecEval};
+    use hanzo_kernel::ternary::{
+        pq2_0_plane_space, pq2_0_space, Pq2MatvecEval, Pq2PlaneMatvecEval,
+    };
     use hanzo_kernel::tune::{self, Evaluator, Verdict};
     let device = tune::device_id(client);
     let space = pq2_0_space();
+    let pspace = pq2_0_plane_space();
     let all = space.enumerate();
+    let pall = pspace.enumerate();
     println!(
-        "== [{label}] PQ2_0 dp4a decode matvec audit: {} configs, device `{device}` ==",
-        all.len()
+        "== [{label}] PQ2_0 decode matvec audit: {} dp4a + {} plane configs, device `{device}` ==",
+        all.len(),
+        pall.len()
     );
     for (rows, k, what) in [
         (17408usize, 5120usize, "ffn gate/up"),
         (5120, 17408, "ffn down"),
         (5120, 5120, "attn proj"),
+        (1024, 5120, "attn kv"),
     ] {
         let (codes, d, x) = pq2_inputs(rows, k);
         let wbytes = (rows * k) as f64 * 34.0 / 128.0;
@@ -1188,7 +1211,31 @@ fn pq2_sweep<R: Runtime>(label: &str, client: &ComputeClient<R>) {
                 Verdict::Pass => {
                     let ms = eval.measure(cfg, eval.nbanks());
                     if ms.is_finite() {
-                        rows_out.push((ms, cfg.clone()));
+                        rows_out.push((ms, format!("dp4a:{}", cfg.name(&space))));
+                    } else {
+                        diverged += 1;
+                    }
+                }
+            }
+        }
+        let peval = Pq2PlaneMatvecEval::new(
+            client,
+            &pspace,
+            &codes,
+            &d,
+            &x,
+            rows,
+            k,
+            nbanks.clamp(2, 64),
+            3,
+        );
+        for cfg in &pall {
+            match peval.static_check(cfg) {
+                Verdict::Reject(_) => rejected += 1,
+                Verdict::Pass => {
+                    let ms = peval.measure(cfg, peval.nbanks());
+                    if ms.is_finite() {
+                        rows_out.push((ms, format!("plane:{}", cfg.name(&pspace))));
                     } else {
                         diverged += 1;
                     }
@@ -1202,31 +1249,24 @@ fn pq2_sweep<R: Runtime>(label: &str, client: &ComputeClient<R>) {
             eval.nbanks(),
             rows_out.len()
         );
-        for (i, (ms, cfg)) in rows_out.iter().enumerate() {
-            if i < 4 || i + 1 == rows_out.len() {
+        for (i, (ms, name)) in rows_out.iter().enumerate() {
+            if i < 6 || i + 1 == rows_out.len() {
                 println!(
-                    "   {:>2}. {:<18} {:8.4} ms  {:6.0} GB/s",
+                    "   {:>2}. {:<24} {:8.4} ms  {:6.0} GB/s",
                     i + 1,
-                    cfg.name(&space),
+                    name,
                     ms,
                     wbytes / (ms * 1e6)
                 );
             }
         }
         if let Some((ms, best)) = rows_out.first() {
+            let wrel = eval.worst_rel().max(peval.worst_rel());
             println!(
-                "   >> BEST {}: {:.4} ms  {:.0} GB/s  (worst_rel {:.2e})",
-                best.name(&space),
-                ms,
+                "   >> BEST {best}: {ms:.4} ms  {:.0} GB/s  (worst_rel {wrel:.2e})",
                 wbytes / (ms * 1e6),
-                eval.worst_rel()
             );
-            tune::global().record(
-                &device,
-                "matvec_pq2_0_dp4a_blk",
-                &format!("{rows}x{k}"),
-                &best.name(&space),
-            );
+            tune::global().record(&device, "matvec_pq2_0", &format!("{rows}x{k}"), best);
         }
     }
 }

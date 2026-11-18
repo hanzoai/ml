@@ -2156,6 +2156,7 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
             residency_set,
+            dsl_pipelines: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -2502,6 +2503,25 @@ pub fn kernel_msl(name: &str) -> Result<&'static str> {
 }
 
 impl MetalDevice {
+    /// The compiled pipeline for a committed DSL kernel, compiled on first use and cached per device.
+    pub fn dsl_pipeline(&self, name: &str) -> Result<hanzo_metal_kernels::metal::ComputePipeline> {
+        if let Some(pl) = self
+            .dsl_pipelines
+            .read()
+            .map_err(MetalError::from)?
+            .get(name)
+        {
+            return Ok(pl.clone());
+        }
+        let msl = format!("#include <metal_stdlib>\n{}", kernel_msl(name)?);
+        let pl = self.compile_msl(name, &msl)?;
+        self.dsl_pipelines
+            .write()
+            .map_err(MetalError::from)?
+            .insert(name.to_string(), pl.clone());
+        Ok(pl)
+    }
+
     /// Dispatch a committed DSL kernel through ml's native Metal encoder -- the reusable seam every
     /// migrated `#[kernel]` shares, mirroring the per-kernel `.spv` dispatch on Vulkan. Resolves the MSL
     /// by name, compiles it through the SAME pipeline hand kernels use (`compile_msl`, driver-cached),
@@ -2520,8 +2540,7 @@ impl MetalDevice {
         grid: objc2_metal::MTLSize,
         threadgroup: objc2_metal::MTLSize,
     ) -> Result<()> {
-        let msl = format!("#include <metal_stdlib>\n{}", kernel_msl(name)?);
-        let pl = self.compile_msl(name, &msl)?;
+        let pl = self.dsl_pipeline(name)?;
         let info = self.new_buffer_with_data(static_meta)?;
         {
             let enc = self.command_encoder()?;
@@ -2680,7 +2699,7 @@ mod dsl_metal_dispatch {
 // gates the DSL output bit-exact against a CPU oracle (scale-relative: max|Δ| / max|ref|, the
 // signed-affine-safe metric) and reports the DSL/hand wall-clock ratio (best-of-N, pipelines
 // pre-compiled outside the timing loop so neither arm pays library-compile cost -- `dispatch_dsl`
-// recompiles per call, which would measure codegen not kernel). Timing is wall-clock, so it is only
+// caches its pipeline per device (`dsl_pipeline`), so only the first call pays codegen). Timing is wall-clock, so it is only
 // meaningful on a quiet GPU; correctness always runs, the ratio is a sign not a spec. A DSL arm earns
 // the production path only where it MEASURES >= hand here.
 //
