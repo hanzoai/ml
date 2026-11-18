@@ -94,8 +94,7 @@ pub struct AdaCheckStore {
 fn validate_worker_name(name: &str) -> Result<()> {
     ensure!(!name.is_empty(), "worker name must not be empty");
     ensure!(
-        !name.contains("..")
-            && !name.bytes().any(|b| matches!(b, b'/' | b'\\' | 0)),
+        !name.contains("..") && !name.bytes().any(|b| matches!(b, b'/' | b'\\' | 0)),
         "invalid worker name in checkpoint: {name:?}"
     );
     Ok(())
@@ -118,11 +117,15 @@ fn f32_slice_to_le_bytes(vals: &[f32]) -> Vec<u8> {
 }
 
 fn le_bytes_to_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
-    ensure!(bytes.len() % 4 == 0, "corrupt f32 chunk byte length {}", bytes.len());
-    let mut out = Vec::with_capacity(bytes.len() / 4);
-    for c in bytes.chunks_exact(4) {
-        let bits = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        out.push(f32::from_bits(bits));
+    ensure!(
+        bytes.len().is_multiple_of(4),
+        "corrupt f32 chunk byte length {}",
+        bytes.len()
+    );
+    let (chunks, _) = bytes.as_chunks::<4>();
+    let mut out = Vec::with_capacity(chunks.len());
+    for &c in chunks {
+        out.push(f32::from_bits(u32::from_le_bytes(c)));
     }
     Ok(out)
 }
@@ -180,7 +183,10 @@ impl AdaCheckStore {
     }
 
     fn blob_path(&self, digest: &str) -> PathBuf {
-        self.root.join("blobs").join(&digest[..2]).join(format!("{digest}.bin"))
+        self.root
+            .join("blobs")
+            .join(&digest[..2])
+            .join(format!("{digest}.bin"))
     }
 
     /// Total physical blob bytes currently stored under `root/blobs`.
@@ -216,6 +222,7 @@ impl AdaCheckStore {
 
     /// Save a complete DiLoCo checkpoint (`theta`, outer optimizer state, and all workers'
     /// inner AdamW states) into `dir/adacheck_manifest.json` backed by deduplicated blobs.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_checkpoint(
         &self,
         dir: &Path,
@@ -244,34 +251,38 @@ impl AdaCheckStore {
         let mut stats = AdaCheckStats::default();
         let mut seen_this_ckpt: HashSet<String> = HashSet::new();
 
-        let mut ingest = |chunks: Vec<(String, Vec<u8>)>, len_elems: usize| -> Result<ChunkedVectorManifest> {
-            let mut digests = Vec::with_capacity(chunks.len());
-            for (digest, bytes) in chunks {
-                let b_len = bytes.len() as u64;
-                stats.logical_bytes += b_len;
-                stats.total_chunks += 1;
-                if !seen_this_ckpt.insert(digest.clone()) {
-                    stats.reused_bytes_intra += b_len;
-                } else {
-                    let bp = self.blob_path(&digest);
-                    if bp.exists() {
-                        stats.reused_bytes_temporal += b_len;
+        let mut ingest =
+            |chunks: Vec<(String, Vec<u8>)>, len_elems: usize| -> Result<ChunkedVectorManifest> {
+                let mut digests = Vec::with_capacity(chunks.len());
+                for (digest, bytes) in chunks {
+                    let b_len = bytes.len() as u64;
+                    stats.logical_bytes += b_len;
+                    stats.total_chunks += 1;
+                    if !seen_this_ckpt.insert(digest.clone()) {
+                        stats.reused_bytes_intra += b_len;
                     } else {
-                        atomic_write(&bp, &bytes)?;
-                        stats.unique_bytes_written += b_len;
-                        stats.unique_chunks_written += 1;
+                        let bp = self.blob_path(&digest);
+                        if bp.exists() {
+                            stats.reused_bytes_temporal += b_len;
+                        } else {
+                            atomic_write(&bp, &bytes)?;
+                            stats.unique_bytes_written += b_len;
+                            stats.unique_chunks_written += 1;
+                        }
                     }
+                    digests.push(digest);
                 }
-                digests.push(digest);
-            }
-            Ok(ChunkedVectorManifest {
-                len_elems,
-                chunks: digests,
-            })
-        };
+                Ok(ChunkedVectorManifest {
+                    len_elems,
+                    chunks: digests,
+                })
+            };
 
         let theta_m = ingest(self.chunk_bytes(&f32_slice_to_le_bytes(theta)), theta.len())?;
-        let mom_m = ingest(self.chunk_bytes(&f32_slice_to_le_bytes(momentum)), momentum.len())?;
+        let mom_m = ingest(
+            self.chunk_bytes(&f32_slice_to_le_bytes(momentum)),
+            momentum.len(),
+        )?;
         let carry_m = ingest(self.chunk_bytes(&f32_slice_to_le_bytes(carry)), carry.len())?;
 
         let mut sorted_names: Vec<&String> = inner.keys().collect();
@@ -348,8 +359,8 @@ impl AdaCheckStore {
                 validate_digest_hex(digest)?;
                 if !blob_cache.contains_key(digest) {
                     let bp = self.blob_path(digest);
-                    let data = fs::read(&bp)
-                        .with_context(|| format!("missing blob {}", bp.display()))?;
+                    let data =
+                        fs::read(&bp).with_context(|| format!("missing blob {}", bp.display()))?;
                     let actual = sha256_hex(&data);
                     if &actual != digest {
                         bail!(
