@@ -409,8 +409,7 @@ pub fn matvec_pq2_0_plane<F: Float>(
                 #[unroll]
                 for i in 0usize..16usize {
                     let c_bits = ((w32 >> ((2 * i) as u32)) & 3u32) | 0x4B00_0000u32;
-                    let w_val =
-                        F::cast_from(f32::reinterpret(c_bits) - 8_388_609.0f32);
+                    let w_val = F::cast_from(f32::reinterpret(c_bits) - 8_388_609.0f32);
                     acc += w_val * y[i];
                 }
                 sumf[r] += d * acc;
@@ -578,5 +577,302 @@ impl<'a, R: Runtime> Evaluator for Pq2PlaneMatvecEval<'a, R> {
                 t.elapsed().as_secs_f64() * 1e3 / iters as f64
             })
             .fold(f64::INFINITY, f64::min)
+    }
+}
+
+// ================================================================================================
+// Native-layout PQ2_0: the kernel reads the GGUF `block_pq2_0` bytes the engine already holds.
+// ================================================================================================
+//
+// `block_pq2_0` is 34 bytes: `half d` then `u8 qs[32]` (element `j` at `qs[j/4] >> 2*(j%4)`). That is
+// 2-byte aligned, so a `u32` view of a block alternates between word-aligned and half-word-shifted.
+// Two consecutive blocks are 68 bytes = exactly 17 words, so block `g` sits in pair `p = g/2`:
+//
+//   half h = g%2 | scale d                  | lane il's 16 codes (qs bytes 4il..4il+3)
+//   -------------+--------------------------+----------------------------------------------
+//   0 (even)     | low  16 bits of w[17p]   | (w[17p+il] >> 16) | (w[17p+il+1] << 16)
+//   1 (odd)      | high 16 bits of w[17p+8] |  w[17p+9+il]
+//
+// Both rows are one branch-free expression with `s = 16*(1-h)`:
+//   `(a >> s) | ((b << 15) << (17 - s))`   (s = 0 shifts `b` out in two legal sub-32 shifts)
+// so every lane of a plane runs the same instructions whatever its block's parity. The `b` index is
+// clamped to the last word, so no read leaves the tensor's `ceil(34*G/4)` words. When `G` is odd the
+// final word is half outside the tensor; the binding must cover `ceil(34*G/4)` words (hanzo-ml's
+// buffers are allocated in >= 4-byte granules).
+
+/// The 32-bit little-endian word of 16 codes lane `il` (0..8) owns in global block `g`.
+#[device]
+pub fn pq2_gguf_codes(wq: &Array<u32>, g: usize, il: usize, nwords: usize) -> u32 {
+    let p = g / 2usize;
+    let h = g % 2usize;
+    let ai = 17usize * p + 9usize * h + il;
+    let mut bi = ai + 1usize;
+    if bi >= nwords {
+        bi = nwords - 1usize;
+    }
+    let s = (16usize * (1usize - h)) as u32;
+    let a = wq[ai];
+    let b = wq[bi];
+    (a >> s) | ((b << 15u32) << (17u32 - s))
+}
+
+/// The f16 block scale of global block `g`, as f32.
+#[device]
+pub fn pq2_gguf_scale(wq: &Array<u32>, g: usize) -> f32 {
+    let p = g / 2usize;
+    let h = g % 2usize;
+    let word = wq[17usize * p + 8usize * h];
+    crate::quant::f16lo_to_f32((word >> ((16usize * h) as u32)) & 0xFFFFu32)
+}
+
+/// PQ2_0 decode matvec over native GGUF blocks: `out[r] = Σ_j d·(code-1)·x[j]`.
+///
+/// Same plane schedule as [`matvec_pq2_0_plane`] (8 lanes per block, 4 blocks per plane step, `nr0`
+/// rows per plane, `nsg` planes per cube, `plane_sum` reduce, no shared memory), but it reads the
+/// engine's resident bytes instead of a repacked copy. Accumulates in f32 for every `F`.
+/// Codes decode exactly: `f32::reinterpret(0x4B00_0000 | c) - 8388609.0 == c - 1`.
+///
+/// Launch: `Block::new_2d(32, nsg)`, `Grid::Static(rows.div_ceil(nsg*nr0), 1, 1)`,
+/// `meta = [k, rows, nwords]` with `nwords = ceil(34 * rows * k/128 / 4)`.
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
+pub fn matvec_pq2_0_gguf<F: Float>(
+    wq: &Array<u32>,
+    x: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>,
+    #[comptime] nsg: usize,
+    #[comptime] nr0: usize,
+) {
+    let lane = UNIT_POS_X as usize;
+    let sg = UNIT_POS_Y as usize;
+    let k = meta[0] as usize;
+    let nout = meta[1] as usize;
+    let nwords = meta[2] as usize;
+    let nb = k / 128usize;
+    let first_row = (CUBE_POS as usize * nsg + sg) * nr0;
+    let ix = lane / 8usize;
+    let il = lane % 8usize;
+
+    let mut sumf = Array::<f32>::new(nr0);
+    #[unroll]
+    for r in 0usize..nr0 {
+        sumf[r] = 0.0f32;
+    }
+
+    if first_row < nout {
+        let mut ib = ix;
+        while ib < nb {
+            let xb = ib * 128usize + il * 16usize;
+            let mut y = Array::<f32>::new(16usize);
+            #[unroll]
+            for i in 0usize..16usize {
+                y[i] = f32::cast_from(x[xb + i]);
+            }
+            #[unroll]
+            for r in 0usize..nr0 {
+                let mut row = first_row + r;
+                if row >= nout {
+                    row = nout - 1usize;
+                }
+                let g = row * nb + ib;
+                let d = pq2_gguf_scale(wq, g);
+                let w32 = pq2_gguf_codes(wq, g, il, nwords);
+                let mut acc = 0.0f32;
+                #[unroll]
+                for i in 0usize..16usize {
+                    let c_bits = ((w32 >> ((2 * i) as u32)) & 3u32) | 0x4B00_0000u32;
+                    acc += (f32::reinterpret(c_bits) - 8_388_609.0f32) * y[i];
+                }
+                sumf[r] += d * acc;
+            }
+            ib += 4usize;
+        }
+    }
+
+    #[unroll]
+    for r in 0usize..nr0 {
+        let tot = plane_sum(sumf[r]);
+        if lane == 0usize && first_row + r < nout {
+            out[first_row + r] = F::cast_from(tot);
+        }
+    }
+}
+
+/// Serialize row-major `codes` + f16-exact scales `d` into GGUF `block_pq2_0` bytes (34 B/block),
+/// bit-for-bit what the engine loads from a `.gguf`.
+pub fn pq2_0_gguf_bytes(codes: &[u8], d: &[f32], rows: usize, k: usize) -> Vec<u8> {
+    assert_eq!(codes.len(), rows * k);
+    assert!(k % QK_PQ2_0 == 0);
+    let nblk = rows * k / QK_PQ2_0;
+    assert_eq!(d.len(), nblk);
+    let mut out = Vec::with_capacity(nblk * 34);
+    for b in 0..nblk {
+        out.extend_from_slice(&half::f16::from_f32(d[b]).to_le_bytes());
+        for q in 0..32 {
+            let base = b * QK_PQ2_0 + q * 4;
+            let mut byte = 0u8;
+            for s in 0..4 {
+                byte |= (codes[base + s] & 3) << (2 * s);
+            }
+            out.push(byte);
+        }
+    }
+    out
+}
+
+/// View GGUF bytes as the `u32` words the kernel binds (`ceil(len/4)`, zero tail).
+pub fn pq2_0_gguf_words(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            u32::from_le_bytes(w)
+        })
+        .collect()
+}
+
+/// The oracle: decode the GGUF bytes exactly as hanzo-ml's `BlockPQ2_0::to_float` does
+/// (`(q - 1) * d.to_f32()`), dot in f64.
+pub fn pq2_0_gguf_ref(bytes: &[u8], x: &[f32], rows: usize, k: usize) -> Vec<f32> {
+    let nb = k / QK_PQ2_0;
+    (0..rows)
+        .map(|r| {
+            let mut acc = 0f64;
+            for b in 0..nb {
+                let blk = &bytes[(r * nb + b) * 34..(r * nb + b + 1) * 34];
+                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32() as f64;
+                for j in 0..QK_PQ2_0 {
+                    let q = ((blk[2 + j / 4] >> ((j % 4) * 2)) & 3) as f64;
+                    acc += (q - 1.0) * d * x[b * QK_PQ2_0 + j] as f64;
+                }
+            }
+            acc as f32
+        })
+        .collect()
+}
+
+/// Launch [`matvec_pq2_0_gguf`] once and read the result back.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_pq2_0_gguf_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    words: &[u32],
+    x: &[f32],
+    rows: usize,
+    k: usize,
+    nsg: usize,
+    nr0: usize,
+) -> Vec<f32> {
+    let wh = client.create_from_slice(u32::as_bytes(words));
+    let xh = client.create_from_slice(f32::as_bytes(x));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    let mh = client.create_from_slice(u32::as_bytes(&[k as u32, rows as u32, words.len() as u32]));
+    unsafe {
+        matvec_pq2_0_gguf::launch_unchecked::<f32, R>(
+            client,
+            Grid::Static(rows.div_ceil(nsg * nr0) as u32, 1, 1),
+            Block::new_2d(32, nsg as u32),
+            ArrayArg::from_raw_parts(wh.clone(), words.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(oh.clone(), rows),
+            ArrayArg::from_raw_parts(mh.clone(), 3),
+            nsg,
+            nr0,
+        );
+    }
+    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Shapes every backend is gated on: odd block counts (the half-word path and the clamped tail),
+/// a single block, and Zen6-27B-class projection shapes.
+pub const PQ2_GGUF_SHAPES: &[(usize, usize)] = &[
+    (1, 128),
+    (3, 128),
+    (7, 384),
+    (33, 640),
+    (257, 1152),
+    (2048, 2048),
+    (5120, 5120),
+    (17408, 5120),
+    (5120, 17408),
+];
+
+/// Correctness board for one runtime: every shape x every schedule, scale-relative error vs the
+/// f64 oracle. Returns (rows, k, nsg, nr0, rel) per case.
+pub fn pq2_0_gguf_board<R: Runtime>(
+    client: &ComputeClient<R>,
+) -> Vec<(usize, usize, usize, usize, f32)> {
+    let mut res = Vec::new();
+    for &(rows, k) in PQ2_GGUF_SHAPES {
+        let (codes, d) = pq2_0_synth(rows, k, 0x9E37_79B9 ^ (rows * 31 + k) as u64);
+        let bytes = pq2_0_gguf_bytes(&codes, &d, rows, k);
+        let words = pq2_0_gguf_words(&bytes);
+        let x: Vec<f32> = (0..k)
+            .map(|i| (((i * 7919) % 2003) as f32 / 1001.5) - 1.0)
+            .collect();
+        let want = pq2_0_gguf_ref(&bytes, &x, rows, k);
+        let maxref = want.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
+        for nsg in [2usize, 4] {
+            for nr0 in [2usize, 4, 8] {
+                let got = matvec_pq2_0_gguf_run(client, &words, &x, rows, k, nsg, nr0);
+                let rel = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max)
+                    / maxref;
+                res.push((rows, k, nsg, nr0, rel));
+            }
+        }
+    }
+    res
+}
+
+#[cfg(test)]
+mod gguf_layout_tests {
+    use super::*;
+
+    /// The host-side model of `pq2_gguf_codes` / `pq2_gguf_scale` must reproduce the byte decode for
+    /// every block parity, lane, and the clamped tail -- proven on the CPU before any GPU runs it.
+    #[test]
+    fn word_view_matches_byte_decode() {
+        for &(rows, k) in &[(1usize, 128usize), (3, 128), (7, 384), (5, 256)] {
+            let (codes, d) = pq2_0_synth(rows, k, 7);
+            let bytes = pq2_0_gguf_bytes(&codes, &d, rows, k);
+            let w = pq2_0_gguf_words(&bytes);
+            let nwords = w.len();
+            for g in 0..rows * k / QK_PQ2_0 {
+                let (p, h) = (g / 2, g % 2);
+                let sc = (w[17 * p + 8 * h] >> (16 * h)) & 0xFFFF;
+                assert_eq!(
+                    half::f16::from_bits(sc as u16).to_f32(),
+                    half::f16::from_f32(d[g]).to_f32()
+                );
+                for il in 0..8 {
+                    let ai = 17 * p + 9 * h + il;
+                    let bi = (ai + 1).min(nwords - 1);
+                    let s = 16 * (1 - h) as u32;
+                    let v = (w[ai] >> s) | ((w[bi] << 15) << (17 - s));
+                    for i in 0..16 {
+                        let want = codes[g * QK_PQ2_0 + il * 16 + i] as u32 & 3;
+                        assert_eq!((v >> (2 * i)) & 3, want, "g={g} il={il} i={i}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_matches_planar_decode() {
+        let (rows, k) = (5, 384);
+        let (codes, d) = pq2_0_synth(rows, k, 11);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01).sin()).collect();
+        let bytes = pq2_0_gguf_bytes(&codes, &d, rows, k);
+        let (_, wd) = pq2_0_pack(&codes, &d, rows, k);
+        let a = pq2_0_gguf_ref(&bytes, &x, rows, k);
+        let b = pq2_0_float_ref(&codes, &wd, &x, rows, k);
+        for (u, v) in a.iter().zip(&b) {
+            assert!((u - v).abs() <= 1e-5 * v.abs().max(1.0), "{u} vs {v}");
+        }
     }
 }
