@@ -353,6 +353,141 @@ impl QMetalStorage {
         ))
     }
 
+    /// Dispatch a generated ternary DSL kernel (`PQ2_0` or `PTQ1_0`, `is_gemm` = decode vs prefill)
+    /// when enabled and eligible; falls back cleanly to legacy (and counts every dispatch).
+    #[allow(clippy::too_many_arguments)]
+    fn try_dispatch_ternary_dsl(
+        &self,
+        device: &crate::MetalDevice,
+        kdtype: hanzo_metal_kernels::GgmlDType,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst: &hanzo_metal_kernels::metal::Buffer,
+        m_total: usize,
+        n: usize,
+        k: usize,
+        src1_bf16: bool,
+        is_gemm: bool,
+    ) -> Result<bool> {
+        use crate::quantized::dsl::{self, QkImpl};
+        use hanzo_metal_kernels::GgmlDType;
+        let (selected, elig, legacy_name, ineligible_name) = match (kdtype, is_gemm, src1_bf16) {
+            (GgmlDType::PQ2_0, false, false) => (
+                dsl::pq2_impl(),
+                dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mv_pq2_0_f32",
+                "kernel_mul_mv_pq2_0_f32[dsl-ineligible]",
+            ),
+            (GgmlDType::PQ2_0, false, true) => (
+                dsl::pq2_impl(),
+                dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mv_pq2_0_bf16",
+                "kernel_mul_mv_pq2_0_bf16[dsl-ineligible]",
+            ),
+            (GgmlDType::PQ2_0, true, false) => (
+                dsl::pq2_impl(),
+                dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mm_pq2_0_f32",
+                "kernel_mul_mm_pq2_0_f32[dsl-ineligible]",
+            ),
+            (GgmlDType::PQ2_0, true, true) => (
+                dsl::pq2_impl(),
+                dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mm_pq2_0_bf16",
+                "kernel_mul_mm_pq2_0_bf16[dsl-ineligible]",
+            ),
+            (GgmlDType::PTQ1_0, false, false) => (
+                dsl::ptq1_impl(),
+                dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mv_ptq1_0_f32",
+                "kernel_mul_mv_ptq1_0_f32[dsl-ineligible]",
+            ),
+            (GgmlDType::PTQ1_0, false, true) => (
+                dsl::ptq1_impl(),
+                dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mv_ptq1_0_bf16",
+                "kernel_mul_mv_ptq1_0_bf16[dsl-ineligible]",
+            ),
+            (GgmlDType::PTQ1_0, true, false) => (
+                dsl::ptq1_impl(),
+                dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mm_ptq1_0_f32",
+                "kernel_mul_mm_ptq1_0_f32[dsl-ineligible]",
+            ),
+            (GgmlDType::PTQ1_0, true, true) => (
+                dsl::ptq1_impl(),
+                dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mm_ptq1_0_bf16",
+                "kernel_mul_mm_ptq1_0_bf16[dsl-ineligible]",
+            ),
+            _ => return Ok(false),
+        };
+        if selected != QkImpl::Dsl {
+            dsl::note_dispatch(QkImpl::Legacy, legacy_name, n, k);
+            return Ok(false);
+        }
+        let Ok(nwords) = elig else {
+            dsl::note_dispatch(QkImpl::Legacy, ineligible_name, n, k);
+            return Ok(false);
+        };
+        let (artifact, meta_words, grid, block) = if !is_gemm {
+            let (a, nsg, nr0) = match kdtype {
+                GgmlDType::PTQ1_0 => dsl::ptq1_matvec_artifact(n, src1_bf16),
+                _ => dsl::pq2_matvec_artifact(n, src1_bf16),
+            };
+            (
+                a,
+                [k as u32, n as u32, nwords as u32],
+                objc2_metal::MTLSize {
+                    width: n.div_ceil(nsg * nr0),
+                    height: 1,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: 32,
+                    height: nsg,
+                    depth: 1,
+                },
+            )
+        } else {
+            let (a, bm) = match kdtype {
+                GgmlDType::PTQ1_0 => dsl::ptq1_matmul_artifact(m_total, n, src1_bf16),
+                _ => dsl::pq2_matmul_artifact(m_total, n, src1_bf16),
+            };
+            (
+                a,
+                [m_total as u32, n as u32, k as u32],
+                objc2_metal::MTLSize {
+                    width: m_total.div_ceil(bm),
+                    height: n.div_ceil(64),
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        };
+        let meta = device.dsl_const_u32(&meta_words)?;
+        let x_off = layout.start_offset() * storage.dtype().size_in_bytes();
+        device.dispatch_dsl(
+            artifact,
+            &[
+                (&self.buffer, 0),
+                (storage.buffer(), x_off),
+                (dst, 0),
+                (&meta, 0),
+            ],
+            2,
+            &[0u32; 8],
+            grid,
+            block,
+        )?;
+        dsl::note_dispatch(QkImpl::Dsl, artifact, n, k);
+        Ok(true)
+    }
+
     fn fwd_mv(
         &self,
         self_shape: &Shape,
@@ -405,66 +540,24 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), out_dtype)
             .with_label("qmatmul")
             .build()?;
-        // PQ2_0 decode (m == 1): the generated DSL matvec when `quantized::dsl` selects it, else the
-        // legacy hand kernel, which stays the default and the fallback. Both paths are counted, so a
-        // benchmark can prove which kernel served every projection.
-        if matches!(kdtype, hanzo_metal_kernels::GgmlDType::PQ2_0) && m == 1 {
-            use crate::quantized::dsl::{self, QkImpl};
-            let legacy_name = if src1_bf16 {
-                "kernel_mul_mv_pq2_0_bf16"
-            } else {
-                "kernel_mul_mv_pq2_0_f32"
-            };
-            if dsl::pq2_impl() == QkImpl::Dsl {
-                match dsl::pq2_dsl_eligible(n, k, self.buffer.length()) {
-                    Ok(nwords) => {
-                        let (artifact, nsg, nr0) = dsl::pq2_matvec_artifact(n, src1_bf16);
-                        let meta = device.dsl_const_u32(&[k as u32, n as u32, nwords as u32])?;
-                        let x_off = layout.start_offset() * storage.dtype().size_in_bytes();
-                        device.dispatch_dsl(
-                            artifact,
-                            &[
-                                (&self.buffer, 0),
-                                (storage.buffer(), x_off),
-                                (&dst, 0),
-                                (&meta, 0),
-                            ],
-                            2,
-                            &[0u32; 8],
-                            objc2_metal::MTLSize {
-                                width: n.div_ceil(nsg * nr0),
-                                height: 1,
-                                depth: 1,
-                            },
-                            objc2_metal::MTLSize {
-                                width: 32,
-                                height: nsg,
-                                depth: 1,
-                            },
-                        )?;
-                        dsl::note_dispatch(QkImpl::Dsl, artifact, n, k);
-                        let dst_storage = crate::MetalStorage::new(
-                            dst,
-                            device.clone(),
-                            dst_shape.elem_count(),
-                            out_dtype,
-                        );
-                        return Ok((dst_storage, dst_shape));
-                    }
-                    Err(_) => dsl::note_dispatch(
-                        QkImpl::Legacy,
-                        if src1_bf16 {
-                            "kernel_mul_mv_pq2_0_bf16[dsl-ineligible]"
-                        } else {
-                            "kernel_mul_mv_pq2_0_f32[dsl-ineligible]"
-                        },
-                        n,
-                        k,
-                    ),
-                }
-            } else {
-                dsl::note_dispatch(QkImpl::Legacy, legacy_name, n, k);
-            }
+        // PQ2_0 / PTQ1_0 decode (m == 1): generated DSL matvec when selected, else legacy hand kernel.
+        if m == 1
+            && self.try_dispatch_ternary_dsl(
+                &device,
+                kdtype,
+                storage,
+                layout,
+                &dst,
+                m,
+                n,
+                k,
+                src1_bf16,
+                false,
+            )?
+        {
+            let dst_storage =
+                crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), out_dtype);
+            return Ok((dst_storage, dst_shape));
         }
         let encoder = device.command_encoder()?;
         // Single batched matvec: the m activation columns dispatch as one grid (grid height = ne11 = m),
@@ -574,63 +667,27 @@ impl QMetalStorage {
             assert_eq!(storage.dtype(), DType::F32);
         }
 
-        if matches!(kdtype, hanzo_metal_kernels::GgmlDType::PQ2_0) && self_shape.rank() == 2 {
-            use crate::quantized::dsl::{self, QkImpl};
+        if self_shape.rank() == 2 {
             let m_total: usize = src_shape.dims()[..src_shape.rank() - 1].iter().product();
-            let legacy_name = if src1_bf16 {
-                "kernel_mul_mm_pq2_0_bf16"
-            } else {
-                "kernel_mul_mm_pq2_0_f32"
-            };
-            if dsl::pq2_impl() == QkImpl::Dsl {
-                match dsl::pq2_dsl_eligible(n, k, self.buffer.length()) {
-                    Ok(_) => {
-                        let (artifact, bm) = dsl::pq2_matmul_artifact(m_total, n, src1_bf16);
-                        let meta = device.dsl_const_u32(&[m_total as u32, n as u32, k as u32])?;
-                        let x_off = layout.start_offset() * storage.dtype().size_in_bytes();
-                        device.dispatch_dsl(
-                            artifact,
-                            &[
-                                (&self.buffer, 0),
-                                (storage.buffer(), x_off),
-                                (&dst, 0),
-                                (&meta, 0),
-                            ],
-                            2,
-                            &[0u32; 8],
-                            objc2_metal::MTLSize {
-                                width: m_total.div_ceil(bm),
-                                height: n.div_ceil(64),
-                                depth: 1,
-                            },
-                            objc2_metal::MTLSize {
-                                width: 128,
-                                height: 1,
-                                depth: 1,
-                            },
-                        )?;
-                        dsl::note_dispatch(QkImpl::Dsl, artifact, n, k);
-                        let dst_storage = crate::MetalStorage::new(
-                            dst,
-                            device.clone(),
-                            dst_shape.elem_count(),
-                            out_dtype,
-                        );
-                        return Ok((dst_storage, dst_shape));
-                    }
-                    Err(_) => dsl::note_dispatch(
-                        QkImpl::Legacy,
-                        if src1_bf16 {
-                            "kernel_mul_mm_pq2_0_bf16[dsl-ineligible]"
-                        } else {
-                            "kernel_mul_mm_pq2_0_f32[dsl-ineligible]"
-                        },
-                        n,
-                        k,
-                    ),
-                }
-            } else {
-                dsl::note_dispatch(QkImpl::Legacy, legacy_name, n, k);
+            if self.try_dispatch_ternary_dsl(
+                &device,
+                kdtype,
+                storage,
+                layout,
+                &dst,
+                m_total,
+                n,
+                k,
+                src1_bf16,
+                true,
+            )? {
+                let dst_storage = crate::MetalStorage::new(
+                    dst,
+                    device.clone(),
+                    dst_shape.elem_count(),
+                    out_dtype,
+                );
+                return Ok((dst_storage, dst_shape));
             }
         }
 

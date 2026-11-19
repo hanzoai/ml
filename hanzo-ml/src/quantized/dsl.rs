@@ -37,6 +37,7 @@ impl QkImpl {
 
 const UNSET: u8 = u8::MAX;
 static PQ2_IMPL: AtomicU8 = AtomicU8::new(UNSET);
+static PTQ1_IMPL: AtomicU8 = AtomicU8::new(UNSET);
 
 fn encode(i: QkImpl) -> u8 {
     match i {
@@ -45,25 +46,39 @@ fn encode(i: QkImpl) -> u8 {
     }
 }
 
-/// The implementation PQ2_0 decode matvecs use: `set_pq2_impl` if called, else `HANZO_PQ2_IMPL`.
-pub fn pq2_impl() -> QkImpl {
-    match PQ2_IMPL.load(Ordering::Relaxed) {
+fn read_impl_env(atom: &AtomicU8, env_var: &str) -> QkImpl {
+    match atom.load(Ordering::Relaxed) {
         0 => QkImpl::Legacy,
         1 => QkImpl::Dsl,
         _ => {
-            let i = match std::env::var("HANZO_PQ2_IMPL").as_deref() {
+            let i = match std::env::var(env_var).as_deref() {
                 Ok("dsl") => QkImpl::Dsl,
                 _ => QkImpl::Legacy,
             };
-            PQ2_IMPL.store(encode(i), Ordering::Relaxed);
+            atom.store(encode(i), Ordering::Relaxed);
             i
         }
     }
 }
 
+/// The implementation PQ2_0 ops use: `set_pq2_impl` if called, else `HANZO_PQ2_IMPL`.
+pub fn pq2_impl() -> QkImpl {
+    read_impl_env(&PQ2_IMPL, "HANZO_PQ2_IMPL")
+}
+
 /// Force the PQ2_0 implementation for this process (A/B tests, interleaved benches).
 pub fn set_pq2_impl(i: QkImpl) {
     PQ2_IMPL.store(encode(i), Ordering::Relaxed);
+}
+
+/// The implementation PTQ1_0 ops use: `set_ptq1_impl` if called, else `HANZO_PTQ1_IMPL`.
+pub fn ptq1_impl() -> QkImpl {
+    read_impl_env(&PTQ1_IMPL, "HANZO_PTQ1_IMPL")
+}
+
+/// Force the PTQ1_0 implementation for this process (A/B tests, interleaved benches).
+pub fn set_ptq1_impl(i: QkImpl) {
+    PTQ1_IMPL.store(encode(i), Ordering::Relaxed);
 }
 
 /// The production PQ2_0 decode schedule `(nsg, nr0)` for `rows` outputs (NSG = 2, NR0 = 4
@@ -124,8 +139,7 @@ pub fn set_pq2_nsg(nsg: Option<usize>) {
     NSG_FORCE.store(nsg.map_or(0, |v| v as u8), Ordering::Relaxed);
 }
 
-/// The generated artifact (= pipeline identity) for a PQ2_0 decode matvec, with its schedule.
-pub fn pq2_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, usize) {
+fn ternary_matvec_schedule(rows: usize) -> (usize, usize) {
     let (mut nsg, mut nr0) = pq2_schedule(rows);
     if let Some(forced) = nsg_override() {
         nsg = forced;
@@ -133,6 +147,12 @@ pub fn pq2_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, usi
     if let Some(forced) = nr0_override() {
         nr0 = forced;
     }
+    (nsg, nr0)
+}
+
+/// The generated artifact (= pipeline identity) for a PQ2_0 decode matvec, with its schedule.
+pub fn pq2_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, usize) {
+    let (nsg, nr0) = ternary_matvec_schedule(rows);
     let a = match (nsg, nr0, bf16) {
         (2, 2, false) => "matvec_pq2_0_gguf_nsg2_nr2_f32",
         (2, 4, false) => "matvec_pq2_0_gguf_nsg2_nr4_f32",
@@ -146,6 +166,26 @@ pub fn pq2_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, usi
         (_, 2, true) => "matvec_pq2_0_gguf_nsg4_nr2_bf16",
         (_, 4, true) => "matvec_pq2_0_gguf_nsg4_nr4_bf16",
         (_, _, true) => "matvec_pq2_0_gguf_nsg4_nr8_bf16",
+    };
+    (a, nsg, nr0)
+}
+
+/// The generated artifact (= pipeline identity) for a PTQ1_0 decode matvec, with its schedule.
+pub fn ptq1_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, usize) {
+    let (nsg, nr0) = ternary_matvec_schedule(rows);
+    let a = match (nsg, nr0, bf16) {
+        (2, 2, false) => "matvec_ptq1_0_gguf_nsg2_nr2_f32",
+        (2, 4, false) => "matvec_ptq1_0_gguf_nsg2_nr4_f32",
+        (2, _, false) => "matvec_ptq1_0_gguf_nsg2_nr8_f32",
+        (2, 2, true) => "matvec_ptq1_0_gguf_nsg2_nr2_bf16",
+        (2, 4, true) => "matvec_ptq1_0_gguf_nsg2_nr4_bf16",
+        (2, _, true) => "matvec_ptq1_0_gguf_nsg2_nr8_bf16",
+        (_, 2, false) => "matvec_ptq1_0_gguf_nsg4_nr2_f32",
+        (_, 4, false) => "matvec_ptq1_0_gguf_nsg4_nr4_f32",
+        (_, _, false) => "matvec_ptq1_0_gguf_nsg4_nr8_f32",
+        (_, 2, true) => "matvec_ptq1_0_gguf_nsg4_nr2_bf16",
+        (_, 4, true) => "matvec_ptq1_0_gguf_nsg4_nr4_bf16",
+        (_, _, true) => "matvec_ptq1_0_gguf_nsg4_nr8_bf16",
     };
     (a, nsg, nr0)
 }
@@ -164,15 +204,28 @@ pub fn pq2_matmul_artifact(m: usize, n: usize, bf16: bool) -> (&'static str, usi
     (a, bm)
 }
 
-/// Whether the native-GGUF DSL matvec can serve an `n x k` PQ2_0 weight held in `buf_bytes` bytes;
-/// `Ok(nwords)` is the kernel's `meta[2]`. The kernel views the 34-byte blocks as u32 words, so the
-/// tensor must be a whole number of words (true whenever `k` is a multiple of 256, i.e. every
-/// production projection) and the buffer must hold all of them.
-pub fn pq2_dsl_eligible(n: usize, k: usize, buf_bytes: usize) -> Result<usize, &'static str> {
+/// The generated artifact (= pipeline identity) and `BM` tile height for a PTQ1_0 prefill GEMM.
+pub fn ptq1_matmul_artifact(m: usize, n: usize, bf16: bool) -> (&'static str, usize) {
+    let bm = if m > 48 && n >= 2048 { 64 } else { 32 };
+    let a = match (bm, bf16) {
+        (32, false) => "matmul_ptq1_0_gguf_bm32_f32",
+        (32, true) => "matmul_ptq1_0_gguf_bm32_bf16",
+        (_, false) => "matmul_ptq1_0_gguf_bm64_f32",
+        (_, true) => "matmul_ptq1_0_gguf_bm64_bf16",
+    };
+    (a, bm)
+}
+
+fn gguf_dsl_eligible(
+    n: usize,
+    k: usize,
+    buf_bytes: usize,
+    block_bytes: usize,
+) -> Result<usize, &'static str> {
     if k % 128 != 0 {
         return Err("k not a multiple of 128");
     }
-    let bytes = n * (k / 128) * 34;
+    let bytes = n * (k / 128) * block_bytes;
     if bytes % 4 != 0 {
         return Err("odd block count: tensor is not a whole number of u32 words");
     }
@@ -183,6 +236,16 @@ pub fn pq2_dsl_eligible(n: usize, k: usize, buf_bytes: usize) -> Result<usize, &
         return Err("tensor exceeds u32 word indexing");
     }
     Ok(bytes / 4)
+}
+
+/// Whether the native-GGUF DSL kernels can serve an `n x k` PQ2_0 weight (`34 B/block`).
+pub fn pq2_dsl_eligible(n: usize, k: usize, buf_bytes: usize) -> Result<usize, &'static str> {
+    gguf_dsl_eligible(n, k, buf_bytes, 34)
+}
+
+/// Whether the native-GGUF DSL kernels can serve an `n x k` PTQ1_0 weight (`28 B/block`).
+pub fn ptq1_dsl_eligible(n: usize, k: usize, buf_bytes: usize) -> Result<usize, &'static str> {
+    gguf_dsl_eligible(n, k, buf_bytes, 28)
 }
 
 type Key = (&'static str, &'static str, usize, usize);
@@ -319,9 +382,24 @@ mod tests {
                     assert!(a.contains(&format!("_nsg{nsg}_nr{nr0}_")), "{a}");
                     assert!(a.ends_with(if bf16 { "_bf16" } else { "_f32" }), "{a}");
                     assert!(seen.insert(a), "duplicate pipeline identity {a}");
+
+                    let (p, got_nsg_p, got_nr0_p) = ptq1_matvec_artifact(5000, bf16);
+                    assert_eq!((got_nsg_p, got_nr0_p), (nsg, nr0));
+                    assert!(seen.insert(p), "duplicate pipeline identity {p}");
                 }
             }
         }
+        for (m, n, want_bm) in [(16usize, 5120usize, 32usize), (64, 1024, 32), (64, 5120, 64)] {
+            for bf16 in [false, true] {
+                let (a, bm) = pq2_matmul_artifact(m, n, bf16);
+                assert_eq!(bm, want_bm);
+                seen.insert(a);
+                let (p, bm_p) = ptq1_matmul_artifact(m, n, bf16);
+                assert_eq!(bm_p, want_bm);
+                seen.insert(p);
+            }
+        }
+        assert_eq!(seen.len(), 24 + 8);
         set_pq2_nsg(None);
         set_pq2_nr0(None);
     }
@@ -335,5 +413,10 @@ mod tests {
         assert!(pq2_dsl_eligible(3, 128, 3 * 34).is_err()); // odd block count
         assert!(pq2_dsl_eligible(4, 256, 10).is_err()); // short buffer
         assert!(pq2_dsl_eligible(4, 100, 1 << 20).is_err());
+        assert_eq!(
+            ptq1_dsl_eligible(3, 128, 3 * 28),
+            Ok(3 * 7) // 28 B = 7 u32 words, even for odd block counts
+        );
+        assert!(ptq1_dsl_eligible(4, 256, 10).is_err());
     }
 }

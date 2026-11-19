@@ -2536,6 +2536,22 @@ dsl_artifacts! {
     "matmul_pq2_0_gguf_bm32_bf16" => "matmul_pq2_0_gguf_f_",
     "matmul_pq2_0_gguf_bm64_f32" => "matmul_pq2_0_gguf_f_f32",
     "matmul_pq2_0_gguf_bm64_bf16" => "matmul_pq2_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg2_nr2_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg2_nr4_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg2_nr8_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg2_nr2_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg2_nr4_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg2_nr8_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg4_nr2_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg4_nr4_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg4_nr8_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg4_nr2_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg4_nr4_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg4_nr8_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matmul_ptq1_0_gguf_bm32_f32" => "matmul_ptq1_0_gguf_f_f32",
+    "matmul_ptq1_0_gguf_bm32_bf16" => "matmul_ptq1_0_gguf_f_",
+    "matmul_ptq1_0_gguf_bm64_f32" => "matmul_ptq1_0_gguf_f_f32",
+    "matmul_ptq1_0_gguf_bm64_bf16" => "matmul_ptq1_0_gguf_f_",
 }
 
 impl MetalDevice {

@@ -58,6 +58,48 @@ macro_rules! pq2_gemm_spec {
     };
 }
 
+/// One PTQ1_0 matvec specialization (`28 B` GGUF blocks).
+#[cfg(feature = "metal")]
+macro_rules! ptq1_spec {
+    ($artifact:literal, $entry:literal, $e:ty, $conv:expr, $nsg:literal, $nr0:literal) => {
+        Spec {
+            artifact: $artifact,
+            entry: $entry,
+            launch: |c| {
+                use hanzo_kernel::ternary::*;
+                let (rows, k) = (3usize, 256usize);
+                let (codes, d) = ptq1_0_synth(rows, k, 1);
+                let words = ptq1_0_gguf_words(&ptq1_0_gguf_bytes(&codes, &d, rows, k));
+                let x: Vec<$e> = (0..k).map(|i| $conv(i as f32 * 1e-3)).collect();
+                let _ = matvec_ptq1_0_gguf_run_as::<$e, cubecl::wgpu::WgpuRuntime>(
+                    c, &words, &x, rows, k, $nsg, $nr0,
+                );
+            },
+        }
+    };
+}
+
+/// One PTQ1_0 prefill GEMM specialization (`f32` or `bf16`, `bm = 32` or `64`).
+#[cfg(feature = "metal")]
+macro_rules! ptq1_gemm_spec {
+    ($artifact:literal, $entry:literal, $e:ty, $conv:expr, $bm:literal) => {
+        Spec {
+            artifact: $artifact,
+            entry: $entry,
+            launch: |c| {
+                use hanzo_kernel::ternary::*;
+                let (m, n, k) = (17usize, 73usize, 256usize);
+                let (codes, d) = ptq1_0_synth(n, k, 1);
+                let words = ptq1_0_gguf_words(&ptq1_0_gguf_bytes(&codes, &d, n, k));
+                let x: Vec<$e> = (0..m * k).map(|i| $conv(i as f32 * 1e-3)).collect();
+                let _ = matmul_ptq1_0_gguf_bm_run_as::<$e, cubecl::wgpu::WgpuRuntime>(
+                    c, &words, &x, m, n, k, $bm,
+                );
+            },
+        }
+    };
+}
+
 /// Every Metal artifact hanzo-ml commits under `src/metal/dsl/`. Adding a DSL kernel to the Metal
 /// path = one entry here + one `kernel_msl` arm in hanzo-ml.
 #[cfg(feature = "metal")]
@@ -110,6 +152,23 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
         pq2_gemm_spec!("matmul_pq2_0_gguf_bm32_bf16", "matmul_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 32),
         pq2_gemm_spec!("matmul_pq2_0_gguf_bm64_f32",  "matmul_pq2_0_gguf_f_f32", f32,        std::convert::identity, 64),
         pq2_gemm_spec!("matmul_pq2_0_gguf_bm64_bf16", "matmul_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 64),
+        // PTQ1_0 decode matvec + prefill GEMM over native 28-byte GGUF blocks.
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg2_nr2_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 2, 2),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg2_nr4_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 2, 4),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg2_nr8_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 2, 8),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg2_nr2_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 2),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg2_nr4_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 4),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg2_nr8_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 8),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg4_nr2_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 4, 2),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg4_nr4_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 4, 4),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg4_nr8_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 4, 8),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg4_nr2_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 2),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg4_nr4_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 4),
+        ptq1_spec!("matvec_ptq1_0_gguf_nsg4_nr8_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 8),
+        ptq1_gemm_spec!("matmul_ptq1_0_gguf_bm32_f32",  "matmul_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 32),
+        ptq1_gemm_spec!("matmul_ptq1_0_gguf_bm32_bf16", "matmul_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 32),
+        ptq1_gemm_spec!("matmul_ptq1_0_gguf_bm64_f32",  "matmul_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 64),
+        ptq1_gemm_spec!("matmul_ptq1_0_gguf_bm64_bf16", "matmul_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 64),
     ]
 }
 
