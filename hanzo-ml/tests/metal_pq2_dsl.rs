@@ -385,3 +385,129 @@ fn pq2_dsl_nr0_sweep() {
         );
     }
 }
+
+#[test]
+fn pq2_dsl_gemm_prefill_f32_and_bf16_match_oracle_and_offset() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0).unwrap();
+    dsl::reset_stats();
+    let cases = [
+        (9usize, 128usize, 256usize),
+        (17, 257, 512),
+        (35, 386, 384),
+        (65, 2048, 256),
+    ];
+    for &(m, n, k) in &cases {
+        let raw = raw_pq2(n, k, (m * 31 + n * 7 + k) as u64);
+        let mm = matmul(&dev, &raw, n, k);
+        let xv = act(m * k);
+        let want32 = hanzo_kernel::ternary::pq2_0_gguf_gemm_ref(&raw, &xv, m, n, k);
+        let x32 = Tensor::from_vec(xv.clone(), (m, k), &dev).unwrap();
+        let got_dsl = forward(&mm, &x32, QkImpl::Dsl);
+        let got_leg = forward(&mm, &x32, QkImpl::Legacy);
+        let rel_dsl = scale_rel(&want32, &got_dsl);
+        let rel_leg = scale_rel(&want32, &got_leg);
+        assert!(
+            rel_dsl <= 5e-4,
+            "GEMM f32 m={m} n={n} k={k}: dsl rel={rel_dsl:.3e} legacy={rel_leg:.3e}"
+        );
+
+        let xb = x32.to_dtype(DType::BF16).unwrap();
+        let xbv: Vec<f32> = xb
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let want_b = hanzo_kernel::ternary::pq2_0_gguf_gemm_ref(&raw, &xbv, m, n, k);
+        let got_b_dsl = forward(&mm, &xb, QkImpl::Dsl);
+        let rel_b_dsl = scale_rel(&want_b, &got_b_dsl);
+        assert!(
+            rel_b_dsl <= 5e-3,
+            "GEMM bf16 m={m} n={n} k={k}: dsl rel={rel_b_dsl:.3e}"
+        );
+    }
+    // Nonzero activation offset (row slice `[7..24, k]` into `[32, k]`) + 3D batch `[2, 11, k]`.
+    let (n, k) = (257usize, 512usize);
+    let raw = raw_pq2(n, k, 999);
+    let mm = matmul(&dev, &raw, n, k);
+    let big = Tensor::from_vec(act(32 * k), (32, k), &dev).unwrap();
+    let sub = big.narrow(0, 7, 17).unwrap();
+    let sub_c = sub.contiguous().unwrap();
+    assert_eq!(forward(&mm, &sub, QkImpl::Dsl), forward(&mm, &sub_c, QkImpl::Dsl));
+
+    let xb3 = Tensor::from_vec(act(22 * k), (2, 11, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let xb2 = xb3.reshape((22, k)).unwrap();
+    assert_eq!(forward(&mm, &xb3, QkImpl::Dsl), forward(&mm, &xb2, QkImpl::Dsl));
+
+    let st = dsl::stats();
+    assert!(st.calls(QkImpl::Dsl) >= (cases.len() * 2 + 4) as u64);
+    assert!(st.calls(QkImpl::Legacy) >= cases.len() as u64);
+    assert_eq!(st.compiles_of("matmul_pq2_0_gguf_bm32_f32"), 1);
+    assert_eq!(st.compiles_of("matmul_pq2_0_gguf_bm32_bf16"), 1);
+    assert_eq!(st.compiles_of("matmul_pq2_0_gguf_bm64_f32"), 1);
+    assert_eq!(st.compiles_of("matmul_pq2_0_gguf_bm64_bf16"), 1);
+    dsl::set_pq2_impl(QkImpl::Legacy);
+}
+
+#[test]
+#[ignore]
+fn pq2_dsl_vs_legacy_gemm_bench() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0).unwrap();
+    let shapes = [
+        (5120usize, 5120usize),
+        (17408, 5120),
+        (5120, 17408),
+        (1024, 5120),
+    ];
+    let ms = [32usize, 128, 512, 2048];
+    eprintln!("shape            m     dtype  legacy_us  dsl_us   ratio(leg/dsl)  dsl_TFLOPS");
+    for &(n, k) in &shapes {
+        let raw = raw_pq2(n, k, (n * 13 + k) as u64);
+        let mm = matmul(&dev, &raw, n, k);
+        for &m in &ms {
+            for &dt in &[DType::F32, DType::BF16] {
+                let x = Tensor::from_vec(act(m * k), (m, k), &dev)
+                    .unwrap()
+                    .to_dtype(dt)
+                    .unwrap();
+                let mut best_leg = f64::INFINITY;
+                let mut best_dsl = f64::INFINITY;
+                let iters = if m >= 512 { 15 } else { 30 };
+                for imp in [QkImpl::Legacy, QkImpl::Dsl, QkImpl::Dsl, QkImpl::Legacy] {
+                    dsl::set_pq2_impl(imp);
+                    for _ in 0..3 {
+                        let _ = mm.forward(&x).unwrap();
+                    }
+                    dev.synchronize().unwrap();
+                    let t = std::time::Instant::now();
+                    for _ in 0..iters {
+                        let _ = mm.forward(&x).unwrap();
+                    }
+                    dev.synchronize().unwrap();
+                    let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                    if imp == QkImpl::Legacy {
+                        best_leg = best_leg.min(us);
+                    } else {
+                        best_dsl = best_dsl.min(us);
+                    }
+                }
+                let tflops = (2.0 * m as f64 * n as f64 * k as f64) / (best_dsl * 1e-6) / 1e12;
+                let dname = if dt == DType::BF16 { "bf16" } else { "f32 " };
+                eprintln!(
+                    "{n:>6}x{k:<6}  {m:<4}  {dname}   {:>8.1}  {:>7.1}  {:>6.3}x         {:>6.2}",
+                    best_leg,
+                    best_dsl,
+                    best_leg / best_dsl,
+                    tflops
+                );
+            }
+        }
+    }
+    dsl::set_pq2_impl(QkImpl::Legacy);
+}

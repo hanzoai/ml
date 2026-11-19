@@ -150,6 +150,20 @@ pub fn pq2_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, usi
     (a, nsg, nr0)
 }
 
+/// The generated artifact (= pipeline identity) and `BM` tile height (`32` for small prefills
+/// `<= 48` or narrow weights `n < 2048` for higher grid parallelism; `64` otherwise to halve
+/// weight dequantization bandwidth) for a PQ2_0 prefill GEMM.
+pub fn pq2_matmul_artifact(m: usize, n: usize, bf16: bool) -> (&'static str, usize) {
+    let bm = if m > 48 && n >= 2048 { 64 } else { 32 };
+    let a = match (bm, bf16) {
+        (32, false) => "matmul_pq2_0_gguf_bm32_f32",
+        (32, true) => "matmul_pq2_0_gguf_bm32_bf16",
+        (_, false) => "matmul_pq2_0_gguf_bm64_f32",
+        (_, true) => "matmul_pq2_0_gguf_bm64_bf16",
+    };
+    (a, bm)
+}
+
 /// Whether the native-GGUF DSL matvec can serve an `n x k` PQ2_0 weight held in `buf_bytes` bytes;
 /// `Ok(nwords)` is the kernel's `meta[2]`. The kernel views the 34-byte blocks as u32 words, so the
 /// tensor must be a whole number of words (true whenever `k` is a multiple of 256, i.e. every

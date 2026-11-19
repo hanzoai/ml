@@ -974,3 +974,471 @@ pub fn f16_decode_probe_run<R: Runtime>(client: &ComputeClient<R>) -> usize {
         .filter(|(b, g)| half::f16::from_bits(**b as u16).to_f32().to_bits() != g.to_bits())
         .count()
 }
+
+// ================================================================================================
+// Prefill GEMM (M > 1) over native GGUF PQ2_0 blocks: one DSL source for Metal, CUDA, Vulkan, ROCm.
+// ================================================================================================
+
+/// Stage one `32 x 32` activation tile `sa` and `64 x 32` dequantized PQ2_0 weight tile `sb`
+/// (both `half::f16`) for block-K step `kb` (`k0 = kb * 32`).
+#[device]
+#[allow(clippy::too_many_arguments)]
+fn pq2_stage_ab_tile<F: Float>(
+    wq: &Array<u32>,
+    x: &Array<F>,
+    sa: &mut SharedMemory<half::f16>,
+    sb: &mut SharedMemory<half::f16>,
+    m0: usize,
+    n0: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    kb: usize,
+    tid: usize,
+    #[comptime] bm: usize,
+    #[comptime] tgt: Target,
+) {
+    let k0 = kb * 32usize;
+    let nb = k / 128usize;
+    // Stage bm x 32 activation tile into stride-40 padded row buffer (+8 half skew avoids bank conflicts).
+    let ak_base = (tid % 4usize) * 8usize;
+    let tid_m = tid / 4usize;
+    #[unroll]
+    for mr in 0usize..(bm / 32usize) {
+        let local_m = mr * 32usize + tid_m;
+        let arow = m0 + local_m;
+        let sa_base = local_m * 40usize + ak_base;
+        if arow < m {
+            let x_base = arow * k + k0 + ak_base;
+            #[unroll]
+            for i in 0usize..8usize {
+                sa[sa_base + i] = half::f16::cast_from(f32::cast_from(x[x_base + i]));
+            }
+        } else {
+            #[unroll]
+            for i in 0usize..8usize {
+                sa[sa_base + i] = half::f16::cast_from(0.0f32);
+            }
+        }
+    }
+    // Stage 32 x 64 [K, N] RowMajor weight tile into stride-72 padded buffer (+8 half skew).
+    let local_n = tid / 2usize;
+    let half_k = tid % 2usize;
+    let nrow = n0 + local_n;
+    let sb_k0 = half_k * 16usize;
+    if nrow < n {
+        let g = nrow * nb + (kb / 4usize);
+        let sword = wq[17usize * (g / 2usize) + 8usize * (g % 2usize)];
+        let sbits = (sword >> ((16usize * (g % 2usize)) as u32)) & 0xFFFFu32;
+        let hw_f16 = comptime!(matches!(tgt, Target::Metal | Target::Cuda | Target::Rocm));
+        let d = if hw_f16 {
+            f32::cast_from(Vector::<half::f16, Const<2>>::reinterpret::<u32>(sbits)[0])
+        } else {
+            crate::quant::f16lo_to_f32(sbits)
+        };
+        let il = 2usize * (kb % 4usize) + half_k;
+        let w32 = pq2_gguf_codes(wq, g, il);
+        #[unroll]
+        for i in 0usize..16usize {
+            let c_bits = ((w32 >> ((2 * i) as u32)) & 3u32) | 0x4B00_0000u32;
+            let w = (f32::reinterpret(c_bits) - 8_388_609.0f32) * d;
+            sb[(sb_k0 + i) * 72usize + local_n] = half::f16::cast_from(w);
+        }
+    } else {
+        #[unroll]
+        for i in 0usize..16usize {
+            sb[(sb_k0 + i) * 72usize + local_n] = half::f16::cast_from(0.0f32);
+        }
+    }
+}
+
+/// Cooperatively flush one warp's `16 x 32` accumulator staging tile `sc` to `out[m, n]`.
+#[device]
+fn pq2_flush_warp_tile<F: Float>(
+    sc: &SharedMemory<f32>,
+    out: &mut Array<F>,
+    tid: usize,
+    tile_m0: usize,
+    tile_n0: usize,
+    m: usize,
+    n: usize,
+) {
+    sync_cube();
+    #[unroll]
+    for i in 0usize..4usize {
+        let idx = tid + i * 128usize;
+        let orow = tile_m0 + idx / 32usize;
+        let ocol = tile_n0 + idx % 32usize;
+        if orow < m && ocol < n {
+            out[orow * n + ocol] = F::cast_from(sc[idx]);
+        }
+    }
+    sync_cube();
+}
+
+/// PQ2_0 prefill GEMM over native GGUF blocks: `out[m, n] = x[m, k] * W[n, k]^T`.
+///
+/// Tiling: `bm` (`32` or `64`) tokens, `BN = 64` output rows, `BK = 32` contraction step; `128`
+/// threads (`4` 32-lane warps arranged `2 x 2`, each owning a `(bm/2) x 32` output sub-tile).
+/// Both `sa` (`[bm, BK]`, stride `40`) and `sb` (`[BK, BN]`, stride `72`) are `+8 half`-skewed
+/// `RowMajor` so `cmma` loads use `transpose = false` without shared-bank conflicts, and the
+/// epilogue shares one `16 x 32` (`2 KB`) `sc` tile across warps (`9216 B` at `bm=32`, `11776 B` at `bm=64`).
+/// - `metal`: `8x8x8` `simdgroup_matrix` (`(bm/16) x 4` accumulators per warp, 4 `dk` steps per `BK=32`).
+/// - `cuda | rocm | vulkan`: `16x16x16` cooperative matrix (`(bm/32) x 2` accumulators per warp, 2 `dk` steps).
+/// - `default`: scalar f16-staged reference contraction on the same shared tiles.
+///
+/// Launch: `Block::new_1d(128)`, `Grid::Static(n.div_ceil(64) as u32, m.div_ceil(bm) as u32, 1)`,
+/// `meta = [m, n, k]`.
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm, cpu), unchecked)]
+pub fn matmul_pq2_0_gguf<F: Float>(
+    wq: &Array<u32>,
+    x: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>,
+    #[comptime] bm: usize,
+    #[comptime] tgt: Target,
+) {
+    let tid = UNIT_POS as usize;
+    let warp = tid / 32usize;
+    let warp_m = warp / 2usize;
+    let warp_n = warp % 2usize;
+    let m = meta[0] as usize;
+    let n = meta[1] as usize;
+    let k = meta[2] as usize;
+    let n0 = CUBE_POS_X as usize * 64usize;
+    let m0 = CUBE_POS_Y as usize * bm;
+    let kb_count = k / 32usize;
+    let warp_rows = bm / 2usize;
+
+    let mut sa = SharedMemory::<half::f16>::new(bm * 40usize);
+    let mut sb = SharedMemory::<half::f16>::new(32usize * 72usize);
+    let mut sc = SharedMemory::<f32>::new(16usize * 32usize);
+
+    island! {
+        metal => {
+            let wm_tiles = bm / 16usize;
+            let mut acc = Sequence::<cmma::Matrix<f32>>::new();
+            #[unroll]
+            for _i in 0usize..(wm_tiles * 4usize) {
+                acc.push(cmma::Matrix::<f32>::from_value(
+                    cmma::MatrixIdent::Accumulator,
+                    8usize,
+                    8usize,
+                    8usize,
+                    cmma::MatrixLayout::Undefined,
+                    0.0f32,
+                ));
+            }
+            for kb in 0..kb_count {
+                pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                sync_cube();
+                #[unroll]
+                for dk in 0usize..4usize {
+                    let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
+                    #[unroll]
+                    for jn in 0usize..4usize {
+                        let b_col = warp_n * 32usize + jn * 8usize;
+                        mb.push(cmma::Matrix::<half::f16>::from_slice(
+                            cmma::MatrixIdent::B,
+                            8usize,
+                            8usize,
+                            8usize,
+                            cmma::MatrixLayout::RowMajor,
+                            &sb.slice((dk * 8usize) * 72usize + b_col, 32usize * 72usize),
+                            72u32,
+                        ));
+                    }
+                    #[unroll]
+                    for im in 0usize..wm_tiles {
+                        let a_row = warp_m * warp_rows + im * 8usize;
+                        let ma = cmma::Matrix::<half::f16>::from_slice(
+                            cmma::MatrixIdent::A,
+                            8usize,
+                            8usize,
+                            8usize,
+                            cmma::MatrixLayout::RowMajor,
+                            &sa.slice(a_row * 40usize + dk * 8usize, bm * 40usize),
+                            40u32,
+                        );
+                        #[unroll]
+                        for jn in 0usize..4usize {
+                            let c = acc.index(im * 4usize + jn);
+                            cmma::execute::<half::f16, half::f16, f32, f32>(&ma, mb.index(jn), c, c);
+                        }
+                    }
+                }
+                sync_cube();
+            }
+            #[unroll]
+            for w in 0usize..4usize {
+                #[unroll]
+                for rh in 0usize..(bm / 32usize) {
+                    if warp == w {
+                        #[unroll]
+                        for im in 0usize..2usize {
+                            #[unroll]
+                            for jn in 0usize..4usize {
+                                let c_off = (im * 8usize) * 32usize + jn * 8usize;
+                                cmma::store(
+                                    &mut sc.slice_mut(c_off, 16usize * 32usize),
+                                    acc.index((rh * 2usize + im) * 4usize + jn),
+                                    32u32,
+                                    cmma::MatrixLayout::RowMajor,
+                                );
+                            }
+                        }
+                    }
+                    pq2_flush_warp_tile(
+                        &sc,
+                        out,
+                        tid,
+                        m0 + (w / 2usize) * warp_rows + rh * 16usize,
+                        n0 + (w % 2usize) * 32usize,
+                        m,
+                        n,
+                    );
+                }
+            }
+        }
+        cuda | rocm | vulkan => {
+            let wm_tiles = bm / 32usize;
+            let mut acc = Sequence::<cmma::Matrix<f32>>::new();
+            #[unroll]
+            for _i in 0usize..(wm_tiles * 2usize) {
+                acc.push(cmma::Matrix::<f32>::from_value(
+                    cmma::MatrixIdent::Accumulator,
+                    16usize,
+                    16usize,
+                    16usize,
+                    cmma::MatrixLayout::Undefined,
+                    0.0f32,
+                ));
+            }
+            for kb in 0..kb_count {
+                pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                sync_cube();
+                #[unroll]
+                for dk in 0usize..2usize {
+                    let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
+                    #[unroll]
+                    for jn in 0usize..2usize {
+                        let b_col = warp_n * 32usize + jn * 16usize;
+                        mb.push(cmma::Matrix::<half::f16>::from_slice(
+                            cmma::MatrixIdent::B,
+                            16usize,
+                            16usize,
+                            16usize,
+                            cmma::MatrixLayout::RowMajor,
+                            &sb.slice((dk * 16usize) * 72usize + b_col, 32usize * 72usize),
+                            72u32,
+                        ));
+                    }
+                    #[unroll]
+                    for im in 0usize..wm_tiles {
+                        let a_row = warp_m * warp_rows + im * 16usize;
+                        let ma = cmma::Matrix::<half::f16>::from_slice(
+                            cmma::MatrixIdent::A,
+                            16usize,
+                            16usize,
+                            16usize,
+                            cmma::MatrixLayout::RowMajor,
+                            &sa.slice(a_row * 40usize + dk * 16usize, bm * 40usize),
+                            40u32,
+                        );
+                        #[unroll]
+                        for jn in 0usize..2usize {
+                            let c = acc.index(im * 2usize + jn);
+                            cmma::execute::<half::f16, half::f16, f32, f32>(&ma, mb.index(jn), c, c);
+                        }
+                    }
+                }
+                sync_cube();
+            }
+            #[unroll]
+            for w in 0usize..4usize {
+                #[unroll]
+                for rh in 0usize..wm_tiles {
+                    if warp == w {
+                        #[unroll]
+                        for jn in 0usize..2usize {
+                            cmma::store(
+                                &mut sc.slice_mut(jn * 16usize, 16usize * 32usize),
+                                acc.index(rh * 2usize + jn),
+                                32u32,
+                                cmma::MatrixLayout::RowMajor,
+                            );
+                        }
+                    }
+                    pq2_flush_warp_tile(
+                        &sc,
+                        out,
+                        tid,
+                        m0 + (w / 2usize) * warp_rows + rh * 16usize,
+                        n0 + (w % 2usize) * 32usize,
+                        m,
+                        n,
+                    );
+                }
+            }
+        }
+        default => {
+            let mut acc = Array::<f32>::new(warp_rows);
+            #[unroll]
+            for i in 0usize..warp_rows {
+                acc[i] = 0.0f32;
+            }
+            let half_m = tid / 64usize;
+            let col = tid % 64usize;
+            for kb in 0..kb_count {
+                pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                sync_cube();
+                #[unroll]
+                for i in 0usize..warp_rows {
+                    let row = half_m * warp_rows + i;
+                    let mut sum = 0.0f32;
+                    for kk in 0usize..32usize {
+                        sum += f32::cast_from(sa[row * 40usize + kk])
+                            * f32::cast_from(sb[kk * 72usize + col]);
+                    }
+                    acc[i] += sum;
+                }
+                sync_cube();
+            }
+            #[unroll]
+            for i in 0usize..warp_rows {
+                let orow = m0 + half_m * warp_rows + i;
+                let ocol = n0 + col;
+                if orow < m && ocol < n {
+                    out[orow * n + ocol] = F::cast_from(acc[i]);
+                }
+            }
+        }
+    }
+}
+
+/// Host f64 reference for PQ2_0 GEMM (`out[m, n] = x[m, k] * W[n, k]^T`).
+pub fn pq2_0_gguf_gemm_ref(
+    bytes: &[u8],
+    x: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    let nb = k / QK_PQ2_0;
+    let mut w = vec![0.0f64; n * k];
+    for r in 0..n {
+        for b in 0..nb {
+            let blk = &bytes[(r * nb + b) * 34..(r * nb + b + 1) * 34];
+            let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32() as f64;
+            for j in 0..QK_PQ2_0 {
+                let q = ((blk[2 + j / 4] >> ((j % 4) * 2)) & 3) as f64;
+                w[r * k + b * QK_PQ2_0 + j] = (q - 1.0) * d;
+            }
+        }
+    }
+    let mut out = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f64;
+            for j in 0..k {
+                acc += x[row * k + j] as f64 * w[col * k + j];
+            }
+            out[row * n + col] = acc as f32;
+        }
+    }
+    out
+}
+
+/// Launch [`matmul_pq2_0_gguf`] with explicit `bm` (`32` or `64`) once and read `[m, n]` back.
+pub fn matmul_pq2_0_gguf_bm_run_as<E: Float + CubeElement + Default, R: Runtime>(
+    client: &ComputeClient<R>,
+    words: &[u32],
+    x: &[E],
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+) -> Vec<E> {
+    let wh = client.create_from_slice(u32::as_bytes(words));
+    let xh = client.create_from_slice(E::as_bytes(x));
+    let oh = client.create_from_slice(E::as_bytes(&vec![E::default(); m * n]));
+    let mh = client.create_from_slice(u32::as_bytes(&[m as u32, n as u32, k as u32]));
+    unsafe {
+        matmul_pq2_0_gguf::launch_unchecked::<E, R>(
+            client,
+            Grid::Static(n.div_ceil(64) as u32, m.div_ceil(bm) as u32, 1),
+            Block::new_1d(128),
+            ArrayArg::from_raw_parts(wh.clone(), words.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(oh.clone(), m * n),
+            ArrayArg::from_raw_parts(mh.clone(), 3),
+            bm,
+            Target::of(client),
+        );
+    }
+    E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Launch [`matmul_pq2_0_gguf`] picking `bm = 32` for small `m` (`<= 48`) and `64` above.
+pub fn matmul_pq2_0_gguf_run_as<E: Float + CubeElement + Default, R: Runtime>(
+    client: &ComputeClient<R>,
+    words: &[u32],
+    x: &[E],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<E> {
+    let bm = if m <= 48 { 32 } else { 64 };
+    matmul_pq2_0_gguf_bm_run_as(client, words, x, m, n, k, bm)
+}
+
+/// Shapes every backend is gated on for PQ2_0 prefill GEMM: ragged small tiles + 27B prefill tiles.
+pub const PQ2_GGUF_GEMM_SHAPES: &[(usize, usize, usize)] = &[
+    (1, 64, 128),
+    (17, 73, 256),
+    (33, 257, 384),
+    (64, 1024, 5120),
+    (128, 5120, 5120),
+    (512, 6144, 5120),
+];
+
+/// Correctness board for [`matmul_pq2_0_gguf`]: scale-relative error vs f64 oracle (`f32` and `bf16`).
+pub fn pq2_0_gguf_gemm_board<R: Runtime>(
+    client: &ComputeClient<R>,
+) -> Vec<(usize, usize, usize, f32, f32)> {
+    let mut res = Vec::new();
+    for &(m, n, k) in PQ2_GGUF_GEMM_SHAPES {
+        let (codes, d) = pq2_0_synth(n, k, 0xA5A5_1234 ^ (m * 17 + n * 31 + k) as u64);
+        let bytes = pq2_0_gguf_bytes(&codes, &d, n, k);
+        let words = pq2_0_gguf_words(&bytes);
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 7919) % 2003) as f32 / 1001.5) - 1.0)
+            .collect();
+        let want = pq2_0_gguf_gemm_ref(&bytes, &x, m, n, k);
+        let maxref = want.iter().fold(0f32, |mx, &v| mx.max(v.abs())).max(1e-30);
+        let got32 = matmul_pq2_0_gguf_run_as::<f32, R>(client, &words, &x, m, n, k);
+        let rel32 = got32
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / maxref;
+        let xb: Vec<half::bf16> = x.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let xb_f: Vec<f32> = xb.iter().map(|v| v.to_f32()).collect();
+        let want_b = pq2_0_gguf_gemm_ref(&bytes, &xb_f, m, n, k);
+        let maxref_b = want_b
+            .iter()
+            .fold(0f32, |mx, &v| mx.max(v.abs()))
+            .max(1e-30);
+        let got_b = matmul_pq2_0_gguf_run_as::<half::bf16, R>(client, &words, &xb, m, n, k);
+        let rel_b = got_b
+            .iter()
+            .zip(&want_b)
+            .map(|(a, b)| (a.to_f32() - b).abs())
+            .fold(0f32, f32::max)
+            / maxref_b;
+        res.push((m, n, k, rel32, rel_b));
+    }
+    res
+}
+

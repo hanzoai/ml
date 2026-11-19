@@ -37,6 +37,27 @@ macro_rules! pq2_spec {
     };
 }
 
+/// One PQ2_0 prefill GEMM specialization (`f32` or `bf16`, `bm = 32` or `64`), launched on a small ragged tile.
+#[cfg(feature = "metal")]
+macro_rules! pq2_gemm_spec {
+    ($artifact:literal, $entry:literal, $e:ty, $conv:expr, $bm:literal) => {
+        Spec {
+            artifact: $artifact,
+            entry: $entry,
+            launch: |c| {
+                use hanzo_kernel::ternary::*;
+                let (m, n, k) = (17usize, 73usize, 256usize);
+                let (codes, d) = pq2_0_synth(n, k, 1);
+                let words = pq2_0_gguf_words(&pq2_0_gguf_bytes(&codes, &d, n, k));
+                let x: Vec<$e> = (0..m * k).map(|i| $conv(i as f32 * 1e-3)).collect();
+                let _ = matmul_pq2_0_gguf_bm_run_as::<$e, cubecl::wgpu::WgpuRuntime>(
+                    c, &words, &x, m, n, k, $bm,
+                );
+            },
+        }
+    };
+}
+
 /// Every Metal artifact hanzo-ml commits under `src/metal/dsl/`. Adding a DSL kernel to the Metal
 /// path = one entry here + one `kernel_msl` arm in hanzo-ml.
 #[cfg(feature = "metal")]
@@ -84,6 +105,11 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
         pq2_spec!("matvec_pq2_0_gguf_nsg4_nr2_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 2),
         pq2_spec!("matvec_pq2_0_gguf_nsg4_nr4_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 4),
         pq2_spec!("matvec_pq2_0_gguf_nsg4_nr8_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 8),
+        // PQ2_0 prefill GEMM (M > 1) over native GGUF blocks (`8x8x8` simdgroup_matrix on Metal).
+        pq2_gemm_spec!("matmul_pq2_0_gguf_bm32_f32",  "matmul_pq2_0_gguf_f_f32", f32,        std::convert::identity, 32),
+        pq2_gemm_spec!("matmul_pq2_0_gguf_bm32_bf16", "matmul_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 32),
+        pq2_gemm_spec!("matmul_pq2_0_gguf_bm64_f32",  "matmul_pq2_0_gguf_f_f32", f32,        std::convert::identity, 64),
+        pq2_gemm_spec!("matmul_pq2_0_gguf_bm64_bf16", "matmul_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 64),
     ]
 }
 

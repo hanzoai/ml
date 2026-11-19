@@ -569,11 +569,72 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), out_dtype)
             .with_label("qmatmul")
             .build()?;
-        let encoder = device.command_encoder()?;
 
         if !src1_bf16 {
             assert_eq!(storage.dtype(), DType::F32);
         }
+
+        if matches!(kdtype, hanzo_metal_kernels::GgmlDType::PQ2_0) && self_shape.rank() == 2 {
+            use crate::quantized::dsl::{self, QkImpl};
+            let m_total: usize = src_shape.dims()[..src_shape.rank() - 1].iter().product();
+            let legacy_name = if src1_bf16 {
+                "kernel_mul_mm_pq2_0_bf16"
+            } else {
+                "kernel_mul_mm_pq2_0_f32"
+            };
+            if dsl::pq2_impl() == QkImpl::Dsl {
+                match dsl::pq2_dsl_eligible(n, k, self.buffer.length()) {
+                    Ok(_) => {
+                        let (artifact, bm) = dsl::pq2_matmul_artifact(m_total, n, src1_bf16);
+                        let meta = device.dsl_const_u32(&[m_total as u32, n as u32, k as u32])?;
+                        let x_off = layout.start_offset() * storage.dtype().size_in_bytes();
+                        device.dispatch_dsl(
+                            artifact,
+                            &[
+                                (&self.buffer, 0),
+                                (storage.buffer(), x_off),
+                                (&dst, 0),
+                                (&meta, 0),
+                            ],
+                            2,
+                            &[0u32; 8],
+                            objc2_metal::MTLSize {
+                                width: n.div_ceil(64),
+                                height: m_total.div_ceil(bm),
+                                depth: 1,
+                            },
+                            objc2_metal::MTLSize {
+                                width: 128,
+                                height: 1,
+                                depth: 1,
+                            },
+                        )?;
+                        dsl::note_dispatch(QkImpl::Dsl, artifact, n, k);
+                        let dst_storage = crate::MetalStorage::new(
+                            dst,
+                            device.clone(),
+                            dst_shape.elem_count(),
+                            out_dtype,
+                        );
+                        return Ok((dst_storage, dst_shape));
+                    }
+                    Err(_) => dsl::note_dispatch(
+                        QkImpl::Legacy,
+                        if src1_bf16 {
+                            "kernel_mul_mm_pq2_0_bf16[dsl-ineligible]"
+                        } else {
+                            "kernel_mul_mm_pq2_0_f32[dsl-ineligible]"
+                        },
+                        n,
+                        k,
+                    ),
+                }
+            } else {
+                dsl::note_dispatch(QkImpl::Legacy, legacy_name, n, k);
+            }
+        }
+
+        let encoder = device.command_encoder()?;
 
         if self_shape.rank() > 4 {
             crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())

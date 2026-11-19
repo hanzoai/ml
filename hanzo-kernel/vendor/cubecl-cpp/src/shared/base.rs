@@ -267,7 +267,10 @@ impl<D: Dialect> CppCompiler<D> {
 
         let mut opt = Optimizer::shared_only(value.body, value.cube_dim);
         let shared_allocs = opt.analysis::<SharedLiveness>();
-        let shared_memories = shared_allocs
+        // HANZO PATCH: cubecl_opt::SharedLiveness iterates a HashMap, so declaration order and
+        // dynamic_shared_mem offsets vary across runs. Sort by id and pack disjoint allocations
+        // deterministically in id order so kernel-gen output is byte-reproducible.
+        let mut shared_memories: Vec<SharedMemory<D>> = shared_allocs
             .allocations
             .values()
             .map(|alloc| match alloc.smem {
@@ -291,6 +294,30 @@ impl<D: Dialect> CppCompiler<D> {
                 },
             })
             .collect();
+        shared_memories.sort_by_key(|s| match s {
+            SharedMemory::Array { index, .. } | SharedMemory::Value { index, .. } => *index,
+        });
+        let all_disjoint = !shared_memories.iter().enumerate().any(|(i, a)| {
+            let (a0, a1) = (a.offset(), a.offset() + a.size());
+            shared_memories[i + 1..].iter().any(|b| {
+                let (b0, b1) = (b.offset(), b.offset() + b.size());
+                a0 < b1 && b0 < a1
+            })
+        });
+        if all_disjoint {
+            let mut cursor = 0usize;
+            for smem in &mut shared_memories {
+                let align = smem.align().max(1);
+                cursor = cursor.next_multiple_of(align);
+                let sz = smem.size();
+                match smem {
+                    SharedMemory::Array { offset, .. } | SharedMemory::Value { offset, .. } => {
+                        *offset = cursor;
+                    }
+                }
+                cursor += sz;
+            }
+        }
 
         let body = Body {
             instructions,
