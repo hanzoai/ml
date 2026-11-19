@@ -599,8 +599,8 @@ impl QMetalStorage {
                             2,
                             &[0u32; 8],
                             objc2_metal::MTLSize {
-                                width: n.div_ceil(64),
-                                height: m_total.div_ceil(bm),
+                                width: m_total.div_ceil(bm),
+                                height: n.div_ceil(64),
                                 depth: 1,
                             },
                             objc2_metal::MTLSize {

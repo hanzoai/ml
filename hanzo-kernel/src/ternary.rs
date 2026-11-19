@@ -1105,8 +1105,8 @@ pub fn matmul_pq2_0_gguf<F: Float>(
     let m = meta[0] as usize;
     let n = meta[1] as usize;
     let k = meta[2] as usize;
-    let n0 = CUBE_POS_X as usize * 64usize;
-    let m0 = CUBE_POS_Y as usize * bm;
+    let m0 = CUBE_POS_X as usize * bm;
+    let n0 = CUBE_POS_Y as usize * 64usize;
     let kb_count = k / 32usize;
     let warp_rows = bm / 2usize;
 
@@ -1366,7 +1366,7 @@ pub fn matmul_pq2_0_gguf_bm_run_as<E: Float + CubeElement + Default, R: Runtime>
     unsafe {
         matmul_pq2_0_gguf::launch_unchecked::<E, R>(
             client,
-            Grid::Static(n.div_ceil(64) as u32, m.div_ceil(bm) as u32, 1),
+            Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1),
             Block::new_1d(128),
             ArrayArg::from_raw_parts(wh.clone(), words.len()),
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
