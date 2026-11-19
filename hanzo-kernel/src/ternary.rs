@@ -1643,30 +1643,26 @@ pub fn pq2_0_gguf_gemm_board<R: Runtime>(
 /// Elements per native GGUF `block_ptq1_0`.
 pub const QK_PTQ1_0: usize = 128;
 
-/// Decode one trit (`-1.0, 0.0, +1.0`) from packed byte `b` (`0..=255`) at base-3 digit power `pow3`
-/// (`1, 3, 9, 27, 81`) via exact integer extraction + exponent-24 bitcast (`zero floor/cancel`).
+/// Dot product of 5 packed trits in byte `b` (`0..=255`) against base-3 collapse coefficients
+/// `c0..c4` (`c_n = y_n - 3*y_{n+1}` for `n < 4`, `c_4 = y_4`). With `u = b / 256.0` (exact IEEE
+/// exponent shift) and `g_k = floor(3^k * u)` (exact in fp32 since `243 * 255 = 61965 < 2^24`),
+/// `Σ_{n=0..4} t_n * y_n = Σ_{k=1..4} g_k * c_{k-1} + g_5 * c_4` (5 `floor` + 5 FMA total).
 #[device]
 #[inline]
-fn ptq1_trit(b: u32, pow3: u32) -> f32 {
-    let t = (((b * pow3) & 0xFFu32) * 3u32) >> 8u32;
-    f32::reinterpret(t | 0x4B00_0000u32) - 8_388_609.0f32
-}
-
-/// Dot product of the 5 packed trits in byte `b` against activations `(y0, y1, y2, y3, y4)`.
-#[device]
-#[inline]
-fn ptq1_dot_5(b: u32, y0: f32, y1: f32, y2: f32, y3: f32, y4: f32) -> f32 {
-    ptq1_trit(b, 1u32) * y0
-        + ptq1_trit(b, 3u32) * y1
-        + ptq1_trit(b, 9u32) * y2
-        + ptq1_trit(b, 27u32) * y3
-        + ptq1_trit(b, 81u32) * y4
+fn ptq1_dot_5_collapsed(b: u32, c0: f32, c1: f32, c2: f32, c3: f32, c4: f32) -> f32 {
+    let u = f32::cast_from(b) * (1.0f32 / 256.0f32);
+    f32::floor(3.0f32 * u) * c0
+        + f32::floor(9.0f32 * u) * c1
+        + f32::floor(27.0f32 * u) * c2
+        + f32::floor(81.0f32 * u) * c3
+        + f32::floor(243.0f32 * u) * c4
 }
 
 /// PTQ1_0 decode matvec over native GGUF `block_ptq1_0` (`28 B = 7 u32` words): `out[r] = Σ_j d·t·x[j]`.
 ///
-/// Zero word-straddling (`7 * g` aligned `u32` words) and exact integer trit extraction (`zero floor`
-/// or `3x/243x` cancellation), reusing `y[16]` across `NR0` output rows per plane.
+/// Uses aligned 32-bit word loads (`7 * g`) and hoists the exact FP32 base-3 collapse coefficients
+/// (`c_n = y_n - 3*y_{n+1}`, `sumy = Σ y`) outside the `NR0` output-row loop (~4x fewer inner-loop
+/// ALU ops than per-trit integer extraction).
 ///
 /// Launch: `Block::new_2d(32, nsg)`, `Grid::Static(rows.div_ceil(nsg*nr0), 1, 1)`,
 /// `meta = [k, rows, nwords]` with `nwords = 7 * rows * (k / 128)`.
@@ -1689,17 +1685,24 @@ pub fn matvec_ptq1_0_gguf<F: Float>(
     let ix = lane / 8usize;
     let it = lane % 8usize;
     let qh_shift = it / 2usize;
-    let mut qh_pow3 = 1u32;
+    let mut qh_p0 = 1.0f32;
     if qh_shift == 1usize {
-        qh_pow3 = 3u32;
+        qh_p0 = 3.0f32;
     } else if qh_shift == 2usize {
-        qh_pow3 = 9u32;
+        qh_p0 = 9.0f32;
     } else if qh_shift == 3usize {
-        qh_pow3 = 27u32;
+        qh_p0 = 27.0f32;
     }
+    let qh_p1 = 3.0f32 * qh_p0;
+    let w01_off = it / 2usize;
+    let p_sh0 = (16usize * (it % 2usize)) as u32;
+    let p_sh1 = p_sh0 + 8u32;
+    let wmid_off = 4usize + it / 4usize;
+    let mid_sh = (8usize * (it % 4usize)) as u32;
+    let tail_sh = (8usize * (it % 2usize)) as u32;
 
     let mut sumf = Array::<f32>::new(nr0);
-    let mut crows = Array::<usize>::new(nr0);
+    let mut rbase = Array::<usize>::new(nr0);
     #[unroll]
     for r in 0usize..nr0 {
         sumf[r] = 0.0f32;
@@ -1707,14 +1710,14 @@ pub fn matvec_ptq1_0_gguf<F: Float>(
         if row >= nout {
             row = nout - 1usize;
         }
-        crows[r] = row;
+        rbase[r] = 7usize * row * nb;
     }
 
     if first_row < nout {
+        let m0 = 2usize * it;
         let mut ib = ix;
         while ib < nb {
             let yb = ib * 128usize;
-            let m0 = 2usize * it;
             let y00 = f32::cast_from(x[yb + m0]);
             let y01 = f32::cast_from(x[yb + 16usize + m0]);
             let y02 = f32::cast_from(x[yb + 32usize + m0]);
@@ -1732,17 +1735,35 @@ pub fn matvec_ptq1_0_gguf<F: Float>(
             let y24 = f32::cast_from(x[yb + 112usize + it]);
             let yt = f32::cast_from(x[yb + 120usize + it]);
 
+            // Hoist base-3 collapse coefficients and activation sum once across all NR0 rows.
+            let c00 = y00 - 3.0f32 * y01;
+            let c01 = y01 - 3.0f32 * y02;
+            let c02 = y02 - 3.0f32 * y03;
+            let c03 = y03 - 3.0f32 * y04;
+            let c10 = y10 - 3.0f32 * y11;
+            let c11 = y11 - 3.0f32 * y12;
+            let c12 = y12 - 3.0f32 * y13;
+            let c13 = y13 - 3.0f32 * y14;
+            let c20 = y20 - 3.0f32 * y21;
+            let c21 = y21 - 3.0f32 * y22;
+            let c22 = y22 - 3.0f32 * y23;
+            let c23 = y23 - 3.0f32 * y24;
+            let sumy = (y00 + y01 + y02 + y03 + y04)
+                + (y10 + y11 + y12 + y13 + y14)
+                + (y20 + y21 + y22 + y23 + y24)
+                + yt;
+
+            let ib7 = 7usize * ib;
             #[unroll]
             for r in 0usize..nr0 {
-                let base = 7usize * (crows[r] * nb + ib);
-                let w_01 = wq[base + it / 2usize];
-                let p_sh = 16usize * (it % 2usize);
-                let b0 = (w_01 >> (p_sh as u32)) & 0xFFu32;
-                let b1 = (w_01 >> ((p_sh + 8usize) as u32)) & 0xFFu32;
-                let w_mid = wq[base + 4usize + it / 4usize];
-                let b2 = (w_mid >> ((8usize * (it % 4usize)) as u32)) & 0xFFu32;
+                let base = rbase[r] + ib7;
+                let w_01 = wq[base + w01_off];
+                let b0 = (w_01 >> p_sh0) & 0xFFu32;
+                let b1 = (w_01 >> p_sh1) & 0xFFu32;
+                let w_mid = wq[base + wmid_off];
+                let b2 = (w_mid >> mid_sh) & 0xFFu32;
                 let w_tail = wq[base + 6usize];
-                let bh = (w_tail >> ((8usize * (it % 2usize)) as u32)) & 0xFFu32;
+                let bh = (w_tail >> tail_sh) & 0xFFu32;
                 let sbits = (w_tail >> 16u32) & 0xFFFFu32;
                 let d = island! {
                     metal | cuda | rocm => {
@@ -1750,11 +1771,13 @@ pub fn matvec_ptq1_0_gguf<F: Float>(
                     }
                     default => { crate::quant::f16lo_to_f32(sbits) }
                 };
-                let acc = ptq1_dot_5(b0, y00, y01, y02, y03, y04)
-                    + ptq1_dot_5(b1, y10, y11, y12, y13, y14)
-                    + ptq1_dot_5(b2, y20, y21, y22, y23, y24)
-                    + ptq1_trit(bh, qh_pow3) * yt;
-                sumf[r] += d * acc;
+                let u_h = f32::cast_from(bh) * (1.0f32 / 256.0f32);
+                let tail_t = f32::floor(qh_p1 * u_h) - 3.0f32 * f32::floor(qh_p0 * u_h);
+                let acc = ptq1_dot_5_collapsed(b0, c00, c01, c02, c03, y04)
+                    + ptq1_dot_5_collapsed(b1, c10, c11, c12, c13, y14)
+                    + ptq1_dot_5_collapsed(b2, c20, c21, c22, c23, y24)
+                    + tail_t * yt;
+                sumf[r] += (acc - sumy) * d;
             }
             ib += 4usize;
         }
