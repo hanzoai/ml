@@ -169,6 +169,70 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
         ptq1_gemm_spec!("matmul_ptq1_0_gguf_bm32_bf16", "matmul_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 32),
         ptq1_gemm_spec!("matmul_ptq1_0_gguf_bm64_f32",  "matmul_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 64),
         ptq1_gemm_spec!("matmul_ptq1_0_gguf_bm64_bf16", "matmul_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 64),
+        // GDN linear-attention ops (zen6 / qwen3_5_moe): conv1d, gating, and lane-split recurrence scan.
+        Spec {
+            artifact: "gdn_conv1d_k4",
+            entry: "gdn_conv1d_f_f32",
+            launch: |c| {
+                let _ = hanzo_kernel::gdn::gdn_conv1d_run::<R>(c, &vec![0.0; 16], &vec![0.0; 16], 1, 4, 4, 4);
+            },
+        },
+        Spec {
+            artifact: "gdn_gating",
+            entry: "gdn_gating_f_f32",
+            launch: |c| {
+                let _ = hanzo_kernel::gdn::gdn_gating_run::<R>(c, &vec![0.0; 4], &vec![0.0; 4], &vec![0.0; 4], &vec![0.0; 4], 4);
+            },
+        },
+        Spec {
+            artifact: "gdn_scan_lanes_k128_v128_l4",
+            entry: "gdn_scan_lanes_f_f32",
+            launch: |c| {
+                let _ = hanzo_kernel::gdn::gdn_scan_lanes_run::<R>(
+                    c, &vec![0.0; 128], &vec![0.0; 128], &vec![0.0; 128], &[0.0], &[0.0],
+                    &vec![0.0; 128 * 128], 1, 1, 128, 128, 4, 64, false,
+                );
+            },
+        },
+        Spec {
+            artifact: "gdn_scan_lanes_k128_v128_l8",
+            entry: "gdn_scan_lanes_f_f32",
+            launch: |c| {
+                let _ = hanzo_kernel::gdn::gdn_scan_lanes_run::<R>(
+                    c, &vec![0.0; 128], &vec![0.0; 128], &vec![0.0; 128], &[0.0], &[0.0],
+                    &vec![0.0; 128 * 128], 1, 1, 128, 128, 8, 128, false,
+                );
+            },
+        },
+        Spec {
+            artifact: "gdn_scan_lanes_k64_v64_l4",
+            entry: "gdn_scan_lanes_f_f32",
+            launch: |c| {
+                let _ = hanzo_kernel::gdn::gdn_scan_lanes_run::<R>(
+                    c, &vec![0.0; 64], &vec![0.0; 64], &vec![0.0; 64], &[0.0], &[0.0],
+                    &vec![0.0; 64 * 64], 1, 1, 64, 64, 4, 64, false,
+                );
+            },
+        },
+        // Tiled online-softmax FlashAttention (`8x8` simdgroup_matrix on Metal, plane=32).
+        Spec {
+            artifact: "flash_attn_d64_p32",
+            entry: "flash_attn_f_f32",
+            launch: |c| {
+                let _ = hanzo_kernel::flash::flash_attn_run::<R>(
+                    c, &vec![0.0; 64], &vec![0.0; 64], &vec![0.0; 64], 1, 1, 1, 1, 1, 1, 64, false,
+                );
+            },
+        },
+        Spec {
+            artifact: "flash_attn_d128_p32",
+            entry: "flash_attn_f_f32",
+            launch: |c| {
+                let _ = hanzo_kernel::flash::flash_attn_run::<R>(
+                    c, &vec![0.0; 128], &vec![0.0; 128], &vec![0.0; 128], 1, 1, 1, 1, 1, 1, 128, false,
+                );
+            },
+        },
     ]
 }
 
