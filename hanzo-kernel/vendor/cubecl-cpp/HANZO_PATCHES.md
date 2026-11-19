@@ -42,3 +42,18 @@ Issue to file upstream (not filed yet; needs owner approval to post):
 > ("reinterpret_cast from rvalue to reference type"). Repro: a `#[cube]` fn returning
 > `f32::reinterpret(113u32 << 23)`, launched on wgpu<msl>. Suggested fix: emit `as_type<T>(x)`
 > for MSL scalar/vector bitcasts (valid for rvalues), or bind constant inputs to a named local.
+
+## hip-wmma-multiwave-lane (`src/hip/mma/wmma_intrinsics_compiler.rs`, `WmmaLoad`/`WmmaStore`)
+
+**Bug.** RDNA 3/3.5 WMMA accumulator load and store helpers compute the intra-wave lane-half as
+`threadIdx.x / uint(16)` while `WMMA_LANE_DEF` computes `wmmaLane = uint(threadIdx.x % 16)`. When a
+kernel launches a 1D multi-wave block (e.g., `Block::new_1d(128)` with 4 wave32s along `x`), waves
+1..3 get `threadIdx.x / 16` in `{2..7}` instead of `{0, 1}`, writing past the 16-row tile and
+leaving early rows uninitialized.
+
+**Fix.** Use `(threadIdx.x % uint(32)) / uint(16)` in `WmmaLoad` (`FragmentIdent::Accumulator`) and
+`WmmaStore`, matching `WMMA_LANE_DEF`.
+
+**Regression gate.** `pq2-check --backend rocm --all` and `--all --ptq1` on `evo` (AMD Radeon 8060S,
+ROCm 7.1, `runtime=hip`, `plane_size=32..32`).
+

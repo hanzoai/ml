@@ -136,12 +136,17 @@ impl<D: Dialect> WmmaLoad<D> {
             FragmentIdent::Accumulator => {
                 let length = 8;
                 let step = get_output_accumulator_index_step(&elem, &frag);
+                // HANZO PATCH: take intra-wave lane (threadIdx.x % 32) / 16 rather than
+                // threadIdx.x / 16 so multi-wave 1D blocks (e.g. Block::new_1d(128)) don't index
+                // out of bounds for waves 1..3. Matches WMMA_LANE_DEF (threadIdx.x % 16).
                 let index = match self.layout {
                     Some(FragmentLayout::ColMajor) => {
-                        "(i * uint(2) + threadIdx.x / uint(16)) + wmmaLane * stride".to_string()
+                        "(i * uint(2) + (threadIdx.x % uint(32)) / uint(16)) + wmmaLane * stride"
+                            .to_string()
                     }
                     Some(FragmentLayout::RowMajor) => {
-                        "(i * uint(2) + threadIdx.x / uint(16)) * stride + wmmaLane".to_string()
+                        "(i * uint(2) + (threadIdx.x % uint(32)) / uint(16)) * stride + wmmaLane"
+                            .to_string()
                     }
                     _ => panic!(
                         "cannot load data to an accumulator without knowing the layout of the data"
@@ -203,6 +208,7 @@ impl<D: Dialect> WmmaStore<D> {
             FragmentLayout::_Dialect(_) => String::new(),
         };
 
+        // HANZO PATCH: intra-wave lane-half `(threadIdx.x % uint(32)) / uint(16)` for multi-wave 1D blocks.
         write!(
             f,
             "
@@ -212,7 +218,7 @@ __device__ void {name}({frag}& frag, {elem}* output_ptr, uint stride) {{
 
     #pragma unroll
     for (uint elemIdx = 0; elemIdx < uint(8); ++elemIdx) {{
-      const uint rowIdx = elemIdx * uint(2) + threadIdx.x / uint(16);
+      const uint rowIdx = elemIdx * uint(2) + (threadIdx.x % uint(32)) / uint(16);
       output_ptr[{output_idx}] = frag[{frag_idx}];
     }}
 }}

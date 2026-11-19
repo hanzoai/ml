@@ -1070,6 +1070,7 @@ fn pq2_stage_ab_tile<F: Float>(
 
 /// Cooperatively flush one warp's `16 x 32` accumulator staging tile `sc` to `out[m, n]`.
 #[device]
+#[allow(clippy::too_many_arguments)]
 fn pq2_flush_warp_tile<F: Float>(
     sc: &SharedMemory<f32>,
     out: &mut Array<F>,
@@ -1078,15 +1079,28 @@ fn pq2_flush_warp_tile<F: Float>(
     tile_n0: usize,
     m: usize,
     n: usize,
+    #[comptime] plane: usize,
 ) {
     sync_cube();
-    #[unroll]
-    for i in 0usize..4usize {
-        let idx = tid + i * 128usize;
-        let orow = tile_m0 + idx / 32usize;
-        let ocol = tile_n0 + idx % 32usize;
-        if orow < m && ocol < n {
-            out[orow * n + ocol] = F::cast_from(sc[idx]);
+    if comptime!(plane == 32usize) {
+        #[unroll]
+        for i in 0usize..4usize {
+            let idx = tid + i * 128usize;
+            let orow = tile_m0 + idx / 32usize;
+            let ocol = tile_n0 + idx % 32usize;
+            if orow < m && ocol < n {
+                out[orow * n + ocol] = F::cast_from(sc[idx]);
+            }
+        }
+    } else if tid < 128usize {
+        #[unroll]
+        for i in 0usize..4usize {
+            let idx = tid + i * 128usize;
+            let orow = tile_m0 + idx / 32usize;
+            let ocol = tile_n0 + idx % 32usize;
+            if orow < m && ocol < n {
+                out[orow * n + ocol] = F::cast_from(sc[idx]);
+            }
         }
     }
     sync_cube();
@@ -1094,8 +1108,9 @@ fn pq2_flush_warp_tile<F: Float>(
 
 /// PQ2_0 prefill GEMM over native GGUF blocks: `out[m, n] = x[m, k] * W[n, k]^T`.
 ///
-/// Tiling: `bm` (`32` or `64`) tokens, `BN = 64` output rows, `BK = 32` contraction step; `128`
-/// threads (`4` 32-lane warps arranged `2 x 2`, each owning a `(bm/2) x 32` output sub-tile).
+/// Tiling: `bm` (`32` or `64`) tokens, `BN = 64` output rows, `BK = 32` contraction step; `4`
+/// planes (`4 * plane` threads: `128` for 32-lane warps/wave32, `256` for 64-lane AMD Vulkan
+/// subgroups) arranged `2 x 2`, each owning a `(bm/2) x 32` output sub-tile.
 /// Both `sa` (`[bm, BK]`, stride `40`) and `sb` (`[BK, BN]`, stride `72`) are `+8 half`-skewed
 /// `RowMajor` so `cmma` loads use `transpose = false` without shared-bank conflicts, and the
 /// epilogue shares one `16 x 32` (`2 KB`) `sc` tile across warps (`9216 B` at `bm=32`, `11776 B` at `bm=64`).
@@ -1103,7 +1118,7 @@ fn pq2_flush_warp_tile<F: Float>(
 /// - `cuda | rocm | vulkan`: `16x16x16` cooperative matrix (`(bm/32) x 2` accumulators per warp, 2 `dk` steps).
 /// - `default`: scalar f16-staged reference contraction on the same shared tiles.
 ///
-/// Launch: `Block::new_1d(128)`, `Grid::Static(n.div_ceil(64) as u32, m.div_ceil(bm) as u32, 1)`,
+/// Launch: `Block::new_1d(4 * plane)`, `Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1)`,
 /// `meta = [m, n, k]`.
 #[kernel(targets(cuda, metal, vulkan, webgpu, rocm, cpu), unchecked)]
 pub fn matmul_pq2_0_gguf<F: Float>(
@@ -1112,10 +1127,11 @@ pub fn matmul_pq2_0_gguf<F: Float>(
     out: &mut Array<F>,
     meta: &Array<u32>,
     #[comptime] bm: usize,
+    #[comptime] plane: usize,
     #[comptime] tgt: Target,
 ) {
     let tid = UNIT_POS as usize;
-    let warp = tid / 32usize;
+    let warp = tid / plane;
     let warp_m = warp / 2usize;
     let warp_n = warp % 2usize;
     let m = meta[0] as usize;
@@ -1212,6 +1228,7 @@ pub fn matmul_pq2_0_gguf<F: Float>(
                         n0 + (w % 2usize) * 32usize,
                         m,
                         n,
+                        plane,
                     );
                 }
             }
@@ -1231,7 +1248,11 @@ pub fn matmul_pq2_0_gguf<F: Float>(
                 ));
             }
             for kb in 0..kb_count {
-                pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                if comptime!(plane == 32usize) {
+                    pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                } else if tid < 128usize {
+                    pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                }
                 sync_cube();
                 #[unroll]
                 for dk in 0usize..2usize {
@@ -1293,6 +1314,7 @@ pub fn matmul_pq2_0_gguf<F: Float>(
                         n0 + (w % 2usize) * 32usize,
                         m,
                         n,
+                        plane,
                     );
                 }
             }
@@ -1375,6 +1397,12 @@ pub fn matmul_pq2_0_gguf_bm_run_as<E: Float + CubeElement + Default, R: Runtime>
     k: usize,
     bm: usize,
 ) -> Vec<E> {
+    let tgt = Target::of(client);
+    let plane = if matches!(tgt, Target::Vulkan) {
+        client.properties().hardware.plane_size_max as usize
+    } else {
+        32usize
+    };
     let wh = client.create_from_slice(u32::as_bytes(words));
     let xh = client.create_from_slice(E::as_bytes(x));
     let oh = client.create_from_slice(E::as_bytes(&vec![E::default(); m * n]));
@@ -1383,13 +1411,14 @@ pub fn matmul_pq2_0_gguf_bm_run_as<E: Float + CubeElement + Default, R: Runtime>
         matmul_pq2_0_gguf::launch_unchecked::<E, R>(
             client,
             Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1),
-            Block::new_1d(128),
+            Block::new_1d((4 * plane) as u32),
             ArrayArg::from_raw_parts(wh.clone(), words.len()),
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
             ArrayArg::from_raw_parts(mh.clone(), 3),
             bm,
-            Target::of(client),
+            plane,
+            tgt,
         );
     }
     E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
@@ -1710,7 +1739,7 @@ fn ptq1_stage_ab_tile<F: Float>(
 /// Same `cmma` tile schedule (`BM = 32|64, BN = 64, BK = 32`) as [`matmul_pq2_0_gguf`], staging
 /// dequantized `block_ptq1_0` weights via [`ptq1_stage_ab_tile`].
 ///
-/// Launch: `Block::new_1d(128)`, `Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1)`,
+/// Launch: `Block::new_1d(4 * plane)`, `Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1)`,
 /// `meta = [m, n, k]`.
 #[kernel(targets(cuda, metal, vulkan, webgpu, rocm, cpu), unchecked)]
 pub fn matmul_ptq1_0_gguf<F: Float>(
@@ -1719,10 +1748,11 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
     out: &mut Array<F>,
     meta: &Array<u32>,
     #[comptime] bm: usize,
+    #[comptime] plane: usize,
     #[comptime] tgt: Target,
 ) {
     let tid = UNIT_POS as usize;
-    let warp = tid / 32usize;
+    let warp = tid / plane;
     let warp_m = warp / 2usize;
     let warp_n = warp % 2usize;
     let m = meta[0] as usize;
@@ -1819,6 +1849,7 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
                         n0 + (w % 2usize) * 32usize,
                         m,
                         n,
+                        plane,
                     );
                 }
             }
@@ -1838,7 +1869,11 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
                 ));
             }
             for kb in 0..kb_count {
-                ptq1_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                if comptime!(plane == 32usize) {
+                    ptq1_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                } else if tid < 128usize {
+                    ptq1_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+                }
                 sync_cube();
                 #[unroll]
                 for dk in 0usize..2usize {
@@ -1900,6 +1935,7 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
                         n0 + (w % 2usize) * 32usize,
                         m,
                         n,
+                        plane,
                     );
                 }
             }
@@ -2157,6 +2193,12 @@ pub fn matmul_ptq1_0_gguf_bm_run_as<E: Float + CubeElement + Default, R: Runtime
     k: usize,
     bm: usize,
 ) -> Vec<E> {
+    let tgt = Target::of(client);
+    let plane = if matches!(tgt, Target::Vulkan) {
+        client.properties().hardware.plane_size_max as usize
+    } else {
+        32usize
+    };
     let wh = client.create_from_slice(u32::as_bytes(words));
     let xh = client.create_from_slice(E::as_bytes(x));
     let oh = client.create_from_slice(E::as_bytes(&vec![E::default(); m * n]));
@@ -2165,13 +2207,14 @@ pub fn matmul_ptq1_0_gguf_bm_run_as<E: Float + CubeElement + Default, R: Runtime
         matmul_ptq1_0_gguf::launch_unchecked::<E, R>(
             client,
             Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1),
-            Block::new_1d(128),
+            Block::new_1d((4 * plane) as u32),
             ArrayArg::from_raw_parts(wh.clone(), words.len()),
             ArrayArg::from_raw_parts(xh.clone(), x.len()),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
             ArrayArg::from_raw_parts(mh.clone(), 3),
             bm,
-            Target::of(client),
+            plane,
+            tgt,
         );
     }
     E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
