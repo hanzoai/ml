@@ -194,7 +194,11 @@ pub fn ptq1_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, us
 /// `<= 48` or narrow weights `n < 2048` for higher grid parallelism; `64` otherwise to halve
 /// weight dequantization bandwidth) for a PQ2_0 prefill GEMM.
 pub fn pq2_matmul_artifact(m: usize, n: usize, bf16: bool) -> (&'static str, usize) {
-    let bm = if m > 48 && n >= 2048 { 64 } else { 32 };
+    let bm = if m > 48 && m.div_ceil(64) * n.div_ceil(64) >= 160 {
+        64
+    } else {
+        32
+    };
     let a = match (bm, bf16) {
         (32, false) => "matmul_pq2_0_gguf_bm32_f32",
         (32, true) => "matmul_pq2_0_gguf_bm32_bf16",
@@ -206,7 +210,11 @@ pub fn pq2_matmul_artifact(m: usize, n: usize, bf16: bool) -> (&'static str, usi
 
 /// The generated artifact (= pipeline identity) and `BM` tile height for a PTQ1_0 prefill GEMM.
 pub fn ptq1_matmul_artifact(m: usize, n: usize, bf16: bool) -> (&'static str, usize) {
-    let bm = if m > 48 && n >= 2048 { 64 } else { 32 };
+    let bm = if m > 48 && m.div_ceil(64) * n.div_ceil(64) >= 160 {
+        64
+    } else {
+        32
+    };
     let a = match (bm, bf16) {
         (32, false) => "matmul_ptq1_0_gguf_bm32_f32",
         (32, true) => "matmul_ptq1_0_gguf_bm32_bf16",

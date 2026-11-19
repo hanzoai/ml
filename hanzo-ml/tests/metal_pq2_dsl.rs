@@ -395,7 +395,7 @@ fn pq2_dsl_gemm_prefill_f32_and_bf16_match_oracle_and_offset() {
         (9usize, 128usize, 256usize),
         (17, 257, 512),
         (35, 386, 384),
-        (65, 2048, 256),
+        (257, 2048, 256),
     ];
     for &(m, n, k) in &cases {
         let raw = raw_pq2(n, k, (m * 31 + n * 7 + k) as u64);

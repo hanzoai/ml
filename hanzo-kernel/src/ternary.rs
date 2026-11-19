@@ -976,95 +976,123 @@ pub fn f16_decode_probe_run<R: Runtime>(client: &ComputeClient<R>) -> usize {
 }
 
 // ================================================================================================
-// Prefill GEMM (M > 1) over native GGUF PQ2_0 blocks: one DSL source for Metal, CUDA, Vulkan, ROCm.
+// Prefill GEMM (M > 1) over native GGUF PQ2_0/PTQ1_0 blocks: one DSL source for Metal, CUDA, Vulkan, ROCm.
 // ================================================================================================
 
-/// Stage a `bm x 32` activation tile `x[m0..m0+bm, k0..k0+32]` into stride-40 padded shared
-/// memory (`+8 half` skew avoids bank conflicts during `cmma` loads).
+/// Load a thread's `bm/32 x 8` activation slice via 128-bit/64-bit `Vector<F, Const<4>>` loads
+/// into `a_reg` (`half::f16`) before the first barrier (branchless via clamped rows).
 #[device]
-#[allow(clippy::too_many_arguments)]
-fn stage_sa_tile<F: Float>(
-    x: &Array<F>,
-    sa: &mut SharedMemory<half::f16>,
-    m0: usize,
-    m: usize,
-    k: usize,
-    k0: usize,
-    tid: usize,
+fn load_sa_vec4<F: Float>(
+    x: &Array<Vector<F, Const<4>>>,
+    a_reg: &mut Array<half::f16>,
+    x_row0_v4: usize,
+    x_row1_v4: usize,
+    k0_v4: usize,
     #[comptime] bm: usize,
 ) {
-    let ak_base = (tid % 4usize) * 8usize;
-    let tid_m = tid / 4usize;
+    let b0 = x_row0_v4 + k0_v4;
+    let v00 = x[b0];
+    let v01 = x[b0 + 1usize];
     #[unroll]
-    for mr in 0usize..(bm / 32usize) {
-        let local_m = mr * 32usize + tid_m;
-        let arow = m0 + local_m;
-        let sa_base = local_m * 40usize + ak_base;
-        if arow < m {
-            let x_base = arow * k + k0 + ak_base;
-            #[unroll]
-            for i in 0usize..8usize {
-                sa[sa_base + i] = half::f16::cast_from(f32::cast_from(x[x_base + i]));
-            }
-        } else {
-            #[unroll]
-            for i in 0usize..8usize {
-                sa[sa_base + i] = half::f16::cast_from(0.0f32);
-            }
+    for i in 0usize..4usize {
+        a_reg[i] = half::f16::cast_from(f32::cast_from(v00[i]));
+        a_reg[4usize + i] = half::f16::cast_from(f32::cast_from(v01[i]));
+    }
+    if comptime!(bm == 64usize) {
+        let b1 = x_row1_v4 + k0_v4;
+        let v10 = x[b1];
+        let v11 = x[b1 + 1usize];
+        #[unroll]
+        for i in 0usize..4usize {
+            a_reg[8usize + i] = half::f16::cast_from(f32::cast_from(v10[i]));
+            a_reg[12usize + i] = half::f16::cast_from(f32::cast_from(v11[i]));
         }
     }
 }
 
-/// Stage one `bm x 32` activation tile `sa` and `32 x 64` dequantized PQ2_0 weight tile `sb`
-/// (both `half::f16`) for block-K step `kb` (`k0 = kb * 32`).
+/// Store a thread's `bm/32 x 8` activation registers into 8x8-block-tiled Metal `sa[bm * 32]`.
+#[device]
+fn store_sa_metal(
+    a_reg: &Array<half::f16>,
+    sa: &mut SharedMemory<half::f16>,
+    sa_base0: usize,
+    #[comptime] bm: usize,
+) {
+    #[unroll]
+    for i in 0usize..8usize {
+        sa[sa_base0 + i] = a_reg[i];
+    }
+    if comptime!(bm == 64usize) {
+        let sa_base1 = sa_base0 + 256usize;
+        #[unroll]
+        for i in 0usize..8usize {
+            sa[sa_base1 + i] = a_reg[8usize + i];
+        }
+    }
+}
+
+/// Store a thread's `bm/32 x 8` activation registers into skewed `sa[bm, 40]`.
+#[device]
+fn store_sa_padded(
+    a_reg: &Array<half::f16>,
+    sa: &mut SharedMemory<half::f16>,
+    sa_base0: usize,
+    #[comptime] bm: usize,
+) {
+    #[unroll]
+    for i in 0usize..8usize {
+        sa[sa_base0 + i] = a_reg[i];
+    }
+    if comptime!(bm == 64usize) {
+        let sa_base1 = sa_base0 + 32usize * 40usize;
+        #[unroll]
+        for i in 0usize..8usize {
+            sa[sa_base1 + i] = a_reg[8usize + i];
+        }
+    }
+}
+
+/// Decode 16 PQ2_0 weights directly in `half` using FMA (`half(q) * d_h - d_h`, branchless).
 #[device]
 #[allow(clippy::too_many_arguments)]
-fn pq2_stage_ab_tile<F: Float>(
+fn load_pq2_b_regs16(
     wq: &Array<u32>,
-    x: &Array<F>,
-    sa: &mut SharedMemory<half::f16>,
-    sb: &mut SharedMemory<half::f16>,
-    m0: usize,
-    n0: usize,
-    m: usize,
-    n: usize,
-    k: usize,
-    kb: usize,
-    tid: usize,
-    #[comptime] bm: usize,
-    #[comptime] tgt: Target,
+    b_reg: &mut Array<half::f16>,
+    qbase: usize,
+    shift: u32,
+    next_off: usize,
+    il: usize,
+    d_h: half::f16,
 ) {
-    let k0 = kb * 32usize;
-    let nb = k / 128usize;
-    stage_sa_tile(x, sa, m0, m, k, k0, tid, bm);
-    // Stage 32 x 64 [K, N] RowMajor weight tile into stride-72 padded buffer (+8 half skew).
-    let local_n = tid / 2usize;
-    let half_k = tid % 2usize;
-    let nrow = n0 + local_n;
-    let sb_k0 = half_k * 16usize;
-    if nrow < n {
-        let g = nrow * nb + (kb / 4usize);
-        let sword = wq[17usize * (g / 2usize) + 8usize * (g % 2usize)];
-        let sbits = (sword >> ((16usize * (g % 2usize)) as u32)) & 0xFFFFu32;
-        let hw_f16 = comptime!(matches!(tgt, Target::Metal | Target::Cuda | Target::Rocm));
-        let d = if hw_f16 {
-            f32::cast_from(Vector::<half::f16, Const<2>>::reinterpret::<u32>(sbits)[0])
-        } else {
-            crate::quant::f16lo_to_f32(sbits)
-        };
-        let il = 2usize * (kb % 4usize) + half_k;
-        let w32 = pq2_gguf_codes(wq, g, il);
-        #[unroll]
-        for i in 0usize..16usize {
-            let c_bits = ((w32 >> ((2 * i) as u32)) & 3u32) | 0x4B00_0000u32;
-            let w = (f32::reinterpret(c_bits) - 8_388_609.0f32) * d;
-            sb[(sb_k0 + i) * 72usize + local_n] = half::f16::cast_from(w);
-        }
-    } else {
-        #[unroll]
-        for i in 0usize..16usize {
-            sb[(sb_k0 + i) * 72usize + local_n] = half::f16::cast_from(0.0f32);
-        }
+    let a = wq[qbase + il];
+    let b = wq[qbase + il + next_off];
+    let w32 = (a >> shift) | ((b << 15u32) << (17u32 - shift));
+    #[unroll]
+    for i in 0usize..16usize {
+        let q = (w32 >> ((2 * i) as u32)) & 3u32;
+        b_reg[i] = half::f16::cast_from(q) * d_h - d_h;
+    }
+}
+
+/// Store 16 decoded weights into 8x8-block-tiled Metal `sb[64 * 32]` (`RowMajor` `[K=8, N=8]` blocks).
+#[device]
+fn store_sb_metal16(b_reg: &Array<half::f16>, sb: &mut SharedMemory<half::f16>, sb_base: usize) {
+    #[unroll]
+    for i in 0usize..8usize {
+        sb[sb_base + i * 8usize] = b_reg[i];
+    }
+    #[unroll]
+    for i in 0usize..8usize {
+        sb[sb_base + 512usize + i * 8usize] = b_reg[8usize + i];
+    }
+}
+
+/// Store 16 decoded weights contiguously into `sb[64, 40]` (`ColMajor` B).
+#[device]
+fn store_sb_colmajor(b_reg: &Array<half::f16>, sb: &mut SharedMemory<half::f16>, sb_base: usize) {
+    #[unroll]
+    for i in 0usize..16usize {
+        sb[sb_base + i] = b_reg[i];
     }
 }
 
@@ -1079,23 +1107,25 @@ fn pq2_flush_warp_tile<F: Float>(
     tile_n0: usize,
     m: usize,
     n: usize,
+    #[comptime] n_stage: usize,
     #[comptime] plane: usize,
 ) {
     sync_cube();
+    let elems = 512usize / n_stage;
     if comptime!(plane == 32usize) {
         #[unroll]
-        for i in 0usize..4usize {
-            let idx = tid + i * 128usize;
+        for i in 0usize..elems {
+            let idx = tid + i * n_stage;
             let orow = tile_m0 + idx / 32usize;
             let ocol = tile_n0 + idx % 32usize;
             if orow < m && ocol < n {
                 out[orow * n + ocol] = F::cast_from(sc[idx]);
             }
         }
-    } else if tid < 128usize {
+    } else if tid < n_stage {
         #[unroll]
-        for i in 0usize..4usize {
-            let idx = tid + i * 128usize;
+        for i in 0usize..elems {
+            let idx = tid + i * n_stage;
             let orow = tile_m0 + idx / 32usize;
             let ocol = tile_n0 + idx % 32usize;
             if orow < m && ocol < n {
@@ -1108,14 +1138,20 @@ fn pq2_flush_warp_tile<F: Float>(
 
 /// PQ2_0 prefill GEMM over native GGUF blocks: `out[m, n] = x[m, k] * W[n, k]^T`.
 ///
-/// Tiling: `bm` (`32` or `64`) tokens, `BN = 64` output rows, `BK = 32` contraction step; `4`
-/// planes (`4 * plane` threads: `128` for 32-lane warps/wave32, `256` for 64-lane AMD Vulkan
-/// subgroups) arranged `2 x 2`, each owning a `(bm/2) x 32` output sub-tile.
-/// Both `sa` (`[bm, BK]`, stride `40`) and `sb` (`[BK, BN]`, stride `72`) are `+8 half`-skewed
-/// `RowMajor` so `cmma` loads use `transpose = false` without shared-bank conflicts, and the
-/// epilogue shares one `16 x 32` (`2 KB`) `sc` tile across warps (`9216 B` at `bm=32`, `11776 B` at `bm=64`).
-/// - `metal`: `8x8x8` `simdgroup_matrix` (`(bm/16) x 4` accumulators per warp, 4 `dk` steps per `BK=32`).
-/// - `cuda | rocm | vulkan`: `16x16x16` cooperative matrix (`(bm/32) x 2` accumulators per warp, 2 `dk` steps).
+/// Tiling: `bm` (`32` or `64`) tokens, `BN = 64` output rows, `BK = 32` contraction step inside a
+/// block-hoisted `128`-element outer loop (`ib = 0..k/128`, `sub = 0..4`); `4` planes
+/// (`4 * plane` threads: `128` for 32-lane warps/wave32, `256` for 64-lane AMD Vulkan subgroups)
+/// arranged `2 x 2`, each owning a `(bm/2) x 32` output sub-tile (`2.0` MMAs/load for `bm=64`).
+///
+/// Row indices are clamped once outside the K-loop so the inner loop is completely branchless;
+/// activations load via 4-wide vectors (`Vector<F, Const<4>>`, guaranteed aligned since `k % 128 == 0`),
+/// weight scale `d_h` and block offsets are hoisted once per 128-element block (4x fewer scale
+/// loads), weights decode in `half` via FMA, and both `x` and `wq` stage into registers before the
+/// first `sync_cube()` to overlap global DRAM latency with the previous sub-step's MMA.
+/// - `metal`: 8x8-block-tiled `sa[bm * 32]` and `sb[64 * 32]` (zero padding, `stride = 8, RowMajor`,
+///   `transpose = false`), 4 `dk` steps per `BK = 32`.
+/// - `cuda | rocm | vulkan`: `+8`-skewed `sa[bm, 40]` (`RowMajor`) and `sb[64, 40]` (`ColMajor`)
+///   with `16x16x16` cooperative matrix (`2` `dk` steps).
 /// - `default`: scalar f16-staged reference contraction on the same shared tiles.
 ///
 /// Launch: `Block::new_1d(4 * plane)`, `Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1)`,
@@ -1123,7 +1159,7 @@ fn pq2_flush_warp_tile<F: Float>(
 #[kernel(targets(cuda, metal, vulkan, webgpu, rocm, cpu), unchecked)]
 pub fn matmul_pq2_0_gguf<F: Float>(
     wq: &Array<u32>,
-    x: &Array<F>,
+    x: &Array<Vector<F, Const<4>>>,
     out: &mut Array<F>,
     meta: &Array<u32>,
     #[comptime] bm: usize,
@@ -1139,15 +1175,41 @@ pub fn matmul_pq2_0_gguf<F: Float>(
     let k = meta[2] as usize;
     let m0 = CUBE_POS_X as usize * bm;
     let n0 = CUBE_POS_Y as usize * 64usize;
-    let kb_count = k / 32usize;
+    let nb = k / 128usize;
+    let k4 = k / 4usize;
     let warp_rows = bm / 2usize;
 
-    let mut sa = SharedMemory::<half::f16>::new(bm * 40usize);
-    let mut sb = SharedMemory::<half::f16>::new(32usize * 72usize);
+    // Clamp row indices once outside the K-loop (epilogue masks `orow < m && ocol < n`).
+    let ak_dk = tid % 4usize;
+    let ak_base = ak_dk * 8usize;
+    let tid_m = tid / 4usize;
+    let arow0 = if m0 + tid_m < m { m0 + tid_m } else { m - 1usize };
+    let arow1 = if m0 + 32usize + tid_m < m {
+        m0 + 32usize + tid_m
+    } else {
+        m - 1usize
+    };
+    let x_row0_v4 = arow0 * k4 + ak_dk * 2usize;
+    let x_row1_v4 = arow1 * k4 + ak_dk * 2usize;
+
+    let local_n = tid / 2usize;
+    let half_k = tid % 2usize;
+    let nrow = if n0 + local_n < n { n0 + local_n } else { n - 1usize };
+    let g_row = nrow * nb;
+
     let mut sc = SharedMemory::<f32>::new(16usize * 32usize);
+    let mut a_reg = Array::<half::f16>::new((bm / 32usize) * 8usize);
+    let mut b_reg = Array::<half::f16>::new(16usize);
+    let hw_f16 = comptime!(matches!(tgt, Target::Metal | Target::Cuda | Target::Rocm));
 
     island! {
         metal => {
+            let mut sa = SharedMemory::<half::f16>::new(bm * 32usize);
+            let mut sb = SharedMemory::<half::f16>::new(64usize * 32usize);
+            let sa_base0 = ak_dk * (bm * 8usize) + tid_m * 8usize;
+            let sb_base =
+                ((half_k * 2usize) * 8usize + local_n / 8usize) * 64usize + (local_n % 8usize);
+
             let wm_tiles = bm / 16usize;
             let mut acc = Sequence::<cmma::Matrix<f32>>::new();
             #[unroll]
@@ -1161,45 +1223,68 @@ pub fn matmul_pq2_0_gguf<F: Float>(
                     0.0f32,
                 ));
             }
-            for kb in 0..kb_count {
-                pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
-                sync_cube();
-                #[unroll]
-                for dk in 0usize..4usize {
-                    let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
+            for ib in 0..nb {
+                let g = g_row + ib;
+                let pair = g / 2usize;
+                let odd = g % 2usize;
+                let sword = wq[17usize * pair + 8usize * odd];
+                let sbits = (sword >> ((16usize * odd) as u32)) & 0xFFFFu32;
+                let d_h = Vector::<half::f16, Const<2>>::reinterpret::<u32>(sbits)[0];
+                let qbase = 17usize * pair + 9usize * odd;
+                let shift = (16usize * (1usize - odd)) as u32;
+                let next_off = 1usize - odd;
+
+                for sub in 0usize..4usize {
+                    let k0_v4 = (ib * 4usize + sub) * 8usize;
+                    let il = 2usize * sub + half_k;
+                    load_sa_vec4(x, &mut a_reg, x_row0_v4, x_row1_v4, k0_v4, bm);
+                    load_pq2_b_regs16(wq, &mut b_reg, qbase, shift, next_off, il, d_h);
+                    sync_cube();
+                    store_sa_metal(&a_reg, &mut sa, sa_base0, bm);
+                    store_sb_metal16(&b_reg, &mut sb, sb_base);
+                    sync_cube();
                     #[unroll]
-                    for jn in 0usize..4usize {
-                        let b_col = warp_n * 32usize + jn * 8usize;
-                        mb.push(cmma::Matrix::<half::f16>::from_slice(
-                            cmma::MatrixIdent::B,
-                            8usize,
-                            8usize,
-                            8usize,
-                            cmma::MatrixLayout::RowMajor,
-                            &sb.slice((dk * 8usize) * 72usize + b_col, 32usize * 72usize),
-                            72u32,
-                        ));
-                    }
-                    #[unroll]
-                    for im in 0usize..wm_tiles {
-                        let a_row = warp_m * warp_rows + im * 8usize;
-                        let ma = cmma::Matrix::<half::f16>::from_slice(
-                            cmma::MatrixIdent::A,
-                            8usize,
-                            8usize,
-                            8usize,
-                            cmma::MatrixLayout::RowMajor,
-                            &sa.slice(a_row * 40usize + dk * 8usize, bm * 40usize),
-                            40u32,
-                        );
+                    for dk in 0usize..4usize {
+                        let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
                         #[unroll]
                         for jn in 0usize..4usize {
-                            let c = acc.index(im * 4usize + jn);
-                            cmma::execute::<half::f16, half::f16, f32, f32>(&ma, mb.index(jn), c, c);
+                            let b_off = (dk * 8usize + warp_n * 4usize + jn) * 64usize;
+                            mb.push(cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::B,
+                                8usize,
+                                8usize,
+                                8usize,
+                                cmma::MatrixLayout::RowMajor,
+                                &sb.slice(b_off, 64usize * 32usize),
+                                8u32,
+                            ));
+                        }
+                        #[unroll]
+                        for im in 0usize..wm_tiles {
+                            let a_off = dk * (bm * 8usize)
+                                + (warp_m * warp_rows + im * 8usize) * 8usize;
+                            let ma = cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::A,
+                                8usize,
+                                8usize,
+                                8usize,
+                                cmma::MatrixLayout::RowMajor,
+                                &sa.slice(a_off, bm * 32usize),
+                                8u32,
+                            );
+                            #[unroll]
+                            for jn in 0usize..4usize {
+                                let c = acc.index(im * 4usize + jn);
+                                cmma::execute::<half::f16, half::f16, f32, f32>(
+                                    &ma,
+                                    mb.index(jn),
+                                    c,
+                                    c,
+                                );
+                            }
                         }
                     }
                 }
-                sync_cube();
             }
             #[unroll]
             for w in 0usize..4usize {
@@ -1228,12 +1313,18 @@ pub fn matmul_pq2_0_gguf<F: Float>(
                         n0 + (w % 2usize) * 32usize,
                         m,
                         n,
+                        128usize,
                         plane,
                     );
                 }
             }
         }
         cuda | rocm | vulkan => {
+            let mut sa = SharedMemory::<half::f16>::new(bm * 40usize);
+            let mut sb = SharedMemory::<half::f16>::new(64usize * 40usize);
+            let sa_base0 = tid_m * 40usize + ak_base;
+            let sb_base = local_n * 40usize + half_k * 16usize;
+
             let wm_tiles = bm / 32usize;
             let mut acc = Sequence::<cmma::Matrix<f32>>::new();
             #[unroll]
@@ -1247,49 +1338,86 @@ pub fn matmul_pq2_0_gguf<F: Float>(
                     0.0f32,
                 ));
             }
-            for kb in 0..kb_count {
-                if comptime!(plane == 32usize) {
-                    pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
-                } else if tid < 128usize {
-                    pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+            for ib in 0..nb {
+                let mut d_h = half::f16::cast_from(0.0f32);
+                let mut qbase = 0usize;
+                let mut shift = 0u32;
+                let mut next_off = 0usize;
+                if comptime!(plane == 32usize) || tid < 128usize {
+                    let g = g_row + ib;
+                    let pair = g / 2usize;
+                    let odd = g % 2usize;
+                    let sword = wq[17usize * pair + 8usize * odd];
+                    let sbits = (sword >> ((16usize * odd) as u32)) & 0xFFFFu32;
+                    d_h = if hw_f16 {
+                        Vector::<half::f16, Const<2>>::reinterpret::<u32>(sbits)[0]
+                    } else {
+                        half::f16::cast_from(crate::quant::f16lo_to_f32(sbits))
+                    };
+                    qbase = 17usize * pair + 9usize * odd;
+                    shift = (16usize * (1usize - odd)) as u32;
+                    next_off = 1usize - odd;
                 }
-                sync_cube();
-                #[unroll]
-                for dk in 0usize..2usize {
-                    let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
-                    #[unroll]
-                    for jn in 0usize..2usize {
-                        let b_col = warp_n * 32usize + jn * 16usize;
-                        mb.push(cmma::Matrix::<half::f16>::from_slice(
-                            cmma::MatrixIdent::B,
-                            16usize,
-                            16usize,
-                            16usize,
-                            cmma::MatrixLayout::RowMajor,
-                            &sb.slice((dk * 16usize) * 72usize + b_col, 32usize * 72usize),
-                            72u32,
-                        ));
+                for sub in 0usize..4usize {
+                    let k0_v4 = (ib * 4usize + sub) * 8usize;
+                    let il = 2usize * sub + half_k;
+                    if comptime!(plane == 32usize) {
+                        load_sa_vec4(x, &mut a_reg, x_row0_v4, x_row1_v4, k0_v4, bm);
+                        load_pq2_b_regs16(wq, &mut b_reg, qbase, shift, next_off, il, d_h);
+                    } else if tid < 128usize {
+                        load_sa_vec4(x, &mut a_reg, x_row0_v4, x_row1_v4, k0_v4, bm);
+                        load_pq2_b_regs16(wq, &mut b_reg, qbase, shift, next_off, il, d_h);
                     }
+                    sync_cube();
+                    if comptime!(plane == 32usize) {
+                        store_sa_padded(&a_reg, &mut sa, sa_base0, bm);
+                        store_sb_colmajor(&b_reg, &mut sb, sb_base);
+                    } else if tid < 128usize {
+                        store_sa_padded(&a_reg, &mut sa, sa_base0, bm);
+                        store_sb_colmajor(&b_reg, &mut sb, sb_base);
+                    }
+                    sync_cube();
                     #[unroll]
-                    for im in 0usize..wm_tiles {
-                        let a_row = warp_m * warp_rows + im * 16usize;
-                        let ma = cmma::Matrix::<half::f16>::from_slice(
-                            cmma::MatrixIdent::A,
-                            16usize,
-                            16usize,
-                            16usize,
-                            cmma::MatrixLayout::RowMajor,
-                            &sa.slice(a_row * 40usize + dk * 16usize, bm * 40usize),
-                            40u32,
-                        );
+                    for dk in 0usize..2usize {
+                        let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
                         #[unroll]
                         for jn in 0usize..2usize {
-                            let c = acc.index(im * 2usize + jn);
-                            cmma::execute::<half::f16, half::f16, f32, f32>(&ma, mb.index(jn), c, c);
+                            let b_col = warp_n * 32usize + jn * 16usize;
+                            mb.push(cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::B,
+                                16usize,
+                                16usize,
+                                16usize,
+                                cmma::MatrixLayout::ColMajor,
+                                &sb.slice(b_col * 40usize + dk * 16usize, 64usize * 40usize),
+                                40u32,
+                            ));
+                        }
+                        #[unroll]
+                        for im in 0usize..wm_tiles {
+                            let a_row = warp_m * warp_rows + im * 16usize;
+                            let ma = cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::A,
+                                16usize,
+                                16usize,
+                                16usize,
+                                cmma::MatrixLayout::RowMajor,
+                                &sa.slice(a_row * 40usize + dk * 16usize, bm * 40usize),
+                                40u32,
+                            );
+                            #[unroll]
+                            for jn in 0usize..2usize {
+                                let c = acc.index(im * 2usize + jn);
+                                cmma::execute::<half::f16, half::f16, f32, f32>(
+                                    &ma,
+                                    mb.index(jn),
+                                    c,
+                                    c,
+                                );
+                            }
                         }
                     }
                 }
-                sync_cube();
             }
             #[unroll]
             for w in 0usize..4usize {
@@ -1314,12 +1442,17 @@ pub fn matmul_pq2_0_gguf<F: Float>(
                         n0 + (w % 2usize) * 32usize,
                         m,
                         n,
+                        128usize,
                         plane,
                     );
                 }
             }
         }
         default => {
+            let mut sa = SharedMemory::<half::f16>::new(bm * 40usize);
+            let mut sb = SharedMemory::<half::f16>::new(64usize * 40usize);
+            let sa_base0 = tid_m * 40usize + ak_base;
+            let sb_base = local_n * 40usize + half_k * 16usize;
             let mut acc = Array::<f32>::new(warp_rows);
             #[unroll]
             for i in 0usize..warp_rows {
@@ -1327,20 +1460,36 @@ pub fn matmul_pq2_0_gguf<F: Float>(
             }
             let half_m = tid / 64usize;
             let col = tid % 64usize;
-            for kb in 0..kb_count {
-                pq2_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
-                sync_cube();
-                #[unroll]
-                for i in 0usize..warp_rows {
-                    let row = half_m * warp_rows + i;
-                    let mut sum = 0.0f32;
-                    for kk in 0usize..32usize {
-                        sum += f32::cast_from(sa[row * 40usize + kk])
-                            * f32::cast_from(sb[kk * 72usize + col]);
+            for ib in 0..nb {
+                let g = g_row + ib;
+                let pair = g / 2usize;
+                let odd = g % 2usize;
+                let sword = wq[17usize * pair + 8usize * odd];
+                let sbits = (sword >> ((16usize * odd) as u32)) & 0xFFFFu32;
+                let d_h = half::f16::cast_from(crate::quant::f16lo_to_f32(sbits));
+                let qbase = 17usize * pair + 9usize * odd;
+                let shift = (16usize * (1usize - odd)) as u32;
+                let next_off = 1usize - odd;
+                for sub in 0usize..4usize {
+                    let k0_v4 = (ib * 4usize + sub) * 8usize;
+                    let il = 2usize * sub + half_k;
+                    load_sa_vec4(x, &mut a_reg, x_row0_v4, x_row1_v4, k0_v4, bm);
+                    load_pq2_b_regs16(wq, &mut b_reg, qbase, shift, next_off, il, d_h);
+                    sync_cube();
+                    store_sa_padded(&a_reg, &mut sa, sa_base0, bm);
+                    store_sb_colmajor(&b_reg, &mut sb, sb_base);
+                    sync_cube();
+                    #[unroll]
+                    for i in 0usize..warp_rows {
+                        let row = half_m * warp_rows + i;
+                        let mut sum = 0.0f32;
+                        for kk in 0usize..32usize {
+                            sum += f32::cast_from(sa[row * 40usize + kk])
+                                * f32::cast_from(sb[col * 40usize + kk]);
+                        }
+                        acc[i] += sum;
                     }
-                    acc[i] += sum;
                 }
-                sync_cube();
             }
             #[unroll]
             for i in 0usize..warp_rows {
@@ -1413,7 +1562,7 @@ pub fn matmul_pq2_0_gguf_bm_run_as<E: Float + CubeElement + Default, R: Runtime>
             Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1),
             Block::new_1d((4 * plane) as u32),
             ArrayArg::from_raw_parts(wh.clone(), words.len()),
-            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len() / 4),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
             ArrayArg::from_raw_parts(mh.clone(), 3),
             bm,
@@ -1620,131 +1769,94 @@ pub fn matvec_ptq1_0_gguf<F: Float>(
     }
 }
 
-/// Stage `bm x 32` activation tile `sa` and `32 x 64` dequantized PTQ1_0 weight tile `sb`.
+/// Decode one PTQ1_0 trit (`{-1, 0, +1}`) directly in `half` via FMA: `half(t) * d_h - d_h`.
+#[device]
+#[inline]
+fn ptq1_trit_h(b: u32, pow3: u32, d_h: half::f16) -> half::f16 {
+    let t = (((b * pow3) & 0xFFu32) * 3u32) >> 8u32;
+    half::f16::cast_from(t) * d_h - d_h
+}
+
+/// Decode 16 PTQ1_0 weights for `il = 2 * sub + half_k` from pre-hoisted block words `w0..w6`
+/// and `half` scale `d_h` into `b_reg[0..16]`.
 #[device]
 #[allow(clippy::too_many_arguments)]
-fn ptq1_stage_ab_tile<F: Float>(
-    wq: &Array<u32>,
-    x: &Array<F>,
-    sa: &mut SharedMemory<half::f16>,
-    sb: &mut SharedMemory<half::f16>,
-    m0: usize,
-    n0: usize,
-    m: usize,
-    n: usize,
-    k: usize,
-    kb: usize,
-    tid: usize,
-    #[comptime] bm: usize,
-    #[comptime] tgt: Target,
+fn load_ptq1_b_regs16(
+    b_reg: &mut Array<half::f16>,
+    w0: u32,
+    w1: u32,
+    w2: u32,
+    w3: u32,
+    w4: u32,
+    w5: u32,
+    w6: u32,
+    il: usize,
+    d_h: half::f16,
 ) {
-    let k0 = kb * 32usize;
-    let nb = k / 128usize;
-    stage_sa_tile(x, sa, m0, m, k, k0, tid, bm);
-    let local_n = tid / 2usize;
-    let half_k = tid % 2usize;
-    let nrow = n0 + local_n;
-    let sb_k0 = half_k * 16usize;
-    if nrow < n {
-        let base = 7usize * (nrow * nb + (kb / 4usize));
-        let w6 = wq[base + 6usize];
-        let sbits = (w6 >> 16u32) & 0xFFFFu32;
-        let hw_f16 = comptime!(matches!(tgt, Target::Metal | Target::Cuda | Target::Rocm));
-        let d = if hw_f16 {
-            f32::cast_from(Vector::<half::f16, Const<2>>::reinterpret::<u32>(sbits)[0])
-        } else {
-            crate::quant::f16lo_to_f32(sbits)
-        };
-        let il = 2usize * (kb % 4usize) + half_k;
-        if il < 5usize {
-            let w0 = wq[base];
-            let w1 = wq[base + 1usize];
-            let w2 = wq[base + 2usize];
-            let w3 = wq[base + 3usize];
-            let mut p3 = 1u32;
-            if il == 1usize {
-                p3 = 3u32;
-            } else if il == 2usize {
-                p3 = 9u32;
-            } else if il == 3usize {
-                p3 = 27u32;
-            } else if il == 4usize {
-                p3 = 81u32;
-            }
-            #[unroll]
-            for j in 0usize..4usize {
-                let sh = (8usize * j) as u32;
-                sb[(sb_k0 + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit((w0 >> sh) & 0xFFu32, p3) * d);
-                sb[(sb_k0 + 4usize + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit((w1 >> sh) & 0xFFu32, p3) * d);
-                sb[(sb_k0 + 8usize + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit((w2 >> sh) & 0xFFu32, p3) * d);
-                sb[(sb_k0 + 12usize + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit((w3 >> sh) & 0xFFu32, p3) * d);
-            }
-        } else if il < 7usize {
-            let w4 = wq[base + 4usize];
-            let w5 = wq[base + 5usize];
-            let mut p_lo = 1u32;
-            let mut p_hi = 3u32;
-            if il == 6usize {
-                p_lo = 9u32;
-                p_hi = 27u32;
-            }
-            #[unroll]
-            for j in 0usize..4usize {
-                let sh = (8usize * j) as u32;
-                let b4 = (w4 >> sh) & 0xFFu32;
-                let b5 = (w5 >> sh) & 0xFFu32;
-                sb[(sb_k0 + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit(b4, p_lo) * d);
-                sb[(sb_k0 + 4usize + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit(b5, p_lo) * d);
-                sb[(sb_k0 + 8usize + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit(b4, p_hi) * d);
-                sb[(sb_k0 + 12usize + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit(b5, p_hi) * d);
-            }
-        } else {
-            let w4 = wq[base + 4usize];
-            let w5 = wq[base + 5usize];
-            let qh0 = w6 & 0xFFu32;
-            let qh1 = (w6 >> 8u32) & 0xFFu32;
-            let mut qh_p = 1u32;
-            #[unroll]
-            for j in 0usize..4usize {
-                let sh = (8usize * j) as u32;
-                sb[(sb_k0 + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit((w4 >> sh) & 0xFFu32, 81u32) * d);
-                sb[(sb_k0 + 4usize + j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit((w5 >> sh) & 0xFFu32, 81u32) * d);
-                sb[(sb_k0 + 8usize + 2usize * j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit(qh0, qh_p) * d);
-                sb[(sb_k0 + 9usize + 2usize * j) * 72usize + local_n] =
-                    half::f16::cast_from(ptq1_trit(qh1, qh_p) * d);
-                qh_p *= 3u32;
-            }
+    if il < 5usize {
+        let mut p3 = 1u32;
+        if il == 1usize {
+            p3 = 3u32;
+        } else if il == 2usize {
+            p3 = 9u32;
+        } else if il == 3usize {
+            p3 = 27u32;
+        } else if il == 4usize {
+            p3 = 81u32;
+        }
+        #[unroll]
+        for j in 0usize..4usize {
+            let sh = (8usize * j) as u32;
+            b_reg[j] = ptq1_trit_h((w0 >> sh) & 0xFFu32, p3, d_h);
+            b_reg[4usize + j] = ptq1_trit_h((w1 >> sh) & 0xFFu32, p3, d_h);
+            b_reg[8usize + j] = ptq1_trit_h((w2 >> sh) & 0xFFu32, p3, d_h);
+            b_reg[12usize + j] = ptq1_trit_h((w3 >> sh) & 0xFFu32, p3, d_h);
+        }
+    } else if il < 7usize {
+        let mut p_lo = 1u32;
+        let mut p_hi = 3u32;
+        if il == 6usize {
+            p_lo = 9u32;
+            p_hi = 27u32;
+        }
+        #[unroll]
+        for j in 0usize..4usize {
+            let sh = (8usize * j) as u32;
+            let b4 = (w4 >> sh) & 0xFFu32;
+            let b5 = (w5 >> sh) & 0xFFu32;
+            b_reg[j] = ptq1_trit_h(b4, p_lo, d_h);
+            b_reg[4usize + j] = ptq1_trit_h(b5, p_lo, d_h);
+            b_reg[8usize + j] = ptq1_trit_h(b4, p_hi, d_h);
+            b_reg[12usize + j] = ptq1_trit_h(b5, p_hi, d_h);
         }
     } else {
+        let qh0 = w6 & 0xFFu32;
+        let qh1 = (w6 >> 8u32) & 0xFFu32;
+        let mut qh_p = 1u32;
         #[unroll]
-        for i in 0usize..16usize {
-            sb[(sb_k0 + i) * 72usize + local_n] = half::f16::cast_from(0.0f32);
+        for j in 0usize..4usize {
+            let sh = (8usize * j) as u32;
+            b_reg[j] = ptq1_trit_h((w4 >> sh) & 0xFFu32, 81u32, d_h);
+            b_reg[4usize + j] = ptq1_trit_h((w5 >> sh) & 0xFFu32, 81u32, d_h);
+            b_reg[8usize + 2usize * j] = ptq1_trit_h(qh0, qh_p, d_h);
+            b_reg[9usize + 2usize * j] = ptq1_trit_h(qh1, qh_p, d_h);
+            qh_p *= 3u32;
         }
     }
 }
 
 /// PTQ1_0 prefill GEMM over native GGUF blocks: `out[m, n] = x[m, k] * W[n, k]^T`.
 ///
-/// Same `cmma` tile schedule (`BM = 32|64, BN = 64, BK = 32`) as [`matmul_pq2_0_gguf`], staging
-/// dequantized `block_ptq1_0` weights via [`ptq1_stage_ab_tile`].
+/// Same optimized Pass-5 schedule (`BM = 32|64, BN = 64, BK = 32`, vectorized `Vector<F, Const<4>>`
+/// activations, branchless clamped rows, block-hoisted 7-word `block_ptq1_0` loads, pure `half`
+/// FMA trit decode, and 8x8-tiled `RowMajor` `stride = 8` Metal staging) as [`matmul_pq2_0_gguf`].
 ///
 /// Launch: `Block::new_1d(4 * plane)`, `Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1)`,
 /// `meta = [m, n, k]`.
 #[kernel(targets(cuda, metal, vulkan, webgpu, rocm, cpu), unchecked)]
 pub fn matmul_ptq1_0_gguf<F: Float>(
     wq: &Array<u32>,
-    x: &Array<F>,
+    x: &Array<Vector<F, Const<4>>>,
     out: &mut Array<F>,
     meta: &Array<u32>,
     #[comptime] bm: usize,
@@ -1760,15 +1872,40 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
     let k = meta[2] as usize;
     let m0 = CUBE_POS_X as usize * bm;
     let n0 = CUBE_POS_Y as usize * 64usize;
-    let kb_count = k / 32usize;
+    let nb = k / 128usize;
+    let k4 = k / 4usize;
     let warp_rows = bm / 2usize;
 
-    let mut sa = SharedMemory::<half::f16>::new(bm * 40usize);
-    let mut sb = SharedMemory::<half::f16>::new(32usize * 72usize);
+    let ak_dk = tid % 4usize;
+    let ak_base = ak_dk * 8usize;
+    let tid_m = tid / 4usize;
+    let arow0 = if m0 + tid_m < m { m0 + tid_m } else { m - 1usize };
+    let arow1 = if m0 + 32usize + tid_m < m {
+        m0 + 32usize + tid_m
+    } else {
+        m - 1usize
+    };
+    let x_row0_v4 = arow0 * k4 + ak_dk * 2usize;
+    let x_row1_v4 = arow1 * k4 + ak_dk * 2usize;
+
+    let local_n = tid / 2usize;
+    let half_k = tid % 2usize;
+    let nrow = if n0 + local_n < n { n0 + local_n } else { n - 1usize };
+    let g_row = nrow * nb;
+
     let mut sc = SharedMemory::<f32>::new(16usize * 32usize);
+    let mut a_reg = Array::<half::f16>::new((bm / 32usize) * 8usize);
+    let mut b_reg = Array::<half::f16>::new(16usize);
+    let hw_f16 = comptime!(matches!(tgt, Target::Metal | Target::Cuda | Target::Rocm));
 
     island! {
         metal => {
+            let mut sa = SharedMemory::<half::f16>::new(bm * 32usize);
+            let mut sb = SharedMemory::<half::f16>::new(64usize * 32usize);
+            let sa_base0 = ak_dk * (bm * 8usize) + tid_m * 8usize;
+            let sb_base =
+                ((half_k * 2usize) * 8usize + local_n / 8usize) * 64usize + (local_n % 8usize);
+
             let wm_tiles = bm / 16usize;
             let mut acc = Sequence::<cmma::Matrix<f32>>::new();
             #[unroll]
@@ -1782,45 +1919,69 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
                     0.0f32,
                 ));
             }
-            for kb in 0..kb_count {
-                ptq1_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
-                sync_cube();
-                #[unroll]
-                for dk in 0usize..4usize {
-                    let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
+            for ib in 0..nb {
+                let base = 7usize * (g_row + ib);
+                let w0 = wq[base];
+                let w1 = wq[base + 1usize];
+                let w2 = wq[base + 2usize];
+                let w3 = wq[base + 3usize];
+                let w4 = wq[base + 4usize];
+                let w5 = wq[base + 5usize];
+                let w6 = wq[base + 6usize];
+                let sbits = (w6 >> 16u32) & 0xFFFFu32;
+                let d_h = Vector::<half::f16, Const<2>>::reinterpret::<u32>(sbits)[0];
+
+                for sub in 0usize..4usize {
+                    let k0_v4 = (ib * 4usize + sub) * 8usize;
+                    let il = 2usize * sub + half_k;
+                    load_sa_vec4(x, &mut a_reg, x_row0_v4, x_row1_v4, k0_v4, bm);
+                    load_ptq1_b_regs16(&mut b_reg, w0, w1, w2, w3, w4, w5, w6, il, d_h);
+                    sync_cube();
+                    store_sa_metal(&a_reg, &mut sa, sa_base0, bm);
+                    store_sb_metal16(&b_reg, &mut sb, sb_base);
+                    sync_cube();
                     #[unroll]
-                    for jn in 0usize..4usize {
-                        let b_col = warp_n * 32usize + jn * 8usize;
-                        mb.push(cmma::Matrix::<half::f16>::from_slice(
-                            cmma::MatrixIdent::B,
-                            8usize,
-                            8usize,
-                            8usize,
-                            cmma::MatrixLayout::RowMajor,
-                            &sb.slice((dk * 8usize) * 72usize + b_col, 32usize * 72usize),
-                            72u32,
-                        ));
-                    }
-                    #[unroll]
-                    for im in 0usize..wm_tiles {
-                        let a_row = warp_m * warp_rows + im * 8usize;
-                        let ma = cmma::Matrix::<half::f16>::from_slice(
-                            cmma::MatrixIdent::A,
-                            8usize,
-                            8usize,
-                            8usize,
-                            cmma::MatrixLayout::RowMajor,
-                            &sa.slice(a_row * 40usize + dk * 8usize, bm * 40usize),
-                            40u32,
-                        );
+                    for dk in 0usize..4usize {
+                        let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
                         #[unroll]
                         for jn in 0usize..4usize {
-                            let c = acc.index(im * 4usize + jn);
-                            cmma::execute::<half::f16, half::f16, f32, f32>(&ma, mb.index(jn), c, c);
+                            let b_off = (dk * 8usize + warp_n * 4usize + jn) * 64usize;
+                            mb.push(cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::B,
+                                8usize,
+                                8usize,
+                                8usize,
+                                cmma::MatrixLayout::RowMajor,
+                                &sb.slice(b_off, 64usize * 32usize),
+                                8u32,
+                            ));
+                        }
+                        #[unroll]
+                        for im in 0usize..wm_tiles {
+                            let a_off = dk * (bm * 8usize)
+                                + (warp_m * warp_rows + im * 8usize) * 8usize;
+                            let ma = cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::A,
+                                8usize,
+                                8usize,
+                                8usize,
+                                cmma::MatrixLayout::RowMajor,
+                                &sa.slice(a_off, bm * 32usize),
+                                8u32,
+                            );
+                            #[unroll]
+                            for jn in 0usize..4usize {
+                                let c = acc.index(im * 4usize + jn);
+                                cmma::execute::<half::f16, half::f16, f32, f32>(
+                                    &ma,
+                                    mb.index(jn),
+                                    c,
+                                    c,
+                                );
+                            }
                         }
                     }
                 }
-                sync_cube();
             }
             #[unroll]
             for w in 0usize..4usize {
@@ -1849,12 +2010,18 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
                         n0 + (w % 2usize) * 32usize,
                         m,
                         n,
+                        128usize,
                         plane,
                     );
                 }
             }
         }
         cuda | rocm | vulkan => {
+            let mut sa = SharedMemory::<half::f16>::new(bm * 40usize);
+            let mut sb = SharedMemory::<half::f16>::new(64usize * 40usize);
+            let sa_base0 = tid_m * 40usize + ak_base;
+            let sb_base = local_n * 40usize + half_k * 16usize;
+
             let wm_tiles = bm / 32usize;
             let mut acc = Sequence::<cmma::Matrix<f32>>::new();
             #[unroll]
@@ -1868,49 +2035,91 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
                     0.0f32,
                 ));
             }
-            for kb in 0..kb_count {
-                if comptime!(plane == 32usize) {
-                    ptq1_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
-                } else if tid < 128usize {
-                    ptq1_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
+            for ib in 0..nb {
+                let mut w0 = 0u32;
+                let mut w1 = 0u32;
+                let mut w2 = 0u32;
+                let mut w3 = 0u32;
+                let mut w4 = 0u32;
+                let mut w5 = 0u32;
+                let mut w6 = 0u32;
+                let mut d_h = half::f16::cast_from(0.0f32);
+                if comptime!(plane == 32usize) || tid < 128usize {
+                    let base = 7usize * (g_row + ib);
+                    w0 = wq[base];
+                    w1 = wq[base + 1usize];
+                    w2 = wq[base + 2usize];
+                    w3 = wq[base + 3usize];
+                    w4 = wq[base + 4usize];
+                    w5 = wq[base + 5usize];
+                    w6 = wq[base + 6usize];
+                    let sbits = (w6 >> 16u32) & 0xFFFFu32;
+                    d_h = if hw_f16 {
+                        Vector::<half::f16, Const<2>>::reinterpret::<u32>(sbits)[0]
+                    } else {
+                        half::f16::cast_from(crate::quant::f16lo_to_f32(sbits))
+                    };
                 }
-                sync_cube();
-                #[unroll]
-                for dk in 0usize..2usize {
-                    let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
-                    #[unroll]
-                    for jn in 0usize..2usize {
-                        let b_col = warp_n * 32usize + jn * 16usize;
-                        mb.push(cmma::Matrix::<half::f16>::from_slice(
-                            cmma::MatrixIdent::B,
-                            16usize,
-                            16usize,
-                            16usize,
-                            cmma::MatrixLayout::RowMajor,
-                            &sb.slice((dk * 16usize) * 72usize + b_col, 32usize * 72usize),
-                            72u32,
-                        ));
+                for sub in 0usize..4usize {
+                    let k0_v4 = (ib * 4usize + sub) * 8usize;
+                    let il = 2usize * sub + half_k;
+                    if comptime!(plane == 32usize) {
+                        load_sa_vec4(x, &mut a_reg, x_row0_v4, x_row1_v4, k0_v4, bm);
+                        load_ptq1_b_regs16(&mut b_reg, w0, w1, w2, w3, w4, w5, w6, il, d_h);
+                    } else if tid < 128usize {
+                        load_sa_vec4(x, &mut a_reg, x_row0_v4, x_row1_v4, k0_v4, bm);
+                        load_ptq1_b_regs16(&mut b_reg, w0, w1, w2, w3, w4, w5, w6, il, d_h);
                     }
+                    sync_cube();
+                    if comptime!(plane == 32usize) {
+                        store_sa_padded(&a_reg, &mut sa, sa_base0, bm);
+                        store_sb_colmajor(&b_reg, &mut sb, sb_base);
+                    } else if tid < 128usize {
+                        store_sa_padded(&a_reg, &mut sa, sa_base0, bm);
+                        store_sb_colmajor(&b_reg, &mut sb, sb_base);
+                    }
+                    sync_cube();
                     #[unroll]
-                    for im in 0usize..wm_tiles {
-                        let a_row = warp_m * warp_rows + im * 16usize;
-                        let ma = cmma::Matrix::<half::f16>::from_slice(
-                            cmma::MatrixIdent::A,
-                            16usize,
-                            16usize,
-                            16usize,
-                            cmma::MatrixLayout::RowMajor,
-                            &sa.slice(a_row * 40usize + dk * 16usize, bm * 40usize),
-                            40u32,
-                        );
+                    for dk in 0usize..2usize {
+                        let mut mb = Sequence::<cmma::Matrix<half::f16>>::new();
                         #[unroll]
                         for jn in 0usize..2usize {
-                            let c = acc.index(im * 2usize + jn);
-                            cmma::execute::<half::f16, half::f16, f32, f32>(&ma, mb.index(jn), c, c);
+                            let b_col = warp_n * 32usize + jn * 16usize;
+                            mb.push(cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::B,
+                                16usize,
+                                16usize,
+                                16usize,
+                                cmma::MatrixLayout::ColMajor,
+                                &sb.slice(b_col * 40usize + dk * 16usize, 64usize * 40usize),
+                                40u32,
+                            ));
+                        }
+                        #[unroll]
+                        for im in 0usize..wm_tiles {
+                            let a_row = warp_m * warp_rows + im * 16usize;
+                            let ma = cmma::Matrix::<half::f16>::from_slice(
+                                cmma::MatrixIdent::A,
+                                16usize,
+                                16usize,
+                                16usize,
+                                cmma::MatrixLayout::RowMajor,
+                                &sa.slice(a_row * 40usize + dk * 16usize, bm * 40usize),
+                                40u32,
+                            );
+                            #[unroll]
+                            for jn in 0usize..2usize {
+                                let c = acc.index(im * 2usize + jn);
+                                cmma::execute::<half::f16, half::f16, f32, f32>(
+                                    &ma,
+                                    mb.index(jn),
+                                    c,
+                                    c,
+                                );
+                            }
                         }
                     }
                 }
-                sync_cube();
             }
             #[unroll]
             for w in 0usize..4usize {
@@ -1935,12 +2144,17 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
                         n0 + (w % 2usize) * 32usize,
                         m,
                         n,
+                        128usize,
                         plane,
                     );
                 }
             }
         }
         default => {
+            let mut sa = SharedMemory::<half::f16>::new(bm * 40usize);
+            let mut sb = SharedMemory::<half::f16>::new(64usize * 40usize);
+            let sa_base0 = tid_m * 40usize + ak_base;
+            let sb_base = local_n * 40usize + half_k * 16usize;
             let mut acc = Array::<f32>::new(warp_rows);
             #[unroll]
             for i in 0usize..warp_rows {
@@ -1948,20 +2162,37 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
             }
             let half_m = tid / 64usize;
             let col = tid % 64usize;
-            for kb in 0..kb_count {
-                ptq1_stage_ab_tile(wq, x, &mut sa, &mut sb, m0, n0, m, n, k, kb, tid, bm, tgt);
-                sync_cube();
-                #[unroll]
-                for i in 0usize..warp_rows {
-                    let row = half_m * warp_rows + i;
-                    let mut sum = 0.0f32;
-                    for kk in 0usize..32usize {
-                        sum += f32::cast_from(sa[row * 40usize + kk])
-                            * f32::cast_from(sb[kk * 72usize + col]);
+            for ib in 0..nb {
+                let base = 7usize * (g_row + ib);
+                let w0 = wq[base];
+                let w1 = wq[base + 1usize];
+                let w2 = wq[base + 2usize];
+                let w3 = wq[base + 3usize];
+                let w4 = wq[base + 4usize];
+                let w5 = wq[base + 5usize];
+                let w6 = wq[base + 6usize];
+                let sbits = (w6 >> 16u32) & 0xFFFFu32;
+                let d_h = half::f16::cast_from(crate::quant::f16lo_to_f32(sbits));
+                for sub in 0usize..4usize {
+                    let k0_v4 = (ib * 4usize + sub) * 8usize;
+                    let il = 2usize * sub + half_k;
+                    load_sa_vec4(x, &mut a_reg, x_row0_v4, x_row1_v4, k0_v4, bm);
+                    load_ptq1_b_regs16(&mut b_reg, w0, w1, w2, w3, w4, w5, w6, il, d_h);
+                    sync_cube();
+                    store_sa_padded(&a_reg, &mut sa, sa_base0, bm);
+                    store_sb_colmajor(&b_reg, &mut sb, sb_base);
+                    sync_cube();
+                    #[unroll]
+                    for i in 0usize..warp_rows {
+                        let row = half_m * warp_rows + i;
+                        let mut sum = 0.0f32;
+                        for kk in 0usize..32usize {
+                            sum += f32::cast_from(sa[row * 40usize + kk])
+                                * f32::cast_from(sb[col * 40usize + kk]);
+                        }
+                        acc[i] += sum;
                     }
-                    acc[i] += sum;
                 }
-                sync_cube();
             }
             #[unroll]
             for i in 0usize..warp_rows {
@@ -2209,7 +2440,7 @@ pub fn matmul_ptq1_0_gguf_bm_run_as<E: Float + CubeElement + Default, R: Runtime
             Grid::Static(m.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1),
             Block::new_1d((4 * plane) as u32),
             ArrayArg::from_raw_parts(wh.clone(), words.len()),
-            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(xh.clone(), x.len() / 4),
             ArrayArg::from_raw_parts(oh.clone(), m * n),
             ArrayArg::from_raw_parts(mh.clone(), 3),
             bm,
