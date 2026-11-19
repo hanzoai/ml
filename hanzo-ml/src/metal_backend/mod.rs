@@ -2559,6 +2559,32 @@ dsl_artifacts! {
     "gdn_scan_lanes_k64_v64_l4" => "gdn_scan_lanes_f_f32",
     "flash_attn_d64_p32" => "flash_attn_f_f32",
     "flash_attn_d128_p32" => "flash_attn_f_f32",
+    // Production GDN (F32 / F16 / BF16 I/O, internal F32 math & state)
+    "gdn_conv1d_step_k4_f32" => "gdn_conv1d_step_f_f32",
+    "gdn_conv1d_step_k4_f16" => "gdn_conv1d_step_f_",
+    "gdn_conv1d_step_k4_bf16" => "gdn_conv1d_step_f_",
+    "gdn_conv1d_stateful_k4_f32" => "gdn_conv1d_stateful_f_f32",
+    "gdn_conv1d_stateful_k4_f16" => "gdn_conv1d_stateful_f_",
+    "gdn_conv1d_stateful_k4_bf16" => "gdn_conv1d_stateful_f_",
+    "gdn_gating_io_f32" => "gdn_gating_io_f_f32",
+    "gdn_gating_io_f16" => "gdn_gating_io_f_",
+    "gdn_gating_io_bf16" => "gdn_gating_io_f_",
+    "gdn_scan_lanes_io_k128_v128_l4_f32" => "gdn_scan_lanes_io_f_f32",
+    "gdn_scan_lanes_io_k128_v128_l4_f16" => "gdn_scan_lanes_io_f_",
+    "gdn_scan_lanes_io_k128_v128_l4_bf16" => "gdn_scan_lanes_io_f_",
+    "gdn_scan_lanes_io_k64_v64_l4_f32" => "gdn_scan_lanes_io_f_f32",
+    "gdn_scan_lanes_io_k64_v64_l4_f16" => "gdn_scan_lanes_io_f_",
+    "gdn_scan_lanes_io_k64_v64_l4_bf16" => "gdn_scan_lanes_io_f_",
+    // Production Paged & Contiguous FlashAttention (d=64/128/256, F32/F16/BF16)
+    "flash_attn_paged_d64_f32" => "flash_attn_paged_f_f32",
+    "flash_attn_paged_d64_f16" => "flash_attn_paged_f_",
+    "flash_attn_paged_d64_bf16" => "flash_attn_paged_f_",
+    "flash_attn_paged_d128_f32" => "flash_attn_paged_f_f32",
+    "flash_attn_paged_d128_f16" => "flash_attn_paged_f_",
+    "flash_attn_paged_d128_bf16" => "flash_attn_paged_f_",
+    "flash_attn_paged_d256_f32" => "flash_attn_paged_f_f32",
+    "flash_attn_paged_d256_f16" => "flash_attn_paged_f_",
+    "flash_attn_paged_d256_bf16" => "flash_attn_paged_f_",
 }
 
 /// Resource binding kind for DSL kernel dispatch via [`MetalDevice::dispatch_dsl_bindings`].
@@ -2901,6 +2927,337 @@ impl MetalDevice {
                 depth: 1,
             },
         )
+    }
+
+    /// Production DSL single-token GDN conv1d step (F32/F16/BF16, k=4, in-place state shift + SiLU).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv1d_step_dsl(
+        &self,
+        dtype: crate::DType,
+        x: (&Buffer, usize),
+        weight: (&Buffer, usize),
+        state: (&Buffer, usize),
+        out: (&Buffer, usize),
+        batch: usize,
+        conv_dim: usize,
+    ) -> Result<()> {
+        let artifact = match dtype {
+            crate::DType::F32 => "gdn_conv1d_step_k4_f32",
+            crate::DType::F16 => "gdn_conv1d_step_k4_f16",
+            crate::DType::BF16 => "gdn_conv1d_step_k4_bf16",
+            other => crate::bail!("gdn_conv1d_step_dsl: unsupported dtype {other:?}"),
+        };
+        let total = batch * conv_dim;
+        if total == 0 {
+            crate::bail!("gdn_conv1d_step_dsl: empty shape ({batch}, {conv_dim})");
+        }
+        let dims = [batch as u32, conv_dim as u32];
+        self.dispatch_dsl_bindings(
+            artifact,
+            &[
+                DslBinding::In(x.0, x.1),
+                DslBinding::In(weight.0, weight.1),
+                DslBinding::Out(state.0, state.1),
+                DslBinding::Out(out.0, out.1),
+                DslBinding::Bytes(slice_as_bytes(&dims)),
+            ],
+            &[0u32; 10],
+            objc2_metal::MTLSize {
+                width: total.div_ceil(64),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        )?;
+        crate::quantized::dsl::note_dispatch(
+            crate::quantized::dsl::QkImpl::Dsl,
+            artifact,
+            conv_dim,
+            batch,
+        );
+        Ok(())
+    }
+
+    /// Production DSL stateful GDN conv1d prefill/chunked step (F32/F16/BF16, k=4) reading
+    /// optional incoming `state_in` (`has_state=true`) and writing trailing `state_out` + SiLU `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv1d_stateful_dsl(
+        &self,
+        dtype: crate::DType,
+        x: (&Buffer, usize),
+        weight: (&Buffer, usize),
+        state_in: (&Buffer, usize),
+        state_out: (&Buffer, usize),
+        out: (&Buffer, usize),
+        batch: usize,
+        conv_dim: usize,
+        seq_len: usize,
+        has_state: bool,
+    ) -> Result<()> {
+        let artifact = match dtype {
+            crate::DType::F32 => "gdn_conv1d_stateful_k4_f32",
+            crate::DType::F16 => "gdn_conv1d_stateful_k4_f16",
+            crate::DType::BF16 => "gdn_conv1d_stateful_k4_bf16",
+            other => crate::bail!("gdn_conv1d_stateful_dsl: unsupported dtype {other:?}"),
+        };
+        let total = batch * conv_dim * seq_len;
+        if total == 0 {
+            crate::bail!("gdn_conv1d_stateful_dsl: empty shape ({batch}, {conv_dim}, {seq_len})");
+        }
+        let dims = [
+            batch as u32,
+            conv_dim as u32,
+            seq_len as u32,
+            u32::from(has_state),
+        ];
+        self.dispatch_dsl_bindings(
+            artifact,
+            &[
+                DslBinding::In(x.0, x.1),
+                DslBinding::In(weight.0, weight.1),
+                DslBinding::In(state_in.0, state_in.1),
+                DslBinding::Out(state_out.0, state_out.1),
+                DslBinding::Out(out.0, out.1),
+                DslBinding::Bytes(slice_as_bytes(&dims)),
+            ],
+            &[0u32; 12],
+            objc2_metal::MTLSize {
+                width: total.div_ceil(64),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        )?;
+        crate::quantized::dsl::note_dispatch(
+            crate::quantized::dsl::QkImpl::Dsl,
+            artifact,
+            conv_dim,
+            seq_len,
+        );
+        Ok(())
+    }
+
+    /// Production DSL typed GDN gating (F32/F16/BF16 I/O, F32 `a_log`/`dt_bias` & internal math).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_gating_io_dsl(
+        &self,
+        dtype: crate::DType,
+        b_in: (&Buffer, usize),
+        a_in: (&Buffer, usize),
+        a_log: (&Buffer, usize),
+        dt_bias: (&Buffer, usize),
+        beta_out: (&Buffer, usize),
+        g_out: (&Buffer, usize),
+        batch_tokens: usize,
+        num_heads: usize,
+    ) -> Result<()> {
+        let artifact = match dtype {
+            crate::DType::F32 => "gdn_gating_io_f32",
+            crate::DType::F16 => "gdn_gating_io_f16",
+            crate::DType::BF16 => "gdn_gating_io_bf16",
+            other => crate::bail!("gdn_gating_io_dsl: unsupported dtype {other:?}"),
+        };
+        let total = batch_tokens * num_heads;
+        if total == 0 {
+            crate::bail!("gdn_gating_io_dsl: empty shape ({batch_tokens}, {num_heads})");
+        }
+        let dims = [total as u32, num_heads as u32];
+        self.dispatch_dsl_bindings(
+            artifact,
+            &[
+                DslBinding::In(b_in.0, b_in.1),
+                DslBinding::In(a_in.0, a_in.1),
+                DslBinding::In(a_log.0, a_log.1),
+                DslBinding::In(dt_bias.0, dt_bias.1),
+                DslBinding::Out(beta_out.0, beta_out.1),
+                DslBinding::Out(g_out.0, g_out.1),
+                DslBinding::Bytes(slice_as_bytes(&dims)),
+            ],
+            &[0u32; 14],
+            objc2_metal::MTLSize {
+                width: total.div_ceil(64),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        )?;
+        crate::quantized::dsl::note_dispatch(
+            crate::quantized::dsl::QkImpl::Dsl,
+            artifact,
+            num_heads,
+            batch_tokens,
+        );
+        Ok(())
+    }
+
+    /// Production DSL typed GDN recurrence scan (F32/F16/BF16 I/O, F32 in-place state).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_scan_lanes_io_dsl(
+        &self,
+        dtype: crate::DType,
+        q: (&Buffer, usize),
+        k: (&Buffer, usize),
+        v: (&Buffer, usize),
+        g: (&Buffer, usize),
+        beta: (&Buffer, usize),
+        state: (&Buffer, usize),
+        out: (&Buffer, usize),
+        bh: usize,
+        seq: usize,
+        k_dim: usize,
+        v_dim: usize,
+    ) -> Result<()> {
+        let artifact = match (k_dim, v_dim, dtype) {
+            (128, 128, crate::DType::F32) => "gdn_scan_lanes_io_k128_v128_l4_f32",
+            (128, 128, crate::DType::F16) => "gdn_scan_lanes_io_k128_v128_l4_f16",
+            (128, 128, crate::DType::BF16) => "gdn_scan_lanes_io_k128_v128_l4_bf16",
+            (64, 64, crate::DType::F32) => "gdn_scan_lanes_io_k64_v64_l4_f32",
+            (64, 64, crate::DType::F16) => "gdn_scan_lanes_io_k64_v64_l4_f16",
+            (64, 64, crate::DType::BF16) => "gdn_scan_lanes_io_k64_v64_l4_bf16",
+            _ => crate::bail!(
+                "gdn_scan_lanes_io_dsl: unsupported k={k_dim} v={v_dim} dtype={dtype:?}"
+            ),
+        };
+        if bh == 0 || seq == 0 {
+            crate::bail!("gdn_scan_lanes_io_dsl: empty shape ({bh}, {seq})");
+        }
+        let dims = [bh as u32, seq as u32];
+        let total_threads = bh * v_dim * 4;
+        self.dispatch_dsl_bindings(
+            artifact,
+            &[
+                DslBinding::In(q.0, q.1),
+                DslBinding::In(k.0, k.1),
+                DslBinding::In(v.0, v.1),
+                DslBinding::In(g.0, g.1),
+                DslBinding::In(beta.0, beta.1),
+                DslBinding::Out(state.0, state.1),
+                DslBinding::Out(out.0, out.1),
+                DslBinding::Bytes(slice_as_bytes(&dims)),
+            ],
+            &[0u32; 16],
+            objc2_metal::MTLSize {
+                width: total_threads.div_ceil(64),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        )?;
+        crate::quantized::dsl::note_dispatch(
+            crate::quantized::dsl::QkImpl::Dsl,
+            artifact,
+            bh,
+            seq,
+        );
+        Ok(())
+    }
+
+    /// Production DSL Paged & Contiguous FlashAttention (d=64/128/256, F32/F16/BF16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_paged_dsl(
+        &self,
+        dtype: crate::DType,
+        q: (&Buffer, usize),
+        k_cache: (&Buffer, usize),
+        v_cache: (&Buffer, usize),
+        block_tables: (&Buffer, usize),
+        context_lens: (&Buffer, usize),
+        out: (&Buffer, usize),
+        batch: usize,
+        n_heads: usize,
+        n_kv: usize,
+        seq_q: usize,
+        d: usize,
+        scale: f32,
+        softcap: f32,
+        causal_mode: u32,
+        block_size: usize,
+        max_blocks: usize,
+        kv_layout: usize,
+        x_vec: usize,
+        sliding_window: usize,
+        q_offset_override: usize,
+    ) -> Result<()> {
+        let (artifact, br) = match (d, dtype) {
+            (64, crate::DType::F32) => ("flash_attn_paged_d64_f32", 16usize),
+            (64, crate::DType::F16) => ("flash_attn_paged_d64_f16", 16usize),
+            (64, crate::DType::BF16) => ("flash_attn_paged_d64_bf16", 16usize),
+            (128, crate::DType::F32) => ("flash_attn_paged_d128_f32", 16usize),
+            (128, crate::DType::F16) => ("flash_attn_paged_d128_f16", 16usize),
+            (128, crate::DType::BF16) => ("flash_attn_paged_d128_bf16", 16usize),
+            (256, crate::DType::F32) => ("flash_attn_paged_d256_f32", 8usize),
+            (256, crate::DType::F16) => ("flash_attn_paged_d256_f16", 8usize),
+            (256, crate::DType::BF16) => ("flash_attn_paged_d256_bf16", 8usize),
+            _ => crate::bail!(
+                "flash_attn_paged_dsl: unsupported head_dim={d} dtype={dtype:?}"
+            ),
+        };
+        if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 {
+            crate::bail!("flash_attn_paged_dsl: empty shape");
+        }
+        let scale_cfg = [scale, softcap];
+        let meta = [
+            seq_q as u32,
+            n_heads as u32,
+            n_kv as u32,
+            causal_mode,
+            block_size as u32,
+            max_blocks as u32,
+            kv_layout as u32,
+            x_vec as u32,
+            sliding_window as u32,
+            q_offset_override as u32,
+            0u32,
+            0u32,
+        ];
+        let blocks = batch * n_heads * seq_q.div_ceil(br);
+        self.dispatch_dsl_bindings(
+            artifact,
+            &[
+                DslBinding::In(q.0, q.1),
+                DslBinding::In(k_cache.0, k_cache.1),
+                DslBinding::In(v_cache.0, v_cache.1),
+                DslBinding::In(block_tables.0, block_tables.1),
+                DslBinding::In(context_lens.0, context_lens.1),
+                DslBinding::Out(out.0, out.1),
+                DslBinding::Bytes(slice_as_bytes(&scale_cfg)),
+                DslBinding::Bytes(slice_as_bytes(&meta)),
+            ],
+            &[0u32; 16],
+            objc2_metal::MTLSize {
+                width: blocks,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        )?;
+        crate::quantized::dsl::note_dispatch(
+            crate::quantized::dsl::QkImpl::Dsl,
+            artifact,
+            n_heads,
+            d,
+        );
+        Ok(())
     }
 }
 

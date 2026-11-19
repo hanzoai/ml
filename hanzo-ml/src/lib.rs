@@ -69,6 +69,8 @@ pub mod dummy_vulkan_backend;
 pub mod dummy_wgpu_backend;
 pub mod error;
 pub mod fattn_decode;
+pub mod flash_attn;
+pub mod gdn;
 mod hc_sinkhorn;
 mod indexer;
 pub mod layout;

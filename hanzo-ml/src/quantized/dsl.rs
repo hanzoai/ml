@@ -38,6 +38,8 @@ impl QkImpl {
 const UNSET: u8 = u8::MAX;
 static PQ2_IMPL: AtomicU8 = AtomicU8::new(UNSET);
 static PTQ1_IMPL: AtomicU8 = AtomicU8::new(UNSET);
+static GDN_IMPL: AtomicU8 = AtomicU8::new(UNSET);
+static FLASH_IMPL: AtomicU8 = AtomicU8::new(UNSET);
 
 fn encode(i: QkImpl) -> u8 {
     match i {
@@ -79,6 +81,26 @@ pub fn ptq1_impl() -> QkImpl {
 /// Force the PTQ1_0 implementation for this process (A/B tests, interleaved benches).
 pub fn set_ptq1_impl(i: QkImpl) {
     PTQ1_IMPL.store(encode(i), Ordering::Relaxed);
+}
+
+/// The implementation GDN ops use: `set_gdn_impl` if called, else `HANZO_GDN_IMPL` (default `legacy`).
+pub fn gdn_impl() -> QkImpl {
+    read_impl_env(&GDN_IMPL, "HANZO_GDN_IMPL")
+}
+
+/// Force the GDN implementation for this process (A/B tests, interleaved benches).
+pub fn set_gdn_impl(i: QkImpl) {
+    GDN_IMPL.store(encode(i), Ordering::Relaxed);
+}
+
+/// The implementation FlashAttention ops use: `set_flash_impl` if called, else `HANZO_FLASH_IMPL` (default `legacy`).
+pub fn flash_impl() -> QkImpl {
+    read_impl_env(&FLASH_IMPL, "HANZO_FLASH_IMPL")
+}
+
+/// Force the FlashAttention implementation for this process (A/B tests, interleaved benches).
+pub fn set_flash_impl(i: QkImpl) {
+    FLASH_IMPL.store(encode(i), Ordering::Relaxed);
 }
 
 /// The production PQ2_0 decode schedule `(nsg, nr0)` for `rows` outputs (NSG = 2, NR0 = 4
