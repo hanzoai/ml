@@ -168,24 +168,36 @@ fn cuda_pq2_and_ptq1_dsl_gemm_prefill_match_oracle_and_offset() {
         let want32 = hanzo_kernel::ternary::pq2_0_gguf_gemm_ref(&raw, &xv, m, n, k);
         let got_dsl = forward_pq2(&mm, &x32, QkImpl::Dsl);
         let rel32 = scale_rel(&want32, &got_dsl);
-        assert!(rel32 <= 5e-4, "CUDA PQ2 GEMM f32 m={m} n={n} k={k}: {rel32:.3e}");
+        assert!(
+            rel32 <= 5e-4,
+            "CUDA PQ2 GEMM f32 m={m} n={n} k={k}: {rel32:.3e}"
+        );
 
         let want_b = hanzo_kernel::ternary::pq2_0_gguf_gemm_ref(&raw, &xbv, m, n, k);
         let got_b = forward_pq2(&mm, &xb, QkImpl::Dsl);
         let rel_b = scale_rel(&want_b, &got_b);
-        assert!(rel_b <= 8e-3, "CUDA PQ2 GEMM bf16 m={m} n={n} k={k}: {rel_b:.3e}");
+        assert!(
+            rel_b <= 8e-3,
+            "CUDA PQ2 GEMM bf16 m={m} n={n} k={k}: {rel_b:.3e}"
+        );
 
         let raw_t = raw_ptq1(n, k, (m * 19 + n * 11 + k) as u64);
         let mm_t = matmul(&dev, GgmlDType::PTQ1_0, &raw_t, n, k);
         let want32_t = hanzo_kernel::ternary::ptq1_0_gguf_gemm_ref(&raw_t, &xv, m, n, k);
         let got_dsl_t = forward_ptq1(&mm_t, &x32, QkImpl::Dsl);
         let rel32_t = scale_rel(&want32_t, &got_dsl_t);
-        assert!(rel32_t <= 5e-4, "CUDA PTQ1 GEMM f32 m={m} n={n} k={k}: {rel32_t:.3e}");
+        assert!(
+            rel32_t <= 5e-4,
+            "CUDA PTQ1 GEMM f32 m={m} n={n} k={k}: {rel32_t:.3e}"
+        );
 
         let want_bt = hanzo_kernel::ternary::ptq1_0_gguf_gemm_ref(&raw_t, &xbv, m, n, k);
         let got_bt = forward_ptq1(&mm_t, &xb, QkImpl::Dsl);
         let rel_bt = scale_rel(&want_bt, &got_bt);
-        assert!(rel_bt <= 8e-3, "CUDA PTQ1 GEMM bf16 m={m} n={n} k={k}: {rel_bt:.3e}");
+        assert!(
+            rel_bt <= 8e-3,
+            "CUDA PTQ1 GEMM bf16 m={m} n={n} k={k}: {rel_bt:.3e}"
+        );
     }
 
     // Nonzero activation offset + 3D batch.
@@ -195,14 +207,20 @@ fn cuda_pq2_and_ptq1_dsl_gemm_prefill_match_oracle_and_offset() {
     let big = Tensor::from_vec(act(32 * k), (32, k), &dev).unwrap();
     let sub = big.narrow(0, 7, 17).unwrap();
     let sub_c = sub.contiguous().unwrap();
-    assert_eq!(forward_pq2(&mm, &sub, QkImpl::Dsl), forward_pq2(&mm, &sub_c, QkImpl::Dsl));
+    assert_eq!(
+        forward_pq2(&mm, &sub, QkImpl::Dsl),
+        forward_pq2(&mm, &sub_c, QkImpl::Dsl)
+    );
 
     let xb3 = Tensor::from_vec(act(22 * k), (2, 11, k), &dev)
         .unwrap()
         .to_dtype(DType::BF16)
         .unwrap();
     let xb2 = xb3.reshape((22, k)).unwrap();
-    assert_eq!(forward_pq2(&mm, &xb3, QkImpl::Dsl), forward_pq2(&mm, &xb2, QkImpl::Dsl));
+    assert_eq!(
+        forward_pq2(&mm, &xb3, QkImpl::Dsl),
+        forward_pq2(&mm, &xb2, QkImpl::Dsl)
+    );
 
     let st = dsl::stats();
     assert_eq!(st.compiles_of("matmul_pq2_0_gguf_bm32_f32"), 1);
@@ -222,7 +240,12 @@ fn cuda_pq2_and_ptq1_dsl_gemm_prefill_match_oracle_and_offset() {
 fn cuda_pq2_and_ptq1_dsl_vs_legacy_bench() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dev = Device::new_cuda(0).unwrap();
-    let shapes = [(5120usize, 5120usize), (17408, 5120), (5120, 17408), (1024, 5120)];
+    let shapes = [
+        (5120usize, 5120usize),
+        (17408, 5120),
+        (5120, 17408),
+        (1024, 5120),
+    ];
     let ms = [1usize, 32, 128, 512, 2048];
     eprintln!("fmt   shape            m     legacy_us  dsl_us   ratio(leg/dsl)  dsl_TFLOPS");
     for (fname, dtype) in [("PQ2 ", GgmlDType::PQ2_0), ("PTQ1", GgmlDType::PTQ1_0)] {

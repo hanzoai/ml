@@ -129,7 +129,9 @@ fn vulkan_pq2_and_ptq1_dsl_matvec_match_oracle_and_legacy() {
             assert_eq!(got_dsl, got_dsl2, "Vulkan {dtype:?} non-deterministic");
             let rel_dsl = scale_rel(&want, &got_dsl);
             let rel_leg = scale_rel(&want, &got_leg);
-            eprintln!("Vulkan {dtype:?} matvec {n:>5}x{k:<5} dsl={rel_dsl:.2e} legacy={rel_leg:.2e}");
+            eprintln!(
+                "Vulkan {dtype:?} matvec {n:>5}x{k:<5} dsl={rel_dsl:.2e} legacy={rel_leg:.2e}"
+            );
             assert!(rel_dsl <= 5e-5, "Vulkan {dtype:?} matvec rel={rel_dsl:.3e}");
             assert!(rel_leg <= 5e-5, "Vulkan {dtype:?} legacy rel={rel_leg:.3e}");
         }
@@ -179,8 +181,13 @@ fn vulkan_pq2_and_ptq1_dsl_gemm_bm32_bm64_offset_and_batch() {
             let got_dsl = forward_as(&mm, &x, dtype, QkImpl::Dsl);
             let _ = forward_as(&mm, &x, dtype, QkImpl::Dsl);
             let rel_dsl = scale_rel(&want, &got_dsl);
-            eprintln!("Vulkan {dtype:?} gemm   m={m:>3} n={n:>4} k={k:<3} ({art}) rel={rel_dsl:.2e}");
-            assert!(rel_dsl <= 5e-3, "Vulkan {dtype:?} gemm ({art}) rel={rel_dsl:.3e}");
+            eprintln!(
+                "Vulkan {dtype:?} gemm   m={m:>3} n={n:>4} k={k:<3} ({art}) rel={rel_dsl:.2e}"
+            );
+            assert!(
+                rel_dsl <= 5e-3,
+                "Vulkan {dtype:?} gemm ({art}) rel={rel_dsl:.3e}"
+            );
         }
 
         // Nonzero start_offset (narrow) + 3D [B, T, K] batch

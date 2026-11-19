@@ -1183,7 +1183,11 @@ pub fn matmul_pq2_0_gguf<F: Float>(
     let ak_dk = tid % 4usize;
     let ak_base = ak_dk * 8usize;
     let tid_m = tid / 4usize;
-    let arow0 = if m0 + tid_m < m { m0 + tid_m } else { m - 1usize };
+    let arow0 = if m0 + tid_m < m {
+        m0 + tid_m
+    } else {
+        m - 1usize
+    };
     let arow1 = if m0 + 32usize + tid_m < m {
         m0 + 32usize + tid_m
     } else {
@@ -1194,7 +1198,11 @@ pub fn matmul_pq2_0_gguf<F: Float>(
 
     let local_n = tid / 2usize;
     let half_k = tid % 2usize;
-    let nrow = if n0 + local_n < n { n0 + local_n } else { n - 1usize };
+    let nrow = if n0 + local_n < n {
+        n0 + local_n
+    } else {
+        n - 1usize
+    };
     let g_row = nrow * nb;
 
     let mut sc = SharedMemory::<f32>::new(16usize * 32usize);
@@ -1504,13 +1512,7 @@ pub fn matmul_pq2_0_gguf<F: Float>(
 }
 
 /// Host f64 reference for PQ2_0 GEMM (`out[m, n] = x[m, k] * W[n, k]^T`).
-pub fn pq2_0_gguf_gemm_ref(
-    bytes: &[u8],
-    x: &[f32],
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<f32> {
+pub fn pq2_0_gguf_gemm_ref(bytes: &[u8], x: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let nb = k / QK_PQ2_0;
     let mut w = vec![0.0f64; n * k];
     for r in 0..n {
@@ -1902,7 +1904,11 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
     let ak_dk = tid % 4usize;
     let ak_base = ak_dk * 8usize;
     let tid_m = tid / 4usize;
-    let arow0 = if m0 + tid_m < m { m0 + tid_m } else { m - 1usize };
+    let arow0 = if m0 + tid_m < m {
+        m0 + tid_m
+    } else {
+        m - 1usize
+    };
     let arow1 = if m0 + 32usize + tid_m < m {
         m0 + 32usize + tid_m
     } else {
@@ -1913,7 +1919,11 @@ pub fn matmul_ptq1_0_gguf<F: Float>(
 
     let local_n = tid / 2usize;
     let half_k = tid % 2usize;
-    let nrow = if n0 + local_n < n { n0 + local_n } else { n - 1usize };
+    let nrow = if n0 + local_n < n {
+        n0 + local_n
+    } else {
+        n - 1usize
+    };
     let g_row = nrow * nb;
 
     let mut sc = SharedMemory::<f32>::new(16usize * 32usize);
@@ -2344,13 +2354,7 @@ pub fn ptq1_0_gguf_ref(bytes: &[u8], x: &[f32], rows: usize, k: usize) -> Vec<f3
 }
 
 /// Host f64 reference for PTQ1_0 GEMM (`out[m, n] = x[m, k] * W[n, k]^T`).
-pub fn ptq1_0_gguf_gemm_ref(
-    bytes: &[u8],
-    x: &[f32],
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<f32> {
+pub fn ptq1_0_gguf_gemm_ref(bytes: &[u8], x: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let nb = k / QK_PTQ1_0;
     let mut w = vec![0.0f64; n * k];
     for r in 0..n {
@@ -2385,11 +2389,7 @@ pub fn matvec_ptq1_0_gguf_run_as<E: Float + CubeElement + Default, R: Runtime>(
     let wh = client.create_from_slice(u32::as_bytes(words));
     let xh = client.create_from_slice(E::as_bytes(x));
     let oh = client.create_from_slice(E::as_bytes(&vec![E::default(); rows]));
-    let mh = client.create_from_slice(u32::as_bytes(&[
-        k as u32,
-        rows as u32,
-        words.len() as u32,
-    ]));
+    let mh = client.create_from_slice(u32::as_bytes(&[k as u32, rows as u32, words.len() as u32]));
     unsafe {
         matvec_ptq1_0_gguf::launch_unchecked::<E, R>(
             client,
@@ -2423,7 +2423,8 @@ pub fn ptq1_0_gguf_board<R: Runtime>(
         let maxref = want.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-30);
         for &nsg in &[2usize, 4usize] {
             for &nr0 in &[2usize, 4usize, 8usize] {
-                let got = matvec_ptq1_0_gguf_run_as::<f32, R>(client, &words, &x, rows, k, nsg, nr0);
+                let got =
+                    matvec_ptq1_0_gguf_run_as::<f32, R>(client, &words, &x, rows, k, nsg, nr0);
                 let rel = got
                     .iter()
                     .zip(&want)
@@ -2503,8 +2504,7 @@ pub fn ptq1_0_gguf_gemm_board<R: Runtime>(
             .iter()
             .fold(0f32, |mx, &v| mx.max(v.abs()))
             .max(1e-30);
-        let got_b =
-            matmul_ptq1_0_gguf_bm_run_as::<half::bf16, R>(client, &words, &xb, m, n, k, bm);
+        let got_b = matmul_ptq1_0_gguf_bm_run_as::<half::bf16, R>(client, &words, &xb, m, n, k, bm);
         let rel_b = got_b
             .iter()
             .zip(&want_b)
@@ -2515,5 +2515,3 @@ pub fn ptq1_0_gguf_gemm_board<R: Runtime>(
     }
     res
 }
-
-

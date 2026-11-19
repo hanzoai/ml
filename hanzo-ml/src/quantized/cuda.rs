@@ -1586,8 +1586,12 @@ impl QCudaStorage {
             {
                 let (o_ptr, _go) = out.device_ptr_mut(&stream);
                 unsafe {
-                    self.device
-                        .dispatch_dsl_4(artifact, [w_ptr, x_ptr, o_ptr, m_ptr], grid, block)?;
+                    self.device.dispatch_dsl_4(
+                        artifact,
+                        [w_ptr, x_ptr, o_ptr, m_ptr],
+                        grid,
+                        block,
+                    )?;
                 }
             }
             CudaStorageSlice::BF16(out)
@@ -1599,8 +1603,12 @@ impl QCudaStorage {
             {
                 let (o_ptr, _go) = out.device_ptr_mut(&stream);
                 unsafe {
-                    self.device
-                        .dispatch_dsl_4(artifact, [w_ptr, x_ptr, o_ptr, m_ptr], grid, block)?;
+                    self.device.dispatch_dsl_4(
+                        artifact,
+                        [w_ptr, x_ptr, o_ptr, m_ptr],
+                        grid,
+                        block,
+                    )?;
                 }
             }
             CudaStorageSlice::F32(out)

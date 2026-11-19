@@ -336,7 +336,9 @@ fn pq2_dsl_nr0_sweep() {
         (QkImpl::Dsl, Some(4), Some(8)),
     ];
     let labels = ["2x2", "2x4", "2x8", "4x2", "4x4", "4x8"];
-    eprintln!("shape            legacy_us   2x2_us   2x4_us   2x8_us   4x2_us   4x4_us   4x8_us   best");
+    eprintln!(
+        "shape            legacy_us   2x2_us   2x4_us   2x8_us   4x2_us   4x4_us   4x8_us   best"
+    );
     for (n, k) in shapes {
         let banks: Vec<QMatMul> = (0..BANKS)
             .map(|b| matmul(&dev, &raw_pq2(n, k, 200 + b as u64), n, k))
@@ -435,14 +437,20 @@ fn pq2_dsl_gemm_prefill_f32_and_bf16_match_oracle_and_offset() {
     let big = Tensor::from_vec(act(32 * k), (32, k), &dev).unwrap();
     let sub = big.narrow(0, 7, 17).unwrap();
     let sub_c = sub.contiguous().unwrap();
-    assert_eq!(forward(&mm, &sub, QkImpl::Dsl), forward(&mm, &sub_c, QkImpl::Dsl));
+    assert_eq!(
+        forward(&mm, &sub, QkImpl::Dsl),
+        forward(&mm, &sub_c, QkImpl::Dsl)
+    );
 
     let xb3 = Tensor::from_vec(act(22 * k), (2, 11, k), &dev)
         .unwrap()
         .to_dtype(DType::BF16)
         .unwrap();
     let xb2 = xb3.reshape((22, k)).unwrap();
-    assert_eq!(forward(&mm, &xb3, QkImpl::Dsl), forward(&mm, &xb2, QkImpl::Dsl));
+    assert_eq!(
+        forward(&mm, &xb3, QkImpl::Dsl),
+        forward(&mm, &xb2, QkImpl::Dsl)
+    );
 
     let st = dsl::stats();
     assert!(st.calls(QkImpl::Dsl) >= (cases.len() * 2 + 4) as u64);

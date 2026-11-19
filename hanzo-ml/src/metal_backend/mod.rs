@@ -3146,13 +3146,22 @@ mod dsl_metal_dispatch {
             .unwrap();
         let off = pad * std::mem::size_of::<f32>();
 
-        md.gdn_conv1d_dsl((&*xb, off), (&*wb, off), (&*ob, off), batch, conv_dim, seq_len)
-            .unwrap();
+        md.gdn_conv1d_dsl(
+            (&*xb, off),
+            (&*wb, off),
+            (&*ob, off),
+            batch,
+            conv_dim,
+            seq_len,
+        )
+        .unwrap();
         md.wait_until_completed().unwrap();
 
         let full: Vec<f32> = read_to_vec(&*ob, pad + want.len());
         let mr = max_rel(&want, &full[pad..]);
-        eprintln!("[dsl_seam gdn_conv1d_dsl] shape=({batch},{conv_dim},{seq_len}) max_rel={mr:.2e}");
+        eprintln!(
+            "[dsl_seam gdn_conv1d_dsl] shape=({batch},{conv_dim},{seq_len}) max_rel={mr:.2e}"
+        );
         assert!(mr < 1e-5, "gdn_conv1d_dsl max_rel {mr}");
     }
 
@@ -3166,7 +3175,9 @@ mod dsl_metal_dispatch {
         let (batch_tokens, num_heads) = (11usize, 16usize);
         let total = batch_tokens * num_heads;
         let b: Vec<f32> = (0..total).map(|i| ((i % 19) as f32 - 9.0) * 0.1).collect();
-        let a: Vec<f32> = (0..total).map(|i| ((i % 23) as f32 - 11.0) * 0.08).collect();
+        let a: Vec<f32> = (0..total)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.08)
+            .collect();
         let a_log: Vec<f32> = (0..num_heads).map(|i| -0.5 + (i as f32) * 0.05).collect();
         let dt_bias: Vec<f32> = (0..num_heads).map(|i| 0.2 - (i as f32) * 0.03).collect();
         let (want_beta, want_g) =
@@ -3211,8 +3222,7 @@ mod dsl_metal_dispatch {
             _ => panic!("not a metal device"),
         };
         let (bh, seq) = (3usize, 9usize);
-        for &(k_dim, v_dim, lanes) in &[(64usize, 64usize, 4usize), (128, 128, 4), (128, 128, 8)]
-        {
+        for &(k_dim, v_dim, lanes) in &[(64usize, 64usize, 4usize), (128, 128, 4), (128, 128, 8)] {
             let [q, k, v, g, beta, state_init] =
                 hanzo_kernel::gdn::gdn_synth(bh, seq, k_dim, v_dim, 42);
             let mut want_state = state_init.clone();
@@ -3235,7 +3245,9 @@ mod dsl_metal_dispatch {
             let gb = md.new_buffer_with_data(&g).unwrap();
             let betab = md.new_buffer_with_data(&beta).unwrap();
             let stateb = md.new_buffer_with_data(&state_init).unwrap();
-            let outb = md.new_buffer_with_data(&vec![0f32; bh * seq * v_dim]).unwrap();
+            let outb = md
+                .new_buffer_with_data(&vec![0f32; bh * seq * v_dim])
+                .unwrap();
 
             md.gdn_scan_lanes_dsl(
                 (&*qb, 0),
@@ -3337,10 +3349,7 @@ mod dsl_metal_dispatch {
                 let w = &want[b * q_b..(b + 1) * q_b];
                 let g = &got[b * q_b..(b + 1) * q_b];
                 let mr = max_rel(w, g);
-                let max_abs = w
-                    .iter()
-                    .zip(g)
-                    .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                let max_abs = w.iter().zip(g).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
                 let want_max = w.iter().fold(0f32, |m, x| m.max(x.abs()));
                 eprintln!(
                     "[dsl_seam flash_attn_dsl] b={b}/{batch} nh={n_heads}/{n_kv} sq={seq_q} sk={seq_k} d={d} causal={causal} want_max={want_max:.3} max_abs={max_abs:.2e} max_rel={mr:.2e}"

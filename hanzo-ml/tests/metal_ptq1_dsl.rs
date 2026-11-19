@@ -1,6 +1,8 @@
 #![cfg(feature = "metal")]
 
-use hanzo_kernel::ternary::{ptq1_0_gguf_bytes, ptq1_0_gguf_gemm_ref, ptq1_0_gguf_ref, ptq1_0_synth};
+use hanzo_kernel::ternary::{
+    ptq1_0_gguf_bytes, ptq1_0_gguf_gemm_ref, ptq1_0_gguf_ref, ptq1_0_synth,
+};
 use hanzo_ml::quantized::dsl::{self, QkImpl};
 use hanzo_ml::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use hanzo_ml::{DType, Device, Module, Tensor};
@@ -49,7 +51,11 @@ fn forward_ptq1(mm: &QMatMul, x: &Tensor, imp: QkImpl) -> Vec<f32> {
 
 fn scale_rel(want: &[f32], got: &[f32]) -> f32 {
     assert_eq!(want.len(), got.len());
-    let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    let scale = want
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
     want.iter()
         .zip(got.iter())
         .map(|(a, b)| (a - b).abs() / scale)

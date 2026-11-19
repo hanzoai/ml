@@ -8,7 +8,12 @@
 
 #[cfg(any(feature = "metal", feature = "cuda", feature = "rocm"))]
 use hanzo_kernel::gen::capture;
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 use hanzo_kernel::gen::Spec;
 use hanzo_kernel::prelude::*;
 use std::path::{Path, PathBuf};
@@ -20,7 +25,12 @@ fn usage() -> ! {
 
 /// One PQ2_0 matvec specialization, launched on a 3-row x 256-col tensor (odd block count, so the
 /// half-word path and the clamped tail are both compiled in).
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! pq2_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $conv:expr, $nsg:literal, $nr0:literal) => {
         Spec {
@@ -39,7 +49,12 @@ macro_rules! pq2_spec {
 }
 
 /// One PQ2_0 prefill GEMM specialization (`f32` or `bf16`, `bm = 32` or `64`), launched on a small ragged tile.
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! pq2_gemm_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $conv:expr, $bm:literal) => {
         Spec {
@@ -58,7 +73,12 @@ macro_rules! pq2_gemm_spec {
 }
 
 /// One PTQ1_0 matvec specialization (`28 B` GGUF blocks).
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! ptq1_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $conv:expr, $nsg:literal, $nr0:literal) => {
         Spec {
@@ -77,7 +97,12 @@ macro_rules! ptq1_spec {
 }
 
 /// One PTQ1_0 prefill GEMM specialization (`f32` or `bf16`, `bm = 32` or `64`).
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! ptq1_gemm_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $conv:expr, $bm:literal) => {
         Spec {
@@ -96,44 +121,297 @@ macro_rules! ptq1_gemm_spec {
 }
 
 /// All 32 ternary (PQ2_0 + PTQ1_0) decode matvec and prefill GEMM specializations for runtime `R`.
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 fn ternary_specs<R: Runtime>() -> Vec<Spec<R>> {
     vec![
         // PQ2_0 decode matvec over native GGUF blocks: one artifact per (NSG, NR0) schedule x dtype.
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg2_nr2_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 2, 2),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg2_nr4_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 2, 4),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg2_nr8_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 2, 8),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg2_nr2_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 2),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg2_nr4_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 4),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg2_nr8_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 8),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg4_nr2_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 4, 2),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg4_nr4_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 4, 4),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg4_nr8_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 4, 8),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg4_nr2_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 2),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg4_nr4_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 4),
-        pq2_spec!(R, "matvec_pq2_0_gguf_nsg4_nr8_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 8),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg2_nr2_f32",
+            "matvec_pq2_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            2,
+            2
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg2_nr4_f32",
+            "matvec_pq2_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            2,
+            4
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg2_nr8_f32",
+            "matvec_pq2_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            2,
+            8
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg2_nr2_bf16",
+            "matvec_pq2_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            2,
+            2
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg2_nr4_bf16",
+            "matvec_pq2_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            2,
+            4
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg2_nr8_bf16",
+            "matvec_pq2_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            2,
+            8
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg4_nr2_f32",
+            "matvec_pq2_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            4,
+            2
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg4_nr4_f32",
+            "matvec_pq2_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            4,
+            4
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg4_nr8_f32",
+            "matvec_pq2_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            4,
+            8
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg4_nr2_bf16",
+            "matvec_pq2_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            4,
+            2
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg4_nr4_bf16",
+            "matvec_pq2_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            4,
+            4
+        ),
+        pq2_spec!(
+            R,
+            "matvec_pq2_0_gguf_nsg4_nr8_bf16",
+            "matvec_pq2_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            4,
+            8
+        ),
         // PQ2_0 prefill GEMM (M > 1) over native GGUF blocks.
-        pq2_gemm_spec!(R, "matmul_pq2_0_gguf_bm32_f32",  "matmul_pq2_0_gguf_f_f32", f32,        std::convert::identity, 32),
-        pq2_gemm_spec!(R, "matmul_pq2_0_gguf_bm32_bf16", "matmul_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 32),
-        pq2_gemm_spec!(R, "matmul_pq2_0_gguf_bm64_f32",  "matmul_pq2_0_gguf_f_f32", f32,        std::convert::identity, 64),
-        pq2_gemm_spec!(R, "matmul_pq2_0_gguf_bm64_bf16", "matmul_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 64),
+        pq2_gemm_spec!(
+            R,
+            "matmul_pq2_0_gguf_bm32_f32",
+            "matmul_pq2_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            32
+        ),
+        pq2_gemm_spec!(
+            R,
+            "matmul_pq2_0_gguf_bm32_bf16",
+            "matmul_pq2_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            32
+        ),
+        pq2_gemm_spec!(
+            R,
+            "matmul_pq2_0_gguf_bm64_f32",
+            "matmul_pq2_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            64
+        ),
+        pq2_gemm_spec!(
+            R,
+            "matmul_pq2_0_gguf_bm64_bf16",
+            "matmul_pq2_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            64
+        ),
         // PTQ1_0 decode matvec + prefill GEMM over native 28-byte GGUF blocks.
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg2_nr2_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 2, 2),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg2_nr4_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 2, 4),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg2_nr8_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 2, 8),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg2_nr2_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 2),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg2_nr4_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 4),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg2_nr8_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 8),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg4_nr2_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 4, 2),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg4_nr4_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 4, 4),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg4_nr8_f32",  "matvec_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 4, 8),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg4_nr2_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 2),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg4_nr4_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 4),
-        ptq1_spec!(R, "matvec_ptq1_0_gguf_nsg4_nr8_bf16", "matvec_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 8),
-        ptq1_gemm_spec!(R, "matmul_ptq1_0_gguf_bm32_f32",  "matmul_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 32),
-        ptq1_gemm_spec!(R, "matmul_ptq1_0_gguf_bm32_bf16", "matmul_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 32),
-        ptq1_gemm_spec!(R, "matmul_ptq1_0_gguf_bm64_f32",  "matmul_ptq1_0_gguf_f_f32", f32,        std::convert::identity, 64),
-        ptq1_gemm_spec!(R, "matmul_ptq1_0_gguf_bm64_bf16", "matmul_ptq1_0_gguf_f_",    half::bf16, half::bf16::from_f32, 64),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg2_nr2_f32",
+            "matvec_ptq1_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            2,
+            2
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg2_nr4_f32",
+            "matvec_ptq1_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            2,
+            4
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg2_nr8_f32",
+            "matvec_ptq1_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            2,
+            8
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg2_nr2_bf16",
+            "matvec_ptq1_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            2,
+            2
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg2_nr4_bf16",
+            "matvec_ptq1_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            2,
+            4
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg2_nr8_bf16",
+            "matvec_ptq1_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            2,
+            8
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg4_nr2_f32",
+            "matvec_ptq1_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            4,
+            2
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg4_nr4_f32",
+            "matvec_ptq1_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            4,
+            4
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg4_nr8_f32",
+            "matvec_ptq1_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            4,
+            8
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg4_nr2_bf16",
+            "matvec_ptq1_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            4,
+            2
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg4_nr4_bf16",
+            "matvec_ptq1_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            4,
+            4
+        ),
+        ptq1_spec!(
+            R,
+            "matvec_ptq1_0_gguf_nsg4_nr8_bf16",
+            "matvec_ptq1_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            4,
+            8
+        ),
+        ptq1_gemm_spec!(
+            R,
+            "matmul_ptq1_0_gguf_bm32_f32",
+            "matmul_ptq1_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            32
+        ),
+        ptq1_gemm_spec!(
+            R,
+            "matmul_ptq1_0_gguf_bm32_bf16",
+            "matmul_ptq1_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            32
+        ),
+        ptq1_gemm_spec!(
+            R,
+            "matmul_ptq1_0_gguf_bm64_f32",
+            "matmul_ptq1_0_gguf_f_f32",
+            f32,
+            std::convert::identity,
+            64
+        ),
+        ptq1_gemm_spec!(
+            R,
+            "matmul_ptq1_0_gguf_bm64_bf16",
+            "matmul_ptq1_0_gguf_f_",
+            half::bf16,
+            half::bf16::from_f32,
+            64
+        ),
     ]
 }
 
@@ -177,14 +455,29 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
             artifact: "gdn_conv1d_k4",
             entry: "gdn_conv1d_f_f32",
             launch: |c| {
-                let _ = hanzo_kernel::gdn::gdn_conv1d_run::<R>(c, &vec![0.0; 16], &vec![0.0; 16], 1, 4, 4, 4);
+                let _ = hanzo_kernel::gdn::gdn_conv1d_run::<R>(
+                    c,
+                    &vec![0.0; 16],
+                    &vec![0.0; 16],
+                    1,
+                    4,
+                    4,
+                    4,
+                );
             },
         },
         Spec {
             artifact: "gdn_gating",
             entry: "gdn_gating_f_f32",
             launch: |c| {
-                let _ = hanzo_kernel::gdn::gdn_gating_run::<R>(c, &vec![0.0; 4], &vec![0.0; 4], &vec![0.0; 4], &vec![0.0; 4], 4);
+                let _ = hanzo_kernel::gdn::gdn_gating_run::<R>(
+                    c,
+                    &vec![0.0; 4],
+                    &vec![0.0; 4],
+                    &vec![0.0; 4],
+                    &vec![0.0; 4],
+                    4,
+                );
             },
         },
         Spec {
@@ -192,8 +485,20 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
             entry: "gdn_scan_lanes_f_f32",
             launch: |c| {
                 let _ = hanzo_kernel::gdn::gdn_scan_lanes_run::<R>(
-                    c, &vec![0.0; 128], &vec![0.0; 128], &vec![0.0; 128], &[0.0], &[0.0],
-                    &vec![0.0; 128 * 128], 1, 1, 128, 128, 4, 64, false,
+                    c,
+                    &vec![0.0; 128],
+                    &vec![0.0; 128],
+                    &vec![0.0; 128],
+                    &[0.0],
+                    &[0.0],
+                    &vec![0.0; 128 * 128],
+                    1,
+                    1,
+                    128,
+                    128,
+                    4,
+                    64,
+                    false,
                 );
             },
         },
@@ -202,8 +507,20 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
             entry: "gdn_scan_lanes_f_f32",
             launch: |c| {
                 let _ = hanzo_kernel::gdn::gdn_scan_lanes_run::<R>(
-                    c, &vec![0.0; 128], &vec![0.0; 128], &vec![0.0; 128], &[0.0], &[0.0],
-                    &vec![0.0; 128 * 128], 1, 1, 128, 128, 8, 128, false,
+                    c,
+                    &vec![0.0; 128],
+                    &vec![0.0; 128],
+                    &vec![0.0; 128],
+                    &[0.0],
+                    &[0.0],
+                    &vec![0.0; 128 * 128],
+                    1,
+                    1,
+                    128,
+                    128,
+                    8,
+                    128,
+                    false,
                 );
             },
         },
@@ -212,8 +529,20 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
             entry: "gdn_scan_lanes_f_f32",
             launch: |c| {
                 let _ = hanzo_kernel::gdn::gdn_scan_lanes_run::<R>(
-                    c, &vec![0.0; 64], &vec![0.0; 64], &vec![0.0; 64], &[0.0], &[0.0],
-                    &vec![0.0; 64 * 64], 1, 1, 64, 64, 4, 64, false,
+                    c,
+                    &vec![0.0; 64],
+                    &vec![0.0; 64],
+                    &vec![0.0; 64],
+                    &[0.0],
+                    &[0.0],
+                    &vec![0.0; 64 * 64],
+                    1,
+                    1,
+                    64,
+                    64,
+                    4,
+                    64,
+                    false,
                 );
             },
         },
@@ -223,7 +552,18 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
             entry: "flash_attn_f_f32",
             launch: |c| {
                 let _ = hanzo_kernel::flash::flash_attn_run::<R>(
-                    c, &vec![0.0; 64], &vec![0.0; 64], &vec![0.0; 64], 1, 1, 1, 1, 1, 1, 64, false,
+                    c,
+                    &vec![0.0; 64],
+                    &vec![0.0; 64],
+                    &vec![0.0; 64],
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    64,
+                    false,
                 );
             },
         },
@@ -232,7 +572,18 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
             entry: "flash_attn_f_f32",
             launch: |c| {
                 let _ = hanzo_kernel::flash::flash_attn_run::<R>(
-                    c, &vec![0.0; 128], &vec![0.0; 128], &vec![0.0; 128], 1, 1, 1, 1, 1, 1, 128, false,
+                    c,
+                    &vec![0.0; 128],
+                    &vec![0.0; 128],
+                    &vec![0.0; 128],
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    128,
+                    false,
                 );
             },
         },
@@ -282,7 +633,10 @@ fn write_or_check(dir: &Path, check: bool, ext: &str, items: &[(&str, String)]) 
 /// `spirv-dis`/`spirv-as` tools.
 #[cfg(all(feature = "vulkan", feature = "spirv-dump"))]
 fn rename_spv_entry_to_main(bytes: &[u8]) -> Vec<u8> {
-    assert!(bytes.len() >= 20 && bytes.len() % 4 == 0, "invalid SPIR-V byte length");
+    assert!(
+        bytes.len() >= 20 && bytes.len() % 4 == 0,
+        "invalid SPIR-V byte length"
+    );
     let words: Vec<u32> = bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -297,7 +651,10 @@ fn rename_spv_entry_to_main(bytes: &[u8]) -> Vec<u8> {
         let header = words[i];
         let wc = (header >> 16) as usize;
         let op = (header & 0xffff) as u16;
-        assert!(wc >= 1 && i + wc <= words.len(), "corrupt SPIR-V instruction at word {i}");
+        assert!(
+            wc >= 1 && i + wc <= words.len(),
+            "corrupt SPIR-V instruction at word {i}"
+        );
         if op == 15 {
             // OpEntryPoint: [header, ExecModel, EntryPointId, Name (null-term literal), Interface...]
             assert!(wc >= 4, "truncated OpEntryPoint");
@@ -324,7 +681,10 @@ fn rename_spv_entry_to_main(bytes: &[u8]) -> Vec<u8> {
         }
         i += wc;
     }
-    assert_eq!(renamed, 1, "expected exactly 1 OpEntryPoint in SPIR-V module, got {renamed}");
+    assert_eq!(
+        renamed, 1,
+        "expected exactly 1 OpEntryPoint in SPIR-V module, got {renamed}"
+    );
     let mut out_bytes = Vec::with_capacity(out.len() * 4);
     for w in out {
         out_bytes.extend_from_slice(&w.to_le_bytes());
@@ -337,7 +697,9 @@ fn rename_spv_entry_to_main(bytes: &[u8]) -> Vec<u8> {
 /// offsets, so two runs on the same IR can permute header/offset order while keeping exact size,
 /// entry point, and instruction opcode counts.
 #[cfg(all(feature = "vulkan", feature = "spirv-dump"))]
-fn spv_fingerprint(bytes: &[u8]) -> Option<(usize, String, std::collections::BTreeMap<u16, usize>)> {
+fn spv_fingerprint(
+    bytes: &[u8],
+) -> Option<(usize, String, std::collections::BTreeMap<u16, usize>)> {
     if bytes.len() < 20 || bytes.len() % 4 != 0 {
         return None;
     }
@@ -487,8 +849,8 @@ fn main() {
         #[cfg(all(feature = "vulkan", feature = "spirv-dump"))]
         "vulkan" => {
             use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-            let spv_tmp = std::env::temp_dir()
-                .join(format!("hanzo-kernel-gen-spv-{}", std::process::id()));
+            let spv_tmp =
+                std::env::temp_dir().join(format!("hanzo-kernel-gen-spv-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&spv_tmp);
             std::fs::create_dir_all(&spv_tmp).expect("create spv temp dir");
             std::env::set_var("CUBECL_DEBUG_SPIRV", &spv_tmp);
@@ -510,7 +872,10 @@ fn main() {
                 .collect();
             let mut items: Vec<(String, Vec<u8>)> = Vec::with_capacity(specs.len());
             for spec in &specs {
-                for ent in std::fs::read_dir(&spv_tmp).expect("read spv temp dir").flatten() {
+                for ent in std::fs::read_dir(&spv_tmp)
+                    .expect("read spv temp dir")
+                    .flatten()
+                {
                     let _ = std::fs::remove_file(ent.path());
                 }
                 (spec.launch)(&client);

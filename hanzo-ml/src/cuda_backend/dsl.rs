@@ -111,7 +111,12 @@ fn parse_dynamic_shared_mem_bytes(cu: &str) -> u32 {
 
 fn cuda_include_paths() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for var in ["CUDA_TOOLKIT_ROOT_DIR", "CUDA_ROOT", "CUDA_HOME", "CUDA_PATH"] {
+    for var in [
+        "CUDA_TOOLKIT_ROOT_DIR",
+        "CUDA_ROOT",
+        "CUDA_HOME",
+        "CUDA_PATH",
+    ] {
         if let Ok(v) = std::env::var(var) {
             roots.push(PathBuf::from(v));
         }
@@ -165,7 +170,12 @@ fn compile_cu_to_ptx(src: &str, cc: i32) -> Result<String> {
         if let Err(err) = compile_res {
             let log = cudarc::nvrtc::result::get_program_log(prog)
                 .ok()
-                .and_then(|raw| CStr::from_ptr(raw.as_ptr()).to_str().ok().map(str::to_owned))
+                .and_then(|raw| {
+                    CStr::from_ptr(raw.as_ptr())
+                        .to_str()
+                        .ok()
+                        .map(str::to_owned)
+                })
                 .unwrap_or_default();
             let _ = cudarc::nvrtc::result::destroy_program(prog);
             return Err(Error::Msg(format!(
@@ -196,11 +206,7 @@ impl CudaDevice {
         let art = kernel_cu(name)?;
         let mod_key = format!("dsl::{name}");
         let shmem_map = DSL_SHMEM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(&shmem) = shmem_map
-            .lock()
-            .unwrap()
-            .get(&(self.id(), mod_key.clone()))
-        {
+        if let Some(&shmem) = shmem_map.lock().unwrap().get(&(self.id(), mod_key.clone())) {
             // Module is already loaded in `custom_modules`; empty ptx slice is unused on hit.
             let func = self.get_or_load_custom_func(art.entry, &mod_key, "")?;
             return Ok((func, shmem));
@@ -209,7 +215,10 @@ impl CudaDevice {
         let ptx = compile_cu_to_ptx(art.cu, cc)?;
         let shmem = parse_dynamic_shared_mem_bytes(art.cu);
         let func = self.get_or_load_custom_func(art.entry, &mod_key, &ptx)?;
-        shmem_map.lock().unwrap().insert((self.id(), mod_key), shmem);
+        shmem_map
+            .lock()
+            .unwrap()
+            .insert((self.id(), mod_key), shmem);
         crate::quantized::dsl::note_compile(name);
         Ok((func, shmem))
     }

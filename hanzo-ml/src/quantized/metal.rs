@@ -543,16 +543,7 @@ impl QMetalStorage {
         // PQ2_0 / PTQ1_0 decode (m == 1): generated DSL matvec when selected, else legacy hand kernel.
         if m == 1
             && self.try_dispatch_ternary_dsl(
-                &device,
-                kdtype,
-                storage,
-                layout,
-                &dst,
-                m,
-                n,
-                k,
-                src1_bf16,
-                false,
+                &device, kdtype, storage, layout, &dst, m, n, k, src1_bf16, false,
             )?
         {
             let dst_storage =
@@ -670,16 +661,7 @@ impl QMetalStorage {
         if self_shape.rank() == 2 {
             let m_total: usize = src_shape.dims()[..src_shape.rank() - 1].iter().product();
             if self.try_dispatch_ternary_dsl(
-                &device,
-                kdtype,
-                storage,
-                layout,
-                &dst,
-                m_total,
-                n,
-                k,
-                src1_bf16,
-                true,
+                &device, kdtype, storage, layout, &dst, m_total, n, k, src1_bf16, true,
             )? {
                 let dst_storage = crate::MetalStorage::new(
                     dst,

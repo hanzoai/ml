@@ -230,11 +230,11 @@ fn gguf_dsl_eligible(
     buf_bytes: usize,
     block_bytes: usize,
 ) -> Result<usize, &'static str> {
-    if k % 128 != 0 {
+    if !k.is_multiple_of(128) {
         return Err("k not a multiple of 128");
     }
     let bytes = n * (k / 128) * block_bytes;
-    if bytes % 4 != 0 {
+    if !bytes.is_multiple_of(4) {
         return Err("odd block count: tensor is not a whole number of u32 words");
     }
     if buf_bytes < bytes {
@@ -397,7 +397,11 @@ mod tests {
                 }
             }
         }
-        for (m, n, want_bm) in [(16usize, 5120usize, 32usize), (64, 1024, 32), (64, 5120, 64)] {
+        for (m, n, want_bm) in [
+            (16usize, 5120usize, 32usize),
+            (64, 1024, 32),
+            (64, 5120, 64),
+        ] {
             for bf16 in [false, true] {
                 let (a, bm) = pq2_matmul_artifact(m, n, bf16);
                 assert_eq!(bm, want_bm);

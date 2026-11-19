@@ -307,27 +307,39 @@ pub fn gdn_scan_run<R: Runtime>(
     k_dim: usize,
     v_dim: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    with_scan_buffers(client, q, k, v, g, beta, state, bh, seq, v_dim, |qh, kh, vh, gh, betah, sh, oh, dh, out_len| {
-        let block = 64u32;
-        let grid = ((bh * v_dim) as u32).div_ceil(block);
-        unsafe {
-            gdn_scan::launch_unchecked::<f32, R>(
-                client,
-                Grid::Static(grid, 1, 1),
-                Block::new_1d(block),
-                ArrayArg::from_raw_parts(qh.clone(), q.len()),
-                ArrayArg::from_raw_parts(kh.clone(), k.len()),
-                ArrayArg::from_raw_parts(vh.clone(), v.len()),
-                ArrayArg::from_raw_parts(gh.clone(), g.len()),
-                ArrayArg::from_raw_parts(betah.clone(), beta.len()),
-                ArrayArg::from_raw_parts(sh.clone(), state.len()),
-                ArrayArg::from_raw_parts(oh.clone(), out_len),
-                ArrayArg::from_raw_parts(dh.clone(), 2),
-                k_dim,
-                v_dim,
-            );
-        }
-    })
+    with_scan_buffers(
+        client,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        bh,
+        seq,
+        v_dim,
+        |qh, kh, vh, gh, betah, sh, oh, dh, out_len| {
+            let block = 64u32;
+            let grid = ((bh * v_dim) as u32).div_ceil(block);
+            unsafe {
+                gdn_scan::launch_unchecked::<f32, R>(
+                    client,
+                    Grid::Static(grid, 1, 1),
+                    Block::new_1d(block),
+                    ArrayArg::from_raw_parts(qh.clone(), q.len()),
+                    ArrayArg::from_raw_parts(kh.clone(), k.len()),
+                    ArrayArg::from_raw_parts(vh.clone(), v.len()),
+                    ArrayArg::from_raw_parts(gh.clone(), g.len()),
+                    ArrayArg::from_raw_parts(betah.clone(), beta.len()),
+                    ArrayArg::from_raw_parts(sh.clone(), state.len()),
+                    ArrayArg::from_raw_parts(oh.clone(), out_len),
+                    ArrayArg::from_raw_parts(dh.clone(), 2),
+                    k_dim,
+                    v_dim,
+                );
+            }
+        },
+    )
 }
 
 /// Host launch for [`gdn_scan_lanes`]. Same tensor layout as [`gdn_scan_run`].
@@ -348,28 +360,40 @@ pub fn gdn_scan_lanes_run<R: Runtime>(
     block: usize,
     vk_layout: bool,
 ) -> (Vec<f32>, Vec<f32>) {
-    with_scan_buffers(client, q, k, v, g, beta, state, bh, seq, v_dim, |qh, kh, vh, gh, betah, sh, oh, dh, out_len| {
-        let grid = ((bh * v_dim * lanes) as u32).div_ceil(block as u32);
-        unsafe {
-            gdn_scan_lanes::launch_unchecked::<f32, R>(
-                client,
-                Grid::Static(grid, 1, 1),
-                Block::new_1d(block as u32),
-                ArrayArg::from_raw_parts(qh.clone(), q.len()),
-                ArrayArg::from_raw_parts(kh.clone(), k.len()),
-                ArrayArg::from_raw_parts(vh.clone(), v.len()),
-                ArrayArg::from_raw_parts(gh.clone(), g.len()),
-                ArrayArg::from_raw_parts(betah.clone(), beta.len()),
-                ArrayArg::from_raw_parts(sh.clone(), state.len()),
-                ArrayArg::from_raw_parts(oh.clone(), out_len),
-                ArrayArg::from_raw_parts(dh.clone(), 2),
-                k_dim,
-                v_dim,
-                lanes,
-                vk_layout,
-            );
-        }
-    })
+    with_scan_buffers(
+        client,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        bh,
+        seq,
+        v_dim,
+        |qh, kh, vh, gh, betah, sh, oh, dh, out_len| {
+            let grid = ((bh * v_dim * lanes) as u32).div_ceil(block as u32);
+            unsafe {
+                gdn_scan_lanes::launch_unchecked::<f32, R>(
+                    client,
+                    Grid::Static(grid, 1, 1),
+                    Block::new_1d(block as u32),
+                    ArrayArg::from_raw_parts(qh.clone(), q.len()),
+                    ArrayArg::from_raw_parts(kh.clone(), k.len()),
+                    ArrayArg::from_raw_parts(vh.clone(), v.len()),
+                    ArrayArg::from_raw_parts(gh.clone(), g.len()),
+                    ArrayArg::from_raw_parts(betah.clone(), beta.len()),
+                    ArrayArg::from_raw_parts(sh.clone(), state.len()),
+                    ArrayArg::from_raw_parts(oh.clone(), out_len),
+                    ArrayArg::from_raw_parts(dh.clone(), 2),
+                    k_dim,
+                    v_dim,
+                    lanes,
+                    vk_layout,
+                );
+            }
+        },
+    )
 }
 
 // ================================== CPU oracles (references) ====================================
