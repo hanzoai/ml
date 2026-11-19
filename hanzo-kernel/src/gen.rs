@@ -141,22 +141,25 @@ pub fn capture<R: Runtime>(
         let log = std::fs::read_to_string(log_path)
             .map_err(|e| format!("read {}: {e}", log_path.display()))?;
         let fresh = &log[before.min(log.len())..];
-        let hit = parse_log(fresh)
-            .into_iter()
-            .find(|c| c.entry() == Some(spec.entry))
-            .or_else(|| {
-                // Already compiled by an earlier spec in this run (cubecl caches by kernel id):
-                // search the whole log.
-                parse_log(&log)
-                    .into_iter()
-                    .find(|c| c.entry() == Some(spec.entry))
-            })
-            .ok_or_else(|| {
-                format!(
-                    "{}: entry `{}` not found in compilation log (CUBECL_DEBUG_LOG set before client creation?)",
-                    spec.artifact, spec.entry
-                )
-            })?;
+        // Only THIS launch's compilations count: specializations of one kernel share an entry name
+        // (comptime params do not rename it), so matching anywhere else in the log could hand back a
+        // different specialization's source.
+        let all = parse_log(fresh);
+        let hits: Vec<Captured> = all
+            .iter()
+            .filter(|c| c.entry() == Some(spec.entry))
+            .cloned()
+            .collect();
+        if hits.len() != 1 {
+            let seen: Vec<&str> = all.iter().filter_map(|c| c.entry()).collect();
+            return Err(format!(
+                "{}: its launch compiled `{}` {} times, expected exactly 1; entries it did compile: {seen:?}",
+                spec.artifact,
+                spec.entry,
+                hits.len()
+            ));
+        }
+        let hit = hits.into_iter().next().unwrap();
         got.push((i, hit.source));
     }
     Ok(got)

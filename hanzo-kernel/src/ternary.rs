@@ -752,7 +752,7 @@ pub fn pq2_0_gguf_ref(bytes: &[u8], x: &[f32], rows: usize, k: usize) -> Vec<f32
         .collect()
 }
 
-/// Launch [`matvec_pq2_0_gguf`] once and read the result back.
+/// Launch [`matvec_pq2_0_gguf`] once and read the result back (f32 activation).
 #[allow(clippy::too_many_arguments)]
 pub fn matvec_pq2_0_gguf_run<R: Runtime>(
     client: &ComputeClient<R>,
@@ -763,12 +763,26 @@ pub fn matvec_pq2_0_gguf_run<R: Runtime>(
     nsg: usize,
     nr0: usize,
 ) -> Vec<f32> {
+    matvec_pq2_0_gguf_run_as::<f32, R>(client, words, x, rows, k, nsg, nr0)
+}
+
+/// Launch [`matvec_pq2_0_gguf`] with activation/output element `E` (f32 or bf16).
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_pq2_0_gguf_run_as<E: Float + CubeElement + Default, R: Runtime>(
+    client: &ComputeClient<R>,
+    words: &[u32],
+    x: &[E],
+    rows: usize,
+    k: usize,
+    nsg: usize,
+    nr0: usize,
+) -> Vec<E> {
     let wh = client.create_from_slice(u32::as_bytes(words));
-    let xh = client.create_from_slice(f32::as_bytes(x));
-    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows]));
+    let xh = client.create_from_slice(E::as_bytes(x));
+    let oh = client.create_from_slice(E::as_bytes(&vec![E::default(); rows]));
     let mh = client.create_from_slice(u32::as_bytes(&[k as u32, rows as u32, words.len() as u32]));
     unsafe {
-        matvec_pq2_0_gguf::launch_unchecked::<f32, R>(
+        matvec_pq2_0_gguf::launch_unchecked::<E, R>(
             client,
             Grid::Static(rows.div_ceil(nsg * nr0) as u32, 1, 1),
             Block::new_2d(32, nsg as u32),
@@ -780,7 +794,21 @@ pub fn matvec_pq2_0_gguf_run<R: Runtime>(
             nr0,
         );
     }
-    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+    E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// The production schedule for a PQ2_0 decode matvec with `rows` outputs: NSG = 4 (128 threads),
+/// NR0 by output count (cold-DRAM M4 Max sweep on perf/metal-pq2-matvec: 2 up to 2048 rows, 4 below
+/// 16384, 8 above). The single source of truth hanzo-ml's dispatch and kernel-gen both read.
+pub fn pq2_0_gguf_schedule(rows: usize) -> (usize, usize) {
+    let nr0 = if rows <= 2048 {
+        2
+    } else if rows < 16384 {
+        4
+    } else {
+        8
+    };
+    (4, nr0)
 }
 
 /// Shapes every backend is gated on: odd block counts (the half-word path and the clamped tail),
@@ -875,4 +903,62 @@ mod gguf_layout_tests {
             assert!((u - v).abs() <= 1e-5 * v.abs().max(1.0), "{u} vs {v}");
         }
     }
+}
+
+// ================================================================================================
+// Compiler regression fixture: the vendored cubecl-cpp `HANZO PATCH (bitcast-of-literal)`.
+// ================================================================================================
+
+/// Decode f16 bit patterns through [`crate::quant::f16lo_to_f32`]. Its subnormal path bitcasts a
+/// constant (`f32::reinterpret(113 << 23)`), which upstream cubecl-cpp lowered to an invalid MSL
+/// reference cast of an rvalue. Running this through each backend's real compiler is the regression
+/// gate for the patch: Metal (patched path), CUDA/HIP (same shared emitter, must stay equivalent),
+/// Vulkan (SPIR-V, untouched).
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
+pub fn f16_decode_probe(bits: &Array<u32>, out: &mut Array<f32>) {
+    let i = ABSOLUTE_POS;
+    if i < bits.len() {
+        out[i] = crate::quant::f16lo_to_f32(bits[i]);
+    }
+}
+
+/// Every f16 class: zeros, smallest/largest subnormals, normals, max, infinities, and a run of
+/// random patterns (NaNs are excluded: their payload is not part of the contract).
+pub fn f16_probe_bits() -> Vec<u32> {
+    let mut v: Vec<u32> = vec![
+        0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x83FF, 0x0400, 0x8400, 0x3C00, 0xBC00, 0x3555,
+        0x7BFF, 0xFBFF, 0x7C00, 0xFC00,
+    ];
+    let mut x = 0x2545_F491u32;
+    while v.len() < 4096 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let h = x & 0xFFFF;
+        if (h & 0x7C00) != 0x7C00 || (h & 0x03FF) == 0 {
+            v.push(h);
+        }
+    }
+    v
+}
+
+/// Run the probe; returns the number of patterns whose decode differs from `half` bit-for-bit.
+pub fn f16_decode_probe_run<R: Runtime>(client: &ComputeClient<R>) -> usize {
+    let bits = f16_probe_bits();
+    let bh = client.create_from_slice(u32::as_bytes(&bits));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0f32; bits.len()]));
+    unsafe {
+        f16_decode_probe::launch_unchecked::<R>(
+            client,
+            Grid::Static(bits.len().div_ceil(256) as u32, 1, 1),
+            Block::new_1d(256),
+            ArrayArg::from_raw_parts(bh, bits.len()),
+            ArrayArg::from_raw_parts(oh.clone(), bits.len()),
+        );
+    }
+    let got = f32::from_bytes(&client.read_one_unchecked(oh)).to_vec();
+    bits.iter()
+        .zip(&got)
+        .filter(|(b, g)| half::f16::from_bits(**b as u16).to_f32().to_bits() != g.to_bits())
+        .count()
 }

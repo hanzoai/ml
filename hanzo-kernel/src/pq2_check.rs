@@ -23,6 +23,15 @@ fn report<R: Runtime>(client: &ComputeClient<R>) -> bool {
         eprintln!("SKIP: kernel requires 32-lane planes (this backend keeps its fallback)");
         return false;
     }
+    // Compiler fixture first: the f16 decode the PQ2 scale path uses, through this backend's real
+    // compiler (the vendored cubecl-cpp bitcast-of-literal patch).
+    let bad = hanzo_kernel::ternary::f16_decode_probe_run(client);
+    println!(
+        "{} f16_decode_probe: {} of {} patterns differ from `half`",
+        if bad == 0 { "ok  " } else { "FAIL" },
+        bad,
+        hanzo_kernel::ternary::f16_probe_bits().len()
+    );
     let mut worst = 0f32;
     let mut fails = 0;
     for (rows, k, nsg, nr0, rel) in pq2_0_gguf_board(client) {
@@ -37,7 +46,7 @@ fn report<R: Runtime>(client: &ComputeClient<R>) -> bool {
         );
     }
     println!("worst_rel={worst:.3e} gate={REL_GATE:.0e} fails={fails}");
-    fails == 0
+    fails == 0 && bad == 0
 }
 
 fn main() {
