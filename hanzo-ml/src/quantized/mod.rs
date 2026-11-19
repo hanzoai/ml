@@ -2317,6 +2317,8 @@ impl QMatMul {
                     | GgmlDType::IQ4_XS
                     | GgmlDType::IQ4_NL
                     | GgmlDType::TQ2_0
+                    | GgmlDType::PQ2_0
+                    | GgmlDType::PTQ1_0
                     | GgmlDType::IQ2_XXS
                     | GgmlDType::IQ2_S
                     | GgmlDType::IQ3_XXS
@@ -3268,6 +3270,46 @@ impl crate::Module for QMatMul {
                 };
                 let xs = xs_on_vdev.as_ref().unwrap_or(xs);
                 let rows: usize = xs.elem_count() / *k;
+                if matches!(dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) {
+                    let xs_f32 = if xs.dtype() == DType::F32 {
+                        vulkan_act_offset0(xs)?
+                    } else {
+                        vulkan_act_offset0(&xs.to_dtype(DType::F32)?)?
+                    };
+                    let d = match xs_f32.device() {
+                        Device::Vulkan(d) => d,
+                        _ => crate::bail!("VulkanQuant input not on vulkan"),
+                    };
+                    let maybe_y = {
+                        let xs_p = packed(&xs_f32)?;
+                        let (store, _) = xs_p.storage_and_layout();
+                        let xv = match &*store {
+                            crate::Storage::Vulkan(v) => v,
+                            _ => crate::bail!("VulkanQuant expected vulkan storage"),
+                        };
+                        d.try_dispatch_ternary_dsl(*dtype, wq, xv, rows, *n, *k)?
+                    };
+                    if let Some(y) = maybe_y {
+                        let mut dims = xs_f32.dims().to_vec();
+                        let last = dims.len() - 1;
+                        dims[last] = *n;
+                        return Ok(crate::tensor::from_storage(
+                            crate::Storage::Vulkan(y),
+                            dims,
+                            crate::op::BackpropOp::none(),
+                            false,
+                        ));
+                    }
+                    // Legacy fallback (default HANZO_PQ2_IMPL=legacy / HANZO_PTQ1_IMPL=legacy,
+                    // or unsupported subgroup/coopmat config): dequantize to f32 and run dense matmul.
+                    let w = qtensor.dequantize(&xs.device())?;
+                    let w = match *xs.dims() {
+                        [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                        [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                        _ => w.t()?,
+                    };
+                    return xs.matmul(&w);
+                }
                 if rows == 1 {
                     // Decode: weights stay quantized in VRAM; the matching native-GGML quant matvec
                     // runs straight out of the block format (no dequant, no copy).

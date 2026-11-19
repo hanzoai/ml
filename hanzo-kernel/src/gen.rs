@@ -38,13 +38,17 @@ pub struct Captured {
 
 impl Captured {
     /// Entry-point name declared in the source, for MSL (`[[kernel]]\nvoid <name>(`) and CUDA/HIP
-    /// (`__global__ void <name>(`).
+    /// (`__global__ void [__launch_bounds__(...)] <name>(`).
     pub fn entry(&self) -> Option<&str> {
         let s = &self.source;
         let at = s.find("[[kernel]]").or_else(|| s.find("__global__"))?;
         let rest = &s[at..];
         let v = rest.find("void ")? + "void ".len();
-        let rest = &rest[v..];
+        let mut rest = rest[v..].trim_start();
+        if let Some(after) = rest.strip_prefix("__launch_bounds__") {
+            let close = after.find(')')?;
+            rest = after[close + 1..].trim_start();
+        }
         let end = rest.find('(')?;
         Some(rest[..end].trim())
     }
@@ -98,7 +102,11 @@ pub fn canonicalize(src: &str) -> String {
 /// `struct info_st {..};`) by iterating a hash set. Sort those blocks by text, but only when no struct
 /// names another one in its body, so a dependent declaration order can never be broken.
 fn sort_prologue_structs(src: &str) -> String {
-    let Some(kernel_at) = src.find("[[kernel]]").or_else(|| src.find("__global__")) else {
+    let Some(kernel_at) = src
+        .find("[[kernel]]")
+        .or_else(|| src.find("extern \"C\" __global__"))
+        .or_else(|| src.find("__global__"))
+    else {
         return src.to_string();
     };
     let (pro, rest) = src.split_at(kernel_at);
