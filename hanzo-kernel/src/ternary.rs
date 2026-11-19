@@ -798,17 +798,14 @@ pub fn matvec_pq2_0_gguf_run_as<E: Float + CubeElement + Default, R: Runtime>(
 }
 
 /// The production schedule for a PQ2_0 decode matvec with `rows` outputs: NSG = 4 (128 threads),
-/// NR0 by output count (cold-DRAM M4 Max sweep on perf/metal-pq2-matvec: 2 up to 2048 rows, 4 below
-/// 16384, 8 above). The single source of truth hanzo-ml's dispatch and kernel-gen both read.
+/// NR0 = 4 at every size. Measured for THIS kernel on dbc M4 Max (`hanzo-ml` test
+/// `pq2_dsl_nr0_sweep`, 27B decode shapes, cold-bank rotation): NR0=8 was the slowest arm at every
+/// shape (+30-46% time at 17408 and 248320 rows), NR0=4 within ~1% of the best everywhere. The NR0=8
+/// rows-based table it replaces came from the HAND kernel's sweep and did not transfer. The single
+/// source of truth hanzo-ml's dispatch and kernel-gen both read.
 pub fn pq2_0_gguf_schedule(rows: usize) -> (usize, usize) {
-    let nr0 = if rows <= 2048 {
-        2
-    } else if rows < 16384 {
-        4
-    } else {
-        8
-    };
-    (4, nr0)
+    let _ = rows;
+    (4, 4)
 }
 
 /// Shapes every backend is gated on: odd block counts (the half-word path and the clamped tail),

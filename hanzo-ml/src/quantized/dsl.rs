@@ -66,23 +66,48 @@ pub fn set_pq2_impl(i: QkImpl) {
     PQ2_IMPL.store(encode(i), Ordering::Relaxed);
 }
 
-/// The production PQ2_0 decode schedule `(nsg, nr0)` for `rows` outputs. Mirrors
+/// The production PQ2_0 decode schedule `(nsg, nr0)` for `rows` outputs (NR0 = 4 everywhere, from the
+/// `pq2_dsl_nr0_sweep` measurement on M4 Max). Mirrors
 /// `hanzo_kernel::ternary::pq2_0_gguf_schedule` (a dev-dependency test holds them equal), which is
 /// what `kernel-gen` generates artifacts for.
 pub fn pq2_schedule(rows: usize) -> (usize, usize) {
-    let nr0 = if rows <= 2048 {
-        2
-    } else if rows < 16384 {
-        4
-    } else {
-        8
-    };
-    (4, nr0)
+    let _ = rows;
+    (4, 4)
+}
+
+/// Diagnostic schedule override for measurement only: `HANZO_PQ2_NR0=2|4|8` forces every PQ2_0
+/// decode matvec onto that generated artifact (set_pq2_nr0 does the same in-process). Production
+/// schedules live in `pq2_schedule`, decided from these measurements.
+static NR0_FORCE: AtomicU8 = AtomicU8::new(UNSET);
+
+fn nr0_override() -> Option<usize> {
+    match NR0_FORCE.load(Ordering::Relaxed) {
+        UNSET => {
+            let v = match std::env::var("HANZO_PQ2_NR0").as_deref() {
+                Ok("2") => 2,
+                Ok("4") => 4,
+                Ok("8") => 8,
+                _ => 0,
+            };
+            NR0_FORCE.store(v, Ordering::Relaxed);
+            (v != 0).then_some(v as usize)
+        }
+        0 => None,
+        v => Some(v as usize),
+    }
+}
+
+/// Force (Some) or clear (None) the diagnostic NR0 override in-process.
+pub fn set_pq2_nr0(nr0: Option<usize>) {
+    NR0_FORCE.store(nr0.map_or(0, |v| v as u8), Ordering::Relaxed);
 }
 
 /// The generated artifact (= pipeline identity) for a PQ2_0 decode matvec, with its schedule.
 pub fn pq2_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, usize) {
-    let (nsg, nr0) = pq2_schedule(rows);
+    let (nsg, mut nr0) = pq2_schedule(rows);
+    if let Some(forced) = nr0_override() {
+        nr0 = forced;
+    }
     let a = match (nr0, bf16) {
         (2, false) => "matvec_pq2_0_gguf_nsg4_nr2_f32",
         (4, false) => "matvec_pq2_0_gguf_nsg4_nr4_f32",
@@ -239,14 +264,17 @@ mod tests {
     #[test]
     fn artifacts_are_distinct_per_schedule_and_dtype() {
         let mut seen = std::collections::HashSet::new();
-        for rows in [100, 5000, 20000] {
+        for nr0 in [2usize, 4, 8] {
+            set_pq2_nr0(Some(nr0));
             for bf16 in [false, true] {
-                let (a, _, nr0) = pq2_matvec_artifact(rows, bf16);
+                let (a, _, got) = pq2_matvec_artifact(5000, bf16);
+                assert_eq!(got, nr0);
                 assert!(a.contains(&format!("_nr{nr0}_")), "{a}");
                 assert!(a.ends_with(if bf16 { "_bf16" } else { "_f32" }), "{a}");
                 assert!(seen.insert(a), "duplicate pipeline identity {a}");
             }
         }
+        set_pq2_nr0(None);
     }
 
     #[test]

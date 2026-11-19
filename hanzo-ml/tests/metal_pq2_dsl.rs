@@ -246,3 +246,133 @@ fn pq2_dsl_real_model_tensors() {
         names.len().min(max)
     );
 }
+
+/// Kernel-level A/B at the 27B decode shapes (run with --ignored on a quiet GPU). Each arm streams
+/// `BANKS` distinct weight copies in rotation so neither benefits from a warm SLC, and both arms run
+/// interleaved per shape. Reports best-of-5 microseconds per matvec and effective GB/s.
+#[test]
+#[ignore]
+fn pq2_dsl_vs_legacy_kernel_bench() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const BANKS: usize = 6;
+    const ITERS: usize = 60;
+    let dev = Device::new_metal(0).unwrap();
+    let shapes = [
+        (10240usize, 5120usize),
+        (6144, 5120),
+        (5120, 6144),
+        (17408, 5120),
+        (5120, 17408),
+        (12288, 5120),
+        (1024, 5120),
+        (248_320, 5120),
+    ];
+    eprintln!("shape            arm     us/matvec   GB/s");
+    for (n, k) in shapes {
+        let banks: Vec<QMatMul> = (0..BANKS)
+            .map(|b| matmul(&dev, &raw_pq2(n, k, 100 + b as u64), n, k))
+            .collect();
+        let x = Tensor::from_vec(act(k), (1, k), &dev).unwrap();
+        let bytes = (n * k / 128 * 34) as f64;
+        let mut res = vec![];
+        for imp in [QkImpl::Legacy, QkImpl::Dsl, QkImpl::Legacy, QkImpl::Dsl] {
+            dsl::set_pq2_impl(imp);
+            for b in &banks {
+                b.forward(&x).unwrap();
+            }
+            dev.synchronize().unwrap();
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                for i in 0..ITERS {
+                    let _ = banks[i % BANKS].forward(&x).unwrap();
+                }
+                dev.synchronize().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() * 1e6 / ITERS as f64);
+            }
+            res.push((imp, best));
+        }
+        for imp in [QkImpl::Legacy, QkImpl::Dsl] {
+            let us = res
+                .iter()
+                .filter(|r| r.0 == imp)
+                .map(|r| r.1)
+                .fold(f64::INFINITY, f64::min);
+            eprintln!(
+                "{n:>6}x{k:<6}  {:<7} {us:>9.1}  {:>6.0}",
+                imp.name(),
+                bytes / us / 1e3
+            );
+        }
+    }
+}
+
+/// DSL schedule sweep at the 27B decode shapes: every generated NR0 artifact vs legacy, interleaved,
+/// cold-bank rotation. The production `pq2_schedule` table is set from this (run with --ignored).
+#[test]
+#[ignore]
+fn pq2_dsl_nr0_sweep() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const BANKS: usize = 6;
+    const ITERS: usize = 60;
+    let dev = Device::new_metal(0).unwrap();
+    let shapes = [
+        (1024usize, 5120usize),
+        (5120, 6144),
+        (6144, 5120),
+        (10240, 5120),
+        (12288, 5120),
+        (17408, 5120),
+        (5120, 17408),
+        (248_320, 5120),
+    ];
+    let arms: [(QkImpl, Option<usize>); 4] = [
+        (QkImpl::Legacy, None),
+        (QkImpl::Dsl, Some(2)),
+        (QkImpl::Dsl, Some(4)),
+        (QkImpl::Dsl, Some(8)),
+    ];
+    eprintln!("shape            legacy_us   nr2_us   nr4_us   nr8_us   best");
+    for (n, k) in shapes {
+        let banks: Vec<QMatMul> = (0..BANKS)
+            .map(|b| matmul(&dev, &raw_pq2(n, k, 200 + b as u64), n, k))
+            .collect();
+        let x = Tensor::from_vec(act(k), (1, k), &dev).unwrap();
+        let mut best = [f64::INFINITY; 4];
+        for _pass in 0..2 {
+            for (ai, (imp, nr0)) in arms.iter().enumerate() {
+                dsl::set_pq2_impl(*imp);
+                dsl::set_pq2_nr0(*nr0);
+                for b in &banks {
+                    b.forward(&x).unwrap();
+                }
+                dev.synchronize().unwrap();
+                for _ in 0..4 {
+                    let t = std::time::Instant::now();
+                    for i in 0..ITERS {
+                        let _ = banks[i % BANKS].forward(&x).unwrap();
+                    }
+                    dev.synchronize().unwrap();
+                    best[ai] = best[ai].min(t.elapsed().as_secs_f64() * 1e6 / ITERS as f64);
+                }
+            }
+        }
+        dsl::set_pq2_nr0(None);
+        let (bi, _) = best[1..]
+            .iter()
+            .enumerate()
+            .fold(
+                (0, f64::INFINITY),
+                |a, (i, v)| if *v < a.1 { (i, *v) } else { a },
+            );
+        eprintln!(
+            "{n:>6}x{k:<6}  {:>9.1} {:>8.1} {:>8.1} {:>8.1}   nr{} ({:+.0}% vs legacy)",
+            best[0],
+            best[1],
+            best[2],
+            best[3],
+            [2, 4, 8][bi],
+            (best[0] / best[1 + bi] - 1.0) * 100.0
+        );
+    }
+}
