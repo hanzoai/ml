@@ -326,22 +326,27 @@ fn pq2_dsl_nr0_sweep() {
         (5120, 17408),
         (248_320, 5120),
     ];
-    let arms: [(QkImpl, Option<usize>); 4] = [
-        (QkImpl::Legacy, None),
-        (QkImpl::Dsl, Some(2)),
-        (QkImpl::Dsl, Some(4)),
-        (QkImpl::Dsl, Some(8)),
+    let arms: [(QkImpl, Option<usize>, Option<usize>); 7] = [
+        (QkImpl::Legacy, None, None),
+        (QkImpl::Dsl, Some(2), Some(2)),
+        (QkImpl::Dsl, Some(2), Some(4)),
+        (QkImpl::Dsl, Some(2), Some(8)),
+        (QkImpl::Dsl, Some(4), Some(2)),
+        (QkImpl::Dsl, Some(4), Some(4)),
+        (QkImpl::Dsl, Some(4), Some(8)),
     ];
-    eprintln!("shape            legacy_us   nr2_us   nr4_us   nr8_us   best");
+    let labels = ["2x2", "2x4", "2x8", "4x2", "4x4", "4x8"];
+    eprintln!("shape            legacy_us   2x2_us   2x4_us   2x8_us   4x2_us   4x4_us   4x8_us   best");
     for (n, k) in shapes {
         let banks: Vec<QMatMul> = (0..BANKS)
             .map(|b| matmul(&dev, &raw_pq2(n, k, 200 + b as u64), n, k))
             .collect();
         let x = Tensor::from_vec(act(k), (1, k), &dev).unwrap();
-        let mut best = [f64::INFINITY; 4];
+        let mut best = [f64::INFINITY; 7];
         for _pass in 0..2 {
-            for (ai, (imp, nr0)) in arms.iter().enumerate() {
+            for (ai, (imp, nsg, nr0)) in arms.iter().enumerate() {
                 dsl::set_pq2_impl(*imp);
+                dsl::set_pq2_nsg(*nsg);
                 dsl::set_pq2_nr0(*nr0);
                 for b in &banks {
                     b.forward(&x).unwrap();
@@ -357,6 +362,7 @@ fn pq2_dsl_nr0_sweep() {
                 }
             }
         }
+        dsl::set_pq2_nsg(None);
         dsl::set_pq2_nr0(None);
         let (bi, _) = best[1..]
             .iter()
@@ -366,12 +372,15 @@ fn pq2_dsl_nr0_sweep() {
                 |a, (i, v)| if *v < a.1 { (i, *v) } else { a },
             );
         eprintln!(
-            "{n:>6}x{k:<6}  {:>9.1} {:>8.1} {:>8.1} {:>8.1}   nr{} ({:+.0}% vs legacy)",
+            "{n:>6}x{k:<6}  {:>9.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}   {} ({:+.1}% vs legacy)",
             best[0],
             best[1],
             best[2],
             best[3],
-            [2, 4, 8][bi],
+            best[4],
+            best[5],
+            best[6],
+            labels[bi],
             (best[0] / best[1 + bi] - 1.0) * 100.0
         );
     }

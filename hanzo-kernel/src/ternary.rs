@@ -601,15 +601,15 @@ impl<'a, R: Runtime> Evaluator for Pq2PlaneMatvecEval<'a, R> {
 // buffers are allocated in >= 4-byte granules).
 
 /// The 32-bit little-endian word of 16 codes lane `il` (0..8) owns in global block `g`.
+/// Even blocks (`h = 0`) straddle `wq[17p + il]` and `wq[17p + il + 1]` (max `17p + 8 < nwords`
+/// since `nwords >= 17p + 9`); odd blocks (`h = 1`) are word-aligned at `wq[17p + 9 + il]`, so
+/// `bi = ai + (1 - h)` never leaves the tensor and needs no runtime `nwords` branch.
 #[device]
-pub fn pq2_gguf_codes(wq: &Array<u32>, g: usize, il: usize, nwords: usize) -> u32 {
+pub fn pq2_gguf_codes(wq: &Array<u32>, g: usize, il: usize) -> u32 {
     let p = g / 2usize;
     let h = g % 2usize;
     let ai = 17usize * p + 9usize * h + il;
-    let mut bi = ai + 1usize;
-    if bi >= nwords {
-        bi = nwords - 1usize;
-    }
+    let bi = ai + (1usize - h);
     let s = (16usize * (1usize - h)) as u32;
     let a = wq[ai];
     let b = wq[bi];
@@ -628,9 +628,13 @@ pub fn pq2_gguf_scale(wq: &Array<u32>, g: usize) -> f32 {
 /// PQ2_0 decode matvec over native GGUF blocks: `out[r] = Σ_j d·(code-1)·x[j]`.
 ///
 /// Same plane schedule as [`matvec_pq2_0_plane`] (8 lanes per block, 4 blocks per plane step, `nr0`
-/// rows per plane, `nsg` planes per cube, `plane_sum` reduce, no shared memory), but it reads the
-/// engine's resident bytes instead of a repacked copy. Accumulates in f32 for every `F`.
-/// Codes decode exactly: `f32::reinterpret(0x4B00_0000 | c) - 8388609.0 == c - 1`.
+/// rows per plane, `nsg` planes per cube, `plane_sum` reduce, no shared memory), reading the
+/// engine's resident bytes directly. Accumulates in f32 for every `F`.
+///
+/// Codes decode bit-exactly via exponent-24 (`f32::reinterpret(0x4B00_0000 | c) - 8388609.0 == c - 1`)
+/// with zero cancellation; row bounds are pre-clamped outside the `K` loop and word-straddle loads
+/// are branch-free (`bi = ai + (1 - h)`). The block scale is hardware f16->f32 on `metal | cuda | rocm`,
+/// with the portable `f16lo_to_f32` fallback elsewhere.
 ///
 /// Launch: `Block::new_2d(32, nsg)`, `Grid::Static(rows.div_ceil(nsg*nr0), 1, 1)`,
 /// `meta = [k, rows, nwords]` with `nwords = ceil(34 * rows * k/128 / 4)`.
@@ -642,21 +646,27 @@ pub fn matvec_pq2_0_gguf<F: Float>(
     meta: &Array<u32>,
     #[comptime] nsg: usize,
     #[comptime] nr0: usize,
+    #[comptime] tgt: Target,
 ) {
     let lane = UNIT_POS_X as usize;
     let sg = UNIT_POS_Y as usize;
     let k = meta[0] as usize;
     let nout = meta[1] as usize;
-    let nwords = meta[2] as usize;
     let nb = k / 128usize;
     let first_row = (CUBE_POS as usize * nsg + sg) * nr0;
     let ix = lane / 8usize;
     let il = lane % 8usize;
 
     let mut sumf = Array::<f32>::new(nr0);
+    let mut crows = Array::<usize>::new(nr0);
     #[unroll]
     for r in 0usize..nr0 {
         sumf[r] = 0.0f32;
+        let mut row = first_row + r;
+        if row >= nout {
+            row = nout - 1usize;
+        }
+        crows[r] = row;
     }
 
     if first_row < nout {
@@ -670,13 +680,16 @@ pub fn matvec_pq2_0_gguf<F: Float>(
             }
             #[unroll]
             for r in 0usize..nr0 {
-                let mut row = first_row + r;
-                if row >= nout {
-                    row = nout - 1usize;
-                }
-                let g = row * nb + ib;
-                let d = pq2_gguf_scale(wq, g);
-                let w32 = pq2_gguf_codes(wq, g, il, nwords);
+                let g = crows[r] * nb + ib;
+                let sword = wq[17usize * (g / 2usize) + 8usize * (g % 2usize)];
+                let sbits = (sword >> ((16usize * (g % 2usize)) as u32)) & 0xFFFFu32;
+                let d = island! {
+                    metal | cuda | rocm => {
+                        f32::cast_from(Vector::<half::f16, Const<2>>::reinterpret::<u32>(sbits)[0])
+                    }
+                    default => { crate::quant::f16lo_to_f32(sbits) }
+                };
+                let w32 = pq2_gguf_codes(wq, g, il);
                 let mut acc = 0.0f32;
                 #[unroll]
                 for i in 0usize..16usize {
@@ -792,20 +805,22 @@ pub fn matvec_pq2_0_gguf_run_as<E: Float + CubeElement + Default, R: Runtime>(
             ArrayArg::from_raw_parts(mh.clone(), 3),
             nsg,
             nr0,
+            Target::of(client),
         );
     }
     E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
 }
 
-/// The production schedule for a PQ2_0 decode matvec with `rows` outputs: NSG = 4 (128 threads),
+/// The production schedule for a PQ2_0 decode matvec with `rows` outputs: NSG = 2 (64 threads),
 /// NR0 = 4 at every size. Measured for THIS kernel on dbc M4 Max (`hanzo-ml` test
-/// `pq2_dsl_nr0_sweep`, 27B decode shapes, cold-bank rotation): NR0=8 was the slowest arm at every
-/// shape (+30-46% time at 17408 and 248320 rows), NR0=4 within ~1% of the best everywhere. The NR0=8
-/// rows-based table it replaces came from the HAND kernel's sweep and did not transfer. The single
-/// source of truth hanzo-ml's dispatch and kernel-gen both read.
+/// `pq2_dsl_nr0_sweep`, 27B decode shapes, cold-bank rotation, interleaved): `(2, 4)` beats legacy
+/// on 7 of 8 shapes (+4.0% to +59%: 1024x5120 13.8 vs 22.0 us, 5120x6144 30.3 vs 34.0 us,
+/// 6144x5120 30.2 vs 33.1 us, 10240x5120 43.9 vs 45.9 us, 12288x5120 51.8 vs 54.5 us,
+/// 17408x5120 70.0 vs 75.0 us, 5120x17408 75.4 vs 78.4 us) and is within 2.6% at 248320x5120
+/// (849.0 vs 826.7 us). The single source of truth hanzo-ml's dispatch and kernel-gen both read.
 pub fn pq2_0_gguf_schedule(rows: usize) -> (usize, usize) {
     let _ = rows;
-    (4, 4)
+    (2, 4)
 }
 
 /// Shapes every backend is gated on: odd block counts (the half-word path and the clamped tail),

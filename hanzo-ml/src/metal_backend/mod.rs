@@ -2520,6 +2520,12 @@ macro_rules! dsl_artifacts {
 dsl_artifacts! {
     "rms_norm_blk" => "rms_norm_blk_f_f32",
     "gemv" => "gemv_f_f32",
+    "matvec_pq2_0_gguf_nsg2_nr2_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg2_nr4_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg2_nr8_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg2_nr2_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg2_nr4_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg2_nr8_bf16" => "matvec_pq2_0_gguf_f_",
     "matvec_pq2_0_gguf_nsg4_nr2_f32" => "matvec_pq2_0_gguf_f_f32",
     "matvec_pq2_0_gguf_nsg4_nr4_f32" => "matvec_pq2_0_gguf_f_f32",
     "matvec_pq2_0_gguf_nsg4_nr8_f32" => "matvec_pq2_0_gguf_f_f32",

@@ -91,7 +91,78 @@ pub fn canonicalize(src: &str) -> String {
     }
     let mut s = out.join("\n");
     s.push('\n');
-    s
+    sort_prologue_structs(&s)
+}
+
+/// cubecl-cpp also emits the prologue's type definitions (`struct alignas(4) half_2 {..};`,
+/// `struct info_st {..};`) by iterating a hash set. Sort those blocks by text, but only when no struct
+/// names another one in its body, so a dependent declaration order can never be broken.
+fn sort_prologue_structs(src: &str) -> String {
+    let Some(kernel_at) = src.find("[[kernel]]").or_else(|| src.find("__global__")) else {
+        return src.to_string();
+    };
+    let (pro, rest) = src.split_at(kernel_at);
+    let lines: Vec<&str> = pro.lines().collect();
+    let mut blocks: Vec<String> = Vec::new();
+    let mut head: Vec<&str> = Vec::new();
+    let mut tail: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].starts_with("struct ") && lines[i].trim_end().ends_with('{') {
+            let mut j = i;
+            while j < lines.len() && lines[j].trim() != "};" {
+                j += 1;
+            }
+            if j == lines.len() {
+                return src.to_string();
+            }
+            blocks.push(lines[i..=j].join("\n"));
+            i = j + 1;
+            // swallow one blank separator after a block
+            if i < lines.len() && lines[i].trim().is_empty() {
+                i += 1;
+            }
+        } else if blocks.is_empty() {
+            head.push(lines[i]);
+            i += 1;
+        } else {
+            tail.push(lines[i]);
+            i += 1;
+        }
+    }
+    if blocks.len() < 2 {
+        return src.to_string();
+    }
+    let names: Vec<String> = blocks
+        .iter()
+        .filter_map(|b| {
+            let first = b.lines().next()?;
+            let name = first.trim_end_matches('{').split_whitespace().last()?;
+            Some(name.to_string())
+        })
+        .collect();
+    let dependent = blocks.iter().any(|b| {
+        let body: String = b.lines().skip(1).collect::<Vec<_>>().join("\n");
+        names.iter().any(|n| body.contains(n.as_str()))
+    });
+    if dependent {
+        return src.to_string();
+    }
+    blocks.sort();
+    let mut out = head.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    for b in &blocks {
+        out.push_str(b);
+        out.push_str("\n\n");
+    }
+    out.push_str(&tail.join("\n"));
+    if !tail.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(rest);
+    out
 }
 
 const START: &str = "[START_KERNEL_COMPILATION]";
@@ -191,6 +262,17 @@ mod tests {
             canonicalize(a),
             "int x = 1;\nfloat l_mut_2;\nuint l_mut_3;\nuint l_mut_12;\nl_mut_2 = 0.0;\n"
         );
+    }
+
+    #[test]
+    fn prologue_structs_sort_when_independent() {
+        let a = "#include <metal_stdlib>\nusing namespace metal;\n\nstruct alignas(4) half_2 {\n    half i_0;\n};\n\nstruct info_st {\n    uint m[8];\n};\n\n[[kernel]]\nvoid k() {\n}\n";
+        let b = "#include <metal_stdlib>\nusing namespace metal;\n\nstruct info_st {\n    uint m[8];\n};\n\nstruct alignas(4) half_2 {\n    half i_0;\n};\n\n[[kernel]]\nvoid k() {\n}\n";
+        assert_eq!(canonicalize(a), canonicalize(b));
+        assert!(canonicalize(a).contains("[[kernel]]\nvoid k()"));
+        // A struct that names another must keep its order.
+        let dep = "struct b_t {\n    a_t x;\n};\n\nstruct a_t {\n    uint y;\n};\n\n[[kernel]]\nvoid k() {\n}\n";
+        assert_eq!(canonicalize(dep), dep);
     }
 
     #[test]

@@ -19,7 +19,7 @@ fn usage() -> ! {
 /// half-word path and the clamped tail are both compiled in).
 #[cfg(feature = "metal")]
 macro_rules! pq2_spec {
-    ($artifact:literal, $entry:literal, $e:ty, $conv:expr, $nr0:literal) => {
+    ($artifact:literal, $entry:literal, $e:ty, $conv:expr, $nsg:literal, $nr0:literal) => {
         Spec {
             artifact: $artifact,
             entry: $entry,
@@ -30,7 +30,7 @@ macro_rules! pq2_spec {
                 let words = pq2_0_gguf_words(&pq2_0_gguf_bytes(&codes, &d, rows, k));
                 let x: Vec<$e> = (0..k).map(|i| $conv(i as f32 * 1e-3)).collect();
                 let _ = matvec_pq2_0_gguf_run_as::<$e, cubecl::wgpu::WgpuRuntime>(
-                    c, &words, &x, rows, k, 4, $nr0,
+                    c, &words, &x, rows, k, $nsg, $nr0,
                 );
             },
         }
@@ -69,52 +69,21 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
                 );
             },
         },
-        // PQ2_0 decode matvec over native GGUF blocks: one artifact per production schedule
-        // (`ternary::pq2_0_gguf_schedule`: NSG=4, NR0 in {2,4,8}) x activation dtype. The entry name
-        // is the same for every NR0 (cubecl names it after kernel + elem), so the ARTIFACT name is
-        // the pipeline identity hanzo-ml caches on.
-        pq2_spec!(
-            "matvec_pq2_0_gguf_nsg4_nr2_f32",
-            "matvec_pq2_0_gguf_f_f32",
-            f32,
-            std::convert::identity,
-            2
-        ),
-        pq2_spec!(
-            "matvec_pq2_0_gguf_nsg4_nr4_f32",
-            "matvec_pq2_0_gguf_f_f32",
-            f32,
-            std::convert::identity,
-            4
-        ),
-        pq2_spec!(
-            "matvec_pq2_0_gguf_nsg4_nr8_f32",
-            "matvec_pq2_0_gguf_f_f32",
-            f32,
-            std::convert::identity,
-            8
-        ),
-        pq2_spec!(
-            "matvec_pq2_0_gguf_nsg4_nr2_bf16",
-            "matvec_pq2_0_gguf_f_",
-            half::bf16,
-            half::bf16::from_f32,
-            2
-        ),
-        pq2_spec!(
-            "matvec_pq2_0_gguf_nsg4_nr4_bf16",
-            "matvec_pq2_0_gguf_f_",
-            half::bf16,
-            half::bf16::from_f32,
-            4
-        ),
-        pq2_spec!(
-            "matvec_pq2_0_gguf_nsg4_nr8_bf16",
-            "matvec_pq2_0_gguf_f_",
-            half::bf16,
-            half::bf16::from_f32,
-            8
-        ),
+        // PQ2_0 decode matvec over native GGUF blocks: one artifact per (NSG, NR0) schedule x dtype.
+        // The entry name is the same for every schedule (cubecl names it after kernel + elem), so
+        // the ARTIFACT name is the pipeline identity hanzo-ml caches on.
+        pq2_spec!("matvec_pq2_0_gguf_nsg2_nr2_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 2, 2),
+        pq2_spec!("matvec_pq2_0_gguf_nsg2_nr4_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 2, 4),
+        pq2_spec!("matvec_pq2_0_gguf_nsg2_nr8_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 2, 8),
+        pq2_spec!("matvec_pq2_0_gguf_nsg2_nr2_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 2),
+        pq2_spec!("matvec_pq2_0_gguf_nsg2_nr4_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 4),
+        pq2_spec!("matvec_pq2_0_gguf_nsg2_nr8_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 2, 8),
+        pq2_spec!("matvec_pq2_0_gguf_nsg4_nr2_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 4, 2),
+        pq2_spec!("matvec_pq2_0_gguf_nsg4_nr4_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 4, 4),
+        pq2_spec!("matvec_pq2_0_gguf_nsg4_nr8_f32",  "matvec_pq2_0_gguf_f_f32", f32,        std::convert::identity, 4, 8),
+        pq2_spec!("matvec_pq2_0_gguf_nsg4_nr2_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 2),
+        pq2_spec!("matvec_pq2_0_gguf_nsg4_nr4_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 4),
+        pq2_spec!("matvec_pq2_0_gguf_nsg4_nr8_bf16", "matvec_pq2_0_gguf_f_",    half::bf16, half::bf16::from_f32, 4, 8),
     ]
 }
 
