@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod avx;
+pub mod dsl;
 pub mod dsv4_qat;
 mod dummy_cuda;
 mod dummy_metal;

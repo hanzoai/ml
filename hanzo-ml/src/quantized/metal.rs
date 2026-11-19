@@ -405,6 +405,67 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), out_dtype)
             .with_label("qmatmul")
             .build()?;
+        // PQ2_0 decode (m == 1): the generated DSL matvec when `quantized::dsl` selects it, else the
+        // legacy hand kernel, which stays the default and the fallback. Both paths are counted, so a
+        // benchmark can prove which kernel served every projection.
+        if matches!(kdtype, hanzo_metal_kernels::GgmlDType::PQ2_0) && m == 1 {
+            use crate::quantized::dsl::{self, QkImpl};
+            let legacy_name = if src1_bf16 {
+                "kernel_mul_mv_pq2_0_bf16"
+            } else {
+                "kernel_mul_mv_pq2_0_f32"
+            };
+            if dsl::pq2_impl() == QkImpl::Dsl {
+                match dsl::pq2_dsl_eligible(n, k, self.buffer.length()) {
+                    Ok(nwords) => {
+                        let (artifact, nsg, nr0) = dsl::pq2_matvec_artifact(n, src1_bf16);
+                        let meta = device.dsl_const_u32(&[k as u32, n as u32, nwords as u32])?;
+                        let x_off = layout.start_offset() * storage.dtype().size_in_bytes();
+                        device.dispatch_dsl(
+                            artifact,
+                            &[
+                                (&self.buffer, 0),
+                                (storage.buffer(), x_off),
+                                (&dst, 0),
+                                (&meta, 0),
+                            ],
+                            2,
+                            &[0u32; 8],
+                            objc2_metal::MTLSize {
+                                width: n.div_ceil(nsg * nr0),
+                                height: 1,
+                                depth: 1,
+                            },
+                            objc2_metal::MTLSize {
+                                width: 32,
+                                height: nsg,
+                                depth: 1,
+                            },
+                        )?;
+                        dsl::note_dispatch(QkImpl::Dsl, artifact, n, k);
+                        let dst_storage = crate::MetalStorage::new(
+                            dst,
+                            device.clone(),
+                            dst_shape.elem_count(),
+                            out_dtype,
+                        );
+                        return Ok((dst_storage, dst_shape));
+                    }
+                    Err(_) => dsl::note_dispatch(
+                        QkImpl::Legacy,
+                        if src1_bf16 {
+                            "kernel_mul_mv_pq2_0_bf16[dsl-ineligible]"
+                        } else {
+                            "kernel_mul_mv_pq2_0_f32[dsl-ineligible]"
+                        },
+                        n,
+                        k,
+                    ),
+                }
+            } else {
+                dsl::note_dispatch(QkImpl::Legacy, legacy_name, n, k);
+            }
+        }
         let encoder = device.command_encoder()?;
         // Single batched matvec: the m activation columns dispatch as one grid (grid height = ne11 = m),
         // so the weight row-block each threadgroup streams is reused across the m columns in cache --

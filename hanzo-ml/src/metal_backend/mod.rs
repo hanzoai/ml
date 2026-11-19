@@ -2157,6 +2157,7 @@ impl BackendDevice for MetalDevice {
             seed_value: Arc::new(RwLock::new(299792458)),
             residency_set,
             dsl_pipelines: Arc::new(RwLock::new(HashMap::new())),
+            dsl_consts: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -2483,27 +2484,54 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     slice.to_vec()
 }
 
-/// Resolve a committed DSL (cubecl) MSL artifact by kernel name -- the Metal twin of
-/// `vulkan_backend::kernel_spv`. A `#[kernel]` authored once in hanzo-kernel is lowered to MSL by
-/// cubecl-cpp's metal dialect (extracted via tools/dsl/msl_extract.sh) and committed under
-/// src/metal/dsl/<name>.metal as human-diffable text. This is the single place mapping a kernel name to
-/// its artifact; cubecl names the Metal entry point after the kernel (no "main" rename, unlike the
-/// SPIR-V seam), so `name` is BOTH the registry key and the Metal function name.
-pub fn kernel_msl(name: &str) -> Result<&'static str> {
-    let src: &'static str = match name {
-        "rms_norm_blk_f_f32" => include_str!("../metal/dsl/rms_norm_blk.metal"),
-        "gemv_f_f32" => include_str!("../metal/dsl/gemv.metal"),
-        _ => {
-            return Err(
-                MetalError::Message(format!("no committed DSL MSL artifact for '{name}'")).into(),
-            )
+/// A committed DSL (cubecl) Metal artifact: its MSL and the entry point inside it.
+#[derive(Debug, Clone, Copy)]
+pub struct DslArtifact {
+    pub msl: &'static str,
+    pub entry: &'static str,
+}
+
+macro_rules! dsl_artifacts {
+    ($($name:literal => $entry:literal),* $(,)?) => {
+        /// Every committed artifact name, for diagnostics and the drift test.
+        pub const DSL_ARTIFACTS: &[&str] = &[$($name),*];
+        /// Resolve a committed DSL artifact by name.
+        pub fn kernel_msl(name: &str) -> Result<DslArtifact> {
+            match name {
+                $($name => Ok(DslArtifact {
+                    msl: include_str!(concat!("../metal/dsl/", $name, ".metal")),
+                    entry: $entry,
+                }),)*
+                _ => Err(MetalError::Message(format!(
+                    "no committed DSL MSL artifact for '{name}'"
+                ))
+                .into()),
+            }
         }
     };
-    Ok(src)
+}
+
+// The Metal twin of `vulkan_backend::kernel_spv`. A `#[kernel]` authored once in hanzo-kernel is
+// lowered to MSL by cubecl-cpp's metal dialect and committed under src/metal/dsl/<artifact>.metal by
+// `kernel-gen` (hanzo-kernel/src/kernel_gen.rs), never by hand; `kernel-gen --check` is the drift gate.
+// The ARTIFACT name is the pipeline identity: comptime specializations of one kernel (NSG/NR0) share
+// cubecl's entry name (kernel + elem suffix; bf16's suffix is empty in cubecl 0.10), so keying on the
+// entry would let two tile schedules collide in one cache slot.
+dsl_artifacts! {
+    "rms_norm_blk" => "rms_norm_blk_f_f32",
+    "gemv" => "gemv_f_f32",
+    "matvec_pq2_0_gguf_nsg4_nr2_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg4_nr4_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg4_nr8_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg4_nr2_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg4_nr4_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg4_nr8_bf16" => "matvec_pq2_0_gguf_f_",
 }
 
 impl MetalDevice {
-    /// The compiled pipeline for a committed DSL kernel, compiled on first use and cached per device.
+    /// The compiled pipeline for a committed DSL artifact: compiled on the first use per device,
+    /// then a read-locked map hit. Every compile is counted (`quantized::dsl::stats`), so "no codegen
+    /// on the decode path" is a number a test asserts, not a belief.
     pub fn dsl_pipeline(&self, name: &str) -> Result<hanzo_metal_kernels::metal::ComputePipeline> {
         if let Some(pl) = self
             .dsl_pipelines
@@ -2513,49 +2541,65 @@ impl MetalDevice {
         {
             return Ok(pl.clone());
         }
-        let msl = format!("#include <metal_stdlib>\n{}", kernel_msl(name)?);
-        let pl = self.compile_msl(name, &msl)?;
-        self.dsl_pipelines
-            .write()
-            .map_err(MetalError::from)?
-            .insert(name.to_string(), pl.clone());
+        let art = kernel_msl(name)?;
+        let mut map = self.dsl_pipelines.write().map_err(MetalError::from)?;
+        if let Some(pl) = map.get(name) {
+            return Ok(pl.clone());
+        }
+        let msl = format!("#include <metal_stdlib>\n{}", art.msl);
+        let pl = self.compile_msl(art.entry, &msl)?;
+        crate::quantized::dsl::note_compile(name);
+        map.insert(name.to_string(), pl.clone());
         Ok(pl)
     }
 
-    /// Dispatch a committed DSL kernel through ml's native Metal encoder -- the reusable seam every
-    /// migrated `#[kernel]` shares, mirroring the per-kernel `.spv` dispatch on Vulkan. Resolves the MSL
-    /// by name, compiles it through the SAME pipeline hand kernels use (`compile_msl`, driver-cached),
-    /// binds `data` in cubecl's buffer convention (indices `0..N-1`; `out_index` takes the write hazard
-    /// via `set_output_buffer`, the rest read via `set_input_buffer`), then binds the trailing
-    /// `constant info_st& info [[buffer(N)]]` populated from `static_meta` (cubecl's array-length
-    /// metadata, which Metal keeps `constant` where Vulkan could strip it). Records the dispatch only --
-    /// the caller drives `wait_until_completed`, so DSL work batches with the surrounding op stream.
+    /// A small immutable u32 buffer (kernel `meta` args such as `[k, rows, nwords]`), created once
+    /// per distinct content and reused, so a per-token dispatch allocates nothing.
+    pub fn dsl_const_u32(&self, v: &[u32]) -> Result<Arc<Buffer>> {
+        if let Some(b) = self.dsl_consts.read().map_err(MetalError::from)?.get(v) {
+            return Ok(b.clone());
+        }
+        let b = self.new_buffer_with_data(v)?;
+        self.dsl_consts
+            .write()
+            .map_err(MetalError::from)?
+            .insert(v.to_vec(), b.clone());
+        Ok(b)
+    }
+
+    /// Dispatch a committed DSL artifact through ml's native Metal encoder -- the one seam every
+    /// migrated `#[kernel]` shares. `data` are `(buffer, byte offset)` views bound in cubecl's
+    /// convention (indices `0..N-1`; `out_index` takes the write hazard via `set_output_buffer`), then
+    /// cubecl's trailing `constant info_st& info [[buffer(N)]]` is bound with `setBytes` from
+    /// `static_meta` (no buffer allocation per dispatch). Records the dispatch only -- the caller's
+    /// command stream decides when it is committed.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_dsl(
         &self,
         name: &str,
-        data: &[&Buffer],
+        data: &[(&Buffer, usize)],
         out_index: usize,
         static_meta: &[u32],
         grid: objc2_metal::MTLSize,
         threadgroup: objc2_metal::MTLSize,
     ) -> Result<()> {
         let pl = self.dsl_pipeline(name)?;
-        let info = self.new_buffer_with_data(static_meta)?;
-        {
-            let enc = self.command_encoder()?;
-            let e = enc.as_ref();
-            e.set_compute_pipeline_state(&pl);
-            for (i, b) in data.iter().enumerate() {
-                if i == out_index {
-                    e.set_output_buffer(i, Some(*b), 0);
-                } else {
-                    e.set_input_buffer(i, Some(*b), 0);
-                }
+        let enc = self.command_encoder()?;
+        let e = enc.as_ref();
+        e.set_compute_pipeline_state(&pl);
+        for (i, (b, off)) in data.iter().enumerate() {
+            if i == out_index {
+                e.set_output_buffer(i, Some(*b), *off);
+            } else {
+                e.set_input_buffer(i, Some(*b), *off);
             }
-            e.set_input_buffer(data.len(), Some(&*info), 0);
-            e.dispatch_thread_groups(grid, threadgroup);
         }
+        e.set_bytes_directly(
+            data.len(),
+            std::mem::size_of_val(static_meta),
+            static_meta.as_ptr().cast(),
+        );
+        e.dispatch_thread_groups(grid, threadgroup);
         Ok(())
     }
 }
@@ -2564,6 +2608,75 @@ impl MetalDevice {
 mod dsl_metal_dispatch {
     use super::*;
     use crate::Device;
+
+    // Every buffer bound through `dispatch_dsl` at a NONZERO byte offset -- weights, activation and
+    // output -- with guard words around the output that must survive. Production allocates a fresh
+    // dst (offset 0), so only this seam-level test can prove output offsets bind correctly.
+    #[test]
+    fn pq2_dsl_seam_honours_every_offset() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let (n, k) = (96usize, 512usize);
+        let (codes, d) = hanzo_kernel::ternary::pq2_0_synth(n, k, 5);
+        let raw = hanzo_kernel::ternary::pq2_0_gguf_bytes(&codes, &d, n, k);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.37).sin()).collect();
+        let want = hanzo_kernel::ternary::pq2_0_gguf_ref(&raw, &x, n, k);
+
+        let (wpad, xpad, opad) = (64usize, 48usize, 16usize); // bytes, multiples of 16
+        let mut wbytes = vec![0xA5u8; wpad];
+        wbytes.extend_from_slice(&raw);
+        let mut xv = vec![f32::NAN; xpad / 4];
+        xv.extend_from_slice(&x);
+        let guard = -12345.0f32;
+        let ov = vec![guard; opad / 4 + n + 4];
+        let wb = md.new_buffer_with_data(&wbytes).unwrap();
+        let xb = md.new_buffer_with_data(&xv).unwrap();
+        let ob = md.new_buffer_with_data(&ov).unwrap();
+        let nwords = raw.len() / 4;
+        let meta = md
+            .dsl_const_u32(&[k as u32, n as u32, nwords as u32])
+            .unwrap();
+        let (artifact, nsg, nr0) = crate::quantized::dsl::pq2_matvec_artifact(n, false);
+        md.dispatch_dsl(
+            artifact,
+            &[(&*wb, wpad), (&*xb, xpad), (&*ob, opad), (&*meta, 0)],
+            2,
+            &[0u32; 8],
+            objc2_metal::MTLSize {
+                width: n.div_ceil(nsg * nr0),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: nsg,
+                depth: 1,
+            },
+        )
+        .unwrap();
+        md.wait_until_completed().unwrap();
+        let got: Vec<f32> = read_to_vec(&ob, opad / 4 + n + 4);
+        assert!(
+            got[..opad / 4].iter().all(|v| *v == guard),
+            "wrote before the output offset"
+        );
+        assert!(
+            got[opad / 4 + n..].iter().all(|v| *v == guard),
+            "wrote past the output"
+        );
+        let out = &got[opad / 4..opad / 4 + n];
+        let maxref = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let rel = want
+            .iter()
+            .zip(out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / maxref;
+        assert!(rel <= 1e-5, "offset dispatch rel {rel}");
+    }
 
     fn rms_ref(x: &[f32], w: &[f32], rows: usize, n: usize, eps: f32) -> Vec<f32> {
         let mut o = vec![0f32; rows * n];
@@ -2674,8 +2787,8 @@ mod dsl_metal_dispatch {
             depth: 1,
         };
         md.dispatch_dsl(
-            "rms_norm_blk_f_f32",
-            &[&*xb, &*wb, &*ob, &*eb, &*ndb],
+            "rms_norm_blk",
+            &[(&*xb, 0), (&*wb, 0), (&*ob, 0), (&*eb, 0), (&*ndb, 0)],
             2,
             &[0u32; 10],
             grid,

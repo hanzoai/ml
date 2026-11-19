@@ -71,6 +71,9 @@ pub struct MetalDevice {
     /// measured codegen, not the kernel. Compile once per device, reuse forever.
     pub(crate) dsl_pipelines:
         Arc<RwLock<std::collections::HashMap<String, hanzo_metal_kernels::metal::ComputePipeline>>>,
+    /// Immutable u32 kernel-argument buffers by content (`dsl_const_u32`), so a DSL dispatch on the
+    /// decode path allocates nothing.
+    pub(crate) dsl_consts: Arc<RwLock<std::collections::HashMap<Vec<u32>, Arc<Buffer>>>>,
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.

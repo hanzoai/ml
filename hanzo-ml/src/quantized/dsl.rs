@@ -1,0 +1,262 @@
+//! The one selection point for quantized kernels that have a DSL implementation (`hanzo-kernel`).
+//!
+//! Backend-independent on purpose: this module decides DSL vs legacy, picks the schedule (which is
+//! also the pipeline identity, i.e. the generated artifact name), checks eligibility, and records
+//! what actually ran. A backend's quantized storage asks here and then executes; `hanzo-engine`
+//! keeps calling `QMatMul` and never learns which implementation served it.
+//!
+//! Switch: `HANZO_PQ2_IMPL=dsl|legacy` (default `legacy` until the 27B qualification makes the DSL
+//! path the default). `set_pq2_impl` overrides it in-process for A/B tests and benches.
+//!
+//! Evidence: every dispatch is counted per (impl, artifact, n, k) and every DSL pipeline compile per
+//! artifact (`stats`, `report`). `HANZO_QK_STATS=1` logs the first dispatch of each key and a full
+//! report at every power-of-two total from 1024 on, so a long benchmark run shows its counts in the
+//! log without an exit hook.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// Which implementation serves a quantized op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QkImpl {
+    /// The hand kernel that shipped before the DSL path (kept as the fallback).
+    Legacy,
+    /// The generated DSL kernel.
+    Dsl,
+}
+
+impl QkImpl {
+    pub fn name(self) -> &'static str {
+        match self {
+            QkImpl::Legacy => "legacy",
+            QkImpl::Dsl => "dsl",
+        }
+    }
+}
+
+const UNSET: u8 = u8::MAX;
+static PQ2_IMPL: AtomicU8 = AtomicU8::new(UNSET);
+
+fn encode(i: QkImpl) -> u8 {
+    match i {
+        QkImpl::Legacy => 0,
+        QkImpl::Dsl => 1,
+    }
+}
+
+/// The implementation PQ2_0 decode matvecs use: `set_pq2_impl` if called, else `HANZO_PQ2_IMPL`.
+pub fn pq2_impl() -> QkImpl {
+    match PQ2_IMPL.load(Ordering::Relaxed) {
+        0 => QkImpl::Legacy,
+        1 => QkImpl::Dsl,
+        _ => {
+            let i = match std::env::var("HANZO_PQ2_IMPL").as_deref() {
+                Ok("dsl") => QkImpl::Dsl,
+                _ => QkImpl::Legacy,
+            };
+            PQ2_IMPL.store(encode(i), Ordering::Relaxed);
+            i
+        }
+    }
+}
+
+/// Force the PQ2_0 implementation for this process (A/B tests, interleaved benches).
+pub fn set_pq2_impl(i: QkImpl) {
+    PQ2_IMPL.store(encode(i), Ordering::Relaxed);
+}
+
+/// The production PQ2_0 decode schedule `(nsg, nr0)` for `rows` outputs. Mirrors
+/// `hanzo_kernel::ternary::pq2_0_gguf_schedule` (a dev-dependency test holds them equal), which is
+/// what `kernel-gen` generates artifacts for.
+pub fn pq2_schedule(rows: usize) -> (usize, usize) {
+    let nr0 = if rows <= 2048 {
+        2
+    } else if rows < 16384 {
+        4
+    } else {
+        8
+    };
+    (4, nr0)
+}
+
+/// The generated artifact (= pipeline identity) for a PQ2_0 decode matvec, with its schedule.
+pub fn pq2_matvec_artifact(rows: usize, bf16: bool) -> (&'static str, usize, usize) {
+    let (nsg, nr0) = pq2_schedule(rows);
+    let a = match (nr0, bf16) {
+        (2, false) => "matvec_pq2_0_gguf_nsg4_nr2_f32",
+        (4, false) => "matvec_pq2_0_gguf_nsg4_nr4_f32",
+        (_, false) => "matvec_pq2_0_gguf_nsg4_nr8_f32",
+        (2, true) => "matvec_pq2_0_gguf_nsg4_nr2_bf16",
+        (4, true) => "matvec_pq2_0_gguf_nsg4_nr4_bf16",
+        (_, true) => "matvec_pq2_0_gguf_nsg4_nr8_bf16",
+    };
+    (a, nsg, nr0)
+}
+
+/// Whether the native-GGUF DSL matvec can serve an `n x k` PQ2_0 weight held in `buf_bytes` bytes;
+/// `Ok(nwords)` is the kernel's `meta[2]`. The kernel views the 34-byte blocks as u32 words, so the
+/// tensor must be a whole number of words (true whenever `k` is a multiple of 256, i.e. every
+/// production projection) and the buffer must hold all of them.
+pub fn pq2_dsl_eligible(n: usize, k: usize, buf_bytes: usize) -> Result<usize, &'static str> {
+    if k % 128 != 0 {
+        return Err("k not a multiple of 128");
+    }
+    let bytes = n * (k / 128) * 34;
+    if bytes % 4 != 0 {
+        return Err("odd block count: tensor is not a whole number of u32 words");
+    }
+    if buf_bytes < bytes {
+        return Err("weight buffer shorter than the tensor");
+    }
+    if bytes / 4 > u32::MAX as usize {
+        return Err("tensor exceeds u32 word indexing");
+    }
+    Ok(bytes / 4)
+}
+
+type Key = (&'static str, &'static str, usize, usize);
+
+fn dispatches() -> &'static Mutex<BTreeMap<Key, u64>> {
+    static M: OnceLock<Mutex<BTreeMap<Key, u64>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn compiles() -> &'static Mutex<BTreeMap<String, u64>> {
+    static M: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+static TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn stats_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HANZO_QK_STATS").is_ok_and(|v| v == "1"))
+}
+
+/// Record one dispatch of `artifact` (a DSL artifact or a legacy kernel name) by `imp`.
+pub fn note_dispatch(imp: QkImpl, artifact: &'static str, n: usize, k: usize) {
+    let first = {
+        let mut m = dispatches().lock().unwrap_or_else(|e| e.into_inner());
+        let c = m.entry((imp.name(), artifact, n, k)).or_insert(0);
+        *c += 1;
+        *c == 1
+    };
+    let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if stats_log() {
+        if first {
+            eprintln!(
+                "[hanzo-qk] first dispatch impl={} artifact={artifact} n={n} k={k}",
+                imp.name()
+            );
+        }
+        if total >= 1024 && total.is_power_of_two() {
+            eprintln!("[hanzo-qk] after {total} dispatches:\n{}", report());
+        }
+    }
+}
+
+/// Record one DSL pipeline compilation of `artifact` (called by the backend's pipeline cache).
+pub fn note_compile(artifact: &str) {
+    let mut m = compiles().lock().unwrap_or_else(|e| e.into_inner());
+    *m.entry(artifact.to_string()).or_insert(0) += 1;
+    if stats_log() {
+        eprintln!("[hanzo-qk] compiled pipeline artifact={artifact}");
+    }
+}
+
+/// A snapshot of what ran.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Stats {
+    /// (impl, artifact, n, k, calls)
+    pub dispatches: Vec<(&'static str, &'static str, usize, usize, u64)>,
+    /// (artifact, compiles)
+    pub compiles: Vec<(String, u64)>,
+}
+
+impl Stats {
+    pub fn calls(&self, imp: QkImpl) -> u64 {
+        self.dispatches
+            .iter()
+            .filter(|d| d.0 == imp.name())
+            .map(|d| d.4)
+            .sum()
+    }
+    pub fn compiles_of(&self, artifact: &str) -> u64 {
+        self.compiles
+            .iter()
+            .find(|c| c.0 == artifact)
+            .map_or(0, |c| c.1)
+    }
+}
+
+pub fn stats() -> Stats {
+    let d = dispatches().lock().unwrap_or_else(|e| e.into_inner());
+    let c = compiles().lock().unwrap_or_else(|e| e.into_inner());
+    Stats {
+        dispatches: d.iter().map(|(k, v)| (k.0, k.1, k.2, k.3, *v)).collect(),
+        compiles: c.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+    }
+}
+
+pub fn reset_stats() {
+    dispatches()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    compiles().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    TOTAL.store(0, Ordering::Relaxed);
+}
+
+/// Human-readable dispatch + compile table.
+pub fn report() -> String {
+    let s = stats();
+    let mut out = String::from("impl    calls       n      k  artifact\n");
+    for (imp, a, n, k, c) in &s.dispatches {
+        out.push_str(&format!("{imp:<7} {c:>6} {n:>7} {k:>6}  {a}\n"));
+    }
+    for (a, c) in &s.compiles {
+        out.push_str(&format!("compiled {c}x  {a}\n"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_matches_the_dsl_source_of_truth() {
+        for rows in [1, 64, 2048, 2049, 5120, 16383, 16384, 17408, 248_320] {
+            assert_eq!(
+                pq2_schedule(rows),
+                hanzo_kernel::ternary::pq2_0_gguf_schedule(rows),
+                "rows={rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifacts_are_distinct_per_schedule_and_dtype() {
+        let mut seen = std::collections::HashSet::new();
+        for rows in [100, 5000, 20000] {
+            for bf16 in [false, true] {
+                let (a, _, nr0) = pq2_matvec_artifact(rows, bf16);
+                assert!(a.contains(&format!("_nr{nr0}_")), "{a}");
+                assert!(a.ends_with(if bf16 { "_bf16" } else { "_f32" }), "{a}");
+                assert!(seen.insert(a), "duplicate pipeline identity {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn eligibility() {
+        assert_eq!(
+            pq2_dsl_eligible(5120, 5120, 5120 * 40 * 34),
+            Ok(5120 * 40 * 34 / 4)
+        );
+        assert!(pq2_dsl_eligible(3, 128, 3 * 34).is_err()); // odd block count
+        assert!(pq2_dsl_eligible(4, 256, 10).is_err()); // short buffer
+        assert!(pq2_dsl_eligible(4, 100, 1 << 20).is_err());
+    }
+}
