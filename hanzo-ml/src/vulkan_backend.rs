@@ -280,6 +280,26 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "matmul_ptq1_0_gguf_bm64_f32" => {
             include_bytes!("vulkan/dsl/matmul_ptq1_0_gguf_bm64_f32.spv")
         }
+        // Canonical DSL production GDN and Paged FlashAttention kernels (F32).
+        "gdn_conv1d_step_k4_f32" => include_bytes!("vulkan/dsl/gdn_conv1d_step_k4_f32.spv"),
+        "gdn_conv1d_stateful_k4_f32" => include_bytes!("vulkan/dsl/gdn_conv1d_stateful_k4_f32.spv"),
+        "gdn_gating_io_f32" => include_bytes!("vulkan/dsl/gdn_gating_io_f32.spv"),
+        "gdn_scan_lanes_io_k128_v128_l4_f32" => {
+            include_bytes!("vulkan/dsl/gdn_scan_lanes_io_k128_v128_l4_f32.spv")
+        }
+        "gdn_scan_lanes_io_k64_v64_l4_f32" => {
+            include_bytes!("vulkan/dsl/gdn_scan_lanes_io_k64_v64_l4_f32.spv")
+        }
+        "flash_attn_paged_d64_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d64_f32.spv"),
+        "flash_attn_paged_d128_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d128_f32.spv"),
+        "flash_attn_paged_d256_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d256_f32.spv"),
+        // Canonical DSL Fast Walsh-Hadamard Transform kernels (F32, B=64..2048, fused signs).
+        "fwht_hadamard_b64_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b64_f32.spv"),
+        "fwht_hadamard_b128_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b128_f32.spv"),
+        "fwht_hadamard_b256_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b256_f32.spv"),
+        "fwht_hadamard_b512_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b512_f32.spv"),
+        "fwht_hadamard_b1024_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b1024_f32.spv"),
+        "fwht_hadamard_b2048_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b2048_f32.spv"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -4143,6 +4163,305 @@ impl VulkanDevice {
             dsl::note_compile(artifact_name);
         }
         dsl::note_dispatch(dsl::QkImpl::Dsl, artifact_name, n, k);
+        Ok(Some(out))
+    }
+
+    fn dispatch_dsl_tracked(
+        &self,
+        artifact: &'static str,
+        bufs: &[vk::Buffer],
+        out_idxs: &[usize],
+        groups: (u32, u32, u32),
+        n_tag: usize,
+        k_tag: usize,
+    ) -> Result<()> {
+        let was_cached = self.inner.pipelines.lock().unwrap().contains_key(artifact);
+        self.dispatch_outs(artifact, bufs, out_idxs, &[], groups)?;
+        if !was_cached {
+            crate::quantized::dsl::note_compile(artifact);
+        }
+        crate::quantized::dsl::note_dispatch(
+            crate::quantized::dsl::QkImpl::Dsl,
+            artifact,
+            n_tag,
+            k_tag,
+        );
+        Ok(())
+    }
+
+    /// Production DSL single-token GDN conv1d step (F32, k=4, updates `state` in place + SiLU).
+    pub fn gdn_conv1d_step_dsl(
+        &self,
+        x: &VulkanStorage,
+        weight: &VulkanStorage,
+        state: &VulkanStorage,
+        batch: usize,
+        conv_dim: usize,
+    ) -> Result<VulkanStorage> {
+        let total = batch * conv_dim;
+        if total == 0 {
+            crate::bail!("vulkan gdn_conv1d_step_dsl: empty shape ({batch}, {conv_dim})");
+        }
+        let out = self.alloc_f32(total)?;
+        let dims = self.upload_u32(&[batch as u32, conv_dim as u32])?;
+        self.dispatch_dsl_tracked(
+            "gdn_conv1d_step_k4_f32",
+            &[
+                x.buffer,
+                weight.buffer,
+                state.buffer,
+                out.buffer,
+                dims.buffer,
+            ],
+            &[2, 3],
+            ((total as u32).div_ceil(64), 1, 1),
+            conv_dim,
+            batch,
+        )?;
+        Ok(out)
+    }
+
+    /// Production DSL stateful GDN conv1d prefill/chunked step (F32, k=4).
+    /// Returns `(out, state_out)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv1d_stateful_dsl(
+        &self,
+        x: &VulkanStorage,
+        weight: &VulkanStorage,
+        state_in: &VulkanStorage,
+        batch: usize,
+        conv_dim: usize,
+        seq_len: usize,
+        has_state: bool,
+    ) -> Result<(VulkanStorage, VulkanStorage)> {
+        let total = batch * conv_dim * seq_len;
+        if total == 0 {
+            crate::bail!(
+                "vulkan gdn_conv1d_stateful_dsl: empty shape ({batch}, {conv_dim}, {seq_len})"
+            );
+        }
+        let out = self.alloc_f32(total)?;
+        let state_out = self.alloc_f32(batch * conv_dim * 4)?;
+        let dims = self.upload_u32(&[
+            batch as u32,
+            conv_dim as u32,
+            seq_len as u32,
+            u32::from(has_state),
+        ])?;
+        self.dispatch_dsl_tracked(
+            "gdn_conv1d_stateful_k4_f32",
+            &[
+                x.buffer,
+                weight.buffer,
+                state_in.buffer,
+                state_out.buffer,
+                out.buffer,
+                dims.buffer,
+            ],
+            &[3, 4],
+            ((total as u32).div_ceil(64), 1, 1),
+            conv_dim,
+            seq_len,
+        )?;
+        Ok((out, state_out))
+    }
+
+    /// Production DSL typed GDN gating (F32): returns `(beta_out, g_out)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_gating_io_dsl(
+        &self,
+        b_in: &VulkanStorage,
+        a_in: &VulkanStorage,
+        a_log: &VulkanStorage,
+        dt_bias: &VulkanStorage,
+        batch_tokens: usize,
+        num_heads: usize,
+    ) -> Result<(VulkanStorage, VulkanStorage)> {
+        let total = batch_tokens * num_heads;
+        if total == 0 {
+            crate::bail!("vulkan gdn_gating_io_dsl: empty shape ({batch_tokens}, {num_heads})");
+        }
+        let beta_out = self.alloc_f32(total)?;
+        let g_out = self.alloc_f32(total)?;
+        let dims = self.upload_u32(&[total as u32, num_heads as u32])?;
+        self.dispatch_dsl_tracked(
+            "gdn_gating_io_f32",
+            &[
+                b_in.buffer,
+                a_in.buffer,
+                a_log.buffer,
+                dt_bias.buffer,
+                beta_out.buffer,
+                g_out.buffer,
+                dims.buffer,
+            ],
+            &[4, 5],
+            ((total as u32).div_ceil(64), 1, 1),
+            num_heads,
+            batch_tokens,
+        )?;
+        Ok((beta_out, g_out))
+    }
+
+    /// Production DSL GDN recurrence scan (F32, updates `state` in place, returns `out`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_scan_lanes_io_dsl(
+        &self,
+        q: &VulkanStorage,
+        k: &VulkanStorage,
+        v: &VulkanStorage,
+        g: &VulkanStorage,
+        beta: &VulkanStorage,
+        state: &VulkanStorage,
+        bh: usize,
+        seq: usize,
+        k_dim: usize,
+        v_dim: usize,
+    ) -> Result<Option<VulkanStorage>> {
+        let artifact = match (k_dim, v_dim) {
+            (128, 128) => "gdn_scan_lanes_io_k128_v128_l4_f32",
+            (64, 64) => "gdn_scan_lanes_io_k64_v64_l4_f32",
+            _ => return Ok(None),
+        };
+        if bh == 0 || seq == 0 {
+            crate::bail!("vulkan gdn_scan_lanes_io_dsl: empty shape ({bh}, {seq})");
+        }
+        let out = self.alloc_f32(bh * seq * v_dim)?;
+        let dims = self.upload_u32(&[bh as u32, seq as u32])?;
+        let total_threads = bh * v_dim * 4;
+        self.dispatch_dsl_tracked(
+            artifact,
+            &[
+                q.buffer,
+                k.buffer,
+                v.buffer,
+                g.buffer,
+                beta.buffer,
+                state.buffer,
+                out.buffer,
+                dims.buffer,
+            ],
+            &[5, 6],
+            ((total_threads as u32).div_ceil(64), 1, 1),
+            bh,
+            seq,
+        )?;
+        Ok(Some(out))
+    }
+
+    /// Production DSL Paged & Contiguous FlashAttention (F32, d=64/128/256, Wave32 + coopmat).
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_paged_dsl(
+        &self,
+        q: &VulkanStorage,
+        k_cache: &VulkanStorage,
+        v_cache: &VulkanStorage,
+        block_tables: &VulkanStorage,
+        context_lens: &VulkanStorage,
+        batch: usize,
+        n_heads: usize,
+        n_kv: usize,
+        seq_q: usize,
+        d: usize,
+        scale: f32,
+        softcap: f32,
+        causal_mode: u32,
+        block_size: usize,
+        max_blocks: usize,
+        kv_layout: usize,
+        x_vec: usize,
+        sliding_window: usize,
+        q_offset_override: usize,
+    ) -> Result<Option<VulkanStorage>> {
+        if !self.inner.coopmat || self.inner.subgroup_size != 32 {
+            return Ok(None);
+        }
+        let artifact = match d {
+            64 => "flash_attn_paged_d64_f32",
+            128 => "flash_attn_paged_d128_f32",
+            256 => "flash_attn_paged_d256_f32",
+            _ => return Ok(None),
+        };
+        if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 {
+            crate::bail!("vulkan flash_attn_paged_dsl: empty shape");
+        }
+        let out = self.alloc_f32(batch * n_heads * seq_q * d)?;
+        let scale_cfg = self.upload_f32(&[scale, softcap])?;
+        let meta = self.upload_u32(&[
+            seq_q as u32,
+            n_heads as u32,
+            n_kv as u32,
+            causal_mode,
+            block_size as u32,
+            max_blocks as u32,
+            kv_layout as u32,
+            x_vec as u32,
+            sliding_window as u32,
+            q_offset_override as u32,
+            0u32,
+            0u32,
+        ])?;
+        let blocks = (batch * n_heads * seq_q.div_ceil(16)) as u32;
+        self.dispatch_dsl_tracked(
+            artifact,
+            &[
+                q.buffer,
+                k_cache.buffer,
+                v_cache.buffer,
+                block_tables.buffer,
+                context_lens.buffer,
+                out.buffer,
+                scale_cfg.buffer,
+                meta.buffer,
+            ],
+            &[5],
+            (blocks, 1, 1),
+            n_heads,
+            d,
+        )?;
+        Ok(Some(out))
+    }
+
+    /// Production DSL Fast Walsh-Hadamard Transform (F32, `B=64..2048`, fused optional signs).
+    pub fn fwht_hadamard_dsl(
+        &self,
+        x: &VulkanStorage,
+        signs: Option<(&VulkanStorage, usize)>,
+        n_blocks: usize,
+        block_size: usize,
+        inverse: bool,
+    ) -> Result<Option<VulkanStorage>> {
+        let artifact = match block_size {
+            64 => "fwht_hadamard_b64_f32",
+            128 => "fwht_hadamard_b128_f32",
+            256 => "fwht_hadamard_b256_f32",
+            512 => "fwht_hadamard_b512_f32",
+            1024 => "fwht_hadamard_b1024_f32",
+            2048 => "fwht_hadamard_b2048_f32",
+            _ => return Ok(None),
+        };
+        if n_blocks == 0 {
+            crate::bail!("vulkan fwht_hadamard_dsl: empty input");
+        }
+        let out = self.alloc_f32(n_blocks * block_size)?;
+        let (sign_buf, sign_w, has_signs) = match signs {
+            Some((s, w)) => (s.buffer, w, 1u32),
+            None => (x.buffer, block_size, 0u32),
+        };
+        let dims = self.upload_u32(&[
+            n_blocks as u32,
+            sign_w as u32,
+            has_signs,
+            u32::from(inverse),
+        ])?;
+        self.dispatch_dsl_tracked(
+            artifact,
+            &[x.buffer, sign_buf, out.buffer, dims.buffer],
+            &[2],
+            (n_blocks as u32, 1, 1),
+            n_blocks,
+            block_size,
+        )?;
         Ok(Some(out))
     }
 

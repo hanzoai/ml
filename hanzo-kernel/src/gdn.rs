@@ -68,6 +68,110 @@ pub fn gdn_conv1d<F: Float>(
     }
 }
 
+/// Single-token decode causal depthwise conv1d + in-place state shift + SiLU (f32/f16/bf16).
+///
+/// Shifts `state[b, ch, 0..k]` left by 1, appends `x[b, ch]` at `k - 1`, dots the `k` taps with
+/// `w[ch, 0..k]` in `f32`, and writes `silu(acc)` to `out[b, ch]`. Bit-equivalent to stepping
+/// [`gdn_conv1d_stateful`] with `seq_len == 1, has_state == 1`.
+///
+/// Layouts: `x`, `out`: `[batch, conv_dim]`; `w`: `[conv_dim, k]`; `state`: `[batch, conv_dim, k]`;
+/// `dims`: `[batch, conv_dim]`.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu, rocm), unchecked)]
+pub fn gdn_conv1d_step<F: Float>(
+    x: &Array<F>,
+    w: &Array<F>,
+    state: &mut Array<F>,
+    out: &mut Array<F>,
+    dims: &Array<u32>, // [batch, conv_dim]
+    #[comptime] k: usize,
+) {
+    let tid = ABSOLUTE_POS;
+    let batch = dims[0] as usize;
+    let conv_dim = dims[1] as usize;
+    if tid < batch * conv_dim {
+        let ch = tid % conv_dim;
+        let s_base = tid * k;
+        let w_base = ch * k;
+
+        let mut acc = 0.0f32;
+        #[unroll]
+        for i in 0..k {
+            let v = if i + 1 < k {
+                state[s_base + i + 1]
+            } else {
+                x[tid]
+            };
+            state[s_base + i] = v;
+            acc += f32::cast_from(v) * f32::cast_from(w[w_base + i]);
+        }
+        let silu = acc / (1.0f32 + (-acc).exp());
+        out[tid] = F::cast_from(silu);
+    }
+}
+
+/// Stateful prefill / chunked-prefill causal depthwise conv1d + SiLU + trailing state handoff.
+///
+/// Reads optional left-context from `state_in[b, ch, 1..k]` when `dims[3] (has_state) != 0`,
+/// computes `out[b, ch, pos]` in `f32`, and writes the exact trailing `k` tokens into
+/// `state_out[b, ch, 0..k]` so one-shot prefill, chunked prefill, and repeated single-token
+/// [`gdn_conv1d_step`] produce identical outputs and states.
+///
+/// Layouts: `x`, `out`: `[batch, conv_dim, seq_len]`; `w`: `[conv_dim, k]`;
+/// `state_in`, `state_out`: `[batch, conv_dim, k]`; `dims`: `[batch, conv_dim, seq_len, has_state]`.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu, rocm), unchecked)]
+pub fn gdn_conv1d_stateful<F: Float>(
+    x: &Array<F>,
+    w: &Array<F>,
+    state_in: &Array<F>,
+    state_out: &mut Array<F>,
+    out: &mut Array<F>,
+    dims: &Array<u32>, // [batch, conv_dim, seq_len, has_state]
+    #[comptime] k: usize,
+) {
+    let gid = ABSOLUTE_POS;
+    let batch = dims[0] as usize;
+    let conv_dim = dims[1] as usize;
+    let seq_len = dims[2] as usize;
+    let has_state = dims[3];
+    if gid < batch * conv_dim * seq_len {
+        let pos = gid % seq_len;
+        let row = gid / seq_len; // b * conv_dim + ch
+        let ch = row % conv_dim;
+        let x_base = row * seq_len;
+        let s_base = row * k;
+        let w_base = ch * k;
+
+        let mut acc = 0.0f32;
+        #[unroll]
+        for i in 0..k {
+            let mut val = 0.0f32;
+            if pos + i >= k - 1 {
+                val = f32::cast_from(x[x_base + pos + i - (k - 1)]);
+            } else if has_state != 0u32 {
+                // state_in[0..k] holds the last k tokens; the k-1 right-most entries [1..k]
+                // immediately precede pos == 0.
+                val = f32::cast_from(state_in[s_base + 1 + pos + i]);
+            }
+            acc += val * f32::cast_from(w[w_base + i]);
+        }
+        out[x_base + pos] = F::cast_from(acc / (1.0f32 + (-acc).exp()));
+
+        if pos + 1 == seq_len {
+            #[unroll]
+            for i in 0..k {
+                let s_val = if seq_len + i >= k {
+                    x[x_base + seq_len + i - k]
+                } else if has_state != 0u32 {
+                    state_in[s_base + seq_len + i]
+                } else {
+                    F::new(0.0f32)
+                };
+                state_out[s_base + i] = s_val;
+            }
+        }
+    }
+}
+
 // ================================= 2. Fused GDN gating ==========================================
 
 /// Fused GDN gating -- mirrors `gdn_gating.comp` / cuda `fused_gdn_gating_kernel`. Per element:
@@ -98,6 +202,39 @@ pub fn gdn_gating<F: Float>(
 
         beta_out[idx] = beta;
         g_out[idx] = g;
+    }
+}
+
+/// Typed fused GDN gating (`F = f32 | f16 | bf16` inputs/outputs, `f32` `a_log`/`dt_bias`,
+/// internal `f32` exp/softplus so `f16`/`bf16` never overflows).
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu, rocm), unchecked)]
+pub fn gdn_gating_io<F: Float>(
+    b_in: &Array<F>,
+    a_in: &Array<F>,
+    a_log: &Array<f32>,
+    dt_bias: &Array<f32>,
+    beta_out: &mut Array<F>,
+    g_out: &mut Array<F>,
+    dims: &Array<u32>, // [total, num_heads]
+) {
+    let idx = ABSOLUTE_POS;
+    let total = dims[0] as usize;
+    if idx < total {
+        let num_heads = dims[1] as usize;
+        let head = idx % num_heads;
+        let b_f = f32::cast_from(b_in[idx]);
+        let a_f = f32::cast_from(a_in[idx]);
+        let x = a_f + dt_bias[head];
+        // Numerically stable softplus: max(x, 0) + ln(1 + exp(-|x|)) prevents f32 exp overflow.
+        let sp = if x > 20.0f32 {
+            x
+        } else {
+            (1.0f32 + x.exp()).ln()
+        };
+        let beta = 1.0f32 / (1.0f32 + (-b_f).exp());
+        let g = -(a_log[head].exp()) * sp;
+        beta_out[idx] = F::cast_from(beta);
+        g_out[idx] = F::cast_from(g);
     }
 }
 
@@ -623,6 +760,321 @@ pub fn gdn_scan_lanes<F: Float>(
     }
 }
 
+/// Typed lane-split gated delta-rule scan (`F = f32 | f16 | bf16` for `q, k, v, g, beta, out`,
+/// `f32` recurrent `state` updated in-place and `f32` internal accumulation for zero half-precision
+/// drift across chunk boundaries and decode steps).
+#[allow(clippy::too_many_arguments)]
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
+pub fn gdn_scan_lanes_io<F: Float>(
+    q: &Array<F>,
+    k: &Array<F>,
+    v: &Array<F>,
+    g: &Array<F>,
+    beta: &Array<F>,
+    state: &mut Array<f32>,
+    out: &mut Array<F>,
+    dims: &Array<u32>, // [bh, seq]
+    #[comptime] k_dim: usize,
+    #[comptime] v_dim: usize,
+    #[comptime] lanes: usize,
+    #[comptime] vk_layout: bool,
+) {
+    let bh = dims[0] as usize;
+    let seq = dims[1] as usize;
+    let seg = comptime!(k_dim / lanes);
+    let lanes_u = comptime!(lanes as u32);
+    let total = bh * v_dim;
+    let group_raw = ABSOLUTE_POS / lanes;
+    let lane = ABSOLUTE_POS % lanes;
+    let valid = group_raw < total;
+    let mut group = group_raw;
+    if !valid {
+        group = 0usize;
+    }
+    let b = group / v_dim;
+    let vi = group % v_dim;
+    let qk_bh = b * seq * k_dim + lane * seg;
+    let v_bh = b * seq * v_dim + vi;
+    let gb_bh = b * seq;
+    let state_base = b * k_dim * v_dim;
+
+    let mut s = Array::<f32>::new(seg);
+    for j in 0..seg {
+        let kj = lane * seg + j;
+        if vk_layout {
+            s[j] = state[state_base + vi * k_dim + kj];
+        } else {
+            s[j] = state[state_base + kj * v_dim + vi];
+        }
+    }
+
+    for t in 0..seq {
+        let decay = f32::cast_from(g[gb_bh + t]).exp();
+        let beta_t = f32::cast_from(beta[gb_bh + t]);
+        let v_t = f32::cast_from(v[v_bh + t * v_dim]);
+
+        let mut kv_mem = 0.0f32;
+        for j in 0..seg {
+            let sj = s[j] * decay;
+            s[j] = sj;
+            kv_mem += sj * f32::cast_from(k[qk_bh + t * k_dim + j]);
+        }
+        let mut off = 1u32;
+        while off < lanes_u {
+            kv_mem += plane_shuffle_xor(kv_mem, off);
+            off *= 2;
+        }
+        let delta = (v_t - kv_mem) * beta_t;
+
+        let mut y_t = 0.0f32;
+        for j in 0..seg {
+            let kj_t = f32::cast_from(k[qk_bh + t * k_dim + j]);
+            let sj = s[j] + kj_t * delta;
+            s[j] = sj;
+            y_t += sj * f32::cast_from(q[qk_bh + t * k_dim + j]);
+        }
+        off = 1u32;
+        while off < lanes_u {
+            y_t += plane_shuffle_xor(y_t, off);
+            off *= 2;
+        }
+        if valid && lane == 0 {
+            out[v_bh + t * v_dim] = F::cast_from(y_t);
+        }
+    }
+
+    if valid {
+        for j in 0..seg {
+            let kj = lane * seg + j;
+            if vk_layout {
+                state[state_base + vi * k_dim + kj] = s[j];
+            } else {
+                state[state_base + kj * v_dim + vi] = s[j];
+            }
+        }
+    }
+}
+
+/// Host launch for [`gdn_conv1d_step`] over any `CubeElement + Float` (`f32`, `f16`, `bf16`).
+pub fn gdn_conv1d_step_run_as<E: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[E],
+    w: &[E],
+    state: &[E],
+    batch: usize,
+    conv_dim: usize,
+    k: usize,
+) -> (Vec<E>, Vec<E>) {
+    let total = batch * conv_dim;
+    let xh = client.create_from_slice(E::as_bytes(x));
+    let wh = client.create_from_slice(E::as_bytes(w));
+    let sh = client.create_from_slice(E::as_bytes(state));
+    let oh = client.create_from_slice(E::as_bytes(&vec![E::from_int(0); total]));
+    let dh = client.create_from_slice(u32::as_bytes(&[batch as u32, conv_dim as u32]));
+    let block = 64u32;
+    let grid = (total as u32).div_ceil(block);
+    unsafe {
+        gdn_conv1d_step::launch_unchecked::<E, R>(
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(sh.clone(), state.len()),
+            ArrayArg::from_raw_parts(oh.clone(), total),
+            ArrayArg::from_raw_parts(dh.clone(), 2),
+            k,
+        );
+    }
+    let out = E::from_bytes(&client.read_one_unchecked(oh)).to_vec();
+    let new_state = E::from_bytes(&client.read_one_unchecked(sh)).to_vec();
+    (out, new_state)
+}
+
+/// Host launch for [`gdn_conv1d_stateful`] over any `CubeElement + Float` (`f32`, `f16`, `bf16`).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_conv1d_stateful_run_as<E: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[E],
+    w: &[E],
+    state_in: &[E],
+    batch: usize,
+    conv_dim: usize,
+    seq_len: usize,
+    has_state: bool,
+    k: usize,
+) -> (Vec<E>, Vec<E>) {
+    let total = batch * conv_dim * seq_len;
+    let s_len = batch * conv_dim * k;
+    let xh = client.create_from_slice(E::as_bytes(x));
+    let wh = client.create_from_slice(E::as_bytes(w));
+    let sih = client.create_from_slice(E::as_bytes(state_in));
+    let soh = client.create_from_slice(E::as_bytes(&vec![E::from_int(0); s_len]));
+    let oh = client.create_from_slice(E::as_bytes(&vec![E::from_int(0); total]));
+    let dh = client.create_from_slice(u32::as_bytes(&[
+        batch as u32,
+        conv_dim as u32,
+        seq_len as u32,
+        u32::from(has_state),
+    ]));
+    let block = 64u32;
+    let grid = (total as u32).div_ceil(block);
+    unsafe {
+        gdn_conv1d_stateful::launch_unchecked::<E, R>(
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(sih.clone(), state_in.len()),
+            ArrayArg::from_raw_parts(soh.clone(), s_len),
+            ArrayArg::from_raw_parts(oh.clone(), total),
+            ArrayArg::from_raw_parts(dh.clone(), 4),
+            k,
+        );
+    }
+    let out = E::from_bytes(&client.read_one_unchecked(oh)).to_vec();
+    let new_state = E::from_bytes(&client.read_one_unchecked(soh)).to_vec();
+    (out, new_state)
+}
+
+/// Host launch for [`gdn_gating_io`] over any `CubeElement + Float` (`f32`, `f16`, `bf16`).
+pub fn gdn_gating_io_run_as<E: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    b: &[E],
+    a: &[E],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    num_heads: usize,
+) -> (Vec<E>, Vec<E>) {
+    let total = b.len();
+    let bh = client.create_from_slice(E::as_bytes(b));
+    let ah = client.create_from_slice(E::as_bytes(a));
+    let alh = client.create_from_slice(f32::as_bytes(a_log));
+    let dth = client.create_from_slice(f32::as_bytes(dt_bias));
+    let betah = client.create_from_slice(E::as_bytes(&vec![E::from_int(0); total]));
+    let gh = client.create_from_slice(E::as_bytes(&vec![E::from_int(0); total]));
+    let dh = client.create_from_slice(u32::as_bytes(&[total as u32, num_heads as u32]));
+    let block = 64u32;
+    let grid = (total as u32).div_ceil(block);
+    unsafe {
+        gdn_gating_io::launch_unchecked::<E, R>(
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
+            ArrayArg::from_raw_parts(bh.clone(), b.len()),
+            ArrayArg::from_raw_parts(ah.clone(), a.len()),
+            ArrayArg::from_raw_parts(alh.clone(), a_log.len()),
+            ArrayArg::from_raw_parts(dth.clone(), dt_bias.len()),
+            ArrayArg::from_raw_parts(betah.clone(), total),
+            ArrayArg::from_raw_parts(gh.clone(), total),
+            ArrayArg::from_raw_parts(dh.clone(), 2),
+        );
+    }
+    let beta = E::from_bytes(&client.read_one_unchecked(betah)).to_vec();
+    let g = E::from_bytes(&client.read_one_unchecked(gh)).to_vec();
+    (beta, g)
+}
+
+/// Host launch for [`gdn_scan_lanes_io`] over any `CubeElement + Float` (`f32`, `f16`, `bf16`).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_scan_lanes_io_run_as<E: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[E],
+    k: &[E],
+    v: &[E],
+    g: &[E],
+    beta: &[E],
+    state: &[f32],
+    bh: usize,
+    seq: usize,
+    k_dim: usize,
+    v_dim: usize,
+    lanes: usize,
+    block: usize,
+    vk_layout: bool,
+) -> (Vec<E>, Vec<f32>) {
+    let out_len = bh * seq * v_dim;
+    let qh = client.create_from_slice(E::as_bytes(q));
+    let kh = client.create_from_slice(E::as_bytes(k));
+    let vh = client.create_from_slice(E::as_bytes(v));
+    let gh = client.create_from_slice(E::as_bytes(g));
+    let betah = client.create_from_slice(E::as_bytes(beta));
+    let sh = client.create_from_slice(f32::as_bytes(state));
+    let oh = client.create_from_slice(E::as_bytes(&vec![E::from_int(0); out_len]));
+    let dh = client.create_from_slice(u32::as_bytes(&[bh as u32, seq as u32]));
+    let grid = ((bh * v_dim * lanes) as u32).div_ceil(block as u32);
+    unsafe {
+        gdn_scan_lanes_io::launch_unchecked::<E, R>(
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block as u32),
+            ArrayArg::from_raw_parts(qh.clone(), q.len()),
+            ArrayArg::from_raw_parts(kh.clone(), k.len()),
+            ArrayArg::from_raw_parts(vh.clone(), v.len()),
+            ArrayArg::from_raw_parts(gh.clone(), g.len()),
+            ArrayArg::from_raw_parts(betah.clone(), beta.len()),
+            ArrayArg::from_raw_parts(sh.clone(), state.len()),
+            ArrayArg::from_raw_parts(oh.clone(), out_len),
+            ArrayArg::from_raw_parts(dh.clone(), 2),
+            k_dim,
+            v_dim,
+            lanes,
+            vk_layout,
+        );
+    }
+    let out = E::from_bytes(&client.read_one_unchecked(oh)).to_vec();
+    let new_state = f32::from_bytes(&client.read_one_unchecked(sh)).to_vec();
+    (out, new_state)
+}
+
+/// CPU oracle for stateful prefill / chunked causal conv1d + SiLU + trailing state update.
+pub fn gdn_conv1d_stateful_ref(
+    x: &[f32],
+    w: &[f32],
+    state_in: &[f32],
+    batch: usize,
+    conv_dim: usize,
+    seq_len: usize,
+    has_state: bool,
+    k: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut out = vec![0.0f32; batch * conv_dim * seq_len];
+    let mut state_out = vec![0.0f32; batch * conv_dim * k];
+    for b in 0..batch {
+        for ch in 0..conv_dim {
+            let row = b * conv_dim + ch;
+            let x_base = row * seq_len;
+            let s_base = row * k;
+            let w_base = ch * k;
+            for pos in 0..seq_len {
+                let mut acc = 0.0f32;
+                for i in 0..k {
+                    let val = if pos + i >= k - 1 {
+                        x[x_base + pos + i - (k - 1)]
+                    } else if has_state {
+                        state_in[s_base + 1 + pos + i]
+                    } else {
+                        0.0
+                    };
+                    acc += val * w[w_base + i];
+                }
+                out[x_base + pos] = acc / (1.0 + (-acc).exp());
+            }
+            for i in 0..k {
+                state_out[s_base + i] = if seq_len + i >= k {
+                    x[x_base + seq_len + i - k]
+                } else if has_state {
+                    state_in[s_base + seq_len + i]
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+    (out, state_out)
+}
+
 /// Deterministic inputs shaped like a Qwen3.5 GDN layer: unit-norm `k`, `q` pre-scaled by
 /// `1/sqrt(k_dim)`, log-decay `g` in `(-0.51, -0.01)`, write strength `beta` in `(0.1, 0.9)`.
 /// Returns `[q, k, v, g, beta, state]`.
@@ -1013,5 +1465,219 @@ mod tests {
                 "gdn_scan bh{bh} s{seq} out={ro} state={rs}"
             );
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_full_pipeline_chunk_and_decode_equivalence_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        let scale_rel = |a: &[f32], b: &[f32]| -> f32 {
+            let m = a.iter().fold(0.0f32, |mx, &v| mx.max(v.abs())).max(1e-30);
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+                / m
+        };
+        let c = CudaRuntime::client(&CudaDevice::new(0));
+        let (batch, conv_dim, seq_len, k) = (2usize, 128usize, 13usize, 4usize);
+        let x_f32 = rnd(batch * conv_dim * seq_len, 0xA101);
+        let w_f32 = rnd(conv_dim * k, 0xA102);
+        let z_f32 = vec![0.0f32; batch * conv_dim * k];
+
+        // 1. One-shot vs chunked [5, 4, 3, 1] vs single-token step for f32, f16, bf16.
+        let (want_out, want_st) =
+            gdn_conv1d_stateful_ref(&x_f32, &w_f32, &z_f32, batch, conv_dim, seq_len, false, k);
+        let (got_full, got_st_full) = gdn_conv1d_stateful_run_as::<f32, CudaRuntime>(
+            &c, &x_f32, &w_f32, &z_f32, batch, conv_dim, seq_len, false, k,
+        );
+        let r_full = scale_rel(&want_out, &got_full);
+        let r_st = scale_rel(&want_st, &got_st_full);
+        eprintln!("[gdn_conv1d_stateful CUDA f32] full: out_rel={r_full:.2e} state_rel={r_st:.2e}");
+        assert!(r_full < 1e-5 && r_st < 1e-6);
+
+        // Chunked prefill [5, 4, 3, 1]
+        let mut st_chunk = z_f32.clone();
+        let mut out_chunk = vec![0.0f32; batch * conv_dim * seq_len];
+        let mut off = 0usize;
+        for &clen in &[5usize, 4, 3, 1] {
+            let mut xc = vec![0.0f32; batch * conv_dim * clen];
+            for r in 0..batch * conv_dim {
+                xc[r * clen..(r + 1) * clen]
+                    .copy_from_slice(&x_f32[r * seq_len + off..r * seq_len + off + clen]);
+            }
+            let (oc, sc) = gdn_conv1d_stateful_run_as::<f32, CudaRuntime>(
+                &c,
+                &xc,
+                &w_f32,
+                &st_chunk,
+                batch,
+                conv_dim,
+                clen,
+                off > 0,
+                k,
+            );
+            for r in 0..batch * conv_dim {
+                out_chunk[r * seq_len + off..r * seq_len + off + clen]
+                    .copy_from_slice(&oc[r * clen..(r + 1) * clen]);
+            }
+            st_chunk = sc;
+            off += clen;
+        }
+        let r_ch = scale_rel(&want_out, &out_chunk);
+        let r_chs = scale_rel(&want_st, &st_chunk);
+        eprintln!("[gdn_conv1d_stateful CUDA f32] chunked [5,4,3,1]: out_rel={r_ch:.2e} state_rel={r_chs:.2e}");
+        assert!(r_ch < 1e-5 && r_chs < 1e-6);
+
+        // Repeated single-token gdn_conv1d_step
+        let mut st_step = z_f32.clone();
+        let mut out_step = vec![0.0f32; batch * conv_dim * seq_len];
+        for t in 0..seq_len {
+            let xt: Vec<f32> = (0..batch * conv_dim)
+                .map(|r| x_f32[r * seq_len + t])
+                .collect();
+            let (ot, st) = gdn_conv1d_step_run_as::<f32, CudaRuntime>(
+                &c, &xt, &w_f32, &st_step, batch, conv_dim, k,
+            );
+            for r in 0..batch * conv_dim {
+                out_step[r * seq_len + t] = ot[r];
+            }
+            st_step = st;
+        }
+        let r_step = scale_rel(&want_out, &out_step);
+        let r_steps = scale_rel(&want_st, &st_step);
+        eprintln!(
+            "[gdn_conv1d_step CUDA f32] 13x step: out_rel={r_step:.2e} state_rel={r_steps:.2e}"
+        );
+        assert!(r_step < 1e-5 && r_steps < 1e-6);
+
+        // BF16 & F16 conv1d_step + conv1d_stateful bit-exact full vs step
+        let x_bf16: Vec<half::bf16> = x_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let w_bf16: Vec<half::bf16> = w_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let z_bf16 = vec![half::bf16::from_f32(0.0); batch * conv_dim * k];
+        let (ob_full, sb_full) = gdn_conv1d_stateful_run_as::<half::bf16, CudaRuntime>(
+            &c, &x_bf16, &w_bf16, &z_bf16, batch, conv_dim, seq_len, false, k,
+        );
+        let mut sb_step = z_bf16.clone();
+        let mut ob_step = vec![half::bf16::from_f32(0.0); batch * conv_dim * seq_len];
+        for t in 0..seq_len {
+            let xt: Vec<half::bf16> = (0..batch * conv_dim)
+                .map(|r| x_bf16[r * seq_len + t])
+                .collect();
+            let (ot, st) = gdn_conv1d_step_run_as::<half::bf16, CudaRuntime>(
+                &c, &xt, &w_bf16, &sb_step, batch, conv_dim, k,
+            );
+            for r in 0..batch * conv_dim {
+                ob_step[r * seq_len + t] = ot[r];
+            }
+            sb_step = st;
+        }
+        assert_eq!(
+            ob_full, ob_step,
+            "BF16 conv1d full vs step not bit-identical"
+        );
+        assert_eq!(
+            sb_full, sb_step,
+            "BF16 conv_state full vs step not bit-identical"
+        );
+
+        let x_f16: Vec<half::f16> = x_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let w_f16: Vec<half::f16> = w_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let z_f16 = vec![half::f16::from_f32(0.0); batch * conv_dim * k];
+        let (oh_full, sh_full) = gdn_conv1d_stateful_run_as::<half::f16, CudaRuntime>(
+            &c, &x_f16, &w_f16, &z_f16, batch, conv_dim, seq_len, false, k,
+        );
+        let mut sh_step = z_f16.clone();
+        let mut oh_step = vec![half::f16::from_f32(0.0); batch * conv_dim * seq_len];
+        for t in 0..seq_len {
+            let xt: Vec<half::f16> = (0..batch * conv_dim)
+                .map(|r| x_f16[r * seq_len + t])
+                .collect();
+            let (ot, st) = gdn_conv1d_step_run_as::<half::f16, CudaRuntime>(
+                &c, &xt, &w_f16, &sh_step, batch, conv_dim, k,
+            );
+            for r in 0..batch * conv_dim {
+                oh_step[r * seq_len + t] = ot[r];
+            }
+            sh_step = st;
+        }
+        assert_eq!(
+            oh_full, oh_step,
+            "F16 conv1d full vs step not bit-identical"
+        );
+        assert_eq!(
+            sh_full, sh_step,
+            "F16 conv_state full vs step not bit-identical"
+        );
+        eprintln!("[gdn_conv1d CUDA f16 & bf16] full vs 13x step: 100% BIT-IDENTICAL");
+
+        // 2. Gating + Scan_lanes_io one-shot vs chunked vs single-token decode (F32 & BF16)
+        let (bh, s_tot, kd, vd) = (4usize, 11usize, 128usize, 128usize);
+        let [q, kk, vv, gg, bb, st0] = gdn_synth(bh, s_tot, kd, vd, 0xB202);
+        let (o_all, s_all) = gdn_scan_lanes_io_run_as::<f32, CudaRuntime>(
+            &c, &q, &kk, &vv, &gg, &bb, &st0, bh, s_tot, kd, vd, 4, 64, false,
+        );
+        let mut s_step = st0.clone();
+        let mut o_step = vec![0.0f32; bh * s_tot * vd];
+        for t in 0..s_tot {
+            let mut qt = vec![0.0f32; bh * kd];
+            let mut kt = vec![0.0f32; bh * kd];
+            let mut vt = vec![0.0f32; bh * vd];
+            let mut gt = vec![0.0f32; bh];
+            let mut bt = vec![0.0f32; bh];
+            for b in 0..bh {
+                qt[b * kd..(b + 1) * kd]
+                    .copy_from_slice(&q[(b * s_tot + t) * kd..(b * s_tot + t + 1) * kd]);
+                kt[b * kd..(b + 1) * kd]
+                    .copy_from_slice(&kk[(b * s_tot + t) * kd..(b * s_tot + t + 1) * kd]);
+                vt[b * vd..(b + 1) * vd]
+                    .copy_from_slice(&vv[(b * s_tot + t) * vd..(b * s_tot + t + 1) * vd]);
+                gt[b] = gg[b * s_tot + t];
+                bt[b] = bb[b * s_tot + t];
+            }
+            let (ot, sn) = gdn_scan_lanes_io_run_as::<f32, CudaRuntime>(
+                &c, &qt, &kt, &vt, &gt, &bt, &s_step, bh, 1, kd, vd, 4, 64, false,
+            );
+            for b in 0..bh {
+                o_step[(b * s_tot + t) * vd..(b * s_tot + t + 1) * vd]
+                    .copy_from_slice(&ot[b * vd..(b + 1) * vd]);
+            }
+            s_step = sn;
+        }
+        let ro = scale_rel(&o_all, &o_step);
+        let rs = scale_rel(&s_all, &s_step);
+        eprintln!("[gdn_scan_lanes_io CUDA] one-shot vs step: out_rel={ro:.2e} state_rel={rs:.2e}");
+        assert!(
+            ro < 1e-6 && rs < 1e-6,
+            "scan one-shot vs step diverged: out={ro} state={rs}"
+        );
+
+        // BF16 scan_lanes_io + gating_io
+        let q_b: Vec<half::bf16> = q.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let k_b: Vec<half::bf16> = kk.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let v_b: Vec<half::bf16> = vv.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let g_b: Vec<half::bf16> = gg.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let b_b: Vec<half::bf16> = bb.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let (ob, sb) = gdn_scan_lanes_io_run_as::<half::bf16, CudaRuntime>(
+            &c, &q_b, &k_b, &v_b, &g_b, &b_b, &st0, bh, s_tot, kd, vd, 4, 64, false,
+        );
+        let ob_f: Vec<f32> = ob.iter().map(|x| x.to_f32()).collect();
+        assert!(scale_rel(&o_all, &ob_f) < 2e-2, "BF16 scan out diverged");
+        assert!(scale_rel(&s_all, &sb) < 2e-2, "BF16 scan state diverged");
+
+        let alog = rnd(bh, 0xC303);
+        let dtb = rnd(bh, 0xC304);
+        let (bg_b, gg_b) =
+            gdn_gating_io_run_as::<half::bf16, CudaRuntime>(&c, &b_b, &g_b, &alog, &dtb, bh);
+        let (wb, wg) = gdn_gating_ref(
+            &b_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            &g_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            &alog,
+            &dtb,
+            bh,
+            false,
+        );
+        assert!(scale_rel(&wb, &bg_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>()) < 2e-2);
+        assert!(scale_rel(&wg, &gg_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>()) < 2e-2);
     }
 }
