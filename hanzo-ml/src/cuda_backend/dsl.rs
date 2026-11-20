@@ -99,6 +99,25 @@ cuda_dsl_artifacts! {
     "flash_attn_paged_d256_f32" => "flash_attn_paged_f_f32",
     "flash_attn_paged_d256_f16" => "flash_attn_paged_f_",
     "flash_attn_paged_d256_bf16" => "flash_attn_paged_f_",
+    // Production Fast Walsh-Hadamard Transform (B=64..2048, F32/F16/BF16, fused signs)
+    "fwht_hadamard_b64_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b64_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b64_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b128_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b128_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b128_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b256_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b256_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b256_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b512_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b512_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b512_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b1024_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b1024_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b1024_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b2048_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b2048_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b2048_bf16" => "fwht_hadamard_f_",
 }
 
 /// Trailing `const __grid_constant__ info_st info` parameter emitted by cubecl-cpp CUDA kernels
@@ -569,12 +588,7 @@ impl CudaDevice {
                 )?;
             }
         }
-        crate::quantized::dsl::note_dispatch(
-            crate::quantized::dsl::QkImpl::Dsl,
-            artifact,
-            bh,
-            seq,
-        );
+        crate::quantized::dsl::note_dispatch(crate::quantized::dsl::QkImpl::Dsl, artifact, bh, seq);
         Ok(out)
     }
 
@@ -613,9 +627,9 @@ impl CudaDevice {
             (256, DType::F32) => "flash_attn_paged_d256_f32",
             (256, DType::F16) => "flash_attn_paged_d256_f16",
             (256, DType::BF16) => "flash_attn_paged_d256_bf16",
-            _ => crate::bail!(
-                "cuda flash_attn_paged_dsl: unsupported head_dim={d} dtype={dtype:?}"
-            ),
+            _ => {
+                crate::bail!("cuda flash_attn_paged_dsl: unsupported head_dim={d} dtype={dtype:?}")
+            }
         };
         if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 {
             crate::bail!("cuda flash_attn_paged_dsl: empty shape");
@@ -642,8 +656,10 @@ impl CudaDevice {
             let (qp, _gq) = cuda_storage_ptr(q.0, q.1, dtype, &stream)?;
             let (kp, _gk) = cuda_storage_ptr(k_cache.0, k_cache.1, dtype, &stream)?;
             let (vp, _gv) = cuda_storage_ptr(v_cache.0, v_cache.1, dtype, &stream)?;
-            let (btp, _gbt) = cuda_storage_ptr(block_tables.0, block_tables.1, DType::U32, &stream)?;
-            let (clp, _gcl) = cuda_storage_ptr(context_lens.0, context_lens.1, DType::U32, &stream)?;
+            let (btp, _gbt) =
+                cuda_storage_ptr(block_tables.0, block_tables.1, DType::U32, &stream)?;
+            let (clp, _gcl) =
+                cuda_storage_ptr(context_lens.0, context_lens.1, DType::U32, &stream)?;
             let (op, _go) = cuda_storage_ptr_mut(&mut out, 0, dtype, &stream)?;
             let (scp, _gsc) = scale_cfg.device_ptr(&stream);
             let (mp, _gm) = meta.device_ptr(&stream);
@@ -661,6 +677,93 @@ impl CudaDevice {
             artifact,
             n_heads,
             d,
+        );
+        Ok(out)
+    }
+
+    /// Production DSL Fast Walsh-Hadamard Transform (`B=64..2048`, F32/F16/BF16, fused optional signs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fwht_hadamard_dsl(
+        &self,
+        dtype: DType,
+        x: (&CudaStorage, usize),
+        signs: Option<(&CudaStorage, usize, usize)>,
+        n_blocks: usize,
+        block_size: usize,
+        inverse: bool,
+    ) -> Result<CudaStorage> {
+        let artifact = match (block_size, dtype) {
+            (64, DType::F32) => "fwht_hadamard_b64_f32",
+            (64, DType::F16) => "fwht_hadamard_b64_f16",
+            (64, DType::BF16) => "fwht_hadamard_b64_bf16",
+            (128, DType::F32) => "fwht_hadamard_b128_f32",
+            (128, DType::F16) => "fwht_hadamard_b128_f16",
+            (128, DType::BF16) => "fwht_hadamard_b128_bf16",
+            (256, DType::F32) => "fwht_hadamard_b256_f32",
+            (256, DType::F16) => "fwht_hadamard_b256_f16",
+            (256, DType::BF16) => "fwht_hadamard_b256_bf16",
+            (512, DType::F32) => "fwht_hadamard_b512_f32",
+            (512, DType::F16) => "fwht_hadamard_b512_f16",
+            (512, DType::BF16) => "fwht_hadamard_b512_bf16",
+            (1024, DType::F32) => "fwht_hadamard_b1024_f32",
+            (1024, DType::F16) => "fwht_hadamard_b1024_f16",
+            (1024, DType::BF16) => "fwht_hadamard_b1024_bf16",
+            (2048, DType::F32) => "fwht_hadamard_b2048_f32",
+            (2048, DType::F16) => "fwht_hadamard_b2048_f16",
+            (2048, DType::BF16) => "fwht_hadamard_b2048_bf16",
+            _ => crate::bail!(
+                "cuda fwht_hadamard_dsl: unsupported block_size={block_size} dtype={dtype:?}"
+            ),
+        };
+        if n_blocks == 0 {
+            crate::bail!("cuda fwht_hadamard_dsl: empty input");
+        }
+        let mut out = self.alloc_dsl_float(n_blocks * block_size, dtype)?;
+        let (sign_w, has_signs) = match signs {
+            Some((_, _, w)) => (w, 1u32),
+            None => (block_size, 0u32),
+        };
+        let dims = self.dsl_const_u32_slice(&[
+            n_blocks as u32,
+            sign_w as u32,
+            has_signs,
+            u32::from(inverse),
+        ])?;
+        let dummy_signs = if signs.is_none() {
+            Some(self.dsl_const_f32_slice(&[1.0f32])?)
+        } else {
+            None
+        };
+        let nt = (block_size / 4).clamp(16, 256) as u32;
+        let stream = self.cuda_stream();
+        {
+            let (xp, _gx) = cuda_storage_ptr(x.0, x.1, dtype, &stream)?;
+            let (sp, _gs_storage, _gs_dummy) = match signs {
+                Some((ss, so, _)) => {
+                    let (p, g) = cuda_storage_ptr(ss, so, DType::F32, &stream)?;
+                    (p, Some(g), None)
+                }
+                None => {
+                    let (p, g) = dummy_signs.as_ref().unwrap().device_ptr(&stream);
+                    (p, None, Some(g))
+                }
+            };
+            let (op, _go) = cuda_storage_ptr_mut(&mut out, 0, dtype, &stream)?;
+            let (dp, _gd) = dims.device_ptr(&stream);
+            unsafe {
+                self.dispatch_dsl_raw::<8>(
+                    artifact,
+                    &[xp, sp, op, dp],
+                    (n_blocks as u32, 1, 1),
+                    (nt, 1, 1),
+                )?;
+            }
+        }
+        crate::quantized::dsl::note_dispatch(
+            crate::quantized::dsl::QkImpl::Dsl,
+            artifact,
+            n_blocks,
+            block_size,
         );
         Ok(out)
     }

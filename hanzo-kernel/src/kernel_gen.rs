@@ -418,7 +418,12 @@ fn ternary_specs<R: Runtime>() -> Vec<Spec<R>> {
 /// Production GDN (stateful prefill, single-token decode step, typed gating, typed lane-split
 /// recurrence) and Paged/Contiguous FlashAttention (`d = 64, 128, 256`) across `f32`, `f16`, `bf16`.
 /// `d256_br` is `8` on Metal (`< 32 KB` threadgroup memory) and `16` on CUDA/ROCm/Vulkan (`16x16` CMMA).
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! gdn_conv_step_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $zero:expr) => {
         Spec {
@@ -433,7 +438,12 @@ macro_rules! gdn_conv_step_spec {
     };
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! gdn_conv_stateful_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $zero:expr) => {
         Spec {
@@ -448,7 +458,12 @@ macro_rules! gdn_conv_stateful_spec {
     };
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! gdn_gating_io_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $zero:expr) => {
         Spec {
@@ -463,7 +478,12 @@ macro_rules! gdn_gating_io_spec {
     };
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! gdn_scan_io_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $zero:expr, $kd:literal, $vd:literal, $lanes:literal, $blk:literal) => {
         Spec {
@@ -491,7 +511,12 @@ macro_rules! gdn_scan_io_spec {
     };
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 macro_rules! flash_paged_spec {
     ($r:ty, $artifact:literal, $entry:literal, $e:ty, $zero:expr, $d:literal, $br:literal) => {
         Spec {
@@ -527,50 +552,405 @@ macro_rules! flash_paged_spec {
     };
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "rocm", feature = "vulkan"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 fn gdn_and_flash_prod_specs<R: Runtime>(is_metal: bool) -> Vec<Spec<R>> {
     let mut specs = vec![
         // Single-token GDN conv1d decode step (in-place state shift + SiLU).
-        gdn_conv_step_spec!(R, "gdn_conv1d_step_k4_f32",  "gdn_conv1d_step_f_f32", f32,        0.0f32),
-        gdn_conv_step_spec!(R, "gdn_conv1d_step_k4_f16",  "gdn_conv1d_step_f_",    half::f16,  half::f16::from_f32(0.0)),
-        gdn_conv_step_spec!(R, "gdn_conv1d_step_k4_bf16", "gdn_conv1d_step_f_",    half::bf16, half::bf16::from_f32(0.0)),
+        gdn_conv_step_spec!(
+            R,
+            "gdn_conv1d_step_k4_f32",
+            "gdn_conv1d_step_f_f32",
+            f32,
+            0.0f32
+        ),
+        gdn_conv_step_spec!(
+            R,
+            "gdn_conv1d_step_k4_f16",
+            "gdn_conv1d_step_f_",
+            half::f16,
+            half::f16::from_f32(0.0)
+        ),
+        gdn_conv_step_spec!(
+            R,
+            "gdn_conv1d_step_k4_bf16",
+            "gdn_conv1d_step_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0)
+        ),
         // Stateful GDN conv1d prefill / chunked prefill + trailing state handoff.
-        gdn_conv_stateful_spec!(R, "gdn_conv1d_stateful_k4_f32",  "gdn_conv1d_stateful_f_f32", f32,        0.0f32),
-        gdn_conv_stateful_spec!(R, "gdn_conv1d_stateful_k4_f16",  "gdn_conv1d_stateful_f_",    half::f16,  half::f16::from_f32(0.0)),
-        gdn_conv_stateful_spec!(R, "gdn_conv1d_stateful_k4_bf16", "gdn_conv1d_stateful_f_",    half::bf16, half::bf16::from_f32(0.0)),
+        gdn_conv_stateful_spec!(
+            R,
+            "gdn_conv1d_stateful_k4_f32",
+            "gdn_conv1d_stateful_f_f32",
+            f32,
+            0.0f32
+        ),
+        gdn_conv_stateful_spec!(
+            R,
+            "gdn_conv1d_stateful_k4_f16",
+            "gdn_conv1d_stateful_f_",
+            half::f16,
+            half::f16::from_f32(0.0)
+        ),
+        gdn_conv_stateful_spec!(
+            R,
+            "gdn_conv1d_stateful_k4_bf16",
+            "gdn_conv1d_stateful_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0)
+        ),
         // Typed GDN gating (f32 internal exp/softplus).
-        gdn_gating_io_spec!(R, "gdn_gating_io_f32",  "gdn_gating_io_f_f32", f32,        0.0f32),
-        gdn_gating_io_spec!(R, "gdn_gating_io_f16",  "gdn_gating_io_f_",    half::f16,  half::f16::from_f32(0.0)),
-        gdn_gating_io_spec!(R, "gdn_gating_io_bf16", "gdn_gating_io_f_",    half::bf16, half::bf16::from_f32(0.0)),
+        gdn_gating_io_spec!(R, "gdn_gating_io_f32", "gdn_gating_io_f_f32", f32, 0.0f32),
+        gdn_gating_io_spec!(
+            R,
+            "gdn_gating_io_f16",
+            "gdn_gating_io_f_",
+            half::f16,
+            half::f16::from_f32(0.0)
+        ),
+        gdn_gating_io_spec!(
+            R,
+            "gdn_gating_io_bf16",
+            "gdn_gating_io_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0)
+        ),
         // Typed GDN lane-split recurrence scan (f32 in-place state).
-        gdn_scan_io_spec!(R, "gdn_scan_lanes_io_k128_v128_l4_f32",  "gdn_scan_lanes_io_f_f32", f32,        0.0f32,                   128, 128, 4, 64),
-        gdn_scan_io_spec!(R, "gdn_scan_lanes_io_k128_v128_l4_f16",  "gdn_scan_lanes_io_f_",    half::f16,  half::f16::from_f32(0.0), 128, 128, 4, 64),
-        gdn_scan_io_spec!(R, "gdn_scan_lanes_io_k128_v128_l4_bf16", "gdn_scan_lanes_io_f_",    half::bf16, half::bf16::from_f32(0.0),128, 128, 4, 64),
-        gdn_scan_io_spec!(R, "gdn_scan_lanes_io_k64_v64_l4_f32",    "gdn_scan_lanes_io_f_f32", f32,        0.0f32,                   64,  64,  4, 64),
-        gdn_scan_io_spec!(R, "gdn_scan_lanes_io_k64_v64_l4_f16",    "gdn_scan_lanes_io_f_",    half::f16,  half::f16::from_f32(0.0), 64,  64,  4, 64),
-        gdn_scan_io_spec!(R, "gdn_scan_lanes_io_k64_v64_l4_bf16",   "gdn_scan_lanes_io_f_",    half::bf16, half::bf16::from_f32(0.0),64,  64,  4, 64),
+        gdn_scan_io_spec!(
+            R,
+            "gdn_scan_lanes_io_k128_v128_l4_f32",
+            "gdn_scan_lanes_io_f_f32",
+            f32,
+            0.0f32,
+            128,
+            128,
+            4,
+            64
+        ),
+        gdn_scan_io_spec!(
+            R,
+            "gdn_scan_lanes_io_k128_v128_l4_f16",
+            "gdn_scan_lanes_io_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            128,
+            128,
+            4,
+            64
+        ),
+        gdn_scan_io_spec!(
+            R,
+            "gdn_scan_lanes_io_k128_v128_l4_bf16",
+            "gdn_scan_lanes_io_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            128,
+            128,
+            4,
+            64
+        ),
+        gdn_scan_io_spec!(
+            R,
+            "gdn_scan_lanes_io_k64_v64_l4_f32",
+            "gdn_scan_lanes_io_f_f32",
+            f32,
+            0.0f32,
+            64,
+            64,
+            4,
+            64
+        ),
+        gdn_scan_io_spec!(
+            R,
+            "gdn_scan_lanes_io_k64_v64_l4_f16",
+            "gdn_scan_lanes_io_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            64,
+            64,
+            4,
+            64
+        ),
+        gdn_scan_io_spec!(
+            R,
+            "gdn_scan_lanes_io_k64_v64_l4_bf16",
+            "gdn_scan_lanes_io_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            64,
+            64,
+            4,
+            64
+        ),
         // Production Paged & Contiguous FlashAttention (d=64, d=128).
-        flash_paged_spec!(R, "flash_attn_paged_d64_f32",  "flash_attn_paged_f_f32", f32,        0.0f32,                    64,  16),
-        flash_paged_spec!(R, "flash_attn_paged_d64_f16",  "flash_attn_paged_f_",    half::f16,  half::f16::from_f32(0.0),  64,  16),
-        flash_paged_spec!(R, "flash_attn_paged_d64_bf16", "flash_attn_paged_f_",    half::bf16, half::bf16::from_f32(0.0), 64,  16),
-        flash_paged_spec!(R, "flash_attn_paged_d128_f32",  "flash_attn_paged_f_f32", f32,        0.0f32,                    128, 16),
-        flash_paged_spec!(R, "flash_attn_paged_d128_f16",  "flash_attn_paged_f_",    half::f16,  half::f16::from_f32(0.0),  128, 16),
-        flash_paged_spec!(R, "flash_attn_paged_d128_bf16", "flash_attn_paged_f_",    half::bf16, half::bf16::from_f32(0.0), 128, 16),
+        flash_paged_spec!(
+            R,
+            "flash_attn_paged_d64_f32",
+            "flash_attn_paged_f_f32",
+            f32,
+            0.0f32,
+            64,
+            16
+        ),
+        flash_paged_spec!(
+            R,
+            "flash_attn_paged_d64_f16",
+            "flash_attn_paged_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            64,
+            16
+        ),
+        flash_paged_spec!(
+            R,
+            "flash_attn_paged_d64_bf16",
+            "flash_attn_paged_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            64,
+            16
+        ),
+        flash_paged_spec!(
+            R,
+            "flash_attn_paged_d128_f32",
+            "flash_attn_paged_f_f32",
+            f32,
+            0.0f32,
+            128,
+            16
+        ),
+        flash_paged_spec!(
+            R,
+            "flash_attn_paged_d128_f16",
+            "flash_attn_paged_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            128,
+            16
+        ),
+        flash_paged_spec!(
+            R,
+            "flash_attn_paged_d128_bf16",
+            "flash_attn_paged_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            128,
+            16
+        ),
     ];
     if is_metal {
         // Metal uses br=8 for d=256 to stay under the 32 KB threadgroup memory ceiling.
         specs.extend([
-            flash_paged_spec!(R, "flash_attn_paged_d256_f32",  "flash_attn_paged_f_f32", f32,        0.0f32,                    256, 8),
-            flash_paged_spec!(R, "flash_attn_paged_d256_f16",  "flash_attn_paged_f_",    half::f16,  half::f16::from_f32(0.0),  256, 8),
-            flash_paged_spec!(R, "flash_attn_paged_d256_bf16", "flash_attn_paged_f_",    half::bf16, half::bf16::from_f32(0.0), 256, 8),
+            flash_paged_spec!(
+                R,
+                "flash_attn_paged_d256_f32",
+                "flash_attn_paged_f_f32",
+                f32,
+                0.0f32,
+                256,
+                8
+            ),
+            flash_paged_spec!(
+                R,
+                "flash_attn_paged_d256_f16",
+                "flash_attn_paged_f_",
+                half::f16,
+                half::f16::from_f32(0.0),
+                256,
+                8
+            ),
+            flash_paged_spec!(
+                R,
+                "flash_attn_paged_d256_bf16",
+                "flash_attn_paged_f_",
+                half::bf16,
+                half::bf16::from_f32(0.0),
+                256,
+                8
+            ),
         ]);
     } else {
         specs.extend([
-            flash_paged_spec!(R, "flash_attn_paged_d256_f32",  "flash_attn_paged_f_f32", f32,        0.0f32,                    256, 16),
-            flash_paged_spec!(R, "flash_attn_paged_d256_f16",  "flash_attn_paged_f_",    half::f16,  half::f16::from_f32(0.0),  256, 16),
-            flash_paged_spec!(R, "flash_attn_paged_d256_bf16", "flash_attn_paged_f_",    half::bf16, half::bf16::from_f32(0.0), 256, 16),
+            flash_paged_spec!(
+                R,
+                "flash_attn_paged_d256_f32",
+                "flash_attn_paged_f_f32",
+                f32,
+                0.0f32,
+                256,
+                16
+            ),
+            flash_paged_spec!(
+                R,
+                "flash_attn_paged_d256_f16",
+                "flash_attn_paged_f_",
+                half::f16,
+                half::f16::from_f32(0.0),
+                256,
+                16
+            ),
+            flash_paged_spec!(
+                R,
+                "flash_attn_paged_d256_bf16",
+                "flash_attn_paged_f_",
+                half::bf16,
+                half::bf16::from_f32(0.0),
+                256,
+                16
+            ),
         ]);
     }
+    macro_rules! fwht_spec {
+        ($artifact:literal, $entry:literal, $e:ty, $zero:expr, $b:expr) => {
+            Spec {
+                artifact: $artifact,
+                entry: $entry,
+                launch: |c| {
+                    let _ = hanzo_kernel::fwht::fwht_hadamard_run_as::<$e, R>(
+                        c,
+                        &vec![$zero; $b],
+                        &vec![1.0f32; $b],
+                        $b,
+                        true,
+                        false,
+                    );
+                },
+            }
+        };
+    }
+    specs.extend([
+        fwht_spec!(
+            "fwht_hadamard_b64_f32",
+            "fwht_hadamard_f_f32",
+            f32,
+            0.0f32,
+            64
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b64_f16",
+            "fwht_hadamard_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            64
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b64_bf16",
+            "fwht_hadamard_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            64
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b128_f32",
+            "fwht_hadamard_f_f32",
+            f32,
+            0.0f32,
+            128
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b128_f16",
+            "fwht_hadamard_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            128
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b128_bf16",
+            "fwht_hadamard_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            128
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b256_f32",
+            "fwht_hadamard_f_f32",
+            f32,
+            0.0f32,
+            256
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b256_f16",
+            "fwht_hadamard_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            256
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b256_bf16",
+            "fwht_hadamard_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            256
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b512_f32",
+            "fwht_hadamard_f_f32",
+            f32,
+            0.0f32,
+            512
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b512_f16",
+            "fwht_hadamard_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            512
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b512_bf16",
+            "fwht_hadamard_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            512
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b1024_f32",
+            "fwht_hadamard_f_f32",
+            f32,
+            0.0f32,
+            1024
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b1024_f16",
+            "fwht_hadamard_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            1024
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b1024_bf16",
+            "fwht_hadamard_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            1024
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b2048_f32",
+            "fwht_hadamard_f_f32",
+            f32,
+            0.0f32,
+            2048
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b2048_f16",
+            "fwht_hadamard_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            2048
+        ),
+        fwht_spec!(
+            "fwht_hadamard_b2048_bf16",
+            "fwht_hadamard_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            2048
+        ),
+    ]);
     specs
 }
 
@@ -1029,12 +1409,13 @@ fn main() {
             let specs: Vec<_> = all_specs
                 .into_iter()
                 .filter(|s| {
-                    // Emit f32 ternary + GDN + paged FlashAttention kernels.
+                    // Emit f32 ternary + GDN + paged FlashAttention + FWHT kernels.
                     s.artifact.ends_with("_f32")
                         && (plane == 32
                             || s.artifact.starts_with("matmul_")
                             || s.artifact.starts_with("gdn_")
-                            || s.artifact.starts_with("flash_attn_paged_"))
+                            || s.artifact.starts_with("flash_attn_paged_")
+                            || s.artifact.starts_with("fwht_"))
                 })
                 .collect();
             let mut items: Vec<(String, Vec<u8>)> = Vec::with_capacity(specs.len());

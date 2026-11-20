@@ -105,7 +105,7 @@ pub fn try_flash_attn_paged(
         return Ok(None);
     }
     let (batch, n_heads, seq_q, d) = q.dims4()?;
-    if !matches!(d, 64 | 128 | 256) || n_kv == 0 || n_heads % n_kv != 0 {
+    if !matches!(d, 64 | 128 | 256) || n_kv == 0 || !n_heads.is_multiple_of(n_kv) {
         return Ok(None);
     }
     let dtype = q.dtype();

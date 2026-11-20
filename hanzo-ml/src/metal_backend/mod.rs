@@ -2585,6 +2585,25 @@ dsl_artifacts! {
     "flash_attn_paged_d256_f32" => "flash_attn_paged_f_f32",
     "flash_attn_paged_d256_f16" => "flash_attn_paged_f_",
     "flash_attn_paged_d256_bf16" => "flash_attn_paged_f_",
+    // Production Fast Walsh-Hadamard Transform (B=64..2048, F32/F16/BF16, fused signs)
+    "fwht_hadamard_b64_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b64_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b64_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b128_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b128_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b128_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b256_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b256_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b256_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b512_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b512_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b512_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b1024_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b1024_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b1024_bf16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b2048_f32" => "fwht_hadamard_f_f32",
+    "fwht_hadamard_b2048_f16" => "fwht_hadamard_f_",
+    "fwht_hadamard_b2048_bf16" => "fwht_hadamard_f_",
 }
 
 /// Resource binding kind for DSL kernel dispatch via [`MetalDevice::dispatch_dsl_bindings`].
@@ -3159,12 +3178,7 @@ impl MetalDevice {
                 depth: 1,
             },
         )?;
-        crate::quantized::dsl::note_dispatch(
-            crate::quantized::dsl::QkImpl::Dsl,
-            artifact,
-            bh,
-            seq,
-        );
+        crate::quantized::dsl::note_dispatch(crate::quantized::dsl::QkImpl::Dsl, artifact, bh, seq);
         Ok(())
     }
 
@@ -3204,9 +3218,7 @@ impl MetalDevice {
             (256, crate::DType::F32) => ("flash_attn_paged_d256_f32", 8usize),
             (256, crate::DType::F16) => ("flash_attn_paged_d256_f16", 8usize),
             (256, crate::DType::BF16) => ("flash_attn_paged_d256_bf16", 8usize),
-            _ => crate::bail!(
-                "flash_attn_paged_dsl: unsupported head_dim={d} dtype={dtype:?}"
-            ),
+            _ => crate::bail!("flash_attn_paged_dsl: unsupported head_dim={d} dtype={dtype:?}"),
         };
         if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 {
             crate::bail!("flash_attn_paged_dsl: empty shape");
@@ -3256,6 +3268,89 @@ impl MetalDevice {
             artifact,
             n_heads,
             d,
+        );
+        Ok(())
+    }
+
+    /// Production DSL Fast Walsh-Hadamard Transform (`B=64..2048`, F32/F16/BF16, fused optional signs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fwht_hadamard_dsl(
+        &self,
+        dtype: crate::DType,
+        x: (&Buffer, usize),
+        signs: Option<(&Buffer, usize, usize)>,
+        out: (&Buffer, usize),
+        n_blocks: usize,
+        block_size: usize,
+        inverse: bool,
+    ) -> Result<()> {
+        let artifact = match (block_size, dtype) {
+            (64, crate::DType::F32) => "fwht_hadamard_b64_f32",
+            (64, crate::DType::F16) => "fwht_hadamard_b64_f16",
+            (64, crate::DType::BF16) => "fwht_hadamard_b64_bf16",
+            (128, crate::DType::F32) => "fwht_hadamard_b128_f32",
+            (128, crate::DType::F16) => "fwht_hadamard_b128_f16",
+            (128, crate::DType::BF16) => "fwht_hadamard_b128_bf16",
+            (256, crate::DType::F32) => "fwht_hadamard_b256_f32",
+            (256, crate::DType::F16) => "fwht_hadamard_b256_f16",
+            (256, crate::DType::BF16) => "fwht_hadamard_b256_bf16",
+            (512, crate::DType::F32) => "fwht_hadamard_b512_f32",
+            (512, crate::DType::F16) => "fwht_hadamard_b512_f16",
+            (512, crate::DType::BF16) => "fwht_hadamard_b512_bf16",
+            (1024, crate::DType::F32) => "fwht_hadamard_b1024_f32",
+            (1024, crate::DType::F16) => "fwht_hadamard_b1024_f16",
+            (1024, crate::DType::BF16) => "fwht_hadamard_b1024_bf16",
+            (2048, crate::DType::F32) => "fwht_hadamard_b2048_f32",
+            (2048, crate::DType::F16) => "fwht_hadamard_b2048_f16",
+            (2048, crate::DType::BF16) => "fwht_hadamard_b2048_bf16",
+            _ => crate::bail!(
+                "fwht_hadamard_dsl: unsupported block_size={block_size} dtype={dtype:?}"
+            ),
+        };
+        if n_blocks == 0 {
+            crate::bail!("fwht_hadamard_dsl: empty input");
+        }
+        let dummy_sign = [1.0f32];
+        let (sign_binding, sign_w, has_signs) = match signs {
+            Some((buf, off, w)) => (DslBinding::In(buf, off), w, 1u32),
+            None => (
+                DslBinding::Bytes(slice_as_bytes(&dummy_sign)),
+                block_size,
+                0u32,
+            ),
+        };
+        let dims = [
+            n_blocks as u32,
+            sign_w as u32,
+            has_signs,
+            u32::from(inverse),
+        ];
+        let nt = (block_size / 4).clamp(16, 256);
+        self.dispatch_dsl_bindings(
+            artifact,
+            &[
+                DslBinding::In(x.0, x.1),
+                sign_binding,
+                DslBinding::Out(out.0, out.1),
+                DslBinding::Bytes(slice_as_bytes(&dims)),
+            ],
+            &[0u32; 8],
+            objc2_metal::MTLSize {
+                width: n_blocks,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: nt,
+                height: 1,
+                depth: 1,
+            },
+        )?;
+        crate::quantized::dsl::note_dispatch(
+            crate::quantized::dsl::QkImpl::Dsl,
+            artifact,
+            n_blocks,
+            block_size,
         );
         Ok(())
     }

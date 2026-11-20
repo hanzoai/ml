@@ -293,6 +293,13 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "flash_attn_paged_d64_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d64_f32.spv"),
         "flash_attn_paged_d128_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d128_f32.spv"),
         "flash_attn_paged_d256_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d256_f32.spv"),
+        // Canonical DSL Fast Walsh-Hadamard Transform kernels (F32, B=64..2048, fused signs).
+        "fwht_hadamard_b64_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b64_f32.spv"),
+        "fwht_hadamard_b128_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b128_f32.spv"),
+        "fwht_hadamard_b256_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b256_f32.spv"),
+        "fwht_hadamard_b512_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b512_f32.spv"),
+        "fwht_hadamard_b1024_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b1024_f32.spv"),
+        "fwht_hadamard_b2048_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b2048_f32.spv"),
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -4168,12 +4175,7 @@ impl VulkanDevice {
         n_tag: usize,
         k_tag: usize,
     ) -> Result<()> {
-        let was_cached = self
-            .inner
-            .pipelines
-            .lock()
-            .unwrap()
-            .contains_key(artifact);
+        let was_cached = self.inner.pipelines.lock().unwrap().contains_key(artifact);
         self.dispatch_outs(artifact, bufs, out_idxs, &[], groups)?;
         if !was_cached {
             crate::quantized::dsl::note_compile(artifact);
@@ -4204,7 +4206,13 @@ impl VulkanDevice {
         let dims = self.upload_u32(&[batch as u32, conv_dim as u32])?;
         self.dispatch_dsl_tracked(
             "gdn_conv1d_step_k4_f32",
-            &[x.buffer, weight.buffer, state.buffer, out.buffer, dims.buffer],
+            &[
+                x.buffer,
+                weight.buffer,
+                state.buffer,
+                out.buffer,
+                dims.buffer,
+            ],
             &[2, 3],
             ((total as u32).div_ceil(64), 1, 1),
             conv_dim,
@@ -4410,6 +4418,49 @@ impl VulkanDevice {
             (blocks, 1, 1),
             n_heads,
             d,
+        )?;
+        Ok(Some(out))
+    }
+
+    /// Production DSL Fast Walsh-Hadamard Transform (F32, `B=64..2048`, fused optional signs).
+    pub fn fwht_hadamard_dsl(
+        &self,
+        x: &VulkanStorage,
+        signs: Option<(&VulkanStorage, usize)>,
+        n_blocks: usize,
+        block_size: usize,
+        inverse: bool,
+    ) -> Result<Option<VulkanStorage>> {
+        let artifact = match block_size {
+            64 => "fwht_hadamard_b64_f32",
+            128 => "fwht_hadamard_b128_f32",
+            256 => "fwht_hadamard_b256_f32",
+            512 => "fwht_hadamard_b512_f32",
+            1024 => "fwht_hadamard_b1024_f32",
+            2048 => "fwht_hadamard_b2048_f32",
+            _ => return Ok(None),
+        };
+        if n_blocks == 0 {
+            crate::bail!("vulkan fwht_hadamard_dsl: empty input");
+        }
+        let out = self.alloc_f32(n_blocks * block_size)?;
+        let (sign_buf, sign_w, has_signs) = match signs {
+            Some((s, w)) => (s.buffer, w, 1u32),
+            None => (x.buffer, block_size, 0u32),
+        };
+        let dims = self.upload_u32(&[
+            n_blocks as u32,
+            sign_w as u32,
+            has_signs,
+            u32::from(inverse),
+        ])?;
+        self.dispatch_dsl_tracked(
+            artifact,
+            &[x.buffer, sign_buf, out.buffer, dims.buffer],
+            &[2],
+            (n_blocks as u32, 1, 1),
+            n_blocks,
+            block_size,
         )?;
         Ok(Some(out))
     }

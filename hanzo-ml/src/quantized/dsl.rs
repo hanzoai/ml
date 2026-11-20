@@ -40,6 +40,7 @@ static PQ2_IMPL: AtomicU8 = AtomicU8::new(UNSET);
 static PTQ1_IMPL: AtomicU8 = AtomicU8::new(UNSET);
 static GDN_IMPL: AtomicU8 = AtomicU8::new(UNSET);
 static FLASH_IMPL: AtomicU8 = AtomicU8::new(UNSET);
+static FWHT_IMPL: AtomicU8 = AtomicU8::new(UNSET);
 
 fn encode(i: QkImpl) -> u8 {
     match i {
@@ -49,13 +50,18 @@ fn encode(i: QkImpl) -> u8 {
 }
 
 fn read_impl_env(atom: &AtomicU8, env_var: &str) -> QkImpl {
+    read_impl_env_default(atom, env_var, QkImpl::Legacy)
+}
+
+fn read_impl_env_default(atom: &AtomicU8, env_var: &str, default: QkImpl) -> QkImpl {
     match atom.load(Ordering::Relaxed) {
         0 => QkImpl::Legacy,
         1 => QkImpl::Dsl,
         _ => {
             let i = match std::env::var(env_var).as_deref() {
                 Ok("dsl") => QkImpl::Dsl,
-                _ => QkImpl::Legacy,
+                Ok("legacy") => QkImpl::Legacy,
+                _ => default,
             };
             atom.store(encode(i), Ordering::Relaxed);
             i
@@ -101,6 +107,18 @@ pub fn flash_impl() -> QkImpl {
 /// Force the FlashAttention implementation for this process (A/B tests, interleaved benches).
 pub fn set_flash_impl(i: QkImpl) {
     FLASH_IMPL.store(encode(i), Ordering::Relaxed);
+}
+
+/// The implementation FWHT Hadamard rotation ops use: `set_fwht_impl` if called, else
+/// `HANZO_FWHT_IMPL` (default `dsl`, replacing the dense O(B^2) matmul fallback on Metal/Vulkan;
+/// set `HANZO_FWHT_IMPL=legacy` to force fallback for A/B).
+pub fn fwht_impl() -> QkImpl {
+    read_impl_env_default(&FWHT_IMPL, "HANZO_FWHT_IMPL", QkImpl::Dsl)
+}
+
+/// Force the FWHT implementation for this process (A/B tests, interleaved benches).
+pub fn set_fwht_impl(i: QkImpl) {
+    FWHT_IMPL.store(encode(i), Ordering::Relaxed);
 }
 
 /// The production PQ2_0 decode schedule `(nsg, nr0)` for `rows` outputs (NSG = 2, NR0 = 4

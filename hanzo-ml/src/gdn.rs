@@ -89,8 +89,7 @@ pub fn try_conv1d_step(
             let (xs, xl) = x_c.storage_and_layout();
             let (ws, wl) = w_c.storage_and_layout();
             let (mut ss, sl) = conv_state.storage_mut_and_layout();
-            let (Storage::Cuda(xs), Storage::Cuda(ws), Storage::Cuda(ss)) =
-                (&*xs, &*ws, &mut *ss)
+            let (Storage::Cuda(xs), Storage::Cuda(ws), Storage::Cuda(ss)) = (&*xs, &*ws, &mut *ss)
             else {
                 return Ok(None);
             };
@@ -269,11 +268,8 @@ pub fn try_conv1d_stateful(
                 dtype,
                 "gdn_conv1d_stateful_dsl_out",
             )?;
-            let state_buf = dev.new_buffer(
-                batch * conv_dim * 4,
-                dtype,
-                "gdn_conv1d_stateful_dsl_state",
-            )?;
+            let state_buf =
+                dev.new_buffer(batch * conv_dim * 4, dtype, "gdn_conv1d_stateful_dsl_state")?;
             {
                 let (xs, xl) = x_c.storage_and_layout();
                 let (ws, wl) = w_c.storage_and_layout();
@@ -376,7 +372,7 @@ pub fn try_gating(
     }
     let num_heads = b.dims()[b.rank() - 1];
     let total = b.elem_count();
-    if num_heads == 0 || total == 0 || total % num_heads != 0 {
+    if num_heads == 0 || total == 0 || !total.is_multiple_of(num_heads) {
         return Ok(None);
     }
     let batch_tokens = total / num_heads;
@@ -403,12 +399,8 @@ pub fn try_gating(
             let (as_, al_l) = a_c.storage_and_layout();
             let (als, all) = al_c.storage_and_layout();
             let (dts, dtl) = dt_c.storage_and_layout();
-            let (
-                Storage::Cuda(bs),
-                Storage::Cuda(as_),
-                Storage::Cuda(als),
-                Storage::Cuda(dts),
-            ) = (&*bs, &*as_, &*als, &*dts)
+            let (Storage::Cuda(bs), Storage::Cuda(as_), Storage::Cuda(als), Storage::Cuda(dts)) =
+                (&*bs, &*as_, &*als, &*dts)
             else {
                 return Ok(None);
             };
@@ -500,7 +492,8 @@ pub fn try_gating(
             else {
                 return Ok(None);
             };
-            let (beta_s, g_s) = dev.gdn_gating_io_dsl(bs, as_, als, dts, batch_tokens, num_heads)?;
+            let (beta_s, g_s) =
+                dev.gdn_gating_io_dsl(bs, as_, als, dts, batch_tokens, num_heads)?;
             Ok(Some((
                 Tensor::from_storage(
                     Storage::Vulkan(beta_s),
@@ -731,7 +724,8 @@ pub fn try_recurrence(
     // Write back if we had to convert or copy `state`.
     if orig_state_dtype != DType::F32 {
         *state = state_f32.to_dtype(orig_state_dtype)?;
-    } else if !state.is_contiguous() || (q.device().is_vulkan() && state.layout().start_offset() != 0)
+    } else if !state.is_contiguous()
+        || (q.device().is_vulkan() && state.layout().start_offset() != 0)
     {
         *state = state_f32;
     }

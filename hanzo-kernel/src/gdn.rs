@@ -1473,7 +1473,11 @@ mod tests {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
         let scale_rel = |a: &[f32], b: &[f32]| -> f32 {
             let m = a.iter().fold(0.0f32, |mx, &v| mx.max(v.abs())).max(1e-30);
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max) / m
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+                / m
         };
         let c = CudaRuntime::client(&CudaDevice::new(0));
         let (batch, conv_dim, seq_len, k) = (2usize, 128usize, 13usize, 4usize);
@@ -1503,7 +1507,15 @@ mod tests {
                     .copy_from_slice(&x_f32[r * seq_len + off..r * seq_len + off + clen]);
             }
             let (oc, sc) = gdn_conv1d_stateful_run_as::<f32, CudaRuntime>(
-                &c, &xc, &w_f32, &st_chunk, batch, conv_dim, clen, off > 0, k,
+                &c,
+                &xc,
+                &w_f32,
+                &st_chunk,
+                batch,
+                conv_dim,
+                clen,
+                off > 0,
+                k,
             );
             for r in 0..batch * conv_dim {
                 out_chunk[r * seq_len + off..r * seq_len + off + clen]
@@ -1521,7 +1533,9 @@ mod tests {
         let mut st_step = z_f32.clone();
         let mut out_step = vec![0.0f32; batch * conv_dim * seq_len];
         for t in 0..seq_len {
-            let xt: Vec<f32> = (0..batch * conv_dim).map(|r| x_f32[r * seq_len + t]).collect();
+            let xt: Vec<f32> = (0..batch * conv_dim)
+                .map(|r| x_f32[r * seq_len + t])
+                .collect();
             let (ot, st) = gdn_conv1d_step_run_as::<f32, CudaRuntime>(
                 &c, &xt, &w_f32, &st_step, batch, conv_dim, k,
             );
@@ -1532,7 +1546,9 @@ mod tests {
         }
         let r_step = scale_rel(&want_out, &out_step);
         let r_steps = scale_rel(&want_st, &st_step);
-        eprintln!("[gdn_conv1d_step CUDA f32] 13x step: out_rel={r_step:.2e} state_rel={r_steps:.2e}");
+        eprintln!(
+            "[gdn_conv1d_step CUDA f32] 13x step: out_rel={r_step:.2e} state_rel={r_steps:.2e}"
+        );
         assert!(r_step < 1e-5 && r_steps < 1e-6);
 
         // BF16 & F16 conv1d_step + conv1d_stateful bit-exact full vs step
@@ -1545,7 +1561,9 @@ mod tests {
         let mut sb_step = z_bf16.clone();
         let mut ob_step = vec![half::bf16::from_f32(0.0); batch * conv_dim * seq_len];
         for t in 0..seq_len {
-            let xt: Vec<half::bf16> = (0..batch * conv_dim).map(|r| x_bf16[r * seq_len + t]).collect();
+            let xt: Vec<half::bf16> = (0..batch * conv_dim)
+                .map(|r| x_bf16[r * seq_len + t])
+                .collect();
             let (ot, st) = gdn_conv1d_step_run_as::<half::bf16, CudaRuntime>(
                 &c, &xt, &w_bf16, &sb_step, batch, conv_dim, k,
             );
@@ -1554,8 +1572,14 @@ mod tests {
             }
             sb_step = st;
         }
-        assert_eq!(ob_full, ob_step, "BF16 conv1d full vs step not bit-identical");
-        assert_eq!(sb_full, sb_step, "BF16 conv_state full vs step not bit-identical");
+        assert_eq!(
+            ob_full, ob_step,
+            "BF16 conv1d full vs step not bit-identical"
+        );
+        assert_eq!(
+            sb_full, sb_step,
+            "BF16 conv_state full vs step not bit-identical"
+        );
 
         let x_f16: Vec<half::f16> = x_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
         let w_f16: Vec<half::f16> = w_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -1566,7 +1590,9 @@ mod tests {
         let mut sh_step = z_f16.clone();
         let mut oh_step = vec![half::f16::from_f32(0.0); batch * conv_dim * seq_len];
         for t in 0..seq_len {
-            let xt: Vec<half::f16> = (0..batch * conv_dim).map(|r| x_f16[r * seq_len + t]).collect();
+            let xt: Vec<half::f16> = (0..batch * conv_dim)
+                .map(|r| x_f16[r * seq_len + t])
+                .collect();
             let (ot, st) = gdn_conv1d_step_run_as::<half::f16, CudaRuntime>(
                 &c, &xt, &w_f16, &sh_step, batch, conv_dim, k,
             );
@@ -1575,8 +1601,14 @@ mod tests {
             }
             sh_step = st;
         }
-        assert_eq!(oh_full, oh_step, "F16 conv1d full vs step not bit-identical");
-        assert_eq!(sh_full, sh_step, "F16 conv_state full vs step not bit-identical");
+        assert_eq!(
+            oh_full, oh_step,
+            "F16 conv1d full vs step not bit-identical"
+        );
+        assert_eq!(
+            sh_full, sh_step,
+            "F16 conv_state full vs step not bit-identical"
+        );
         eprintln!("[gdn_conv1d CUDA f16 & bf16] full vs 13x step: 100% BIT-IDENTICAL");
 
         // 2. Gating + Scan_lanes_io one-shot vs chunked vs single-token decode (F32 & BF16)
@@ -1594,9 +1626,12 @@ mod tests {
             let mut gt = vec![0.0f32; bh];
             let mut bt = vec![0.0f32; bh];
             for b in 0..bh {
-                qt[b * kd..(b + 1) * kd].copy_from_slice(&q[(b * s_tot + t) * kd..(b * s_tot + t + 1) * kd]);
-                kt[b * kd..(b + 1) * kd].copy_from_slice(&kk[(b * s_tot + t) * kd..(b * s_tot + t + 1) * kd]);
-                vt[b * vd..(b + 1) * vd].copy_from_slice(&vv[(b * s_tot + t) * vd..(b * s_tot + t + 1) * vd]);
+                qt[b * kd..(b + 1) * kd]
+                    .copy_from_slice(&q[(b * s_tot + t) * kd..(b * s_tot + t + 1) * kd]);
+                kt[b * kd..(b + 1) * kd]
+                    .copy_from_slice(&kk[(b * s_tot + t) * kd..(b * s_tot + t + 1) * kd]);
+                vt[b * vd..(b + 1) * vd]
+                    .copy_from_slice(&vv[(b * s_tot + t) * vd..(b * s_tot + t + 1) * vd]);
                 gt[b] = gg[b * s_tot + t];
                 bt[b] = bb[b * s_tot + t];
             }
@@ -1612,7 +1647,10 @@ mod tests {
         let ro = scale_rel(&o_all, &o_step);
         let rs = scale_rel(&s_all, &s_step);
         eprintln!("[gdn_scan_lanes_io CUDA] one-shot vs step: out_rel={ro:.2e} state_rel={rs:.2e}");
-        assert!(ro < 1e-6 && rs < 1e-6, "scan one-shot vs step diverged: out={ro} state={rs}");
+        assert!(
+            ro < 1e-6 && rs < 1e-6,
+            "scan one-shot vs step diverged: out={ro} state={rs}"
+        );
 
         // BF16 scan_lanes_io + gating_io
         let q_b: Vec<half::bf16> = q.iter().map(|&x| half::bf16::from_f32(x)).collect();
@@ -1629,7 +1667,8 @@ mod tests {
 
         let alog = rnd(bh, 0xC303);
         let dtb = rnd(bh, 0xC304);
-        let (bg_b, gg_b) = gdn_gating_io_run_as::<half::bf16, CudaRuntime>(&c, &b_b, &g_b, &alog, &dtb, bh);
+        let (bg_b, gg_b) =
+            gdn_gating_io_run_as::<half::bf16, CudaRuntime>(&c, &b_b, &g_b, &alog, &dtb, bh);
         let (wb, wg) = gdn_gating_ref(
             &b_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
             &g_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),

@@ -37,11 +37,7 @@ fn rel_err(a: &[f32], b: &[f32]) -> f32 {
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0.0f32, f32::max);
-    let max_mag = b
-        .iter()
-        .map(|y| y.abs())
-        .fold(0.0f32, f32::max)
-        .max(1e-6);
+    let max_mag = b.iter().map(|y| y.abs()).fold(0.0f32, f32::max).max(1e-6);
     max_diff / max_mag
 }
 
@@ -278,12 +274,48 @@ fn run_gdn_suite(dev: &Device, dtypes: &[DType], label: &str) {
             .contiguous()
             .unwrap();
 
-        let full_v = out_full.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let chunk_v = out_chunk.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let step_v = out_step.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let st_full_v = st_full.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let st_chunk_v = st_chunk.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let st_step_v = st_step.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let full_v = out_full
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let chunk_v = out_chunk
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let step_v = out_step
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let st_full_v = st_full
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let st_chunk_v = st_chunk
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let st_step_v = st_step
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
 
         let e_fc = rel_err(&full_v, &chunk_v);
         let e_fs = rel_err(&full_v, &step_v);
@@ -303,8 +335,14 @@ fn run_gdn_suite(dev: &Device, dtypes: &[DType], label: &str) {
             let a_log_v = pseudo_vec(rnh, 505, 0.4);
             let dt_bias_v = pseudo_vec(rnh, 606, 0.3);
 
-            let b_in = Tensor::from_vec(b_in_v, (rb, rseq, rnh), dev).unwrap().to_dtype(dtype).unwrap();
-            let a_in = Tensor::from_vec(a_in_v, (rb, rseq, rnh), dev).unwrap().to_dtype(dtype).unwrap();
+            let b_in = Tensor::from_vec(b_in_v, (rb, rseq, rnh), dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let a_in = Tensor::from_vec(a_in_v, (rb, rseq, rnh), dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
             let a_log = Tensor::from_vec(a_log_v, rnh, dev).unwrap();
             let dt_bias = Tensor::from_vec(dt_bias_v, rnh, dev).unwrap();
 
@@ -315,13 +353,25 @@ fn run_gdn_suite(dev: &Device, dtypes: &[DType], label: &str) {
             let q_v = pseudo_vec(rb * rseq * rnh * kd, 707, 0.3);
             let k_v = pseudo_vec(rb * rseq * rnh * kd, 808, 0.3);
             let v_v = pseudo_vec(rb * rseq * rnh * vd, 909, 0.3);
-            let q = Tensor::from_vec(q_v, (rb, rseq, rnh, kd), dev).unwrap().to_dtype(dtype).unwrap();
-            let k = Tensor::from_vec(k_v, (rb, rseq, rnh, kd), dev).unwrap().to_dtype(dtype).unwrap();
-            let v = Tensor::from_vec(v_v, (rb, rseq, rnh, vd), dev).unwrap().to_dtype(dtype).unwrap();
+            let q = Tensor::from_vec(q_v, (rb, rseq, rnh, kd), dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let k = Tensor::from_vec(k_v, (rb, rseq, rnh, kd), dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let v = Tensor::from_vec(v_v, (rb, rseq, rnh, vd), dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
 
             // Nonzero offset check on `q`: prepend a dummy batch and narrow(0, 1, rb).
             let pad = Tensor::zeros((1, rseq, rnh, kd), dtype, dev).unwrap();
-            let q_off = Tensor::cat(&[&pad, &q], 0).unwrap().narrow(0, 1, rb).unwrap();
+            let q_off = Tensor::cat(&[&pad, &q], 0)
+                .unwrap()
+                .narrow(0, 1, rb)
+                .unwrap();
 
             let mut st_one = Tensor::zeros((rb, rnh, kd, vd), DType::F32, dev).unwrap();
             let out_one = try_recurrence(&q_off, &k, &v, &g, &beta, &mut st_one, true)
@@ -343,20 +393,73 @@ fn run_gdn_suite(dev: &Device, dtypes: &[DType], label: &str) {
             }
             let out_steps = Tensor::cat(&step_ys, 1).unwrap();
 
-            let one_v = out_one.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let steps_v = out_steps.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let one_v = out_one
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let steps_v = out_steps
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             let st1_v = st_one.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             let st2_v = st_step_r.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
             // Also compare against CPU f32 reference using the quantized inputs
-            let q_f32 = q.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let k_f32 = k.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let v_f32 = v.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let g_f32 = g.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let b_f32 = beta.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let q_f32 = q
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let k_f32 = k
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let v_f32 = v
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let g_f32 = g
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let b_f32 = beta
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             let mut st_ref = vec![0.0f32; rb * rnh * kd * vd];
             let out_ref = gdn_recurrence_ref(
-                &q_f32, &k_f32, &v_f32, &g_f32, &b_f32, &mut st_ref, rb, rseq, rnh, kd, vd, true,
+                &q_f32,
+                &k_f32,
+                &v_f32,
+                &g_f32,
+                &b_f32,
+                &mut st_ref,
+                rb,
+                rseq,
+                rnh,
+                kd,
+                vd,
+                true,
             );
 
             let e_os = rel_err(&one_v, &steps_v);
@@ -402,11 +505,14 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
         let q = Tensor::zeros((1, 4, 2, 128), DType::F32, dev).unwrap();
         let k = Tensor::zeros((1, 2, 8, 128), DType::F32, dev).unwrap();
         let v = Tensor::zeros((1, 2, 8, 128), DType::F32, dev).unwrap();
-        assert!(
-            try_flash_attn_contiguous(&q, &k, &v, FlashAttnConfig::causal(1.0 / 128.0f32.sqrt()))
-                .unwrap()
-                .is_none()
-        );
+        assert!(try_flash_attn_contiguous(
+            &q,
+            &k,
+            &v,
+            FlashAttnConfig::causal(1.0 / 128.0f32.sqrt())
+        )
+        .unwrap()
+        .is_none());
     }
 
     dsl::set_flash_impl(QkImpl::Dsl);
@@ -436,7 +542,7 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
             // Noncontiguous shuffled page table across all 3 requests
             let bt_v: Vec<u32> = vec![
                 7, 2, 11, 0, // req 0
-                9, 4, 1, 6,  // req 1
+                9, 4, 1, 6, // req 1
                 10, 3, 5, 8, // req 2
             ];
             let q_v = pseudo_vec(batch * n_heads * seq_q * d, 1111 + d as u64, 0.4);
@@ -487,10 +593,11 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
                 let x_vec = 8usize;
                 let (k5, v4) =
                     pack_engine_standard_kv(&kf_v, &vf_v, num_blocks, n_kv, block_size, d, x_vec);
-                let kc = Tensor::from_vec(k5, (num_blocks, n_kv, d / x_vec, block_size, x_vec), dev)
-                    .unwrap()
-                    .to_dtype(dtype)
-                    .unwrap();
+                let kc =
+                    Tensor::from_vec(k5, (num_blocks, n_kv, d / x_vec, block_size, x_vec), dev)
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
                 let vc = Tensor::from_vec(v4, (num_blocks, n_kv, d, block_size), dev)
                     .unwrap()
                     .to_dtype(dtype)
@@ -516,7 +623,8 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
         }
 
         // Contiguous SDPA check (with causal prefill)
-        let (batch, n_heads, n_kv, seq_q, seq_k, d) = (2usize, 8usize, 2usize, 7usize, 37usize, 128usize);
+        let (batch, n_heads, n_kv, seq_q, seq_k, d) =
+            (2usize, 8usize, 2usize, 7usize, 37usize, 128usize);
         let q_v = pseudo_vec(batch * n_heads * seq_q * d, 4444, 0.4);
         let k_v = pseudo_vec(batch * n_kv * seq_k * d, 5555, 0.4);
         let v_v = pseudo_vec(batch * n_kv * seq_k * d, 6666, 0.4);
@@ -527,13 +635,28 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
         let ref_c = flash_paged_ref(
             &q_v, &k_v, &v_v, &bt_contig, &cl_contig, batch, n_heads, n_kv, seq_q, d, seq_k, 1, cfg,
         );
-        let q = Tensor::from_vec(q_v, (batch, n_heads, seq_q, d), dev).unwrap().to_dtype(dtype).unwrap();
-        let k = Tensor::from_vec(k_v, (batch, n_kv, seq_k, d), dev).unwrap().to_dtype(dtype).unwrap();
-        let v = Tensor::from_vec(v_v, (batch, n_kv, seq_k, d), dev).unwrap().to_dtype(dtype).unwrap();
+        let q = Tensor::from_vec(q_v, (batch, n_heads, seq_q, d), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let k = Tensor::from_vec(k_v, (batch, n_kv, seq_k, d), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let v = Tensor::from_vec(v_v, (batch, n_kv, seq_k, d), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
         let out = try_flash_attn_contiguous(&q, &k, &v, cfg)
             .unwrap()
             .expect("DSL flash_attn_contiguous should dispatch");
-        let got = out.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let err = rel_err(&got, &ref_c);
         eprintln!("[{label} flash_contig {dtype:?}] d=128 sq=7 sk=37 rel={err:.2e}");
         assert!(err <= tol, "flash_contig err {err:.2e} > {tol:.2e}");
@@ -556,12 +679,175 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
     dsl::set_flash_impl(QkImpl::Legacy);
 }
 
+fn fwht_ref_f64(x: &[f32], signs: Option<&[f32]>, b: usize, inverse: bool) -> Vec<f32> {
+    let n_blocks = x.len() / b;
+    let scale = 1.0f64 / (b as f64).sqrt();
+    let mut out = vec![0.0f32; x.len()];
+    let mut buf = vec![0.0f64; b];
+    for blk in 0..n_blocks {
+        let base = blk * b;
+        for i in 0..b {
+            let mut v = x[base + i] as f64;
+            if let Some(s) = signs {
+                if !inverse {
+                    v *= s[(base + i) % s.len()] as f64;
+                }
+            }
+            buf[i] = v;
+        }
+        let mut half = 1usize;
+        while half < b {
+            let step = half << 1;
+            let mut start = 0usize;
+            while start < b {
+                for j in 0..half {
+                    let a = buf[start + j];
+                    let bv = buf[start + j + half];
+                    buf[start + j] = a + bv;
+                    buf[start + j + half] = a - bv;
+                }
+                start += step;
+            }
+            half = step;
+        }
+        for i in 0..b {
+            let mut v = buf[i] * scale;
+            if let Some(s) = signs {
+                if inverse {
+                    v *= s[(base + i) % s.len()] as f64;
+                }
+            }
+            out[base + i] = v as f32;
+        }
+    }
+    out
+}
+
+fn run_fwht_suite(dev: &Device, dtypes: &[DType], label: &str) {
+    // 1. Default is DSL; explicit legacy returns Ok(None).
+    assert_eq!(dsl::fwht_impl(), QkImpl::Dsl, "FWHT default must be dsl");
+    dsl::set_fwht_impl(QkImpl::Legacy);
+    let x_probe = Tensor::zeros((2, 1024), DType::F32, dev).unwrap();
+    assert!(
+        hanzo_ml::fwht::try_hadamard_fwht(&x_probe, None, 1024, false)
+            .unwrap()
+            .is_none(),
+        "HANZO_FWHT_IMPL=legacy must return Ok(None)"
+    );
+    dsl::set_fwht_impl(QkImpl::Dsl);
+    dsl::reset_stats();
+
+    for &dt in dtypes {
+        let tol = match dt {
+            DType::F32 => 1e-4,
+            DType::F16 => 5e-3,
+            DType::BF16 => 4e-2,
+            _ => unreachable!(),
+        };
+        for &b in &[64usize, 128, 256, 512, 1024, 2048] {
+            let width = if b == 1024 { 5120 } else { b * 3 };
+            let rows = 3usize;
+            let x_data = pseudo_vec(rows * width, (b as u64) * 31 + 1, 1.0);
+            let s_data: Vec<f32> = pseudo_vec(width, (b as u64) * 97 + 7, 1.0)
+                .into_iter()
+                .map(|v| if v >= 0.0 { 1.0 } else { -1.0 })
+                .collect();
+            let x = Tensor::from_vec(x_data.clone(), (1, rows, width), dev)
+                .unwrap()
+                .to_dtype(dt)
+                .unwrap();
+            let x_round: Vec<f32> = x
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let signs = Tensor::from_vec(s_data.clone(), width, dev).unwrap();
+
+            for &inv in &[false, true] {
+                let got_t = hanzo_ml::fwht::try_hadamard_fwht(&x, Some(&signs), b, inv)
+                    .unwrap()
+                    .expect("fwht DSL must handle supported block size");
+                assert_eq!(got_t.dims(), x.dims());
+                assert_eq!(got_t.dtype(), dt);
+                let got: Vec<f32> = got_t
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let want = fwht_ref_f64(&x_round, Some(&s_data), b, inv);
+                let err = rel_err(&got, &want);
+                assert!(
+                    err <= tol,
+                    "[{label}] fwht b={b} dt={dt:?} inv={inv} err={err:.3e} > tol={tol:.1e}"
+                );
+            }
+
+            // Round-trip: inverse(forward(x)) == x and signless check
+            let fwd = hanzo_ml::fwht::try_hadamard_fwht(&x, Some(&signs), b, false)
+                .unwrap()
+                .unwrap();
+            let rt = hanzo_ml::fwht::try_hadamard_fwht(&fwd, Some(&signs), b, true)
+                .unwrap()
+                .unwrap();
+            let rt_v: Vec<f32> = rt
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let rt_err = rel_err(&rt_v, &x_round);
+            assert!(
+                rt_err <= tol * 2.5,
+                "[{label}] fwht roundtrip b={b} dt={dt:?} err={rt_err:.3e}"
+            );
+
+            let nosign = hanzo_ml::fwht::try_hadamard_fwht(&x, None, b, false)
+                .unwrap()
+                .unwrap();
+            let ns_v: Vec<f32> = nosign
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let ns_want = fwht_ref_f64(&x_round, None, b, false);
+            let ns_err = rel_err(&ns_v, &ns_want);
+            assert!(
+                ns_err <= tol,
+                "[{label}] fwht signless b={b} dt={dt:?} err={ns_err:.3e}"
+            );
+        }
+        eprintln!("[{label}] FWHT B=64..2048 dt={dt:?} fwd/inv/roundtrip/signless OK");
+    }
+
+    let stats = dsl::stats();
+    assert_eq!(
+        stats.compiles_of("fwht_hadamard_b1024_f32"),
+        1,
+        "fwht_hadamard_b1024_f32 must compile exactly once"
+    );
+    let calls: u64 = stats
+        .dispatches
+        .iter()
+        .filter(|d| d.1 == "fwht_hadamard_b1024_f32")
+        .map(|d| d.4)
+        .sum();
+    assert!(calls >= 5, "must have dispatched >= 5 FWHT b=1024 calls");
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_gdn_and_flash_paged_prod_dsl() {
     let dev = Device::new_cuda(0).expect("CUDA device 0");
     run_gdn_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "CUDA");
     run_flash_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "CUDA");
+    run_fwht_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "CUDA");
 }
 
 #[cfg(feature = "vulkan")]
@@ -570,6 +856,7 @@ fn vulkan_gdn_and_flash_paged_prod_dsl() {
     let dev = Device::new_vulkan(0).expect("Vulkan device 0");
     run_gdn_suite(&dev, &[DType::F32], "Vulkan");
     run_flash_suite(&dev, &[DType::F32], "Vulkan");
+    run_fwht_suite(&dev, &[DType::F32], "Vulkan");
 }
 
 #[cfg(feature = "metal")]
@@ -578,4 +865,5 @@ fn metal_gdn_and_flash_paged_prod_dsl() {
     let dev = Device::new_metal(0).expect("Metal device 0");
     run_gdn_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
     run_flash_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
+    run_fwht_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
 }

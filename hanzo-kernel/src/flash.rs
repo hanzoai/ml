@@ -1772,14 +1772,49 @@ mod tests {
             let bs_arg = if layout == 2 { 64 } else { block_size };
 
             let want = flash_attn_paged_ref(
-                &q, &k_cache, &v_cache, &block_tables, &ctx_lens,
-                b, n_heads, n_kv, seq_q, d, 1, bs_arg, max_blocks, layout, x_vec,
-                window, 0, scale, softcap,
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &ctx_lens,
+                b,
+                n_heads,
+                n_kv,
+                seq_q,
+                d,
+                1,
+                bs_arg,
+                max_blocks,
+                layout,
+                x_vec,
+                window,
+                0,
+                scale,
+                softcap,
             );
             let got = flash_attn_paged_run_as::<f32, CudaRuntime>(
-                &c, &q, &k_cache, &v_cache, &block_tables, &ctx_lens,
-                b, n_heads, n_kv, seq_q, d, br, 16, 1, bs_arg, max_blocks, layout, x_vec,
-                window, 0, scale, softcap,
+                &c,
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &ctx_lens,
+                b,
+                n_heads,
+                n_kv,
+                seq_q,
+                d,
+                br,
+                16,
+                1,
+                bs_arg,
+                max_blocks,
+                layout,
+                x_vec,
+                window,
+                0,
+                scale,
+                softcap,
             );
             let rel = scale_rel(&want, &got);
             eprintln!("[flash_paged CUDA f32] d={d:3} sq={seq_q} layout={layout} win={window:2} cap={softcap:.0} rel={rel:.2e}");
@@ -1795,38 +1830,113 @@ mod tests {
                     &q_h.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
                     &k_h.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
                     &v_h.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
-                    &block_tables, &ctx_lens,
-                    b, n_heads, n_kv, seq_q, d, 1, block_size, max_blocks, 1, x_vec_16,
-                    window, 0, scale, softcap,
+                    &block_tables,
+                    &ctx_lens,
+                    b,
+                    n_heads,
+                    n_kv,
+                    seq_q,
+                    d,
+                    1,
+                    block_size,
+                    max_blocks,
+                    1,
+                    x_vec_16,
+                    window,
+                    0,
+                    scale,
+                    softcap,
                 );
                 let got_h = flash_attn_paged_run_as::<half::f16, CudaRuntime>(
-                    &c, &q_h, &k_h, &v_h, &block_tables, &ctx_lens,
-                    b, n_heads, n_kv, seq_q, d, br, 16, 1, block_size, max_blocks, 1, x_vec_16,
-                    window, 0, scale, softcap,
+                    &c,
+                    &q_h,
+                    &k_h,
+                    &v_h,
+                    &block_tables,
+                    &ctx_lens,
+                    b,
+                    n_heads,
+                    n_kv,
+                    seq_q,
+                    d,
+                    br,
+                    16,
+                    1,
+                    block_size,
+                    max_blocks,
+                    1,
+                    x_vec_16,
+                    window,
+                    0,
+                    scale,
+                    softcap,
                 );
-                let rel_h = scale_rel(&want_h, &got_h.iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+                let rel_h = scale_rel(
+                    &want_h,
+                    &got_h.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+                );
                 eprintln!("[flash_paged CUDA f16] d={d:3} sq={seq_q} layout=1 rel={rel_h:.2e}");
                 assert!(rel_h < 2e-2, "flash_attn_paged f16 failed: rel={rel_h:.3e}");
 
                 let q_b: Vec<half::bf16> = q.iter().map(|&v| half::bf16::from_f32(v)).collect();
-                let k_b: Vec<half::bf16> = k_cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
-                let v_b: Vec<half::bf16> = v_cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
+                let k_b: Vec<half::bf16> =
+                    k_cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
+                let v_b: Vec<half::bf16> =
+                    v_cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
                 let want_b = flash_attn_paged_ref(
                     &q_b.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
                     &k_b.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
                     &v_b.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
-                    &block_tables, &ctx_lens,
-                    b, n_heads, n_kv, seq_q, d, 1, block_size, max_blocks, 1, x_vec_16,
-                    window, 0, scale, softcap,
+                    &block_tables,
+                    &ctx_lens,
+                    b,
+                    n_heads,
+                    n_kv,
+                    seq_q,
+                    d,
+                    1,
+                    block_size,
+                    max_blocks,
+                    1,
+                    x_vec_16,
+                    window,
+                    0,
+                    scale,
+                    softcap,
                 );
                 let got_b = flash_attn_paged_run_as::<half::bf16, CudaRuntime>(
-                    &c, &q_b, &k_b, &v_b, &block_tables, &ctx_lens,
-                    b, n_heads, n_kv, seq_q, d, br, 16, 1, block_size, max_blocks, 1, x_vec_16,
-                    window, 0, scale, softcap,
+                    &c,
+                    &q_b,
+                    &k_b,
+                    &v_b,
+                    &block_tables,
+                    &ctx_lens,
+                    b,
+                    n_heads,
+                    n_kv,
+                    seq_q,
+                    d,
+                    br,
+                    16,
+                    1,
+                    block_size,
+                    max_blocks,
+                    1,
+                    x_vec_16,
+                    window,
+                    0,
+                    scale,
+                    softcap,
                 );
-                let rel_b = scale_rel(&want_b, &got_b.iter().map(|v| v.to_f32()).collect::<Vec<_>>());
+                let rel_b = scale_rel(
+                    &want_b,
+                    &got_b.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+                );
                 eprintln!("[flash_paged CUDA bf16] d={d:3} sq={seq_q} layout=1 rel={rel_b:.2e}");
-                assert!(rel_b < 2e-2, "flash_attn_paged bf16 failed: rel={rel_b:.3e}");
+                assert!(
+                    rel_b < 2e-2,
+                    "flash_attn_paged bf16 failed: rel={rel_b:.3e}"
+                );
             }
         }
     }
