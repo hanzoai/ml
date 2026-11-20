@@ -2152,13 +2152,7 @@ impl RocmDevice {
         self.grouped_q4k
     }
 
-    pub(crate) fn use_grouped_q4k(
-        &self,
-        experts: usize,
-        slots: usize,
-        n: usize,
-        k: usize,
-    ) -> bool {
+    pub(crate) fn use_grouped_q4k(&self, experts: usize, slots: usize, n: usize, k: usize) -> bool {
         // The HIP Q8_1 quantizer indexes the activation blocks with signed ints.
         const MAX: usize = i32::MAX as usize;
         self.grouped_q4k
