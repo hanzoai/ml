@@ -82,6 +82,29 @@ let module = manager.get_or_compile_module(Source::Binary)?;
 - `HANZO_ROCM_ARCH` - Override GPU architecture detection (e.g., "gfx908")
 - `HANZO_ROCM_VERSION` - Override ROCm version detection (e.g., "6.1")
 
+### Experimental grouped GGUF MoE prefill on gfx1201
+
+Set `HANZO_ROCM_GFX1201_GROUPED_Q4K=1` before creating a ROCm device.
+This enables the shared Q4_K routing plan for F16 multi-token prefill
+when a model calls `try_moe_shared_q4k`. The gate and up projections
+share Q8_1 activations. A compatible Q4_K down projection reuses the
+routing plan as well. Each wave reuses its packed weights across four
+routes and uses the indexed matvec reduction for remainder routes.
+
+The plan reads back one tile-count scalar to validate expert IDs before
+scattering the routes. Single-token decode and unsupported expert
+projections on `gfx1201` use the indexed matvec path. If kernel target
+detection selects another architecture, set `ROCM_GFX_ARCH=gfx1201` for
+the ROCm kernel cache.
+
+Run the hardware regression from the workspace root on a gfx1201 device
+with ROCm configured:
+
+```sh
+HANZO_ROCM_GFX1201_GROUPED_Q4K=1 ROCM_GFX_ARCH=gfx1201 \
+  cargo test -p hanzo-ml --features rocm --test rocm_grouped_q4k -- --ignored
+```
+
 ## Requirements
 
 - ROCm/HIP installed (provides `hipcc`)

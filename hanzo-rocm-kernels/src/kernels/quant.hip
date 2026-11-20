@@ -802,36 +802,13 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
 // ON-DEVICE), bank offset by ids[s] IN-KERNEL, output row `row` of that expert against slot s's
 // pre-quantized q8_1 activation (xq + s*ncols, xd + s*ncols/32) into y[s*n + row]. Collapses the host
 // per-expert launch loop into one well-occupied capture-clean grid + int8 dp4a.
-template <int WTYPE, typename XT>
-__device__ __forceinline__ void moe_qmatvec_dp4a_core(
-    const int n,                        // output rows per expert (weight rows)
-    const int ncols,                    // k, multiple of WELEMS (256 or 128)
-    const int nslots,                   // routed slots (= nrows)
-    const uint8_t* __restrict__ wbank,  // [E, n, k] blocks
-    const int* __restrict__ ids,        // [nslots] expert id per slot
-    const int8_t* __restrict__ xq,      // [nslots, ncols] q8_1 int8 quants
-    const __half* __restrict__ xd,      // [nslots, ncols/32] q8_1 f16 scales
-    XT* __restrict__ y                  // [nslots, n]
-) {
+template <int WTYPE>
+__device__ __forceinline__ float moe_qmatvec_wave_sum(
+    int lane, int nblocks, const uint8_t* row_ptr,
+    const int8_t* xq_row, const __half* xd_row) {
     constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
     constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
     constexpr int WSUB32 = WELEMS / 32;
-    const int s = blockIdx.y;
-    if (s >= nslots) {
-        return;
-    }
-    const int lane = threadIdx.x & 31;
-    const int rows_per_block = blockDim.x >> 5;
-    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
-    if (row >= n) {
-        return;
-    }
-    const int nblocks = ncols / WELEMS;
-    const int expert = ids[s];
-    const uint8_t* row_ptr = wbank + ((size_t)expert * n + row) * (size_t)nblocks * WBYTES;
-    const int8_t* xq_row = xq + (size_t)s * ncols;
-    const __half* xd_row = xd + (size_t)s * (ncols >> 5);
-
     // Stride lanes over (super-block x sub-unit) work items, NOT whole super-blocks. The expert
     // shapes are narrow-k (gate/up k=2048 -> 8 super-blocks, down k=768 -> 3), so whole-super-block
     // striding leaves 24/32 (gate/up) or 29/32 (down) lanes idle. NSUB sub-units per super-block
@@ -850,6 +827,40 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down(acc, off);
     }
+    return acc;
+}
+
+template <int WTYPE, typename XT>
+__device__ __forceinline__ void moe_qmatvec_dp4a_core(
+    const int n,                        // output rows per expert (weight rows)
+    const int ncols,                    // k, multiple of WELEMS (256 or 128)
+    const int nslots,                   // routed slots (= nrows)
+    const uint8_t* __restrict__ wbank,  // [E, n, k] blocks
+    const int* __restrict__ ids,        // [nslots] expert id per slot
+    const int8_t* __restrict__ xq,      // [nslots, ncols] q8_1 int8 quants
+    const __half* __restrict__ xd,      // [nslots, ncols/32] q8_1 f16 scales
+    XT* __restrict__ y                  // [nslots, n]
+) {
+    constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
+    constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
+    const int s = blockIdx.y;
+    if (s >= nslots) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    if (row >= n) {
+        return;
+    }
+    const int nblocks = ncols / WELEMS;
+    const int expert = ids[s];
+    const uint8_t* row_ptr = wbank + ((size_t)expert * n + row) * (size_t)nblocks * WBYTES;
+    const int8_t* xq_row = xq + (size_t)s * ncols;
+    const __half* xd_row = xd + (size_t)s * (ncols >> 5);
+
+    const float acc = moe_qmatvec_wave_sum<WTYPE>(
+        lane, nblocks, row_ptr, xq_row, xd_row);
     if (lane == 0) {
         qstore(&y[(size_t)s * n + row], acc);
     }
@@ -3251,6 +3262,8 @@ DEFINE_MOE_QMATVECU(ptq1_0,       DW_PTQ1_0)
 #undef DEFINE_QMATVECU
 #undef DW_Q8_0
 #undef DW_Q4_0
+static constexpr int MOE_Q4_K_WEIGHT = DW_Q4_K;
+
 #undef DW_Q4_K
 #undef DW_Q6_K
 #undef DW_IQ4_XS
@@ -4223,4 +4236,173 @@ DEFINE_MOE_QMMQ(iq3s,  WT_IQ3_S)
 #undef WT_ROCMFP4
 #undef WT_IQ4_NL
 #undef WT_IQ3_S
+#endif
+
+#if defined(__HIPCC__) && defined(__gfx1201__)
+// Device-side plan for the Q4_K grouped path. Chunk-local counts are turned
+// into stable expert-major slot offsets and tiles. The prefix pass reports
+// the launch size and validates expert IDs.
+constexpr int MOE_PLAN_CHUNK = 64;
+constexpr int MOE_PLAN_MAX_EXPERTS = 256;
+constexpr int MOE_PLAN_TILE = 32;
+
+extern "C" __global__ void moe_plan_count_slots(
+    const unsigned* ids, int slots, int experts, int* chunk_counts) {
+    __shared__ int counts[MOE_PLAN_MAX_EXPERTS + 1];
+    const int lane = threadIdx.x;
+    const int chunk = blockIdx.x;
+    const int stride = experts + 1;
+    for (int e = lane; e < stride; e += MOE_PLAN_CHUNK) counts[e] = 0;
+    __syncthreads();
+
+    const int slot = chunk * MOE_PLAN_CHUNK + lane;
+    if (slot < slots) {
+        const unsigned id = ids[slot];
+        // The final column counts invalid IDs. No unchecked expert indexing.
+        atomicAdd(counts + (id < static_cast<unsigned>(experts) ? id : experts), 1);
+    }
+    __syncthreads();
+    for (int e = lane; e < stride; e += MOE_PLAN_CHUNK) {
+        chunk_counts[static_cast<size_t>(chunk) * stride + e] = counts[e];
+    }
+}
+
+extern "C" __global__ void moe_plan_prefix(
+    int chunks, int experts, int tile_capacity, int* chunk_counts,
+    int* tile_expert, int* tile_pos0, int* tile_nrows, int* tile_count) {
+    // One thread scans the small histogram. Per-chunk columns become
+    // absolute destination offsets in place. -1 signals invalid metadata.
+    const int stride = experts + 1;
+    *tile_count = -1;
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        if (chunk_counts[static_cast<size_t>(chunk) * stride + experts] != 0) return;
+    }
+    int total = 0;
+    int tiles = 0;
+    for (int expert = 0; expert < experts; ++expert) {
+        const int first = total;
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            int& cell = chunk_counts[static_cast<size_t>(chunk) * stride + expert];
+            const int count = cell;
+            cell = total;
+            total += count;
+        }
+        for (int pos = first; pos < total;) {
+            if (tiles == tile_capacity) return;
+            const int n = (total - pos < MOE_PLAN_TILE) ? total - pos : MOE_PLAN_TILE;
+            tile_expert[tiles] = expert;
+            tile_pos0[tiles] = pos;
+            tile_nrows[tiles] = n;
+            ++tiles;
+            pos += n;
+        }
+    }
+    *tile_count = tiles;
+}
+
+extern "C" __global__ void moe_plan_scatter(
+    const unsigned* ids, int slots, int experts, const int* offsets,
+    const int* tile_count, int* slot_map) {
+    if (*tile_count < 0) return;
+    __shared__ unsigned chunk_ids[MOE_PLAN_CHUNK];
+    const int lane = threadIdx.x;
+    const int chunk = blockIdx.x;
+    const int slot = chunk * MOE_PLAN_CHUNK + lane;
+    chunk_ids[lane] = slot < slots ? ids[slot] : static_cast<unsigned>(experts);
+    __syncthreads();
+    if (slot >= slots) return;
+
+    const unsigned expert = chunk_ids[lane];
+    int rank = 0;
+    for (int i = 0; i < lane; ++i) rank += chunk_ids[i] == expert;
+    const int offset = offsets[static_cast<size_t>(chunk) * (experts + 1) + expert];
+    slot_map[offset + rank] = slot;
+}
+
+// One set of packed Q4_K weights and scales per lane, consumed by several slots.
+// The order of each slot's integer dots, FP32 partials and shuffles stays the same.
+extern "C" __global__ void moe_q4k_grouped_gfx1201_wave4_f16(
+    int N, int K, int ncol_tiles, const int8_t* xq, const __half* xd,
+    const uint8_t* wq, __half* y, const int* slot_map, const int* tile_expert,
+    const int* tile_pos0, const int* tile_nrows, const int* tile_count) {
+    constexpr int Slots = 4;
+    const int tile = blockIdx.x / ncol_tiles;
+    const int col = (blockIdx.x % ncol_tiles) * 4 + (threadIdx.x >> 5);
+    if (tile >= *tile_count || col >= N) return;
+
+    const int lane = threadIdx.x & 31;
+    const int blocks = K / 256;
+    const int scales = K / 32;
+    const int first = tile_pos0[tile];
+    const int rows = tile_nrows[tile];
+    const uint8_t* bank = wq + (static_cast<size_t>(tile_expert[tile]) * N + col) * blocks * 144;
+    int row = 0;
+    for (; row + Slots <= rows; row += Slots) {
+        int slot[Slots];
+        float acc[Slots] = {};
+        #pragma unroll
+        for (int r = 0; r < Slots; ++r) slot[r] = slot_map[first + row + r];
+        for (int unit = lane; unit < blocks * 4; unit += 32) {
+            const int b = unit / 4;
+            const int sub = unit % 4;
+            const uint8_t* block = bank + b * 144;
+            const uint4 header = *reinterpret_cast<const uint4*>(block);
+            const float d = __half2float(__ushort_as_half(header.x & 0xffffu));
+            const float dmin = __half2float(__ushort_as_half(header.x >> 16));
+            int sc_lo, m_lo, sc_hi, m_hi;
+            q4k_scale_min_words(header.y, header.z, header.w, 2 * sub, &sc_lo, &m_lo);
+            q4k_scale_min_words(header.y, header.z, header.w, 2 * sub + 1, &sc_hi, &m_hi);
+            const auto* packed = reinterpret_cast<const int*>(block + 16) + sub * 8;
+
+            int dot1_lo[Slots] = {}, dot2_lo[Slots] = {};
+            int dot1_hi[Slots] = {}, dot2_hi[Slots] = {};
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int w = packed[i];
+                const int wlo = w & 0x0f0f0f0f;
+                const int whi = (w >> 4) & 0x0f0f0f0f;
+                #pragma unroll
+                for (int r = 0; r < Slots; ++r) {
+                    const auto* u = reinterpret_cast<const int*>(
+                        xq + static_cast<size_t>(slot[r]) * K + b * 256 + sub * 64);
+                    dot1_lo[r] = hip_dp4a(wlo, u[i], dot1_lo[r]);
+                    dot2_lo[r] = hip_dp4a(0x01010101, u[i], dot2_lo[r]);
+                    dot1_hi[r] = hip_dp4a(whi, u[i + 8], dot1_hi[r]);
+                    dot2_hi[r] = hip_dp4a(0x01010101, u[i + 8], dot2_hi[r]);
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < Slots; ++r) {
+                const auto* d8 = xd + static_cast<size_t>(slot[r]) * scales + b * 8 + 2 * sub;
+                const float lo = __half2float(d8[0]);
+                const float hi = __half2float(d8[1]);
+                const float sumf_d = lo * (dot1_lo[r] * sc_lo) + hi * (dot1_hi[r] * sc_hi);
+                const float sumf_m = lo * (dot2_lo[r] * m_lo) + hi * (dot2_hi[r] * m_hi);
+                const float partial = d * sumf_d - dmin * sumf_m;
+                acc[r] += partial;
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            #pragma unroll
+            for (int r = 0; r < Slots; ++r) acc[r] += __shfl_down(acc[r], off);
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < Slots; ++r) {
+                qstore(&y[static_cast<size_t>(slot[r]) * N + col], acc[r]);
+            }
+        }
+    }
+    // Reuse the scalar-slot wave for remainder rows without speculative reads.
+    for (; row < rows; ++row) {
+        const int slot = slot_map[first + row];
+        const float acc = moe_qmatvec_wave_sum<MOE_Q4_K_WEIGHT>(
+            lane, blocks, bank, xq + static_cast<size_t>(slot) * K,
+            xd + static_cast<size_t>(slot) * scales);
+        if (lane == 0) qstore(&y[static_cast<size_t>(slot) * N + col], acc);
+    }
+}
+
+
 #endif

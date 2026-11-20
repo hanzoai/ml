@@ -1562,8 +1562,7 @@ impl QTensor {
                 let rocm_dev = resident.device();
                 let qt = crate::RocmQuantType::from_ggml(self.storage.dtype()).unwrap();
                 let out_dtype = x.dtype();
-                // e_cnt is not read: ids stay on-device and the router guarantees the bound, so the
-                // old host bounds check (and its DtoH `to_vec1`) is gone.
+                // Router IDs stay on-device. The indexed path relies on the router's bound.
                 let (_e_cnt, n, k) = self.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
                 let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
@@ -1578,7 +1577,7 @@ impl QTensor {
                 // QStorage::indexed_moe_forward.
                 // Decode-only types (no qmmq kernel) ride the per-slot matvec core for prefill too
                 // (correct at any token count). ONE predicate gates every prefill site.
-                let use_qmmq = t > 1 && qt.qmmq_capable();
+                let use_qmmq = t > 1 && !rocm_dev.is_gfx1201() && qt.qmmq_capable();
                 let x_flat = match x_exp.dtype() {
                     // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
                     // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
@@ -2079,6 +2078,139 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
     Ok((ids, w))
 }
 
+/// Try the gfx1201 shared Q4_K expert plan for gate, up and down. The caller
+/// supplies its usual activation between gate/up and down.
+#[allow(unused_variables)]
+pub fn try_moe_shared_q4k(
+    x: &Tensor,
+    ids: &Tensor,
+    gate: &QMatMul,
+    up: &QMatMul,
+    down: &QMatMul,
+    activate: impl FnOnce(&Tensor, &Tensor) -> Result<Tensor>,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    #[cfg(feature = "rocm")]
+    {
+        let Device::Rocm(dev) = x.device() else {
+            return Ok(None);
+        };
+        if !dev.grouped_q4k_enabled() || x.dtype() != DType::F16 {
+            return Ok(None);
+        }
+        let (tokens, topk) = ids.dims2()?;
+        let (xt, copies, hidden) = x.dims3()?;
+        if tokens <= 1
+            || tokens != xt
+            || topk == 0
+            || copies != 1
+            || !ids.device().same_device(x.device())
+        {
+            return Ok(None);
+        }
+        let banks = |projection: &QMatMul| match projection {
+            QMatMul::QTensor(q) => match &q.storage {
+                QStorage::Rocm(w) if q.dtype() == GgmlDType::Q4K => {
+                    Some((w.resident(), q.shape().dims3()))
+                }
+                _ => None,
+            },
+            QMatMul::RocmQuant {
+                qtensor,
+                wq,
+                dtype: GgmlDType::Q4K,
+                ..
+            } => Some((wq.clone(), qtensor.shape().dims3())),
+            _ => None,
+        };
+        let (Some((gw, gs)), Some((uw, us))) = (banks(gate), banks(up)) else {
+            return Ok(None);
+        };
+        let (experts, inter, k) = gs?;
+        let slots = tokens
+            .checked_mul(topk)
+            .ok_or_else(|| crate::Error::Msg("shared Q4_K: slot count overflow".into()))?;
+        if (experts, inter, k) != us?
+            || k != hidden
+            || gw.device.id() != dev.id()
+            || uw.device.id() != dev.id()
+            || !dev.use_grouped_q4k(experts, slots, inter, hidden)
+        {
+            return Ok(None);
+        }
+        let ids_flat = packed(&ids.reshape((slots,))?.to_dtype(DType::U32)?)?;
+        let (ids_storage, _) = ids_flat.storage_and_layout();
+        let Storage::Rocm(ids_storage) = &*ids_storage else {
+            crate::bail!("shared Q4_K: expected ROCm route IDs");
+        };
+        let plan = dev.plan_grouped_q4k(ids_storage, experts, slots)?;
+        let x_flat = packed(
+            &x.broadcast_as((tokens, topk, hidden))?
+                .reshape((slots, hidden))?,
+        )?;
+        let as_tensor = |storage, width, dtype| {
+            crate::tensor::from_storage(
+                Storage::Rocm(storage),
+                (tokens, topk, width),
+                crate::op::BackpropOp::none(),
+                false,
+            )
+            .to_dtype(dtype)
+        };
+        let (g, u) = {
+            let (x_storage, _) = x_flat.storage_and_layout();
+            let Storage::Rocm(x_storage) = &*x_storage else {
+                crate::bail!("shared Q4_K: expected ROCm activations");
+            };
+            let q8 = dev.quantize_q8_1(x_storage, slots, hidden)?;
+            (
+                as_tensor(
+                    dev.project_grouped_q4k(&plan, &gw, &q8, inter, hidden)?,
+                    inter,
+                    x.dtype(),
+                )?,
+                as_tensor(
+                    dev.project_grouped_q4k(&plan, &uw, &q8, inter, hidden)?,
+                    inter,
+                    x.dtype(),
+                )?,
+            )
+        };
+        let active = activate(&g, &u)?;
+        let mut down_bank = None;
+        if let Some((bank, shape)) = banks(down) {
+            let (e, n, k) = shape?;
+            if e == experts
+                && k == inter
+                && bank.device.id() == dev.id()
+                && active.dims() == [tokens, topk, inter]
+                && active.device().same_device(x.device())
+                && active.dtype() == DType::F16
+                && dev.use_grouped_q4k(experts, slots, n, inter)
+            {
+                down_bank = Some((bank, n));
+            }
+        }
+        let y = if let Some((bank, n)) = down_bank {
+            let flat = packed(&active.reshape((slots, inter))?)?;
+            let (storage, _) = flat.storage_and_layout();
+            let Storage::Rocm(storage) = &*storage else {
+                crate::bail!("shared Q4_K: expected ROCm intermediate");
+            };
+            let q8 = dev.quantize_q8_1(storage, slots, inter)?;
+            as_tensor(
+                dev.project_grouped_q4k(&plan, &bank, &q8, n, inter)?,
+                n,
+                active.dtype(),
+            )?
+        } else {
+            down.indexed_moe_forward(&active, ids)?
+        };
+        return Ok(Some((g, u, y)));
+    }
+    #[cfg(not(feature = "rocm"))]
+    Ok(None)
+}
+
 /// Fused MoE gate+up projections. Both expert banks consume the SAME routed token `x` [t,1,k], so the
 /// shared input is broadcast + quantized ONCE and matvec'd against both banks (vs once per bank,
 /// re-materializing + re-quantizing the identical activation). Returns the raw (gate_out, up_out)
@@ -2102,7 +2234,7 @@ pub fn moe_gate_up(
                     if let Some(qt) = crate::RocmQuantType::from_ggml(dt) {
                         let (_e, n, k) = gq.shape().dims3()?;
                         let (t, topk) = ids.dims2()?;
-                        let use_qmmq = t > 1 && qt.qmmq_capable();
+                        let use_qmmq = t > 1 && !dev.is_gfx1201() && qt.qmmq_capable();
                         if x.dim(1)? == 1 && !use_qmmq {
                             let nrows = t * topk;
                             let x_exp = x.broadcast_as((t, topk, k))?;
@@ -2506,7 +2638,7 @@ impl QMatMul {
             } if crate::RocmQuantType::from_ggml(*dtype).is_some() => {
                 let qt = crate::RocmQuantType::from_ggml(*dtype).unwrap();
                 let wbank = wq.as_ref();
-                // e_cnt unused: ids stay on-device, router guarantees the bound (no host check).
+                // Router IDs stay on-device. The indexed path relies on the router's bound.
                 let (_e_cnt, n, k) = qtensor.shape().dims3()?;
                 let (t, topk) = ids.dims2()?;
                 let s = x.dim(1)?; // 1 (gate/up: shared input) or topk (down: per-slot)
@@ -2521,7 +2653,7 @@ impl QMatMul {
                 // capture-clean dp4a/scalar matvec, which takes bf16/f16 natively.
                 // Decode-only types (no qmmq kernel) ride the per-slot matvec core for prefill too
                 // (correct at any token count). ONE predicate gates every prefill site.
-                let use_qmmq = t > 1 && qt.qmmq_capable();
+                let use_qmmq = t > 1 && !wbank.device.is_gfx1201() && qt.qmmq_capable();
                 let x_flat = match x_exp.dtype() {
                     // qmmq quantizes f16/f32 activations natively, so keep the model's dtype and skip
                     // the f32->f16 cast (a 16.7M-elem read+write per gate/up). Other dtypes (bf16 with
@@ -3138,7 +3270,8 @@ impl crate::Module for QMatMul {
                 // the `else` branch below -- correct, just not WMMA-accelerated. ONE predicate, read here
                 // and at the two MoE `use_qmmq` sites.
                 #[cfg(feature = "rocm")]
-                let qmmq_ok = unified_qt.map(|qt| qt.qmmq_capable()).unwrap_or(false);
+                let qmmq_ok =
+                    unified_qt.is_some_and(|qt| qt.qmmq_capable()) && !wq.device.is_gfx1201();
                 #[cfg(not(feature = "rocm"))]
                 let qmmq_ok = false;
                 if rows == 1 && unified_qt.is_some() {
