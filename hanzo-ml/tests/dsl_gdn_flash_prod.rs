@@ -10,6 +10,8 @@
 //!   sliding window, softcap, and `d = 64, 128, 256`,
 //! - Single-compile proof (`compiled == 1` across repeated calls).
 
+#![cfg(any(feature = "cuda", feature = "vulkan", feature = "metal"))]
+
 use hanzo_ml::flash_attn::{
     try_flash_attn_contiguous, try_flash_attn_paged, FlashAttnConfig, KvCacheLayout,
 };
@@ -67,9 +69,9 @@ fn gdn_recurrence_ref(
             for t in 0..seq {
                 let g_v = g[((bi * seq + t) * nh) + hi].exp();
                 let beta_v = beta[((bi * seq + t) * nh) + hi];
-                let q_off = (((bi * seq + t) * nh + hi) * kd) as usize;
+                let q_off = ((bi * seq + t) * nh + hi) * kd;
                 let k_off = q_off;
-                let v_off = (((bi * seq + t) * nh + hi) * vd) as usize;
+                let v_off = ((bi * seq + t) * nh + hi) * vd;
                 for vi in 0..vd {
                     let mut kv = 0.0f32;
                     for ki in 0..kd {
