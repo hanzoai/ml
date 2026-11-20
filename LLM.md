@@ -44,6 +44,21 @@ with quantization (GGUF/GGML/AFQ/GPTQ/AWQ). The compute core beneath Hanzo infer
   the runtime (`hanzo-train fit` / `join`). Tests: `cargo test -p hanzo-train` (tiny classifier
   and synthetic DSpark cache, all CPU). Kai (hanzoai/decision `train`) is one user.
 
+## Kernels: DSL first (standing rule, owner 2026-11-18)
+New numerical kernels are written once in the DSL (`hanzo-kernel`, a CubeCL facade lowering to
+Metal / CUDA / ROCm / Vulkan). Backend source under `hanzo-ml` is either **generated** by
+`kernel-gen` or a **named hand fallback with a measured reason**. Never ship a hand port of a DSL
+kernel. Per-backend speed comes from DSL schedules (`tune::Space`) and `island!` arms, not from
+forked operator logic. If the DSL or CubeCL cannot express or compile something, fix the compiler.
+- **Generate:** `cd hanzo-kernel && cargo run --release --features metal --bin kernel-gen --
+  --target metal --out ../hanzo-ml/src/metal/dsl`. It captures the source the runtime itself
+  compiled (`CUBECL_DEBUG_LOG`) and canonicalizes cubecl-cpp's hash-ordered local declarations.
+  Gate: the same command with `--check` must pass on the target device before a release.
+- **Compiler fixes** live in `hanzo-kernel/vendor/<crate>` behind `[patch.crates-io]`, with every
+  change marked `HANZO PATCH` (today: cubecl-cpp bitcast-of-literal, which broke `f16lo_to_f32` on MSL).
+- **Per-backend correctness** uses one fixture set: `pq2-check --backend metal|cuda|rocm|vulkan`
+  (native GGUF PQ2_0 matvec, gate 1e-5 scale-relative). A backend that fails keeps its fallback.
+
 ## Backends and models
 - **Vulkan dtypes.** Storage is F32 or U32 (BF16 is held as F32, I64 as U32). U32 reductions
   run their own kernel (`reduce_u32.comp`; argmax/argmin take the first index on ties, as the

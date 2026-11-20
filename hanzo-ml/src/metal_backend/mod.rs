@@ -2156,6 +2156,8 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
             residency_set,
+            dsl_pipelines: Arc::new(RwLock::new(HashMap::new())),
+            dsl_consts: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -2482,69 +2484,503 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     slice.to_vec()
 }
 
-/// Resolve a committed DSL (cubecl) MSL artifact by kernel name -- the Metal twin of
-/// `vulkan_backend::kernel_spv`. A `#[kernel]` authored once in hanzo-kernel is lowered to MSL by
-/// cubecl-cpp's metal dialect (extracted via tools/dsl/msl_extract.sh) and committed under
-/// src/metal/dsl/<name>.metal as human-diffable text. This is the single place mapping a kernel name to
-/// its artifact; cubecl names the Metal entry point after the kernel (no "main" rename, unlike the
-/// SPIR-V seam), so `name` is BOTH the registry key and the Metal function name.
-pub fn kernel_msl(name: &str) -> Result<&'static str> {
-    let src: &'static str = match name {
-        "rms_norm_blk_f_f32" => include_str!("../metal/dsl/rms_norm_blk.metal"),
-        "gemv_f_f32" => include_str!("../metal/dsl/gemv.metal"),
-        _ => {
-            return Err(
-                MetalError::Message(format!("no committed DSL MSL artifact for '{name}'")).into(),
-            )
+/// A committed DSL (cubecl) Metal artifact: its MSL and the entry point inside it.
+#[derive(Debug, Clone, Copy)]
+pub struct DslArtifact {
+    pub msl: &'static str,
+    pub entry: &'static str,
+}
+
+macro_rules! dsl_artifacts {
+    ($($name:literal => $entry:literal),* $(,)?) => {
+        /// Every committed artifact name, for diagnostics and the drift test.
+        pub const DSL_ARTIFACTS: &[&str] = &[$($name),*];
+        /// Resolve a committed DSL artifact by name.
+        pub fn kernel_msl(name: &str) -> Result<DslArtifact> {
+            match name {
+                $($name => Ok(DslArtifact {
+                    msl: include_str!(concat!("../metal/dsl/", $name, ".metal")),
+                    entry: $entry,
+                }),)*
+                _ => Err(MetalError::Message(format!(
+                    "no committed DSL MSL artifact for '{name}'"
+                ))
+                .into()),
+            }
         }
     };
-    Ok(src)
+}
+
+// The Metal twin of `vulkan_backend::kernel_spv`. A `#[kernel]` authored once in hanzo-kernel is
+// lowered to MSL by cubecl-cpp's metal dialect and committed under src/metal/dsl/<artifact>.metal by
+// `kernel-gen` (hanzo-kernel/src/kernel_gen.rs), never by hand; `kernel-gen --check` is the drift gate.
+// The ARTIFACT name is the pipeline identity: comptime specializations of one kernel (NSG/NR0) share
+// cubecl's entry name (kernel + elem suffix; bf16's suffix is empty in cubecl 0.10), so keying on the
+// entry would let two tile schedules collide in one cache slot.
+dsl_artifacts! {
+    "rms_norm_blk" => "rms_norm_blk_f_f32",
+    "gemv" => "gemv_f_f32",
+    "matvec_pq2_0_gguf_nsg2_nr2_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg2_nr4_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg2_nr8_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg2_nr2_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg2_nr4_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg2_nr8_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg4_nr2_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg4_nr4_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg4_nr8_f32" => "matvec_pq2_0_gguf_f_f32",
+    "matvec_pq2_0_gguf_nsg4_nr2_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg4_nr4_bf16" => "matvec_pq2_0_gguf_f_",
+    "matvec_pq2_0_gguf_nsg4_nr8_bf16" => "matvec_pq2_0_gguf_f_",
+    "matmul_pq2_0_gguf_bm32_f32" => "matmul_pq2_0_gguf_f_f32",
+    "matmul_pq2_0_gguf_bm32_bf16" => "matmul_pq2_0_gguf_f_",
+    "matmul_pq2_0_gguf_bm64_f32" => "matmul_pq2_0_gguf_f_f32",
+    "matmul_pq2_0_gguf_bm64_bf16" => "matmul_pq2_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg2_nr2_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg2_nr4_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg2_nr8_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg2_nr2_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg2_nr4_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg2_nr8_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg4_nr2_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg4_nr4_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg4_nr8_f32" => "matvec_ptq1_0_gguf_f_f32",
+    "matvec_ptq1_0_gguf_nsg4_nr2_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg4_nr4_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matvec_ptq1_0_gguf_nsg4_nr8_bf16" => "matvec_ptq1_0_gguf_f_",
+    "matmul_ptq1_0_gguf_bm32_f32" => "matmul_ptq1_0_gguf_f_f32",
+    "matmul_ptq1_0_gguf_bm32_bf16" => "matmul_ptq1_0_gguf_f_",
+    "matmul_ptq1_0_gguf_bm64_f32" => "matmul_ptq1_0_gguf_f_f32",
+    "matmul_ptq1_0_gguf_bm64_bf16" => "matmul_ptq1_0_gguf_f_",
+    "gdn_conv1d_k4" => "gdn_conv1d_f_f32",
+    "gdn_gating" => "gdn_gating_f_f32",
+    "gdn_scan_lanes_k128_v128_l4" => "gdn_scan_lanes_f_f32",
+    "gdn_scan_lanes_k128_v128_l8" => "gdn_scan_lanes_f_f32",
+    "gdn_scan_lanes_k64_v64_l4" => "gdn_scan_lanes_f_f32",
+    "flash_attn_d64_p32" => "flash_attn_f_f32",
+    "flash_attn_d128_p32" => "flash_attn_f_f32",
+}
+
+/// Resource binding kind for DSL kernel dispatch via [`MetalDevice::dispatch_dsl_bindings`].
+pub enum DslBinding<'a> {
+    /// Read-only device buffer + byte offset.
+    In(&'a Buffer, usize),
+    /// Output (read/write) device buffer + byte offset, registered with the hazard tracker.
+    Out(&'a Buffer, usize),
+    /// Small read-only metadata/scalar bytes (`<= 4096` bytes) bound inline via `setBytes`.
+    Bytes(&'a [u8]),
 }
 
 impl MetalDevice {
-    /// Dispatch a committed DSL kernel through ml's native Metal encoder -- the reusable seam every
-    /// migrated `#[kernel]` shares, mirroring the per-kernel `.spv` dispatch on Vulkan. Resolves the MSL
-    /// by name, compiles it through the SAME pipeline hand kernels use (`compile_msl`, driver-cached),
-    /// binds `data` in cubecl's buffer convention (indices `0..N-1`; `out_index` takes the write hazard
-    /// via `set_output_buffer`, the rest read via `set_input_buffer`), then binds the trailing
-    /// `constant info_st& info [[buffer(N)]]` populated from `static_meta` (cubecl's array-length
-    /// metadata, which Metal keeps `constant` where Vulkan could strip it). Records the dispatch only --
-    /// the caller drives `wait_until_completed`, so DSL work batches with the surrounding op stream.
+    /// The compiled pipeline for a committed DSL artifact: compiled on the first use per device,
+    /// then a read-locked map hit. Every compile is counted (`quantized::dsl::stats`), so "no codegen
+    /// on the decode path" is a number a test asserts, not a belief.
+    pub fn dsl_pipeline(&self, name: &str) -> Result<hanzo_metal_kernels::metal::ComputePipeline> {
+        if let Some(pl) = self
+            .dsl_pipelines
+            .read()
+            .map_err(MetalError::from)?
+            .get(name)
+        {
+            return Ok(pl.clone());
+        }
+        let art = kernel_msl(name)?;
+        let mut map = self.dsl_pipelines.write().map_err(MetalError::from)?;
+        if let Some(pl) = map.get(name) {
+            return Ok(pl.clone());
+        }
+        let msl = format!("#include <metal_stdlib>\n{}", art.msl);
+        let pl = self.compile_msl(art.entry, &msl)?;
+        crate::quantized::dsl::note_compile(name);
+        map.insert(name.to_string(), pl.clone());
+        Ok(pl)
+    }
+
+    /// A small immutable u32 buffer (kernel `meta` args such as `[k, rows, nwords]`), created once
+    /// per distinct content and reused, so a per-token dispatch allocates nothing.
+    pub fn dsl_const_u32(&self, v: &[u32]) -> Result<Arc<Buffer>> {
+        if let Some(b) = self.dsl_consts.read().map_err(MetalError::from)?.get(v) {
+            return Ok(b.clone());
+        }
+        let b = self.new_buffer_with_data(v)?;
+        self.dsl_consts
+            .write()
+            .map_err(MetalError::from)?
+            .insert(v.to_vec(), b.clone());
+        Ok(b)
+    }
+
+    /// Dispatch a committed DSL artifact through ml's native Metal encoder -- the one seam every
+    /// migrated `#[kernel]` shares. `data` are `(buffer, byte offset)` views bound in cubecl's
+    /// convention (indices `0..N-1`; `out_index` takes the write hazard via `set_output_buffer`), then
+    /// cubecl's trailing `constant info_st& info [[buffer(N)]]` is bound with `setBytes` from
+    /// `static_meta` (no buffer allocation per dispatch). Records the dispatch only -- the caller's
+    /// command stream decides when it is committed.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_dsl(
         &self,
         name: &str,
-        data: &[&Buffer],
+        data: &[(&Buffer, usize)],
         out_index: usize,
         static_meta: &[u32],
         grid: objc2_metal::MTLSize,
         threadgroup: objc2_metal::MTLSize,
     ) -> Result<()> {
-        let msl = format!("#include <metal_stdlib>\n{}", kernel_msl(name)?);
-        let pl = self.compile_msl(name, &msl)?;
-        let info = self.new_buffer_with_data(static_meta)?;
-        {
-            let enc = self.command_encoder()?;
-            let e = enc.as_ref();
-            e.set_compute_pipeline_state(&pl);
-            for (i, b) in data.iter().enumerate() {
-                if i == out_index {
-                    e.set_output_buffer(i, Some(*b), 0);
+        self.dispatch_dsl_outputs(name, data, &[out_index], static_meta, grid, threadgroup)
+    }
+
+    /// Multi-output variant of [`dispatch_dsl`] so every buffer written by the kernel (`gdn_gating`
+    /// outputs or `gdn_scan_lanes` state + out) registers with the encoder's write hazard tracker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_dsl_outputs(
+        &self,
+        name: &str,
+        data: &[(&Buffer, usize)],
+        out_indices: &[usize],
+        static_meta: &[u32],
+        grid: objc2_metal::MTLSize,
+        threadgroup: objc2_metal::MTLSize,
+    ) -> Result<()> {
+        let bindings: Vec<DslBinding<'_>> = data
+            .iter()
+            .enumerate()
+            .map(|(i, &(b, off))| {
+                if out_indices.contains(&i) {
+                    DslBinding::Out(b, off)
                 } else {
-                    e.set_input_buffer(i, Some(*b), 0);
+                    DslBinding::In(b, off)
                 }
+            })
+            .collect();
+        self.dispatch_dsl_bindings(name, &bindings, static_meta, grid, threadgroup)
+    }
+
+    /// Dispatch a registered DSL kernel artifact with mixed input buffers, output buffers, and
+    /// inline read-only constant bytes (dims/scale/meta), trailing `info.static_meta`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_dsl_bindings(
+        &self,
+        name: &str,
+        bindings: &[DslBinding<'_>],
+        static_meta: &[u32],
+        grid: objc2_metal::MTLSize,
+        threadgroup: objc2_metal::MTLSize,
+    ) -> Result<()> {
+        let pl = self.dsl_pipeline(name)?;
+        let enc = self.command_encoder()?;
+        let e = enc.as_ref();
+        e.set_compute_pipeline_state(&pl);
+        for (i, binding) in bindings.iter().enumerate() {
+            match *binding {
+                DslBinding::In(b, off) => e.set_input_buffer(i, Some(b), off),
+                DslBinding::Out(b, off) => e.set_output_buffer(i, Some(b), off),
+                DslBinding::Bytes(raw) => e.set_bytes_directly(i, raw.len(), raw.as_ptr().cast()),
             }
-            e.set_input_buffer(data.len(), Some(&*info), 0);
-            e.dispatch_thread_groups(grid, threadgroup);
         }
+        e.set_bytes_directly(
+            bindings.len(),
+            std::mem::size_of_val(static_meta),
+            static_meta.as_ptr().cast(),
+        );
+        e.dispatch_thread_groups(grid, threadgroup);
         Ok(())
     }
+
+    /// Dispatch DSL `gdn_conv1d_k4` (causal depthwise conv1d k=4 + SiLU, f32):
+    /// `x: [batch, conv_dim, seq_len]`, `weight: [conv_dim, 4]`, `out: [batch, conv_dim, seq_len]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv1d_dsl(
+        &self,
+        x: (&Buffer, usize),
+        weight: (&Buffer, usize),
+        out: (&Buffer, usize),
+        batch: usize,
+        conv_dim: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        if batch == 0 || conv_dim == 0 || seq_len == 0 {
+            crate::bail!("gdn_conv1d_dsl: empty shape ({batch}, {conv_dim}, {seq_len})");
+        }
+        let total = batch * conv_dim * seq_len;
+        let dims = [conv_dim as u32, seq_len as u32];
+        let static_meta = [
+            total as u32,
+            (conv_dim * 4) as u32,
+            total as u32,
+            2,
+            total as u32,
+            (conv_dim * 4) as u32,
+            total as u32,
+            2,
+        ];
+        self.dispatch_dsl_bindings(
+            "gdn_conv1d_k4",
+            &[
+                DslBinding::In(x.0, x.1),
+                DslBinding::In(weight.0, weight.1),
+                DslBinding::Out(out.0, out.1),
+                DslBinding::Bytes(slice_as_bytes(&dims)),
+            ],
+            &static_meta,
+            objc2_metal::MTLSize {
+                width: total.div_ceil(64),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        )
+    }
+
+    /// Dispatch DSL `gdn_gating` (f32): `beta = sigmoid(b)`, `g = -exp(a_log) * softplus(a + dt_bias)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_gating_dsl(
+        &self,
+        b_in: (&Buffer, usize),
+        a_in: (&Buffer, usize),
+        a_log: (&Buffer, usize),
+        dt_bias: (&Buffer, usize),
+        beta_out: (&Buffer, usize),
+        g_out: (&Buffer, usize),
+        batch_tokens: usize,
+        num_heads: usize,
+    ) -> Result<()> {
+        if batch_tokens == 0 || num_heads == 0 {
+            crate::bail!("gdn_gating_dsl: empty shape ({batch_tokens}, {num_heads})");
+        }
+        let total = batch_tokens * num_heads;
+        let dims = [num_heads as u32];
+        let nh = num_heads as u32;
+        let tot = total as u32;
+        let static_meta = [tot, tot, nh, nh, tot, tot, 1, tot, tot, nh, nh, tot, tot, 1];
+        self.dispatch_dsl_bindings(
+            "gdn_gating",
+            &[
+                DslBinding::In(b_in.0, b_in.1),
+                DslBinding::In(a_in.0, a_in.1),
+                DslBinding::In(a_log.0, a_log.1),
+                DslBinding::In(dt_bias.0, dt_bias.1),
+                DslBinding::Out(beta_out.0, beta_out.1),
+                DslBinding::Out(g_out.0, g_out.1),
+                DslBinding::Bytes(slice_as_bytes(&dims)),
+            ],
+            &static_meta,
+            objc2_metal::MTLSize {
+                width: total.div_ceil(64),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        )
+    }
+
+    /// Dispatch DSL `gdn_scan_lanes` (f32, non-transposed `[bh, k_dim, v_dim]` state layout).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_scan_lanes_dsl(
+        &self,
+        q: (&Buffer, usize),
+        k: (&Buffer, usize),
+        v: (&Buffer, usize),
+        g: (&Buffer, usize),
+        beta: (&Buffer, usize),
+        state: (&Buffer, usize),
+        out: (&Buffer, usize),
+        bh: usize,
+        seq: usize,
+        k_dim: usize,
+        v_dim: usize,
+        lanes: usize,
+    ) -> Result<()> {
+        if bh == 0 || seq == 0 {
+            crate::bail!("gdn_scan_lanes_dsl: empty shape ({bh}, {seq})");
+        }
+        let artifact = match (k_dim, v_dim, lanes) {
+            (128, 128, 4) => "gdn_scan_lanes_k128_v128_l4",
+            (128, 128, 8) => "gdn_scan_lanes_k128_v128_l8",
+            (64, 64, 4) => "gdn_scan_lanes_k64_v64_l4",
+            _ => crate::bail!(
+                "gdn_scan_lanes_dsl: unsupported specialization k={k_dim} v={v_dim} lanes={lanes}"
+            ),
+        };
+        let dims = [bh as u32, seq as u32];
+        let block = 128usize;
+        let total_threads = bh * v_dim * lanes;
+        self.dispatch_dsl_bindings(
+            artifact,
+            &[
+                DslBinding::In(q.0, q.1),
+                DslBinding::In(k.0, k.1),
+                DslBinding::In(v.0, v.1),
+                DslBinding::In(g.0, g.1),
+                DslBinding::In(beta.0, beta.1),
+                DslBinding::Out(state.0, state.1),
+                DslBinding::Out(out.0, out.1),
+                DslBinding::Bytes(slice_as_bytes(&dims)),
+            ],
+            &[0u32; 16],
+            objc2_metal::MTLSize {
+                width: total_threads.div_ceil(block),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: block,
+                height: 1,
+                depth: 1,
+            },
+        )
+    }
+
+    /// Dispatch DSL `flash_attn` (`simdgroup_matrix` f16 CMMA, f32 I/O, GQA + causal support).
+    /// `kv_strides` is `[stride_b, stride_h, stride_s]` in f32 elements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_dsl(
+        &self,
+        q: (&Buffer, usize),
+        k: (&Buffer, usize),
+        v: (&Buffer, usize),
+        out: (&Buffer, usize),
+        batch: usize,
+        n_heads: usize,
+        n_kv: usize,
+        seq_q: usize,
+        seq_k: usize,
+        d: usize,
+        causal: bool,
+        scale: f32,
+        kv_strides: [usize; 3],
+        q_offset: usize,
+    ) -> Result<()> {
+        if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 || seq_k == 0 {
+            crate::bail!("flash_attn_dsl: empty shape");
+        }
+        let artifact = match d {
+            64 => "flash_attn_d64_p32",
+            128 => "flash_attn_d128_p32",
+            _ => crate::bail!("flash_attn_dsl: unsupported head_dim={d}"),
+        };
+        let scale_arr = [scale];
+        let meta = [
+            seq_q as u32,
+            seq_k as u32,
+            n_heads as u32,
+            n_kv as u32,
+            u32::from(causal),
+            kv_strides[0] as u32,
+            kv_strides[1] as u32,
+            kv_strides[2] as u32,
+            q_offset as u32,
+        ];
+        let blocks = batch * n_heads * seq_q.div_ceil(16);
+        self.dispatch_dsl_bindings(
+            artifact,
+            &[
+                DslBinding::In(q.0, q.1),
+                DslBinding::In(k.0, k.1),
+                DslBinding::In(v.0, v.1),
+                DslBinding::Out(out.0, out.1),
+                DslBinding::Bytes(slice_as_bytes(&scale_arr)),
+                DslBinding::Bytes(slice_as_bytes(&meta)),
+            ],
+            &[0u32; 12],
+            objc2_metal::MTLSize {
+                width: blocks,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        )
+    }
+}
+
+fn slice_as_bytes<T>(s: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), std::mem::size_of_val(s)) }
 }
 
 #[cfg(test)]
 mod dsl_metal_dispatch {
     use super::*;
     use crate::Device;
+
+    // Every buffer bound through `dispatch_dsl` at a NONZERO byte offset -- weights, activation and
+    // output -- with guard words around the output that must survive. Production allocates a fresh
+    // dst (offset 0), so only this seam-level test can prove output offsets bind correctly.
+    #[test]
+    fn pq2_dsl_seam_honours_every_offset() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let (n, k) = (96usize, 512usize);
+        let (codes, d) = hanzo_kernel::ternary::pq2_0_synth(n, k, 5);
+        let raw = hanzo_kernel::ternary::pq2_0_gguf_bytes(&codes, &d, n, k);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.37).sin()).collect();
+        let want = hanzo_kernel::ternary::pq2_0_gguf_ref(&raw, &x, n, k);
+
+        let (wpad, xpad, opad) = (64usize, 48usize, 16usize); // bytes, multiples of 16
+        let mut wbytes = vec![0xA5u8; wpad];
+        wbytes.extend_from_slice(&raw);
+        let mut xv = vec![f32::NAN; xpad / 4];
+        xv.extend_from_slice(&x);
+        let guard = -12345.0f32;
+        let ov = vec![guard; opad / 4 + n + 4];
+        let wb = md.new_buffer_with_data(&wbytes).unwrap();
+        let xb = md.new_buffer_with_data(&xv).unwrap();
+        let ob = md.new_buffer_with_data(&ov).unwrap();
+        let nwords = raw.len() / 4;
+        let meta = md
+            .dsl_const_u32(&[k as u32, n as u32, nwords as u32])
+            .unwrap();
+        let (artifact, nsg, nr0) = crate::quantized::dsl::pq2_matvec_artifact(n, false);
+        md.dispatch_dsl(
+            artifact,
+            &[(&*wb, wpad), (&*xb, xpad), (&*ob, opad), (&*meta, 0)],
+            2,
+            &[0u32; 8],
+            objc2_metal::MTLSize {
+                width: n.div_ceil(nsg * nr0),
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: nsg,
+                depth: 1,
+            },
+        )
+        .unwrap();
+        md.wait_until_completed().unwrap();
+        let got: Vec<f32> = read_to_vec(&ob, opad / 4 + n + 4);
+        assert!(
+            got[..opad / 4].iter().all(|v| *v == guard),
+            "wrote before the output offset"
+        );
+        assert!(
+            got[opad / 4 + n..].iter().all(|v| *v == guard),
+            "wrote past the output"
+        );
+        let out = &got[opad / 4..opad / 4 + n];
+        let maxref = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let rel = want
+            .iter()
+            .zip(out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / maxref;
+        assert!(rel <= 1e-5, "offset dispatch rel {rel}");
+    }
 
     fn rms_ref(x: &[f32], w: &[f32], rows: usize, n: usize, eps: f32) -> Vec<f32> {
         let mut o = vec![0f32; rows * n];
@@ -2655,8 +3091,8 @@ mod dsl_metal_dispatch {
             depth: 1,
         };
         md.dispatch_dsl(
-            "rms_norm_blk_f_f32",
-            &[&*xb, &*wb, &*ob, &*eb, &*ndb],
+            "rms_norm_blk",
+            &[(&*xb, 0), (&*wb, 0), (&*ob, 0), (&*eb, 0), (&*ndb, 0)],
             2,
             &[0u32; 10],
             grid,
@@ -2673,6 +3109,255 @@ mod dsl_metal_dispatch {
         eprintln!("[dsl_seam dispatch_dsl] rms_norm_blk rows={rows} n={n} max_rel={mr:.2e}");
         assert!(mr < 2e-3, "seam dispatch_dsl rms_norm_blk max_rel {mr}");
     }
+
+    fn max_rel(want: &[f32], got: &[f32]) -> f32 {
+        let scale = want.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+        want.iter()
+            .zip(got)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs() / scale))
+    }
+
+    #[test]
+    fn gdn_conv1d_dsl_via_ml_metal() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let (batch, conv_dim, seq_len) = (2usize, 17usize, 19usize);
+        let x: Vec<f32> = (0..batch * conv_dim * seq_len)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.05)
+            .collect();
+        let w: Vec<f32> = (0..conv_dim * 4)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+            .collect();
+        let want = hanzo_kernel::gdn::gdn_conv1d_ref(&x, &w, batch, conv_dim, seq_len, 4);
+
+        // Nonzero offsets verify buffer-offset binding in `dispatch_dsl_bindings`.
+        let pad = 7usize;
+        let mut x_pad = vec![99.0f32; pad];
+        x_pad.extend_from_slice(&x);
+        let mut w_pad = vec![99.0f32; pad];
+        w_pad.extend_from_slice(&w);
+        let xb = md.new_buffer_with_data(&x_pad).unwrap();
+        let wb = md.new_buffer_with_data(&w_pad).unwrap();
+        let ob = md
+            .new_buffer_with_data(&vec![0f32; pad + want.len()])
+            .unwrap();
+        let off = pad * std::mem::size_of::<f32>();
+
+        md.gdn_conv1d_dsl(
+            (&*xb, off),
+            (&*wb, off),
+            (&*ob, off),
+            batch,
+            conv_dim,
+            seq_len,
+        )
+        .unwrap();
+        md.wait_until_completed().unwrap();
+
+        let full: Vec<f32> = read_to_vec(&*ob, pad + want.len());
+        let mr = max_rel(&want, &full[pad..]);
+        eprintln!(
+            "[dsl_seam gdn_conv1d_dsl] shape=({batch},{conv_dim},{seq_len}) max_rel={mr:.2e}"
+        );
+        assert!(mr < 1e-5, "gdn_conv1d_dsl max_rel {mr}");
+    }
+
+    #[test]
+    fn gdn_gating_dsl_via_ml_metal() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let (batch_tokens, num_heads) = (11usize, 16usize);
+        let total = batch_tokens * num_heads;
+        let b: Vec<f32> = (0..total).map(|i| ((i % 19) as f32 - 9.0) * 0.1).collect();
+        let a: Vec<f32> = (0..total)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.08)
+            .collect();
+        let a_log: Vec<f32> = (0..num_heads).map(|i| -0.5 + (i as f32) * 0.05).collect();
+        let dt_bias: Vec<f32> = (0..num_heads).map(|i| 0.2 - (i as f32) * 0.03).collect();
+        let (want_beta, want_g) =
+            hanzo_kernel::gdn::gdn_gating_ref(&b, &a, &a_log, &dt_bias, num_heads, false);
+
+        let bb = md.new_buffer_with_data(&b).unwrap();
+        let ab = md.new_buffer_with_data(&a).unwrap();
+        let alb = md.new_buffer_with_data(&a_log).unwrap();
+        let dtb = md.new_buffer_with_data(&dt_bias).unwrap();
+        let beta_b = md.new_buffer_with_data(&vec![0f32; total]).unwrap();
+        let g_b = md.new_buffer_with_data(&vec![0f32; total]).unwrap();
+
+        md.gdn_gating_dsl(
+            (&*bb, 0),
+            (&*ab, 0),
+            (&*alb, 0),
+            (&*dtb, 0),
+            (&*beta_b, 0),
+            (&*g_b, 0),
+            batch_tokens,
+            num_heads,
+        )
+        .unwrap();
+        md.wait_until_completed().unwrap();
+
+        let got_beta: Vec<f32> = read_to_vec(&*beta_b, total);
+        let got_g: Vec<f32> = read_to_vec(&*g_b, total);
+        let mr_beta = max_rel(&want_beta, &got_beta);
+        let mr_g = max_rel(&want_g, &got_g);
+        eprintln!(
+            "[dsl_seam gdn_gating_dsl] total={total} nh={num_heads} beta_rel={mr_beta:.2e} g_rel={mr_g:.2e}"
+        );
+        assert!(mr_beta < 1e-5, "gdn_gating_dsl beta max_rel {mr_beta}");
+        assert!(mr_g < 1e-5, "gdn_gating_dsl g max_rel {mr_g}");
+    }
+
+    #[test]
+    fn gdn_scan_lanes_dsl_via_ml_metal() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let (bh, seq) = (3usize, 9usize);
+        for &(k_dim, v_dim, lanes) in &[(64usize, 64usize, 4usize), (128, 128, 4), (128, 128, 8)] {
+            let [q, k, v, g, beta, state_init] =
+                hanzo_kernel::gdn::gdn_synth(bh, seq, k_dim, v_dim, 42);
+            let mut want_state = state_init.clone();
+            let want_out = hanzo_kernel::gdn::gdn_scan_ref(
+                &q,
+                &k,
+                &v,
+                &g,
+                &beta,
+                &mut want_state,
+                bh,
+                seq,
+                k_dim,
+                v_dim,
+            );
+
+            let qb = md.new_buffer_with_data(&q).unwrap();
+            let kb = md.new_buffer_with_data(&k).unwrap();
+            let vb = md.new_buffer_with_data(&v).unwrap();
+            let gb = md.new_buffer_with_data(&g).unwrap();
+            let betab = md.new_buffer_with_data(&beta).unwrap();
+            let stateb = md.new_buffer_with_data(&state_init).unwrap();
+            let outb = md
+                .new_buffer_with_data(&vec![0f32; bh * seq * v_dim])
+                .unwrap();
+
+            md.gdn_scan_lanes_dsl(
+                (&*qb, 0),
+                (&*kb, 0),
+                (&*vb, 0),
+                (&*gb, 0),
+                (&*betab, 0),
+                (&*stateb, 0),
+                (&*outb, 0),
+                bh,
+                seq,
+                k_dim,
+                v_dim,
+                lanes,
+            )
+            .unwrap();
+            md.wait_until_completed().unwrap();
+
+            let got_out: Vec<f32> = read_to_vec(&*outb, bh * seq * v_dim);
+            let got_state: Vec<f32> = read_to_vec(&*stateb, bh * k_dim * v_dim);
+            let mr_out = max_rel(&want_out, &got_out);
+            let mr_state = max_rel(&want_state, &got_state);
+            eprintln!(
+                "[dsl_seam gdn_scan_lanes_dsl] k={k_dim} v={v_dim} l={lanes} out_rel={mr_out:.2e} state_rel={mr_state:.2e}"
+            );
+            assert!(mr_out < 1e-5, "gdn_scan_lanes out max_rel {mr_out}");
+            assert!(mr_state < 1e-5, "gdn_scan_lanes state max_rel {mr_state}");
+        }
+    }
+
+    #[test]
+    fn flash_attn_dsl_via_ml_metal() {
+        let dev = Device::new_metal(0).unwrap();
+        let md = match &dev {
+            Device::Metal(m) => m,
+            _ => panic!("not a metal device"),
+        };
+        let cases = [
+            // (batch, n_heads, n_kv, seq_q, seq_k, d, causal)
+            (1usize, 8usize, 2usize, 1usize, 37usize, 64usize, false),
+            (1, 4, 2, 40, 40, 64, true),
+            (2, 4, 2, 1, 23, 128, false),
+            (2, 4, 2, 19, 19, 128, true),
+        ];
+        for &(batch, n_heads, n_kv, seq_q, seq_k, d, causal) in &cases {
+            let q: Vec<f32> = (0..batch * n_heads * seq_q * d)
+                .map(|i| (((i * 7) % 31) as f32 - 15.0) * 0.04)
+                .collect();
+            let k: Vec<f32> = (0..batch * n_kv * seq_k * d)
+                .map(|i| (((i * 11) % 29) as f32 - 14.0) * 0.04)
+                .collect();
+            let v: Vec<f32> = (0..batch * n_kv * seq_k * d)
+                .map(|i| (((i * 13) % 23) as f32 - 11.0) * 0.05)
+                .collect();
+
+            let mut want = Vec::with_capacity(q.len());
+            let q_b = n_heads * seq_q * d;
+            let kv_b = n_kv * seq_k * d;
+            for b in 0..batch {
+                want.extend_from_slice(&hanzo_kernel::attn::sdpa_ref(
+                    &q[b * q_b..(b + 1) * q_b],
+                    &k[b * kv_b..(b + 1) * kv_b],
+                    &v[b * kv_b..(b + 1) * kv_b],
+                    n_heads,
+                    n_kv,
+                    seq_q,
+                    seq_k,
+                    d,
+                    causal,
+                ));
+            }
+
+            let qb = md.new_buffer_with_data(&q).unwrap();
+            let kb = md.new_buffer_with_data(&k).unwrap();
+            let vb = md.new_buffer_with_data(&v).unwrap();
+            let ob = md.new_buffer_with_data(&vec![0f32; want.len()]).unwrap();
+            let scale = 1.0f32 / (d as f32).sqrt();
+            md.flash_attn_dsl(
+                (&*qb, 0),
+                (&*kb, 0),
+                (&*vb, 0),
+                (&*ob, 0),
+                batch,
+                n_heads,
+                n_kv,
+                seq_q,
+                seq_k,
+                d,
+                causal,
+                scale,
+                [kv_b, seq_k * d, d],
+                0,
+            )
+            .unwrap();
+            md.wait_until_completed().unwrap();
+
+            let got: Vec<f32> = read_to_vec(&*ob, want.len());
+            for b in 0..batch {
+                let w = &want[b * q_b..(b + 1) * q_b];
+                let g = &got[b * q_b..(b + 1) * q_b];
+                let mr = max_rel(w, g);
+                let max_abs = w.iter().zip(g).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                let want_max = w.iter().fold(0f32, |m, x| m.max(x.abs()));
+                eprintln!(
+                    "[dsl_seam flash_attn_dsl] b={b}/{batch} nh={n_heads}/{n_kv} sq={seq_q} sk={seq_k} d={d} causal={causal} want_max={want_max:.3} max_abs={max_abs:.2e} max_rel={mr:.2e}"
+                );
+                assert!(mr < 5e-3, "flash_attn_dsl b={b} max_rel {mr}");
+            }
+        }
+    }
 }
 
 // The DSL-vs-hand decode board: a committed DSL (cubecl) kernel raced against its shipped hand-written
@@ -2680,7 +3365,7 @@ mod dsl_metal_dispatch {
 // gates the DSL output bit-exact against a CPU oracle (scale-relative: max|Δ| / max|ref|, the
 // signed-affine-safe metric) and reports the DSL/hand wall-clock ratio (best-of-N, pipelines
 // pre-compiled outside the timing loop so neither arm pays library-compile cost -- `dispatch_dsl`
-// recompiles per call, which would measure codegen not kernel). Timing is wall-clock, so it is only
+// caches its pipeline per device (`dsl_pipeline`), so only the first call pays codegen). Timing is wall-clock, so it is only
 // meaningful on a quiet GPU; correctness always runs, the ratio is a sign not a spec. A DSL arm earns
 // the production path only where it MEASURES >= hand here.
 //
