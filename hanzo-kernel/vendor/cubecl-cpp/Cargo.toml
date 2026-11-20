@@ -13,6 +13,7 @@
 edition = "2024"
 name = "cubecl-cpp"
 version = "0.10.0"
+publish = false
 authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
 build = false
 autolib = false
@@ -65,18 +66,22 @@ version = "1.16.1"
 
 [dependencies.cubecl-common]
 version = "0.10.0"
+publish = false
 default-features = false
 
 [dependencies.cubecl-core]
 version = "0.10.0"
+publish = false
 default-features = false
 
 [dependencies.cubecl-opt]
 version = "0.10.0"
+publish = false
 default-features = false
 
 [dependencies.cubecl-runtime]
 version = "0.10.0"
+publish = false
 features = ["channel-mutex"]
 default-features = false
 
