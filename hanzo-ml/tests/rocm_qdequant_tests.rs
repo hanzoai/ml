@@ -2,7 +2,8 @@
 //!
 //! A multi-row forward of a type with no native GEMM multiplies by a dense weight. That weight
 //! is decoded in VRAM by `qdequant_core<WTYPE>`, which reads each element out of the same
-//! per-type decode the matvec runs. Every type the unified core wires must therefore produce, on
+//! per-type decode the matvec runs (the Prism ternary types have direct dequantizers that
+//! index the same elements). Every type the unified core wires must therefore produce, on
 //! the device, the very values the CPU `to_float` does.
 #![cfg(feature = "rocm")]
 
@@ -24,7 +25,7 @@ impl Lcg {
 
 /// Every type the unified core wires, less Q8_1: that is the activation format the int8 paths
 /// quantize into, no GGML file stores a weight in it, and the CPU loader has no reference for it.
-const WIRED: [GgmlDType; 24] = [
+const WIRED: [GgmlDType; 26] = [
     GgmlDType::Q8_0,
     GgmlDType::Q4_0,
     GgmlDType::Q4K,
@@ -49,6 +50,8 @@ const WIRED: [GgmlDType; 24] = [
     GgmlDType::MXFP4,
     GgmlDType::ROCMFP4,
     GgmlDType::ROCMFP4_FAST,
+    GgmlDType::PQ2_0,
+    GgmlDType::PTQ1_0,
 ];
 
 /// Same value: equal, both NaN, or within a part in 10^5. Random block bytes put every bit

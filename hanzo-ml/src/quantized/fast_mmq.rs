@@ -43,6 +43,8 @@ fn supports(dtype: GgmlDType) -> bool {
             | GgmlDType::IQ3_S
             | GgmlDType::IQ4_XS
             | GgmlDType::IQ1_S
+            | GgmlDType::PQ2_0
+            | GgmlDType::PTQ1_0
     )
 }
 
@@ -52,6 +54,7 @@ fn qk_for(dtype: GgmlDType) -> usize {
         GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 | GgmlDType::Q8_0 => {
             32
         }
+        GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 => 128,
         GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => 256,
         GgmlDType::IQ2_XXS
         | GgmlDType::IQ2_XS
@@ -87,7 +90,9 @@ fn ds_layout_for(dtype: GgmlDType) -> DsLayout {
         | GgmlDType::IQ2_S
         | GgmlDType::IQ3_XXS
         | GgmlDType::IQ3_S
-        | GgmlDType::IQ4_XS => DsLayout::D4,
+        | GgmlDType::IQ4_XS
+        | GgmlDType::PQ2_0
+        | GgmlDType::PTQ1_0 => DsLayout::D4,
         // IQ1_S carries a delta bias -> needs the activation sum (ds = scale + sum), i.e. DS4.
         GgmlDType::IQ1_S => DsLayout::DS4,
         _ => unreachable!(),
@@ -156,6 +161,8 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
         GgmlDType::IQ3_S => ffi::launch_mmq_gguf_iq3_s,
         GgmlDType::IQ4_XS => ffi::launch_mmq_gguf_iq4_xs,
         GgmlDType::IQ1_S => ffi::launch_mmq_gguf_iq1_s,
+        GgmlDType::PQ2_0 => ffi::launch_mmq_gguf_pq2_0,
+        GgmlDType::PTQ1_0 => ffi::launch_mmq_gguf_ptq1_0,
         _ => return None,
     };
     Some(f)
@@ -274,6 +281,10 @@ fn get_device_info(dev: &CudaDevice) -> DeviceInfo {
     info
 }
 
+pub(crate) fn compute_cap(dev: &CudaDevice) -> i32 {
+    get_device_info(dev).cc
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -313,7 +324,9 @@ pub fn try_fwd(
     }
 
     let qk = qk_for(w_dtype);
-    if k % qk != 0 {
+    if !k.is_multiple_of(qk)
+        || (matches!(w_dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) && !k.is_multiple_of(256))
+    {
         return Ok(None);
     }
 
@@ -325,6 +338,12 @@ pub fn try_fwd(
     let dev = qstorage.device();
     let stream = dev.cuda_stream();
     let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+
+    let prof = super::cuda::cuda_profile_enabled();
+    if prof {
+        crate::backend::BackendDevice::synchronize(dev)?;
+    }
+    let t_quant = prof.then(std::time::Instant::now);
 
     // MMQ quantize expects f32 input. Convert if needed.
     let rhs_f32_storage: Option<CudaStorage> = if input_dtype != DType::F32 {
@@ -396,7 +415,16 @@ pub fn try_fwd(
             1,
             stream_ptr,
         );
-
+    }
+    if let Some(t0) = t_quant {
+        crate::backend::BackendDevice::synchronize(dev)?;
+        super::cuda::PROF_MMQ_QUANT_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let t_kern = prof.then(std::time::Instant::now);
+    unsafe {
         let launcher = mmq_launcher(w_dtype).expect("supports() checked");
         launcher(
             fixup_ptr,
@@ -415,6 +443,14 @@ pub fn try_fwd(
             stream_ptr,
         );
     }
+    if let Some(t0) = t_kern {
+        crate::backend::BackendDevice::synchronize(dev)?;
+        super::cuda::PROF_MMQ_KERNEL_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        super::cuda::PROF_MMQ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let mut out_shape = rhs_l.shape().dims().to_vec();
     out_shape.pop();
@@ -425,9 +461,17 @@ pub fn try_fwd(
     if input_dtype == DType::F32 {
         Ok(Some((out_storage, out_shape.into())))
     } else {
+        let t_cast = prof.then(std::time::Instant::now);
         // Cast f32 output back to input dtype
         let out_layout = crate::Layout::contiguous(Shape::from(out_shape.clone()));
         let cast_storage = out_storage.to_dtype(&out_layout, input_dtype)?;
+        if let Some(t0) = t_cast {
+            crate::backend::BackendDevice::synchronize(dev)?;
+            super::cuda::PROF_MMQ_CAST_NS.fetch_add(
+                t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Ok(Some((cast_storage, out_shape.into())))
     }
 }
@@ -484,6 +528,8 @@ fn moe_mmq_launcher(dtype: GgmlDType) -> Option<MoeMmqLauncher> {
         GgmlDType::IQ3_S => ffi::launch_mmq_gguf_moe_iq3_s,
         GgmlDType::IQ4_XS => ffi::launch_mmq_gguf_moe_iq4_xs,
         GgmlDType::IQ1_S => ffi::launch_mmq_gguf_moe_iq1_s,
+        GgmlDType::PQ2_0 => ffi::launch_mmq_gguf_moe_pq2_0,
+        GgmlDType::PTQ1_0 => ffi::launch_mmq_gguf_moe_ptq1_0,
         _ => return None,
     };
     Some(f)
@@ -517,7 +563,9 @@ pub(crate) fn indexed_moe_grouped(
     let topk = nslots / batch;
 
     let qk = qk_for(w_dtype);
-    if k % qk != 0 {
+    if !k.is_multiple_of(qk)
+        || (matches!(w_dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) && !k.is_multiple_of(256))
+    {
         return Ok(None);
     }
 

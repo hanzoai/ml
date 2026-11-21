@@ -21,6 +21,32 @@ use hanzo_kernel::quant::{
 };
 use std::time::Instant;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Count of checks that printed MISMATCH; `main` exits nonzero when any did, so CI cannot pass a
+/// gate that printed a failure.
+static FAILS: AtomicUsize = AtomicUsize::new(0);
+
+fn mark(ok: bool, pass: &'static str, fail: &'static str) -> &'static str {
+    if ok {
+        pass
+    } else {
+        FAILS.fetch_add(1, Ordering::Relaxed);
+        fail
+    }
+}
+
+/// The device limits a kernel's schedule has to fit: the workgroup shared-memory ceiling and plane
+/// width differ per driver (RADV reports 64 KiB, the Windows AMD driver 32 KiB), and a schedule that
+/// overruns them fails silently with wrong output.
+fn limits<R: Runtime>(name: &str, client: &ComputeClient<R>) {
+    let hw = &client.properties().hardware;
+    println!(
+        "[{name:<7}] limits: shared_memory={} B  plane={}..{}  max_units_per_cube={}",
+        hw.max_shared_memory_size, hw.plane_size_min, hw.plane_size_max, hw.max_units_per_cube
+    );
+}
+
 // dp4a matvec parity: i8-packed one-thread-per-row (portable) vs block-per-row (coalesced reads +
 // shared-mem reduction, the bandwidth-bound winner). GB/s is on REAL int8 bytes (rows*k) so it
 // compares fairly to the hand-tuned dp4a (~166 GB/s; gfx1151 DRAM roofline ~256, MALL cache ~32MB).
@@ -58,11 +84,7 @@ fn check_dp4a<R: Runtime>(
             rows,
             k,
             rel,
-            if rel < 2e-2 {
-                "MATCH ✓"
-            } else {
-                "MISMATCH ✗"
-            },
+            mark(rel < 2e-2, "MATCH ✓", "MISMATCH ✗"),
             ms,
             real_bytes / (ms * 1e6),
             flop / (ms * 1e6)
@@ -117,7 +139,7 @@ fn check_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: 
         rows,
         k,
         rel,
-        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" },
+        mark(ok, "BIT-EXACT ✓", "MISMATCH ✗"),
         ms,
         gbps,
         gflops
@@ -153,7 +175,7 @@ fn check_moe_q4k<R: Runtime>(
         n,
         k,
         rel,
-        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" },
+        mark(ok, "BIT-EXACT ✓", "MISMATCH ✗"),
         ms,
         gbps,
         gflops
@@ -217,7 +239,7 @@ fn check_matvec_q4k_dp4a_blk<R: Runtime>(
         k,
         nt,
         srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        mark(ok, "MATCH ✓", "MISMATCH ✗"),
         ms,
         gbps
     );
@@ -245,7 +267,7 @@ fn check_moe_q4k_blk<R: Runtime>(
     println!(
         "[{:<7}] MoEQ4Kb E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbps, gflops
     );
 }
 
@@ -313,7 +335,7 @@ fn check_moe_q4k_dp4a_blk<R: Runtime>(
     println!(
         "[{:<7}] MoEdp4a E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbps, gflops
     );
 }
 
@@ -344,7 +366,7 @@ fn check_moe_q6k<R: Runtime>(
         n,
         k,
         srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        mark(ok, "MATCH ✓", "MISMATCH ✗"),
         ms,
         gbps,
         gflops
@@ -412,7 +434,7 @@ fn check_moe_q6k_dp4a_blk<R: Runtime>(
     println!(
         "[{:<7}] MoEq6dp4a E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbps, gflops
     );
 }
 
@@ -438,7 +460,7 @@ fn check_moe_q6k_blk<R: Runtime>(
     println!(
         "[{:<7}] MoEQ6Kb E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbps, gflops
     );
 }
 
@@ -516,7 +538,7 @@ fn check_moe_route<R: Runtime>(
         wrel,
         ties,
         ntok,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        mark(ok, "MATCH ✓", "MISMATCH ✗"),
         ms
     );
 }
@@ -622,7 +644,7 @@ fn check_sdpa_blk<R: Runtime>(
     println!(
         "[{:<7}] SDPAblk h{}kv{} q{} k{} d{} nt={:<3} scale_rel={:.2e} (max_rel={:.1e})  {}  {:.4} ms  {:.0} GB/s",
         name, n_heads, n_kv, seq_q, seq_k, d, nt, srel, mrel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbs
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbs
     );
 }
 
@@ -683,7 +705,7 @@ fn check_gemv<R: Runtime>(name: &str, client: &ComputeClient<R>, n: usize, k: us
         k,
         nt,
         rel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        mark(ok, "MATCH ✓", "MISMATCH ✗"),
         ms,
         gbs
     );
@@ -707,11 +729,7 @@ fn check_mmq_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize, n:
         n,
         k,
         rel,
-        if rel < 1e-2 {
-            "COOPMAT ✓"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(rel < 1e-2, "COOPMAT ✓", "MISMATCH ✗"),
         ms,
         gflops
     );
@@ -741,11 +759,7 @@ fn check_mmq_q4k_rt<R: Runtime>(
         n,
         k,
         rel,
-        if rel < 1e-2 {
-            "COOPMAT ✓"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(rel < 1e-2, "COOPMAT ✓", "MISMATCH ✗"),
         ms,
         gflops
     );
@@ -802,11 +816,7 @@ fn check_mmq_q4k_id<R: Runtime>(
         n,
         k,
         rel,
-        if rel < 1e-2 {
-            "COOPMAT ✓"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(rel < 1e-2, "COOPMAT ✓", "MISMATCH ✗"),
         ms,
         gflops
     );
@@ -874,11 +884,7 @@ fn check_q8_0_packed<R: Runtime>(
         k,
         nt,
         rel,
-        if rel < 3e-3 {
-            "BIT-EXACT ✓"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(rel < 3e-3, "BIT-EXACT ✓", "MISMATCH ✗"),
         ms,
         gbps,
         gflops
@@ -907,11 +913,7 @@ fn check_q8_0_packed_sg<R: Runtime>(
         k,
         nt,
         rel,
-        if rel < 3e-3 {
-            "BIT-EXACT ✓"
-        } else {
-            "MISMATCH ✗ (plane!=nt?)"
-        },
+        mark(rel < 3e-3, "BIT-EXACT ✓", "MISMATCH ✗ (plane!=nt?)"),
         ms,
         gbps
     );
@@ -942,11 +944,7 @@ fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usiz
         rows,
         k,
         rel,
-        if ok {
-            "MATCH ✓ (f32-reorder tol)"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(ok, "MATCH ✓ (f32-reorder tol)", "MISMATCH ✗"),
         ms,
         gbps
     );
@@ -990,15 +988,259 @@ fn check_rms<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, n: 
         rows,
         n,
         rel,
-        if rel < 3e-3 {
-            "MATCH ✓"
-        } else {
-            "MISMATCH ✗"
-        }
+        mark(rel < 3e-3, "MATCH ✓", "MISMATCH ✗")
     );
 }
 
+/// Gate: the lane-split GDN scan matches the CPU oracle (output and final state) for lane counts and
+/// both state layouts, at a shape with a ragged tail (seq 33). A lane count the device's planes cannot
+/// hold is skipped, not failed.
+fn check_gdn_lanes<R: Runtime>(name: &str, client: &ComputeClient<R>) {
+    use hanzo_kernel::gdn::{gdn_scan_lanes_space, gdn_synth, GdnLanesEval};
+    use hanzo_kernel::tune::{Evaluator, Verdict};
+    let (bh, seq, kd, vd) = (6usize, 33usize, 128usize, 128usize);
+    let space = gdn_scan_lanes_space(kd);
+    let inputs = gdn_synth(bh, seq, kd, vd, 0xC0FFEE);
+    let eval = GdnLanesEval::new(client, &space, &inputs, (bh, seq, kd, vd), 2, 1);
+    for (lanes, block, layout) in [
+        (1, 64, 0),
+        (4, 64, 0),
+        (8, 128, 0),
+        (8, 128, 1),
+        (16, 128, 1),
+        (32, 256, 0),
+    ] {
+        let cfg = space.config(&[("LANES", lanes), ("BLOCK", block), ("LAYOUT", layout)]);
+        if let Verdict::Reject(why) = eval.static_check(&cfg) {
+            println!("[{name:<7}] gdn_scan_lanes lanes={lanes} block={block} layout={layout}  skipped ({why})");
+            continue;
+        }
+        let ms = eval.measure(&cfg, 2);
+        println!(
+            "[{name:<7}] gdn_scan_lanes lanes={lanes:<2} block={block:<3} layout={layout}  max_rel={:.2e}  {}",
+            eval.worst_rel(),
+            mark(ms.is_finite(), "MATCH ✓", "MISMATCH ✗")
+        );
+    }
+}
+
+/// `matvec-check gdnsweep`: audit the whole schedule space of the lane-split GDN scan on this device,
+/// per shape class (decode, speculative verify, prefill). Every config is either rejected statically
+/// (with the reason), rejected by the oracle, or timed cold; the table is the audit, the winner per
+/// class is recorded in the tuner's per-device cache, and the speedup is against the one-thread-per-
+/// column scan (`lanes=1`) the engine ran before.
+fn gdn_lanes_sweep<R: Runtime>(label: &str, client: &ComputeClient<R>) {
+    use hanzo_kernel::gdn::{gdn_scan_lanes_space, gdn_synth, GdnLanesEval};
+    use hanzo_kernel::tune::{self, Evaluator, Verdict};
+    let (bh, kd, vd) = (48usize, 128usize, 128usize);
+    let device = tune::device_id(client);
+    let space = gdn_scan_lanes_space(kd);
+    let all = space.enumerate();
+    println!(
+        "== [{label}] gdn_scan_lanes schedule audit: {} feasible configs, device `{device}` ==",
+        all.len()
+    );
+    let baseline = space.config(&[("LANES", 1), ("BLOCK", 64), ("LAYOUT", 0)]);
+    for (class, seq) in [("decode", 1usize), ("verify", 8), ("prefill", 515)] {
+        let inputs = gdn_synth(bh, seq, kd, vd, 7);
+        let bank_bytes =
+            4 * (2 * bh * seq * kd + 2 * bh * seq * vd + 2 * bh * seq + 3 * bh * kd * vd);
+        let nbanks = (192usize << 20).div_ceil(bank_bytes).clamp(2, 96);
+        let eval = GdnLanesEval::new(client, &space, &inputs, (bh, seq, kd, vd), nbanks, 3);
+        let traffic = (4 * (2 * bh * seq * kd + 2 * bh * seq * vd + 2 * bh * kd * vd)) as f64;
+        let (mut rows, mut statically, mut diverged) = (Vec::new(), Vec::new(), 0usize);
+        for cfg in &all {
+            match eval.static_check(cfg) {
+                Verdict::Reject(why) => statically.push((cfg.name(&space), why)),
+                Verdict::Pass => {
+                    let ms = eval.measure(cfg, nbanks);
+                    if ms.is_finite() {
+                        rows.push((ms, cfg.clone()));
+                    } else {
+                        diverged += 1;
+                    }
+                }
+            }
+        }
+        rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        println!(
+            "-- {class}: bh={bh} seq={seq} k=v={kd}, {nbanks} cold banks | measured {} | static-rejected {} | oracle-rejected {diverged}",
+            rows.len(),
+            statically.len()
+        );
+        if let Some((why_name, why)) = statically.first() {
+            println!("   (e.g. {why_name}: {why})");
+        }
+        let base_ms = rows.iter().find(|(_, c)| *c == baseline).map(|(m, _)| *m);
+        for (i, (ms, cfg)) in rows.iter().enumerate() {
+            if i < 6 || *cfg == baseline || i + 1 == rows.len() {
+                println!(
+                    "   {:>2}. {:<28} {:8.4} ms  {:6.0} GB/s{}",
+                    i + 1,
+                    cfg.name(&space),
+                    ms,
+                    traffic / (ms * 1e6),
+                    if *cfg == baseline {
+                        "   <- before (one thread per column)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        if let Some((best_ms, best)) = rows.first() {
+            println!(
+                "   >> BEST {}: {:.4} ms{}  (worst_rel {:.2e})",
+                best.name(&space),
+                best_ms,
+                base_ms
+                    .map(|b| format!("  = {:.1}x the baseline", b / best_ms))
+                    .unwrap_or_default(),
+                eval.worst_rel()
+            );
+            tune::global().record(
+                &device,
+                "gdn_scan_lanes",
+                &format!("{class}:bh{bh}:k{kd}"),
+                &best.name(&space),
+            );
+        }
+    }
+}
+
+fn pq2_inputs(rows: usize, k: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    use hanzo_kernel::ternary::pq2_0_synth;
+    let (codes, d) = pq2_0_synth(rows, k, 0xB0_5A1);
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let xv = (0..k)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+        })
+        .collect();
+    (codes, d, xv)
+}
+
+/// Gate: the PQ2_0 dp4a decode matvec matches the host reference (same quantized activation) across
+/// thread counts and chunkings.
+fn check_pq2<R: Runtime>(name: &str, client: &ComputeClient<R>) {
+    use hanzo_kernel::ternary::{pq2_0_space, Pq2MatvecEval};
+    use hanzo_kernel::tune::{Evaluator, Verdict};
+    let space = pq2_0_space();
+    for (rows, k) in [(256usize, 1024usize), (384, 2048)] {
+        let (codes, d, x) = pq2_inputs(rows, k);
+        let eval = Pq2MatvecEval::new(client, &space, &codes, &d, &x, rows, k, 2, 1);
+        for (nt, chunk) in [(32, 1), (64, 2), (128, 4), (256, 1)] {
+            let cfg = space.config(&[("NT", nt), ("CHUNK", chunk)]);
+            if let Verdict::Reject(why) = eval.static_check(&cfg) {
+                println!(
+                    "[{name:<7}] PQ2_0 dp4a {rows}x{k} nt={nt} chunk={chunk}  skipped ({why})"
+                );
+                continue;
+            }
+            let ms = eval.measure(&cfg, 2);
+            println!(
+                "[{name:<7}] PQ2_0 dp4a {rows}x{k} nt={nt:<3} chunk={chunk}  max_rel={:.2e}  {}",
+                eval.worst_rel(),
+                mark(ms.is_finite(), "MATCH ✓", "MISMATCH ✗")
+            );
+        }
+    }
+}
+
+/// `matvec-check pq2sweep`: audit the PQ2_0 decode matvec schedule on the Bonsai-2 27B layer shapes,
+/// cold (weight banks past the last-level cache). GB/s counts the 2.125 bits per weight actually read.
+fn pq2_sweep<R: Runtime>(label: &str, client: &ComputeClient<R>) {
+    use hanzo_kernel::ternary::{pq2_0_space, Pq2MatvecEval};
+    use hanzo_kernel::tune::{self, Evaluator, Verdict};
+    let device = tune::device_id(client);
+    let space = pq2_0_space();
+    let all = space.enumerate();
+    println!(
+        "== [{label}] PQ2_0 dp4a decode matvec audit: {} configs, device `{device}` ==",
+        all.len()
+    );
+    for (rows, k, what) in [
+        (17408usize, 5120usize, "ffn gate/up"),
+        (5120, 17408, "ffn down"),
+        (5120, 5120, "attn proj"),
+    ] {
+        let (codes, d, x) = pq2_inputs(rows, k);
+        let wbytes = (rows * k) as f64 * 34.0 / 128.0;
+        let nbanks = ((192usize << 20) as f64 / wbytes).ceil() as usize;
+        let eval = Pq2MatvecEval::new(
+            client,
+            &space,
+            &codes,
+            &d,
+            &x,
+            rows,
+            k,
+            nbanks.clamp(2, 64),
+            3,
+        );
+        let (mut rows_out, mut rejected, mut diverged) = (Vec::new(), 0usize, 0usize);
+        for cfg in &all {
+            match eval.static_check(cfg) {
+                Verdict::Reject(_) => rejected += 1,
+                Verdict::Pass => {
+                    let ms = eval.measure(cfg, eval.nbanks());
+                    if ms.is_finite() {
+                        rows_out.push((ms, cfg.clone()));
+                    } else {
+                        diverged += 1;
+                    }
+                }
+            }
+        }
+        rows_out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        println!(
+            "-- {what} {rows}x{k} ({:.1} MB of weights, {} cold banks) | measured {} | static-rejected {rejected} | oracle-rejected {diverged}",
+            wbytes / 1e6,
+            eval.nbanks(),
+            rows_out.len()
+        );
+        for (i, (ms, cfg)) in rows_out.iter().enumerate() {
+            if i < 4 || i + 1 == rows_out.len() {
+                println!(
+                    "   {:>2}. {:<18} {:8.4} ms  {:6.0} GB/s",
+                    i + 1,
+                    cfg.name(&space),
+                    ms,
+                    wbytes / (ms * 1e6)
+                );
+            }
+        }
+        if let Some((ms, best)) = rows_out.first() {
+            println!(
+                "   >> BEST {}: {:.4} ms  {:.0} GB/s  (worst_rel {:.2e})",
+                best.name(&space),
+                ms,
+                wbytes / (ms * 1e6),
+                eval.worst_rel()
+            );
+            tune::global().record(
+                &device,
+                "matvec_pq2_0_dp4a_blk",
+                &format!("{rows}x{k}"),
+                &best.name(&space),
+            );
+        }
+    }
+}
+
 fn main() {
+    run();
+    let fails = FAILS.load(Ordering::Relaxed);
+    if fails > 0 {
+        eprintln!("matvec-check: {fails} check(s) MISMATCH");
+        std::process::exit(1);
+    }
+}
+
+fn run() {
     let (rows, k) = (4096usize, 4096usize);
     let ctrl = 256usize; // small-K control: reorder noise ~ ctrl*eps, should be ~1e-6
 
@@ -1230,6 +1472,17 @@ fn main() {
     {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
         let c = WgpuRuntime::client(&WgpuDevice::default());
+        limits::<WgpuRuntime>("VULKAN", &c);
+        if std::env::args().any(|a| a == "gdnsweep") {
+            gdn_lanes_sweep::<WgpuRuntime>("VULKAN", &c);
+            return;
+        }
+        if std::env::args().any(|a| a == "pq2sweep") {
+            pq2_sweep::<WgpuRuntime>("VULKAN", &c);
+            return;
+        }
+        check_gdn_lanes::<WgpuRuntime>("VULKAN", &c);
+        check_pq2::<WgpuRuntime>("VULKAN", &c);
         check::<WgpuRuntime>("VULKAN", &c, rows, k);
         check::<WgpuRuntime>("VK/ctrl", &c, rows, ctrl);
         check_q4k::<WgpuRuntime>("VULKAN", &c, rows, k);
@@ -1299,6 +1552,17 @@ fn main() {
     {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
         let c = WgpuRuntime::client(&WgpuDevice::default());
+        limits::<WgpuRuntime>("METAL", &c);
+        if std::env::args().any(|a| a == "gdnsweep") {
+            gdn_lanes_sweep::<WgpuRuntime>("METAL", &c);
+            return;
+        }
+        if std::env::args().any(|a| a == "pq2sweep") {
+            pq2_sweep::<WgpuRuntime>("METAL", &c);
+            return;
+        }
+        check_gdn_lanes::<WgpuRuntime>("METAL", &c);
+        check_pq2::<WgpuRuntime>("METAL", &c);
         check::<WgpuRuntime>("METAL", &c, rows, k);
         check_q4k::<WgpuRuntime>("METAL", &c, rows, k);
         // Full Qwen3 decode board on cubecl-Metal: same shapes the Vulkan branch gates on, so the DSL's
@@ -1316,9 +1580,12 @@ fn main() {
         // Fused top-k router (128 experts, top-8): decode batch + prefill batch.
         check_moe_route::<WgpuRuntime>("METAL", &c, 8, 128, 8, 128);
         check_moe_route::<WgpuRuntime>("METAL", &c, 512, 128, 8, 128);
-        // NB: check_sdpa_blk is omitted here -- cubecl 0.10 errors in its Metal client.profile
-        // timing path for sdpa_blk (execution error during profiling); the kernel itself is bit-exact
-        // (see flash-metal-check for the device-timestamped attention A/B). Tracked as a next-step.
+        // Decode attention at the engine's shape (d=128). Metal's workgroup shared memory is 32 KiB, so
+        // this also guards the kernel's shared-memory footprint (see `limits` above).
+        check_sdpa_blk::<WgpuRuntime>("METAL", &c, 32, 8, 1, 2048, 2048, 128, false, 32);
+        check_sdpa_blk::<WgpuRuntime>("METAL", &c, 32, 8, 1, 2048, 2048, 128, false, 64);
+        check_sdpa_blk::<WgpuRuntime>("METAL", &c, 32, 8, 1, 2048, 4096, 128, false, 64);
+        check_sdpa_blk::<WgpuRuntime>("METAL", &c, 32, 8, 128, 128, 128, 128, true, 64);
         // NB: check_matvec_q4k_dp4a_blk (DENSE int8 dp4a matvec) is omitted -- it panics in wgpu
         // (worker-thread abort -> zero output, scale_rel 1.0) on cubecl 0.10 Metal, though the MoE dp4a
         // twin below dispatches fine. Root-cause is a next-step; the f32-direct + naive Q4_K paths cover
@@ -1334,15 +1601,42 @@ fn main() {
     {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
         let c = CudaRuntime::client(&CudaDevice::default());
+        limits::<CudaRuntime>("CUDA", &c);
+        if std::env::args().any(|a| a == "gdnsweep") {
+            gdn_lanes_sweep::<CudaRuntime>("CUDA", &c);
+            return;
+        }
+        if std::env::args().any(|a| a == "pq2sweep") {
+            pq2_sweep::<CudaRuntime>("CUDA", &c);
+            return;
+        }
+        check_gdn_lanes::<CudaRuntime>("CUDA", &c);
+        check_pq2::<CudaRuntime>("CUDA", &c);
         check::<CudaRuntime>("CUDA", &c, rows, k);
         check_q4k::<CudaRuntime>("CUDA", &c, rows, k);
         check_dp4a::<CudaRuntime>("CUDA", &c, rows, k, true);
         check_rms::<CudaRuntime>("CUDA", &c, rows, k);
+        // Decode attention at the engine's shape (d=128): nt=32 and nt=64, packed, strided KV and causal prefill.
+        check_sdpa_blk::<CudaRuntime>("CUDA", &c, 32, 8, 1, 2048, 2048, 128, false, 32);
+        check_sdpa_blk::<CudaRuntime>("CUDA", &c, 32, 8, 1, 2048, 2048, 128, false, 64);
+        check_sdpa_blk::<CudaRuntime>("CUDA", &c, 32, 8, 1, 2048, 4096, 128, false, 64);
+        check_sdpa_blk::<CudaRuntime>("CUDA", &c, 32, 8, 128, 128, 128, 128, true, 64);
     }
     #[cfg(feature = "rocm")]
     {
         use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
         let c = HipRuntime::client(&AmdDevice::default());
+        limits::<HipRuntime>("ROCM", &c);
+        if std::env::args().any(|a| a == "gdnsweep") {
+            gdn_lanes_sweep::<HipRuntime>("ROCM", &c);
+            return;
+        }
+        if std::env::args().any(|a| a == "pq2sweep") {
+            pq2_sweep::<HipRuntime>("ROCM", &c);
+            return;
+        }
+        check_gdn_lanes::<HipRuntime>("ROCM", &c);
+        check_pq2::<HipRuntime>("ROCM", &c);
         check::<HipRuntime>("ROCM", &c, rows, k);
         check_q4k::<HipRuntime>("ROCM", &c, rows, k);
         check_dp4a::<HipRuntime>("ROCM", &c, rows, k, true);

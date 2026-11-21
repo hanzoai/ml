@@ -215,7 +215,9 @@ impl Tuner {
     }
 
     /// Record a winner in memory and append it to the device's on-disk file.
-    fn record(&self, device: &str, op: &str, key: &str, winner: &str) {
+    /// Record `winner` for `(device, op, key)` in memory and on disk, as a search the caller ran itself
+    /// (an exhaustive audit, say) would. Same cache and same format as [`Tuner::select`].
+    pub fn record(&self, device: &str, op: &str, key: &str, winner: &str) {
         {
             let mut inner = self.inner.lock().expect("tuner cache poisoned");
             inner.winners.insert(
