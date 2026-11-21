@@ -813,6 +813,7 @@ pub(crate) fn vec_dot_pq2_0_q8_0(n: usize, xs: &[BlockPQ2_0], ys: &[BlockQ8_0]) 
     #[cfg(target_arch = "aarch64")]
     {
         // Baseline NEON is mandatory on aarch64.
+    println!("dispatching vec_dot_pq2_0_q8_0");
         return unsafe { vec_dot_pq2_0_q8_0_neon(n, xs, ys) };
     }
     #[cfg(target_arch = "x86_64")]

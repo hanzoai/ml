@@ -77,6 +77,7 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
                 out.extend_from_slice(&[0u8, 0, 0, 0, 0, 0xC0, 0, 0x20]);
             }
         }
+        GgmlDType::PQ2_0 => (0..nblk).for_each(|_| emit_d_then(0.03, 32, &mut out, &mut c)),
         // K-quants: quantize random f32 (candle's CPU quantizer) to valid blocks, then reuse the
         // identical bytes on both devices. block_q4_K = 144 B, block_q6_K = 210 B.
         GgmlDType::Q4K | GgmlDType::Q6K => {
@@ -502,7 +503,6 @@ fn check_bf16_half_mm_bounded(dtype: GgmlDType) {
                 0,
                 &dst,
                 true, // src1_bf16
-                true, // src1_half -> kernel_mul_mm_q*_K_bf16_half
             )
             .unwrap();
         }
@@ -1023,5 +1023,169 @@ fn metal_fwd_f16_weight_m4_routes_correctly() {
                 "F16 fwd m={m} mismatch at [{i},{n}]: got {g} exp {r}"
             );
         }
+    }
+}
+
+#[test]
+fn metal_dequant_pq2_0_bit_exact() {
+    check_dequant_bit_exact(GgmlDType::PQ2_0);
+}
+
+#[test]
+fn metal_matvec_pq2_0_matches_cpu() {
+    check(GgmlDType::PQ2_0);
+}
+
+#[test]
+fn metal_pq2_0_tg128_tiers_tails_bf16_and_legacy_fallback() {
+    let dev = match Device::new_metal(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip PQ2_0 tg128 test: no Metal device ({e})");
+            return;
+        }
+    };
+    let cpu = Device::Cpu;
+
+    // Exercise all three tg128 NR0 tiers (nr2: n<=2048, nr4: 2048<n<16384, nr8: n>=16384),
+    // including ragged non-multiple-of-32 row tails (1027, 2051, 16389), m=1 and m=4,
+    // both F32 and BF16 activations, and legacy fallback parity.
+    for &(nout, k, m) in &[
+        (1027usize, 512usize, 1usize),
+        (2051, 512, 1),
+        (2051, 512, 4),
+        (16389, 256, 1),
+    ] {
+        let raw = synth(GgmlDType::PQ2_0, nout, k);
+        let w_deq: Vec<f32> = QTensor::new(
+            QStorage::from_data(Cow::Owned(raw.clone()), &cpu, GgmlDType::PQ2_0).unwrap(),
+            (nout, k),
+        )
+        .unwrap()
+        .dequantize(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        let q_metal = QTensor::new(
+            QStorage::from_data(Cow::Owned(raw), &dev, GgmlDType::PQ2_0).unwrap(),
+            (nout, k),
+        )
+        .unwrap();
+        let matmul = QMatMul::from_qtensor(q_metal).unwrap();
+
+        // 1. F32 activation: tg128 vs legacy vs CPU f64 reference
+        let x_f32_host: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7_000_001)).collect();
+        let x_f32 = Tensor::from_vec(x_f32_host.clone(), (m, k), &dev).unwrap();
+
+        hanzo_metal_kernels::set_pq2_metal_legacy(false);
+        let y_tg128: Vec<f32> = matmul
+            .forward(&x_f32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        hanzo_metal_kernels::set_pq2_metal_legacy(true);
+        let y_legacy: Vec<f32> = matmul
+            .forward(&x_f32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        hanzo_metal_kernels::set_pq2_metal_legacy(false);
+
+        let mut max_ref = 0.0f32;
+        let mut max_err_tg128 = 0.0f32;
+        let mut max_diff_legacy = 0.0f32;
+        for row in 0..m {
+            for n in 0..nout {
+                let mut r = 0.0f64;
+                for j in 0..k {
+                    r += x_f32_host[row * k + j] as f64 * w_deq[n * k + j] as f64;
+                }
+                let r32 = r as f32;
+                let g_tg = y_tg128[row * nout + n];
+                let g_leg = y_legacy[row * nout + n];
+                max_ref = max_ref.max(r32.abs());
+                max_err_tg128 = max_err_tg128.max((g_tg - r32).abs());
+                max_diff_legacy = max_diff_legacy.max((g_tg - g_leg).abs());
+            }
+        }
+        assert!(
+            max_err_tg128 / max_ref.max(1e-6) < 1e-5,
+            "PQ2_0 F32 tg128 [{nout}x{k} m={m}] rel err too high: {}",
+            max_err_tg128 / max_ref.max(1e-6)
+        );
+        assert!(
+            max_diff_legacy / max_ref.max(1e-6) < 1e-5,
+            "PQ2_0 F32 tg128 vs legacy [{nout}x{k} m={m}] diff too high: {}",
+            max_diff_legacy / max_ref.max(1e-6)
+        );
+
+        // 2. BF16 activation: tg128 vs legacy vs CPU f64 reference
+        let x_bf16 = x_f32.to_dtype(hanzo_ml::DType::BF16).unwrap();
+        let x_bf16_f32: Vec<f32> = x_bf16
+            .to_dtype(hanzo_ml::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        hanzo_metal_kernels::set_pq2_metal_legacy(false);
+        let yb_tg128: Vec<f32> = matmul
+            .forward(&x_bf16)
+            .unwrap()
+            .to_dtype(hanzo_ml::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        hanzo_metal_kernels::set_pq2_metal_legacy(true);
+        let yb_legacy: Vec<f32> = matmul
+            .forward(&x_bf16)
+            .unwrap()
+            .to_dtype(hanzo_ml::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        hanzo_metal_kernels::set_pq2_metal_legacy(false);
+
+        let mut max_bref = 0.0f32;
+        let mut max_berr_tg128 = 0.0f32;
+        let mut max_bdiff_legacy = 0.0f32;
+        for row in 0..m {
+            for n in 0..nout {
+                let mut r = 0.0f64;
+                for j in 0..k {
+                    r += x_bf16_f32[row * k + j] as f64 * w_deq[n * k + j] as f64;
+                }
+                let r32 = r as f32;
+                let g_tg = yb_tg128[row * nout + n];
+                let g_leg = yb_legacy[row * nout + n];
+                max_bref = max_bref.max(r32.abs());
+                max_berr_tg128 = max_berr_tg128.max((g_tg - r32).abs());
+                max_bdiff_legacy = max_bdiff_legacy.max((g_tg - g_leg).abs());
+            }
+        }
+        assert!(
+            max_berr_tg128 / max_bref.max(1e-6) < 6e-3,
+            "PQ2_0 BF16 tg128 [{nout}x{k} m={m}] rel err too high: {}",
+            max_berr_tg128 / max_bref.max(1e-6)
+        );
+        assert!(
+            max_bdiff_legacy / max_bref.max(1e-6) < 8e-3,
+            "PQ2_0 BF16 tg128 vs legacy [{nout}x{k} m={m}] diff too high: {}",
+            max_bdiff_legacy / max_bref.max(1e-6)
+        );
     }
 }

@@ -1,0 +1,1041 @@
+From f75602ac8d950eb957b0d020163709ebb14335da Mon Sep 17 00:00:00 2001
+From: Zach Kelling <z@zeekay.io>
+Date: Mon, 16 Nov 2026 15:05:54 -0800
+Subject: [PATCH 1/2] perf(metal,kernel): DSL-tuned tg128 PQ2_0 SIMD4 matvec
+ with legacy fallback
+
+---
+ hanzo-kernel/src/main.rs                      |  86 ++++--
+ hanzo-kernel/src/ternary.rs                   | 251 ++++++++++++++++++
+ hanzo-metal-kernels/src/kernels/quantized.rs  | 101 ++++++-
+ .../src/metal_src/quantized.metal             | 179 ++++++++++++-
+ hanzo-ml/tests/metal_iquant_tests.rs          | 165 ++++++++++++
+ 5 files changed, 751 insertions(+), 31 deletions(-)
+
+diff --git a/hanzo-kernel/src/main.rs b/hanzo-kernel/src/main.rs
+index ccf76234a..f4c54fede 100644
+--- a/hanzo-kernel/src/main.rs
++++ b/hanzo-kernel/src/main.rs
+@@ -1123,13 +1123,16 @@ fn pq2_inputs(rows: usize, k: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+     (codes, d, xv)
+ }
+ 
+-/// Gate: the PQ2_0 dp4a decode matvec matches the host reference (same quantized activation) across
+-/// thread counts and chunkings.
++/// Gate: the PQ2_0 decode matvecs (dp4a and simdgroup plane) match the host reference across
++/// schedules and ragged row tails.
+ fn check_pq2<R: Runtime>(name: &str, client: &ComputeClient<R>) {
+-    use hanzo_kernel::ternary::{pq2_0_space, Pq2MatvecEval};
++    use hanzo_kernel::ternary::{
++        pq2_0_plane_space, pq2_0_space, Pq2MatvecEval, Pq2PlaneMatvecEval,
++    };
+     use hanzo_kernel::tune::{Evaluator, Verdict};
+     let space = pq2_0_space();
+-    for (rows, k) in [(256usize, 1024usize), (384, 2048)] {
++    let pspace = pq2_0_plane_space();
++    for (rows, k) in [(256usize, 1024usize), (387, 2048)] {
+         let (codes, d, x) = pq2_inputs(rows, k);
+         let eval = Pq2MatvecEval::new(client, &space, &codes, &d, &x, rows, k, 2, 1);
+         for (nt, chunk) in [(32, 1), (64, 2), (128, 4), (256, 1)] {
+@@ -1147,25 +1150,45 @@ fn check_pq2<R: Runtime>(name: &str, client: &ComputeClient<R>) {
+                 mark(ms.is_finite(), "MATCH ✓", "MISMATCH ✗")
+             );
+         }
++        let peval = Pq2PlaneMatvecEval::new(client, &pspace, &codes, &d, &x, rows, k, 2, 1);
++        for (nsg, nr0) in [(2, 2), (4, 2), (4, 4), (4, 8)] {
++            let cfg = pspace.config(&[("NSG", nsg), ("NR0", nr0)]);
++            if let Verdict::Reject(_) = peval.static_check(&cfg) {
++                continue;
++            }
++            let ms = peval.measure(&cfg, 2);
++            println!(
++                "[{name:<7}] PQ2_0 tg{} {rows}x{k} nr0={nr0}  max_rel={:.2e}  {}",
++                nsg * 32,
++                peval.worst_rel(),
++                mark(ms.is_finite(), "MATCH ✓", "MISMATCH ✗")
++            );
++        }
+     }
+ }
+ 
+-/// `matvec-check pq2sweep`: audit the PQ2_0 decode matvec schedule on the Bonsai-2 27B layer shapes,
++/// `matvec-check pq2sweep`: audit the PQ2_0 decode matvec schedules on the Bonsai-2 27B layer shapes,
+ /// cold (weight banks past the last-level cache). GB/s counts the 2.125 bits per weight actually read.
+ fn pq2_sweep<R: Runtime>(label: &str, client: &ComputeClient<R>) {
+-    use hanzo_kernel::ternary::{pq2_0_space, Pq2MatvecEval};
++    use hanzo_kernel::ternary::{
++        pq2_0_plane_space, pq2_0_space, Pq2MatvecEval, Pq2PlaneMatvecEval,
++    };
+     use hanzo_kernel::tune::{self, Evaluator, Verdict};
+     let device = tune::device_id(client);
+     let space = pq2_0_space();
++    let pspace = pq2_0_plane_space();
+     let all = space.enumerate();
++    let pall = pspace.enumerate();
+     println!(
+-        "== [{label}] PQ2_0 dp4a decode matvec audit: {} configs, device `{device}` ==",
+-        all.len()
++        "== [{label}] PQ2_0 decode matvec audit: {} dp4a + {} plane configs, device `{device}` ==",
++        all.len(),
++        pall.len()
+     );
+     for (rows, k, what) in [
+         (17408usize, 5120usize, "ffn gate/up"),
+         (5120, 17408, "ffn down"),
+         (5120, 5120, "attn proj"),
++        (1024, 5120, "attn kv"),
+     ] {
+         let (codes, d, x) = pq2_inputs(rows, k);
+         let wbytes = (rows * k) as f64 * 34.0 / 128.0;
+@@ -1188,7 +1211,31 @@ fn pq2_sweep<R: Runtime>(label: &str, client: &ComputeClient<R>) {
+                 Verdict::Pass => {
+                     let ms = eval.measure(cfg, eval.nbanks());
+                     if ms.is_finite() {
+-                        rows_out.push((ms, cfg.clone()));
++                        rows_out.push((ms, format!("dp4a:{}", cfg.name(&space))));
++                    } else {
++                        diverged += 1;
++                    }
++                }
++            }
++        }
++        let peval = Pq2PlaneMatvecEval::new(
++            client,
++            &pspace,
++            &codes,
++            &d,
++            &x,
++            rows,
++            k,
++            nbanks.clamp(2, 64),
++            3,
++        );
++        for cfg in &pall {
++            match peval.static_check(cfg) {
++                Verdict::Reject(_) => rejected += 1,
++                Verdict::Pass => {
++                    let ms = peval.measure(cfg, peval.nbanks());
++                    if ms.is_finite() {
++                        rows_out.push((ms, format!("plane:{}", cfg.name(&pspace))));
+                     } else {
+                         diverged += 1;
+                     }
+@@ -1202,31 +1249,24 @@ fn pq2_sweep<R: Runtime>(label: &str, client: &ComputeClient<R>) {
+             eval.nbanks(),
+             rows_out.len()
+         );
+-        for (i, (ms, cfg)) in rows_out.iter().enumerate() {
+-            if i < 4 || i + 1 == rows_out.len() {
++        for (i, (ms, name)) in rows_out.iter().enumerate() {
++            if i < 6 || i + 1 == rows_out.len() {
+                 println!(
+-                    "   {:>2}. {:<18} {:8.4} ms  {:6.0} GB/s",
++                    "   {:>2}. {:<24} {:8.4} ms  {:6.0} GB/s",
+                     i + 1,
+-                    cfg.name(&space),
++                    name,
+                     ms,
+                     wbytes / (ms * 1e6)
+                 );
+             }
+         }
+         if let Some((ms, best)) = rows_out.first() {
++            let wrel = eval.worst_rel().max(peval.worst_rel());
+             println!(
+-                "   >> BEST {}: {:.4} ms  {:.0} GB/s  (worst_rel {:.2e})",
+-                best.name(&space),
+-                ms,
++                "   >> BEST {best}: {ms:.4} ms  {:.0} GB/s  (worst_rel {wrel:.2e})",
+                 wbytes / (ms * 1e6),
+-                eval.worst_rel()
+-            );
+-            tune::global().record(
+-                &device,
+-                "matvec_pq2_0_dp4a_blk",
+-                &format!("{rows}x{k}"),
+-                &best.name(&space),
+             );
++            tune::global().record(&device, "matvec_pq2_0", &format!("{rows}x{k}"), best);
+         }
+     }
+ }
+diff --git a/hanzo-kernel/src/ternary.rs b/hanzo-kernel/src/ternary.rs
+index f3a4f551e..29e84474c 100644
+--- a/hanzo-kernel/src/ternary.rs
++++ b/hanzo-kernel/src/ternary.rs
+@@ -329,3 +329,254 @@ impl<'a, R: Runtime> Evaluator for Pq2MatvecEval<'a, R> {
+             .fold(f64::INFINITY, f64::min)
+     }
+ }
++
++/// Host f64 reference for direct float-activation PQ2_0 matvec (`w = d * (code - 1)`).
++pub fn pq2_0_float_ref(codes: &[u8], d: &[f32], x: &[f32], rows: usize, k: usize) -> Vec<f32> {
++    (0..rows)
++        .map(|r| {
++            let mut acc = 0.0f64;
++            for b in 0..(k / QK_PQ2_0) {
++                let scale = d[r * (k / QK_PQ2_0) + b] as f64;
++                let base = b * QK_PQ2_0;
++                let mut bacc = 0.0f64;
++                for i in 0..QK_PQ2_0 {
++                    let c = codes[r * k + base + i] as f64 - 1.0;
++                    bacc += c * x[base + i] as f64;
++                }
++                acc += scale * bacc;
++            }
++            acc as f32
++        })
++        .collect()
++}
++
++/// Multi-row simdgroup/plane PQ2_0 decode matvec (`tg128` schedule family for SIMD4 float backends
++/// such as Apple Silicon Metal where `dot(float4, float4)` outpaces emulated `dp4a`).
++///
++/// One 32-lane plane cooperates on `4` consecutive 128-weight blocks per step (`8` lanes/block,
++/// `16` weights = `1` `u32` word per lane) across `nr0` output rows simultaneously, decoding each
++/// 2-bit code via IEEE-754 binary16 exponent-25 (`as_type<f16>(0x6400 | code) - 1025.0 == code - 1`
++/// bit-exactly, zero `uitofp`, zero `floor`, zero `sumy` cancellation) and reducing across the
++/// plane with `plane_sum` (no shared memory, no barriers). Requires hardware `plane_size == 32`.
++///
++/// Launch geometry: `Block::new_2d(32, nsg as u32)` (`128` threads at `nsg = 4`),
++/// `Grid::Static(rows.div_ceil(nsg * nr0) as u32, 1, 1)`. `meta = [k, rows]`.
++#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
++pub fn matvec_pq2_0_plane<F: Float>(
++    wq: &Array<u32>,
++    wd: &Array<F>,
++    x: &Array<F>,
++    out: &mut Array<F>,
++    meta: &Array<u32>,
++    #[comptime] nsg: usize,
++    #[comptime] nr0: usize,
++) {
++    let lane = UNIT_POS_X as usize;
++    let sg = UNIT_POS_Y as usize;
++    let k = meta[0] as usize;
++    let nout = meta[1] as usize;
++    let nb = k / 128;
++    let first_row = (CUBE_POS as usize * nsg + sg) * nr0;
++
++    let ix = lane / 8;
++    let il = lane % 8;
++
++    let mut sumf = Array::<F>::new(nr0);
++    #[unroll]
++    for r in 0..nr0 {
++        sumf[r] = F::new(0.0f32);
++    }
++
++    if first_row < nout {
++        let mut ib = ix;
++        while ib < nb {
++            let xb = ib * 128 + il * 16;
++            let mut y = Array::<F>::new(16);
++            #[unroll]
++            for i in 0..16usize {
++                y[i] = x[xb + i];
++            }
++            #[unroll]
++            for r in 0..nr0 {
++                let crow = if first_row + r < nout {
++                    first_row + r
++                } else {
++                    nout - 1
++                };
++                let d = wd[crow * nb + ib];
++                let w32 = wq[crow * (nb * 8) + ib * 8 + il];
++                let mut acc = F::new(0.0f32);
++                #[unroll]
++                for i in 0..16usize {
++                    let c_bits = ((w32 >> ((2 * i) as u32)) & 3u32) | 0x6400u32;
++                    let w_val =
++                        F::cast_from(half::f16::reinterpret(c_bits as u16)) - F::new(1025.0f32);
++                    acc += w_val * y[i];
++                }
++                sumf[r] += d * acc;
++            }
++            ib += 4;
++        }
++    }
++
++    #[unroll]
++    for r in 0..nr0 {
++        let tot = plane_sum(sumf[r]);
++        if lane == 0 && first_row + r < nout {
++            out[first_row + r] = tot;
++        }
++    }
++}
++
++/// Schedule space of [`matvec_pq2_0_plane`]: simdgroups per threadgroup (`NSG=4` -> `tg128`) and
++/// output rows per simdgroup (`NR0`).
++pub fn pq2_0_plane_space() -> Space {
++    Space::new().param("NSG", [2, 4]).param("NR0", [2, 4, 8])
++}
++
++/// Cold-weight, oracle-gated fitness for [`pq2_0_plane_space`].
++pub struct Pq2PlaneMatvecEval<'a, R: Runtime> {
++    client: &'a ComputeClient<R>,
++    space: &'a Space,
++    banks: Vec<(cubecl::server::Handle, cubecl::server::Handle)>,
++    x: cubecl::server::Handle,
++    meta: cubecl::server::Handle,
++    out: cubecl::server::Handle,
++    lens: (usize, usize, usize),
++    rows: usize,
++    oracle: Vec<f32>,
++    maxref: f32,
++    repeats: usize,
++    worst_rel: std::cell::Cell<f32>,
++}
++
++impl<'a, R: Runtime> Pq2PlaneMatvecEval<'a, R> {
++    #[allow(clippy::too_many_arguments)]
++    pub fn new(
++        client: &'a ComputeClient<R>,
++        space: &'a Space,
++        codes: &[u8],
++        d: &[f32],
++        x: &[f32],
++        rows: usize,
++        k: usize,
++        nbanks: usize,
++        repeats: usize,
++    ) -> Self {
++        let (wq, wd) = pq2_0_pack(codes, d, rows, k);
++        let banks = (0..nbanks.max(1))
++            .map(|_| {
++                (
++                    client.create_from_slice(u32::as_bytes(&wq)),
++                    client.create_from_slice(f32::as_bytes(&wd)),
++                )
++            })
++            .collect();
++        let oracle = pq2_0_float_ref(codes, &wd, x, rows, k);
++        let maxref = oracle.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-30);
++        Self {
++            client,
++            space,
++            banks,
++            x: client.create_from_slice(f32::as_bytes(x)),
++            meta: client.create_from_slice(u32::as_bytes(&[k as u32, rows as u32])),
++            out: client.create_from_slice(f32::as_bytes(&vec![0.0f32; rows])),
++            lens: (wq.len(), wd.len(), x.len()),
++            rows,
++            oracle,
++            maxref,
++            repeats,
++            worst_rel: std::cell::Cell::new(0.0),
++        }
++    }
++
++    pub fn nbanks(&self) -> usize {
++        self.banks.len()
++    }
++
++    pub fn worst_rel(&self) -> f32 {
++        self.worst_rel.get()
++    }
++
++    fn cfg(&self, c: &Config) -> (usize, usize) {
++        (
++            c.get(self.space, "NSG") as usize,
++            c.get(self.space, "NR0") as usize,
++        )
++    }
++
++    fn dispatch(&self, bank: usize, nsg: usize, nr0: usize) {
++        let (a, b) = &self.banks[bank];
++        let grid_x = self.rows.div_ceil(nsg * nr0) as u32;
++        unsafe {
++            matvec_pq2_0_plane::launch_unchecked::<f32, R>(
++                self.client,
++                Grid::Static(grid_x, 1, 1),
++                Block::new_2d(32, nsg as u32),
++                ArrayArg::from_raw_parts(a.clone(), self.lens.0),
++                ArrayArg::from_raw_parts(b.clone(), self.lens.1),
++                ArrayArg::from_raw_parts(self.x.clone(), self.lens.2),
++                ArrayArg::from_raw_parts(self.out.clone(), self.rows),
++                ArrayArg::from_raw_parts(self.meta.clone(), 2),
++                nsg,
++                nr0,
++            );
++        }
++    }
++
++    fn read_out(&self) -> Vec<f32> {
++        f32::from_bytes(&self.client.read_one_unchecked(self.out.clone())).to_vec()
++    }
++}
++
++impl<'a, R: Runtime> Evaluator for Pq2PlaneMatvecEval<'a, R> {
++    fn static_check(&self, cfg: &Config) -> Verdict {
++        let (nsg, _) = self.cfg(cfg);
++        let hw = &self.client.properties().hardware;
++        if hw.plane_size_min != 32 || hw.plane_size_max != 32 {
++            return Verdict::Reject(format!(
++                "matvec_pq2_0_plane requires 32-lane hardware planes, got {}..{}",
++                hw.plane_size_min, hw.plane_size_max
++            ));
++        }
++        if (32 * nsg) as u32 > hw.max_units_per_cube {
++            return Verdict::Reject(format!(
++                "{} threads exceed {} units per cube",
++                32 * nsg,
++                hw.max_units_per_cube
++            ));
++        }
++        Verdict::Pass
++    }
++
++    fn measure(&self, cfg: &Config, iters: usize) -> f64 {
++        let (nsg, nr0) = self.cfg(cfg);
++        self.dispatch(0, nsg, nr0);
++        let rel = self
++            .read_out()
++            .iter()
++            .zip(&self.oracle)
++            .map(|(a, b)| (a - b).abs())
++            .fold(0f32, f32::max)
++            / self.maxref;
++        self.worst_rel.set(self.worst_rel.get().max(rel));
++        if !(rel <= 1e-5) {
++            return f64::INFINITY;
++        }
++        let nb = self.banks.len();
++        for i in 0..(2 * nb) {
++            self.dispatch(i % nb, nsg, nr0);
++        }
++        let _ = self.read_out();
++        (0..self.repeats)
++            .map(|_| {
++                let t = std::time::Instant::now();
++                for i in 0..iters {
++                    self.dispatch(i % nb, nsg, nr0);
++                }
++                let _ = self.read_out();
++                t.elapsed().as_secs_f64() * 1e3 / iters as f64
++            })
++            .fold(f64::INFINITY, f64::min)
++    }
++}
+diff --git a/hanzo-metal-kernels/src/kernels/quantized.rs b/hanzo-metal-kernels/src/kernels/quantized.rs
+index d12ffa9c5..b8b9f9a0e 100644
+--- a/hanzo-metal-kernels/src/kernels/quantized.rs
++++ b/hanzo-metal-kernels/src/kernels/quantized.rs
+@@ -58,6 +58,51 @@ fn matvec_threadgroup_mem(dtype: GgmlDType) -> usize {
+     }
+ }
+ 
++/// Runtime fallback switch for the Metal `PQ2_0` matvec:
++///   * default (`false`): dispatches the DSL-tuned `tg128` (`32x4` = 128 threads/threadgroup)
++///     exact binary16-mantissa SIMD4 matvec (`nr2` for `N <= 2048`, `nr4` for `2048 < N < 16384`,
++///     `nr8` for `N >= 16384`).
++///   * `HANZO_METAL_PQ2_LEGACY=1` (`true`): preserves the 64-thread `(4, 16, 16)` base-4 collapse
++///     implementation (`kernel_mul_mv_pq2_0_{f32,bf16}` / `kernel_mul_mv_id_pq2_0_f32`).
++static PQ2_METAL_LEGACY_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
++
++pub fn pq2_metal_legacy_enabled() -> bool {
++    use std::sync::atomic::Ordering::Relaxed;
++    match PQ2_METAL_LEGACY_STATE.load(Relaxed) {
++        1 => false,
++        2 => true,
++        _ => {
++            let legacy = std::env::var("HANZO_METAL_PQ2_LEGACY")
++                .map(|v| {
++                    let s = v.trim();
++                    !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false")
++                })
++                .unwrap_or(false);
++            PQ2_METAL_LEGACY_STATE.store(if legacy { 2 } else { 1 }, Relaxed);
++            legacy
++        }
++    }
++}
++
++/// Override the `PQ2_0` Metal matvec mode (`true` = legacy 64-thread fallback, `false` = `tg128`).
++pub fn set_pq2_metal_legacy(legacy: bool) {
++    PQ2_METAL_LEGACY_STATE.store(
++        if legacy { 2 } else { 1 },
++        std::sync::atomic::Ordering::Relaxed,
++    );
++}
++
++#[inline]
++fn pq2_tg128_nr0(n: usize) -> usize {
++    if n <= 2048 {
++        2
++    } else if n < 16384 {
++        4
++    } else {
++        8
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub fn call_quantized_matmul_mv_t(
+     device: &Device,
+@@ -189,7 +234,14 @@ pub fn call_quantized_matmul_mv_t_offset(
+         | GgmlDType::IQ1_S
+         | GgmlDType::IQ1_M => (4, 16, 8),
+         GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
+-        GgmlDType::PQ2_0 => (4, 16, 16),
++        GgmlDType::PQ2_0 => {
++            if pq2_metal_legacy_enabled() {
++                (4, 16, 16)
++            } else {
++                let nr0 = pq2_tg128_nr0(n);
++                (32, 4, 4 * nr0)
++            }
++        }
+         GgmlDType::PTQ1_0 => (4, 16, 8),
+     };
+     let thread_groups_count = MTLSize {
+@@ -203,13 +255,23 @@ pub fn call_quantized_matmul_mv_t_offset(
+         depth: 1,
+     };
+     // A bf16 activation (src1) + bf16 dst skips the bf16<->f32 round-trip GgufMatMul otherwise wraps
+-    // around the projection. Only Q4_K/Q6_K carry a bf16-native matvec (the two K-quants Q4_K_M uses);
++    // around the projection. Only Q4_K/Q6_K/PQ2_0/PTQ1_0 carry a bf16-native matvec;
+     // any other dtype must reach here with an f32 activation.
+     let name = if src1_bf16 {
+         match dtype {
+             GgmlDType::Q4K => "kernel_mul_mv_q4_K_bf16",
+             GgmlDType::Q6K => "kernel_mul_mv_q6_K_bf16",
+-            GgmlDType::PQ2_0 => "kernel_mul_mv_pq2_0_bf16",
++            GgmlDType::PQ2_0 => {
++                if pq2_metal_legacy_enabled() {
++                    "kernel_mul_mv_pq2_0_bf16"
++                } else {
++                    match pq2_tg128_nr0(n) {
++                        2 => "kernel_mul_mv_pq2_0_tg128_nr2_bf16",
++                        4 => "kernel_mul_mv_pq2_0_tg128_nr4_bf16",
++                        _ => "kernel_mul_mv_pq2_0_tg128_nr8_bf16",
++                    }
++                }
++            }
+             GgmlDType::PTQ1_0 => "kernel_mul_mv_ptq1_0_bf16",
+             other => {
+                 return Err(MetalKernelError::LoadFunctionError(format!(
+@@ -243,7 +305,17 @@ pub fn call_quantized_matmul_mv_t_offset(
+             GgmlDType::IQ1_M => "kernel_mul_mv_iq1_m_f32",
+             GgmlDType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
+             GgmlDType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
+-            GgmlDType::PQ2_0 => "kernel_mul_mv_pq2_0_f32",
++            GgmlDType::PQ2_0 => {
++                if pq2_metal_legacy_enabled() {
++                    "kernel_mul_mv_pq2_0_f32"
++                } else {
++                    match pq2_tg128_nr0(n) {
++                        2 => "kernel_mul_mv_pq2_0_tg128_nr2_f32",
++                        4 => "kernel_mul_mv_pq2_0_tg128_nr4_f32",
++                        _ => "kernel_mul_mv_pq2_0_tg128_nr8_f32",
++                    }
++                }
++            }
+             GgmlDType::PTQ1_0 => "kernel_mul_mv_ptq1_0_f32",
+         }
+     };
+@@ -631,7 +703,14 @@ pub fn call_mul_mv_id(
+         | GgmlDType::IQ1_S
+         | GgmlDType::IQ1_M => (4, 16, 8),
+         GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
+-        GgmlDType::PQ2_0 => (4, 16, 16),
++        GgmlDType::PQ2_0 => {
++            if pq2_metal_legacy_enabled() {
++                (4, 16, 16)
++            } else {
++                let nr0 = pq2_tg128_nr0(n);
++                (32, 4, 4 * nr0)
++            }
++        }
+         GgmlDType::PTQ1_0 => (4, 16, 8),
+     };
+ 
+@@ -657,7 +736,17 @@ pub fn call_mul_mv_id(
+         GgmlDType::IQ1_M => "kernel_mul_mv_id_iq1_m_f32",
+         GgmlDType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
+         GgmlDType::IQ4_XS => "kernel_mul_mv_id_iq4_xs_f32",
+-        GgmlDType::PQ2_0 => "kernel_mul_mv_id_pq2_0_f32",
++        GgmlDType::PQ2_0 => {
++            if pq2_metal_legacy_enabled() {
++                "kernel_mul_mv_id_pq2_0_f32"
++            } else {
++                match pq2_tg128_nr0(n) {
++                    2 => "kernel_mul_mv_id_pq2_0_tg128_nr2_f32",
++                    4 => "kernel_mul_mv_id_pq2_0_tg128_nr4_f32",
++                    _ => "kernel_mul_mv_id_pq2_0_tg128_nr8_f32",
++                }
++            }
++        }
+         GgmlDType::PTQ1_0 => "kernel_mul_mv_id_ptq1_0_f32",
+         other => {
+             return Err(MetalKernelError::LoadFunctionError(format!(
+diff --git a/hanzo-metal-kernels/src/metal_src/quantized.metal b/hanzo-metal-kernels/src/metal_src/quantized.metal
+index 440fde8c9..82c74f43b 100644
+--- a/hanzo-metal-kernels/src/metal_src/quantized.metal
++++ b/hanzo-metal-kernels/src/metal_src/quantized.metal
+@@ -6762,6 +6762,178 @@ kernel void kernel_mul_mv_pq2_0_bf16(
+ }
+ #endif
+ 
++// DSL-tuned tg128 (NSG=4 simdgroups = 128 threads/threadgroup) PQ2_0 decode matvec:
++//   * Coalesced 2-byte-aligned `ushort2` load (4 bytes = 16 ternary codes per lane; 8 lanes read
++//     one 32-byte `block_pq2_0::qs` array per simdgroup sector).
++//   * Exact IEEE-754 binary16 exponent-25 decode: `0x6400 | code` is exact `1024.0h + code`, so
++//     subtracting `1025.0h` yields exact `{-1.0h, 0.0h, +1.0h, +2.0h}` with zero `uitofp`
++//     conversions, zero `floor()` ops, and zero `sumy` cancellation.
++//   * Shape-selected `NR0 in {2, 4, 8}` rows/simdgroup (`nr2` for `N <= 2048`, `nr4` for
++//     `2048 < N < 16384`, `nr8` for `N >= 16384`) from cold-DRAM M4 Max schedule sweep.
++template<typename T, int NSG, int NR0>
++void kernel_mul_mv_pq2_0_tg128_impl(
++        device const  void * src0,
++        device const T     * src1,
++        device       T     * dst,
++                   int64_t   ne00,
++                   int64_t   ne01,
++                   int64_t   ne02,
++                   int64_t   ne10,
++                   int64_t   ne12,
++                   int64_t   ne0,
++                   int64_t   ne1,
++                   uint      r2,
++                   uint      r3,
++        threadgroup int8_t * shared_values,
++                   uint3     tgpig,
++                   uint      tiisg,
++                   uint      sgitg) {
++    (void)shared_values;
++    const uint nb = (uint)(ne00 / QK_PQ2_0);
++    const uint first_row = (tgpig.x * (uint)NSG + sgitg) * (uint)NR0;
++    if (first_row >= (uint)ne01) {
++        return;
++    }
++    const uint r1 = tgpig.y;
++    const uint im = tgpig.z;
++
++    const uint i12 = im % (uint)ne12;
++    const uint i13 = im / (uint)ne12;
++    const uint64_t offset0 = (uint64_t)(i12 / r2) * ((uint64_t)nb * (uint64_t)ne01)
++                           + (uint64_t)(i13 / r3) * ((uint64_t)nb * (uint64_t)ne01 * (uint64_t)ne02);
++
++    device const block_pq2_0 * x_base = (device const block_pq2_0 *) src0 + offset0;
++    device const T           * y      = (device const T           *) src1
++                                      + (uint64_t)r1 * (uint64_t)ne10
++                                      + (uint64_t)im * (uint64_t)ne00 * (uint64_t)ne1;
++
++    device const block_pq2_0 * ax[NR0];
++    for (int r = 0; r < NR0; ++r) {
++        const uint crow = MIN(first_row + (uint)r, (uint)ne01 - 1u);
++        ax[r] = x_base + (uint64_t)crow * nb;
++    }
++
++    const uint ix = tiisg >> 3;
++    const uint il = tiisg & 7u;
++    device const T * yb = y + ix * QK_PQ2_0 + il * 16;
++    float sumf[NR0] = {0.f};
++    const half4 h_bias = half4(1025.0h);
++
++    for (uint ib = ix; ib < nb; ib += (N_SIMDWIDTH / 8)) {
++        const float4 y0 = float4((float)yb[0],  (float)yb[4],  (float)yb[8],  (float)yb[12]);
++        const float4 y1 = float4((float)yb[1],  (float)yb[5],  (float)yb[9],  (float)yb[13]);
++        const float4 y2 = float4((float)yb[2],  (float)yb[6],  (float)yb[10], (float)yb[14]);
++        const float4 y3 = float4((float)yb[3],  (float)yb[7],  (float)yb[11], (float)yb[15]);
++
++        for (short r = 0; r < NR0; ++r) {
++            const uchar4 q4 = as_type<uchar4>(*(device const ushort2 *)(ax[r][ib].qs + 4 * il));
++            const ushort4 uq = ushort4(q4);
++            const half4 h0 = as_type<half4>((uq & ushort(3))        | ushort(0x6400)) - h_bias;
++            const half4 h1 = as_type<half4>(((uq >> 2) & ushort(3)) | ushort(0x6400)) - h_bias;
++            const half4 h2 = as_type<half4>(((uq >> 4) & ushort(3)) | ushort(0x6400)) - h_bias;
++            const half4 h3 = as_type<half4>((uq >> 6)               | ushort(0x6400)) - h_bias;
++            const float acc = dot(float4(h0), y0) + dot(float4(h1), y1)
++                            + dot(float4(h2), y2) + dot(float4(h3), y3);
++            sumf[r] = fma((float)ax[r][ib].d, acc, sumf[r]);
++        }
++        yb += QK_PQ2_0 * (N_SIMDWIDTH / 8);
++    }
++
++    for (int r = 0; r < NR0; ++r) {
++        const float tot = simd_sum(sumf[r]);
++        if (tiisg == 0 && first_row + (uint)r < (uint)ne01) {
++            dst[(uint64_t)r1 * (uint64_t)ne0 + (uint64_t)im * (uint64_t)ne0 * (uint64_t)ne1 + first_row + (uint)r] = (T)tot;
++        }
++    }
++}
++
++#define DEFINE_PQ2_TG128_F32(NR0) \
++void kernel_mul_mv_pq2_0_tg128_nr##NR0##_f32_impl( \
++        device const  void * src0, \
++        device const float * src1, \
++        device       float * dst, \
++                   int64_t   ne00, \
++                   int64_t   ne01, \
++                   int64_t   ne02, \
++                   int64_t   ne10, \
++                   int64_t   ne12, \
++                   int64_t   ne0, \
++                   int64_t   ne1, \
++                   uint      r2, \
++                   uint      r3, \
++        threadgroup int8_t * shared_values, \
++                   uint3     tgpig, \
++                   uint      tiisg, \
++                   uint      sgitg) { \
++    kernel_mul_mv_pq2_0_tg128_impl<float, 4, NR0>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg); \
++} \
++[[host_name("kernel_mul_mv_pq2_0_tg128_nr" #NR0 "_f32")]] \
++kernel void kernel_mul_mv_pq2_0_tg128_nr##NR0##_f32( \
++        device const  void * src0, \
++        device const float * src1, \
++        device       float * dst, \
++        constant   int64_t & ne00, \
++        constant   int64_t & ne01, \
++        constant   int64_t & ne02, \
++        constant  uint64_t & nb00, \
++        constant  uint64_t & nb01, \
++        constant  uint64_t & nb02, \
++        constant   int64_t & ne10, \
++        constant   int64_t & ne11, \
++        constant   int64_t & ne12, \
++        constant  uint64_t & nb10, \
++        constant  uint64_t & nb11, \
++        constant  uint64_t & nb12, \
++        constant   int64_t & ne0, \
++        constant   int64_t & ne1, \
++        constant   uint    & r2, \
++        constant   uint    & r3, \
++        uint3 tgpig[[threadgroup_position_in_grid]], \
++        uint tiisg[[thread_index_in_simdgroup]], \
++        uint sgitg[[simdgroup_index_in_threadgroup]]) { \
++    (void)nb00; (void)nb01; (void)nb02; (void)ne11; (void)nb10; (void)nb11; (void)nb12; \
++    kernel_mul_mv_pq2_0_tg128_nr##NR0##_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg); \
++}
++
++DEFINE_PQ2_TG128_F32(2)
++DEFINE_PQ2_TG128_F32(4)
++DEFINE_PQ2_TG128_F32(8)
++
++#if defined(__HAVE_BFLOAT__)
++#define DEFINE_PQ2_TG128_BF16(NR0) \
++[[host_name("kernel_mul_mv_pq2_0_tg128_nr" #NR0 "_bf16")]] \
++kernel void kernel_mul_mv_pq2_0_tg128_nr##NR0##_bf16( \
++        device const   void * src0, \
++        device const bfloat * src1, \
++        device       bfloat * dst, \
++        constant    int64_t & ne00, \
++        constant    int64_t & ne01, \
++        constant    int64_t & ne02, \
++        constant   uint64_t & nb00, \
++        constant   uint64_t & nb01, \
++        constant   uint64_t & nb02, \
++        constant    int64_t & ne10, \
++        constant    int64_t & ne11, \
++        constant    int64_t & ne12, \
++        constant   uint64_t & nb10, \
++        constant   uint64_t & nb11, \
++        constant   uint64_t & nb12, \
++        constant    int64_t & ne0, \
++        constant    int64_t & ne1, \
++        constant    uint    & r2, \
++        constant    uint    & r3, \
++        uint3 tgpig[[threadgroup_position_in_grid]], \
++        uint tiisg[[thread_index_in_simdgroup]], \
++        uint sgitg[[simdgroup_index_in_threadgroup]]) { \
++    (void)nb00; (void)nb01; (void)nb02; (void)ne11; (void)nb10; (void)nb11; (void)nb12; \
++    kernel_mul_mv_pq2_0_tg128_impl<bfloat, 4, NR0>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg); \
++}
++
++DEFINE_PQ2_TG128_BF16(2)
++DEFINE_PQ2_TG128_BF16(4)
++DEFINE_PQ2_TG128_BF16(8)
++#endif
++
+ // PTQ1_0 dot against base-3 collapse coefficients staged by caller:
+ // with u = b/256 and g_k = floor(3^k*u) (exact in fp32 since 243*255 = 61965 < 2^24),
+ // sum_{n=0..4} t_n*y_n = sum_{k=1..4} g_k*(y_{k-1} - 3*y_k) + g_5*y_4.
+@@ -8296,8 +8468,11 @@ template [[host_name("kernel_mul_mv_id_iq3_s_f32")]]   kernel kernel_mul_mv_id_t
+ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_s_f32_impl>>;
+ template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl>>;
+ template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl>>;
+-template [[host_name("kernel_mul_mv_id_pq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_pq2_0_f32_impl>>;
+-template [[host_name("kernel_mul_mv_id_ptq1_0_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_ptq1_0_f32_impl>>;
++template [[host_name("kernel_mul_mv_id_pq2_0_f32")]]            kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_pq2_0_f32_impl>>;
++template [[host_name("kernel_mul_mv_id_pq2_0_tg128_nr2_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_pq2_0_tg128_nr2_f32_impl>>;
++template [[host_name("kernel_mul_mv_id_pq2_0_tg128_nr4_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_pq2_0_tg128_nr4_f32_impl>>;
++template [[host_name("kernel_mul_mv_id_pq2_0_tg128_nr8_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_pq2_0_tg128_nr8_f32_impl>>;
++template [[host_name("kernel_mul_mv_id_ptq1_0_f32")]]           kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_ptq1_0_f32_impl>>;
+ 
+ kernel void kernel_pool_2d_max_f32(
+         device  const float * src0,
+diff --git a/hanzo-ml/tests/metal_iquant_tests.rs b/hanzo-ml/tests/metal_iquant_tests.rs
+index 1cd4025e9..e56410127 100644
+--- a/hanzo-ml/tests/metal_iquant_tests.rs
++++ b/hanzo-ml/tests/metal_iquant_tests.rs
+@@ -77,6 +77,7 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
+                 out.extend_from_slice(&[0u8, 0, 0, 0, 0, 0xC0, 0, 0x20]);
+             }
+         }
++        GgmlDType::PQ2_0 => (0..nblk).for_each(|_| emit_d_then(0.03, 32, &mut out, &mut c)),
+         // K-quants: quantize random f32 (candle's CPU quantizer) to valid blocks, then reuse the
+         // identical bytes on both devices. block_q4_K = 144 B, block_q6_K = 210 B.
+         GgmlDType::Q4K | GgmlDType::Q6K => {
+@@ -1025,3 +1026,167 @@ fn metal_fwd_f16_weight_m4_routes_correctly() {
+         }
+     }
+ }
++
++#[test]
++fn metal_dequant_pq2_0_bit_exact() {
++    check_dequant_bit_exact(GgmlDType::PQ2_0);
++}
++
++#[test]
++fn metal_matvec_pq2_0_matches_cpu() {
++    check(GgmlDType::PQ2_0);
++}
++
++#[test]
++fn metal_pq2_0_tg128_tiers_tails_bf16_and_legacy_fallback() {
++    let dev = match Device::new_metal(0) {
++        Ok(d) => d,
++        Err(e) => {
++            eprintln!("skip PQ2_0 tg128 test: no Metal device ({e})");
++            return;
++        }
++    };
++    let cpu = Device::Cpu;
++
++    // Exercise all three tg128 NR0 tiers (nr2: n<=2048, nr4: 2048<n<16384, nr8: n>=16384),
++    // including ragged non-multiple-of-32 row tails (1027, 2051, 16389), m=1 and m=4,
++    // both F32 and BF16 activations, and legacy fallback parity.
++    for &(nout, k, m) in &[
++        (1027usize, 512usize, 1usize),
++        (2051, 512, 1),
++        (2051, 512, 4),
++        (16389, 256, 1),
++    ] {
++        let raw = synth(GgmlDType::PQ2_0, nout, k);
++        let w_deq: Vec<f32> = QTensor::new(
++            QStorage::from_data(Cow::Owned(raw.clone()), &cpu, GgmlDType::PQ2_0).unwrap(),
++            (nout, k),
++        )
++        .unwrap()
++        .dequantize(&cpu)
++        .unwrap()
++        .flatten_all()
++        .unwrap()
++        .to_vec1::<f32>()
++        .unwrap();
++
++        let q_metal = QTensor::new(
++            QStorage::from_data(Cow::Owned(raw), &dev, GgmlDType::PQ2_0).unwrap(),
++            (nout, k),
++        )
++        .unwrap();
++        let matmul = QMatMul::from_qtensor(q_metal).unwrap();
++
++        // 1. F32 activation: tg128 vs legacy vs CPU f64 reference
++        let x_f32_host: Vec<f32> = (0..m * k).map(|i| pseudo(i + 7_000_001)).collect();
++        let x_f32 = Tensor::from_vec(x_f32_host.clone(), (m, k), &dev).unwrap();
++
++        hanzo_metal_kernels::set_pq2_metal_legacy(false);
++        let y_tg128: Vec<f32> = matmul
++            .forward(&x_f32)
++            .unwrap()
++            .flatten_all()
++            .unwrap()
++            .to_vec1::<f32>()
++            .unwrap();
++
++        hanzo_metal_kernels::set_pq2_metal_legacy(true);
++        let y_legacy: Vec<f32> = matmul
++            .forward(&x_f32)
++            .unwrap()
++            .flatten_all()
++            .unwrap()
++            .to_vec1::<f32>()
++            .unwrap();
++        hanzo_metal_kernels::set_pq2_metal_legacy(false);
++
++        let mut max_ref = 0.0f32;
++        let mut max_err_tg128 = 0.0f32;
++        let mut max_diff_legacy = 0.0f32;
++        for row in 0..m {
++            for n in 0..nout {
++                let mut r = 0.0f64;
++                for j in 0..k {
++                    r += x_f32_host[row * k + j] as f64 * w_deq[n * k + j] as f64;
++                }
++                let r32 = r as f32;
++                let g_tg = y_tg128[row * nout + n];
++                let g_leg = y_legacy[row * nout + n];
++                max_ref = max_ref.max(r32.abs());
++                max_err_tg128 = max_err_tg128.max((g_tg - r32).abs());
++                max_diff_legacy = max_diff_legacy.max((g_tg - g_leg).abs());
++            }
++        }
++        assert!(
++            max_err_tg128 / max_ref.max(1e-6) < 1e-5,
++            "PQ2_0 F32 tg128 [{nout}x{k} m={m}] rel err too high: {}",
++            max_err_tg128 / max_ref.max(1e-6)
++        );
++        assert!(
++            max_diff_legacy / max_ref.max(1e-6) < 1e-5,
++            "PQ2_0 F32 tg128 vs legacy [{nout}x{k} m={m}] diff too high: {}",
++            max_diff_legacy / max_ref.max(1e-6)
++        );
++
++        // 2. BF16 activation: tg128 vs legacy vs CPU f64 reference
++        let x_bf16 = x_f32.to_dtype(hanzo_ml::DType::BF16).unwrap();
++        let x_bf16_f32: Vec<f32> = x_bf16
++            .to_dtype(hanzo_ml::DType::F32)
++            .unwrap()
++            .flatten_all()
++            .unwrap()
++            .to_vec1::<f32>()
++            .unwrap();
++
++        hanzo_metal_kernels::set_pq2_metal_legacy(false);
++        let yb_tg128: Vec<f32> = matmul
++            .forward(&x_bf16)
++            .unwrap()
++            .to_dtype(hanzo_ml::DType::F32)
++            .unwrap()
++            .flatten_all()
++            .unwrap()
++            .to_vec1::<f32>()
++            .unwrap();
++
++        hanzo_metal_kernels::set_pq2_metal_legacy(true);
++        let yb_legacy: Vec<f32> = matmul
++            .forward(&x_bf16)
++            .unwrap()
++            .to_dtype(hanzo_ml::DType::F32)
++            .unwrap()
++            .flatten_all()
++            .unwrap()
++            .to_vec1::<f32>()
++            .unwrap();
++        hanzo_metal_kernels::set_pq2_metal_legacy(false);
++
++        let mut max_bref = 0.0f32;
++        let mut max_berr_tg128 = 0.0f32;
++        let mut max_bdiff_legacy = 0.0f32;
++        for row in 0..m {
++            for n in 0..nout {
++                let mut r = 0.0f64;
++                for j in 0..k {
++                    r += x_bf16_f32[row * k + j] as f64 * w_deq[n * k + j] as f64;
++                }
++                let r32 = r as f32;
++                let g_tg = yb_tg128[row * nout + n];
++                let g_leg = yb_legacy[row * nout + n];
++                max_bref = max_bref.max(r32.abs());
++                max_berr_tg128 = max_berr_tg128.max((g_tg - r32).abs());
++                max_bdiff_legacy = max_bdiff_legacy.max((g_tg - g_leg).abs());
++            }
++        }
++        assert!(
++            max_berr_tg128 / max_bref.max(1e-6) < 6e-3,
++            "PQ2_0 BF16 tg128 [{nout}x{k} m={m}] rel err too high: {}",
++            max_berr_tg128 / max_bref.max(1e-6)
++        );
++        assert!(
++            max_bdiff_legacy / max_bref.max(1e-6) < 8e-3,
++            "PQ2_0 BF16 tg128 vs legacy [{nout}x{k} m={m}] diff too high: {}",
++            max_bdiff_legacy / max_bref.max(1e-6)
++        );
++    }
++}
+-- 
+2.43.0
+
+
+From 99035e80b2e9598f5573abfc45b163d2e6761a8a Mon Sep 17 00:00:00 2001
+From: Zach Kelling <z@zeekay.io>
+Date: Mon, 16 Nov 2026 21:21:45 -0800
+Subject: [PATCH 2/2] Fix usize type mismatches and bit-decoding in PQ2_0
+ matvec plane
+
+---
+ hanzo-kernel/src/ternary.rs | 33 ++++++++++++++++-----------------
+ 1 file changed, 16 insertions(+), 17 deletions(-)
+
+diff --git a/hanzo-kernel/src/ternary.rs b/hanzo-kernel/src/ternary.rs
+index 29e84474c..4a1328cb6 100644
+--- a/hanzo-kernel/src/ternary.rs
++++ b/hanzo-kernel/src/ternary.rs
+@@ -375,54 +375,53 @@ pub fn matvec_pq2_0_plane<F: Float>(
+     let sg = UNIT_POS_Y as usize;
+     let k = meta[0] as usize;
+     let nout = meta[1] as usize;
+-    let nb = k / 128;
++    let nb = k / 128usize;
+     let first_row = (CUBE_POS as usize * nsg + sg) * nr0;
+ 
+-    let ix = lane / 8;
+-    let il = lane % 8;
++    let ix = lane / 8usize;
++    let il = lane % 8usize;
+ 
+     let mut sumf = Array::<F>::new(nr0);
+     #[unroll]
+-    for r in 0..nr0 {
++    for r in 0usize..nr0 {
+         sumf[r] = F::new(0.0f32);
+     }
+ 
+     if first_row < nout {
+         let mut ib = ix;
+         while ib < nb {
+-            let xb = ib * 128 + il * 16;
+-            let mut y = Array::<F>::new(16);
++            let xb = ib * 128usize + il * 16usize;
++            let mut y = Array::<F>::new(16usize);
+             #[unroll]
+-            for i in 0..16usize {
++            for i in 0usize..16usize {
+                 y[i] = x[xb + i];
+             }
+             #[unroll]
+-            for r in 0..nr0 {
++            for r in 0usize..nr0 {
+                 let crow = if first_row + r < nout {
+                     first_row + r
+                 } else {
+-                    nout - 1
++                    nout - 1usize
+                 };
+                 let d = wd[crow * nb + ib];
+-                let w32 = wq[crow * (nb * 8) + ib * 8 + il];
++                let w32 = wq[crow * (nb * 8usize) + ib * 8usize + il];
+                 let mut acc = F::new(0.0f32);
+                 #[unroll]
+-                for i in 0..16usize {
+-                    let c_bits = ((w32 >> ((2 * i) as u32)) & 3u32) | 0x6400u32;
+-                    let w_val =
+-                        F::cast_from(half::f16::reinterpret(c_bits as u16)) - F::new(1025.0f32);
++                for i in 0usize..16usize {
++                    let c_bits = ((w32 >> ((2 * i) as u32)) & 3u32) | 0x4B00_0000u32;
++                    let w_val = F::cast_from(f32::reinterpret(c_bits) - 8_388_609.0f32);
+                     acc += w_val * y[i];
+                 }
+                 sumf[r] += d * acc;
+             }
+-            ib += 4;
++            ib += 4usize;
+         }
+     }
+ 
+     #[unroll]
+-    for r in 0..nr0 {
++    for r in 0usize..nr0 {
+         let tot = plane_sum(sumf[r]);
+-        if lane == 0 && first_row + r < nout {
++        if lane == 0usize && first_row + r < nout {
+             out[first_row + r] = tot;
+         }
+     }
+-- 
+2.43.0
+

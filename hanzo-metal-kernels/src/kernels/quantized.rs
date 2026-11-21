@@ -58,6 +58,51 @@ fn matvec_threadgroup_mem(dtype: GgmlDType) -> usize {
     }
 }
 
+/// Runtime fallback switch for the Metal `PQ2_0` matvec:
+///   * default (`false`): dispatches the DSL-tuned `tg128` (`32x4` = 128 threads/threadgroup)
+///     exact binary16-mantissa SIMD4 matvec (`nr2` for `N <= 2048`, `nr4` for `2048 < N < 16384`,
+///     `nr8` for `N >= 16384`).
+///   * `HANZO_METAL_PQ2_LEGACY=1` (`true`): preserves the 64-thread `(4, 16, 16)` base-4 collapse
+///     implementation (`kernel_mul_mv_pq2_0_{f32,bf16}` / `kernel_mul_mv_id_pq2_0_f32`).
+static PQ2_METAL_LEGACY_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn pq2_metal_legacy_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match PQ2_METAL_LEGACY_STATE.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let legacy = std::env::var("HANZO_METAL_PQ2_LEGACY")
+                .map(|v| {
+                    let s = v.trim();
+                    !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false")
+                })
+                .unwrap_or(false);
+            PQ2_METAL_LEGACY_STATE.store(if legacy { 2 } else { 1 }, Relaxed);
+            legacy
+        }
+    }
+}
+
+/// Override the `PQ2_0` Metal matvec mode (`true` = legacy 64-thread fallback, `false` = `tg128`).
+pub fn set_pq2_metal_legacy(legacy: bool) {
+    PQ2_METAL_LEGACY_STATE.store(
+        if legacy { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[inline]
+fn pq2_tg128_nr0(n: usize) -> usize {
+    if n <= 2048 {
+        2
+    } else if n < 16384 {
+        4
+    } else {
+        8
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mv_t(
     device: &Device,
@@ -189,7 +234,14 @@ pub fn call_quantized_matmul_mv_t_offset(
         | GgmlDType::IQ1_S
         | GgmlDType::IQ1_M => (4, 16, 8),
         GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
-        GgmlDType::PQ2_0 => (4, 16, 16),
+        GgmlDType::PQ2_0 => {
+            if pq2_metal_legacy_enabled() {
+                (4, 16, 16)
+            } else {
+                let nr0 = pq2_tg128_nr0(n);
+                (32, 4, 4 * nr0)
+            }
+        }
         GgmlDType::PTQ1_0 => (4, 16, 8),
     };
     let thread_groups_count = MTLSize {
@@ -203,13 +255,23 @@ pub fn call_quantized_matmul_mv_t_offset(
         depth: 1,
     };
     // A bf16 activation (src1) + bf16 dst skips the bf16<->f32 round-trip GgufMatMul otherwise wraps
-    // around the projection. Only Q4_K/Q6_K carry a bf16-native matvec (the two K-quants Q4_K_M uses);
+    // around the projection. Only Q4_K/Q6_K/PQ2_0/PTQ1_0 carry a bf16-native matvec;
     // any other dtype must reach here with an f32 activation.
     let name = if src1_bf16 {
         match dtype {
             GgmlDType::Q4K => "kernel_mul_mv_q4_K_bf16",
             GgmlDType::Q6K => "kernel_mul_mv_q6_K_bf16",
-            GgmlDType::PQ2_0 => "kernel_mul_mv_pq2_0_bf16",
+            GgmlDType::PQ2_0 => {
+                if pq2_metal_legacy_enabled() {
+                    "kernel_mul_mv_pq2_0_bf16"
+                } else {
+                    match pq2_tg128_nr0(n) {
+                        2 => "kernel_mul_mv_pq2_0_tg128_nr2_bf16",
+                        4 => "kernel_mul_mv_pq2_0_tg128_nr4_bf16",
+                        _ => "kernel_mul_mv_pq2_0_tg128_nr8_bf16",
+                    }
+                }
+            }
             GgmlDType::PTQ1_0 => "kernel_mul_mv_ptq1_0_bf16",
             other => {
                 return Err(MetalKernelError::LoadFunctionError(format!(
@@ -243,7 +305,17 @@ pub fn call_quantized_matmul_mv_t_offset(
             GgmlDType::IQ1_M => "kernel_mul_mv_iq1_m_f32",
             GgmlDType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
             GgmlDType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
-            GgmlDType::PQ2_0 => "kernel_mul_mv_pq2_0_f32",
+            GgmlDType::PQ2_0 => {
+                if pq2_metal_legacy_enabled() {
+                    "kernel_mul_mv_pq2_0_f32"
+                } else {
+                    match pq2_tg128_nr0(n) {
+                        2 => "kernel_mul_mv_pq2_0_tg128_nr2_f32",
+                        4 => "kernel_mul_mv_pq2_0_tg128_nr4_f32",
+                        _ => "kernel_mul_mv_pq2_0_tg128_nr8_f32",
+                    }
+                }
+            }
             GgmlDType::PTQ1_0 => "kernel_mul_mv_ptq1_0_f32",
         }
     };
@@ -631,7 +703,14 @@ pub fn call_mul_mv_id(
         | GgmlDType::IQ1_S
         | GgmlDType::IQ1_M => (4, 16, 8),
         GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
-        GgmlDType::PQ2_0 => (4, 16, 16),
+        GgmlDType::PQ2_0 => {
+            if pq2_metal_legacy_enabled() {
+                (4, 16, 16)
+            } else {
+                let nr0 = pq2_tg128_nr0(n);
+                (32, 4, 4 * nr0)
+            }
+        }
         GgmlDType::PTQ1_0 => (4, 16, 8),
     };
 
@@ -657,7 +736,17 @@ pub fn call_mul_mv_id(
         GgmlDType::IQ1_M => "kernel_mul_mv_id_iq1_m_f32",
         GgmlDType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
         GgmlDType::IQ4_XS => "kernel_mul_mv_id_iq4_xs_f32",
-        GgmlDType::PQ2_0 => "kernel_mul_mv_id_pq2_0_f32",
+        GgmlDType::PQ2_0 => {
+            if pq2_metal_legacy_enabled() {
+                "kernel_mul_mv_id_pq2_0_f32"
+            } else {
+                match pq2_tg128_nr0(n) {
+                    2 => "kernel_mul_mv_id_pq2_0_tg128_nr2_f32",
+                    4 => "kernel_mul_mv_id_pq2_0_tg128_nr4_f32",
+                    _ => "kernel_mul_mv_id_pq2_0_tg128_nr8_f32",
+                }
+            }
+        }
         GgmlDType::PTQ1_0 => "kernel_mul_mv_id_ptq1_0_f32",
         other => {
             return Err(MetalKernelError::LoadFunctionError(format!(
