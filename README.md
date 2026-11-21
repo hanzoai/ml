@@ -1,6 +1,9 @@
 <p align="center"><img src=".github/hero.svg" alt="ml" width="880"></p>
 
 # Hanzo ML
+
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/ml&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/ml&ref=main&action=edit) [![Deploy with Hanzo](https://hanzo.app/badges/deploy-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/ml&ref=main&action=deploy)
+
 [![crates.io](https://img.shields.io/crates/v/hanzo-ml.svg?style=flat-square&color=black)](https://crates.io/crates/hanzo-ml)
 [![docs.rs](https://img.shields.io/docsrs/hanzo-ml?style=flat-square&color=black)](https://docs.rs/hanzo-ml)
 [![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-black?style=flat-square)](https://github.com/hanzoai/ml)
