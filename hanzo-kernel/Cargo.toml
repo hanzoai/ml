@@ -41,6 +41,14 @@ cuda = ["cubecl/cuda"]
 rocm = ["dep:hanzo-cubecl-hip", "cubecl/std"]
 
 [[bin]]
+name = "kernel-gen"
+path = "src/kernel_gen.rs"
+
+[[bin]]
+name = "pq2-check"
+path = "src/pq2_check.rs"
+
+[[bin]]
 name = "matvec-check"
 path = "src/main.rs"
 
@@ -57,3 +65,12 @@ path = "src/mmq_check.rs"
 name = "flash-metal-check"
 path = "src/flash_metal_check.rs"
 required-features = ["metal"]
+
+# Our fork of the one cubecl crate we had to fix, vendored at its crates.io version so the diff is
+# reviewable in-tree (`diff -r` against the registry copy shows only `HANZO PATCH` hunks):
+#   - bitcast-of-literal: `f32::reinterpret(<constant>)` lowered to a reference cast of an rvalue,
+#     which MSL rejects ("reinterpret_cast from rvalue to reference type"), so any DSL kernel using
+#     `quant::f16lo_to_f32` failed to compile on Metal.
+# hanzo-ml consumes the generated artifacts (kernel-gen), not cubecl, so only this workspace needs it.
+[patch.crates-io]
+cubecl-cpp = { path = "vendor/cubecl-cpp" }

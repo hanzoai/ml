@@ -251,6 +251,45 @@ pub fn gdn_gating_run<R: Runtime>(
     (beta, g)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn with_scan_buffers<R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &[f32],
+    bh: usize,
+    seq: usize,
+    v_dim: usize,
+    launch: impl FnOnce(
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        usize,
+    ),
+) -> (Vec<f32>, Vec<f32>) {
+    let out_len = bh * seq * v_dim;
+    let qh = client.create_from_slice(f32::as_bytes(q));
+    let kh = client.create_from_slice(f32::as_bytes(k));
+    let vh = client.create_from_slice(f32::as_bytes(v));
+    let gh = client.create_from_slice(f32::as_bytes(g));
+    let betah = client.create_from_slice(f32::as_bytes(beta));
+    let sh = client.create_from_slice(f32::as_bytes(state));
+    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; out_len]));
+    let dh = client.create_from_slice(u32::as_bytes(&[bh as u32, seq as u32]));
+    launch(&qh, &kh, &vh, &gh, &betah, &sh, &oh, &dh, out_len);
+    let out = f32::from_bytes(&client.read_one_unchecked(oh)).to_vec();
+    let new_state = f32::from_bytes(&client.read_one_unchecked(sh)).to_vec();
+    (out, new_state)
+}
+
 /// Host launch for `gdn_scan`. `q`/`k`: `[bh, seq, k_dim]` (`q` pre-scaled by `1/sqrt(k_dim)`);
 /// `v`: `[bh, seq, v_dim]`; `g`/`beta`: `[bh, seq]`; `state`: `[bh, k_dim, v_dim]`. Returns
 /// `(out [bh, seq, v_dim], new_state [bh, k_dim, v_dim])`.
@@ -268,37 +307,69 @@ pub fn gdn_scan_run<R: Runtime>(
     k_dim: usize,
     v_dim: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    let out_len = bh * seq * v_dim;
-    let qh = client.create_from_slice(f32::as_bytes(q));
-    let kh = client.create_from_slice(f32::as_bytes(k));
-    let vh = client.create_from_slice(f32::as_bytes(v));
-    let gh = client.create_from_slice(f32::as_bytes(g));
-    let betah = client.create_from_slice(f32::as_bytes(beta));
-    let sh = client.create_from_slice(f32::as_bytes(state));
-    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; out_len]));
-    let dh = client.create_from_slice(u32::as_bytes(&[bh as u32, seq as u32]));
-    let block = 64u32;
-    let grid = ((bh * v_dim) as u32).div_ceil(block);
-    unsafe {
-        gdn_scan::launch_unchecked::<f32, R>(
-            client,
-            Grid::Static(grid, 1, 1),
-            Block::new_1d(block),
-            ArrayArg::from_raw_parts(qh.clone(), q.len()),
-            ArrayArg::from_raw_parts(kh.clone(), k.len()),
-            ArrayArg::from_raw_parts(vh.clone(), v.len()),
-            ArrayArg::from_raw_parts(gh.clone(), g.len()),
-            ArrayArg::from_raw_parts(betah.clone(), beta.len()),
-            ArrayArg::from_raw_parts(sh.clone(), state.len()),
-            ArrayArg::from_raw_parts(oh.clone(), out_len),
-            ArrayArg::from_raw_parts(dh.clone(), 2),
-            k_dim,
-            v_dim,
-        );
-    }
-    let out = f32::from_bytes(&client.read_one_unchecked(oh)).to_vec();
-    let new_state = f32::from_bytes(&client.read_one_unchecked(sh)).to_vec();
-    (out, new_state)
+    with_scan_buffers(client, q, k, v, g, beta, state, bh, seq, v_dim, |qh, kh, vh, gh, betah, sh, oh, dh, out_len| {
+        let block = 64u32;
+        let grid = ((bh * v_dim) as u32).div_ceil(block);
+        unsafe {
+            gdn_scan::launch_unchecked::<f32, R>(
+                client,
+                Grid::Static(grid, 1, 1),
+                Block::new_1d(block),
+                ArrayArg::from_raw_parts(qh.clone(), q.len()),
+                ArrayArg::from_raw_parts(kh.clone(), k.len()),
+                ArrayArg::from_raw_parts(vh.clone(), v.len()),
+                ArrayArg::from_raw_parts(gh.clone(), g.len()),
+                ArrayArg::from_raw_parts(betah.clone(), beta.len()),
+                ArrayArg::from_raw_parts(sh.clone(), state.len()),
+                ArrayArg::from_raw_parts(oh.clone(), out_len),
+                ArrayArg::from_raw_parts(dh.clone(), 2),
+                k_dim,
+                v_dim,
+            );
+        }
+    })
+}
+
+/// Host launch for [`gdn_scan_lanes`]. Same tensor layout as [`gdn_scan_run`].
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_scan_lanes_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &[f32],
+    bh: usize,
+    seq: usize,
+    k_dim: usize,
+    v_dim: usize,
+    lanes: usize,
+    block: usize,
+    vk_layout: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    with_scan_buffers(client, q, k, v, g, beta, state, bh, seq, v_dim, |qh, kh, vh, gh, betah, sh, oh, dh, out_len| {
+        let grid = ((bh * v_dim * lanes) as u32).div_ceil(block as u32);
+        unsafe {
+            gdn_scan_lanes::launch_unchecked::<f32, R>(
+                client,
+                Grid::Static(grid, 1, 1),
+                Block::new_1d(block as u32),
+                ArrayArg::from_raw_parts(qh.clone(), q.len()),
+                ArrayArg::from_raw_parts(kh.clone(), k.len()),
+                ArrayArg::from_raw_parts(vh.clone(), v.len()),
+                ArrayArg::from_raw_parts(gh.clone(), g.len()),
+                ArrayArg::from_raw_parts(betah.clone(), beta.len()),
+                ArrayArg::from_raw_parts(sh.clone(), state.len()),
+                ArrayArg::from_raw_parts(oh.clone(), out_len),
+                ArrayArg::from_raw_parts(dh.clone(), 2),
+                k_dim,
+                v_dim,
+                lanes,
+                vk_layout,
+            );
+        }
+    })
 }
 
 // ================================== CPU oracles (references) ====================================
