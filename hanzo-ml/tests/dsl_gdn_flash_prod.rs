@@ -482,17 +482,15 @@ fn run_gdn_suite(dev: &Device, dtypes: &[DType], label: &str) {
         }
     }
 
-    // Verify single-compile invariant on `gdn_conv1d_step_k4_f32`
+    // Verify single-compile invariant on `gdn_conv1d_step_k4_f32` (or `_p64` on Wave64 Vulkan)
     let stats = dsl::stats();
-    assert_eq!(
-        stats.compiles_of("gdn_conv1d_step_k4_f32"),
-        1,
-        "must compile exactly once"
-    );
+    let step_compiles = stats.compiles_of("gdn_conv1d_step_k4_f32")
+        + stats.compiles_of("gdn_conv1d_step_k4_f32_p64");
+    assert_eq!(step_compiles, 1, "must compile exactly once");
     let step_calls: u64 = stats
         .dispatches
         .iter()
-        .filter(|d| d.1 == "gdn_conv1d_step_k4_f32")
+        .filter(|d| d.1 == "gdn_conv1d_step_k4_f32" || d.1 == "gdn_conv1d_step_k4_f32_p64")
         .map(|d| d.4)
         .sum();
     assert!(step_calls >= 13, "must have dispatched >= 13 steps");
@@ -665,15 +663,13 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
     }
 
     let stats = dsl::stats();
-    assert_eq!(
-        stats.compiles_of("flash_attn_paged_d128_f32"),
-        1,
-        "must compile exactly once"
-    );
+    let f_compiles = stats.compiles_of("flash_attn_paged_d128_f32")
+        + stats.compiles_of("flash_attn_paged_d128_f32_p64");
+    assert_eq!(f_compiles, 1, "must compile exactly once");
     let f_calls: u64 = stats
         .dispatches
         .iter()
-        .filter(|d| d.1 == "flash_attn_paged_d128_f32")
+        .filter(|d| d.1 == "flash_attn_paged_d128_f32" || d.1 == "flash_attn_paged_d128_f32_p64")
         .map(|d| d.4)
         .sum();
     assert!(f_calls >= 4, "must have dispatched >= 4 calls");
@@ -829,15 +825,16 @@ fn run_fwht_suite(dev: &Device, dtypes: &[DType], label: &str) {
     }
 
     let stats = dsl::stats();
+    let fwht_compiles = stats.compiles_of("fwht_hadamard_b1024_f32")
+        + stats.compiles_of("fwht_hadamard_b1024_f32_p64");
     assert_eq!(
-        stats.compiles_of("fwht_hadamard_b1024_f32"),
-        1,
-        "fwht_hadamard_b1024_f32 must compile exactly once"
+        fwht_compiles, 1,
+        "fwht_hadamard_b1024_f32[_p64] must compile exactly once"
     );
     let calls: u64 = stats
         .dispatches
         .iter()
-        .filter(|d| d.1 == "fwht_hadamard_b1024_f32")
+        .filter(|d| d.1 == "fwht_hadamard_b1024_f32" || d.1 == "fwht_hadamard_b1024_f32_p64")
         .map(|d| d.4)
         .sum();
     assert!(calls >= 5, "must have dispatched >= 5 FWHT b=1024 calls");
