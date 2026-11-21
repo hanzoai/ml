@@ -40,6 +40,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod autotune_lab;
 pub mod canonical;
 pub mod lineage;
 pub mod provenance;
