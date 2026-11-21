@@ -1467,10 +1467,8 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn gdn_full_pipeline_chunk_and_decode_equivalence_cuda() {
-        use cubecl::cuda::{CudaDevice, CudaRuntime};
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
+    fn run_gdn_full_pipeline_suite<R: Runtime>(c: &ComputeClient<R>, tag: &str, test_half: bool) {
         let scale_rel = |a: &[f32], b: &[f32]| -> f32 {
             let m = a.iter().fold(0.0f32, |mx, &v| mx.max(v.abs())).max(1e-30);
             a.iter()
@@ -1479,21 +1477,22 @@ mod tests {
                 .fold(0.0f32, f32::max)
                 / m
         };
-        let c = CudaRuntime::client(&CudaDevice::new(0));
         let (batch, conv_dim, seq_len, k) = (2usize, 128usize, 13usize, 4usize);
         let x_f32 = rnd(batch * conv_dim * seq_len, 0xA101);
         let w_f32 = rnd(conv_dim * k, 0xA102);
         let z_f32 = vec![0.0f32; batch * conv_dim * k];
 
-        // 1. One-shot vs chunked [5, 4, 3, 1] vs single-token step for f32, f16, bf16.
+        // 1. One-shot vs chunked [5, 4, 3, 1] vs single-token step for f32 (and f16, bf16).
         let (want_out, want_st) =
             gdn_conv1d_stateful_ref(&x_f32, &w_f32, &z_f32, batch, conv_dim, seq_len, false, k);
-        let (got_full, got_st_full) = gdn_conv1d_stateful_run_as::<f32, CudaRuntime>(
-            &c, &x_f32, &w_f32, &z_f32, batch, conv_dim, seq_len, false, k,
+        let (got_full, got_st_full) = gdn_conv1d_stateful_run_as::<f32, R>(
+            c, &x_f32, &w_f32, &z_f32, batch, conv_dim, seq_len, false, k,
         );
         let r_full = scale_rel(&want_out, &got_full);
         let r_st = scale_rel(&want_st, &got_st_full);
-        eprintln!("[gdn_conv1d_stateful CUDA f32] full: out_rel={r_full:.2e} state_rel={r_st:.2e}");
+        eprintln!(
+            "[gdn_conv1d_stateful {tag} f32] full: out_rel={r_full:.2e} state_rel={r_st:.2e}"
+        );
         assert!(r_full < 1e-5 && r_st < 1e-6);
 
         // Chunked prefill [5, 4, 3, 1]
@@ -1506,8 +1505,8 @@ mod tests {
                 xc[r * clen..(r + 1) * clen]
                     .copy_from_slice(&x_f32[r * seq_len + off..r * seq_len + off + clen]);
             }
-            let (oc, sc) = gdn_conv1d_stateful_run_as::<f32, CudaRuntime>(
-                &c,
+            let (oc, sc) = gdn_conv1d_stateful_run_as::<f32, R>(
+                c,
                 &xc,
                 &w_f32,
                 &st_chunk,
@@ -1526,7 +1525,7 @@ mod tests {
         }
         let r_ch = scale_rel(&want_out, &out_chunk);
         let r_chs = scale_rel(&want_st, &st_chunk);
-        eprintln!("[gdn_conv1d_stateful CUDA f32] chunked [5,4,3,1]: out_rel={r_ch:.2e} state_rel={r_chs:.2e}");
+        eprintln!("[gdn_conv1d_stateful {tag} f32] chunked [5,4,3,1]: out_rel={r_ch:.2e} state_rel={r_chs:.2e}");
         assert!(r_ch < 1e-5 && r_chs < 1e-6);
 
         // Repeated single-token gdn_conv1d_step
@@ -1536,9 +1535,8 @@ mod tests {
             let xt: Vec<f32> = (0..batch * conv_dim)
                 .map(|r| x_f32[r * seq_len + t])
                 .collect();
-            let (ot, st) = gdn_conv1d_step_run_as::<f32, CudaRuntime>(
-                &c, &xt, &w_f32, &st_step, batch, conv_dim, k,
-            );
+            let (ot, st) =
+                gdn_conv1d_step_run_as::<f32, R>(c, &xt, &w_f32, &st_step, batch, conv_dim, k);
             for r in 0..batch * conv_dim {
                 out_step[r * seq_len + t] = ot[r];
             }
@@ -1547,75 +1545,77 @@ mod tests {
         let r_step = scale_rel(&want_out, &out_step);
         let r_steps = scale_rel(&want_st, &st_step);
         eprintln!(
-            "[gdn_conv1d_step CUDA f32] 13x step: out_rel={r_step:.2e} state_rel={r_steps:.2e}"
+            "[gdn_conv1d_step {tag} f32] 13x step: out_rel={r_step:.2e} state_rel={r_steps:.2e}"
         );
         assert!(r_step < 1e-5 && r_steps < 1e-6);
 
-        // BF16 & F16 conv1d_step + conv1d_stateful bit-exact full vs step
-        let x_bf16: Vec<half::bf16> = x_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
-        let w_bf16: Vec<half::bf16> = w_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
-        let z_bf16 = vec![half::bf16::from_f32(0.0); batch * conv_dim * k];
-        let (ob_full, sb_full) = gdn_conv1d_stateful_run_as::<half::bf16, CudaRuntime>(
-            &c, &x_bf16, &w_bf16, &z_bf16, batch, conv_dim, seq_len, false, k,
-        );
-        let mut sb_step = z_bf16.clone();
-        let mut ob_step = vec![half::bf16::from_f32(0.0); batch * conv_dim * seq_len];
-        for t in 0..seq_len {
-            let xt: Vec<half::bf16> = (0..batch * conv_dim)
-                .map(|r| x_bf16[r * seq_len + t])
-                .collect();
-            let (ot, st) = gdn_conv1d_step_run_as::<half::bf16, CudaRuntime>(
-                &c, &xt, &w_bf16, &sb_step, batch, conv_dim, k,
+        if test_half {
+            // BF16 & F16 conv1d_step + conv1d_stateful bit-exact full vs step
+            let x_bf16: Vec<half::bf16> = x_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let w_bf16: Vec<half::bf16> = w_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let z_bf16 = vec![half::bf16::from_f32(0.0); batch * conv_dim * k];
+            let (ob_full, sb_full) = gdn_conv1d_stateful_run_as::<half::bf16, R>(
+                c, &x_bf16, &w_bf16, &z_bf16, batch, conv_dim, seq_len, false, k,
             );
-            for r in 0..batch * conv_dim {
-                ob_step[r * seq_len + t] = ot[r];
+            let mut sb_step = z_bf16.clone();
+            let mut ob_step = vec![half::bf16::from_f32(0.0); batch * conv_dim * seq_len];
+            for t in 0..seq_len {
+                let xt: Vec<half::bf16> = (0..batch * conv_dim)
+                    .map(|r| x_bf16[r * seq_len + t])
+                    .collect();
+                let (ot, st) = gdn_conv1d_step_run_as::<half::bf16, R>(
+                    c, &xt, &w_bf16, &sb_step, batch, conv_dim, k,
+                );
+                for r in 0..batch * conv_dim {
+                    ob_step[r * seq_len + t] = ot[r];
+                }
+                sb_step = st;
             }
-            sb_step = st;
-        }
-        assert_eq!(
-            ob_full, ob_step,
-            "BF16 conv1d full vs step not bit-identical"
-        );
-        assert_eq!(
-            sb_full, sb_step,
-            "BF16 conv_state full vs step not bit-identical"
-        );
-
-        let x_f16: Vec<half::f16> = x_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-        let w_f16: Vec<half::f16> = w_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-        let z_f16 = vec![half::f16::from_f32(0.0); batch * conv_dim * k];
-        let (oh_full, sh_full) = gdn_conv1d_stateful_run_as::<half::f16, CudaRuntime>(
-            &c, &x_f16, &w_f16, &z_f16, batch, conv_dim, seq_len, false, k,
-        );
-        let mut sh_step = z_f16.clone();
-        let mut oh_step = vec![half::f16::from_f32(0.0); batch * conv_dim * seq_len];
-        for t in 0..seq_len {
-            let xt: Vec<half::f16> = (0..batch * conv_dim)
-                .map(|r| x_f16[r * seq_len + t])
-                .collect();
-            let (ot, st) = gdn_conv1d_step_run_as::<half::f16, CudaRuntime>(
-                &c, &xt, &w_f16, &sh_step, batch, conv_dim, k,
+            assert_eq!(
+                ob_full, ob_step,
+                "BF16 conv1d {tag} full vs step not bit-identical"
             );
-            for r in 0..batch * conv_dim {
-                oh_step[r * seq_len + t] = ot[r];
-            }
-            sh_step = st;
-        }
-        assert_eq!(
-            oh_full, oh_step,
-            "F16 conv1d full vs step not bit-identical"
-        );
-        assert_eq!(
-            sh_full, sh_step,
-            "F16 conv_state full vs step not bit-identical"
-        );
-        eprintln!("[gdn_conv1d CUDA f16 & bf16] full vs 13x step: 100% BIT-IDENTICAL");
+            assert_eq!(
+                sb_full, sb_step,
+                "BF16 conv_state {tag} full vs step not bit-identical"
+            );
 
-        // 2. Gating + Scan_lanes_io one-shot vs chunked vs single-token decode (F32 & BF16)
+            let x_f16: Vec<half::f16> = x_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let w_f16: Vec<half::f16> = w_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let z_f16 = vec![half::f16::from_f32(0.0); batch * conv_dim * k];
+            let (oh_full, sh_full) = gdn_conv1d_stateful_run_as::<half::f16, R>(
+                c, &x_f16, &w_f16, &z_f16, batch, conv_dim, seq_len, false, k,
+            );
+            let mut sh_step = z_f16.clone();
+            let mut oh_step = vec![half::f16::from_f32(0.0); batch * conv_dim * seq_len];
+            for t in 0..seq_len {
+                let xt: Vec<half::f16> = (0..batch * conv_dim)
+                    .map(|r| x_f16[r * seq_len + t])
+                    .collect();
+                let (ot, st) = gdn_conv1d_step_run_as::<half::f16, R>(
+                    c, &xt, &w_f16, &sh_step, batch, conv_dim, k,
+                );
+                for r in 0..batch * conv_dim {
+                    oh_step[r * seq_len + t] = ot[r];
+                }
+                sh_step = st;
+            }
+            assert_eq!(
+                oh_full, oh_step,
+                "F16 conv1d {tag} full vs step not bit-identical"
+            );
+            assert_eq!(
+                sh_full, sh_step,
+                "F16 conv_state {tag} full vs step not bit-identical"
+            );
+            eprintln!("[gdn_conv1d {tag} f16 & bf16] full vs 13x step: 100% BIT-IDENTICAL");
+        }
+
+        // 2. Gating + Scan_lanes_io one-shot vs chunked vs single-token decode
         let (bh, s_tot, kd, vd) = (4usize, 11usize, 128usize, 128usize);
         let [q, kk, vv, gg, bb, st0] = gdn_synth(bh, s_tot, kd, vd, 0xB202);
-        let (o_all, s_all) = gdn_scan_lanes_io_run_as::<f32, CudaRuntime>(
-            &c, &q, &kk, &vv, &gg, &bb, &st0, bh, s_tot, kd, vd, 4, 64, false,
+        let (o_all, s_all) = gdn_scan_lanes_io_run_as::<f32, R>(
+            c, &q, &kk, &vv, &gg, &bb, &st0, bh, s_tot, kd, vd, 4, 64, false,
         );
         let mut s_step = st0.clone();
         let mut o_step = vec![0.0f32; bh * s_tot * vd];
@@ -1635,8 +1635,8 @@ mod tests {
                 gt[b] = gg[b * s_tot + t];
                 bt[b] = bb[b * s_tot + t];
             }
-            let (ot, sn) = gdn_scan_lanes_io_run_as::<f32, CudaRuntime>(
-                &c, &qt, &kt, &vt, &gt, &bt, &s_step, bh, 1, kd, vd, 4, 64, false,
+            let (ot, sn) = gdn_scan_lanes_io_run_as::<f32, R>(
+                c, &qt, &kt, &vt, &gt, &bt, &s_step, bh, 1, kd, vd, 4, 64, false,
             );
             for b in 0..bh {
                 o_step[(b * s_tot + t) * vd..(b * s_tot + t + 1) * vd]
@@ -1646,38 +1646,83 @@ mod tests {
         }
         let ro = scale_rel(&o_all, &o_step);
         let rs = scale_rel(&s_all, &s_step);
-        eprintln!("[gdn_scan_lanes_io CUDA] one-shot vs step: out_rel={ro:.2e} state_rel={rs:.2e}");
+        eprintln!(
+            "[gdn_scan_lanes_io {tag}] one-shot vs step: out_rel={ro:.2e} state_rel={rs:.2e}"
+        );
         assert!(
             ro < 1e-6 && rs < 1e-6,
-            "scan one-shot vs step diverged: out={ro} state={rs}"
+            "scan {tag} one-shot vs step diverged: out={ro} state={rs}"
         );
-
-        // BF16 scan_lanes_io + gating_io
-        let q_b: Vec<half::bf16> = q.iter().map(|&x| half::bf16::from_f32(x)).collect();
-        let k_b: Vec<half::bf16> = kk.iter().map(|&x| half::bf16::from_f32(x)).collect();
-        let v_b: Vec<half::bf16> = vv.iter().map(|&x| half::bf16::from_f32(x)).collect();
-        let g_b: Vec<half::bf16> = gg.iter().map(|&x| half::bf16::from_f32(x)).collect();
-        let b_b: Vec<half::bf16> = bb.iter().map(|&x| half::bf16::from_f32(x)).collect();
-        let (ob, sb) = gdn_scan_lanes_io_run_as::<half::bf16, CudaRuntime>(
-            &c, &q_b, &k_b, &v_b, &g_b, &b_b, &st0, bh, s_tot, kd, vd, 4, 64, false,
-        );
-        let ob_f: Vec<f32> = ob.iter().map(|x| x.to_f32()).collect();
-        assert!(scale_rel(&o_all, &ob_f) < 2e-2, "BF16 scan out diverged");
-        assert!(scale_rel(&s_all, &sb) < 2e-2, "BF16 scan state diverged");
 
         let alog = rnd(bh, 0xC303);
         let dtb = rnd(bh, 0xC304);
-        let (bg_b, gg_b) =
-            gdn_gating_io_run_as::<half::bf16, CudaRuntime>(&c, &b_b, &g_b, &alog, &dtb, bh);
-        let (wb, wg) = gdn_gating_ref(
-            &b_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
-            &g_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
-            &alog,
-            &dtb,
-            bh,
-            false,
+        let (bg_f, gg_f) = gdn_gating_io_run_as::<f32, R>(c, &bb[..bh], &gg[..bh], &alog, &dtb, bh);
+        let (wb_f, wg_f) = gdn_gating_ref(&bb[..bh], &gg[..bh], &alog, &dtb, bh, false);
+        assert!(
+            scale_rel(&wb_f, &bg_f) < 1e-5,
+            "F32 gating {tag} beta diverged"
         );
-        assert!(scale_rel(&wb, &bg_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>()) < 2e-2);
-        assert!(scale_rel(&wg, &gg_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>()) < 2e-2);
+        assert!(
+            scale_rel(&wg_f, &gg_f) < 1e-5,
+            "F32 gating {tag} g diverged"
+        );
+
+        if test_half {
+            // BF16 scan_lanes_io + gating_io
+            let q_b: Vec<half::bf16> = q.iter().map(|&x| half::bf16::from_f32(x)).collect();
+            let k_b: Vec<half::bf16> = kk.iter().map(|&x| half::bf16::from_f32(x)).collect();
+            let v_b: Vec<half::bf16> = vv.iter().map(|&x| half::bf16::from_f32(x)).collect();
+            let g_b: Vec<half::bf16> = gg.iter().map(|&x| half::bf16::from_f32(x)).collect();
+            let b_b: Vec<half::bf16> = bb.iter().map(|&x| half::bf16::from_f32(x)).collect();
+            let (ob, sb) = gdn_scan_lanes_io_run_as::<half::bf16, R>(
+                c, &q_b, &k_b, &v_b, &g_b, &b_b, &st0, bh, s_tot, kd, vd, 4, 64, false,
+            );
+            let ob_f: Vec<f32> = ob.iter().map(|x| x.to_f32()).collect();
+            assert!(
+                scale_rel(&o_all, &ob_f) < 2e-2,
+                "BF16 scan {tag} out diverged"
+            );
+            assert!(
+                scale_rel(&s_all, &sb) < 2e-2,
+                "BF16 scan {tag} state diverged"
+            );
+
+            let (bg_b, gg_b) =
+                gdn_gating_io_run_as::<half::bf16, R>(c, &b_b, &g_b, &alog, &dtb, bh);
+            let (wb, wg) = gdn_gating_ref(
+                &b_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+                &g_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+                &alog,
+                &dtb,
+                bh,
+                false,
+            );
+            assert!(scale_rel(&wb, &bg_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>()) < 2e-2);
+            assert!(scale_rel(&wg, &gg_b.iter().map(|x| x.to_f32()).collect::<Vec<_>>()) < 2e-2);
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_full_pipeline_chunk_and_decode_equivalence_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        let c = CudaRuntime::client(&CudaDevice::new(0));
+        run_gdn_full_pipeline_suite(&c, "CUDA", true);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn gdn_full_pipeline_chunk_and_decode_equivalence_rocm() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        let c = HipRuntime::client(&AmdDevice::default());
+        run_gdn_full_pipeline_suite(&c, "ROCM", true);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn gdn_full_pipeline_chunk_and_decode_equivalence_vulkan() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        run_gdn_full_pipeline_suite(&c, "VULKAN", false);
     }
 }

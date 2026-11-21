@@ -140,10 +140,17 @@ fn vulkan_pq2_and_ptq1_dsl_matvec_match_oracle_and_legacy() {
     let st = dsl::stats();
     let pq2_art = dsl::pq2_matvec_artifact(5120, false).0;
     let ptq1_art = dsl::ptq1_matvec_artifact(5120, false).0;
-    assert_eq!(dispatches_of(&st, pq2_art), 6);
-    assert_eq!(dispatches_of(&st, ptq1_art), 6);
-    assert_eq!(compiles_of(&st, pq2_art), 1);
-    assert_eq!(compiles_of(&st, ptq1_art), 1);
+    let is_wave32 = matches!(&dev, Device::Vulkan(v) if v.subgroup_size() == 32);
+    if is_wave32 {
+        assert_eq!(dispatches_of(&st, pq2_art), 6);
+        assert_eq!(dispatches_of(&st, ptq1_art), 6);
+        assert_eq!(compiles_of(&st, pq2_art), 1);
+        assert_eq!(compiles_of(&st, ptq1_art), 1);
+    } else {
+        // Wave64 Vulkan adapters cleanly fall back to legacy matvec for M=1.
+        assert_eq!(dispatches_of(&st, pq2_art), 0);
+        assert_eq!(dispatches_of(&st, ptq1_art), 0);
+    }
     dsl::set_pq2_impl(QkImpl::Legacy);
     dsl::set_ptq1_impl(QkImpl::Legacy);
 }
@@ -220,14 +227,20 @@ fn vulkan_pq2_and_ptq1_dsl_gemm_bm32_bm64_offset_and_batch() {
     }
 
     let st = dsl::stats();
-    for art in [
+    let is_wave64 = matches!(&dev, Device::Vulkan(v) if v.subgroup_size() == 64);
+    for base in [
         "matmul_pq2_0_gguf_bm32_f32",
         "matmul_pq2_0_gguf_bm64_f32",
         "matmul_ptq1_0_gguf_bm32_f32",
         "matmul_ptq1_0_gguf_bm64_f32",
     ] {
-        assert!(dispatches_of(&st, art) >= 2, "{art} did not dispatch");
-        assert_eq!(compiles_of(&st, art), 1, "{art} compiled != 1x");
+        let art = if is_wave64 {
+            format!("{base}_p64")
+        } else {
+            base.to_string()
+        };
+        assert!(dispatches_of(&st, &art) >= 2, "{art} did not dispatch");
+        assert_eq!(compiles_of(&st, &art), 1, "{art} compiled != 1x");
     }
     dsl::set_pq2_impl(QkImpl::Legacy);
     dsl::set_ptq1_impl(QkImpl::Legacy);

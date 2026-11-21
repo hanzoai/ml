@@ -660,37 +660,43 @@ pub fn flash_attn_paged<F: Float>(
     for j in j_start..j_end {
         island! {
             cuda | rocm | vulkan => {
-                let mut ksh = SharedMemory::<f16>::new(bc * d);
-                let per_k = bc * d / plane;
-                for e in 0..per_k {
-                    let idx = lane * per_k + e;
-                    let c = idx / d;
-                    let dd = idx % d;
-                    let kpos = j * bc + c;
-                    let mut val = 0.0f32;
-                    if kpos < ctx_len {
-                        val = f32::cast_from(load_paged_k(
-                            k_cache, block_tables, b_i, kv, kpos, dd, n_kv,
-                            block_size, max_blocks, kv_layout, x_vec, d,
-                        ));
-                    }
-                    ksh[idx] = f16::cast_from(val);
-                }
-                sync_cube();
+                // Chunk K along head_dim in 32-col slices (16 * 32 f16 = 1 KB) so d = 256
+                // stays under 32 KB total shared memory on AMD/Intel Vulkan adapters.
+                let mut ksh = SharedMemory::<f16>::new(16usize * 32usize);
+                let per_k = 16usize * 32usize / plane;
                 for cg in 0..bc / 16usize {
                     let cacc = cmma::Matrix::<f32>::from_value(
                         cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32,
                     );
-                    for dk in 0..d / 16usize {
-                        let a = cmma::Matrix::<f16>::from_slice(
-                            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-                            &qsh.to_slice().slice(dk * 16usize, br * d), d as u32,
-                        );
-                        let b = cmma::Matrix::<f16>::from_slice(
-                            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
-                            &ksh.to_slice().slice(cg * 16usize * d + dk * 16usize, bc * d), d as u32,
-                        );
-                        cmma::execute::<f16, f16, f32, f32>(&a, &b, &cacc, &cacc);
+                    for d_blk in 0..d / 32usize {
+                        let d_base = d_blk * 32usize;
+                        for e in 0..per_k {
+                            let idx = lane * per_k + e;
+                            let c = idx / 32usize;
+                            let dc = idx % 32usize;
+                            let kpos = j * bc + cg * 16usize + c;
+                            let mut val = 0.0f32;
+                            if kpos < ctx_len {
+                                val = f32::cast_from(load_paged_k(
+                                    k_cache, block_tables, b_i, kv, kpos, d_base + dc, n_kv,
+                                    block_size, max_blocks, kv_layout, x_vec, d,
+                                ));
+                            }
+                            ksh[idx] = f16::cast_from(val);
+                        }
+                        sync_cube();
+                        for dk_sub in 0..2usize {
+                            let a = cmma::Matrix::<f16>::from_slice(
+                                cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+                                &qsh.to_slice().slice(d_base + dk_sub * 16usize, br * d), d as u32,
+                            );
+                            let b = cmma::Matrix::<f16>::from_slice(
+                                cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
+                                &ksh.to_slice().slice(dk_sub * 16usize, 16usize * 32usize), 32u32,
+                            );
+                            cmma::execute::<f16, f16, f32, f32>(&a, &b, &cacc, &cacc);
+                        }
+                        sync_cube();
                     }
                     cmma::store(&mut sf.to_slice_mut().slice_mut(cg * 16usize, br * bc), &cacc, bc as u32, cmma::MatrixLayout::RowMajor);
                 }
@@ -845,11 +851,13 @@ pub fn flash_attn_paged<F: Float>(
         // P @ V with compact `ovt[br * 16]` tile scratch so `d = 64, 128, 256` fit under 32 KB.
         island! {
             cuda | rocm | vulkan => {
+                // Chunk V along head_dim in 32-col slices (bc * 32 f16 = 1 KB) so d = 256
+                // stays under 32 KB total shared memory on AMD/Intel Vulkan adapters.
                 let mut psh = SharedMemory::<f16>::new(br * bc);
-                let mut vsh = SharedMemory::<f16>::new(bc * d);
+                let mut vsh = SharedMemory::<f16>::new(bc * 32usize);
                 let mut ovt = SharedMemory::<f32>::new(br * 16usize);
                 let per_p = br * bc / plane;
-                let per_v = bc * d / plane;
+                let per_v = bc * 32usize / plane;
                 let per_tile = br * 16usize / plane;
                 for e in 0..per_p {
                     let idx = lane * per_p + e;
@@ -861,46 +869,50 @@ pub fn flash_attn_paged<F: Float>(
                     }
                     psh[idx] = f16::cast_from(val);
                 }
-                for e in 0..per_v {
-                    let idx = lane * per_v + e;
-                    let c = idx / d;
-                    let dd = idx % d;
-                    let kpos = j * bc + c;
-                    let mut val = 0.0f32;
-                    if kpos < ctx_len {
-                        val = f32::cast_from(load_paged_v(
-                            v_cache, block_tables, b_i, kv, kpos, dd, n_kv,
-                            block_size, max_blocks, kv_layout, d,
-                        ));
-                    }
-                    vsh[idx] = f16::cast_from(val);
-                }
                 sync_cube();
-                for dn in 0..d / 16usize {
-                    let cacc = cmma::Matrix::<f32>::from_value(
-                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32,
-                    );
-                    for kc in 0..bc / 16usize {
-                        let a = cmma::Matrix::<f16>::from_slice(
-                            cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-                            &psh.to_slice().slice(kc * 16usize, br * bc), bc as u32,
-                        );
-                        let b = cmma::Matrix::<f16>::from_slice(
-                            cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
-                            &vsh.to_slice().slice(kc * 16usize * d + dn * 16usize, bc * d), d as u32,
-                        );
-                        cmma::execute::<f16, f16, f32, f32>(&a, &b, &cacc, &cacc);
-                    }
-                    cmma::store(&mut ovt.to_slice_mut(), &cacc, 16u32, cmma::MatrixLayout::RowMajor);
-                    sync_cube();
-                    for e in 0..per_tile {
-                        let tidx = lane * per_tile + e;
-                        let r = tidx / 16usize;
-                        let col = tidx % 16usize;
-                        let oidx = r * d + dn * 16usize + col;
-                        of[oidx] = of[oidx] * emf[r] + ovt[tidx];
+                for d_blk in 0..d / 32usize {
+                    let d_base = d_blk * 32usize;
+                    for e in 0..per_v {
+                        let idx = lane * per_v + e;
+                        let c = idx / 32usize;
+                        let dc = idx % 32usize;
+                        let kpos = j * bc + c;
+                        let mut val = 0.0f32;
+                        if kpos < ctx_len {
+                            val = f32::cast_from(load_paged_v(
+                                v_cache, block_tables, b_i, kv, kpos, d_base + dc, n_kv,
+                                block_size, max_blocks, kv_layout, d,
+                            ));
+                        }
+                        vsh[idx] = f16::cast_from(val);
                     }
                     sync_cube();
+                    for dn_sub in 0..2usize {
+                        let cacc = cmma::Matrix::<f32>::from_value(
+                            cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32,
+                        );
+                        for kc in 0..bc / 16usize {
+                            let a = cmma::Matrix::<f16>::from_slice(
+                                cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+                                &psh.to_slice().slice(kc * 16usize, br * bc), bc as u32,
+                            );
+                            let b = cmma::Matrix::<f16>::from_slice(
+                                cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
+                                &vsh.to_slice().slice(kc * 16usize * 32usize + dn_sub * 16usize, bc * 32usize), 32u32,
+                            );
+                            cmma::execute::<f16, f16, f32, f32>(&a, &b, &cacc, &cacc);
+                        }
+                        cmma::store(&mut ovt.to_slice_mut(), &cacc, 16u32, cmma::MatrixLayout::RowMajor);
+                        sync_cube();
+                        for e in 0..per_tile {
+                            let tidx = lane * per_tile + e;
+                            let r = tidx / 16usize;
+                            let col = tidx % 16usize;
+                            let oidx = r * d + d_base + dn_sub * 16usize + col;
+                            of[oidx] = of[oidx] * emf[r] + ovt[tidx];
+                        }
+                        sync_cube();
+                    }
                 }
             }
             metal => {
@@ -1728,12 +1740,8 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn flash_attn_paged_cuda_all_layouts_and_dtypes() {
-        use cubecl::cuda::{CudaDevice, CudaRuntime};
-        let c = CudaRuntime::client(&CudaDevice::new(0));
-
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
+    fn run_flash_paged_suite<R: Runtime>(c: &ComputeClient<R>, tag: &str, test_half: bool) {
         // 3 requests in batch with variable context_lens, shuffled noncontiguous physical pages,
         // GQA (8 Q heads / 2 KV heads), chunked prefill (seq_q=5) and decode (seq_q=1),
         // layouts 0 (4D paged), 1 (Engine Standard 5D K / 4D V), and 2 (contiguous),
@@ -1792,8 +1800,8 @@ mod tests {
                 scale,
                 softcap,
             );
-            let got = flash_attn_paged_run_as::<f32, CudaRuntime>(
-                &c,
+            let got = flash_attn_paged_run_as::<f32, R>(
+                c,
                 &q,
                 &k_cache,
                 &v_cache,
@@ -1817,11 +1825,14 @@ mod tests {
                 softcap,
             );
             let rel = scale_rel(&want, &got);
-            eprintln!("[flash_paged CUDA f32] d={d:3} sq={seq_q} layout={layout} win={window:2} cap={softcap:.0} rel={rel:.2e}");
-            assert!(rel < 2e-2, "flash_attn_paged f32 failed: rel={rel:.3e}");
+            eprintln!("[flash_paged {tag} f32] d={d:3} sq={seq_q} layout={layout} win={window:2} cap={softcap:.0} rel={rel:.2e}");
+            assert!(
+                rel < 2e-2,
+                "flash_attn_paged {tag} f32 failed: rel={rel:.3e}"
+            );
 
             // BF16 & F16 verification on Standard Engine 5D layout (x_vec=8 for 2-byte dtypes)
-            if layout == 1 && d == 128 {
+            if test_half && layout == 1 && d == 128 {
                 let x_vec_16 = 8usize;
                 let q_h: Vec<half::f16> = q.iter().map(|&v| half::f16::from_f32(v)).collect();
                 let k_h: Vec<half::f16> = k_cache.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -1847,8 +1858,8 @@ mod tests {
                     scale,
                     softcap,
                 );
-                let got_h = flash_attn_paged_run_as::<half::f16, CudaRuntime>(
-                    &c,
+                let got_h = flash_attn_paged_run_as::<half::f16, R>(
+                    c,
                     &q_h,
                     &k_h,
                     &v_h,
@@ -1875,8 +1886,11 @@ mod tests {
                     &want_h,
                     &got_h.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
                 );
-                eprintln!("[flash_paged CUDA f16] d={d:3} sq={seq_q} layout=1 rel={rel_h:.2e}");
-                assert!(rel_h < 2e-2, "flash_attn_paged f16 failed: rel={rel_h:.3e}");
+                eprintln!("[flash_paged {tag} f16] d={d:3} sq={seq_q} layout=1 rel={rel_h:.2e}");
+                assert!(
+                    rel_h < 2e-2,
+                    "flash_attn_paged {tag} f16 failed: rel={rel_h:.3e}"
+                );
 
                 let q_b: Vec<half::bf16> = q.iter().map(|&v| half::bf16::from_f32(v)).collect();
                 let k_b: Vec<half::bf16> =
@@ -1904,8 +1918,8 @@ mod tests {
                     scale,
                     softcap,
                 );
-                let got_b = flash_attn_paged_run_as::<half::bf16, CudaRuntime>(
-                    &c,
+                let got_b = flash_attn_paged_run_as::<half::bf16, R>(
+                    c,
                     &q_b,
                     &k_b,
                     &v_b,
@@ -1932,12 +1946,36 @@ mod tests {
                     &want_b,
                     &got_b.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
                 );
-                eprintln!("[flash_paged CUDA bf16] d={d:3} sq={seq_q} layout=1 rel={rel_b:.2e}");
+                eprintln!("[flash_paged {tag} bf16] d={d:3} sq={seq_q} layout=1 rel={rel_b:.2e}");
                 assert!(
                     rel_b < 2e-2,
-                    "flash_attn_paged bf16 failed: rel={rel_b:.3e}"
+                    "flash_attn_paged {tag} bf16 failed: rel={rel_b:.3e}"
                 );
             }
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn flash_attn_paged_cuda_all_layouts_and_dtypes() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        let c = CudaRuntime::client(&CudaDevice::new(0));
+        run_flash_paged_suite(&c, "CUDA", true);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn flash_attn_paged_rocm_all_layouts_and_dtypes() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        let c = HipRuntime::client(&AmdDevice::default());
+        run_flash_paged_suite(&c, "ROCM", true);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn flash_attn_paged_vulkan_all_layouts_f32() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        run_flash_paged_suite(&c, "VULKAN", false);
     }
 }

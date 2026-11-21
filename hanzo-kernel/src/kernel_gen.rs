@@ -1134,12 +1134,16 @@ fn metal_specs() -> Vec<Spec<cubecl::wgpu::WgpuRuntime>> {
 #[cfg(any(feature = "metal", feature = "cuda", feature = "rocm"))]
 fn write_or_check(dir: &Path, check: bool, ext: &str, items: &[(&str, String)]) -> bool {
     let mut ok = true;
-    for (stem, src) in items {
+    for (stem, raw_src) in items {
+        let src = raw_src.replace("\r\n", "\n");
         let path = dir.join(format!("{stem}.{ext}"));
         if check {
             match std::fs::read_to_string(&path) {
-                Ok(cur) if cur == *src => eprintln!("ok     {}", path.display()),
+                Ok(cur) if cur.replace("\r\n", "\n") == src => {
+                    eprintln!("ok     {}", path.display())
+                }
                 Ok(cur) => {
+                    let cur = cur.replace("\r\n", "\n");
                     ok = false;
                     let first = cur
                         .lines()
@@ -1161,7 +1165,7 @@ fn write_or_check(dir: &Path, check: bool, ext: &str, items: &[(&str, String)]) 
             }
         } else {
             std::fs::create_dir_all(dir).expect("create out dir");
-            std::fs::write(&path, src).expect("write artifact");
+            std::fs::write(&path, &src).expect("write artifact");
             eprintln!("wrote  {}", path.display());
         }
     }
@@ -1374,8 +1378,8 @@ fn main() {
         }
         #[cfg(feature = "rocm")]
         "rocm" => {
-            use hanzo_cubecl_hip::{HipDevice, HipRuntime};
-            let client = HipRuntime::client(&HipDevice::new(0));
+            use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+            let client = HipRuntime::client(&AmdDevice::default());
             let mut specs = ternary_specs::<HipRuntime>();
             specs.extend(gdn_and_flash_prod_specs::<HipRuntime>(false));
             let got = capture(&client, &specs, &log).unwrap_or_else(|e| {

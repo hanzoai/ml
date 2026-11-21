@@ -32,12 +32,22 @@ pub struct WmmaStore<D: Dialect> {
     layout: FragmentLayout<D>,
 }
 
-#[derive(new, Debug, Clone, PartialEq)]
+#[derive(new, Debug, Clone)]
 pub struct WmmaExecute<D: Dialect> {
     frag_a: Fragment<D>,
     frag_b: Fragment<D>,
     frag_c: Fragment<D>,
     frag_d: Fragment<D>,
+}
+
+// HANZO PATCH: WmmaExecute::fn_name and format_extension depend only on the A/C element types
+// (HIP WMMA vector registers are layout-agnostic), not on FragmentLayout. Deriving PartialEq
+// over full Fragment structs caused hip/dialect.rs to emit duplicate `wmma_execute_16x16x16_*`
+// definitions whenever one kernel used both ColMajor (Q@K^T) and RowMajor (P@V) B fragments.
+impl<D: Dialect> PartialEq for WmmaExecute<D> {
+    fn eq(&self, other: &Self) -> bool {
+        self.frag_a.elem == other.frag_a.elem && self.frag_c.elem == other.frag_c.elem
+    }
 }
 
 #[derive(new, Debug, Clone, PartialEq)]

@@ -252,10 +252,8 @@ mod tests {
         md / mm
     }
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn fwht_hadamard_cuda_all_sizes_and_dtypes() {
-        let client = cubecl::cuda::CudaRuntime::client(&Default::default());
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
+    fn run_fwht_suite<R: Runtime>(client: &ComputeClient<R>, tag: &str, test_half: bool) {
         for &b in &[64usize, 128, 256, 512, 1024, 2048] {
             let width = b * 5; // matches Zen 6 27B 5120 = 5 * 1024
             let rows = 3usize;
@@ -266,49 +264,81 @@ mod tests {
                 .collect();
             for &inverse in &[false, true] {
                 let want = fwht_hadamard_ref(&x, Some(&signs), b, inverse);
-                let got_f32 = fwht_hadamard_run_as::<f32, cubecl::cuda::CudaRuntime>(
-                    &client, &x, &signs, b, true, inverse,
-                );
+                let got_f32 = fwht_hadamard_run_as::<f32, R>(client, &x, &signs, b, true, inverse);
                 let e32 = rel_err(&got_f32, &want);
-                assert!(e32 < 2e-6, "fwht f32 b={b} inv={inverse} rel={e32:.2e}");
+                assert!(
+                    e32 < 2e-6,
+                    "fwht {tag} f32 b={b} inv={inverse} rel={e32:.2e}"
+                );
 
-                let x16: Vec<half::f16> = x.iter().map(|&v| half::f16::from_f32(v)).collect();
-                let x16_f32: Vec<f32> = x16.iter().map(|v| v.to_f32()).collect();
-                let want16 = fwht_hadamard_ref(&x16_f32, Some(&signs), b, inverse);
-                let got16: Vec<f32> = fwht_hadamard_run_as::<half::f16, cubecl::cuda::CudaRuntime>(
-                    &client, &x16, &signs, b, true, inverse,
-                )
-                .into_iter()
-                .map(|v| v.to_f32())
-                .collect();
-                let e16 = rel_err(&got16, &want16);
-                assert!(e16 < 2e-3, "fwht f16 b={b} inv={inverse} rel={e16:.2e}");
-
-                let xb16: Vec<half::bf16> = x.iter().map(|&v| half::bf16::from_f32(v)).collect();
-                let xb16_f32: Vec<f32> = xb16.iter().map(|v| v.to_f32()).collect();
-                let wantb16 = fwht_hadamard_ref(&xb16_f32, Some(&signs), b, inverse);
-                let gotb16: Vec<f32> =
-                    fwht_hadamard_run_as::<half::bf16, cubecl::cuda::CudaRuntime>(
-                        &client, &xb16, &signs, b, true, inverse,
+                if test_half {
+                    let x16: Vec<half::f16> = x.iter().map(|&v| half::f16::from_f32(v)).collect();
+                    let x16_f32: Vec<f32> = x16.iter().map(|v| v.to_f32()).collect();
+                    let want16 = fwht_hadamard_ref(&x16_f32, Some(&signs), b, inverse);
+                    let got16: Vec<f32> = fwht_hadamard_run_as::<half::f16, R>(
+                        client, &x16, &signs, b, true, inverse,
                     )
                     .into_iter()
                     .map(|v| v.to_f32())
                     .collect();
-                let eb16 = rel_err(&gotb16, &wantb16);
-                assert!(
-                    eb16 < 1.5e-2,
-                    "fwht bf16 b={b} inv={inverse} rel={eb16:.2e}"
-                );
-                eprintln!("[fwht CUDA] b={b:4} inv={inverse:<5} f32={e32:.2e} f16={e16:.2e} bf16={eb16:.2e}");
+                    let e16 = rel_err(&got16, &want16);
+                    assert!(
+                        e16 < 2e-3,
+                        "fwht {tag} f16 b={b} inv={inverse} rel={e16:.2e}"
+                    );
+
+                    let xb16: Vec<half::bf16> =
+                        x.iter().map(|&v| half::bf16::from_f32(v)).collect();
+                    let xb16_f32: Vec<f32> = xb16.iter().map(|v| v.to_f32()).collect();
+                    let wantb16 = fwht_hadamard_ref(&xb16_f32, Some(&signs), b, inverse);
+                    let gotb16: Vec<f32> = fwht_hadamard_run_as::<half::bf16, R>(
+                        client, &xb16, &signs, b, true, inverse,
+                    )
+                    .into_iter()
+                    .map(|v| v.to_f32())
+                    .collect();
+                    let eb16 = rel_err(&gotb16, &wantb16);
+                    assert!(
+                        eb16 < 1.5e-2,
+                        "fwht {tag} bf16 b={b} inv={inverse} rel={eb16:.2e}"
+                    );
+                    eprintln!(
+                        "[fwht {tag}] b={b:4} inv={inverse:<5} f32={e32:.2e} f16={e16:.2e} bf16={eb16:.2e}"
+                    );
+                } else {
+                    eprintln!("[fwht {tag}] b={b:4} inv={inverse:<5} f32={e32:.2e}");
+                }
             }
             // Round-trip: inverse(forward(x)) == x
-            let fwd = fwht_hadamard_run_as::<f32, cubecl::cuda::CudaRuntime>(
-                &client, &x, &signs, b, true, false,
+            let fwd = fwht_hadamard_run_as::<f32, R>(client, &x, &signs, b, true, false);
+            let rt = fwht_hadamard_run_as::<f32, R>(client, &fwd, &signs, b, true, true);
+            assert!(
+                rel_err(&rt, &x) < 3e-6,
+                "fwht {tag} round-trip failed for b={b}"
             );
-            let rt = fwht_hadamard_run_as::<f32, cubecl::cuda::CudaRuntime>(
-                &client, &fwd, &signs, b, true, true,
-            );
-            assert!(rel_err(&rt, &x) < 3e-6, "fwht round-trip failed for b={b}");
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fwht_hadamard_cuda_all_sizes_and_dtypes() {
+        let client = cubecl::cuda::CudaRuntime::client(&Default::default());
+        run_fwht_suite(&client, "CUDA", true);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn fwht_hadamard_rocm_all_sizes_and_dtypes() {
+        use hanzo_cubecl_hip::{AmdDevice, HipRuntime};
+        let client = HipRuntime::client(&AmdDevice::default());
+        run_fwht_suite(&client, "ROCM", true);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn fwht_hadamard_vulkan_all_sizes_f32() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        run_fwht_suite(&client, "VULKAN", false);
     }
 }

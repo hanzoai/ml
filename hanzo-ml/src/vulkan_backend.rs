@@ -300,6 +300,49 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "fwht_hadamard_b512_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b512_f32.spv"),
         "fwht_hadamard_b1024_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b1024_f32.spv"),
         "fwht_hadamard_b2048_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b2048_f32.spv"),
+        // AMD Wave64 (subgroup_size == 64) canonical DSL SPIR-V artifacts (generated on gfx1151).
+        "matmul_pq2_0_gguf_bm32_f32_p64" => {
+            include_bytes!("vulkan/dsl/matmul_pq2_0_gguf_bm32_f32_p64.spv")
+        }
+        "matmul_pq2_0_gguf_bm64_f32_p64" => {
+            include_bytes!("vulkan/dsl/matmul_pq2_0_gguf_bm64_f32_p64.spv")
+        }
+        "matmul_ptq1_0_gguf_bm32_f32_p64" => {
+            include_bytes!("vulkan/dsl/matmul_ptq1_0_gguf_bm32_f32_p64.spv")
+        }
+        "matmul_ptq1_0_gguf_bm64_f32_p64" => {
+            include_bytes!("vulkan/dsl/matmul_ptq1_0_gguf_bm64_f32_p64.spv")
+        }
+        "gdn_conv1d_step_k4_f32_p64" => include_bytes!("vulkan/dsl/gdn_conv1d_step_k4_f32_p64.spv"),
+        "gdn_conv1d_stateful_k4_f32_p64" => {
+            include_bytes!("vulkan/dsl/gdn_conv1d_stateful_k4_f32_p64.spv")
+        }
+        "gdn_gating_io_f32_p64" => include_bytes!("vulkan/dsl/gdn_gating_io_f32_p64.spv"),
+        "gdn_scan_lanes_io_k128_v128_l4_f32_p64" => {
+            include_bytes!("vulkan/dsl/gdn_scan_lanes_io_k128_v128_l4_f32_p64.spv")
+        }
+        "gdn_scan_lanes_io_k64_v64_l4_f32_p64" => {
+            include_bytes!("vulkan/dsl/gdn_scan_lanes_io_k64_v64_l4_f32_p64.spv")
+        }
+        "flash_attn_paged_d64_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_d64_f32_p64.spv")
+        }
+        "flash_attn_paged_d128_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_d128_f32_p64.spv")
+        }
+        "flash_attn_paged_d256_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_d256_f32_p64.spv")
+        }
+        "fwht_hadamard_b64_f32_p64" => include_bytes!("vulkan/dsl/fwht_hadamard_b64_f32_p64.spv"),
+        "fwht_hadamard_b128_f32_p64" => include_bytes!("vulkan/dsl/fwht_hadamard_b128_f32_p64.spv"),
+        "fwht_hadamard_b256_f32_p64" => include_bytes!("vulkan/dsl/fwht_hadamard_b256_f32_p64.spv"),
+        "fwht_hadamard_b512_f32_p64" => include_bytes!("vulkan/dsl/fwht_hadamard_b512_f32_p64.spv"),
+        "fwht_hadamard_b1024_f32_p64" => {
+            include_bytes!("vulkan/dsl/fwht_hadamard_b1024_f32_p64.spv")
+        }
+        "fwht_hadamard_b2048_f32_p64" => {
+            include_bytes!("vulkan/dsl/fwht_hadamard_b2048_f32_p64.spv")
+        }
         _ => crate::bail!("vulkan: no SPIR-V kernel for `{name}`"),
     };
     Ok(b)
@@ -903,6 +946,11 @@ impl VulkanDevice {
     /// fp16xfp16 -> fp32 subgroup config, else `None`. Used to pick the coopmat matmul path.
     pub fn coopmat_info(&self) -> Option<(u32, u32, u32)> {
         self.inner.coopmat.then_some(self.inner.cm_mnk)
+    }
+
+    /// Reported Vulkan subgroup width (32 on NVIDIA/Apple/RDNA-Wave32, 64 on AMD Wave64).
+    pub fn subgroup_size(&self) -> u32 {
+        self.inner.subgroup_size
     }
 
     /// Quantize `W[nout x k]` (row-major fp32) to Q8_0 and upload it to the GPU once. Per 32-block:
@@ -4106,15 +4154,14 @@ impl VulkanDevice {
         if elig.is_err() {
             return Ok(None);
         }
-        // Committed ternary SPIR-V artifacts target Wave32 (subgroup_size == 32). Wave64
-        // adapters (RADV gfx1151) fall back cleanly until `_p64` SPIR-V artifacts are emitted.
-        if self.inner.subgroup_size != 32 {
+        let is_wave64 = self.inner.subgroup_size == 64;
+        if self.inner.subgroup_size != 32 && !is_wave64 {
             return Ok(None);
         }
 
         let (artifact_name, groups, meta_words): (&'static str, (u32, u32, u32), [u32; 3]) =
             if m == 1 {
-                if !self.inner.subgroup_matvec {
+                if is_wave64 || !self.inner.subgroup_matvec {
                     return Ok(None);
                 }
                 let (art, nsg, nr0) = match dtype {
@@ -4132,10 +4179,21 @@ impl VulkanDevice {
                 if !self.inner.coopmat || self.inner.cm_mnk != (16, 16, 16) {
                     return Ok(None);
                 }
-                let (art, bm) = match dtype {
+                let (art_base, bm) = match dtype {
                     GgmlDType::PQ2_0 => dsl::pq2_matmul_artifact(m, n, false),
                     GgmlDType::PTQ1_0 => dsl::ptq1_matmul_artifact(m, n, false),
                     _ => return Ok(None),
+                };
+                let art = if is_wave64 {
+                    match art_base {
+                        "matmul_pq2_0_gguf_bm32_f32" => "matmul_pq2_0_gguf_bm32_f32_p64",
+                        "matmul_pq2_0_gguf_bm64_f32" => "matmul_pq2_0_gguf_bm64_f32_p64",
+                        "matmul_ptq1_0_gguf_bm32_f32" => "matmul_ptq1_0_gguf_bm32_f32_p64",
+                        "matmul_ptq1_0_gguf_bm64_f32" => "matmul_ptq1_0_gguf_bm64_f32_p64",
+                        _ => return Ok(None),
+                    }
+                } else {
+                    art_base
                 };
                 (
                     art,
@@ -4204,8 +4262,13 @@ impl VulkanDevice {
         }
         let out = self.alloc_f32(total)?;
         let dims = self.upload_u32(&[batch as u32, conv_dim as u32])?;
+        let artifact = if self.inner.subgroup_size == 64 {
+            "gdn_conv1d_step_k4_f32_p64"
+        } else {
+            "gdn_conv1d_step_k4_f32"
+        };
         self.dispatch_dsl_tracked(
-            "gdn_conv1d_step_k4_f32",
+            artifact,
             &[
                 x.buffer,
                 weight.buffer,
@@ -4248,8 +4311,13 @@ impl VulkanDevice {
             seq_len as u32,
             u32::from(has_state),
         ])?;
+        let artifact = if self.inner.subgroup_size == 64 {
+            "gdn_conv1d_stateful_k4_f32_p64"
+        } else {
+            "gdn_conv1d_stateful_k4_f32"
+        };
         self.dispatch_dsl_tracked(
-            "gdn_conv1d_stateful_k4_f32",
+            artifact,
             &[
                 x.buffer,
                 weight.buffer,
@@ -4284,8 +4352,13 @@ impl VulkanDevice {
         let beta_out = self.alloc_f32(total)?;
         let g_out = self.alloc_f32(total)?;
         let dims = self.upload_u32(&[total as u32, num_heads as u32])?;
+        let artifact = if self.inner.subgroup_size == 64 {
+            "gdn_gating_io_f32_p64"
+        } else {
+            "gdn_gating_io_f32"
+        };
         self.dispatch_dsl_tracked(
-            "gdn_gating_io_f32",
+            artifact,
             &[
                 b_in.buffer,
                 a_in.buffer,
@@ -4318,9 +4391,12 @@ impl VulkanDevice {
         k_dim: usize,
         v_dim: usize,
     ) -> Result<Option<VulkanStorage>> {
-        let artifact = match (k_dim, v_dim) {
-            (128, 128) => "gdn_scan_lanes_io_k128_v128_l4_f32",
-            (64, 64) => "gdn_scan_lanes_io_k64_v64_l4_f32",
+        let is_wave64 = self.inner.subgroup_size == 64;
+        let artifact = match (k_dim, v_dim, is_wave64) {
+            (128, 128, false) => "gdn_scan_lanes_io_k128_v128_l4_f32",
+            (64, 64, false) => "gdn_scan_lanes_io_k64_v64_l4_f32",
+            (128, 128, true) => "gdn_scan_lanes_io_k128_v128_l4_f32_p64",
+            (64, 64, true) => "gdn_scan_lanes_io_k64_v64_l4_f32_p64",
             _ => return Ok(None),
         };
         if bh == 0 || seq == 0 {
@@ -4349,7 +4425,7 @@ impl VulkanDevice {
         Ok(Some(out))
     }
 
-    /// Production DSL Paged & Contiguous FlashAttention (F32, d=64/128/256, Wave32 + coopmat).
+    /// Production DSL Paged & Contiguous FlashAttention (F32, d=64/128/256, Wave32/Wave64 + coopmat).
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attn_paged_dsl(
         &self,
@@ -4373,13 +4449,17 @@ impl VulkanDevice {
         sliding_window: usize,
         q_offset_override: usize,
     ) -> Result<Option<VulkanStorage>> {
-        if !self.inner.coopmat || self.inner.subgroup_size != 32 {
+        let is_wave64 = self.inner.subgroup_size == 64;
+        if !self.inner.coopmat || (self.inner.subgroup_size != 32 && !is_wave64) {
             return Ok(None);
         }
-        let artifact = match d {
-            64 => "flash_attn_paged_d64_f32",
-            128 => "flash_attn_paged_d128_f32",
-            256 => "flash_attn_paged_d256_f32",
+        let artifact = match (d, is_wave64) {
+            (64, false) => "flash_attn_paged_d64_f32",
+            (128, false) => "flash_attn_paged_d128_f32",
+            (256, false) => "flash_attn_paged_d256_f32",
+            (64, true) => "flash_attn_paged_d64_f32_p64",
+            (128, true) => "flash_attn_paged_d128_f32_p64",
+            (256, true) => "flash_attn_paged_d256_f32_p64",
             _ => return Ok(None),
         };
         if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 {
@@ -4431,13 +4511,20 @@ impl VulkanDevice {
         block_size: usize,
         inverse: bool,
     ) -> Result<Option<VulkanStorage>> {
-        let artifact = match block_size {
-            64 => "fwht_hadamard_b64_f32",
-            128 => "fwht_hadamard_b128_f32",
-            256 => "fwht_hadamard_b256_f32",
-            512 => "fwht_hadamard_b512_f32",
-            1024 => "fwht_hadamard_b1024_f32",
-            2048 => "fwht_hadamard_b2048_f32",
+        let is_wave64 = self.inner.subgroup_size == 64;
+        let artifact = match (block_size, is_wave64) {
+            (64, false) => "fwht_hadamard_b64_f32",
+            (128, false) => "fwht_hadamard_b128_f32",
+            (256, false) => "fwht_hadamard_b256_f32",
+            (512, false) => "fwht_hadamard_b512_f32",
+            (1024, false) => "fwht_hadamard_b1024_f32",
+            (2048, false) => "fwht_hadamard_b2048_f32",
+            (64, true) => "fwht_hadamard_b64_f32_p64",
+            (128, true) => "fwht_hadamard_b128_f32_p64",
+            (256, true) => "fwht_hadamard_b256_f32_p64",
+            (512, true) => "fwht_hadamard_b512_f32_p64",
+            (1024, true) => "fwht_hadamard_b1024_f32_p64",
+            (2048, true) => "fwht_hadamard_b2048_f32_p64",
             _ => return Ok(None),
         };
         if n_blocks == 0 {
