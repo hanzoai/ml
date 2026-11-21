@@ -39,15 +39,7 @@ pub const APPROVED_LICENSES: &[&str] = &[
 ];
 
 /// Secret token prefixes scrubbed from prompts, commands, and tool outputs before export.
-const SECRET_PREFIXES: &[&str] = &[
-    "sk-",
-    "ghp_",
-    "gho_",
-    "github_pat_",
-    "AKIA",
-    "xoxb-",
-    "hf_",
-];
+const SECRET_PREFIXES: &[&str] = &["sk-", "ghp_", "gho_", "github_pat_", "AKIA", "xoxb-", "hf_"];
 
 /// Verifies that a base model or trace dataset carries an approved permissive SPDX identifier.
 pub fn verify_spdx_license(spdx_id: &str, artifact_kind: &str) -> Result<()> {
@@ -337,21 +329,11 @@ pub fn sanitize_trace(trace: &AgentTrace) -> (AgentTrace, usize) {
 /// Specific reward-hacking pattern detected in a coding-agent trace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RewardHackViolation {
-    AssertionDeletion {
-        removed: usize,
-        added: usize,
-    },
-    ForbiddenTestModification {
-        files: Vec<String>,
-    },
-    ExitCodeSpoofing {
-        spoof_reason: String,
-    },
+    AssertionDeletion { removed: usize, added: usize },
+    ForbiddenTestModification { files: Vec<String> },
+    ExitCodeSpoofing { spoof_reason: String },
     EmptyOrTautologicalPatch,
-    CircularRetryLoop {
-        signature: String,
-        repeats: usize,
-    },
+    CircularRetryLoop { signature: String, repeats: usize },
 }
 
 /// Result of auditing one trajectory with [`RewardHackingDetector`].
@@ -454,15 +436,11 @@ impl RewardHackingDetector {
         {
             spoof_detail = Some(format!(
                 "reported exit_code=0 despite verifier_passed={}, tests_ran={}, tests_failed={}",
-                trace.outcome.verifier_passed,
-                trace.outcome.tests_ran,
-                trace.outcome.tests_failed
+                trace.outcome.verifier_passed, trace.outcome.tests_ran, trace.outcome.tests_failed
             ));
         }
         if let Some(spoof_reason) = spoof_detail {
-            violations.push(RewardHackViolation::ExitCodeSpoofing {
-                spoof_reason,
-            });
+            violations.push(RewardHackViolation::ExitCodeSpoofing { spoof_reason });
         }
 
         // 4. Empty or tautological patch when a substantive code repair is required.
@@ -500,15 +478,10 @@ impl RewardHackingDetector {
             }
         }
         if let Some((signature, repeats)) = loop_hit {
-            violations.push(RewardHackViolation::CircularRetryLoop {
-                signature,
-                repeats,
-            });
+            violations.push(RewardHackViolation::CircularRetryLoop { signature, repeats });
         }
 
-        RewardHackVerdict {
-            violations,
-        }
+        RewardHackVerdict { violations }
     }
 
     /// Returns `true` iff `trace` passed independent verification cleanly with zero reward-hack
@@ -856,7 +829,8 @@ impl TraceDatasetBuilder {
 
         // When a token budget cap is configured, prioritize concise high-density trajectories.
         if self.max_token_budget.is_some() {
-            candidate_trajectories.sort_by_key(|(toks, recs, _)| (*toks / recs.len().max(1), *toks));
+            candidate_trajectories
+                .sort_by_key(|(toks, recs, _)| (*toks / recs.len().max(1), *toks));
         }
 
         let mut sft_records = Vec::new();
@@ -1201,11 +1175,7 @@ fn batch_sft_tensors(
             rec.action_id,
             cfg.num_actions
         );
-        states_flat.extend(pad_or_truncate_state(
-            &rec.state_tokens,
-            s,
-            cfg.vocab_size,
-        )?);
+        states_flat.extend(pad_or_truncate_state(&rec.state_tokens, s, cfg.vocab_size)?);
         actions.push(rec.action_id);
         weights.push(rec.advantage_weight);
         tokens_sum += rec.token_count;
@@ -1494,10 +1464,11 @@ mod tests {
     fn secret_redactor_scrubs_credentials_and_emails() {
         let synthetic_api = format!("{}{}", "sk-", "synthetic0000test9999");
         let synthetic_bearer = format!("Bearer {}", "tok_synthetic_0000_abcd");
+        let synthetic_dsn = format!("{}://admin:pass123@db.internal:5432/app", "postgres");
         let pem_header = format!("-----BEGIN {}-----", "TEST PRIVATE KEY");
         let pem_footer = format!("-----END {}-----", "TEST PRIVATE KEY");
         let raw = format!(
-            "contact ops.user@example.org with {synthetic_api} or {synthetic_bearer} db postgres://admin:pass123@db.internal:5432/app {pem_header}body{pem_footer}"
+            "contact ops.user@example.org with {synthetic_api} or {synthetic_bearer} db {synthetic_dsn} {pem_header}body{pem_footer}"
         );
         let (clean, count) = redact_text_secrets(&raw);
         assert!(count >= 5, "expected >= 5 redactions, got {count}: {clean}");
