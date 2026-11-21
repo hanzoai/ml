@@ -558,6 +558,70 @@ macro_rules! flash_paged_spec {
     feature = "rocm",
     feature = "vulkan"
 ))]
+macro_rules! flash_paged_split_kv_spec {
+    ($r:ty, $artifact:literal, $entry:literal, $e:ty, $zero:expr, $d:literal) => {
+        Spec {
+            artifact: $artifact,
+            entry: $entry,
+            launch: |c| {
+                let _ = hanzo_kernel::flash::flash_attn_paged_split_kv_run_as::<$e, $r>(
+                    c,
+                    &vec![$zero; $d],
+                    &vec![$zero; 16 * $d],
+                    &vec![$zero; 16 * $d],
+                    &[0u32],
+                    &[1u32],
+                    1,
+                    1,
+                    1,
+                    1,
+                    $d,
+                    1,
+                    1,
+                    16,
+                    1,
+                    0,
+                    4,
+                    0,
+                    0,
+                    1.0 / ($d as f32).sqrt(),
+                    0.0,
+                );
+            },
+        }
+    };
+}
+
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
+macro_rules! flash_split_kv_reduce_spec {
+    ($r:ty, $artifact:literal, $entry:literal, $e:ty, $d:literal) => {
+        Spec {
+            artifact: $artifact,
+            entry: $entry,
+            launch: |c| {
+                let _ = hanzo_kernel::flash::flash_attn_split_kv_reduce_run_as::<$e, $r>(
+                    c,
+                    &vec![0.0f32; 2 * ($d + 2)],
+                    1,
+                    2,
+                    $d,
+                );
+            },
+        }
+    };
+}
+
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan"
+))]
 fn gdn_and_flash_prod_specs<R: Runtime>(is_metal: bool) -> Vec<Spec<R>> {
     let mut specs = vec![
         // Single-token GDN conv1d decode step (in-place state shift + SiLU).
@@ -805,6 +869,145 @@ fn gdn_and_flash_prod_specs<R: Runtime>(is_metal: bool) -> Vec<Spec<R>> {
             ),
         ]);
     }
+    specs.extend([
+        // Canonical DSL Split-KV paged & contiguous FlashAttention decode (d=64, 128, 256).
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d64_f32",
+            "flash_attn_paged_split_kv_f_f32",
+            f32,
+            0.0f32,
+            64
+        ),
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d64_f16",
+            "flash_attn_paged_split_kv_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            64
+        ),
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d64_bf16",
+            "flash_attn_paged_split_kv_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            64
+        ),
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d128_f32",
+            "flash_attn_paged_split_kv_f_f32",
+            f32,
+            0.0f32,
+            128
+        ),
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d128_f16",
+            "flash_attn_paged_split_kv_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            128
+        ),
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d128_bf16",
+            "flash_attn_paged_split_kv_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            128
+        ),
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d256_f32",
+            "flash_attn_paged_split_kv_f_f32",
+            f32,
+            0.0f32,
+            256
+        ),
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d256_f16",
+            "flash_attn_paged_split_kv_f_",
+            half::f16,
+            half::f16::from_f32(0.0),
+            256
+        ),
+        flash_paged_split_kv_spec!(
+            R,
+            "flash_attn_paged_split_kv_d256_bf16",
+            "flash_attn_paged_split_kv_f_",
+            half::bf16,
+            half::bf16::from_f32(0.0),
+            256
+        ),
+        // Second-pass online-softmax merge for Split-KV FlashAttention (d=64, 128, 256).
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d64_f32",
+            "flash_attn_split_kv_reduce_f_f32",
+            f32,
+            64
+        ),
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d64_f16",
+            "flash_attn_split_kv_reduce_f_",
+            half::f16,
+            64
+        ),
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d64_bf16",
+            "flash_attn_split_kv_reduce_f_",
+            half::bf16,
+            64
+        ),
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d128_f32",
+            "flash_attn_split_kv_reduce_f_f32",
+            f32,
+            128
+        ),
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d128_f16",
+            "flash_attn_split_kv_reduce_f_",
+            half::f16,
+            128
+        ),
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d128_bf16",
+            "flash_attn_split_kv_reduce_f_",
+            half::bf16,
+            128
+        ),
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d256_f32",
+            "flash_attn_split_kv_reduce_f_f32",
+            f32,
+            256
+        ),
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d256_f16",
+            "flash_attn_split_kv_reduce_f_",
+            half::f16,
+            256
+        ),
+        flash_split_kv_reduce_spec!(
+            R,
+            "flash_attn_split_kv_reduce_d256_bf16",
+            "flash_attn_split_kv_reduce_f_",
+            half::bf16,
+            256
+        ),
+    ]);
     macro_rules! fwht_spec {
         ($artifact:literal, $entry:literal, $e:ty, $zero:expr, $b:expr) => {
             Spec {
@@ -1407,18 +1610,26 @@ fn main() {
                 eprintln!("runtime is `{name}`, not wgpu<spirv>: refusing to write Vulkan SPIR-V");
                 std::process::exit(1);
             }
-            let plane = client.properties().hardware.plane_size_max;
+            let hw_plane = client.properties().hardware.plane_size_max;
+            let force_p64 = std::env::var_os("HANZO_KERNEL_GEN_P64").is_some();
+            let plane = if force_p64 { 64 } else { hw_plane };
             let mut all_specs = ternary_specs::<WgpuRuntime>();
             all_specs.extend(gdn_and_flash_prod_specs::<WgpuRuntime>(false));
             let specs: Vec<_> = all_specs
                 .into_iter()
                 .filter(|s| {
-                    // Emit f32 ternary + GDN + paged FlashAttention + FWHT kernels.
+                    if force_p64 && hw_plane != 64 {
+                        return s.artifact.ends_with("_f32")
+                            && (s.artifact.starts_with("flash_attn_paged_split_kv_")
+                                || s.artifact.starts_with("flash_attn_split_kv_"));
+                    }
+                    // Emit f32 ternary + GDN + paged/split-KV FlashAttention + FWHT kernels.
                     s.artifact.ends_with("_f32")
                         && (plane == 32
                             || s.artifact.starts_with("matmul_")
                             || s.artifact.starts_with("gdn_")
                             || s.artifact.starts_with("flash_attn_paged_")
+                            || s.artifact.starts_with("flash_attn_split_kv_")
                             || s.artifact.starts_with("fwht_"))
                 })
                 .collect();
