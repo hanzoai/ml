@@ -18,6 +18,7 @@ pub mod cudnn;
 #[cfg(feature = "cutile")]
 pub mod cutile;
 mod device;
+pub mod dsl;
 mod error;
 mod utils;
 pub use device::{

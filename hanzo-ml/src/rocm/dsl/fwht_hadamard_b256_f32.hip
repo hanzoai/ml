@@ -1,0 +1,309 @@
+#include <hip/hip_runtime.h>
+typedef unsigned int uint;
+typedef unsigned char uint8;
+typedef unsigned short uint16;
+typedef unsigned int uint32;
+typedef unsigned long long int uint64;
+typedef signed char int8;
+typedef signed short int16;
+typedef signed int int32;
+typedef signed long long int int64;
+
+struct info_st {
+  uint32 static_meta[8];
+};
+
+extern "C" __global__ void __launch_bounds__(64)
+    fwht_hadamard_f_f32(const float *__restrict__ buffer_0,
+                        const float *__restrict__ buffer_1, float *buffer_2,
+                        const uint32 *__restrict__ buffer_3,
+                        const info_st *__restrict__ info_ptr) {
+  uint32 threadIdxGlobal = threadIdx.x + threadIdx.y * blockDim.x +
+                           threadIdx.z * (blockDim.x * blockDim.y);
+  uint32 blockIdxGlobal = (blockIdx.z * gridDim.y * gridDim.x) +
+                          (blockIdx.y * gridDim.x) + blockIdx.x;
+  extern __shared__ __align__(4) uchar dynamic_shared_mem[];
+  const info_st &info = *info_ptr;
+  const uint32 *dynamic_meta = reinterpret_cast<const uint32 *>(
+      reinterpret_cast<const char *>(info_ptr) + sizeof(info_st));
+
+  // Shared array size: 256, 1024 bytes
+  float *shared_memory_9 = reinterpret_cast<float *>(&dynamic_shared_mem[0]);
+  uint32 l_mut_6;
+  float l_mut_14;
+  float l_mut_18;
+  float l_mut_22;
+  float l_mut_26;
+  const uint32 l_0 = buffer_3[uint32(0)];
+  const bool l_1 = blockIdxGlobal < l_0;
+  if (l_1) {
+    const uint32 l_2 = buffer_3[uint32(1)];
+    const uint32 l_3 = buffer_3[uint32(2)];
+    const uint32 l_4 = buffer_3[uint32(3)];
+    const uint32 l_5 = blockIdxGlobal * uint32(256);
+    l_mut_6 = uint32(0);
+    const bool l_7 = l_3 != uint32(0);
+    if (l_7) {
+      const uint32 l_8 = l_5 % l_2;
+      l_mut_6 = l_8;
+    }
+    const uint32 l_10 = threadIdxGlobal + uint32(0);
+    const uint32 l_11 = l_10 * uint32(4);
+    const uint32 l_12 = l_5 + l_11;
+    const float l_13 = buffer_0[l_12];
+    l_mut_14 = l_13;
+    const uint32 l_15 = l_5 + l_11;
+    const uint32 l_16 = l_15 + uint32(1);
+    const float l_17 = buffer_0[l_16];
+    l_mut_18 = l_17;
+    const uint32 l_19 = l_5 + l_11;
+    const uint32 l_20 = l_19 + uint32(2);
+    const float l_21 = buffer_0[l_20];
+    l_mut_22 = l_21;
+    const uint32 l_23 = l_5 + l_11;
+    const uint32 l_24 = l_23 + uint32(3);
+    const float l_25 = buffer_0[l_24];
+    l_mut_26 = l_25;
+    const bool l_27 = l_3 != uint32(0);
+    const bool l_28 = l_4 == uint32(0);
+    const bool l_29 = l_27 && l_28;
+    if (l_29) {
+      const uint32 l_30 = l_mut_6 + l_11;
+      const float l_31 = buffer_1[l_30];
+      l_mut_14 = l_mut_14 * l_31;
+      const uint32 l_32 = l_mut_6 + l_11;
+      const uint32 l_33 = l_32 + uint32(1);
+      const float l_34 = buffer_1[l_33];
+      l_mut_18 = l_mut_18 * l_34;
+      const uint32 l_35 = l_mut_6 + l_11;
+      const uint32 l_36 = l_35 + uint32(2);
+      const float l_37 = buffer_1[l_36];
+      l_mut_22 = l_mut_22 * l_37;
+      const uint32 l_38 = l_mut_6 + l_11;
+      const uint32 l_39 = l_38 + uint32(3);
+      const float l_40 = buffer_1[l_39];
+      l_mut_26 = l_mut_26 * l_40;
+    }
+    const float l_41 = l_mut_14 + l_mut_18;
+    const float l_42 = l_mut_14 - l_mut_18;
+    const float l_43 = l_mut_22 + l_mut_26;
+    const float l_44 = l_mut_22 - l_mut_26;
+    const float l_45 = l_41 + l_43;
+    shared_memory_9[l_11] = l_45;
+    const uint32 l_46 = l_11 + uint32(1);
+    const float l_47 = l_42 + l_44;
+    shared_memory_9[l_46] = l_47;
+    const uint32 l_48 = l_11 + uint32(2);
+    const float l_49 = l_41 - l_43;
+    shared_memory_9[l_48] = l_49;
+    const uint32 l_50 = l_11 + uint32(3);
+    const float l_51 = l_42 - l_44;
+    shared_memory_9[l_50] = l_51;
+    __syncthreads();
+
+    const uint32 l_52 = threadIdxGlobal + uint32(0);
+    const uint32 l_53 = l_52 >> uint32(2);
+    const uint32 l_54 = l_52 & uint32(3);
+    const uint32 l_55 = l_53 * uint32(8);
+    const uint32 l_56 = l_55 + l_54;
+    const uint32 l_57 = l_56 + uint32(4);
+    const float l_58 = shared_memory_9[l_56];
+    const float l_59 = shared_memory_9[l_57];
+    const float l_60 = l_58 + l_59;
+    shared_memory_9[l_56] = l_60;
+    const float l_61 = l_58 - l_59;
+    shared_memory_9[l_57] = l_61;
+    const uint32 l_62 = threadIdxGlobal + uint32(64);
+    const uint32 l_63 = l_62 >> uint32(2);
+    const uint32 l_64 = l_62 & uint32(3);
+    const uint32 l_65 = l_63 * uint32(8);
+    const uint32 l_66 = l_65 + l_64;
+    const uint32 l_67 = l_66 + uint32(4);
+    const float l_68 = shared_memory_9[l_66];
+    const float l_69 = shared_memory_9[l_67];
+    const float l_70 = l_68 + l_69;
+    shared_memory_9[l_66] = l_70;
+    const float l_71 = l_68 - l_69;
+    shared_memory_9[l_67] = l_71;
+    __syncthreads();
+
+    const uint32 l_72 = threadIdxGlobal + uint32(0);
+    const uint32 l_73 = l_72 >> uint32(3);
+    const uint32 l_74 = l_72 & uint32(7);
+    const uint32 l_75 = l_73 * uint32(16);
+    const uint32 l_76 = l_75 + l_74;
+    const uint32 l_77 = l_76 + uint32(8);
+    const float l_78 = shared_memory_9[l_76];
+    const float l_79 = shared_memory_9[l_77];
+    const float l_80 = l_78 + l_79;
+    shared_memory_9[l_76] = l_80;
+    const float l_81 = l_78 - l_79;
+    shared_memory_9[l_77] = l_81;
+    const uint32 l_82 = threadIdxGlobal + uint32(64);
+    const uint32 l_83 = l_82 >> uint32(3);
+    const uint32 l_84 = l_82 & uint32(7);
+    const uint32 l_85 = l_83 * uint32(16);
+    const uint32 l_86 = l_85 + l_84;
+    const uint32 l_87 = l_86 + uint32(8);
+    const float l_88 = shared_memory_9[l_86];
+    const float l_89 = shared_memory_9[l_87];
+    const float l_90 = l_88 + l_89;
+    shared_memory_9[l_86] = l_90;
+    const float l_91 = l_88 - l_89;
+    shared_memory_9[l_87] = l_91;
+    __syncthreads();
+
+    const uint32 l_92 = threadIdxGlobal + uint32(0);
+    const uint32 l_93 = l_92 >> uint32(4);
+    const uint32 l_94 = l_92 & uint32(15);
+    const uint32 l_95 = l_93 * uint32(32);
+    const uint32 l_96 = l_95 + l_94;
+    const uint32 l_97 = l_96 + uint32(16);
+    const float l_98 = shared_memory_9[l_96];
+    const float l_99 = shared_memory_9[l_97];
+    const float l_100 = l_98 + l_99;
+    shared_memory_9[l_96] = l_100;
+    const float l_101 = l_98 - l_99;
+    shared_memory_9[l_97] = l_101;
+    const uint32 l_102 = threadIdxGlobal + uint32(64);
+    const uint32 l_103 = l_102 >> uint32(4);
+    const uint32 l_104 = l_102 & uint32(15);
+    const uint32 l_105 = l_103 * uint32(32);
+    const uint32 l_106 = l_105 + l_104;
+    const uint32 l_107 = l_106 + uint32(16);
+    const float l_108 = shared_memory_9[l_106];
+    const float l_109 = shared_memory_9[l_107];
+    const float l_110 = l_108 + l_109;
+    shared_memory_9[l_106] = l_110;
+    const float l_111 = l_108 - l_109;
+    shared_memory_9[l_107] = l_111;
+    __syncthreads();
+
+    const uint32 l_112 = threadIdxGlobal + uint32(0);
+    const uint32 l_113 = l_112 >> uint32(5);
+    const uint32 l_114 = l_112 & uint32(31);
+    const uint32 l_115 = l_113 * uint32(64);
+    const uint32 l_116 = l_115 + l_114;
+    const uint32 l_117 = l_116 + uint32(32);
+    const float l_118 = shared_memory_9[l_116];
+    const float l_119 = shared_memory_9[l_117];
+    const float l_120 = l_118 + l_119;
+    shared_memory_9[l_116] = l_120;
+    const float l_121 = l_118 - l_119;
+    shared_memory_9[l_117] = l_121;
+    const uint32 l_122 = threadIdxGlobal + uint32(64);
+    const uint32 l_123 = l_122 >> uint32(5);
+    const uint32 l_124 = l_122 & uint32(31);
+    const uint32 l_125 = l_123 * uint32(64);
+    const uint32 l_126 = l_125 + l_124;
+    const uint32 l_127 = l_126 + uint32(32);
+    const float l_128 = shared_memory_9[l_126];
+    const float l_129 = shared_memory_9[l_127];
+    const float l_130 = l_128 + l_129;
+    shared_memory_9[l_126] = l_130;
+    const float l_131 = l_128 - l_129;
+    shared_memory_9[l_127] = l_131;
+    __syncthreads();
+
+    const uint32 l_132 = threadIdxGlobal + uint32(0);
+    const uint32 l_133 = l_132 >> uint32(6);
+    const uint32 l_134 = l_132 & uint32(63);
+    const uint32 l_135 = l_133 * uint32(128);
+    const uint32 l_136 = l_135 + l_134;
+    const uint32 l_137 = l_136 + uint32(64);
+    const float l_138 = shared_memory_9[l_136];
+    const float l_139 = shared_memory_9[l_137];
+    const float l_140 = l_138 + l_139;
+    shared_memory_9[l_136] = l_140;
+    const float l_141 = l_138 - l_139;
+    shared_memory_9[l_137] = l_141;
+    const uint32 l_142 = threadIdxGlobal + uint32(64);
+    const uint32 l_143 = l_142 >> uint32(6);
+    const uint32 l_144 = l_142 & uint32(63);
+    const uint32 l_145 = l_143 * uint32(128);
+    const uint32 l_146 = l_145 + l_144;
+    const uint32 l_147 = l_146 + uint32(64);
+    const float l_148 = shared_memory_9[l_146];
+    const float l_149 = shared_memory_9[l_147];
+    const float l_150 = l_148 + l_149;
+    shared_memory_9[l_146] = l_150;
+    const float l_151 = l_148 - l_149;
+    shared_memory_9[l_147] = l_151;
+    __syncthreads();
+
+    const uint32 l_152 = threadIdxGlobal + uint32(0);
+    const uint32 l_153 = l_152 >> uint32(7);
+    const uint32 l_154 = l_152 & uint32(127);
+    const uint32 l_155 = l_153 * uint32(256);
+    const uint32 l_156 = l_155 + l_154;
+    const uint32 l_157 = l_156 + uint32(128);
+    const float l_158 = shared_memory_9[l_156];
+    const float l_159 = shared_memory_9[l_157];
+    const float l_160 = l_158 + l_159;
+    shared_memory_9[l_156] = l_160;
+    const float l_161 = l_158 - l_159;
+    shared_memory_9[l_157] = l_161;
+    const uint32 l_162 = threadIdxGlobal + uint32(64);
+    const uint32 l_163 = l_162 >> uint32(7);
+    const uint32 l_164 = l_162 & uint32(127);
+    const uint32 l_165 = l_163 * uint32(256);
+    const uint32 l_166 = l_165 + l_164;
+    const uint32 l_167 = l_166 + uint32(128);
+    const float l_168 = shared_memory_9[l_166];
+    const float l_169 = shared_memory_9[l_167];
+    const float l_170 = l_168 + l_169;
+    shared_memory_9[l_166] = l_170;
+    const float l_171 = l_168 - l_169;
+    shared_memory_9[l_167] = l_171;
+    __syncthreads();
+
+    const uint32 l_172 = threadIdxGlobal + uint32(0);
+    const uint32 l_173 = l_172 * uint32(4);
+    const float l_174 = shared_memory_9[l_173];
+    const float l_175 = l_174 * float(0.0625);
+    l_mut_26 = l_175;
+    const uint32 l_176 = l_173 + uint32(1);
+    const float l_177 = shared_memory_9[l_176];
+    const float l_178 = l_177 * float(0.0625);
+    l_mut_22 = l_178;
+    const uint32 l_179 = l_173 + uint32(2);
+    const float l_180 = shared_memory_9[l_179];
+    const float l_181 = l_180 * float(0.0625);
+    l_mut_18 = l_181;
+    const uint32 l_182 = l_173 + uint32(3);
+    const float l_183 = shared_memory_9[l_182];
+    const float l_184 = l_183 * float(0.0625);
+    l_mut_14 = l_184;
+    const bool l_185 = l_3 != uint32(0);
+    const bool l_186 = l_4 != uint32(0);
+    const bool l_187 = l_185 && l_186;
+    if (l_187) {
+      const uint32 l_188 = l_mut_6 + l_173;
+      const float l_189 = buffer_1[l_188];
+      l_mut_26 = l_mut_26 * l_189;
+      const uint32 l_190 = l_mut_6 + l_173;
+      const uint32 l_191 = l_190 + uint32(1);
+      const float l_192 = buffer_1[l_191];
+      l_mut_22 = l_mut_22 * l_192;
+      const uint32 l_193 = l_mut_6 + l_173;
+      const uint32 l_194 = l_193 + uint32(2);
+      const float l_195 = buffer_1[l_194];
+      l_mut_18 = l_mut_18 * l_195;
+      const uint32 l_196 = l_mut_6 + l_173;
+      const uint32 l_197 = l_196 + uint32(3);
+      const float l_198 = buffer_1[l_197];
+      l_mut_14 = l_mut_14 * l_198;
+    }
+    const uint32 l_199 = l_5 + l_173;
+    buffer_2[l_199] = l_mut_26;
+    const uint32 l_200 = l_5 + l_173;
+    const uint32 l_201 = l_200 + uint32(1);
+    buffer_2[l_201] = l_mut_22;
+    const uint32 l_202 = l_5 + l_173;
+    const uint32 l_203 = l_202 + uint32(2);
+    buffer_2[l_203] = l_mut_18;
+    const uint32 l_204 = l_5 + l_173;
+    const uint32 l_205 = l_204 + uint32(3);
+    buffer_2[l_205] = l_mut_14;
+  }
+}

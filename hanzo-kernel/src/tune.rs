@@ -1152,10 +1152,11 @@ mod tests {
     #[test]
     fn device_file_path_is_xdg_shaped() {
         let t = Tuner::new("/x/y");
-        assert_eq!(
-            t.device_file("Cuda::Runtime").to_str().unwrap(),
-            "/x/y/hanzo-kernel/autotune/Cuda__Runtime.tsv"
-        );
+        let want = PathBuf::from("/x/y")
+            .join("hanzo-kernel")
+            .join("autotune")
+            .join("Cuda__Runtime.tsv");
+        assert_eq!(t.device_file("Cuda::Runtime"), want);
     }
 
     // --- evolutionary search ------------------------------------------------------------------

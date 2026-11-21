@@ -12,11 +12,13 @@
 //!   expects.
 
 pub mod adam;
+pub mod agent_lightning;
 pub mod cache;
 pub mod cluster;
 pub mod dspark;
 pub mod gpu;
 pub mod model;
+pub mod raft;
 
 pub use cache::Cache;
 pub use model::{markov_bias, verify_checkpoint, Dspark, DsparkCfg};

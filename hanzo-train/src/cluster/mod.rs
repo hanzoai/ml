@@ -23,12 +23,14 @@
 //! [`replay`] reruns a run's rounds in one process from its log: with the same parts, the same
 //! exchange and the same outer step, it lands on the run's θ_global bit for bit.
 
+pub mod adacheck;
 pub mod coordinator;
 pub mod net;
 pub mod replay;
 pub mod worker;
 
 pub use crate::adam::{Adam, Hyper};
+pub use adacheck::{AdaCheckManifest, AdaCheckRestoreStats, AdaCheckStats, AdaCheckStore};
 pub use coordinator::{
     lead, start, Closed, Coordinator, Inner, Keep, Mark, Part, Report, Run, Start, Work,
 };
