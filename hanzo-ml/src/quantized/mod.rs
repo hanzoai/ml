@@ -14,8 +14,11 @@ pub mod ggml_file;
 pub mod gguf_file;
 mod iq_grids;
 pub mod iq_quants;
+pub mod t4x8_mx;
+pub mod dsv4_qat;
 pub mod imatrix_file;
 pub mod k_quants;
+use t4x8_mx::*;
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(not(target_arch = "wasm32"))]
@@ -155,6 +158,7 @@ impl QStorage {
                 GgmlDType::IQ4_XS => metal::load_quantized(d, as_t_slice::<BlockIQ4xs>(&data)),
                 GgmlDType::MXFP4 => metal::load_quantized(d, as_t_slice::<BlockMXFP4>(&data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(&data)),
+                GgmlDType::I32 => metal::load_quantized(d, as_t_slice::<i32>(&data)),
                 // IQ / ternary / 1-bit / NVFP4 codec types have no native Metal loader (CPU-decode only).
                 other => crate::bail!("{other:?} is not supported on the Metal backend"),
             },
@@ -177,6 +181,7 @@ impl QStorage {
                 GgmlDType::IQ4_XS => cuda::load_quantized(d, as_t_slice::<BlockIQ4xs>(&data)),
                 GgmlDType::MXFP4 => cuda::load_quantized(d, as_t_slice::<BlockMXFP4>(&data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(&data)),
+                GgmlDType::I32 => cuda::load_quantized(d, as_t_slice::<i32>(&data)),
                 // IQ / ternary / 1-bit / NVFP4 codec types: no native on-GPU quant-matmul kernel, but the
                 // GGML blocks upload to VRAM byte-for-byte like any other quant. QCudaStorage::fwd then
                 // dequantizes them to f32 (CPU codebook decode + upload) for a dense matmul -- see
@@ -195,6 +200,8 @@ impl QStorage {
                 GgmlDType::TQ2_0 => cuda::load_quantized(d, as_t_slice::<BlockTQ2_0>(&data)),
                 GgmlDType::NVFP4 => cuda::load_quantized(d, as_t_slice::<BlockNVFP4>(&data)),
                 GgmlDType::Q1_0 => cuda::load_quantized(d, as_t_slice::<BlockQ1_0>(&data)),
+                GgmlDType::PQ2_0 => cuda::load_quantized(d, as_t_slice::<BlockPQ2_0>(&data)),
+                GgmlDType::T4X8_MX => cuda::load_quantized(d, as_t_slice::<BlockT4x8Mx64>(&data)),
             },
             #[cfg(feature = "rocm")]
             Device::Rocm(d) => Ok(Self::Rocm(dtype.from_data(data), d.clone())),
@@ -425,6 +432,9 @@ pub enum GgmlDType {
     F32,
     F16,
     BF16,
+    /// Raw int32 (GGML type 26) — integer side tables like DeepSeek-V4's
+    /// `ffn_gate_tid2eid` hash-routing table. Dequantizes by casting to f32.
+    I32,
     Q4_0,
     Q4_1,
     Q5_0,
@@ -462,6 +472,9 @@ pub enum GgmlDType {
     TQ2_0,
     NVFP4,
     Q1_0,
+    PQ2_0,
+    #[allow(non_camel_case_types)]
+    T4X8_MX,
 }
 
 // --- Single-source-of-truth wiring (Cut 2) -----------------------------------------
@@ -484,6 +497,7 @@ macro_rules! gen_from_u32 {
                 0 => Self::F32,
                 1 => Self::F16,
                 30 => Self::BF16,
+                26 => Self::I32,
                 $( $id => Self::$v, )+
                 _ => crate::bail!("unknown dtype for tensor {u}"),
             };
@@ -502,6 +516,7 @@ macro_rules! gen_to_u32 {
                 Self::F32 => 0,
                 Self::F16 => 1,
                 Self::BF16 => 30,
+                Self::I32 => 26,
                 $( Self::$v => $id, )+
             }
         }
@@ -516,6 +531,7 @@ macro_rules! gen_cpu_zeros {
                 Self::F32 => Box::new(vec![f32::zeros(); elem_count]),
                 Self::F16 => Box::new(vec![f16::zeros(); elem_count]),
                 Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
+                Self::I32 => Box::new(vec![0i32; elem_count]),
                 $( Self::$v => Box::new(vec![<$b>::zeros(); elem_count / <$b>::BLCK_SIZE]), )+
             }
         }
@@ -529,6 +545,7 @@ macro_rules! gen_from_data {
                 Self::F32 => Box::new(as_t_slice::<f32>(&data).to_vec()),
                 Self::F16 => Box::new(as_t_slice::<f16>(&data).to_vec()),
                 Self::BF16 => Box::new(as_t_slice::<bf16>(&data).to_vec()),
+                Self::I32 => Box::new(as_t_slice::<i32>(&data).to_vec()),
                 $( Self::$v => Box::new(as_t_slice::<$b>(&data).to_vec()), )+
             }
         }
@@ -543,6 +560,7 @@ macro_rules! gen_type_size {
             match self {
                 Self::F32 => 4,
                 Self::F16 | Self::BF16 => 2,
+                Self::I32 => 4,
                 $( Self::$v => std::mem::size_of::<$b>(), )+
             }
         }
@@ -560,6 +578,7 @@ macro_rules! gen_type_align {
             match self {
                 Self::F32 => std::mem::align_of::<f32>(),
                 Self::F16 | Self::BF16 => std::mem::align_of::<f16>(),
+                Self::I32 => std::mem::align_of::<i32>(),
                 $( Self::$v => std::mem::align_of::<$b>(), )+
             }
         }
@@ -583,6 +602,7 @@ macro_rules! gen_from_mmap {
                 Self::F32 => Box::new(QMmap::<f32>::new(mmap, offset, n_blocks)),
                 Self::F16 => Box::new(QMmap::<f16>::new(mmap, offset, n_blocks)),
                 Self::BF16 => Box::new(QMmap::<bf16>::new(mmap, offset, n_blocks)),
+                Self::I32 => Box::new(QMmap::<i32>::new(mmap, offset, n_blocks)),
                 $( Self::$v => Box::new(QMmap::<$b>::new(mmap, offset, n_blocks)), )+
             }
         }
@@ -603,6 +623,7 @@ impl GgmlDType {
         match self {
             Self::F32 => 1,
             Self::F16 | Self::BF16 => 1,
+            Self::I32 => 1,
             Self::Q4_0 => k_quants::QK4_0,
             Self::Q4_1 => k_quants::QK4_1,
             Self::Q5_0 => k_quants::QK5_0,
@@ -612,6 +633,8 @@ impl GgmlDType {
             Self::IQ4_NL => k_quants::QK4_NL,
             Self::MXFP4 => k_quants::QK_MXFP4,
             Self::Q1_0 => iq_quants::QK1_0,
+            Self::PQ2_0 => iq_quants::QK_PQ2_0,
+            Self::T4X8_MX => t4x8_mx::QK_T4X8_MX,
             Self::NVFP4 => iq_quants::QK_NVFP4,
             Self::Q2K
             | Self::Q3K
@@ -1524,6 +1547,32 @@ pub fn moe_route(logits: &Tensor, topk: usize, norm: bool) -> Result<(Tensor, Te
             return Ok((ids_t, w_t));
         }
     }
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(cdev) = logits.device() {
+        if std::env::var("HANZO_MOE_ROUTE_FALLBACK").is_err() && n_experts <= 256 && topk <= 32 {
+            let logits_c = logits.to_dtype(DType::F32)?.contiguous()?;
+            let (lg_store, _) = logits_c.storage_and_layout();
+            let lr = match &*lg_store {
+                Storage::Cuda(c) => c,
+                _ => crate::bail!("moe_route: logits not on cuda after contiguous()"),
+            };
+            let lview = lr.as_cuda_slice::<f32>()?.slice(0..);
+            let (ids, w) = cuda::moe_route(&lview, ntok, n_experts, topk, norm, cdev)?;
+            let ids_t = crate::tensor::from_storage(
+                Storage::Cuda(ids),
+                (ntok, topk),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            let w_t = crate::tensor::from_storage(
+                Storage::Cuda(w),
+                (ntok, topk),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            return Ok((ids_t, w_t));
+        }
+    }
     let lf = logits.to_dtype(DType::F32)?;
     let mx = lf.max_keepdim(D::Minus1)?;
     let e = lf.broadcast_sub(&mx)?.exp()?;
@@ -1788,7 +1837,7 @@ impl QMatMul {
             }
         }
         let dequantize = match qtensor.dtype() {
-            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
+            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::I32 => true,
             // The Vulkan/wgpu/ROCm backends have no generic native quantized matmul, so dequantize
             // to f32 here (once, at construction) and run the regular f32 GPU matmul.
             _ => {

@@ -4,6 +4,7 @@
 #include "cuda_bf16.h"
 #include "cuda_fp16.h"
 #include <stdint.h>
+#include <type_traits>
 
 // Constants, types, and helpers shared with the indexed MoE kernels.
 
@@ -172,6 +173,14 @@ typedef struct {
   uint8_t qs[QK5_1 / 2];
 } block_q5_1;
 
+#define QK_PQ2_0 128
+#define QR_PQ2_0 4
+#define QI_PQ2_0 4
+typedef struct {
+  half d;
+  uint8_t qs[QK_PQ2_0 / 4];
+} block_pq2_0;
+
 // VDR = vec-dot unroll factor per type.
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_1_Q8_1_MMVQ 2
@@ -184,6 +193,7 @@ typedef struct {
 #define VDR_Q4_K_Q8_1_MMVQ 2
 #define VDR_Q5_K_Q8_1_MMVQ 2
 #define VDR_Q6_K_Q8_1_MMVQ 1
+#define VDR_PQ2_0_Q8_1_MMVQ 1
 
 // ---------------------------------------------------------------------------
 // vec_dot impl helpers (per-quant-type)
@@ -631,6 +641,55 @@ vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
   return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_pq2_0_q8_1_multi(
+    const void *__restrict__ vbq,
+    const block_q8_1 *__restrict__ bq8_1,
+    const int &kbx,
+    const int &iqs,
+    const uint32_t stride_col_y,
+    float *result) {
+  const block_pq2_0 *bq2_0 = (const block_pq2_0 *)vbq + kbx;
+  const float d2 = __half2float(bq2_0->d);
+  const int16_t *qs = (const int16_t *)bq2_0->qs + iqs * 4;
+
+  int sumi[ncols_dst] = {};
+
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int q = qs[j];
+    const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+    const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+    const int qx = __byte_perm(qe, qo, 0x5140);
+    const int qy = __byte_perm(qe, qo, 0x7362);
+
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+      const block_q8_1 *bq8_1_chunk = bq8_1 + col * stride_col_y + iqs;
+      const int u = get_int_from_int8_aligned(bq8_1_chunk->qs, j * 2 + 0);
+      const int v = get_int_from_int8_aligned(bq8_1_chunk->qs, j * 2 + 1);
+      sumi[col] = ggml_cuda_dp4a(u, qx, sumi[col]);
+      sumi[col] = ggml_cuda_dp4a(v, qy, sumi[col]);
+    }
+  }
+
+#pragma unroll
+  for (int col = 0; col < ncols_dst; ++col) {
+    const block_q8_1 *bq8_1_chunk = bq8_1 + col * stride_col_y + iqs;
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    result[col] = d2 * d8 * (float)sumi[col];
+  }
+}
+
+static __device__ __forceinline__ float
+vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &kbx,
+                   const int &iqs) {
+  float result;
+  vec_dot_pq2_0_q8_1_multi<1>(vbq, bq8_1, kbx, iqs, 0, &result);
+  return result;
+}
+
 // Core mat-vec-q template.
 
 static constexpr __device__ int mmvq_nwarps_for(int ncols_dst) {
@@ -638,7 +697,7 @@ static constexpr __device__ int mmvq_nwarps_for(int ncols_dst) {
 }
 
 static constexpr __device__ int mmvq_rows_per_cuda_block_for(int ncols_dst) {
-  return (ncols_dst == 1) ? 1 : 2;
+  return (ncols_dst == 1 || ncols_dst >= 8) ? 1 : 2;
 }
 
 template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
@@ -666,14 +725,29 @@ static __device__ void mmvq_core_impl(
     const int kby = kbx * (qk / QK8_1);
     const int kqs = vdr * (tid % (qi / vdr));
 
-#pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
+    if constexpr (std::is_same_v<block_q_t, block_pq2_0> && ncols_dst > 1) {
 #pragma unroll
       for (int i = 0; i < rows_per_cuda_block; ++i) {
         const int row = row0 + i;
         const int weight_kbx = row * blocks_per_row_x + kbx;
-        tmp[j][i] +=
-            vec_dot_q_cuda(vx, &y[j * stride_col_y + kby], weight_kbx, kqs);
+        float dots[ncols_dst];
+        vec_dot_pq2_0_q8_1_multi<ncols_dst>(vx, &y[kby], weight_kbx, kqs,
+                                            stride_col_y, dots);
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+          tmp[j][i] += dots[j];
+        }
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+          const int row = row0 + i;
+          const int weight_kbx = row * blocks_per_row_x + kbx;
+          tmp[j][i] +=
+              vec_dot_q_cuda(vx, &y[j * stride_col_y + kby], weight_kbx, kqs);
+        }
       }
     }
   }
@@ -805,6 +879,8 @@ MMVQ_PLAIN_BATCH_SET(q5_k, block_q5_K, QK_K, QI5_K, VDR_Q5_K_Q8_1_MMVQ,
                      vec_dot_q5_K_q8_1)
 MMVQ_PLAIN_BATCH_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
                      vec_dot_q6_K_q8_1)
+MMVQ_PLAIN_BATCH_SET(pq2_0, block_pq2_0, QK_PQ2_0, QI_PQ2_0,
+                     VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1)
 
 // Padding-aware BF16/F16/F32 -> Q8_1 quantize kernels.
 
@@ -984,6 +1060,7 @@ MMVQ_LAUNCHER_PLAIN(q3_k, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(q4_k, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(q5_k, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(q6_k, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_PLAIN(pq2_0, bf16, __nv_bfloat16)
 
 MMVQ_LAUNCHER_PLAIN(q4_0, f16, half)
 MMVQ_LAUNCHER_PLAIN(q4_1, f16, half)
@@ -995,6 +1072,7 @@ MMVQ_LAUNCHER_PLAIN(q3_k, f16, half)
 MMVQ_LAUNCHER_PLAIN(q4_k, f16, half)
 MMVQ_LAUNCHER_PLAIN(q5_k, f16, half)
 MMVQ_LAUNCHER_PLAIN(q6_k, f16, half)
+MMVQ_LAUNCHER_PLAIN(pq2_0, f16, half)
 
 MMVQ_LAUNCHER_PLAIN(q4_0, f32, float)
 MMVQ_LAUNCHER_PLAIN(q4_1, f32, float)
@@ -1006,6 +1084,7 @@ MMVQ_LAUNCHER_PLAIN(q3_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q4_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q5_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q6_k, f32, float)
+MMVQ_LAUNCHER_PLAIN(pq2_0, f32, float)
 
 // Quantize launchers.
 

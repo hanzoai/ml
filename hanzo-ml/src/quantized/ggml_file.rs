@@ -232,6 +232,12 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q1_0 => {
             from_raw_data::<iq_quants::BlockQ1_0>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::PQ2_0 => {
+            from_raw_data::<iq_quants::BlockPQ2_0>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::T4X8_MX => {
+            from_raw_data::<crate::quantized::t4x8_mx::BlockT4x8Mx64>(raw_data, size_in_bytes, dims, device)
+        }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
 }

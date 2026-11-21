@@ -402,3 +402,66 @@ Two gaps closed on the CUDA path (GB10), both validated by `cuda_iquant_tests.rs
   -- the base-3 scalar unpack is the wall (compute-bound), exactly as the "fits-but-irregular" call
   predicted; TQ2_0's clean 2-bit dp4a is the real win. GOTCHA (unchanged): bindgen_cuda tracks .cu mtimes
   not .cuh -- a new mmq_instance_*.cu compiles fresh, but after a .cuh-only edit `touch` the dependents.
+
+## CUDA i-quant decode: unpack_ksigns kills the KSIGNS gather -- IQ2_XXS 1.71x (the REAL GB10 wall)
+The i-quant DECODE matvec (`iquant_mmvq.cu`) is ~75% of GB10 i-quant decode GPU-time (nsys). Diffing it
+against llama.cpp's `vec_dot_iq2_xxs_q8_1` (the reference that was beating us) found TWO ROCm-port
+artifacts, BOTH fixed bit-identically to match llama -- and the A/B isolates which one actually mattered.
+- **THE LEVER -- kill the divergent KSIGNS `__constant__` gather (`unpack_ksigns`).** The sign codebook
+  `KSIGNS_IQ2XS_D[idx]` was a per-coord `__constant__` load with a DIVERGENT index (each lane a different
+  idx) -> serialized through the constant cache. llama computes it table-free: the 7-bit index's 8th sign
+  is the popcount-parity of the other 7, so `__popc` reconstructs the 8-bit mask (`unpack_ksigns(v) =
+  (v ^ ((popc(v&127)&1)<<7)) * 0x01010101`, broadcast for the byte selectors). PROVED bit-identical:
+  `KSIGNS_IQ2XS_D[i] == i ^ ((popc(i)&1)<<7)` for all i (e.g. [1]=129=0x81, [2]=130, [4]=132). NO
+  constant-cache gather on the decode hot path.
+- **THE NEUTRAL HALF -- `__vsub4` 1-dp4a (matches llama, but flat).** Signs applied via CUDA-native
+  `__vsub4((g^m)-m = -g)` -> ONE dp4a, vs the 2-dp4a `dp4a(g,u) - 2*dp4a(g&mask,u)` form RDNA3.5 needed
+  (no `__vsub4`). Bit-identical. The A/B proves this alone is ~0% (the ROCm note's "2-dp4a vs vsub4 is a
+  wash" holds on Blackwell too -- `__vsub4` is emulated post-Kepler).
+- **A/B (kernel microbench, 4096x4096, GB10, `bench_iquant_decode`; controls IQ1_S/IQ4_XS byte-identical
+  across runs -> harness thermal-stable):** ksigns types win, raw-byte types flat -- which ISOLATES the
+  gather as the cause:
+    IQ2_XXS 84.67->49.49 us = **1.71x** (51->87 GB/s) -- the dominant kernel
+    IQ3_XXS 113.09->80.95 us = **1.40x** (57->79 GB/s)
+    IQ2_XS  150.87->120.51 us = **1.25x** (32->40 GB/s)
+    IQ2_S/IQ3_S (raw-byte signs, no gather to kill -> only the neutral __vsub4): FLAT (202/84 us)
+- **CORRECTS the prior "47 GB/s VALU wall" conclusion.** The occupancy fork measured the BASELINE kernel
+  (51 GB/s) and called it a VALU wall; it was actually the KSIGNS-GATHER wall. `unpack_ksigns` lifts
+  IQ2_XXS to 87 GB/s == the ROCm/llama practical wall that GB10 had been LAGGING. Every prior "non-lever"
+  (occupancy, graphs, op-fusion) missed it because none touched the codebook-decode sign math.
+- DRY: one selector-based `dp4a_signed(b, sel, grid, u)` over all 5 sign types (IQ2_XXS/IQ2_XS/IQ3_XXS
+  ksigns + IQ2_S/IQ3_S raw-byte broadcast); `iq_bytemask4` dropped; f32 scale kept (bit-exact vs the
+  to_float oracle, only the integer grid*act dot is dp4a). FOLLOW-UP: `KSIGNS_IQ2XS_D` (iquant_grids.cuh)
+  is now dead in the decode path -- drop from the table + `gen_iquant_grids.py`. Bit-exact: 13/13
+  `cuda_iquant_tests` (max_rel ~1.7e-4 = the f32-weight-materialization floor). SHIPPED ml 0.11.26 /
+  kernels 0.11.23.
+- **MODEL-LEVEL: a GB10 NON-LEVER (the honest end-to-end result).** Same-engine A/B (hanzo-engine
+  v1.4.1, ml 0.11.25 baseline vs 0.11.26 dp4a, Qwen3-4B-UD-IQ2_XXS = IQ2_XXS-dominated 204 tensors,
+  `bench --prompt-len 128 --gen-len 256`): **FLAT** both graphs-ON (dp4a 66.1 vs base 66.2 T/s) AND
+  eager (60.2 vs 60.2). The 1.71x KERNEL win does NOT surface end-to-end because GB10 hanzo i-quant
+  decode is **HOST/launch-overhead-bound, not matvec-GPU-bound** -- the GPU finishes the (now faster)
+  matvec and stalls on per-token host work, so shrinking matvec GPU-time doesn't move the wall. (The
+  op-fusion profile's "75% matvec" was GPU-BUSY share, NOT wall share.) So dp4a joins occupancy /
+  graphs-for-kernel / op-fusion / moe_route as a real kernel win that is a GB10 **model-level non-lever**;
+  the actual GB10 decode lever is LAUNCH reduction -- which is exactly what the dense-Llama decode-graph
+  gate (+6.8%, hanzo-engine v1.4.1) attacks. dp4a STILL ships and stays: bit-exact (zero regression),
+  decomplects (one selector helper, drops a 128-entry table + a divergent constant gather, matches
+  llama), and is a LATENT win for genuinely matvec-bound regimes (ROCm 30B-A3B eager surfaced the
+  i-quant kernel 2.27x -- a different platform/bottleneck). NOTE: corrects this section's earlier
+  "compute-bound, kernel wins fully surface" framing, which held on ROCm-eager but NOT GB10-under-graphs.
+
+## CUDA fused moe_route router -- bit-exact, a GB10 model-level NON-LEVER but SHIPPED for backend symmetry
+Ported the ROCm `moe_route` fusion (softmax->topk->renorm, one block/token) to CUDA + a bit-exact gate
+(`cuda_moe_route_numeric`, nbad_id=0, max_w_err 5.96e-8) -- but the decode A/B on Qwen3-30B-A3B-UD-IQ2_M
+is FLAT both graph regimes (graphs-ON 34.25 vs 34.37, eager 32.32 vs 32.38; +-3% noise, no direction).
+WHY (the ROCm rule "a fusion helps only if it ELIMINATES work"): the fusion REPACKAGES the routing into
+one block-serial launch, it doesn't eliminate it -- at decode ntok=1 the single 64-thread block
+underutilizes the GPU exactly as the parallel ml-op sort/sum/div do, and CUDA decode is not router-
+launch-bound (graphs buy ~6% total). ROCm's +13% came from its disproportionately expensive amdgcn
+gpu-sort, which CUDA lacks. SHIPPED (ml 0.11.29) as the backend-TWIN of the ROCm moe_route: composing it
+completes the abstraction -- ONE `quantized::moe_route` with ROCm + CUDA fast paths + the ml-op fallback,
+symmetric backends -- which is MORE decomplected than CUDA-missing, so the earlier "2nd path" worry doesn't
+hold (the ROCm fast path already exists; CUDA was the only backend still on the unfused ml-op chain). Flat
+perf is fine to re-bench on a 256-expert model (DeepSeek-V4, 2x router math) where it may clear the floor.
+ALSO in this release: dropped the now-dead `KSIGNS_IQ2XS_D` CUDA decode table (gen_iquant_grids.py
+`DECODE_SKIP` -- unpack_ksigns reconstructs it in-kernel; the Rust ksigns stays for the CPU oracle).

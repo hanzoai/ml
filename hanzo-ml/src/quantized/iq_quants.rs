@@ -21,6 +21,7 @@ use half::f16;
 
 // ggml block sizes that are not QK_K.
 pub const QK1_0: usize = 128;
+pub const QK_PQ2_0: usize = 128;
 pub const QK_NVFP4: usize = 64;
 pub const QK_NVFP4_SUB: usize = 16;
 
@@ -79,6 +80,36 @@ quant_format! {
                 let byte = xs[i].qs[j / 8];
                 let bit = (byte >> (j % 8)) & 1;
                 ys[i * QK1_0 + j] = if bit != 0 { d } else { neg_d };
+            }
+        }
+    },
+}
+
+// ============================================================================
+// PQ2_0 — 2-bit ternary at group size 128 (d: f16, qs: [u8; 32]).
+// value = (q&3 - 1) * d. (0 -> -1, 1 -> 0, 2 -> +1).
+// ============================================================================
+quant_format! {
+    name: BlockPQ2_0,
+    dtype: PQ2_0,
+    block_elems: QK_PQ2_0,
+    byte_size: 34,
+    vec_dot: BlockQ8_0,
+    fields: {
+        d: f16,
+        qs: [u8; QK_PQ2_0 / 4],
+    },
+    decode: |xs, ys| {
+        let k = ys.len();
+        debug_assert!(k.is_multiple_of(QK_PQ2_0), "dequantize_row_pq2_0: {k} % {QK_PQ2_0} != 0");
+        let nb = k / QK_PQ2_0;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            for j in 0..QK_PQ2_0 {
+                let byte = xs[i].qs[j / 4];
+                let q = (byte >> ((j % 4) * 2)) & 3;
+                let trit = (q as i8) - 1;
+                ys[i * QK_PQ2_0 + j] = trit as f32 * d;
             }
         }
     },

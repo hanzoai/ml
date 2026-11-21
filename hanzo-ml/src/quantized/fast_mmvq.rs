@@ -32,6 +32,7 @@ fn supports(dtype: GgmlDType) -> bool {
             | GgmlDType::Q4K
             | GgmlDType::Q5K
             | GgmlDType::Q6K
+            | GgmlDType::PQ2_0
     )
 }
 
@@ -109,6 +110,7 @@ fn plain_launcher_bf16(dtype: GgmlDType) -> Option<PlainLauncher> {
         GgmlDType::Q4K => ffi::launch_mmvq_gguf_q4_k_bf16_plain,
         GgmlDType::Q5K => ffi::launch_mmvq_gguf_q5_k_bf16_plain,
         GgmlDType::Q6K => ffi::launch_mmvq_gguf_q6_k_bf16_plain,
+        GgmlDType::PQ2_0 => ffi::launch_mmvq_gguf_pq2_0_bf16_plain,
         _ => return None,
     };
     Some(f)
@@ -127,6 +129,7 @@ fn plain_launcher_f16(dtype: GgmlDType) -> Option<PlainLauncher> {
         GgmlDType::Q4K => ffi::launch_mmvq_gguf_q4_k_f16_plain,
         GgmlDType::Q5K => ffi::launch_mmvq_gguf_q5_k_f16_plain,
         GgmlDType::Q6K => ffi::launch_mmvq_gguf_q6_k_f16_plain,
+        GgmlDType::PQ2_0 => ffi::launch_mmvq_gguf_pq2_0_f16_plain,
         _ => return None,
     };
     Some(f)
@@ -145,6 +148,7 @@ fn plain_launcher_f32(dtype: GgmlDType) -> Option<PlainLauncher> {
         GgmlDType::Q4K => ffi::launch_mmvq_gguf_q4_k_f32_plain,
         GgmlDType::Q5K => ffi::launch_mmvq_gguf_q5_k_f32_plain,
         GgmlDType::Q6K => ffi::launch_mmvq_gguf_q6_k_f32_plain,
+        GgmlDType::PQ2_0 => ffi::launch_mmvq_gguf_pq2_0_f32_plain,
         _ => return None,
     };
     Some(f)

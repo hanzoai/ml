@@ -2709,6 +2709,42 @@ impl GgmlType for f32 {
     }
 }
 
+// Raw int32 side-table type (GGML type 26), e.g. DeepSeek-V4's `ffn_gate_tid2eid`.
+// Never matmul'd — only read + dequantized (i32 -> f32 cast).
+impl GgmlType for i32 {
+    const DTYPE: GgmlDType = GgmlDType::I32;
+    const BLCK_SIZE: usize = 1;
+    const DIRECT_COPY: bool = false;
+    type VecDotType = f32;
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        let n = n.min(xs.len()).min(ys.len());
+        (0..n).map(|i| xs[i] as f32 * ys[i]).sum()
+    }
+
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        debug_assert_eq!(xs.len(), ys.len());
+        for (y, &x) in ys.iter_mut().zip(xs) {
+            *y = x as i32;
+        }
+    }
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        debug_assert_eq!(xs.len(), ys.len());
+        for (y, &x) in ys.iter_mut().zip(xs) {
+            *y = x as f32;
+        }
+    }
+
+    fn direct_copy(xs: &[f32], ys: &mut [Self]) {
+        Self::from_float(xs, ys)
+    }
+}
+
 impl GgmlType for f16 {
     const DTYPE: GgmlDType = GgmlDType::F16;
     const BLCK_SIZE: usize = 1;
