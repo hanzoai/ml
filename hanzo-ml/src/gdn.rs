@@ -18,7 +18,7 @@ fn ensure_contiguous_offset_zero(t: &Tensor) -> Result<Tensor> {
     if t.is_contiguous() && t.layout().start_offset() == 0 {
         Ok(t.clone())
     } else {
-        t.contiguous()
+        t.force_contiguous()
     }
 }
 
@@ -181,7 +181,7 @@ pub fn try_conv1d_step(
             let x_c = ensure_contiguous_offset_zero(x)?;
             let w_c = ensure_contiguous_offset_zero(&w)?;
             if !conv_state.is_contiguous() || conv_state.layout().start_offset() != 0 {
-                *conv_state = conv_state.contiguous()?;
+                *conv_state = conv_state.force_contiguous()?;
             }
             let (xs, _) = x_c.storage_and_layout();
             let (ws, _) = w_c.storage_and_layout();
@@ -695,7 +695,12 @@ pub fn try_recurrence(
     {
         state.clone()
     } else {
-        state.to_dtype(DType::F32)?.contiguous()?
+        let s = state.to_dtype(DType::F32)?;
+        if q.device().is_vulkan() {
+            ensure_contiguous_offset_zero(&s)?
+        } else {
+            ensure_contiguous_view(&s)?
+        }
     };
 
     let out_bh: Tensor = match q.device() {

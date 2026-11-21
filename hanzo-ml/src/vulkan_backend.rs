@@ -522,6 +522,9 @@ struct Submitter {
     // barrier and at the start of every batch. See `dispatch` for the correctness argument (WAW/WAR
     // can't occur within a batch because the buffer pool only recycles handles across fences).
     written_since_barrier: std::collections::HashSet<vk::Buffer>,
+    // Buffers read since the last memory barrier; an in-place write (`copy2d`, `slice_set`,
+    // `gdn_scan`, `gdn_conv1d_step`) to any buffer in this set triggers a WAR barrier.
+    read_since_barrier: std::collections::HashSet<vk::Buffer>,
     // Per-batch profiling accumulators (VK_PROFILE=1). `record_ns` is the wall time spent in
     // the dispatch recording path (descriptor push/update + cmd_dispatch + barrier bookkeeping)
     // since the batch began; `barriers` counts memory barriers emitted this batch. Both reset per
@@ -4859,6 +4862,7 @@ impl VulkanDevice {
         s.recording = false;
         s.n = 0;
         s.written_since_barrier.clear();
+        s.read_since_barrier.clear();
         Ok(())
     }
 
@@ -5262,6 +5266,7 @@ impl VulkanDevice {
                 s.n = 0;
                 s.work = 0;
                 s.written_since_barrier.clear();
+                s.read_since_barrier.clear();
                 s.record_ns = 0;
                 s.barriers = 0;
                 if self.inner.gpu_profile {
@@ -5279,20 +5284,18 @@ impl VulkanDevice {
             // Both paths share the identical descriptor-push + barrier + dispatch recording below, so a
             // captured graph replays the exact op/barrier sequence the eager forward would run.
             let cmd = if s.capturing { s.graph_cmd } else { s.cmd };
-            // RAW hazard: if this dispatch touches a buffer that an earlier dispatch in this same
-            // batch wrote (and we haven't barriered since), insert ONE memory barrier first, then
-            // start a new barrier-free group. Independent dispatches (disjoint buffers, or reading
-            // only weights/inputs from an earlier already-fenced batch) need no barrier and the GPU
-            // can overlap their fixed launch/drain overhead -- the win on the decode hot path, which
-            // is hundreds of tiny dispatches/token where that overhead, not compute, dominates.
-            // We test ALL bindings (not just the inputs): a fresh output handle is never already in
-            // the set (the pool recycles handles only across fences, so live handles are unique
-            // in-batch), so this is exact for normal ops AND also catches the in-place scatter
-            // kernels' read-modify-write of binding 0.
+            // RAW/WAW/WAR hazard tracking: insert a barrier when this dispatch touches any buffer
+            // written since the last barrier (RAW/WAW) OR writes in-place to any buffer read since
+            // the last barrier (WAR — e.g. `copy2d`/`slice_set`/`gdn_scan`/`gdn_conv1d_step`
+            // mutating a state or KV buffer that an earlier dispatch in this batch is still reading).
             let reads_inflight_write = bufs.iter().any(|b| s.written_since_barrier.contains(b));
-            if reads_inflight_write {
+            let writes_inflight_read = out_idxs
+                .iter()
+                .filter_map(|&idx| bufs.get(idx))
+                .any(|b| s.read_since_barrier.contains(b));
+            if reads_inflight_write || writes_inflight_read {
                 let bar = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
                 dev.cmd_pipeline_barrier(
                     cmd,
@@ -5304,6 +5307,7 @@ impl VulkanDevice {
                     &[],
                 );
                 s.written_since_barrier.clear();
+                s.read_since_barrier.clear();
                 s.barriers += 1;
             }
             // Buffer infos are needed by both paths; build them once. (WriteDescriptorSet borrows
@@ -5418,6 +5422,9 @@ impl VulkanDevice {
             // runs post-fence), so no two live allocations in one batch share a handle -- thus the
             // only intra-batch hazard is RAW, which this set captures. Cross-batch ordering is the
             // full queue_submit + fence wait in flush_locked.
+            for &buf in bufs {
+                s.read_since_barrier.insert(buf);
+            }
             for &out_idx in out_idxs {
                 if let Some(&out_buf) = bufs.get(out_idx) {
                     s.written_since_barrier.insert(out_buf);
@@ -5568,6 +5575,7 @@ impl VulkanDevice {
             s.graph_cmd = cmd;
             s.capturing = true;
             s.written_since_barrier.clear();
+            s.read_since_barrier.clear();
             s.n = 0;
             s.barriers = 0;
             cmd
@@ -5597,6 +5605,7 @@ impl VulkanDevice {
             s.graph_cmd = vk::CommandBuffer::null();
             s.n = 0;
             s.written_since_barrier.clear();
+            s.read_since_barrier.clear();
             (cmd, n)
         };
         // This capture era's reservations transfer to the graph (captures never nest: begin bails on
@@ -5637,6 +5646,7 @@ impl VulkanDevice {
         s.graph_cmd = vk::CommandBuffer::null();
         s.n = 0;
         s.written_since_barrier.clear();
+        s.read_since_barrier.clear();
         drop(s);
         let mut pool = self.inner.bufpool.lock().unwrap();
         pool.capture_depth = pool.capture_depth.saturating_sub(1);
@@ -6353,6 +6363,7 @@ impl BackendDevice for VulkanDevice {
                 work: 0,
                 submits: 0,
                 written_since_barrier: std::collections::HashSet::new(),
+                read_since_barrier: std::collections::HashSet::new(),
                 record_ns: 0,
                 barriers: 0,
                 qpool,

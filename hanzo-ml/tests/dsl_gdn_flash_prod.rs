@@ -845,6 +845,255 @@ fn run_fwht_suite(dev: &Device, dtypes: &[DType], label: &str) {
     assert!(calls >= 5, "must have dispatched >= 5 FWHT b=1024 calls");
 }
 
+/// Regression guard for:
+/// 1) Narrowed contiguous slices with non-zero `start_offset()` passed to DSL GDN / FWHT / Flash
+///    (must materialize at offset 0 on Vulkan instead of silently reading element 0).
+/// 2) In-place read-then-write (WAR) sequences within one unflushed GPU command batch.
+fn run_offset_and_war_regression_suite(dev: &Device, label: &str) {
+    dsl::set_gdn_impl(QkImpl::Dsl);
+    dsl::set_fwht_impl(QkImpl::Dsl);
+    dsl::set_flash_impl(QkImpl::Dsl);
+
+    // 1. Narrowed non-zero start_offset on FWHT
+    let x_big = Tensor::from_vec(pseudo_vec(3 * 128, 701, 0.8), (3, 128), dev).unwrap();
+    let x_slice = x_big.narrow(0, 2, 1).unwrap();
+    assert!(x_slice.is_contiguous() && x_slice.layout().start_offset() > 0);
+    let x_packed = x_slice.force_contiguous().unwrap();
+    let y_slice = hanzo_ml::fwht::try_hadamard_fwht(&x_slice, None, 128, false)
+        .unwrap()
+        .expect("FWHT DSL active")
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let y_packed = hanzo_ml::fwht::try_hadamard_fwht(&x_packed, None, 128, false)
+        .unwrap()
+        .expect("FWHT DSL active")
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let fwht_err = rel_err(&y_slice, &y_packed);
+    assert!(
+        fwht_err <= 1e-5,
+        "[{label}] FWHT non-zero start_offset mismatch: {fwht_err:.2e}"
+    );
+
+    // 1b. Narrowed non-zero start_offset on FlashAttention contiguous SDPA
+    let q_big = Tensor::from_vec(pseudo_vec(3 * 2 * 4 * 64, 702, 0.4), (3, 2, 4, 64), dev).unwrap();
+    let k_big = Tensor::from_vec(pseudo_vec(3 * 2 * 16 * 64, 703, 0.4), (3, 2, 16, 64), dev).unwrap();
+    let v_big = Tensor::from_vec(pseudo_vec(3 * 2 * 16 * 64, 704, 0.4), (3, 2, 16, 64), dev).unwrap();
+    let q_sl = q_big.narrow(0, 1, 2).unwrap();
+    let k_sl = k_big.narrow(0, 1, 2).unwrap();
+    let v_sl = v_big.narrow(0, 1, 2).unwrap();
+    assert!(q_sl.is_contiguous() && q_sl.layout().start_offset() > 0);
+    let flash_cfg = FlashAttnConfig::causal(1.0 / 8.0);
+    let flash_sl = try_flash_attn_contiguous(&q_sl, &k_sl, &v_sl, flash_cfg)
+        .unwrap()
+        .expect("Flash DSL active")
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let flash_pk = try_flash_attn_contiguous(
+        &q_sl.force_contiguous().unwrap(),
+        &k_sl.force_contiguous().unwrap(),
+        &v_sl.force_contiguous().unwrap(),
+        flash_cfg,
+    )
+    .unwrap()
+    .expect("Flash DSL active")
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+    let flash_off_err = rel_err(&flash_sl, &flash_pk);
+    assert!(
+        flash_off_err <= 1e-5,
+        "[{label}] FlashAttention non-zero start_offset mismatch: {flash_off_err:.2e}"
+    );
+
+    // 2. Narrowed non-zero start_offset on GDN recurrence + WAR in-place state snapshot
+    let (b, total_seq, nh, kd, vd) = (1usize, 5usize, 2usize, 64usize, 64usize);
+    let q_all = Tensor::from_vec(pseudo_vec(b * total_seq * nh * kd, 711, 0.3), (b, total_seq, nh, kd), dev).unwrap();
+    let k_all = Tensor::from_vec(pseudo_vec(b * total_seq * nh * kd, 712, 0.3), (b, total_seq, nh, kd), dev).unwrap();
+    let v_all = Tensor::from_vec(pseudo_vec(b * total_seq * nh * vd, 713, 0.3), (b, total_seq, nh, vd), dev).unwrap();
+    let g_all = Tensor::from_vec(
+        pseudo_vec(b * total_seq * nh, 714, 0.25).into_iter().map(|x| x - 0.35).collect(),
+        (b, total_seq, nh),
+        dev,
+    )
+    .unwrap();
+    let beta_all = Tensor::from_vec(
+        pseudo_vec(b * total_seq * nh, 715, 0.4).into_iter().map(|x| (x + 1.0) * 0.5).collect(),
+        (b, total_seq, nh),
+        dev,
+    )
+    .unwrap();
+
+    // Run full 5 steps in one shot
+    let mut st_one = Tensor::zeros((b, nh, kd, vd), DType::F32, dev).unwrap();
+    let y_one = try_recurrence(&q_all, &k_all, &v_all, &g_all, &beta_all, &mut st_one, true)
+        .unwrap()
+        .expect("GDN DSL active");
+
+    // Run step-by-step using `.narrow(1, t, 1)` (non-zero start_offset for t >= 1!)
+    // AND snapshot `st_step` via on-GPU `force_contiguous()` (no host readback flush!) before next in-place step (WAR test).
+    let mut st_step = Tensor::zeros((b, nh, kd, vd), DType::F32, dev).unwrap();
+    let mut y_steps = Vec::new();
+    let mut snapshots = Vec::new();
+    for t in 0..total_seq {
+        let qt = q_all.narrow(1, t, 1).unwrap();
+        let kt = k_all.narrow(1, t, 1).unwrap();
+        let vt = v_all.narrow(1, t, 1).unwrap();
+        let gt = g_all.narrow(1, t, 1).unwrap();
+        let bt = beta_all.narrow(1, t, 1).unwrap();
+        let yt = try_recurrence(&qt, &kt, &vt, &gt, &bt, &mut st_step, true)
+            .unwrap()
+            .expect("GDN DSL active");
+        snapshots.push(st_step.force_contiguous().unwrap());
+        y_steps.push(yt);
+    }
+    let y_cat = Tensor::cat(&y_steps, 1).unwrap();
+    let y_err = rel_err(
+        &y_one.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &y_cat.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+    let st_err = rel_err(
+        &st_one.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &st_step.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+    // Snapshot taken at t=2 must match an independent 3-step run (proves no WAR overwrite by t=3,4!)
+    let mut st_3 = Tensor::zeros((b, nh, kd, vd), DType::F32, dev).unwrap();
+    let _ = try_recurrence(
+        &q_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
+        &k_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
+        &v_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
+        &g_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
+        &beta_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
+        &mut st_3,
+        true,
+    )
+    .unwrap()
+    .expect("GDN DSL active");
+    let war_err = rel_err(
+        &snapshots[2].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &st_3.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+
+    // 3. Prefix-fork & speculative-rollback from snapshot[2]:
+    // Fork A replays tokens 3..5 from snapshots[2] (must match 5-step st_one).
+    // Fork B branches onto an alternate 2-token speculative continuation from snapshots[2]
+    // (must match an independent 3+2 reference run, and leave snapshots[2] bit-identical).
+    let mut fork_a = snapshots[2].force_contiguous().unwrap();
+    let y_fork_a = try_recurrence(
+        &q_all.narrow(1, 3, 2).unwrap(),
+        &k_all.narrow(1, 3, 2).unwrap(),
+        &v_all.narrow(1, 3, 2).unwrap(),
+        &g_all.narrow(1, 3, 2).unwrap(),
+        &beta_all.narrow(1, 3, 2).unwrap(),
+        &mut fork_a,
+        true,
+    )
+    .unwrap()
+    .expect("GDN DSL active");
+    let fork_a_st_err = rel_err(
+        &fork_a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &st_one.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+    let fork_a_y_err = rel_err(
+        &y_fork_a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &y_one.narrow(1, 3, 2).unwrap().force_contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+
+    let q_alt = Tensor::from_vec(pseudo_vec(b * 2 * nh * kd, 811, 0.3), (b, 2, nh, kd), dev).unwrap();
+    let k_alt = Tensor::from_vec(pseudo_vec(b * 2 * nh * kd, 812, 0.3), (b, 2, nh, kd), dev).unwrap();
+    let v_alt = Tensor::from_vec(pseudo_vec(b * 2 * nh * vd, 813, 0.3), (b, 2, nh, vd), dev).unwrap();
+    let g_alt = Tensor::from_vec(
+        pseudo_vec(b * 2 * nh, 814, 0.25).into_iter().map(|x| x - 0.35).collect(),
+        (b, 2, nh),
+        dev,
+    )
+    .unwrap();
+    let beta_alt = Tensor::from_vec(
+        pseudo_vec(b * 2 * nh, 815, 0.4).into_iter().map(|x| (x + 1.0) * 0.5).collect(),
+        (b, 2, nh),
+        dev,
+    )
+    .unwrap();
+
+    let mut fork_b = snapshots[2].force_contiguous().unwrap();
+    let y_fork_b = try_recurrence(&q_alt, &k_alt, &v_alt, &g_alt, &beta_alt, &mut fork_b, true)
+        .unwrap()
+        .expect("GDN DSL active");
+    let mut st_ref_b = st_3.force_contiguous().unwrap();
+    let y_ref_b = try_recurrence(&q_alt, &k_alt, &v_alt, &g_alt, &beta_alt, &mut st_ref_b, true)
+        .unwrap()
+        .expect("GDN DSL active");
+    let fork_b_st_err = rel_err(
+        &fork_b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &st_ref_b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+    let fork_b_y_err = rel_err(
+        &y_fork_b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &y_ref_b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+
+    // 4. Vulkan command-graph capture + repeated replay WAR test:
+    // Record a graph that reads `st_graph` (via affine scale=1, bias=0 into `snap_before`)
+    // and then mutates `st_graph` in-place via `try_recurrence`. Replay 3 times and verify
+    // `snap_before` always reflects the pre-step state while `st_graph` advances to step r.
+    #[cfg(feature = "vulkan")]
+    if let Device::Vulkan(vk_dev) = dev {
+        let q1 = q_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
+        let k1 = k_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
+        let v1 = v_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
+        let g1 = g_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
+        let b1 = beta_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
+
+        let mut st_graph = st_3.force_contiguous().unwrap();
+        if vk_dev.begin_graph_capture().is_ok() {
+            let snap_before = st_graph.affine(1.0, 0.0).unwrap();
+            let _y_g = try_recurrence(&q1, &k1, &v1, &g1, &b1, &mut st_graph, true)
+                .unwrap()
+                .expect("GDN DSL active in Vulkan graph capture");
+            let graph = vk_dev.end_graph_capture().expect("end_graph_capture");
+
+            let mut st_expected = st_3.force_contiguous().unwrap();
+            for replay_idx in 1..=3 {
+                let expected_before = st_expected.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let _ = try_recurrence(&q1, &k1, &v1, &g1, &b1, &mut st_expected, true)
+                    .unwrap()
+                    .expect("GDN DSL reference step");
+                let expected_after = st_expected.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+                graph.replay().expect("VkGraph::replay");
+                let got_before = snap_before.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let got_after = st_graph.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let err_before = rel_err(&got_before, &expected_before);
+                let err_after = rel_err(&got_after, &expected_after);
+                assert!(
+                    err_before <= 1e-4 && err_after <= 1e-4,
+                    "[{label}] VkGraph replay #{replay_idx} WAR mismatch: before={err_before:.2e} after={err_after:.2e}"
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "[{label} offset+WAR regression] fwht={fwht_err:.2e} gdn_y={y_err:.2e} gdn_st={st_err:.2e} war_snap={war_err:.2e} fork_a=({fork_a_y_err:.2e},{fork_a_st_err:.2e}) fork_b=({fork_b_y_err:.2e},{fork_b_st_err:.2e})"
+    );
+    assert!(y_err <= 1e-4 && st_err <= 1e-4, "[{label}] GDN narrowed slice mismatch: y={y_err:.2e} st={st_err:.2e}");
+    assert!(war_err <= 1e-4, "[{label}] WAR snapshot corrupted by subsequent in-place GDN step: {war_err:.2e}");
+    assert!(
+        fork_a_st_err <= 1e-4 && fork_a_y_err <= 1e-4 && fork_b_st_err <= 1e-4 && fork_b_y_err <= 1e-4,
+        "[{label}] prefix-fork / speculative-rollback mismatch: fork_a=({fork_a_y_err:.2e},{fork_a_st_err:.2e}) fork_b=({fork_b_y_err:.2e},{fork_b_st_err:.2e})"
+    );
+
+    dsl::set_gdn_impl(QkImpl::Legacy);
+    dsl::set_flash_impl(QkImpl::Legacy);
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_gdn_and_flash_paged_prod_dsl() {
@@ -852,6 +1101,7 @@ fn cuda_gdn_and_flash_paged_prod_dsl() {
     run_gdn_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "CUDA");
     run_flash_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "CUDA");
     run_fwht_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "CUDA");
+    run_offset_and_war_regression_suite(&dev, "CUDA");
 }
 
 #[cfg(feature = "vulkan")]
@@ -861,6 +1111,7 @@ fn vulkan_gdn_and_flash_paged_prod_dsl() {
     run_gdn_suite(&dev, &[DType::F32], "Vulkan");
     run_flash_suite(&dev, &[DType::F32], "Vulkan");
     run_fwht_suite(&dev, &[DType::F32], "Vulkan");
+    run_offset_and_war_regression_suite(&dev, "Vulkan");
 }
 
 #[cfg(feature = "metal")]
@@ -870,6 +1121,7 @@ fn metal_gdn_and_flash_paged_prod_dsl() {
     run_gdn_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
     run_flash_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
     run_fwht_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
+    run_offset_and_war_regression_suite(&dev, "Metal");
 }
 
 #[cfg(feature = "rocm")]
@@ -879,4 +1131,5 @@ fn rocm_gdn_and_flash_paged_prod_dsl() {
     run_gdn_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "ROCm");
     run_flash_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "ROCm");
     run_fwht_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "ROCm");
+    run_offset_and_war_regression_suite(&dev, "ROCm");
 }

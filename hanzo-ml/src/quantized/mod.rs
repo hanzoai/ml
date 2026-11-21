@@ -470,6 +470,10 @@ impl QStorage {
     )> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr_with_guard(stream),
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(_) => crate::bail!("not implemented"),
+            #[cfg(feature = "wgpu")]
+            QStorage::Wgpu(..) => crate::bail!("not implemented"),
             QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Stream(_) => {
                 crate::bail!("not implemented");
             }
