@@ -1,4 +1,4 @@
-//! Datasets & Dataloaders for Hanzo
+//! Dataset loaders (MNIST, Fashion-MNIST, CIFAR-10, TinyStories) and a batcher for hanzo-ml.
 pub mod batcher;
 pub mod hub;
 pub mod nlp;

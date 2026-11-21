@@ -35,6 +35,7 @@ fn assert_close(fused: &[Tensor], slow: &[Tensor], tol: f32, what: &str) -> Resu
     assert_eq!(fused.len(), slow.len());
     for (i, (a, b)) in fused.iter().zip(slow).enumerate() {
         let d = max_diff(a, b)?;
+        println!("{what}: input {i} max |Δ| {d:.2e}");
         assert!(d < tol, "{what}: input {i} gradient differs by {d}");
     }
     Ok(())
@@ -169,6 +170,7 @@ fn half_precision_rows(device: &Device) -> Result<()> {
     for (i, (f, s)) in fused.iter().zip(&slow).enumerate() {
         let scale = s.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         let d = max_diff(f, s)?;
+        println!("layer_norm bf16: input {i} max |Δ| {d:.2e} at scale {scale:.2}");
         assert!(
             d < 2e-2 * scale.max(1.0),
             "layer_norm bf16 input {i}: {d} (scale {scale})"
@@ -181,14 +183,127 @@ fn half_precision_rows(device: &Device) -> Result<()> {
     let fused = grads(&[&z], &y, &w)?;
     let slow = grads(&[&z], &ops::softmax(z.as_tensor(), 2)?, &w)?;
     let d = max_diff(&fused[0], &slow[0])?;
+    println!("softmax bf16: max |Δ| {d:.2e}");
     assert!(d < 2e-2, "softmax bf16: {d}");
     Ok(())
 }
 
+fn geglu(device: &Device) -> Result<()> {
+    let (g, u) = (var(&[7, 130], device)?, var(&[7, 130], device)?);
+    let w = Tensor::randn(0f32, 1f32, (7, 130), device)?;
+    let fused = grads(&[&g, &u], &ops::geglu(g.as_tensor(), u.as_tensor())?, &w)?;
+    let slow = grads(&[&g, &u], &(g.as_tensor().gelu_erf()? * u.as_tensor())?, &w)?;
+    assert_close(&fused, &slow, 1e-4, "geglu")?;
+    let bf = |v: &Var| v.as_tensor().to_dtype(DType::BF16);
+    let y = ops::geglu(&bf(&g)?, &bf(&u)?)?.to_dtype(DType::F32)?;
+    let fused = grads(&[&g, &u], &y, &w)?;
+    for (i, (f, s)) in fused.iter().zip(&slow).enumerate() {
+        let scale = s.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        let d = max_diff(f, s)?;
+        println!("geglu bf16: input {i} max |Δ| {d:.2e} at scale {scale:.2}");
+        assert!(
+            d < 2e-2 * scale.max(1.0),
+            "geglu bf16 input {i}: {d} (scale {scale})"
+        );
+    }
+    Ok(())
+}
+
+fn select(device: &Device) -> Result<()> {
+    let x = var(&[6, 9], device)?;
+    let w = Tensor::randn(0f32, 1f32, (4, 9), device)?;
+    let index = Tensor::new(&[4u32, 0, 5, 2], device)?;
+    let inverse = Tensor::new(&[1u32, 4, 3, 4, 0, 2], device)?;
+    let fused = grads(&[&x], &ops::select(x.as_tensor(), &index, &inverse)?, &w)?;
+    let slow = grads(&[&x], &x.as_tensor().index_select(&index, 0)?, &w)?;
+    assert_close(&fused, &slow, 1e-7, "select")
+}
+
 test_device!(softmax_last_dim, softmax_cpu, softmax_gpu, softmax_metal);
+test_device!(geglu, geglu_cpu, geglu_gpu, geglu_metal);
+test_device!(select, select_cpu, select_gpu, select_metal);
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norm_no_bias, lnnb_cpu, lnnb_gpu, lnnb_metal);
 test_device!(rms_norm, rms_cpu, rms_gpu, rms_metal);
 test_device!(silu_mul, silu_mul_cpu, silu_mul_gpu, silu_mul_metal);
 test_device!(rope, rope_cpu, rope_gpu, rope_metal);
 test_device!(half_precision_rows, half_cpu, half_gpu, half_metal);
+
+/// Mean device ms of each fused CUDA training kernel at the sizes hanzo-kernel's
+/// `small_speed_on_cuda` times; a backward is timed from its op's output, whose gradient of ones
+/// it fills: `cargo test --features cuda --test grad -- --ignored --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn fused_speed() -> Result<()> {
+    use hanzo_nn::optim::{adamw, grad_norm, Update};
+    let dev = Device::new_cuda(0)?;
+    let timer = dev.timer()?.expect("CUDA has a timer");
+    let time = |f: &dyn Fn() -> Result<()>| -> Result<f32> {
+        let mut total = 0f32;
+        for i in 0..23 {
+            dev.synchronize()?;
+            timer.start()?;
+            f()?;
+            timer.stop()?;
+            if i >= 3 {
+                total += timer.elapsed()? / 20.0;
+            }
+        }
+        Ok(total)
+    };
+    let bf = |shape: &[usize]| -> Result<Var> {
+        Var::from_tensor(&Tensor::randn(0f32, 1f32, shape, &dev)?.to_dtype(DType::BF16)?)
+    };
+    let (g, u) = (bf(&[8192, 1152])?, bf(&[8192, 1152])?);
+    let fwd = time(&|| ops::geglu(g.as_tensor(), u.as_tensor()).map(|_| ()))?;
+    let back = time(&|| {
+        ops::geglu(g.as_tensor(), u.as_tensor())?.backward()?;
+        Ok(())
+    })? - fwd;
+    println!(
+        "[small speed .cu] geglu {}: forward {fwd:.3} ms, backward {back:.3} ms",
+        8192 * 1152
+    );
+    let y = bf(&[16384, 1024])?;
+    let f = time(&|| ops::softmax_last_dim(y.as_tensor()).map(|_| ()))?;
+    let b = time(&|| {
+        ops::softmax_last_dim(y.as_tensor())?.backward()?;
+        Ok(())
+    })? - f;
+    println!("[small speed .cu] softmax backward 16384x1024: {b:.3} ms");
+    let (x, a, bb) = (bf(&[8192, 768])?, bf(&[768])?, bf(&[768])?);
+    let norm = || ops::layer_norm(x.as_tensor(), a.as_tensor(), bb.as_tensor(), 1e-5);
+    let f = time(&|| norm().map(|_| ()))?;
+    let b = time(&|| {
+        norm()?.backward()?;
+        Ok(())
+    })? - f;
+    println!("[small speed .cu] layer norm backward 8192x768: {b:.3} ms");
+    let f32v = |s: f64| -> Result<Var> {
+        Var::from_tensor(&(Tensor::randn(0f32, 1f32, (768, 2304), &dev)? * s)?)
+    };
+    let (theta, m, v) = (f32v(1.0)?, f32v(0.1)?, f32v(0.1)?);
+    v.set(&v.as_tensor().sqr()?)?;
+    let gt = Tensor::randn(0f32, 1f32, (768, 2304), &dev)?;
+    let step = Update {
+        lr: 2e-5,
+        beta1: 0.9,
+        beta2: 0.98,
+        eps: 1e-6,
+        weight_decay: 0.01,
+        scale_m: 1.9,
+        scale_v: 7.3,
+        grad_scale: 1.0,
+    };
+    let ms = time(&|| adamw(&theta, &gt, &m, &v, &step))?;
+    let norm = Var::from_tensor(&gt)?;
+    let mut store = norm.as_tensor().sum_all()?.backward()?;
+    store.insert(norm.as_tensor(), gt.clone());
+    let ss = time(&|| grad_norm(&store, &[norm.clone()]).map(|_| ()))?;
+    println!(
+        "[small speed .cu] adamw {}: {ms:.3} ms, sum of squares {ss:.3} ms",
+        768 * 2304
+    );
+    Ok(())
+}

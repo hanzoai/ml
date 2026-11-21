@@ -1,9 +1,16 @@
-//! The fused Metal AdamW step and gradient norm equal the tensor-op path on the CPU.
-#![cfg(feature = "metal")]
+//! The fused AdamW step and gradient norm equal the tensor-op path on the CPU.
+#![cfg(any(feature = "metal", feature = "cuda"))]
 
 use hanzo_ml::{DType, Device, Result, Tensor, Var};
 use hanzo_nn::optim::{grad_norm, AdamW, ParamsAdamW};
 use hanzo_nn::Optimizer;
+
+fn gpu() -> Result<Device> {
+    #[cfg(feature = "metal")]
+    return Device::new_metal(0);
+    #[cfg(not(feature = "metal"))]
+    Device::new_cuda(0)
+}
 
 fn params() -> ParamsAdamW {
     ParamsAdamW {
@@ -32,8 +39,7 @@ fn run(dev: &Device, w0: &Tensor, c: &Tensor, steps: usize, scale: f64) -> Resul
 
 #[test]
 fn adamw_fused_matches_tensor_path() -> Result<()> {
-    let metal = Device::new_metal(0)?;
-    // an odd length: the kernel's last threadgroup is partial
+    let metal = gpu()?;
     let w0 = Tensor::randn(0f32, 1f32, (37, 129), &Device::Cpu)?;
     let c = Tensor::randn(0f32, 1f32, (37, 129), &Device::Cpu)?;
     for scale in [1.0, 0.25] {
@@ -55,7 +61,7 @@ fn adamw_fused_matches_tensor_path() -> Result<()> {
 
 #[test]
 fn grad_norm_mixes_fused_and_other_dtypes() -> Result<()> {
-    let metal = Device::new_metal(0)?;
+    let metal = gpu()?;
     let a = Var::from_tensor(&Tensor::randn(0f32, 1f32, 1000, &metal)?)?;
     let b = Var::from_tensor(&Tensor::randn(0f32, 1f32, 300, &metal)?.to_dtype(DType::BF16)?)?;
     let loss = (a.as_tensor().sum_all()? * 3.0)?
@@ -64,5 +70,53 @@ fn grad_norm_mixes_fused_and_other_dtypes() -> Result<()> {
     let n = grad_norm(&grads, &[a, b])?;
     let want = (1000.0 * 9.0 + 300.0 * 4.0f64).sqrt();
     assert!((n - want).abs() / want < 1e-5, "{n} vs {want}");
+    Ok(())
+}
+
+/// One step of the fused kernel against the same step in tensor ops on the same device.
+#[test]
+fn adamw_one_step_is_the_composite() -> Result<()> {
+    use hanzo_nn::optim::{adamw, Update};
+    let dev = gpu()?;
+    let shape = (1025, 769);
+    let theta = Tensor::randn(0f32, 1f32, shape, &dev)?;
+    let g = (Tensor::randn(0f32, 1f32, shape, &dev)? * 3.0)?;
+    let m = (Tensor::randn(0f32, 1f32, shape, &dev)? * 0.1)?;
+    let v = Tensor::randn(0f32, 1f32, shape, &dev)?.sqr()?;
+    let u = Update {
+        lr: 2e-5,
+        beta1: 0.9,
+        beta2: 0.98,
+        eps: 1e-6,
+        weight_decay: 0.01,
+        scale_m: 1.0 / (1.0 - 0.9f64.powi(7)),
+        scale_v: 1.0 / (1.0 - 0.98f64.powi(7)),
+        grad_scale: 0.37,
+    };
+    let (vt, vm, vv) = (
+        Var::from_tensor(&theta)?,
+        Var::from_tensor(&m)?,
+        Var::from_tensor(&v)?,
+    );
+    adamw(&vt, &g, &vm, &vv, &u)?;
+    let g = (g * u.grad_scale)?;
+    let m = ((m * u.beta1)? + (&g * (1.0 - u.beta1))?)?;
+    let v = ((v * u.beta2)? + (g.sqr()? * (1.0 - u.beta2))?)?;
+    let step = ((&m * u.scale_m)? / ((&v * u.scale_v)?.sqrt()? + u.eps)?)?;
+    let theta = ((theta * (1.0 - u.lr * u.weight_decay))? - (step * u.lr)?)?;
+    for (name, fused, composite) in [
+        ("theta", vt.as_tensor(), &theta),
+        ("m", vm.as_tensor(), &m),
+        ("v", vv.as_tensor(), &v),
+    ] {
+        let d = (fused - composite)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        let s = composite.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        println!("adamw one step {name}: max |Δ| {d:.2e} at scale {s:.2}");
+        assert!(d <= 1e-6 * s, "{name}: {d} at scale {s}");
+    }
     Ok(())
 }

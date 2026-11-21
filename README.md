@@ -1,397 +1,141 @@
-<p align="center"><img src=".github/hero.svg" alt="ml" width="880"></p>
+<p align="center"><img src=".github/hero.svg" alt="Hanzo ML" width="880"></p>
 
 # Hanzo ML
-[![crates.io](https://img.shields.io/crates/v/hanzo-ml.svg?style=flat-square&color=black)](https://crates.io/crates/hanzo-ml)
-[![docs.rs](https://img.shields.io/docsrs/hanzo-ml?style=flat-square&color=black)](https://docs.rs/hanzo-ml)
-[![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-black?style=flat-square)](https://github.com/hanzoai/ml)
 
-**Fast, multi-backend tensor & ML for Rust — CPU · CUDA · Metal · ROCm · Vulkan, with quantization built in.**
+Tensors, autograd, quantized inference and training in Rust. One `Tensor` API over CPU, CUDA,
+ROCm, Metal, Vulkan and wgpu. It is the compute layer under [Hanzo Engine](https://github.com/hanzoai/engine).
 
-Hanzo ML is a lightweight, memory-safe machine-learning framework for Rust, tuned for performance and
-built for real deployment — the compute core beneath [Hanzo](https://hanzo.ai) inference. Rebuilt for the
-Hanzo stack with optimizations for Edge AI, quantization, multimodal workloads, and NVIDIA GB10 / DGX
-Spark unified memory. It's the canonical Rust implementation of the Hanzo compute substrate: one core,
-every backend, from a browser tab to a datacenter GPU.
-
-## Key Features
-
-- **High Performance**: GPU acceleration via CUDA (incl. unified/managed memory for NVIDIA GB10 / DGX Spark), Metal (Apple Silicon), ROCm (AMD RDNA3.5 APUs), Vulkan, and CPU optimizations
-- **Edge AI Optimized**: Quantization support (GGUF, GGML, AFQ, GPTQ, AWQ). On AMD `gfx1151` the full GGUF quant zoo (22 types: Q/K, legacy, IQ1-4, TQ) decodes resident + bit-exact through one unified compute core -- prefill beats llama.cpp (1.1-1.26x), decode at HIP parity.
-- **Multimodal**: Text, vision, audio, and 3D model support
-- **WebAssembly**: Run models in the browser with WASM support
-- **Rust Native**: Memory-safe, zero-cost abstractions
-- **Hanzo Integration**: Works seamlessly with Hanzo Engine for inference
-
-## Get started
-
-Make sure that you have [`hanzo-ml`](https://github.com/hanzoai/ml/tree/main/hanzo-ml) correctly installed as described in the [installation guide](https://github.com/hanzoai/ml/blob/main/hanzo-ml-book/src/guide/installation.md).
-
-Let's see how to run a simple matrix multiplication.
-Write the following to your `myapp/src/main.rs` file:
 ```rust
 use hanzo_ml::{Device, Tensor};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = Device::Cpu;
-
+fn main() -> hanzo_ml::Result<()> {
+    let device = Device::Cpu; // or Device::new_cuda(0)?, new_rocm(0)?, new_metal(0)?, new_vulkan(0)?
     let a = Tensor::randn(0f32, 1., (2, 3), &device)?;
     let b = Tensor::randn(0f32, 1., (3, 4), &device)?;
-
-    let c = a.matmul(&b)?;
-    println!("{c}");
+    println!("{}", a.matmul(&b)?); // a [2, 4] f32 tensor
     Ok(())
 }
 ```
 
-`cargo run` should display a tensor of shape `Tensor[[2, 4], f32]`.
-
-
-Having installed `hanzo` with Cuda support, simply define the `device` to be on GPU:
-
-```diff
-- let device = Device::Cpu;
-+ let device = Device::new_cuda(0)?;
-```
-
-For more advanced examples, please have a look at the following section.
-
-## Check out our examples
-
-Browser (WASM) examples — build and run locally from [`hanzo-ml-wasm-examples`](https://github.com/hanzoai/ml/tree/main/hanzo-ml-wasm-examples):
-- **yolo**: pose estimation and object recognition.
-- **whisper**: speech recognition.
-- **llama2.c**: text generation.
-- **T5**: text generation.
-- **Phi-1.5 / Phi-2**: text generation.
-- **Segment Anything Model**: image segmentation.
-- **BLIP**: image captioning.
-
-We also provide some command line based examples using state of the art models:
-
-- [LLaMA v1, v2, and v3](./hanzo-ml-examples/examples/llama/): general LLM, includes
-  the SOLAR-10.7B variant.
-- [Falcon](./hanzo-ml-examples/examples/falcon/): general LLM.
-- [Codegeex4](./hanzo-ml-examples/examples/codegeex4-9b/): Code completion, code interpreter, web search, function calling, repository-level
-- [GLM4](./hanzo-ml-examples/examples/glm4/): Open Multilingual Multimodal Chat LMs by THUDM
-- [Gemma v1 and v2](./hanzo-ml-examples/examples/gemma/): 2b and 7b+/9b general LLMs from Google Deepmind.
-- [RecurrentGemma](./hanzo-ml-examples/examples/recurrent-gemma/): 2b and 7b
-  Griffin based models from Google that mix attention with a RNN like state.
-- [Phi-1, Phi-1.5, Phi-2, and Phi-3](./hanzo-ml-examples/examples/phi/): 1.3b,
-  2.7b, and 3.8b general LLMs with performance on par with 7b models.
-- [StableLM-3B-4E1T](./hanzo-ml-examples/examples/stable-lm/): a 3b general LLM
-  pre-trained on 1T tokens of English and code datasets. Also supports
-  StableLM-2, a 1.6b LLM trained on 2T tokens, as well as the code variants.
-- [Mamba](./hanzo-ml-examples/examples/mamba/): an inference only
-  implementation of the Mamba state space model.
-- [Mistral7b-v0.1](./hanzo-ml-examples/examples/mistral/): a 7b general LLM with
-  better performance than all publicly available 13b models as of 2023-09-28.
-- [Mixtral8x7b-v0.1](./hanzo-ml-examples/examples/mixtral/): a sparse mixture of
-  experts 8x7b general LLM with better performance than a Llama 2 70B model with
-  much faster inference.
-- [StarCoder](./hanzo-ml-examples/examples/bigcode/) and
-  [StarCoder2](./hanzo-ml-examples/examples/starcoder2/): LLM specialized to code generation.
-- [Qwen1.5](./hanzo-ml-examples/examples/qwen/): Bilingual (English/Chinese) LLMs.
-- [RWKV v5 and v6](./hanzo-ml-examples/examples/rwkv/): An RNN with transformer level LLM
-  performance.
-- [Replit-code-v1.5](./hanzo-ml-examples/examples/replit-code/): a 3.3b LLM specialized for code completion.
-- [Yi-6B / Yi-34B](./hanzo-ml-examples/examples/yi/): two bilingual
-  (English/Chinese) general LLMs with 6b and 34b parameters.
-- [Quantized LLaMA](./hanzo-ml-examples/examples/quantized/): quantized version of
-  the LLaMA model using the same quantization techniques as
-  [llama.cpp](https://github.com/ggerganov/llama.cpp).
-
-<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/quantized/assets/aoc.gif" width="600">
-  
-- [Stable Diffusion](./hanzo-ml-examples/examples/stable-diffusion/): text to
-  image generative model, support for the 1.5, 2.1, SDXL 1.0 and Turbo versions.
-
-<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg" width="200">
-
-- [Wuerstchen](./hanzo-ml-examples/examples/wuerstchen/): another text to
-  image generative model.
-
-<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/wuerstchen/assets/cat.jpg" width="200">
-
-- [yolo-v3](./hanzo-ml-examples/examples/yolo-v3/) and
-  [yolo-v8](./hanzo-ml-examples/examples/yolo-v8/): object detection and pose
-  estimation models.
-
-<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.od.jpg" width="200"><img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/yolo-v8/assets/bike.pose.jpg" width="200">
-- [segment-anything](./hanzo-ml-examples/examples/segment-anything/): image
-  segmentation model with prompt.
-
-<img src="https://github.com/hanzoai/ml/raw/main/hanzo-ml-examples/examples/segment-anything/assets/sam_merged.jpg" width="200">
-
-- [SegFormer](./hanzo-ml-examples/examples/segformer/): transformer based semantic segmentation model.
-- [Whisper](./hanzo-ml-examples/examples/whisper/): speech recognition model.
-- [EnCodec](./hanzo-ml-examples/examples/encodec/): high-quality audio compression
-  model using residual vector quantization.
-- [MetaVoice](./hanzo-ml-examples/examples/metavoice/): foundational model for
-  text-to-speech.
-- [Parler-TTS](./hanzo-ml-examples/examples/parler-tts/): large text-to-speech
-  model.
-- [T5](./hanzo-ml-examples/examples/t5), [Bert](./hanzo-ml-examples/examples/bert/),
-  [JinaBert](./hanzo-ml-examples/examples/jina-bert/) : useful for sentence embeddings.
-- [DINOv2](./hanzo-ml-examples/examples/dinov2/): computer vision model trained
-  using self-supervision (can be used for imagenet classification, depth
-  evaluation, segmentation).
-- [VGG](./hanzo-ml-examples/examples/vgg/),
-  [RepVGG](./hanzo-ml-examples/examples/repvgg): computer vision models.
-- [BLIP](./hanzo-ml-examples/examples/blip/): image to text model, can be used to
-  generate captions for an image.
-- [CLIP](./hanzo-ml-examples/examples/clip/): multi-model vision and language
-  model.
-- [TrOCR](./hanzo-ml-examples/examples/trocr/): a transformer OCR model, with
-  dedicated submodels for hand-writing and printed recognition.
-- [Marian-MT](./hanzo-ml-examples/examples/marian-mt/): neural machine translation
-  model, generates the translated text from the input text.
-- [Moondream](./hanzo-ml-examples/examples/moondream/): tiny computer-vision model 
-  that can answer real-world questions about images.
-
-Run them using commands like:
-```
-cargo run --example quantized --release
-```
-
-In order to use **CUDA** add `--features cuda` to the example command line. If
-you have cuDNN installed, use `--features cudnn` for even more speedups.
-
-There are also some wasm examples for whisper and
-[llama2.c](https://github.com/karpathy/llama2.c). Build and run them locally with
-`trunk` from [`hanzo-ml-wasm-examples`](https://github.com/hanzoai/ml/tree/main/hanzo-ml-wasm-examples)
-(whisper, llama2.c, T5, Phi-1.5 / Phi-2, Segment Anything Model).
-
-For LLaMA2, run the following command to retrieve the weight files and start a
-test server:
 ```bash
-cd hanzo-ml-wasm-examples/llama2-c
-# Tiny Llama-2 weights from Andrej Karpathy's tinyllamas (see the example README for tokenizer.json):
-wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin -O model.bin
-trunk serve --release --port 8081
-```
-And then head over to
-[http://localhost:8081/](http://localhost:8081/).
-
-<!--- ANCHOR: useful_libraries --->
-
-<!--- ANCHOR: features --->
-
-## Features
-
-- Simple syntax, looks and feels like PyTorch.
-    - Model training.
-    - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/hanzoai/ml/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/hanzo-flash-attn/src/lib.rs#L152).
-- Backends.
-    - Optimized CPU backend, with MKL on x86 and Accelerate on macOS.
-    - CUDA, including unified memory on NVIDIA GB10 / DGX Spark, and multi-GPU via NCCL.
-    - Metal on Apple Silicon, ROCm on AMD, and Vulkan.
-    - WASM support, run your models in a browser.
-- Included models.
-    - Language Models.
-        - LLaMA v1, v2, and v3 with variants such as SOLAR-10.7B.
-        - Falcon.
-        - StarCoder, StarCoder2.
-        - Phi 1, 1.5, 2, and 3.
-        - Mamba, Minimal Mamba
-        - Gemma v1 2b and 7b+, v2 2b and 9b.
-        - Mistral 7b v0.1.
-        - Mixtral 8x7b v0.1.
-        - StableLM-3B-4E1T, StableLM-2-1.6B, Stable-Code-3B.
-        - Replit-code-v1.5-3B.
-        - Bert.
-        - Yi-6B and Yi-34B.
-        - Qwen1.5, Qwen1.5 MoE.
-        - RWKV v5 and v6.
-    - Quantized LLMs.
-        - Llama 7b, 13b, 70b, as well as the chat and code variants.
-        - Mistral 7b, and 7b instruct.
-        - Mixtral 8x7b.
-        - Zephyr 7b a and b (Mistral-7b based).
-        - OpenChat 3.5 (Mistral-7b based).
-    - Text to text.
-        - T5 and its variants: FlanT5, UL2, MADLAD400 (translation), CoEdit (Grammar correction).
-        - Marian MT (Machine Translation).
-    - Text to image.
-        - Stable Diffusion v1.5, v2.1, XL v1.0.
-        - Wurstchen v2.
-    - Image to text.
-        - BLIP.
-        - TrOCR.
-    - Audio.
-        - Whisper, multi-lingual speech-to-text.
-        - EnCodec, audio compression model.
-        - MetaVoice-1B, text-to-speech model.
-        - Parler-TTS, text-to-speech model.
-    - Computer Vision Models.
-        - DINOv2, ConvMixer, EfficientNet, ResNet, ViT, VGG, RepVGG, ConvNeXT,
-          ConvNeXTv2, MobileOne, EfficientVit (MSRA), MobileNetv4, Hiera, FastViT.
-        - yolo-v3, yolo-v8.
-        - Segment-Anything Model (SAM).
-        - SegFormer.
-- File formats: load models from safetensors, npz, ggml, or PyTorch files.
-- Serverless (on CPU), small and fast deployments.
-- Quantization support using the llama.cpp quantized types.
-
-<!--- ANCHOR_END: features --->
-
-## How to use
-
-<!--- ANCHOR: cheatsheet --->
-Cheatsheet:
-
-|            | Using PyTorch                            | Using Hanzo ML                                                   |
-|------------|------------------------------------------|------------------------------------------------------------------|
-| Creation   | `torch.Tensor([[1, 2], [3, 4]])`         | `Tensor::new(&[[1f32, 2.], [3., 4.]], &Device::Cpu)?`           |
-| Creation   | `torch.zeros((2, 2))`                    | `Tensor::zeros((2, 2), DType::F32, &Device::Cpu)?`               |
-| Indexing   | `tensor[:, :4]`                          | `tensor.i((.., ..4))?`                                           |
-| Operations | `tensor.view((2, 2))`                    | `tensor.reshape((2, 2))?`                                        |
-| Operations | `a.matmul(b)`                            | `a.matmul(&b)?`                                                  |
-| Arithmetic | `a + b`                                  | `&a + &b`                                                        |
-| Device     | `tensor.to(device="cuda")`               | `tensor.to_device(&Device::new_cuda(0)?)?`                            |
-| Dtype      | `tensor.to(dtype=torch.float16)`         | `tensor.to_dtype(&DType::F16)?`                                  |
-| Saving     | `torch.save({"A": A}, "model.bin")`      | `hanzo_ml::safetensors::save(&HashMap::from([("A", A)]), "model.safetensors")?` |
-| Loading    | `weights = torch.load("model.bin")`      | `hanzo_ml::safetensors::load("model.safetensors", &device)`        |
-
-<!--- ANCHOR_END: cheatsheet --->
-
-
-## Structure
-
-- [hanzo-ml](./hanzo-ml): core ops, devices, and the `Tensor` type
-- [hanzo-nn](./hanzo-nn/): layers to build real models
-- [hanzo-transformers](./hanzo-transformers): transformer building blocks
-- [hanzo-kernel](./hanzo-kernel/): the portable kernel DSL, one source lowered to every backend
-- [hanzo-kernels](./hanzo-kernels/): CUDA kernels
-- [hanzo-rocm-kernels](./hanzo-rocm-kernels/): ROCm kernels
-- [hanzo-metal-kernels](./hanzo-metal-kernels/): Metal kernels
-- [hanzo-flash-attn](./hanzo-flash-attn): flash attention v2, with v3 in [hanzo-flash-attn-v3](./hanzo-flash-attn-v3)
-- [hanzo-3d](./hanzo-3d/): 3D model support
-- [hanzo-train](./hanzo-train/): one model trained across heterogeneous machines (DiLoCo local SGD, bf16 deltas, bit-identical resume) behind a small `Model` trait, and the DSpark draft trainer on it; [hanzo-training](./hanzo-training/): config-driven training loops
-- [hanzo-datasets](./hanzo-datasets/): datasets and data loaders
-- [hanzo-onnx](./hanzo-onnx/): ONNX model evaluation
-- [hanzo-ml-pyo3](./hanzo-ml-pyo3/): Python bindings
-- [hanzo-ml-examples](./hanzo-ml-examples/): the library in realistic settings
-
-## FAQ
-
-### Why Hanzo ML?
-
-Serverless inference wants a small binary. A full framework like PyTorch is large enough that spinning
-up an instance on a cluster is slow, and Hanzo ML deploys as one lightweight binary instead.
-
-It also takes Python out of the serving path, which removes both the interpreter overhead and the
-[GIL](https://www.backblaze.com/blog/the-python-gil-past-present-and-future/) from production.
-
-### Common Errors
-
-#### Missing symbols when compiling with the mkl feature.
-
-If you get some missing symbols when compiling binaries/tests using the mkl
-or accelerate features, e.g. for mkl you get:
-```
-  = note: /usr/bin/ld: (....o): in function `blas::sgemm':
-          .../blas-0.22.0/src/lib.rs:1944: undefined reference to `sgemm_' collect2: error: ld returned 1 exit status
-
-  = note: some `extern` functions couldn't be found; some native libraries may need to be installed or have their path specified
-  = note: use the `-l` flag to specify native libraries to link
-  = note: use the `cargo:rustc-link-lib` directive to specify the native libraries to link with Cargo
-```
-or for accelerate:
-```
-Undefined symbols for architecture arm64:
-            "_dgemm_", referenced from:
-                hanzo_core::accelerate::dgemm::h1b71a038552bcabe in libhanzo_core...
-            "_sgemm_", referenced from:
-                hanzo_core::accelerate::sgemm::h2cf21c592cba3c47 in libhanzo_core...
-          ld: symbol(s) not found for architecture arm64
+cargo add hanzo-ml                      # CPU
+cargo add hanzo-ml --features cuda      # or rocm, metal, vulkan, wgpu, mkl, accelerate
 ```
 
-This is likely due to a missing linker flag that was needed to enable the mkl library. You
-can try adding the following for mkl at the top of your binary:
-```rust
-extern crate intel_mkl_src;
-```
-or for accelerate:
-```rust
-extern crate accelerate_src;
-```
+## Backends
 
-#### Cannot run the LLaMA examples: access to source requires login credentials
+| Backend | Feature | Device | Notes |
+|---|---|---|---|
+| CPU | default (`mkl`, `accelerate` optional) | `Device::Cpu` | quantized dot products in AVX2/AVX-512, NEON and wasm simd128 |
+| CUDA | `cuda` (`cudnn`, `nccl`, `cutile`) | `Device::new_cuda(i)` | on unified-memory parts such as GB10, allocations of `ML_CUDA_UMA_THRESHOLD` (8 GiB default) or more are managed memory |
+| ROCm | `rocm` (`rocm-miopen` for convolution) | `Device::new_rocm(i)` | HIP kernels compiled by `hipcc` for the GPU's arch on first use and cached; developed and measured on gfx1151 (Strix Halo) |
+| Metal | `metal` | `Device::new_metal(i)` | Apple Silicon |
+| Vulkan | `vulkan` | `Device::new_vulkan(i)` | SPIR-V kernels through `ash`; uses cooperative matrix and integer dot product when the driver has them |
+| wgpu | `wgpu` | `Device::new_wgpu(i)` | WGSL kernels for matmul, Q8_0/Q4_0/Q4_K matvecs, flash attention, norms and elementwise ops; convolution, pooling and upsampling return an error |
+| WASM | build for `wasm32` | `Device::Cpu` | see [`hanzo-ml-wasm-examples`](hanzo-ml-wasm-examples) |
 
-```
-Error: request error: https://huggingface.co/meta-llama/Llama-2-7b-hf/resolve/main/tokenizer.json: status code 401
-```
+The book's [Backends](hanzo-ml-book/src/backends.md) chapter has the details per backend.
 
-This is likely because you're not permissioned for the LLaMA-v2 model. To fix
-this, you have to register on the huggingface-hub, accept the [LLaMA-v2 model
-conditions](https://huggingface.co/meta-llama/Llama-2-7b-hf), and set up your
-authentication token. See issue
-[#350](https://github.com/hanzoai/ml/issues/350) for more details.
+## What is ours
 
-#### Missing cute/cutlass headers when compiling flash-attn
+- **Kernel DSL** ([`hanzo-kernel`](hanzo-kernel)). A kernel is one Rust function marked
+  `#[kernel(targets(...))]`. The same source runs on the CPU and lowers to CUDA, ROCm (HIP),
+  Metal (MSL) and Vulkan (SPIR-V). Each kernel has a host reference beside it, and tests compare
+  every backend against it. `hanzo_kernel::tune` times a kernel's schedules once per device and
+  shape and caches the winner on disk. The Vulkan backend dispatches DSL kernels for RMSNorm,
+  softmax, fused add-RMSNorm, decode attention, the MoE router, the MoE and large dense Q4_K/Q6_K
+  matvecs, the Q4_K prefill GEMM and the single-row GEMV. On ROCm the DSL norms match the
+  hand-written kernels but reach only 84–92% of their speed, so the hand-written ones stay.
+- **ROCm backend.** Quantized weights stay on the device in GGML layout. One HIP core
+  (`hanzo-rocm-kernels/src/kernels/quant.hip`) decodes 25 GGML types on the device and runs
+  prefill as an int8 WMMA GEMM for Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q4_K, Q5_K, Q6_K, IQ4_XS,
+  TQ2_0 and both ROCmFP4 variants. Autograd runs on it too.
+- **Quantization.** GGUF and GGML files with 28 block types beside F32/F16/BF16/I32: the legacy
+  and K quants, the IQ1–IQ4 codebooks, TQ1_0/TQ2_0, MXFP4, NVFP4, ROCmFP4 (dual scale and fast)
+  and Q1_0. Every type decodes on the CPU; each GPU backend has native kernels for a subset.
+  NVFP4 has no GPU kernel yet: CUDA dequantizes it to F32 for a dense matmul, Metal refuses it.
+  F8E4M3 is a tensor dtype with CUDA kernels.
+- **Training.** Reverse-mode autograd. The fused softmax, layer-norm, rms-norm, rope, silu-mul,
+  GeGLU and select ops carry their own gradients, checked against the unfused composites on CPU,
+  CUDA and Metal (`hanzo-nn/tests/grad.rs`). Optimizers: SGD, AdamW (one fused kernel on CUDA and
+  Metal), Muon, MuonClip and Muon with AdamW. [`hanzo-train`](hanzo-train) trains one model across
+  mixed machines by local SGD with an outer Nesterov step (DiLoCo); a resumed run matches the
+  uninterrupted one bit for bit.
+- **Classical learning.** [`hanzo-learn`](hanzo-learn): least squares, logistic regression,
+  gradient-boosted trees, isolation forest and local outlier factor. Fitting and predicting are
+  two traits, and each fitted model is named by a content hash.
 
-```
-  In file included from kernels/flash_fwd_launch_template.h:11:0,
-                   from kernels/flash_fwd_hdim224_fp16_sm80.cu:5:
-  kernels/flash_fwd_kernel.h:8:10: fatal error: cute/algorithm/copy.hpp: No such file or directory
-   #include <cute/algorithm/copy.hpp>
-            ^~~~~~~~~~~~~~~~~~~~~~~~~
-  compilation terminated.
-  Error: nvcc error while compiling:
-```
-[cutlass](https://github.com/NVIDIA/cutlass) is provided as a git submodule so you may want to run the following command to check it in properly.
+## Measured
+
+Each number is from the record cited; none is a projection.
+
+| Result | Where | Source |
+|---|---|---|
+| DSL `add_rmsnorm` 23.4 ms vs 166.5 ms for the GLSL kernel it replaced (7.1x), max error 4.5e-6 | Vulkan, gfx1151, 4096x4096 | commit `38181d48b`, 2026-07-08 |
+| DSL `rms_norm` 10.6x the GLSL kernel it replaced | Vulkan | commit `487ff722d`, 2026-07-02 |
+| DSL Q4_K decode matvec vs the hand-written one: 1.022x at 6144 rows, 0.947x at 2048, 0.871x at 1024, so only shapes of 4096 rows or more take the DSL kernel | Vulkan, gfx1151 | commit `3e2f8b080`, 2026-07-22 |
+| DSL `rms_norm` and `add_rmsnorm` at 84–92% of the hand-written HIP kernels; the hand-written ones stay | ROCm, gfx1151 | commit `b8e3f3a87`, 2026-07-08 |
+| Q6_K prefill GEMM 1.70–1.74x after SWAR decode; int8 WMMA peak 57.1 TOP/s vs f16 56.8 TF/s | ROCm, gfx1151, ROCm 7.13 | [`hanzo-rocm-kernels/bench/README.md`](hanzo-rocm-kernels/bench/README.md), 2026-06-24 |
+
+## Crates
+
+| Crate | What | Published |
+|---|---|---|
+| [hanzo-ml](hanzo-ml) | `Tensor`, devices, autograd, quantization | [crates.io](https://crates.io/crates/hanzo-ml) |
+| [hanzo-nn](hanzo-nn) | layers, fused ops, optimizers, `VarBuilder` | [crates.io](https://crates.io/crates/hanzo-nn) |
+| [hanzo-transformers](hanzo-transformers) | model implementations and quantized variants | [crates.io](https://crates.io/crates/hanzo-transformers) |
+| [hanzo-kernel](hanzo-kernel), [hanzo-kernel-macros](hanzo-kernel-macros) | the kernel DSL and its `#[kernel]` attribute | [crates.io](https://crates.io/crates/hanzo-kernel) |
+| [hanzo-kernels](hanzo-kernels) | CUDA kernels | [crates.io](https://crates.io/crates/hanzo-kernels) |
+| [hanzo-rocm-kernels](hanzo-rocm-kernels) | HIP kernels and their compile cache | [crates.io](https://crates.io/crates/hanzo-rocm-kernels) |
+| [hanzo-metal-kernels](hanzo-metal-kernels) | Metal kernels | [crates.io](https://crates.io/crates/hanzo-metal-kernels) |
+| [hanzo-flash-attn](hanzo-flash-attn), [hanzo-flash-attn-v3](hanzo-flash-attn-v3) | FlashAttention-2 (CUDA) and FlashAttention-3 (Hopper) | [crates.io](https://crates.io/crates/hanzo-flash-attn) |
+| [hanzo-onnx](hanzo-onnx) | ONNX evaluation, including the `ai.onnx.ml` domain | [crates.io](https://crates.io/crates/hanzo-onnx) |
+| [hanzo-datasets](hanzo-datasets) | MNIST, Fashion-MNIST, CIFAR-10 and TinyStories loaders and a batcher | [crates.io](https://crates.io/crates/hanzo-datasets) |
+| [hanzo-train](hanzo-train) | distributed training (DiLoCo) and the DSpark draft trainer | git only |
+| [hanzo-training](hanzo-training) | GRPO over hanzo-ml autograd | [crates.io](https://crates.io/crates/hanzo-training) |
+| [hanzo-learn](hanzo-learn) | classical statistical learning | git only |
+| [hanzo-research](hanzo-research) | client for `api.hanzo.ai/v1/research`: experiments, results and their provenance | [crates.io](https://crates.io/crates/hanzo-research) |
+| [hanzo-3d](hanzo-3d) | meshes, Gaussian splats, voxels, OBJ/PLY I/O | [crates.io](https://crates.io/crates/hanzo-3d) |
+| [hanzo-ml-pyo3](hanzo-ml-pyo3) | Python bindings, built with maturin | not published |
+| [hanzo-ml-examples](hanzo-ml-examples) | runnable examples, one directory each | not published |
+
+A git-only crate is used as `hanzo-train = { git = "https://github.com/hanzoai/ml" }`.
+
+## Examples
+
 ```bash
-git submodule update --init
+make example NAME=quantized                  # CPU
+make example NAME=quantized FEATURES=cuda    # or metal, mkl, accelerate
 ```
 
-#### Compiling with flash-attention fails
+Each example directory in [`hanzo-ml-examples/examples`](hanzo-ml-examples/examples) has a README.
+Browser builds are in [`hanzo-ml-wasm-examples`](hanzo-ml-wasm-examples).
 
-```
-/usr/include/c++/11/bits/std_function.h:530:146: error: parameter packs not expanded with ‘...’:
-```
+## Develop
 
-This is a bug in gcc-11 triggered by the Cuda compiler. To fix this, install a different, supported gcc version - for example gcc-10, and specify the path to the compiler in the NVCC_CCBIN environment variable.
-```
-env NVCC_CCBIN=/usr/lib/gcc/x86_64-linux-gnu/10 cargo ...
-```
+`make help` lists the targets. `make check` is the CI gate, `make test` runs the CPU tests,
+`make test-kernel` tests the DSL, and `make book` builds the [book](hanzo-ml-book).
 
-#### Linking error on windows when running rustdoc or mdbook tests
+## Troubleshooting
 
-```
-Couldn't compile the test.
----- .\hanzo-ml-book\src\inference\hub.md - Using_the_hub::Using_in_a_real_model_ (line 50) stdout ----
-error: linking with `link.exe` failed: exit code: 1181
-//very long chain of linking
- = note: LINK : fatal error LNK1181: cannot open input file 'windows.0.48.5.lib'
-```
+**Undefined `sgemm_` or `dgemm_` with `mkl` or `accelerate`.** Link the BLAS crate from your
+binary: `extern crate intel_mkl_src;` or `extern crate accelerate_src;`.
 
-Make sure you link all native libraries that might be located outside a project target, e.g., to run mdbook tests, you should run:
+**`cute/algorithm/copy.hpp` not found building flash attention.** CUTLASS is a submodule:
+`git submodule update --init`.
 
-```
-mdbook test hanzo-ml-book -L .\target\debug\deps\ `
--L native=$env:USERPROFILE\.cargo\registry\src\index.crates.io-6f17d22bba15001f\windows_x86_64_msvc-0.42.2\lib `
--L native=$env:USERPROFILE\.cargo\registry\src\index.crates.io-6f17d22bba15001f\windows_x86_64_msvc-0.48.5\lib
-```
+**`parameter packs not expanded` from gcc 11 under nvcc.** Point nvcc at another host compiler,
+e.g. `NVCC_CCBIN=/usr/lib/gcc/x86_64-linux-gnu/10 cargo ...`.
 
-#### Extremely slow model load time with WSL
+**401 downloading a gated model.** Accept the model's terms on its hub page and log in with
+`hf auth login`.
 
-This may be caused by the models being loaded from `/mnt/c`, more details on
-[stackoverflow](https://stackoverflow.com/questions/68972448/why-is-wsl-extremely-slow-when-compared-with-native-windows-npm-yarn-processing).
+**Slow model loads under WSL.** Keep weights off `/mnt/c`.
 
-#### Tracking down errors
+**Where did the error come from?** Run with `RUST_BACKTRACE=1`. For CUDA, add
+`CUDA_LAUNCH_BLOCKING=1` so the failing kernel is the one reported.
 
-You can set `RUST_BACKTRACE=1` to be provided with backtraces when a hanzo
-error is generated.
+## License
 
-#### CudaRC error
-
-If you encounter an error like this one `called `Result::unwrap()` on an `Err` value: LoadLibraryExW { source: Os { code: 126, kind: Uncategorized, message: "The specified module could not be found." } }` on windows. To fix copy and rename these 3 files (make sure they are in path). The paths depend on your cuda version.
-`c:\Windows\System32\nvcuda.dll` -> `cuda.dll`
-`c:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\cublas64_12.dll` -> `cublas.dll`
-`c:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\curand64_10.dll` -> `curand.dll`
-
-## Hanzo — the Open AI Cloud
-
-Open source · every language · on-chain settlement. [hanzo.ai](https://hanzo.ai) · [docs.hanzo.ai](https://docs.hanzo.ai)
-
-**SDKs in every language** — [Python](https://github.com/hanzoai/python-sdk) (flagship) · [TypeScript](https://github.com/hanzo-js/sdk) · [Go](https://github.com/hanzo-go/sdk) · [Rust](https://crates.io/crates/hanzo-client) · [C++](https://github.com/hanzo-cpp/sdk) · [Swift](https://github.com/hanzo-swift/sdk) · [Kotlin](https://github.com/hanzo-kt/sdk) · [umbrella](https://github.com/hanzoai/sdk)
+MIT OR Apache-2.0, at your option ([LICENSE](LICENSE)). See [NOTICE](NOTICE) for third-party
+attributions.

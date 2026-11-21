@@ -1,26 +1,25 @@
-## Installation 
+# hanzo-ml-pyo3
 
-From the `hanzo-ml-pyo3` directory, enable a virtual env where you will want the
-hanzo package to be installed then run.
+Python bindings for [hanzo-ml](https://github.com/hanzoai/ml): tensors, `nn` modules, ONNX
+evaluation and utilities, as the Python module `hanzo`. Built locally with
+[maturin](https://www.maturin.rs); not published.
 
 ```bash
-maturin develop -r 
+cd hanzo-ml-pyo3
+maturin develop -r      # inside a virtual env
 python test.py
 ```
 
-## Generating Stub Files for Type Hinting
+## Type stubs
 
-For type hinting support, the `hanzo-ml-pyo3` package requires `*.pyi` files. You can automatically generate these files using the `stub.py` script.
+The package ships `*.pyi` stubs, generated from the built module:
 
-### Steps:
-1. Install the package using `maturin`.
-2. Generate the stub files by running:
-   ```
-   python stub.py
-   ```
-
-### Validation:
-To ensure that the stub files match the current implementation, execute:
+```bash
+python stub.py          # regenerate
+python stub.py --check  # fail if the stubs differ from the module
 ```
-python stub.py --check
-```
+
+## License
+
+MIT OR Apache-2.0. See [NOTICE](https://github.com/hanzoai/ml/blob/main/NOTICE) for
+third-party attributions.

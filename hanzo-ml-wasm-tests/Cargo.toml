@@ -4,7 +4,7 @@ name = "hanzo-ml-wasm-tests"
 publish = false
 version = "0.11.8"
 edition = "2021"
-description = "WASM tests for hanzo"
+description = "WASM tests for hanzo-ml."
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 

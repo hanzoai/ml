@@ -13,8 +13,8 @@ dynamic = [
 ]
 
 [project.urls]
-Homepage = 'https://github.com/huggingface/hanzo'
-Source = 'https://github.com/huggingface/hanzo'
+Homepage = 'https://github.com/hanzoai/ml'
+Source = 'https://github.com/hanzoai/ml'
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

@@ -8,8 +8,7 @@ repository = "https://github.com/hanzoai/ml"
 
 # Zero-dependency foundation: representations, geometry (Vec3/Mat/Quat/Camera), and
 # glTF-adjacent I/O (OBJ, PLY — including the 3D-Gaussian-Splatting PLY layout) are all
-# pure std. A `candle` feature adds tensor interop for the diffusion pipelines; kept optional
-# so the crate builds and its roundtrip gates run with no external toolchain.
+# pure std, so the crate builds and its roundtrip gates run with no external toolchain.
 [features]
 default = []
 

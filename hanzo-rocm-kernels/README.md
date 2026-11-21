@@ -1,131 +1,42 @@
-# hanzo-ml-rocm-kernels
+# hanzo-rocm-kernels
 
-ROCm/HIP kernel support for the Hanzo deep learning framework.
+HIP kernels for the [hanzo-ml](https://crates.io/crates/hanzo-ml) ROCm backend, and the cache that
+compiles them.
 
-## Overview
+## How a kernel gets to the GPU
 
-This crate provides ROCm (AMD GPU) kernel support for Hanzo. Unlike CUDA which can embed PTX directly, ROCm/HIP requires ahead-of-time (AOT) compilation for specific GPU architectures.
+Kernels ship as HIP source (`src/kernels/*.hip`). The first time one is needed, `KernelCache`
+compiles it with `hipcc --offload-arch=<arch> -O3 --genco`, extracts the code object for that
+arch with `clang-offload-bundler`, and stores it as
+`~/.cache/hanzo-ml-rocm/<arch>-<rocm version>/<name>_<source hash>.cso`. Later runs load the
+cached object. A changed source gets a new hash and recompiles.
 
-## Architecture
+| Variable | Effect |
+|---|---|
+| `ROCM_GFX_ARCH` | the target arch, e.g. `gfx1151`; else read from `rocminfo`, else `gfx1151` |
+| `ROCM_VERSION` | the version in the cache path; else parsed from `hipcc --version` |
+| `ROCM_PATH` | where to find `clang-offload-bundler` and the other ROCm tools |
 
-### AOT Cache System
+## Kernels
 
-We use an **Ahead-of-Time (AOT) compilation cache** approach:
+| File | Holds |
+|---|---|
+| `quant.hip` | the unified quantized core: int8 dot-product matvec, int8 WMMA prefill GEMM, on-device dequantize, mixture-of-experts matvecs |
+| `flash.hip` | flash-attention decode (single query, strided KV, GQA) |
+| `gdn.hip` | Gated DeltaNet conv, gating and a fused scan |
+| `dsl_rms_norm.hip`, `dsl_add_rmsnorm.hip` | generated from the [hanzo-kernel](https://crates.io/crates/hanzo-kernel) DSL, do not edit; used by hanzo-ml's A/B tests, while production keeps the faster hand-written norms in `reduce.hip` |
+| `affine`, `binary`, `unary`, `ternary`, `cast`, `fill`, `indexing`, `reduce`, `sort`, `conv`, `rope` | the rest of the op set |
 
-1. **Source Code**: HIP kernels are shipped as source code (`.hip` files)
-2. **On-Demand Compilation**: First time a kernel is needed, it's compiled using `hipcc`
-3. **Caching**: Compiled binaries are cached for reuse
-4. **Future Runs**: Load cached binaries directly (no recompilation)
+The prefill GEMM covers Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q4_K, Q5_K, Q6_K, IQ4_XS, TQ2_0,
+ROCmFP4 and ROCmFP4 fast. WMMA paths are compiled for gfx11 parts (gfx1100–gfx1103,
+gfx1150–gfx1152).
 
-### Cache Location
+## Bench
 
-Compiled binaries are stored at:
-
-```
-~/.cache/hanzo-ml-rocm/{arch}-{rocm_version}/
-```
-
-For example:
-- `~/.cache/hanzo-ml-rocm/gfx908-6.1/binary_a1b2c3d4.cso`
-- `~/.cache/hanzo-ml-rocm/gfx942-6.2/binary_a1b2c3d4.cso`
-
-Where:
-- `{arch}` = GPU architecture (gfx908, gfx90a, gfx942, etc.)
-- `{rocm_version}` = ROCm version (6.0, 6.1, 6.2, etc.)
-- `{hash}` = SHA256 hash of source code (first 16 chars)
-
-### Key Components
-
-#### CacheManager (`src/cache.rs`)
-
-Manages the AOT compilation cache:
-
-- **GPU Detection**: Automatically detects GPU architecture using `rocminfo` or falls back to environment variable `HANZO_ROCM_ARCH`
-- **Version Detection**: Detects ROCm version using `hipcc --version` or environment variable `HANZO_ROCM_VERSION`
-- **Compilation**: Invokes `hipcc` with appropriate flags:
-  ```bash
-  hipcc --offload-arch={arch} -O3 -fPIC -c -o output.o input.hip
-  ```
-- **Caching**: Stores compiled `.cso` (code object) files with source hash versioning
-
-Usage:
-```rust
-use hanzo_rocm_kernels::CacheManager;
-use rocm_rs::hip::Device;
-
-let device = Device::new(0)?;
-let cache = CacheManager::new(&device)?;
-let binary = cache.get_or_compile("binary", source_code)?;
-```
-
-#### KernelManager (`src/manager.rs`)
-
-Higher-level manager that:
-
-- Wraps CacheManager
-- Loads compiled binaries as `rocm_rs::hip::Module`
-- Returns `Arc<Module>` for thread-safe sharing
-- Maintains in-memory module cache
-
-Usage:
-```rust
-use hanzo_rocm_kernels::KernelManager;
-use hanzo_rocm_kernels::source::Source;
-
-let device = Device::new(0)?;
-let manager = KernelManager::new(&device)?;
-let module = manager.get_or_compile_module(Source::Binary)?;
-```
-
-### Environment Variables
-
-- `HANZO_ROCM_ARCH` - Override GPU architecture detection (e.g., "gfx908")
-- `HANZO_ROCM_VERSION` - Override ROCm version detection (e.g., "6.1")
-
-## Requirements
-
-- ROCm/HIP installed (provides `hipcc`)
-- AMD GPU with supported architecture
-
-## Kernel Types
-
-Currently supports:
-- **Binary operations**: Add, Sub, Mul, Div, Minimum, Maximum
-
-## Building
-
-```bash
-cd hanzo-ml-rocm-kernels
-cargo build
-```
-
-Note: First build will compile dependencies. No GPU required for building, but `hipcc` must be in PATH if you want to compile kernels.
-
-## Testing
-
-```bash
-cargo test
-```
-
-## Implementation Notes
-
-### Why AOT instead of JIT?
-
-The `rocm-rs` crate (v0.5) doesn't support runtime compilation. It only supports:
-- `Module::load(path)` - Load from file
-- `Module::load_data(bytes)` - Load from bytes
-
-This makes JIT compilation (via hiprtc) unavailable, so we compile ahead-of-time on first run.
-
-### Supported GPU Architectures
-
-Common AMD GPU architectures:
-- CDNA2: gfx90a (MI200 series)
-- CDNA3: gfx942 (MI300 series)
-- RDNA3: gfx1100, gfx1101, gfx1102 (RX 7000 series)
-
-The system will try to auto-detect, but you can override with `HANZO_ROCM_ARCH`.
+[`bench/`](bench) is a standalone HIP harness for the prefill GEMM: a numeric oracle and a
+microbenchmark against dequantize-plus-rocBLAS. Its README records the gfx1151 results.
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0. See [NOTICE](https://github.com/hanzoai/ml/blob/main/NOTICE) for
+third-party attributions.

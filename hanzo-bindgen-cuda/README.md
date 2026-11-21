@@ -1,12 +1,11 @@
-# Bindgen Cuda
+# hanzo-bindgen-cuda
 
-[![Latest version](https://img.shields.io/crates/v/bindgen_cuda.svg)](https://crates.io/crates/bindgen_cuda)
-[![Documentation](https://docs.rs/bindgen_cuda/badge.svg)](https://docs.rs/bindgen_cuda)
-![License](https://img.shields.io/crates/l/bindgen_cuda.svg)
+Compile CUDA kernels from a `build.rs`, either to PTX embedded as string constants or to a
+static library called through FFI. `nvcc` runs once per kernel file, in parallel, and only
+when the source changed. The library name is `bindgen_cuda`.
 
-Similar crate than [bindgen](https://github.com/rust-lang/rust-bindgen) in philosophy.
-It will help create automatic bindgen to cuda kernels source files and make them easier to use
-directly from Rust.
+`CUDA_COMPUTE_CAP` picks the architecture (else `nvidia-smi` is asked), `NVCC` the compiler
+and `NVCC_CCBIN` its host compiler.
 
 
 ## PTX inclusion
@@ -19,10 +18,10 @@ __global__ void cuda_hello(){
 }
 ```
 
-You can add `bindgen_cuda` as a build dependency:
+Add it as a build dependency:
 
 ```bash
-cargo add --build bindgen_cuda
+cargo add --build hanzo-bindgen-cuda
 ```
 
 And then create this `build.rs`

@@ -1,3 +1,7 @@
+# hanzo-ml-wasm-tests
+
+hanzo-ml tests compiled to WebAssembly and run in a browser.
+
 Run the tests with:
 ```bash
 RUST_LOG=wasm_bindgen_test_runner wasm-pack test --chrome --headless

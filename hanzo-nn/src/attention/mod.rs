@@ -1,9 +1,11 @@
 pub mod attention_residuals;
 pub mod cpu_flash;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod rocm;
 pub mod varlen;
 
-use hanzo_ml::Tensor;
+use hanzo_ml::{Result, Tensor};
 
 pub use attention_residuals::AttentionResiduals;
 pub use cpu_flash::flash_attn;
@@ -43,5 +45,37 @@ impl AttnMask {
             AttnMask::Causal { kv_offset } => *kv_offset,
             _ => 0,
         }
+    }
+}
+
+/// Whether [`packed`] runs on `dev` in `dtype` with heads of `head` dimensions.
+pub fn packs(dev: &hanzo_ml::Device, dtype: hanzo_ml::DType, head: usize) -> bool {
+    match dev {
+        hanzo_ml::Device::Cpu => dtype == hanzo_ml::DType::F32,
+        hanzo_ml::Device::Cuda(_) => {
+            cfg!(feature = "cuda") && dtype == hanzo_ml::DType::BF16 && head == 64
+        }
+        _ => false,
+    }
+}
+
+/// [`cpu_flash::packed::packed`] on the device of `qkv`; on CUDA it carries a gradient.
+#[allow(clippy::too_many_arguments)]
+pub fn packed(
+    qkv: &Tensor,
+    lens: &[usize],
+    heads: usize,
+    window: Option<usize>,
+    cos: &Tensor,
+    sin: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    match qkv.device() {
+        hanzo_ml::Device::Cpu => {
+            cpu_flash::packed::packed(qkv, lens, heads, window, cos, sin, scale)
+        }
+        #[cfg(feature = "cuda")]
+        hanzo_ml::Device::Cuda(_) => cuda::packed(qkv, lens, heads, window, cos, sin, scale),
+        d => hanzo_ml::bail!("packed attention: no kernel on {d:?}"),
     }
 }

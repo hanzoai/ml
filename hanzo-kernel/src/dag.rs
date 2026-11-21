@@ -1230,6 +1230,7 @@ mod tests {
         assert!(maxerr < 1e-5, "reference disagreement {maxerr}");
     }
 
+    #[cfg(feature = "cpu")]
     #[test]
     fn rms_norm_gated_engine_pattern_fuses() {
         // The exact per-GDN-layer chain from hanzo-engine `models/gdn.rs` `RmsNormGated`:

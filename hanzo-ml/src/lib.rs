@@ -1,4 +1,4 @@
-//! ML framework for Rust
+//! Tensors, autograd and quantization for Rust, on the CPU, CUDA, ROCm, Metal, Vulkan and wgpu.
 //!
 //! ```rust
 //! use hanzo_ml::{Tensor, DType, Device};
@@ -12,40 +12,17 @@
 //! # Ok(())}
 //! ```
 //!
-//! ## Features
+//! - `Tensor` and `Device`: n-dimensional arrays on one device; the backend is a cargo feature
+//!   (`cuda`, `rocm`, `metal`, `vulkan`, `wgpu`; `mkl` or `accelerate` for CPU BLAS).
+//! - `Var` and `backprop`: reverse-mode autograd.
+//! - `quantized`: GGUF and GGML files, `QTensor`, `QMatMul`, and 28 block types with a CPU
+//!   reference decode for each.
+//! - `safetensors`, `npy`, `pickle`: weight formats.
+//! - `CustomOp1`, `CustomOp2`, `CustomOp3`: a kernel of your own as a graph op, with its backward.
 //!
-//! - Simple syntax (looks and feels like PyTorch)
-//! - CPU and Cuda backends (and M1 support)
-//! - Enable serverless (CPU) small and fast deployments
-//! - Model training
-//! - Distributed computing (NCCL).
-//! - Models out of the box (Llama, Whisper, Falcon, ...)
-//!
-//! ## FAQ
-//!
-//! - Why Hanzo?
-//!
-//! Hanzo stems from the need to reduce binary size in order to *enable serverless*
-//! possible by making the whole engine smaller than PyTorch very large library volume
-//!
-//! And simply *removing Python* from production workloads.
-//! Python can really add overhead in more complex workflows and the [GIL](https://www.backblaze.com/blog/the-python-gil-past-present-and-future/) is a notorious source of headaches.
-//!
-//! Rust is cool, and a lot of the HF ecosystem already has Rust crates [safetensors](https://github.com/huggingface/safetensors) and [tokenizers](https://github.com/huggingface/tokenizers)
-//!
-//! ## Other Crates
-//!
-//! Hanzo consists of a number of crates. This crate holds core the common data structures but you may wish
-//! to look at the docs for the other crates which can be found here:
-//!
-//! - [hanzo-ml](https://docs.rs/hanzo-ml/). Core Datastructures and DataTypes.
-//! - [hanzo-nn](https://docs.rs/hanzo-nn/). Building blocks for Neural Nets.
-//! - [hanzo-datasets](https://docs.rs/hanzo-datasets/). Rust access to commonly used Datasets like MNIST.
-//! - [hanzo-ml-examples](https://docs.rs/hanzo-ml-examples/). Examples of Hanzo in Use.
-//! - [hanzo-onnx](https://docs.rs/hanzo-onnx/). Loading and using ONNX models.
-//! - [hanzo-ml-pyo3](https://docs.rs/hanzo-ml-pyo3/). Access to Hanzo from Python.
-//! - [hanzo-transformers](https://docs.rs/hanzo-transformers/). Hanzo implementation of many published transformer models.
-//!
+//! Layers and optimizers are in [hanzo-nn](https://docs.rs/hanzo-nn), model implementations in
+//! [hanzo-transformers](https://docs.rs/hanzo-transformers), and the kernel DSL in
+//! [hanzo-kernel](https://docs.rs/hanzo-kernel).
 
 #[cfg(feature = "accelerate")]
 mod accelerate;
@@ -110,7 +87,7 @@ pub use cpu_backend::{CpuStorage, CpuStorageRef};
 pub use custom_op::{
     CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3, InplaceOpN,
 };
-pub use device::{Device, DeviceLocation, NdArray};
+pub use device::{Device, DeviceLocation, NdArray, Timer};
 pub use dtype::{DType, DTypeParseError, FloatDType, IntDType, WithDType};
 pub use dummy_dtype::{F4, F6E2M3, F6E3M2, F8E8M0};
 pub use error::{Context, Error, Result};

@@ -1157,6 +1157,26 @@ impl QTensor {
         self.storage.data()
     }
 
+    /// `dst [m, n] = lhs [m, k] · Wᵀ` for this `[n, k]` CPU weight, without allocating.
+    pub fn matmul_into(&self, lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+        let (n, k) = self.shape.dims2()?;
+        if k == 0 || lhs.len() % k != 0 {
+            crate::bail!("matmul_into: lhs of {} values for k {k}", lhs.len());
+        }
+        let m = lhs.len() / k;
+        if dst.len() != m * n {
+            crate::bail!("matmul_into: dst of {} values for {m} x {n}", dst.len());
+        }
+        let storage = match &self.storage {
+            QStorage::Cpu(s) => s,
+            _ => crate::bail!("matmul_into: a CPU weight"),
+        };
+        if !repack::try_matmul_f32(storage.as_ref(), &self.repacked_qs, (m, k, n), lhs, dst)? {
+            storage.matmul_t((m, k, n), lhs, dst)?;
+        }
+        Ok(())
+    }
+
     // Resident PLANAR expert bank for the DSL block-reduced MoE kernels: the packed GGML bank is
     // de-interleaved into per-field device arrays once (at first sight of its CPU bytes) and reused
     // every token. Only Q4_K/Q6_K -- the dtypes with a committed `moe_matvec_q*k_blk_*` .spv.
@@ -3421,6 +3441,25 @@ impl crate::Module for QMatMul {
 #[cfg(test)]
 mod tests {
     use super::GgmlDType;
+
+    #[test]
+    fn matmul_into_is_the_matmul() -> crate::Result<()> {
+        use crate::{Device, Module, Tensor};
+        let dev = Device::Cpu;
+        let (m, k, n) = (5, 64, 12);
+        let w = Tensor::randn(0f32, 1.0, (n, k), &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (m, k), &dev)?;
+        let q = std::sync::Arc::new(super::QTensor::quantize(&w, GgmlDType::Q8_0)?);
+        let want = super::QMatMul::from_arc(q.clone())?.forward(&x)?;
+        let mut dst = vec![0f32; m * n];
+        q.matmul_into(&x.flatten_all()?.to_vec1::<f32>()?, &mut dst)?;
+        let got = Tensor::from_vec(dst, (m, n), &dev)?;
+        let gap = (want - got)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(gap < 1e-4, "{gap}");
+        assert!(q.matmul_into(&[0f32; 63], &mut [0f32; 12]).is_err());
+        assert!(q.matmul_into(&[0f32; 64], &mut [0f32; 11]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn block_align_divides_type_size() {

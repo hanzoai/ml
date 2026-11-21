@@ -1,10 +1,10 @@
 [package]
 name = "tensor-tools"
-# Not published: the crate name `tensor-tools` on crates.io belongs to the upstream candle author, not Hanzo.
+# Not published: the crate name `tensor-tools` on crates.io belongs to another author.
 publish = false
 version.workspace = true
 edition.workspace = true
-description.workspace = true
+description = "List, print, quantize and dequantize tensor files: safetensors, npz, GGML, GGUF and PyTorch."
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true

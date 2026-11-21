@@ -11,6 +11,7 @@ use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
@@ -68,6 +69,47 @@ pub struct CudaDevice {
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
+    pub(crate) launches: Arc<AtomicU64>,
+    graphs: Arc<AtomicU64>,
+}
+
+/// Captured work that replays as one launch.
+pub struct Graph {
+    graph: Mutex<cudarc::driver::CudaGraph>,
+    launches: Arc<AtomicU64>,
+}
+
+// SAFETY: CUDA allows a graph on any thread once calls on it are serialized; the mutex does.
+unsafe impl Send for Graph {}
+unsafe impl Sync for Graph {}
+
+impl Graph {
+    pub fn launch(&self) -> Result<()> {
+        self.launches.fetch_add(1, Ordering::Relaxed);
+        self.graph.lock().unwrap().launch().w()
+    }
+}
+
+/// Two events that time the device work between them on the device's stream.
+pub struct Timer {
+    start: cudarc::driver::CudaEvent,
+    stop: cudarc::driver::CudaEvent,
+    stream: Arc<cudarc::driver::CudaStream>,
+}
+
+impl Timer {
+    pub fn start(&self) -> Result<()> {
+        self.start.record(&self.stream).w()
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        self.stop.record(&self.stream).w()
+    }
+
+    /// Milliseconds from start to stop, waiting for stop.
+    pub fn elapsed(&self) -> Result<f32> {
+        self.start.elapsed_ms(&self.stop).w()
+    }
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -255,6 +297,7 @@ pub(crate) fn cuda_graph_htod_cache_enabled() -> bool {
 pub struct CudaFunc {
     func: CudaFunction,
     stream: Arc<cudarc::driver::CudaStream>,
+    launches: Arc<AtomicU64>,
 }
 
 impl std::ops::Deref for CudaFunc {
@@ -283,6 +326,7 @@ macro_rules! builder_arg {
 
 impl CudaFunc {
     pub fn builder(&self) -> cudarc::driver::LaunchArgs<'_> {
+        self.launches.fetch_add(1, Ordering::Relaxed);
         self.stream.launch_builder(&self.func)
     }
 }
@@ -290,6 +334,48 @@ impl CudaFunc {
 impl CudaDevice {
     pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
         self.stream.clone()
+    }
+
+    pub fn timer(&self) -> Result<Timer> {
+        use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+        Ok(Timer {
+            start: self.context.new_event(Some(CU_EVENT_DEFAULT)).w()?,
+            stop: self.context.new_event(Some(CU_EVENT_DEFAULT)).w()?,
+            stream: self.stream.clone(),
+        })
+    }
+
+    /// Kernel and cuBLAS launches so far, and graph launches.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.launches.load(Ordering::Relaxed),
+            self.graphs.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Captures `f`'s work as a [`Graph`]; the tensors `f` returns are rewritten by every launch.
+    pub fn capture<T>(&self, mut f: impl FnMut() -> Result<T>) -> Result<(T, Graph)> {
+        use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+        let _cache = self.enable_cuda_graph_htod_cache();
+        drop(f()?);
+        self.stream.synchronize().w()?;
+        self.stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .w()?;
+        let out = f();
+        let graph = self
+            .stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .w();
+        let out = out?;
+        let graph = graph?.ok_or_else(|| crate::Error::Msg("capture: no work to replay".into()))?;
+        Ok((
+            out,
+            Graph {
+                graph: Mutex::new(graph),
+                launches: self.graphs.clone(),
+            },
+        ))
     }
 
     /// When turned on, all cuda tensors **created after calling this function** will
@@ -326,6 +412,7 @@ impl CudaDevice {
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
+                launches: self.launches.clone(),
             });
         }
         drop(ms);
@@ -336,6 +423,7 @@ impl CudaDevice {
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
+            launches: self.launches.clone(),
         })
     }
 
@@ -346,6 +434,7 @@ impl CudaDevice {
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
+                launches: self.launches.clone(),
             });
         }
         drop(ms);
@@ -356,6 +445,7 @@ impl CudaDevice {
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
+            launches: self.launches.clone(),
         })
     }
 
@@ -371,10 +461,34 @@ impl CudaDevice {
         Self::from_context_and_stream(context, stream)
     }
 
+    /// Bytes the device's memory pool keeps reserved across synchronizations.
+    const POOL: u64 = 16 << 30;
+
+    fn retain(context: &cudarc::driver::CudaContext) -> Result<()> {
+        use cudarc::driver::sys;
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        let mut keep = Self::POOL;
+        // SAFETY: ffi; `pool` and `keep` outlive the calls.
+        unsafe {
+            sys::cuDeviceGetDefaultMemPool(&mut pool, context.cu_device())
+                .result()
+                .w()?;
+            sys::cuMemPoolSetAttribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &mut keep as *mut u64 as *mut c_void,
+            )
+            .result()
+            .w()?;
+        }
+        Ok(())
+    }
+
     fn from_context_and_stream(
         context: Arc<cudarc::driver::CudaContext>,
         stream: Arc<cudarc::driver::CudaStream>,
     ) -> Result<Self> {
+        Self::retain(&context)?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
@@ -389,35 +503,14 @@ impl CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
+            launches: Arc::new(AtomicU64::new(0)),
+            graphs: Arc::new(AtomicU64::new(0)),
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unified / managed memory (CUDA UMA path for GB10-class coherent devices).
-//
-// A discrete GPU keeps model state in host RAM *and* a separate VRAM copy; on a
-// physically unified device (e.g. GB10 DGX Spark, 128 GiB coherent memory) that
-// double-counting caps everything >= ~80 GiB. This section adds, additively:
-//   * detection of the unified / managed capability (mirrors the ROCm APU
-//     `RocmDevice::is_integrated()` precedent),
-//   * a size-gated `cuMemAllocManaged`-backed allocation path (cudarc's
-//     `UnifiedSlice`, which frees with the correct `cuMemFree` — a managed
-//     pointer wrapped in a device-malloc `CudaSlice` would be freed with the
-//     invalid `cuMemFreeAsync`), and
-//   * `cuMemAdvise` / `cuMemPrefetchAsync` (v2) hint helpers, usable on managed
-//     buffers *and* on an mmap'd weight region (the HMM-direct loader seam).
-//
-// Discrete behaviour is unchanged: a non-unified device reports `is_unified() ==
-// false`, `should_use_managed()` returns false, and the managed entry points are
-// simply never called.
-//
-// Toolkit pinning: the v2 advise/prefetch entry points require CUDA >= 12.2, and
-// the `CUmemLocation { type_, id }` literal matches the cudarc binding layout for
-// CUDA < 13.2. The stack targets CUDA 13.0; on 13.2 (cudarc feature
-// `cuda-13020`) the `id` field moves into an anonymous union and this section
-// needs a one-line cfg.
-// ---------------------------------------------------------------------------
+// Unified memory: managed allocations and advise/prefetch hints where the device shares host memory.
+// `CUmemLocation { type_, id }` is cudarc's layout for CUDA < 13.2.
 
 /// Default managed-allocation size gate: a buffer at least this large on a
 /// unified device is backed by `cuMemAllocManaged` instead of device-malloc.

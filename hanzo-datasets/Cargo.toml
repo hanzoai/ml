@@ -2,7 +2,7 @@
 name = "hanzo-datasets"
 version = "0.11.9"
 edition = "2021"
-description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
+description = "MNIST, Fashion-MNIST, CIFAR-10 and TinyStories loaders and a batcher for hanzo-ml."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]

@@ -6,12 +6,16 @@ mod ptx {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Id {
     Affine,
+    Attention,
+    Backward,
     Binary,
     Cast,
     Conv,
     Fill,
+    Glu,
     Indexing,
     IquantMmvq,
+    Optim,
     Quantized,
     Reduce,
     Sort,
@@ -19,14 +23,18 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 12] = [
+pub const ALL_IDS: [Id; 16] = [
     Id::Affine,
+    Id::Attention,
+    Id::Backward,
     Id::Binary,
     Id::Cast,
     Id::Conv,
     Id::Fill,
+    Id::Glu,
     Id::Indexing,
     Id::IquantMmvq,
+    Id::Optim,
     Id::Quantized,
     Id::Reduce,
     Id::Sort,
@@ -70,12 +78,16 @@ macro_rules! mdl {
 }
 
 mdl!(AFFINE, Affine);
+mdl!(ATTENTION, Attention);
+mdl!(BACKWARD, Backward);
 mdl!(BINARY, Binary);
 mdl!(CAST, Cast);
 mdl!(CONV, Conv);
 mdl!(FILL, Fill);
+mdl!(GLU, Glu);
 mdl!(INDEXING, Indexing);
 mdl!(IQUANT_MMVQ, IquantMmvq);
+mdl!(OPTIM, Optim);
 mdl!(QUANTIZED, Quantized);
 mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);

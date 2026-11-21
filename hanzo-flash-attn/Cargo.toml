@@ -6,7 +6,7 @@
 name = "hanzo-flash-attn"
 version = "0.11.36"
 edition = "2021"
-description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
+description = "FlashAttention-2 CUDA kernels for hanzo-ml."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]

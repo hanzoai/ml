@@ -1,6 +1,5 @@
 [book]
-authors = ["Nicolas Patry"]
+authors = ["Hanzo AI"]
 language = "en"
-# multilingual = false
 src = "src"
-title = "ML Documentation"
+title = "Hanzo ML"

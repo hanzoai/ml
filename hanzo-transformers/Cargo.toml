@@ -1,8 +1,8 @@
 [package]
 name = "hanzo-transformers"
-version = "0.11.11"
+version = "0.11.12"
 edition = "2021"
-description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
+description = "Language, vision and audio model implementations on hanzo-ml, with quantized variants."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]

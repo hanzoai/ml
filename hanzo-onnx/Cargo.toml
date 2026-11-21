@@ -2,7 +2,7 @@
 name = "hanzo-onnx"
 version = "0.11.9"
 edition = "2021"
-description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
+description = "ONNX model evaluation on hanzo-ml, including the ai.onnx.ml domain."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]

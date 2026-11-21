@@ -1,19 +1,11 @@
-//! hanzo-nn
+//! Layers, fused ops and optimizers on [hanzo-ml](https://docs.rs/hanzo-ml).
 //!
-//! ## Other Crates
-//!
-//! Hanzo consists of a number of crates. This crate holds structs and functions
-//! that allow you to build and train neural nets. You may wish
-//! to look at the docs for the other crates which can be found here:
-//!
-//! - [hanzo-ml](https://docs.rs/hanzo-ml/). Core Datastructures and DataTypes.
-//! - [hanzo-nn](https://docs.rs/hanzo-nn/). Building blocks for Neural Nets.
-//! - [hanzo-datasets](https://docs.rs/hanzo-datasets/). Rust access to commonly used Datasets like MNIST.
-//! - [hanzo-ml-examples](https://docs.rs/hanzo-ml-examples/). Examples of Hanzo in Use.
-//! - [hanzo-onnx](https://docs.rs/hanzo-onnx/). Loading and using ONNX models.
-//! - [hanzo-ml-pyo3](https://docs.rs/hanzo-ml-pyo3/). Access to Hanzo from Python.
-//! - [hanzo-transformers](https://docs.rs/hanzo-transformers/). Hanzo implementation of many published transformer models.
-//!
+//! - Layers: linear, embedding, convolution, normalization, recurrent, rotary embedding, KV
+//!   cache, mixture of experts, attention.
+//! - `ops` and `rotary_emb`: fused softmax, layer-norm, rms-norm, rope, silu-mul, GeGLU and
+//!   select, each with its own backward pass.
+//! - `optim`: SGD, AdamW, Muon, MuonClip and Muon with AdamW.
+//! - `VarBuilder` and `VarMap`: named parameters, from weight files or for training.
 
 pub mod activation;
 pub mod attention;

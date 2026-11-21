@@ -37,7 +37,7 @@ resolver = "2"
 [workspace.package]
 version = "0.11.18"
 edition = "2021"
-description = "Multi-backend tensor & ML framework for Rust — part of the Hanzo ML stack."
+description = "Tensors, autograd and quantized inference for Rust on CPU, CUDA, ROCm, Metal and Vulkan."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
@@ -52,15 +52,15 @@ anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 chrono = "0.4"
 # Hanzo-renamed workspace dependencies (at version 0.10.x)
-hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.104" }
+hanzo-ml = { path = "./hanzo-ml", package = "hanzo-ml", version = "0.11.108" }
 hanzo-datasets = { path = "./hanzo-datasets", version = "0.11.9" }
 hanzo-flash-attn = { path = "./hanzo-flash-attn", version = "0.11.36" }
 hanzo-flash-attn-v3 = { path = "./hanzo-flash-attn-v3", version = "0.11.10" }
-hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.37" }
-hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.45" }
-hanzo-nn = { path = "./hanzo-nn", version = "0.11.44" }
+hanzo-kernels = { path = "./hanzo-kernels", version = "0.11.38" }
+hanzo-metal-kernels = { path = "./hanzo-metal-kernels", version = "0.11.46" }
+hanzo-nn = { path = "./hanzo-nn", version = "0.11.46" }
 hanzo-onnx = { path = "./hanzo-onnx", version = "0.11.9" }
-hanzo-transformers = { path = "./hanzo-transformers", version = "0.11.11" }
+hanzo-transformers = { path = "./hanzo-transformers", version = "0.11.12" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
 cudarc = { version = "0.19.8", features = [

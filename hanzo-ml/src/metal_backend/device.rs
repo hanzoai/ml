@@ -188,6 +188,17 @@ impl MetalDevice {
         &self.kernels
     }
 
+    /// Encoders taken and command buffers committed so far.
+    pub fn counts(&self) -> (u64, u64) {
+        self.commands.totals()
+    }
+
+    /// Runs `f` with its dispatches on one command buffer.
+    pub fn batch<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _hold = self.commands.hold();
+        f()
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }

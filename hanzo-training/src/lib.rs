@@ -1,6 +1,5 @@
-//! Hanzo Training - ML Training Framework
-//!
-//! A high-performance training framework for machine learning models.
+//! GRPO training on hanzo-ml autograd ([`grpo`]), and the training-config format
+//! ([`TrainingConfig`]) read from YAML, JSON or TOML.
 
 pub mod config;
 pub mod dataset;

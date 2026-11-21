@@ -2,31 +2,23 @@
 
 [Introduction](README.md)
 
-# User Guide
+# Guide
 
 - [Installation](guide/installation.md)
-- [Tutorial - MNIST](guide/mnist/intro.md)
-  - [Modeling](guide/mnist/modeling.md)
-  - [Training](guide/mnist/training.md)
-  - [Saving And Loading](guide/mnist/saving_loading.md)
-- [PyTorch cheatsheet](guide/cheatsheet.md)
+- [MNIST, step by step](guide/mnist/intro.md)
+  - [A model](guide/mnist/modeling.md)
+  - [Training it](guide/mnist/training.md)
+  - [Saving and loading](guide/mnist/saving_loading.md)
+- [From PyTorch](guide/cheatsheet.md)
 
-# Reference Guide
+# Reference
 
-- [Running a model](inference/inference.md)
-    - [Using the hub](inference/hub.md)
-- [Error management](error_manage.md)
+- [Backends](backends.md)
+- [Kernel DSL and autotuner](kernel.md)
+- [Quantization](quantization.md)
+- [Training](training.md)
+- [Loading weights](weights.md)
+- [cuTile kernels](cutile.md)
+- [Recording results](research.md)
+- [Errors](errors.md)
 - [Tracing](tracing.md)
-- [Training](training/training.md)
-    - [Simplified](training/simplified.md)
-    - [MNIST](training/mnist.md)
-    - [Fine-tuning]()
-    - [Serialization]()
-- [Advanced CUDA usage]()
-    - [Writing cuTile kernels](guide/cutile.md)
-    - [Porting a custom kernel]()
-- [Using MKL]()
-- [Creating apps]()
-    - [Creating a WASM app]()
-    - [Creating a REST api webserver]()
-    - [Creating a desktop Tauri app]()

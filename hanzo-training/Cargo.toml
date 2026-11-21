@@ -2,7 +2,7 @@
 name = "hanzo-training"
 version = "0.11.9"
 edition = "2021"
-description = "Training framework for Hanzo ML models on zen-agentic-dataset"
+description = "GRPO training on hanzo-ml autograd, with JSONL datasets and config files."
 repository = "https://github.com/hanzoai/ml"
 keywords = ["machine-learning", "training", "transformer", "llm"]
 categories = ["science", "algorithms"]
