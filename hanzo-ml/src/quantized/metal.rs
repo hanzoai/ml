@@ -369,53 +369,55 @@ impl QMetalStorage {
         src1_bf16: bool,
         is_gemm: bool,
     ) -> Result<bool> {
-        use crate::quantized::dsl::{self, QkImpl};
+        use crate::quantized::dsl::{self, QkBackend, QkImpl, QkOp};
         use hanzo_metal_kernels::GgmlDType;
+        let pq2_sel = dsl::select_impl(QkBackend::Metal, QkOp::Pq2 { m: m_total, n, k });
+        let ptq1_sel = dsl::select_impl(QkBackend::Metal, QkOp::Ptq1 { m: m_total, n, k });
         let (selected, elig, legacy_name, ineligible_name) = match (kdtype, is_gemm, src1_bf16) {
             (GgmlDType::PQ2_0, false, false) => (
-                dsl::pq2_impl(),
+                pq2_sel,
                 dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
                 "kernel_mul_mv_pq2_0_f32",
                 "kernel_mul_mv_pq2_0_f32[dsl-ineligible]",
             ),
             (GgmlDType::PQ2_0, false, true) => (
-                dsl::pq2_impl(),
+                pq2_sel,
                 dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
                 "kernel_mul_mv_pq2_0_bf16",
                 "kernel_mul_mv_pq2_0_bf16[dsl-ineligible]",
             ),
             (GgmlDType::PQ2_0, true, false) => (
-                dsl::pq2_impl(),
+                pq2_sel,
                 dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
                 "kernel_mul_mm_pq2_0_f32",
                 "kernel_mul_mm_pq2_0_f32[dsl-ineligible]",
             ),
             (GgmlDType::PQ2_0, true, true) => (
-                dsl::pq2_impl(),
+                pq2_sel,
                 dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
                 "kernel_mul_mm_pq2_0_bf16",
                 "kernel_mul_mm_pq2_0_bf16[dsl-ineligible]",
             ),
             (GgmlDType::PTQ1_0, false, false) => (
-                dsl::ptq1_impl(),
+                ptq1_sel,
                 dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
                 "kernel_mul_mv_ptq1_0_f32",
                 "kernel_mul_mv_ptq1_0_f32[dsl-ineligible]",
             ),
             (GgmlDType::PTQ1_0, false, true) => (
-                dsl::ptq1_impl(),
+                ptq1_sel,
                 dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
                 "kernel_mul_mv_ptq1_0_bf16",
                 "kernel_mul_mv_ptq1_0_bf16[dsl-ineligible]",
             ),
             (GgmlDType::PTQ1_0, true, false) => (
-                dsl::ptq1_impl(),
+                ptq1_sel,
                 dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
                 "kernel_mul_mm_ptq1_0_f32",
                 "kernel_mul_mm_ptq1_0_f32[dsl-ineligible]",
             ),
             (GgmlDType::PTQ1_0, true, true) => (
-                dsl::ptq1_impl(),
+                ptq1_sel,
                 dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
                 "kernel_mul_mm_ptq1_0_bf16",
                 "kernel_mul_mm_ptq1_0_bf16[dsl-ineligible]",

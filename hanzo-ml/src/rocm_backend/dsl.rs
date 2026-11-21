@@ -315,8 +315,12 @@ impl RocmDevice {
         k: usize,
     ) -> Result<Option<RocmStorage>> {
         let active = match dtype {
-            GgmlDType::PQ2_0 => dsl::pq2_impl() == QkImpl::Dsl,
-            GgmlDType::PTQ1_0 => dsl::ptq1_impl() == QkImpl::Dsl,
+            GgmlDType::PQ2_0 => {
+                dsl::select_impl(dsl::QkBackend::Rocm, dsl::QkOp::Pq2 { m, n, k }) == QkImpl::Dsl
+            }
+            GgmlDType::PTQ1_0 => {
+                dsl::select_impl(dsl::QkBackend::Rocm, dsl::QkOp::Ptq1 { m, n, k }) == QkImpl::Dsl
+            }
             _ => return Ok(None),
         };
         if !active || m == 0 || n == 0 || k == 0 {

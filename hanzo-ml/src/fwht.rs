@@ -52,7 +52,11 @@ pub fn try_hadamard_fwht(
     block_size: usize,
     inverse: bool,
 ) -> Result<Option<Tensor>> {
-    if dsl::fwht_impl() != QkImpl::Dsl {
+    if dsl::select_impl(
+        dsl::QkBackend::from_device(x.device()),
+        dsl::QkOp::Fwht { block_size },
+    ) != QkImpl::Dsl
+    {
         return Ok(None);
     }
     if !matches!(block_size, 64 | 128 | 256 | 512 | 1024 | 2048) {

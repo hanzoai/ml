@@ -45,7 +45,15 @@ pub fn try_conv1d_step(
     weight: &Tensor,
     conv_state: &mut Tensor,
 ) -> Result<Option<Tensor>> {
-    if dsl::gdn_impl() != QkImpl::Dsl {
+    if dsl::select_impl(
+        dsl::QkBackend::from_device(x.device()),
+        dsl::QkOp::Gdn {
+            seq_len: 1,
+            k_dim: 128,
+            v_dim: 128,
+        },
+    ) != QkImpl::Dsl
+    {
         return Ok(None);
     }
     let (batch, conv_dim) = match x.dims() {
@@ -218,10 +226,18 @@ pub fn try_conv1d_stateful(
     state_in: &Tensor,
     has_state: bool,
 ) -> Result<Option<(Tensor, Tensor)>> {
-    if dsl::gdn_impl() != QkImpl::Dsl {
+    let (batch, conv_dim, seq_len) = x_t.dims3()?;
+    if dsl::select_impl(
+        dsl::QkBackend::from_device(x_t.device()),
+        dsl::QkOp::Gdn {
+            seq_len,
+            k_dim: 128,
+            v_dim: 128,
+        },
+    ) != QkImpl::Dsl
+    {
         return Ok(None);
     }
-    let (batch, conv_dim, seq_len) = x_t.dims3()?;
     if state_in.dims() != [batch, conv_dim, 4] {
         return Ok(None);
     }
@@ -426,9 +442,6 @@ pub fn try_gating(
     a_log: &Tensor,
     dt_bias: &Tensor,
 ) -> Result<Option<(Tensor, Tensor)>> {
-    if dsl::gdn_impl() != QkImpl::Dsl {
-        return Ok(None);
-    }
     if b.shape() != a.shape() || b.rank() == 0 {
         return Ok(None);
     }
@@ -442,6 +455,17 @@ pub fn try_gating(
         return Ok(None);
     }
     let batch_tokens = total / num_heads;
+    if dsl::select_impl(
+        dsl::QkBackend::from_device(b.device()),
+        dsl::QkOp::Gdn {
+            seq_len: batch_tokens,
+            k_dim: 128,
+            v_dim: 128,
+        },
+    ) != QkImpl::Dsl
+    {
+        return Ok(None);
+    }
     let al = if a_log.dtype() == DType::F32 {
         a_log.clone()
     } else {
@@ -628,11 +652,19 @@ pub fn try_recurrence(
     state: &mut Tensor,
     apply_q_scale: bool,
 ) -> Result<Option<Tensor>> {
-    if dsl::gdn_impl() != QkImpl::Dsl {
-        return Ok(None);
-    }
     let (b, seq, nh, kd) = q.dims4()?;
     let vd = v.dim(3)?;
+    if dsl::select_impl(
+        dsl::QkBackend::from_device(q.device()),
+        dsl::QkOp::Gdn {
+            seq_len: seq,
+            k_dim: kd,
+            v_dim: vd,
+        },
+    ) != QkImpl::Dsl
+    {
+        return Ok(None);
+    }
     if !matches!((kd, vd), (128, 128) | (64, 64)) {
         return Ok(None);
     }
