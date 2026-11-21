@@ -191,6 +191,57 @@ pub fn try_flash_attn_paged(
                 false,
             )))
         }
+        #[cfg(feature = "rocm")]
+        crate::Device::Rocm(dev) => {
+            let q_c = ensure_contiguous_view(q)?;
+            let k_c = ensure_contiguous_view(k_cache)?;
+            let v_c = ensure_contiguous_view(v_cache)?;
+            let bt_c = ensure_contiguous_view(block_tables)?;
+            let cl_c = ensure_contiguous_view(context_lens)?;
+            let (qs, ql) = q_c.storage_and_layout();
+            let (ks, kl) = k_c.storage_and_layout();
+            let (vs, vl) = v_c.storage_and_layout();
+            let (bts, btl) = bt_c.storage_and_layout();
+            let (cls, cll) = cl_c.storage_and_layout();
+            let (
+                Storage::Rocm(qs),
+                Storage::Rocm(ks),
+                Storage::Rocm(vs),
+                Storage::Rocm(bts),
+                Storage::Rocm(cls),
+            ) = (&*qs, &*ks, &*vs, &*bts, &*cls)
+            else {
+                return Ok(None);
+            };
+            let out_s = dev.flash_attn_paged_dsl(
+                dtype,
+                (qs, ql.start_offset()),
+                (ks, kl.start_offset()),
+                (vs, vl.start_offset()),
+                (bts, btl.start_offset()),
+                (cls, cll.start_offset()),
+                batch,
+                n_heads,
+                n_kv,
+                seq_q,
+                d,
+                cfg.scale,
+                cfg.softcap,
+                cfg.causal_mode,
+                block_size,
+                max_blocks,
+                kv_layout,
+                x_vec,
+                cfg.sliding_window,
+                cfg.q_offset_override,
+            )?;
+            Ok(Some(Tensor::from_storage(
+                Storage::Rocm(out_s),
+                (batch, n_heads, seq_q, d),
+                BackpropOp::none(),
+                false,
+            )))
+        }
         #[cfg(feature = "metal")]
         crate::Device::Metal(dev) => {
             let q_c = ensure_contiguous_view(q)?;

@@ -108,6 +108,35 @@ pub fn try_conv1d_step(
                 false,
             )))
         }
+        #[cfg(feature = "rocm")]
+        crate::Device::Rocm(dev) => {
+            let x_c = ensure_contiguous_view(x)?;
+            let w_c = ensure_contiguous_view(&w)?;
+            if !conv_state.is_contiguous() {
+                *conv_state = conv_state.contiguous()?;
+            }
+            let (xs, xl) = x_c.storage_and_layout();
+            let (ws, wl) = w_c.storage_and_layout();
+            let (mut ss, sl) = conv_state.storage_mut_and_layout();
+            let (Storage::Rocm(xs), Storage::Rocm(ws), Storage::Rocm(ss)) = (&*xs, &*ws, &mut *ss)
+            else {
+                return Ok(None);
+            };
+            let out_s = dev.gdn_conv1d_step_dsl(
+                dtype,
+                (xs, xl.start_offset()),
+                (ws, wl.start_offset()),
+                (ss, sl.start_offset()),
+                batch,
+                conv_dim,
+            )?;
+            Ok(Some(Tensor::from_storage(
+                Storage::Rocm(out_s),
+                (batch, 1, conv_dim),
+                BackpropOp::none(),
+                false,
+            )))
+        }
         #[cfg(feature = "metal")]
         crate::Device::Metal(dev) => {
             let x_c = ensure_contiguous_view(x)?;
@@ -251,6 +280,43 @@ pub fn try_conv1d_stateful(
                 ),
                 Tensor::from_storage(
                     Storage::Cuda(state_out_s),
+                    (batch, conv_dim, 4),
+                    BackpropOp::none(),
+                    false,
+                ),
+            )))
+        }
+        #[cfg(feature = "rocm")]
+        crate::Device::Rocm(dev) => {
+            let x_c = ensure_contiguous_view(x_t)?;
+            let w_c = ensure_contiguous_view(&w)?;
+            let s_c = ensure_contiguous_view(&s_in)?;
+            let (xs, xl) = x_c.storage_and_layout();
+            let (ws, wl) = w_c.storage_and_layout();
+            let (ss, sl) = s_c.storage_and_layout();
+            let (Storage::Rocm(xs), Storage::Rocm(ws), Storage::Rocm(ss)) = (&*xs, &*ws, &*ss)
+            else {
+                return Ok(None);
+            };
+            let (out_s, state_out_s) = dev.gdn_conv1d_stateful_dsl(
+                dtype,
+                (xs, xl.start_offset()),
+                (ws, wl.start_offset()),
+                (ss, sl.start_offset()),
+                batch,
+                conv_dim,
+                seq_len,
+                has_state,
+            )?;
+            Ok(Some((
+                Tensor::from_storage(
+                    Storage::Rocm(out_s),
+                    (batch, conv_dim, seq_len),
+                    BackpropOp::none(),
+                    false,
+                ),
+                Tensor::from_storage(
+                    Storage::Rocm(state_out_s),
                     (batch, conv_dim, 4),
                     BackpropOp::none(),
                     false,
@@ -421,6 +487,40 @@ pub fn try_gating(
                     false,
                 ),
                 Tensor::from_storage(Storage::Cuda(g_s), out_shape, BackpropOp::none(), false),
+            )))
+        }
+        #[cfg(feature = "rocm")]
+        crate::Device::Rocm(dev) => {
+            let b_c = ensure_contiguous_view(b)?;
+            let a_c = ensure_contiguous_view(a)?;
+            let al_c = ensure_contiguous_view(&al)?;
+            let dt_c = ensure_contiguous_view(&dt)?;
+            let (bs, bl) = b_c.storage_and_layout();
+            let (as_, al_l) = a_c.storage_and_layout();
+            let (als, all) = al_c.storage_and_layout();
+            let (dts, dtl) = dt_c.storage_and_layout();
+            let (Storage::Rocm(bs), Storage::Rocm(as_), Storage::Rocm(als), Storage::Rocm(dts)) =
+                (&*bs, &*as_, &*als, &*dts)
+            else {
+                return Ok(None);
+            };
+            let (beta_s, g_s) = dev.gdn_gating_io_dsl(
+                dtype,
+                (bs, bl.start_offset()),
+                (as_, al_l.start_offset()),
+                (als, all.start_offset()),
+                (dts, dtl.start_offset()),
+                batch_tokens,
+                num_heads,
+            )?;
+            Ok(Some((
+                Tensor::from_storage(
+                    Storage::Rocm(beta_s),
+                    out_shape.clone(),
+                    BackpropOp::none(),
+                    false,
+                ),
+                Tensor::from_storage(Storage::Rocm(g_s), out_shape, BackpropOp::none(), false),
             )))
         }
         #[cfg(feature = "metal")]
@@ -633,6 +733,45 @@ pub fn try_recurrence(
             )?;
             Tensor::from_storage(
                 Storage::Cuda(out_s),
+                (bh, seq, vd),
+                BackpropOp::none(),
+                false,
+            )
+        }
+        #[cfg(feature = "rocm")]
+        crate::Device::Rocm(dev) => {
+            let (qs, ql) = q_bh.storage_and_layout();
+            let (ks, kl) = k_bh.storage_and_layout();
+            let (vs, vl) = v_bh.storage_and_layout();
+            let (gs, gl) = g_bh.storage_and_layout();
+            let (bs, bl) = beta_bh.storage_and_layout();
+            let (mut ss, sl) = state_f32.storage_mut_and_layout();
+            let (
+                Storage::Rocm(qs),
+                Storage::Rocm(ks),
+                Storage::Rocm(vs),
+                Storage::Rocm(gs),
+                Storage::Rocm(bs),
+                Storage::Rocm(ss),
+            ) = (&*qs, &*ks, &*vs, &*gs, &*bs, &mut *ss)
+            else {
+                return Ok(None);
+            };
+            let out_s = dev.gdn_scan_lanes_io_dsl(
+                dtype,
+                (qs, ql.start_offset()),
+                (ks, kl.start_offset()),
+                (vs, vl.start_offset()),
+                (gs, gl.start_offset()),
+                (bs, bl.start_offset()),
+                (ss, sl.start_offset()),
+                bh,
+                seq,
+                kd,
+                vd,
+            )?;
+            Tensor::from_storage(
+                Storage::Rocm(out_s),
                 (bh, seq, vd),
                 BackpropOp::none(),
                 false,
