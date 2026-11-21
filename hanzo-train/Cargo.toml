@@ -1,11 +1,10 @@
 [package]
 name = "hanzo-train"
-version = "0.11.19"
+# Not published: an application binary, not a library other crates depend on.
+publish = false
+version.workspace = true
 edition.workspace = true
-description = "Training on hanzo-ml: one model across heterogeneous machines (DiLoCo local SGD, bf16 deltas, bit-identical resume), and the DSpark draft trainer on it."
-repository.workspace = true
-keywords = ["training", "distributed", "diloco", "machine-learning"]
-categories = ["science"]
+description = "Native-Rust training loop for DSpark speculative-draft models (hanzo-ml autograd)."
 license.workspace = true
 
 [[bin]]
@@ -17,15 +16,10 @@ name = "hanzo_train"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = { workspace = true }
 hanzo-ml = { workspace = true }
 hanzo-nn = { workspace = true }
 half = { workspace = true }
-libc = { workspace = true }
-rayon = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true, features = ["float_roundtrip"] }
-sha2 = "0.10"
-socket2 = { version = "0.6", features = ["all"] }
+serde_json = { workspace = true }
 rand = { workspace = true }
 clap = { workspace = true }

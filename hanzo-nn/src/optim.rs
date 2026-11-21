@@ -150,40 +150,39 @@ impl Optimizer for AdamW {
     }
 
     fn step(&mut self, grads: &hanzo_ml::backprop::GradStore) -> Result<()> {
-        self.step_scaled(grads, 1.0)
-    }
-}
-
-impl AdamW {
-    /// One step with every gradient multiplied by `grad_scale` first (gradient clipping, loss
-    /// scaling). An F32 parameter on Metal is updated by one fused kernel that reads the
-    /// parameter, its gradient and both moments once and writes them back once; anything else
-    /// takes the tensor-op path.
-    pub fn step_scaled(
-        &mut self,
-        grads: &hanzo_ml::backprop::GradStore,
-        grad_scale: f64,
-    ) -> Result<()> {
         self.step_t += 1;
-        let p = &self.params;
-        let u = Update {
-            lr: p.lr,
-            beta1: p.beta1,
-            beta2: p.beta2,
-            eps: p.eps,
-            weight_decay: p.weight_decay,
-            scale_m: 1f64 / (1f64 - p.beta1.powi(self.step_t as i32)),
-            scale_v: 1f64 / (1f64 - p.beta2.powi(self.step_t as i32)),
-            grad_scale,
-        };
+        let lr = self.params.lr;
+        let lambda = self.params.weight_decay;
+        let lr_lambda = lr * lambda;
+        let beta1 = self.params.beta1;
+        let beta2 = self.params.beta2;
+        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
+        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
         for var in self.vars.iter() {
-            if let Some(g) = grads.get(&var.var) {
-                adamw(&var.var, g, &var.first_moment, &var.second_moment, &u)?;
+            let theta = &var.var;
+            let m = &var.first_moment;
+            let v = &var.second_moment;
+            if let Some(g) = grads.get(theta) {
+                // This involves locking 3 RWLocks per params, if the parameters are large this
+                // should not be an issue but this may be problematic with models with lots of
+                // small parameters.
+                let next_m = ((m.as_tensor() * beta1)? + (g * (1.0 - beta1))?)?;
+                let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
+                let m_hat = (&next_m * scale_m)?;
+                let v_hat = (&next_v * scale_v)?;
+                let next_theta = (theta.as_tensor() * (1f64 - lr_lambda))?;
+                let adjusted_grad = (m_hat / (v_hat.sqrt()? + self.params.eps)?)?;
+                let next_theta = (next_theta - (adjusted_grad * lr)?)?;
+                m.set(&next_m)?;
+                v.set(&next_v)?;
+                theta.set(&next_theta)?;
             }
         }
         Ok(())
     }
+}
 
+impl AdamW {
     pub fn new_lr(vars: Vec<Var>, learning_rate: f64) -> Result<Self> {
         let params = ParamsAdamW {
             lr: learning_rate,
@@ -198,181 +197,6 @@ impl AdamW {
 
     pub fn set_params(&mut self, params: ParamsAdamW) {
         self.params = params;
-    }
-}
-
-/// One AdamW update's constants: the learning rate, betas, epsilon and decoupled weight decay,
-/// the bias corrections `1 / (1 − βᵗ)` of step `t`, and the factor every gradient is multiplied
-/// by first (clipping, loss scaling).
-#[derive(Clone, Copy, Debug)]
-pub struct Update {
-    pub lr: f64,
-    pub beta1: f64,
-    pub beta2: f64,
-    pub eps: f64,
-    pub weight_decay: f64,
-    pub scale_m: f64,
-    pub scale_v: f64,
-    pub grad_scale: f64,
-}
-
-/// One AdamW update of `theta` from its gradient `g` and moments `m`, `v`:
-///
-///   m ← β₁m + (1 − β₁)g,  v ← β₂v + (1 − β₂)g²,
-///   θ ← θ(1 − lr·λ) − lr · m·scale_m / (√(v·scale_v) + ε).
-///
-/// An F32 parameter on Metal is updated by one fused kernel that reads the parameter, its
-/// gradient and both moments once and writes them back once; anything else takes the tensor-op
-/// path, the same arithmetic in the same order.
-pub fn adamw(theta: &Var, g: &Tensor, m: &Var, v: &Var, u: &Update) -> Result<()> {
-    #[cfg(feature = "metal")]
-    if fused::fits(theta, g) {
-        let step = hanzo_metal_kernels::AdamWStep {
-            lr: u.lr as f32,
-            beta1: u.beta1 as f32,
-            beta2: u.beta2 as f32,
-            eps: u.eps as f32,
-            weight_decay: u.weight_decay as f32,
-            scale_m: u.scale_m as f32,
-            scale_v: u.scale_v as f32,
-            grad_scale: u.grad_scale as f32,
-        };
-        return theta
-            .as_tensor()
-            .inplace_op([g, m.as_tensor(), v.as_tensor()], &fused::AdamW(step));
-    }
-    let g = if u.grad_scale == 1.0 {
-        g.clone()
-    } else {
-        (g * u.grad_scale)?
-    };
-    let next_m = ((m.as_tensor() * u.beta1)? + (&g * (1.0 - u.beta1))?)?;
-    let next_v = ((v.as_tensor() * u.beta2)? + (g.sqr()? * (1.0 - u.beta2))?)?;
-    let m_hat = (&next_m * u.scale_m)?;
-    let v_hat = (&next_v * u.scale_v)?;
-    let next_theta = (theta.as_tensor() * (1f64 - u.lr * u.weight_decay))?;
-    let adjusted_grad = (m_hat / (v_hat.sqrt()? + u.eps)?)?;
-    let next_theta = (next_theta - (adjusted_grad * u.lr)?)?;
-    m.set(&next_m)?;
-    v.set(&next_v)?;
-    theta.set(&next_theta)
-}
-
-/// The global L2 norm of the gradients of `vars`: `sqrt(Σ‖g‖²)`, one host read. On Metal each
-/// contiguous F32 gradient adds its sum of squares into one accumulator with a single kernel.
-pub fn grad_norm(grads: &hanzo_ml::backprop::GradStore, vars: &[Var]) -> Result<f64> {
-    let present: Vec<&Tensor> = vars
-        .iter()
-        .filter_map(|v| grads.get(v.as_tensor()))
-        .collect();
-    let Some(first) = present.first() else {
-        return Ok(0.0);
-    };
-    #[cfg(feature = "metal")]
-    if first.device().is_metal() {
-        let acc = Tensor::zeros(1, hanzo_ml::DType::F32, first.device())?;
-        let mut rest = Vec::new();
-        for g in &present {
-            if fused::fits(g, g) {
-                acc.inplace_op([*g], &fused::SumSq)?;
-            } else {
-                rest.push(g.to_dtype(hanzo_ml::DType::F32)?.sqr()?.sum_all()?);
-            }
-        }
-        let mut total = acc.sum_all()?;
-        if !rest.is_empty() {
-            total = (total + Tensor::stack(&rest, 0)?.sum_all()?)?;
-        }
-        return Ok((total.to_scalar::<f32>()? as f64).sqrt());
-    }
-    let _ = first;
-    let sq = present
-        .iter()
-        .map(|g| g.to_dtype(hanzo_ml::DType::F32)?.sqr()?.sum_all())
-        .collect::<Result<Vec<_>>>()?;
-    Ok((Tensor::stack(&sq, 0)?.sum_all()?.to_scalar::<f32>()? as f64).sqrt())
-}
-
-#[cfg(feature = "metal")]
-mod fused {
-    use hanzo_metal_kernels::BufferOffset;
-    use hanzo_ml::{DType, InplaceOpN, Layout, MetalStorage, Result, Tensor};
-
-    /// A parameter and its gradient the fused kernels take: F32, contiguous, on Metal.
-    pub fn fits(theta: &Tensor, g: &Tensor) -> bool {
-        theta.device().is_metal()
-            && theta.dtype() == DType::F32
-            && g.dtype() == DType::F32
-            && theta.is_contiguous()
-            && g.is_contiguous()
-    }
-
-    fn at<'a>(s: &'a MetalStorage, l: &Layout) -> BufferOffset<'a> {
-        BufferOffset {
-            buffer: s.buffer(),
-            offset_in_bytes: l.start_offset() * DType::F32.size_in_bytes(),
-        }
-    }
-
-    pub struct AdamW(pub hanzo_metal_kernels::AdamWStep);
-
-    impl InplaceOpN<3> for AdamW {
-        fn name(&self) -> &'static str {
-            "adamw"
-        }
-
-        fn metal_fwd(
-            &self,
-            w: &mut MetalStorage,
-            wl: &Layout,
-            [(g, gl), (m, ml), (v, vl)]: [(&MetalStorage, &Layout); 3],
-        ) -> Result<()> {
-            use hanzo_ml::backend::BackendStorage;
-            let device = w.device().clone();
-            let encoder = device.command_encoder()?;
-            encoder.set_label("adamw");
-            hanzo_metal_kernels::call_adamw(
-                device.metal_device(),
-                &encoder,
-                device.kernels(),
-                wl.shape().elem_count(),
-                self.0,
-                at(w, wl),
-                at(g, gl),
-                at(m, ml),
-                at(v, vl),
-            )
-            .map_err(hanzo_ml::Error::wrap)
-        }
-    }
-
-    pub struct SumSq;
-
-    impl InplaceOpN<1> for SumSq {
-        fn name(&self) -> &'static str {
-            "sumsq"
-        }
-
-        fn metal_fwd(
-            &self,
-            acc: &mut MetalStorage,
-            _acc_l: &Layout,
-            [(x, xl)]: [(&MetalStorage, &Layout); 1],
-        ) -> Result<()> {
-            use hanzo_ml::backend::BackendStorage;
-            let device = acc.device().clone();
-            let encoder = device.command_encoder()?;
-            encoder.set_label("sumsq");
-            hanzo_metal_kernels::call_sumsq(
-                device.metal_device(),
-                &encoder,
-                device.kernels(),
-                xl.shape().elem_count(),
-                at(x, xl),
-                acc.buffer(),
-            )
-            .map_err(hanzo_ml::Error::wrap)
-        }
     }
 }
 
@@ -413,12 +237,7 @@ pub fn newton_schulz(g: &Tensor, steps: usize) -> Result<Tensor> {
     let transposed = d0 > d1;
     let x = if transposed { g_flat.t()? } else { g_flat };
 
-    let norm = x
-        .sqr()?
-        .sum_all()?
-        .sqrt()?
-        .to_dtype(hanzo_ml::DType::F64)?
-        .to_scalar::<f64>()?;
+    let norm = x.sqr()?.sum_all()?.sqrt()?.to_dtype(hanzo_ml::DType::F64)?.to_scalar::<f64>()?;
     let mut x = x.affine(1.0 / (norm + 1e-7), 0.0)?;
 
     let a = 3.4445f64;
@@ -632,11 +451,7 @@ impl Optimizer for MuonClip {
                     let numel = (d0 * d1) as f64;
                     let target_rms = 1.0 / (d0.max(d1) as f64).sqrt();
 
-                    let sum_sq = ortho_update
-                        .sqr()?
-                        .sum_all()?
-                        .to_dtype(hanzo_ml::DType::F64)?
-                        .to_scalar::<f64>()?;
+                    let sum_sq = ortho_update.sqr()?.sum_all()?.to_dtype(hanzo_ml::DType::F64)?.to_scalar::<f64>()?;
                     let current_rms = (sum_sq / numel).sqrt();
                     let scale = target_rms / (current_rms + 1e-7);
                     ortho_update = ortho_update.affine(scale, 0.0)?;
@@ -644,12 +459,7 @@ impl Optimizer for MuonClip {
 
                 // 2. QK-Clip: prevent loss spikes and softmax saturation
                 if let Some(clip_threshold) = self.params.qk_clip_threshold {
-                    let frob_norm = ortho_update
-                        .sqr()?
-                        .sum_all()?
-                        .sqrt()?
-                        .to_dtype(hanzo_ml::DType::F64)?
-                        .to_scalar::<f64>()?;
+                    let frob_norm = ortho_update.sqr()?.sum_all()?.sqrt()?.to_dtype(hanzo_ml::DType::F64)?.to_scalar::<f64>()?;
                     if frob_norm > clip_threshold {
                         let scale = clip_threshold / (frob_norm + 1e-7);
                         ortho_update = ortho_update.affine(scale, 0.0)?;
@@ -668,6 +478,7 @@ impl Optimizer for MuonClip {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,7 +487,11 @@ mod tests {
     #[test]
     fn test_newton_schulz_orthogonalization() -> Result<()> {
         let dev = Device::Cpu;
-        let data: Vec<f32> = vec![1.0, 0.0, 0.5, 0.0, 1.0, 0.0, -0.5, 0.0, 1.0];
+        let data: Vec<f32> = vec![
+            1.0, 0.0, 0.5,
+            0.0, 1.0, 0.0,
+            -0.5, 0.0, 1.0,
+        ];
         let t = Tensor::from_vec(data, (3, 3), &dev)?;
         let ortho = newton_schulz(&t, 5)?;
         let prod = ortho.matmul(&ortho.t()?)?;
@@ -684,11 +499,7 @@ mod tests {
         for i in 0..3 {
             for j in 0..3 {
                 if i != j {
-                    assert!(
-                        mat[i][j].abs() < 1e-4,
-                        "Off-diag not close to 0: {}",
-                        mat[i][j]
-                    );
+                    assert!(mat[i][j].abs() < 1e-4, "Off-diag not close to 0: {}", mat[i][j]);
                 }
             }
         }
@@ -708,3 +519,5 @@ mod tests {
         Ok(())
     }
 }
+
+

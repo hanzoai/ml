@@ -28,7 +28,7 @@
 //! ```
 //!
 //! [`Layer Normalization`]: https://arxiv.org/abs/1607.06450
-use hanzo_ml::{DType, Module, Result, Tensor, D};
+use hanzo_ml::{DType, Error, Module, Result, Tensor, D};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerNormConfig {
@@ -116,11 +116,9 @@ impl LayerNorm {
 impl Module for LayerNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         if x.is_contiguous() && self.remove_mean {
-            let eps = self.eps as f32;
-            return match self.bias.as_ref() {
-                Some(bias) => crate::ops::layer_norm(x, &self.weight, bias, eps),
-                None => crate::ops::layer_norm(x, &self.weight, &self.weight.zeros_like()?, eps),
-            };
+            if let Some(bias) = self.bias.as_ref() {
+                return crate::ops::layer_norm(x, &self.weight, bias, self.eps as f32);
+            }
         }
         let x_dtype = x.dtype();
         let internal_dtype = match x_dtype {
@@ -152,20 +150,23 @@ pub fn layer_norm<C: Into<LayerNormConfig>>(
 ) -> Result<LayerNorm> {
     let config = config.into();
 
-    // Old PyTorch state dicts name the parameters `gamma`/`beta`; read those when they are the
-    // ones present, `weight`/`bias` otherwise. The bias is read only for an affine norm: a
-    // bias-free norm (ModernBERT's) has none to find, and a fresh VarMap has neither name yet.
+    // Convert old format to new format if needed from a PyTorch state_dict
+    // Safetensors not always in new weight/bias format
     // https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py#L575
-    let name = |new: &'static str, old: &'static str| {
-        if !vb.contains_tensor(new) && vb.contains_tensor(old) {
-            old
-        } else {
-            new
-        }
-    };
-    let weight = vb.get_with_hints(size, name("weight", "gamma"), crate::Init::Const(1.))?;
+    let weight_tensor_name = ["weight", "gamma"]
+        .iter()
+        .find(|&name| vb.contains_tensor(name))
+        .ok_or_else(|| Error::Msg("Failed to find weight tensor".into()))?;
+
+    let weight = vb.get_with_hints(size, weight_tensor_name, crate::Init::Const(1.))?;
+
+    let bias_tensor_name = ["bias", "beta"]
+        .iter()
+        .find(|&name| vb.contains_tensor(name))
+        .ok_or_else(|| Error::Msg("Failed to find weight tensor".into()))?;
+
     let bias = if config.affine {
-        Some(vb.get_with_hints(size, name("bias", "beta"), crate::Init::Const(0.))?)
+        Some(vb.get_with_hints(size, bias_tensor_name, crate::Init::Const(0.))?)
     } else {
         None
     };

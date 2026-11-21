@@ -1,5 +1,4 @@
 pub mod affine;
-pub mod backward;
 pub mod binary;
 pub mod cast;
 pub mod convolution;
@@ -7,7 +6,6 @@ pub mod fill;
 pub mod indexing;
 mod macros;
 pub mod mlx_gemm;
-pub mod optim;
 pub mod quantized;
 pub mod random;
 pub mod reduce;

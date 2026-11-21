@@ -82,6 +82,15 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
         Ok((storage, layout.shape().clone()))
     }
 
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        storage: &hanzo_ml::RocmStorage,
+        layout: &Layout,
+    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
+        Ok((storage.sigmoid(layout)?, layout.shape().clone()))
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
@@ -214,15 +223,6 @@ impl hanzo_ml::CustomOp1 for Sigmoid {
 
         let new_storage = hanzo_ml::MetalStorage::new(buffer, device.clone(), el_count, dtype);
         Ok((new_storage, layout.shape().clone()))
-    }
-
-    #[cfg(feature = "rocm")]
-    fn rocm_fwd(
-        &self,
-        storage: &hanzo_ml::RocmStorage,
-        layout: &Layout,
-    ) -> Result<(hanzo_ml::RocmStorage, Shape)> {
-        Ok((storage.sigmoid(layout)?, layout.shape().clone()))
     }
 
     fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
@@ -470,105 +470,6 @@ impl hanzo_ml::CustomOp1 for SoftmaxLastDim {
             hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
         Ok((newstorage, layout.shape().clone()))
     }
-
-    /// `dx = y ⊙ (dy − ⟨dy, y⟩)` along the last dim, accumulated in `F32`.
-    fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
-        #[cfg(feature = "metal")]
-        if fused_bwd::fits(&[res, grad_res]) {
-            // SAFETY: the kernel writes every element of `dx`.
-            let dx = unsafe { res.empty_like()? };
-            dx.inplace_op([res, grad_res], &fused_bwd::Softmax)?;
-            return Ok(Some(dx));
-        }
-        let dtype = res.dtype();
-        let y = res.to_dtype(DType::F32)?;
-        let g = grad_res.to_dtype(DType::F32)?;
-        let dot = (&g * &y)?.sum_keepdim(D::Minus1)?;
-        Ok(Some((y * g.broadcast_sub(&dot)?)?.to_dtype(dtype)?))
-    }
-}
-
-/// `e^x` for `x ≤ 0`, as a polynomial the compiler vectorizes: `x = n ln 2 + r`, `|r| ≤ ln 2 / 2`,
-/// `e^r` by Cephes' `expf` polynomial, scaled by `2^n` through the exponent bits. Within 2 ulp;
-/// below −87 it is zero.
-#[inline(always)]
-fn exp_neg(x: f32) -> f32 {
-    let x = x.max(-87.0);
-    let n = (x * std::f32::consts::LOG2_E + 0.5).floor();
-    let r = x - n * 0.693_359_4 + n * 2.121_944_4e-4;
-    let p = ((((1.987_569_1e-4 * r + 1.398_199_9e-3) * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r
-        + 1.666_666_5e-1)
-        * r
-        + 0.5;
-    let y = p * r * r + r + 1.0;
-    y * f32::from_bits(((n as i32 + 127) << 23) as u32)
-}
-
-/// `gelu_erf(g) · u` with `erf` by Abramowitz and Stegun 7.1.26 (absolute error under 1.5e-7,
-/// PyTorch's vectorized CPU `erf`): `erf(z) = 1 − t (a₁ + t (a₂ + …)) e^{−z²}`,
-/// `t = 1 / (1 + p z)`, odd in `z`.
-#[inline(always)]
-fn geglu1(g: f32, u: f32) -> f32 {
-    let z = (g * std::f32::consts::FRAC_1_SQRT_2).abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * z);
-    let poly = ((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_74) * t
-        + 0.254_829_6)
-        * t;
-    let erf = (1.0 - poly * exp_neg(-z * z)).copysign(g);
-    (erf + 1.) * 0.5 * g * u
-}
-
-/// `gelu_erf(gate) · up`, elementwise, on the CPU in one parallel, vectorized pass.
-struct GeGlu;
-
-impl hanzo_ml::CustomOp2 for GeGlu {
-    fn name(&self) -> &'static str {
-        "geglu"
-    }
-
-    fn cpu_fwd(
-        &self,
-        gate: &CpuStorage,
-        l1: &Layout,
-        up: &CpuStorage,
-        l2: &Layout,
-    ) -> Result<(CpuStorage, Shape)> {
-        let (CpuStorage::F32(g), CpuStorage::F32(u)) = (gate, up) else {
-            hanzo_ml::bail!("geglu: f32 only")
-        };
-        let (Some((g0, g1)), Some((u0, u1))) = (l1.contiguous_offsets(), l2.contiguous_offsets())
-        else {
-            hanzo_ml::bail!("geglu: contiguous inputs only")
-        };
-        let (g, u) = (&g[g0..g1], &u[u0..u1]);
-        let mut dst = vec![0f32; g.len()];
-        dst.par_chunks_mut(4096)
-            .zip(g.par_chunks(4096).zip(u.par_chunks(4096)))
-            .for_each(|(d, (g, u))| {
-                for ((d, &g), &u) in d.iter_mut().zip(g).zip(u) {
-                    *d = geglu1(g, u);
-                }
-            });
-        Ok((CpuStorage::F32(dst), l1.shape().clone()))
-    }
-}
-
-/// GeGLU's product, `gelu_erf(gate) · up`. On the CPU, for F32 inputs no gradient flows
-/// through, one parallel pass whose `erf` is within 1.5e-7 of the exact one; everywhere else,
-/// and wherever a gradient flows, the composite.
-pub fn geglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
-    let fused = gate.device().is_cpu()
-        && gate.dtype() == DType::F32
-        && up.dtype() == DType::F32
-        && gate.shape() == up.shape()
-        && gate.is_contiguous()
-        && up.is_contiguous()
-        && !gate.track_op()
-        && !up.track_op();
-    if fused {
-        return gate.apply_op2_no_bwd(up, &GeGlu);
-    }
-    gate.gelu_erf()? * up
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
@@ -581,7 +482,7 @@ pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
             return softmax(xs, D::Minus1);
         }
     }
-    xs.apply_op1(SoftmaxLastDim)
+    xs.apply_op1_no_bwd(&SoftmaxLastDim)
 }
 
 #[derive(Debug, Clone)]
@@ -827,33 +728,6 @@ impl hanzo_ml::CustomOp2 for RmsNorm {
             hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
-
-    /// With `r = (mean(x²) + eps)^-½` and `u = dy ⊙ α`:
-    /// `dx = r (u − x r² mean(u ⊙ x))`, `dα = Σ_rows dy ⊙ x r`. Accumulated in `F32`.
-    fn bwd(
-        &self,
-        arg: &Tensor,
-        alpha: &Tensor,
-        _res: &Tensor,
-        grad_res: &Tensor,
-    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
-        let d = arg.dim(D::Minus1)?;
-        let x = arg.to_dtype(DType::F32)?.reshape(((), d))?;
-        let g = grad_res.to_dtype(DType::F32)?.reshape(((), d))?;
-        let a = alpha.to_dtype(DType::F32)?;
-        let r = (x.sqr()?.mean_keepdim(1)? + self.eps as f64)?
-            .sqrt()?
-            .recip()?;
-        let xr = x.broadcast_mul(&r)?;
-        let u = g.broadcast_mul(&a)?;
-        let proj = (&u * &xr)?.mean_keepdim(1)?;
-        let dx = (u - xr.broadcast_mul(&proj)?)?.broadcast_mul(&r)?;
-        let da = (g * xr)?.sum(0)?;
-        Ok((
-            Some(dx.reshape(arg.shape())?.to_dtype(arg.dtype())?),
-            Some(da.to_dtype(alpha.dtype())?),
-        ))
-    }
 }
 
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
@@ -904,7 +778,7 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             return rms_norm_slow(xs, &alpha, eps);
         }
     }
-    xs.apply_op2(&alpha, RmsNorm { eps })
+    xs.apply_op2_no_bwd(&alpha, &RmsNorm { eps })
 }
 
 // Fused SwiGLU: silu(a) * b, elementwise (both same shape). One op instead of silu + mul.
@@ -987,26 +861,6 @@ impl hanzo_ml::CustomOp2 for SiluMul {
         let out = s1.silu_mul(l1, s2, l2)?;
         Ok((out, l1.shape().clone()))
     }
-
-    /// `d gate = dy ⊙ up ⊙ σ(gate)(1 + gate(1 − σ(gate)))`, `d up = dy ⊙ silu(gate)`, in `F32`.
-    fn bwd(
-        &self,
-        gate: &Tensor,
-        up: &Tensor,
-        _res: &Tensor,
-        grad_res: &Tensor,
-    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
-        let a = gate.to_dtype(DType::F32)?;
-        let g = grad_res.to_dtype(DType::F32)?;
-        let s = sigmoid(&a)?;
-        let ds = (&s * ((&a * (1.0 - &s)?)? + 1.0)?)?;
-        let dgate = (&g * up.to_dtype(DType::F32)?)?.mul(&ds)?;
-        let dup = (g * (a * s)?)?;
-        Ok((
-            Some(dgate.to_dtype(gate.dtype())?),
-            Some(dup.to_dtype(up.dtype())?),
-        ))
-    }
 }
 
 /// Fused SwiGLU: `silu(gate) * up`. Falls back to the unfused tensor ops where there's no kernel.
@@ -1027,7 +881,7 @@ pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
             return silu(gate)?.mul(up);
         }
     }
-    gate.apply_op2(up, SiluMul)
+    gate.apply_op2_no_bwd(up, &SiluMul)
 }
 
 #[derive(Debug, Clone)]
@@ -1254,163 +1108,6 @@ impl hanzo_ml::CustomOp3 for LayerNorm {
             hanzo_ml::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
-
-    /// With `x̂ = (x − μ) r`, `r = (var + eps)^-½` and `u = dy ⊙ α`:
-    /// `dx = r (u − mean(u) − x̂ mean(u ⊙ x̂))`, `dα = Σ_rows dy ⊙ x̂`, `dβ = Σ_rows dy`.
-    /// Accumulated in `F32`.
-    fn bwd(
-        &self,
-        arg: &Tensor,
-        alpha: &Tensor,
-        beta: &Tensor,
-        _res: &Tensor,
-        grad_res: &Tensor,
-    ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
-        let d = arg.dim(D::Minus1)?;
-        #[cfg(feature = "metal")]
-        if fused_bwd::fits(&[arg, grad_res, alpha]) {
-            let n = arg.elem_count() / d;
-            let dev = arg.device();
-            // SAFETY: the kernels write every element of `dx` and of `stats`.
-            let dx = unsafe { arg.empty_like()? };
-            let stats = unsafe { Tensor::empty((n, 2), DType::F32, dev)? };
-            let dparams = Tensor::zeros((2, d), DType::F32, dev)?;
-            dx.inplace_op(
-                [arg, grad_res, alpha, &stats, &dparams],
-                &fused_bwd::LayerNorm { eps: self.eps },
-            )?;
-            return Ok((
-                Some(dx),
-                Some(dparams.get(0)?.to_dtype(alpha.dtype())?),
-                Some(dparams.get(1)?.to_dtype(beta.dtype())?),
-            ));
-        }
-        let x = arg.to_dtype(DType::F32)?.reshape(((), d))?;
-        let g = grad_res.to_dtype(DType::F32)?.reshape(((), d))?;
-        let a = alpha.to_dtype(DType::F32)?;
-        let xc = x.broadcast_sub(&x.mean_keepdim(1)?)?;
-        let r = (xc.sqr()?.mean_keepdim(1)? + self.eps as f64)?
-            .sqrt()?
-            .recip()?;
-        let xhat = xc.broadcast_mul(&r)?;
-        let u = g.broadcast_mul(&a)?;
-        let proj = (&u * &xhat)?.mean_keepdim(1)?;
-        let dx = u
-            .broadcast_sub(&u.mean_keepdim(1)?)?
-            .sub(&xhat.broadcast_mul(&proj)?)?
-            .broadcast_mul(&r)?;
-        let da = (&g * xhat)?.sum(0)?;
-        let db = g.sum(0)?;
-        Ok((
-            Some(dx.reshape(arg.shape())?.to_dtype(arg.dtype())?),
-            Some(da.to_dtype(alpha.dtype())?),
-            Some(db.to_dtype(beta.dtype())?),
-        ))
-    }
-}
-
-/// Fused Metal backward passes of the last-dim softmax and LayerNorm: one threadgroup per row,
-/// accumulated in F32, instead of a dozen tensor ops over the whole activation.
-#[cfg(feature = "metal")]
-mod fused_bwd {
-    use hanzo_metal_kernels::BufferOffset;
-    use hanzo_ml::backend::BackendStorage;
-    use hanzo_ml::{DType, InplaceOpN, Layout, MetalStorage, Result, Tensor};
-
-    /// Every tensor on Metal, contiguous and of one float dtype the kernels take.
-    pub fn fits(ts: &[&Tensor]) -> bool {
-        let dtype = ts[0].dtype();
-        matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
-            && ts
-                .iter()
-                .all(|t| t.device().is_metal() && t.is_contiguous() && t.dtype() == dtype)
-    }
-
-    fn at<'a>(s: &'a MetalStorage, l: &Layout) -> BufferOffset<'a> {
-        BufferOffset {
-            buffer: s.buffer(),
-            offset_in_bytes: l.start_offset() * s.dtype().size_in_bytes(),
-        }
-    }
-
-    fn name(dtype: DType) -> &'static str {
-        match dtype {
-            DType::F16 => "f16",
-            DType::BF16 => "bf16",
-            _ => "f32",
-        }
-    }
-
-    pub struct Softmax;
-
-    impl InplaceOpN<2> for Softmax {
-        fn name(&self) -> &'static str {
-            "softmax-bwd"
-        }
-
-        fn metal_fwd(
-            &self,
-            dx: &mut MetalStorage,
-            dxl: &Layout,
-            [(y, yl), (dy, dyl)]: [(&MetalStorage, &Layout); 2],
-        ) -> Result<()> {
-            let device = dx.device().clone();
-            let encoder = device.command_encoder()?;
-            encoder.set_label("softmax-bwd");
-            let d = *dxl.dims().last().unwrap_or(&1);
-            hanzo_metal_kernels::call_softmax_bwd(
-                device.metal_device(),
-                &encoder,
-                device.kernels(),
-                name(dx.dtype()),
-                dxl.shape().elem_count() / d.max(1),
-                d,
-                at(y, yl),
-                at(dy, dyl),
-                at(dx, dxl),
-            )
-            .map_err(hanzo_ml::Error::wrap)
-        }
-    }
-
-    pub struct LayerNorm {
-        pub eps: f32,
-    }
-
-    impl InplaceOpN<5> for LayerNorm {
-        fn name(&self) -> &'static str {
-            "layer-norm-bwd"
-        }
-
-        fn metal_fwd(
-            &self,
-            dx: &mut MetalStorage,
-            dxl: &Layout,
-            [(x, xl), (dy, dyl), (alpha, al), (stats, _), (dparams, _)]: [(&MetalStorage, &Layout);
-                5],
-        ) -> Result<()> {
-            let device = dx.device().clone();
-            let encoder = device.command_encoder()?;
-            encoder.set_label("layer-norm-bwd");
-            let d = *dxl.dims().last().unwrap_or(&1);
-            hanzo_metal_kernels::call_layer_norm_bwd(
-                device.metal_device(),
-                &encoder,
-                device.kernels(),
-                name(dx.dtype()),
-                dxl.shape().elem_count() / d.max(1),
-                d,
-                self.eps,
-                at(x, xl),
-                at(dy, dyl),
-                at(alpha, al),
-                at(dx, dxl),
-                stats.buffer(),
-                dparams.buffer(),
-            )
-            .map_err(hanzo_ml::Error::wrap)
-        }
-    }
 }
 
 pub fn layer_norm_slow(x: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
@@ -1448,7 +1145,7 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
     if xs.device().is_rocm() || xs.device().is_vulkan() {
         return layer_norm_slow(xs, alpha, beta, eps);
     }
-    xs.apply_op3(alpha, beta, LayerNorm { eps })
+    xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
 }
 
 // https://pytorch.org/docs/stable/generated/torch.nn.PixelShuffle.html

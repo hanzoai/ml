@@ -123,7 +123,9 @@ fn routed_experts_match_the_cpu_at_model_shapes() -> Result<()> {
         (GgmlDType::Q8_0, 16, 2560, 640, true),
     ];
     for (dtype, experts, n, k, per_slot) in cases {
-        for t in [1usize, 5] {
+        // One token takes the decode matvec; a prompt takes the expert-grouped int8 GEMM, whose
+        // tile height follows the tokens each expert gets (5 and 40 reach different tiles).
+        for t in [1usize, 5, 40] {
             for act in [DType::F16, DType::F32] {
                 let e = moe_case(&gpu, dtype, experts, n, k, t, 10, per_slot, act)?;
                 println!("{dtype:?} E={experts} n={n} k={k} t={t} {act:?}: rel {e:.2e}");
@@ -136,6 +138,43 @@ fn routed_experts_match_the_cpu_at_model_shapes() -> Result<()> {
         worst < 1e-2,
         "routed experts off by {worst} of the largest output"
     );
+    Ok(())
+}
+
+/// A dense weight of each type the model stores agrees with the CPU's dequantized weights for one
+/// token (the decode matvec, in the activation's own dtype) and for a prompt (the int8 GEMM).
+#[test]
+fn a_dense_weight_matches_the_cpu_for_a_token_and_a_prompt() -> Result<()> {
+    let gpu = Device::new_rocm(0)?;
+    let mut rng = Lcg(0x9a11);
+    for (dtype, n, k, t) in [
+        (GgmlDType::Q8_0, 640, 2560, 1),
+        (GgmlDType::IQ3_S, 640, 2560, 1),
+        (GgmlDType::IQ4_NL, 2560, 640, 1),
+        (GgmlDType::Q8_0, 640, 2560, 37),
+        (GgmlDType::IQ3_S, 640, 2560, 37),
+        (GgmlDType::IQ4_NL, 2560, 640, 37),
+    ] {
+        let raw = blocks(dtype, n * k, &mut rng);
+        let reference =
+            qtensor_from_ggml(dtype, &raw, vec![n, k], &Device::Cpu)?.dequantize(&Device::Cpu)?;
+        let x: Vec<f32> = (0..t * k).map(|_| rng.unit()).collect();
+        let want = Tensor::from_vec(x.clone(), (t, k), &Device::Cpu)?
+            .matmul(&reference.t()?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let w = QMatMul::from_qtensor(qtensor_from_ggml(dtype, &raw, vec![n, k], &gpu)?)?;
+        for act in [DType::F16, DType::F32] {
+            let got = w
+                .forward(&Tensor::from_vec(x.clone(), (t, k), &gpu)?.to_dtype(act)?)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let e = rel(&got, &want);
+            println!("{dtype:?} t={t} {act:?}: rel {e:.2e}");
+            assert!(e < 1e-2, "{dtype:?} t={t} {act:?} off by {e}");
+        }
+    }
     Ok(())
 }
 

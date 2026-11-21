@@ -16,9 +16,8 @@ METAL_FUNC uint get_strided_index(
     #pragma clang loop unroll(full)
     for (uint d = 0; d < num_dims; d++) {
         uint dim_idx = num_dims - 1 - d;
-        uint dim = static_cast<uint>(dims[dim_idx]);
-        strided_i += (idx % dim) * static_cast<uint>(strides[dim_idx]);
-        idx /= dim;
+        strided_i += (idx % dims[dim_idx]) * strides[dim_idx];
+        idx /= dims[dim_idx];
     }
     return strided_i;
 }

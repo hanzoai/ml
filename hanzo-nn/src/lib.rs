@@ -28,7 +28,6 @@ pub mod kv_cache;
 pub mod layer_norm;
 pub mod linear;
 pub mod loss;
-pub mod memory;
 pub mod moe;
 pub mod ops;
 pub mod optim;
