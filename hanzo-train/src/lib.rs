@@ -6,11 +6,15 @@
 //!   A model plugs in behind [`cluster::Model`].
 //! - [`adam`]: AdamW with a learning rate per parameter and its state in the open.
 //! - [`gpu`]: a floor on free memory, and GPU utilization on macOS.
+//! - [`adacheck`]: adaptive redundancy-aware checkpoints across distributed workers and sequential
+//!   steps (`HIP-1348`): content-addressed sub-tensor chunking, zero suppression, cross-worker /
+//!   temporal deduplication, and bit-exact delta encoding.
 //! - [`model`], [`cache`], [`dspark`]: the DSpark speculative-draft model, the target cache it
 //!   trains on, and the two on the cluster runtime; the `hanzo-train` binary (`fit`, `join`)
 //!   trains it and writes a checkpoint in the exact layout the engine's `qwen3_dspark.rs` loader
 //!   expects.
 
+pub mod adacheck;
 pub mod adam;
 pub mod cache;
 pub mod cluster;
