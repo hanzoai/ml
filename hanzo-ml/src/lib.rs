@@ -49,6 +49,7 @@
 
 #[cfg(feature = "accelerate")]
 mod accelerate;
+pub mod attn_dsl;
 pub mod backend;
 pub mod backprop;
 pub mod compute;
@@ -69,6 +70,8 @@ pub mod dummy_vulkan_backend;
 pub mod dummy_wgpu_backend;
 pub mod error;
 pub mod fattn_decode;
+pub mod gdn_dsl;
+pub mod hadamard_dsl;
 mod hc_sinkhorn;
 mod indexer;
 pub mod layout;

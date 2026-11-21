@@ -55,16 +55,51 @@ pub fn gdn_conv1d<F: Float>(
         let x_base = row * seq_len;
         let w_base = ch * k;
 
-        let mut acc = F::new(0.0f32);
+        let mut acc = 0.0f32;
         for i in 0..k {
             // src_pos = pos - (k-1) + i; contribute only when it is in-range (causal zero-pad).
             if pos + i >= k - 1 {
                 let src = pos + i - (k - 1);
-                acc += x[x_base + src] * w[w_base + i];
+                acc += f32::cast_from(x[x_base + src]) * f32::cast_from(w[w_base + i]);
             }
         }
         // SiLU (matches the shader's acc * sigmoid(acc), sigmoid = 1/(1+exp(-acc))).
-        out[x_base + pos] = acc / (F::new(1.0f32) + (-acc).exp());
+        out[x_base + pos] = F::cast_from(acc / (1.0f32 + (-acc).exp()));
+    }
+}
+
+/// Single-step causal depthwise conv1d + SiLU (decode, seq_len == 1).
+///
+/// Shifts `conv_state [batch, conv_dim, k]` left by 1, inserts `x [batch, conv_dim]` at index
+/// `k - 1`, dots against `w [conv_dim, k]` in f32, and writes SiLU output to `out [batch, conv_dim]`.
+/// `dims = [batch, conv_dim]`.
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu, rocm), unchecked)]
+pub fn gdn_conv1d_step<F: Float>(
+    x: &Array<F>,
+    w: &Array<F>,
+    conv_state: &mut Array<F>,
+    out: &mut Array<F>,
+    dims: &Array<u32>, // [batch, conv_dim]
+    #[comptime] k: usize,
+) {
+    let gid = ABSOLUTE_POS;
+    let batch = dims[0] as usize;
+    let conv_dim = dims[1] as usize;
+    if gid < batch * conv_dim {
+        let ch = gid % conv_dim;
+        let cs_base = gid * k;
+        let w_base = ch * k;
+
+        let mut acc = 0.0f32;
+        for i in 0..k - 1 {
+            let v = conv_state[cs_base + i + 1];
+            conv_state[cs_base + i] = v;
+            acc += f32::cast_from(v) * f32::cast_from(w[w_base + i]);
+        }
+        let xn = x[gid];
+        conv_state[cs_base + k - 1] = xn;
+        acc += f32::cast_from(xn) * f32::cast_from(w[w_base + k - 1]);
+        out[gid] = F::cast_from(acc / (1.0f32 + (-acc).exp()));
     }
 }
 
@@ -72,7 +107,7 @@ pub fn gdn_conv1d<F: Float>(
 
 /// Fused GDN gating -- mirrors `gdn_gating.comp` / cuda `fused_gdn_gating_kernel`. Per element:
 ///   `beta = sigmoid(b)`,  `g = -exp(a_log) * softplus(a + dt_bias)`,  `softplus(x) = log(1 + exp(x))`.
-/// `a_log` and `dt_bias` are per-head (indexed `idx % num_heads`), broadcast over the leading dims.
+/// `a_log` and `dt_bias` are per-head f32 tensors (`idx % num_heads`), broadcast over leading dims.
 ///
 /// `a_log` here is the RAW `A_log` (the shader convention). The GGUF `ssm_a` instead stores the
 /// precomputed `-exp(A_log)`; a caller holding that passes it as `a_log` with the sign folded, i.e.
@@ -81,23 +116,34 @@ pub fn gdn_conv1d<F: Float>(
 pub fn gdn_gating<F: Float>(
     b_in: &Array<F>,
     a_in: &Array<F>,
-    a_log: &Array<F>,
-    dt_bias: &Array<F>,
+    a_log: &Array<f32>,
+    dt_bias: &Array<f32>,
     beta_out: &mut Array<F>,
     g_out: &mut Array<F>,
-    dims: &Array<u32>, // [num_heads]
+    dims: &Array<u32>, // [num_heads, precomputed_neg_exp_a]
 ) {
     let idx = ABSOLUTE_POS;
     if idx < beta_out.len() {
         let num_heads = dims[0] as usize;
+        let precomputed_neg_exp = dims[1];
         let head = idx % num_heads;
 
-        let beta = F::new(1.0f32) / (F::new(1.0f32) + (-b_in[idx]).exp());
-        let softplus = (F::new(1.0f32) + (a_in[idx] + dt_bias[head]).exp()).ln();
-        let g = -(a_log[head].exp()) * softplus;
+        let bf = f32::cast_from(b_in[idx]);
+        let af = f32::cast_from(a_in[idx]);
+        let beta = 1.0f32 / (1.0f32 + (-bf).exp());
+        let x = af + dt_bias[head];
+        let mut softplus = x;
+        if x <= 20.0f32 {
+            softplus = (1.0f32 + x.exp()).ln();
+        }
+        let mut neg_exp_a = a_log[head];
+        if precomputed_neg_exp == 0u32 {
+            neg_exp_a = -(neg_exp_a.exp());
+        }
+        let g = neg_exp_a * softplus;
 
-        beta_out[idx] = beta;
-        g_out[idx] = g;
+        beta_out[idx] = F::cast_from(beta);
+        g_out[idx] = F::cast_from(g);
     }
 }
 
@@ -191,15 +237,28 @@ pub fn gdn_conv1d_run<R: Runtime>(
     seq_len: usize,
     k: usize,
 ) -> Vec<f32> {
+    gdn_conv1d_run_as::<f32, R>(client, x, w, batch, conv_dim, seq_len, k)
+}
+
+/// Typed host launch for [`gdn_conv1d`] supporting `F32`, `F16`, and `BF16`.
+pub fn gdn_conv1d_run_as<F: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[F],
+    w: &[F],
+    batch: usize,
+    conv_dim: usize,
+    seq_len: usize,
+    k: usize,
+) -> Vec<F> {
     let total = batch * conv_dim * seq_len;
-    let xh = client.create_from_slice(f32::as_bytes(x));
-    let wh = client.create_from_slice(f32::as_bytes(w));
+    let xh = client.create_from_slice(F::as_bytes(x));
+    let wh = client.create_from_slice(F::as_bytes(w));
     let dh = client.create_from_slice(u32::as_bytes(&[conv_dim as u32, seq_len as u32]));
-    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; total]));
+    let oh = client.create_from_slice(F::as_bytes(&vec![F::new(0.0f32); total]));
     let block = 64u32;
     let grid = (total as u32).div_ceil(block);
     unsafe {
-        gdn_conv1d::launch_unchecked::<f32, R>(
+        gdn_conv1d::launch_unchecked::<F, R>(
             client,
             Grid::Static(grid, 1, 1),
             Block::new_1d(block),
@@ -210,7 +269,57 @@ pub fn gdn_conv1d_run<R: Runtime>(
             k,
         );
     }
-    f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+    F::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Host launch for `gdn_conv1d_step`. `x`: `[batch, conv_dim]`, `w`: `[conv_dim, k]`,
+/// `conv_state`: `[batch, conv_dim, k]`. Returns `(out, new_conv_state)`.
+pub fn gdn_conv1d_step_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[f32],
+    w: &[f32],
+    conv_state: &[f32],
+    batch: usize,
+    conv_dim: usize,
+    k: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    gdn_conv1d_step_run_as::<f32, R>(client, x, w, conv_state, batch, conv_dim, k)
+}
+
+/// Typed host launch for [`gdn_conv1d_step`] supporting `F32`, `F16`, and `BF16`.
+pub fn gdn_conv1d_step_run_as<F: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    x: &[F],
+    w: &[F],
+    conv_state: &[F],
+    batch: usize,
+    conv_dim: usize,
+    k: usize,
+) -> (Vec<F>, Vec<F>) {
+    let total = batch * conv_dim;
+    let xh = client.create_from_slice(F::as_bytes(x));
+    let wh = client.create_from_slice(F::as_bytes(w));
+    let ch = client.create_from_slice(F::as_bytes(conv_state));
+    let oh = client.create_from_slice(F::as_bytes(&vec![F::new(0.0f32); total]));
+    let dh = client.create_from_slice(u32::as_bytes(&[batch as u32, conv_dim as u32]));
+    let block = 64u32;
+    let grid = (total as u32).div_ceil(block);
+    unsafe {
+        gdn_conv1d_step::launch_unchecked::<F, R>(
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
+            ArrayArg::from_raw_parts(xh.clone(), x.len()),
+            ArrayArg::from_raw_parts(wh.clone(), w.len()),
+            ArrayArg::from_raw_parts(ch.clone(), conv_state.len()),
+            ArrayArg::from_raw_parts(oh.clone(), total),
+            ArrayArg::from_raw_parts(dh.clone(), 2),
+            k,
+        );
+    }
+    let out = F::from_bytes(&client.read_one_unchecked(oh)).to_vec();
+    let new_cs = F::from_bytes(&client.read_one_unchecked(ch)).to_vec();
+    (out, new_cs)
 }
 
 /// Host launch for `gdn_gating`. `b`/`a`: `[total]`; `a_log`/`dt_bias`: `[num_heads]`. Returns `(beta, g)`.
@@ -222,18 +331,30 @@ pub fn gdn_gating_run<R: Runtime>(
     dt_bias: &[f32],
     num_heads: usize,
 ) -> (Vec<f32>, Vec<f32>) {
+    gdn_gating_run_as::<f32, R>(client, b, a, a_log, dt_bias, num_heads)
+}
+
+/// Typed host launch for [`gdn_gating`] (`b`/`a`/`beta`/`g` in `F`, `a_log`/`dt_bias` in `f32`).
+pub fn gdn_gating_run_as<F: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    b: &[F],
+    a: &[F],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    num_heads: usize,
+) -> (Vec<F>, Vec<F>) {
     let total = b.len();
-    let bh = client.create_from_slice(f32::as_bytes(b));
-    let ah = client.create_from_slice(f32::as_bytes(a));
+    let bh = client.create_from_slice(F::as_bytes(b));
+    let ah = client.create_from_slice(F::as_bytes(a));
     let alh = client.create_from_slice(f32::as_bytes(a_log));
     let dth = client.create_from_slice(f32::as_bytes(dt_bias));
-    let betah = client.create_from_slice(f32::as_bytes(&vec![0.0f32; total]));
-    let gh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; total]));
-    let dh = client.create_from_slice(u32::as_bytes(&[num_heads as u32]));
+    let betah = client.create_from_slice(F::as_bytes(&vec![F::new(0.0f32); total]));
+    let gh = client.create_from_slice(F::as_bytes(&vec![F::new(0.0f32); total]));
+    let dh = client.create_from_slice(u32::as_bytes(&[num_heads as u32, 0u32]));
     let block = 64u32;
     let grid = (total as u32).div_ceil(block);
     unsafe {
-        gdn_gating::launch_unchecked::<f32, R>(
+        gdn_gating::launch_unchecked::<F, R>(
             client,
             Grid::Static(grid, 1, 1),
             Block::new_1d(block),
@@ -243,12 +364,51 @@ pub fn gdn_gating_run<R: Runtime>(
             ArrayArg::from_raw_parts(dth.clone(), dt_bias.len()),
             ArrayArg::from_raw_parts(betah.clone(), total),
             ArrayArg::from_raw_parts(gh.clone(), total),
-            ArrayArg::from_raw_parts(dh.clone(), 1),
+            ArrayArg::from_raw_parts(dh.clone(), 2),
         );
     }
-    let beta = f32::from_bytes(&client.read_one_unchecked(betah)).to_vec();
-    let g = f32::from_bytes(&client.read_one_unchecked(gh)).to_vec();
+    let beta = F::from_bytes(&client.read_one_unchecked(betah)).to_vec();
+    let g = F::from_bytes(&client.read_one_unchecked(gh)).to_vec();
     (beta, g)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_scan_buffers_as<F: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[F],
+    k: &[F],
+    v: &[F],
+    g: &[F],
+    beta: &[F],
+    state: &[f32],
+    bh: usize,
+    seq: usize,
+    v_dim: usize,
+    launch: impl FnOnce(
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        &cubecl::server::Handle,
+        usize,
+    ),
+) -> (Vec<F>, Vec<f32>) {
+    let out_len = bh * seq * v_dim;
+    let qh = client.create_from_slice(F::as_bytes(q));
+    let kh = client.create_from_slice(F::as_bytes(k));
+    let vh = client.create_from_slice(F::as_bytes(v));
+    let gh = client.create_from_slice(F::as_bytes(g));
+    let betah = client.create_from_slice(F::as_bytes(beta));
+    let sh = client.create_from_slice(f32::as_bytes(state));
+    let oh = client.create_from_slice(F::as_bytes(&vec![F::new(0.0f32); out_len]));
+    let dh = client.create_from_slice(u32::as_bytes(&[bh as u32, seq as u32]));
+    launch(&qh, &kh, &vh, &gh, &betah, &sh, &oh, &dh, out_len);
+    let out = F::from_bytes(&client.read_one_unchecked(oh)).to_vec();
+    let new_state = f32::from_bytes(&client.read_one_unchecked(sh)).to_vec();
+    (out, new_state)
 }
 
 /// Host launch for `gdn_scan`. `q`/`k`: `[bh, seq, k_dim]` (`q` pre-scaled by `1/sqrt(k_dim)`);
@@ -268,37 +428,92 @@ pub fn gdn_scan_run<R: Runtime>(
     k_dim: usize,
     v_dim: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    let out_len = bh * seq * v_dim;
-    let qh = client.create_from_slice(f32::as_bytes(q));
-    let kh = client.create_from_slice(f32::as_bytes(k));
-    let vh = client.create_from_slice(f32::as_bytes(v));
-    let gh = client.create_from_slice(f32::as_bytes(g));
-    let betah = client.create_from_slice(f32::as_bytes(beta));
-    let sh = client.create_from_slice(f32::as_bytes(state));
-    let oh = client.create_from_slice(f32::as_bytes(&vec![0.0f32; out_len]));
-    let dh = client.create_from_slice(u32::as_bytes(&[bh as u32, seq as u32]));
-    let block = 64u32;
-    let grid = ((bh * v_dim) as u32).div_ceil(block);
-    unsafe {
-        gdn_scan::launch_unchecked::<f32, R>(
-            client,
-            Grid::Static(grid, 1, 1),
-            Block::new_1d(block),
-            ArrayArg::from_raw_parts(qh.clone(), q.len()),
-            ArrayArg::from_raw_parts(kh.clone(), k.len()),
-            ArrayArg::from_raw_parts(vh.clone(), v.len()),
-            ArrayArg::from_raw_parts(gh.clone(), g.len()),
-            ArrayArg::from_raw_parts(betah.clone(), beta.len()),
-            ArrayArg::from_raw_parts(sh.clone(), state.len()),
-            ArrayArg::from_raw_parts(oh.clone(), out_len),
-            ArrayArg::from_raw_parts(dh.clone(), 2),
-            k_dim,
-            v_dim,
-        );
-    }
-    let out = f32::from_bytes(&client.read_one_unchecked(oh)).to_vec();
-    let new_state = f32::from_bytes(&client.read_one_unchecked(sh)).to_vec();
-    (out, new_state)
+    with_scan_buffers_as::<f32, R>(client, q, k, v, g, beta, state, bh, seq, v_dim, |qh, kh, vh, gh, betah, sh, oh, dh, out_len| {
+        let block = 64u32;
+        let grid = ((bh * v_dim) as u32).div_ceil(block);
+        unsafe {
+            gdn_scan::launch_unchecked::<f32, R>(
+                client,
+                Grid::Static(grid, 1, 1),
+                Block::new_1d(block),
+                ArrayArg::from_raw_parts(qh.clone(), q.len()),
+                ArrayArg::from_raw_parts(kh.clone(), k.len()),
+                ArrayArg::from_raw_parts(vh.clone(), v.len()),
+                ArrayArg::from_raw_parts(gh.clone(), g.len()),
+                ArrayArg::from_raw_parts(betah.clone(), beta.len()),
+                ArrayArg::from_raw_parts(sh.clone(), state.len()),
+                ArrayArg::from_raw_parts(oh.clone(), out_len),
+                ArrayArg::from_raw_parts(dh.clone(), 2),
+                k_dim,
+                v_dim,
+            );
+        }
+    })
+}
+
+/// Host launch for [`gdn_scan_lanes`]. Same tensor layout as [`gdn_scan_run`].
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_scan_lanes_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &[f32],
+    bh: usize,
+    seq: usize,
+    k_dim: usize,
+    v_dim: usize,
+    lanes: usize,
+    block: usize,
+    vk_layout: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    gdn_scan_lanes_run_as::<f32, R>(
+        client, q, k, v, g, beta, state, bh, seq, k_dim, v_dim, lanes, block, vk_layout,
+    )
+}
+
+/// Typed host launch for [`gdn_scan_lanes`] (`q`/`k`/`v`/`g`/`beta`/`out` in `F`, `state` always `f32`).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_scan_lanes_run_as<F: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[F],
+    k: &[F],
+    v: &[F],
+    g: &[F],
+    beta: &[F],
+    state: &[f32],
+    bh: usize,
+    seq: usize,
+    k_dim: usize,
+    v_dim: usize,
+    lanes: usize,
+    block: usize,
+    vk_layout: bool,
+) -> (Vec<F>, Vec<f32>) {
+    with_scan_buffers_as::<F, R>(client, q, k, v, g, beta, state, bh, seq, v_dim, |qh, kh, vh, gh, betah, sh, oh, dh, out_len| {
+        let grid = ((bh * v_dim * lanes) as u32).div_ceil(block as u32);
+        unsafe {
+            gdn_scan_lanes::launch_unchecked::<F, R>(
+                client,
+                Grid::Static(grid, 1, 1),
+                Block::new_1d(block as u32),
+                ArrayArg::from_raw_parts(qh.clone(), q.len()),
+                ArrayArg::from_raw_parts(kh.clone(), k.len()),
+                ArrayArg::from_raw_parts(vh.clone(), v.len()),
+                ArrayArg::from_raw_parts(gh.clone(), g.len()),
+                ArrayArg::from_raw_parts(betah.clone(), beta.len()),
+                ArrayArg::from_raw_parts(sh.clone(), state.len()),
+                ArrayArg::from_raw_parts(oh.clone(), out_len),
+                ArrayArg::from_raw_parts(dh.clone(), 2),
+                k_dim,
+                v_dim,
+                lanes,
+                vk_layout,
+            );
+        }
+    })
 }
 
 // ================================== CPU oracles (references) ====================================
@@ -442,7 +657,7 @@ pub fn gdn_scan_lanes<F: Float>(
     v: &Array<F>,
     g: &Array<F>,
     beta: &Array<F>,
-    state: &mut Array<F>,
+    state: &mut Array<f32>,
     out: &mut Array<F>,
     dims: &Array<u32>, // [bh, seq]
     #[comptime] k_dim: usize,
@@ -471,7 +686,7 @@ pub fn gdn_scan_lanes<F: Float>(
     let gb_bh = b * seq;
     let state_base = b * k_dim * v_dim;
 
-    let mut s = Array::<F>::new(seg);
+    let mut s = Array::<f32>::new(seg);
     for j in 0..seg {
         let kj = lane * seg + j;
         if vk_layout {
@@ -482,15 +697,15 @@ pub fn gdn_scan_lanes<F: Float>(
     }
 
     for t in 0..seq {
-        let decay = g[gb_bh + t].exp();
-        let beta_t = beta[gb_bh + t];
-        let v_t = v[v_bh + t * v_dim];
+        let decay = f32::cast_from(g[gb_bh + t]).exp();
+        let beta_t = f32::cast_from(beta[gb_bh + t]);
+        let v_t = f32::cast_from(v[v_bh + t * v_dim]);
 
-        let mut kv_mem = F::new(0.0f32);
+        let mut kv_mem = 0.0f32;
         for j in 0..seg {
             let sj = s[j] * decay;
             s[j] = sj;
-            kv_mem += sj * k[qk_bh + t * k_dim + j];
+            kv_mem += sj * f32::cast_from(k[qk_bh + t * k_dim + j]);
         }
         let mut off = 1u32;
         while off < lanes_u {
@@ -499,12 +714,12 @@ pub fn gdn_scan_lanes<F: Float>(
         }
         let delta = (v_t - kv_mem) * beta_t;
 
-        let mut y_t = F::new(0.0f32);
+        let mut y_t = 0.0f32;
         for j in 0..seg {
-            let kj_t = k[qk_bh + t * k_dim + j];
+            let kj_t = f32::cast_from(k[qk_bh + t * k_dim + j]);
             let sj = s[j] + kj_t * delta;
             s[j] = sj;
-            y_t += sj * q[qk_bh + t * k_dim + j];
+            y_t += sj * f32::cast_from(q[qk_bh + t * k_dim + j]);
         }
         off = 1u32;
         while off < lanes_u {
@@ -512,7 +727,7 @@ pub fn gdn_scan_lanes<F: Float>(
             off *= 2;
         }
         if valid && lane == 0 {
-            out[v_bh + t * v_dim] = y_t;
+            out[v_bh + t * v_dim] = F::cast_from(y_t);
         }
     }
 
@@ -839,6 +1054,54 @@ mod tests {
                 rel < 2e-3,
                 "gdn_conv1d b{batch} c{conv_dim} s{seq_len} max_rel {rel}"
             );
+        }
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn gdn_conv1d_step_cpu_matches_full() {
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let c = CpuRuntime::client(&CpuDevice::default());
+        for &(batch, conv_dim, seq_len) in &[(1usize, 128usize, 11usize), (2, 64, 7)] {
+            let x_full = rnd(batch * conv_dim * seq_len, 0x1357 + conv_dim as u64);
+            let w = rnd(conv_dim * 4, 0x2468 + seq_len as u64);
+            let want_full = gdn_conv1d_ref(&x_full, &w, batch, conv_dim, seq_len, 4);
+
+            let mut conv_state = vec![0.0f32; batch * conv_dim * 4];
+            let mut got_full = vec![0.0f32; batch * conv_dim * seq_len];
+            for t in 0..seq_len {
+                let mut xt = Vec::with_capacity(batch * conv_dim);
+                for b in 0..batch {
+                    for ch in 0..conv_dim {
+                        xt.push(x_full[(b * conv_dim + ch) * seq_len + t]);
+                    }
+                }
+                let (yt, new_cs) =
+                    gdn_conv1d_step_run::<CpuRuntime>(&c, &xt, &w, &conv_state, batch, conv_dim, 4);
+                conv_state = new_cs;
+                for b in 0..batch {
+                    for ch in 0..conv_dim {
+                        got_full[(b * conv_dim + ch) * seq_len + t] = yt[b * conv_dim + ch];
+                    }
+                }
+            }
+            let rel = max_rel(&want_full, &got_full);
+            eprintln!("[gdn_conv1d_step CPU] b{batch} c{conv_dim} s{seq_len} max_rel={rel:.2e}");
+            assert!(rel < 1e-5, "gdn_conv1d_step rel {rel}");
+            for b in 0..batch {
+                for ch in 0..conv_dim {
+                    for i in 0..4 {
+                        let got_s = conv_state[(b * conv_dim + ch) * 4 + i];
+                        let pos = seq_len as isize - 4 + i as isize;
+                        let want_s = if pos >= 0 {
+                            x_full[(b * conv_dim + ch) * seq_len + pos as usize]
+                        } else {
+                            0.0
+                        };
+                        assert!((got_s - want_s).abs() < 1e-6);
+                    }
+                }
+            }
         }
     }
 

@@ -52,6 +52,7 @@ pub mod prelude {
 
 pub use cubecl;
 
+pub mod gen;
 pub mod ternary;
 pub mod tune;
 
@@ -61,6 +62,7 @@ pub mod quant;
 pub mod attn;
 pub mod dag;
 pub mod fuse;
+pub mod fwht;
 pub mod gdn;
 pub mod glu;
 pub mod grad;

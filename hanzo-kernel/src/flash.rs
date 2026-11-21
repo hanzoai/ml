@@ -50,7 +50,7 @@ pub fn flash_attn<F: Float>(
     k: &Array<F>,
     v: &Array<F>,
     out: &mut Array<F>,
-    scale: &Array<F>,
+    scale: &Array<f32>,
     meta: &Array<u32>,
     #[comptime] d: usize,
     #[comptime] br: usize,
@@ -74,6 +74,10 @@ pub fn flash_attn<F: Float>(
     let kv_batch_stride = meta[5] as usize;
     let kv_head_stride = meta[6] as usize;
     let key_stride = meta[7] as usize;
+    let mut q_past = 0usize;
+    if seq_k > seq_q {
+        q_past = seq_k - seq_q;
+    }
 
     // Decompose the flat cube index into (batch, head, query-tile). GQA maps head -> shared kv head.
     let n_qtiles = (seq_q + br - 1) / br;
@@ -93,69 +97,54 @@ pub fn flash_attn<F: Float>(
     let per_q = br * d / plane; // Q-tile elements this lane owns (staged once, below)
 
     // Shared state: query tile [br, d] (staged ONCE), score/prob tile [br, bc], output accumulator
-    // [br, d], and per-row (m, l, rescale). `qsh` is the f16 Q the coopmat arms read every key tile;
-    // the default (CPU-oracle) arm reads Q from global directly and never touches it.
+    // [br, d], and per-row (m, l, rescale). All online-softmax math stays in f32 across F32/F16/BF16.
     let mut qsh = SharedMemory::<f16>::new(br * d);
-    let mut sf = SharedMemory::<F>::new(br * bc);
-    let mut of = SharedMemory::<F>::new(br * d);
-    let mut mf = SharedMemory::<F>::new(br);
-    let mut lf = SharedMemory::<F>::new(br);
-    let mut emf = SharedMemory::<F>::new(br); // per-row rescale exp(m_old - m_new) for this tile
+    let mut sf = SharedMemory::<f32>::new(br * bc);
+    let mut of = SharedMemory::<f32>::new(br * d);
+    let mut mf = SharedMemory::<f32>::new(br);
+    let mut lf = SharedMemory::<f32>::new(br);
+    let mut emf = SharedMemory::<f32>::new(br); // per-row rescale exp(m_old - m_new) for this tile
 
     // Init the output accumulator and per-row running state.
     for e in 0..per_o {
-        of[lane * per_o + e] = F::new(0.0f32);
+        of[lane * per_o + e] = f32::new(0.0f32);
     }
     if lane < br {
-        mf[lane] = F::new(-3.4e38f32);
-        lf[lane] = F::new(0.0f32);
+        mf[lane] = f32::new(-3.4e38f32);
+        lf[lane] = f32::new(0.0f32);
     }
 
-    // Stage Q[br, d] from global f32 to f16 shared ONCE, before the key loop (llama Qf,
-    // flash_attn_cm1.comp:87). Ragged query rows (qpos >= seq_q) stage 0. The coopmat arms below read
-    // this every key tile; hoisting it out of the loop removes the per-tile Q re-stage that capped the
-    // kernel at 0.38 TFLOP/s. Inert for the CPU oracle (its default arm reads Q from global).
+    // Stage Q[br, d] from global to f16 shared ONCE, before the key loop.
     for e in 0..per_q {
         let idx = lane * per_q + e;
         let r = idx / d;
         let dd = idx % d;
         let qpos = qt * br + r;
-        let val = if qpos < seq_q {
-            q[q_head_base + qpos * d + dd]
-        } else {
-            F::new(0.0f32)
-        };
+        let mut val = f32::new(0.0f32);
+        if qpos < seq_q {
+            val = f32::cast_from(q[q_head_base + qpos * d + dd]);
+        }
         qsh[idx] = f16::cast_from(val);
     }
     sync_cube();
 
-    // Causal early-exit: a key tile whose first key (j*bc) already exceeds this query tile's last row
-    // (qt*br + br - 1) is entirely above the causal diagonal -> every score is -inf -> P = 0 and the
-    // running (m, l, O) are unchanged (a mathematical no-op). Bounding the loop to the diagonal tile is
-    // therefore bit-exact and drops ~half the key tiles on causal prefill -- llama's masked-block skip
-    // (flash_attn_cm1.comp:146), expressed directly since our causality is computed inline, not masked.
+    // Causal early-exit: causal=1 aligns qpos=0 -> kpos=0; causal=2 bottom-right aligns qpos=0 -> kpos=seq_k-seq_q.
     let n_jt = (seq_k + bc - 1) / bc;
-    let n_jt_eff = if causal == 1 {
-        let bound = (qt * br + br - 1) / bc + 1;
-        if bound < n_jt {
-            bound
-        } else {
-            n_jt
+    let mut n_jt_eff = n_jt;
+    if causal == 1 || causal == 2 {
+        let mut shift = 0usize;
+        if causal == 2 {
+            shift = q_past;
         }
-    } else {
-        n_jt
-    };
+        let bound = (shift + qt * br + br - 1) / bc + 1;
+        if bound < n_jt {
+            n_jt_eff = bound;
+        }
+    }
     for j in 0..n_jt_eff {
         // ---- Q@Kᵀ: fill the [br, bc] score tile. Out-of-range / causally-masked entries -> -inf. ----
         island! {
-            // Accelerated: f16 cooperative-matrix. Stage Q[br,d]/K[bc,d] tiles to f16 shared (bounds
-            // -> 0), then C[br,bc] = Q @ Kᵀ over d/16 cmma(16x16x16) chunks (K loaded ColMajor gives
-            // Kᵀ, exactly `mmq_q8_wmma`'s W layout), f16 in -> f32 accumulate. Store to `sf`, then the
-            // scale+mask pass matches the default arm's semantics. Lowers to WMMA (CUDA/ROCm) +
-            // OpCooperativeMatrixMulAddKHR (SPIR-V), one 16x16x16 fragment. Metal composes it from 8x8
-            // (its simdgroup_matrix caps at 8x8x8) in the sibling `metal =>` arm below.
             cuda | rocm | vulkan => {
-                // Q is already in `qsh` (staged once, above). Stage only this key tile's K[bc,d].
                 let mut ksh = SharedMemory::<f16>::new(bc * d);
                 let per_k = bc * d / plane;
                 for e in 0..per_k {
@@ -163,17 +152,16 @@ pub fn flash_attn<F: Float>(
                     let c = idx / d;
                     let dd = idx % d;
                     let kpos = j * bc + c;
-                    let val = if kpos < seq_k { k[kvbase + kpos * key_stride + dd] } else { F::new(0.0f32) };
+                    let mut val = f32::new(0.0f32);
+                    if kpos < seq_k {
+                        val = f32::cast_from(k[kvbase + kpos * key_stride + dd]);
+                    }
                     ksh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
-                // The bc score columns split into bc/16 cooperative-matrix col-groups. Each accumulates
-                // C[br,16] = Q @ Kᵀ over d/16 contraction chunks (K ColMajor -> Kᵀ, `mmq_q8_wmma`'s W
-                // layout), then stores to sf columns [cg*16, cg*16+16). Bc=32 amortizes the K stage +
-                // barrier over twice the keys per online-softmax step (llama base Bc=32).
                 for cg in 0..bc / 16usize {
-                    let cacc = cmma::Matrix::<F>::from_value(
-                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
+                    let cacc = cmma::Matrix::<f32>::from_value(
+                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, f32::new(0.0f32),
                     );
                     for dk in 0..d / 16usize {
                         let a = cmma::Matrix::<f16>::from_slice(
@@ -184,7 +172,7 @@ pub fn flash_attn<F: Float>(
                             cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor,
                             &ksh.to_slice().slice(cg * 16usize * d + dk * 16usize, bc * d), d as u32,
                         );
-                        cmma::execute::<f16, f16, F, F>(&a, &b, &cacc, &cacc);
+                        cmma::execute::<f16, f16, f32, f32>(&a, &b, &cacc, &cacc);
                     }
                     cmma::store(&mut sf.to_slice_mut().slice_mut(cg * 16usize, br * bc), &cacc, bc as u32, cmma::MatrixLayout::RowMajor);
                 }
@@ -195,21 +183,15 @@ pub fn flash_attn<F: Float>(
                     let c = idx % bc;
                     let qpos = qt * br + r;
                     let kpos = j * bc + c;
-                    let masked = causal == 1 && kpos > qpos;
+                    let masked = (causal == 1 && kpos > qpos) || (causal == 2 && kpos > q_past + qpos);
                     if qpos < seq_q && kpos < seq_k && !masked {
                         sf[idx] = sf[idx] * sc;
                     } else {
-                        sf[idx] = F::new(-3.4e38f32);
+                        sf[idx] = f32::new(-3.4e38f32);
                     }
                 }
             }
-            // Metal simdgroup_matrix caps fragments at 8x8x8 (cubecl-cpp metal dialect). Stage the SAME
-            // f16 Q[br,d]/K[bc,d] tiles, then compose the 16x16 score tile as a (br/8)x(bc/8) grid of
-            // 8x8 accumulators, each contracting d in 8-wide steps. K is loaded ColMajor -> Kᵀ (the
-            // 8x8-probe-proven transpose mechanic). Every load reads inside the zero-padded staged tile,
-            // so ragged seq is handled at staging exactly as the 16x16 arm -- no OOB direct-slice read.
             metal => {
-                // Q is already in `qsh` (staged once, above). Stage only this key tile's K[bc,d].
                 let mut ksh = SharedMemory::<f16>::new(bc * d);
                 let per_k = bc * d / plane;
                 for e in 0..per_k {
@@ -217,14 +199,17 @@ pub fn flash_attn<F: Float>(
                     let c = idx / d;
                     let dd = idx % d;
                     let kpos = j * bc + c;
-                    let val = if kpos < seq_k { k[kvbase + kpos * key_stride + dd] } else { F::new(0.0f32) };
+                    let mut val = f32::new(0.0f32);
+                    if kpos < seq_k {
+                        val = f32::cast_from(k[kvbase + kpos * key_stride + dd]);
+                    }
                     ksh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
                 for ti in 0..br / 8usize {
                     for tj in 0..bc / 8usize {
-                        let cacc = cmma::Matrix::<F>::from_value(
-                            cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
+                        let cacc = cmma::Matrix::<f32>::from_value(
+                            cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, f32::new(0.0f32),
                         );
                         for dk in 0..d / 8usize {
                             let a = cmma::Matrix::<f16>::from_slice(
@@ -235,7 +220,7 @@ pub fn flash_attn<F: Float>(
                                 cmma::MatrixIdent::B, 8usize, 8usize, 8usize, cmma::MatrixLayout::ColMajor,
                                 &ksh.to_slice().slice(tj * 8usize * d + dk * 8usize, bc * d), d as u32,
                             );
-                            cmma::execute::<f16, f16, F, F>(&a, &b, &cacc, &cacc);
+                            cmma::execute::<f16, f16, f32, f32>(&a, &b, &cacc, &cacc);
                         }
                         cmma::store(
                             &mut sf.to_slice_mut().slice_mut(ti * 8usize * bc + tj * 8usize, br * bc),
@@ -250,16 +235,14 @@ pub fn flash_attn<F: Float>(
                     let c = idx % bc;
                     let qpos = qt * br + r;
                     let kpos = j * bc + c;
-                    let masked = causal == 1 && kpos > qpos;
+                    let masked = (causal == 1 && kpos > qpos) || (causal == 2 && kpos > q_past + qpos);
                     if qpos < seq_q && kpos < seq_k && !masked {
                         sf[idx] = sf[idx] * sc;
                     } else {
-                        sf[idx] = F::new(-3.4e38f32);
+                        sf[idx] = f32::new(-3.4e38f32);
                     }
                 }
             }
-            // NORMATIVE oracle: the identical Q@Kᵀ as portable scalar MACs, bounds/mask applied inline.
-            // This is the arm the CPU runtime executes -- the bit-exact gate for the whole structure.
             default => {
                 for e in 0..per_s {
                     let idx = lane * per_s + e;
@@ -267,17 +250,17 @@ pub fn flash_attn<F: Float>(
                     let c = idx % bc;
                     let qpos = qt * br + r;
                     let kpos = j * bc + c;
-                    let masked = causal == 1 && kpos > qpos;
+                    let masked = (causal == 1 && kpos > qpos) || (causal == 2 && kpos > q_past + qpos);
                     if qpos < seq_q && kpos < seq_k && !masked {
                         let qb = q_head_base + qpos * d;
                         let kb = kvbase + kpos * key_stride;
-                        let mut acc = F::new(0.0f32);
+                        let mut acc = f32::new(0.0f32);
                         for dd in 0..d {
-                            acc += q[qb + dd] * k[kb + dd];
+                            acc += f32::cast_from(q[qb + dd]) * f32::cast_from(k[kb + dd]);
                         }
                         sf[idx] = acc * sc;
                     } else {
-                        sf[idx] = F::new(-3.4e38f32);
+                        sf[idx] = f32::new(-3.4e38f32);
                     }
                 }
             }
@@ -289,7 +272,7 @@ pub fn flash_attn<F: Float>(
             let r = lane;
             let qpos = qt * br + r;
             if qpos < seq_q {
-                let mut rowmax = F::new(-3.4e38f32);
+                let mut rowmax = f32::new(-3.4e38f32);
                 for c in 0..bc {
                     let s = sf[r * bc + c];
                     if s > rowmax {
@@ -302,7 +285,7 @@ pub fn flash_attn<F: Float>(
                     m_new = rowmax;
                 }
                 let em = (m_old - m_new).exp();
-                let mut psum = F::new(0.0f32);
+                let mut psum = f32::new(0.0f32);
                 for c in 0..bc {
                     let p = (sf[r * bc + c] - m_new).exp();
                     sf[r * bc + c] = p;
@@ -312,29 +295,27 @@ pub fn flash_attn<F: Float>(
                 mf[r] = m_new;
                 emf[r] = em;
             } else {
-                emf[r] = F::new(1.0f32);
+                emf[r] = f32::new(1.0f32);
             }
         }
         sync_cube();
 
         // ---- P@V: rescale the running output by exp(m_old - m_new), then add this tile's P@V. ----
         island! {
-            // Accelerated: f16 cooperative-matrix. Stage P[br,bc] (from `sf`) and V[bc,d] to f16 shared
-            // (invalid rows / out-of-range keys -> 0), then O_tile[br,d] = P @ V over d/16 cmma chunks
-            // (K-dim = bc = 16, one chunk) into `ovt`, then rescale-combine of = emf*of + O_tile. Causal
-            // masking rides in P (masked entries are 0 after the online softmax). Metal composes the
-            // same tile from 8x8 fragments in the sibling `metal =>` arm below.
             cuda | rocm | vulkan => {
                 let mut psh = SharedMemory::<f16>::new(br * bc);
                 let mut vsh = SharedMemory::<f16>::new(bc * d);
-                let mut ovt = SharedMemory::<F>::new(br * d);
+                let mut ovt = SharedMemory::<f32>::new(br * d);
                 let per_p = br * bc / plane;
                 let per_v = bc * d / plane;
                 for e in 0..per_p {
                     let idx = lane * per_p + e;
                     let r = idx / bc;
                     let qpos = qt * br + r;
-                    let val = if qpos < seq_q { sf[idx] } else { F::new(0.0f32) };
+                    let mut val = f32::new(0.0f32);
+                    if qpos < seq_q {
+                        val = sf[idx];
+                    }
                     psh[idx] = f16::cast_from(val);
                 }
                 for e in 0..per_v {
@@ -342,16 +323,16 @@ pub fn flash_attn<F: Float>(
                     let c = idx / d;
                     let dd = idx % d;
                     let kpos = j * bc + c;
-                    let val = if kpos < seq_k { v[kvbase + kpos * key_stride + dd] } else { F::new(0.0f32) };
+                    let mut val = f32::new(0.0f32);
+                    if kpos < seq_k {
+                        val = f32::cast_from(v[kvbase + kpos * key_stride + dd]);
+                    }
                     vsh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
-                // O_tile[br,d] = P @ V. The d output columns split into d/16 groups; each accumulates
-                // over the bc/16 contraction chunks of the key dimension (P[br,kc*16..] @ V[kc*16..,dn*16..]),
-                // then stores O_tile columns [dn*16, dn*16+16). Bc=32 -> two contraction chunks per group.
                 for dn in 0..d / 16usize {
-                    let cacc = cmma::Matrix::<F>::from_value(
-                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
+                    let cacc = cmma::Matrix::<f32>::from_value(
+                        cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, f32::new(0.0f32),
                     );
                     for kc in 0..bc / 16usize {
                         let a = cmma::Matrix::<f16>::from_slice(
@@ -362,7 +343,7 @@ pub fn flash_attn<F: Float>(
                             cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor,
                             &vsh.to_slice().slice(kc * 16usize * d + dn * 16usize, bc * d), d as u32,
                         );
-                        cmma::execute::<f16, f16, F, F>(&a, &b, &cacc, &cacc);
+                        cmma::execute::<f16, f16, f32, f32>(&a, &b, &cacc, &cacc);
                     }
                     cmma::store(&mut ovt.to_slice_mut().slice_mut(dn * 16usize, br * d), &cacc, d as u32, cmma::MatrixLayout::RowMajor);
                 }
@@ -373,21 +354,20 @@ pub fn flash_attn<F: Float>(
                     of[idx] = of[idx] * emf[r] + ovt[idx];
                 }
             }
-            // Metal 8x8x8 simdgroup_matrix. Stage the SAME P[br,bc]/V[bc,d] f16 tiles, then compose the
-            // 16xd context tile as a (br/8)x(d/8) grid of 8x8 accumulators, each contracting bc in
-            // 8-wide steps (V loaded RowMajor; P is the online-softmax probabilities from `sf`). The
-            // rescale-combine of = emf*of + O_tile is identical to the 16x16 arm.
             metal => {
                 let mut psh = SharedMemory::<f16>::new(br * bc);
                 let mut vsh = SharedMemory::<f16>::new(bc * d);
-                let mut ovt = SharedMemory::<F>::new(br * d);
+                let mut ovt = SharedMemory::<f32>::new(br * d);
                 let per_p = br * bc / plane;
                 let per_v = bc * d / plane;
                 for e in 0..per_p {
                     let idx = lane * per_p + e;
                     let r = idx / bc;
                     let qpos = qt * br + r;
-                    let val = if qpos < seq_q { sf[idx] } else { F::new(0.0f32) };
+                    let mut val = f32::new(0.0f32);
+                    if qpos < seq_q {
+                        val = sf[idx];
+                    }
                     psh[idx] = f16::cast_from(val);
                 }
                 for e in 0..per_v {
@@ -395,14 +375,17 @@ pub fn flash_attn<F: Float>(
                     let c = idx / d;
                     let dd = idx % d;
                     let kpos = j * bc + c;
-                    let val = if kpos < seq_k { v[kvbase + kpos * key_stride + dd] } else { F::new(0.0f32) };
+                    let mut val = f32::new(0.0f32);
+                    if kpos < seq_k {
+                        val = f32::cast_from(v[kvbase + kpos * key_stride + dd]);
+                    }
                     vsh[idx] = f16::cast_from(val);
                 }
                 sync_cube();
                 for ti in 0..br / 8usize {
                     for tn in 0..d / 8usize {
-                        let cacc = cmma::Matrix::<F>::from_value(
-                            cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, F::new(0.0f32),
+                        let cacc = cmma::Matrix::<f32>::from_value(
+                            cmma::MatrixIdent::Accumulator, 8usize, 8usize, 8usize, cmma::MatrixLayout::Undefined, f32::new(0.0f32),
                         );
                         for k8 in 0..bc / 8usize {
                             let a = cmma::Matrix::<f16>::from_slice(
@@ -413,7 +396,7 @@ pub fn flash_attn<F: Float>(
                                 cmma::MatrixIdent::B, 8usize, 8usize, 8usize, cmma::MatrixLayout::RowMajor,
                                 &vsh.to_slice().slice(k8 * 8usize * d + tn * 8usize, bc * d), d as u32,
                             );
-                            cmma::execute::<f16, f16, F, F>(&a, &b, &cacc, &cacc);
+                            cmma::execute::<f16, f16, f32, f32>(&a, &b, &cacc, &cacc);
                         }
                         cmma::store(
                             &mut ovt.to_slice_mut().slice_mut(ti * 8usize * d + tn * 8usize, br * d),
@@ -428,8 +411,6 @@ pub fn flash_attn<F: Float>(
                     of[idx] = of[idx] * emf[r] + ovt[idx];
                 }
             }
-            // NORMATIVE oracle: the identical rescale + P@V as portable scalar MACs. The arm the CPU
-            // runtime executes -- gating the online rescale and the f32 accumulation order.
             default => {
                 for e in 0..per_o {
                     let idx = lane * per_o + e;
@@ -440,7 +421,7 @@ pub fn flash_attn<F: Float>(
                         let kpos = j * bc + c;
                         if kpos < seq_k {
                             let kb = kvbase + kpos * key_stride;
-                            o += sf[r * bc + c] * v[kb + dd];
+                            o += sf[r * bc + c] * f32::cast_from(v[kb + dd]);
                         }
                     }
                     of[idx] = o;
@@ -457,7 +438,7 @@ pub fn flash_attn<F: Float>(
         let dd = idx % d;
         let qpos = qt * br + r;
         if qpos < seq_q {
-            out[q_head_base + qpos * d + dd] = of[idx] / lf[r];
+            out[q_head_base + qpos * d + dd] = F::cast_from(of[idx] / lf[r]);
         }
     }
 }
@@ -562,6 +543,480 @@ pub fn flash_attn_launch<R: Runtime>(
         );
     }
     f32::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Write new key/value tokens into paged physical KV blocks (`hanzo-paged-attn` layout):
+/// `key`, `value`: `[num_tokens, num_kv_heads, head_size]`
+/// `key_cache`: `[num_blocks, num_kv_heads, head_size / x, block_size, x]`
+/// `value_cache`: `[num_blocks, num_kv_heads, head_size, block_size]`
+/// `slot_mapping`: `[num_tokens]` (`i64`, `< 0` skipped as padding)
+/// `dims`: `[num_tokens, num_kv_heads, head_size, block_size]`.
+#[kernel(targets(cuda, metal, vulkan, rocm, cpu), unchecked)]
+pub fn reshape_and_cache<F: Float>(
+    key: &Array<F>,
+    value: &Array<F>,
+    key_cache: &mut Array<F>,
+    value_cache: &mut Array<F>,
+    slot_mapping: &Array<i64>,
+    dims: &Array<u32>,
+    #[comptime] x: usize,
+) {
+    let gid = ABSOLUTE_POS;
+    let num_tokens = dims[0] as usize;
+    let num_kv_heads = dims[1] as usize;
+    let head_size = dims[2] as usize;
+    let block_size = dims[3] as usize;
+    let per_tok = num_kv_heads * head_size;
+    if gid < num_tokens * per_tok {
+        let tok = gid / per_tok;
+        let slot = slot_mapping[tok];
+        if slot >= 0i64 {
+            let rem = gid - tok * per_tok;
+            let kv_head = rem / head_size;
+            let dd = rem - kv_head * head_size;
+            let slot_u = slot as usize;
+            let blk = slot_u / block_size;
+            let blk_off = slot_u % block_size;
+            let vec_idx = dd / x;
+            let vec_off = dd % x;
+            let k_idx =
+                (((blk * num_kv_heads + kv_head) * (head_size / x) + vec_idx) * block_size
+                    + blk_off)
+                    * x
+                    + vec_off;
+            let v_idx =
+                ((blk * num_kv_heads + kv_head) * head_size + dd) * block_size + blk_off;
+            key_cache[k_idx] = key[gid];
+            value_cache[v_idx] = value[gid];
+        }
+    }
+}
+
+/// Paged decode attention over Engine's non-contiguous physical KV blocks (`hanzo-paged-attn`
+/// layout):
+/// - `q`, `out`: `[num_seqs, num_heads, head_size]`
+/// - `key_cache`: `[num_blocks, num_kv_heads, head_size / x, block_size, x]`
+/// - `value_cache`: `[num_blocks, num_kv_heads, head_size, block_size]`
+/// - `block_tables`: `[num_seqs, max_blocks_per_seq]` (`u32`)
+/// - `context_lens`: `[num_seqs]` (`u32`)
+/// - `scale_cfg`: `[softmax_scale, softcap]` (`f32`, `softcap <= 0.0` disabled)
+/// - `meta`: `[num_heads, num_kv_heads, max_blocks_per_seq, sliding_window, block_size]` (`u32`, `sliding_window == 0` disabled)
+///
+/// Launch: `Block::new_1d((nsg * plane) as u32)`, `Grid::Static((num_seqs * num_heads) as u32, 1, 1)`.
+/// Accumulates Q*K and softmax in f32 across `F32`, `F16`, and `BF16` storage.
+#[kernel(targets(cuda, metal, vulkan, webgpu, rocm), unchecked)]
+pub fn paged_attn<F: Float>(
+    q: &Array<F>,
+    key_cache: &Array<F>,
+    value_cache: &Array<F>,
+    block_tables: &Array<u32>,
+    context_lens: &Array<u32>,
+    out: &mut Array<F>,
+    scale_cfg: &Array<f32>,
+    meta: &Array<u32>,
+    #[comptime] d: usize,
+    #[comptime] x: usize,
+    #[comptime] plane: usize,
+    #[comptime] nsg: usize,
+) {
+    let tid = UNIT_POS as usize;
+    let sg = tid / plane;
+    let lane = tid % plane;
+    let seg = comptime!(d / plane);
+
+    let num_heads = meta[0] as usize;
+    let num_kv_heads = meta[1] as usize;
+    let max_blocks = meta[2] as usize;
+    let sliding_window = meta[3] as usize;
+    let block_size = meta[4] as usize;
+    let scale = scale_cfg[0];
+    let softcap = scale_cfg[1];
+
+    let cube = CUBE_POS as usize;
+    let seq_idx = cube / num_heads;
+    let head_idx = cube % num_heads;
+    let kv_head = head_idx / (num_heads / num_kv_heads);
+    let ctx_len = context_lens[seq_idx] as usize;
+    let mut start_tok = 0usize;
+    if sliding_window > 0usize && ctx_len > sliding_window {
+        start_tok = ctx_len - sliding_window;
+    }
+    let start_block = start_tok / block_size;
+    let ctx_blocks = (ctx_len + block_size - 1usize) / block_size;
+
+    let q_base = (seq_idx * num_heads + head_idx) * d;
+    let mut q_reg = Array::<f32>::new(seg);
+    let mut acc = Array::<f32>::new(seg);
+    #[unroll]
+    for e in 0..seg {
+        q_reg[e] = f32::cast_from(q[q_base + lane * seg + e]);
+        acc[e] = f32::new(0.0f32);
+    }
+
+    let mut m_sg = f32::new(-3.4e38f32);
+    let mut l_sg = f32::new(0.0f32);
+
+    let mut b = start_block + sg;
+    while b < ctx_blocks {
+        let phys = block_tables[seq_idx * max_blocks + b] as usize;
+        let kv_blk_base = phys * num_kv_heads + kv_head;
+        for tok in 0..block_size {
+            let ctx_pos = b * block_size + tok;
+            if ctx_pos >= start_tok && ctx_pos < ctx_len {
+                let mut dot = f32::new(0.0f32);
+                #[unroll]
+                for e in 0..seg {
+                    let dd = lane * seg + e;
+                    let vec_idx = dd / x;
+                    let vec_off = dd % x;
+                    let k_idx = ((kv_blk_base * (d / x) + vec_idx) * block_size + tok) * x + vec_off;
+                    dot += q_reg[e] * f32::cast_from(key_cache[k_idx]);
+                }
+                let full_dot = plane_sum(dot);
+                let mut score = full_dot * scale;
+                if softcap > 0.0f32 {
+                    let y = score / softcap;
+                    let mut cy = y;
+                    if y > 10.0f32 {
+                        cy = f32::new(10.0f32);
+                    } else if y < -10.0f32 {
+                        cy = f32::new(-10.0f32);
+                    }
+                    let e2 = (2.0f32 * cy).exp();
+                    score = softcap * ((e2 - 1.0f32) / (e2 + 1.0f32));
+                }
+                let mut m_new = m_sg;
+                if score > m_sg {
+                    m_new = score;
+                }
+                let em = (m_sg - m_new).exp();
+                let p = (score - m_new).exp();
+                l_sg = l_sg * em + p;
+                m_sg = m_new;
+                #[unroll]
+                for e in 0..seg {
+                    let dd = lane * seg + e;
+                    let v_idx = (kv_blk_base * d + dd) * block_size + tok;
+                    acc[e] = acc[e] * em + p * f32::cast_from(value_cache[v_idx]);
+                }
+            }
+        }
+        b += nsg;
+    }
+
+    let mut sm_m = SharedMemory::<f32>::new(nsg);
+    let mut sm_l = SharedMemory::<f32>::new(nsg);
+    let mut sm_acc = SharedMemory::<f32>::new(nsg * d);
+    if lane == 0usize {
+        sm_m[sg] = m_sg;
+        sm_l[sg] = l_sg;
+    }
+    #[unroll]
+    for e in 0..seg {
+        sm_acc[sg * d + lane * seg + e] = acc[e];
+    }
+    sync_cube();
+
+    if sg == 0usize {
+        let mut m_tot = f32::new(-3.4e38f32);
+        for s in 0..nsg {
+            if sm_l[s] > 0.0f32 && sm_m[s] > m_tot {
+                m_tot = sm_m[s];
+            }
+        }
+        let mut l_tot = f32::new(0.0f32);
+        for s in 0..nsg {
+            if sm_l[s] > 0.0f32 {
+                l_tot += sm_l[s] * (sm_m[s] - m_tot).exp();
+            }
+        }
+        let mut inv_l = f32::new(0.0f32);
+        if l_tot > 0.0f32 {
+            inv_l = 1.0f32 / l_tot;
+        }
+        #[unroll]
+        for e in 0..seg {
+            let dd = lane * seg + e;
+            let mut sum_v = f32::new(0.0f32);
+            for s in 0..nsg {
+                if sm_l[s] > 0.0f32 {
+                    sum_v += sm_acc[s * d + dd] * (sm_m[s] - m_tot).exp();
+                }
+            }
+            out[q_base + dd] = F::cast_from(sum_v * inv_l);
+        }
+    }
+}
+
+/// CPU oracle for paged decode attention matching [`paged_attn`] and [`reshape_and_cache`].
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attn_ref(
+    q: &[f32],
+    key_cache: &[f32],
+    value_cache: &[f32],
+    block_tables: &[u32],
+    context_lens: &[u32],
+    num_seqs: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    d: usize,
+    block_size: usize,
+    x: usize,
+    max_blocks: usize,
+    scale: f32,
+    softcap: f32,
+    sliding_window: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; num_seqs * num_heads * d];
+    let groups = num_heads / num_kv_heads;
+    for s in 0..num_seqs {
+        let ctx_len = context_lens[s] as usize;
+        let start_tok = if sliding_window > 0 && ctx_len > sliding_window {
+            ctx_len - sliding_window
+        } else {
+            0
+        };
+        for h in 0..num_heads {
+            let kv_h = h / groups;
+            let qb = (s * num_heads + h) * d;
+            let mut scores = Vec::with_capacity(ctx_len - start_tok);
+            let mut kvs = Vec::with_capacity(ctx_len - start_tok);
+            for pos in start_tok..ctx_len {
+                let b = pos / block_size;
+                let tok = pos % block_size;
+                let phys = block_tables[s * max_blocks + b] as usize;
+                let kv_blk_base = phys * num_kv_heads + kv_h;
+                kvs.push(kv_blk_base);
+                let mut dot = 0.0f32;
+                for dd in 0..d {
+                    let k_idx = ((kv_blk_base * (d / x) + dd / x) * block_size + tok) * x + (dd % x);
+                    dot += q[qb + dd] * key_cache[k_idx];
+                }
+                let mut sc = dot * scale;
+                if softcap > 0.0 {
+                    sc = softcap * (sc / softcap).tanh();
+                }
+                scores.push(sc);
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|&sc| (sc - m).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (i, pos) in (start_tok..ctx_len).enumerate() {
+                let tok = pos % block_size;
+                let kv_blk_base = kvs[i];
+                let w = exps[i] / sum;
+                for dd in 0..d {
+                    let v_idx = (kv_blk_base * d + dd) * block_size + tok;
+                    out[qb + dd] += w * value_cache[v_idx];
+                }
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attn_run<R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[f32],
+    key_cache: &[f32],
+    value_cache: &[f32],
+    block_tables: &[u32],
+    context_lens: &[u32],
+    num_seqs: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    d: usize,
+    block_size: usize,
+    x: usize,
+    max_blocks: usize,
+    scale: f32,
+    softcap: f32,
+    sliding_window: usize,
+) -> Vec<f32> {
+    paged_attn_run_as::<f32, R>(
+        client,
+        q,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lens,
+        num_seqs,
+        num_heads,
+        num_kv_heads,
+        d,
+        block_size,
+        x,
+        max_blocks,
+        scale,
+        softcap,
+        sliding_window,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attn_run_as<F: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[F],
+    key_cache: &[F],
+    value_cache: &[F],
+    block_tables: &[u32],
+    context_lens: &[u32],
+    num_seqs: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    d: usize,
+    block_size: usize,
+    x: usize,
+    max_blocks: usize,
+    scale: f32,
+    softcap: f32,
+    sliding_window: usize,
+) -> Vec<F> {
+    let plane = (client.properties().hardware.plane_size_max as usize).max(32);
+    let nsg = 4usize;
+    let qh = client.create_from_slice(F::as_bytes(q));
+    let kch = client.create_from_slice(F::as_bytes(key_cache));
+    let vch = client.create_from_slice(F::as_bytes(value_cache));
+    let bth = client.create_from_slice(u32::as_bytes(block_tables));
+    let clh = client.create_from_slice(u32::as_bytes(context_lens));
+    let oh = client.create_from_slice(F::as_bytes(&vec![F::new(0.0f32); num_seqs * num_heads * d]));
+    let sh = client.create_from_slice(f32::as_bytes(&[scale, softcap]));
+    let mh = client.create_from_slice(u32::as_bytes(&[
+        num_heads as u32,
+        num_kv_heads as u32,
+        max_blocks as u32,
+        sliding_window as u32,
+        block_size as u32,
+    ]));
+    unsafe {
+        paged_attn::launch_unchecked::<F, R>(
+            client,
+            Grid::Static((num_seqs * num_heads) as u32, 1, 1),
+            Block::new_1d((nsg * plane) as u32),
+            ArrayArg::from_raw_parts(qh.clone(), q.len()),
+            ArrayArg::from_raw_parts(kch.clone(), key_cache.len()),
+            ArrayArg::from_raw_parts(vch.clone(), value_cache.len()),
+            ArrayArg::from_raw_parts(bth.clone(), block_tables.len()),
+            ArrayArg::from_raw_parts(clh.clone(), context_lens.len()),
+            ArrayArg::from_raw_parts(oh.clone(), num_seqs * num_heads * d),
+            ArrayArg::from_raw_parts(sh.clone(), 2),
+            ArrayArg::from_raw_parts(mh.clone(), 5),
+            d,
+            x,
+            plane,
+            nsg,
+        );
+    }
+    F::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Host launch for [`reshape_and_cache`] (`F32`, `F16`, `BF16`). Returns `(key_cache, value_cache)`.
+#[allow(clippy::too_many_arguments)]
+pub fn reshape_and_cache_run_as<F: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    key: &[F],
+    value: &[F],
+    key_cache: &[F],
+    value_cache: &[F],
+    slot_mapping: &[i64],
+    num_tokens: usize,
+    num_kv_heads: usize,
+    d: usize,
+    block_size: usize,
+    x: usize,
+) -> (Vec<F>, Vec<F>) {
+    let kh = client.create_from_slice(F::as_bytes(key));
+    let vh = client.create_from_slice(F::as_bytes(value));
+    let kch = client.create_from_slice(F::as_bytes(key_cache));
+    let vch = client.create_from_slice(F::as_bytes(value_cache));
+    let smh = client.create_from_slice(i64::as_bytes(slot_mapping));
+    let dh = client.create_from_slice(u32::as_bytes(&[
+        num_tokens as u32,
+        num_kv_heads as u32,
+        d as u32,
+        block_size as u32,
+    ]));
+    let total = num_tokens * num_kv_heads * d;
+    let block = 64u32;
+    let grid = (total as u32).div_ceil(block);
+    unsafe {
+        reshape_and_cache::launch_unchecked::<F, R>(
+            client,
+            Grid::Static(grid, 1, 1),
+            Block::new_1d(block),
+            ArrayArg::from_raw_parts(kh.clone(), key.len()),
+            ArrayArg::from_raw_parts(vh.clone(), value.len()),
+            ArrayArg::from_raw_parts(kch.clone(), key_cache.len()),
+            ArrayArg::from_raw_parts(vch.clone(), value_cache.len()),
+            ArrayArg::from_raw_parts(smh.clone(), slot_mapping.len()),
+            ArrayArg::from_raw_parts(dh.clone(), 4),
+            x,
+        );
+    }
+    let kc = F::from_bytes(&client.read_one_unchecked(kch)).to_vec();
+    let vc = F::from_bytes(&client.read_one_unchecked(vch)).to_vec();
+    (kc, vc)
+}
+
+/// Typed host launcher for [`flash_attn`] supporting explicit `(br, bc)` and `F32`/`F16`/`BF16`.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_launch_as<F: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[F],
+    k: &[F],
+    v: &[F],
+    b: usize,
+    n_heads: usize,
+    n_kv: usize,
+    seq_q: usize,
+    seq_k: usize,
+    kv_seq_pad: usize,
+    d: usize,
+    causal_mode: u32,
+    br: usize,
+    bc: usize,
+    plane: usize,
+    target: Target,
+) -> Vec<F> {
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let meta = [
+        seq_q as u32,
+        seq_k as u32,
+        n_heads as u32,
+        n_kv as u32,
+        causal_mode,
+        (n_kv * kv_seq_pad * d) as u32,
+        (kv_seq_pad * d) as u32,
+        d as u32,
+        0u32,
+    ];
+    let qh = client.create_from_slice(F::as_bytes(q));
+    let kh = client.create_from_slice(F::as_bytes(k));
+    let vh = client.create_from_slice(F::as_bytes(v));
+    let sh = client.create_from_slice(f32::as_bytes(&[scale]));
+    let mh = client.create_from_slice(u32::as_bytes(&meta));
+    let oh = client.create_from_slice(F::as_bytes(&vec![F::new(0.0f32); b * n_heads * seq_q * d]));
+    let cubes = b * n_heads * seq_q.div_ceil(br);
+    unsafe {
+        flash_attn::launch_unchecked::<F, R>(
+            client,
+            Grid::Static(cubes as u32, 1, 1),
+            Block::new_1d(plane as u32),
+            ArrayArg::from_raw_parts(qh.clone(), q.len()),
+            ArrayArg::from_raw_parts(kh.clone(), k.len()),
+            ArrayArg::from_raw_parts(vh.clone(), v.len()),
+            ArrayArg::from_raw_parts(oh.clone(), b * n_heads * seq_q * d),
+            ArrayArg::from_raw_parts(sh.clone(), 1),
+            ArrayArg::from_raw_parts(mh.clone(), 9),
+            d,
+            br,
+            bc,
+            plane,
+            target,
+        );
+    }
+    F::from_bytes(&client.read_one_unchecked(oh)).to_vec()
 }
 
 #[cfg(test)]
@@ -965,5 +1420,224 @@ mod tests {
                 "CUDA plane 32 vs 64 diverged ({agree}) -- coopmat no longer warp-scoped"
             );
         }
+    }
+
+    fn check_paged_backend<R: Runtime>(c: &ComputeClient<R>, tag: &str) {
+        for &(num_seqs, nh, nkv, d, block_size, lens, softcap, sw) in &[
+            (2usize, 8usize, 2usize, 64usize, 16usize, [19usize, 37usize], 0.0f32, 0usize),
+            (2, 24, 4, 256, 32, [67, 41], 0.0, 0),
+            (2, 8, 2, 128, 32, [51, 25], 50.0, 32),
+        ] {
+            let max_blocks = (lens[0].max(lens[1])).div_ceil(block_size);
+            let total_blocks = num_seqs * max_blocks + 3;
+            // Shuffled non-contiguous physical page assignment.
+            let mut block_tables = vec![0u32; num_seqs * max_blocks];
+            for s in 0..num_seqs {
+                for b in 0..max_blocks {
+                    block_tables[s * max_blocks + b] =
+                        ((total_blocks - 1 - (s * max_blocks + b) * 2) % total_blocks) as u32;
+                }
+            }
+            let total_toks: usize = lens.iter().sum();
+            let k_flat = rnd(total_toks * nkv * d, 0x5151);
+            let v_flat = rnd(total_toks * nkv * d, 0x6262);
+            let mut slot_mapping: Vec<i64> = Vec::with_capacity(total_toks);
+            for s in 0..num_seqs {
+                for pos in 0..lens[s] {
+                    let phys = block_tables[s * max_blocks + pos / block_size] as i64;
+                    slot_mapping.push(phys * block_size as i64 + (pos % block_size) as i64);
+                }
+            }
+            let x = 4usize;
+            let kc0 = vec![0.0f32; total_blocks * nkv * (d / x) * block_size * x];
+            let vc0 = vec![0.0f32; total_blocks * nkv * d * block_size];
+            let (kc, vc) = reshape_and_cache_run_as::<f32, R>(
+                c,
+                &k_flat,
+                &v_flat,
+                &kc0,
+                &vc0,
+                &slot_mapping,
+                total_toks,
+                nkv,
+                d,
+                block_size,
+                x,
+            );
+            let q = rnd(num_seqs * nh * d, 0x7373);
+            let cl = [lens[0] as u32, lens[1] as u32];
+            let scale = 1.0f32 / (d as f32).sqrt();
+            let got = paged_attn_run::<R>(
+                c,
+                &q,
+                &kc,
+                &vc,
+                &block_tables,
+                &cl,
+                num_seqs,
+                nh,
+                nkv,
+                d,
+                block_size,
+                x,
+                max_blocks,
+                scale,
+                softcap,
+                sw,
+            );
+            let want = paged_attn_ref(
+                &q,
+                &kc,
+                &vc,
+                &block_tables,
+                &cl,
+                num_seqs,
+                nh,
+                nkv,
+                d,
+                block_size,
+                x,
+                max_blocks,
+                scale,
+                softcap,
+                sw,
+            );
+            let rel = scale_rel(&got, &want);
+            eprintln!("[paged-{tag}] s={num_seqs} nh={nh}/{nkv} d={d} lens={lens:?} cap={softcap} sw={sw} rel={rel:.2e}");
+            assert!(rel < 2e-5, "paged-{tag} d={d} rel {rel}");
+
+            // Verify BF16 paged path matches F32 reference to bf16 precision.
+            let x_b = 8usize;
+            let kb: Vec<half::bf16> = k_flat.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let vb: Vec<half::bf16> = v_flat.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let qb: Vec<half::bf16> = q.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let kcb0 = vec![half::bf16::ZERO; total_blocks * nkv * (d / x_b) * block_size * x_b];
+            let vcb0 = vec![half::bf16::ZERO; total_blocks * nkv * d * block_size];
+            let (kcb, vcb) = reshape_and_cache_run_as::<half::bf16, R>(
+                c,
+                &kb,
+                &vb,
+                &kcb0,
+                &vcb0,
+                &slot_mapping,
+                total_toks,
+                nkv,
+                d,
+                block_size,
+                x_b,
+            );
+            let got_b: Vec<f32> = paged_attn_run_as::<half::bf16, R>(
+                c,
+                &qb,
+                &kcb,
+                &vcb,
+                &block_tables,
+                &cl,
+                num_seqs,
+                nh,
+                nkv,
+                d,
+                block_size,
+                x_b,
+                max_blocks,
+                scale,
+                softcap,
+                sw,
+            )
+            .into_iter()
+            .map(|v| v.to_f32())
+            .collect();
+            let rel_b = scale_rel(&got_b, &want);
+            eprintln!("[paged-{tag}-bf16] d={d} rel={rel_b:.2e}");
+            assert!(rel_b < 2e-2, "paged-{tag}-bf16 d={d} rel {rel_b}");
+        }
+    }
+
+    fn check_flash_d256_causal2<R: Runtime>(c: &ComputeClient<R>, tag: &str, tgt: Target) {
+        let plane = (c.properties().hardware.plane_size_max as usize).max(32);
+        // Bottom-right causal (causal=2) with sq < sk (chunked prefill / speculative verify).
+        for &(nh, nkv, sq, sk, d, br, bc, causal) in &[
+            (6usize, 2usize, 12usize, 40usize, 128usize, 16usize, 16usize, 2u32),
+            (24, 4, 8, 32, 128, 16, 16, 2),
+        ] {
+            let q = rnd(nh * sq * d, 0x1357);
+            let k = rnd(nkv * sk * d, 0x2468);
+            let v = rnd(nkv * sk * d, 0x369c);
+            let got = flash_attn_launch_as::<f32, R>(
+                c, &q, &k, &v, 1, nh, nkv, sq, sk, sk, d, causal, br, bc, plane, tgt,
+            );
+            // Reference bottom-right causal: key_pos <= (sk - sq) + query_pos
+            let q_past = sk - sq;
+            let groups = nh / nkv;
+            let scale = 1.0f32 / (d as f32).sqrt();
+            let mut want = vec![0.0f32; nh * sq * d];
+            for h in 0..nh {
+                let kvh = h / groups;
+                for i in 0..sq {
+                    let lim = q_past + i;
+                    let mut scores = vec![f32::NEG_INFINITY; sk];
+                    let mut m = f32::NEG_INFINITY;
+                    for j in 0..=lim {
+                        let mut dot = 0.0f32;
+                        for dd in 0..d {
+                            dot += q[(h * sq + i) * d + dd] * k[(kvh * sk + j) * d + dd];
+                        }
+                        let sc = dot * scale;
+                        scores[j] = sc;
+                        if sc > m {
+                            m = sc;
+                        }
+                    }
+                    let mut exps = vec![0.0f32; sk];
+                    let mut sum = 0.0f32;
+                    for j in 0..=lim {
+                        let e = (scores[j] - m).exp();
+                        exps[j] = e;
+                        sum += e;
+                    }
+                    for dd in 0..d {
+                        let mut acc = 0.0f32;
+                        for j in 0..=lim {
+                            acc += (exps[j] / sum) * v[(kvh * sk + j) * d + dd];
+                        }
+                        want[(h * sq + i) * d + dd] = acc;
+                    }
+                }
+            }
+            let rel = scale_rel(&got, &want);
+            eprintln!("[flash-{tag}-d256-c2] nh{nh}/{nkv} sq{sq} sk{sk} d{d} br{br} rel={rel:.2e}");
+            assert!(rel < 2e-3, "flash-{tag} d={d} causal=2 rel {rel}");
+
+            let qb: Vec<half::bf16> = q.iter().map(|&x| half::bf16::from_f32(x)).collect();
+            let kb: Vec<half::bf16> = k.iter().map(|&x| half::bf16::from_f32(x)).collect();
+            let vb: Vec<half::bf16> = v.iter().map(|&x| half::bf16::from_f32(x)).collect();
+            let got_b: Vec<f32> = flash_attn_launch_as::<half::bf16, R>(
+                c, &qb, &kb, &vb, 1, nh, nkv, sq, sk, sk, d, causal, br, bc, plane, tgt,
+            )
+            .into_iter()
+            .map(|x| x.to_f32())
+            .collect();
+            let rel_b = scale_rel(&got_b, &want);
+            eprintln!("[flash-{tag}-bf16-c2] d={d} rel={rel_b:.2e}");
+            assert!(rel_b < 2e-2, "flash-{tag}-bf16 d={d} rel {rel_b}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn paged_attn_matches_ref_on_cuda() {
+        use cubecl::cuda::{CudaDevice, CudaRuntime};
+        let c = CudaRuntime::client(&CudaDevice::default());
+        check_paged_backend::<CudaRuntime>(&c, "cuda");
+        check_flash_d256_causal2::<CudaRuntime>(&c, "cuda", Target::Cuda);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn paged_attn_matches_ref_on_vulkan() {
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        let c = WgpuRuntime::client(&WgpuDevice::default());
+        check_paged_backend::<WgpuRuntime>(&c, "vulkan");
+        check_flash_d256_causal2::<WgpuRuntime>(&c, "vulkan", Target::Vulkan);
     }
 }
