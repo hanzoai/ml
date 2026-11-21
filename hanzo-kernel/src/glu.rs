@@ -1,4 +1,5 @@
 //! GeGLU, `y = gelu(g) u` with `gelu(x) = x Φ(x)`, and its gradient, computed in F32.
+#![allow(unstable_name_collisions)]
 
 use crate::prelude::*;
 

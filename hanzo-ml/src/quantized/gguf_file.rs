@@ -803,3 +803,86 @@ pub fn write<W: std::io::Seek + std::io::Write>(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod bonsai_load_tests {
+    use super::{Content, Value};
+    use crate::quantized::iq_quants::{BlockPQ2_0, QK_PQ2_0};
+    use crate::quantized::k_quants::GgmlType;
+    use crate::quantized::GgmlDType;
+    use crate::Device;
+
+    // End-to-end load of the real Ternary-Bonsai-2-27B-PQ2_0.gguf (env-gated): parse the
+    // metadata, check the prism.hadamard contract keys are present, resolve the PQ2_0
+    // embedding/head tensors, and decode token_embd's first 16 blocks bit-exactly against
+    // the ProCreations C reference fixture shared with the iq_quants KAT.
+    #[test]
+    fn bonsai_pq2_gguf_loads() {
+        let path = std::env::var("BONSAI_PQ2_GGUF").unwrap_or_default();
+        if path.is_empty() {
+            eprintln!("skipped: set BONSAI_PQ2_GGUF to the 27B PQ2_0 gguf");
+            return;
+        }
+        let (gguf, mmap) = Content::read_mmap(&path).unwrap();
+
+        match gguf.metadata.get("general.architecture").unwrap() {
+            Value::String(arch) => assert_eq!(arch, "qwen35"),
+            v => panic!("general.architecture is {v:?}, not a string"),
+        }
+        for key in [
+            "prism.hadamard.version",
+            "prism.hadamard.block_size",
+            "prism.hadamard.transform",
+            "prism.hadamard.axis",
+            "prism.hadamard.sign_mode",
+            "prism.hadamard.sign_widths",
+            "prism.hadamard.sign_values",
+            "prism.hadamard.weight_names",
+            "prism.hadamard.inverse_weight_names",
+        ] {
+            assert!(gguf.metadata.contains_key(key), "missing required {key}");
+        }
+        assert_eq!(gguf.tensor_infos.len(), 851);
+
+        let embd = gguf
+            .tensor_mmap(&mmap, "token_embd.weight", &Device::Cpu)
+            .unwrap();
+        assert_eq!(embd.dtype(), GgmlDType::PQ2_0);
+        let output = gguf
+            .tensor_mmap(&mmap, "output.weight", &Device::Cpu)
+            .unwrap();
+        assert_eq!(output.dtype(), GgmlDType::PQ2_0);
+
+        const NBLK: usize = 16;
+        let bytes = embd.data().unwrap();
+        let raw = &bytes[..NBLK * std::mem::size_of::<BlockPQ2_0>()];
+        let words = raw.len().div_ceil(16);
+        let mut backing: Vec<u128> = vec![0u128; words];
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, words * 16) };
+        dst[..raw.len()].copy_from_slice(raw);
+        let ptr = backing.as_ptr() as *const u8;
+        std::mem::forget(backing);
+        let buf = unsafe { Vec::from_raw_parts(ptr as *mut u8, raw.len(), words * 16) };
+        let blocks = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const BlockPQ2_0, NBLK) };
+        let mut ys = vec![0f32; NBLK * QK_PQ2_0];
+        BlockPQ2_0::to_float(blocks, &mut ys);
+        let expected = include_str!("testdata/pq2_real_embd.hex");
+        for b in 0..NBLK {
+            for j in 0..QK_PQ2_0 {
+                let tok = expected
+                    .lines()
+                    .nth(b)
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(j)
+                    .unwrap();
+                assert_eq!(
+                    ys[b * QK_PQ2_0 + j].to_bits(),
+                    u32::from_str_radix(tok, 16).unwrap(),
+                    "token_embd block {b} elem {j}"
+                );
+            }
+        }
+    }
+}

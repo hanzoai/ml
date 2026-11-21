@@ -1,5 +1,6 @@
-// LOAD + DEQUANTIZE for 11 GGUF quant types ported verbatim from llama.cpp
-// (ggml/src/ggml-quants.c dequantize_row_*). Each block struct is a bit-for-bit
+// LOAD + DEQUANTIZE for the GGUF quant types ported verbatim from llama.cpp
+// (ggml/src/ggml-quants.c dequantize_row_*), the Prism (Bonsai 2) ternary family
+// PQ2_0/PTQ1_0, and the ROCmFPX fork ROCMFP4 types. Each block struct is a bit-for-bit
 // replica of the matching block_<t> in ggml-common.h; the `quant_format!` macro
 // re-asserts the byte size against the GGUF on-disk layout at compile time.
 //
@@ -23,6 +24,9 @@ use half::f16;
 pub const QK1_0: usize = 128;
 pub const QK_NVFP4: usize = 64;
 pub const QK_NVFP4_SUB: usize = 16;
+// Prism (Bonsai 2) ternary family: both are group-128 (ggml-common.h QK_PQ2_0 / QK_PTQ1_0).
+pub const QK_PQ2_0: usize = 128;
+pub const QK_PTQ1_0: usize = 128;
 
 // IQ1_S / IQ1_M codebook delta (llama.cpp ggml-common.h:1121, IQ1S_DELTA 0.125f).
 const IQ1S_DELTA: f32 = 0.125;
@@ -699,6 +703,478 @@ quant_format! {
     },
 }
 
+// ============================================================================
+// 12. PQ2_0 - Prism (Bonsai 2) 2-bit ternary, 128 elems. 00=-1, 01=0, 10=+1, 11=+2:
+//     value = (code - 1) * d (asymmetric; the +2 slot is what buys the Hadamard basis).
+//     block_pq2_0 (ggml-common.h): d FIRST, then 32 qs bytes -> 34 B.
+//     ProCreations dequantize_row_pq2_0 (ggml-quants.c:494).
+// ============================================================================
+quant_format! {
+    name: BlockPQ2_0,
+    dtype: PQ2_0,
+    block_elems: QK_PQ2_0,
+    byte_size: 34,
+    vec_dot: BlockQ8_0,
+    vec_dot_fn: vec_dot_pq2_0_q8_0,
+    fields: {
+        d: f16,
+        qs: [u8; QK_PQ2_0 / 4],
+    },
+    decode: |xs, ys| {
+        let k = ys.len();
+        debug_assert!(k.is_multiple_of(QK_PQ2_0), "dequantize_row_pq2_0: {k} % {QK_PQ2_0} != 0");
+        let nb = k / QK_PQ2_0;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            for j in 0..QK_PQ2_0 {
+                let byte = xs[i].qs[j / 4];
+                let q = ((byte >> ((j % 4) * 2)) & 3) as i32;
+                ys[i * QK_PQ2_0 + j] = (q - 1) as f32 * d;
+            }
+        }
+    },
+}
+
+// ============================================================================
+// 13. PTQ1_0 - Prism (Bonsai 2) 1-bit ternary, 128 elems. Base-3 packing: 5 trits per
+//     qs byte + 4 per qh byte, value = (trit - 1) * d. Staged element order (ggml-quants.c
+//     ptq1_0_stages {32,16,8}): e = n*16+m over qs[0..15], e = 80+n*8+m over qs[16..23],
+//     e = 120+n*2+m over qh. xi = ((byte.wrapping_mul(3^n) as u16) * 3) >> 8.
+//     block_ptq1_0 (ggml-common.h): scale d at the END -> 24 + 2 + 2 = 28 B.
+// ============================================================================
+quant_format! {
+    name: BlockPTQ1_0,
+    dtype: PTQ1_0,
+    block_elems: QK_PTQ1_0,
+    byte_size: 28,
+    vec_dot: BlockQ8_0,
+    vec_dot_fn: vec_dot_ptq1_0_q8_0,
+    fields: {
+        qs: [u8; (QK_PTQ1_0 - 4 * QK_PTQ1_0 / 64) / 5],
+        qh: [u8; QK_PTQ1_0 / 64],
+        d: f16,
+    },
+    decode: |xs, ys| {
+        let k = ys.len();
+        debug_assert!(k.is_multiple_of(QK_PTQ1_0), "dequantize_row_ptq1_0: {k} % {QK_PTQ1_0} != 0");
+        let nb = k / QK_PTQ1_0;
+        let pow3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+        let mut yi = 0usize;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            // 16-byte chunks: 5 digits x 16 elements.
+            let mut j = 0usize;
+            while j + 16 <= 24 {
+                for n in 0..5 {
+                    for m in 0..16 {
+                        let q = xs[i].qs[j + m].wrapping_mul(pow3[n]);
+                        let xi = ((q as u16) * 3) >> 8;
+                        ys[yi] = (xi as i32 - 1) as f32 * d;
+                        yi += 1;
+                    }
+                }
+                j += 16;
+            }
+            // 8-byte tail chunk: 5 digits x 8 elements.
+            while j + 8 <= 24 {
+                for n in 0..5 {
+                    for m in 0..8 {
+                        let q = xs[i].qs[j + m].wrapping_mul(pow3[n]);
+                        let xi = ((q as u16) * 3) >> 8;
+                        ys[yi] = (xi as i32 - 1) as f32 * d;
+                        yi += 1;
+                    }
+                }
+                j += 8;
+            }
+            // qh: 4 digits x 2 elements.
+            for n in 0..4 {
+                for m in 0..2 {
+                    let q = xs[i].qh[m].wrapping_mul(pow3[n]);
+                    let xi = ((q as u16) * 3) >> 8;
+                    ys[yi] = (xi as i32 - 1) as f32 * d;
+                    yi += 1;
+                }
+            }
+        }
+    },
+}
+
+// ============================================================================
+// Fast SIMD + integer-accumulating CPU vec_dot for PQ2_0 and PTQ1_0 vs Q8_0
+// ============================================================================
+
+#[inline]
+pub(crate) fn vec_dot_pq2_0_q8_0(n: usize, xs: &[BlockPQ2_0], ys: &[BlockQ8_0]) -> f32 {
+    debug_assert!(
+        n.is_multiple_of(QK_PQ2_0),
+        "vec_dot BlockPQ2_0: {n} not divisible by {QK_PQ2_0}"
+    );
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Baseline NEON is mandatory on aarch64.
+        return unsafe { vec_dot_pq2_0_q8_0_neon(n, xs, ys) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_pq2_0_q8_0_avx2(n, xs, ys) };
+        }
+    }
+    #[allow(unreachable_code)]
+    vec_dot_pq2_0_q8_0_scalar(n, xs, ys)
+}
+
+#[inline]
+pub(crate) fn vec_dot_ptq1_0_q8_0(n: usize, xs: &[BlockPTQ1_0], ys: &[BlockQ8_0]) -> f32 {
+    debug_assert!(
+        n.is_multiple_of(QK_PTQ1_0),
+        "vec_dot BlockPTQ1_0: {n} not divisible by {QK_PTQ1_0}"
+    );
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { vec_dot_ptq1_0_q8_0_neon(n, xs, ys) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_ptq1_0_q8_0_avx2(n, xs, ys) };
+        }
+    }
+    #[allow(unreachable_code)]
+    vec_dot_ptq1_0_q8_0_scalar(n, xs, ys)
+}
+
+pub(crate) fn vec_dot_pq2_0_q8_0_scalar(n: usize, xs: &[BlockPQ2_0], ys: &[BlockQ8_0]) -> f32 {
+    let nb = n / QK_PQ2_0;
+    let mut sumf = 0f32;
+    for i in 0..nb {
+        let x = &xs[i];
+        let d0 = x.d.to_f32();
+        let mut sumi = 0f32;
+        for sub in 0..4 {
+            let yb = &ys[i * 4 + sub];
+            let qs_sub = &x.qs[sub * 8..sub * 8 + 8];
+            let mut isum = 0i32;
+            for b_idx in 0..8 {
+                let byte = qs_sub[b_idx];
+                let y4 = &yb.qs[b_idx * 4..b_idx * 4 + 4];
+                isum += (((byte & 3) as i32) - 1) * (y4[0] as i32)
+                    + ((((byte >> 2) & 3) as i32) - 1) * (y4[1] as i32)
+                    + ((((byte >> 4) & 3) as i32) - 1) * (y4[2] as i32)
+                    + ((((byte >> 6) & 3) as i32) - 1) * (y4[3] as i32);
+            }
+            sumi += yb.d.to_f32() * (isum as f32);
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+pub(crate) fn vec_dot_ptq1_0_q8_0_scalar(n: usize, xs: &[BlockPTQ1_0], ys: &[BlockQ8_0]) -> f32 {
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+    let nb = n / QK_PTQ1_0;
+    let mut sumf = 0f32;
+    let mut q = [0i8; QK_PTQ1_0];
+    for i in 0..nb {
+        let x = &xs[i];
+        let d0 = x.d.to_f32();
+        let mut idx = 0usize;
+        for &p in &POW3 {
+            for m in 0..16 {
+                let xi = (((x.qs[m].wrapping_mul(p) as u16) * 3) >> 8) as i8 - 1;
+                q[idx + m] = xi;
+            }
+            idx += 16;
+        }
+        for &p in &POW3 {
+            for m in 0..8 {
+                let xi = (((x.qs[16 + m].wrapping_mul(p) as u16) * 3) >> 8) as i8 - 1;
+                q[idx + m] = xi;
+            }
+            idx += 8;
+        }
+        for &p in &POW3[..4] {
+            q[idx] = (((x.qh[0].wrapping_mul(p) as u16) * 3) >> 8) as i8 - 1;
+            q[idx + 1] = (((x.qh[1].wrapping_mul(p) as u16) * 3) >> 8) as i8 - 1;
+            idx += 2;
+        }
+        let mut sumi = 0f32;
+        for sub in 0..4 {
+            let yb = &ys[i * 4 + sub];
+            let qs_sub = &q[sub * 32..sub * 32 + 32];
+            let mut isum = 0i32;
+            for j in 0..32 {
+                isum += (qs_sub[j] as i32) * (yb.qs[j] as i32);
+            }
+            sumi += yb.d.to_f32() * (isum as f32);
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn neon_dot32_s8(
+    q0: std::arch::aarch64::int8x16_t,
+    q1: std::arch::aarch64::int8x16_t,
+    y_ptr: *const i8,
+) -> i32 {
+    use std::arch::aarch64::*;
+    let y0 = vld1q_s8(y_ptr);
+    let y1 = vld1q_s8(y_ptr.add(16));
+    #[cfg(target_feature = "dotprod")]
+    {
+        let acc = vdotq_s32(vdupq_n_s32(0), q0, y0);
+        let acc = vdotq_s32(acc, q1, y1);
+        return vaddvq_s32(acc);
+    }
+    #[cfg(not(target_feature = "dotprod"))]
+    {
+        // |q| <= 2 and |y| <= 128 => |q*y| <= 256; sum of 4 <= 1024, never overflows i16.
+        let s0 = vaddq_s16(
+            vmull_s8(vget_low_s8(q0), vget_low_s8(y0)),
+            vmull_high_s8(q0, y0),
+        );
+        let s1 = vaddq_s16(
+            vmull_s8(vget_low_s8(q1), vget_low_s8(y1)),
+            vmull_high_s8(q1, y1),
+        );
+        vaddlvq_s16(vaddq_s16(s0, s1))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_dot_pq2_0_q8_0_neon(n: usize, xs: &[BlockPQ2_0], ys: &[BlockQ8_0]) -> f32 {
+    use std::arch::aarch64::*;
+    const IDX_LO: [u8; 16] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3];
+    const IDX_HI: [u8; 16] = [4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7];
+    const SHIFTS: [i8; 16] = [0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6];
+
+    let nb = n / QK_PQ2_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 4);
+    let idx_lo = vld1q_u8(IDX_LO.as_ptr());
+    let idx_hi = vld1q_u8(IDX_HI.as_ptr());
+    let shifts = vld1q_s8(SHIFTS.as_ptr());
+    let mask3 = vdupq_n_u8(3);
+    let ones = vdupq_n_s8(1);
+    let zero8 = vdup_n_u8(0);
+
+    let mut sumf = 0f32;
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = x.d.to_f32();
+        let mut sumi = 0f32;
+        for sub in 0..4 {
+            let yb = ys.get_unchecked(i * 4 + sub);
+            let raw = vcombine_u8(vld1_u8(x.qs.as_ptr().add(sub * 8)), zero8);
+            let q0 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(raw, idx_lo), shifts), mask3)),
+                ones,
+            );
+            let q1 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(raw, idx_hi), shifts), mask3)),
+                ones,
+            );
+            let isum = neon_dot32_s8(q0, q1, yb.qs.as_ptr());
+            sumi += yb.d.to_f32() * (isum as f32);
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_dot_ptq1_0_q8_0_neon(n: usize, xs: &[BlockPTQ1_0], ys: &[BlockQ8_0]) -> f32 {
+    use std::arch::aarch64::*;
+    const POW3_QH: [u8; 8] = [1, 1, 3, 3, 9, 9, 27, 27];
+
+    let nb = n / QK_PTQ1_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 4);
+    let three8 = vdup_n_u8(3);
+    let three16 = vdupq_n_u8(3);
+    let ones16 = vdupq_n_s8(1);
+    let ones8 = vdup_n_s8(1);
+    let pow3_qh = vld1_u8(POW3_QH.as_ptr());
+
+    #[inline(always)]
+    unsafe fn trits16(
+        v: uint8x16_t,
+        p: u8,
+        three8: uint8x8_t,
+        three16: uint8x16_t,
+        ones16: int8x16_t,
+    ) -> int8x16_t {
+        let q = vmulq_u8(v, vdupq_n_u8(p));
+        let lo = vshrn_n_u16::<8>(vmull_u8(vget_low_u8(q), three8));
+        let hi = vshrn_n_u16::<8>(vmull_high_u8(q, three16));
+        vsubq_s8(vreinterpretq_s8_u8(vcombine_u8(lo, hi)), ones16)
+    }
+
+    #[inline(always)]
+    unsafe fn trits8(v: uint8x8_t, p: uint8x8_t, three8: uint8x8_t, ones8: int8x8_t) -> int8x8_t {
+        let q = vmul_u8(v, p);
+        vsub_s8(
+            vreinterpret_s8_u8(vshrn_n_u16::<8>(vmull_u8(q, three8))),
+            ones8,
+        )
+    }
+
+    let mut sumf = 0f32;
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = x.d.to_f32();
+        let qs0 = vld1q_u8(x.qs.as_ptr());
+        let qs1 = vld1_u8(x.qs.as_ptr().add(16));
+        let qh_rep = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes(x.qh)));
+
+        let t0 = trits16(qs0, 1, three8, three16, ones16);
+        let t1 = trits16(qs0, 3, three8, three16, ones16);
+        let t2 = trits16(qs0, 9, three8, three16, ones16);
+        let t3 = trits16(qs0, 27, three8, three16, ones16);
+        let t4 = trits16(qs0, 81, three8, three16, ones16);
+
+        let u0 = trits8(qs1, vdup_n_u8(1), three8, ones8);
+        let u1 = trits8(qs1, vdup_n_u8(3), three8, ones8);
+        let u2 = trits8(qs1, vdup_n_u8(9), three8, ones8);
+        let u3 = trits8(qs1, vdup_n_u8(27), three8, ones8);
+        let u4 = trits8(qs1, vdup_n_u8(81), three8, ones8);
+        let uh = trits8(qh_rep, pow3_qh, three8, ones8);
+
+        let y0 = ys.get_unchecked(i * 4);
+        let y1 = ys.get_unchecked(i * 4 + 1);
+        let y2 = ys.get_unchecked(i * 4 + 2);
+        let y3 = ys.get_unchecked(i * 4 + 3);
+
+        let s0 = y0.d.to_f32() * (neon_dot32_s8(t0, t1, y0.qs.as_ptr()) as f32);
+        let s1 = y1.d.to_f32() * (neon_dot32_s8(t2, t3, y1.qs.as_ptr()) as f32);
+        let s2 = y2.d.to_f32() * (neon_dot32_s8(t4, vcombine_s8(u0, u1), y2.qs.as_ptr()) as f32);
+        let s3 = y3.d.to_f32()
+            * (neon_dot32_s8(vcombine_s8(u2, u3), vcombine_s8(u4, uh), y3.qs.as_ptr()) as f32);
+        sumf += d0 * ((s0 + s1) + (s2 + s3));
+    }
+    sumf
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn avx2_dot32_u8_minus1(codes_u8: std::arch::x86_64::__m256i, y_ptr: *const i8) -> i32 {
+    use std::arch::x86_64::*;
+    let qy = _mm256_loadu_si256(y_ptr as *const __m256i);
+    let ones_u8 = _mm256_set1_epi8(1);
+    let ones_16 = _mm256_set1_epi16(1);
+    let prod16 = _mm256_maddubs_epi16(codes_u8, qy);
+    let sumy16 = _mm256_maddubs_epi16(ones_u8, qy);
+    let diff16 = _mm256_sub_epi16(prod16, sumy16);
+    let sum32 = _mm256_madd_epi16(diff16, ones_16);
+    let sum128 = _mm_add_epi32(
+        _mm256_castsi256_si128(sum32),
+        _mm256_extracti128_si256(sum32, 1),
+    );
+    let hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    let sum64 = _mm_add_epi32(sum128, hi64);
+    let hi32 = _mm_shuffle_epi32(sum64, 0x01);
+    _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_pq2_0_q8_0_avx2(n: usize, xs: &[BlockPQ2_0], ys: &[BlockQ8_0]) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = n / QK_PQ2_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 4);
+    let shuf = _mm256_setr_epi8(
+        0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7,
+        7, 7,
+    );
+    let odd_byte_mask = _mm256_set1_epi16(0xFF00u16 as i16);
+    let mask3 = _mm256_set1_epi8(3);
+
+    let mut sumf = 0f32;
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = x.d.to_f32();
+        let mut sumi = 0f32;
+        for sub in 0..4 {
+            let yb = ys.get_unchecked(i * 4 + sub);
+            let raw64 = std::ptr::read_unaligned(x.qs.as_ptr().add(sub * 8) as *const u64) as i64;
+            let rep = _mm256_shuffle_epi8(_mm256_set1_epi64x(raw64), shuf);
+            let s02 = _mm256_blendv_epi8(rep, _mm256_srli_epi16(rep, 2), odd_byte_mask);
+            let s46 = _mm256_blendv_epi8(
+                _mm256_srli_epi16(rep, 4),
+                _mm256_srli_epi16(rep, 6),
+                odd_byte_mask,
+            );
+            let codes = _mm256_and_si256(_mm256_blend_epi16(s02, s46, 0xAA), mask3);
+            let isum = avx2_dot32_u8_minus1(codes, yb.qs.as_ptr());
+            sumi += yb.d.to_f32() * (isum as f32);
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_ptq1_0_q8_0_avx2(n: usize, xs: &[BlockPTQ1_0], ys: &[BlockQ8_0]) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = n / QK_PTQ1_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 4);
+    let mask_ff = _mm256_set1_epi16(0x00FF);
+    let three16 = _mm256_set1_epi16(3);
+    let p_1_3 = _mm256_setr_epi16(1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3);
+    let p_9_27 = _mm256_setr_epi16(9, 9, 9, 9, 9, 9, 9, 9, 27, 27, 27, 27, 27, 27, 27, 27);
+    let p_81_qh = _mm256_setr_epi16(81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27);
+
+    let mut sumf = 0f32;
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = x.d.to_f32();
+
+        let qs0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(x.qs.as_ptr() as *const __m128i));
+        let qs16_u64 = std::ptr::read_unaligned(x.qs.as_ptr().add(16) as *const u64) as i64;
+        let qs1_dup = _mm256_cvtepu8_epi16(_mm_set1_epi64x(qs16_u64));
+        let qh_rep_u64 = ((u16::from_le_bytes(x.qh) as u64) * 0x0001_0001_0001_0001u64) as i64;
+        let tail16 = _mm256_cvtepu8_epi16(_mm_set_epi64x(qh_rep_u64, qs16_u64));
+
+        let dec = |b16: __m256i, p16: __m256i| -> __m256i {
+            let q8 = _mm256_and_si256(_mm256_mullo_epi16(b16, p16), mask_ff);
+            _mm256_srli_epi16(_mm256_mullo_epi16(q8, three16), 8)
+        };
+        let pack32 = |a: __m256i, b: __m256i| -> __m256i {
+            _mm256_permute4x64_epi64(_mm256_packus_epi16(a, b), 0xD8)
+        };
+
+        let xi0 = dec(qs0, _mm256_set1_epi16(1));
+        let xi1 = dec(qs0, _mm256_set1_epi16(3));
+        let xi2 = dec(qs0, _mm256_set1_epi16(9));
+        let xi3 = dec(qs0, _mm256_set1_epi16(27));
+        let xi4 = dec(qs0, _mm256_set1_epi16(81));
+        let xi_u01 = dec(qs1_dup, p_1_3);
+        let xi_u23 = dec(qs1_dup, p_9_27);
+        let xi_u4h = dec(tail16, p_81_qh);
+
+        let c0 = pack32(xi0, xi1);
+        let c1 = pack32(xi2, xi3);
+        let c2 = pack32(xi4, xi_u01);
+        let c3 = pack32(xi_u23, xi_u4h);
+
+        let y0 = ys.get_unchecked(i * 4);
+        let y1 = ys.get_unchecked(i * 4 + 1);
+        let y2 = ys.get_unchecked(i * 4 + 2);
+        let y3 = ys.get_unchecked(i * 4 + 3);
+
+        let s0 = y0.d.to_f32() * (avx2_dot32_u8_minus1(c0, y0.qs.as_ptr()) as f32);
+        let s1 = y1.d.to_f32() * (avx2_dot32_u8_minus1(c1, y1.qs.as_ptr()) as f32);
+        let s2 = y2.d.to_f32() * (avx2_dot32_u8_minus1(c2, y2.qs.as_ptr()) as f32);
+        let s3 = y3.d.to_f32() * (avx2_dot32_u8_minus1(c3, y3.qs.as_ptr()) as f32);
+        sumf += d0 * ((s0 + s1) + (s2 + s3));
+    }
+    sumf
+}
+
 #[cfg(test)]
 mod rocmfp4_tests {
     use super::*;
@@ -810,6 +1286,238 @@ mod rocmfp4_tests {
         assert!(
             err < 2e-2,
             "vec_dot rel err {err} (got {got}, exact {exact})"
+        );
+    }
+}
+
+// ============================================================================
+// PQ2_0 / PTQ1_0 known-answer tests.
+// The .hex fixtures hold the f32 bit patterns (u32 bits, %08x) printed by
+// ProCreations' own dequantize_row_pq2_0 / dequantize_row_ptq1_0
+// (runtime/source/llama/ggml/src/ggml-quants.c) on 16 packed blocks:
+//   pq2_real_attnqkv / pq2_real_embd: first 16 blocks of blk.0.attn_qkv.weight
+//   and token_embd.weight in Ternary-Bonsai-2-27B-PQ2_0.gguf (2026-09-20);
+//   pq2_synth / ptq1_synth: deterministic xorshift bytes, finite f16 scales.
+// Bit-exact agreement pins the layout to the ggml-common.h blocks and the decode
+// to the Prism reference.
+// ============================================================================
+#[cfg(test)]
+mod pq_ptq_kat_tests {
+    use super::*;
+    use crate::quantized::k_quants::GgmlType;
+    use crate::quantized::GgmlDType;
+
+    const NBLK: usize = 16;
+
+    // include_bytes! gives 1-aligned storage; re-back it on 16 so it can be read
+    // as blocks (same trick as quant_format's proof module).
+    fn aligned_copy(raw: &[u8]) -> Vec<u8> {
+        let words = raw.len().div_ceil(16);
+        let mut backing: Vec<u128> = vec![0u128; words];
+        let out =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, words * 16) };
+        out[..raw.len()].copy_from_slice(raw);
+        let ptr = backing.as_ptr() as *const u8;
+        std::mem::forget(backing);
+        unsafe { Vec::from_raw_parts(ptr as *mut u8, raw.len(), words * 16) }
+    }
+
+    fn expected_bits(fixture: &str, block: usize, elem: usize) -> u32 {
+        let tok = fixture
+            .lines()
+            .nth(block)
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(elem)
+            .unwrap_or("0");
+        u32::from_str_radix(tok, 16).unwrap()
+    }
+
+    #[test]
+    fn pq2_0_block_layout_matches_ggml_common() {
+        assert_eq!(std::mem::size_of::<BlockPQ2_0>(), 34);
+        assert_eq!(std::mem::offset_of!(BlockPQ2_0, d), 0);
+        assert_eq!(std::mem::offset_of!(BlockPQ2_0, qs), 2);
+    }
+
+    #[test]
+    fn ptq1_0_block_layout_matches_ggml_common() {
+        assert_eq!(std::mem::size_of::<BlockPTQ1_0>(), 28);
+        assert_eq!(std::mem::offset_of!(BlockPTQ1_0, qs), 0);
+        assert_eq!(std::mem::offset_of!(BlockPTQ1_0, qh), 24);
+        assert_eq!(std::mem::offset_of!(BlockPTQ1_0, d), 26);
+    }
+
+    fn assert_pq2_bits(raw: &[u8], expected: &str) {
+        let buf = aligned_copy(raw);
+        let blocks = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const BlockPQ2_0, NBLK) };
+        let mut ys = vec![0f32; NBLK * QK_PQ2_0];
+        BlockPQ2_0::to_float(blocks, &mut ys);
+        for b in 0..NBLK {
+            for j in 0..QK_PQ2_0 {
+                assert_eq!(
+                    ys[b * QK_PQ2_0 + j].to_bits(),
+                    expected_bits(expected, b, j),
+                    "block {b} elem {j}"
+                );
+            }
+        }
+    }
+
+    fn assert_ptq1_bits(raw: &[u8], expected: &str) {
+        let buf = aligned_copy(raw);
+        let blocks =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const BlockPTQ1_0, NBLK) };
+        let mut ys = vec![0f32; NBLK * QK_PTQ1_0];
+        BlockPTQ1_0::to_float(blocks, &mut ys);
+        for b in 0..NBLK {
+            for j in 0..QK_PTQ1_0 {
+                assert_eq!(
+                    ys[b * QK_PTQ1_0 + j].to_bits(),
+                    expected_bits(expected, b, j),
+                    "block {b} elem {j}"
+                );
+            }
+        }
+    }
+
+    macro_rules! kat {
+        ($name:ident, $check:ident, $fixture:literal) => {
+            #[test]
+            fn $name() {
+                $check(
+                    include_bytes!(concat!("testdata/", $fixture, ".bin")),
+                    include_str!(concat!("testdata/", $fixture, ".hex")),
+                );
+            }
+        };
+    }
+
+    kat!(
+        pq2_0_real_attn_qkv_bitexact,
+        assert_pq2_bits,
+        "pq2_real_attnqkv"
+    );
+    kat!(
+        pq2_0_real_token_embd_bitexact,
+        assert_pq2_bits,
+        "pq2_real_embd"
+    );
+    kat!(pq2_0_synth_bitexact, assert_pq2_bits, "pq2_synth");
+    kat!(ptq1_0_synth_bitexact, assert_ptq1_bits, "ptq1_synth");
+
+    #[test]
+    fn pq2_ptq1_dtype_wiring() {
+        assert_eq!(GgmlDType::from_u32(142).unwrap(), GgmlDType::PQ2_0);
+        assert_eq!(GgmlDType::from_u32(143).unwrap(), GgmlDType::PTQ1_0);
+        assert_eq!(GgmlDType::PQ2_0.to_u32(), 142);
+        assert_eq!(GgmlDType::PTQ1_0.to_u32(), 143);
+        assert_eq!(GgmlDType::PQ2_0.block_size(), 128);
+        assert_eq!(GgmlDType::PTQ1_0.block_size(), 128);
+        assert_eq!(GgmlDType::PQ2_0.type_size(), 34);
+        assert_eq!(GgmlDType::PTQ1_0.type_size(), 28);
+    }
+
+    #[test]
+    fn pq2_0_vec_dot_matches_reference() {
+        use crate::quantized::k_quants::QK8_0;
+
+        let raw = include_bytes!("testdata/pq2_real_attnqkv.bin");
+        let buf = aligned_copy(raw);
+        let xs = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const BlockPQ2_0, NBLK) };
+        let n = NBLK * QK_PQ2_0;
+
+        let mut wf32 = vec![0f32; n];
+        BlockPQ2_0::to_float(xs, &mut wf32);
+
+        let yf32: Vec<f32> = (0..n)
+            .map(|i| ((i.wrapping_mul(73).wrapping_add(19) % 251) as f32 - 125.0) * 0.013)
+            .collect();
+        let nb8 = n / QK8_0;
+        let mut ys_q8 = vec![
+            BlockQ8_0 {
+                d: f16::from_bits(0),
+                qs: [0; QK8_0],
+            };
+            nb8
+        ];
+        for (i, b) in ys_q8.iter_mut().enumerate() {
+            BlockQ8_0::from_float(&yf32[i * QK8_0..][..QK8_0], std::slice::from_mut(b));
+        }
+
+        // Exact reference against the quantized Q8_0 rhs (`to_float(xs) . to_float(ys_q8)`).
+        let mut y_deq = vec![0f32; n];
+        BlockQ8_0::to_float(&ys_q8, &mut y_deq);
+        let ref_q8: f32 = wf32.iter().zip(&y_deq).map(|(a, b)| a * b).sum();
+        let unopt = BlockPQ2_0::vec_dot_unopt(n, xs, &ys_q8);
+        let simd = BlockPQ2_0::vec_dot(n, xs, &ys_q8);
+        let scalar = vec_dot_pq2_0_q8_0_scalar(n, xs, &ys_q8);
+
+        let rel_simd = (simd - ref_q8).abs() / ref_q8.abs().max(1e-6);
+        let rel_unopt = (simd - unopt).abs() / unopt.abs().max(1e-6);
+        let rel_scalar = (scalar - ref_q8).abs() / ref_q8.abs().max(1e-6);
+        assert!(
+            rel_simd < 1e-4,
+            "PQ2_0 SIMD vec_dot rel_err {rel_simd} (simd={simd}, ref_q8={ref_q8})"
+        );
+        assert!(
+            rel_unopt < 1e-4,
+            "PQ2_0 SIMD vs unopt rel_err {rel_unopt} (simd={simd}, unopt={unopt})"
+        );
+        assert!(
+            rel_scalar < 1e-4,
+            "PQ2_0 scalar vec_dot rel_err {rel_scalar} (scalar={scalar}, ref_q8={ref_q8})"
+        );
+    }
+
+    #[test]
+    fn ptq1_0_vec_dot_matches_reference() {
+        use crate::quantized::k_quants::QK8_0;
+
+        let raw = include_bytes!("testdata/ptq1_synth.bin");
+        let buf = aligned_copy(raw);
+        let xs = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const BlockPTQ1_0, NBLK) };
+        let n = NBLK * QK_PTQ1_0;
+
+        let mut wf32 = vec![0f32; n];
+        BlockPTQ1_0::to_float(xs, &mut wf32);
+
+        let yf32: Vec<f32> = (0..n)
+            .map(|i| ((i.wrapping_mul(97).wrapping_add(31) % 241) as f32 - 120.0) * 0.017)
+            .collect();
+        let nb8 = n / QK8_0;
+        let mut ys_q8 = vec![
+            BlockQ8_0 {
+                d: f16::from_bits(0),
+                qs: [0; QK8_0],
+            };
+            nb8
+        ];
+        for (i, b) in ys_q8.iter_mut().enumerate() {
+            BlockQ8_0::from_float(&yf32[i * QK8_0..][..QK8_0], std::slice::from_mut(b));
+        }
+
+        let mut y_deq = vec![0f32; n];
+        BlockQ8_0::to_float(&ys_q8, &mut y_deq);
+        let ref_q8: f32 = wf32.iter().zip(&y_deq).map(|(a, b)| a * b).sum();
+        let unopt = BlockPTQ1_0::vec_dot_unopt(n, xs, &ys_q8);
+        let simd = BlockPTQ1_0::vec_dot(n, xs, &ys_q8);
+        let scalar = vec_dot_ptq1_0_q8_0_scalar(n, xs, &ys_q8);
+
+        let rel_simd = (simd - ref_q8).abs() / ref_q8.abs().max(1e-6);
+        let rel_unopt = (simd - unopt).abs() / unopt.abs().max(1e-6);
+        let rel_scalar = (scalar - ref_q8).abs() / ref_q8.abs().max(1e-6);
+        assert!(
+            rel_simd < 1e-4,
+            "PTQ1_0 SIMD vec_dot rel_err {rel_simd} (simd={simd}, ref_q8={ref_q8})"
+        );
+        assert!(
+            rel_unopt < 1e-4,
+            "PTQ1_0 SIMD vs unopt rel_err {rel_unopt} (simd={simd}, unopt={unopt})"
+        );
+        assert!(
+            rel_scalar < 1e-4,
+            "PTQ1_0 scalar vec_dot rel_err {rel_scalar} (scalar={scalar}, ref_q8={ref_q8})"
         );
     }
 }

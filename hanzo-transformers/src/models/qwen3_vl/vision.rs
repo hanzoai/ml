@@ -1,5 +1,3 @@
-use std::f64;
-
 use hanzo_ml::{DType, Device, IndexOp, Result, Tensor, D};
 use hanzo_nn::{
     embedding, layer_norm, linear, Activation, Embedding, LayerNorm, LayerNormConfig, Linear,

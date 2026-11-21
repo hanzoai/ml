@@ -424,6 +424,8 @@ __device__ __forceinline__ void q3k_scales(const uint8_t* __restrict__ s, int8_t
 #define DW_MXFP4  22   // 17 B,  32 elems,  E8M0 scale + FP4 codebook (gpt-oss). val = e8m0_half(e)*KVALUES_MXFP4[idx]
 #define DW_ROCMFP4      23 // 18 B,  32 elems,  two UE4M3 half-scales + Codebook10 (ROCmFPX 100). val = ue4m3_half(e[h])*KVALUES_ROCMFP4[idx]
 #define DW_ROCMFP4_FAST 24 // 17 B,  32 elems,  one UE4M3 half-scale + Codebook10 (ROCmFPX 101).
+#define DW_PQ2_0        25 // 34 B, 128 elems,  Prism 2-bit asymmetric ternary {-1,0,+1,+2}. val = d*((q&3)-1)
+#define DW_PTQ1_0       26 // 28 B, 128 elems,  Prism base-3 ternary {-1,0,+1}. val = d*(xi-1)
 
 // Type-dispatched f32 -> output store (the only place the element type leaks): __half needs
 // __float2half, hip_bfloat16 takes float in its ctor. Keeps both cores' epilogue type-agnostic.
@@ -739,36 +741,37 @@ template <> struct qdp4a<DW_Q3_K> {
     }
 };
 
-// Per-type byte stride for the q8_1-paired dp4a path (= on-disk super-block bytes; mirrors
-// qdw_traits::BYTES). All wired dp4a types are 256-element super-blocks.
+// Per-type byte stride & block size for the q8_1-paired dp4a path (= on-disk super-block bytes; mirrors
+// qdw_traits::BYTES / ELEMS).
 template <int WTYPE> struct qdp4a_traits;
-template <> struct qdp4a_traits<DW_Q4_K> { static constexpr int BYTES = 144; };
-template <> struct qdp4a_traits<DW_Q6_K> { static constexpr int BYTES = 210; };
-template <> struct qdp4a_traits<DW_Q2_K> { static constexpr int BYTES = 84;  };
-template <> struct qdp4a_traits<DW_Q3_K> { static constexpr int BYTES = 110; };
-template <> struct qdp4a_traits<DW_Q5_K> { static constexpr int BYTES = 176; };
+template <> struct qdp4a_traits<DW_Q4_K> { static constexpr int BYTES = 144; static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_Q6_K> { static constexpr int BYTES = 210; static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_Q2_K> { static constexpr int BYTES = 84;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_Q3_K> { static constexpr int BYTES = 110; static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_Q5_K> { static constexpr int BYTES = 176; static constexpr int ELEMS = 256; };
 
-// THE unified dp4a decode core. Warp per output row; lane-strided over the row's 256-elem
-// super-blocks; per-type `qdp4a<WTYPE>::block` does the int8 dot of one super-block against its
-// pre-quantized q8_1 activation slice; warp-shuffle reduces. XT is only the output store type (the
-// q8_1 activation is already int8 + f16 scale, dtype-independent).
+// THE unified dp4a decode core. Warp per output row; lane-strided over the row's super-blocks;
+// per-type `qdp4a<WTYPE>::partial` does the int8 dot of one sub-block against its pre-quantized q8_1
+// activation slice; warp-shuffle reduces. XT is only the output store type.
 template <int WTYPE, typename XT>
 __device__ __forceinline__ void qmatvec_dp4a_core(
     const int nrows,
-    const int ncols,                  // multiple of 256
+    const int ncols,                  // multiple of WELEMS (256 or 128)
     const uint8_t* __restrict__ wq,
     const int8_t*  __restrict__ xq,   // [ncols] q8_1 int8 quants
     const __half*  __restrict__ xd,   // [ncols/32] q8_1 f16 scales
     XT* __restrict__ y
 ) {
     constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
+    constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
+    constexpr int WSUB32 = WELEMS / 32;
     const int lane = threadIdx.x & 31;
     const int rows_per_block = blockDim.x >> 5;
     const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
     if (row >= nrows) {
         return;
     }
-    const int nblocks = ncols >> 8; // ncols / 256
+    const int nblocks = ncols / WELEMS;
     const uint8_t* row_ptr = wq + (size_t)row * (size_t)nblocks * WBYTES;
 
     // Stride lanes over (super-block x sub-unit) work items, NOT whole super-blocks -- the SAME fix the
@@ -783,7 +786,7 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
         const int b = u / NSUB;
         const int sub = u - b * NSUB;
         acc += qdp4a<WTYPE>::partial(
-            row_ptr + (size_t)b * WBYTES, xq + (size_t)b * 256, xd + (size_t)b * 8, sub);
+            row_ptr + (size_t)b * WBYTES, xq + (size_t)b * WELEMS, xd + (size_t)b * WSUB32, sub);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -802,7 +805,7 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
 template <int WTYPE, typename XT>
 __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     const int n,                        // output rows per expert (weight rows)
-    const int ncols,                    // k, multiple of 256
+    const int ncols,                    // k, multiple of WELEMS (256 or 128)
     const int nslots,                   // routed slots (= nrows)
     const uint8_t* __restrict__ wbank,  // [E, n, k] blocks
     const int* __restrict__ ids,        // [nslots] expert id per slot
@@ -811,6 +814,8 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     XT* __restrict__ y                  // [nslots, n]
 ) {
     constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
+    constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
+    constexpr int WSUB32 = WELEMS / 32;
     const int s = blockIdx.y;
     if (s >= nslots) {
         return;
@@ -821,7 +826,7 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     if (row >= n) {
         return;
     }
-    const int nblocks = ncols >> 8; // ncols / 256
+    const int nblocks = ncols / WELEMS;
     const int expert = ids[s];
     const uint8_t* row_ptr = wbank + ((size_t)expert * n + row) * (size_t)nblocks * WBYTES;
     const int8_t* xq_row = xq + (size_t)s * ncols;
@@ -839,7 +844,7 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
         const int b = u / NSUB;
         const int sub = u - b * NSUB;
         acc += qdp4a<WTYPE>::partial(
-            row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * 256, xd_row + (size_t)b * 8, sub);
+            row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * WELEMS, xd_row + (size_t)b * WSUB32, sub);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -1929,6 +1934,8 @@ template <> struct qdw_traits<DW_IQ1_M>  { static constexpr int BYTES = 56;  sta
 template <> struct qdw_traits<DW_MXFP4>  { static constexpr int BYTES = 17;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
 template <> struct qdw_traits<DW_ROCMFP4>      { static constexpr int BYTES = 18;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 2; };
 template <> struct qdw_traits<DW_ROCMFP4_FAST> { static constexpr int BYTES = 17;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_PQ2_0>        { static constexpr int BYTES = 34;  static constexpr int ELEMS = 128; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_PTQ1_0>       { static constexpr int BYTES = 28;  static constexpr int ELEMS = 128; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
 
 // Per-type decode. `partial<XT>(blk, xb, lane)` returns lane L's partial dot over its owned
 // positions { e*32 + L } of ONE block, mirroring the CPU `to_float` for that type bit-for-bit.
@@ -2477,6 +2484,54 @@ template <> struct qdec<DW_IQ1_M> {
     }
 };
 
+// PQ2_0: Prism (Bonsai-2) 2-bit asymmetric ternary {-1,0,+1,+2}, 128 elems, 34B: f16 d at +0, qs[32] at +2.
+template <> struct qdec<DW_PQ2_0> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const uint8_t* qs = blk + 2;
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int p = e * 32 + lane;
+            const uint8_t byte = qs[p >> 2];
+            const int q = (int)((byte >> ((p & 3) * 2)) & 3) - 1;
+            s += ((float)q * d) * (float)xb[p];
+        }
+        return s;
+    }
+};
+
+// PTQ1_0: Prism (Bonsai-2) base-3 ternary {-1,0,+1}, 128 elems, 28B: qs[24] at +0, qh[2] at +24, f16 d at +26.
+__device__ __forceinline__ int ptq1_0_w(const uint8_t* __restrict__ qs, const uint8_t* __restrict__ qh, int p) {
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+    uint8_t b; int n;
+    if (p < 80)       { n = p >> 4;             b = qs[p & 15]; }
+    else if (p < 120) { const int p2 = p - 80;  n = p2 >> 3; b = qs[16 + (p2 & 7)]; }
+    else              { const int p3 = p - 120; n = p3 >> 1; b = qh[p3 & 1]; }
+    const uint16_t q = (uint16_t)(uint8_t)(b * pow3[n]);
+    return (int)((q * 3) >> 8) - 1;
+}
+
+template <> struct qdec<DW_PTQ1_0> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const uint8_t* qs = blk;
+        const uint8_t* qh = blk + 24;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int p = e * 32 + lane;
+            const int q = ptq1_0_w(qs, qh, p);
+            s += ((float)q * d) * (float)xb[p];
+        }
+        return s;
+    }
+};
+
 // ----------------------------------------------------------------------------------------------
 // int8-dp4a DECODE for the IQ codebook quants (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M). The int8-SIMD twin
 // of the scalar `qdec<DW_IQ*>` above: instead of decoding each grid coordinate to f32 and doing float
@@ -2769,16 +2824,82 @@ template <> struct qdp4a<DW_IQ1_M> {
     }
 };
 
-// IQ dp4a byte strides (= on-disk super-block bytes; mirror qdw_traits::BYTES). All 256-elem.
-template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  };
-template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  };
-template <> struct qdp4a_traits<DW_IQ2_S>   { static constexpr int BYTES = 82;  };
-template <> struct qdp4a_traits<DW_IQ3_XXS> { static constexpr int BYTES = 98;  };
-template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; };
-template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  };
-template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  };
+// PQ2_0 / PTQ1_0 native int8 dp4a specializations (128 elems = 4 sub-blocks of 32).
+template <> struct qdp4a<DW_PQ2_0> {
+    static constexpr int NSUB = 4;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const float d8 = __half2float(xd8[e]);
+        const uint8_t* b = blk + 2 + e * 8;
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint8_t byte = b[i];
+            const int w0 = (int)( byte       & 3) - 1;
+            const int w1 = (int)((byte >> 2) & 3) - 1;
+            const int w2 = (int)((byte >> 4) & 3) - 1;
+            const int w3 = (int)((byte >> 6) & 3) - 1;
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
 
-// IQ dp4a entry points (decode + MoE, f16/bf16/f32) via the SAME launcher generator as the K-quants.
+template <> struct qdp4a<DW_PTQ1_0> {
+    static constexpr int NSUB = 4;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint8_t* qs = blk;
+        const uint8_t* qh = blk + 24;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        const int p0 = e * 32;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int w0 = ptq1_0_w(qs, qh, p0 + 4 * i + 0);
+            const int w1 = ptq1_0_w(qs, qh, p0 + 4 * i + 1);
+            const int w2 = ptq1_0_w(qs, qh, p0 + 4 * i + 2);
+            const int w3 = ptq1_0_w(qs, qh, p0 + 4 * i + 3);
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ + Prism dp4a byte strides & block sizes (= on-disk super-block bytes; mirror qdw_traits).
+template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ2_S>   { static constexpr int BYTES = 82;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ3_XXS> { static constexpr int BYTES = 98;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_PQ2_0>   { static constexpr int BYTES = 34;  static constexpr int ELEMS = 128; };
+template <> struct qdp4a_traits<DW_PTQ1_0>  { static constexpr int BYTES = 28;  static constexpr int ELEMS = 128; };
+
+// IQ + Prism dp4a entry points (decode + MoE, f16/bf16/f32) via the SAME launcher generator as the K-quants.
 DEFINE_QMATVEC_DP4A(iq2xxs, DW_IQ2_XXS)
 DEFINE_QMATVEC_DP4A(iq2xs,  DW_IQ2_XS)
 DEFINE_QMATVEC_DP4A(iq2s,   DW_IQ2_S)
@@ -2786,6 +2907,8 @@ DEFINE_QMATVEC_DP4A(iq3xxs, DW_IQ3_XXS)
 DEFINE_QMATVEC_DP4A(iq3s,   DW_IQ3_S)
 DEFINE_QMATVEC_DP4A(iq1_s,  DW_IQ1_S)
 DEFINE_QMATVEC_DP4A(iq1_m,  DW_IQ1_M)
+DEFINE_QMATVEC_DP4A(pq2_0,  DW_PQ2_0)
+DEFINE_QMATVEC_DP4A(ptq1_0, DW_PTQ1_0)
 
 #undef DEFINE_QMATVEC_DP4A
 
@@ -2933,6 +3056,8 @@ DEFINE_QMATVECU(iq1_m, DW_IQ1_M)
 DEFINE_QMATVECU(mxfp4,  DW_MXFP4)
 DEFINE_QMATVECU(rocmfp4,      DW_ROCMFP4)
 DEFINE_QMATVECU(rocmfp4_fast, DW_ROCMFP4_FAST)
+DEFINE_QMATVECU(pq2_0,        DW_PQ2_0)
+DEFINE_QMATVECU(ptq1_0,       DW_PTQ1_0)
 
 
 DEFINE_QDEQUANT(q8_0, DW_Q8_0)
@@ -2960,6 +3085,8 @@ DEFINE_QDEQUANT(iq1_m, DW_IQ1_M)
 DEFINE_QDEQUANT(mxfp4, DW_MXFP4)
 DEFINE_QDEQUANT(rocmfp4, DW_ROCMFP4)
 DEFINE_QDEQUANT(rocmfp4_fast, DW_ROCMFP4_FAST)
+DEFINE_QDEQUANT(pq2_0, DW_PQ2_0)
+DEFINE_QDEQUANT(ptq1_0, DW_PTQ1_0)
 
 #undef DEFINE_QDEQUANT
 
@@ -3059,6 +3186,8 @@ DEFINE_MOE_QMATVECU(iq1_m, DW_IQ1_M)
 DEFINE_MOE_QMATVECU(mxfp4,  DW_MXFP4)
 DEFINE_MOE_QMATVECU(rocmfp4,      DW_ROCMFP4)
 DEFINE_MOE_QMATVECU(rocmfp4_fast, DW_ROCMFP4_FAST)
+DEFINE_MOE_QMATVECU(pq2_0,        DW_PQ2_0)
+DEFINE_MOE_QMATVECU(ptq1_0,       DW_PTQ1_0)
 
 #undef DEFINE_MOE_QMATVECU
 #undef DEFINE_QMATVECU
@@ -3084,6 +3213,8 @@ DEFINE_MOE_QMATVECU(rocmfp4_fast, DW_ROCMFP4_FAST)
 #undef DW_TQ1_0
 #undef DW_IQ1_S
 #undef DW_IQ1_M
+#undef DW_PQ2_0
+#undef DW_PTQ1_0
 
 // ----------------------------------------------------------------------------------------------
 // Native Q8_0 quant GEMM (prefill path) using RDNA3 WMMA (matrix cores).

@@ -174,6 +174,14 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockIQ1m> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockIQ1m::to_float(&vec, &mut out);
             }
+            GgmlDType::PQ2_0 => {
+                let vec: Vec<crate::quantized::BlockPQ2_0> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockPQ2_0::to_float(&vec, &mut out);
+            }
+            GgmlDType::PTQ1_0 => {
+                let vec: Vec<crate::quantized::BlockPTQ1_0> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockPTQ1_0::to_float(&vec, &mut out);
+            }
             // dbc-validation: dequant-to-float not wired for these newer ternary/FP4
             // codecs on the Metal readback path (GAP in source). Bail honestly rather
             // than silently mis-decode. Q8_0/Q4_K (the validated models) have arms above.
@@ -386,7 +394,10 @@ impl QMetalStorage {
         let src1_bf16 = storage.dtype() == DType::BF16
             && matches!(
                 kdtype,
-                hanzo_metal_kernels::GgmlDType::Q4K | hanzo_metal_kernels::GgmlDType::Q6K
+                hanzo_metal_kernels::GgmlDType::Q4K
+                    | hanzo_metal_kernels::GgmlDType::Q6K
+                    | hanzo_metal_kernels::GgmlDType::PQ2_0
+                    | hanzo_metal_kernels::GgmlDType::PTQ1_0
             );
         let out_dtype = if src1_bf16 { DType::BF16 } else { DType::F32 };
         let dst = device
@@ -486,7 +497,10 @@ impl QMetalStorage {
         let src1_bf16 = storage.dtype() == DType::BF16
             && matches!(
                 kdtype,
-                hanzo_metal_kernels::GgmlDType::Q4K | hanzo_metal_kernels::GgmlDType::Q6K
+                hanzo_metal_kernels::GgmlDType::Q4K
+                    | hanzo_metal_kernels::GgmlDType::Q6K
+                    | hanzo_metal_kernels::GgmlDType::PQ2_0
+                    | hanzo_metal_kernels::GgmlDType::PTQ1_0
             );
         let out_dtype = if src1_bf16 { DType::BF16 } else { DType::F32 };
         let dst = device
@@ -832,6 +846,8 @@ impl TryFrom<GgmlDType> for hanzo_metal_kernels::GgmlDType {
             GgmlDType::IQ1_M => hanzo_metal_kernels::GgmlDType::IQ1_M,
             GgmlDType::IQ4_NL => hanzo_metal_kernels::GgmlDType::IQ4_NL,
             GgmlDType::IQ4_XS => hanzo_metal_kernels::GgmlDType::IQ4_XS,
+            GgmlDType::PQ2_0 => hanzo_metal_kernels::GgmlDType::PQ2_0,
+            GgmlDType::PTQ1_0 => hanzo_metal_kernels::GgmlDType::PTQ1_0,
             #[allow(unreachable_patterns)]
             other => crate::bail!("no Metal quantized kernel for dtype {other:?}"),
         };

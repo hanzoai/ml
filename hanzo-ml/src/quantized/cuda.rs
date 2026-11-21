@@ -2,7 +2,7 @@ use super::{GgmlDType, QStorage};
 use crate::quantized::k_quants::GgmlType;
 use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
-use half::f16;
+use half::{bf16, f16};
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaView, DevicePtr, PushKernelArg, SyncOnDrop};
 
@@ -53,6 +53,126 @@ pub(crate) fn fast_mmq_enabled() -> bool {
         FAST_MMQ.store(env, std::sync::atomic::Ordering::Relaxed);
     });
     FAST_MMQ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CudaProfileSnapshot {
+    pub dp4a_decode_ms: f64,
+    pub dp4a_decode_calls: usize,
+    pub dp4a_verify_ms: f64,
+    pub dp4a_verify_calls: usize,
+    pub dp4a_ge64m_ms: f64,
+    pub dp4a_ge64m_calls: usize,
+    pub bf16_dequant_ms: f64,
+    pub bf16_dequant_calls: usize,
+    pub bf16_gemm_ms: f64,
+    pub mmq_quant_ms: f64,
+    pub mmq_kernel_ms: f64,
+    pub mmq_cast_ms: f64,
+    pub mmq_calls: usize,
+    pub fwht_ms: f64,
+    pub fwht_calls: usize,
+}
+
+static CUDA_PROFILE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static PROF_DP4A_DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_DP4A_DECODE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PROF_DP4A_VERIFY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_DP4A_VERIFY_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PROF_DP4A_GE64M_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_DP4A_GE64M_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PROF_BF16_DEQUANT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_BF16_DEQUANT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PROF_BF16_GEMM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_MMQ_QUANT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_MMQ_KERNEL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_MMQ_CAST_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_MMQ_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PROF_FWHT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_FWHT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Selects the `b * m` threshold below which CUDA falls back to the DP4A
+/// vector kernel instead of MMQ tensor-core GEMM.
+///
+/// GB10 / Blackwell (`SM >= 100`, `cc >= 1000`) crossovers were measured at
+/// `m=2` for `PQ2_0` and `m=4` for `PTQ1_0`; earlier NVIDIA architectures keep
+/// the conservative `8` threshold unless overridden via
+/// `HANZO_PQ2_MMQ_MAX_BM` / `HANZO_PTQ1_MMQ_MAX_BM`.
+fn mmq_max_vec_bm(dtype: GgmlDType, compute_cap: i32) -> usize {
+    let env_key = match dtype {
+        GgmlDType::PQ2_0 => Some("HANZO_PQ2_MMQ_MAX_BM"),
+        GgmlDType::PTQ1_0 => Some("HANZO_PTQ1_MMQ_MAX_BM"),
+        _ => None,
+    };
+    if let Some(key) = env_key {
+        if let Ok(v) = std::env::var(key) {
+            if let Ok(parsed) = v.parse::<usize>() {
+                return parsed.max(1);
+            }
+        }
+    }
+    match dtype {
+        GgmlDType::PQ2_0 if compute_cap >= 1000 => 1,
+        GgmlDType::PTQ1_0 if compute_cap >= 1000 => 3,
+        _ => 8,
+    }
+}
+
+pub fn cuda_profile_enabled() -> bool {
+    *CUDA_PROFILE_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HANZO_CUDA_PROFILE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    })
+}
+
+pub fn cuda_profile_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    PROF_DP4A_DECODE_NS.store(0, Relaxed);
+    PROF_DP4A_DECODE_CALLS.store(0, Relaxed);
+    PROF_DP4A_VERIFY_NS.store(0, Relaxed);
+    PROF_DP4A_VERIFY_CALLS.store(0, Relaxed);
+    PROF_DP4A_GE64M_NS.store(0, Relaxed);
+    PROF_DP4A_GE64M_CALLS.store(0, Relaxed);
+    PROF_BF16_DEQUANT_NS.store(0, Relaxed);
+    PROF_BF16_DEQUANT_CALLS.store(0, Relaxed);
+    PROF_BF16_GEMM_NS.store(0, Relaxed);
+    PROF_MMQ_QUANT_NS.store(0, Relaxed);
+    PROF_MMQ_KERNEL_NS.store(0, Relaxed);
+    PROF_MMQ_CAST_NS.store(0, Relaxed);
+    PROF_MMQ_CALLS.store(0, Relaxed);
+    PROF_FWHT_NS.store(0, Relaxed);
+    PROF_FWHT_CALLS.store(0, Relaxed);
+}
+
+pub fn cuda_profile_snapshot() -> CudaProfileSnapshot {
+    use std::sync::atomic::Ordering::Relaxed;
+    CudaProfileSnapshot {
+        dp4a_decode_ms: PROF_DP4A_DECODE_NS.load(Relaxed) as f64 / 1e6,
+        dp4a_decode_calls: PROF_DP4A_DECODE_CALLS.load(Relaxed),
+        dp4a_verify_ms: PROF_DP4A_VERIFY_NS.load(Relaxed) as f64 / 1e6,
+        dp4a_verify_calls: PROF_DP4A_VERIFY_CALLS.load(Relaxed),
+        dp4a_ge64m_ms: PROF_DP4A_GE64M_NS.load(Relaxed) as f64 / 1e6,
+        dp4a_ge64m_calls: PROF_DP4A_GE64M_CALLS.load(Relaxed),
+        bf16_dequant_ms: PROF_BF16_DEQUANT_NS.load(Relaxed) as f64 / 1e6,
+        bf16_dequant_calls: PROF_BF16_DEQUANT_CALLS.load(Relaxed),
+        bf16_gemm_ms: PROF_BF16_GEMM_NS.load(Relaxed) as f64 / 1e6,
+        mmq_quant_ms: PROF_MMQ_QUANT_NS.load(Relaxed) as f64 / 1e6,
+        mmq_kernel_ms: PROF_MMQ_KERNEL_NS.load(Relaxed) as f64 / 1e6,
+        mmq_cast_ms: PROF_MMQ_CAST_NS.load(Relaxed) as f64 / 1e6,
+        mmq_calls: PROF_MMQ_CALLS.load(Relaxed),
+        fwht_ms: PROF_FWHT_NS.load(Relaxed) as f64 / 1e6,
+        fwht_calls: PROF_FWHT_CALLS.load(Relaxed),
+    }
 }
 
 pub const WARP_SIZE: usize = 32;
@@ -137,6 +257,29 @@ fn dequantize_f32(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    if matches!(dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) {
+        let kernel_name = match dtype {
+            GgmlDType::PQ2_0 => "dequantize_block_pq2_0_f32",
+            GgmlDType::PTQ1_0 => "dequantize_block_ptq1_0_f32",
+            _ => unreachable!(),
+        };
+        let nblocks = elem_count / 128;
+        let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+        let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+        if nblocks > 0 {
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (nblocks.min(65535) as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            builder.arg(&data.inner);
+            builder.arg(&dst);
+            barg!(builder, nblocks as i64);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let nb = elem_count.div_ceil(256);
     let (kernel_name, is_k, block_dim, num_blocks) = match dtype {
         GgmlDType::Q4_0 => ("dequantize_block_q4_0_f32", false, 32, nb),
@@ -197,6 +340,29 @@ fn dequantize_f16(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    if matches!(dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) {
+        let kernel_name = match dtype {
+            GgmlDType::PQ2_0 => "dequantize_block_pq2_0_f16",
+            GgmlDType::PTQ1_0 => "dequantize_block_ptq1_0_f16",
+            _ => unreachable!(),
+        };
+        let nblocks = elem_count / 128;
+        let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+        let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+        if nblocks > 0 {
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (nblocks.min(65535) as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            builder.arg(&data.inner);
+            builder.arg(&dst);
+            barg!(builder, nblocks as i64);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let nb = elem_count.div_ceil(256);
     let (kernel_name, is_k, block_dim, num_blocks) = match dtype {
         GgmlDType::Q4_0 => ("dequantize_block_q4_0_f16", false, 32, nb),
@@ -246,6 +412,35 @@ fn dequantize_f16(
         builder.arg(&data.inner);
         builder.arg(&dst);
         barg!(builder, nb32 as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+    }
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+fn dequantize_bf16(
+    data: &PaddedCudaSlice,
+    dtype: GgmlDType,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let kernel_name = match dtype {
+        GgmlDType::PQ2_0 => "dequantize_block_pq2_0_bf16",
+        GgmlDType::PTQ1_0 => "dequantize_block_ptq1_0_bf16",
+        _ => crate::bail!("unsupported dtype for dequantize_bf16 {dtype:?}"),
+    };
+    let nblocks = elem_count / 128;
+    let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+    let dst = unsafe { dev.alloc::<bf16>(elem_count)? };
+    if nblocks > 0 {
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (nblocks.min(65535) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(&data.inner);
+        builder.arg(&dst);
+        barg!(builder, nblocks as i64);
         unsafe { builder.launch(cfg) }.w()?;
     }
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
@@ -312,9 +507,16 @@ fn get_rows(
         GgmlDType::Q4K => ("get_rows_q4_K", 32, hidden / dtype.block_size(), false),
         GgmlDType::Q5K => ("get_rows_q5_K", 64, hidden / dtype.block_size(), false),
         GgmlDType::Q6K => ("get_rows_q6_K", 64, hidden / dtype.block_size(), false),
+        GgmlDType::PQ2_0 => ("get_rows_pq2_0", 128, hidden / dtype.block_size(), true),
+        GgmlDType::PTQ1_0 => ("get_rows_ptq1_0", 128, hidden / dtype.block_size(), true),
         _ => crate::bail!("unsupported dtype for CUDA quantized embedding {dtype:?}"),
     };
-    let func = dev.get_or_load_func(kernel_name, &hanzo_kernels::QUANTIZED)?;
+    let ptx = if matches!(dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) {
+        &hanzo_kernels::IQUANT_MMVQ
+    } else {
+        &hanzo_kernels::QUANTIZED
+    };
+    let func = dev.get_or_load_func(kernel_name, ptx)?;
     let ids_len = ids.len();
     let dst = unsafe { dev.alloc::<f32>(ids_len * hidden)? };
     if ids_len == 0 {
@@ -532,6 +734,9 @@ fn iquant_dp4a_suffix(dtype: GgmlDType) -> Option<&'static str> {
         // Symmetric ternary {-1,0,1}: 2-bit (TQ2_0, clean) + base-3 (TQ1_0, scalar unpack + dp4a dot).
         GgmlDType::TQ2_0 => "tq2_0",
         GgmlDType::TQ1_0 => "tq1_0",
+        // Prism / Bonsai-2 128-elem ternary: 2-bit asymmetric {-1,0,+1,+2} (PQ2_0) + base-3 {-1,0,+1} (PTQ1_0).
+        GgmlDType::PQ2_0 => "pq2_0",
+        GgmlDType::PTQ1_0 => "ptq1_0",
         _ => return None,
     })
 }
@@ -553,13 +758,12 @@ fn mul_mat_vec_iquant_dp4a(
 ) -> Result<CudaStorage> {
     let suffix = iquant_dp4a_suffix(dtype)
         .ok_or_else(|| crate::Error::Msg(format!("no i-quant dp4a kernel for {dtype:?}")).bt())?;
-    // i-quant super-block is 256 weights (8 q8_1 sub-blocks of 32) -- ncols is always a multiple, so
-    // the activation needs no MATRIX_ROW_PADDING (the dp4a core reads exactly ncols int8 + ncols/32 f16).
-    if ncols % 256 != 0 {
-        crate::bail!("i-quant ncols {ncols} must be a multiple of 256");
+    let blk_sz = dtype.block_size();
+    if !ncols.is_multiple_of(blk_sz) {
+        crate::bail!("i-quant ncols {ncols} must be a multiple of {blk_sz}");
     }
-    if b_size == 0 || b_size > 8 {
-        crate::bail!("only bsize between 1 and 8 are supported, got {b_size}");
+    if b_size == 0 {
+        crate::bail!("bsize must be >= 1, got {b_size}");
     }
     if y.len() != ncols * b_size {
         crate::bail!(
@@ -571,8 +775,8 @@ fn mul_mat_vec_iquant_dp4a(
 
     // Quantize the f32 activation -> separated (int8 `xq` [b_size, ncols], f16 scale `xd`
     // [b_size, ncols/32]). One warp per 32-block; guard `wid >= b_size*nblk32` in-kernel.
-    let mut xq = dev.alloc_zeros::<u8>(b_size * ncols)?;
-    let mut xd = dev.alloc_zeros::<f16>(b_size * nblk32)?;
+    let xq = dev.alloc_zeros::<u8>(b_size * ncols)?;
+    let xd = dev.alloc_zeros::<f16>(b_size * nblk32)?;
     {
         let func = dev.get_or_load_func("iq_quantize_q8_f32", &hanzo_kernels::IQUANT_MMVQ)?;
         let nwarp = (b_size * nblk32) as u32;
@@ -591,16 +795,12 @@ fn mul_mat_vec_iquant_dp4a(
         unsafe { builder.launch(cfg) }.w()?;
     }
 
-    // Decode matvec: warp-per-row, lane-strided over (super-block x sub-unit). One launch per
-    // activation row (b_size is tiny on the decode/vec path).
-    let kernel_name = format!("qmatvec_dp4a_{suffix}_f32");
-    let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
     let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
     const ROWS_PER_BLOCK: u32 = 8; // 8 warps/block
-    for bi in 0..b_size {
-        let xq_b = xq.slice(bi * ncols..(bi + 1) * ncols);
-        let xd_b = xd.slice(bi * nblk32..(bi + 1) * nblk32);
-        let dst_b = dst.slice(bi * nrows..(bi + 1) * nrows);
+    if b_size == 1 {
+        // Fast single-token decode GEMV path.
+        let kernel_name = format!("qmatvec_dp4a_{suffix}_f32");
+        let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: ((nrows as u32).div_ceil(ROWS_PER_BLOCK), 1, 1),
             block_dim: (ROWS_PER_BLOCK * WARP_SIZE as u32, 1, 1),
@@ -609,9 +809,32 @@ fn mul_mat_vec_iquant_dp4a(
         let mut builder = func.builder();
         barg!(builder, nrows as i32, ncols as i32);
         builder.arg(&data.inner);
-        builder.arg(&xq_b);
-        builder.arg(&xd_b);
-        builder.arg(&dst_b);
+        builder.arg(&xq);
+        builder.arg(&xd);
+        builder.arg(&dst);
+        unsafe { builder.launch(cfg) }.w()?;
+    } else {
+        // Batched multi-token dp4a GEMM (speculative verification & small-batch prefill):
+        // unpacks each weight block ONCE into registers per M-tile (BM=16) and accumulates
+        // across all activation rows in a single kernel launch.
+        const BM: u32 = 16;
+        let kernel_name = format!("qmatmul_dp4a_{suffix}_f32");
+        let func = dev.get_or_load_func(&kernel_name, &hanzo_kernels::IQUANT_MMVQ)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (
+                (nrows as u32).div_ceil(ROWS_PER_BLOCK),
+                (b_size as u32).div_ceil(BM),
+                1,
+            ),
+            block_dim: (ROWS_PER_BLOCK * WARP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        barg!(builder, nrows as i32, ncols as i32, b_size as i32);
+        builder.arg(&data.inner);
+        builder.arg(&xq);
+        builder.arg(&xd);
+        builder.arg(&dst);
         unsafe { builder.launch(cfg) }.w()?;
     }
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
@@ -728,7 +951,7 @@ fn indexed_moe_forward_fused_q8_1_input(
     // flattened [batch*topk] (1-D). batch comes from the input, which is always [batch, topk|1, k].
     let n_slots = idx_shape.elem_count();
     assert!(
-        n_slots % batch == 0,
+        n_slots.is_multiple_of(batch),
         "ids count {n_slots} not a multiple of batch {batch}"
     );
     let topk = n_slots / batch;
@@ -872,8 +1095,9 @@ impl QCudaStorage {
         let suffix = iquant_dp4a_suffix(self.dtype).ok_or_else(|| {
             crate::Error::Msg(format!("no i-quant MoE kernel for {:?}", self.dtype)).bt()
         })?;
-        if k % 256 != 0 {
-            crate::bail!("i-quant MoE ncols {k} must be a multiple of 256");
+        let blk_sz = self.dtype.block_size();
+        if !k.is_multiple_of(blk_sz) {
+            crate::bail!("i-quant MoE ncols {k} must be a multiple of {blk_sz}");
         }
         if x_flat.len() != nrows * k {
             crate::bail!(
@@ -885,8 +1109,8 @@ impl QCudaStorage {
         let nblk32 = k / 32;
 
         // Quantize the nrows routed activations -> separated (int8 xq [nrows,k], f16 scale xd [nrows,k/32]).
-        let mut xq = dev.alloc_zeros::<u8>(nrows * k)?;
-        let mut xd = dev.alloc_zeros::<f16>(nrows * nblk32)?;
+        let xq = dev.alloc_zeros::<u8>(nrows * k)?;
+        let xd = dev.alloc_zeros::<f16>(nrows * nblk32)?;
         {
             let func = dev.get_or_load_func("iq_quantize_q8_f32", &hanzo_kernels::IQUANT_MMVQ)?;
             let nwarp = (nrows * nblk32) as u32;
@@ -994,6 +1218,8 @@ impl QCudaStorage {
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
                 | GgmlDType::Q8K
+                | GgmlDType::PQ2_0
+                | GgmlDType::PTQ1_0
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -1063,6 +1289,12 @@ impl QCudaStorage {
             }
             GgmlDType::ROCMFP4_FAST => {
                 deq::<crate::quantized::iq_quants::BlockROCMFP4Fast>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::PQ2_0 => {
+                deq::<crate::quantized::iq_quants::BlockPQ2_0>(&buffer, block_len, &mut out)
+            }
+            GgmlDType::PTQ1_0 => {
+                deq::<crate::quantized::iq_quants::BlockPTQ1_0>(&buffer, block_len, &mut out)
             }
         }
 
@@ -1213,7 +1445,45 @@ impl QCudaStorage {
             }
             .bt())?,
         };
-        get_rows(&self.data, self.dtype, hidden, &ids, self.device())
+        match self.dtype {
+            GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::BF16
+            | GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+            | GgmlDType::PQ2_0
+            | GgmlDType::PTQ1_0 => get_rows(&self.data, self.dtype, hidden, &ids, self.device()),
+            // dtypes without a get_rows kernel (i-quant, ternary, NVFP4): gather each
+            // requested row through the CPU to_float reference and upload the f32 result.
+            _ => self.embedding_dequant_rows(hidden, &ids),
+        }
+    }
+
+    fn embedding_dequant_rows(&self, hidden: usize, ids: &CudaView<u32>) -> Result<CudaStorage> {
+        let ids: Vec<u32> = self.device().clone_dtoh(ids)?;
+        let row_bytes = hidden * self.dtype.type_size() / self.dtype.block_size();
+        let table = self.data.inner.slice(..self.data.len);
+        let mut out = Vec::with_capacity(ids.len() * hidden);
+        for id in ids {
+            let lo = id as usize * row_bytes;
+            let row = table.slice(lo..lo + row_bytes);
+            let bytes: Vec<u8> = self.device().clone_dtoh(&row)?;
+            let q = self.dtype.from_data(std::borrow::Cow::Borrowed(&bytes));
+            let crate::CpuStorage::F32(v) = q.dequantize(hidden)? else {
+                crate::bail!("embedding dequant did not yield f32")
+            };
+            out.extend_from_slice(&v);
+        }
+        self.device()
+            .storage_from_cpu_storage(&crate::CpuStorage::F32(out))
     }
 
     pub fn fwd(
@@ -1226,7 +1496,8 @@ impl QCudaStorage {
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
         } else {
-            8
+            let cc = crate::quantized::fast_mmq::compute_cap(&self.device);
+            mmq_max_vec_bm(self.dtype, cc)
         };
         let use_vec_kernel = match layout.shape().dims() {
             [b, m, _k] => b * m <= max_bm,
@@ -1259,13 +1530,55 @@ impl QCudaStorage {
             if iquant_dp4a_suffix(self.dtype).is_some() {
                 if use_vec_kernel {
                     // DECODE: native dp4a mmvq.
+                    if cuda_profile_enabled() {
+                        crate::backend::BackendDevice::synchronize(&self.device)?;
+                        let t0 = std::time::Instant::now();
+                        let res = self.mul_mat_vec_iquant(self_shape, storage, layout)?;
+                        crate::backend::BackendDevice::synchronize(&self.device)?;
+                        PROF_DP4A_DECODE_NS.fetch_add(
+                            t0.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        PROF_DP4A_DECODE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(res);
+                    }
                     return self.mul_mat_vec_iquant(self_shape, storage, layout);
                 }
                 // PREFILL: native int8-WMMA MMQ GEMM (qmmq) for the 7 i-quants with an MMQ kernel
-                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS, IQ1_S). Decode-only types (IQ1_M, TQ1_0/TQ2_0)
-                // have no MMQ kernel -> try_fwd returns None and they fall to the dequant dense matmul.
+                // (IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS, IQ1_S).
                 if let Some(out) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
                     return Ok(out);
+                }
+                // Types without a WMMA MMQ kernel (PQ2_0, PTQ1_0, TQ1_0, TQ2_0, IQ1_M) use the
+                // single-launch batched qmatmul_dp4a kernel for speculative verification / small-batch
+                // prefill (b*m <= 64) and for huge vocabulary matrices (>= 64M weights) to avoid
+                // multi-GB FP32 weight dequantization.
+                let bm = match layout.shape().dims() {
+                    [b, m, _k] => b * m,
+                    [b, _k] => *b,
+                    _ => usize::MAX,
+                };
+                if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+                    && (bm <= 64 || self_shape.elem_count() >= 64 * 1024 * 1024)
+                {
+                    if cuda_profile_enabled() {
+                        crate::backend::BackendDevice::synchronize(&self.device)?;
+                        let t0 = std::time::Instant::now();
+                        let res = self.mul_mat_vec_iquant(self_shape, storage, layout)?;
+                        crate::backend::BackendDevice::synchronize(&self.device)?;
+                        let ns = t0.elapsed().as_nanos() as u64;
+                        if bm <= 64 && self_shape.elem_count() < 64 * 1024 * 1024 {
+                            PROF_DP4A_VERIFY_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+                            PROF_DP4A_VERIFY_CALLS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            PROF_DP4A_GE64M_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+                            PROF_DP4A_GE64M_CALLS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return Ok(res);
+                    }
+                    return self.mul_mat_vec_iquant(self_shape, storage, layout);
                 }
             }
             return self.dequantize_matmul_dense(self_shape, storage, layout);
@@ -1417,13 +1730,59 @@ impl QCudaStorage {
         if k2 != k {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
-        let data_f32 = self.dequantize(n * k)?;
-        let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
-        let out = storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?;
         let mut out_shape = layout.shape().dims().to_vec();
         out_shape.pop();
         out_shape.push(n);
-        Ok((out, out_shape.into()))
+        let out_shape_s: crate::Shape = out_shape.into();
+
+        if matches!(self.dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0)
+            && std::env::var_os("HANZO_PQ2_FP32_PREFILL").is_none()
+        {
+            let prof = cuda_profile_enabled();
+            if prof {
+                crate::backend::BackendDevice::synchronize(&self.device)?;
+            }
+            let t_dq = prof.then(std::time::Instant::now);
+            let data_bf16 = dequantize_bf16(&self.data, self.dtype, n * k, &self.device)?;
+            if let Some(t0) = t_dq {
+                crate::backend::BackendDevice::synchronize(&self.device)?;
+                PROF_BF16_DEQUANT_NS.fetch_add(
+                    t0.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                PROF_BF16_DEQUANT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let t_gemm = prof.then(std::time::Instant::now);
+            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
+            let out_dtype = storage.dtype();
+            let (act_bf16, act_l) = if out_dtype == crate::DType::BF16 {
+                (None, layout.clone())
+            } else {
+                let converted = storage.to_dtype(layout, crate::DType::BF16)?;
+                (Some(converted), crate::Layout::contiguous(layout.shape()))
+            };
+            let act_ref = act_bf16.as_ref().unwrap_or(storage);
+            let out_bf16 = act_ref.matmul(&data_bf16, (b, m, n, k), &act_l, &rhs_l)?;
+            let out = if out_dtype == crate::DType::BF16 {
+                out_bf16
+            } else {
+                let out_l = crate::Layout::contiguous(&out_shape_s);
+                out_bf16.to_dtype(&out_l, out_dtype)?
+            };
+            if let Some(t0) = t_gemm {
+                crate::backend::BackendDevice::synchronize(&self.device)?;
+                PROF_BF16_GEMM_NS.fetch_add(
+                    t0.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            return Ok((out, out_shape_s));
+        }
+
+        let data_f32 = self.dequantize(n * k)?;
+        let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
+        let out = storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?;
+        Ok((out, out_shape_s))
     }
 
     fn dequantize_matmul(
@@ -1488,6 +1847,175 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         device: device.clone(),
         dtype,
     }))
+}
+
+/// Fused CUDA Fast Walsh-Hadamard Transform (FWHT) with optional explicit sign vector.
+///
+/// Computes in a single kernel launch:
+/// - `is_inverse == false`: `((x * signs).reshape(-1, B) @ H_B) * (1 / sqrt(B))`
+/// - `is_inverse == true`:  `((x.reshape(-1, B) @ H_B) * (1 / sqrt(B))) * signs`
+///
+/// Supports `DType::F32`, `DType::F16`, and `DType::BF16` directly without intermediate FP32
+/// global-memory allocations. `block_size` must be a power of 2 in `1..=8192`.
+pub fn hadamard_fwht(
+    x: &crate::Tensor,
+    signs: Option<&crate::Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+) -> Result<crate::Tensor> {
+    if !block_size.is_power_of_two() || block_size == 0 || block_size > 8192 {
+        crate::bail!("hadamard_fwht block_size must be a power of 2 in 1..=8192, got {block_size}");
+    }
+    let orig_shape = x.shape().clone();
+    let Some(&width) = orig_shape.dims().last() else {
+        crate::bail!("hadamard_fwht expects rank >= 1");
+    };
+    if !width.is_multiple_of(block_size) {
+        crate::bail!("hadamard_fwht width {width} is not divisible by block_size {block_size}");
+    }
+    let x = x.contiguous()?;
+    let elem_count = orig_shape.elem_count();
+    let total_blocks = (elem_count / block_size) as i64;
+    if total_blocks == 0 {
+        return Ok(x);
+    }
+
+    let signs_contig = match signs {
+        Some(s) => {
+            if s.dtype() != crate::DType::F32 {
+                crate::bail!("hadamard_fwht signs must be F32, got {:?}", s.dtype());
+            }
+            if s.elem_count() != width {
+                crate::bail!(
+                    "hadamard_fwht signs len {} != width {width}",
+                    s.elem_count()
+                );
+            }
+            Some(s.contiguous()?)
+        }
+        None => None,
+    };
+
+    let (x_storage, x_layout) = x.storage_and_layout();
+    let crate::Storage::Cuda(x_cuda) = &*x_storage else {
+        crate::bail!("hadamard_fwht requires a CUDA tensor");
+    };
+    let dev = &x_cuda.device;
+    let (x_o1, x_o2) = x_layout.contiguous_offsets().ok_or_else(|| {
+        crate::Error::RequiresContiguous {
+            op: "hadamard_fwht",
+        }
+        .bt()
+    })?;
+
+    let signs_guard = signs_contig.as_ref().map(|s| s.storage_and_layout());
+    let signs_view = if let Some((s_storage, s_layout)) = signs_guard.as_ref() {
+        let crate::Storage::Cuda(s_cuda) = &**s_storage else {
+            crate::bail!("hadamard_fwht signs must be on CUDA");
+        };
+        let (s_o1, s_o2) = s_layout.contiguous_offsets().ok_or_else(|| {
+            crate::Error::RequiresContiguous {
+                op: "hadamard_fwht_signs",
+            }
+            .bt()
+        })?;
+        Some(s_cuda.as_cuda_slice::<f32>()?.slice(s_o1..s_o2))
+    } else {
+        None
+    };
+
+    let has_signs = i32::from(signs_view.is_some());
+    let is_inv = i32::from(is_inverse);
+    let b_i32 = block_size as i32;
+    let w_i32 = width as i32;
+    let grid_x = (total_blocks as u32).clamp(1, 65_535);
+    let elems_per_thread = (block_size / 1024).max(1);
+    let threads = block_size / elems_per_thread;
+    let shared_mem_bytes = if threads > 32 {
+        (block_size * std::mem::size_of::<f32>()) as u32
+    } else {
+        0
+    };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes,
+    };
+    let null_ptr = 0u64;
+
+    let prof = cuda_profile_enabled();
+    if prof {
+        crate::backend::BackendDevice::synchronize(dev)?;
+    }
+    let t_fwht = prof.then(std::time::Instant::now);
+
+    let out_storage = match x.dtype() {
+        crate::DType::F32 => {
+            let x_slice = x_cuda.as_cuda_slice::<f32>()?.slice(x_o1..x_o2);
+            let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+            let func = dev.get_or_load_func("hadamard_fwht_f32", &hanzo_kernels::IQUANT_MMVQ)?;
+            let mut builder = func.builder();
+            builder.arg(&x_slice);
+            if let Some(ref sv) = signs_view {
+                builder.arg(sv);
+            } else {
+                builder.arg(&null_ptr);
+            }
+            builder.arg(&dst);
+            barg!(builder, b_i32, w_i32, has_signs, is_inv, total_blocks);
+            unsafe { builder.launch(cfg) }.w()?;
+            CudaStorage::wrap_cuda_slice(dst, dev.clone())
+        }
+        crate::DType::F16 => {
+            let x_slice = x_cuda.as_cuda_slice::<f16>()?.slice(x_o1..x_o2);
+            let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+            let func = dev.get_or_load_func("hadamard_fwht_f16", &hanzo_kernels::IQUANT_MMVQ)?;
+            let mut builder = func.builder();
+            builder.arg(&x_slice);
+            if let Some(ref sv) = signs_view {
+                builder.arg(sv);
+            } else {
+                builder.arg(&null_ptr);
+            }
+            builder.arg(&dst);
+            barg!(builder, b_i32, w_i32, has_signs, is_inv, total_blocks);
+            unsafe { builder.launch(cfg) }.w()?;
+            CudaStorage::wrap_cuda_slice(dst, dev.clone())
+        }
+        crate::DType::BF16 => {
+            let x_slice = x_cuda.as_cuda_slice::<half::bf16>()?.slice(x_o1..x_o2);
+            let dst = unsafe { dev.alloc::<half::bf16>(elem_count)? };
+            let func = dev.get_or_load_func("hadamard_fwht_bf16", &hanzo_kernels::IQUANT_MMVQ)?;
+            let mut builder = func.builder();
+            builder.arg(&x_slice);
+            if let Some(ref sv) = signs_view {
+                builder.arg(sv);
+            } else {
+                builder.arg(&null_ptr);
+            }
+            builder.arg(&dst);
+            barg!(builder, b_i32, w_i32, has_signs, is_inv, total_blocks);
+            unsafe { builder.launch(cfg) }.w()?;
+            CudaStorage::wrap_cuda_slice(dst, dev.clone())
+        }
+        dt => crate::bail!("hadamard_fwht unsupported dtype {dt:?}"),
+    };
+    if let Some(t0) = t_fwht {
+        crate::backend::BackendDevice::synchronize(dev)?;
+        PROF_FWHT_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        PROF_FWHT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop(signs_guard);
+    drop(x_storage);
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Cuda(out_storage),
+        orig_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 #[cfg(test)]
@@ -1727,6 +2255,8 @@ mod test {
             GgmlDType::TQ2_0,
             GgmlDType::NVFP4,
             GgmlDType::Q1_0,
+            GgmlDType::PQ2_0,
+            GgmlDType::PTQ1_0,
         ] {
             // Bounded byte pattern (<= 0x3F) so every embedded f16 scale decodes finite (no NaN/Inf), yet
             // varied. Sizing comes from the dtype so it is correct for both 256- and 32-element blocks.
@@ -1990,5 +2520,548 @@ mod test {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn cuda_pq2_ptq1_128blk_dp4a_dequant_and_get_rows() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let cuda_dev = crate::Device::Cuda(dev.clone());
+        // k = 384 = 3 * 128 (deliberately NOT a multiple of 256!) verifies 128-element super-block sizing.
+        let (n, k) = (6usize, 384usize);
+
+        for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0] {
+            let nbytes = (n * k / dtype.block_size()) * dtype.type_size();
+            let bytes: Vec<u8> = (0..nbytes)
+                .map(|i| (i.wrapping_mul(41).wrapping_add(7) & 0x3F) as u8)
+                .collect();
+
+            // CPU reference dequantization.
+            let qcpu = dtype.from_data(std::borrow::Cow::Borrowed(&bytes));
+            let crate::CpuStorage::F32(w_cpu) = qcpu.dequantize(n * k)? else {
+                unreachable!()
+            };
+
+            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)?
+            {
+                QStorage::Cuda(s) => s,
+                _ => unreachable!(),
+            };
+
+            // 1. Native GPU dequantize_f32 must match CPU to_float bit-for-bit.
+            let w_gpu_s = qcuda.dequantize(n * k)?;
+            let w_gpu = dev.clone_dtoh(&w_gpu_s.as_cuda_slice::<f32>()?.as_view())?;
+            for idx in 0..n * k {
+                assert_eq!(
+                    w_gpu[idx].to_bits(),
+                    w_cpu[idx].to_bits(),
+                    "{dtype:?} GPU dequantize_f32 mismatch at {idx}: gpu={} cpu={}",
+                    w_gpu[idx],
+                    w_cpu[idx]
+                );
+            }
+
+            // 2. Native GPU dequantize_f16 must match f16::from_f32(w_cpu).
+            let w_f16_s = qcuda.dequantize_f16(n * k)?;
+            let w_f16 = dev.clone_dtoh(&w_f16_s.as_cuda_slice::<f16>()?.as_view())?;
+            for idx in 0..n * k {
+                let diff = (w_f16[idx].to_f32() - w_cpu[idx]).abs();
+                assert!(
+                    diff <= 1e-3 * w_cpu[idx].abs() + 1e-5,
+                    "{dtype:?} f16 diff {diff}"
+                );
+            }
+
+            // 3. Native GPU get_rows (embedding) must match CPU rows bit-for-bit.
+            let ids_vec: Vec<u32> = vec![5, 0, 3];
+            let ids_cuda = CudaStorage::wrap_cuda_slice(dev.clone_htod(&ids_vec)?, dev.clone());
+            let ids_l = crate::Layout::contiguous(ids_vec.len());
+            let emb_s = qcuda.embedding(n, k, &ids_cuda, &ids_l)?;
+            let emb = dev.clone_dtoh(&emb_s.as_cuda_slice::<f32>()?.as_view())?;
+            for (ri, &row_id) in ids_vec.iter().enumerate() {
+                for c in 0..k {
+                    assert_eq!(
+                        emb[ri * k + c].to_bits(),
+                        w_cpu[row_id as usize * k + c].to_bits(),
+                        "{dtype:?} get_rows mismatch at row {row_id} col {c}"
+                    );
+                }
+            }
+
+            // 4. Decode (m=1, qmatvec_dp4a), batched verification (m=2..32, qmatmul_dp4a), and
+            //    prefill (m=128, BF16 Tensor Core GEMM via dequantize_matmul_dense) vs oracle,
+            //    plus bit-for-bit agreement between m=1 single-token GEMV and m=16 batched GEMM on every row!
+            for m in [1usize, 2, 8, 12, 16, 32, 128] {
+                let inp: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 13 + 5) % 29) as f32 * 0.03 - 0.4)
+                    .collect();
+                let input = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+                let input_l = crate::Layout::contiguous((m, k));
+                let self_shape: crate::Shape = (n, k).into();
+                let (out, out_shape) = qcuda.fwd(&self_shape, &input, &input_l)?;
+                assert_eq!(out_shape.dims().to_vec(), vec![m, n]);
+                let got = dev.clone_dtoh(&out.as_cuda_slice::<f32>()?.as_view())?;
+                let mut max_abs = 0f32;
+                let mut max_err = 0f32;
+                for r in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0f32;
+                        for c in 0..k {
+                            acc += w_cpu[j * k + c] * inp[r * k + c];
+                        }
+                        max_abs = max_abs.max(acc.abs());
+                        max_err = max_err.max((got[r * n + j] - acc).abs());
+                    }
+                }
+                let tol = 0.03 * max_abs + 1e-3;
+                assert!(
+                    max_err <= tol,
+                    "{dtype:?} m={m}: max_err {max_err} > tol {tol} (max_abs {max_abs})"
+                );
+
+                if m == 16 {
+                    // Verify bit-for-bit parity between batched qmatmul_dp4a (m=16) and single-token qmatvec_dp4a (m=1).
+                    for r in 0..m {
+                        let row_inp = &inp[r * k..(r + 1) * k];
+                        let row_cuda =
+                            CudaStorage::wrap_cuda_slice(dev.clone_htod(row_inp)?, dev.clone());
+                        let row_l = crate::Layout::contiguous((1usize, k));
+                        let (row_out, _) = qcuda.fwd(&self_shape, &row_cuda, &row_l)?;
+                        let row_got = dev.clone_dtoh(&row_out.as_cuda_slice::<f32>()?.as_view())?;
+                        for j in 0..n {
+                            assert_eq!(
+                                got[r * n + j].to_bits(),
+                                row_got[j].to_bits(),
+                                "{dtype:?} batched qmatmul_dp4a vs qmatvec_dp4a mismatch at row {r} col {j}: {} vs {}",
+                                got[r * n + j],
+                                row_got[j]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_hadamard_fwht_matches_dense_hb() -> Result<()> {
+        let cuda_dev = crate::Device::new_cuda(0)?;
+        let b = 512usize;
+        let width = 2560usize; // 5 * 512 (Bonsai-2 4B hidden_size)
+        let rows = 6usize;
+
+        let scale = 1.0f32 / (b as f32).sqrt();
+        let mut h_data = vec![0.0f32; b * b];
+        for i in 0..b {
+            for j in 0..b {
+                h_data[i * b + j] = if (i & j).count_ones() % 2 == 0 {
+                    scale
+                } else {
+                    -scale
+                };
+            }
+        }
+        let h_b = crate::Tensor::from_vec(h_data, (b, b), &cuda_dev)?;
+        let signs_vec: Vec<f32> = (0..width)
+            .map(|i| if (i * 7 + 3) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs = crate::Tensor::from_vec(signs_vec, width, &cuda_dev)?;
+
+        let x_vec: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 19 + 11) % 97) as f32 * 0.02 - 0.9)
+            .collect();
+        let x_f32 = crate::Tensor::from_vec(x_vec, (rows, width), &cuda_dev)?;
+
+        // Forward F32 with signs
+        let ref_fwd = x_f32
+            .broadcast_mul(&signs)?
+            .reshape((rows * (width / b), b))?
+            .matmul(&h_b)?
+            .reshape((rows, width))?;
+        let got_fwd = hadamard_fwht(&x_f32, Some(&signs), b, false)?;
+        let ref_v = ref_fwd.flatten_all()?.to_vec1::<f32>()?;
+        let got_v = got_fwd.flatten_all()?.to_vec1::<f32>()?;
+        for i in 0..ref_v.len() {
+            let diff = (ref_v[i] - got_v[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "fwht fwd f32 mismatch at {i}: {} vs {}",
+                ref_v[i],
+                got_v[i]
+            );
+        }
+
+        // Inverse BF16 with signs: T^{-1}(T(x)) == x
+        let x_bf16 = x_f32.to_dtype(crate::DType::BF16)?;
+        let y_bf16 = hadamard_fwht(&x_bf16, Some(&signs), b, false)?;
+        let rec_bf16 = hadamard_fwht(&y_bf16, Some(&signs), b, true)?;
+        let x_bf16_v = x_bf16
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rec_v = rec_bf16
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for i in 0..x_bf16_v.len() {
+            let diff = (x_bf16_v[i] - rec_v[i]).abs();
+            assert!(
+                diff < 2e-2,
+                "fwht roundtrip bf16 mismatch at {i}: {} vs {}",
+                x_bf16_v[i],
+                rec_v[i]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_hadamard_fwht_4096_matches_dense_hb() -> Result<()> {
+        let cuda_dev = crate::Device::new_cuda(0)?;
+        let b = 4096usize;
+        let width = 4096usize; // Bonsai-2 9B prism.hadamard.block_size
+        let rows = 3usize;
+
+        let scale = 1.0f32 / (b as f32).sqrt();
+        let mut h_data = vec![0.0f32; b * b];
+        for i in 0..b {
+            for j in 0..b {
+                h_data[i * b + j] = if (i & j).count_ones() % 2 == 0 {
+                    scale
+                } else {
+                    -scale
+                };
+            }
+        }
+        let h_b = crate::Tensor::from_vec(h_data, (b, b), &cuda_dev)?;
+        let signs_vec: Vec<f32> = (0..width)
+            .map(|i| if (i * 7 + 3) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs = crate::Tensor::from_vec(signs_vec, width, &cuda_dev)?;
+
+        let x_vec: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 19 + 11) % 97) as f32 * 0.02 - 0.9)
+            .collect();
+        let x_f32 = crate::Tensor::from_vec(x_vec, (rows, width), &cuda_dev)?;
+
+        let ref_fwd = x_f32.broadcast_mul(&signs)?.matmul(&h_b)?;
+        let got_fwd = hadamard_fwht(&x_f32, Some(&signs), b, false)?;
+        let ref_v = ref_fwd.flatten_all()?.to_vec1::<f32>()?;
+        let got_v = got_fwd.flatten_all()?.to_vec1::<f32>()?;
+        for i in 0..ref_v.len() {
+            let diff = (ref_v[i] - got_v[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "fwht 4096 fwd f32 mismatch at {i}: {} vs {}",
+                ref_v[i],
+                got_v[i]
+            );
+        }
+
+        let x_bf16 = x_f32.to_dtype(crate::DType::BF16)?;
+        let y_bf16 = hadamard_fwht(&x_bf16, Some(&signs), b, false)?;
+        let rec_bf16 = hadamard_fwht(&y_bf16, Some(&signs), b, true)?;
+        let x_bf16_v = x_bf16
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rec_v = rec_bf16
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for i in 0..x_bf16_v.len() {
+            let diff = (x_bf16_v[i] - rec_v[i]).abs();
+            assert!(
+                diff < 3e-2,
+                "fwht 4096 roundtrip bf16 mismatch at {i}: {} vs {}",
+                x_bf16_v[i],
+                rec_v[i]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_pq2_ptq1_mmq_gemm_matches_reference() -> Result<()> {
+        use crate::backend::BackendStorage;
+        let dev = CudaDevice::new(0)?;
+        let cuda_dev = crate::Device::Cuda(dev.clone());
+
+        let shapes_and_ms: &[(usize, usize, &[usize])] = &[
+            (256, 256, &[9, 16, 64]),
+            // nrows = 192 tests need_check = true (not divisible by mmq_y = 128)
+            (192, 512, &[9, 16, 64, 512]),
+            (256, 5120, &[9, 21, 64]),
+            // 27B FFN projection dimensions (> 64M weights)
+            (17408, 5120, &[16, 64]),
+            (5120, 17408, &[16, 64]),
+        ];
+
+        for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0] {
+            for &(n, k, ms) in shapes_and_ms {
+                let nbytes = (n * k / dtype.block_size()) * dtype.type_size();
+                // Deterministic pseudo-random block bytes; keep valid f16 scales (msb exponents near 1.0).
+                let mut bytes: Vec<u8> = (0..nbytes)
+                    .map(|i| (i.wrapping_mul(131).wrapping_add(17) & 0xFF) as u8)
+                    .collect();
+                let blk_bytes = dtype.type_size();
+                let d_off = if dtype == GgmlDType::PQ2_0 { 0 } else { 26 };
+                let scale_bits = f16::from_f32(0.0625).to_bits().to_le_bytes();
+                for b in 0..(n * k / dtype.block_size()) {
+                    let off = b * blk_bytes + d_off;
+                    bytes[off] = scale_bits[0];
+                    bytes[off + 1] = scale_bits[1];
+                }
+
+                let qcuda =
+                    match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)? {
+                        QStorage::Cuda(s) => s,
+                        _ => unreachable!(),
+                    };
+                let self_shape: crate::Shape = (n, k).into();
+                // GPU dequantized f32 reference weight matrix [k, n] stored as [n, k] transposed
+                let w_f32 = qcuda.dequantize(n * k)?;
+                let rhs_ref_l =
+                    crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((1, k, n))?;
+
+                for &m in ms {
+                    let inp: Vec<f32> = (0..m * k)
+                        .map(|i| ((i.wrapping_mul(29).wrapping_add(3)) % 47) as f32 * 0.04 - 0.9)
+                        .collect();
+                    let inp_f32 = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+                    let inp_l = crate::Layout::contiguous((m, k));
+
+                    // Reference in F32 using GPU dense matmul over CPU-exact dequantized weights
+                    let ref_s = inp_f32.matmul(
+                        &w_f32,
+                        (1, m, n, k),
+                        &crate::Layout::contiguous((1, m, k)),
+                        &rhs_ref_l,
+                    )?;
+                    let ref_v = dev.clone_dtoh(&ref_s.as_cuda_slice::<f32>()?.as_view())?;
+
+                    // Test F32, BF16 (only smaller shapes to keep test runtime fast), and F16
+                    let test_dtypes: &[crate::DType] = if n <= 512 && k <= 1024 && m == 16 {
+                        &[crate::DType::F32, crate::DType::BF16, crate::DType::F16]
+                    } else {
+                        &[crate::DType::F32]
+                    };
+
+                    for &in_dt in test_dtypes {
+                        let (in_st, dt_tol) = if in_dt == crate::DType::F32 {
+                            (inp_f32.try_clone(&inp_l)?, 0.03f32)
+                        } else {
+                            (inp_f32.to_dtype(&inp_l, in_dt)?, 0.05f32)
+                        };
+
+                        // Verify fast_mmq::try_fwd explicitly triggers (returns Some) AND matches reference.
+                        let (mmq_out, mmq_shape) = crate::quantized::fast_mmq::try_fwd(
+                            &qcuda,
+                            &self_shape,
+                            &in_st,
+                            &inp_l,
+                        )?
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{dtype:?} fast_mmq::try_fwd returned None for m={m}, n={n}, k={k}"
+                            )
+                        });
+                        assert_eq!(mmq_shape.dims().to_vec(), vec![m, n]);
+                        let mmq_f32 = if in_dt == crate::DType::F32 {
+                            mmq_out
+                        } else {
+                            mmq_out.to_dtype(
+                                &crate::Layout::contiguous(&mmq_shape),
+                                crate::DType::F32,
+                            )?
+                        };
+                        let got = dev.clone_dtoh(&mmq_f32.as_cuda_slice::<f32>()?.as_view())?;
+
+                        // Also verify qcuda.fwd takes the MMQ path when m > 8.
+                        let (fwd_out, _) = qcuda.fwd(&self_shape, &in_st, &inp_l)?;
+                        let fwd_f32 = if in_dt == crate::DType::F32 {
+                            fwd_out
+                        } else {
+                            fwd_out.to_dtype(
+                                &crate::Layout::contiguous(&mmq_shape),
+                                crate::DType::F32,
+                            )?
+                        };
+                        let got_fwd = dev.clone_dtoh(&fwd_f32.as_cuda_slice::<f32>()?.as_view())?;
+
+                        let mut max_abs = 0f32;
+                        let mut max_err = 0f32;
+                        let mut max_fwd_diff = 0f32;
+                        for idx in 0..m * n {
+                            max_abs = max_abs.max(ref_v[idx].abs());
+                            max_err = max_err.max((got[idx] - ref_v[idx]).abs());
+                            max_fwd_diff = max_fwd_diff.max((got[idx] - got_fwd[idx]).abs());
+                        }
+                        let tol = dt_tol * max_abs + 2e-2;
+                        assert!(
+                            max_err <= tol,
+                            "{dtype:?} MMQ {in_dt:?} m={m} n={n} k={k}: max_err={max_err} > tol={tol} (max_abs={max_abs})"
+                        );
+                        assert!(
+                            max_fwd_diff <= 1e-5,
+                            "{dtype:?} qcuda.fwd diverged from fast_mmq::try_fwd: {max_fwd_diff}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_pq2_ptq1_mmq_moe_matches_reference() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let cuda_dev = crate::Device::Cuda(dev.clone());
+        let (experts, n, k, batch, topk) = (4usize, 192usize, 512usize, 16usize, 2usize);
+
+        for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0] {
+            let blk_bytes = dtype.type_size();
+            let total_blks = experts * n * k / dtype.block_size();
+            let mut bytes: Vec<u8> = (0..total_blks * blk_bytes)
+                .map(|i| (i.wrapping_mul(89).wrapping_add(11) & 0xFF) as u8)
+                .collect();
+            let d_off = if dtype == GgmlDType::PQ2_0 { 0 } else { 26 };
+            let scale_bits = f16::from_f32(0.05).to_bits().to_le_bytes();
+            for b in 0..total_blks {
+                let off = b * blk_bytes + d_off;
+                bytes[off] = scale_bits[0];
+                bytes[off + 1] = scale_bits[1];
+            }
+
+            let qcuda = match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)?
+            {
+                QStorage::Cuda(s) => s,
+                _ => unreachable!(),
+            };
+            let w_shape: crate::Shape = (experts, n, k).into();
+            let inp: Vec<f32> = (0..batch * k)
+                .map(|i| ((i * 17 + 9) % 41) as f32 * 0.04 - 0.8)
+                .collect();
+            let inp_slice = dev.clone_htod(&inp)?;
+            let in_shape: crate::Shape = (batch, 1usize, k).into();
+            let ids: Vec<u32> = (0..batch * topk)
+                .map(|i| ((i * 3 + 1) % experts) as u32)
+                .collect();
+            let ids_slice = dev.clone_htod(&ids)?;
+            let idx_shape: crate::Shape = (batch, topk).into();
+
+            let (out, out_shape) = qcuda
+                .moe_iquant_qmmq(
+                    &w_shape,
+                    &inp_slice,
+                    &in_shape,
+                    &ids_slice.as_view(),
+                    &idx_shape,
+                )?
+                .expect("PQ2_0/PTQ1_0 moe_iquant_qmmq returned None");
+            assert_eq!(out_shape.dims().to_vec(), vec![batch, topk, n]);
+            let got = dev.clone_dtoh(&out.as_cuda_slice::<f32>()?.as_view())?;
+
+            // Oracle via dequantize
+            let w_f32_s = qcuda.dequantize(experts * n * k)?;
+            let w_f32 = dev.clone_dtoh(&w_f32_s.as_cuda_slice::<f32>()?.as_view())?;
+            let mut max_abs = 0f32;
+            let mut max_err = 0f32;
+            for b_idx in 0..batch {
+                for slot in 0..topk {
+                    let e = ids[b_idx * topk + slot] as usize;
+                    for j in 0..n {
+                        let mut acc = 0f32;
+                        for i in 0..k {
+                            acc += w_f32[(e * n + j) * k + i] * inp[b_idx * k + i];
+                        }
+                        let g = got[(b_idx * topk + slot) * n + j];
+                        max_abs = max_abs.max(acc.abs());
+                        max_err = max_err.max((g - acc).abs());
+                    }
+                }
+            }
+            let tol = 0.03 * max_abs + 2e-2;
+            assert!(
+                max_err <= tol,
+                "{dtype:?} MoE MMQ max_err={max_err} > tol={tol}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_pq2_ptq1_mmq_crossover() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let cuda_dev = crate::Device::Cuda(dev.clone());
+        for (n, k) in [
+            (5120usize, 5120usize),
+            (17408usize, 5120usize),
+            (5120usize, 17408usize),
+        ] {
+            for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0] {
+                let nbytes = (n * k / dtype.block_size()) * dtype.type_size();
+                let bytes = vec![0x55u8; nbytes];
+                let qcuda =
+                    match QStorage::from_data(std::borrow::Cow::Owned(bytes), &cuda_dev, dtype)? {
+                        QStorage::Cuda(s) => s,
+                        _ => unreachable!(),
+                    };
+                let self_shape: crate::Shape = (n, k).into();
+                for m in [2usize, 4, 8, 9, 16, 21, 64, 512] {
+                    let inp = vec![0.1f32; m * k];
+                    let in_st = CudaStorage::wrap_cuda_slice(dev.clone_htod(&inp)?, dev.clone());
+                    let in_l = crate::Layout::contiguous((m, k));
+                    // warmup
+                    let _ = qcuda.mul_mat_vec_iquant(&self_shape, &in_st, &in_l)?;
+                    let _ =
+                        crate::quantized::fast_mmq::try_fwd(&qcuda, &self_shape, &in_st, &in_l)?;
+                    crate::backend::BackendDevice::synchronize(&dev)?;
+
+                    let iters = if m <= 21 { 20 } else { 10 };
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        let _ = qcuda.mul_mat_vec_iquant(&self_shape, &in_st, &in_l)?;
+                    }
+                    crate::backend::BackendDevice::synchronize(&dev)?;
+                    let dp4a_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+                    let t1 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        let _ = crate::quantized::fast_mmq::try_fwd(
+                            &qcuda,
+                            &self_shape,
+                            &in_st,
+                            &in_l,
+                        )?;
+                    }
+                    crate::backend::BackendDevice::synchronize(&dev)?;
+                    let mmq_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+                    eprintln!(
+                        "CROSSOVER {dtype:?} n={n} k={k} m={m}: dp4a={dp4a_us:.1}us mmq={mmq_us:.1}us ratio(dp4a/mmq)={:.2}x",
+                        dp4a_us / mmq_us
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mmq_max_vec_bm_profiles_by_compute_cap() {
+        // Only check defaults when env overrides are unset.
+        if std::env::var_os("HANZO_PQ2_MMQ_MAX_BM").is_none() {
+            assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 1210), 1);
+            assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 1000), 1);
+            assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 900), 8);
+            assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 890), 8);
+        }
+        if std::env::var_os("HANZO_PTQ1_MMQ_MAX_BM").is_none() {
+            assert_eq!(mmq_max_vec_bm(GgmlDType::PTQ1_0, 1210), 3);
+            assert_eq!(mmq_max_vec_bm(GgmlDType::PTQ1_0, 900), 8);
+        }
+        assert_eq!(mmq_max_vec_bm(GgmlDType::Q4_0, 1210), 8);
     }
 }

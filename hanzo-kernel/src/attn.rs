@@ -114,7 +114,7 @@ pub fn sdpa_run<R: Runtime>(
 /// combines those partials with the flash rescale (global max, exp-weighted l/acc). This is the decode
 /// occupancy cure for `sdpa` (which is one thread per (head,query) -> one thread streams the entire
 /// head serially). GQA-native (reads the shared KV head, no repeat_kv), single-pass, numerically the
-/// same online softmax as `sdpa`. `nt` = threads/workgroup (power of 2). GPU-only (cooperative block).
+/// same online softmax as `sdpa`. `nt` = threads/workgroup (a power of two, 32 or more). GPU-only (cooperative block).
 #[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
 pub fn sdpa_blk<F: Float>(
     q: &Array<F>,
@@ -182,46 +182,56 @@ pub fn sdpa_blk<F: Float>(
         }
         kk += nt;
     }
-    // Workgroup combine of the per-thread (m, l, acc[d]) partials, flash-style (tree reduce).
-    let mut sm = SharedMemory::<F>::new(nt);
-    let mut sl = SharedMemory::<F>::new(nt);
-    let mut sacc = SharedMemory::<F>::new(nt * d);
-    sm[t] = m;
-    sl[t] = l;
-    for dd in 0..d {
-        sacc[t * d + dd] = acc[dd];
-    }
+    // Workgroup combine of the per-thread (m, l, acc[d]) partials, flash-style.
+    //
+    // Shared memory is O(nt + 33*nt), never O(nt*d): staging every thread's whole accumulator took
+    // nt*d floats (32 KiB at d=128, nt=64), which with the two scalar arrays overran the 32 KiB
+    // workgroup limit some drivers report and returned garbage. Phase 1 tree-reduces the scalars to
+    // the global max `gm` and total weight `ltot`; phase 2 sums `acc * exp(m - gm) / ltot` across
+    // threads 32 columns at a time. Requires nt >= 32 (nt is a power of two). Rows are
+    // 33 wide so both the write (row = thread) and the read (column = thread) are bank-conflict free.
+    let mut rm = SharedMemory::<F>::new(nt);
+    let mut rl = SharedMemory::<F>::new(nt);
+    rm[t] = m;
+    rl[t] = l;
     sync_cube();
     let mut stride = CUBE_DIM / 2;
     while stride > 0 {
         if UNIT_POS < stride {
-            let mo = sm[(UNIT_POS + stride) as usize];
-            let lo = sl[(UNIT_POS + stride) as usize];
-            let mc = sm[t];
-            let lc = sl[t];
+            let mo = rm[(UNIT_POS + stride) as usize];
+            let lo = rl[(UNIT_POS + stride) as usize];
+            let mc = rm[t];
+            let lc = rl[t];
             let mut gm = mc;
             if mo > gm {
                 gm = mo;
             }
             let ca = (mc - gm).exp();
             let cb = (mo - gm).exp();
-            sm[t] = gm;
-            sl[t] = lc * ca + lo * cb;
-            let obase = ((UNIT_POS + stride) as usize) * d;
-            for dd in 0..d {
-                let a = sacc[t * d + dd];
-                let b = sacc[obase + dd];
-                sacc[t * d + dd] = a * ca + b * cb;
-            }
+            rm[t] = gm;
+            rl[t] = lc * ca + lo * cb;
         }
         sync_cube();
         stride /= 2;
     }
-    if t == 0 {
-        let ll = sl[0];
-        for dd in 0..d {
-            out[qbase + dd] = sacc[dd] / ll;
+    let w = (m - rm[0]).exp() / rl[0];
+    let mut sacc = SharedMemory::<F>::new(nt * 33);
+    for ch in 0..(d + 31) / 32 {
+        let base = ch * 32;
+        for j in 0..32usize {
+            if base + j < d {
+                sacc[t * 33 + j] = acc[base + j] * w;
+            }
         }
+        sync_cube();
+        if t < 32usize && base + t < d {
+            let mut sum = F::new(0.0f32);
+            for tt in 0..nt {
+                sum += sacc[tt * 33 + t];
+            }
+            out[qbase + base + t] = sum;
+        }
+        sync_cube();
     }
 }
 

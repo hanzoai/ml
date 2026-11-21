@@ -27,6 +27,9 @@
 // Ternary (base-3 / 2-bit) weight ids (match quant.hip's DW_* id space). Symmetric ternary {-1,0,1}.
 #define DW_TQ2_0   5
 #define DW_TQ1_0   19
+// Prism / Bonsai-2 128-element ternary formats: PQ2_0 ({-1,0,+1,+2}, 34B) and PTQ1_0 ({-1,0,+1} base-3, 28B).
+#define DW_PQ2_0   25
+#define DW_PTQ1_0  26
 
 // IQ1_S/IQ1_M signed-grid delta bias (iq_quants.rs:28); both 1-bit types share it.
 constexpr float IQ1S_DELTA = 0.125f;
@@ -453,17 +456,95 @@ template <> struct qdp4a<DW_TQ1_0> {
     }
 };
 
-// IQ dp4a byte strides (= on-disk super-block bytes; mirror qdw_traits::BYTES). All 256-elem.
-template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  };
-template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  };
-template <> struct qdp4a_traits<DW_IQ2_S>   { static constexpr int BYTES = 82;  };
-template <> struct qdp4a_traits<DW_IQ3_XXS> { static constexpr int BYTES = 98;  };
-template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; };
-template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  };
-template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  };
-template <> struct qdp4a_traits<DW_IQ4_XS>  { static constexpr int BYTES = 136; };
-template <> struct qdp4a_traits<DW_TQ2_0>   { static constexpr int BYTES = 66;  };
-template <> struct qdp4a_traits<DW_TQ1_0>   { static constexpr int BYTES = 54;  };
+// PQ2_0 (Prism / Bonsai-2 2-bit asymmetric ternary {-1, 0, +1, +2}, 128 elems, 34B: f16 d at +0, qs[32] at +2).
+template <> struct qdp4a<DW_PQ2_0> {
+    static constexpr int NSUB = 4;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const float d8 = __half2float(xd8[e]);
+        const uint8_t* b = blk + 2 + e * 8;
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint8_t byte = b[i];
+            const int w0 = (int)( byte       & 3) - 1;
+            const int w1 = (int)((byte >> 2) & 3) - 1;
+            const int w2 = (int)((byte >> 4) & 3) - 1;
+            const int w3 = (int)((byte >> 6) & 3) - 1;
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// PTQ1_0 base-3 unpack of ONE logical coord p in [0,128) -> ternary {-1, 0, +1}.
+// Block (28B): qs[24] at +0 (16B*5=80 + 8B*5=40), qh[2] at +24 (2B*4=8), f16 d at +26.
+__device__ __forceinline__ int ptq1_0_w(const uint8_t* __restrict__ qs, const uint8_t* __restrict__ qh, int p) {
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+    uint8_t b; int n;
+    if (p < 80)       { n = p >> 4;             b = qs[p & 15]; }
+    else if (p < 120) { const int p2 = p - 80;  n = p2 >> 3; b = qs[16 + (p2 & 7)]; }
+    else              { const int p3 = p - 120; n = p3 >> 1; b = qh[p3 & 1]; }
+    const uint16_t q = (uint16_t)(uint8_t)(b * pow3[n]);
+    return (int)((q * 3) >> 8) - 1;
+}
+
+template <> struct qdp4a<DW_PTQ1_0> {
+    static constexpr int NSUB = 4;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint8_t* qs = blk;
+        const uint8_t* qh = blk + 24;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const float d8 = __half2float(xd8[e]);
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        const int p0 = e * 32;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int w0 = ptq1_0_w(qs, qh, p0 + 4 * i + 0);
+            const int w1 = ptq1_0_w(qs, qh, p0 + 4 * i + 1);
+            const int w2 = ptq1_0_w(qs, qh, p0 + 4 * i + 2);
+            const int w3 = ptq1_0_w(qs, qh, p0 + 4 * i + 3);
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+// IQ dp4a byte strides & block sizes (= on-disk super-block bytes; mirror qdw_traits).
+template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ2_S>   { static constexpr int BYTES = 82;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ3_XXS> { static constexpr int BYTES = 98;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ3_S>   { static constexpr int BYTES = 110; static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_IQ4_XS>  { static constexpr int BYTES = 136; static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_TQ2_0>   { static constexpr int BYTES = 66;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_TQ1_0>   { static constexpr int BYTES = 54;  static constexpr int ELEMS = 256; };
+template <> struct qdp4a_traits<DW_PQ2_0>   { static constexpr int BYTES = 34;  static constexpr int ELEMS = 128; };
+template <> struct qdp4a_traits<DW_PTQ1_0>  { static constexpr int BYTES = 28;  static constexpr int ELEMS = 128; };
 
 // ---- activation -> q8 (separated int8 qs `xq` + per-32 f16 scale `xd`) ----
 extern "C" __global__ void iq_quantize_q8_f16(
@@ -578,20 +659,22 @@ extern "C" __global__ void iq_quantize_q8_f32(
 template <int WTYPE, typename XT>
 __device__ __forceinline__ void qmatvec_dp4a_core(
     const int nrows,
-    const int ncols,                  // multiple of 256
+    const int ncols,                  // multiple of WELEMS (256 or 128)
     const uint8_t* __restrict__ wq,
     const int8_t*  __restrict__ xq,   // [ncols] q8_1 int8 quants
     const __half*  __restrict__ xd,   // [ncols/32] q8_1 f16 scales
     XT* __restrict__ y
 ) {
     constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
+    constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
+    constexpr int WSUB32 = WELEMS / 32;
     const int lane = threadIdx.x & 31;
     const int rows_per_block = blockDim.x >> 5;
     const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
     if (row >= nrows) {
         return;
     }
-    const int nblocks = ncols >> 8; // ncols / 256
+    const int nblocks = ncols / WELEMS;
     const uint8_t* row_ptr = wq + (size_t)row * (size_t)nblocks * WBYTES;
 
     // Stride lanes over (super-block x sub-unit) work items, NOT whole super-blocks -- the SAME fix the
@@ -606,7 +689,7 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
         const int b = u / NSUB;
         const int sub = u - b * NSUB;
         acc += qdp4a<WTYPE>::partial(
-            row_ptr + (size_t)b * WBYTES, xq + (size_t)b * 256, xd + (size_t)b * 8, sub);
+            row_ptr + (size_t)b * WBYTES, xq + (size_t)b * WELEMS, xd + (size_t)b * WSUB32, sub);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -620,7 +703,7 @@ __device__ __forceinline__ void qmatvec_dp4a_core(
 template <int WTYPE, typename XT>
 __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     const int n,                        // output rows per expert (weight rows)
-    const int ncols,                    // k, multiple of 256
+    const int ncols,                    // k, multiple of WELEMS (256 or 128)
     const int nslots,                   // routed slots (= nrows)
     const uint8_t* __restrict__ wbank,  // [E, n, k] blocks
     const int* __restrict__ ids,        // [nslots] expert id per slot
@@ -629,6 +712,8 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     XT* __restrict__ y                  // [nslots, n]
 ) {
     constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
+    constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
+    constexpr int WSUB32 = WELEMS / 32;
     const int s = blockIdx.y;
     if (s >= nslots) {
         return;
@@ -639,7 +724,7 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     if (row >= n) {
         return;
     }
-    const int nblocks = ncols >> 8; // ncols / 256
+    const int nblocks = ncols / WELEMS;
     const int expert = ids[s];
     const uint8_t* row_ptr = wbank + ((size_t)expert * n + row) * (size_t)nblocks * WBYTES;
     const int8_t* xq_row = xq + (size_t)s * ncols;
@@ -657,7 +742,7 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
         const int b = u / NSUB;
         const int sub = u - b * NSUB;
         acc += qdp4a<WTYPE>::partial(
-            row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * 256, xd_row + (size_t)b * 8, sub);
+            row_ptr + (size_t)b * WBYTES, xq_row + (size_t)b * WELEMS, xd_row + (size_t)b * WSUB32, sub);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -668,7 +753,178 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
     }
 }
 
-// ---- per-type extern "C" launchers (f16/bf16/f32 dst, dense + MoE) ----
+// ---- Batched dp4a matmul core (M > 1): unpacks each weight block once per M-tile ----
+template <int WTYPE, int BM>
+struct qdp4a_batch {
+    static __device__ __forceinline__ void accum(
+        const uint8_t* __restrict__ blk,
+        const int8_t*  __restrict__ xq_base,
+        const __half*  __restrict__ xd_base,
+        const int ncols,
+        const int nblk32,
+        const int b_elem_off,
+        const int b_sub_off,
+        const int sub,
+        const int m_cnt,
+        float (&acc)[BM]
+    ) {
+        for (int m = 0; m < m_cnt; ++m) {
+            acc[m] += qdp4a<WTYPE>::partial(
+                blk,
+                xq_base + (size_t)m * ncols + b_elem_off,
+                xd_base + (size_t)m * nblk32 + b_sub_off,
+                sub);
+        }
+    }
+};
+
+// Register-cached weight unpack for PQ2_0 across M activation rows.
+template <int BM>
+struct qdp4a_batch<DW_PQ2_0, BM> {
+    static __device__ __forceinline__ void accum(
+        const uint8_t* __restrict__ blk,
+        const int8_t*  __restrict__ xq_base,
+        const __half*  __restrict__ xd_base,
+        const int ncols,
+        const int nblk32,
+        const int b_elem_off,
+        const int b_sub_off,
+        const int e,
+        const int m_cnt,
+        float (&acc)[BM]
+    ) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const uint8_t* b = blk + 2 + e * 8;
+        int wp[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint8_t byte = b[i];
+            const int w0 = (int)( byte       & 3) - 1;
+            const int w1 = (int)((byte >> 2) & 3) - 1;
+            const int w2 = (int)((byte >> 4) & 3) - 1;
+            const int w3 = (int)((byte >> 6) & 3) - 1;
+            wp[i] = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+        }
+        for (int m = 0; m < m_cnt; ++m) {
+            const float d8 = __half2float(xd_base[(size_t)m * nblk32 + b_sub_off + e]);
+            const int* u = reinterpret_cast<const int*>(xq_base + (size_t)m * ncols + b_elem_off) + e * 8;
+            int idot = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                idot = hip_dp4a(wp[i], u[i], idot);
+            }
+            acc[m] += d * d8 * (float)idot;
+        }
+    }
+};
+
+// Register-cached base-3 weight unpack for PTQ1_0 across M activation rows.
+template <int BM>
+struct qdp4a_batch<DW_PTQ1_0, BM> {
+    static __device__ __forceinline__ void accum(
+        const uint8_t* __restrict__ blk,
+        const int8_t*  __restrict__ xq_base,
+        const __half*  __restrict__ xd_base,
+        const int ncols,
+        const int nblk32,
+        const int b_elem_off,
+        const int b_sub_off,
+        const int e,
+        const int m_cnt,
+        float (&acc)[BM]
+    ) {
+        const uint8_t* qs = blk;
+        const uint8_t* qh = blk + 24;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const int p0 = e * 32;
+        int wp[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int w0 = ptq1_0_w(qs, qh, p0 + 4 * i + 0);
+            const int w1 = ptq1_0_w(qs, qh, p0 + 4 * i + 1);
+            const int w2 = ptq1_0_w(qs, qh, p0 + 4 * i + 2);
+            const int w3 = ptq1_0_w(qs, qh, p0 + 4 * i + 3);
+            wp[i] = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+        }
+        for (int m = 0; m < m_cnt; ++m) {
+            const float d8 = __half2float(xd_base[(size_t)m * nblk32 + b_sub_off + e]);
+            const int* u = reinterpret_cast<const int*>(xq_base + (size_t)m * ncols + b_elem_off) + e * 8;
+            int idot = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                idot = hip_dp4a(wp[i], u[i], idot);
+            }
+            acc[m] += d * d8 * (float)idot;
+        }
+    }
+};
+
+template <int WTYPE, typename XT, int BM = 16>
+__device__ __forceinline__ void qmatmul_dp4a_core(
+    const int nrows,
+    const int ncols,                  // multiple of WELEMS (256 or 128)
+    const int b_size,                 // number of input rows M
+    const uint8_t* __restrict__ wq,
+    const int8_t*  __restrict__ xq,   // [b_size, ncols] q8_1 int8 quants
+    const __half*  __restrict__ xd,   // [b_size, ncols/32] q8_1 f16 scales
+    XT* __restrict__ y                // [b_size, nrows]
+) {
+    constexpr int WBYTES = qdp4a_traits<WTYPE>::BYTES;
+    constexpr int WELEMS = qdp4a_traits<WTYPE>::ELEMS;
+    constexpr int WSUB32 = WELEMS / 32;
+    const int lane = threadIdx.x & 31;
+    const int rows_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * rows_per_block + (threadIdx.x >> 5);
+    const int m0 = blockIdx.y * BM;
+    if (row >= nrows || m0 >= b_size) {
+        return;
+    }
+    const int m_cnt = min(BM, b_size - m0);
+    const int nblocks = ncols / WELEMS;
+    const int nblk32 = ncols >> 5;
+    const uint8_t* row_ptr = wq + (size_t)row * (size_t)nblocks * WBYTES;
+    const int8_t* xq_base = xq + (size_t)m0 * ncols;
+    const __half* xd_base = xd + (size_t)m0 * nblk32;
+
+    float acc[BM];
+    #pragma unroll
+    for (int m = 0; m < BM; ++m) {
+        acc[m] = 0.0f;
+    }
+
+    constexpr int NSUB = qdp4a<WTYPE>::NSUB;
+    const int nunits = nblocks * NSUB;
+    for (int u = lane; u < nunits; u += 32) {
+        const int b = u / NSUB;
+        const int sub = u - b * NSUB;
+        qdp4a_batch<WTYPE, BM>::accum(
+            row_ptr + (size_t)b * WBYTES,
+            xq_base,
+            xd_base,
+            ncols,
+            nblk32,
+            b * WELEMS,
+            b * WSUB32,
+            sub,
+            m_cnt,
+            acc);
+    }
+
+    for (int m = 0; m < m_cnt; ++m) {
+        float v = acc[m];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        }
+        if (lane == 0) {
+            qstore(&y[(size_t)(m0 + m) * nrows + row], v);
+        }
+    }
+}
+
+// ---- per-type extern "C" launchers (f16/bf16/f32 dst, dense + batched + MoE) ----
 #define DEFINE_QMATVEC_DP4A(NAME, WTYPE)                                                             \
     extern "C" __global__ void qmatvec_dp4a_##NAME##_f16(                                            \
         const int nrows, const int ncols, const uint8_t* __restrict__ wq,                            \
@@ -679,6 +935,21 @@ __device__ __forceinline__ void moe_qmatvec_dp4a_core(
         const int nrows, const int ncols, const uint8_t* __restrict__ wq,                            \
         const int8_t* __restrict__ xq, const __half* __restrict__ xd, __nv_bfloat16* __restrict__ y) {\
         qmatvec_dp4a_core<WTYPE, __nv_bfloat16>(nrows, ncols, wq, xq, xd, y);                          \
+    }                                                                                                \
+    extern "C" __global__ void qmatmul_dp4a_##NAME##_f16(                                            \
+        const int nrows, const int ncols, const int b_size, const uint8_t* __restrict__ wq,          \
+        const int8_t* __restrict__ xq, const __half* __restrict__ xd, __half* __restrict__ y) {      \
+        qmatmul_dp4a_core<WTYPE, __half>(nrows, ncols, b_size, wq, xq, xd, y);                        \
+    }                                                                                                \
+    extern "C" __global__ void qmatmul_dp4a_##NAME##_bf16(                                           \
+        const int nrows, const int ncols, const int b_size, const uint8_t* __restrict__ wq,          \
+        const int8_t* __restrict__ xq, const __half* __restrict__ xd, __nv_bfloat16* __restrict__ y) {\
+        qmatmul_dp4a_core<WTYPE, __nv_bfloat16>(nrows, ncols, b_size, wq, xq, xd, y);                  \
+    }                                                                                                \
+    extern "C" __global__ void qmatmul_dp4a_##NAME##_f32(                                            \
+        const int nrows, const int ncols, const int b_size, const uint8_t* __restrict__ wq,          \
+        const int8_t* __restrict__ xq, const __half* __restrict__ xd, float* __restrict__ y) {       \
+        qmatmul_dp4a_core<WTYPE, float>(nrows, ncols, b_size, wq, xq, xd, y);                         \
     }                                                                                                \
     extern "C" __global__ void moe_qmatvec_dp4a_##NAME##_f16(                                        \
         const int n, const int ncols, const int nslots, const uint8_t* __restrict__ wbank,           \
@@ -714,4 +985,285 @@ DEFINE_QMATVEC_DP4A(iq1_m,  DW_IQ1_M)
 DEFINE_QMATVEC_DP4A(iq4xs,  DW_IQ4_XS)
 DEFINE_QMATVEC_DP4A(tq2_0,  DW_TQ2_0)
 DEFINE_QMATVEC_DP4A(tq1_0,  DW_TQ1_0)
+DEFINE_QMATVEC_DP4A(pq2_0,  DW_PQ2_0)
+DEFINE_QMATVEC_DP4A(ptq1_0, DW_PTQ1_0)
+
+// ---- Native GPU dequantize + get_rows for PQ2_0 (34B, 128 elems) & PTQ1_0 (28B, 128 elems) ----
+template <typename DST_T>
+__device__ __forceinline__ void dequantize_pq2_0_impl(
+    const uint8_t* __restrict__ vx,
+    DST_T* __restrict__ y,
+    const int64_t nblocks
+) {
+    const int tid = threadIdx.x; // 0..127
+    if (tid >= 128) return;
+    for (int64_t ib = blockIdx.x; ib < nblocks; ib += gridDim.x) {
+        const uint8_t* blk = vx + (size_t)ib * 34;
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const uint8_t byte = blk[2 + (tid >> 2)];
+        const int q = (int)((byte >> ((tid & 3) * 2)) & 3) - 1;
+        qstore(&y[(size_t)ib * 128 + tid], (float)q * d);
+    }
+}
+
+template <typename DST_T>
+__device__ __forceinline__ void dequantize_ptq1_0_impl(
+    const uint8_t* __restrict__ vx,
+    DST_T* __restrict__ y,
+    const int64_t nblocks
+) {
+    const int tid = threadIdx.x; // 0..127
+    if (tid >= 128) return;
+    for (int64_t ib = blockIdx.x; ib < nblocks; ib += gridDim.x) {
+        const uint8_t* blk = vx + (size_t)ib * 28;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const int q = ptq1_0_w(blk, blk + 24, tid);
+        qstore(&y[(size_t)ib * 128 + tid], (float)q * d);
+    }
+}
+
+extern "C" __global__ void dequantize_block_pq2_0_f32(
+    const uint8_t* __restrict__ vx, float* __restrict__ y, const int64_t nblocks) {
+    dequantize_pq2_0_impl<float>(vx, y, nblocks);
+}
+
+extern "C" __global__ void dequantize_block_pq2_0_f16(
+    const uint8_t* __restrict__ vx, __half* __restrict__ y, const int64_t nblocks) {
+    dequantize_pq2_0_impl<__half>(vx, y, nblocks);
+}
+
+extern "C" __global__ void dequantize_block_ptq1_0_f32(
+    const uint8_t* __restrict__ vx, float* __restrict__ y, const int64_t nblocks) {
+    dequantize_ptq1_0_impl<float>(vx, y, nblocks);
+}
+
+extern "C" __global__ void dequantize_block_ptq1_0_f16(
+    const uint8_t* __restrict__ vx, __half* __restrict__ y, const int64_t nblocks) {
+    dequantize_ptq1_0_impl<__half>(vx, y, nblocks);
+}
+
+extern "C" __global__ void dequantize_block_pq2_0_bf16(
+    const uint8_t* __restrict__ vx, __nv_bfloat16* __restrict__ y, const int64_t nblocks) {
+    dequantize_pq2_0_impl<__nv_bfloat16>(vx, y, nblocks);
+}
+
+extern "C" __global__ void dequantize_block_ptq1_0_bf16(
+    const uint8_t* __restrict__ vx, __nv_bfloat16* __restrict__ y, const int64_t nblocks) {
+    dequantize_ptq1_0_impl<__nv_bfloat16>(vx, y, nblocks);
+}
+
+extern "C" __global__ void get_rows_pq2_0(
+    const uint8_t* __restrict__ src0,
+    const uint32_t* __restrict__ src1,
+    float* __restrict__ dst,
+    const int64_t ne00,
+    const size_t nb01
+) {
+    const int tid = threadIdx.x; // 0..127
+    if (tid >= 128) return;
+    const size_t i10 = (size_t)blockIdx.x;
+    const size_t i01 = (size_t)src1[i10];
+    const uint8_t* src_row = src0 + i01 * nb01;
+    float* dst_row = dst + i10 * (size_t)ne00;
+    const int64_t blocks_per_row = ne00 / 128;
+    for (int64_t ib = blockIdx.y; ib < blocks_per_row; ib += gridDim.y) {
+        const uint8_t* blk = src_row + (size_t)ib * 34;
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const uint8_t byte = blk[2 + (tid >> 2)];
+        const int q = (int)((byte >> ((tid & 3) * 2)) & 3) - 1;
+        dst_row[(size_t)ib * 128 + tid] = (float)q * d;
+    }
+}
+
+extern "C" __global__ void get_rows_ptq1_0(
+    const uint8_t* __restrict__ src0,
+    const uint32_t* __restrict__ src1,
+    float* __restrict__ dst,
+    const int64_t ne00,
+    const size_t nb01
+) {
+    const int tid = threadIdx.x; // 0..127
+    if (tid >= 128) return;
+    const size_t i10 = (size_t)blockIdx.x;
+    const size_t i01 = (size_t)src1[i10];
+    const uint8_t* src_row = src0 + i01 * nb01;
+    float* dst_row = dst + i10 * (size_t)ne00;
+    const int64_t blocks_per_row = ne00 / 128;
+    for (int64_t ib = blockIdx.y; ib < blocks_per_row; ib += gridDim.y) {
+        const uint8_t* blk = src_row + (size_t)ib * 28;
+        const uint16_t d_bits = (uint16_t)blk[26] | ((uint16_t)blk[27] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const int q = ptq1_0_w(blk, blk + 24, tid);
+        dst_row[(size_t)ib * 128 + tid] = (float)q * d;
+    }
+}
+
+// ---- Fused Fast Walsh-Hadamard Transform (FWHT) with optional sign vector ----
+// Forward (is_inverse == 0): y = ((x * signs).reshape(-1, B) @ H_B) * (1 / sqrt(B))
+// Inverse (is_inverse != 0): y = ((x.reshape(-1, B) @ H_B) * (1 / sqrt(B))) * signs
+// Supports power-of-2 block_size B in [1, 1024]. Launched with blockDim.x = B, gridDim.x = total_blocks.
+__device__ __forceinline__ float fwht_load_f32(const float* p, size_t idx) { return p[idx]; }
+__device__ __forceinline__ float fwht_load_f32(const __half* p, size_t idx) { return __half2float(p[idx]); }
+__device__ __forceinline__ float fwht_load_f32(const __nv_bfloat16* p, size_t idx) { return __bfloat162float(p[idx]); }
+
+template <typename T, int E>
+__device__ __forceinline__ void hadamard_fwht_core_e(
+    const T* __restrict__ x,
+    const float* __restrict__ signs, // [width] or nullptr when has_signs == 0
+    T* __restrict__ y,
+    const int block_size,
+    const int width,
+    const int has_signs,
+    const int is_inverse,
+    const int64_t total_blocks
+) {
+    extern __shared__ float smem[];
+    const int tid = threadIdx.x;
+    const int threads = block_size / E;
+    if (tid >= threads) return;
+    const float inv_sqrt_b = rsqrtf((float)block_size);
+    const int blocks_per_row = width / block_size;
+    const int lane_base = tid * E;
+
+    for (int64_t blk = blockIdx.x; blk < total_blocks; blk += gridDim.x) {
+        const size_t blk_base = (size_t)blk * (size_t)block_size;
+        const int row_col_base = (int)(blk % blocks_per_row) * block_size + lane_base;
+
+        float v[E];
+        #pragma unroll
+        for (int r = 0; r < E; ++r) {
+            float val = fwht_load_f32(x, blk_base + (size_t)(lane_base + r));
+            if (!is_inverse && has_signs) {
+                val *= signs[row_col_base + r];
+            }
+            v[r] = val;
+        }
+
+        // 1. In-register butterfly stages for stride < E (zero shuffles, zero barriers)
+        #pragma unroll
+        for (int stride = 1; stride < E; stride <<= 1) {
+            #pragma unroll
+            for (int base_r = 0; base_r < E; base_r += 2 * stride) {
+                #pragma unroll
+                for (int off = 0; off < stride; ++off) {
+                    const float a = v[base_r + off];
+                    const float b = v[base_r + off + stride];
+                    v[base_r + off] = a + b;
+                    v[base_r + off + stride] = a - b;
+                }
+            }
+        }
+
+        // 2. Intra-warp shuffle stages: global stride = E * lane_stride
+        const int warp_limit = (threads < 32) ? threads : 32;
+        for (int lane_stride = 1; lane_stride < warp_limit; lane_stride <<= 1) {
+            const int neg_bit = tid & lane_stride;
+            #pragma unroll
+            for (int r = 0; r < E; ++r) {
+                const float partner = __shfl_xor_sync(0xffffffffu, v[r], lane_stride);
+                v[r] = neg_bit ? (partner - v[r]) : (v[r] + partner);
+            }
+        }
+
+        // 3. Cross-warp shared memory stages (stride >= 32 * E)
+        if (threads > 32) {
+            #pragma unroll
+            for (int r = 0; r < E; ++r) {
+                smem[lane_base + r] = v[r];
+            }
+            __syncthreads();
+            for (int stride = 32 * E; stride < block_size; stride <<= 1) {
+                float nv[E];
+                #pragma unroll
+                for (int r = 0; r < E; ++r) {
+                    const int pos = lane_base + r;
+                    const float partner = smem[pos ^ stride];
+                    nv[r] = (pos & stride) ? (partner - v[r]) : (v[r] + partner);
+                }
+                __syncthreads();
+                #pragma unroll
+                for (int r = 0; r < E; ++r) {
+                    v[r] = nv[r];
+                    smem[lane_base + r] = v[r];
+                }
+                __syncthreads();
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < E; ++r) {
+            float val = v[r] * inv_sqrt_b;
+            if (is_inverse && has_signs) {
+                val *= signs[row_col_base + r];
+            }
+            qstore(&y[blk_base + (size_t)(lane_base + r)], val);
+        }
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void hadamard_fwht_core(
+    const T* __restrict__ x,
+    const float* __restrict__ signs,
+    T* __restrict__ y,
+    const int block_size,
+    const int width,
+    const int has_signs,
+    const int is_inverse,
+    const int64_t total_blocks
+) {
+    if (block_size <= 1024) {
+        hadamard_fwht_core_e<T, 1>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+    } else if (block_size == 2048) {
+        hadamard_fwht_core_e<T, 2>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+    } else if (block_size == 4096) {
+        hadamard_fwht_core_e<T, 4>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+    } else {
+        hadamard_fwht_core_e<T, 8>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+    }
+}
+
+extern "C" __global__ void hadamard_fwht_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ signs,
+    float* __restrict__ y,
+    const int block_size,
+    const int width,
+    const int has_signs,
+    const int is_inverse,
+    const int64_t total_blocks
+) {
+    hadamard_fwht_core<float>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+}
+
+extern "C" __global__ void hadamard_fwht_f16(
+    const __half* __restrict__ x,
+    const float* __restrict__ signs,
+    __half* __restrict__ y,
+    const int block_size,
+    const int width,
+    const int has_signs,
+    const int is_inverse,
+    const int64_t total_blocks
+) {
+    hadamard_fwht_core<__half>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+}
+
+extern "C" __global__ void hadamard_fwht_bf16(
+    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ signs,
+    __nv_bfloat16* __restrict__ y,
+    const int block_size,
+    const int width,
+    const int has_signs,
+    const int is_inverse,
+    const int64_t total_blocks
+) {
+    hadamard_fwht_core<__nv_bfloat16>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+}
+
+
 

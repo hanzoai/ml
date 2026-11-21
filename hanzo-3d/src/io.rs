@@ -1,9 +1,19 @@
 //! Serialization for the 3D representations — the glTF-adjacent formats a client consumes.
 //!
-//! Hand-rolled, std-only, ASCII: [`Mesh`] ⇄ OBJ and PLY, [`GaussianSplat`] ⇄ the standard
-//! 3D-Gaussian-Splatting PLY layout. Every writer has a matching reader, and the roundtrip is
-//! exact (the gate in `tests/`). Binary PLY and full glTF are deliberately out of the base crate —
-//! ASCII keeps the invariant "what we wrote, we read back bit-for-bit" trivially checkable.
+//! Reads and writes ASCII OBJ/PLY meshes and the Gaussian-splat PLY layout used by this crate.
+//! Mesh coordinates roundtrip exactly. Gaussian scales and opacity need a small floating-point
+//! tolerance because they are converted at the file boundary. Binary PLY and full glTF are not
+//! supported.
+//!
+//! [`Gaussian`] keeps scales in linear units and opacity in `[0, 1]`. PLY stores natural-log
+//! scales and logit opacity (`ln(p) - ln(1 - p)`); reading applies `exp` and sigmoid. For example,
+//! a scale of `2` is stored as about `0.6931472`, and opacity `0.5` is stored as `0`. A zero scale
+//! or opacity is stored as `-inf`; opacity `1` is stored as `inf`. These endpoints roundtrip
+//! without clamping. Negative scales or opacity outside `[0, 1]` can produce `NaN` on export.
+//!
+//! Before version 0.1.3, Hanzo wrote scale and opacity directly as linear values. Those files
+//! need an explicit conversion before this reader can interpret them correctly. The property
+//! names did not change, so the reader cannot reliably detect that older convention.
 
 use crate::geometry::{Quat, Vec3};
 use crate::representations::{Gaussian, GaussianSplat, Mesh};
@@ -157,13 +167,16 @@ pub fn ply_to_mesh(src: &str) -> Result<Mesh> {
 
 // ---- PLY (gaussian splat) -------------------------------------------------------------------
 
-/// The per-splat properties, in the order the standard 3DGS PLY writes them.
+/// The per-splat properties, in the order used by this module's PLY reader and writer.
 const SPLAT_PROPS: &[&str] = &[
     "x", "y", "z", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3", "f_dc_0",
     "f_dc_1", "f_dc_2", "opacity",
 ];
 
 /// Write a [`GaussianSplat`] as the standard 3D-Gaussian-Splatting ASCII PLY.
+///
+/// Scales are written in log-space and opacity as a logit. See the [module documentation](self)
+/// for endpoint behavior and compatibility with older Hanzo files.
 pub fn splat_to_ply(g: &GaussianSplat) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "ply");
@@ -181,9 +194,9 @@ pub fn splat_to_ply(g: &GaussianSplat) -> String {
             sp.position.x,
             sp.position.y,
             sp.position.z,
-            sp.scale.x,
-            sp.scale.y,
-            sp.scale.z,
+            sp.scale.x.ln(),
+            sp.scale.y.ln(),
+            sp.scale.z.ln(),
             sp.rotation.w,
             sp.rotation.x,
             sp.rotation.y,
@@ -191,13 +204,16 @@ pub fn splat_to_ply(g: &GaussianSplat) -> String {
             sp.color[0],
             sp.color[1],
             sp.color[2],
-            sp.opacity,
+            sp.opacity.ln() - (-sp.opacity).ln_1p(),
         );
     }
     s
 }
 
 /// Parse a 3DGS ASCII PLY into a [`GaussianSplat`] (the layout [`splat_to_ply`] emits).
+///
+/// Converts log-space scales and logit opacity back to linear values. Properties must appear
+/// in the writer's order; this is not a general-purpose PLY parser.
 pub fn ply_to_splat(src: &str) -> Result<GaussianSplat> {
     let (header, body) = split_ply_header(src)?;
     let n = header.count("vertex")?;
@@ -217,13 +233,24 @@ pub fn ply_to_splat(src: &str) -> Result<GaussianSplat> {
         }
         out.splats.push(Gaussian {
             position: Vec3::new(f[0], f[1], f[2]),
-            scale: Vec3::new(f[3], f[4], f[5]),
+            scale: Vec3::new(f[3].exp(), f[4].exp(), f[5].exp()),
             rotation: Quat::new(f[6], f[7], f[8], f[9]),
             color: [f[10], f[11], f[12]],
-            opacity: f[13],
+            opacity: sigmoid(f[13]),
         });
     }
     Ok(out)
+}
+
+fn sigmoid(logit: f32) -> f32 {
+    // Use a non-positive exponent in either branch. exp(-logit) alone would
+    // overflow for a very negative logit, losing a representable tiny opacity.
+    if logit >= 0.0 {
+        1.0 / (1.0 + (-logit).exp())
+    } else {
+        let exp = logit.exp();
+        exp / (1.0 + exp)
+    }
 }
 
 // ---- shared parsing helpers -----------------------------------------------------------------

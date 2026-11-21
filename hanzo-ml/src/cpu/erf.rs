@@ -1,4 +1,4 @@
-#![allow(clippy::excessive_precision)]
+#![allow(clippy::excessive_precision, deprecated)]
 // Code taken from https://github.com/statrs-dev/statrs
 //! Provides the [error](https://en.wikipedia.org/wiki/Error_function) and
 //! related functions
@@ -23,7 +23,6 @@ mod evaluate {
         }
     }
 }
-use std::f64;
 
 /// `erf` calculates the error function at `x`.
 pub fn erf_f64(x: f64) -> f64 {

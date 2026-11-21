@@ -1,5 +1,5 @@
-//! The correctness gate: every writer's output parses back to the exact value, and the camera
-//! projection is an exact inverse. If these pass, the crate is a faithful serialization foundation.
+//! Mesh roundtrips preserve exact values; splat scale/opacity conversions and the camera inverse
+//! are checked with floating-point tolerances. Separate PLY fixtures check the file encoding.
 
 use hanzo_3d::geometry::{Camera, Quat, Vec3};
 use hanzo_3d::io::{
@@ -35,7 +35,7 @@ fn mesh_ply_roundtrip_is_exact() {
 }
 
 #[test]
-fn gaussian_splat_ply_roundtrip_is_exact() {
+fn gaussian_splat_ply_roundtrip_preserves_linear_values() {
     let g = GaussianSplat {
         splats: vec![
             Gaussian {
@@ -60,9 +60,16 @@ fn gaussian_splat_ply_roundtrip_is_exact() {
         ],
     };
     let back = ply_to_splat(&splat_to_ply(&g)).expect("parse splat PLY");
-    assert_eq!(back, g, "splat PLY roundtrip differs");
+    assert_eq!(back.len(), g.len());
+    for (actual, expected) in back.splats.iter().zip(&g.splats) {
+        assert_eq!(actual.position, expected.position);
+        assert_eq!(actual.rotation, expected.rotation);
+        assert_eq!(actual.color, expected.color);
+        assert!((actual.scale - expected.scale).length() < 1e-6);
+        assert!((actual.opacity - expected.opacity).abs() < 1e-6);
+    }
     println!(
-        "[hanzo-3d] 3DGS PLY roundtrip: {} splats bit-match",
+        "[hanzo-3d] 3DGS PLY roundtrip: {} splats preserve linear scale and opacity",
         back.len()
     );
 }

@@ -45,7 +45,7 @@ fn bench_shape(
     m: usize,
 ) -> hanzo_ml::Result<()> {
     let raw = synth(dtype, nout, k);
-    let bytes = raw.len();
+    let _bytes = raw.len();
     let qs = QStorage::from_data(Cow::Owned(raw), dev, dtype)?;
     let q = QTensor::new(qs, (nout, k))?;
     let matmul = QMatMul::from_qtensor(q)?;

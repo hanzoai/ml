@@ -21,6 +21,32 @@ use hanzo_kernel::quant::{
 };
 use std::time::Instant;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Count of checks that printed MISMATCH; `main` exits nonzero when any did, so CI cannot pass a
+/// gate that printed a failure.
+static FAILS: AtomicUsize = AtomicUsize::new(0);
+
+fn mark(ok: bool, pass: &'static str, fail: &'static str) -> &'static str {
+    if ok {
+        pass
+    } else {
+        FAILS.fetch_add(1, Ordering::Relaxed);
+        fail
+    }
+}
+
+/// The device limits a kernel's schedule has to fit: the workgroup shared-memory ceiling and plane
+/// width differ per driver (RADV reports 64 KiB, the Windows AMD driver 32 KiB), and a schedule that
+/// overruns them fails silently with wrong output.
+fn limits<R: Runtime>(name: &str, client: &ComputeClient<R>) {
+    let hw = &client.properties().hardware;
+    println!(
+        "[{name:<7}] limits: shared_memory={} B  plane={}..{}  max_units_per_cube={}",
+        hw.max_shared_memory_size, hw.plane_size_min, hw.plane_size_max, hw.max_units_per_cube
+    );
+}
+
 // dp4a matvec parity: i8-packed one-thread-per-row (portable) vs block-per-row (coalesced reads +
 // shared-mem reduction, the bandwidth-bound winner). GB/s is on REAL int8 bytes (rows*k) so it
 // compares fairly to the hand-tuned dp4a (~166 GB/s; gfx1151 DRAM roofline ~256, MALL cache ~32MB).
@@ -58,11 +84,7 @@ fn check_dp4a<R: Runtime>(
             rows,
             k,
             rel,
-            if rel < 2e-2 {
-                "MATCH ✓"
-            } else {
-                "MISMATCH ✗"
-            },
+            mark(rel < 2e-2, "MATCH ✓", "MISMATCH ✗"),
             ms,
             real_bytes / (ms * 1e6),
             flop / (ms * 1e6)
@@ -117,7 +139,7 @@ fn check_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: 
         rows,
         k,
         rel,
-        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" },
+        mark(ok, "BIT-EXACT ✓", "MISMATCH ✗"),
         ms,
         gbps,
         gflops
@@ -153,7 +175,7 @@ fn check_moe_q4k<R: Runtime>(
         n,
         k,
         rel,
-        if ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" },
+        mark(ok, "BIT-EXACT ✓", "MISMATCH ✗"),
         ms,
         gbps,
         gflops
@@ -217,7 +239,7 @@ fn check_matvec_q4k_dp4a_blk<R: Runtime>(
         k,
         nt,
         srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        mark(ok, "MATCH ✓", "MISMATCH ✗"),
         ms,
         gbps
     );
@@ -245,7 +267,7 @@ fn check_moe_q4k_blk<R: Runtime>(
     println!(
         "[{:<7}] MoEQ4Kb E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbps, gflops
     );
 }
 
@@ -313,7 +335,7 @@ fn check_moe_q4k_dp4a_blk<R: Runtime>(
     println!(
         "[{:<7}] MoEdp4a E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbps, gflops
     );
 }
 
@@ -344,7 +366,7 @@ fn check_moe_q6k<R: Runtime>(
         n,
         k,
         srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        mark(ok, "MATCH ✓", "MISMATCH ✗"),
         ms,
         gbps,
         gflops
@@ -412,7 +434,7 @@ fn check_moe_q6k_dp4a_blk<R: Runtime>(
     println!(
         "[{:<7}] MoEq6dp4a E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbps, gflops
     );
 }
 
@@ -438,7 +460,7 @@ fn check_moe_q6k_blk<R: Runtime>(
     println!(
         "[{:<7}] MoEQ6Kb E{} {}x{}x{} nt={:<3} scale_rel={:.2e}  {}  {:.3} ms  {:.0} GB/s  {:.0} GFLOP/s",
         name, e, slots, n, k, nt, srel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbps, gflops
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbps, gflops
     );
 }
 
@@ -516,7 +538,7 @@ fn check_moe_route<R: Runtime>(
         wrel,
         ties,
         ntok,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        mark(ok, "MATCH ✓", "MISMATCH ✗"),
         ms
     );
 }
@@ -622,7 +644,7 @@ fn check_sdpa_blk<R: Runtime>(
     println!(
         "[{:<7}] SDPAblk h{}kv{} q{} k{} d{} nt={:<3} scale_rel={:.2e} (max_rel={:.1e})  {}  {:.4} ms  {:.0} GB/s",
         name, n_heads, n_kv, seq_q, seq_k, d, nt, srel, mrel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" }, ms, gbs
+        mark(ok, "MATCH ✓", "MISMATCH ✗"), ms, gbs
     );
 }
 
@@ -683,7 +705,7 @@ fn check_gemv<R: Runtime>(name: &str, client: &ComputeClient<R>, n: usize, k: us
         k,
         nt,
         rel,
-        if ok { "MATCH ✓" } else { "MISMATCH ✗" },
+        mark(ok, "MATCH ✓", "MISMATCH ✗"),
         ms,
         gbs
     );
@@ -707,11 +729,7 @@ fn check_mmq_q4k<R: Runtime>(name: &str, client: &ComputeClient<R>, m: usize, n:
         n,
         k,
         rel,
-        if rel < 1e-2 {
-            "COOPMAT ✓"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(rel < 1e-2, "COOPMAT ✓", "MISMATCH ✗"),
         ms,
         gflops
     );
@@ -741,11 +759,7 @@ fn check_mmq_q4k_rt<R: Runtime>(
         n,
         k,
         rel,
-        if rel < 1e-2 {
-            "COOPMAT ✓"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(rel < 1e-2, "COOPMAT ✓", "MISMATCH ✗"),
         ms,
         gflops
     );
@@ -802,11 +816,7 @@ fn check_mmq_q4k_id<R: Runtime>(
         n,
         k,
         rel,
-        if rel < 1e-2 {
-            "COOPMAT ✓"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(rel < 1e-2, "COOPMAT ✓", "MISMATCH ✗"),
         ms,
         gflops
     );
@@ -874,11 +884,7 @@ fn check_q8_0_packed<R: Runtime>(
         k,
         nt,
         rel,
-        if rel < 3e-3 {
-            "BIT-EXACT ✓"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(rel < 3e-3, "BIT-EXACT ✓", "MISMATCH ✗"),
         ms,
         gbps,
         gflops
@@ -907,11 +913,7 @@ fn check_q8_0_packed_sg<R: Runtime>(
         k,
         nt,
         rel,
-        if rel < 3e-3 {
-            "BIT-EXACT ✓"
-        } else {
-            "MISMATCH ✗ (plane!=nt?)"
-        },
+        mark(rel < 3e-3, "BIT-EXACT ✓", "MISMATCH ✗ (plane!=nt?)"),
         ms,
         gbps
     );
@@ -942,11 +944,7 @@ fn check<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, k: usiz
         rows,
         k,
         rel,
-        if ok {
-            "MATCH ✓ (f32-reorder tol)"
-        } else {
-            "MISMATCH ✗"
-        },
+        mark(ok, "MATCH ✓ (f32-reorder tol)", "MISMATCH ✗"),
         ms,
         gbps
     );
@@ -990,15 +988,20 @@ fn check_rms<R: Runtime>(name: &str, client: &ComputeClient<R>, rows: usize, n: 
         rows,
         n,
         rel,
-        if rel < 3e-3 {
-            "MATCH ✓"
-        } else {
-            "MISMATCH ✗"
-        }
+        mark(rel < 3e-3, "MATCH ✓", "MISMATCH ✗")
     );
 }
 
 fn main() {
+    run();
+    let fails = FAILS.load(Ordering::Relaxed);
+    if fails > 0 {
+        eprintln!("matvec-check: {fails} check(s) MISMATCH");
+        std::process::exit(1);
+    }
+}
+
+fn run() {
     let (rows, k) = (4096usize, 4096usize);
     let ctrl = 256usize; // small-K control: reorder noise ~ ctrl*eps, should be ~1e-6
 
@@ -1230,6 +1233,7 @@ fn main() {
     {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
         let c = WgpuRuntime::client(&WgpuDevice::default());
+        limits::<WgpuRuntime>("VULKAN", &c);
         check::<WgpuRuntime>("VULKAN", &c, rows, k);
         check::<WgpuRuntime>("VK/ctrl", &c, rows, ctrl);
         check_q4k::<WgpuRuntime>("VULKAN", &c, rows, k);
@@ -1299,6 +1303,7 @@ fn main() {
     {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
         let c = WgpuRuntime::client(&WgpuDevice::default());
+        limits::<WgpuRuntime>("METAL", &c);
         check::<WgpuRuntime>("METAL", &c, rows, k);
         check_q4k::<WgpuRuntime>("METAL", &c, rows, k);
         // Full Qwen3 decode board on cubecl-Metal: same shapes the Vulkan branch gates on, so the DSL's
@@ -1316,9 +1321,12 @@ fn main() {
         // Fused top-k router (128 experts, top-8): decode batch + prefill batch.
         check_moe_route::<WgpuRuntime>("METAL", &c, 8, 128, 8, 128);
         check_moe_route::<WgpuRuntime>("METAL", &c, 512, 128, 8, 128);
-        // NB: check_sdpa_blk is omitted here -- cubecl 0.10 errors in its Metal client.profile
-        // timing path for sdpa_blk (execution error during profiling); the kernel itself is bit-exact
-        // (see flash-metal-check for the device-timestamped attention A/B). Tracked as a next-step.
+        // Decode attention at the engine's shape (d=128). Metal's workgroup shared memory is 32 KiB, so
+        // this also guards the kernel's shared-memory footprint (see `limits` above).
+        check_sdpa_blk::<WgpuRuntime>("METAL", &c, 32, 8, 1, 2048, 2048, 128, false, 32);
+        check_sdpa_blk::<WgpuRuntime>("METAL", &c, 32, 8, 1, 2048, 2048, 128, false, 64);
+        check_sdpa_blk::<WgpuRuntime>("METAL", &c, 32, 8, 1, 2048, 4096, 128, false, 64);
+        check_sdpa_blk::<WgpuRuntime>("METAL", &c, 32, 8, 128, 128, 128, 128, true, 64);
         // NB: check_matvec_q4k_dp4a_blk (DENSE int8 dp4a matvec) is omitted -- it panics in wgpu
         // (worker-thread abort -> zero output, scale_rel 1.0) on cubecl 0.10 Metal, though the MoE dp4a
         // twin below dispatches fine. Root-cause is a next-step; the f32-direct + naive Q4_K paths cover
@@ -1334,10 +1342,16 @@ fn main() {
     {
         use cubecl::cuda::{CudaDevice, CudaRuntime};
         let c = CudaRuntime::client(&CudaDevice::default());
+        limits::<CudaRuntime>("CUDA", &c);
         check::<CudaRuntime>("CUDA", &c, rows, k);
         check_q4k::<CudaRuntime>("CUDA", &c, rows, k);
         check_dp4a::<CudaRuntime>("CUDA", &c, rows, k, true);
         check_rms::<CudaRuntime>("CUDA", &c, rows, k);
+        // Decode attention at the engine's shape (d=128): nt=32 and nt=64, packed, strided KV and causal prefill.
+        check_sdpa_blk::<CudaRuntime>("CUDA", &c, 32, 8, 1, 2048, 2048, 128, false, 32);
+        check_sdpa_blk::<CudaRuntime>("CUDA", &c, 32, 8, 1, 2048, 2048, 128, false, 64);
+        check_sdpa_blk::<CudaRuntime>("CUDA", &c, 32, 8, 1, 2048, 4096, 128, false, 64);
+        check_sdpa_blk::<CudaRuntime>("CUDA", &c, 32, 8, 128, 128, 128, 128, true, 64);
     }
     #[cfg(feature = "rocm")]
     {

@@ -554,6 +554,9 @@ pub enum RocmQuantType {
     // the scale (decode + MoE-decode only).
     ROCMFP4,
     ROCMFP4_FAST,
+    // Prism / Bonsai-2 128-elem ternary: 2-bit asymmetric {-1,0,+1,+2} (PQ2_0) + base-3 {-1,0,+1} (PTQ1_0).
+    PQ2_0,
+    PTQ1_0,
 }
 
 impl RocmQuantType {
@@ -587,6 +590,8 @@ impl RocmQuantType {
             G::MXFP4 => Self::MXFP4,
             G::ROCMFP4 => Self::ROCMFP4,
             G::ROCMFP4_FAST => Self::ROCMFP4_FAST,
+            G::PQ2_0 => Self::PQ2_0,
+            G::PTQ1_0 => Self::PTQ1_0,
             _ => return None,
         })
     }
@@ -604,6 +609,7 @@ impl RocmQuantType {
             | Self::MXFP4
             | Self::ROCMFP4
             | Self::ROCMFP4_FAST => 32,
+            Self::PQ2_0 | Self::PTQ1_0 => 128,
             Self::Q4K
             | Self::Q6K
             | Self::IQ4_XS
@@ -651,6 +657,8 @@ impl RocmQuantType {
             Self::MXFP4 => 17,
             Self::ROCMFP4 => 18,
             Self::ROCMFP4_FAST => 17,
+            Self::PQ2_0 => 34,
+            Self::PTQ1_0 => 28,
         }
     }
 
@@ -730,7 +738,11 @@ impl RocmQuantType {
             | Self::TQ1_0
             | Self::IQ1_S
             | Self::IQ1_M
-            | Self::MXFP4 => {
+            | Self::MXFP4
+            | Self::ROCMFP4
+            | Self::ROCMFP4_FAST
+            | Self::PQ2_0
+            | Self::PTQ1_0 => {
                 unreachable!("prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
             }
         }
@@ -790,7 +802,11 @@ impl RocmQuantType {
                 | Self::TQ1_0
                 | Self::IQ1_S
                 | Self::IQ1_M
-                | Self::MXFP4,
+                | Self::MXFP4
+                | Self::ROCMFP4
+                | Self::ROCMFP4_FAST
+                | Self::PQ2_0
+                | Self::PTQ1_0,
                 _,
             ) => {
                 unreachable!("moe_prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
@@ -843,6 +859,8 @@ impl RocmQuantType {
             Self::MXFP4 => "mxfp4",
             Self::ROCMFP4 => "rocmfp4",
             Self::ROCMFP4_FAST => "rocmfp4_fast",
+            Self::PQ2_0 => "pq2_0",
+            Self::PTQ1_0 => "ptq1_0",
         }
     }
 
@@ -882,6 +900,8 @@ impl RocmQuantType {
                 | Self::IQ3_S
                 | Self::IQ1_S
                 | Self::IQ1_M
+                | Self::PQ2_0
+                | Self::PTQ1_0
         )
     }
 
@@ -935,6 +955,12 @@ impl RocmQuantType {
             (Self::IQ1_M, Act::F16) => "qmatvec_dp4a_iq1_m_f16",
             (Self::IQ1_M, Act::Bf16) => "qmatvec_dp4a_iq1_m_bf16",
             (Self::IQ1_M, Act::F32) => "qmatvec_dp4a_iq1_m_f32",
+            (Self::PQ2_0, Act::F16) => "qmatvec_dp4a_pq2_0_f16",
+            (Self::PQ2_0, Act::Bf16) => "qmatvec_dp4a_pq2_0_bf16",
+            (Self::PQ2_0, Act::F32) => "qmatvec_dp4a_pq2_0_f32",
+            (Self::PTQ1_0, Act::F16) => "qmatvec_dp4a_ptq1_0_f16",
+            (Self::PTQ1_0, Act::Bf16) => "qmatvec_dp4a_ptq1_0_bf16",
+            (Self::PTQ1_0, Act::F32) => "qmatvec_dp4a_ptq1_0_f32",
             _ => unreachable!("dp4a_decode_kernel: {self:?} is not dp4a-capable"),
         }
     }
@@ -978,6 +1004,12 @@ impl RocmQuantType {
             (Self::IQ1_M, Act::F16) => "moe_qmatvec_dp4a_iq1_m_f16",
             (Self::IQ1_M, Act::Bf16) => "moe_qmatvec_dp4a_iq1_m_bf16",
             (Self::IQ1_M, Act::F32) => "moe_qmatvec_dp4a_iq1_m_f32",
+            (Self::PQ2_0, Act::F16) => "moe_qmatvec_dp4a_pq2_0_f16",
+            (Self::PQ2_0, Act::Bf16) => "moe_qmatvec_dp4a_pq2_0_bf16",
+            (Self::PQ2_0, Act::F32) => "moe_qmatvec_dp4a_pq2_0_f32",
+            (Self::PTQ1_0, Act::F16) => "moe_qmatvec_dp4a_ptq1_0_f16",
+            (Self::PTQ1_0, Act::Bf16) => "moe_qmatvec_dp4a_ptq1_0_bf16",
+            (Self::PTQ1_0, Act::F32) => "moe_qmatvec_dp4a_ptq1_0_f32",
             _ => unreachable!("dp4a_moe_kernel: {self:?} is not dp4a-capable"),
         }
     }
