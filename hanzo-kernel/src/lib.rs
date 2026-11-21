@@ -52,6 +52,7 @@ pub mod prelude {
 
 pub use cubecl;
 
+pub mod gen;
 pub mod ternary;
 pub mod tune;
 
