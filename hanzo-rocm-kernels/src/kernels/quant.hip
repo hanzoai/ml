@@ -426,6 +426,8 @@ __device__ __forceinline__ void q3k_scales(const uint8_t* __restrict__ s, int8_t
 #define DW_ROCMFP4_FAST 24 // 17 B,  32 elems,  one UE4M3 half-scale + Codebook10 (ROCmFPX 101).
 #define DW_PQ2_0        25 // 34 B, 128 elems,  Prism 2-bit asymmetric ternary {-1,0,+1,+2}. val = d*((q&3)-1)
 #define DW_PTQ1_0       26 // 28 B, 128 elems,  Prism base-3 ternary {-1,0,+1}. val = d*(xi-1)
+#define DW_Q1_0         27 // 18 B, 128 elems,  binary {-1,+1}. val = d*((bit)?+1:-1)
+#define DW_Q2_0         28 // 18 B,  64 elems,  2-bit asymmetric {-1,0,+1,+2}. val = d*((q&3)-1)
 
 // Type-dispatched f32 -> output store (the only place the element type leaks): __half needs
 // __float2half, hip_bfloat16 takes float in its ctor. Keeps both cores' epilogue type-agnostic.
@@ -1936,6 +1938,8 @@ template <> struct qdw_traits<DW_ROCMFP4>      { static constexpr int BYTES = 18
 template <> struct qdw_traits<DW_ROCMFP4_FAST> { static constexpr int BYTES = 17;  static constexpr int ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
 template <> struct qdw_traits<DW_PQ2_0>        { static constexpr int BYTES = 34;  static constexpr int ELEMS = 128; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
 template <> struct qdw_traits<DW_PTQ1_0>       { static constexpr int BYTES = 28;  static constexpr int ELEMS = 128; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_Q1_0>         { static constexpr int BYTES = 18;  static constexpr int ELEMS = 128; static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
+template <> struct qdw_traits<DW_Q2_0>         { static constexpr int BYTES = 18;  static constexpr int ELEMS = 64;  static constexpr bool SYMMETRIC = true;  static constexpr int NSC = 1; };
 
 // Per-type decode. `partial<XT>(blk, xb, lane)` returns lane L's partial dot over its owned
 // positions { e*32 + L } of ONE block, mirroring the CPU `to_float` for that type bit-for-bit.
@@ -2532,6 +2536,40 @@ template <> struct qdec<DW_PTQ1_0> {
     }
 };
 
+template <> struct qdec<DW_Q1_0> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const uint8_t* qs = blk + 2;
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int p = e * 32 + lane;
+            const int q = ((qs[p >> 3] >> (p & 7)) & 1) ? 1 : -1;
+            s += ((float)q * d) * (float)xb[p];
+        }
+        return s;
+    }
+};
+
+template <> struct qdec<DW_Q2_0> {
+    template <typename XT>
+    static __device__ __forceinline__ float partial(const uint8_t* __restrict__ blk, const XT* __restrict__ xb, int lane) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const uint8_t* qs = blk + 2;
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const int p = e * 32 + lane;
+            const int q = (int)((qs[p >> 2] >> ((p & 3) * 2)) & 3) - 1;
+            s += ((float)q * d) * (float)xb[p];
+        }
+        return s;
+    }
+};
+
 // ----------------------------------------------------------------------------------------------
 // int8-dp4a DECODE for the IQ codebook quants (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M). The int8-SIMD twin
 // of the scalar `qdec<DW_IQ*>` above: instead of decoding each grid coordinate to f32 and doing float
@@ -2888,6 +2926,74 @@ template <> struct qdp4a<DW_PTQ1_0> {
     }
 };
 
+template <> struct qdp4a<DW_Q1_0> {
+    static constexpr int NSUB = 4;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const float d8 = __half2float(xd8[e]);
+        const uint8_t* b = blk + 2 + e * 4;
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t byte = b[i];
+            const int w0 = (byte & 0x01) ? 1 : -1;
+            const int w1 = (byte & 0x02) ? 1 : -1;
+            const int w2 = (byte & 0x04) ? 1 : -1;
+            const int w3 = (byte & 0x08) ? 1 : -1;
+            const int w4 = (byte & 0x10) ? 1 : -1;
+            const int w5 = (byte & 0x20) ? 1 : -1;
+            const int w6 = (byte & 0x40) ? 1 : -1;
+            const int w7 = (byte & 0x80) ? 1 : -1;
+            const int wp0 = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            const int wp1 = (w4 & 0xFF) | ((w5 & 0xFF) << 8) | ((w6 & 0xFF) << 16) | ((w7 & 0xFF) << 24);
+            idot = hip_dp4a(wp0, u[2 * i], idot);
+            idot = hip_dp4a(wp1, u[2 * i + 1], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
+template <> struct qdp4a<DW_Q2_0> {
+    static constexpr int NSUB = 2;
+    static __device__ __forceinline__ float partial(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8, int e) {
+        const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float d = __half2float(__ushort_as_half(d_bits));
+        const float d8 = __half2float(xd8[e]);
+        const uint8_t* b = blk + 2 + e * 8;
+        const int* u = reinterpret_cast<const int*>(xq8) + e * 8;
+        int idot = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint8_t byte = b[i];
+            const int w0 = (int)( byte       & 3) - 1;
+            const int w1 = (int)((byte >> 2) & 3) - 1;
+            const int w2 = (int)((byte >> 4) & 3) - 1;
+            const int w3 = (int)((byte >> 6) & 3) - 1;
+            const int wp = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) | ((w3 & 0xFF) << 24);
+            idot = hip_dp4a(wp, u[i], idot);
+        }
+        return d * d8 * (float)idot;
+    }
+    static __device__ __forceinline__ float block(
+            const uint8_t* __restrict__ blk, const int8_t* __restrict__ xq8, const __half* __restrict__ xd8) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < NSUB; ++e) s += partial(blk, xq8, xd8, e);
+        return s;
+    }
+};
+
 // IQ + Prism dp4a byte strides & block sizes (= on-disk super-block bytes; mirror qdw_traits).
 template <> struct qdp4a_traits<DW_IQ2_XXS> { static constexpr int BYTES = 66;  static constexpr int ELEMS = 256; };
 template <> struct qdp4a_traits<DW_IQ2_XS>  { static constexpr int BYTES = 74;  static constexpr int ELEMS = 256; };
@@ -2898,6 +3004,8 @@ template <> struct qdp4a_traits<DW_IQ1_S>   { static constexpr int BYTES = 50;  
 template <> struct qdp4a_traits<DW_IQ1_M>   { static constexpr int BYTES = 56;  static constexpr int ELEMS = 256; };
 template <> struct qdp4a_traits<DW_PQ2_0>   { static constexpr int BYTES = 34;  static constexpr int ELEMS = 128; };
 template <> struct qdp4a_traits<DW_PTQ1_0>  { static constexpr int BYTES = 28;  static constexpr int ELEMS = 128; };
+template <> struct qdp4a_traits<DW_Q1_0>    { static constexpr int BYTES = 18;  static constexpr int ELEMS = 128; };
+template <> struct qdp4a_traits<DW_Q2_0>    { static constexpr int BYTES = 18;  static constexpr int ELEMS = 64;  };
 
 // IQ + Prism dp4a entry points (decode + MoE, f16/bf16/f32) via the SAME launcher generator as the K-quants.
 DEFINE_QMATVEC_DP4A(iq2xxs, DW_IQ2_XXS)
@@ -2909,6 +3017,8 @@ DEFINE_QMATVEC_DP4A(iq1_s,  DW_IQ1_S)
 DEFINE_QMATVEC_DP4A(iq1_m,  DW_IQ1_M)
 DEFINE_QMATVEC_DP4A(pq2_0,  DW_PQ2_0)
 DEFINE_QMATVEC_DP4A(ptq1_0, DW_PTQ1_0)
+DEFINE_QMATVEC_DP4A(q1_0,   DW_Q1_0)
+DEFINE_QMATVEC_DP4A(q2_0,   DW_Q2_0)
 
 #undef DEFINE_QMATVEC_DP4A
 
@@ -3058,6 +3168,8 @@ DEFINE_QMATVECU(rocmfp4,      DW_ROCMFP4)
 DEFINE_QMATVECU(rocmfp4_fast, DW_ROCMFP4_FAST)
 DEFINE_QMATVECU(pq2_0,        DW_PQ2_0)
 DEFINE_QMATVECU(ptq1_0,       DW_PTQ1_0)
+DEFINE_QMATVECU(q1_0,         DW_Q1_0)
+DEFINE_QMATVECU(q2_0,         DW_Q2_0)
 
 
 DEFINE_QDEQUANT(q8_0, DW_Q8_0)
@@ -3143,8 +3255,53 @@ __device__ __forceinline__ void qdequant_ptq1_0_direct(
         FN<float>(nblocks, wq, out);                                                                  \
     }
 
+template <typename OT>
+__device__ __forceinline__ void qdequant_q1_0_direct(
+    const int nblocks, const uint8_t* __restrict__ wq, OT* __restrict__ out) {
+    const size_t tid = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    const size_t b = tid >> 5;
+    const int lane = (int)(tid & 31);
+    if (b >= (size_t)nblocks) {
+        return;
+    }
+    const uint8_t* blk = wq + b * 18;
+    const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+    const float d = __half2float(__ushort_as_half(d_bits));
+    const uint8_t* qs = blk + 2;
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int p = e * 32 + lane;
+        const int q = ((qs[p >> 3] >> (p & 7)) & 1) ? 1 : -1;
+        qstore(&out[b * 128 + p], (float)q * d);
+    }
+}
+
+template <typename OT>
+__device__ __forceinline__ void qdequant_q2_0_direct(
+    const int nblocks, const uint8_t* __restrict__ wq, OT* __restrict__ out) {
+    const size_t tid = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    const size_t b = tid >> 5;
+    const int lane = (int)(tid & 31);
+    if (b >= (size_t)nblocks) {
+        return;
+    }
+    const uint8_t* blk = wq + b * 18;
+    const uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+    const float d = __half2float(__ushort_as_half(d_bits));
+    const uint8_t* qs = blk + 2;
+    #pragma unroll
+    for (int e = 0; e < 2; ++e) {
+        const int p = e * 32 + lane;
+        const int q = (int)((qs[p >> 2] >> ((p & 3) * 2)) & 3) - 1;
+        qstore(&out[b * 64 + p], (float)q * d);
+    }
+}
+
 DEFINE_QDEQUANT_DIRECT(pq2_0, qdequant_pq2_0_direct)
 DEFINE_QDEQUANT_DIRECT(ptq1_0, qdequant_ptq1_0_direct)
+DEFINE_QDEQUANT_DIRECT(q1_0, qdequant_q1_0_direct)
+DEFINE_QDEQUANT_DIRECT(q2_0, qdequant_q2_0_direct)
+#undef DEFINE_QDEQUANT_DIRECT
 
 #undef DEFINE_QDEQUANT
 
@@ -3246,6 +3403,8 @@ DEFINE_MOE_QMATVECU(rocmfp4,      DW_ROCMFP4)
 DEFINE_MOE_QMATVECU(rocmfp4_fast, DW_ROCMFP4_FAST)
 DEFINE_MOE_QMATVECU(pq2_0,        DW_PQ2_0)
 DEFINE_MOE_QMATVECU(ptq1_0,       DW_PTQ1_0)
+DEFINE_MOE_QMATVECU(q1_0,         DW_Q1_0)
+DEFINE_MOE_QMATVECU(q2_0,         DW_Q2_0)
 
 #undef DEFINE_MOE_QMATVECU
 #undef DEFINE_QMATVECU
@@ -3271,8 +3430,157 @@ DEFINE_MOE_QMATVECU(ptq1_0,       DW_PTQ1_0)
 #undef DW_TQ1_0
 #undef DW_IQ1_S
 #undef DW_IQ1_M
+#undef DW_MXFP4
+#undef DW_ROCMFP4
+#undef DW_ROCMFP4_FAST
 #undef DW_PQ2_0
 #undef DW_PTQ1_0
+#undef DW_Q1_0
+#undef DW_Q2_0
+
+__device__ __forceinline__ float qload(__half v)        { return __half2float(v); }
+__device__ __forceinline__ float qload(hip_bfloat16 v)  { return (float)v; }
+__device__ __forceinline__ float qload(float v)         { return v; }
+
+template <typename InT, typename OutT, int E>
+__device__ __forceinline__ void hadamard_fwht_rocm_e(
+    const InT* __restrict__ x,
+    const float* __restrict__ signs,
+    OutT* __restrict__ y,
+    int block_size,
+    int width,
+    int has_signs,
+    int is_inverse,
+    int64_t total_blocks,
+    float* smem
+) {
+    const int tid = (int)threadIdx.x;
+    const int threads = block_size / E;
+    if (tid >= threads) {
+        return;
+    }
+    const float inv_sqrt_b = rsqrtf((float)block_size);
+    const int blocks_per_row = width / block_size;
+
+    for (int64_t blk = (int64_t)blockIdx.x; blk < total_blocks; blk += (int64_t)gridDim.x) {
+        const size_t blk_base = (size_t)blk * (size_t)block_size;
+        const int row_col_base = (int)(blk % blocks_per_row) * block_size;
+
+        float v[E];
+        #pragma unroll
+        for (int r = 0; r < E; ++r) {
+            const int pos = (r << 8) + tid;
+            float val = qload(x[blk_base + (size_t)pos]);
+            if (!is_inverse && has_signs) {
+                val *= signs[row_col_base + pos];
+            }
+            v[r] = val;
+        }
+
+        constexpr int CHUNK_E = (E > 16) ? 16 : E;
+        for (int r0 = 0; r0 < E; r0 += CHUNK_E) {
+            #pragma unroll
+            for (int r = 0; r < CHUNK_E; ++r) {
+                smem[(r << 8) + tid] = v[r0 + r];
+            }
+            __syncthreads();
+            for (int stride = 1; stride < threads; stride <<= 1) {
+                float nv[CHUNK_E];
+                #pragma unroll
+                for (int r = 0; r < CHUNK_E; ++r) {
+                    const int pos = (r << 8) + tid;
+                    const float partner = smem[pos ^ stride];
+                    nv[r] = (pos & stride) ? (partner - v[r0 + r]) : (v[r0 + r] + partner);
+                }
+                __syncthreads();
+                #pragma unroll
+                for (int r = 0; r < CHUNK_E; ++r) {
+                    v[r0 + r] = nv[r];
+                    smem[(r << 8) + tid] = nv[r];
+                }
+                __syncthreads();
+            }
+        }
+
+        for (int sr = 1; sr < E; sr <<= 1) {
+            for (int base = 0; base < E; base += 2 * sr) {
+                for (int off = 0; off < sr; ++off) {
+                    const float a = v[base + off];
+                    const float b = v[base + off + sr];
+                    v[base + off] = a + b;
+                    v[base + off + sr] = a - b;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < E; ++r) {
+            const int pos = (r << 8) + tid;
+            float val = v[r] * inv_sqrt_b;
+            if (is_inverse && has_signs) {
+                val *= signs[row_col_base + pos];
+            }
+            qstore(&y[blk_base + (size_t)pos], val);
+        }
+    }
+}
+
+template <typename InT, typename OutT>
+__device__ __forceinline__ void hadamard_fwht_rocm_dispatch(
+    const InT* __restrict__ x,
+    const float* __restrict__ signs,
+    OutT* __restrict__ y,
+    int block_size,
+    int width,
+    int has_signs,
+    int is_inverse,
+    int64_t total_blocks
+) {
+#ifdef __HIPCC__
+    extern __shared__ float smem[];
+#else
+    float smem[4096];
+#endif
+    if (block_size <= 256) {
+        hadamard_fwht_rocm_e<InT, OutT, 1>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks, smem);
+    } else if (block_size == 512) {
+        hadamard_fwht_rocm_e<InT, OutT, 2>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks, smem);
+    } else if (block_size == 1024) {
+        hadamard_fwht_rocm_e<InT, OutT, 4>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks, smem);
+    } else if (block_size == 2048) {
+        hadamard_fwht_rocm_e<InT, OutT, 8>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks, smem);
+    } else if (block_size == 4096) {
+        hadamard_fwht_rocm_e<InT, OutT, 16>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks, smem);
+    } else {
+        hadamard_fwht_rocm_e<InT, OutT, 32>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks, smem);
+    }
+}
+
+extern "C" __global__ void hadamard_fwht_f32_f32(
+    const float* __restrict__ x, const float* __restrict__ signs, float* __restrict__ y,
+    int block_size, int width, int has_signs, int is_inverse, int64_t total_blocks) {
+    hadamard_fwht_rocm_dispatch<float, float>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+}
+extern "C" __global__ void hadamard_fwht_f16_f32(
+    const __half* __restrict__ x, const float* __restrict__ signs, float* __restrict__ y,
+    int block_size, int width, int has_signs, int is_inverse, int64_t total_blocks) {
+    hadamard_fwht_rocm_dispatch<__half, float>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+}
+extern "C" __global__ void hadamard_fwht_f16_f16(
+    const __half* __restrict__ x, const float* __restrict__ signs, __half* __restrict__ y,
+    int block_size, int width, int has_signs, int is_inverse, int64_t total_blocks) {
+    hadamard_fwht_rocm_dispatch<__half, __half>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+}
+extern "C" __global__ void hadamard_fwht_bf16_f32(
+    const hip_bfloat16* __restrict__ x, const float* __restrict__ signs, float* __restrict__ y,
+    int block_size, int width, int has_signs, int is_inverse, int64_t total_blocks) {
+    hadamard_fwht_rocm_dispatch<hip_bfloat16, float>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+}
+extern "C" __global__ void hadamard_fwht_bf16_bf16(
+    const hip_bfloat16* __restrict__ x, const float* __restrict__ signs, hip_bfloat16* __restrict__ y,
+    int block_size, int width, int has_signs, int is_inverse, int64_t total_blocks) {
+    hadamard_fwht_rocm_dispatch<hip_bfloat16, hip_bfloat16>(x, signs, y, block_size, width, has_signs, is_inverse, total_blocks);
+}
 
 // ----------------------------------------------------------------------------------------------
 // Native Q8_0 quant GEMM (prefill path) using RDNA3 WMMA (matrix cores).
@@ -3484,6 +3792,10 @@ typedef int v4i_ld __attribute__((ext_vector_type(4)));
 #define WT_ROCMFP4      12  // 18 B,  32 elems, SYM dual codebook (LUT). q_w = KVALUES_ROCMFP4_D[nib]; scales ue4m3_half(blk[16..17])
 #define WT_IQ4_NL 13  // 18 B,  32 elems,  SYM codebook (LUT).  q_w = KVALUES[idx]; scale d
 #define WT_IQ3_S  14  // 110 B, 256 elems, SYM signed grid.     q_w = +-grid (1..15); scale d*(1+2*nib)
+#define WT_PQ2_0  15  // 34 B,  128 elems, SYM 2-bit {-1,0,1,2}. q_w = q-1;         scale d
+#define WT_PTQ1_0 16  // 28 B,  128 elems, SYM base-3 {-1,0,1}.  q_w = xi-1;        scale d
+#define WT_Q1_0   17  // 18 B,  128 elems, SYM binary {-1,+1}.   q_w = bit?1:-1;    scale d
+#define WT_Q2_0   18  // 18 B,   64 elems, SYM 2-bit {-1,0,1,2}. q_w = q-1;         scale d
 // Per-type traits: BYTES = on-disk super-block stride; SBLK_ELEMS = elems/super-block (32 or 256);
 // SYMMETRIC = no min bias; SCALE_STEP = elems per distinct weight scale (16 for Q6_K else 32).
 // Derived: SUBS = 32-blocks per super-block; NSC16 = distinct scales per 32-block (2 iff SCALE_STEP=16).
@@ -3503,6 +3815,10 @@ template <> struct wt_traits<WT_ROCMFP4_FAST> { static constexpr int BYTES = 17;
 template <> struct wt_traits<WT_ROCMFP4>      { static constexpr int BYTES = 18; static constexpr int SBLK_ELEMS = 32; static constexpr bool SYMMETRIC = true; static constexpr int SCALE_STEP = 16 ; };
 template <> struct wt_traits<WT_IQ4_NL> { static constexpr int BYTES = 18;  static constexpr int SBLK_ELEMS = 32;  static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
 template <> struct wt_traits<WT_IQ3_S>  { static constexpr int BYTES = 110; static constexpr int SBLK_ELEMS = 256; static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_PQ2_0>  { static constexpr int BYTES = 34;  static constexpr int SBLK_ELEMS = 128; static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_PTQ1_0> { static constexpr int BYTES = 28;  static constexpr int SBLK_ELEMS = 128; static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_Q1_0>   { static constexpr int BYTES = 18;  static constexpr int SBLK_ELEMS = 128; static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
+template <> struct wt_traits<WT_Q2_0>   { static constexpr int BYTES = 18;  static constexpr int SBLK_ELEMS = 64;  static constexpr bool SYMMETRIC = true;  static constexpr int SCALE_STEP = 32; };
 
 // q4k_scale_min / KVALUES_IQ4NL_D are defined above for the decode core and reused verbatim here --
 // ONE decode source per format (the prefill decode below mirrors the same bit layout as qdec<WTYPE>).
@@ -3748,6 +4064,56 @@ __device__ __forceinline__ v4i_ld decode_w_half<WT_IQ3_S>(const uint8_t* sb, int
     v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
 }
 
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_PQ2_0>(const uint8_t* sb, int g, int half) {
+    const uint8_t* qs = sb + 2;
+    const int base_p = g * 32 + half;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int p = base_p + i;
+        tmp[i] = (int8_t)((int)((qs[p >> 2] >> ((p & 3) * 2)) & 3) - 1);
+    }
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_PTQ1_0>(const uint8_t* sb, int g, int half) {
+    const int base_p = g * 32 + half;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        tmp[i] = (int8_t)ptq1_0_w(sb, sb + 24, base_p + i);
+    }
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_Q1_0>(const uint8_t* sb, int g, int half) {
+    const uint8_t* qs = sb + 2;
+    const int base_p = g * 32 + half;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int p = base_p + i;
+        tmp[i] = (int8_t)(((qs[p >> 3] >> (p & 7)) & 1) ? 1 : -1);
+    }
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
+template <>
+__device__ __forceinline__ v4i_ld decode_w_half<WT_Q2_0>(const uint8_t* sb, int g, int half) {
+    const uint8_t* qs = sb + 2;
+    const int base_p = g * 32 + half;
+    int8_t tmp[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int p = base_p + i;
+        tmp[i] = (int8_t)((int)((qs[p >> 2] >> ((p & 3) * 2)) & 3) - 1);
+    }
+    v4i_ld v; __builtin_memcpy(&v, tmp, 16); return v;
+}
+
 
 // MAIN per-(32-block, 16-group) weight scale. `sub16` = the 16-group index within the super-block
 // (= g*2 + (half==16)). For SCALE_STEP=32 types both halves of a 32-sub-block return the same value
@@ -3825,6 +4191,22 @@ template <> __device__ __forceinline__ float decode_w_mainscale<WT_IQ3_S>(const 
     const int nib = (sb[106 + (g >> 1)] >> (4 * (g & 1))) & 0xF;
     return __half2float(*reinterpret_cast<const __half*>(sb)) * (float)(1 + 2 * nib);
 }
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_PQ2_0>(const uint8_t* sb, int) {
+    const uint16_t d_bits = (uint16_t)sb[0] | ((uint16_t)sb[1] << 8);
+    return __half2float(__ushort_as_half(d_bits));
+}
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_PTQ1_0>(const uint8_t* sb, int) {
+    const uint16_t d_bits = (uint16_t)sb[26] | ((uint16_t)sb[27] << 8);
+    return __half2float(__ushort_as_half(d_bits));
+}
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q1_0>(const uint8_t* sb, int) {
+    const uint16_t d_bits = (uint16_t)sb[0] | ((uint16_t)sb[1] << 8);
+    return __half2float(__ushort_as_half(d_bits));
+}
+template <> __device__ __forceinline__ float decode_w_mainscale<WT_Q2_0>(const uint8_t* sb, int) {
+    const uint16_t d_bits = (uint16_t)sb[0] | ((uint16_t)sb[1] << 8);
+    return __half2float(__ushort_as_half(d_bits));
+}
 
 // SECONDARY per-32-sub-block weight scalar. ASYMMETRIC: dmin * m_g (the min bias scale). SYMMETRIC
 // SCALE_STEP=16 (Q6_K): the 2nd-16-group main scale of sub-block g (so the high half scales by it).
@@ -3869,6 +4251,10 @@ template <> __device__ __forceinline__ float decode_w_secscale<WT_ROCMFP4>(const
 }
 template <> __device__ __forceinline__ float decode_w_secscale<WT_IQ4_NL>(const uint8_t*, int) { return 0.0f; }
 template <> __device__ __forceinline__ float decode_w_secscale<WT_IQ3_S>(const uint8_t*, int) { return 0.0f; }
+template <> __device__ __forceinline__ float decode_w_secscale<WT_PQ2_0>(const uint8_t*, int) { return 0.0f; }
+template <> __device__ __forceinline__ float decode_w_secscale<WT_PTQ1_0>(const uint8_t*, int) { return 0.0f; }
+template <> __device__ __forceinline__ float decode_w_secscale<WT_Q1_0>(const uint8_t*, int) { return 0.0f; }
+template <> __device__ __forceinline__ float decode_w_secscale<WT_Q2_0>(const uint8_t*, int) { return 0.0f; }
 
 // Shared int8 tile row stride: 32 data bytes + 16 pad bytes = 48. The pad is 16-ALIGNED so the 32-byte
 // fragment loads (`__builtin_memcpy(&frag, &sXi[row*SROW], 32)`) lower to `ds_load_b128` (two 16-byte
@@ -4157,6 +4543,10 @@ DEFINE_QMMQ(rocmfp4_fast, WT_ROCMFP4_FAST)
 DEFINE_QMMQ(rocmfp4,      WT_ROCMFP4)
 DEFINE_QMMQ(iq4nl, WT_IQ4_NL)
 DEFINE_QMMQ(iq3s,  WT_IQ3_S)
+DEFINE_QMMQ(pq2_0, WT_PQ2_0)
+DEFINE_QMMQ(ptq1_0, WT_PTQ1_0)
+DEFINE_QMMQ(q1_0,  WT_Q1_0)
+DEFINE_QMMQ(q2_0,  WT_Q2_0)
 
 #undef DEFINE_QMMQ
 
@@ -4200,6 +4590,10 @@ DEFINE_MOE_QMMQ(rocmfp4_fast, WT_ROCMFP4_FAST)
 DEFINE_MOE_QMMQ(rocmfp4,      WT_ROCMFP4)
 DEFINE_MOE_QMMQ(iq4nl, WT_IQ4_NL)
 DEFINE_MOE_QMMQ(iq3s,  WT_IQ3_S)
+DEFINE_MOE_QMMQ(pq2_0, WT_PQ2_0)
+DEFINE_MOE_QMMQ(ptq1_0, WT_PTQ1_0)
+DEFINE_MOE_QMMQ(q1_0,  WT_Q1_0)
+DEFINE_MOE_QMMQ(q2_0,  WT_Q2_0)
 
 #undef DEFINE_MOE_QMMQ
 #undef DEFINE_MOE_QMMQ_NW
@@ -4223,4 +4617,8 @@ DEFINE_MOE_QMMQ(iq3s,  WT_IQ3_S)
 #undef WT_ROCMFP4
 #undef WT_IQ4_NL
 #undef WT_IQ3_S
+#undef WT_PQ2_0
+#undef WT_PTQ1_0
+#undef WT_Q1_0
+#undef WT_Q2_0
 #endif

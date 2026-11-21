@@ -234,6 +234,9 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q1_0 => {
             from_raw_data::<iq_quants::BlockQ1_0>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::Q2_0 => {
+            from_raw_data::<iq_quants::BlockQ2_0>(raw_data, size_in_bytes, dims, device)
+        }
         GgmlDType::ROCMFP4 => {
             from_raw_data::<iq_quants::BlockROCMFP4>(raw_data, size_in_bytes, dims, device)
         }

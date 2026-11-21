@@ -1939,3 +1939,249 @@ fn quantize_reads_a_view_not_its_storage() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn cpu_seed_set_and_get_reproducible() -> Result<()> {
+    let dev = Device::Cpu;
+    dev.set_seed(1337)?;
+    assert_eq!(dev.get_current_seed()?, 1337);
+    let a1 = Tensor::randn(0f32, 1.0, (4, 16), &dev)?.to_vec2::<f32>()?;
+    let u1 = Tensor::rand(-1f32, 1.0, (4, 16), &dev)?.to_vec2::<f32>()?;
+
+    dev.set_seed(1337)?;
+    let a2 = Tensor::randn(0f32, 1.0, (4, 16), &dev)?.to_vec2::<f32>()?;
+    let u2 = Tensor::rand(-1f32, 1.0, (4, 16), &dev)?.to_vec2::<f32>()?;
+    assert_eq!(a1, a2);
+    assert_eq!(u1, u2);
+    Ok(())
+}
+
+#[test]
+fn q1_0_q2_0_pq2_0_ptq1_0_roundtrip_and_simd_vec_dot() -> Result<()> {
+    use half::f16;
+    use quantized::{BlockPQ2_0, BlockPTQ1_0, BlockQ1_0, BlockQ2_0};
+
+    assert_eq!(GgmlDType::Q2_0.to_u32(), 42);
+    assert_eq!(GgmlDType::from_u32(42)?, GgmlDType::Q2_0);
+    assert_eq!(GgmlDType::Q2_0.block_size(), 64);
+    assert_eq!(GgmlDType::Q2_0.type_size(), 18);
+    assert_eq!(std::mem::size_of::<BlockQ2_0>(), 18);
+
+    let scale = f16::from_f32(0.25).to_f32();
+    let exact_q1: Vec<f32> = (0..128)
+        .map(|i| if (i * 5 + 1) % 2 == 0 { scale } else { -scale })
+        .collect();
+    let mut b_q1 = [BlockQ1_0::zeros(); 1];
+    BlockQ1_0::from_float(&exact_q1, &mut b_q1);
+    let mut d_q1 = vec![0.0f32; 128];
+    BlockQ1_0::to_float(&b_q1, &mut d_q1);
+    assert_eq!(d_q1, exact_q1);
+
+    let exact_q2: Vec<f32> = (0..64)
+        .map(|i| (((i * 3 + 1) % 3) - 1) as f32 * scale)
+        .collect();
+    let mut b_q2 = [BlockQ2_0::zeros(); 1];
+    BlockQ2_0::from_float(&exact_q2, &mut b_q2);
+    let mut d_q2 = vec![0.0f32; 64];
+    BlockQ2_0::to_float(&b_q2, &mut d_q2);
+    assert_eq!(d_q2, exact_q2);
+
+    let mut b_q2_code3 = BlockQ2_0 {
+        d: f16::from_f32(scale),
+        qs: [0xE4u8; 16],
+    };
+    b_q2_code3.qs[0] = 0b11_10_01_00;
+    let mut d_q2_code3 = vec![0.0f32; 64];
+    BlockQ2_0::to_float(&[b_q2_code3], &mut d_q2_code3);
+    assert_eq!(&d_q2_code3[..4], &[-scale, 0.0, scale, 2.0 * scale]);
+
+    let exact_pq2: Vec<f32> = (0..128)
+        .map(|i| (((i * 7 + 2) % 3) - 1) as f32 * scale)
+        .collect();
+    let mut b_pq2 = [BlockPQ2_0::zeros(); 1];
+    BlockPQ2_0::from_float(&exact_pq2, &mut b_pq2);
+    let mut d_pq2 = vec![0.0f32; 128];
+    BlockPQ2_0::to_float(&b_pq2, &mut d_pq2);
+    assert_eq!(d_pq2, exact_pq2);
+
+    let exact_ptq1: Vec<f32> = (0..128)
+        .map(|i| (((i * 11 + 2) % 3) - 1) as f32 * scale)
+        .collect();
+    let mut b_ptq1 = [BlockPTQ1_0::zeros(); 1];
+    BlockPTQ1_0::from_float(&exact_ptq1, &mut b_ptq1);
+    let mut d_ptq1 = vec![0.0f32; 128];
+    BlockPTQ1_0::to_float(&b_ptq1, &mut d_ptq1);
+    assert_eq!(d_ptq1, exact_ptq1);
+
+    let k = 512usize;
+    let x_vals: Vec<f32> = (0..k)
+        .map(|i| ((i * 37 + 13) % 101) as f32 * 0.03 - 1.5)
+        .collect();
+    let y_vals: Vec<f32> = (0..k)
+        .map(|i| ((i * 53 + 7) % 97) as f32 * 0.025 - 1.2)
+        .collect();
+    let mut y_q8 = vec![k_quants::BlockQ8_0::zeros(); k / 32];
+    k_quants::BlockQ8_0::from_float(&y_vals, &mut y_q8);
+    let mut y_deq = vec![0.0f32; k];
+    k_quants::BlockQ8_0::to_float(&y_q8, &mut y_deq);
+
+    fn check_vec_dot<T: GgmlType>(k: usize, x: &[f32], y_q8: &[T::VecDotType], y_deq: &[f32]) {
+        let mut xb = vec![T::zeros(); k / T::BLCK_SIZE];
+        T::from_float(x, &mut xb);
+        let mut x_deq = vec![0.0f32; k];
+        T::to_float(&xb, &mut x_deq);
+        let want: f32 = x_deq.iter().zip(y_deq.iter()).map(|(a, b)| a * b).sum();
+        let got = T::vec_dot(k, &xb, y_q8);
+        let tol = 1e-4 * want.abs().max(1.0);
+        assert!(
+            (got - want).abs() <= tol,
+            "{:?} vec_dot mismatch: got={got} want={want}",
+            T::DTYPE
+        );
+    }
+
+    check_vec_dot::<BlockQ1_0>(k, &x_vals, &y_q8, &y_deq);
+    check_vec_dot::<BlockQ2_0>(k, &x_vals, &y_q8, &y_deq);
+    check_vec_dot::<BlockPQ2_0>(k, &x_vals, &y_q8, &y_deq);
+    check_vec_dot::<BlockPTQ1_0>(k, &x_vals, &y_q8, &y_deq);
+
+    let mut raw_ptq1 = Vec::with_capacity(16);
+    for blk_idx in 0..16usize {
+        let mut qs = [0u8; 24];
+        for j in 0..24 {
+            qs[j] = ((blk_idx * 16 + j) & 0xFF) as u8;
+        }
+        let qh = [
+            ((blk_idx * 17) & 0xFF) as u8,
+            ((blk_idx * 29 + 3) & 0xFF) as u8,
+        ];
+        raw_ptq1.push(BlockPTQ1_0 {
+            qs,
+            qh,
+            d: f16::from_f32(0.125),
+        });
+    }
+    let y_wide: Vec<f32> = (0..2048)
+        .map(|i| ((i * 19 + 5) % 89) as f32 * 0.02 - 0.9)
+        .collect();
+    let mut y_wide_q8 = vec![k_quants::BlockQ8_0::zeros(); 2048 / 32];
+    k_quants::BlockQ8_0::from_float(&y_wide, &mut y_wide_q8);
+    let mut y_wide_deq = vec![0.0f32; 2048];
+    k_quants::BlockQ8_0::to_float(&y_wide_q8, &mut y_wide_deq);
+    let mut raw_ptq1_deq = vec![0.0f32; 2048];
+    BlockPTQ1_0::to_float(&raw_ptq1, &mut raw_ptq1_deq);
+    let want_raw: f32 = raw_ptq1_deq
+        .iter()
+        .zip(y_wide_deq.iter())
+        .map(|(a, b)| a * b)
+        .sum();
+    let got_raw = BlockPTQ1_0::vec_dot(2048, &raw_ptq1, &y_wide_q8);
+    assert!(
+        (got_raw - want_raw).abs() <= 1e-4 * want_raw.abs().max(1.0),
+        "PTQ1_0 all-256-bytes vec_dot mismatch: got={got_raw} want={want_raw}"
+    );
+
+    let dev = Device::Cpu;
+    for dtype in [
+        GgmlDType::Q1_0,
+        GgmlDType::Q2_0,
+        GgmlDType::PQ2_0,
+        GgmlDType::PTQ1_0,
+    ] {
+        let w = Tensor::from_slice(&x_vals, (4, 128), &dev)?;
+        let qt = quantized::QTensor::quantize(&w, dtype)?;
+        let w_ref = qt.dequantize(&dev)?;
+        let qmm = quantized::QMatMul::from_qtensor(qt)?;
+        for m in [1usize, 4, 9] {
+            let lhs_v: Vec<f32> = (0..m * 128)
+                .map(|i| ((i * 23 + 3) % 71) as f32 * 0.03 - 1.0)
+                .collect();
+            let lhs = Tensor::from_vec(lhs_v, (m, 128), &dev)?;
+            let got = qmm.forward(&lhs)?;
+            let want = lhs.matmul(&w_ref.t()?)?;
+            let diff = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let ref_max = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1.0);
+            assert!(
+                diff / ref_max < 2e-2,
+                "{dtype:?} m={m} QMatMul rel diff {} too large",
+                diff / ref_max
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cpu_hadamard_fwht_matches_sylvester_matrix() -> Result<()> {
+    let dev = Device::Cpu;
+    for b in [64usize, 128, 512, 1024, 4096] {
+        let width = if b <= 1024 { b * 2 } else { b };
+        let rows = if b == 4096 { 3usize } else { 5usize };
+
+        let scale = 1.0f32 / (b as f32).sqrt();
+        let mut h_data = vec![0.0f32; b * b];
+        for i in 0..b {
+            for j in 0..b {
+                h_data[i * b + j] = if (i & j).count_ones() % 2 == 0 {
+                    scale
+                } else {
+                    -scale
+                };
+            }
+        }
+        let h_b = Tensor::from_vec(h_data, (b, b), &dev)?;
+
+        let signs_v: Vec<f32> = (0..width)
+            .map(|i| if (i * 7 + 3) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs = Tensor::from_vec(signs_v, width, &dev)?;
+
+        let x_v: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 19 + 11) % 97) as f32 * 0.02 - 0.9)
+            .collect();
+        let x = Tensor::from_vec(x_v, (rows, width), &dev)?;
+
+        let ref_fwd = x
+            .broadcast_mul(&signs)?
+            .reshape((rows * (width / b), b))?
+            .matmul(&h_b)?
+            .reshape((rows, width))?;
+
+        let got_fwd = x.hadamard_fwht(b, Some(&signs))?;
+        assert_eq!(got_fwd.dtype(), DType::F32);
+        let diff_fwd = (&got_fwd - &ref_fwd)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(diff_fwd < 1e-5, "B={b} fwd max diff {diff_fwd}");
+
+        let rec = got_fwd.hadamard_fwht(b, None)?.broadcast_mul(&signs)?;
+        let diff_rec = (&rec - &x)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff_rec < 1e-5, "B={b} inv max diff {diff_rec}");
+
+        let rec_fn = quantized::hadamard_fwht(&got_fwd, Some(&signs), b, true)?;
+        let diff_rec_fn = (&rec_fn - &x)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff_rec_fn < 1e-5,
+            "B={b} quantized::hadamard_fwht inv max diff {diff_rec_fn}"
+        );
+
+        for dt in [DType::F16, DType::BF16] {
+            let x_half = x.to_dtype(dt)?;
+            let x_half_f32 = x_half.to_dtype(DType::F32)?;
+            let ref_half = x_half_f32
+                .broadcast_mul(&signs)?
+                .reshape((rows * (width / b), b))?
+                .matmul(&h_b)?
+                .reshape((rows, width))?;
+            let got_half = x_half.hadamard_fwht(b, Some(&signs))?;
+            assert_eq!(got_half.dtype(), DType::F32);
+            let diff_half = (&got_half - &ref_half)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(diff_half < 1e-5, "B={b} {dt:?}->F32 max diff {diff_half}");
+        }
+    }
+    Ok(())
+}

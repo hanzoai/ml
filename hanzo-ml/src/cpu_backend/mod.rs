@@ -1815,35 +1815,7 @@ fn elu<T: num_traits::Float>(v: T, alpha: T) -> T {
     }
 }
 
-#[inline]
-fn slice_as_bytes<T>(slice: &[T]) -> &[u8] {
-    let byte_len = std::mem::size_of_val(slice);
-    // SAFETY: T is a plain numerical type (u32, i32, f32, f16, bf16, etc.) with no uninitialized
-    // padding bytes. Any aligned &[T] is a valid &[u8] of length len * size_of::<T>().
-    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, byte_len) }
-}
-
 impl CpuStorage {
-    /// Returns the underlying storage buffer as a raw byte slice.
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::U8(v) => v.as_slice(),
-            Self::U32(v) => slice_as_bytes(v),
-            Self::I16(v) => slice_as_bytes(v),
-            Self::I32(v) => slice_as_bytes(v),
-            Self::I64(v) => slice_as_bytes(v),
-            Self::BF16(v) => slice_as_bytes(v),
-            Self::F16(v) => slice_as_bytes(v),
-            Self::F32(v) => slice_as_bytes(v),
-            Self::F64(v) => slice_as_bytes(v),
-            Self::F8E4M3(v) => slice_as_bytes(v),
-            Self::F6E2M3(v) => v.as_slice(),
-            Self::F6E3M2(v) => v.as_slice(),
-            Self::F4(v) => v.as_slice(),
-            Self::F8E8M0(v) => v.as_slice(),
-        }
-    }
-
     pub fn as_slice<D: WithDType>(&self) -> Result<&[D]> {
         D::cpu_storage_as_slice(self)
     }
@@ -3251,6 +3223,37 @@ impl BackendStorage for CpuStorage {
     }
 }
 
+const DEFAULT_CPU_SEED: u64 = 299_792_458;
+static CPU_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(DEFAULT_CPU_SEED);
+static CPU_SEED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+std::thread_local! {
+    static CPU_THREAD_RNG: std::cell::RefCell<Option<(u64, rand::rngs::StdRng)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_cpu_rng<R, F: FnOnce(&mut dyn rand::RngCore) -> R>(f: F) -> R {
+    use rand::SeedableRng;
+    let epoch = CPU_SEED_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    if epoch == 0 {
+        let mut rng = rand::rng();
+        return f(&mut rng);
+    }
+    CPU_THREAD_RNG.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_reseed = match slot.as_ref() {
+            Some((local_epoch, _)) => *local_epoch != epoch,
+            None => true,
+        };
+        if needs_reseed {
+            let seed = CPU_SEED.load(std::sync::atomic::Ordering::Acquire);
+            *slot = Some((epoch, rand::rngs::StdRng::seed_from_u64(seed)));
+        }
+        let (_, rng) = slot.as_mut().unwrap();
+        f(rng)
+    })
+}
+
 impl BackendDevice for CpuDevice {
     type Storage = CpuStorage;
 
@@ -3278,20 +3281,25 @@ impl BackendDevice for CpuDevice {
         Ok(Self)
     }
 
-    fn set_seed(&self, _seed: u64) -> Result<()> {
-        crate::bail!("cannot seed the CPU rng with set_seed")
+    fn set_seed(&self, seed: u64) -> Result<()> {
+        use rand::SeedableRng;
+        CPU_SEED.store(seed, std::sync::atomic::Ordering::Release);
+        let epoch = CPU_SEED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        CPU_THREAD_RNG.with(|cell| {
+            *cell.borrow_mut() = Some((epoch, rand::rngs::StdRng::seed_from_u64(seed)));
+        });
+        Ok(())
     }
 
     fn get_current_seed(&self) -> Result<u64> {
-        crate::bail!("cannot get the CPU rng seed with get_current_seed")
+        Ok(CPU_SEED.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn rand_uniform(&self, shape: &Shape, dtype: DType, min: f64, max: f64) -> Result<CpuStorage> {
         use rand::prelude::*;
 
         let elem_count = shape.elem_count();
-        let mut rng = rand::rng();
-        match dtype {
+        with_cpu_rng(|rng| match dtype {
             DType::U8
             | DType::U32
             | DType::I16
@@ -3306,7 +3314,7 @@ impl BackendDevice for CpuDevice {
                 let uniform = rand::distr::Uniform::new(bf16::from_f64(min), bf16::from_f64(max))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(rng.sample::<bf16, _>(uniform))
+                    data.push(uniform.sample(rng))
                 }
                 Ok(CpuStorage::BF16(data))
             }
@@ -3315,7 +3323,7 @@ impl BackendDevice for CpuDevice {
                 let uniform = rand::distr::Uniform::new(f16::from_f64(min), f16::from_f64(max))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(rng.sample::<f16, _>(uniform))
+                    data.push(uniform.sample(rng))
                 }
                 Ok(CpuStorage::F16(data))
             }
@@ -3325,7 +3333,7 @@ impl BackendDevice for CpuDevice {
                     rand::distr::Uniform::new(F8E4M3::from_f64(min), F8E4M3::from_f64(max))
                         .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(rng.sample::<F8E4M3, _>(uniform))
+                    data.push(uniform.sample(rng))
                 }
                 Ok(CpuStorage::F8E4M3(data))
             }
@@ -3334,7 +3342,7 @@ impl BackendDevice for CpuDevice {
                 let uniform =
                     rand::distr::Uniform::new(min as f32, max as f32).map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(rng.sample::<f32, _>(uniform))
+                    data.push(uniform.sample(rng))
                 }
                 Ok(CpuStorage::F32(data))
             }
@@ -3342,19 +3350,18 @@ impl BackendDevice for CpuDevice {
                 let mut data = Vec::with_capacity(elem_count);
                 let uniform = rand::distr::Uniform::new(min, max).map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(rng.sample::<f64, _>(uniform))
+                    data.push(uniform.sample(rng))
                 }
                 Ok(CpuStorage::F64(data))
             }
-        }
+        })
     }
 
     fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<CpuStorage> {
         use rand::prelude::*;
 
         let elem_count = shape.elem_count();
-        let mut rng = rand::rng();
-        match dtype {
+        with_cpu_rng(|rng| match dtype {
             DType::U8
             | DType::U32
             | DType::I16
@@ -3369,7 +3376,7 @@ impl BackendDevice for CpuDevice {
                 let normal = rand_distr::Normal::new(bf16::from_f64(mean), bf16::from_f64(std))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
+                    data.push(normal.sample(rng))
                 }
                 Ok(CpuStorage::BF16(data))
             }
@@ -3378,7 +3385,7 @@ impl BackendDevice for CpuDevice {
                 let normal = rand_distr::Normal::new(f16::from_f64(mean), f16::from_f64(std))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
+                    data.push(normal.sample(rng))
                 }
                 Ok(CpuStorage::F16(data))
             }
@@ -3387,7 +3394,7 @@ impl BackendDevice for CpuDevice {
                 let normal = rand_distr::Normal::new(F8E4M3::from_f64(mean), F8E4M3::from_f64(std))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
+                    data.push(normal.sample(rng))
                 }
                 Ok(CpuStorage::F8E4M3(data))
             }
@@ -3396,7 +3403,7 @@ impl BackendDevice for CpuDevice {
                 let normal =
                     rand_distr::Normal::new(mean as f32, std as f32).map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
+                    data.push(normal.sample(rng))
                 }
                 Ok(CpuStorage::F32(data))
             }
@@ -3404,11 +3411,11 @@ impl BackendDevice for CpuDevice {
                 let mut data = Vec::with_capacity(elem_count);
                 let normal = rand_distr::Normal::new(mean, std).map_err(Error::wrap)?;
                 for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
+                    data.push(normal.sample(rng))
                 }
                 Ok(CpuStorage::F64(data))
             }
-        }
+        })
     }
 
     #[allow(clippy::uninit_vec)]

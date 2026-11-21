@@ -262,6 +262,10 @@ fn run_case(dev: &Device, dtype: GgmlDType, nout: usize, k: usize) -> hanzo_ml::
         GgmlDType::IQ3_XXS => vk.matvec_iq3xxs(&wq, &x_host, nout, k)?,
         GgmlDType::IQ2_S => vk.matvec_iq2s(&wq, &x_host, nout, k)?,
         GgmlDType::TQ2_0 => vk.matvec_tq2_0(&wq, &x_host, nout, k)?,
+        GgmlDType::Q1_0 => vk.matvec_q1_0(&wq, &x_host, nout, k)?,
+        GgmlDType::Q2_0 => vk.matvec_q2_0(&wq, &x_host, nout, k)?,
+        GgmlDType::PQ2_0 => vk.matvec_pq2_0(&wq, &x_host, nout, k)?,
+        GgmlDType::PTQ1_0 => vk.matvec_ptq1_0(&wq, &x_host, nout, k)?,
         _ => panic!("unsupported dtype in run_case: {dtype:?}"),
     };
     assert_eq!(y_gpu.len(), nout);
@@ -1488,6 +1492,92 @@ fn vulkan_row_view_projects_its_own_row() -> hanzo_ml::Result<()> {
         let got = head.forward(&last)?.flatten_all()?.to_vec1::<f32>()?;
         let want = head.forward(&alone)?.flatten_all()?.to_vec1::<f32>()?;
         assert_eq!(got, want, "{dt:?}: the view read another row");
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_matvec_bonsai_quants_match_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    for dtype in [
+        GgmlDType::Q1_0,
+        GgmlDType::Q2_0,
+        GgmlDType::PQ2_0,
+        GgmlDType::PTQ1_0,
+    ] {
+        for &(nout, k) in &[(256usize, 256usize), (512, 1024)] {
+            let s = run_case(&dev, dtype, nout, k)?;
+            assert!(
+                s.max_rel < 1e-3 && s.max_abs < 2e-3,
+                "{dtype:?} GPU/CPU mismatch: max_abs={} max_rel={}",
+                s.max_abs,
+                s.max_rel
+            );
+            let (raw, w_deq, _) = weight_bytes(dtype, nout, k)?;
+            let qs = QStorage::from_data(std::borrow::Cow::Owned(raw), &dev, dtype)?;
+            let qmm = QMatMul::from_arc(Arc::new(QTensor::new(qs, (nout, k))?))?;
+            let x_host: Vec<f32> = (0..k).map(|i| pseudo(i + 77)).collect();
+            let x_vk = Tensor::from_vec(x_host.clone(), (1, k), &dev)?;
+            let y_vk = qmm.forward(&x_vk)?.flatten_all()?.to_vec1::<f32>()?;
+            for r in 0..nout {
+                let want: f32 = (0..k).map(|c| w_deq[r * k + c] * x_host[c]).sum();
+                assert!(
+                    (y_vk[r] - want).abs() < 2e-3,
+                    "{dtype:?} QMatMul row {r}: got={} want={}",
+                    y_vk[r],
+                    want
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_hadamard_fwht_matches_cpu() -> hanzo_ml::Result<()> {
+    let Some(dev) = gpu() else { return Ok(()) };
+    let cpu = Device::Cpu;
+    for b in [64usize, 128, 512, 1024, 4096] {
+        let width = if b <= 1024 { b * 2 } else { b };
+        let rows = 3usize;
+        let signs_v: Vec<f32> = (0..width)
+            .map(|i| if (i * 7 + 3) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let x_v: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 19 + 11) % 97) as f32 * 0.02 - 0.9)
+            .collect();
+
+        let signs_cpu = Tensor::from_vec(signs_v.clone(), width, &cpu)?;
+        let x_cpu = Tensor::from_vec(x_v.clone(), (rows, width), &cpu)?;
+        let ref_fwd = x_cpu
+            .hadamard_fwht(b, Some(&signs_cpu))?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        let signs_vk = Tensor::from_vec(signs_v, width, &dev)?;
+        let x_vk = Tensor::from_vec(x_v.clone(), (rows, width), &dev)?;
+        let got_fwd_t = x_vk.hadamard_fwht(b, Some(&signs_vk))?;
+        let got_fwd = got_fwd_t.flatten_all()?.to_vec1::<f32>()?;
+        for i in 0..ref_fwd.len() {
+            assert!(
+                (got_fwd[i] - ref_fwd[i]).abs() < 2e-5,
+                "Vulkan FWHT B={b} fwd mismatch at {i}: {} vs {}",
+                got_fwd[i],
+                ref_fwd[i]
+            );
+        }
+
+        let rec_vk = hanzo_ml::quantized::hadamard_fwht(&got_fwd_t, Some(&signs_vk), b, true)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for i in 0..x_v.len() {
+            assert!(
+                (rec_vk[i] - x_v[i]).abs() < 2e-5,
+                "Vulkan FWHT B={b} inv mismatch at {i}: {} vs {}",
+                rec_vk[i],
+                x_v[i]
+            );
+        }
     }
     Ok(())
 }

@@ -88,6 +88,7 @@ fn kernel_wgsl(name: &str) -> Result<&'static str> {
         "softmax_rows" => include_str!("wgpu/shaders/softmax_rows.wgsl"),
         "rms_norm" => include_str!("wgpu/shaders/rms_norm.wgsl"),
         "rope" => include_str!("wgpu/shaders/rope.wgsl"),
+        "hadamard_fwht" => include_str!("wgpu/shaders/hadamard_fwht.wgsl"),
         _ => crate::bail!("wgpu: no WGSL kernel for `{name}`"),
     };
     Ok(s)
@@ -445,6 +446,43 @@ impl WgpuDevice {
         }
         let xs = self.upload_f32(x)?;
         self.matvec_q8_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hadamard_fwht_gpu(
+        &self,
+        x: &WgpuStorage,
+        x_off: usize,
+        signs: Option<(&WgpuStorage, usize)>,
+        block_size: usize,
+        width: usize,
+        is_inverse: bool,
+        total_blocks: usize,
+    ) -> Result<WgpuStorage> {
+        let elem_count = total_blocks * block_size;
+        let out = self.alloc_f32(elem_count)?;
+        if total_blocks > 0 {
+            let (s_buf, s_off, has_s) = match signs {
+                Some((s, off)) => (&s.buffer, off as u32, 1u32),
+                None => (&x.buffer, 0u32, 0u32),
+            };
+            self.dispatch(
+                "hadamard_fwht",
+                &[&x.buffer, s_buf, &out.buffer],
+                &pack_u32(&[
+                    x_off as u32,
+                    s_off,
+                    block_size as u32,
+                    width as u32,
+                    has_s,
+                    u32::from(is_inverse),
+                    total_blocks as u32,
+                    0u32,
+                ]),
+                ((total_blocks as u32).clamp(1, 65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
     }
 
     /// Native-GGML Q4_K matvec with both operands on the GPU: `y[nout] = Wq * x[k]`, `Wq` is the raw
