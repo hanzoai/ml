@@ -1,0 +1,2 @@
+cargo:rerun-if-env-changed=MLIR_SYS_200_PREFIX
+cargo:rustc-env=LLVM_INCLUDE_DIRECTORY=/home/z/.local/share/tracel/tracel-llvm-20.1.4-7/include

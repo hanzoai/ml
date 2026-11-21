@@ -59,12 +59,13 @@ impl KernelCache {
         source: &'static str,
         func_name: &str,
     ) -> Result<usize, KernelError> {
+        let cache_key = format!("{module_name}::{func_name}");
         {
             let funcs = self
                 .functions
                 .lock()
                 .map_err(|_| KernelError::Internal("Failed to lock functions cache".to_string()))?;
-            if let Some(&ptr) = funcs.get(func_name) {
+            if let Some(&ptr) = funcs.get(&cache_key) {
                 return Ok(ptr);
             }
         }
@@ -76,7 +77,7 @@ impl KernelCache {
         self.functions
             .lock()
             .map_err(|_| KernelError::Internal("Failed to lock functions cache".to_string()))?
-            .insert(func_name.to_string(), raw);
+            .insert(cache_key, raw);
         Ok(raw)
     }
 

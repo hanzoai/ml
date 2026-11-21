@@ -1486,12 +1486,153 @@ impl QCudaStorage {
             .storage_from_cpu_storage(&crate::CpuStorage::F32(out))
     }
 
+    /// Native-GGUF DSL dispatch for `PQ2_0` and `PTQ1_0` on CUDA (`HANZO_PQ2_IMPL=dsl` /
+    /// `HANZO_PTQ1_IMPL=dsl`; `legacy` remains the default). Handles both `m == 1` decode matvec
+    /// and `m > 1` prefill GEMM for contiguous `F32` and `BF16` activations (including nonzero
+    /// `layout.start_offset()`).
+    fn try_dispatch_ternary_dsl(
+        &self,
+        self_shape: &crate::Shape,
+        storage: &CudaStorage,
+        layout: &crate::Layout,
+    ) -> Result<Option<(CudaStorage, crate::Shape)>> {
+        use super::dsl::{self, QkImpl};
+        use crate::cuda_backend::CudaStorageSlice;
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+        if !matches!(self.dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) {
+            return Ok(None);
+        }
+        if !layout.is_contiguous() || self_shape.rank() != 2 {
+            return Ok(None);
+        }
+        let src1_bf16 = match &storage.slice {
+            CudaStorageSlice::F32(_) => false,
+            CudaStorageSlice::BF16(_) => true,
+            _ => return Ok(None),
+        };
+        let (n, k) = self_shape.dims2()?;
+        let src_dims = layout.shape().dims();
+        if src_dims.len() < 2 || src_dims[src_dims.len() - 1] != k {
+            return Ok(None);
+        }
+        let m_total: usize = src_dims[..src_dims.len() - 1].iter().product();
+        if m_total == 0 {
+            return Ok(None);
+        }
+        let is_gemm = m_total > 1;
+        let selected = match self.dtype {
+            GgmlDType::PTQ1_0 => dsl::ptq1_impl(),
+            _ => dsl::pq2_impl(),
+        };
+        if selected != QkImpl::Dsl {
+            let legacy_name = match (self.dtype, is_gemm) {
+                (GgmlDType::PQ2_0, false) => "cuda_legacy_pq2_0_dp4a",
+                (GgmlDType::PQ2_0, true) => "cuda_legacy_pq2_0_prefill",
+                (GgmlDType::PTQ1_0, false) => "cuda_legacy_ptq1_0_dp4a",
+                _ => "cuda_legacy_ptq1_0_prefill",
+            };
+            dsl::note_dispatch(QkImpl::Legacy, legacy_name, n, k);
+            return Ok(None);
+        }
+        let eligible = match self.dtype {
+            GgmlDType::PTQ1_0 => dsl::ptq1_dsl_eligible(n, k, self.data.len),
+            _ => dsl::pq2_dsl_eligible(n, k, self.data.len),
+        };
+        let nwords = match eligible {
+            Ok(nw) => nw,
+            Err(_) => return Ok(None),
+        };
+
+        let (artifact, meta_words, grid, block) = if !is_gemm {
+            let (a, nsg, nr0) = match self.dtype {
+                GgmlDType::PTQ1_0 => dsl::ptq1_matvec_artifact(n, src1_bf16),
+                _ => dsl::pq2_matvec_artifact(n, src1_bf16),
+            };
+            (
+                a,
+                [k as u32, n as u32, nwords as u32],
+                (n.div_ceil(nsg * nr0) as u32, 1, 1),
+                (32, nsg as u32, 1),
+            )
+        } else {
+            let (a, bm) = match self.dtype {
+                GgmlDType::PTQ1_0 => dsl::ptq1_matmul_artifact(m_total, n, src1_bf16),
+                _ => dsl::pq2_matmul_artifact(m_total, n, src1_bf16),
+            };
+            (
+                a,
+                [m_total as u32, n as u32, k as u32],
+                (m_total.div_ceil(bm) as u32, n.div_ceil(64) as u32, 1),
+                (128, 1, 1),
+            )
+        };
+
+        let mut out_dims = src_dims.to_vec();
+        *out_dims.last_mut().unwrap() = n;
+        let out_shape = crate::Shape::from(out_dims);
+        let out_elems = out_shape.elem_count();
+
+        let stream = self.device.cuda_stream();
+        let meta = self.device.dsl_const_u32(&meta_words)?;
+        let (w_ptr, _gw) = self.data.inner.device_ptr(&stream);
+        let (m_ptr, _gm) = meta.device_ptr(&stream);
+
+        let out_slice = if src1_bf16 {
+            let x_slice = storage.as_cuda_slice::<half::bf16>()?;
+            let (x_base, _gx) = x_slice.device_ptr(&stream);
+            let x_ptr = x_base + (layout.start_offset() * std::mem::size_of::<half::bf16>()) as u64;
+            let mut out = unsafe { self.device.alloc::<half::bf16>(out_elems)? };
+            {
+                let (o_ptr, _go) = out.device_ptr_mut(&stream);
+                unsafe {
+                    self.device.dispatch_dsl_4(
+                        artifact,
+                        [w_ptr, x_ptr, o_ptr, m_ptr],
+                        grid,
+                        block,
+                    )?;
+                }
+            }
+            CudaStorageSlice::BF16(out)
+        } else {
+            let x_slice = storage.as_cuda_slice::<f32>()?;
+            let (x_base, _gx) = x_slice.device_ptr(&stream);
+            let x_ptr = x_base + (layout.start_offset() * std::mem::size_of::<f32>()) as u64;
+            let mut out = unsafe { self.device.alloc::<f32>(out_elems)? };
+            {
+                let (o_ptr, _go) = out.device_ptr_mut(&stream);
+                unsafe {
+                    self.device.dispatch_dsl_4(
+                        artifact,
+                        [w_ptr, x_ptr, o_ptr, m_ptr],
+                        grid,
+                        block,
+                    )?;
+                }
+            }
+            CudaStorageSlice::F32(out)
+        };
+
+        dsl::note_dispatch(QkImpl::Dsl, artifact, n, k);
+        Ok(Some((
+            CudaStorage {
+                slice: out_slice,
+                device: self.device.clone(),
+            },
+            out_shape,
+        )))
+    }
+
     pub fn fwd(
         &self,
         self_shape: &crate::Shape,
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        if let Some(out) = self.try_dispatch_ternary_dsl(self_shape, storage, layout)? {
+            return Ok(out);
+        }
         // Fallback
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1

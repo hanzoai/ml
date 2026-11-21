@@ -18,7 +18,7 @@ objc2-metal = { version = "0.3.1", optional = true }
 objc2-foundation = { version = "0.3.1", optional = true }
 cudarc = { version = "0.19.8", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8", "cuda-version-from-build-system", "dynamic-linking"], default-features = false, optional = true }
 rocm-rs = { package = "hanzo-rocm", version = "0.5.2", default-features = false, features = ["macros"], optional = true }
-hanzo-rocm-kernels = { path = "../hanzo-rocm-kernels", version = "0.11.45", optional = true }
+hanzo-rocm-kernels = { path = "../hanzo-rocm-kernels", version = "0.11.46", optional = true }
 ash = { version = "0.38", optional = true }
 wgpu = { version = "22", optional = true }
 pollster = { version = "0.3", optional = true }

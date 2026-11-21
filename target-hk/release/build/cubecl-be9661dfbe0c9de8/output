@@ -1,0 +1,5 @@
+cargo:rustc-check-cfg=cfg(test_runtime_default)
+cargo:rustc-check-cfg=cfg(test_runtime_cpu)
+cargo:rustc-check-cfg=cfg(test_runtime_cuda)
+cargo:rustc-check-cfg=cfg(test_runtime_hip)
+cargo:rustc-check-cfg=cfg(test_runtime_wgpu)

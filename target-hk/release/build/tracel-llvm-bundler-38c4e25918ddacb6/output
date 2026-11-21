@@ -1,0 +1,1 @@
+cargo:rerun-if-changed=/home/z/.local/share/tracel/tracel-llvm-20.1.4-7/.tracel-llvm-installed
