@@ -5262,6 +5262,24 @@ impl VulkanDevice {
                     .map_err(vkerr)?;
                 dev.begin_command_buffer(s.cmd, &vk::CommandBufferBeginInfo::default())
                     .map_err(vkerr)?;
+                let init_bar = [vk::MemoryBarrier::default()
+                    .src_access_mask(
+                        vk::AccessFlags::HOST_WRITE
+                            | vk::AccessFlags::SHADER_WRITE
+                            | vk::AccessFlags::SHADER_READ,
+                    )
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )];
+                dev.cmd_pipeline_barrier(
+                    s.cmd,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &init_bar,
+                    &[],
+                    &[],
+                );
                 s.recording = true;
                 s.n = 0;
                 s.work = 0;
@@ -5599,6 +5617,23 @@ impl VulkanDevice {
             let cmd = s.graph_cmd;
             let n = s.n;
             unsafe {
+                let end_bar = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::HOST_READ
+                            | vk::AccessFlags::HOST_WRITE
+                            | vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE,
+                    )];
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &end_bar,
+                    &[],
+                    &[],
+                );
                 dev.end_command_buffer(cmd).map_err(vkerr)?;
             }
             s.capturing = false;
@@ -5919,6 +5954,23 @@ fn flush_locked(
     let record_ms = s.record_ns as f64 / 1e6;
     let (mut submit_ms, mut wait_ms) = (0.0f64, 0.0f64);
     unsafe {
+        let end_bar = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::HOST_READ
+                    | vk::AccessFlags::HOST_WRITE
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE,
+            )];
+        dev.cmd_pipeline_barrier(
+            s.cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &end_bar,
+            &[],
+            &[],
+        );
         dev.end_command_buffer(s.cmd).map_err(vkerr)?;
         dev.reset_fences(&[s.fence]).map_err(vkerr)?;
         let cmds = [s.cmd];
