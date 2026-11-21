@@ -374,7 +374,10 @@ pub fn prepare_batch(
     cfg: &RaftConfig,
     dev: &Device,
 ) -> Result<PreparedRaftBatch> {
-    ensure!(!samples.is_empty(), "samples must not be empty in prepare_batch");
+    ensure!(
+        !samples.is_empty(),
+        "samples must not be empty in prepare_batch"
+    );
     let indices: Vec<usize> = (0..samples.len()).collect();
     prepare_indexed_batch(samples, &indices, cfg, dev)
 }
@@ -400,7 +403,12 @@ fn prepare_indexed_batch(
     let mut cite = Vec::with_capacity(b);
 
     for &idx in indices {
-        ensure!(idx < samples.len(), "sample index {} out of bounds {}", idx, samples.len());
+        ensure!(
+            idx < samples.len(),
+            "sample index {} out of bounds {}",
+            idx,
+            samples.len()
+        );
         let item = &samples[idx];
         ensure!(
             item.query_tokens.len() == s,
