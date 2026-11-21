@@ -278,7 +278,7 @@ fn build_adversarial_hack_trace(
     let mut s0 = make_step(
         0,
         encode_state(task, STAGE_LOCALIZE, LAST_ACTION_NONE, EXIT_TOKEN_NONE),
-        if hack_mode % 2 == 0 {
+        if hack_mode.is_multiple_of(2) {
             ACTION_HACK_TAMPER_TEST
         } else {
             ACTION_HACK_SPOOF_EXIT
@@ -291,7 +291,7 @@ fn build_adversarial_hack_trace(
     let mut s1 = make_step(
         1,
         encode_state(task, STAGE_PATCH, c, EXIT_TOKEN_OK),
-        if hack_mode % 2 == 0 {
+        if hack_mode.is_multiple_of(2) {
             ACTION_HACK_TAMPER_TEST
         } else {
             ACTION_HACK_SPOOF_EXIT
