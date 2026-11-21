@@ -10,7 +10,12 @@
 //!   sliding window, softcap, and `d = 64, 128, 256`,
 //! - Single-compile proof (`compiled == 1` across repeated calls).
 
-#![cfg(any(feature = "cuda", feature = "vulkan", feature = "metal"))]
+#![cfg(any(
+    feature = "cuda",
+    feature = "vulkan",
+    feature = "metal",
+    feature = "rocm"
+))]
 
 use hanzo_ml::flash_attn::{
     try_flash_attn_contiguous, try_flash_attn_paged, FlashAttnConfig, KvCacheLayout,
@@ -865,4 +870,13 @@ fn metal_gdn_and_flash_paged_prod_dsl() {
     run_gdn_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
     run_flash_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
     run_fwht_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "Metal");
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_gdn_and_flash_paged_prod_dsl() {
+    let dev = Device::new_rocm(0).expect("ROCm device 0");
+    run_gdn_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "ROCm");
+    run_flash_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "ROCm");
+    run_fwht_suite(&dev, &[DType::F32, DType::F16, DType::BF16], "ROCm");
 }

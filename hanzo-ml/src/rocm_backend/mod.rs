@@ -11,6 +11,7 @@ use rocm_rs::hip::bindings;
 use rocm_rs::rocblas::{self, level3::GemmStridedBatchedType, types::Operation};
 
 mod device;
+pub mod dsl;
 mod error;
 #[cfg(feature = "rocm-miopen")]
 mod miopen;

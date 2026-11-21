@@ -184,6 +184,49 @@ pub fn try_hadamard_fwht(
                 false,
             )))
         }
+        #[cfg(feature = "rocm")]
+        crate::Device::Rocm(dev) => {
+            let x_c = ensure_contiguous_view(x)?;
+            let s_c = match &signs_f32 {
+                Some(s) => Some(ensure_contiguous_view(s)?),
+                None => None,
+            };
+            let out_s = {
+                let (xs, xl) = x_c.storage_and_layout();
+                let Storage::Rocm(xs) = &*xs else {
+                    return Ok(None);
+                };
+                if let Some(sc) = &s_c {
+                    let (ss, sl) = sc.storage_and_layout();
+                    let Storage::Rocm(ss) = &*ss else {
+                        return Ok(None);
+                    };
+                    dev.fwht_hadamard_dsl(
+                        orig_dtype,
+                        (xs, xl.start_offset()),
+                        Some((ss, sl.start_offset(), sc.elem_count())),
+                        n_blocks,
+                        block_size,
+                        inverse,
+                    )?
+                } else {
+                    dev.fwht_hadamard_dsl(
+                        orig_dtype,
+                        (xs, xl.start_offset()),
+                        None,
+                        n_blocks,
+                        block_size,
+                        inverse,
+                    )?
+                }
+            };
+            Ok(Some(Tensor::from_storage(
+                Storage::Rocm(out_s),
+                orig_shape,
+                BackpropOp::none(),
+                false,
+            )))
+        }
         #[cfg(feature = "vulkan")]
         crate::Device::Vulkan(dev) => {
             let xf = if orig_dtype == DType::F32 {

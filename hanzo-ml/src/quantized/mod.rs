@@ -3127,6 +3127,40 @@ impl crate::Module for QMatMul {
                 };
                 let xs = xs_recovered.as_ref().unwrap_or(xs);
                 let rows: usize = xs.elem_count() / *k;
+                // Canonical DSL ternary path (PQ2_0 / PTQ1_0, decode matvec + prefill GEMM, F32/BF16)
+                // gated on HANZO_PQ2_IMPL / HANZO_PTQ1_IMPL == dsl (defaults to legacy).
+                #[cfg(feature = "rocm")]
+                if matches!(*dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0)
+                    && matches!(xs.dtype(), DType::F32 | DType::BF16)
+                {
+                    if let Device::Rocm(d) = xs.device() {
+                        let xs_c = xs.contiguous()?;
+                        let (store, layout) = xs_c.storage_and_layout();
+                        if let crate::Storage::Rocm(xr) = &*store {
+                            if let Some(y) = d.try_ternary_dsl_matmul(
+                                *dtype,
+                                wq,
+                                qtensor.storage_size_in_bytes(),
+                                xr,
+                                layout.start_offset(),
+                                xs_c.dtype(),
+                                rows,
+                                *n,
+                                *k,
+                            )? {
+                                let mut dims = xs_c.dims().to_vec();
+                                let last = dims.len() - 1;
+                                dims[last] = *n;
+                                return Ok(crate::tensor::from_storage(
+                                    crate::Storage::Rocm(y),
+                                    dims,
+                                    crate::op::BackpropOp::none(),
+                                    false,
+                                ));
+                            }
+                        }
+                    }
+                }
                 // Table-driven unified decode: a type is decode-native iff the single
                 // `qmatvec_core<WTYPE>` has a `decode_block` wired for it (RocmQuantType::from_ggml).
                 // Q8_0/Q4_0/Q4_K/Q6_K/IQ4_XS/TQ2_0 today; adding a type is one enum row, no kernel.
