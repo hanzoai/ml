@@ -1464,10 +1464,11 @@ mod tests {
     fn secret_redactor_scrubs_credentials_and_emails() {
         let synthetic_api = format!("{}{}", "sk-", "synthetic0000test9999");
         let synthetic_bearer = format!("Bearer {}", "tok_synthetic_0000_abcd");
+        let synthetic_dsn = format!("{}://admin:pass123@db.internal:5432/app", "postgres");
         let pem_header = format!("-----BEGIN {}-----", "TEST PRIVATE KEY");
         let pem_footer = format!("-----END {}-----", "TEST PRIVATE KEY");
         let raw = format!(
-            "contact ops.user@example.org with {synthetic_api} or {synthetic_bearer} db postgres://admin:pass123@db.internal:5432/app {pem_header}body{pem_footer}"
+            "contact ops.user@example.org with {synthetic_api} or {synthetic_bearer} db {synthetic_dsn} {pem_header}body{pem_footer}"
         );
         let (clean, count) = redact_text_secrets(&raw);
         assert!(count >= 5, "expected >= 5 redactions, got {count}: {clean}");
