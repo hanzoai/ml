@@ -704,12 +704,8 @@ impl RocmDevice {
             }
             dsl::note_dispatch(QkImpl::Dsl, split_artifact, n_heads, d);
             if num_splits > 1 {
-                let rmeta = self.dsl_const_u32_slice(&[
-                    total_qh as u32,
-                    num_splits as u32,
-                    0u32,
-                    0u32,
-                ])?;
+                let rmeta =
+                    self.dsl_const_u32_slice(&[total_qh as u32, num_splits as u32, 0u32, 0u32])?;
                 let rmp = rmeta.as_ptr();
                 unsafe {
                     self.dispatch_dsl_raw(

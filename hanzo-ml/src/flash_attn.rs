@@ -103,9 +103,16 @@ fn is_kv_strided_contiguous(
     d_ok && seq_ok && head_ok && batch_ok
 }
 
+type ContigBtEntry = (usize, Tensor);
+type ContigClEntry = (usize, usize, Tensor);
+
+// Grow-only thread-local metadata caches so a captured CUDA/Metal/Vulkan graph never sees its
+// bound `dummy_bt` or `context_lens` buffer freed when a later eager call uses another `seq_k`.
 thread_local! {
-    static CONTIG_META_CACHE: std::cell::RefCell<Option<(usize, usize, Tensor, Tensor)>> =
-        const { std::cell::RefCell::new(None) };
+    static CONTIG_BT_CACHE: std::cell::RefCell<Vec<ContigBtEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static CONTIG_CL_CACHE: std::cell::RefCell<Vec<ContigClEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 const SPLIT_KV_UNINIT: usize = usize::MAX;
@@ -123,7 +130,8 @@ fn read_flash_split_kv_override() -> Option<usize> {
     if v != SPLIT_KV_UNINIT {
         return Some(v);
     }
-    let parsed = std::env::var("HANZO_FLASH_SPLIT_KV")
+    let parsed = std::env::var("ML_SPLIT_KV_PARTITIONS")
+        .or_else(|_| std::env::var("HANZO_FLASH_SPLIT_KV"))
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
@@ -396,10 +404,12 @@ pub fn try_flash_attn_paged(
             {
                 return Ok(None);
             }
-            let k_in_place = is_kv_strided_contiguous(k_cache, batch, n_kv, seq_k, d, kv_seq_stride)
-                && (!need_zero_offset || k_cache.layout().start_offset() == 0);
-            let v_in_place = is_kv_strided_contiguous(v_cache, batch, n_kv, seq_k, d, kv_seq_stride)
-                && (!need_zero_offset || v_cache.layout().start_offset() == 0);
+            let k_in_place =
+                is_kv_strided_contiguous(k_cache, batch, n_kv, seq_k, d, kv_seq_stride)
+                    && (!need_zero_offset || k_cache.layout().start_offset() == 0);
+            let v_in_place =
+                is_kv_strided_contiguous(v_cache, batch, n_kv, seq_k, d, kv_seq_stride)
+                    && (!need_zero_offset || v_cache.layout().start_offset() == 0);
             if k_in_place && v_in_place {
                 (
                     k_cache.clone(),
@@ -681,23 +691,29 @@ pub fn try_flash_attn_contiguous(
         seq_k
     };
     let dev = q.device();
-    let (dummy_bt, ctx_lens) = CONTIG_META_CACHE.with(|cell| -> Result<(Tensor, Tensor)> {
+    let dummy_bt = CONTIG_BT_CACHE.with(|cell| -> Result<Tensor> {
         let mut guard = cell.borrow_mut();
-        if let Some((cb, csk, bt, cl)) = guard.as_ref() {
-            if *cb == batch && bt.device().same_device(dev) {
-                if *csk == seq_k {
-                    return Ok((bt.clone(), cl.clone()));
-                }
-                let bt_reuse = bt.clone();
-                let cl_new = Tensor::from_vec(vec![seq_k as u32; batch], batch, dev)?;
-                *guard = Some((batch, seq_k, bt_reuse.clone(), cl_new.clone()));
-                return Ok((bt_reuse, cl_new));
-            }
+        if let Some((_, bt)) = guard
+            .iter()
+            .find(|(cb, bt)| *cb == batch && bt.device().same_device(dev))
+        {
+            return Ok(bt.clone());
         }
         let bt_new = Tensor::zeros((batch, 1), DType::U32, dev)?;
+        guard.push((batch, bt_new.clone()));
+        Ok(bt_new)
+    })?;
+    let ctx_lens = CONTIG_CL_CACHE.with(|cell| -> Result<Tensor> {
+        let mut guard = cell.borrow_mut();
+        if let Some((_, _, cl)) = guard
+            .iter()
+            .find(|(cb, csk, cl)| *cb == batch && *csk == seq_k && cl.device().same_device(dev))
+        {
+            return Ok(cl.clone());
+        }
         let cl_new = Tensor::from_vec(vec![seq_k as u32; batch], batch, dev)?;
-        *guard = Some((batch, seq_k, bt_new.clone(), cl_new.clone()));
-        Ok((bt_new, cl_new))
+        guard.push((batch, seq_k, cl_new.clone()));
+        Ok(cl_new)
     })?;
     try_flash_attn_paged(
         q,
@@ -721,40 +737,100 @@ mod tests {
         set_flash_split_kv_override(None);
 
         // Short context stays single-pass (num_splits == 1).
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 64, 0), 1);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 128, 0), 1);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 64, 0),
+            1
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 128, 0),
+            1
+        );
 
         // CUDA (GB10-calibrated): 16 at 512, 32 at 4K..8K, 128 at 16K..32K (avoids 256 overhead).
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 512, 0), 16);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 4096, 0), 32);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 8192, 0), 32);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 16384, 0), 128);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 32768, 0), 128);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 512, 0),
+            16
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 4096, 0),
+            32
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 8192, 0),
+            32
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 16384, 0),
+            128
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 32768, 0),
+            128
+        );
 
         // Metal (Apple Silicon-calibrated): 16 at 512, 128 at 4K, 256 at 8K..32K for GQA,
         // and capped at 128 for MHA (gqa_ratio == 1) at 16K..32K.
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 512, 0), 16);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 4096, 0), 128);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 8192, 0), 256);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 32768, 0), 256);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 24, 1, 128, 32768, 0), 128);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 512, 0),
+            16
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 4096, 0),
+            128
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 8192, 0),
+            256
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 2, 1, 128, 32768, 0),
+            256
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 24, 1, 128, 32768, 0),
+            128
+        );
 
         // Vulkan favors higher split counts at 4K (d=256) and 8K..32K.
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Vulkan, 1, 24, 2, 1, 256, 4096, 0), 64);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Vulkan, 1, 24, 2, 1, 128, 8192, 0), 128);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Vulkan, 1, 24, 2, 1, 256, 4096, 0),
+            64
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Vulkan, 1, 24, 2, 1, 128, 8192, 0),
+            128
+        );
 
         // Sliding window clamps active context before partitioning.
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 32768, 128), 1);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 32768, 512), 16);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 32768, 128),
+            1
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 32768, 512),
+            16
+        );
 
         // Large batch scales splits down proportionally to avoid oversubscription.
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 4, 24, 2, 1, 128, 32768, 0), 32);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 16, 24, 2, 1, 128, 32768, 0), 8);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 4, 24, 2, 1, 128, 32768, 0),
+            32
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 16, 24, 2, 1, 128, 32768, 0),
+            8
+        );
 
         // In-process override takes precedence and clears cleanly.
         set_flash_split_kv_override(Some(256));
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 64, 0), 256);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 64, 0),
+            256
+        );
         set_flash_split_kv_override(None);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 64, 0), 1);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 2, 1, 128, 64, 0),
+            1
+        );
     }
 }

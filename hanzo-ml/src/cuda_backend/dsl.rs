@@ -316,9 +316,7 @@ impl CudaDevice {
         }
         let slice = Arc::new(self.clone_htod(words)?);
         let mut guard = cache.lock().unwrap();
-        if guard.len() > 2048 {
-            guard.clear();
-        }
+        // Retain all cached metadata slices so captured CUDA graphs never lose bound device pointers.
         guard.insert(key, slice.clone());
         Ok(slice)
     }
@@ -333,9 +331,6 @@ impl CudaDevice {
         }
         let slice = Arc::new(self.clone_htod(vals)?);
         let mut guard = cache.lock().unwrap();
-        if guard.len() > 512 {
-            guard.clear();
-        }
         guard.insert(key, slice.clone());
         Ok(slice)
     }
@@ -731,12 +726,7 @@ impl CudaDevice {
                 num_splits as u32,
             ])?;
             let rmeta = if num_splits > 1 {
-                Some(self.dsl_const_u32_slice(&[
-                    total_qh as u32,
-                    num_splits as u32,
-                    0u32,
-                    0u32,
-                ])?)
+                Some(self.dsl_const_u32_slice(&[total_qh as u32, num_splits as u32, 0u32, 0u32])?)
             } else {
                 None
             };
@@ -756,8 +746,7 @@ impl CudaDevice {
             let mut partial_guard = if capturing {
                 None
             } else {
-                let cache =
-                    DSL_SPLIT_KV_PARTIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                let cache = DSL_SPLIT_KV_PARTIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
                 let mut g = cache.lock().unwrap();
                 let need_grow = g.get(&stream_key).is_none_or(|b| b.len() < partial_len);
                 if need_grow {
