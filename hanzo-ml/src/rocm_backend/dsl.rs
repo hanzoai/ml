@@ -658,6 +658,7 @@ impl RocmDevice {
                 crate::quantized::dsl::QkBackend::Rocm,
                 batch,
                 n_heads,
+                n_kv,
                 seq_q,
                 d,
                 max_ctx_est,

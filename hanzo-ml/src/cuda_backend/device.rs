@@ -327,7 +327,7 @@ impl CudaDevice {
         Ok(Some(cached))
     }
 
-    fn cuda_graph_capture_active(&self) -> bool {
+    pub(crate) fn cuda_graph_capture_active(&self) -> bool {
         matches!(
             self.stream.capture_status(),
             Ok(status) if status != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE

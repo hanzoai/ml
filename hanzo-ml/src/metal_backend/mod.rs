@@ -3312,6 +3312,7 @@ impl MetalDevice {
                 crate::quantized::dsl::QkBackend::Metal,
                 batch,
                 n_heads,
+                n_kv,
                 seq_q,
                 d,
                 max_ctx_est,

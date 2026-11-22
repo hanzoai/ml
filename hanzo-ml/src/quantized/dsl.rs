@@ -155,13 +155,23 @@ fn encode_opt(i: Option<QkImpl>) -> u8 {
     }
 }
 
+fn read_ml_or_legacy_env(env_var: &str) -> Result<String, std::env::VarError> {
+    if let Some(suffix) = env_var.strip_prefix("HANZO_") {
+        let ml_key = format!("ML_{suffix}");
+        if let Ok(val) = std::env::var(&ml_key) {
+            return Ok(val);
+        }
+    }
+    std::env::var(env_var)
+}
+
 fn read_phase_override(atom: &AtomicU8, env_var: &str) -> Option<QkImpl> {
     match atom.load(Ordering::Relaxed) {
         OVERRIDE_NONE => None,
         OVERRIDE_LEGACY => Some(QkImpl::Legacy),
         OVERRIDE_DSL => Some(QkImpl::Dsl),
         _ => {
-            let parsed = match std::env::var(env_var).as_deref() {
+            let parsed = match read_ml_or_legacy_env(env_var).as_deref() {
                 Ok("dsl") => Some(QkImpl::Dsl),
                 Ok("legacy") => Some(QkImpl::Legacy),
                 _ => None,
@@ -177,7 +187,7 @@ fn read_op_override(atom: &AtomicU8, env_var: &str) -> u8 {
     match cur {
         OVERRIDE_NONE | OVERRIDE_LEGACY | OVERRIDE_DSL | OVERRIDE_AUTO => cur,
         _ => {
-            let v = match std::env::var(env_var).as_deref() {
+            let v = match read_ml_or_legacy_env(env_var).as_deref() {
                 Ok("dsl") => OVERRIDE_DSL,
                 Ok("legacy") => OVERRIDE_LEGACY,
                 Ok("auto") => OVERRIDE_AUTO,
@@ -195,7 +205,9 @@ fn dsl_policy_auto_enabled() -> bool {
         1 => true,
         _ => {
             let on = matches!(
-                std::env::var("HANZO_DSL_POLICY").as_deref(),
+                std::env::var("ML_DSL_POLICY")
+                    .or_else(|_| std::env::var("HANZO_DSL_POLICY"))
+                    .as_deref(),
                 Ok("auto") | Ok("qualified") | Ok("metal-promoted")
             );
             DSL_POLICY_AUTO.store(u8::from(on), Ordering::Relaxed);

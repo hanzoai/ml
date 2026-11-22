@@ -4548,6 +4548,7 @@ impl VulkanDevice {
                 crate::quantized::dsl::QkBackend::Vulkan,
                 batch,
                 n_heads,
+                n_kv,
                 seq_q,
                 d,
                 max_ctx_est,
