@@ -6,8 +6,8 @@
 //! - Forward (`inverse == false`): `y = ((x * signs).reshape(-1, B) @ H_B).reshape_as(x)`
 //! - Inverse (`inverse == true`): `y = (x.reshape(-1, B) @ H_B).reshape_as(x) * signs`
 //!
-//! Controlled by [`crate::quantized::dsl::fwht_impl`] (`HANZO_FWHT_IMPL=dsl|legacy`, default
-//! `dsl` so Metal and Vulkan get the ~6× FWHT speedup out of the box, with `HANZO_FWHT_IMPL=legacy`
+//! Controlled by [`crate::quantized::dsl::fwht_impl`] (`ML_FWHT_IMPL=dsl|legacy`, default
+//! `dsl` so Metal and Vulkan get the ~6x FWHT speedup out of the box, with `ML_FWHT_IMPL=legacy`
 //! as an instant fallback switch for A/B).
 
 #![allow(unused_variables, unused_mut, unreachable_code, dead_code)]
@@ -45,7 +45,7 @@ fn ensure_contiguous_offset_zero(t: &Tensor) -> Result<Tensor> {
 /// - `inverse`: `false` for pre-sign forward fold `H(x * s)`, `true` for post-sign inverse fold `H(x) * s`
 ///
 /// Returns `Ok(Some(out))` with the same shape and dtype as `x`, or `Ok(None)` when disabled via
-/// `HANZO_FWHT_IMPL=legacy` or on an unsupported backend/block_size.
+/// `ML_FWHT_IMPL=legacy` or on an unsupported backend/block_size.
 pub fn try_hadamard_fwht(
     x: &Tensor,
     signs: Option<&Tensor>,

@@ -533,17 +533,17 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The first hunt (GPU; opt-in via `HANZO_COOPMAT_HUNT=1`). Tunes the coopmat prefill kernel at the
+    /// The first hunt (GPU; opt-in via `ML_COOPMAT_HUNT=1`). Tunes the coopmat prefill kernel at the
     /// ffn gate/up shape, seeded with the shipped incumbent, and prints the full evidence trail. A win
     /// updates the shader defaults; a plateau (incumbent stays best over the whole sound genome) is the
-    /// valid, valuable equilibrium result. Set `HANZO_COOPMAT_NOSTATS=1` to skip RADV shaderstats,
-    /// `HANZO_HUNT_SEED=<n>` to reseed.
+    /// valid, valuable equilibrium result. Set `ML_COOPMAT_NOSTATS=1` to skip RADV shaderstats,
+    /// `ML_HUNT_SEED=<n>` to reseed.
     #[test]
     fn coopmat_hunt() {
-        if std::env::var_os("HANZO_COOPMAT_HUNT").is_none() {
+        if crate::ml_env_os("ML_COOPMAT_HUNT", "HANZO_COOPMAT_HUNT").is_none() {
             return;
         }
-        let shaderstats = std::env::var_os("HANZO_COOPMAT_NOSTATS").is_none();
+        let shaderstats = crate::ml_env_os("ML_COOPMAT_NOSTATS", "HANZO_COOPMAT_NOSTATS").is_none();
         if shaderstats {
             // RADV reads this at device init, so it must be set before VulkanDevice::new.
             unsafe { std::env::set_var("RADV_DEBUG", "shaderstats") };
@@ -559,10 +559,10 @@ mod tests {
             eprintln!("[hunt] device has no cooperative matrix; skipping");
             return;
         }
-        let (m, n, k) = (512usize, 11008usize, 2048usize); // ffn gate/up -- the dominant coopmat shape
+        let (m, n, k) = (512usize, 11008usize, 2048usize); // ffn gate/up: the dominant coopmat shape
         let (bank, xh, oracle, maxref) = build_bank_and_oracle(&dev, m, n, k);
         eprintln!(
-            "[hunt] cold bank: {} tiles x {} MB = {} MB (MALL {} MB) -- timing streams cold weights",
+            "[hunt] cold bank: {} tiles x {} MB = {} MB (MALL {} MB) - timing streams cold weights",
             bank.len(),
             tile_bytes(n, k) >> 20,
             (bank.len() * tile_bytes(n, k)) >> 20,
@@ -601,7 +601,7 @@ mod tests {
             .elitism(2)
             .measure_iters(30)
             .seed_config(inc.clone());
-        let seed = std::env::var("HANZO_HUNT_SEED")
+        let seed = crate::ml_env_var("ML_HUNT_SEED", "HANZO_HUNT_SEED")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0xC0FFEEu64);

@@ -1611,7 +1611,9 @@ fn main() {
                 std::process::exit(1);
             }
             let hw_plane = client.properties().hardware.plane_size_max;
-            let force_p64 = std::env::var_os("HANZO_KERNEL_GEN_P64").is_some();
+            let force_p64 = std::env::var_os("ML_KERNEL_GEN_P64")
+                .or_else(|| std::env::var_os("HANZO_KERNEL_GEN_P64"))
+                .is_some();
             let plane = if force_p64 { 64 } else { hw_plane };
             let mut all_specs = ternary_specs::<WgpuRuntime>();
             all_specs.extend(gdn_and_flash_prod_specs::<WgpuRuntime>(false));

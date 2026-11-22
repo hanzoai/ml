@@ -5,11 +5,11 @@
 //! what actually ran. A backend's quantized storage asks here and then executes; `hanzo-engine`
 //! keeps calling `QMatMul` and never learns which implementation served it.
 //!
-//! Switch: `HANZO_PQ2_IMPL=dsl|legacy` (default `legacy` until the 27B qualification makes the DSL
+//! Switch: `ML_PQ2_IMPL=dsl|legacy` (default `legacy` until the 27B qualification makes the DSL
 //! path the default). `set_pq2_impl` overrides it in-process for A/B tests and benches.
 //!
 //! Evidence: every dispatch is counted per (impl, artifact, n, k) and every DSL pipeline compile per
-//! artifact (`stats`, `report`). `HANZO_QK_STATS=1` logs the first dispatch of each key and a full
+//! artifact (`stats`, `report`). `ML_QK_STATS=1` logs the first dispatch of each key and a full
 //! report at every power-of-two total from 1024 on, so a long benchmark run shows its counts in the
 //! log without an exit hook.
 
@@ -155,13 +155,13 @@ fn encode_opt(i: Option<QkImpl>) -> u8 {
     }
 }
 
-fn read_phase_override(atom: &AtomicU8, env_var: &str) -> Option<QkImpl> {
+fn read_phase_override(atom: &AtomicU8, ml_var: &str, legacy_var: &str) -> Option<QkImpl> {
     match atom.load(Ordering::Relaxed) {
         OVERRIDE_NONE => None,
         OVERRIDE_LEGACY => Some(QkImpl::Legacy),
         OVERRIDE_DSL => Some(QkImpl::Dsl),
         _ => {
-            let parsed = match std::env::var(env_var).as_deref() {
+            let parsed = match crate::ml_env_var(ml_var, legacy_var).as_deref() {
                 Ok("dsl") => Some(QkImpl::Dsl),
                 Ok("legacy") => Some(QkImpl::Legacy),
                 _ => None,
@@ -172,12 +172,12 @@ fn read_phase_override(atom: &AtomicU8, env_var: &str) -> Option<QkImpl> {
     }
 }
 
-fn read_op_override(atom: &AtomicU8, env_var: &str) -> u8 {
+fn read_op_override(atom: &AtomicU8, ml_var: &str, legacy_var: &str) -> u8 {
     let cur = atom.load(Ordering::Relaxed);
     match cur {
         OVERRIDE_NONE | OVERRIDE_LEGACY | OVERRIDE_DSL | OVERRIDE_AUTO => cur,
         _ => {
-            let v = match std::env::var(env_var).as_deref() {
+            let v = match crate::ml_env_var(ml_var, legacy_var).as_deref() {
                 Ok("dsl") => OVERRIDE_DSL,
                 Ok("legacy") => OVERRIDE_LEGACY,
                 Ok("auto") => OVERRIDE_AUTO,
@@ -195,7 +195,7 @@ fn dsl_policy_auto_enabled() -> bool {
         1 => true,
         _ => {
             let on = matches!(
-                std::env::var("HANZO_DSL_POLICY").as_deref(),
+                crate::ml_env_var("ML_DSL_POLICY", "HANZO_DSL_POLICY").as_deref(),
                 Ok("auto") | Ok("qualified") | Ok("metal-promoted")
             );
             DSL_POLICY_AUTO.store(u8::from(on), Ordering::Relaxed);
@@ -209,12 +209,17 @@ pub fn set_dsl_policy_auto(enabled: bool) {
     DSL_POLICY_AUTO.store(u8::from(enabled), Ordering::Relaxed);
 }
 
-fn read_impl_env(atom: &AtomicU8, env_var: &str) -> QkImpl {
-    read_impl_env_default(atom, env_var, QkImpl::Legacy)
+fn read_impl_env(atom: &AtomicU8, ml_var: &str, legacy_var: &str) -> QkImpl {
+    read_impl_env_default(atom, ml_var, legacy_var, QkImpl::Legacy)
 }
 
-fn read_impl_env_default(atom: &AtomicU8, env_var: &str, default: QkImpl) -> QkImpl {
-    match read_op_override(atom, env_var) {
+fn read_impl_env_default(
+    atom: &AtomicU8,
+    ml_var: &str,
+    legacy_var: &str,
+    default: QkImpl,
+) -> QkImpl {
+    match read_op_override(atom, ml_var, legacy_var) {
         OVERRIDE_LEGACY => QkImpl::Legacy,
         OVERRIDE_DSL => QkImpl::Dsl,
         _ => default,
@@ -299,29 +304,37 @@ pub fn qualified_policy_impl(backend: QkBackend, op: QkOp) -> QkImpl {
 
 /// Phase-, operation-, shape-, and backend-aware kernel selection with full env-var and in-process
 /// override precedence:
-/// 1. Phase-specific override (`HANZO_{PQ2,PTQ1,GDN,FLASH}_{DECODE,PREFILL}_IMPL` / `set_*_{decode,prefill}_impl`)
-/// 2. Operation-level override (`HANZO_{PQ2,PTQ1,GDN,FLASH,FWHT}_IMPL=dsl|legacy` / `set_*_impl`)
-/// 3. Qualified hardware/phase policy (`qualified_policy_impl`) when `HANZO_*_IMPL=auto` or `HANZO_DSL_POLICY=auto`
+/// 1. Phase-specific override (`ML_{PQ2,PTQ1,GDN,FLASH}_{DECODE,PREFILL}_IMPL` / `set_*_{decode,prefill}_impl`)
+/// 2. Operation-level override (`ML_{PQ2,PTQ1,GDN,FLASH,FWHT}_IMPL=dsl|legacy` / `set_*_impl`)
+/// 3. Qualified hardware/phase policy (`qualified_policy_impl`) when `ML_*_IMPL=auto` or `ML_DSL_POLICY=auto`
 /// 4. Conservative global default (`Dsl` for FWHT; `Legacy` for PQ2, PTQ1, GDN, FlashAttention)
 pub fn select_impl(backend: QkBackend, op: QkOp) -> QkImpl {
     match op {
-        QkOp::Fwht { .. } => match read_op_override(&FWHT_IMPL, "HANZO_FWHT_IMPL") {
-            OVERRIDE_LEGACY => QkImpl::Legacy,
-            OVERRIDE_DSL => QkImpl::Dsl,
-            OVERRIDE_AUTO => qualified_policy_impl(backend, op),
-            _ => QkImpl::Dsl,
-        },
+        QkOp::Fwht { .. } => {
+            match read_op_override(&FWHT_IMPL, "ML_FWHT_IMPL", "HANZO_FWHT_IMPL") {
+                OVERRIDE_LEGACY => QkImpl::Legacy,
+                OVERRIDE_DSL => QkImpl::Dsl,
+                OVERRIDE_AUTO => qualified_policy_impl(backend, op),
+                _ => QkImpl::Dsl,
+            }
+        }
         QkOp::Pq2 { m, .. } => {
             let phase_ov = match QkPhase::from_m(m) {
-                QkPhase::Decode => read_phase_override(&PQ2_DECODE_IMPL, "HANZO_PQ2_DECODE_IMPL"),
-                QkPhase::Prefill => {
-                    read_phase_override(&PQ2_PREFILL_IMPL, "HANZO_PQ2_PREFILL_IMPL")
-                }
+                QkPhase::Decode => read_phase_override(
+                    &PQ2_DECODE_IMPL,
+                    "ML_PQ2_DECODE_IMPL",
+                    "HANZO_PQ2_DECODE_IMPL",
+                ),
+                QkPhase::Prefill => read_phase_override(
+                    &PQ2_PREFILL_IMPL,
+                    "ML_PQ2_PREFILL_IMPL",
+                    "HANZO_PQ2_PREFILL_IMPL",
+                ),
             };
             if let Some(forced) = phase_ov {
                 return forced;
             }
-            match read_op_override(&PQ2_IMPL, "HANZO_PQ2_IMPL") {
+            match read_op_override(&PQ2_IMPL, "ML_PQ2_IMPL", "HANZO_PQ2_IMPL") {
                 OVERRIDE_LEGACY => QkImpl::Legacy,
                 OVERRIDE_DSL => QkImpl::Dsl,
                 OVERRIDE_AUTO => qualified_policy_impl(backend, op),
@@ -331,17 +344,21 @@ pub fn select_impl(backend: QkBackend, op: QkOp) -> QkImpl {
         }
         QkOp::Ptq1 { m, .. } => {
             let phase_ov = match QkPhase::from_m(m) {
-                QkPhase::Decode => {
-                    read_phase_override(&PTQ1_DECODE_IMPL, "HANZO_PTQ1_DECODE_IMPL")
-                }
-                QkPhase::Prefill => {
-                    read_phase_override(&PTQ1_PREFILL_IMPL, "HANZO_PTQ1_PREFILL_IMPL")
-                }
+                QkPhase::Decode => read_phase_override(
+                    &PTQ1_DECODE_IMPL,
+                    "ML_PTQ1_DECODE_IMPL",
+                    "HANZO_PTQ1_DECODE_IMPL",
+                ),
+                QkPhase::Prefill => read_phase_override(
+                    &PTQ1_PREFILL_IMPL,
+                    "ML_PTQ1_PREFILL_IMPL",
+                    "HANZO_PTQ1_PREFILL_IMPL",
+                ),
             };
             if let Some(forced) = phase_ov {
                 return forced;
             }
-            match read_op_override(&PTQ1_IMPL, "HANZO_PTQ1_IMPL") {
+            match read_op_override(&PTQ1_IMPL, "ML_PTQ1_IMPL", "HANZO_PTQ1_IMPL") {
                 OVERRIDE_LEGACY => QkImpl::Legacy,
                 OVERRIDE_DSL => QkImpl::Dsl,
                 OVERRIDE_AUTO => qualified_policy_impl(backend, op),
@@ -351,15 +368,21 @@ pub fn select_impl(backend: QkBackend, op: QkOp) -> QkImpl {
         }
         QkOp::Gdn { seq_len, .. } => {
             let phase_ov = match QkPhase::from_m(seq_len) {
-                QkPhase::Decode => read_phase_override(&GDN_DECODE_IMPL, "HANZO_GDN_DECODE_IMPL"),
-                QkPhase::Prefill => {
-                    read_phase_override(&GDN_PREFILL_IMPL, "HANZO_GDN_PREFILL_IMPL")
-                }
+                QkPhase::Decode => read_phase_override(
+                    &GDN_DECODE_IMPL,
+                    "ML_GDN_DECODE_IMPL",
+                    "HANZO_GDN_DECODE_IMPL",
+                ),
+                QkPhase::Prefill => read_phase_override(
+                    &GDN_PREFILL_IMPL,
+                    "ML_GDN_PREFILL_IMPL",
+                    "HANZO_GDN_PREFILL_IMPL",
+                ),
             };
             if let Some(forced) = phase_ov {
                 return forced;
             }
-            match read_op_override(&GDN_IMPL, "HANZO_GDN_IMPL") {
+            match read_op_override(&GDN_IMPL, "ML_GDN_IMPL", "HANZO_GDN_IMPL") {
                 OVERRIDE_LEGACY => QkImpl::Legacy,
                 OVERRIDE_DSL => QkImpl::Dsl,
                 OVERRIDE_AUTO => qualified_policy_impl(backend, op),
@@ -369,17 +392,21 @@ pub fn select_impl(backend: QkBackend, op: QkOp) -> QkImpl {
         }
         QkOp::FlashAttn { seq_q, .. } => {
             let phase_ov = match QkPhase::from_seq_q(seq_q) {
-                QkPhase::Decode => {
-                    read_phase_override(&FLASH_DECODE_IMPL, "HANZO_FLASH_DECODE_IMPL")
-                }
-                QkPhase::Prefill => {
-                    read_phase_override(&FLASH_PREFILL_IMPL, "HANZO_FLASH_PREFILL_IMPL")
-                }
+                QkPhase::Decode => read_phase_override(
+                    &FLASH_DECODE_IMPL,
+                    "ML_FLASH_DECODE_IMPL",
+                    "HANZO_FLASH_DECODE_IMPL",
+                ),
+                QkPhase::Prefill => read_phase_override(
+                    &FLASH_PREFILL_IMPL,
+                    "ML_FLASH_PREFILL_IMPL",
+                    "HANZO_FLASH_PREFILL_IMPL",
+                ),
             };
             if let Some(forced) = phase_ov {
                 return forced;
             }
-            match read_op_override(&FLASH_IMPL, "HANZO_FLASH_IMPL") {
+            match read_op_override(&FLASH_IMPL, "ML_FLASH_IMPL", "HANZO_FLASH_IMPL") {
                 OVERRIDE_LEGACY => QkImpl::Legacy,
                 OVERRIDE_DSL => QkImpl::Dsl,
                 OVERRIDE_AUTO => qualified_policy_impl(backend, op),
@@ -430,7 +457,7 @@ pub fn set_flash_prefill_impl(i: Option<QkImpl>) {
     FLASH_PREFILL_IMPL.store(encode_opt(i), Ordering::Relaxed);
 }
 
-/// Clear all operation-level in-process overrides so `HANZO_DSL_POLICY` / `qualified_policy_impl`
+/// Clear all operation-level in-process overrides so `ML_DSL_POLICY` / `qualified_policy_impl`
 /// can be evaluated directly.
 pub fn clear_op_overrides() {
     for a in [&PQ2_IMPL, &PTQ1_IMPL, &GDN_IMPL, &FLASH_IMPL, &FWHT_IMPL] {
@@ -446,9 +473,9 @@ pub fn clear_op_overrides() {
     set_flash_prefill_impl(None);
 }
 
-/// The implementation PQ2_0 ops use: `set_pq2_impl` if called, else `HANZO_PQ2_IMPL`.
+/// The implementation PQ2_0 ops use: `set_pq2_impl` if called, else `ML_PQ2_IMPL`.
 pub fn pq2_impl() -> QkImpl {
-    read_impl_env(&PQ2_IMPL, "HANZO_PQ2_IMPL")
+    read_impl_env(&PQ2_IMPL, "ML_PQ2_IMPL", "HANZO_PQ2_IMPL")
 }
 
 /// Force the PQ2_0 implementation for this process (A/B tests, interleaved benches).
@@ -456,9 +483,9 @@ pub fn set_pq2_impl(i: QkImpl) {
     PQ2_IMPL.store(encode(i), Ordering::Relaxed);
 }
 
-/// The implementation PTQ1_0 ops use: `set_ptq1_impl` if called, else `HANZO_PTQ1_IMPL`.
+/// The implementation PTQ1_0 ops use: `set_ptq1_impl` if called, else `ML_PTQ1_IMPL`.
 pub fn ptq1_impl() -> QkImpl {
-    read_impl_env(&PTQ1_IMPL, "HANZO_PTQ1_IMPL")
+    read_impl_env(&PTQ1_IMPL, "ML_PTQ1_IMPL", "HANZO_PTQ1_IMPL")
 }
 
 /// Force the PTQ1_0 implementation for this process (A/B tests, interleaved benches).
@@ -466,9 +493,9 @@ pub fn set_ptq1_impl(i: QkImpl) {
     PTQ1_IMPL.store(encode(i), Ordering::Relaxed);
 }
 
-/// The implementation GDN ops use: `set_gdn_impl` if called, else `HANZO_GDN_IMPL` (default `legacy`).
+/// The implementation GDN ops use: `set_gdn_impl` if called, else `ML_GDN_IMPL` (default `legacy`).
 pub fn gdn_impl() -> QkImpl {
-    read_impl_env(&GDN_IMPL, "HANZO_GDN_IMPL")
+    read_impl_env(&GDN_IMPL, "ML_GDN_IMPL", "HANZO_GDN_IMPL")
 }
 
 /// Force the GDN implementation for this process (A/B tests, interleaved benches).
@@ -476,9 +503,9 @@ pub fn set_gdn_impl(i: QkImpl) {
     GDN_IMPL.store(encode(i), Ordering::Relaxed);
 }
 
-/// The implementation FlashAttention ops use: `set_flash_impl` if called, else `HANZO_FLASH_IMPL` (default `legacy`).
+/// The implementation FlashAttention ops use: `set_flash_impl` if called, else `ML_FLASH_IMPL` (default `legacy`).
 pub fn flash_impl() -> QkImpl {
-    read_impl_env(&FLASH_IMPL, "HANZO_FLASH_IMPL")
+    read_impl_env(&FLASH_IMPL, "ML_FLASH_IMPL", "HANZO_FLASH_IMPL")
 }
 
 /// Force the FlashAttention implementation for this process (A/B tests, interleaved benches).
@@ -487,10 +514,10 @@ pub fn set_flash_impl(i: QkImpl) {
 }
 
 /// The implementation FWHT Hadamard rotation ops use: `set_fwht_impl` if called, else
-/// `HANZO_FWHT_IMPL` (default `dsl`, replacing the dense O(B^2) matmul fallback on Metal/Vulkan;
-/// set `HANZO_FWHT_IMPL=legacy` to force fallback for A/B).
+/// `ML_FWHT_IMPL` (default `dsl`, replacing the dense O(B^2) matmul fallback on Metal/Vulkan;
+/// set `ML_FWHT_IMPL=legacy` to force fallback for A/B).
 pub fn fwht_impl() -> QkImpl {
-    read_impl_env_default(&FWHT_IMPL, "HANZO_FWHT_IMPL", QkImpl::Dsl)
+    read_impl_env_default(&FWHT_IMPL, "ML_FWHT_IMPL", "HANZO_FWHT_IMPL", QkImpl::Dsl)
 }
 
 /// Force the FWHT implementation for this process (A/B tests, interleaved benches).
@@ -507,8 +534,8 @@ pub fn pq2_schedule(rows: usize) -> (usize, usize) {
     (2, 4)
 }
 
-/// Diagnostic schedule override for measurement only: `HANZO_PQ2_NR0=2|4|8` and
-/// `HANZO_PQ2_NSG=2|4` force every PQ2_0 decode matvec onto that generated artifact (`set_pq2_nr0` /
+/// Diagnostic schedule override for measurement only: `ML_PQ2_NR0=2|4|8` and
+/// `ML_PQ2_NSG=2|4` force every PQ2_0 decode matvec onto that generated artifact (`set_pq2_nr0` /
 /// `set_pq2_nsg` do the same in-process). Production schedules live in `pq2_schedule`.
 static NR0_FORCE: AtomicU8 = AtomicU8::new(UNSET);
 static NSG_FORCE: AtomicU8 = AtomicU8::new(UNSET);
@@ -516,7 +543,7 @@ static NSG_FORCE: AtomicU8 = AtomicU8::new(UNSET);
 fn nr0_override() -> Option<usize> {
     match NR0_FORCE.load(Ordering::Relaxed) {
         UNSET => {
-            let v = match std::env::var("HANZO_PQ2_NR0").as_deref() {
+            let v = match crate::ml_env_var("ML_PQ2_NR0", "HANZO_PQ2_NR0").as_deref() {
                 Ok("2") => 2,
                 Ok("4") => 4,
                 Ok("8") => 8,
@@ -533,7 +560,7 @@ fn nr0_override() -> Option<usize> {
 fn nsg_override() -> Option<usize> {
     match NSG_FORCE.load(Ordering::Relaxed) {
         UNSET => {
-            let v = match std::env::var("HANZO_PQ2_NSG").as_deref() {
+            let v = match crate::ml_env_var("ML_PQ2_NSG", "HANZO_PQ2_NSG").as_deref() {
                 Ok("2") => 2,
                 Ok("4") => 4,
                 _ => 0,
@@ -681,7 +708,7 @@ static TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn stats_log() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("HANZO_QK_STATS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::ml_env_var("ML_QK_STATS", "HANZO_QK_STATS").is_ok_and(|v| v == "1"))
 }
 
 /// Record one dispatch of `artifact` (a DSL artifact or a legacy kernel name) by `imp`.
@@ -775,6 +802,8 @@ pub fn report() -> String {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn schedule_matches_the_dsl_source_of_truth() {
         for rows in [1, 64, 2048, 2049, 5120, 16383, 16384, 17408, 248_320] {
@@ -788,6 +817,7 @@ mod tests {
 
     #[test]
     fn artifacts_are_distinct_per_schedule_and_dtype() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut seen = std::collections::HashSet::new();
         for nsg in [2usize, 4] {
             set_pq2_nsg(Some(nsg));
@@ -843,6 +873,7 @@ mod tests {
 
     #[test]
     fn phase_and_backend_selection_policy_and_overrides() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_op_overrides();
         set_dsl_policy_auto(false);
 
@@ -875,7 +906,7 @@ mod tests {
             QkImpl::Legacy
         );
 
-        // 2. Qualified hardware/phase policy (`HANZO_DSL_POLICY=auto` / `set_dsl_policy_auto(true)`):
+        // 2. Qualified hardware/phase policy (`ML_DSL_POLICY=auto` / `set_dsl_policy_auto(true)`):
         //    - Metal: FWHT=Dsl, PQ2 decode & prefill=Dsl, PTQ1 decode=Legacy / prefill=Dsl,
         //             GDN=Dsl, FlashAttn=Legacy.
         //    - CUDA/ROCm/Vulkan: FWHT=Dsl, PQ2/PTQ1/GDN/FlashAttn=Legacy unless overridden.
@@ -979,10 +1010,7 @@ mod tests {
             QkImpl::Legacy
         );
         for b in [QkBackend::Cuda, QkBackend::Rocm, QkBackend::Vulkan] {
-            assert_eq!(
-                select_impl(b, QkOp::Fwht { block_size: 1024 }),
-                QkImpl::Dsl
-            );
+            assert_eq!(select_impl(b, QkOp::Fwht { block_size: 1024 }), QkImpl::Dsl);
             assert_eq!(
                 select_impl(
                     b,
@@ -1075,5 +1103,113 @@ mod tests {
 
         clear_op_overrides();
         set_dsl_policy_auto(false);
+    }
+
+    fn reset_all_env_caches() {
+        for a in [
+            &PQ2_IMPL,
+            &PTQ1_IMPL,
+            &GDN_IMPL,
+            &FLASH_IMPL,
+            &FWHT_IMPL,
+            &PQ2_DECODE_IMPL,
+            &PQ2_PREFILL_IMPL,
+            &PTQ1_DECODE_IMPL,
+            &PTQ1_PREFILL_IMPL,
+            &GDN_DECODE_IMPL,
+            &GDN_PREFILL_IMPL,
+            &FLASH_DECODE_IMPL,
+            &FLASH_PREFILL_IMPL,
+            &DSL_POLICY_AUTO,
+            &NR0_FORCE,
+            &NSG_FORCE,
+        ] {
+            a.store(UNSET, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn ml_env_vars_precedence_and_legacy_fallback() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let vars = [
+            "ML_PQ2_IMPL",
+            "HANZO_PQ2_IMPL",
+            "ML_PQ2_DECODE_IMPL",
+            "HANZO_PQ2_DECODE_IMPL",
+            "ML_PTQ1_PREFILL_IMPL",
+            "HANZO_PTQ1_PREFILL_IMPL",
+            "ML_GDN_IMPL",
+            "HANZO_GDN_IMPL",
+            "ML_FLASH_IMPL",
+            "HANZO_FLASH_IMPL",
+            "ML_FWHT_IMPL",
+            "HANZO_FWHT_IMPL",
+            "ML_DSL_POLICY",
+            "HANZO_DSL_POLICY",
+            "ML_PQ2_NR0",
+            "HANZO_PQ2_NR0",
+            "ML_PQ2_NSG",
+            "HANZO_PQ2_NSG",
+        ];
+        for v in vars {
+            unsafe { std::env::remove_var(v) };
+        }
+        reset_all_env_caches();
+
+        // Legacy HANZO_* still works when ML_* is unset.
+        unsafe {
+            std::env::set_var("HANZO_PQ2_IMPL", "dsl");
+            std::env::set_var("HANZO_FWHT_IMPL", "legacy");
+            std::env::set_var("HANZO_PQ2_NR0", "8");
+        }
+        reset_all_env_caches();
+        assert_eq!(pq2_impl(), QkImpl::Dsl);
+        assert_eq!(fwht_impl(), QkImpl::Legacy);
+        assert_eq!(pq2_matvec_artifact(5120, false).2, 8);
+
+        // Canonical ML_* strictly wins over legacy HANZO_* when both are set.
+        unsafe {
+            std::env::set_var("ML_PQ2_IMPL", "legacy");
+            std::env::set_var("ML_FWHT_IMPL", "dsl");
+            std::env::set_var("ML_PQ2_NR0", "2");
+            std::env::set_var("HANZO_PQ2_DECODE_IMPL", "legacy");
+            std::env::set_var("ML_PQ2_DECODE_IMPL", "dsl");
+            std::env::set_var("HANZO_DSL_POLICY", "off");
+            std::env::set_var("ML_DSL_POLICY", "auto");
+        }
+        reset_all_env_caches();
+        assert_eq!(pq2_impl(), QkImpl::Legacy);
+        assert_eq!(fwht_impl(), QkImpl::Dsl);
+        assert_eq!(pq2_matvec_artifact(5120, false).2, 2);
+        assert_eq!(
+            select_impl(
+                QkBackend::Cuda,
+                QkOp::Pq2 {
+                    m: 1,
+                    n: 5120,
+                    k: 5120
+                }
+            ),
+            QkImpl::Dsl
+        );
+        assert_eq!(
+            select_impl(
+                QkBackend::Metal,
+                QkOp::Ptq1 {
+                    m: 64,
+                    n: 5120,
+                    k: 5120
+                }
+            ),
+            QkImpl::Dsl
+        );
+
+        for v in vars {
+            unsafe { std::env::remove_var(v) };
+        }
+        clear_op_overrides();
+        set_dsl_policy_auto(false);
+        set_pq2_nr0(None);
+        set_pq2_nsg(None);
     }
 }

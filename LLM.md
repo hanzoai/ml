@@ -58,6 +58,13 @@ forked operator logic. If the DSL or CubeCL cannot express or compile something,
   change marked `HANZO PATCH` (today: cubecl-cpp bitcast-of-literal, which broke `f16lo_to_f32` on MSL).
 - **Per-backend correctness** uses one fixture set: `pq2-check --backend metal|cuda|rocm|vulkan`
   (native GGUF PQ2_0 matvec, gate 1e-5 scale-relative). A backend that fails keeps its fallback.
+- **Environment variables use `ML_*`.** Framework, DSL, kernel, backend, and tuning knobs take the
+  `ML_` prefix (`ML_DSL_POLICY`, `ML_{PQ2,PTQ1,GDN,FLASH,FWHT}_IMPL`,
+  `ML_{PQ2,PTQ1,GDN,FLASH}_{DECODE,PREFILL}_IMPL`, `ML_FLASH_SPLIT_KV`, `ML_QK_STATS`,
+  `ML_CUDA_UMA_THRESHOLD`, `ML_CUDA_PROFILE`, `ML_METAL_MATVEC_MAX`, `ML_VK_POOL_CAP_GB`,
+  `ML_ROCM_ARCH`, `ML_ROCM_VERSION`, `ML_KERNEL_GEN_P64`), read via `hanzo_ml::utils::ml_env_var`
+  with silent fallback to legacy `HANZO_*` only when `ML_*` is unset. Platform auth credentials
+  (`HANZO_API_KEY` in `hanzo-research`) keep `HANZO_`.
 
 ## Backends and models
 - **Vulkan dtypes.** Storage is F32 or U32 (BF16 is held as F32, I64 as U32). U32 reductions

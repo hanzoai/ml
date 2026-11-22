@@ -1421,7 +1421,10 @@ pub fn flash_attn_paged_split_kv_run_as<E: Float + CubeElement, R: Runtime>(
     softcap: f32,
 ) -> Vec<E> {
     let num_splits = num_splits.max(1);
-    let hw_plane = if std::env::var_os("HANZO_KERNEL_GEN_P64").is_some() {
+    let hw_plane = if std::env::var_os("ML_KERNEL_GEN_P64")
+        .or_else(|| std::env::var_os("HANZO_KERNEL_GEN_P64"))
+        .is_some()
+    {
         64
     } else {
         client.properties().hardware.plane_size_max as usize
@@ -1561,7 +1564,10 @@ pub fn flash_attn_split_kv_reduce_run_as<E: Float + CubeElement, R: Runtime>(
     num_splits: usize,
     d: usize,
 ) -> Vec<E> {
-    let hw_plane = if std::env::var_os("HANZO_KERNEL_GEN_P64").is_some() {
+    let hw_plane = if std::env::var_os("ML_KERNEL_GEN_P64")
+        .or_else(|| std::env::var_os("HANZO_KERNEL_GEN_P64"))
+        .is_some()
+    {
         64
     } else {
         client.properties().hardware.plane_size_max as usize
@@ -2556,8 +2562,9 @@ mod tests {
     fn flash_attn_paged_split_kv_cpu_exact() {
         use cubecl::cpu::{CpuDevice, CpuRuntime};
         let c = CpuRuntime::client(&CpuDevice::default());
-        let (b, n_heads, n_kv, seq_q, d, block_size, max_blocks, x_vec) =
-            (1usize, 2usize, 1usize, 1usize, 64usize, 16usize, 3usize, 4usize);
+        let (b, n_heads, n_kv, seq_q, d, block_size, max_blocks, x_vec) = (
+            1usize, 2usize, 1usize, 1usize, 64usize, 16usize, 3usize, 4usize,
+        );
         let q = rnd(b * n_heads * seq_q * d, 0x7101);
         let k_cache = rnd(max_blocks * n_kv * block_size * d, 0x7102);
         let v_cache = rnd(max_blocks * n_kv * block_size * d, 0x7103);

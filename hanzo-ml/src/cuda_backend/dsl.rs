@@ -728,12 +728,7 @@ impl CudaDevice {
                 num_splits as u32,
             ])?;
             let rmeta = if num_splits > 1 {
-                Some(self.dsl_const_u32_slice(&[
-                    total_qh as u32,
-                    num_splits as u32,
-                    0u32,
-                    0u32,
-                ])?)
+                Some(self.dsl_const_u32_slice(&[total_qh as u32, num_splits as u32, 0u32, 0u32])?)
             } else {
                 None
             };

@@ -105,15 +105,15 @@ static PROF_FWHT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// GB10 / Blackwell (`SM >= 100`, `cc >= 1000`) crossovers were measured at
 /// `m=2` for `PQ2_0` and `m=4` for `PTQ1_0`; earlier NVIDIA architectures keep
 /// the conservative `8` threshold unless overridden via
-/// `HANZO_PQ2_MMQ_MAX_BM` / `HANZO_PTQ1_MMQ_MAX_BM`.
+/// `ML_PQ2_MMQ_MAX_BM` / `ML_PTQ1_MMQ_MAX_BM`.
 fn mmq_max_vec_bm(dtype: GgmlDType, compute_cap: i32) -> usize {
-    let env_key = match dtype {
-        GgmlDType::PQ2_0 => Some("HANZO_PQ2_MMQ_MAX_BM"),
-        GgmlDType::PTQ1_0 => Some("HANZO_PTQ1_MMQ_MAX_BM"),
+    let env_keys = match dtype {
+        GgmlDType::PQ2_0 => Some(("ML_PQ2_MMQ_MAX_BM", "HANZO_PQ2_MMQ_MAX_BM")),
+        GgmlDType::PTQ1_0 => Some(("ML_PTQ1_MMQ_MAX_BM", "HANZO_PTQ1_MMQ_MAX_BM")),
         _ => None,
     };
-    if let Some(key) = env_key {
-        if let Ok(v) = std::env::var(key) {
+    if let Some((ml_key, legacy_key)) = env_keys {
+        if let Ok(v) = crate::ml_env_var(ml_key, legacy_key) {
             if let Ok(parsed) = v.parse::<usize>() {
                 return parsed.max(1);
             }
@@ -129,7 +129,7 @@ fn mmq_max_vec_bm(dtype: GgmlDType, compute_cap: i32) -> usize {
 pub fn cuda_profile_enabled() -> bool {
     *CUDA_PROFILE_ENABLED.get_or_init(|| {
         matches!(
-            std::env::var("HANZO_CUDA_PROFILE").as_deref(),
+            crate::ml_env_var("ML_CUDA_PROFILE", "HANZO_CUDA_PROFILE").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
         )
     })
@@ -1486,8 +1486,8 @@ impl QCudaStorage {
             .storage_from_cpu_storage(&crate::CpuStorage::F32(out))
     }
 
-    /// Native-GGUF DSL dispatch for `PQ2_0` and `PTQ1_0` on CUDA (`HANZO_PQ2_IMPL=dsl` /
-    /// `HANZO_PTQ1_IMPL=dsl`; `legacy` remains the default). Handles both `m == 1` decode matvec
+    /// Native-GGUF DSL dispatch for `PQ2_0` and `PTQ1_0` on CUDA (`ML_PQ2_IMPL=dsl` /
+    /// `ML_PTQ1_IMPL=dsl`; `legacy` remains the default). Handles both `m == 1` decode matvec
     /// and `m > 1` prefill GEMM for contiguous `F32` and `BF16` activations (including nonzero
     /// `layout.start_offset()`).
     fn try_dispatch_ternary_dsl(
@@ -1522,14 +1522,10 @@ impl QCudaStorage {
         }
         let is_gemm = m_total > 1;
         let selected = match self.dtype {
-            GgmlDType::PTQ1_0 => dsl::select_impl(
-                dsl::QkBackend::Cuda,
-                dsl::QkOp::Ptq1 { m: m_total, n, k },
-            ),
-            _ => dsl::select_impl(
-                dsl::QkBackend::Cuda,
-                dsl::QkOp::Pq2 { m: m_total, n, k },
-            ),
+            GgmlDType::PTQ1_0 => {
+                dsl::select_impl(dsl::QkBackend::Cuda, dsl::QkOp::Ptq1 { m: m_total, n, k })
+            }
+            _ => dsl::select_impl(dsl::QkBackend::Cuda, dsl::QkOp::Pq2 { m: m_total, n, k }),
         };
         if selected != QkImpl::Dsl {
             let legacy_name = match (self.dtype, is_gemm) {
@@ -1883,7 +1879,7 @@ impl QCudaStorage {
         let out_shape_s: crate::Shape = out_shape.into();
 
         if matches!(self.dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0)
-            && std::env::var_os("HANZO_PQ2_FP32_PREFILL").is_none()
+            && crate::ml_env_os("ML_PQ2_FP32_PREFILL", "HANZO_PQ2_FP32_PREFILL").is_none()
         {
             let prof = cuda_profile_enabled();
             if prof {
@@ -3199,13 +3195,13 @@ mod test {
     #[test]
     fn mmq_max_vec_bm_profiles_by_compute_cap() {
         // Only check defaults when env overrides are unset.
-        if std::env::var_os("HANZO_PQ2_MMQ_MAX_BM").is_none() {
+        if crate::ml_env_os("ML_PQ2_MMQ_MAX_BM", "HANZO_PQ2_MMQ_MAX_BM").is_none() {
             assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 1210), 1);
             assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 1000), 1);
             assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 900), 8);
             assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 890), 8);
         }
-        if std::env::var_os("HANZO_PTQ1_MMQ_MAX_BM").is_none() {
+        if crate::ml_env_os("ML_PTQ1_MMQ_MAX_BM", "HANZO_PTQ1_MMQ_MAX_BM").is_none() {
             assert_eq!(mmq_max_vec_bm(GgmlDType::PTQ1_0, 1210), 3);
             assert_eq!(mmq_max_vec_bm(GgmlDType::PTQ1_0, 900), 8);
         }
