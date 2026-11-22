@@ -558,6 +558,8 @@ pub enum RocmQuantType {
     // Prism / Bonsai-2 128-elem ternary: 2-bit asymmetric {-1,0,+1,+2} (PQ2_0) + base-3 {-1,0,+1} (PTQ1_0).
     PQ2_0,
     PTQ1_0,
+    Q1_0,
+    Q2_0,
 }
 
 impl RocmQuantType {
@@ -593,6 +595,8 @@ impl RocmQuantType {
             G::ROCMFP4_FAST => Self::ROCMFP4_FAST,
             G::PQ2_0 => Self::PQ2_0,
             G::PTQ1_0 => Self::PTQ1_0,
+            G::Q1_0 => Self::Q1_0,
+            G::Q2_0 => Self::Q2_0,
             _ => return None,
         })
     }
@@ -610,7 +614,8 @@ impl RocmQuantType {
             | Self::MXFP4
             | Self::ROCMFP4
             | Self::ROCMFP4_FAST => 32,
-            Self::PQ2_0 | Self::PTQ1_0 => 128,
+            Self::Q2_0 => 64,
+            Self::PQ2_0 | Self::PTQ1_0 | Self::Q1_0 => 128,
             Self::Q4K
             | Self::Q6K
             | Self::IQ4_XS
@@ -660,6 +665,8 @@ impl RocmQuantType {
             Self::ROCMFP4_FAST => 17,
             Self::PQ2_0 => 34,
             Self::PTQ1_0 => 28,
+            Self::Q1_0 => 18,
+            Self::Q2_0 => 18,
         }
     }
 
@@ -707,6 +714,10 @@ impl RocmQuantType {
                 | Self::ROCMFP4_FAST
                 | Self::IQ4_NL
                 | Self::IQ3_S
+                | Self::PQ2_0
+                | Self::PTQ1_0
+                | Self::Q1_0
+                | Self::Q2_0
         )
     }
 
@@ -730,6 +741,10 @@ impl RocmQuantType {
             Self::ROCMFP4_FAST => "qmmq_rocmfp4_fast_f16",
             Self::IQ4_NL => "qmmq_iq4nl_f16",
             Self::IQ3_S => "qmmq_iq3s_f16",
+            Self::PQ2_0 => "qmmq_pq2_0_f16",
+            Self::PTQ1_0 => "qmmq_ptq1_0_f16",
+            Self::Q1_0 => "qmmq_q1_0_f16",
+            Self::Q2_0 => "qmmq_q2_0_f16",
             Self::Q2K
             | Self::Q3K
             | Self::IQ2_XXS
@@ -739,11 +754,7 @@ impl RocmQuantType {
             | Self::TQ1_0
             | Self::IQ1_S
             | Self::IQ1_M
-            | Self::MXFP4
-            | Self::ROCMFP4
-            | Self::ROCMFP4_FAST
-            | Self::PQ2_0
-            | Self::PTQ1_0 => {
+            | Self::MXFP4 => {
                 unreachable!("prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
             }
         }
@@ -793,6 +804,24 @@ impl RocmQuantType {
             (Self::IQ3_S, 128) => "moe_qmmq_iq3s_f16",
             (Self::IQ3_S, 64) => "moe_qmmq_iq3s_tm64_f16",
             (Self::IQ3_S, _) => "moe_qmmq_iq3s_tm32_f16",
+            (Self::ROCMFP4, 128) => "moe_qmmq_rocmfp4_f16",
+            (Self::ROCMFP4, 64) => "moe_qmmq_rocmfp4_tm64_f16",
+            (Self::ROCMFP4, _) => "moe_qmmq_rocmfp4_tm32_f16",
+            (Self::ROCMFP4_FAST, 128) => "moe_qmmq_rocmfp4_fast_f16",
+            (Self::ROCMFP4_FAST, 64) => "moe_qmmq_rocmfp4_fast_tm64_f16",
+            (Self::ROCMFP4_FAST, _) => "moe_qmmq_rocmfp4_fast_tm32_f16",
+            (Self::PQ2_0, 128) => "moe_qmmq_pq2_0_f16",
+            (Self::PQ2_0, 64) => "moe_qmmq_pq2_0_tm64_f16",
+            (Self::PQ2_0, _) => "moe_qmmq_pq2_0_tm32_f16",
+            (Self::PTQ1_0, 128) => "moe_qmmq_ptq1_0_f16",
+            (Self::PTQ1_0, 64) => "moe_qmmq_ptq1_0_tm64_f16",
+            (Self::PTQ1_0, _) => "moe_qmmq_ptq1_0_tm32_f16",
+            (Self::Q1_0, 128) => "moe_qmmq_q1_0_f16",
+            (Self::Q1_0, 64) => "moe_qmmq_q1_0_tm64_f16",
+            (Self::Q1_0, _) => "moe_qmmq_q1_0_tm32_f16",
+            (Self::Q2_0, 128) => "moe_qmmq_q2_0_f16",
+            (Self::Q2_0, 64) => "moe_qmmq_q2_0_tm64_f16",
+            (Self::Q2_0, _) => "moe_qmmq_q2_0_tm32_f16",
             (
                 Self::Q2K
                 | Self::Q3K
@@ -803,21 +832,11 @@ impl RocmQuantType {
                 | Self::TQ1_0
                 | Self::IQ1_S
                 | Self::IQ1_M
-                | Self::MXFP4
-                | Self::ROCMFP4
-                | Self::ROCMFP4_FAST
-                | Self::PQ2_0
-                | Self::PTQ1_0,
+                | Self::MXFP4,
                 _,
             ) => {
                 unreachable!("moe_prefill_kernel: {self:?} is decode-only (gated by qmmq_capable)")
             }
-            (Self::ROCMFP4, 128) => "moe_qmmq_rocmfp4_f16",
-            (Self::ROCMFP4, 64) => "moe_qmmq_rocmfp4_tm64_f16",
-            (Self::ROCMFP4, _) => "moe_qmmq_rocmfp4_tm32_f16",
-            (Self::ROCMFP4_FAST, 128) => "moe_qmmq_rocmfp4_fast_f16",
-            (Self::ROCMFP4_FAST, 64) => "moe_qmmq_rocmfp4_fast_tm64_f16",
-            (Self::ROCMFP4_FAST, _) => "moe_qmmq_rocmfp4_fast_tm32_f16",
         }
     }
 
@@ -862,6 +881,8 @@ impl RocmQuantType {
             Self::ROCMFP4_FAST => "rocmfp4_fast",
             Self::PQ2_0 => "pq2_0",
             Self::PTQ1_0 => "ptq1_0",
+            Self::Q1_0 => "q1_0",
+            Self::Q2_0 => "q2_0",
         }
     }
 
@@ -903,6 +924,8 @@ impl RocmQuantType {
                 | Self::IQ1_M
                 | Self::PQ2_0
                 | Self::PTQ1_0
+                | Self::Q1_0
+                | Self::Q2_0
         )
     }
 
@@ -962,6 +985,12 @@ impl RocmQuantType {
             (Self::PTQ1_0, Act::F16) => "qmatvec_dp4a_ptq1_0_f16",
             (Self::PTQ1_0, Act::Bf16) => "qmatvec_dp4a_ptq1_0_bf16",
             (Self::PTQ1_0, Act::F32) => "qmatvec_dp4a_ptq1_0_f32",
+            (Self::Q1_0, Act::F16) => "qmatvec_dp4a_q1_0_f16",
+            (Self::Q1_0, Act::Bf16) => "qmatvec_dp4a_q1_0_bf16",
+            (Self::Q1_0, Act::F32) => "qmatvec_dp4a_q1_0_f32",
+            (Self::Q2_0, Act::F16) => "qmatvec_dp4a_q2_0_f16",
+            (Self::Q2_0, Act::Bf16) => "qmatvec_dp4a_q2_0_bf16",
+            (Self::Q2_0, Act::F32) => "qmatvec_dp4a_q2_0_f32",
             _ => unreachable!("dp4a_decode_kernel: {self:?} is not dp4a-capable"),
         }
     }
@@ -1011,6 +1040,12 @@ impl RocmQuantType {
             (Self::PTQ1_0, Act::F16) => "moe_qmatvec_dp4a_ptq1_0_f16",
             (Self::PTQ1_0, Act::Bf16) => "moe_qmatvec_dp4a_ptq1_0_bf16",
             (Self::PTQ1_0, Act::F32) => "moe_qmatvec_dp4a_ptq1_0_f32",
+            (Self::Q1_0, Act::F16) => "moe_qmatvec_dp4a_q1_0_f16",
+            (Self::Q1_0, Act::Bf16) => "moe_qmatvec_dp4a_q1_0_bf16",
+            (Self::Q1_0, Act::F32) => "moe_qmatvec_dp4a_q1_0_f32",
+            (Self::Q2_0, Act::F16) => "moe_qmatvec_dp4a_q2_0_f16",
+            (Self::Q2_0, Act::Bf16) => "moe_qmatvec_dp4a_q2_0_bf16",
+            (Self::Q2_0, Act::F32) => "moe_qmatvec_dp4a_q2_0_f32",
             _ => unreachable!("dp4a_moe_kernel: {self:?} is not dp4a-capable"),
         }
     }
@@ -2413,6 +2448,124 @@ pub fn gdn_conv_rocm(x: &Tensor, w: &Tensor, state: &Tensor, fresh: bool) -> Res
             device: dev,
         }),
         (batch, seq, ch),
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+pub fn hadamard_fwht_rocm(
+    x: &Tensor,
+    signs: Option<&Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+    out_dtype: DType,
+) -> Result<Tensor> {
+    use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
+    let orig_shape = x.shape().clone();
+    let Some(&width) = orig_shape.dims().last() else {
+        crate::bail!("hadamard_fwht expects rank >= 1");
+    };
+    let elem_count = orig_shape.elem_count();
+    let total_blocks = (elem_count / block_size) as i64;
+    let x = x.contiguous()?;
+    if total_blocks == 0 {
+        return x.to_dtype(out_dtype);
+    }
+
+    let signs_contig = match signs {
+        Some(s) => {
+            if s.elem_count() != width {
+                crate::bail!(
+                    "hadamard_fwht signs len {} != width {width}",
+                    s.elem_count()
+                );
+            }
+            let s_f32 = if s.dtype() == DType::F32 {
+                s.contiguous()?
+            } else {
+                s.to_dtype(DType::F32)?.contiguous()?
+            };
+            Some(s_f32)
+        }
+        None => None,
+    };
+
+    let func = match (x.dtype(), out_dtype) {
+        (DType::F32, DType::F32) => "hadamard_fwht_f32_f32",
+        (DType::F16, DType::F32) => "hadamard_fwht_f16_f32",
+        (DType::F16, DType::F16) => "hadamard_fwht_f16_f16",
+        (DType::BF16, DType::F32) => "hadamard_fwht_bf16_f32",
+        (DType::BF16, DType::BF16) => "hadamard_fwht_bf16_bf16",
+        (in_dt, out_dt) => {
+            crate::bail!("hadamard_fwht_rocm unsupported dtype pair ({in_dt:?}, {out_dt:?})")
+        }
+    };
+
+    let (dev, mut px) = match &*x.storage() {
+        Storage::Rocm(r) => (r.device.clone(), unsafe {
+            r.slice.offset_ptr(x.layout().start_offset())
+        }),
+        _ => crate::bail!("hadamard_fwht_rocm requires ROCm tensor"),
+    };
+    let mut ps: *mut std::ffi::c_void = if let Some(ref sc) = signs_contig {
+        gdn_f32_ptr(sc, "hadamard_fwht_rocm signs")?
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let mut b_i32 = block_size as i32;
+    let mut w_i32 = width as i32;
+    let mut has_s = i32::from(signs_contig.is_some());
+    let mut is_inv = i32::from(is_inverse);
+    let mut tot_i64 = total_blocks;
+
+    let elems_per_thread = (block_size / 256).max(1);
+    let threads = (block_size / elems_per_thread) as u32;
+    let shmem = (block_size.min(4096) * std::mem::size_of::<f32>()) as u32;
+    let grid = rocm_rs::hip::Dim3::from((total_blocks as u32).clamp(1, 65_535));
+    let block = rocm_rs::hip::Dim3::from(threads);
+
+    macro_rules! launch_fwht {
+        ($variant:ident, $ty:ty) => {{
+            let out = dev.alloc::<$ty>(elem_count)?;
+            let mut po = out.as_ptr() as *mut std::ffi::c_void;
+            unsafe {
+                launch_kernel_shmem(
+                    &dev,
+                    QuantKernel::NAME,
+                    QuantKernel::CODE,
+                    func,
+                    grid,
+                    block,
+                    shmem,
+                    &mut [
+                        &mut px as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        &mut ps as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        &mut po as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                        &mut b_i32 as *mut i32 as *mut std::ffi::c_void,
+                        &mut w_i32 as *mut i32 as *mut std::ffi::c_void,
+                        &mut has_s as *mut i32 as *mut std::ffi::c_void,
+                        &mut is_inv as *mut i32 as *mut std::ffi::c_void,
+                        &mut tot_i64 as *mut i64 as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+            RocmStorage {
+                slice: RocmStorageSlice::$variant(out),
+                device: dev,
+            }
+        }};
+    }
+
+    let out_storage = match out_dtype {
+        DType::F32 => launch_fwht!(F32, f32),
+        DType::F16 => launch_fwht!(F16, f16),
+        DType::BF16 => launch_fwht!(BF16, bf16),
+        other => crate::bail!("hadamard_fwht_rocm unsupported out_dtype {other:?}"),
+    };
+    Ok(crate::tensor::from_storage(
+        Storage::Rocm(out_storage),
+        orig_shape,
         crate::op::BackpropOp::none(),
         false,
     ))

@@ -96,6 +96,25 @@ fn synth(dtype: GgmlDType, nout: usize, k: usize) -> Vec<u8> {
                 c += 1;
             }
         }
+        GgmlDType::PQ2_0 => {
+            let nblk128 = nout * (k / 128);
+            (0..nblk128).for_each(|_| emit_d_then(0.15, 32, &mut out, &mut c));
+        }
+        GgmlDType::PTQ1_0 => {
+            let nblk128 = nout * (k / 128);
+            for _ in 0..nblk128 {
+                for _ in 0..26 {
+                    out.push(pbyte(c));
+                    c += 1;
+                }
+                out.extend_from_slice(&f16::from_f32(pseudo(c) * 0.2).to_le_bytes());
+                c += 1;
+            }
+        }
+        GgmlDType::Q1_0 => {
+            let nblk128 = nout * (k / 128);
+            (0..nblk128).for_each(|_| emit_d_then(0.2, 16, &mut out, &mut c));
+        }
         _ => panic!("synth: {dtype:?} is not an i-quant type"),
     }
     out
@@ -657,4 +676,749 @@ fn cuda_moe_route_numeric() {
         }
     }
     println!("cuda_moe_route_numeric: worst max_w_err across all configs = {worst:.3e}");
+}
+
+fn q8_1_roundtrip_f16d(x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0f32; x.len()];
+    let mut i = 0;
+    for blk in x.chunks(32) {
+        let absmax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let d = if absmax > 0.0 {
+            half::f16::from_f32(absmax / 127.0).to_f32()
+        } else {
+            0.0
+        };
+        let inv = if absmax > 0.0 { 127.0 / absmax } else { 0.0 };
+        for &v in blk {
+            let q = (v * inv).round().clamp(-127.0, 127.0);
+            out[i] = q * d;
+            i += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn cuda_bonsai2_q1_pq2_ptq1_comprehensive_oracle() {
+    use hanzo_ml::DType;
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no CUDA device ({e})");
+            return;
+        }
+    };
+    let cpu = Device::Cpu;
+
+    for dtype in [GgmlDType::Q1_0, GgmlDType::PQ2_0, GgmlDType::PTQ1_0] {
+        // Exercise non-multiple-of-4 nrows (5, 7, 19), standard nrows (256), and non-multiple-of-256 k (384).
+        for &(nout, k) in &[(5usize, 384usize), (7, 512), (19, 1024), (256, 512)] {
+            let raw = synth(dtype, nout, k);
+            let q_cpu = QTensor::new(
+                QStorage::from_data(Cow::Owned(raw.clone()), &cpu, dtype).unwrap(),
+                (nout, k),
+            )
+            .unwrap();
+            let w_cpu: Vec<f32> = q_cpu
+                .dequantize(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+
+            let q_cuda = std::sync::Arc::new(
+                QTensor::new(
+                    QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(),
+                    (nout, k),
+                )
+                .unwrap(),
+            );
+
+            // 1. Dequantize F32 bit-exact parity vs CPU.
+            let w_gpu: Vec<f32> = q_cuda
+                .dequantize(&dev)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for i in 0..w_cpu.len() {
+                assert_eq!(
+                    w_gpu[i].to_bits(),
+                    w_cpu[i].to_bits(),
+                    "{dtype:?} [{nout}x{k}] dequantize mismatch at {i}"
+                );
+            }
+
+            // 2. Dequantize F16 tight parity vs CPU.
+            let w_f16: Vec<f32> = q_cuda
+                .dequantize_f16(&dev)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for i in 0..w_cpu.len() {
+                let diff = (w_f16[i] - w_cpu[i]).abs();
+                assert!(diff < 1e-5, "{dtype:?} dequantize_f16 diff {diff}");
+            }
+
+            // 3. Embed / get_rows bit-exact parity vs CPU.
+            let ids_vec: Vec<u32> = vec![0, (nout / 2) as u32, (nout - 1) as u32];
+            let ids_gpu = Tensor::from_vec(ids_vec.clone(), ids_vec.len(), &dev).unwrap();
+            let emb_gpu: Vec<f32> = q_cuda
+                .embedding(&ids_gpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for (ri, &rid) in ids_vec.iter().enumerate() {
+                for c in 0..k {
+                    assert_eq!(
+                        emb_gpu[ri * k + c].to_bits(),
+                        w_cpu[rid as usize * k + c].to_bits(),
+                        "{dtype:?} embed mismatch row {rid} col {c}"
+                    );
+                }
+            }
+
+            let mm_gpu = QMatMul::from_arc(q_cuda).unwrap();
+            let w_gpu_dense = Tensor::from_vec(w_cpu.clone(), (nout, k), &dev).unwrap();
+
+            // 4. Decode m=1 across F32, BF16, and F16 inputs (direct iq_quantize_q8_{f32,bf16,f16}).
+            let x1_raw: Vec<f32> = q8_1_roundtrip(
+                &(0..k)
+                    .map(|i| pseudo(i + nout * 31 + k))
+                    .collect::<Vec<_>>(),
+            );
+            let x1_f32 = Tensor::from_vec(x1_raw, (1, k), &dev).unwrap();
+            for in_dt in [DType::F32, DType::BF16, DType::F16] {
+                let x_in = x1_f32.to_dtype(in_dt).unwrap();
+                let y_out = mm_gpu.forward(&x_in).unwrap();
+                assert_eq!(y_out.dtype(), in_dt);
+                let y_got: Vec<f32> = y_out
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let x_rt: Vec<f32> = q8_1_roundtrip_f16d(
+                    &x_in
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap(),
+                );
+                let mut max_err = 0f32;
+                let mut max_ref = 0f32;
+                for r in 0..nout {
+                    let mut acc = 0f64;
+                    for c in 0..k {
+                        acc += (w_cpu[r * k + c] as f64) * (x_rt[c] as f64);
+                    }
+                    let want = if in_dt == DType::BF16 {
+                        half::bf16::from_f32(acc as f32).to_f32()
+                    } else if in_dt == DType::F16 {
+                        half::f16::from_f32(acc as f32).to_f32()
+                    } else {
+                        acc as f32
+                    };
+                    max_ref = max_ref.max(want.abs());
+                    max_err = max_err.max((y_got[r] - want).abs());
+                }
+                let tol = if in_dt == DType::F32 {
+                    1e-4 * max_ref.max(1.0)
+                } else if in_dt == DType::F16 {
+                    2e-3 * max_ref.max(1.0)
+                } else {
+                    1e-2 * max_ref.max(1.0)
+                };
+                assert!(
+                    max_err < tol,
+                    "{dtype:?} [{nout}x{k}] decode {in_dt:?} max_err={max_err:.3e} > tol={tol:.3e}"
+                );
+            }
+
+            // 5. Verify m=4, 16 and prefill m=64, 256 against q8_1-matched dense reference (< 1e-4 rel).
+            for &m in &[1usize, 4, 16, 64, 256] {
+                if m == 256 && nout < 256 && k != 384 {
+                    continue;
+                }
+                let xm_host: Vec<f32> = (0..m * k)
+                    .map(|i| pseudo(i + m * 97 + k))
+                    .collect::<Vec<_>>()
+                    .chunks(k)
+                    .flat_map(q8_1_roundtrip_f16d)
+                    .collect();
+                let xm = Tensor::from_vec(xm_host, (m, k), &dev).unwrap();
+                let ym: Vec<f32> = mm_gpu
+                    .forward(&xm)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let ym_ref: Vec<f32> = xm
+                    .matmul(&w_gpu_dense.t().unwrap())
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let mut sse = 0f64;
+                let mut rsq = 0f64;
+                let mut max_abs = 0f32;
+                for (&g, &r) in ym.iter().zip(&ym_ref) {
+                    let diff = (g - r).abs();
+                    max_abs = max_abs.max(diff);
+                    sse += (diff as f64) * (diff as f64);
+                    rsq += (r as f64) * (r as f64);
+                }
+                let rel_rmse = ((sse / ym.len() as f64).sqrt()
+                    / (rsq / ym.len() as f64).sqrt().max(1e-9))
+                    as f32;
+                let rel_tol = if k % 256 != 0 && m > 64 { 5e-3 } else { 5e-4 };
+                assert!(
+                    rel_rmse < rel_tol,
+                    "{dtype:?} [{nout}x{k}] m={m} rel_rmse={rel_rmse:.3e} > {rel_tol:.3e} (max_abs={max_abs:.3e})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cuda_q2_0_entrypoints_oracle() {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    use half::f16;
+    use hanzo_ml::backend::BackendDevice;
+    let dev = match hanzo_ml::CudaDevice::new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no CUDA device ({e})");
+            return;
+        }
+    };
+    let (nout, k) = (19usize, 256usize);
+    let nblocks = nout * (k / 64);
+    let mut raw = Vec::with_capacity(nblocks * 18);
+    let mut w_cpu = vec![0f32; nout * k];
+    for b in 0..nblocks {
+        let d_f16 = f16::from_f32(pseudo(b * 19 + 3) * 0.2);
+        let d = d_f16.to_f32();
+        raw.extend_from_slice(&d_f16.to_le_bytes());
+        for j in 0..16 {
+            let byte = pbyte(b * 37 + j);
+            raw.push(byte);
+            for sub in 0..4 {
+                let code = ((byte >> (2 * sub)) & 3) as i32 - 1;
+                w_cpu[b * 64 + j * 4 + sub] = (code as f32) * d;
+            }
+        }
+    }
+    let wq_dev = dev.clone_htod(&raw).unwrap();
+
+    // 1. dequantize_q2_0_f32 bit-exact vs CPU.
+    let deq_dev = unsafe { dev.alloc::<f32>(nout * k).unwrap() };
+    let f_deq = dev
+        .get_or_load_func("dequantize_q2_0_f32", &hanzo_kernels::IQUANT_MMVQ)
+        .unwrap();
+    let mut b_deq = f_deq.builder();
+    let nb_i64 = nblocks as i64;
+    b_deq.arg(&wq_dev);
+    b_deq.arg(&deq_dev);
+    b_deq.arg(&nb_i64);
+    unsafe {
+        b_deq.launch(LaunchConfig {
+            grid_dim: (nblocks as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .unwrap();
+    let deq_host = dev.clone_dtoh(&deq_dev).unwrap();
+    for i in 0..w_cpu.len() {
+        assert_eq!(
+            deq_host[i].to_bits(),
+            w_cpu[i].to_bits(),
+            "q2_0 dequant mismatch at {i}"
+        );
+    }
+
+    // 2. qmatvec_q2_0_dp4a_f32 (with nrows=19 non-multiple-of-4) vs CPU.
+    let x_raw: Vec<f32> = (0..k).map(|i| pseudo(i + 41)).collect();
+    let x_host = q8_1_roundtrip_f16d(&x_raw);
+    let x_dev = dev.clone_htod(&x_raw).unwrap();
+    let total_q8 = k / 32;
+    let xq_dev = unsafe { dev.alloc::<u8>(total_q8 * 32).unwrap() };
+    let xd_dev = unsafe { dev.alloc::<f16>(total_q8).unwrap() };
+    let f_q8 = dev
+        .get_or_load_func("iq_quantize_q8_f32", &hanzo_kernels::IQUANT_MMVQ)
+        .unwrap();
+    let m_one = 1i32;
+    let k_i32 = k as i32;
+    let tot_i32 = total_q8 as i32;
+    let mut b_q8 = f_q8.builder();
+    b_q8.arg(&m_one);
+    b_q8.arg(&k_i32);
+    b_q8.arg(&tot_i32);
+    b_q8.arg(&x_dev);
+    b_q8.arg(&xq_dev);
+    b_q8.arg(&xd_dev);
+    unsafe {
+        b_q8.launch(LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .unwrap();
+
+    let y_dev = unsafe { dev.alloc::<f32>(nout).unwrap() };
+    let f_mv = dev
+        .get_or_load_func("qmatvec_q2_0_dp4a_f32", &hanzo_kernels::IQUANT_MMVQ)
+        .unwrap();
+    let n_i32 = nout as i32;
+    let mut b_mv = f_mv.builder();
+    b_mv.arg(&n_i32);
+    b_mv.arg(&k_i32);
+    b_mv.arg(&wq_dev);
+    b_mv.arg(&xq_dev);
+    b_mv.arg(&xd_dev);
+    b_mv.arg(&y_dev);
+    unsafe {
+        b_mv.launch(LaunchConfig {
+            grid_dim: ((nout as u32).div_ceil(16), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .unwrap();
+    let y_host = dev.clone_dtoh(&y_dev).unwrap();
+    for r in 0..nout {
+        let mut acc = 0f64;
+        for c in 0..k {
+            acc += (w_cpu[r * k + c] as f64) * (x_host[c] as f64);
+        }
+        let diff = (y_host[r] - acc as f32).abs();
+        assert!(diff < 1e-4, "q2_0 matvec row {r} diff {diff}");
+    }
+}
+
+#[test]
+fn cuda_wide_fwht_and_fused_rmsnorm_fwht_oracle() {
+    use hanzo_ml::DType;
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no CUDA device ({e})");
+            return;
+        }
+    };
+    let cpu = Device::Cpu;
+
+    // Cover B = 512, 1024, 4096 including block-diagonal D = 5120, B = 1024 and D = 17408, B = 1024.
+    let configs = [
+        (4usize, 2560usize, 512usize),
+        (3usize, 5120usize, 1024usize),
+        (2usize, 17408usize, 1024usize),
+        (3usize, 4096usize, 4096usize),
+    ];
+
+    for (rows, width, b) in configs {
+        let x_vec: Vec<f32> = (0..rows * width)
+            .map(|i| pseudo(i + width + b) * 0.8)
+            .collect();
+        let r_vec: Vec<f32> = (0..rows * width)
+            .map(|i| pseudo(i + width * 3 + 17) * 0.5)
+            .collect();
+        let w_vec: Vec<f32> = (0..width)
+            .map(|i| 0.5 + 0.5 * pseudo(i + 777).abs())
+            .collect();
+        let s_vec: Vec<f32> = (0..width)
+            .map(|i| if (i * 13 + 5) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+
+        let x_gpu = Tensor::from_vec(x_vec.clone(), (rows, width), &dev).unwrap();
+        let r_gpu = Tensor::from_vec(r_vec.clone(), (rows, width), &dev).unwrap();
+        let w_gpu = Tensor::from_vec(w_vec.clone(), width, &dev).unwrap();
+        let s_gpu = Tensor::from_vec(s_vec.clone(), width, &dev).unwrap();
+
+        let x_cpu = Tensor::from_vec(x_vec, (rows, width), &cpu).unwrap();
+        let w_cpu = Tensor::from_vec(w_vec, width, &cpu).unwrap();
+        let s_cpu = Tensor::from_vec(s_vec, width, &cpu).unwrap();
+
+        // 1. Forward + inverse FWHT vs CPU oracle (< 1e-5) and exact roundtrip.
+        let y_gpu = hanzo_ml::quantized::hadamard_fwht(&x_gpu, Some(&s_gpu), b, false).unwrap();
+        let y_cpu = hanzo_ml::quantized::hadamard_fwht(&x_cpu, Some(&s_cpu), b, false).unwrap();
+        let yg = y_gpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let yc = y_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut max_fwht_diff = 0f32;
+        for i in 0..yg.len() {
+            max_fwht_diff = max_fwht_diff.max((yg[i] - yc[i]).abs());
+        }
+        assert!(
+            max_fwht_diff < 1e-5,
+            "FWHT fwd D={width} B={b} max_diff={max_fwht_diff:.3e}"
+        );
+
+        let rec_gpu = hanzo_ml::quantized::hadamard_fwht(&y_gpu, Some(&s_gpu), b, true).unwrap();
+        let rec_v = rec_gpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let orig_v = x_gpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut max_rt_diff = 0f32;
+        for i in 0..orig_v.len() {
+            max_rt_diff = max_rt_diff.max((rec_v[i] - orig_v[i]).abs());
+        }
+        assert!(
+            max_rt_diff < 1e-5,
+            "FWHT inverse roundtrip D={width} B={b} max_diff={max_rt_diff:.3e}"
+        );
+
+        // 2. Fused rms_norm_hadamard_fwht (F32, BF16, F16 inputs -> F32 dst) vs CPU oracle (< 1e-5).
+        let eps = 1e-6f32;
+        let rn_gpu = x_gpu
+            .rms_norm_hadamard_fwht(&w_gpu, eps, Some(&s_gpu), b)
+            .unwrap();
+        assert_eq!(rn_gpu.dtype(), DType::F32);
+        let rn_cpu = x_cpu
+            .rms_norm_hadamard_fwht(&w_cpu, eps, Some(&s_cpu), b)
+            .unwrap();
+        let rng = rn_gpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let rnc = rn_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut max_rn_diff = 0f32;
+        for i in 0..rng.len() {
+            max_rn_diff = max_rn_diff.max((rng[i] - rnc[i]).abs());
+        }
+        assert!(
+            max_rn_diff < 1e-5,
+            "rms_norm_hadamard_fwht F32 D={width} B={b} max_diff={max_rn_diff:.3e}"
+        );
+
+        // 3. Fused add_rms_norm_hadamard_fwht in BF16 and F32 vs CPU oracle (< 1e-5).
+        for dt in [DType::F32, DType::BF16, DType::F16] {
+            let xd = x_gpu.to_dtype(dt).unwrap();
+            let rd = r_gpu.to_dtype(dt).unwrap();
+            let wd = w_gpu.to_dtype(dt).unwrap();
+            let xc = xd.to_device(&cpu).unwrap();
+            let rc = rd.to_device(&cpu).unwrap();
+            let wc = wd.to_device(&cpu).unwrap();
+
+            let (h_g, rot_g) = xd
+                .add_rms_norm_hadamard_fwht(&rd, &wd, eps, Some(&s_gpu), b)
+                .unwrap();
+            let (h_c, rot_c) = xc
+                .add_rms_norm_hadamard_fwht(&rc, &wc, eps, Some(&s_cpu), b)
+                .unwrap();
+            assert_eq!(h_g.dtype(), dt);
+            assert_eq!(rot_g.dtype(), DType::F32);
+
+            let hg = h_g
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let hc = h_c
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for i in 0..hg.len() {
+                assert_eq!(
+                    hg[i].to_bits(),
+                    hc[i].to_bits(),
+                    "{dt:?} residual_out mismatch at {i}: gpu={} cpu={}",
+                    hg[i],
+                    hc[i]
+                );
+            }
+
+            let rg = rot_g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let rc_v = rot_c.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let mut max_d = 0f32;
+            for i in 0..rg.len() {
+                max_d = max_d.max((rg[i] - rc_v[i]).abs());
+            }
+            assert!(
+                max_d < 1e-5,
+                "add_rms_norm_hadamard_fwht {dt:?} D={width} B={b} max_diff={max_d:.3e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cuda_shared_iq_q8_sibling_matvec_parity() {
+    use hanzo_ml::DType;
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip: no CUDA device ({e})");
+            return;
+        }
+    };
+    let (k, b_fwht) = (5120usize, 1024usize);
+    let eps = 1e-6f32;
+    let w_norm = Tensor::from_vec(
+        (0..k)
+            .map(|i| 0.7 + 0.3 * pseudo(i + 11).abs())
+            .collect::<Vec<_>>(),
+        k,
+        &dev,
+    )
+    .unwrap();
+    let signs = Tensor::from_vec(
+        (0..k)
+            .map(|i| {
+                if (i * 5 + 1) % 2 == 0 {
+                    1.0f32
+                } else {
+                    -1.0f32
+                }
+            })
+            .collect::<Vec<_>>(),
+        k,
+        &dev,
+    )
+    .unwrap();
+
+    for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0, GgmlDType::Q1_0] {
+        let wq = QMatMul::from_qtensor(
+            QTensor::new(
+                QStorage::from_data(Cow::Owned(synth(dtype, 512, k)), &dev, dtype).unwrap(),
+                (512, k),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let wk = QMatMul::from_qtensor(
+            QTensor::new(
+                QStorage::from_data(Cow::Owned(synth(dtype, 128, k)), &dev, dtype).unwrap(),
+                (128, k),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let wv = QMatMul::from_qtensor(
+            QTensor::new(
+                QStorage::from_data(Cow::Owned(synth(dtype, 19, k)), &dev, dtype).unwrap(),
+                (19, k),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        for &m in &[1usize, 4] {
+            let x_bf16 = Tensor::from_vec(
+                (0..m * k)
+                    .map(|i| pseudo(i + 909) * 0.9)
+                    .collect::<Vec<_>>(),
+                (m, k),
+                &dev,
+            )
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+            let x_rot = x_bf16
+                .rms_norm_hadamard_fwht(&w_norm, eps, Some(&signs), b_fwht)
+                .unwrap();
+
+            // Path A: standalone quantize_iq_q8 + forward_iq_q8 vs QMatMul::forward (bit-exact).
+            let q8_sep = QMatMul::quantize_iq_q8(&x_rot).unwrap();
+            // Path B: single-launch fused rms_norm_hadamard_fwht_iq_q8 + forward_iq_q8 (bit-exact).
+            let q8_fused =
+                QMatMul::rms_norm_hadamard_fwht_iq_q8(&x_bf16, &w_norm, eps, Some(&signs), b_fwht)
+                    .unwrap();
+
+            for proj in [&wq, &wk, &wv] {
+                let want = if m == 1 {
+                    proj.forward(&x_rot).unwrap()
+                } else {
+                    // At m=4, PQ2_0 QMatMul::forward may route to MMQ; compare against q8_sep (dp4a).
+                    proj.forward_iq_q8(&q8_sep).unwrap()
+                };
+                let got_sep = proj.forward_iq_q8(&q8_sep).unwrap();
+                let got_fused = proj.forward_iq_q8(&q8_fused).unwrap();
+
+                let v_want = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let v_sep = got_sep.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let v_fused = got_fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                for i in 0..v_want.len() {
+                    assert_eq!(
+                        v_sep[i].to_bits(),
+                        v_want[i].to_bits(),
+                        "{dtype:?} m={m} quantize_iq_q8 mismatch at {i}"
+                    );
+                    assert_eq!(
+                        v_fused[i].to_bits(),
+                        v_sep[i].to_bits(),
+                        "{dtype:?} m={m} fused rms_norm_hadamard_fwht_iq_q8 mismatch at {i}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_bonsai2_cuda_kernels() {
+    use hanzo_ml::DType;
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip bench: no CUDA device ({e})");
+            return;
+        }
+    };
+    let shapes = [(4096usize, 4096usize), (12288, 4096), (5120, 17408)];
+    let (warm, iters) = (30usize, 300usize);
+
+    println!("=== GB10 Bonsai-2 CUDA Decode (m=1) & Shared-Q8 Microbench ===");
+    for &(nout, k) in &shapes {
+        let x = Tensor::from_vec(
+            (0..k).map(|i| pseudo(i + 17)).collect::<Vec<_>>(),
+            (1, k),
+            &dev,
+        )
+        .unwrap();
+        let q8 = QMatMul::quantize_iq_q8(&x).unwrap();
+        for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0, GgmlDType::Q1_0] {
+            let raw = synth(dtype, nout, k);
+            let wbytes = raw.len() as f64;
+            let mm = QMatMul::from_qtensor(
+                QTensor::new(
+                    QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(),
+                    (nout, k),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            for _ in 0..warm {
+                let _ = mm.forward(&x).unwrap();
+                let _ = mm.forward_iq_q8(&q8).unwrap();
+            }
+            dev.synchronize().unwrap();
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(mm.forward(&x).unwrap());
+            }
+            dev.synchronize().unwrap();
+            let us_fwd = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let gbps_fwd = wbytes / us_fwd / 1e3;
+
+            let t1 = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(mm.forward_iq_q8(&q8).unwrap());
+            }
+            dev.synchronize().unwrap();
+            let us_q8 = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let gbps_q8 = wbytes / us_q8 / 1e3;
+
+            println!(
+                "DECODE {dtype:>6?} [{nout:5}x{k:5}]: fwd={us_fwd:6.2} us ({gbps_fwd:5.1} GB/s) | shared_q8={us_q8:6.2} us ({gbps_q8:5.1} GB/s)"
+            );
+        }
+    }
+
+    println!("=== GB10 Bonsai-2 Wide-CTA FWHT & Fused RMSNorm+FWHT+Q8 Microbench ===");
+    for &(width, b) in &[(4096usize, 4096usize), (5120, 1024), (17408, 1024)] {
+        let x = Tensor::from_vec(
+            (0..width).map(|i| pseudo(i + 3)).collect::<Vec<_>>(),
+            (1, width),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let res = Tensor::from_vec(
+            (0..width).map(|i| pseudo(i + 99)).collect::<Vec<_>>(),
+            (1, width),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let w = Tensor::from_vec(vec![1.0f32; width], width, &dev).unwrap();
+        let s = Tensor::from_vec(vec![1.0f32; width], width, &dev).unwrap();
+
+        for _ in 0..warm {
+            let _ = hanzo_ml::quantized::hadamard_fwht(&x, Some(&s), b, false).unwrap();
+            let _ =
+                QMatMul::add_rms_norm_hadamard_fwht_iq_q8(&x, &res, &w, 1e-6, Some(&s), b).unwrap();
+        }
+        dev.synchronize().unwrap();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(
+                hanzo_ml::quantized::hadamard_fwht(&x, Some(&s), b, false).unwrap(),
+            );
+        }
+        dev.synchronize().unwrap();
+        let us_fwht = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(
+                QMatMul::add_rms_norm_hadamard_fwht_iq_q8(&x, &res, &w, 1e-6, Some(&s), b).unwrap(),
+            );
+        }
+        dev.synchronize().unwrap();
+        let us_fused = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!(
+            "FWHT [1x{width:5}, B={b:4}]: fwht_bf16={us_fwht:5.2} us | fused_add_rmsnorm_fwht_q8={us_fused:5.2} us"
+        );
+    }
+
+    println!("=== GB10 Bonsai-2 CUDA MMQ Prefill (m=128) Microbench ===");
+    for &(nout, k) in &shapes {
+        let m = 128usize;
+        let x = Tensor::from_vec(
+            (0..(m * k)).map(|i| pseudo(i + 23)).collect::<Vec<_>>(),
+            (m, k),
+            &dev,
+        )
+        .unwrap();
+        let flops = 2.0 * (m as f64) * (nout as f64) * (k as f64);
+        for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0, GgmlDType::Q1_0] {
+            let raw = synth(dtype, nout, k);
+            let mm = QMatMul::from_qtensor(
+                QTensor::new(
+                    QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(),
+                    (nout, k),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            for _ in 0..10 {
+                let _ = mm.forward(&x).unwrap();
+            }
+            dev.synchronize().unwrap();
+            let p_iters = 50usize;
+            let t0 = std::time::Instant::now();
+            for _ in 0..p_iters {
+                std::hint::black_box(mm.forward(&x).unwrap());
+            }
+            dev.synchronize().unwrap();
+            let us = t0.elapsed().as_secs_f64() * 1e6 / p_iters as f64;
+            let tflops = flops / us / 1e6;
+            println!(
+                "PREFILL m=128 {dtype:>6?} [{nout:5}x{k:5}]: {us:7.1} us ({tflops:5.2} TFLOP/s)"
+            );
+        }
+    }
 }

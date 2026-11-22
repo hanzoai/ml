@@ -592,6 +592,61 @@ pub fn with_f16c() -> bool {
     crate::cpu::features::get().f16c
 }
 
+// Read canonical `ML_*` env var first; fall back to `legacy_hanzo_name` only when `ML_*` is unset.
+pub fn ml_env_var(ml_name: &str, legacy_hanzo_name: &str) -> Result<String, std::env::VarError> {
+    match std::env::var(ml_name) {
+        Err(std::env::VarError::NotPresent) => std::env::var(legacy_hanzo_name),
+        res => res,
+    }
+}
+
+// Read canonical `ML_*` OsString env var first; fall back to `legacy_hanzo_name` only when `ML_*` is unset.
+pub fn ml_env_os(ml_name: &str, legacy_hanzo_name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(ml_name).or_else(|| std::env::var_os(legacy_hanzo_name))
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::{ml_env_os, ml_env_var};
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn ml_prefix_takes_precedence_over_legacy_hanzo() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ml_k = "ML_TEST_ENV_PRECEDENCE";
+        let hz_k = "HANZO_TEST_ENV_PRECEDENCE";
+        unsafe {
+            std::env::remove_var(ml_k);
+            std::env::remove_var(hz_k);
+        }
+        assert_eq!(ml_env_var(ml_k, hz_k), Err(std::env::VarError::NotPresent));
+        assert_eq!(ml_env_os(ml_k, hz_k), None);
+
+        unsafe {
+            std::env::set_var(hz_k, "legacy");
+        }
+        assert_eq!(ml_env_var(ml_k, hz_k).as_deref(), Ok("legacy"));
+
+        unsafe {
+            std::env::set_var(ml_k, "dsl");
+        }
+        assert_eq!(ml_env_var(ml_k, hz_k).as_deref(), Ok("dsl"));
+        assert_eq!(
+            ml_env_os(ml_k, hz_k)
+                .and_then(|v| v.into_string().ok())
+                .as_deref(),
+            Some("dsl")
+        );
+
+        unsafe {
+            std::env::remove_var(ml_k);
+            std::env::remove_var(hz_k);
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::linux_parse_cpu_list;

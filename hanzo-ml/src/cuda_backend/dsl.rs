@@ -261,7 +261,9 @@ type ShmemCache = HashMap<(DeviceId, String), u32>;
 type MetaCache = HashMap<(DeviceId, [u32; 3]), Arc<CudaSlice<u32>>>;
 type U32VecCache = HashMap<(DeviceId, Vec<u32>), Arc<CudaSlice<u32>>>;
 type F32VecCache = HashMap<(DeviceId, Vec<u32>), Arc<CudaSlice<f32>>>;
-type PartialF32Cache = HashMap<DeviceId, CudaSlice<f32>>;
+/// Stream-scoped grow-only scratch buffer cache: keyed by `(DeviceId, raw CUstream ptr)` so
+/// concurrent CUDA streams never share a partial-softmax scratch allocation.
+type PartialF32Cache = HashMap<(DeviceId, usize), CudaSlice<f32>>;
 
 static DSL_SHMEM_CACHE: OnceLock<Mutex<ShmemCache>> = OnceLock::new();
 static DSL_META_CACHE: OnceLock<Mutex<MetaCache>> = OnceLock::new();
@@ -314,9 +316,7 @@ impl CudaDevice {
         }
         let slice = Arc::new(self.clone_htod(words)?);
         let mut guard = cache.lock().unwrap();
-        if guard.len() > 2048 {
-            guard.clear();
-        }
+        // Retain all cached metadata slices so captured CUDA graphs never lose bound device pointers.
         guard.insert(key, slice.clone());
         Ok(slice)
     }
@@ -331,9 +331,6 @@ impl CudaDevice {
         }
         let slice = Arc::new(self.clone_htod(vals)?);
         let mut guard = cache.lock().unwrap();
-        if guard.len() > 512 {
-            guard.clear();
-        }
         guard.insert(key, slice.clone());
         Ok(slice)
     }
@@ -703,6 +700,7 @@ impl CudaDevice {
                 crate::quantized::dsl::QkBackend::Cuda,
                 batch,
                 n_heads,
+                n_kv,
                 seq_q,
                 d,
                 max_ctx_est,
@@ -734,17 +732,42 @@ impl CudaDevice {
             };
             let split_blocks = (total_qh * num_splits) as u32;
             let stream = self.cuda_stream();
-            let cache = DSL_SPLIT_KV_PARTIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            let mut partial_guard = cache.lock().unwrap();
-            let need_grow = partial_guard
-                .get(&self.id())
-                .is_none_or(|b| b.len() < partial_len);
-            if need_grow {
-                let cap = partial_len.next_power_of_two().max(4096);
-                let fresh = unsafe { self.alloc::<f32>(cap)? };
-                partial_guard.insert(self.id(), fresh);
-            }
-            let partial_slice = partial_guard.get_mut(&self.id()).unwrap();
+            // During CUDA graph capture, NEVER bind a pointer into the shared eager cache:
+            // allocate a fresh stream-ordered buffer so CUDA graph instantiation
+            // (`CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH`) owns, isolates, and auto-frees
+            // the partial scratch independently per graph replay (zero aliasing, zero UAF).
+            let capturing = self.cuda_graph_capture_active();
+            let mut graph_partial: Option<CudaSlice<f32>> = if capturing {
+                Some(unsafe { self.alloc::<f32>(partial_len)? })
+            } else {
+                None
+            };
+            let stream_key = (self.id(), stream.cu_stream() as usize);
+            let mut partial_guard = if capturing {
+                None
+            } else {
+                let cache = DSL_SPLIT_KV_PARTIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                let mut g = cache.lock().unwrap();
+                let need_grow = g.get(&stream_key).is_none_or(|b| b.len() < partial_len);
+                if need_grow {
+                    let cap = partial_len.next_power_of_two().max(4096);
+                    let fresh = unsafe { self.alloc::<f32>(cap)? };
+                    // Replacing the previous `CudaSlice` drops it via stream-ordered
+                    // `cuMemFreeAsync` on this exact stream, strictly after all prior pass-2
+                    // kernels on this stream finish.
+                    g.insert(stream_key, fresh);
+                }
+                Some(g)
+            };
+            let partial_slice: &mut CudaSlice<f32> = if let Some(ref mut buf) = graph_partial {
+                buf
+            } else {
+                partial_guard
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&stream_key)
+                    .unwrap()
+            };
             {
                 let (qp, _gq) = cuda_storage_ptr(q.0, q.1, dtype, &stream)?;
                 let (kp, _gk) = cuda_storage_ptr(k_cache.0, k_cache.1, dtype, &stream)?;
@@ -794,6 +817,7 @@ impl CudaDevice {
                 );
             }
             drop(partial_guard);
+            drop(graph_partial);
             return Ok(out);
         }
         let meta = self.dsl_const_u32_slice(&[

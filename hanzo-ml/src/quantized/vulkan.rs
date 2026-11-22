@@ -206,6 +206,10 @@ mod tests {
             GgmlDType::IQ4_XS,
             GgmlDType::Q4_0,
             GgmlDType::Q4K,
+            GgmlDType::Q1_0,
+            GgmlDType::Q2_0,
+            GgmlDType::PQ2_0,
+            GgmlDType::PTQ1_0,
             GgmlDType::F32,
         ] {
             let layout = Layout::of(dtype);

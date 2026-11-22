@@ -108,17 +108,16 @@ macro_rules! quant_format {
         vec_dot: $vecdot:ty,
         $(vec_dot_fn: $vecdot_fn:path,)?
         fields: { $( $(#[$fmeta:meta])* $fname:ident : $fty:ty ),+ $(,)? },
-        decode: |$xs:ident, $ys:ident| $decode:block $(,)?
+        decode: |$xs:ident, $ys:ident| $decode:block
+        $(, encode: |$exs:ident, $eys:ident| $encode:block)? $(,)?
     ) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, PartialEq)]
         #[repr(C)]
         pub struct $name {
-            $( $(#[$fmeta])* pub(crate) $fname : $fty ),+
+            $( $(#[$fmeta])* pub $fname : $fty ),+
         }
 
-        // Pin the in-memory layout to the GGUF on-disk byte size. If the fields don't
-        // add up to `byte_size`, this fails to compile — the miswire is impossible.
         const _: () = assert!(
             ::std::mem::size_of::<$name>() == $bytes,
             concat!(stringify!($name), " on-disk byte size mismatch"),
@@ -129,14 +128,10 @@ macro_rules! quant_format {
             const BLCK_SIZE: usize = $blck;
             type VecDotType = $vecdot;
 
-            // The dequant: the supplied `decode` body, with the exact `to_float` signature.
             fn to_float($xs: &[Self], $ys: &mut [f32]) $decode
 
-            // Decode-only: we read these from GGUF but never quantize *to* them.
-            fn from_float(_xs: &[f32], _ys: &mut [Self]) {
-                panic!(
-                    concat!(stringify!($dtype), " quantize (from_float) is not supported")
-                )
+            fn from_float(xs: &[f32], ys: &mut [Self]) {
+                quant_format!(@from_float_body $dtype, xs, ys $(, |$exs, $eys| $encode)?)
             }
 
             #[inline]
@@ -156,6 +151,17 @@ macro_rules! quant_format {
             }
         }
     };
+    (@from_float_body $dtype:ident, $xs:ident, $ys:ident) => {{
+        let _ = ($xs, $ys);
+        panic!(
+            concat!(stringify!($dtype), " quantize (from_float) is not supported")
+        )
+    }};
+    (@from_float_body $dtype:ident, $xs:ident, $ys:ident, |$exs:ident, $eys:ident| $encode:block) => {{
+        let $exs = $xs;
+        let $eys = $ys;
+        $encode
+    }};
     (@vec_dot_body $self_ty:ty, $n:ident, $xs:ident, $ys:ident) => {
         <$self_ty>::vec_dot_unopt($n, $xs, $ys)
     };
@@ -166,23 +172,10 @@ macro_rules! quant_format {
 
 pub(crate) use quant_format;
 
-/// A single declarative table of every quant type, driving the `mod.rs` wiring so that
-/// `from_u32` / `to_u32` / `cpu_zeros` / `from_data` / `type_size` / `block_size` are
-/// generated from ONE list instead of six hand-maintained `match` blocks.
-///
-/// Each row is `Variant => Block @ ggml_id`. Call it with a callback macro that takes the
-/// whole list; see [`impl_dtype_wiring!`] for the concrete expansion used by `mod.rs`, and
-/// the `#[cfg(test)]` `for_each_quant_smoke` test below for how a consumer iterates it.
-///
-/// (Left as the canonical *source of truth* the migration points `mod.rs` at; wiring the
-/// real `GgmlDType` impl to it is the final, mechanical migration step — it must land in
-/// the same commit that removes the six hand-written match blocks, and is intentionally
-/// NOT done here to avoid colliding with the concurrent edits to `mod.rs`.)
 #[macro_export]
 macro_rules! for_each_quant {
     ($cb:ident) => {
         $cb! {
-            // Variant         Block            ggml type id
             Q4_0     => BlockQ4_0     @ 2,
             Q4_1     => BlockQ4_1     @ 3,
             Q5_0     => BlockQ5_0     @ 6,
@@ -209,6 +202,7 @@ macro_rules! for_each_quant {
             TQ2_0    => BlockTQ2_0    @ 35,
             NVFP4    => BlockNVFP4    @ 40,
             Q1_0     => BlockQ1_0     @ 41,
+            Q2_0     => BlockQ2_0     @ 42,
             ROCMFP4      => BlockROCMFP4      @ 100,
             ROCMFP4_FAST => BlockROCMFP4Fast  @ 101,
             PQ2_0    => BlockPQ2_0    @ 142,

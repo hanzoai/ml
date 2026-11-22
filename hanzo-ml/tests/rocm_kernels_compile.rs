@@ -10,7 +10,9 @@ fn compiles<K: KernelSource>() {
     let src = dir.join(format!("hanzo_{}_compile_check.hip", K::NAME));
     let out = dir.join(format!("hanzo_{}_compile_check.hsaco", K::NAME));
     std::fs::write(&src, K::CODE).unwrap();
-    let arch = std::env::var("HANZO_ROCM_ARCH").unwrap_or_else(|_| "gfx1151".into());
+    let arch = hanzo_ml::utils::ml_env_var("ML_ROCM_ARCH", "HANZO_ROCM_ARCH")
+        .or_else(|_| std::env::var("ROCM_GFX_ARCH"))
+        .unwrap_or_else(|_| "gfx1151".into());
     let status = std::process::Command::new("hipcc")
         .args(["--genco", "-O1", &format!("--offload-arch={arch}"), "-o"])
         .arg(&out)

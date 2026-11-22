@@ -98,6 +98,8 @@ mod tensor;
 mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
+#[allow(unused_imports)]
+pub(crate) use utils::{ml_env_os, ml_env_var};
 mod variable;
 #[cfg(feature = "vulkan")]
 pub mod vulkan_backend;

@@ -264,15 +264,15 @@ fn ptq1_dispatch_proof_and_single_compile() {
 
 #[test]
 fn ptq1_dsl_real_model_tensors() {
-    let Ok(path) = std::env::var("HANZO_PTQ1_GGUF") else {
-        eprintln!("HANZO_PTQ1_GGUF unset; skipping real-model tensors");
+    let Ok(path) = hanzo_ml::utils::ml_env_var("ML_PTQ1_GGUF", "HANZO_PTQ1_GGUF") else {
+        eprintln!("ML_PTQ1_GGUF unset; skipping real-model tensors");
         return;
     };
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dev = Device::new_metal(0).unwrap();
     let mut f = std::fs::File::open(&path).unwrap();
     let content = hanzo_ml::quantized::gguf_file::Content::read(&mut f).unwrap();
-    let max = std::env::var("HANZO_PTQ1_GGUF_MAX")
+    let max = hanzo_ml::utils::ml_env_var("ML_PTQ1_GGUF_MAX", "HANZO_PTQ1_GGUF_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(24usize);
