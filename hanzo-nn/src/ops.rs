@@ -769,6 +769,17 @@ impl hanzo_ml::CustomOp2 for Select {
         Self::rows(x, xl, index, il)
     }
 
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        x: &hanzo_ml::VulkanStorage,
+        xl: &Layout,
+        index: &hanzo_ml::VulkanStorage,
+        il: &Layout,
+    ) -> Result<(hanzo_ml::VulkanStorage, Shape)> {
+        Self::rows(x, xl, index, il)
+    }
+
     #[cfg(feature = "rocm")]
     fn rocm_fwd(
         &self,

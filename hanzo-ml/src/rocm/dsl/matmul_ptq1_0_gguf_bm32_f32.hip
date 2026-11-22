@@ -1,0 +1,1164 @@
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+typedef unsigned int uint;
+typedef unsigned char uint8;
+typedef unsigned short uint16;
+typedef unsigned int uint32;
+typedef unsigned long long int uint64;
+typedef signed char int8;
+typedef signed short int16;
+typedef signed int int32;
+typedef signed long long int int64;
+
+struct __align__(16) float_4 {
+  float i_0;
+  float i_1;
+  float i_2;
+  float i_3;
+};
+
+struct __align__(4) __half_2 {
+  __half i_0;
+  __half i_1;
+};
+
+struct info_st {
+  uint32 static_meta[8];
+};
+
+typedef _Float16 half8_t __attribute__((ext_vector_type(8)));
+typedef _Float16 half16_t __attribute__((ext_vector_type(16)));
+typedef float float8_t __attribute__((ext_vector_type(8)));
+
+// Fill the fragment.
+__device__ void wmma_fill_float_c_16x16x16_(float8_t &frag, float value) {
+#pragma unroll
+  for (uint i = 0; i < 8; ++i) {
+    frag[i] = value;
+  }
+}
+
+// Load the fragment.
+__device__ void wmma_load___half_b_16x16x16_col_(half16_t &frag,
+                                                 const __half *value_ptr,
+                                                 const uint stride) {
+  uint wmmaLane = uint(threadIdx.x % 16);
+
+#pragma unroll
+  for (uint i = 0; i < 16; ++i) {
+    const uint index = i + wmmaLane * stride;
+    frag[i * 1] = value_ptr[index];
+  }
+}
+
+// Load the fragment.
+__device__ void wmma_load___half_a_16x16x16_row_(half16_t &frag,
+                                                 const __half *value_ptr,
+                                                 const uint stride) {
+  uint wmmaLane = uint(threadIdx.x % 16);
+
+#pragma unroll
+  for (uint i = 0; i < 16; ++i) {
+    const uint index = i + wmmaLane * stride;
+    frag[i * 1] = value_ptr[index];
+  }
+}
+
+// Execute wmma.
+__device__ void wmma_execute_16x16x16___half_float(const half16_t &frag_a,
+                                                   const half16_t &frag_b,
+                                                   const float8_t &frag_c,
+                                                   float8_t &frag_d) {
+  frag_d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(frag_a, frag_b, frag_c);
+}
+
+// Store the fragment.
+__device__ void wmma_store_float_c_16x16x16__row(float8_t &frag,
+                                                 float *output_ptr,
+                                                 uint stride) {
+  uint wmmaLane = uint(threadIdx.x % 16);
+
+#pragma unroll
+  for (uint elemIdx = 0; elemIdx < uint(8); ++elemIdx) {
+    const uint rowIdx = elemIdx * uint(2) + (threadIdx.x % uint(32)) / uint(16);
+    output_ptr[wmmaLane + rowIdx * stride] = frag[elemIdx];
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    matmul_ptq1_0_gguf_f_f32(const uint32 *__restrict__ buffer_0,
+                             const float_4 *__restrict__ buffer_1,
+                             float *buffer_2,
+                             const uint32 *__restrict__ buffer_3,
+                             const info_st *__restrict__ info_ptr) {
+  uint32 threadIdxGlobal = threadIdx.x + threadIdx.y * blockDim.x +
+                           threadIdx.z * (blockDim.x * blockDim.y);
+  extern __shared__ __align__(4) uchar dynamic_shared_mem[];
+  const info_st &info = *info_ptr;
+  const uint32 *dynamic_meta = reinterpret_cast<const uint32 *>(
+      reinterpret_cast<const char *>(info_ptr) + sizeof(info_st));
+
+  // Shared array size: 512, 2048 bytes
+  float *shared_memory_38 = reinterpret_cast<float *>(&dynamic_shared_mem[0]);
+  // Shared array size: 1280, 2560 bytes
+  __half *shared_memory_41 =
+      reinterpret_cast<__half *>(&dynamic_shared_mem[2048]);
+  // Shared array size: 2560, 5120 bytes
+  __half *shared_memory_42 =
+      reinterpret_cast<__half *>(&dynamic_shared_mem[4608]);
+  __half l_arr_39[8];
+
+  __half l_arr_40[16];
+
+  float8_t frag_acc_48;
+  float8_t frag_acc_49;
+  uint32 l_mut_16;
+  uint32 l_mut_23;
+  uint32 l_mut_51;
+  uint32 l_mut_52;
+  uint32 l_mut_53;
+  uint32 l_mut_54;
+  uint32 l_mut_55;
+  __half l_mut_57;
+  uint32 l_mut_106;
+  uint32 l_mut_256;
+  const uint32 l_0 = threadIdxGlobal / uint32(32);
+  const uint32 l_1 = l_0 / uint32(2);
+  const uint32 l_2 = l_0 % uint32(2);
+  const uint32 l_3 = buffer_3[uint32(0)];
+  const uint32 l_4 = buffer_3[uint32(1)];
+  const uint32 l_5 = buffer_3[uint32(2)];
+  const uint32 l_6 = blockIdx.x * uint32(32);
+  const uint32 l_7 = blockIdx.y * uint32(64);
+  const uint32 l_8 = l_5 / uint32(128);
+  const uint32 l_9 = l_5 / uint32(4);
+  const uint32 l_10 = threadIdxGlobal % uint32(4);
+  const uint32 l_11 = l_10 * uint32(8);
+  const uint32 l_12 = threadIdxGlobal / uint32(4);
+  const uint32 l_13 = l_6 + l_12;
+  const bool l_14 = l_13 < l_3;
+  if (l_14) {
+    const uint32 l_15 = l_6 + l_12;
+    l_mut_16 = l_15;
+  } else {
+    const uint32 l_17 = l_3 - uint32(1);
+    l_mut_16 = l_17;
+  }
+  const uint32 l_18 = l_6 + uint32(32);
+  const uint32 l_19 = l_18 + l_12;
+  const bool l_20 = l_19 < l_3;
+  if (l_20) {
+    const uint32 l_21 = l_6 + uint32(32);
+    const uint32 l_22 = l_21 + l_12;
+    l_mut_23 = l_22;
+  } else {
+    const uint32 l_24 = l_3 - uint32(1);
+    l_mut_23 = l_24;
+  }
+  const uint32 l_25 = l_mut_16 * l_9;
+  const uint32 l_26 = l_10 * uint32(2);
+  const uint32 l_27 = l_25 + l_26;
+  const uint32 l_28 = l_mut_23 * l_9;
+  const uint32 l_29 = l_10 * uint32(2);
+  const uint32 l_30 = l_28 + l_29;
+  const uint32 l_31 = threadIdxGlobal / uint32(2);
+  const uint32 l_32 = threadIdxGlobal % uint32(2);
+  const uint32 l_33 = l_7 + l_31;
+  const bool l_34 = l_33 < l_4;
+  if (l_34) {
+    const uint32 l_35 = l_7 + l_31;
+    l_mut_23 = l_35;
+  } else {
+    const uint32 l_36 = l_4 - uint32(1);
+    l_mut_23 = l_36;
+  }
+  const uint32 l_37 = l_mut_23 * l_8;
+  const uint32 l_43 = l_12 * uint32(40);
+  const uint32 l_44 = l_43 + l_11;
+  const uint32 l_45 = l_31 * uint32(40);
+  const uint32 l_46 = l_32 * uint32(16);
+  const uint32 l_47 = l_45 + l_46;
+  wmma_fill_float_c_16x16x16_(frag_acc_48, float(0.0));
+  wmma_fill_float_c_16x16x16_(frag_acc_49, float(0.0));
+
+  for (uint32 l_mut_50 = uint32(0); l_mut_50 < l_8; ++l_mut_50) {
+    l_mut_23 = uint32(0);
+    l_mut_16 = uint32(0);
+    l_mut_51 = uint32(0);
+    l_mut_52 = uint32(0);
+    l_mut_53 = uint32(0);
+    l_mut_54 = uint32(0);
+    l_mut_55 = uint32(0);
+    const __half l_56 = __half(float(0.0));
+    l_mut_57 = l_56;
+    const bool l_58 = threadIdxGlobal < uint32(128);
+    const bool l_59 = bool(true) || l_58;
+    if (l_59) {
+      const uint32 l_60 = l_37 + l_mut_50;
+      const uint32 l_61 = uint32(7) * l_60;
+      const uint32 l_62 = buffer_0[l_61];
+      l_mut_23 = l_62;
+      const uint32 l_63 = l_61 + uint32(1);
+      const uint32 l_64 = buffer_0[l_63];
+      l_mut_16 = l_64;
+      const uint32 l_65 = l_61 + uint32(2);
+      const uint32 l_66 = buffer_0[l_65];
+      l_mut_51 = l_66;
+      const uint32 l_67 = l_61 + uint32(3);
+      const uint32 l_68 = buffer_0[l_67];
+      l_mut_52 = l_68;
+      const uint32 l_69 = l_61 + uint32(4);
+      const uint32 l_70 = buffer_0[l_69];
+      l_mut_53 = l_70;
+      const uint32 l_71 = l_61 + uint32(5);
+      const uint32 l_72 = buffer_0[l_71];
+      l_mut_54 = l_72;
+      const uint32 l_73 = l_61 + uint32(6);
+      const uint32 l_74 = buffer_0[l_73];
+      l_mut_55 = l_74;
+      const uint32 l_75 = l_mut_55 >> uint32(16);
+      const uint32 l_76 = l_75 & uint32(65535);
+      const __half_2 l_77 = reinterpret_cast<__half_2 const &>(l_76);
+      const __half l_78 = l_77.i_0;
+      l_mut_57 = l_78;
+    }
+
+    for (uint32 l_mut_79 = uint32(0); l_mut_79 < uint32(4); ++l_mut_79) {
+      half16_t frag_b_570;
+      half16_t frag_b_576;
+      half16_t frag_a_582;
+      half16_t frag_b_588;
+      half16_t frag_b_594;
+      half16_t frag_a_600;
+      const uint32 l_80 = l_mut_50 * uint32(4);
+      const uint32 l_81 = l_80 + l_mut_79;
+      const uint32 l_82 = l_81 * uint32(8);
+      const uint32 l_83 = uint32(2) * l_mut_79;
+      const uint32 l_84 = l_83 + l_32;
+      const uint32 l_85 = l_27 + l_82;
+      const float_4 l_86 = buffer_1[l_85];
+      const uint32 l_87 = l_85 + uint32(1);
+      const float_4 l_88 = buffer_1[l_87];
+      const float l_89 = l_86.i_0;
+      const __half l_90 = __half(l_89);
+      l_arr_39[uint32(0)] = l_90;
+      const float l_91 = l_88.i_0;
+      const __half l_92 = __half(l_91);
+      l_arr_39[uint32(4)] = l_92;
+      const float l_93 = l_86.i_1;
+      const __half l_94 = __half(l_93);
+      l_arr_39[uint32(1)] = l_94;
+      const float l_95 = l_88.i_1;
+      const __half l_96 = __half(l_95);
+      l_arr_39[uint32(5)] = l_96;
+      const float l_97 = l_86.i_2;
+      const __half l_98 = __half(l_97);
+      l_arr_39[uint32(2)] = l_98;
+      const float l_99 = l_88.i_2;
+      const __half l_100 = __half(l_99);
+      l_arr_39[uint32(6)] = l_100;
+      const float l_101 = l_86.i_3;
+      const __half l_102 = __half(l_101);
+      l_arr_39[uint32(3)] = l_102;
+      const float l_103 = l_88.i_3;
+      const __half l_104 = __half(l_103);
+      l_arr_39[uint32(7)] = l_104;
+      const bool l_105 = l_84 < uint32(5);
+      if (l_105) {
+        l_mut_106 = uint32(1);
+        const bool l_107 = l_84 == uint32(1);
+        if (l_107) {
+          l_mut_106 = uint32(3);
+        } else {
+          const bool l_108 = l_84 == uint32(2);
+          if (l_108) {
+            l_mut_106 = uint32(9);
+          } else {
+            const bool l_109 = l_84 == uint32(3);
+            if (l_109) {
+              l_mut_106 = uint32(27);
+            } else {
+              const bool l_110 = l_84 == uint32(4);
+              if (l_110) {
+                l_mut_106 = uint32(81);
+              }
+            }
+          }
+        }
+        const uint32 l_111 = l_mut_23 >> uint32(0);
+        const uint32 l_112 = l_111 & uint32(255);
+        const uint32 l_113 = l_112 * l_mut_106;
+        const uint32 l_114 = l_113 & uint32(255);
+        const uint32 l_115 = l_114 * uint32(3);
+        const uint32 l_116 = l_115 >> uint32(8);
+        const __half l_117 = __half(l_116);
+        const __half l_118 = l_117 * l_mut_57;
+        const __half l_119 = l_118 - l_mut_57;
+        l_arr_40[uint32(0)] = l_119;
+        const uint32 l_120 = l_mut_16 >> uint32(0);
+        const uint32 l_121 = l_120 & uint32(255);
+        const uint32 l_122 = l_121 * l_mut_106;
+        const uint32 l_123 = l_122 & uint32(255);
+        const uint32 l_124 = l_123 * uint32(3);
+        const uint32 l_125 = l_124 >> uint32(8);
+        const __half l_126 = __half(l_125);
+        const __half l_127 = l_126 * l_mut_57;
+        const __half l_128 = l_127 - l_mut_57;
+        l_arr_40[uint32(4)] = l_128;
+        const uint32 l_129 = l_mut_51 >> uint32(0);
+        const uint32 l_130 = l_129 & uint32(255);
+        const uint32 l_131 = l_130 * l_mut_106;
+        const uint32 l_132 = l_131 & uint32(255);
+        const uint32 l_133 = l_132 * uint32(3);
+        const uint32 l_134 = l_133 >> uint32(8);
+        const __half l_135 = __half(l_134);
+        const __half l_136 = l_135 * l_mut_57;
+        const __half l_137 = l_136 - l_mut_57;
+        l_arr_40[uint32(8)] = l_137;
+        const uint32 l_138 = l_mut_52 >> uint32(0);
+        const uint32 l_139 = l_138 & uint32(255);
+        const uint32 l_140 = l_139 * l_mut_106;
+        const uint32 l_141 = l_140 & uint32(255);
+        const uint32 l_142 = l_141 * uint32(3);
+        const uint32 l_143 = l_142 >> uint32(8);
+        const __half l_144 = __half(l_143);
+        const __half l_145 = l_144 * l_mut_57;
+        const __half l_146 = l_145 - l_mut_57;
+        l_arr_40[uint32(12)] = l_146;
+        const uint32 l_147 = l_mut_23 >> uint32(8);
+        const uint32 l_148 = l_147 & uint32(255);
+        const uint32 l_149 = l_148 * l_mut_106;
+        const uint32 l_150 = l_149 & uint32(255);
+        const uint32 l_151 = l_150 * uint32(3);
+        const uint32 l_152 = l_151 >> uint32(8);
+        const __half l_153 = __half(l_152);
+        const __half l_154 = l_153 * l_mut_57;
+        const __half l_155 = l_154 - l_mut_57;
+        l_arr_40[uint32(1)] = l_155;
+        const uint32 l_156 = l_mut_16 >> uint32(8);
+        const uint32 l_157 = l_156 & uint32(255);
+        const uint32 l_158 = l_157 * l_mut_106;
+        const uint32 l_159 = l_158 & uint32(255);
+        const uint32 l_160 = l_159 * uint32(3);
+        const uint32 l_161 = l_160 >> uint32(8);
+        const __half l_162 = __half(l_161);
+        const __half l_163 = l_162 * l_mut_57;
+        const __half l_164 = l_163 - l_mut_57;
+        l_arr_40[uint32(5)] = l_164;
+        const uint32 l_165 = l_mut_51 >> uint32(8);
+        const uint32 l_166 = l_165 & uint32(255);
+        const uint32 l_167 = l_166 * l_mut_106;
+        const uint32 l_168 = l_167 & uint32(255);
+        const uint32 l_169 = l_168 * uint32(3);
+        const uint32 l_170 = l_169 >> uint32(8);
+        const __half l_171 = __half(l_170);
+        const __half l_172 = l_171 * l_mut_57;
+        const __half l_173 = l_172 - l_mut_57;
+        l_arr_40[uint32(9)] = l_173;
+        const uint32 l_174 = l_mut_52 >> uint32(8);
+        const uint32 l_175 = l_174 & uint32(255);
+        const uint32 l_176 = l_175 * l_mut_106;
+        const uint32 l_177 = l_176 & uint32(255);
+        const uint32 l_178 = l_177 * uint32(3);
+        const uint32 l_179 = l_178 >> uint32(8);
+        const __half l_180 = __half(l_179);
+        const __half l_181 = l_180 * l_mut_57;
+        const __half l_182 = l_181 - l_mut_57;
+        l_arr_40[uint32(13)] = l_182;
+        const uint32 l_183 = l_mut_23 >> uint32(16);
+        const uint32 l_184 = l_183 & uint32(255);
+        const uint32 l_185 = l_184 * l_mut_106;
+        const uint32 l_186 = l_185 & uint32(255);
+        const uint32 l_187 = l_186 * uint32(3);
+        const uint32 l_188 = l_187 >> uint32(8);
+        const __half l_189 = __half(l_188);
+        const __half l_190 = l_189 * l_mut_57;
+        const __half l_191 = l_190 - l_mut_57;
+        l_arr_40[uint32(2)] = l_191;
+        const uint32 l_192 = l_mut_16 >> uint32(16);
+        const uint32 l_193 = l_192 & uint32(255);
+        const uint32 l_194 = l_193 * l_mut_106;
+        const uint32 l_195 = l_194 & uint32(255);
+        const uint32 l_196 = l_195 * uint32(3);
+        const uint32 l_197 = l_196 >> uint32(8);
+        const __half l_198 = __half(l_197);
+        const __half l_199 = l_198 * l_mut_57;
+        const __half l_200 = l_199 - l_mut_57;
+        l_arr_40[uint32(6)] = l_200;
+        const uint32 l_201 = l_mut_51 >> uint32(16);
+        const uint32 l_202 = l_201 & uint32(255);
+        const uint32 l_203 = l_202 * l_mut_106;
+        const uint32 l_204 = l_203 & uint32(255);
+        const uint32 l_205 = l_204 * uint32(3);
+        const uint32 l_206 = l_205 >> uint32(8);
+        const __half l_207 = __half(l_206);
+        const __half l_208 = l_207 * l_mut_57;
+        const __half l_209 = l_208 - l_mut_57;
+        l_arr_40[uint32(10)] = l_209;
+        const uint32 l_210 = l_mut_52 >> uint32(16);
+        const uint32 l_211 = l_210 & uint32(255);
+        const uint32 l_212 = l_211 * l_mut_106;
+        const uint32 l_213 = l_212 & uint32(255);
+        const uint32 l_214 = l_213 * uint32(3);
+        const uint32 l_215 = l_214 >> uint32(8);
+        const __half l_216 = __half(l_215);
+        const __half l_217 = l_216 * l_mut_57;
+        const __half l_218 = l_217 - l_mut_57;
+        l_arr_40[uint32(14)] = l_218;
+        const uint32 l_219 = l_mut_23 >> uint32(24);
+        const uint32 l_220 = l_219 & uint32(255);
+        const uint32 l_221 = l_220 * l_mut_106;
+        const uint32 l_222 = l_221 & uint32(255);
+        const uint32 l_223 = l_222 * uint32(3);
+        const uint32 l_224 = l_223 >> uint32(8);
+        const __half l_225 = __half(l_224);
+        const __half l_226 = l_225 * l_mut_57;
+        const __half l_227 = l_226 - l_mut_57;
+        l_arr_40[uint32(3)] = l_227;
+        const uint32 l_228 = l_mut_16 >> uint32(24);
+        const uint32 l_229 = l_228 & uint32(255);
+        const uint32 l_230 = l_229 * l_mut_106;
+        const uint32 l_231 = l_230 & uint32(255);
+        const uint32 l_232 = l_231 * uint32(3);
+        const uint32 l_233 = l_232 >> uint32(8);
+        const __half l_234 = __half(l_233);
+        const __half l_235 = l_234 * l_mut_57;
+        const __half l_236 = l_235 - l_mut_57;
+        l_arr_40[uint32(7)] = l_236;
+        const uint32 l_237 = l_mut_51 >> uint32(24);
+        const uint32 l_238 = l_237 & uint32(255);
+        const uint32 l_239 = l_238 * l_mut_106;
+        const uint32 l_240 = l_239 & uint32(255);
+        const uint32 l_241 = l_240 * uint32(3);
+        const uint32 l_242 = l_241 >> uint32(8);
+        const __half l_243 = __half(l_242);
+        const __half l_244 = l_243 * l_mut_57;
+        const __half l_245 = l_244 - l_mut_57;
+        l_arr_40[uint32(11)] = l_245;
+        const uint32 l_246 = l_mut_52 >> uint32(24);
+        const uint32 l_247 = l_246 & uint32(255);
+        const uint32 l_248 = l_247 * l_mut_106;
+        const uint32 l_249 = l_248 & uint32(255);
+        const uint32 l_250 = l_249 * uint32(3);
+        const uint32 l_251 = l_250 >> uint32(8);
+        const __half l_252 = __half(l_251);
+        const __half l_253 = l_252 * l_mut_57;
+        const __half l_254 = l_253 - l_mut_57;
+        l_arr_40[uint32(15)] = l_254;
+      } else {
+        const bool l_255 = l_84 < uint32(7);
+        if (l_255) {
+          l_mut_106 = uint32(1);
+          l_mut_256 = uint32(3);
+          const bool l_257 = l_84 == uint32(6);
+          if (l_257) {
+            l_mut_106 = uint32(9);
+            l_mut_256 = uint32(27);
+          }
+          const uint32 l_258 = l_mut_53 >> uint32(0);
+          const uint32 l_259 = l_258 & uint32(255);
+          const uint32 l_260 = l_mut_54 >> uint32(0);
+          const uint32 l_261 = l_260 & uint32(255);
+          const uint32 l_262 = l_259 * l_mut_106;
+          const uint32 l_263 = l_262 & uint32(255);
+          const uint32 l_264 = l_263 * uint32(3);
+          const uint32 l_265 = l_264 >> uint32(8);
+          const __half l_266 = __half(l_265);
+          const __half l_267 = l_266 * l_mut_57;
+          const __half l_268 = l_267 - l_mut_57;
+          l_arr_40[uint32(0)] = l_268;
+          const uint32 l_269 = l_261 * l_mut_106;
+          const uint32 l_270 = l_269 & uint32(255);
+          const uint32 l_271 = l_270 * uint32(3);
+          const uint32 l_272 = l_271 >> uint32(8);
+          const __half l_273 = __half(l_272);
+          const __half l_274 = l_273 * l_mut_57;
+          const __half l_275 = l_274 - l_mut_57;
+          l_arr_40[uint32(4)] = l_275;
+          const uint32 l_276 = l_259 * l_mut_256;
+          const uint32 l_277 = l_276 & uint32(255);
+          const uint32 l_278 = l_277 * uint32(3);
+          const uint32 l_279 = l_278 >> uint32(8);
+          const __half l_280 = __half(l_279);
+          const __half l_281 = l_280 * l_mut_57;
+          const __half l_282 = l_281 - l_mut_57;
+          l_arr_40[uint32(8)] = l_282;
+          const uint32 l_283 = l_261 * l_mut_256;
+          const uint32 l_284 = l_283 & uint32(255);
+          const uint32 l_285 = l_284 * uint32(3);
+          const uint32 l_286 = l_285 >> uint32(8);
+          const __half l_287 = __half(l_286);
+          const __half l_288 = l_287 * l_mut_57;
+          const __half l_289 = l_288 - l_mut_57;
+          l_arr_40[uint32(12)] = l_289;
+          const uint32 l_290 = l_mut_53 >> uint32(8);
+          const uint32 l_291 = l_290 & uint32(255);
+          const uint32 l_292 = l_mut_54 >> uint32(8);
+          const uint32 l_293 = l_292 & uint32(255);
+          const uint32 l_294 = l_291 * l_mut_106;
+          const uint32 l_295 = l_294 & uint32(255);
+          const uint32 l_296 = l_295 * uint32(3);
+          const uint32 l_297 = l_296 >> uint32(8);
+          const __half l_298 = __half(l_297);
+          const __half l_299 = l_298 * l_mut_57;
+          const __half l_300 = l_299 - l_mut_57;
+          l_arr_40[uint32(1)] = l_300;
+          const uint32 l_301 = l_293 * l_mut_106;
+          const uint32 l_302 = l_301 & uint32(255);
+          const uint32 l_303 = l_302 * uint32(3);
+          const uint32 l_304 = l_303 >> uint32(8);
+          const __half l_305 = __half(l_304);
+          const __half l_306 = l_305 * l_mut_57;
+          const __half l_307 = l_306 - l_mut_57;
+          l_arr_40[uint32(5)] = l_307;
+          const uint32 l_308 = l_291 * l_mut_256;
+          const uint32 l_309 = l_308 & uint32(255);
+          const uint32 l_310 = l_309 * uint32(3);
+          const uint32 l_311 = l_310 >> uint32(8);
+          const __half l_312 = __half(l_311);
+          const __half l_313 = l_312 * l_mut_57;
+          const __half l_314 = l_313 - l_mut_57;
+          l_arr_40[uint32(9)] = l_314;
+          const uint32 l_315 = l_293 * l_mut_256;
+          const uint32 l_316 = l_315 & uint32(255);
+          const uint32 l_317 = l_316 * uint32(3);
+          const uint32 l_318 = l_317 >> uint32(8);
+          const __half l_319 = __half(l_318);
+          const __half l_320 = l_319 * l_mut_57;
+          const __half l_321 = l_320 - l_mut_57;
+          l_arr_40[uint32(13)] = l_321;
+          const uint32 l_322 = l_mut_53 >> uint32(16);
+          const uint32 l_323 = l_322 & uint32(255);
+          const uint32 l_324 = l_mut_54 >> uint32(16);
+          const uint32 l_325 = l_324 & uint32(255);
+          const uint32 l_326 = l_323 * l_mut_106;
+          const uint32 l_327 = l_326 & uint32(255);
+          const uint32 l_328 = l_327 * uint32(3);
+          const uint32 l_329 = l_328 >> uint32(8);
+          const __half l_330 = __half(l_329);
+          const __half l_331 = l_330 * l_mut_57;
+          const __half l_332 = l_331 - l_mut_57;
+          l_arr_40[uint32(2)] = l_332;
+          const uint32 l_333 = l_325 * l_mut_106;
+          const uint32 l_334 = l_333 & uint32(255);
+          const uint32 l_335 = l_334 * uint32(3);
+          const uint32 l_336 = l_335 >> uint32(8);
+          const __half l_337 = __half(l_336);
+          const __half l_338 = l_337 * l_mut_57;
+          const __half l_339 = l_338 - l_mut_57;
+          l_arr_40[uint32(6)] = l_339;
+          const uint32 l_340 = l_323 * l_mut_256;
+          const uint32 l_341 = l_340 & uint32(255);
+          const uint32 l_342 = l_341 * uint32(3);
+          const uint32 l_343 = l_342 >> uint32(8);
+          const __half l_344 = __half(l_343);
+          const __half l_345 = l_344 * l_mut_57;
+          const __half l_346 = l_345 - l_mut_57;
+          l_arr_40[uint32(10)] = l_346;
+          const uint32 l_347 = l_325 * l_mut_256;
+          const uint32 l_348 = l_347 & uint32(255);
+          const uint32 l_349 = l_348 * uint32(3);
+          const uint32 l_350 = l_349 >> uint32(8);
+          const __half l_351 = __half(l_350);
+          const __half l_352 = l_351 * l_mut_57;
+          const __half l_353 = l_352 - l_mut_57;
+          l_arr_40[uint32(14)] = l_353;
+          const uint32 l_354 = l_mut_53 >> uint32(24);
+          const uint32 l_355 = l_354 & uint32(255);
+          const uint32 l_356 = l_mut_54 >> uint32(24);
+          const uint32 l_357 = l_356 & uint32(255);
+          const uint32 l_358 = l_355 * l_mut_106;
+          const uint32 l_359 = l_358 & uint32(255);
+          const uint32 l_360 = l_359 * uint32(3);
+          const uint32 l_361 = l_360 >> uint32(8);
+          const __half l_362 = __half(l_361);
+          const __half l_363 = l_362 * l_mut_57;
+          const __half l_364 = l_363 - l_mut_57;
+          l_arr_40[uint32(3)] = l_364;
+          const uint32 l_365 = l_357 * l_mut_106;
+          const uint32 l_366 = l_365 & uint32(255);
+          const uint32 l_367 = l_366 * uint32(3);
+          const uint32 l_368 = l_367 >> uint32(8);
+          const __half l_369 = __half(l_368);
+          const __half l_370 = l_369 * l_mut_57;
+          const __half l_371 = l_370 - l_mut_57;
+          l_arr_40[uint32(7)] = l_371;
+          const uint32 l_372 = l_355 * l_mut_256;
+          const uint32 l_373 = l_372 & uint32(255);
+          const uint32 l_374 = l_373 * uint32(3);
+          const uint32 l_375 = l_374 >> uint32(8);
+          const __half l_376 = __half(l_375);
+          const __half l_377 = l_376 * l_mut_57;
+          const __half l_378 = l_377 - l_mut_57;
+          l_arr_40[uint32(11)] = l_378;
+          const uint32 l_379 = l_357 * l_mut_256;
+          const uint32 l_380 = l_379 & uint32(255);
+          const uint32 l_381 = l_380 * uint32(3);
+          const uint32 l_382 = l_381 >> uint32(8);
+          const __half l_383 = __half(l_382);
+          const __half l_384 = l_383 * l_mut_57;
+          const __half l_385 = l_384 - l_mut_57;
+          l_arr_40[uint32(15)] = l_385;
+        } else {
+          const uint32 l_386 = l_mut_55 & uint32(255);
+          const uint32 l_387 = l_mut_55 >> uint32(8);
+          const uint32 l_388 = l_387 & uint32(255);
+          l_mut_256 = uint32(1);
+          const uint32 l_389 = l_mut_53 >> uint32(0);
+          const uint32 l_390 = l_389 & uint32(255);
+          const uint32 l_391 = l_390 * uint32(81);
+          const uint32 l_392 = l_391 & uint32(255);
+          const uint32 l_393 = l_392 * uint32(3);
+          const uint32 l_394 = l_393 >> uint32(8);
+          const __half l_395 = __half(l_394);
+          const __half l_396 = l_395 * l_mut_57;
+          const __half l_397 = l_396 - l_mut_57;
+          l_arr_40[uint32(0)] = l_397;
+          const uint32 l_398 = l_mut_54 >> uint32(0);
+          const uint32 l_399 = l_398 & uint32(255);
+          const uint32 l_400 = l_399 * uint32(81);
+          const uint32 l_401 = l_400 & uint32(255);
+          const uint32 l_402 = l_401 * uint32(3);
+          const uint32 l_403 = l_402 >> uint32(8);
+          const __half l_404 = __half(l_403);
+          const __half l_405 = l_404 * l_mut_57;
+          const __half l_406 = l_405 - l_mut_57;
+          l_arr_40[uint32(4)] = l_406;
+          const uint32 l_407 = l_386 * l_mut_256;
+          const uint32 l_408 = l_407 & uint32(255);
+          const uint32 l_409 = l_408 * uint32(3);
+          const uint32 l_410 = l_409 >> uint32(8);
+          const __half l_411 = __half(l_410);
+          const __half l_412 = l_411 * l_mut_57;
+          const __half l_413 = l_412 - l_mut_57;
+          l_arr_40[uint32(8)] = l_413;
+          const uint32 l_414 = l_388 * l_mut_256;
+          const uint32 l_415 = l_414 & uint32(255);
+          const uint32 l_416 = l_415 * uint32(3);
+          const uint32 l_417 = l_416 >> uint32(8);
+          const __half l_418 = __half(l_417);
+          const __half l_419 = l_418 * l_mut_57;
+          const __half l_420 = l_419 - l_mut_57;
+          l_arr_40[uint32(9)] = l_420;
+          l_mut_256 = l_mut_256 * uint32(3);
+          const uint32 l_421 = l_mut_53 >> uint32(8);
+          const uint32 l_422 = l_421 & uint32(255);
+          const uint32 l_423 = l_422 * uint32(81);
+          const uint32 l_424 = l_423 & uint32(255);
+          const uint32 l_425 = l_424 * uint32(3);
+          const uint32 l_426 = l_425 >> uint32(8);
+          const __half l_427 = __half(l_426);
+          const __half l_428 = l_427 * l_mut_57;
+          const __half l_429 = l_428 - l_mut_57;
+          l_arr_40[uint32(1)] = l_429;
+          const uint32 l_430 = l_mut_54 >> uint32(8);
+          const uint32 l_431 = l_430 & uint32(255);
+          const uint32 l_432 = l_431 * uint32(81);
+          const uint32 l_433 = l_432 & uint32(255);
+          const uint32 l_434 = l_433 * uint32(3);
+          const uint32 l_435 = l_434 >> uint32(8);
+          const __half l_436 = __half(l_435);
+          const __half l_437 = l_436 * l_mut_57;
+          const __half l_438 = l_437 - l_mut_57;
+          l_arr_40[uint32(5)] = l_438;
+          const uint32 l_439 = l_386 * l_mut_256;
+          const uint32 l_440 = l_439 & uint32(255);
+          const uint32 l_441 = l_440 * uint32(3);
+          const uint32 l_442 = l_441 >> uint32(8);
+          const __half l_443 = __half(l_442);
+          const __half l_444 = l_443 * l_mut_57;
+          const __half l_445 = l_444 - l_mut_57;
+          l_arr_40[uint32(10)] = l_445;
+          const uint32 l_446 = l_388 * l_mut_256;
+          const uint32 l_447 = l_446 & uint32(255);
+          const uint32 l_448 = l_447 * uint32(3);
+          const uint32 l_449 = l_448 >> uint32(8);
+          const __half l_450 = __half(l_449);
+          const __half l_451 = l_450 * l_mut_57;
+          const __half l_452 = l_451 - l_mut_57;
+          l_arr_40[uint32(11)] = l_452;
+          l_mut_256 = l_mut_256 * uint32(3);
+          const uint32 l_453 = l_mut_53 >> uint32(16);
+          const uint32 l_454 = l_453 & uint32(255);
+          const uint32 l_455 = l_454 * uint32(81);
+          const uint32 l_456 = l_455 & uint32(255);
+          const uint32 l_457 = l_456 * uint32(3);
+          const uint32 l_458 = l_457 >> uint32(8);
+          const __half l_459 = __half(l_458);
+          const __half l_460 = l_459 * l_mut_57;
+          const __half l_461 = l_460 - l_mut_57;
+          l_arr_40[uint32(2)] = l_461;
+          const uint32 l_462 = l_mut_54 >> uint32(16);
+          const uint32 l_463 = l_462 & uint32(255);
+          const uint32 l_464 = l_463 * uint32(81);
+          const uint32 l_465 = l_464 & uint32(255);
+          const uint32 l_466 = l_465 * uint32(3);
+          const uint32 l_467 = l_466 >> uint32(8);
+          const __half l_468 = __half(l_467);
+          const __half l_469 = l_468 * l_mut_57;
+          const __half l_470 = l_469 - l_mut_57;
+          l_arr_40[uint32(6)] = l_470;
+          const uint32 l_471 = l_386 * l_mut_256;
+          const uint32 l_472 = l_471 & uint32(255);
+          const uint32 l_473 = l_472 * uint32(3);
+          const uint32 l_474 = l_473 >> uint32(8);
+          const __half l_475 = __half(l_474);
+          const __half l_476 = l_475 * l_mut_57;
+          const __half l_477 = l_476 - l_mut_57;
+          l_arr_40[uint32(12)] = l_477;
+          const uint32 l_478 = l_388 * l_mut_256;
+          const uint32 l_479 = l_478 & uint32(255);
+          const uint32 l_480 = l_479 * uint32(3);
+          const uint32 l_481 = l_480 >> uint32(8);
+          const __half l_482 = __half(l_481);
+          const __half l_483 = l_482 * l_mut_57;
+          const __half l_484 = l_483 - l_mut_57;
+          l_arr_40[uint32(13)] = l_484;
+          l_mut_256 = l_mut_256 * uint32(3);
+          const uint32 l_485 = l_mut_53 >> uint32(24);
+          const uint32 l_486 = l_485 & uint32(255);
+          const uint32 l_487 = l_486 * uint32(81);
+          const uint32 l_488 = l_487 & uint32(255);
+          const uint32 l_489 = l_488 * uint32(3);
+          const uint32 l_490 = l_489 >> uint32(8);
+          const __half l_491 = __half(l_490);
+          const __half l_492 = l_491 * l_mut_57;
+          const __half l_493 = l_492 - l_mut_57;
+          l_arr_40[uint32(3)] = l_493;
+          const uint32 l_494 = l_mut_54 >> uint32(24);
+          const uint32 l_495 = l_494 & uint32(255);
+          const uint32 l_496 = l_495 * uint32(81);
+          const uint32 l_497 = l_496 & uint32(255);
+          const uint32 l_498 = l_497 * uint32(3);
+          const uint32 l_499 = l_498 >> uint32(8);
+          const __half l_500 = __half(l_499);
+          const __half l_501 = l_500 * l_mut_57;
+          const __half l_502 = l_501 - l_mut_57;
+          l_arr_40[uint32(7)] = l_502;
+          const uint32 l_503 = l_386 * l_mut_256;
+          const uint32 l_504 = l_503 & uint32(255);
+          const uint32 l_505 = l_504 * uint32(3);
+          const uint32 l_506 = l_505 >> uint32(8);
+          const __half l_507 = __half(l_506);
+          const __half l_508 = l_507 * l_mut_57;
+          const __half l_509 = l_508 - l_mut_57;
+          l_arr_40[uint32(14)] = l_509;
+          const uint32 l_510 = l_388 * l_mut_256;
+          const uint32 l_511 = l_510 & uint32(255);
+          const uint32 l_512 = l_511 * uint32(3);
+          const uint32 l_513 = l_512 >> uint32(8);
+          const __half l_514 = __half(l_513);
+          const __half l_515 = l_514 * l_mut_57;
+          const __half l_516 = l_515 - l_mut_57;
+          l_arr_40[uint32(15)] = l_516;
+          l_mut_256 = l_mut_256 * uint32(3);
+        }
+      }
+      __syncthreads();
+
+      const uint32 l_517 = l_44 + uint32(0);
+      const __half l_518 = l_arr_39[uint32(0)];
+      shared_memory_41[l_517] = l_518;
+      const uint32 l_519 = l_44 + uint32(1);
+      const __half l_520 = l_arr_39[uint32(1)];
+      shared_memory_41[l_519] = l_520;
+      const uint32 l_521 = l_44 + uint32(2);
+      const __half l_522 = l_arr_39[uint32(2)];
+      shared_memory_41[l_521] = l_522;
+      const uint32 l_523 = l_44 + uint32(3);
+      const __half l_524 = l_arr_39[uint32(3)];
+      shared_memory_41[l_523] = l_524;
+      const uint32 l_525 = l_44 + uint32(4);
+      const __half l_526 = l_arr_39[uint32(4)];
+      shared_memory_41[l_525] = l_526;
+      const uint32 l_527 = l_44 + uint32(5);
+      const __half l_528 = l_arr_39[uint32(5)];
+      shared_memory_41[l_527] = l_528;
+      const uint32 l_529 = l_44 + uint32(6);
+      const __half l_530 = l_arr_39[uint32(6)];
+      shared_memory_41[l_529] = l_530;
+      const uint32 l_531 = l_44 + uint32(7);
+      const __half l_532 = l_arr_39[uint32(7)];
+      shared_memory_41[l_531] = l_532;
+      const uint32 l_533 = l_47 + uint32(0);
+      const __half l_534 = l_arr_40[uint32(0)];
+      shared_memory_42[l_533] = l_534;
+      const uint32 l_535 = l_47 + uint32(1);
+      const __half l_536 = l_arr_40[uint32(1)];
+      shared_memory_42[l_535] = l_536;
+      const uint32 l_537 = l_47 + uint32(2);
+      const __half l_538 = l_arr_40[uint32(2)];
+      shared_memory_42[l_537] = l_538;
+      const uint32 l_539 = l_47 + uint32(3);
+      const __half l_540 = l_arr_40[uint32(3)];
+      shared_memory_42[l_539] = l_540;
+      const uint32 l_541 = l_47 + uint32(4);
+      const __half l_542 = l_arr_40[uint32(4)];
+      shared_memory_42[l_541] = l_542;
+      const uint32 l_543 = l_47 + uint32(5);
+      const __half l_544 = l_arr_40[uint32(5)];
+      shared_memory_42[l_543] = l_544;
+      const uint32 l_545 = l_47 + uint32(6);
+      const __half l_546 = l_arr_40[uint32(6)];
+      shared_memory_42[l_545] = l_546;
+      const uint32 l_547 = l_47 + uint32(7);
+      const __half l_548 = l_arr_40[uint32(7)];
+      shared_memory_42[l_547] = l_548;
+      const uint32 l_549 = l_47 + uint32(8);
+      const __half l_550 = l_arr_40[uint32(8)];
+      shared_memory_42[l_549] = l_550;
+      const uint32 l_551 = l_47 + uint32(9);
+      const __half l_552 = l_arr_40[uint32(9)];
+      shared_memory_42[l_551] = l_552;
+      const uint32 l_553 = l_47 + uint32(10);
+      const __half l_554 = l_arr_40[uint32(10)];
+      shared_memory_42[l_553] = l_554;
+      const uint32 l_555 = l_47 + uint32(11);
+      const __half l_556 = l_arr_40[uint32(11)];
+      shared_memory_42[l_555] = l_556;
+      const uint32 l_557 = l_47 + uint32(12);
+      const __half l_558 = l_arr_40[uint32(12)];
+      shared_memory_42[l_557] = l_558;
+      const uint32 l_559 = l_47 + uint32(13);
+      const __half l_560 = l_arr_40[uint32(13)];
+      shared_memory_42[l_559] = l_560;
+      const uint32 l_561 = l_47 + uint32(14);
+      const __half l_562 = l_arr_40[uint32(14)];
+      shared_memory_42[l_561] = l_562;
+      const uint32 l_563 = l_47 + uint32(15);
+      const __half l_564 = l_arr_40[uint32(15)];
+      shared_memory_42[l_563] = l_564;
+      __syncthreads();
+
+      const uint32 l_565 = l_2 * uint32(32);
+      const uint32 l_566 = l_565 + uint32(0);
+      const uint32 l_567 = l_566 * uint32(40);
+      const uint32 l_568 = l_567 + uint32(0);
+      const uint32 l_569 = uint32(2560) - l_568;
+      __half *_tmp_0 = shared_memory_42 + l_568;
+      wmma_load___half_b_16x16x16_col_(frag_b_570, _tmp_0, uint32(40));
+      const uint32 l_571 = l_2 * uint32(32);
+      const uint32 l_572 = l_571 + uint32(16);
+      const uint32 l_573 = l_572 * uint32(40);
+      const uint32 l_574 = l_573 + uint32(0);
+      const uint32 l_575 = uint32(2560) - l_574;
+      __half *_tmp_1 = shared_memory_42 + l_574;
+      wmma_load___half_b_16x16x16_col_(frag_b_576, _tmp_1, uint32(40));
+      const uint32 l_577 = l_1 * uint32(16);
+      const uint32 l_578 = l_577 + uint32(0);
+      const uint32 l_579 = l_578 * uint32(40);
+      const uint32 l_580 = l_579 + uint32(0);
+      const uint32 l_581 = uint32(1280) - l_580;
+      __half *_tmp_2 = shared_memory_41 + l_580;
+      wmma_load___half_a_16x16x16_row_(frag_a_582, _tmp_2, uint32(40));
+      wmma_execute_16x16x16___half_float(frag_a_582, frag_b_570, frag_acc_48,
+                                         frag_acc_48);
+      wmma_execute_16x16x16___half_float(frag_a_582, frag_b_576, frag_acc_49,
+                                         frag_acc_49);
+      const uint32 l_583 = l_2 * uint32(32);
+      const uint32 l_584 = l_583 + uint32(0);
+      const uint32 l_585 = l_584 * uint32(40);
+      const uint32 l_586 = l_585 + uint32(16);
+      const uint32 l_587 = uint32(2560) - l_586;
+      __half *_tmp_3 = shared_memory_42 + l_586;
+      wmma_load___half_b_16x16x16_col_(frag_b_588, _tmp_3, uint32(40));
+      const uint32 l_589 = l_2 * uint32(32);
+      const uint32 l_590 = l_589 + uint32(16);
+      const uint32 l_591 = l_590 * uint32(40);
+      const uint32 l_592 = l_591 + uint32(16);
+      const uint32 l_593 = uint32(2560) - l_592;
+      __half *_tmp_4 = shared_memory_42 + l_592;
+      wmma_load___half_b_16x16x16_col_(frag_b_594, _tmp_4, uint32(40));
+      const uint32 l_595 = l_1 * uint32(16);
+      const uint32 l_596 = l_595 + uint32(0);
+      const uint32 l_597 = l_596 * uint32(40);
+      const uint32 l_598 = l_597 + uint32(16);
+      const uint32 l_599 = uint32(1280) - l_598;
+      __half *_tmp_5 = shared_memory_41 + l_598;
+      wmma_load___half_a_16x16x16_row_(frag_a_600, _tmp_5, uint32(40));
+      wmma_execute_16x16x16___half_float(frag_a_600, frag_b_588, frag_acc_48,
+                                         frag_acc_48);
+      wmma_execute_16x16x16___half_float(frag_a_600, frag_b_594, frag_acc_49,
+                                         frag_acc_49);
+    }
+  }
+  const bool l_601 = l_0 == uint32(0);
+  if (l_601) {
+    float *_tmp_6 = shared_memory_38 + uint32(0);
+    wmma_store_float_c_16x16x16__row(frag_acc_48, _tmp_6, uint32(32));
+    float *_tmp_7 = shared_memory_38 + uint32(16);
+    wmma_store_float_c_16x16x16__row(frag_acc_49, _tmp_7, uint32(32));
+  }
+  const uint32 l_602 = l_6 + uint32(0);
+  const uint32 l_603 = l_602 + uint32(0);
+  const uint32 l_604 = l_7 + uint32(0);
+  __syncthreads();
+
+  const uint32 l_605 = threadIdxGlobal + uint32(0);
+  const uint32 l_606 = l_605 / uint32(32);
+  const uint32 l_607 = l_603 + l_606;
+  const uint32 l_608 = l_605 % uint32(32);
+  const uint32 l_609 = l_604 + l_608;
+  const bool l_610 = l_607 < l_3;
+  const bool l_611 = l_609 < l_4;
+  const bool l_612 = l_610 && l_611;
+  if (l_612) {
+    const uint32 l_613 = l_607 * l_4;
+    const uint32 l_614 = l_613 + l_609;
+    const float l_615 = shared_memory_38[l_605];
+    buffer_2[l_614] = l_615;
+  }
+  const uint32 l_616 = threadIdxGlobal + uint32(128);
+  const uint32 l_617 = l_616 / uint32(32);
+  const uint32 l_618 = l_603 + l_617;
+  const uint32 l_619 = l_616 % uint32(32);
+  const uint32 l_620 = l_604 + l_619;
+  const bool l_621 = l_618 < l_3;
+  const bool l_622 = l_620 < l_4;
+  const bool l_623 = l_621 && l_622;
+  if (l_623) {
+    const uint32 l_624 = l_618 * l_4;
+    const uint32 l_625 = l_624 + l_620;
+    const float l_626 = shared_memory_38[l_616];
+    buffer_2[l_625] = l_626;
+  }
+  const uint32 l_627 = threadIdxGlobal + uint32(256);
+  const uint32 l_628 = l_627 / uint32(32);
+  const uint32 l_629 = l_603 + l_628;
+  const uint32 l_630 = l_627 % uint32(32);
+  const uint32 l_631 = l_604 + l_630;
+  const bool l_632 = l_629 < l_3;
+  const bool l_633 = l_631 < l_4;
+  const bool l_634 = l_632 && l_633;
+  if (l_634) {
+    const uint32 l_635 = l_629 * l_4;
+    const uint32 l_636 = l_635 + l_631;
+    const float l_637 = shared_memory_38[l_627];
+    buffer_2[l_636] = l_637;
+  }
+  const uint32 l_638 = threadIdxGlobal + uint32(384);
+  const uint32 l_639 = l_638 / uint32(32);
+  const uint32 l_640 = l_603 + l_639;
+  const uint32 l_641 = l_638 % uint32(32);
+  const uint32 l_642 = l_604 + l_641;
+  const bool l_643 = l_640 < l_3;
+  const bool l_644 = l_642 < l_4;
+  const bool l_645 = l_643 && l_644;
+  if (l_645) {
+    const uint32 l_646 = l_640 * l_4;
+    const uint32 l_647 = l_646 + l_642;
+    const float l_648 = shared_memory_38[l_638];
+    buffer_2[l_647] = l_648;
+  }
+  __syncthreads();
+
+  const bool l_649 = l_0 == uint32(1);
+  if (l_649) {
+    float *_tmp_8 = shared_memory_38 + uint32(0);
+    wmma_store_float_c_16x16x16__row(frag_acc_48, _tmp_8, uint32(32));
+    float *_tmp_9 = shared_memory_38 + uint32(16);
+    wmma_store_float_c_16x16x16__row(frag_acc_49, _tmp_9, uint32(32));
+  }
+  const uint32 l_650 = l_6 + uint32(0);
+  const uint32 l_651 = l_650 + uint32(0);
+  const uint32 l_652 = l_7 + uint32(32);
+  __syncthreads();
+
+  const uint32 l_653 = threadIdxGlobal + uint32(0);
+  const uint32 l_654 = l_653 / uint32(32);
+  const uint32 l_655 = l_651 + l_654;
+  const uint32 l_656 = l_653 % uint32(32);
+  const uint32 l_657 = l_652 + l_656;
+  const bool l_658 = l_655 < l_3;
+  const bool l_659 = l_657 < l_4;
+  const bool l_660 = l_658 && l_659;
+  if (l_660) {
+    const uint32 l_661 = l_655 * l_4;
+    const uint32 l_662 = l_661 + l_657;
+    const float l_663 = shared_memory_38[l_653];
+    buffer_2[l_662] = l_663;
+  }
+  const uint32 l_664 = threadIdxGlobal + uint32(128);
+  const uint32 l_665 = l_664 / uint32(32);
+  const uint32 l_666 = l_651 + l_665;
+  const uint32 l_667 = l_664 % uint32(32);
+  const uint32 l_668 = l_652 + l_667;
+  const bool l_669 = l_666 < l_3;
+  const bool l_670 = l_668 < l_4;
+  const bool l_671 = l_669 && l_670;
+  if (l_671) {
+    const uint32 l_672 = l_666 * l_4;
+    const uint32 l_673 = l_672 + l_668;
+    const float l_674 = shared_memory_38[l_664];
+    buffer_2[l_673] = l_674;
+  }
+  const uint32 l_675 = threadIdxGlobal + uint32(256);
+  const uint32 l_676 = l_675 / uint32(32);
+  const uint32 l_677 = l_651 + l_676;
+  const uint32 l_678 = l_675 % uint32(32);
+  const uint32 l_679 = l_652 + l_678;
+  const bool l_680 = l_677 < l_3;
+  const bool l_681 = l_679 < l_4;
+  const bool l_682 = l_680 && l_681;
+  if (l_682) {
+    const uint32 l_683 = l_677 * l_4;
+    const uint32 l_684 = l_683 + l_679;
+    const float l_685 = shared_memory_38[l_675];
+    buffer_2[l_684] = l_685;
+  }
+  const uint32 l_686 = threadIdxGlobal + uint32(384);
+  const uint32 l_687 = l_686 / uint32(32);
+  const uint32 l_688 = l_651 + l_687;
+  const uint32 l_689 = l_686 % uint32(32);
+  const uint32 l_690 = l_652 + l_689;
+  const bool l_691 = l_688 < l_3;
+  const bool l_692 = l_690 < l_4;
+  const bool l_693 = l_691 && l_692;
+  if (l_693) {
+    const uint32 l_694 = l_688 * l_4;
+    const uint32 l_695 = l_694 + l_690;
+    const float l_696 = shared_memory_38[l_686];
+    buffer_2[l_695] = l_696;
+  }
+  __syncthreads();
+
+  const bool l_697 = l_0 == uint32(2);
+  if (l_697) {
+    float *_tmp_10 = shared_memory_38 + uint32(0);
+    wmma_store_float_c_16x16x16__row(frag_acc_48, _tmp_10, uint32(32));
+    float *_tmp_11 = shared_memory_38 + uint32(16);
+    wmma_store_float_c_16x16x16__row(frag_acc_49, _tmp_11, uint32(32));
+  }
+  const uint32 l_698 = l_6 + uint32(16);
+  const uint32 l_699 = l_698 + uint32(0);
+  const uint32 l_700 = l_7 + uint32(0);
+  __syncthreads();
+
+  const uint32 l_701 = threadIdxGlobal + uint32(0);
+  const uint32 l_702 = l_701 / uint32(32);
+  const uint32 l_703 = l_699 + l_702;
+  const uint32 l_704 = l_701 % uint32(32);
+  const uint32 l_705 = l_700 + l_704;
+  const bool l_706 = l_703 < l_3;
+  const bool l_707 = l_705 < l_4;
+  const bool l_708 = l_706 && l_707;
+  if (l_708) {
+    const uint32 l_709 = l_703 * l_4;
+    const uint32 l_710 = l_709 + l_705;
+    const float l_711 = shared_memory_38[l_701];
+    buffer_2[l_710] = l_711;
+  }
+  const uint32 l_712 = threadIdxGlobal + uint32(128);
+  const uint32 l_713 = l_712 / uint32(32);
+  const uint32 l_714 = l_699 + l_713;
+  const uint32 l_715 = l_712 % uint32(32);
+  const uint32 l_716 = l_700 + l_715;
+  const bool l_717 = l_714 < l_3;
+  const bool l_718 = l_716 < l_4;
+  const bool l_719 = l_717 && l_718;
+  if (l_719) {
+    const uint32 l_720 = l_714 * l_4;
+    const uint32 l_721 = l_720 + l_716;
+    const float l_722 = shared_memory_38[l_712];
+    buffer_2[l_721] = l_722;
+  }
+  const uint32 l_723 = threadIdxGlobal + uint32(256);
+  const uint32 l_724 = l_723 / uint32(32);
+  const uint32 l_725 = l_699 + l_724;
+  const uint32 l_726 = l_723 % uint32(32);
+  const uint32 l_727 = l_700 + l_726;
+  const bool l_728 = l_725 < l_3;
+  const bool l_729 = l_727 < l_4;
+  const bool l_730 = l_728 && l_729;
+  if (l_730) {
+    const uint32 l_731 = l_725 * l_4;
+    const uint32 l_732 = l_731 + l_727;
+    const float l_733 = shared_memory_38[l_723];
+    buffer_2[l_732] = l_733;
+  }
+  const uint32 l_734 = threadIdxGlobal + uint32(384);
+  const uint32 l_735 = l_734 / uint32(32);
+  const uint32 l_736 = l_699 + l_735;
+  const uint32 l_737 = l_734 % uint32(32);
+  const uint32 l_738 = l_700 + l_737;
+  const bool l_739 = l_736 < l_3;
+  const bool l_740 = l_738 < l_4;
+  const bool l_741 = l_739 && l_740;
+  if (l_741) {
+    const uint32 l_742 = l_736 * l_4;
+    const uint32 l_743 = l_742 + l_738;
+    const float l_744 = shared_memory_38[l_734];
+    buffer_2[l_743] = l_744;
+  }
+  __syncthreads();
+
+  const bool l_745 = l_0 == uint32(3);
+  if (l_745) {
+    float *_tmp_12 = shared_memory_38 + uint32(0);
+    wmma_store_float_c_16x16x16__row(frag_acc_48, _tmp_12, uint32(32));
+    float *_tmp_13 = shared_memory_38 + uint32(16);
+    wmma_store_float_c_16x16x16__row(frag_acc_49, _tmp_13, uint32(32));
+  }
+  const uint32 l_746 = l_6 + uint32(16);
+  const uint32 l_747 = l_746 + uint32(0);
+  const uint32 l_748 = l_7 + uint32(32);
+  __syncthreads();
+
+  const uint32 l_749 = threadIdxGlobal + uint32(0);
+  const uint32 l_750 = l_749 / uint32(32);
+  const uint32 l_751 = l_747 + l_750;
+  const uint32 l_752 = l_749 % uint32(32);
+  const uint32 l_753 = l_748 + l_752;
+  const bool l_754 = l_751 < l_3;
+  const bool l_755 = l_753 < l_4;
+  const bool l_756 = l_754 && l_755;
+  if (l_756) {
+    const uint32 l_757 = l_751 * l_4;
+    const uint32 l_758 = l_757 + l_753;
+    const float l_759 = shared_memory_38[l_749];
+    buffer_2[l_758] = l_759;
+  }
+  const uint32 l_760 = threadIdxGlobal + uint32(128);
+  const uint32 l_761 = l_760 / uint32(32);
+  const uint32 l_762 = l_747 + l_761;
+  const uint32 l_763 = l_760 % uint32(32);
+  const uint32 l_764 = l_748 + l_763;
+  const bool l_765 = l_762 < l_3;
+  const bool l_766 = l_764 < l_4;
+  const bool l_767 = l_765 && l_766;
+  if (l_767) {
+    const uint32 l_768 = l_762 * l_4;
+    const uint32 l_769 = l_768 + l_764;
+    const float l_770 = shared_memory_38[l_760];
+    buffer_2[l_769] = l_770;
+  }
+  const uint32 l_771 = threadIdxGlobal + uint32(256);
+  const uint32 l_772 = l_771 / uint32(32);
+  const uint32 l_773 = l_747 + l_772;
+  const uint32 l_774 = l_771 % uint32(32);
+  const uint32 l_775 = l_748 + l_774;
+  const bool l_776 = l_773 < l_3;
+  const bool l_777 = l_775 < l_4;
+  const bool l_778 = l_776 && l_777;
+  if (l_778) {
+    const uint32 l_779 = l_773 * l_4;
+    const uint32 l_780 = l_779 + l_775;
+    const float l_781 = shared_memory_38[l_771];
+    buffer_2[l_780] = l_781;
+  }
+  const uint32 l_782 = threadIdxGlobal + uint32(384);
+  const uint32 l_783 = l_782 / uint32(32);
+  const uint32 l_784 = l_747 + l_783;
+  const uint32 l_785 = l_782 % uint32(32);
+  const uint32 l_786 = l_748 + l_785;
+  const bool l_787 = l_784 < l_3;
+  const bool l_788 = l_786 < l_4;
+  const bool l_789 = l_787 && l_788;
+  if (l_789) {
+    const uint32 l_790 = l_784 * l_4;
+    const uint32 l_791 = l_790 + l_786;
+    const float l_792 = shared_memory_38[l_782];
+    buffer_2[l_791] = l_792;
+  }
+  __syncthreads();
+}

@@ -2180,7 +2180,7 @@ pub fn matvec_q8_dp4a_i8_run<R: Runtime>(
 // error, amplified by the near-cancellation of the affine dp4a sum (sub-block partials are hundreds of
 // x the output), garbled qwen3 decode. Renormalize subnormals via one f32 subtract of the magic bias.
 #[device]
-fn f16lo_to_f32(h: u32) -> f32 {
+pub fn f16lo_to_f32(h: u32) -> f32 {
     let magic = 113u32 << 23; // 2^-14 in f32 bits, the subnormal renormalization bias
     let shifted_exp = 0x7C00u32 << 13; // fp16 exponent mask, shifted into f32 position
     let mut o = (h & 0x7FFF) << 13; // exponent + mantissa, shifted to f32

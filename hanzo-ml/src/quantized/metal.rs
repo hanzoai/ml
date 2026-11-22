@@ -353,6 +353,143 @@ impl QMetalStorage {
         ))
     }
 
+    /// Dispatch a generated ternary DSL kernel (`PQ2_0` or `PTQ1_0`, `is_gemm` = decode vs prefill)
+    /// when enabled and eligible; falls back cleanly to legacy (and counts every dispatch).
+    #[allow(clippy::too_many_arguments)]
+    fn try_dispatch_ternary_dsl(
+        &self,
+        device: &crate::MetalDevice,
+        kdtype: hanzo_metal_kernels::GgmlDType,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst: &hanzo_metal_kernels::metal::Buffer,
+        m_total: usize,
+        n: usize,
+        k: usize,
+        src1_bf16: bool,
+        is_gemm: bool,
+    ) -> Result<bool> {
+        use crate::quantized::dsl::{self, QkBackend, QkImpl, QkOp};
+        use hanzo_metal_kernels::GgmlDType;
+        let pq2_sel = dsl::select_impl(QkBackend::Metal, QkOp::Pq2 { m: m_total, n, k });
+        let ptq1_sel = dsl::select_impl(QkBackend::Metal, QkOp::Ptq1 { m: m_total, n, k });
+        let (selected, elig, legacy_name, ineligible_name) = match (kdtype, is_gemm, src1_bf16) {
+            (GgmlDType::PQ2_0, false, false) => (
+                pq2_sel,
+                dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mv_pq2_0_f32",
+                "kernel_mul_mv_pq2_0_f32[dsl-ineligible]",
+            ),
+            (GgmlDType::PQ2_0, false, true) => (
+                pq2_sel,
+                dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mv_pq2_0_bf16",
+                "kernel_mul_mv_pq2_0_bf16[dsl-ineligible]",
+            ),
+            (GgmlDType::PQ2_0, true, false) => (
+                pq2_sel,
+                dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mm_pq2_0_f32",
+                "kernel_mul_mm_pq2_0_f32[dsl-ineligible]",
+            ),
+            (GgmlDType::PQ2_0, true, true) => (
+                pq2_sel,
+                dsl::pq2_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mm_pq2_0_bf16",
+                "kernel_mul_mm_pq2_0_bf16[dsl-ineligible]",
+            ),
+            (GgmlDType::PTQ1_0, false, false) => (
+                ptq1_sel,
+                dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mv_ptq1_0_f32",
+                "kernel_mul_mv_ptq1_0_f32[dsl-ineligible]",
+            ),
+            (GgmlDType::PTQ1_0, false, true) => (
+                ptq1_sel,
+                dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mv_ptq1_0_bf16",
+                "kernel_mul_mv_ptq1_0_bf16[dsl-ineligible]",
+            ),
+            (GgmlDType::PTQ1_0, true, false) => (
+                ptq1_sel,
+                dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mm_ptq1_0_f32",
+                "kernel_mul_mm_ptq1_0_f32[dsl-ineligible]",
+            ),
+            (GgmlDType::PTQ1_0, true, true) => (
+                ptq1_sel,
+                dsl::ptq1_dsl_eligible(n, k, self.buffer.length()),
+                "kernel_mul_mm_ptq1_0_bf16",
+                "kernel_mul_mm_ptq1_0_bf16[dsl-ineligible]",
+            ),
+            _ => return Ok(false),
+        };
+        if selected != QkImpl::Dsl {
+            dsl::note_dispatch(QkImpl::Legacy, legacy_name, n, k);
+            return Ok(false);
+        }
+        let Ok(nwords) = elig else {
+            dsl::note_dispatch(QkImpl::Legacy, ineligible_name, n, k);
+            return Ok(false);
+        };
+        let (artifact, meta_words, grid, block) = if !is_gemm {
+            let (a, nsg, nr0) = match kdtype {
+                GgmlDType::PTQ1_0 => dsl::ptq1_matvec_artifact(n, src1_bf16),
+                _ => dsl::pq2_matvec_artifact(n, src1_bf16),
+            };
+            (
+                a,
+                [k as u32, n as u32, nwords as u32],
+                objc2_metal::MTLSize {
+                    width: n.div_ceil(nsg * nr0),
+                    height: 1,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: 32,
+                    height: nsg,
+                    depth: 1,
+                },
+            )
+        } else {
+            let (a, bm) = match kdtype {
+                GgmlDType::PTQ1_0 => dsl::ptq1_matmul_artifact(m_total, n, src1_bf16),
+                _ => dsl::pq2_matmul_artifact(m_total, n, src1_bf16),
+            };
+            (
+                a,
+                [m_total as u32, n as u32, k as u32],
+                objc2_metal::MTLSize {
+                    width: m_total.div_ceil(bm),
+                    height: n.div_ceil(64),
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        };
+        let meta = device.dsl_const_u32(&meta_words)?;
+        let x_off = layout.start_offset() * storage.dtype().size_in_bytes();
+        device.dispatch_dsl(
+            artifact,
+            &[
+                (&self.buffer, 0),
+                (storage.buffer(), x_off),
+                (dst, 0),
+                (&meta, 0),
+            ],
+            2,
+            &[0u32; 8],
+            grid,
+            block,
+        )?;
+        dsl::note_dispatch(QkImpl::Dsl, artifact, n, k);
+        Ok(true)
+    }
+
     fn fwd_mv(
         &self,
         self_shape: &Shape,
@@ -405,6 +542,16 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), out_dtype)
             .with_label("qmatmul")
             .build()?;
+        // PQ2_0 / PTQ1_0 decode (m == 1): generated DSL matvec when selected, else legacy hand kernel.
+        if m == 1
+            && self.try_dispatch_ternary_dsl(
+                &device, kdtype, storage, layout, &dst, m, n, k, src1_bf16, false,
+            )?
+        {
+            let dst_storage =
+                crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), out_dtype);
+            return Ok((dst_storage, dst_shape));
+        }
         let encoder = device.command_encoder()?;
         // Single batched matvec: the m activation columns dispatch as one grid (grid height = ne11 = m),
         // so the weight row-block each threadgroup streams is reused across the m columns in cache --
@@ -508,11 +655,27 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), out_dtype)
             .with_label("qmatmul")
             .build()?;
-        let encoder = device.command_encoder()?;
 
         if !src1_bf16 {
             assert_eq!(storage.dtype(), DType::F32);
         }
+
+        if self_shape.rank() == 2 {
+            let m_total: usize = src_shape.dims()[..src_shape.rank() - 1].iter().product();
+            if self.try_dispatch_ternary_dsl(
+                &device, kdtype, storage, layout, &dst, m_total, n, k, src1_bf16, true,
+            )? {
+                let dst_storage = crate::MetalStorage::new(
+                    dst,
+                    device.clone(),
+                    dst_shape.elem_count(),
+                    out_dtype,
+                );
+                return Ok((dst_storage, dst_shape));
+            }
+        }
+
+        let encoder = device.command_encoder()?;
 
         if self_shape.rank() > 4 {
             crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())
