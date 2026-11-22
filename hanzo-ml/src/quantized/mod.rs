@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod avx;
+pub mod bitcos;
 pub mod dsl;
 pub mod dsv4_qat;
 mod dummy_cuda;
@@ -2764,6 +2765,31 @@ impl QTensor {
 }
 
 impl QTensor {
+    /// Losslessly convert a 2D `PQ2_0` or `PTQ1_0` tensor into a `BitcosMatrix`.
+    pub fn to_bitcos_matrix(&self) -> Result<bitcos::BitcosMatrix> {
+        self.to_bitcos_matrix_with_config(bitcos::BitcosConfig::default())
+    }
+
+    /// Losslessly convert a 2D `PQ2_0` or `PTQ1_0` tensor into a `BitcosMatrix` with custom config.
+    pub fn to_bitcos_matrix_with_config(
+        &self,
+        config: bitcos::BitcosConfig,
+    ) -> Result<bitcos::BitcosMatrix> {
+        let (rows, cols) = self.shape.dims2()?;
+        let raw = self.data()?;
+        match self.dtype() {
+            GgmlDType::PQ2_0 => {
+                let blocks = as_t_slice::<BlockPQ2_0>(&raw);
+                bitcos::BitcosMatrix::encode_from_pq2_0_with_config(blocks, rows, cols, config)
+            }
+            GgmlDType::PTQ1_0 => {
+                let blocks = as_t_slice::<BlockPTQ1_0>(&raw);
+                bitcos::BitcosMatrix::encode_from_ptq1_0_with_config(blocks, rows, cols, config)
+            }
+            dt => crate::bail!("to_bitcos_matrix: unsupported dtype {dt:?}, expected PQ2_0/PTQ1_0"),
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn storage_ref(&self) -> &dyn QuantizedType {
         match &self.storage {
