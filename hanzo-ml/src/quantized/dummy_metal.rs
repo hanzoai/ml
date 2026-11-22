@@ -95,3 +95,13 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
 ) -> Result<super::QStorage> {
     Err(Error::NotCompiledWithMetalSupport)
 }
+
+pub fn hadamard_fwht(
+    _x: &crate::Tensor,
+    _signs: Option<&crate::Tensor>,
+    _block_size: usize,
+    _is_inverse: bool,
+    _out_dtype: crate::DType,
+) -> Result<crate::Tensor> {
+    Err(Error::NotCompiledWithMetalSupport)
+}
