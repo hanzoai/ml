@@ -34,6 +34,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: |
           set -euo pipefail
@@ -94,13 +95,17 @@ jobs:
             export CARGO_TARGET_DIR="/dev/shm/maturin-${GITHUB_RUN_ID}-${{ matrix.target }}"
           fi
           python3 -m venv "$RUNNER_TEMP/maturin-venv"
-          "$RUNNER_TEMP/maturin-venv/bin/pip" install --upgrade pip "maturin[zig]>=1.0,<2.0"
-          "$RUNNER_TEMP/maturin-venv/bin/maturin" build \
+          export PATH="$RUNNER_TEMP/maturin-venv/bin:$PATH"
+          pip install --upgrade pip "maturin[zig]>=1.0,<2.0"
+          if [ -x "$RUNNER_TEMP/maturin-venv/bin/python-zig" ] && ! command -v zig >/dev/null 2>&1; then
+            ln -sf python-zig "$RUNNER_TEMP/maturin-venv/bin/zig"
+          fi
+          maturin build \
             --release \
             --zig \
             --compatibility manylinux_2_28 \
             --target "${{ matrix.rust_target }}" \
-            --interpreter python3 \
+            --interpreter python \
             --out dist \
             ${{ env.FEATURES_FLAG }}
           if [ -n "${CARGO_TARGET_DIR:-}" ]; then
