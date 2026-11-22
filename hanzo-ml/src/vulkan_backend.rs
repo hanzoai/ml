@@ -4174,7 +4174,9 @@ impl VulkanDevice {
     ) -> Result<Option<VulkanStorage>> {
         use crate::quantized::{dsl, GgmlDType};
         let impl_sel = match dtype {
-            GgmlDType::PQ2_0 => dsl::select_impl(dsl::QkBackend::Vulkan, dsl::QkOp::Pq2 { m, n, k }),
+            GgmlDType::PQ2_0 => {
+                dsl::select_impl(dsl::QkBackend::Vulkan, dsl::QkOp::Pq2 { m, n, k })
+            }
             GgmlDType::PTQ1_0 => {
                 dsl::select_impl(dsl::QkBackend::Vulkan, dsl::QkOp::Ptq1 { m, n, k })
             }
@@ -4591,12 +4593,7 @@ impl VulkanDevice {
                 d,
             )?;
             if num_splits > 1 {
-                let rmeta = self.upload_u32(&[
-                    total_qh as u32,
-                    num_splits as u32,
-                    0u32,
-                    0u32,
-                ])?;
+                let rmeta = self.upload_u32(&[total_qh as u32, num_splits as u32, 0u32, 0u32])?;
                 self.dispatch_dsl_tracked(
                     reduce_artifact,
                     &[partial_buf.buffer, out.buffer, rmeta.buffer],
@@ -5406,9 +5403,7 @@ impl VulkanDevice {
                             | vk::AccessFlags::SHADER_WRITE
                             | vk::AccessFlags::SHADER_READ,
                     )
-                    .dst_access_mask(
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                    )];
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
                 dev.cmd_pipeline_barrier(
                     s.cmd,
                     vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,

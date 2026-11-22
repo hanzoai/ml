@@ -696,9 +696,27 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
                 .unwrap()
                 .to_dtype(dtype)
                 .unwrap();
-            let q_rt = q.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let k_rt = k.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let v_rt = v.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let q_rt = q
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let k_rt = k
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let v_rt = v
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             let bt_c = vec![0u32];
             let cl_c = vec![seq_k as u32];
             let ref_skv = flash_paged_ref(
@@ -722,10 +740,17 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
                 for qh in 0..(batch * n_heads * seq_q) {
                     let s = qh * d;
                     let e = rel_err(&got_skv[s..s + d], &ref_skv[s..s + d]);
-                    eprintln!("  qh={qh:2} rel={e:.2e} got0..4={:?} ref0..4={:?}", &got_skv[s..s+4], &ref_skv[s..s+4]);
+                    eprintln!(
+                        "  qh={qh:2} rel={e:.2e} got0..4={:?} ref0..4={:?}",
+                        &got_skv[s..s + 4],
+                        &ref_skv[s..s + 4]
+                    );
                 }
             }
-            assert!(err_skv <= tol, "flash_split_kv err {err_skv:.2e} > {tol:.2e}");
+            assert!(
+                err_skv <= tol,
+                "flash_split_kv err {err_skv:.2e} > {tol:.2e}"
+            );
 
             // Zero-copy strided KV cache view (narrowed dim=2 from capacity=1024 to seq_k=512)
             let cap_seq = 1024usize;
@@ -747,7 +772,10 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
             .unwrap();
             let k_zc = k_cap.narrow(2, 0, seq_k).unwrap();
             let v_zc = v_cap.narrow(2, 0, seq_k).unwrap();
-            assert!(!k_zc.is_contiguous(), "narrowed GQA KV cache view must be strided");
+            assert!(
+                !k_zc.is_contiguous(),
+                "narrowed GQA KV cache view must be strided"
+            );
             let k_zc_contig = k_zc.contiguous().unwrap();
             let v_zc_contig = v_zc.contiguous().unwrap();
             let out_zc = try_flash_attn_contiguous(&q, &k_zc, &v_zc, cfg)
@@ -756,30 +784,58 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
             let out_zc_ref = try_flash_attn_contiguous(&q, &k_zc_contig, &v_zc_contig, cfg)
                 .unwrap()
                 .unwrap();
-            let got_zc = out_zc.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let got_zc_ref = out_zc_ref.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let got_zc = out_zc
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got_zc_ref = out_zc_ref
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             let err_zc = rel_err(&got_zc, &got_zc_ref);
             if err_zc > 1e-6 {
                 for qh in 0..(batch * n_heads * seq_q) {
                     let s = qh * d;
                     let e = rel_err(&got_zc[s..s + d], &got_zc_ref[s..s + d]);
-                    eprintln!("  ZC qh={qh:2} rel={e:.2e} got0..4={:?} ref0..4={:?}", &got_zc[s..s+4], &got_zc_ref[s..s+4]);
+                    eprintln!(
+                        "  ZC qh={qh:2} rel={e:.2e} got0..4={:?} ref0..4={:?}",
+                        &got_zc[s..s + 4],
+                        &got_zc_ref[s..s + 4]
+                    );
                 }
             }
-            assert!(err_zc <= 1e-6, "zero-copy strided Split-KV mismatch {err_zc:.2e}");
+            assert!(
+                err_zc <= 1e-6,
+                "zero-copy strided Split-KV mismatch {err_zc:.2e}"
+            );
         }
     }
 
     let stats = dsl::stats();
     let f_compiles = stats.compiles_of("flash_attn_paged_d128_f32")
         + stats.compiles_of("flash_attn_paged_d128_f32_p64");
-    assert_eq!(f_compiles, 1, "flash_attn_paged_d128_f32 must compile exactly once");
+    assert_eq!(
+        f_compiles, 1,
+        "flash_attn_paged_d128_f32 must compile exactly once"
+    );
     let skv_compiles = stats.compiles_of("flash_attn_paged_split_kv_d128_f32")
         + stats.compiles_of("flash_attn_paged_split_kv_d128_f32_p64");
-    assert_eq!(skv_compiles, 1, "flash_attn_paged_split_kv_d128_f32 must compile exactly once");
+    assert_eq!(
+        skv_compiles, 1,
+        "flash_attn_paged_split_kv_d128_f32 must compile exactly once"
+    );
     let red_compiles = stats.compiles_of("flash_attn_split_kv_reduce_d128_f32")
         + stats.compiles_of("flash_attn_split_kv_reduce_d128_f32_p64");
-    assert_eq!(red_compiles, 1, "flash_attn_split_kv_reduce_d128_f32 must compile exactly once");
+    assert_eq!(
+        red_compiles, 1,
+        "flash_attn_split_kv_reduce_d128_f32 must compile exactly once"
+    );
     let f_calls: u64 = stats
         .dispatches
         .iter()
@@ -995,8 +1051,10 @@ fn run_offset_and_war_regression_suite(dev: &Device, label: &str) {
 
     // 1b. Narrowed non-zero start_offset on FlashAttention contiguous SDPA
     let q_big = Tensor::from_vec(pseudo_vec(3 * 2 * 4 * 64, 702, 0.4), (3, 2, 4, 64), dev).unwrap();
-    let k_big = Tensor::from_vec(pseudo_vec(3 * 2 * 16 * 64, 703, 0.4), (3, 2, 16, 64), dev).unwrap();
-    let v_big = Tensor::from_vec(pseudo_vec(3 * 2 * 16 * 64, 704, 0.4), (3, 2, 16, 64), dev).unwrap();
+    let k_big =
+        Tensor::from_vec(pseudo_vec(3 * 2 * 16 * 64, 703, 0.4), (3, 2, 16, 64), dev).unwrap();
+    let v_big =
+        Tensor::from_vec(pseudo_vec(3 * 2 * 16 * 64, 704, 0.4), (3, 2, 16, 64), dev).unwrap();
     let q_sl = q_big.narrow(0, 1, 2).unwrap();
     let k_sl = k_big.narrow(0, 1, 2).unwrap();
     let v_sl = v_big.narrow(0, 1, 2).unwrap();
@@ -1029,17 +1087,38 @@ fn run_offset_and_war_regression_suite(dev: &Device, label: &str) {
 
     // 2. Narrowed non-zero start_offset on GDN recurrence + WAR in-place state snapshot
     let (b, total_seq, nh, kd, vd) = (1usize, 5usize, 2usize, 64usize, 64usize);
-    let q_all = Tensor::from_vec(pseudo_vec(b * total_seq * nh * kd, 711, 0.3), (b, total_seq, nh, kd), dev).unwrap();
-    let k_all = Tensor::from_vec(pseudo_vec(b * total_seq * nh * kd, 712, 0.3), (b, total_seq, nh, kd), dev).unwrap();
-    let v_all = Tensor::from_vec(pseudo_vec(b * total_seq * nh * vd, 713, 0.3), (b, total_seq, nh, vd), dev).unwrap();
+    let q_all = Tensor::from_vec(
+        pseudo_vec(b * total_seq * nh * kd, 711, 0.3),
+        (b, total_seq, nh, kd),
+        dev,
+    )
+    .unwrap();
+    let k_all = Tensor::from_vec(
+        pseudo_vec(b * total_seq * nh * kd, 712, 0.3),
+        (b, total_seq, nh, kd),
+        dev,
+    )
+    .unwrap();
+    let v_all = Tensor::from_vec(
+        pseudo_vec(b * total_seq * nh * vd, 713, 0.3),
+        (b, total_seq, nh, vd),
+        dev,
+    )
+    .unwrap();
     let g_all = Tensor::from_vec(
-        pseudo_vec(b * total_seq * nh, 714, 0.25).into_iter().map(|x| x - 0.35).collect(),
+        pseudo_vec(b * total_seq * nh, 714, 0.25)
+            .into_iter()
+            .map(|x| x - 0.35)
+            .collect(),
         (b, total_seq, nh),
         dev,
     )
     .unwrap();
     let beta_all = Tensor::from_vec(
-        pseudo_vec(b * total_seq * nh, 715, 0.4).into_iter().map(|x| (x + 1.0) * 0.5).collect(),
+        pseudo_vec(b * total_seq * nh, 715, 0.4)
+            .into_iter()
+            .map(|x| (x + 1.0) * 0.5)
+            .collect(),
         (b, total_seq, nh),
         dev,
     )
@@ -1084,14 +1163,22 @@ fn run_offset_and_war_regression_suite(dev: &Device, label: &str) {
         &k_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
         &v_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
         &g_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
-        &beta_all.narrow(1, 0, 3).unwrap().force_contiguous().unwrap(),
+        &beta_all
+            .narrow(1, 0, 3)
+            .unwrap()
+            .force_contiguous()
+            .unwrap(),
         &mut st_3,
         true,
     )
     .unwrap()
     .expect("GDN DSL active");
     let war_err = rel_err(
-        &snapshots[2].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &snapshots[2]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
         &st_3.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
     );
 
@@ -1117,20 +1204,37 @@ fn run_offset_and_war_regression_suite(dev: &Device, label: &str) {
     );
     let fork_a_y_err = rel_err(
         &y_fork_a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-        &y_one.narrow(1, 3, 2).unwrap().force_contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        &y_one
+            .narrow(1, 3, 2)
+            .unwrap()
+            .force_contiguous()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
     );
 
-    let q_alt = Tensor::from_vec(pseudo_vec(b * 2 * nh * kd, 811, 0.3), (b, 2, nh, kd), dev).unwrap();
-    let k_alt = Tensor::from_vec(pseudo_vec(b * 2 * nh * kd, 812, 0.3), (b, 2, nh, kd), dev).unwrap();
-    let v_alt = Tensor::from_vec(pseudo_vec(b * 2 * nh * vd, 813, 0.3), (b, 2, nh, vd), dev).unwrap();
+    let q_alt =
+        Tensor::from_vec(pseudo_vec(b * 2 * nh * kd, 811, 0.3), (b, 2, nh, kd), dev).unwrap();
+    let k_alt =
+        Tensor::from_vec(pseudo_vec(b * 2 * nh * kd, 812, 0.3), (b, 2, nh, kd), dev).unwrap();
+    let v_alt =
+        Tensor::from_vec(pseudo_vec(b * 2 * nh * vd, 813, 0.3), (b, 2, nh, vd), dev).unwrap();
     let g_alt = Tensor::from_vec(
-        pseudo_vec(b * 2 * nh, 814, 0.25).into_iter().map(|x| x - 0.35).collect(),
+        pseudo_vec(b * 2 * nh, 814, 0.25)
+            .into_iter()
+            .map(|x| x - 0.35)
+            .collect(),
         (b, 2, nh),
         dev,
     )
     .unwrap();
     let beta_alt = Tensor::from_vec(
-        pseudo_vec(b * 2 * nh, 815, 0.4).into_iter().map(|x| (x + 1.0) * 0.5).collect(),
+        pseudo_vec(b * 2 * nh, 815, 0.4)
+            .into_iter()
+            .map(|x| (x + 1.0) * 0.5)
+            .collect(),
         (b, 2, nh),
         dev,
     )
@@ -1141,9 +1245,17 @@ fn run_offset_and_war_regression_suite(dev: &Device, label: &str) {
         .unwrap()
         .expect("GDN DSL active");
     let mut st_ref_b = st_3.force_contiguous().unwrap();
-    let y_ref_b = try_recurrence(&q_alt, &k_alt, &v_alt, &g_alt, &beta_alt, &mut st_ref_b, true)
-        .unwrap()
-        .expect("GDN DSL active");
+    let y_ref_b = try_recurrence(
+        &q_alt,
+        &k_alt,
+        &v_alt,
+        &g_alt,
+        &beta_alt,
+        &mut st_ref_b,
+        true,
+    )
+    .unwrap()
+    .expect("GDN DSL active");
     let fork_b_st_err = rel_err(
         &fork_b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
         &st_ref_b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
@@ -1163,7 +1275,11 @@ fn run_offset_and_war_regression_suite(dev: &Device, label: &str) {
         let k1 = k_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
         let v1 = v_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
         let g1 = g_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
-        let b1 = beta_all.narrow(1, 0, 1).unwrap().force_contiguous().unwrap();
+        let b1 = beta_all
+            .narrow(1, 0, 1)
+            .unwrap()
+            .force_contiguous()
+            .unwrap();
 
         let mut st_graph = st_3.force_contiguous().unwrap();
         if vk_dev.begin_graph_capture().is_ok() {
@@ -1197,8 +1313,14 @@ fn run_offset_and_war_regression_suite(dev: &Device, label: &str) {
     eprintln!(
         "[{label} offset+WAR regression] fwht={fwht_err:.2e} gdn_y={y_err:.2e} gdn_st={st_err:.2e} war_snap={war_err:.2e} fork_a=({fork_a_y_err:.2e},{fork_a_st_err:.2e}) fork_b=({fork_b_y_err:.2e},{fork_b_st_err:.2e})"
     );
-    assert!(y_err <= 1e-4 && st_err <= 1e-4, "[{label}] GDN narrowed slice mismatch: y={y_err:.2e} st={st_err:.2e}");
-    assert!(war_err <= 1e-4, "[{label}] WAR snapshot corrupted by subsequent in-place GDN step: {war_err:.2e}");
+    assert!(
+        y_err <= 1e-4 && st_err <= 1e-4,
+        "[{label}] GDN narrowed slice mismatch: y={y_err:.2e} st={st_err:.2e}"
+    );
+    assert!(
+        war_err <= 1e-4,
+        "[{label}] WAR snapshot corrupted by subsequent in-place GDN step: {war_err:.2e}"
+    );
     assert!(
         fork_a_st_err <= 1e-4 && fork_a_y_err <= 1e-4 && fork_b_st_err <= 1e-4 && fork_b_y_err <= 1e-4,
         "[{label}] prefix-fork / speculative-rollback mismatch: fork_a=({fork_a_y_err:.2e},{fork_a_st_err:.2e}) fork_b=({fork_b_y_err:.2e},{fork_b_st_err:.2e})"
@@ -1221,18 +1343,30 @@ fn run_split_kv_32k_and_policy_rollback_suite(dev: &Device, dtype: DType, label:
 
     let (batch, n_heads, n_kv, seq_q, seq_k, d) =
         (1usize, 24usize, 2usize, 1usize, 32_768usize, 128usize);
-    let q = Tensor::from_vec(pseudo_vec(batch * n_heads * seq_q * d, 32001, 0.35), (batch, n_heads, seq_q, d), dev)
-        .unwrap()
-        .to_dtype(dtype)
-        .unwrap();
-    let k = Tensor::from_vec(pseudo_vec(batch * n_kv * seq_k * d, 32002, 0.35), (batch, n_kv, seq_k, d), dev)
-        .unwrap()
-        .to_dtype(dtype)
-        .unwrap();
-    let v = Tensor::from_vec(pseudo_vec(batch * n_kv * seq_k * d, 32003, 0.35), (batch, n_kv, seq_k, d), dev)
-        .unwrap()
-        .to_dtype(dtype)
-        .unwrap();
+    let q = Tensor::from_vec(
+        pseudo_vec(batch * n_heads * seq_q * d, 32001, 0.35),
+        (batch, n_heads, seq_q, d),
+        dev,
+    )
+    .unwrap()
+    .to_dtype(dtype)
+    .unwrap();
+    let k = Tensor::from_vec(
+        pseudo_vec(batch * n_kv * seq_k * d, 32002, 0.35),
+        (batch, n_kv, seq_k, d),
+        dev,
+    )
+    .unwrap()
+    .to_dtype(dtype)
+    .unwrap();
+    let v = Tensor::from_vec(
+        pseudo_vec(batch * n_kv * seq_k * d, 32003, 0.35),
+        (batch, n_kv, seq_k, d),
+        dev,
+    )
+    .unwrap()
+    .to_dtype(dtype)
+    .unwrap();
     let cfg = FlashAttnConfig::causal(1.0 / (d as f32).sqrt());
 
     set_flash_split_kv_override(Some(1));
@@ -1352,9 +1486,7 @@ fn run_split_kv_partition_sweep(dev: &Device, dtype: DType, label: &str) {
     eprintln!(
         "| d | seq_k | auto_s | s=1 (us) | s=8 (us) | s=16 (us) | s=32 (us) | s=64 (us) | s=128 (us) | s=256 (us) | best_s | best_us | best_GB/s | max_rel |"
     );
-    eprintln!(
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-    );
+    eprintln!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 
     for &d in &[64usize, 128, 256] {
         let q = Tensor::from_vec(

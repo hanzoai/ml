@@ -343,10 +343,12 @@ pub fn try_flash_attn_paged(
             {
                 return Ok(None);
             }
-            let k_in_place = is_kv_strided_contiguous(k_cache, batch, n_kv, seq_k, d, kv_seq_stride)
-                && (!need_zero_offset || k_cache.layout().start_offset() == 0);
-            let v_in_place = is_kv_strided_contiguous(v_cache, batch, n_kv, seq_k, d, kv_seq_stride)
-                && (!need_zero_offset || v_cache.layout().start_offset() == 0);
+            let k_in_place =
+                is_kv_strided_contiguous(k_cache, batch, n_kv, seq_k, d, kv_seq_stride)
+                    && (!need_zero_offset || k_cache.layout().start_offset() == 0);
+            let v_in_place =
+                is_kv_strided_contiguous(v_cache, batch, n_kv, seq_k, d, kv_seq_stride)
+                    && (!need_zero_offset || v_cache.layout().start_offset() == 0);
             if k_in_place && v_in_place {
                 (
                     k_cache.clone(),
@@ -668,32 +670,77 @@ mod tests {
         set_flash_split_kv_override(None);
 
         // Short context stays single-pass (num_splits == 1).
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 64, 0), 1);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 1, 128, 128, 0), 1);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 64, 0),
+            1
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Metal, 1, 24, 1, 128, 128, 0),
+            1
+        );
 
         // Medium/long single-request decode scales up to 128 splits at 16K..32K.
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 512, 0), 16);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 4096, 0), 32);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 8192, 0), 64);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 16384, 0), 128);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 32768, 0), 128);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 512, 0),
+            16
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 4096, 0),
+            32
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 8192, 0),
+            64
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 16384, 0),
+            128
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 32768, 0),
+            128
+        );
 
         // Vulkan favors higher split counts at 4K (d=256) and 8K.
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Vulkan, 1, 24, 1, 256, 4096, 0), 64);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Vulkan, 1, 24, 1, 128, 8192, 0), 128);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Vulkan, 1, 24, 1, 256, 4096, 0),
+            64
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Vulkan, 1, 24, 1, 128, 8192, 0),
+            128
+        );
 
         // Sliding window clamps active context before partitioning.
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 32768, 128), 1);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 32768, 512), 16);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 32768, 128),
+            1
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 32768, 512),
+            16
+        );
 
         // Large batch scales splits down proportionally to avoid oversubscription.
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 4, 24, 1, 128, 32768, 0), 32);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 16, 24, 1, 128, 32768, 0), 8);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 4, 24, 1, 128, 32768, 0),
+            32
+        );
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 16, 24, 1, 128, 32768, 0),
+            8
+        );
 
         // In-process override takes precedence and clears cleanly.
         set_flash_split_kv_override(Some(256));
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 64, 0), 256);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 64, 0),
+            256
+        );
         set_flash_split_kv_override(None);
-        assert_eq!(choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 64, 0), 1);
+        assert_eq!(
+            choose_flash_split_kv_for(QkBackend::Cuda, 1, 24, 1, 128, 64, 0),
+            1
+        );
     }
 }

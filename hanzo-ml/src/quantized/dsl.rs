@@ -331,9 +331,7 @@ pub fn select_impl(backend: QkBackend, op: QkOp) -> QkImpl {
         }
         QkOp::Ptq1 { m, .. } => {
             let phase_ov = match QkPhase::from_m(m) {
-                QkPhase::Decode => {
-                    read_phase_override(&PTQ1_DECODE_IMPL, "HANZO_PTQ1_DECODE_IMPL")
-                }
+                QkPhase::Decode => read_phase_override(&PTQ1_DECODE_IMPL, "HANZO_PTQ1_DECODE_IMPL"),
                 QkPhase::Prefill => {
                     read_phase_override(&PTQ1_PREFILL_IMPL, "HANZO_PTQ1_PREFILL_IMPL")
                 }
@@ -979,10 +977,7 @@ mod tests {
             QkImpl::Legacy
         );
         for b in [QkBackend::Cuda, QkBackend::Rocm, QkBackend::Vulkan] {
-            assert_eq!(
-                select_impl(b, QkOp::Fwht { block_size: 1024 }),
-                QkImpl::Dsl
-            );
+            assert_eq!(select_impl(b, QkOp::Fwht { block_size: 1024 }), QkImpl::Dsl);
             assert_eq!(
                 select_impl(
                     b,

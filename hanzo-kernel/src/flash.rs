@@ -1180,12 +1180,15 @@ pub fn flash_attn_paged_split_kv<F: Float>(
     let q_offset_override = meta[9] as usize;
     let num_splits = meta[11] as usize;
 
-    let qh_idx = cube / num_splits;
-    let split_idx = cube % num_splits;
-    let qpos = qh_idx % seq_q;
-    let bh = qh_idx / seq_q;
-    let h = bh % n_heads;
-    let b_i = bh / n_heads;
+    let per_batch_qh = n_heads * seq_q;
+    let per_batch_cubes = per_batch_qh * num_splits;
+    let b_i = cube / per_batch_cubes;
+    let rem = cube % per_batch_cubes;
+    let split_idx = rem / per_batch_qh;
+    let in_b_qh = rem % per_batch_qh;
+    let qh_idx = b_i * per_batch_qh + in_b_qh;
+    let qpos = in_b_qh % seq_q;
+    let h = in_b_qh / seq_q;
     let kv = h / (n_heads / n_kv);
 
     let ctx_len = context_lens[b_i] as usize;
@@ -1236,77 +1239,127 @@ pub fn flash_attn_paged_split_kv<F: Float>(
     let mut m_acc = f32::new(-3.4e38f32);
     let mut l_acc = f32::new(0.0f32);
 
-    for kpos in k_start..k_end {
-        let mut dot = 0.0f32;
-        for e in 0..per_d {
-            let dd = e * plane + lane;
-            let kv_val = f32::cast_from(load_paged_k(
-                k_cache,
-                block_tables,
-                b_i,
-                kv,
-                kpos,
-                dd,
-                n_kv,
-                block_size,
-                max_blocks,
-                kv_layout,
-                x_vec,
-                d,
-            ));
-            dot += q_reg[e] * kv_val;
-        }
-        let mut s = 0.0f32;
-        island! {
-            cuda | rocm | vulkan | metal => {
-                let plane_u = comptime!(plane as u32);
-                let mut sum = dot;
-                let mut off = 1u32;
-                while off < plane_u {
-                    sum += plane_shuffle_xor(sum, off);
-                    off *= 2u32;
-                }
-                s = sum * sc;
+    if kv_layout == 2usize {
+        let kv_head_base = (b_i * n_kv + kv) * block_size * d;
+        for kpos in k_start..k_end {
+            let row = kv_head_base + kpos * d;
+            let mut dot = 0.0f32;
+            for e in 0..per_d {
+                let dd = e * plane + lane;
+                dot += q_reg[e] * f32::cast_from(k_cache[row + dd]);
             }
-            default => {
-                let mut dsh = SharedMemory::<f32>::new(plane);
-                dsh[lane] = dot;
-                sync_cube();
-                let mut sum = 0.0f32;
-                for l in 0..plane {
-                    sum += dsh[l];
+            let mut s = 0.0f32;
+            island! {
+                cuda | rocm | vulkan | metal => {
+                    let plane_u = comptime!(plane as u32);
+                    let mut sum = dot;
+                    let mut off = 1u32;
+                    while off < plane_u {
+                        sum += plane_shuffle_xor(sum, off);
+                        off *= 2u32;
+                    }
+                    s = sum * sc;
                 }
-                s = sum * sc;
-                sync_cube();
+                default => {
+                    let mut dsh = SharedMemory::<f32>::new(plane);
+                    dsh[lane] = dot;
+                    sync_cube();
+                    let mut sum = 0.0f32;
+                    for l in 0..plane {
+                        sum += dsh[l];
+                    }
+                    s = sum * sc;
+                    sync_cube();
+                }
+            };
+            if softcap > 0.0f32 {
+                s = softcap * (s / softcap).tanh();
             }
-        };
-        if softcap > 0.0f32 {
-            s = softcap * (s / softcap).tanh();
+            let mut m_new = m_acc;
+            if s > m_new {
+                m_new = s;
+            }
+            let alpha = (m_acc - m_new).exp();
+            let p = (s - m_new).exp();
+            l_acc = l_acc * alpha + p;
+            m_acc = m_new;
+            for e in 0..per_d {
+                let dd = e * plane + lane;
+                o_reg[e] = o_reg[e] * alpha + p * f32::cast_from(v_cache[row + dd]);
+            }
         }
-        let mut m_new = m_acc;
-        if s > m_new {
-            m_new = s;
-        }
-        let alpha = (m_acc - m_new).exp();
-        let p = (s - m_new).exp();
-        l_acc = l_acc * alpha + p;
-        m_acc = m_new;
-        for e in 0..per_d {
-            let dd = e * plane + lane;
-            let vv = f32::cast_from(load_paged_v(
-                v_cache,
-                block_tables,
-                b_i,
-                kv,
-                kpos,
-                dd,
-                n_kv,
-                block_size,
-                max_blocks,
-                kv_layout,
-                d,
-            ));
-            o_reg[e] = o_reg[e] * alpha + p * vv;
+    } else {
+        let bt_row = b_i * max_blocks;
+        let dx = d / x_vec;
+        for kpos in k_start..k_end {
+            let blk = block_tables[bt_row + kpos / block_size] as usize;
+            let off = kpos % block_size;
+            let blk_kv = blk * n_kv + kv;
+            let mut dot = 0.0f32;
+            if kv_layout == 0usize {
+                let row = (blk_kv * block_size + off) * d;
+                for e in 0..per_d {
+                    let dd = e * plane + lane;
+                    dot += q_reg[e] * f32::cast_from(k_cache[row + dd]);
+                }
+            } else {
+                let k_blk_base = blk_kv * dx;
+                for e in 0..per_d {
+                    let dd = e * plane + lane;
+                    let k_idx =
+                        ((k_blk_base + (dd / x_vec)) * block_size + off) * x_vec + (dd % x_vec);
+                    dot += q_reg[e] * f32::cast_from(k_cache[k_idx]);
+                }
+            }
+            let mut s = 0.0f32;
+            island! {
+                cuda | rocm | vulkan | metal => {
+                    let plane_u = comptime!(plane as u32);
+                    let mut sum = dot;
+                    let mut off_s = 1u32;
+                    while off_s < plane_u {
+                        sum += plane_shuffle_xor(sum, off_s);
+                        off_s *= 2u32;
+                    }
+                    s = sum * sc;
+                }
+                default => {
+                    let mut dsh = SharedMemory::<f32>::new(plane);
+                    dsh[lane] = dot;
+                    sync_cube();
+                    let mut sum = 0.0f32;
+                    for l in 0..plane {
+                        sum += dsh[l];
+                    }
+                    s = sum * sc;
+                    sync_cube();
+                }
+            };
+            if softcap > 0.0f32 {
+                s = softcap * (s / softcap).tanh();
+            }
+            let mut m_new = m_acc;
+            if s > m_new {
+                m_new = s;
+            }
+            let alpha = (m_acc - m_new).exp();
+            let p = (s - m_new).exp();
+            l_acc = l_acc * alpha + p;
+            m_acc = m_new;
+            if kv_layout == 0usize {
+                let row = (blk_kv * block_size + off) * d;
+                for e in 0..per_d {
+                    let dd = e * plane + lane;
+                    o_reg[e] = o_reg[e] * alpha + p * f32::cast_from(v_cache[row + dd]);
+                }
+            } else {
+                let v_blk_base = blk_kv * d;
+                for e in 0..per_d {
+                    let dd = e * plane + lane;
+                    let v_idx = (v_blk_base + dd) * block_size + off;
+                    o_reg[e] = o_reg[e] * alpha + p * f32::cast_from(v_cache[v_idx]);
+                }
+            }
         }
     }
 
@@ -2556,8 +2609,9 @@ mod tests {
     fn flash_attn_paged_split_kv_cpu_exact() {
         use cubecl::cpu::{CpuDevice, CpuRuntime};
         let c = CpuRuntime::client(&CpuDevice::default());
-        let (b, n_heads, n_kv, seq_q, d, block_size, max_blocks, x_vec) =
-            (1usize, 2usize, 1usize, 1usize, 64usize, 16usize, 3usize, 4usize);
+        let (b, n_heads, n_kv, seq_q, d, block_size, max_blocks, x_vec) = (
+            1usize, 2usize, 1usize, 1usize, 64usize, 16usize, 3usize, 4usize,
+        );
         let q = rnd(b * n_heads * seq_q * d, 0x7101);
         let k_cache = rnd(max_blocks * n_kv * block_size * d, 0x7102);
         let v_cache = rnd(max_blocks * n_kv * block_size * d, 0x7103);

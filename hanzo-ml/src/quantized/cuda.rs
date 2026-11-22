@@ -1522,14 +1522,10 @@ impl QCudaStorage {
         }
         let is_gemm = m_total > 1;
         let selected = match self.dtype {
-            GgmlDType::PTQ1_0 => dsl::select_impl(
-                dsl::QkBackend::Cuda,
-                dsl::QkOp::Ptq1 { m: m_total, n, k },
-            ),
-            _ => dsl::select_impl(
-                dsl::QkBackend::Cuda,
-                dsl::QkOp::Pq2 { m: m_total, n, k },
-            ),
+            GgmlDType::PTQ1_0 => {
+                dsl::select_impl(dsl::QkBackend::Cuda, dsl::QkOp::Ptq1 { m: m_total, n, k })
+            }
+            _ => dsl::select_impl(dsl::QkBackend::Cuda, dsl::QkOp::Pq2 { m: m_total, n, k }),
         };
         if selected != QkImpl::Dsl {
             let legacy_name = match (self.dtype, is_gemm) {
