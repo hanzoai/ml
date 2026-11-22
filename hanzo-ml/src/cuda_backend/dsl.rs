@@ -261,11 +261,13 @@ type ShmemCache = HashMap<(DeviceId, String), u32>;
 type MetaCache = HashMap<(DeviceId, [u32; 3]), Arc<CudaSlice<u32>>>;
 type U32VecCache = HashMap<(DeviceId, Vec<u32>), Arc<CudaSlice<u32>>>;
 type F32VecCache = HashMap<(DeviceId, Vec<u32>), Arc<CudaSlice<f32>>>;
+type PartialF32Cache = HashMap<DeviceId, CudaSlice<f32>>;
 
 static DSL_SHMEM_CACHE: OnceLock<Mutex<ShmemCache>> = OnceLock::new();
 static DSL_META_CACHE: OnceLock<Mutex<MetaCache>> = OnceLock::new();
 static DSL_U32_VEC_CACHE: OnceLock<Mutex<U32VecCache>> = OnceLock::new();
 static DSL_F32_VEC_CACHE: OnceLock<Mutex<F32VecCache>> = OnceLock::new();
+static DSL_SPLIT_KV_PARTIAL_CACHE: OnceLock<Mutex<PartialF32Cache>> = OnceLock::new();
 
 impl CudaDevice {
     /// Compile (once per device + artifact) and return `(CudaFunc, shared_mem_bytes)` for a
@@ -697,7 +699,8 @@ impl CudaDevice {
             } else {
                 max_blocks.saturating_mul(block_size)
             };
-            let num_splits = crate::flash_attn::choose_flash_split_kv(
+            let num_splits = crate::flash_attn::choose_flash_split_kv_for(
+                crate::quantized::dsl::QkBackend::Cuda,
                 batch,
                 n_heads,
                 seq_q,
@@ -710,7 +713,6 @@ impl CudaDevice {
             } else {
                 1
             };
-            let mut partial_buf = self.alloc_dsl_float(partial_len, DType::F32)?;
             let meta = self.dsl_const_u32_slice(&[
                 seq_q as u32,
                 n_heads as u32,
@@ -725,8 +727,29 @@ impl CudaDevice {
                 0u32,
                 num_splits as u32,
             ])?;
+            let rmeta = if num_splits > 1 {
+                Some(self.dsl_const_u32_slice(&[
+                    total_qh as u32,
+                    num_splits as u32,
+                    0u32,
+                    0u32,
+                ])?)
+            } else {
+                None
+            };
             let split_blocks = (total_qh * num_splits) as u32;
             let stream = self.cuda_stream();
+            let cache = DSL_SPLIT_KV_PARTIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut partial_guard = cache.lock().unwrap();
+            let need_grow = partial_guard
+                .get(&self.id())
+                .is_none_or(|b| b.len() < partial_len);
+            if need_grow {
+                let cap = partial_len.next_power_of_two().max(4096);
+                let fresh = unsafe { self.alloc::<f32>(cap)? };
+                partial_guard.insert(self.id(), fresh);
+            }
+            let partial_slice = partial_guard.get_mut(&self.id()).unwrap();
             {
                 let (qp, _gq) = cuda_storage_ptr(q.0, q.1, dtype, &stream)?;
                 let (kp, _gk) = cuda_storage_ptr(k_cache.0, k_cache.1, dtype, &stream)?;
@@ -736,7 +759,7 @@ impl CudaDevice {
                 let (clp, _gcl) =
                     cuda_storage_ptr(context_lens.0, context_lens.1, DType::U32, &stream)?;
                 let (op, _go) = cuda_storage_ptr_mut(&mut out, 0, dtype, &stream)?;
-                let (pp, _gp) = cuda_storage_ptr_mut(&mut partial_buf, 0, DType::F32, &stream)?;
+                let (pp, _gp) = partial_slice.device_ptr_mut(&stream);
                 let (scp, _gsc) = scale_cfg.device_ptr(&stream);
                 let (mp, _gm) = meta.device_ptr(&stream);
                 unsafe {
@@ -754,15 +777,9 @@ impl CudaDevice {
                 n_heads,
                 d,
             );
-            if num_splits > 1 {
-                let rmeta = self.dsl_const_u32_slice(&[
-                    total_qh as u32,
-                    num_splits as u32,
-                    0u32,
-                    0u32,
-                ])?;
+            if let Some(rmeta) = rmeta {
                 {
-                    let (pp, _gp) = cuda_storage_ptr(&partial_buf, 0, DType::F32, &stream)?;
+                    let (pp, _gp) = partial_slice.device_ptr(&stream);
                     let (op, _go) = cuda_storage_ptr_mut(&mut out, 0, dtype, &stream)?;
                     let (rmp, _grm) = rmeta.device_ptr(&stream);
                     unsafe {
@@ -781,6 +798,7 @@ impl CudaDevice {
                     d,
                 );
             }
+            drop(partial_guard);
             return Ok(out);
         }
         let meta = self.dsl_const_u32_slice(&[
