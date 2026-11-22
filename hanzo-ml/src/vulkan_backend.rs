@@ -4174,8 +4174,10 @@ impl VulkanDevice {
     ) -> Result<Option<VulkanStorage>> {
         use crate::quantized::{dsl, GgmlDType};
         let impl_sel = match dtype {
-            GgmlDType::PQ2_0 => dsl::pq2_impl(),
-            GgmlDType::PTQ1_0 => dsl::ptq1_impl(),
+            GgmlDType::PQ2_0 => dsl::select_impl(dsl::QkBackend::Vulkan, dsl::QkOp::Pq2 { m, n, k }),
+            GgmlDType::PTQ1_0 => {
+                dsl::select_impl(dsl::QkBackend::Vulkan, dsl::QkOp::Ptq1 { m, n, k })
+            }
             _ => return Ok(None),
         };
         if impl_sel != dsl::QkImpl::Dsl {

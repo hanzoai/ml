@@ -186,10 +186,36 @@ pub fn try_flash_attn_paged(
     layout: KvCacheLayout,
     cfg: FlashAttnConfig,
 ) -> Result<Option<Tensor>> {
-    if dsl::flash_impl() != QkImpl::Dsl {
+    let (batch, n_heads, seq_q, d) = q.dims4()?;
+    let seq_k_est = match layout {
+        KvCacheLayout::FlatPaged4D => {
+            let (_nb, _k_nkv, bs, _kd) = k_cache.dims4()?;
+            let mb = block_tables.dim(1)?;
+            mb.saturating_mul(bs)
+        }
+        KvCacheLayout::EngineStandard5D4D { .. } => {
+            let (_nb, _k_nkv, _dx, bs, _xv) = k_cache.dims5()?;
+            let mb = block_tables.dim(1)?;
+            mb.saturating_mul(bs)
+        }
+        KvCacheLayout::Contiguous { .. } => {
+            let (_kb, _k_nkv, seq_k, _kd) = k_cache.dims4()?;
+            seq_k
+        }
+    };
+    if dsl::select_impl(
+        dsl::QkBackend::from_device(q.device()),
+        dsl::QkOp::FlashAttn {
+            batch,
+            n_heads,
+            seq_q,
+            seq_k: seq_k_est,
+            head_dim: d,
+        },
+    ) != QkImpl::Dsl
+    {
         return Ok(None);
     }
-    let (batch, n_heads, seq_q, d) = q.dims4()?;
     if !matches!(d, 64 | 128 | 256) || n_kv == 0 || !n_heads.is_multiple_of(n_kv) {
         return Ok(None);
     }
@@ -503,11 +529,21 @@ pub fn try_flash_attn_contiguous(
     v: &Tensor,
     cfg: FlashAttnConfig,
 ) -> Result<Option<Tensor>> {
-    if dsl::flash_impl() != QkImpl::Dsl {
+    let (batch, n_heads, seq_q, d) = q.dims4()?;
+    let (kb, n_kv, seq_k, kd) = k.dims4()?;
+    if dsl::select_impl(
+        dsl::QkBackend::from_device(q.device()),
+        dsl::QkOp::FlashAttn {
+            batch,
+            n_heads,
+            seq_q,
+            seq_k,
+            head_dim: d,
+        },
+    ) != QkImpl::Dsl
+    {
         return Ok(None);
     }
-    let (batch, _n_heads, _seq_q, d) = q.dims4()?;
-    let (kb, n_kv, seq_k, kd) = k.dims4()?;
     if kb != batch || kd != d || v.dims() != [batch, n_kv, seq_k, d] {
         return Ok(None);
     }
