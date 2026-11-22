@@ -42,6 +42,7 @@ use sha2::{Digest, Sha256};
 
 pub mod canonical;
 pub mod lineage;
+pub mod protocol;
 pub mod provenance;
 pub mod wal;
 pub mod wire;
@@ -53,6 +54,11 @@ pub use lineage::{
     derive_lineage_policy, verify_promotion_eligibility, ArtifactRef, Claim, ContaminationError,
     DataPurpose, DeterminismReport, EnvironmentV1, GateSpec, LineagePolicy, PairEvidence,
     ResearchEvent, TeacherInteraction,
+};
+pub use protocol::{
+    paired_comparison, student_t_ci95, CiStats, CorrectnessChecks, ExperimentRecordV2,
+    HardwareSpec, LocalResearchLedger, Opportunity, StatisticalComparison, SyncReceipt,
+    WorkloadManifest,
 };
 pub use wal::ResearchWal;
 pub use wire::{

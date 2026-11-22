@@ -131,6 +131,23 @@ impl Run {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Study {
+    pub project: String,
+    pub id: String,
+    pub title: String,
+    pub question: String,
+    pub method: String,
+    #[serde(deserialize_with = "list")]
+    pub runs: Vec<String>,
+    pub finding: String,
+    pub limits: String,
+    pub revision: String,
+    pub canonical: bool,
+    pub when: String,
+}
+
 /// What a batch post filed: the project, the records new to it, the canonical ones.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
