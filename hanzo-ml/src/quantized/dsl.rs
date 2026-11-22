@@ -294,14 +294,11 @@ pub fn qualified_policy_impl(backend: QkBackend, op: QkOp) -> QkImpl {
                 && seq_q > 0
                 && seq_k > 0
                 && matches!(head_dim, 64 | 128 | 256);
-            if backend == QkBackend::Vulkan && valid_dims {
-                QkImpl::Dsl
-            } else if backend == QkBackend::Metal
-                && valid_dims
+            let metal_short_decode = backend == QkBackend::Metal
                 && batch == 1
                 && QkPhase::from_seq_q(seq_q) == QkPhase::Decode
-                && seq_k <= 128
-            {
+                && seq_k <= 128;
+            if valid_dims && (backend == QkBackend::Vulkan || metal_short_decode) {
                 QkImpl::Dsl
             } else {
                 QkImpl::Legacy

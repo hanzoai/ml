@@ -2185,3 +2185,67 @@ fn cpu_hadamard_fwht_matches_sylvester_matrix() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn q4k_repack_tile_and_decode_parity_across_m() -> Result<()> {
+    let dev = Device::Cpu;
+    let n = 64usize;
+    let k = 512usize;
+    let w_vals: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 41 + 17) % 127) as f32 * 0.025 - 1.55)
+        .collect();
+    let w = Tensor::from_vec(w_vals, (n, k), &dev)?;
+
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0] {
+        let qt = quantized::QTensor::quantize(&w, dtype)?;
+        let w_deq = qt.dequantize(&dev)?;
+        let qmm = quantized::QMatMul::from_qtensor(qt)?;
+
+        for m in [1usize, 3, 4, 16] {
+            let lhs_vals: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 29 + 7) % 113) as f32 * 0.02 - 1.1)
+                .collect();
+            let lhs_q_deq = match dtype {
+                GgmlDType::Q4K => {
+                    let mut q = vec![k_quants::BlockQ8K::zeros(); m * (k / k_quants::QK_K)];
+                    for r in 0..m {
+                        k_quants::BlockQ8K::from_float(
+                            &lhs_vals[r * k..(r + 1) * k],
+                            &mut q[r * (k / k_quants::QK_K)..(r + 1) * (k / k_quants::QK_K)],
+                        );
+                    }
+                    let mut d = vec![0.0f32; m * k];
+                    k_quants::BlockQ8K::to_float(&q, &mut d);
+                    d
+                }
+                _ => {
+                    let mut q = vec![k_quants::BlockQ8_0::zeros(); m * (k / k_quants::QK8_0)];
+                    for r in 0..m {
+                        k_quants::BlockQ8_0::from_float(
+                            &lhs_vals[r * k..(r + 1) * k],
+                            &mut q[r * (k / k_quants::QK8_0)..(r + 1) * (k / k_quants::QK8_0)],
+                        );
+                    }
+                    let mut d = vec![0.0f32; m * k];
+                    k_quants::BlockQ8_0::to_float(&q, &mut d);
+                    d
+                }
+            };
+            let lhs = Tensor::from_vec(lhs_vals, (m, k), &dev)?;
+            let lhs_q_ref = Tensor::from_vec(lhs_q_deq, (m, k), &dev)?;
+            let got = qmm.forward(&lhs)?;
+            let want_exact_q = lhs_q_ref.matmul(&w_deq.t()?)?;
+            let max_diff = (&got - &want_exact_q)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            let max_ref = want_exact_q.abs()?.max_all()?.to_scalar::<f32>()?.max(1.0);
+            assert!(
+                max_diff / max_ref < 5e-4,
+                "{dtype:?} m={m} QMatMul vs dequant(Q8)*dequant(W) rel diff {} >= 5e-4",
+                max_diff / max_ref
+            );
+        }
+    }
+    Ok(())
+}
