@@ -99,6 +99,24 @@ cuda_dsl_artifacts! {
     "flash_attn_paged_d256_f32" => "flash_attn_paged_f_f32",
     "flash_attn_paged_d256_f16" => "flash_attn_paged_f_",
     "flash_attn_paged_d256_bf16" => "flash_attn_paged_f_",
+    "flash_attn_paged_split_kv_d64_f32" => "flash_attn_paged_split_kv_f_f32",
+    "flash_attn_paged_split_kv_d64_f16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d64_bf16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d128_f32" => "flash_attn_paged_split_kv_f_f32",
+    "flash_attn_paged_split_kv_d128_f16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d128_bf16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d256_f32" => "flash_attn_paged_split_kv_f_f32",
+    "flash_attn_paged_split_kv_d256_f16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d256_bf16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_split_kv_reduce_d64_f32" => "flash_attn_split_kv_reduce_f_f32",
+    "flash_attn_split_kv_reduce_d64_f16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d64_bf16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d128_f32" => "flash_attn_split_kv_reduce_f_f32",
+    "flash_attn_split_kv_reduce_d128_f16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d128_bf16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d256_f32" => "flash_attn_split_kv_reduce_f_f32",
+    "flash_attn_split_kv_reduce_d256_f16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d256_bf16" => "flash_attn_split_kv_reduce_f_",
     // Production Fast Walsh-Hadamard Transform (B=64..2048, F32/F16/BF16, fused signs)
     "fwht_hadamard_b64_f32" => "fwht_hadamard_f_f32",
     "fwht_hadamard_b64_f16" => "fwht_hadamard_f_",
@@ -617,16 +635,52 @@ impl CudaDevice {
         sliding_window: usize,
         q_offset_override: usize,
     ) -> Result<CudaStorage> {
-        let artifact = match (d, dtype) {
-            (64, DType::F32) => "flash_attn_paged_d64_f32",
-            (64, DType::F16) => "flash_attn_paged_d64_f16",
-            (64, DType::BF16) => "flash_attn_paged_d64_bf16",
-            (128, DType::F32) => "flash_attn_paged_d128_f32",
-            (128, DType::F16) => "flash_attn_paged_d128_f16",
-            (128, DType::BF16) => "flash_attn_paged_d128_bf16",
-            (256, DType::F32) => "flash_attn_paged_d256_f32",
-            (256, DType::F16) => "flash_attn_paged_d256_f16",
-            (256, DType::BF16) => "flash_attn_paged_d256_bf16",
+        let (artifact, split_artifact, reduce_artifact) = match (d, dtype) {
+            (64, DType::F32) => (
+                "flash_attn_paged_d64_f32",
+                "flash_attn_paged_split_kv_d64_f32",
+                "flash_attn_split_kv_reduce_d64_f32",
+            ),
+            (64, DType::F16) => (
+                "flash_attn_paged_d64_f16",
+                "flash_attn_paged_split_kv_d64_f16",
+                "flash_attn_split_kv_reduce_d64_f16",
+            ),
+            (64, DType::BF16) => (
+                "flash_attn_paged_d64_bf16",
+                "flash_attn_paged_split_kv_d64_bf16",
+                "flash_attn_split_kv_reduce_d64_bf16",
+            ),
+            (128, DType::F32) => (
+                "flash_attn_paged_d128_f32",
+                "flash_attn_paged_split_kv_d128_f32",
+                "flash_attn_split_kv_reduce_d128_f32",
+            ),
+            (128, DType::F16) => (
+                "flash_attn_paged_d128_f16",
+                "flash_attn_paged_split_kv_d128_f16",
+                "flash_attn_split_kv_reduce_d128_f16",
+            ),
+            (128, DType::BF16) => (
+                "flash_attn_paged_d128_bf16",
+                "flash_attn_paged_split_kv_d128_bf16",
+                "flash_attn_split_kv_reduce_d128_bf16",
+            ),
+            (256, DType::F32) => (
+                "flash_attn_paged_d256_f32",
+                "flash_attn_paged_split_kv_d256_f32",
+                "flash_attn_split_kv_reduce_d256_f32",
+            ),
+            (256, DType::F16) => (
+                "flash_attn_paged_d256_f16",
+                "flash_attn_paged_split_kv_d256_f16",
+                "flash_attn_split_kv_reduce_d256_f16",
+            ),
+            (256, DType::BF16) => (
+                "flash_attn_paged_d256_bf16",
+                "flash_attn_paged_split_kv_d256_bf16",
+                "flash_attn_split_kv_reduce_d256_bf16",
+            ),
             _ => {
                 crate::bail!("cuda flash_attn_paged_dsl: unsupported head_dim={d} dtype={dtype:?}")
             }
@@ -634,8 +688,101 @@ impl CudaDevice {
         if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 {
             crate::bail!("cuda flash_attn_paged_dsl: empty shape");
         }
-        let mut out = self.alloc_dsl_float(batch * n_heads * seq_q * d, dtype)?;
+        let total_qh = batch * n_heads * seq_q;
+        let mut out = self.alloc_dsl_float(total_qh * d, dtype)?;
         let scale_cfg = self.dsl_const_f32_slice(&[scale, softcap])?;
+        if seq_q <= 4 {
+            let max_ctx_est = if kv_layout == 2 {
+                max_blocks.max(1)
+            } else {
+                max_blocks.saturating_mul(block_size)
+            };
+            let num_splits = crate::flash_attn::choose_flash_split_kv(
+                batch,
+                n_heads,
+                seq_q,
+                d,
+                max_ctx_est,
+                sliding_window,
+            );
+            let partial_len = if num_splits > 1 {
+                total_qh * num_splits * (d + 2)
+            } else {
+                1
+            };
+            let mut partial_buf = self.alloc_dsl_float(partial_len, DType::F32)?;
+            let meta = self.dsl_const_u32_slice(&[
+                seq_q as u32,
+                n_heads as u32,
+                n_kv as u32,
+                causal_mode,
+                block_size as u32,
+                max_blocks as u32,
+                kv_layout as u32,
+                x_vec as u32,
+                sliding_window as u32,
+                q_offset_override as u32,
+                0u32,
+                num_splits as u32,
+            ])?;
+            let split_blocks = (total_qh * num_splits) as u32;
+            let stream = self.cuda_stream();
+            {
+                let (qp, _gq) = cuda_storage_ptr(q.0, q.1, dtype, &stream)?;
+                let (kp, _gk) = cuda_storage_ptr(k_cache.0, k_cache.1, dtype, &stream)?;
+                let (vp, _gv) = cuda_storage_ptr(v_cache.0, v_cache.1, dtype, &stream)?;
+                let (btp, _gbt) =
+                    cuda_storage_ptr(block_tables.0, block_tables.1, DType::U32, &stream)?;
+                let (clp, _gcl) =
+                    cuda_storage_ptr(context_lens.0, context_lens.1, DType::U32, &stream)?;
+                let (op, _go) = cuda_storage_ptr_mut(&mut out, 0, dtype, &stream)?;
+                let (pp, _gp) = cuda_storage_ptr_mut(&mut partial_buf, 0, DType::F32, &stream)?;
+                let (scp, _gsc) = scale_cfg.device_ptr(&stream);
+                let (mp, _gm) = meta.device_ptr(&stream);
+                unsafe {
+                    self.dispatch_dsl_raw::<18>(
+                        split_artifact,
+                        &[qp, kp, vp, btp, clp, op, pp, scp, mp],
+                        (split_blocks, 1, 1),
+                        (32, 1, 1),
+                    )?;
+                }
+            }
+            crate::quantized::dsl::note_dispatch(
+                crate::quantized::dsl::QkImpl::Dsl,
+                split_artifact,
+                n_heads,
+                d,
+            );
+            if num_splits > 1 {
+                let rmeta = self.dsl_const_u32_slice(&[
+                    total_qh as u32,
+                    num_splits as u32,
+                    0u32,
+                    0u32,
+                ])?;
+                {
+                    let (pp, _gp) = cuda_storage_ptr(&partial_buf, 0, DType::F32, &stream)?;
+                    let (op, _go) = cuda_storage_ptr_mut(&mut out, 0, dtype, &stream)?;
+                    let (rmp, _grm) = rmeta.device_ptr(&stream);
+                    unsafe {
+                        self.dispatch_dsl_raw::<6>(
+                            reduce_artifact,
+                            &[pp, op, rmp],
+                            (total_qh as u32, 1, 1),
+                            (32, 1, 1),
+                        )?;
+                    }
+                }
+                crate::quantized::dsl::note_dispatch(
+                    crate::quantized::dsl::QkImpl::Dsl,
+                    reduce_artifact,
+                    n_heads,
+                    d,
+                );
+            }
+            return Ok(out);
+        }
         let meta = self.dsl_const_u32_slice(&[
             seq_q as u32,
             n_heads as u32,

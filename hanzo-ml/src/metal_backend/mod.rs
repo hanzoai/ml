@@ -2599,6 +2599,24 @@ dsl_artifacts! {
     "flash_attn_paged_d256_f32" => "flash_attn_paged_f_f32",
     "flash_attn_paged_d256_f16" => "flash_attn_paged_f_",
     "flash_attn_paged_d256_bf16" => "flash_attn_paged_f_",
+    "flash_attn_paged_split_kv_d64_f32" => "flash_attn_paged_split_kv_f_f32",
+    "flash_attn_paged_split_kv_d64_f16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d64_bf16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d128_f32" => "flash_attn_paged_split_kv_f_f32",
+    "flash_attn_paged_split_kv_d128_f16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d128_bf16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d256_f32" => "flash_attn_paged_split_kv_f_f32",
+    "flash_attn_paged_split_kv_d256_f16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_paged_split_kv_d256_bf16" => "flash_attn_paged_split_kv_f_",
+    "flash_attn_split_kv_reduce_d64_f32" => "flash_attn_split_kv_reduce_f_f32",
+    "flash_attn_split_kv_reduce_d64_f16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d64_bf16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d128_f32" => "flash_attn_split_kv_reduce_f_f32",
+    "flash_attn_split_kv_reduce_d128_f16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d128_bf16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d256_f32" => "flash_attn_split_kv_reduce_f_f32",
+    "flash_attn_split_kv_reduce_d256_f16" => "flash_attn_split_kv_reduce_f_",
+    "flash_attn_split_kv_reduce_d256_bf16" => "flash_attn_split_kv_reduce_f_",
     // Production Fast Walsh-Hadamard Transform (B=64..2048, F32/F16/BF16, fused signs)
     "fwht_hadamard_b64_f32" => "fwht_hadamard_f_f32",
     "fwht_hadamard_b64_f16" => "fwht_hadamard_f_",
@@ -3222,22 +3240,165 @@ impl MetalDevice {
         sliding_window: usize,
         q_offset_override: usize,
     ) -> Result<()> {
-        let (artifact, br) = match (d, dtype) {
-            (64, crate::DType::F32) => ("flash_attn_paged_d64_f32", 16usize),
-            (64, crate::DType::F16) => ("flash_attn_paged_d64_f16", 16usize),
-            (64, crate::DType::BF16) => ("flash_attn_paged_d64_bf16", 16usize),
-            (128, crate::DType::F32) => ("flash_attn_paged_d128_f32", 16usize),
-            (128, crate::DType::F16) => ("flash_attn_paged_d128_f16", 16usize),
-            (128, crate::DType::BF16) => ("flash_attn_paged_d128_bf16", 16usize),
-            (256, crate::DType::F32) => ("flash_attn_paged_d256_f32", 8usize),
-            (256, crate::DType::F16) => ("flash_attn_paged_d256_f16", 8usize),
-            (256, crate::DType::BF16) => ("flash_attn_paged_d256_bf16", 8usize),
+        let (artifact, split_artifact, reduce_artifact, br) = match (d, dtype) {
+            (64, crate::DType::F32) => (
+                "flash_attn_paged_d64_f32",
+                "flash_attn_paged_split_kv_d64_f32",
+                "flash_attn_split_kv_reduce_d64_f32",
+                16usize,
+            ),
+            (64, crate::DType::F16) => (
+                "flash_attn_paged_d64_f16",
+                "flash_attn_paged_split_kv_d64_f16",
+                "flash_attn_split_kv_reduce_d64_f16",
+                16usize,
+            ),
+            (64, crate::DType::BF16) => (
+                "flash_attn_paged_d64_bf16",
+                "flash_attn_paged_split_kv_d64_bf16",
+                "flash_attn_split_kv_reduce_d64_bf16",
+                16usize,
+            ),
+            (128, crate::DType::F32) => (
+                "flash_attn_paged_d128_f32",
+                "flash_attn_paged_split_kv_d128_f32",
+                "flash_attn_split_kv_reduce_d128_f32",
+                16usize,
+            ),
+            (128, crate::DType::F16) => (
+                "flash_attn_paged_d128_f16",
+                "flash_attn_paged_split_kv_d128_f16",
+                "flash_attn_split_kv_reduce_d128_f16",
+                16usize,
+            ),
+            (128, crate::DType::BF16) => (
+                "flash_attn_paged_d128_bf16",
+                "flash_attn_paged_split_kv_d128_bf16",
+                "flash_attn_split_kv_reduce_d128_bf16",
+                16usize,
+            ),
+            (256, crate::DType::F32) => (
+                "flash_attn_paged_d256_f32",
+                "flash_attn_paged_split_kv_d256_f32",
+                "flash_attn_split_kv_reduce_d256_f32",
+                8usize,
+            ),
+            (256, crate::DType::F16) => (
+                "flash_attn_paged_d256_f16",
+                "flash_attn_paged_split_kv_d256_f16",
+                "flash_attn_split_kv_reduce_d256_f16",
+                8usize,
+            ),
+            (256, crate::DType::BF16) => (
+                "flash_attn_paged_d256_bf16",
+                "flash_attn_paged_split_kv_d256_bf16",
+                "flash_attn_split_kv_reduce_d256_bf16",
+                8usize,
+            ),
             _ => crate::bail!("flash_attn_paged_dsl: unsupported head_dim={d} dtype={dtype:?}"),
         };
         if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 {
             crate::bail!("flash_attn_paged_dsl: empty shape");
         }
         let scale_cfg = [scale, softcap];
+        if seq_q <= 4 {
+            let total_qh = batch * n_heads * seq_q;
+            let max_ctx_est = if kv_layout == 2 {
+                max_blocks.max(1)
+            } else {
+                max_blocks.saturating_mul(block_size)
+            };
+            let num_splits = crate::flash_attn::choose_flash_split_kv(
+                batch,
+                n_heads,
+                seq_q,
+                d,
+                max_ctx_est,
+                sliding_window,
+            );
+            let partial_len = if num_splits > 1 {
+                total_qh * num_splits * (d + 2)
+            } else {
+                1
+            };
+            let partial_buf =
+                self.new_buffer(partial_len, crate::DType::F32, "flash_split_kv_partial")?;
+            let meta = [
+                seq_q as u32,
+                n_heads as u32,
+                n_kv as u32,
+                causal_mode,
+                block_size as u32,
+                max_blocks as u32,
+                kv_layout as u32,
+                x_vec as u32,
+                sliding_window as u32,
+                q_offset_override as u32,
+                0u32,
+                num_splits as u32,
+            ];
+            let split_blocks = total_qh * num_splits;
+            self.dispatch_dsl_bindings(
+                split_artifact,
+                &[
+                    DslBinding::In(q.0, q.1),
+                    DslBinding::In(k_cache.0, k_cache.1),
+                    DslBinding::In(v_cache.0, v_cache.1),
+                    DslBinding::In(block_tables.0, block_tables.1),
+                    DslBinding::In(context_lens.0, context_lens.1),
+                    DslBinding::Out(out.0, out.1),
+                    DslBinding::Out(&partial_buf, 0),
+                    DslBinding::Bytes(slice_as_bytes(&scale_cfg)),
+                    DslBinding::Bytes(slice_as_bytes(&meta)),
+                ],
+                &[0u32; 18],
+                objc2_metal::MTLSize {
+                    width: split_blocks,
+                    height: 1,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            )?;
+            crate::quantized::dsl::note_dispatch(
+                crate::quantized::dsl::QkImpl::Dsl,
+                split_artifact,
+                n_heads,
+                d,
+            );
+            if num_splits > 1 {
+                let rmeta = [total_qh as u32, num_splits as u32, 0u32, 0u32];
+                self.dispatch_dsl_bindings(
+                    reduce_artifact,
+                    &[
+                        DslBinding::In(&partial_buf, 0),
+                        DslBinding::Out(out.0, out.1),
+                        DslBinding::Bytes(slice_as_bytes(&rmeta)),
+                    ],
+                    &[0u32; 6],
+                    objc2_metal::MTLSize {
+                        width: total_qh,
+                        height: 1,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
+                )?;
+                crate::quantized::dsl::note_dispatch(
+                    crate::quantized::dsl::QkImpl::Dsl,
+                    reduce_artifact,
+                    n_heads,
+                    d,
+                );
+            }
+            return Ok(());
+        }
         let meta = [
             seq_q as u32,
             n_heads as u32,

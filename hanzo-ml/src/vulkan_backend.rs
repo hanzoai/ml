@@ -293,6 +293,24 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "flash_attn_paged_d64_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d64_f32.spv"),
         "flash_attn_paged_d128_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d128_f32.spv"),
         "flash_attn_paged_d256_f32" => include_bytes!("vulkan/dsl/flash_attn_paged_d256_f32.spv"),
+        "flash_attn_paged_split_kv_d64_f32" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_split_kv_d64_f32.spv")
+        }
+        "flash_attn_paged_split_kv_d128_f32" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_split_kv_d128_f32.spv")
+        }
+        "flash_attn_paged_split_kv_d256_f32" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_split_kv_d256_f32.spv")
+        }
+        "flash_attn_split_kv_reduce_d64_f32" => {
+            include_bytes!("vulkan/dsl/flash_attn_split_kv_reduce_d64_f32.spv")
+        }
+        "flash_attn_split_kv_reduce_d128_f32" => {
+            include_bytes!("vulkan/dsl/flash_attn_split_kv_reduce_d128_f32.spv")
+        }
+        "flash_attn_split_kv_reduce_d256_f32" => {
+            include_bytes!("vulkan/dsl/flash_attn_split_kv_reduce_d256_f32.spv")
+        }
         // Canonical DSL Fast Walsh-Hadamard Transform kernels (F32, B=64..2048, fused signs).
         "fwht_hadamard_b64_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b64_f32.spv"),
         "fwht_hadamard_b128_f32" => include_bytes!("vulkan/dsl/fwht_hadamard_b128_f32.spv"),
@@ -332,6 +350,24 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         }
         "flash_attn_paged_d256_f32_p64" => {
             include_bytes!("vulkan/dsl/flash_attn_paged_d256_f32_p64.spv")
+        }
+        "flash_attn_paged_split_kv_d64_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_split_kv_d64_f32_p64.spv")
+        }
+        "flash_attn_paged_split_kv_d128_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_split_kv_d128_f32_p64.spv")
+        }
+        "flash_attn_paged_split_kv_d256_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_paged_split_kv_d256_f32_p64.spv")
+        }
+        "flash_attn_split_kv_reduce_d64_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_split_kv_reduce_d64_f32_p64.spv")
+        }
+        "flash_attn_split_kv_reduce_d128_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_split_kv_reduce_d128_f32_p64.spv")
+        }
+        "flash_attn_split_kv_reduce_d256_f32_p64" => {
+            include_bytes!("vulkan/dsl/flash_attn_split_kv_reduce_d256_f32_p64.spv")
         }
         "fwht_hadamard_b64_f32_p64" => include_bytes!("vulkan/dsl/fwht_hadamard_b64_f32_p64.spv"),
         "fwht_hadamard_b128_f32_p64" => include_bytes!("vulkan/dsl/fwht_hadamard_b128_f32_p64.spv"),
@@ -4453,23 +4489,122 @@ impl VulkanDevice {
         q_offset_override: usize,
     ) -> Result<Option<VulkanStorage>> {
         let is_wave64 = self.inner.subgroup_size == 64;
-        if !self.inner.coopmat || (self.inner.subgroup_size != 32 && !is_wave64) {
+        if self.inner.subgroup_size != 32 && !is_wave64 {
             return Ok(None);
         }
-        let artifact = match (d, is_wave64) {
-            (64, false) => "flash_attn_paged_d64_f32",
-            (128, false) => "flash_attn_paged_d128_f32",
-            (256, false) => "flash_attn_paged_d256_f32",
-            (64, true) => "flash_attn_paged_d64_f32_p64",
-            (128, true) => "flash_attn_paged_d128_f32_p64",
-            (256, true) => "flash_attn_paged_d256_f32_p64",
+        if seq_q > 4 && !self.inner.coopmat {
+            return Ok(None);
+        }
+        let (artifact, split_artifact, reduce_artifact) = match (d, is_wave64) {
+            (64, false) => (
+                "flash_attn_paged_d64_f32",
+                "flash_attn_paged_split_kv_d64_f32",
+                "flash_attn_split_kv_reduce_d64_f32",
+            ),
+            (128, false) => (
+                "flash_attn_paged_d128_f32",
+                "flash_attn_paged_split_kv_d128_f32",
+                "flash_attn_split_kv_reduce_d128_f32",
+            ),
+            (256, false) => (
+                "flash_attn_paged_d256_f32",
+                "flash_attn_paged_split_kv_d256_f32",
+                "flash_attn_split_kv_reduce_d256_f32",
+            ),
+            (64, true) => (
+                "flash_attn_paged_d64_f32_p64",
+                "flash_attn_paged_split_kv_d64_f32_p64",
+                "flash_attn_split_kv_reduce_d64_f32_p64",
+            ),
+            (128, true) => (
+                "flash_attn_paged_d128_f32_p64",
+                "flash_attn_paged_split_kv_d128_f32_p64",
+                "flash_attn_split_kv_reduce_d128_f32_p64",
+            ),
+            (256, true) => (
+                "flash_attn_paged_d256_f32_p64",
+                "flash_attn_paged_split_kv_d256_f32_p64",
+                "flash_attn_split_kv_reduce_d256_f32_p64",
+            ),
             _ => return Ok(None),
         };
         if batch == 0 || n_heads == 0 || n_kv == 0 || seq_q == 0 {
             crate::bail!("vulkan flash_attn_paged_dsl: empty shape");
         }
-        let out = self.alloc_f32(batch * n_heads * seq_q * d)?;
+        let total_qh = batch * n_heads * seq_q;
+        let out = self.alloc_f32(total_qh * d)?;
         let scale_cfg = self.upload_f32(&[scale, softcap])?;
+        if seq_q <= 4 {
+            let max_ctx_est = if kv_layout == 2 {
+                max_blocks.max(1)
+            } else {
+                max_blocks.saturating_mul(block_size)
+            };
+            let num_splits = crate::flash_attn::choose_flash_split_kv(
+                batch,
+                n_heads,
+                seq_q,
+                d,
+                max_ctx_est,
+                sliding_window,
+            );
+            let partial_len = if num_splits > 1 {
+                total_qh * num_splits * (d + 2)
+            } else {
+                1
+            };
+            let partial_buf = self.alloc_f32(partial_len)?;
+            let meta = self.upload_u32(&[
+                seq_q as u32,
+                n_heads as u32,
+                n_kv as u32,
+                causal_mode,
+                block_size as u32,
+                max_blocks as u32,
+                kv_layout as u32,
+                x_vec as u32,
+                sliding_window as u32,
+                q_offset_override as u32,
+                0u32,
+                num_splits as u32,
+            ])?;
+            let split_blocks = (total_qh * num_splits) as u32;
+            self.dispatch_dsl_tracked(
+                split_artifact,
+                &[
+                    q.buffer,
+                    k_cache.buffer,
+                    v_cache.buffer,
+                    block_tables.buffer,
+                    context_lens.buffer,
+                    out.buffer,
+                    partial_buf.buffer,
+                    scale_cfg.buffer,
+                    meta.buffer,
+                ],
+                &[5, 6],
+                (split_blocks, 1, 1),
+                n_heads,
+                d,
+            )?;
+            if num_splits > 1 {
+                let rmeta = self.upload_u32(&[
+                    total_qh as u32,
+                    num_splits as u32,
+                    0u32,
+                    0u32,
+                ])?;
+                self.dispatch_dsl_tracked(
+                    reduce_artifact,
+                    &[partial_buf.buffer, out.buffer, rmeta.buffer],
+                    &[1],
+                    (total_qh as u32, 1, 1),
+                    n_heads,
+                    d,
+                )?;
+            }
+            return Ok(Some(out));
+        }
         let meta = self.upload_u32(&[
             seq_q as u32,
             n_heads as u32,

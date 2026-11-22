@@ -1125,6 +1125,496 @@ pub fn flash_attn_paged_run_as<E: Float + CubeElement, R: Runtime>(
     E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
 }
 
+/// Canonical DSL Split-KV paged & contiguous FlashAttention decode / small-query pass
+/// (`F = f32 | f16 | bf16`).
+///
+/// Eliminates the single-pass `flash_attn_paged` decode bottleneck (`br = 16` MMA padding waste +
+/// low threadgroup occupancy at `seq_q <= 4`) by launching one warp (`plane = 32` or `64` lanes)
+/// per `(query_row, kv_split)` across `b * n_heads * seq_q * num_splits` cubes:
+/// - Each lane `lane in 0..plane` holds `per_d = d / plane` strided query and output elements
+///   (`dd = e * plane + lane`) in private registers (`q_reg[per_d]`, `o_reg[per_d]`).
+/// - Coalesced warp loads across `dd = e * plane + lane` read `K` and `V` from any of the 3 KV
+///   cache layouts (`0 = FlatPaged4D`, `1 = EngineStandard5D4D`, `2 = Contiguous`), reducing the
+///   `Q · K` dot product across the warp via `plane_shuffle_xor` butterfly (`5` steps on Wave32,
+///   `6` steps on Wave64) with zero shared memory and zero threadgroup barriers on GPU.
+/// - Partitioning operates directly over the active causal + sliding-window span
+///   `[win_start, win_end)`, so every split processes only valid keys with zero wasted iterations.
+/// - When `num_splits == 1`, normalizes `o_reg / l_acc` and writes `out` directly in a single pass.
+/// - When `num_splits > 1`, writes unnormalized `o_reg[0..d]`, `m_acc`, and `l_acc` into
+///   `partial_buf[(qh_idx * num_splits + split_idx) * (d + 2) ..]` (`f32`), followed by
+///   [`flash_attn_split_kv_reduce`].
+///
+/// `scale_cfg = [scale, softcap]`.
+/// `meta = [seq_q, n_heads, n_kv, causal, block_size, max_blocks, kv_layout, x_vec,
+///          sliding_window, q_offset_override, cube_base, num_splits]`.
+#[allow(clippy::too_many_arguments, unused_assignments)]
+#[kernel(targets(cuda, rocm, vulkan, metal, cpu), unchecked)]
+pub fn flash_attn_paged_split_kv<F: Float>(
+    q: &Array<F>,
+    k_cache: &Array<F>,
+    v_cache: &Array<F>,
+    block_tables: &Array<u32>,
+    context_lens: &Array<u32>,
+    out: &mut Array<F>,
+    partial_buf: &mut Array<f32>,
+    scale_cfg: &Array<f32>,
+    meta: &Array<u32>,
+    #[comptime] d: usize,
+    #[comptime] plane: usize,
+    #[comptime] target: Target,
+) {
+    let cube = CUBE_POS as usize + meta[10] as usize;
+    let lane = UNIT_POS as usize;
+    let sc = scale_cfg[0];
+    let softcap = scale_cfg[1];
+
+    let seq_q = meta[0] as usize;
+    let n_heads = meta[1] as usize;
+    let n_kv = meta[2] as usize;
+    let causal = meta[3];
+    let block_size = meta[4] as usize;
+    let max_blocks = meta[5] as usize;
+    let kv_layout = meta[6] as usize;
+    let x_vec = meta[7] as usize;
+    let sliding_window = meta[8] as usize;
+    let q_offset_override = meta[9] as usize;
+    let num_splits = meta[11] as usize;
+
+    let qh_idx = cube / num_splits;
+    let split_idx = cube % num_splits;
+    let qpos = qh_idx % seq_q;
+    let bh = qh_idx / seq_q;
+    let h = bh % n_heads;
+    let b_i = bh / n_heads;
+    let kv = h / (n_heads / n_kv);
+
+    let ctx_len = context_lens[b_i] as usize;
+    let mut q_offset = 0usize;
+    if causal == 2u32 {
+        q_offset = q_offset_override;
+    } else if ctx_len >= seq_q {
+        q_offset = ctx_len - seq_q;
+    }
+    let q_abs = q_offset + qpos;
+
+    let mut win_end = ctx_len;
+    if causal != 0u32 {
+        let c_end = q_abs + 1usize;
+        if c_end < win_end {
+            win_end = c_end;
+        }
+    }
+    let mut win_start = 0usize;
+    if sliding_window > 0usize && q_abs + 1usize > sliding_window {
+        win_start = q_abs + 1usize - sliding_window;
+    }
+    if win_start > win_end {
+        win_start = win_end;
+    }
+
+    let active_len = win_end - win_start;
+    let chunk = (active_len + num_splits - 1usize) / num_splits;
+    let mut k_start = win_start + split_idx * chunk;
+    if k_start > win_end {
+        k_start = win_end;
+    }
+    let mut k_end = k_start + chunk;
+    if k_end > win_end {
+        k_end = win_end;
+    }
+
+    let per_d = comptime!(d / plane);
+    let q_base = qh_idx * d;
+    let mut q_reg = Array::<f32>::new(per_d);
+    let mut o_reg = Array::<f32>::new(per_d);
+    for e in 0..per_d {
+        let dd = e * plane + lane;
+        q_reg[e] = f32::cast_from(q[q_base + dd]);
+        o_reg[e] = 0.0f32;
+    }
+
+    let mut m_acc = f32::new(-3.4e38f32);
+    let mut l_acc = f32::new(0.0f32);
+
+    for kpos in k_start..k_end {
+        let mut dot = 0.0f32;
+        for e in 0..per_d {
+            let dd = e * plane + lane;
+            let kv_val = f32::cast_from(load_paged_k(
+                k_cache,
+                block_tables,
+                b_i,
+                kv,
+                kpos,
+                dd,
+                n_kv,
+                block_size,
+                max_blocks,
+                kv_layout,
+                x_vec,
+                d,
+            ));
+            dot += q_reg[e] * kv_val;
+        }
+        let mut s = 0.0f32;
+        island! {
+            cuda | rocm | vulkan | metal => {
+                let plane_u = comptime!(plane as u32);
+                let mut sum = dot;
+                let mut off = 1u32;
+                while off < plane_u {
+                    sum += plane_shuffle_xor(sum, off);
+                    off *= 2u32;
+                }
+                s = sum * sc;
+            }
+            default => {
+                let mut dsh = SharedMemory::<f32>::new(plane);
+                dsh[lane] = dot;
+                sync_cube();
+                let mut sum = 0.0f32;
+                for l in 0..plane {
+                    sum += dsh[l];
+                }
+                s = sum * sc;
+                sync_cube();
+            }
+        };
+        if softcap > 0.0f32 {
+            s = softcap * (s / softcap).tanh();
+        }
+        let mut m_new = m_acc;
+        if s > m_new {
+            m_new = s;
+        }
+        let alpha = (m_acc - m_new).exp();
+        let p = (s - m_new).exp();
+        l_acc = l_acc * alpha + p;
+        m_acc = m_new;
+        for e in 0..per_d {
+            let dd = e * plane + lane;
+            let vv = f32::cast_from(load_paged_v(
+                v_cache,
+                block_tables,
+                b_i,
+                kv,
+                kpos,
+                dd,
+                n_kv,
+                block_size,
+                max_blocks,
+                kv_layout,
+                d,
+            ));
+            o_reg[e] = o_reg[e] * alpha + p * vv;
+        }
+    }
+
+    if num_splits == 1usize {
+        let mut inv_l = 0.0f32;
+        if l_acc > 0.0f32 {
+            inv_l = 1.0f32 / l_acc;
+        }
+        for e in 0..per_d {
+            let dd = e * plane + lane;
+            out[q_base + dd] = F::cast_from(o_reg[e] * inv_l);
+        }
+    } else {
+        let p_base = (qh_idx * num_splits + split_idx) * (d + 2usize);
+        for e in 0..per_d {
+            let dd = e * plane + lane;
+            partial_buf[p_base + dd] = o_reg[e];
+        }
+        if lane == 0usize {
+            partial_buf[p_base + d] = m_acc;
+            partial_buf[p_base + d + 1usize] = l_acc;
+        }
+    }
+}
+
+/// Second-pass numerically stable online-softmax merge for [`flash_attn_paged_split_kv`].
+///
+/// Grid = `total_qh = b * n_heads * seq_q` cubes, block = `plane` threads (`32` or `64`).
+/// Each lane `lane in 0..plane` merges its `per_d = d / plane` head dimensions (`dd = e * plane + lane`)
+/// across `s in 0..num_splits` using `f32` log-sum-exp rescaling and casts the final normalized
+/// output to `F`.
+///
+/// `meta = [total_qh, num_splits, cube_base, 0]`.
+#[kernel(targets(cuda, rocm, vulkan, metal, cpu), unchecked)]
+pub fn flash_attn_split_kv_reduce<F: Float>(
+    partial_buf: &Array<f32>,
+    out: &mut Array<F>,
+    meta: &Array<u32>,
+    #[comptime] d: usize,
+    #[comptime] plane: usize,
+) {
+    let cube = CUBE_POS as usize + meta[2] as usize;
+    let lane = UNIT_POS as usize;
+    let total_qh = meta[0] as usize;
+    let num_splits = meta[1] as usize;
+    let per_d = comptime!(d / plane);
+
+    if cube < total_qh {
+        let mut m_acc = f32::new(-3.4e38f32);
+        let mut l_acc = f32::new(0.0f32);
+        let mut o_reg = Array::<f32>::new(per_d);
+        for e in 0..per_d {
+            o_reg[e] = 0.0f32;
+        }
+        let stride = d + 2usize;
+        let qh_base = cube * num_splits * stride;
+        for s in 0..num_splits {
+            let p_base = qh_base + s * stride;
+            let m_s = partial_buf[p_base + d];
+            let l_s = partial_buf[p_base + d + 1usize];
+            if l_s > 0.0f32 {
+                let mut m_new = m_acc;
+                if m_s > m_new {
+                    m_new = m_s;
+                }
+                let scale_prev = (m_acc - m_new).exp();
+                let scale_curr = (m_s - m_new).exp();
+                l_acc = l_acc * scale_prev + l_s * scale_curr;
+                for e in 0..per_d {
+                    let dd = e * plane + lane;
+                    o_reg[e] = o_reg[e] * scale_prev + partial_buf[p_base + dd] * scale_curr;
+                }
+                m_acc = m_new;
+            }
+        }
+        let mut inv_l = 0.0f32;
+        if l_acc > 0.0f32 {
+            inv_l = 1.0f32 / l_acc;
+        }
+        let out_base = cube * d;
+        for e in 0..per_d {
+            let dd = e * plane + lane;
+            out[out_base + dd] = F::cast_from(o_reg[e] * inv_l);
+        }
+    }
+}
+
+/// Host launch for [`flash_attn_paged_split_kv`] (+ [`flash_attn_split_kv_reduce`] when
+/// `num_splits > 1`) over any `CubeElement + Float` (`f32`, `f16`, `bf16`).
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_paged_split_kv_run_as<E: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    q: &[E],
+    k_cache: &[E],
+    v_cache: &[E],
+    block_tables: &[u32],
+    context_lens: &[u32],
+    b: usize,
+    n_heads: usize,
+    n_kv: usize,
+    seq_q: usize,
+    d: usize,
+    num_splits: usize,
+    causal: u32,
+    block_size: usize,
+    max_blocks: usize,
+    kv_layout: usize,
+    x_vec: usize,
+    sliding_window: usize,
+    q_offset_override: usize,
+    scale: f32,
+    softcap: f32,
+) -> Vec<E> {
+    let num_splits = num_splits.max(1);
+    let hw_plane = if std::env::var_os("HANZO_KERNEL_GEN_P64").is_some() {
+        64
+    } else {
+        client.properties().hardware.plane_size_max as usize
+    };
+    let plane = if hw_plane == 64 { 64 } else { 32 };
+    let target = Target::of(client);
+    let total_qh = b * n_heads * seq_q;
+    let split_cubes = total_qh * num_splits;
+    let out_len = total_qh * d;
+    let partial_len = if num_splits > 1 {
+        split_cubes * (d + 2)
+    } else {
+        1
+    };
+
+    let qh = client.create_from_slice(E::as_bytes(q));
+    let kh = client.create_from_slice(E::as_bytes(k_cache));
+    let vh = client.create_from_slice(E::as_bytes(v_cache));
+    let bth = client.create_from_slice(u32::as_bytes(block_tables));
+    let clh = client.create_from_slice(u32::as_bytes(context_lens));
+    let oh = client.create_from_slice(E::as_bytes(&vec![E::from_int(0); out_len]));
+    let ph = client.create_from_slice(f32::as_bytes(&vec![0.0f32; partial_len]));
+    let sch = client.create_from_slice(f32::as_bytes(&[scale, softcap]));
+
+    let meta = |cube_base: usize| -> [u32; 12] {
+        [
+            seq_q as u32,
+            n_heads as u32,
+            n_kv as u32,
+            causal,
+            block_size as u32,
+            max_blocks as u32,
+            kv_layout as u32,
+            x_vec as u32,
+            sliding_window as u32,
+            q_offset_override as u32,
+            cube_base as u32,
+            num_splits as u32,
+        ]
+    };
+
+    if target == Target::Cpu {
+        for c_idx in 0..split_cubes {
+            let mh = client.create_from_slice(u32::as_bytes(&meta(c_idx)));
+            unsafe {
+                flash_attn_paged_split_kv::launch_unchecked::<E, R>(
+                    client,
+                    Grid::Static(1, 1, 1),
+                    Block::new_1d(plane as u32),
+                    ArrayArg::from_raw_parts(qh.clone(), q.len()),
+                    ArrayArg::from_raw_parts(kh.clone(), k_cache.len()),
+                    ArrayArg::from_raw_parts(vh.clone(), v_cache.len()),
+                    ArrayArg::from_raw_parts(bth.clone(), block_tables.len()),
+                    ArrayArg::from_raw_parts(clh.clone(), context_lens.len()),
+                    ArrayArg::from_raw_parts(oh.clone(), out_len),
+                    ArrayArg::from_raw_parts(ph.clone(), partial_len),
+                    ArrayArg::from_raw_parts(sch.clone(), 2),
+                    ArrayArg::from_raw_parts(mh.clone(), 12),
+                    d,
+                    plane,
+                    target,
+                );
+            }
+        }
+        if num_splits > 1 {
+            for c_idx in 0..total_qh {
+                let rmh = client.create_from_slice(u32::as_bytes(&[
+                    total_qh as u32,
+                    num_splits as u32,
+                    c_idx as u32,
+                    0u32,
+                ]));
+                unsafe {
+                    flash_attn_split_kv_reduce::launch_unchecked::<E, R>(
+                        client,
+                        Grid::Static(1, 1, 1),
+                        Block::new_1d(plane as u32),
+                        ArrayArg::from_raw_parts(ph.clone(), partial_len),
+                        ArrayArg::from_raw_parts(oh.clone(), out_len),
+                        ArrayArg::from_raw_parts(rmh.clone(), 4),
+                        d,
+                        plane,
+                    );
+                }
+            }
+        }
+    } else {
+        let mh = client.create_from_slice(u32::as_bytes(&meta(0)));
+        unsafe {
+            flash_attn_paged_split_kv::launch_unchecked::<E, R>(
+                client,
+                Grid::Static(split_cubes as u32, 1, 1),
+                Block::new_1d(plane as u32),
+                ArrayArg::from_raw_parts(qh.clone(), q.len()),
+                ArrayArg::from_raw_parts(kh.clone(), k_cache.len()),
+                ArrayArg::from_raw_parts(vh.clone(), v_cache.len()),
+                ArrayArg::from_raw_parts(bth.clone(), block_tables.len()),
+                ArrayArg::from_raw_parts(clh.clone(), context_lens.len()),
+                ArrayArg::from_raw_parts(oh.clone(), out_len),
+                ArrayArg::from_raw_parts(ph.clone(), partial_len),
+                ArrayArg::from_raw_parts(sch.clone(), 2),
+                ArrayArg::from_raw_parts(mh.clone(), 12),
+                d,
+                plane,
+                target,
+            );
+        }
+        if num_splits > 1 {
+            let rmh = client.create_from_slice(u32::as_bytes(&[
+                total_qh as u32,
+                num_splits as u32,
+                0u32,
+                0u32,
+            ]));
+            unsafe {
+                flash_attn_split_kv_reduce::launch_unchecked::<E, R>(
+                    client,
+                    Grid::Static(total_qh as u32, 1, 1),
+                    Block::new_1d(plane as u32),
+                    ArrayArg::from_raw_parts(ph.clone(), partial_len),
+                    ArrayArg::from_raw_parts(oh.clone(), out_len),
+                    ArrayArg::from_raw_parts(rmh.clone(), 4),
+                    d,
+                    plane,
+                );
+            }
+        }
+    }
+    E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
+/// Standalone host launch for [`flash_attn_split_kv_reduce`] (`F = f32 | f16 | bf16`).
+pub fn flash_attn_split_kv_reduce_run_as<E: Float + CubeElement, R: Runtime>(
+    client: &ComputeClient<R>,
+    partial_buf: &[f32],
+    total_qh: usize,
+    num_splits: usize,
+    d: usize,
+) -> Vec<E> {
+    let hw_plane = if std::env::var_os("HANZO_KERNEL_GEN_P64").is_some() {
+        64
+    } else {
+        client.properties().hardware.plane_size_max as usize
+    };
+    let plane = if hw_plane == 64 { 64 } else { 32 };
+    let target = Target::of(client);
+    let out_len = total_qh * d;
+    let ph = client.create_from_slice(f32::as_bytes(partial_buf));
+    let oh = client.create_from_slice(E::as_bytes(&vec![E::from_int(0); out_len]));
+    if target == Target::Cpu {
+        for c_idx in 0..total_qh {
+            let rmh = client.create_from_slice(u32::as_bytes(&[
+                total_qh as u32,
+                num_splits as u32,
+                c_idx as u32,
+                0u32,
+            ]));
+            unsafe {
+                flash_attn_split_kv_reduce::launch_unchecked::<E, R>(
+                    client,
+                    Grid::Static(1, 1, 1),
+                    Block::new_1d(plane as u32),
+                    ArrayArg::from_raw_parts(ph.clone(), partial_buf.len()),
+                    ArrayArg::from_raw_parts(oh.clone(), out_len),
+                    ArrayArg::from_raw_parts(rmh.clone(), 4),
+                    d,
+                    plane,
+                );
+            }
+        }
+    } else {
+        let rmh = client.create_from_slice(u32::as_bytes(&[
+            total_qh as u32,
+            num_splits as u32,
+            0u32,
+            0u32,
+        ]));
+        unsafe {
+            flash_attn_split_kv_reduce::launch_unchecked::<E, R>(
+                client,
+                Grid::Static(total_qh as u32, 1, 1),
+                Block::new_1d(plane as u32),
+                ArrayArg::from_raw_parts(ph.clone(), partial_buf.len()),
+                ArrayArg::from_raw_parts(oh.clone(), out_len),
+                ArrayArg::from_raw_parts(rmh.clone(), 4),
+                d,
+                plane,
+            );
+        }
+    }
+    E::from_bytes(&client.read_one_unchecked(oh)).to_vec()
+}
+
 /// Exact f64 CPU oracle for [`flash_attn_paged`] across all 3 KV layouts, GQA, variable
 /// `context_lens`, causal `q_offset`, sliding window, and softcapping.
 #[allow(clippy::too_many_arguments)]
@@ -1831,6 +2321,42 @@ mod tests {
                 "flash_attn_paged {tag} f32 failed: rel={rel:.3e}"
             );
 
+            if seq_q <= 4 {
+                for num_splits in [1usize, 4, 16] {
+                    let got_skv = flash_attn_paged_split_kv_run_as::<f32, R>(
+                        c,
+                        &q,
+                        &k_cache,
+                        &v_cache,
+                        &block_tables,
+                        &ctx_lens,
+                        b,
+                        n_heads,
+                        n_kv,
+                        seq_q,
+                        d,
+                        num_splits,
+                        1,
+                        block_size,
+                        max_blocks,
+                        layout,
+                        x_vec,
+                        window,
+                        0,
+                        scale,
+                        softcap,
+                    );
+                    let rel_skv = scale_rel(&want, &got_skv);
+                    eprintln!(
+                        "[flash_split_kv {tag} f32] d={d:3} sq={seq_q} splits={num_splits:2} layout={layout} win={window:2} cap={softcap:.0} rel={rel_skv:.2e}"
+                    );
+                    assert!(
+                        rel_skv < 1e-4,
+                        "flash_attn_paged_split_kv {tag} f32 (splits={num_splits}) failed: rel={rel_skv:.3e}"
+                    );
+                }
+            }
+
             // BF16 & F16 verification on Standard Engine 5D layout (x_vec=8 for 2-byte dtypes)
             if test_half && layout == 1 && d == 128 {
                 let x_vec_16 = 8usize;
@@ -1891,6 +2417,41 @@ mod tests {
                     rel_h < 2e-2,
                     "flash_attn_paged {tag} f16 failed: rel={rel_h:.3e}"
                 );
+                if seq_q <= 4 {
+                    for num_splits in [1usize, 4] {
+                        let got_skv_h = flash_attn_paged_split_kv_run_as::<half::f16, R>(
+                            c,
+                            &q_h,
+                            &k_h,
+                            &v_h,
+                            &block_tables,
+                            &ctx_lens,
+                            b,
+                            n_heads,
+                            n_kv,
+                            seq_q,
+                            d,
+                            num_splits,
+                            1,
+                            block_size,
+                            max_blocks,
+                            1,
+                            x_vec_16,
+                            window,
+                            0,
+                            scale,
+                            softcap,
+                        );
+                        let rel_skv_h = scale_rel(
+                            &want_h,
+                            &got_skv_h.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+                        );
+                        assert!(
+                            rel_skv_h < 5e-3,
+                            "flash_attn_paged_split_kv {tag} f16 (splits={num_splits}) failed: rel={rel_skv_h:.3e}"
+                        );
+                    }
+                }
 
                 let q_b: Vec<half::bf16> = q.iter().map(|&v| half::bf16::from_f32(v)).collect();
                 let k_b: Vec<half::bf16> =
@@ -1951,7 +2512,106 @@ mod tests {
                     rel_b < 2e-2,
                     "flash_attn_paged {tag} bf16 failed: rel={rel_b:.3e}"
                 );
+                if seq_q <= 4 {
+                    for num_splits in [1usize, 4] {
+                        let got_skv_b = flash_attn_paged_split_kv_run_as::<half::bf16, R>(
+                            c,
+                            &q_b,
+                            &k_b,
+                            &v_b,
+                            &block_tables,
+                            &ctx_lens,
+                            b,
+                            n_heads,
+                            n_kv,
+                            seq_q,
+                            d,
+                            num_splits,
+                            1,
+                            block_size,
+                            max_blocks,
+                            1,
+                            x_vec_16,
+                            window,
+                            0,
+                            scale,
+                            softcap,
+                        );
+                        let rel_skv_b = scale_rel(
+                            &want_b,
+                            &got_skv_b.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+                        );
+                        assert!(
+                            rel_skv_b < 2e-2,
+                            "flash_attn_paged_split_kv {tag} bf16 (splits={num_splits}) failed: rel={rel_skv_b:.3e}"
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn flash_attn_paged_split_kv_cpu_exact() {
+        use cubecl::cpu::{CpuDevice, CpuRuntime};
+        let c = CpuRuntime::client(&CpuDevice::default());
+        let (b, n_heads, n_kv, seq_q, d, block_size, max_blocks, x_vec) =
+            (1usize, 2usize, 1usize, 1usize, 64usize, 16usize, 3usize, 4usize);
+        let q = rnd(b * n_heads * seq_q * d, 0x7101);
+        let k_cache = rnd(max_blocks * n_kv * block_size * d, 0x7102);
+        let v_cache = rnd(max_blocks * n_kv * block_size * d, 0x7103);
+        let block_tables = vec![2u32, 0, 1];
+        let ctx_lens = vec![35u32];
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let want = flash_attn_paged_ref(
+            &q,
+            &k_cache,
+            &v_cache,
+            &block_tables,
+            &ctx_lens,
+            b,
+            n_heads,
+            n_kv,
+            seq_q,
+            d,
+            1,
+            block_size,
+            max_blocks,
+            1,
+            x_vec,
+            16,
+            0,
+            scale,
+            30.0,
+        );
+        for num_splits in [1usize, 2] {
+            let got = flash_attn_paged_split_kv_run_as::<f32, CpuRuntime>(
+                &c,
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &ctx_lens,
+                b,
+                n_heads,
+                n_kv,
+                seq_q,
+                d,
+                num_splits,
+                1,
+                block_size,
+                max_blocks,
+                1,
+                x_vec,
+                16,
+                0,
+                scale,
+                30.0,
+            );
+            let rel = scale_rel(&want, &got);
+            eprintln!("[flash_split_kv CPU f32] d=64 splits={num_splits} rel={rel:.2e}");
+            assert!(rel < 1e-5, "CPU split_kv rel={rel:.3e}");
         }
     }
 

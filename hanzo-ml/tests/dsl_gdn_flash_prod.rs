@@ -665,19 +665,133 @@ fn run_flash_suite(dev: &Device, dtypes: &[DType], label: &str) {
         let err = rel_err(&got, &ref_c);
         eprintln!("[{label} flash_contig {dtype:?}] d=128 sq=7 sk=37 rel={err:.2e}");
         assert!(err <= tol, "flash_contig err {err:.2e} > {tol:.2e}");
+
+        // Long-context Split-KV decode & speculative-verify (seq_q in {1, 3}, seq_k = 512 -> num_splits = 8)
+        for &(d, seq_q, win, cap) in &[
+            (64usize, 1usize, 0usize, 0.0f32),
+            (128usize, 1usize, 0usize, 0.0f32),
+            (128usize, 3usize, 128usize, 30.0f32),
+            (256usize, 1usize, 0usize, 0.0f32),
+        ] {
+            let (batch, n_heads, n_kv, seq_k) = (1usize, 8usize, 2usize, 512usize);
+            let q_v = pseudo_vec(batch * n_heads * seq_q * d, (7771 + d + seq_q) as u64, 0.4);
+            let k_v = pseudo_vec(batch * n_kv * seq_k * d, (7772 + d) as u64, 0.4);
+            let v_v = pseudo_vec(batch * n_kv * seq_k * d, (7773 + d) as u64, 0.4);
+            let cfg = FlashAttnConfig {
+                scale: 1.0 / (d as f32).sqrt(),
+                softcap: cap,
+                causal_mode: 1,
+                sliding_window: win,
+                q_offset_override: 0,
+            };
+            let q = Tensor::from_vec(q_v, (batch, n_heads, seq_q, d), dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let k = Tensor::from_vec(k_v, (batch, n_kv, seq_k, d), dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let v = Tensor::from_vec(v_v, (batch, n_kv, seq_k, d), dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let q_rt = q.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let k_rt = k.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let v_rt = v.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let bt_c = vec![0u32];
+            let cl_c = vec![seq_k as u32];
+            let ref_skv = flash_paged_ref(
+                &q_rt, &k_rt, &v_rt, &bt_c, &cl_c, batch, n_heads, n_kv, seq_q, d, seq_k, 1, cfg,
+            );
+            let out_skv = try_flash_attn_contiguous(&q, &k, &v, cfg)
+                .unwrap()
+                .expect("DSL Split-KV flash_attn_contiguous should dispatch");
+            let got_skv = out_skv
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let err_skv = rel_err(&got_skv, &ref_skv);
+            eprintln!(
+                "[{label} flash_split_kv {dtype:?}] d={d:3} sq={seq_q} sk={seq_k} win={win:3} cap={cap:2.0} rel={err_skv:.2e}"
+            );
+            if err_skv > tol {
+                for qh in 0..(batch * n_heads * seq_q) {
+                    let s = qh * d;
+                    let e = rel_err(&got_skv[s..s + d], &ref_skv[s..s + d]);
+                    eprintln!("  qh={qh:2} rel={e:.2e} got0..4={:?} ref0..4={:?}", &got_skv[s..s+4], &ref_skv[s..s+4]);
+                }
+            }
+            assert!(err_skv <= tol, "flash_split_kv err {err_skv:.2e} > {tol:.2e}");
+
+            // Zero-copy strided KV cache view (narrowed dim=2 from capacity=1024 to seq_k=512)
+            let cap_seq = 1024usize;
+            let k_cap = Tensor::from_vec(
+                pseudo_vec(batch * n_kv * cap_seq * d, (7872 + d) as u64, 0.4),
+                (batch, n_kv, cap_seq, d),
+                dev,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let v_cap = Tensor::from_vec(
+                pseudo_vec(batch * n_kv * cap_seq * d, (7873 + d) as u64, 0.4),
+                (batch, n_kv, cap_seq, d),
+                dev,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let k_zc = k_cap.narrow(2, 0, seq_k).unwrap();
+            let v_zc = v_cap.narrow(2, 0, seq_k).unwrap();
+            assert!(!k_zc.is_contiguous(), "narrowed GQA KV cache view must be strided");
+            let k_zc_contig = k_zc.contiguous().unwrap();
+            let v_zc_contig = v_zc.contiguous().unwrap();
+            let out_zc = try_flash_attn_contiguous(&q, &k_zc, &v_zc, cfg)
+                .unwrap()
+                .expect("zero-copy strided Split-KV must dispatch");
+            let out_zc_ref = try_flash_attn_contiguous(&q, &k_zc_contig, &v_zc_contig, cfg)
+                .unwrap()
+                .unwrap();
+            let got_zc = out_zc.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let got_zc_ref = out_zc_ref.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let err_zc = rel_err(&got_zc, &got_zc_ref);
+            if err_zc > 1e-6 {
+                for qh in 0..(batch * n_heads * seq_q) {
+                    let s = qh * d;
+                    let e = rel_err(&got_zc[s..s + d], &got_zc_ref[s..s + d]);
+                    eprintln!("  ZC qh={qh:2} rel={e:.2e} got0..4={:?} ref0..4={:?}", &got_zc[s..s+4], &got_zc_ref[s..s+4]);
+                }
+            }
+            assert!(err_zc <= 1e-6, "zero-copy strided Split-KV mismatch {err_zc:.2e}");
+        }
     }
 
     let stats = dsl::stats();
     let f_compiles = stats.compiles_of("flash_attn_paged_d128_f32")
         + stats.compiles_of("flash_attn_paged_d128_f32_p64");
-    assert_eq!(f_compiles, 1, "must compile exactly once");
+    assert_eq!(f_compiles, 1, "flash_attn_paged_d128_f32 must compile exactly once");
+    let skv_compiles = stats.compiles_of("flash_attn_paged_split_kv_d128_f32")
+        + stats.compiles_of("flash_attn_paged_split_kv_d128_f32_p64");
+    assert_eq!(skv_compiles, 1, "flash_attn_paged_split_kv_d128_f32 must compile exactly once");
+    let red_compiles = stats.compiles_of("flash_attn_split_kv_reduce_d128_f32")
+        + stats.compiles_of("flash_attn_split_kv_reduce_d128_f32_p64");
+    assert_eq!(red_compiles, 1, "flash_attn_split_kv_reduce_d128_f32 must compile exactly once");
     let f_calls: u64 = stats
         .dispatches
         .iter()
-        .filter(|d| d.1 == "flash_attn_paged_d128_f32" || d.1 == "flash_attn_paged_d128_f32_p64")
+        .filter(|d| {
+            d.1 == "flash_attn_paged_d128_f32"
+                || d.1 == "flash_attn_paged_d128_f32_p64"
+                || d.1 == "flash_attn_paged_split_kv_d128_f32"
+                || d.1 == "flash_attn_paged_split_kv_d128_f32_p64"
+        })
         .map(|d| d.4)
         .sum();
-    assert!(f_calls >= 4, "must have dispatched >= 4 calls");
+    assert!(f_calls >= 6, "must have dispatched >= 6 d128 flash calls");
 
     dsl::set_flash_impl(QkImpl::Legacy);
 }
