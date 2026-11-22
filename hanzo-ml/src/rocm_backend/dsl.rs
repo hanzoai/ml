@@ -654,7 +654,8 @@ impl RocmDevice {
             } else {
                 max_blocks.saturating_mul(block_size)
             };
-            let num_splits = crate::flash_attn::choose_flash_split_kv(
+            let num_splits = crate::flash_attn::choose_flash_split_kv_for(
+                crate::quantized::dsl::QkBackend::Rocm,
                 batch,
                 n_heads,
                 seq_q,
