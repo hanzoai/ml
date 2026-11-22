@@ -30,7 +30,7 @@ fn ensure_contiguous_offset_zero(t: &Tensor) -> Result<Tensor> {
     if t.is_contiguous() && t.layout().start_offset() == 0 {
         Ok(t.clone())
     } else {
-        t.contiguous()
+        t.force_contiguous()
     }
 }
 
