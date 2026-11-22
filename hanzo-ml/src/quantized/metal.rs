@@ -182,6 +182,14 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockPTQ1_0> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockPTQ1_0::to_float(&vec, &mut out);
             }
+            GgmlDType::Q1_0 => {
+                let vec: Vec<crate::quantized::BlockQ1_0> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockQ1_0::to_float(&vec, &mut out);
+            }
+            GgmlDType::Q2_0 => {
+                let vec: Vec<crate::quantized::BlockQ2_0> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockQ2_0::to_float(&vec, &mut out);
+            }
             // dbc-validation: dequant-to-float not wired for these newer ternary/FP4
             // codecs on the Metal readback path (GAP in source). Bail honestly rather
             // than silently mis-decode. Q8_0/Q4_K (the validated models) have arms above.
@@ -535,6 +543,8 @@ impl QMetalStorage {
                     | hanzo_metal_kernels::GgmlDType::Q6K
                     | hanzo_metal_kernels::GgmlDType::PQ2_0
                     | hanzo_metal_kernels::GgmlDType::PTQ1_0
+                    | hanzo_metal_kernels::GgmlDType::Q1_0
+                    | hanzo_metal_kernels::GgmlDType::Q2_0
             );
         let out_dtype = if src1_bf16 { DType::BF16 } else { DType::F32 };
         let dst = device
@@ -648,6 +658,8 @@ impl QMetalStorage {
                     | hanzo_metal_kernels::GgmlDType::Q6K
                     | hanzo_metal_kernels::GgmlDType::PQ2_0
                     | hanzo_metal_kernels::GgmlDType::PTQ1_0
+                    | hanzo_metal_kernels::GgmlDType::Q1_0
+                    | hanzo_metal_kernels::GgmlDType::Q2_0
             );
         let out_dtype = if src1_bf16 { DType::BF16 } else { DType::F32 };
         let dst = device
@@ -1011,9 +1023,116 @@ impl TryFrom<GgmlDType> for hanzo_metal_kernels::GgmlDType {
             GgmlDType::IQ4_XS => hanzo_metal_kernels::GgmlDType::IQ4_XS,
             GgmlDType::PQ2_0 => hanzo_metal_kernels::GgmlDType::PQ2_0,
             GgmlDType::PTQ1_0 => hanzo_metal_kernels::GgmlDType::PTQ1_0,
+            GgmlDType::Q1_0 => hanzo_metal_kernels::GgmlDType::Q1_0,
+            GgmlDType::Q2_0 => hanzo_metal_kernels::GgmlDType::Q2_0,
             #[allow(unreachable_patterns)]
             other => crate::bail!("no Metal quantized kernel for dtype {other:?}"),
         };
         Ok(dt)
     }
+}
+
+pub fn hadamard_fwht(
+    x: &crate::Tensor,
+    signs: Option<&crate::Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+    out_dtype: DType,
+) -> Result<crate::Tensor> {
+    use crate::MetalError;
+
+    let orig_shape = x.shape().clone();
+    let Some(&width) = orig_shape.dims().last() else {
+        crate::bail!("hadamard_fwht expects rank >= 1");
+    };
+    let elem_count = orig_shape.elem_count();
+    let total_blocks = elem_count / block_size;
+    let x = x.contiguous()?;
+    if total_blocks == 0 {
+        return x.to_dtype(out_dtype);
+    }
+
+    let signs_contig = match signs {
+        Some(s) => {
+            if s.elem_count() != width {
+                crate::bail!(
+                    "hadamard_fwht signs len {} != width {width}",
+                    s.elem_count()
+                );
+            }
+            let s_f32 = if s.dtype() == DType::F32 {
+                s.contiguous()?
+            } else {
+                s.to_dtype(DType::F32)?.contiguous()?
+            };
+            Some(s_f32)
+        }
+        None => None,
+    };
+
+    let map_dtype = |dt: DType| -> Result<hanzo_metal_kernels::DType> {
+        match dt {
+            DType::F32 => Ok(hanzo_metal_kernels::DType::F32),
+            DType::F16 => Ok(hanzo_metal_kernels::DType::F16),
+            DType::BF16 => Ok(hanzo_metal_kernels::DType::BF16),
+            other => crate::bail!("hadamard_fwht unsupported dtype {other:?}"),
+        }
+    };
+    let in_kdt = map_dtype(x.dtype())?;
+    let out_kdt = map_dtype(out_dtype)?;
+
+    let (x_store, x_layout) = x.storage_and_layout();
+    let crate::Storage::Metal(x_metal) = &*x_store else {
+        crate::bail!("hadamard_fwht requires a Metal tensor");
+    };
+    let device = x_metal.device().clone();
+    let x_offset = x_layout.start_offset() * x.dtype().size_in_bytes();
+
+    let signs_guard = signs_contig.as_ref().map(|s| s.storage_and_layout());
+    let signs_arg = if let Some((s_store, s_layout)) = signs_guard.as_ref() {
+        let crate::Storage::Metal(s_metal) = &**s_store else {
+            crate::bail!("hadamard_fwht signs must be on Metal");
+        };
+        Some((
+            s_metal.buffer(),
+            s_layout.start_offset() * DType::F32.size_in_bytes(),
+        ))
+    } else {
+        None
+    };
+
+    let dst = device
+        .new_buffer_builder()
+        .with_size_for(elem_count, out_dtype)
+        .with_label("hadamard_fwht")
+        .build()?;
+    {
+        let encoder = device.command_encoder()?;
+        hanzo_metal_kernels::call_hadamard_fwht(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            in_kdt,
+            out_kdt,
+            x_metal.buffer(),
+            x_offset,
+            signs_arg,
+            &dst,
+            0,
+            block_size,
+            width,
+            is_inverse,
+            total_blocks,
+        )
+        .map_err(MetalError::from)?;
+    }
+    drop(signs_guard);
+    drop(x_store);
+    let out_storage = MetalStorage::new(dst, device, elem_count, out_dtype);
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Metal(out_storage),
+        orig_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
 }

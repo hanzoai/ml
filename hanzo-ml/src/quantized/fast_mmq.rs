@@ -45,6 +45,8 @@ fn supports(dtype: GgmlDType) -> bool {
             | GgmlDType::IQ1_S
             | GgmlDType::PQ2_0
             | GgmlDType::PTQ1_0
+            | GgmlDType::Q1_0
+            | GgmlDType::Q2_0
     )
 }
 
@@ -54,7 +56,8 @@ fn qk_for(dtype: GgmlDType) -> usize {
         GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 | GgmlDType::Q8_0 => {
             32
         }
-        GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 => 128,
+        GgmlDType::Q2_0 => 64,
+        GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 | GgmlDType::Q1_0 => 128,
         GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => 256,
         GgmlDType::IQ2_XXS
         | GgmlDType::IQ2_XS
@@ -92,7 +95,9 @@ fn ds_layout_for(dtype: GgmlDType) -> DsLayout {
         | GgmlDType::IQ3_S
         | GgmlDType::IQ4_XS
         | GgmlDType::PQ2_0
-        | GgmlDType::PTQ1_0 => DsLayout::D4,
+        | GgmlDType::PTQ1_0
+        | GgmlDType::Q1_0
+        | GgmlDType::Q2_0 => DsLayout::D4,
         // IQ1_S carries a delta bias -> needs the activation sum (ds = scale + sum), i.e. DS4.
         GgmlDType::IQ1_S => DsLayout::DS4,
         _ => unreachable!(),
@@ -163,6 +168,8 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
         GgmlDType::IQ1_S => ffi::launch_mmq_gguf_iq1_s,
         GgmlDType::PQ2_0 => ffi::launch_mmq_gguf_pq2_0,
         GgmlDType::PTQ1_0 => ffi::launch_mmq_gguf_ptq1_0,
+        GgmlDType::Q1_0 => ffi::launch_mmq_gguf_q1_0,
+        GgmlDType::Q2_0 => ffi::launch_mmq_gguf_q2_0,
         _ => return None,
     };
     Some(f)
@@ -325,7 +332,10 @@ pub fn try_fwd(
 
     let qk = qk_for(w_dtype);
     if !k.is_multiple_of(qk)
-        || (matches!(w_dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) && !k.is_multiple_of(256))
+        || (matches!(
+            w_dtype,
+            GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 | GgmlDType::Q1_0 | GgmlDType::Q2_0
+        ) && !k.is_multiple_of(256))
     {
         return Ok(None);
     }
@@ -530,6 +540,8 @@ fn moe_mmq_launcher(dtype: GgmlDType) -> Option<MoeMmqLauncher> {
         GgmlDType::IQ1_S => ffi::launch_mmq_gguf_moe_iq1_s,
         GgmlDType::PQ2_0 => ffi::launch_mmq_gguf_moe_pq2_0,
         GgmlDType::PTQ1_0 => ffi::launch_mmq_gguf_moe_ptq1_0,
+        GgmlDType::Q1_0 => ffi::launch_mmq_gguf_moe_q1_0,
+        GgmlDType::Q2_0 => ffi::launch_mmq_gguf_moe_q2_0,
         _ => return None,
     };
     Some(f)
@@ -564,7 +576,10 @@ pub(crate) fn indexed_moe_grouped(
 
     let qk = qk_for(w_dtype);
     if !k.is_multiple_of(qk)
-        || (matches!(w_dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0) && !k.is_multiple_of(256))
+        || (matches!(
+            w_dtype,
+            GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 | GgmlDType::Q1_0 | GgmlDType::Q2_0
+        ) && !k.is_multiple_of(256))
     {
         return Ok(None);
     }

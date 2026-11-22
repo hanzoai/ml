@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint  w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Pc { uint nout; uint k; };
+
+shared float ssum[64];
+
+uint rdbyte(uint bo) {
+    return bitfieldExtract(w[bo >> 2u], int((bo & 3u) * 8u), 8);
+}
+
+float rdscale(uint bo) {
+    uint lo = rdbyte(bo);
+    uint hi = rdbyte(bo + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint nblocks = k / 64u;
+    uint total_bytes = nblocks * 16u;
+
+    for (uint n = gl_WorkGroupID.x; n < nout; n += gl_NumWorkGroups.x) {
+        uint rowbase = n * nblocks * 18u;
+        float acc = 0.0;
+        for (uint bi = tid; bi < total_bytes; bi += 64u) {
+            uint b = bi >> 4u;
+            uint j = bi & 15u;
+            uint bb = rowbase + b * 18u;
+            float d = rdscale(bb);
+            uint q = rdbyte(bb + 2u + j);
+            uint xbase = b * 64u + j * 4u;
+            float s = float(int(q & 3u) - 1) * x[xbase]
+                    + float(int((q >> 2u) & 3u) - 1) * x[xbase + 1u]
+                    + float(int((q >> 4u) & 3u) - 1) * x[xbase + 2u]
+                    + float(int((q >> 6u) & 3u) - 1) * x[xbase + 3u];
+            acc += d * s;
+        }
+        ssum[tid] = acc;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                ssum[tid] += ssum[tid + s];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            y[n] = ssum[0];
+        }
+        barrier();
+    }
+}

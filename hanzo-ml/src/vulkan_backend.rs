@@ -104,6 +104,11 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_iq3xxs" => spv!("mul_mat_vec_iq3xxs"),
         "mul_mat_vec_iq2s" => spv!("mul_mat_vec_iq2s"),
         "mul_mat_vec_tq2_0" => spv!("mul_mat_vec_tq2_0"),
+        "mul_mat_vec_q1_0" => spv!("mul_mat_vec_q1_0"),
+        "mul_mat_vec_q2_0" => spv!("mul_mat_vec_q2_0"),
+        "mul_mat_vec_pq2_0" => spv!("mul_mat_vec_pq2_0"),
+        "mul_mat_vec_ptq1_0" => spv!("mul_mat_vec_ptq1_0"),
+        "hadamard_fwht" => spv!("hadamard_fwht"),
         "mul_mat_vec_iq4nl" => spv!("mul_mat_vec_iq4nl"),
         "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
         "moe_matvec_q6k" => spv!("moe_matvec_q6k"),
@@ -4704,6 +4709,203 @@ impl VulkanDevice {
         }
         let xs = self.upload_f32(x)?;
         self.matvec_tq2_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    pub fn matvec_q1_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(128) {
+            crate::bail!("matvec_q1_0_gpu: k must be a multiple of 128, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q1_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        if nout > 0 {
+            let push = push_u32(&[nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_vec_q1_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).min(65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
+    }
+
+    pub fn matvec_q1_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q1_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q1_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    pub fn matvec_q2_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(64) {
+            crate::bail!("matvec_q2_0_gpu: k must be a multiple of 64, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q2_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        if nout > 0 {
+            let push = push_u32(&[nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_vec_q2_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).min(65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
+    }
+
+    pub fn matvec_q2_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q2_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q2_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    pub fn matvec_pq2_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(128) {
+            crate::bail!("matvec_pq2_0_gpu: k must be a multiple of 128, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_pq2_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        if nout > 0 {
+            let push = push_u32(&[nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_vec_pq2_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).min(65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
+    }
+
+    pub fn matvec_pq2_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_pq2_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_pq2_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    pub fn matvec_ptq1_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(128) {
+            crate::bail!("matvec_ptq1_0_gpu: k must be a multiple of 128, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_ptq1_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        if nout > 0 {
+            let push = push_u32(&[nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_vec_ptq1_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).min(65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
+    }
+
+    pub fn matvec_ptq1_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_ptq1_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_ptq1_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hadamard_fwht_gpu(
+        &self,
+        x: &VulkanStorage,
+        x_off: usize,
+        signs: Option<(&VulkanStorage, usize)>,
+        block_size: usize,
+        width: usize,
+        is_inverse: bool,
+        total_blocks: usize,
+    ) -> Result<VulkanStorage> {
+        let elem_count = total_blocks * block_size;
+        let out = self.alloc_f32(elem_count)?;
+        if total_blocks > 0 {
+            let (s_buf, s_off, has_s) = match signs {
+                Some((s, off)) => (s.buffer, off as u32, 1u32),
+                None => (x.buffer, 0u32, 0u32),
+            };
+            let push = push_u32(&[
+                x_off as u32,
+                s_off,
+                block_size as u32,
+                width as u32,
+                has_s,
+                u32::from(is_inverse),
+                total_blocks as u32,
+            ]);
+            self.dispatch(
+                "hadamard_fwht",
+                &[x.buffer, s_buf, out.buffer],
+                &push,
+                ((total_blocks as u32).clamp(1, 65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
     }
 
     // Allocate a storage buffer of `bytes` bytes, returning it plus whether its memory is

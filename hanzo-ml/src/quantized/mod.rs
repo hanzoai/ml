@@ -58,6 +58,8 @@ pub mod utils;
 pub mod quant_format;
 use half::{bf16, f16};
 
+pub use cuda::{rms_norm_hadamard_fwht, IqQ8Activation};
+pub use iq_quants::{BlockPQ2_0, BlockPTQ1_0, BlockQ1_0, BlockQ2_0};
 pub use k_quants::GgmlType;
 
 // Borrows `data` (does not consume it) so the returned slice stays valid for the caller's lifetime.
@@ -199,6 +201,8 @@ impl QStorage {
                 GgmlDType::IQ1_M => metal::load_quantized(d, as_t_slice::<BlockIQ1m>(&data)),
                 GgmlDType::PQ2_0 => metal::load_quantized(d, as_t_slice::<BlockPQ2_0>(&data)),
                 GgmlDType::PTQ1_0 => metal::load_quantized(d, as_t_slice::<BlockPTQ1_0>(&data)),
+                GgmlDType::Q1_0 => metal::load_quantized(d, as_t_slice::<BlockQ1_0>(&data)),
+                GgmlDType::Q2_0 => metal::load_quantized(d, as_t_slice::<BlockQ2_0>(&data)),
                 // Ternary / NVFP4 have no native Metal kernel yet (CPU-decode only).
                 other => crate::bail!("{other:?} is not supported on the Metal backend"),
             },
@@ -246,6 +250,7 @@ impl QStorage {
                 }
                 GgmlDType::PQ2_0 => cuda::load_quantized(d, as_t_slice::<BlockPQ2_0>(&data)),
                 GgmlDType::PTQ1_0 => cuda::load_quantized(d, as_t_slice::<BlockPTQ1_0>(&data)),
+                GgmlDType::Q2_0 => cuda::load_quantized(d, as_t_slice::<BlockQ2_0>(&data)),
             },
             #[cfg(feature = "rocm")]
             Device::Rocm(d) => Ok(Self::Rocm(rocm::QRocmStorage::new(data, dtype, d)?)),
@@ -526,6 +531,7 @@ pub enum GgmlDType {
     TQ2_0,
     NVFP4,
     Q1_0,
+    Q2_0,
     // ROCmFPX fork types: 4-bit, 32 elems/block, UE4M3 half-scales (100 dual, 101 fast).
     #[allow(non_camel_case_types)]
     ROCMFP4,
@@ -698,6 +704,7 @@ impl GgmlDType {
             Self::IQ4_NL => k_quants::QK4_NL,
             Self::MXFP4 => k_quants::QK_MXFP4,
             Self::Q1_0 => iq_quants::QK1_0,
+            Self::Q2_0 => iq_quants::QK2_0,
             Self::NVFP4 => iq_quants::QK_NVFP4,
             Self::ROCMFP4 | Self::ROCMFP4_FAST => iq_quants::QK_ROCMFP4,
             Self::PQ2_0 => iq_quants::QK_PQ2_0,
@@ -2330,6 +2337,10 @@ impl QMatMul {
                     | GgmlDType::IQ1_S
                     | GgmlDType::IQ1_M
                     | GgmlDType::IQ2_XS
+                    | GgmlDType::Q1_0
+                    | GgmlDType::Q2_0
+                    | GgmlDType::PQ2_0
+                    | GgmlDType::PTQ1_0
             );
             if native_vk {
                 if let QStorage::Vulkan(resident) = &qtensor.storage {
@@ -3383,6 +3394,10 @@ impl crate::Module for QMatMul {
                             GgmlDType::IQ3_XXS => d.matvec_iq3xxs_gpu(wq, xv, *n, *k)?,
                             GgmlDType::IQ2_S => d.matvec_iq2s_gpu(wq, xv, *n, *k)?,
                             GgmlDType::TQ2_0 => d.matvec_tq2_0_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q1_0 => d.matvec_q1_0_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::Q2_0 => d.matvec_q2_0_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::PQ2_0 => d.matvec_pq2_0_gpu(wq, xv, *n, *k)?,
+                            GgmlDType::PTQ1_0 => d.matvec_ptq1_0_gpu(wq, xv, *n, *k)?,
                             other => crate::bail!("VulkanQuant: no native matvec for {other:?}"),
                         }
                     };
@@ -3535,6 +3550,419 @@ impl crate::Module for QMatMul {
                 dense_matmul(&xs.to_dtype(DType::F16)?, w)?.to_dtype(in_dtype)
             }
         }
+    }
+}
+
+#[inline]
+fn fwht_block_cpu(blk: &mut [f32]) {
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "arm", target_feature = "neon")
+    ))]
+    {
+        neon::fwht_block_neon(blk);
+        return;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if crate::cpu::features::get().avx2 {
+            unsafe { avx::fwht_block_avx2(blk) };
+            return;
+        }
+    }
+    #[allow(unreachable_code)]
+    {
+        let b = blk.len();
+        let mut stride = 1usize;
+        while stride < b {
+            let step = stride * 2;
+            let mut base = 0usize;
+            while base < b {
+                for i in 0..stride {
+                    let a = blk[base + i];
+                    let c = blk[base + stride + i];
+                    blk[base + i] = a + c;
+                    blk[base + stride + i] = a - c;
+                }
+                base += step;
+            }
+            stride = step;
+        }
+    }
+}
+
+#[inline]
+fn fwht_scale_row_cpu(row: &mut [f32], scale: f32, post_signs: Option<&[f32]>) {
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "arm", target_feature = "neon")
+    ))]
+    {
+        neon::fwht_scale_row_neon(row, scale, post_signs);
+        return;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if crate::cpu::features::get().avx2 {
+            unsafe { avx::fwht_scale_row_avx2(row, scale, post_signs) };
+            return;
+        }
+    }
+    #[allow(unreachable_code)]
+    match post_signs {
+        Some(s) => {
+            for (v, &sv) in row.iter_mut().zip(s.iter()) {
+                *v = *v * scale * sv;
+            }
+        }
+        None => {
+            for v in row.iter_mut() {
+                *v *= scale;
+            }
+        }
+    }
+}
+
+fn cpu_hadamard_fwht(
+    x: &Tensor,
+    signs: Option<&Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+    out_dtype: DType,
+) -> Result<Tensor> {
+    use rayon::prelude::*;
+
+    let orig_shape = x.shape().clone();
+    let Some(&width) = orig_shape.dims().last() else {
+        crate::bail!("hadamard_fwht expects rank >= 1");
+    };
+    let elem_count = orig_shape.elem_count();
+    let x = x.contiguous()?;
+    if elem_count == 0 {
+        return x.to_dtype(out_dtype);
+    }
+
+    let signs_vec: Option<Vec<f32>> = match signs {
+        Some(s) => {
+            if !s.device().is_cpu() {
+                crate::bail!("hadamard_fwht signs must be on CPU");
+            }
+            if s.elem_count() != width {
+                crate::bail!(
+                    "hadamard_fwht signs len {} != width {width}",
+                    s.elem_count()
+                );
+            }
+            let s_f32 = if s.dtype() == DType::F32 {
+                s.contiguous()?
+            } else {
+                s.to_dtype(DType::F32)?.contiguous()?
+            };
+            Some(s_f32.flatten_all()?.to_vec1::<f32>()?)
+        }
+        None => None,
+    };
+    let pre_signs = if !is_inverse {
+        signs_vec.as_deref()
+    } else {
+        None
+    };
+    let post_signs = if is_inverse {
+        signs_vec.as_deref()
+    } else {
+        None
+    };
+    let inv_sqrt_b = 1.0f32 / (block_size as f32).sqrt();
+
+    let mut out = vec![0.0f32; elem_count];
+    {
+        let (x_store, x_layout) = x.storage_and_layout();
+        let Storage::Cpu(cpu_s) = &*x_store else {
+            crate::bail!("cpu_hadamard_fwht requires CPU storage");
+        };
+        let (o1, o2) = x_layout.contiguous_offsets().ok_or_else(|| {
+            crate::Error::RequiresContiguous {
+                op: "hadamard_fwht",
+            }
+            .bt()
+        })?;
+        let rows = elem_count / width;
+
+        let process_row = |r: usize, row: &mut [f32]| {
+            let base = r * width;
+            match cpu_s {
+                CpuStorage::F32(xs) => {
+                    let src = &xs[o1 + base..o1 + base + width];
+                    match pre_signs {
+                        Some(sv) => {
+                            for c in 0..width {
+                                row[c] = src[c] * sv[c];
+                            }
+                        }
+                        None => row.copy_from_slice(src),
+                    }
+                }
+                CpuStorage::F16(xs) => {
+                    let src = &xs[o1 + base..o1 + base + width];
+                    match pre_signs {
+                        Some(sv) => {
+                            for c in 0..width {
+                                row[c] = src[c].to_f32() * sv[c];
+                            }
+                        }
+                        None => {
+                            for c in 0..width {
+                                row[c] = src[c].to_f32();
+                            }
+                        }
+                    }
+                }
+                CpuStorage::BF16(xs) => {
+                    let src = &xs[o1 + base..o1 + base + width];
+                    match pre_signs {
+                        Some(sv) => {
+                            for c in 0..width {
+                                row[c] = src[c].to_f32() * sv[c];
+                            }
+                        }
+                        None => {
+                            for c in 0..width {
+                                row[c] = src[c].to_f32();
+                            }
+                        }
+                    }
+                }
+                other => unreachable!("validated float dtype, got {:?}", other.dtype()),
+            }
+            let _ = o2;
+            for blk in row.chunks_exact_mut(block_size) {
+                fwht_block_cpu(blk);
+            }
+            fwht_scale_row_cpu(row, inv_sqrt_b, post_signs);
+        };
+
+        if rows <= 1 {
+            process_row(0, &mut out[..width]);
+        } else {
+            out.par_chunks_mut(width)
+                .enumerate()
+                .for_each(|(r, row)| process_row(r, row));
+        }
+    }
+
+    let out_cpu = match out_dtype {
+        DType::F32 => CpuStorage::F32(out),
+        DType::F16 => CpuStorage::F16(out.into_iter().map(f16::from_f32).collect()),
+        DType::BF16 => CpuStorage::BF16(out.into_iter().map(bf16::from_f32).collect()),
+        other => crate::bail!("hadamard_fwht unsupported out_dtype {other:?}"),
+    };
+    Ok(crate::tensor::from_storage(
+        Storage::Cpu(out_cpu),
+        orig_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+#[cfg(feature = "vulkan")]
+fn vulkan_hadamard_fwht(
+    dev: &crate::VulkanDevice,
+    x: &Tensor,
+    signs: Option<&Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+) -> Result<Tensor> {
+    let orig_shape = x.shape().clone();
+    let Some(&width) = orig_shape.dims().last() else {
+        crate::bail!("hadamard_fwht expects rank >= 1");
+    };
+    let elem_count = orig_shape.elem_count();
+    let total_blocks = elem_count / block_size;
+    let x = x.contiguous()?;
+    if total_blocks == 0 {
+        return Ok(x);
+    }
+    let signs_contig = match signs {
+        Some(s) => {
+            if s.elem_count() != width {
+                crate::bail!(
+                    "hadamard_fwht signs len {} != width {width}",
+                    s.elem_count()
+                );
+            }
+            Some(s.contiguous()?)
+        }
+        None => None,
+    };
+    let (x_store, x_layout) = x.storage_and_layout();
+    let Storage::Vulkan(xv) = &*x_store else {
+        crate::bail!("vulkan_hadamard_fwht expected Vulkan storage");
+    };
+    let signs_guard = signs_contig.as_ref().map(|s| s.storage_and_layout());
+    let signs_arg = if let Some((s_store, s_layout)) = signs_guard.as_ref() {
+        let Storage::Vulkan(sv) = &**s_store else {
+            crate::bail!("hadamard_fwht signs must be on Vulkan");
+        };
+        Some((sv, s_layout.start_offset()))
+    } else {
+        None
+    };
+    let out = dev.hadamard_fwht_gpu(
+        xv,
+        x_layout.start_offset(),
+        signs_arg,
+        block_size,
+        width,
+        is_inverse,
+        total_blocks,
+    )?;
+    drop(signs_guard);
+    drop(x_store);
+    Ok(crate::tensor::from_storage(
+        Storage::Vulkan(out),
+        orig_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+#[cfg(feature = "wgpu")]
+fn wgpu_hadamard_fwht(
+    dev: &crate::WgpuDevice,
+    x: &Tensor,
+    signs: Option<&Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+) -> Result<Tensor> {
+    let orig_shape = x.shape().clone();
+    let Some(&width) = orig_shape.dims().last() else {
+        crate::bail!("hadamard_fwht expects rank >= 1");
+    };
+    let elem_count = orig_shape.elem_count();
+    let total_blocks = elem_count / block_size;
+    let x = x.contiguous()?;
+    if total_blocks == 0 {
+        return Ok(x);
+    }
+    let signs_contig = match signs {
+        Some(s) => {
+            if s.elem_count() != width {
+                crate::bail!(
+                    "hadamard_fwht signs len {} != width {width}",
+                    s.elem_count()
+                );
+            }
+            Some(s.contiguous()?)
+        }
+        None => None,
+    };
+    let (x_store, x_layout) = x.storage_and_layout();
+    let Storage::Wgpu(xw) = &*x_store else {
+        crate::bail!("wgpu_hadamard_fwht expected Wgpu storage");
+    };
+    let signs_guard = signs_contig.as_ref().map(|s| s.storage_and_layout());
+    let signs_arg = if let Some((s_store, s_layout)) = signs_guard.as_ref() {
+        let Storage::Wgpu(sw) = &**s_store else {
+            crate::bail!("hadamard_fwht signs must be on Wgpu");
+        };
+        Some((sw, s_layout.start_offset()))
+    } else {
+        None
+    };
+    let out = dev.hadamard_fwht_gpu(
+        xw,
+        x_layout.start_offset(),
+        signs_arg,
+        block_size,
+        width,
+        is_inverse,
+        total_blocks,
+    )?;
+    drop(signs_guard);
+    drop(x_store);
+    Ok(crate::tensor::from_storage(
+        Storage::Wgpu(out),
+        orig_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+fn hadamard_fwht_impl(
+    x: &Tensor,
+    signs: Option<&Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+    out_dtype: DType,
+) -> Result<Tensor> {
+    if !block_size.is_power_of_two() || block_size == 0 || block_size > 8192 {
+        crate::bail!("hadamard_fwht block_size must be a power of 2 in 1..=8192, got {block_size}");
+    }
+    let Some(&width) = x.dims().last() else {
+        crate::bail!("hadamard_fwht expects rank >= 1");
+    };
+    if !width.is_multiple_of(block_size) {
+        crate::bail!("hadamard_fwht width {width} is not divisible by block_size {block_size}");
+    }
+    if !matches!(x.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+        crate::bail!("hadamard_fwht unsupported dtype {:?}", x.dtype());
+    }
+    if let Some(s) = signs {
+        if !matches!(s.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+            crate::bail!("hadamard_fwht unsupported signs dtype {:?}", s.dtype());
+        }
+        if s.elem_count() != width {
+            crate::bail!(
+                "hadamard_fwht signs len {} != width {width}",
+                s.elem_count()
+            );
+        }
+    }
+
+    match x.device() {
+        Device::Cpu => cpu_hadamard_fwht(x, signs, block_size, is_inverse, out_dtype),
+        Device::Cuda(_) => {
+            let s_f32 = match signs {
+                Some(s) if s.dtype() != DType::F32 => Some(s.to_dtype(DType::F32)?),
+                _ => None,
+            };
+            let s_ref = s_f32.as_ref().or(signs);
+            if out_dtype != x.dtype() {
+                let x_cast = x.to_dtype(out_dtype)?;
+                cuda::hadamard_fwht(&x_cast, s_ref, block_size, is_inverse)
+            } else {
+                cuda::hadamard_fwht(x, s_ref, block_size, is_inverse)
+            }
+        }
+        Device::Metal(_) => metal::hadamard_fwht(x, signs, block_size, is_inverse, out_dtype),
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => {
+            crate::rocm_backend::hadamard_fwht_rocm(x, signs, block_size, is_inverse, out_dtype)
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(d) => vulkan_hadamard_fwht(d, x, signs, block_size, is_inverse),
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(d) => wgpu_hadamard_fwht(d, x, signs, block_size, is_inverse),
+    }
+}
+
+pub fn hadamard_fwht(
+    x: &Tensor,
+    signs: Option<&Tensor>,
+    block_size: usize,
+    is_inverse: bool,
+) -> Result<Tensor> {
+    hadamard_fwht_impl(x, signs, block_size, is_inverse, x.dtype())
+}
+
+impl Tensor {
+    pub fn hadamard_fwht(&self, block_size: usize, signs: Option<&Tensor>) -> Result<Tensor> {
+        if !block_size.is_power_of_two() || !(2..=8192).contains(&block_size) {
+            crate::bail!(
+                "hadamard_fwht block_size must be a power of 2 in 2..=8192, got {block_size}"
+            );
+        }
+        hadamard_fwht_impl(self, signs, block_size, false, DType::F32)
     }
 }
 
