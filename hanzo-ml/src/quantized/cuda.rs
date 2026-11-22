@@ -108,17 +108,17 @@ static PROF_FWHT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// GB10 / Blackwell (`SM >= 100`, `cc >= 1000`) crossovers were measured at
 /// `m=2` for `PQ2_0` and `m=4` for `PTQ1_0`; earlier NVIDIA architectures keep
 /// the conservative `8` threshold unless overridden via
-/// `HANZO_PQ2_MMQ_MAX_BM` / `HANZO_PTQ1_MMQ_MAX_BM`.
+/// `ML_PQ2_MMQ_MAX_BM` / `ML_PTQ1_MMQ_MAX_BM`.
 fn mmq_max_vec_bm(dtype: GgmlDType, compute_cap: i32) -> usize {
-    let env_key = match dtype {
-        GgmlDType::PQ2_0 => Some("HANZO_PQ2_MMQ_MAX_BM"),
-        GgmlDType::PTQ1_0 => Some("HANZO_PTQ1_MMQ_MAX_BM"),
-        GgmlDType::Q1_0 => Some("HANZO_Q1_MMQ_MAX_BM"),
-        GgmlDType::Q2_0 => Some("HANZO_Q2_MMQ_MAX_BM"),
+    let env_keys = match dtype {
+        GgmlDType::PQ2_0 => Some(("ML_PQ2_MMQ_MAX_BM", "HANZO_PQ2_MMQ_MAX_BM")),
+        GgmlDType::PTQ1_0 => Some(("ML_PTQ1_MMQ_MAX_BM", "HANZO_PTQ1_MMQ_MAX_BM")),
+        GgmlDType::Q1_0 => Some(("ML_Q1_MMQ_MAX_BM", "HANZO_Q1_MMQ_MAX_BM")),
+        GgmlDType::Q2_0 => Some(("ML_Q2_MMQ_MAX_BM", "HANZO_Q2_MMQ_MAX_BM")),
         _ => None,
     };
-    if let Some(key) = env_key {
-        if let Ok(v) = std::env::var(key) {
+    if let Some((ml_key, legacy_key)) = env_keys {
+        if let Ok(v) = crate::ml_env_var(ml_key, legacy_key) {
             if let Ok(parsed) = v.parse::<usize>() {
                 return parsed.max(1);
             }
@@ -134,7 +134,7 @@ fn mmq_max_vec_bm(dtype: GgmlDType, compute_cap: i32) -> usize {
 pub fn cuda_profile_enabled() -> bool {
     *CUDA_PROFILE_ENABLED.get_or_init(|| {
         matches!(
-            std::env::var("HANZO_CUDA_PROFILE").as_deref(),
+            crate::ml_env_var("ML_CUDA_PROFILE", "HANZO_CUDA_PROFILE").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
         )
     })
@@ -785,9 +785,12 @@ fn iq_quantize_storage_to_q8(
     if !ncols.is_multiple_of(32) {
         crate::bail!("iq_quantize_q8 ncols {ncols} must be a multiple of 32");
     }
-    let (o1, o2) = rhs_l
-        .contiguous_offsets()
-        .ok_or_else(|| crate::Error::RequiresContiguous { op: "iq-quantize-q8" }.bt())?;
+    let (o1, o2) = rhs_l.contiguous_offsets().ok_or_else(|| {
+        crate::Error::RequiresContiguous {
+            op: "iq-quantize-q8",
+        }
+        .bt()
+    })?;
     let ncols_padded = pad(ncols, IQ_Q8_ROW_PAD);
     let total_blocks_padded = b_size * (ncols_padded / 32);
     let xq = unsafe { dev.alloc::<u8>(total_blocks_padded * 32)? };
@@ -805,11 +808,19 @@ fn iq_quantize_storage_to_q8(
         crate::DType::F32 => {
             let y = rhs.as_cuda_slice::<f32>()?.slice(o1..o2);
             if y.len() != ncols * b_size {
-                crate::bail!("unexpected y size {}, ncols {ncols} bsize {b_size}", y.len());
+                crate::bail!(
+                    "unexpected y size {}, ncols {ncols} bsize {b_size}",
+                    y.len()
+                );
             }
             let func = dev.get_or_load_func("iq_quantize_q8_f32", &hanzo_kernels::IQUANT_MMVQ)?;
             let mut builder = func.builder();
-            barg!(builder, b_size as i32, ncols as i32, total_blocks_padded as i32);
+            barg!(
+                builder,
+                b_size as i32,
+                ncols as i32,
+                total_blocks_padded as i32
+            );
             builder.arg(&y);
             builder.arg(&xq);
             builder.arg(&xd);
@@ -818,11 +829,19 @@ fn iq_quantize_storage_to_q8(
         crate::DType::BF16 => {
             let y = rhs.as_cuda_slice::<bf16>()?.slice(o1..o2);
             if y.len() != ncols * b_size {
-                crate::bail!("unexpected y size {}, ncols {ncols} bsize {b_size}", y.len());
+                crate::bail!(
+                    "unexpected y size {}, ncols {ncols} bsize {b_size}",
+                    y.len()
+                );
             }
             let func = dev.get_or_load_func("iq_quantize_q8_bf16", &hanzo_kernels::IQUANT_MMVQ)?;
             let mut builder = func.builder();
-            barg!(builder, b_size as i32, ncols as i32, total_blocks_padded as i32);
+            barg!(
+                builder,
+                b_size as i32,
+                ncols as i32,
+                total_blocks_padded as i32
+            );
             builder.arg(&y);
             builder.arg(&xq);
             builder.arg(&xd);
@@ -831,11 +850,19 @@ fn iq_quantize_storage_to_q8(
         crate::DType::F16 => {
             let y = rhs.as_cuda_slice::<f16>()?.slice(o1..o2);
             if y.len() != ncols * b_size {
-                crate::bail!("unexpected y size {}, ncols {ncols} bsize {b_size}", y.len());
+                crate::bail!(
+                    "unexpected y size {}, ncols {ncols} bsize {b_size}",
+                    y.len()
+                );
             }
             let func = dev.get_or_load_func("iq_quantize_q8_f16", &hanzo_kernels::IQUANT_MMVQ)?;
             let mut builder = func.builder();
-            barg!(builder, b_size as i32, ncols as i32, total_blocks_padded as i32);
+            barg!(
+                builder,
+                b_size as i32,
+                ncols as i32,
+                total_blocks_padded as i32
+            );
             builder.arg(&y);
             builder.arg(&xq);
             builder.arg(&xd);
@@ -970,7 +997,17 @@ fn mul_mat_vec_iquant_dp4a(
         crate::bail!("bsize must be >= 1, got {b_size}");
     }
     let (xq, xd) = iq_quantize_storage_to_q8(rhs, rhs_l, b_size, ncols, dev)?;
-    launch_iquant_dp4a_from_q8(data, &xq, &xd, dtype, rhs.dtype(), ncols, nrows, b_size, dev)
+    launch_iquant_dp4a_from_q8(
+        data,
+        &xq,
+        &xd,
+        dtype,
+        rhs.dtype(),
+        ncols,
+        nrows,
+        b_size,
+        dev,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1625,8 +1662,8 @@ impl QCudaStorage {
             .storage_from_cpu_storage(&crate::CpuStorage::F32(out))
     }
 
-    /// Native-GGUF DSL dispatch for `PQ2_0` and `PTQ1_0` on CUDA (`HANZO_PQ2_IMPL=dsl` /
-    /// `HANZO_PTQ1_IMPL=dsl`; `legacy` remains the default). Handles both `m == 1` decode matvec
+    /// Native-GGUF DSL dispatch for `PQ2_0` and `PTQ1_0` on CUDA (`ML_PQ2_IMPL=dsl` /
+    /// `ML_PTQ1_IMPL=dsl`; `legacy` remains the default). Handles both `m == 1` decode matvec
     /// and `m > 1` prefill GEMM for contiguous `F32` and `BF16` activations (including nonzero
     /// `layout.start_offset()`).
     fn try_dispatch_ternary_dsl(
@@ -2016,8 +2053,7 @@ impl QCudaStorage {
         if matches!(
             self.dtype,
             GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 | GgmlDType::Q1_0 | GgmlDType::Q2_0
-        )
-            && std::env::var_os("HANZO_PQ2_FP32_PREFILL").is_none()
+        ) && crate::ml_env_os("ML_PQ2_FP32_PREFILL", "HANZO_PQ2_FP32_PREFILL").is_none()
         {
             let prof = cuda_profile_enabled();
             if prof {
@@ -2164,7 +2200,10 @@ impl IqQ8Activation {
             crate::bail!("IqQ8Activation requires non-empty batch");
         }
         let dtype = xs.dtype();
-        if !matches!(dtype, crate::DType::F32 | crate::DType::BF16 | crate::DType::F16) {
+        if !matches!(
+            dtype,
+            crate::DType::F32 | crate::DType::BF16 | crate::DType::F16
+        ) {
             crate::bail!("IqQ8Activation unsupported dtype {dtype:?}");
         }
         if !xs.device().is_cuda() {
@@ -2210,7 +2249,10 @@ impl IqQ8Activation {
     }
 
     pub fn with_dtype(&self, dtype: crate::DType) -> Result<Self> {
-        if !matches!(dtype, crate::DType::F32 | crate::DType::BF16 | crate::DType::F16) {
+        if !matches!(
+            dtype,
+            crate::DType::F32 | crate::DType::BF16 | crate::DType::F16
+        ) {
             crate::bail!("IqQ8Activation unsupported output dtype {dtype:?}");
         }
         let inner = match &self.inner {
@@ -2286,7 +2328,13 @@ fn fwht_launch_params(block_size: usize) -> (u32, u32) {
     (nt as u32, smem_bytes)
 }
 
-fn fwht_cpu_inplace(buf: &mut [f32], signs: Option<&[f32]>, width: usize, block_size: usize, is_inverse: bool) {
+fn fwht_cpu_inplace(
+    buf: &mut [f32],
+    signs: Option<&[f32]>,
+    width: usize,
+    block_size: usize,
+    is_inverse: bool,
+) {
     let scale = 1.0f32 / (block_size as f32).sqrt();
     if !is_inverse {
         if let Some(sv) = signs {
@@ -2350,7 +2398,13 @@ fn hadamard_fwht_cpu_fallback(
         ),
         None => None,
     };
-    fwht_cpu_inplace(&mut vals, signs_vec.as_deref(), width, block_size, is_inverse);
+    fwht_cpu_inplace(
+        &mut vals,
+        signs_vec.as_deref(),
+        width,
+        block_size,
+        is_inverse,
+    );
     crate::Tensor::from_vec(vals, x.shape(), &crate::Device::Cpu)?
         .to_dtype(orig_dtype)?
         .to_device(&orig_dev)
@@ -2386,7 +2440,10 @@ fn rms_norm_hadamard_fwht_cpu_fallback(
                     *v = q.to_f32();
                     h_bf16.push(q);
                 }
-                Some(crate::Tensor::from_vec(h_bf16, x.shape(), &crate::Device::Cpu)?.to_device(&orig_dev)?)
+                Some(
+                    crate::Tensor::from_vec(h_bf16, x.shape(), &crate::Device::Cpu)?
+                        .to_device(&orig_dev)?,
+                )
             }
             crate::DType::F16 => {
                 let mut h_f16 = Vec::with_capacity(vals.len());
@@ -2395,7 +2452,10 @@ fn rms_norm_hadamard_fwht_cpu_fallback(
                     *v = q.to_f32();
                     h_f16.push(q);
                 }
-                Some(crate::Tensor::from_vec(h_f16, x.shape(), &crate::Device::Cpu)?.to_device(&orig_dev)?)
+                Some(
+                    crate::Tensor::from_vec(h_f16, x.shape(), &crate::Device::Cpu)?
+                        .to_device(&orig_dev)?,
+                )
             }
             _ => {
                 for (v, &rv) in vals.iter_mut().zip(r_vals.iter()) {
@@ -2465,7 +2525,10 @@ pub fn hadamard_fwht(
             crate::bail!("hadamard_fwht signs must be F32, got {:?}", s.dtype());
         }
         if s.elem_count() != width {
-            crate::bail!("hadamard_fwht signs len {} != width {width}", s.elem_count());
+            crate::bail!(
+                "hadamard_fwht signs len {} != width {width}",
+                s.elem_count()
+            );
         }
     }
 
@@ -2605,7 +2668,11 @@ fn rms_norm_hadamard_fwht_impl(
     block_size: usize,
     want_dst: bool,
     want_q8: bool,
-) -> Result<(Option<crate::Tensor>, Option<crate::Tensor>, Option<IqQ8Activation>)> {
+) -> Result<(
+    Option<crate::Tensor>,
+    Option<crate::Tensor>,
+    Option<IqQ8Activation>,
+)> {
     if !block_size.is_power_of_two() || block_size == 0 || block_size > 8192 {
         crate::bail!(
             "rms_norm_hadamard_fwht block_size must be a power of 2 in 1..=8192, got {block_size}"
@@ -2639,7 +2706,10 @@ fn rms_norm_hadamard_fwht_impl(
     }
     if let Some(s) = signs {
         if s.dtype() != crate::DType::F32 {
-            crate::bail!("rms_norm_hadamard_fwht signs must be F32, got {:?}", s.dtype());
+            crate::bail!(
+                "rms_norm_hadamard_fwht signs must be F32, got {:?}",
+                s.dtype()
+            );
         }
         if s.elem_count() != width {
             crate::bail!(
@@ -2829,10 +2899,8 @@ fn rms_norm_hadamard_fwht_impl(
     let res_out_storage = match x_contig.dtype() {
         crate::DType::F32 => {
             let x_slice = x_cuda.as_cuda_slice::<f32>()?.slice(x_o1..x_o2);
-            let func = dev.get_or_load_func(
-                "rms_norm_hadamard_fwht_f32",
-                &hanzo_kernels::IQUANT_MMVQ,
-            )?;
+            let func =
+                dev.get_or_load_func("rms_norm_hadamard_fwht_f32", &hanzo_kernels::IQUANT_MMVQ)?;
             let mut builder = func.builder();
             builder.arg(&x_slice);
             if let Some((r_storage, r_layout)) = res_guard.as_ref() {
@@ -2855,10 +2923,8 @@ fn rms_norm_hadamard_fwht_impl(
         }
         crate::DType::BF16 => {
             let x_slice = x_cuda.as_cuda_slice::<bf16>()?.slice(x_o1..x_o2);
-            let func = dev.get_or_load_func(
-                "rms_norm_hadamard_fwht_bf16",
-                &hanzo_kernels::IQUANT_MMVQ,
-            )?;
+            let func =
+                dev.get_or_load_func("rms_norm_hadamard_fwht_bf16", &hanzo_kernels::IQUANT_MMVQ)?;
             let mut builder = func.builder();
             builder.arg(&x_slice);
             if let Some((r_storage, r_layout)) = res_guard.as_ref() {
@@ -2881,10 +2947,8 @@ fn rms_norm_hadamard_fwht_impl(
         }
         crate::DType::F16 => {
             let x_slice = x_cuda.as_cuda_slice::<f16>()?.slice(x_o1..x_o2);
-            let func = dev.get_or_load_func(
-                "rms_norm_hadamard_fwht_f16",
-                &hanzo_kernels::IQUANT_MMVQ,
-            )?;
+            let func =
+                dev.get_or_load_func("rms_norm_hadamard_fwht_f16", &hanzo_kernels::IQUANT_MMVQ)?;
             let mut builder = func.builder();
             builder.arg(&x_slice);
             if let Some((r_storage, r_layout)) = res_guard.as_ref() {
@@ -2952,9 +3016,8 @@ pub fn rms_norm_hadamard_fwht(
     signs: Option<&crate::Tensor>,
     block_size: usize,
 ) -> Result<(Option<crate::Tensor>, crate::Tensor)> {
-    let (res_out, dst, _) = rms_norm_hadamard_fwht_impl(
-        x, residual, weight, eps, signs, block_size, true, false,
-    )?;
+    let (res_out, dst, _) =
+        rms_norm_hadamard_fwht_impl(x, residual, weight, eps, signs, block_size, true, false)?;
     Ok((res_out, dst.unwrap()))
 }
 
@@ -2966,7 +3029,10 @@ fn hadamard_fwht_q8_impl(
 ) -> Result<IqQ8Activation> {
     let orig_shape = x.shape().clone();
     if orig_shape.rank() < 2 {
-        crate::bail!("hadamard_fwht_iq_q8 expects rank >= 2, got {:?}", orig_shape);
+        crate::bail!(
+            "hadamard_fwht_iq_q8 expects rank >= 2, got {:?}",
+            orig_shape
+        );
     }
     let width = *orig_shape.dims().last().unwrap();
     if !x.device().is_cuda() || block_size < 32 || !width.is_multiple_of(32) {
@@ -2974,9 +3040,7 @@ fn hadamard_fwht_q8_impl(
         return IqQ8Activation::quantize(&y);
     }
     if !block_size.is_power_of_two() || block_size > 8192 || !width.is_multiple_of(block_size) {
-        crate::bail!(
-            "hadamard_fwht_iq_q8 invalid width {width} or block_size {block_size}"
-        );
+        crate::bail!("hadamard_fwht_iq_q8 invalid width {width} or block_size {block_size}");
     }
     if let Some(s) = signs {
         if s.dtype() != crate::DType::F32 || s.elem_count() != width {
@@ -3054,7 +3118,8 @@ fn hadamard_fwht_q8_impl(
         }
         crate::DType::BF16 => {
             let x_slice = x_cuda.as_cuda_slice::<bf16>()?.slice(x_o1..x_o2);
-            let func = dev.get_or_load_func("hadamard_fwht_q8_bf16", &hanzo_kernels::IQUANT_MMVQ)?;
+            let func =
+                dev.get_or_load_func("hadamard_fwht_q8_bf16", &hanzo_kernels::IQUANT_MMVQ)?;
             let mut builder = func.builder();
             builder.arg(&x_slice);
             if let Some(ref sv) = signs_view {
@@ -3169,9 +3234,8 @@ impl super::QMatMul {
         signs: Option<&crate::Tensor>,
         block_size: usize,
     ) -> Result<IqQ8Activation> {
-        let (_, _, q8) = rms_norm_hadamard_fwht_impl(
-            xs, None, weight, eps, signs, block_size, false, true,
-        )?;
+        let (_, _, q8) =
+            rms_norm_hadamard_fwht_impl(xs, None, weight, eps, signs, block_size, false, true)?;
         Ok(q8.unwrap())
     }
 
@@ -3217,8 +3281,7 @@ impl super::QMatMul {
         match self {
             Self::QTensor(qt) => match &qt.storage {
                 QStorage::Cuda(qcuda) if iquant_dp4a_suffix(qcuda.dtype).is_some() => {
-                    let (out, out_shape) =
-                        qcuda.fwd_shared_q8_dtype(&qt.shape, q8, out_dtype)?;
+                    let (out, out_shape) = qcuda.fwd_shared_q8_dtype(&qt.shape, q8, out_dtype)?;
                     Ok(crate::tensor::from_storage(
                         crate::Storage::Cuda(out),
                         out_shape,
@@ -4234,11 +4297,11 @@ mod test {
             (5120usize, 17408usize),
         ] {
             for dtype in [
-            GgmlDType::PQ2_0,
-            GgmlDType::PTQ1_0,
-            GgmlDType::Q1_0,
-            GgmlDType::Q2_0,
-        ] {
+                GgmlDType::PQ2_0,
+                GgmlDType::PTQ1_0,
+                GgmlDType::Q1_0,
+                GgmlDType::Q2_0,
+            ] {
                 let nbytes = (n * k / dtype.block_size()) * dtype.type_size();
                 let bytes = vec![0x55u8; nbytes];
                 let qcuda =
@@ -4290,13 +4353,13 @@ mod test {
     #[test]
     fn mmq_max_vec_bm_profiles_by_compute_cap() {
         // Only check defaults when env overrides are unset.
-        if std::env::var_os("HANZO_PQ2_MMQ_MAX_BM").is_none() {
+        if crate::ml_env_os("ML_PQ2_MMQ_MAX_BM", "HANZO_PQ2_MMQ_MAX_BM").is_none() {
             assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 1210), 1);
             assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 1000), 1);
             assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 900), 8);
             assert_eq!(mmq_max_vec_bm(GgmlDType::PQ2_0, 890), 8);
         }
-        if std::env::var_os("HANZO_PTQ1_MMQ_MAX_BM").is_none() {
+        if crate::ml_env_os("ML_PTQ1_MMQ_MAX_BM", "HANZO_PTQ1_MMQ_MAX_BM").is_none() {
             assert_eq!(mmq_max_vec_bm(GgmlDType::PTQ1_0, 1210), 3);
             assert_eq!(mmq_max_vec_bm(GgmlDType::PTQ1_0, 900), 8);
         }

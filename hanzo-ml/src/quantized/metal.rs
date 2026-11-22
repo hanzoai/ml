@@ -8,12 +8,12 @@ use std::sync::{Arc, OnceLock};
 /// the matvec wins (weights stream once, reused across the m columns in cache); above it the GEMM's
 /// tile-fill weight-reuse wins. MEASURED matvec/GEMM crossover on the K-quant decode weights (dbc M4
 /// Max, Qwen3-1.7B-Q4_K_M): matvec 150 t/s at m=5, a TIE at m=9 (114 = 114 t/s), GEMM ahead by m=13.
-/// Default 8 is the safe side of the tie. Do NOT raise this without re-measuring -- above the crossover
-/// the GEMM is faster; `HANZO_METAL_MATVEC_MAX` overrides it for that re-measurement.
+/// Default 8 is the safe side of the tie. Do NOT raise this without re-measuring: above the crossover
+/// the GEMM is faster; `ML_METAL_MATVEC_MAX` overrides it for that re-measurement.
 fn metal_matvec_max() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
-        std::env::var("HANZO_METAL_MATVEC_MAX")
+        crate::ml_env_var("ML_METAL_MATVEC_MAX", "HANZO_METAL_MATVEC_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8)
@@ -620,7 +620,7 @@ impl QMetalStorage {
         // matvec: weights stream once and reuse across the m columns in cache, vs the prefill GEMM whose
         // K-quant tiling is built for ~512-row prefill and wastes most of the tile on a handful of rows
         // (~6x the per-matmul cost, measured on the spec-decode verify). Threshold = measured matvec/GEMM
-        // crossover; HANZO_METAL_MATVEC_MAX overrides for re-measurement.
+        // crossover; ML_METAL_MATVEC_MAX overrides for re-measurement.
         //
         // ONLY the quantized weight families take this route. Their matvec kernels index src0/src1 in
         // block/element units, so `call_quantized_matmul_mv_t`'s zero byte-strides are correct and rows

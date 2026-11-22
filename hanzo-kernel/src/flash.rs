@@ -1474,7 +1474,10 @@ pub fn flash_attn_paged_split_kv_run_as<E: Float + CubeElement, R: Runtime>(
     softcap: f32,
 ) -> Vec<E> {
     let num_splits = num_splits.max(1);
-    let hw_plane = if std::env::var_os("HANZO_KERNEL_GEN_P64").is_some() {
+    let hw_plane = if std::env::var_os("ML_KERNEL_GEN_P64")
+        .or_else(|| std::env::var_os("HANZO_KERNEL_GEN_P64"))
+        .is_some()
+    {
         64
     } else {
         client.properties().hardware.plane_size_max as usize
@@ -1614,7 +1617,10 @@ pub fn flash_attn_split_kv_reduce_run_as<E: Float + CubeElement, R: Runtime>(
     num_splits: usize,
     d: usize,
 ) -> Vec<E> {
-    let hw_plane = if std::env::var_os("HANZO_KERNEL_GEN_P64").is_some() {
+    let hw_plane = if std::env::var_os("ML_KERNEL_GEN_P64")
+        .or_else(|| std::env::var_os("HANZO_KERNEL_GEN_P64"))
+        .is_some()
+    {
         64
     } else {
         client.properties().hardware.plane_size_max as usize

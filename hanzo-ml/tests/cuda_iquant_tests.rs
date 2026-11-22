@@ -882,7 +882,8 @@ fn cuda_bonsai2_q1_pq2_ptq1_comprehensive_oracle() {
                     rsq += (r as f64) * (r as f64);
                 }
                 let rel_rmse = ((sse / ym.len() as f64).sqrt()
-                    / (rsq / ym.len() as f64).sqrt().max(1e-9)) as f32;
+                    / (rsq / ym.len() as f64).sqrt().max(1e-9))
+                    as f32;
                 let rel_tol = if k % 256 != 0 && m > 64 { 5e-3 } else { 5e-4 };
                 assert!(
                     rel_rmse < rel_tol,
@@ -944,7 +945,11 @@ fn cuda_q2_0_entrypoints_oracle() {
     .unwrap();
     let deq_host = dev.clone_dtoh(&deq_dev).unwrap();
     for i in 0..w_cpu.len() {
-        assert_eq!(deq_host[i].to_bits(), w_cpu[i].to_bits(), "q2_0 dequant mismatch at {i}");
+        assert_eq!(
+            deq_host[i].to_bits(),
+            w_cpu[i].to_bits(),
+            "q2_0 dequant mismatch at {i}"
+        );
     }
 
     // 2. qmatvec_q2_0_dp4a_f32 (with nrows=19 non-multiple-of-4) vs CPU.
@@ -1165,14 +1170,22 @@ fn cuda_shared_iq_q8_sibling_matvec_parity() {
     let (k, b_fwht) = (5120usize, 1024usize);
     let eps = 1e-6f32;
     let w_norm = Tensor::from_vec(
-        (0..k).map(|i| 0.7 + 0.3 * pseudo(i + 11).abs()).collect::<Vec<_>>(),
+        (0..k)
+            .map(|i| 0.7 + 0.3 * pseudo(i + 11).abs())
+            .collect::<Vec<_>>(),
         k,
         &dev,
     )
     .unwrap();
     let signs = Tensor::from_vec(
         (0..k)
-            .map(|i| if (i * 5 + 1) % 2 == 0 { 1.0f32 } else { -1.0f32 })
+            .map(|i| {
+                if (i * 5 + 1) % 2 == 0 {
+                    1.0f32
+                } else {
+                    -1.0f32
+                }
+            })
             .collect::<Vec<_>>(),
         k,
         &dev,
@@ -1207,7 +1220,9 @@ fn cuda_shared_iq_q8_sibling_matvec_parity() {
 
         for &m in &[1usize, 4] {
             let x_bf16 = Tensor::from_vec(
-                (0..m * k).map(|i| pseudo(i + 909) * 0.9).collect::<Vec<_>>(),
+                (0..m * k)
+                    .map(|i| pseudo(i + 909) * 0.9)
+                    .collect::<Vec<_>>(),
                 (m, k),
                 &dev,
             )
@@ -1283,8 +1298,11 @@ fn bench_bonsai2_cuda_kernels() {
             let raw = synth(dtype, nout, k);
             let wbytes = raw.len() as f64;
             let mm = QMatMul::from_qtensor(
-                QTensor::new(QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(), (nout, k))
-                    .unwrap(),
+                QTensor::new(
+                    QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(),
+                    (nout, k),
+                )
+                .unwrap(),
             )
             .unwrap();
 
@@ -1339,8 +1357,8 @@ fn bench_bonsai2_cuda_kernels() {
 
         for _ in 0..warm {
             let _ = hanzo_ml::quantized::hadamard_fwht(&x, Some(&s), b, false).unwrap();
-            let _ = QMatMul::add_rms_norm_hadamard_fwht_iq_q8(&x, &res, &w, 1e-6, Some(&s), b)
-                .unwrap();
+            let _ =
+                QMatMul::add_rms_norm_hadamard_fwht_iq_q8(&x, &res, &w, 1e-6, Some(&s), b).unwrap();
         }
         dev.synchronize().unwrap();
 
@@ -1379,8 +1397,11 @@ fn bench_bonsai2_cuda_kernels() {
         for dtype in [GgmlDType::PQ2_0, GgmlDType::PTQ1_0, GgmlDType::Q1_0] {
             let raw = synth(dtype, nout, k);
             let mm = QMatMul::from_qtensor(
-                QTensor::new(QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(), (nout, k))
-                    .unwrap(),
+                QTensor::new(
+                    QStorage::from_data(Cow::Owned(raw), &dev, dtype).unwrap(),
+                    (nout, k),
+                )
+                .unwrap(),
             )
             .unwrap();
             for _ in 0..10 {
@@ -1395,7 +1416,9 @@ fn bench_bonsai2_cuda_kernels() {
             dev.synchronize().unwrap();
             let us = t0.elapsed().as_secs_f64() * 1e6 / p_iters as f64;
             let tflops = flops / us / 1e6;
-            println!("PREFILL m=128 {dtype:>6?} [{nout:5}x{k:5}]: {us:7.1} us ({tflops:5.2} TFLOP/s)");
+            println!(
+                "PREFILL m=128 {dtype:>6?} [{nout:5}x{k:5}]: {us:7.1} us ({tflops:5.2} TFLOP/s)"
+            );
         }
     }
 }

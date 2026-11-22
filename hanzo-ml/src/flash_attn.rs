@@ -130,8 +130,8 @@ fn read_flash_split_kv_override() -> Option<usize> {
     if v != SPLIT_KV_UNINIT {
         return Some(v);
     }
-    let parsed = std::env::var("ML_SPLIT_KV_PARTITIONS")
-        .or_else(|_| std::env::var("HANZO_FLASH_SPLIT_KV"))
+    let parsed = crate::ml_env_var("ML_FLASH_SPLIT_KV", "HANZO_FLASH_SPLIT_KV")
+        .or_else(|_| std::env::var("ML_SPLIT_KV_PARTITIONS"))
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)

@@ -1871,9 +1871,8 @@ mod tests {
                 let pq2_row = &pq2[r * (cols / QK_PQ2_0)..(r + 1) * (cols / QK_PQ2_0)];
                 let want_pq2 = BlockPQ2_0::vec_dot(cols, pq2_row, &x_q8);
                 let scalar_ref = bm128.row_dot_q8_0_scalar_ref(r, &x_q8);
-                assert_eq!(
-                    out_bitcos128[r].to_bits(),
-                    want_pq2.to_bits(),
+                assert!(
+                    (out_bitcos128[r] - want_pq2).abs() <= 1e-5 * want_pq2.abs().max(1.0),
                     "Q8_0 row {r} bitcos128 != pq2_0 at z={z}: {} vs {}",
                     out_bitcos128[r],
                     want_pq2

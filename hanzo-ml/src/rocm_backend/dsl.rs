@@ -299,7 +299,7 @@ impl RocmDevice {
     }
 
     /// Try canonical DSL `PQ2_0` / `PTQ1_0` decode matvec (`m == 1`) or prefill GEMM (`m > 1`) on
-    /// ROCm (`F32` or `BF16` activations). Returns `Ok(None)` when disabled (`HANZO_*_IMPL=legacy`)
+    /// ROCm (`F32` or `BF16` activations). Returns `Ok(None)` when disabled (`ML_*_IMPL=legacy`)
     /// or ineligible so caller falls back cleanly to legacy ROCm kernels.
     #[allow(clippy::too_many_arguments)]
     pub fn try_ternary_dsl_matmul(

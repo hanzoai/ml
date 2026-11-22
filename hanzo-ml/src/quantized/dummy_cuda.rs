@@ -255,7 +255,13 @@ mod cpu_fwht_fallback {
             Some(s) => Some(s.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
             None => None,
         };
-        fwht_cpu_inplace(&mut vals, signs_vec.as_deref(), width, block_size, is_inverse);
+        fwht_cpu_inplace(
+            &mut vals,
+            signs_vec.as_deref(),
+            width,
+            block_size,
+            is_inverse,
+        );
         Tensor::from_vec(vals, x.shape(), &Device::Cpu)?
             .to_dtype(orig_dtype)?
             .to_device(&orig_dev)

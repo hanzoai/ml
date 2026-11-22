@@ -4165,7 +4165,7 @@ impl VulkanDevice {
     }
 
     /// Canonical DSL `PQ2_0` / `PTQ1_0` ternary matvec (`m == 1`) and prefill GEMM (`m > 1`)
-    /// over native GGML blocks, gated by `HANZO_PQ2_IMPL` / `HANZO_PTQ1_IMPL` (`legacy` default).
+    /// over native GGML blocks, gated by `ML_PQ2_IMPL` / `ML_PTQ1_IMPL` (`legacy` default).
     /// Returns `Ok(None)` when the legacy fallback should run (default, unsupported subgroup width
     /// for committed SPIR-V, or missing coopmat on `m > 1`).
     pub fn try_dispatch_ternary_dsl(
@@ -6081,7 +6081,7 @@ impl VulkanDevice {
     // destroyed, so a generous value on a big-memory box merely retains the reusable working set.
     fn pool_free_cap(&self) -> u64 {
         // Explicit override (GiB) for A/B measurement and constrained deployments.
-        if let Some(gb) = std::env::var("HANZO_VK_POOL_CAP_GB")
+        if let Some(gb) = crate::ml_env_var("ML_VK_POOL_CAP_GB", "HANZO_VK_POOL_CAP_GB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -9875,11 +9875,11 @@ mod dsl_dispatch_proof {
     /// 32 MB MALL has evicted. Both are gated bit-exact against the same CPU oracle. `dev.matvec_q4k`
     /// uploads x + reads back per call, an overhead identical for both arms, so the DSL/hand ratio is
     /// the honest in-engine sign (the precise cold kernel GB/s is the matvec-check f32sweep + dp4a
-    /// anchor). HANZO_Q4K_AB=1 arms it; run in a quiet window only (wall-clock timing).
+    /// anchor). ML_Q4K_AB=1 arms it; run in a quiet window only (wall-clock timing).
     #[test]
     fn q4k_dsl_vs_hand_cm_ab() {
-        if std::env::var_os("HANZO_Q4K_AB").is_none() {
-            eprintln!("[q4k-ab] set HANZO_Q4K_AB=1 to run the cold A/B (skipped)");
+        if crate::ml_env_os("ML_Q4K_AB", "HANZO_Q4K_AB").is_none() {
+            eprintln!("[q4k-ab] set ML_Q4K_AB=1 to run the cold A/B (skipped)");
             return;
         }
         use crate::quantized::k_quants::{BlockQ4K, GgmlType};
@@ -11041,7 +11041,7 @@ mod dsl_dispatch_proof {
     /// (raw for dp4a, split for coopmat). Both submit through the same dispatch path, so per-submit
     /// overhead cancels in the ratio -- this same-harness ratio is the go/no-go for routing coopmat
     /// into matmul_q4k_gpu_off (a cache-warm ratio, NOT an absolute in-engine number). Gated on
-    /// HANZO_MMQ_AB=1 so it never runs in normal CI.
+    /// ML_MMQ_AB=1 so it never runs in normal CI.
     ///
     /// Measured on gfx1151/RADV as the sole GPU workload: the DSL i8 coopmat arm (`mmq_q4k_rt`) runs
     /// 0.51-0.78x of the dp4a hand tile across the ffn/attn projection shapes (only the tiny n=256
@@ -11052,7 +11052,7 @@ mod dsl_dispatch_proof {
     /// will not close this.
     #[test]
     fn mmq_q4k_coopmat_vs_dp4a_prefill_ab() {
-        if std::env::var_os("HANZO_MMQ_AB").is_none() {
+        if crate::ml_env_os("ML_MMQ_AB", "HANZO_MMQ_AB").is_none() {
             return;
         }
         let dev = match VulkanDevice::new(0) {
@@ -11344,7 +11344,7 @@ mod dsl_dispatch_proof {
     /// The tiled int8-dp4a Q6_K prefill matmul (mul_mm_q6k_tiled_dp4a) agrees with the trusted column
     /// kernel (mul_mat_q6k) on identical Q6_K weight bytes -- so the in-kernel 6-bit decode is correct;
     /// the only divergence is the q8 activation quantization the dp4a path adds. Also times both at real
-    /// prefill shapes when HANZO_MMQ_AB=1 (the win over the column kernel that dominates Q4_K_M prefill).
+    /// prefill shapes when ML_MMQ_AB=1 (the win over the column kernel that dominates Q4_K_M prefill).
     #[test]
     fn mul_mm_q6k_coopmat_and_dp4a_match_column() {
         let dev = match VulkanDevice::new(0) {
@@ -11365,7 +11365,7 @@ mod dsl_dispatch_proof {
             s ^= s << 17;
             s
         };
-        let ab = std::env::var_os("HANZO_MMQ_AB").is_some();
+        let ab = crate::ml_env_os("ML_MMQ_AB", "HANZO_MMQ_AB").is_some();
         let shapes: &[(usize, usize, usize)] = if ab {
             &[
                 (37, 64, 256),

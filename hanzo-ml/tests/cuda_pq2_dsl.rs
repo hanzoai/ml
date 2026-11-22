@@ -5,7 +5,7 @@
 //! 2. `PQ2_0` and `PTQ1_0` prefill GEMM (`m > 1`, `bm = 32` and `bm = 64`, `f32` and `bf16`) vs
 //!    f64 oracle, plus nonzero activation slice offset and 3D batch shapes.
 //! 3. Single-compile proof (`compiled 1x`) and dispatch counters (`quantized::dsl::stats`).
-//! 4. Real Zen 6 27B GGUF tensors when `HANZO_PQ2_GGUF` / `HANZO_PTQ1_GGUF` are set.
+//! 4. Real Zen 6 27B GGUF tensors when `ML_PQ2_GGUF` / `ML_PTQ1_GGUF` are set.
 //! 5. Matched interleaved A/B benchmark (`#[ignore]`: decode + prefill, DSL vs legacy on GB10).
 #![cfg(feature = "cuda")]
 

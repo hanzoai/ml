@@ -2,7 +2,7 @@
 //! powered by canonical `hanzo-kernel` DSL artifacts across CUDA, Vulkan, and Metal.
 //!
 //! Validates:
-//! - Legacy-default safety (`HANZO_GDN_IMPL=legacy`, `HANZO_FLASH_IMPL=legacy` -> `Ok(None)`),
+//! - Legacy-default safety (`ML_GDN_IMPL=legacy`, `ML_FLASH_IMPL=legacy` -> `Ok(None)`),
 //! - Full GDN sequence equivalence: one-shot prefill == chunked prefill == single-token decode,
 //! - `F32`, `F16`, `BF16` accuracy + nonzero `narrow()` byte offsets,
 //! - Paged FlashAttention across `FlatPaged4D`, `EngineStandard5D4D`, and `Contiguous` layouts,
@@ -905,7 +905,7 @@ fn run_fwht_suite(dev: &Device, dtypes: &[DType], label: &str) {
         hanzo_ml::fwht::try_hadamard_fwht(&x_probe, None, 1024, false)
             .unwrap()
             .is_none(),
-        "HANZO_FWHT_IMPL=legacy must return Ok(None)"
+        "ML_FWHT_IMPL=legacy must return Ok(None)"
     );
     dsl::set_fwht_impl(QkImpl::Dsl);
     dsl::reset_stats();

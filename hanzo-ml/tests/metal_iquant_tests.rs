@@ -418,7 +418,7 @@ fn metal_mm_q6k_bf16_matches_f32() {
 // scale-relative deviation max|half - f32tile| / max|f32tile|. The f32-tile path (`QMatMul::forward`
 // on a bf16 activation) is the reference -- itself proven bit-exact to CPU by
 // `metal_mm_q*k_bf16_matches_f32` above. Driving the half kernel directly (src1_half = true) keeps
-// the accuracy gate on the KERNEL, orthogonal to the `HANZO_METAL_MM_F16` routing policy, and avoids
+// the accuracy gate on the KERNEL, orthogonal to the `ML_METAL_MM_F16` routing policy, and avoids
 // mutating a process-global env flag from a parallel test. A wrong stride here diverges loudly (the
 // two kernels see the same weights + activation), so this also guards the direct invocation.
 fn check_bf16_half_mm_bounded(dtype: GgmlDType) {

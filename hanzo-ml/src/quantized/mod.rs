@@ -2340,8 +2340,6 @@ impl QMatMul {
                     | GgmlDType::IQ2_XS
                     | GgmlDType::Q1_0
                     | GgmlDType::Q2_0
-                    | GgmlDType::PQ2_0
-                    | GgmlDType::PTQ1_0
             );
             if native_vk {
                 if let QStorage::Vulkan(resident) = &qtensor.storage {
@@ -3169,7 +3167,7 @@ impl crate::Module for QMatMul {
                 let xs = xs_recovered.as_ref().unwrap_or(xs);
                 let rows: usize = xs.elem_count() / *k;
                 // Canonical DSL ternary path (PQ2_0 / PTQ1_0, decode matvec + prefill GEMM, F32/BF16)
-                // gated on HANZO_PQ2_IMPL / HANZO_PTQ1_IMPL == dsl (defaults to legacy).
+                // gated on ML_PQ2_IMPL / ML_PTQ1_IMPL == dsl (defaults to legacy).
                 #[cfg(feature = "rocm")]
                 if matches!(*dtype, GgmlDType::PQ2_0 | GgmlDType::PTQ1_0)
                     && matches!(xs.dtype(), DType::F32 | DType::BF16)
@@ -3375,7 +3373,7 @@ impl crate::Module for QMatMul {
                             false,
                         ));
                     }
-                    // Legacy fallback (default HANZO_PQ2_IMPL=legacy / HANZO_PTQ1_IMPL=legacy,
+                    // Legacy fallback (default ML_PQ2_IMPL=legacy / ML_PTQ1_IMPL=legacy,
                     // or unsupported subgroup/coopmat config): dequantize to f32 and run dense matmul.
                     let w = qtensor.dequantize(&xs.device())?;
                     let w = match *xs.dims() {
