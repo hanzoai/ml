@@ -14,6 +14,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use std::fmt;
 
+pub use crate::{ArtifactRecord as Artifact, ExperimentRecord as Experiment};
+
 fn list<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
     Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }

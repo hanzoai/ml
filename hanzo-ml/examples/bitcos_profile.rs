@@ -1368,6 +1368,7 @@ fn main() -> anyhow::Result<()> {
             next_hypothesis: "Evaluate BitcosMatrix-G128 sparse skip on attention output & Qwen3/Bonsai-2 9B FFN projections".into(),
             historical: false,
             recorded_at: String::new(),
+            ..Default::default()
         };
         let receipt = ledger.record_experiment(&mut exp, &[("bitcos_profile_json", &report_bytes)])?;
         println!(

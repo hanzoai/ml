@@ -73,25 +73,72 @@ pub fn mend(path: impl AsRef<Path>) -> io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let mut data = Vec::new();
-    File::open(path)?.read_to_end(&mut data)?;
-    if data.is_empty() || data.ends_with(b"\n") {
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    if len == 0 {
         return Ok(());
     }
+    f.seek(SeekFrom::End(-1))?;
+    let mut last_byte = [0u8; 1];
+    f.read_exact(&mut last_byte)?;
+    if last_byte[0] == b'\n' {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(0))?;
+    let mut data = Vec::with_capacity(len as usize);
+    f.read_to_end(&mut data)?;
     let end = data
         .iter()
         .rposition(|&b| b == b'\n')
         .map_or(0, |idx| idx + 1);
-    if serde_json::from_slice::<serde_json::Value>(&data[end..]).is_err() {
-        let f = OpenOptions::new().write(true).open(path)?;
-        f.set_len(end as u64)?;
-        f.sync_data()?;
+    if serde_json::from_slice::<ResearchEvent>(&data[end..]).is_err() {
+        let wf = OpenOptions::new().write(true).open(path)?;
+        wf.set_len(end as u64)?;
+        wf.sync_data()?;
         return Ok(());
     }
-    let mut f = OpenOptions::new().append(true).open(path)?;
-    f.write_all(b"\n")?;
-    f.sync_data()?;
+    let mut af = OpenOptions::new().append(true).open(path)?;
+    af.write_all(b"\n")?;
+    af.sync_data()?;
     Ok(())
+}
+
+fn read_tail(path: &Path) -> io::Result<Option<ResearchEvent>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let mut chunk_size = 8192u64.min(len);
+    loop {
+        f.seek(SeekFrom::End(-(chunk_size as i64)))?;
+        let mut buf = vec![0u8; chunk_size as usize];
+        f.read_exact(&mut buf)?;
+        let trimmed_end = buf
+            .iter()
+            .rposition(|&b| !b.is_ascii_whitespace())
+            .map(|i| i + 1);
+        if let Some(te) = trimmed_end {
+            let slice = &buf[..te];
+            if let Some(nl) = slice.iter().rposition(|&b| b == b'\n') {
+                let line = &slice[nl + 1..];
+                let ev = serde_json::from_slice::<ResearchEvent>(line)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                return Ok(Some(ev));
+            }
+            if chunk_size == len {
+                let ev = serde_json::from_slice::<ResearchEvent>(slice)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                return Ok(Some(ev));
+            }
+        } else if chunk_size == len {
+            return Ok(None);
+        }
+        chunk_size = (chunk_size * 2).min(len);
+    }
 }
 
 /// Read all events in file order; errors on any malformed line.
@@ -111,7 +158,11 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<ResearchEvent>> {
         let event = serde_json::from_str::<ResearchEvent>(&line).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{}: line {} is not a valid ResearchEvent: {e}", path.display(), idx + 1),
+                format!(
+                    "{}: line {} is not a valid ResearchEvent: {e}",
+                    path.display(),
+                    idx + 1
+                ),
             )
         })?;
         out.push(event);
@@ -129,13 +180,22 @@ pub fn verify(path: impl AsRef<Path>) -> io::Result<String> {
         if ev.sequence != want_seq {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{}: line {} has sequence {}, expected {want_seq}", path.display(), i + 1, ev.sequence),
+                format!(
+                    "{}: line {} has sequence {}, expected {want_seq}",
+                    path.display(),
+                    i + 1,
+                    ev.sequence
+                ),
             ));
         }
         if ev.previous_event_hash != last {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{}: line {} previous_event_hash mismatch", path.display(), i + 1),
+                format!(
+                    "{}: line {} previous_event_hash mismatch",
+                    path.display(),
+                    i + 1
+                ),
             ));
         }
         let recomputed_payload = rfc8785_digest(&ev.payload)
@@ -212,8 +272,7 @@ impl ResearchWal {
         let json_val = serde_json::to_value(payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let events = read(&self.wal_path)?;
-        let (seq, prev) = match events.last() {
+        let (seq, prev) = match read_tail(&self.wal_path)? {
             Some(last) => {
                 let h = last
                     .digest()
@@ -223,10 +282,7 @@ impl ResearchWal {
             None => (1, GENESIS.to_string()),
         };
 
-        let event_id = format!(
-            "{}-{}-{}-{}",
-            self.run_id, self.worker_id, seq, event_type
-        );
+        let event_id = format!("{}-{}-{}-{}", self.run_id, self.worker_id, seq, event_type);
         let event = ResearchEvent::new(
             self.run_id.clone(),
             self.worker_id.clone(),
@@ -272,8 +328,8 @@ impl ResearchWal {
             Some(s) => s.to_string(),
             None => default_event_id(&self.run_id, &self.worker_id, event_type, &json_val)?,
         };
-        let want_payload_hash = rfc8785_digest(&json_val)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let want_payload_hash =
+            rfc8785_digest(&json_val).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let events = read(&self.wal_path)?;
         for existing in &events {
@@ -390,7 +446,10 @@ mod tests {
 
         // Torn tail mend check
         {
-            let mut f = OpenOptions::new().append(true).open(wal.wal_path()).unwrap();
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(wal.wal_path())
+                .unwrap();
             f.write_all(b"{\"run_id\":\"torn").unwrap();
         }
         let wal_recovered = ResearchWal::open(&temp, "run-test").unwrap();
@@ -398,7 +457,11 @@ mod tests {
 
         // Interior corruption must fail open & verify
         let raw = std::fs::read_to_string(wal.wal_path()).unwrap();
-        std::fs::write(wal.wal_path(), raw.replacen("\"loss\":1.25", "\"loss\":9.99", 1)).unwrap();
+        std::fs::write(
+            wal.wal_path(),
+            raw.replacen("\"loss\":1.25", "\"loss\":9.99", 1),
+        )
+        .unwrap();
         assert!(ResearchWal::open(&temp, "run-test").is_err());
 
         let _ = std::fs::remove_dir_all(&temp);

@@ -111,7 +111,10 @@ impl CloudLeaseManager {
     fn local_path(&self, uri: &str) -> Option<PathBuf> {
         let dir = self.local_dir.as_ref()?;
         let key = rfc8785_digest(&uri).unwrap_or_else(|_| sanitize_segment(uri));
-        Some(dir.join("leases").join(format!("{}.json", &key[..24.min(key.len())])))
+        Some(
+            dir.join("leases")
+                .join(format!("{}.json", &key[..24.min(key.len())])),
+        )
     }
 
     fn acquire_offline(
@@ -174,7 +177,8 @@ impl CloudLeaseManager {
             fs::rename(tmp, p)?;
         }
         if let Some(dir) = &self.local_dir {
-            let mut wal = ResearchWal::open_worker(&dir.join("wal"), "lease-offline", &self.worker_id)?;
+            let mut wal =
+                ResearchWal::open_worker(&dir.join("wal"), "lease-offline", &self.worker_id)?;
             wal.append("lease_acquired_offline", &lease)?;
         }
         Ok(LeaseOutcome {
@@ -290,7 +294,8 @@ impl CloudLeaseManager {
         };
         if !reclaimed_from.is_empty() {
             if let Some(dir) = &self.local_dir {
-                let mut wal = ResearchWal::open_worker(&dir.join("wal"), campaign, &self.worker_id)?;
+                let mut wal =
+                    ResearchWal::open_worker(&dir.join("wal"), campaign, &self.worker_id)?;
                 wal.append("lease_reclaimed", &lease)?;
             }
         }
