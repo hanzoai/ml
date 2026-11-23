@@ -1728,3 +1728,508 @@ fn test_native_tasks_linked_machines_evo_dgx_sse_schedules_and_cli() {
     assert_eq!(r_tick["verdict"], "proven");
     assert_eq!(r_tick["stopped_stage"], 2);
 }
+
+#[test]
+fn promising_inconclusive_enqueues_bounded_continuation_without_dev_only_promotion() {
+    use hanzo_research::{paired_mcnemar, validate_dataset_manifest_sha256};
+
+    let dir = TempDir::new("promising-cont");
+    let manifest_sha =
+        hanzo_research::rfc8785_digest(&json!({"dataset": "swe-dev-367", "n": 367})).unwrap();
+    assert_eq!(
+        validate_dataset_manifest_sha256(&manifest_sha).unwrap(),
+        manifest_sha
+    );
+
+    // Construct a shuffled n=367 paired binary trace with +3.0pp gain (+11 net wins, 39 discordant -> p ~ 0.054-0.145)
+    let mut base_corr = Vec::with_capacity(367);
+    let mut cand_corr = Vec::with_capacity(367);
+    let mut ex_ids = Vec::with_capacity(367);
+    for i in 0..367_usize {
+        ex_ids.push(format!("swe-dev-{i:04}"));
+        let h = ((i.wrapping_mul(2654435761)) >> 8) % 367;
+        // 25 cand-only wins, 14 base-only wins (+11 / 367 = +3.00pp), rest concordant shuffled
+        if i < 25 {
+            base_corr.push(false);
+            cand_corr.push(true);
+        } else if i < 39 {
+            base_corr.push(true);
+            cand_corr.push(false);
+        } else if h % 2 == 0 {
+            base_corr.push(true);
+            cand_corr.push(true);
+        } else {
+            base_corr.push(false);
+            cand_corr.push(false);
+        }
+    }
+    // Deterministic permutation so pairs are authentically interleaved per-example
+    let mut order: Vec<usize> = (0..367).collect();
+    order.sort_by_key(|&i| (i.wrapping_mul(11400714819323198485)) ^ (i << 13));
+    let b_shuf: Vec<bool> = order.iter().map(|&i| base_corr[i]).collect();
+    let c_shuf: Vec<bool> = order.iter().map(|&i| cand_corr[i]).collect();
+
+    let mcn = paired_mcnemar(
+        &c_shuf,
+        &b_shuf,
+        Some(&ex_ids),
+        Some(&manifest_sha),
+        true,
+        0.05,
+        2.0,
+        Some(1.0),
+        0.20,
+        false,
+    )
+    .unwrap();
+    assert!((mcn.delta * 100.0 - (1100.0 / 367.0)).abs() < 1e-6);
+    assert_eq!(mcn.verdict, "promising_inconclusive");
+
+    // Dev-only plan (canonical_qualification = false) must NEVER promote as "proven" even on huge effect
+    let dev_only_plan = ProgressiveAbPlan {
+        stages: vec![ProgressiveStage {
+            name: "dev_screen".into(),
+            reps: 367,
+            prompt_len: 256,
+            gen_len: 64,
+        }],
+        min_effect_pct: Some(2.0),
+        promising_effect_pct: Some(1.0),
+        futility_alpha: 0.20,
+        max_continuations: 1,
+        canonical_qualification: false,
+        require_example_ids: true,
+        ..ProgressiveAbPlan::default()
+    };
+    let dev_runner = ProgressiveAbRunner::new(dev_only_plan);
+    let huge_cand: Vec<bool> = (0..367).map(|i| i % 5 != 0).collect();
+    let low_base: Vec<bool> = (0..367).map(|i| i % 5 == 0).collect();
+    let dev_huge_res = dev_runner
+        .run("accuracy", "%", |_, st| {
+            Ok(ProgressiveStageOutput {
+                stage_name: st.name.clone(),
+                baseline_correct: low_base.clone(),
+                candidate_correct: huge_cand.clone(),
+                example_ids: ex_ids.clone(),
+                dataset_manifest_sha256: manifest_sha.clone(),
+                parity_passed: true,
+                memory_integrity_passed: true,
+                ..ProgressiveStageOutput::default()
+            })
+        })
+        .unwrap();
+    assert_eq!(dev_huge_res.verdict, "promising_inconclusive");
+    assert_ne!(dev_huge_res.verdict, "proven");
+
+    // AutonomousController campaign: tick 1 gets +3.0pp dev gain -> promising_inconclusive -> enqueues 1 continuation;
+    // tick 2 runs continuation_depth=1 on independent dev evidence (still modest gain) -> no 2nd continuation!
+    let exec_path = dir.path().join("exec_promising.py");
+    let payload_json = json!({
+        "status": "complete",
+        "baseline_correct": b_shuf,
+        "candidate_correct": c_shuf,
+        "example_ids": ex_ids,
+        "dataset_manifest_sha256": manifest_sha,
+        "parity_passed": true,
+        "memory_integrity_passed": true,
+        "gpu_time_sec": 0.25,
+    });
+    let payload_file = dir.path().join("stage_resp.json");
+    fs::write(&payload_file, serde_json::to_vec(&payload_json).unwrap()).unwrap();
+    let seen_reqs = dir.path().join("seen_reqs.jsonl");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+req_path = sys.argv[sys.argv.index("--request") + 1]
+out_path = sys.argv[sys.argv.index("--output") + 1]
+req = json.load(open(req_path))
+with open({seen:?}, "a") as f:
+    f.write(json.dumps(req) + "\n")
+resp = json.load(open({payload:?}))
+resp["trial_id"] = req["trial_id"]
+resp["objective_id"] = req["objective_id"]
+with open(out_path, "w") as f:
+    json.dump(resp, f)
+"#,
+        seen = seen_reqs.display().to_string(),
+        payload = payload_file.display().to_string(),
+    );
+    fs::write(&exec_path, script).unwrap();
+    let mut perms = fs::metadata(&exec_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&exec_path, perms).unwrap();
+
+    let mut space = BTreeMap::new();
+    space.insert(
+        "agent_eval".to_string(),
+        vec![SearchArm {
+            arm: "prompt_router".into(),
+            variant: "v1".into(),
+            hypothesis: "structured routing lifts dev solve rate".into(),
+            config: BTreeMap::new(),
+        }],
+    );
+    let reg = CampaignRegistry {
+        campaign: "dev-screen-campaign".into(),
+        repo: "hanzoai/ml".into(),
+        objectives: vec![ObjectiveSpec {
+            id: "swe_dev".into(),
+            study: "swe_dev".into(),
+            family: "agent_eval".into(),
+            metric: "accuracy".into(),
+            unit: "%".into(),
+            direction: "higher".into(),
+            backends: vec!["CPU".into()],
+            ..ObjectiveSpec::default()
+        }],
+        search_space: space,
+        plan: ProgressiveAbPlan {
+            stages: vec![ProgressiveStage {
+                name: "dev".into(),
+                reps: 367,
+                prompt_len: 256,
+                gen_len: 64,
+            }],
+            min_effect_pct: Some(2.0),
+            promising_effect_pct: Some(1.0),
+            futility_alpha: 0.20,
+            max_continuations: 1,
+            canonical_qualification: false,
+            require_example_ids: true,
+            ..ProgressiveAbPlan::default()
+        },
+    };
+    let ctrl = AutonomousController::open(
+        dir.path().join("ledger"),
+        None,
+        Some(reg),
+        ".",
+        16,
+        Some("worker-promising"),
+    )
+    .unwrap();
+
+    let t1 = ctrl
+        .tick(&exec_path, None, None, None, 5, false, None, 120)
+        .unwrap();
+    assert_eq!(t1["verdict"], "promising_inconclusive");
+    assert_eq!(t1["epistemic_verdict"], "inconclusive");
+    assert_eq!(t1["status"], "promising_inconclusive");
+
+    let open_after_t1 = ctrl.ledger.opportunities().unwrap().top_open(None, 10);
+    assert_eq!(open_after_t1.len(), 1);
+    assert!(open_after_t1[0]
+        .trigger_rule
+        .starts_with("continuation_independent_dev:1/1:"));
+
+    let t2 = ctrl
+        .tick(&exec_path, None, None, None, 5, false, None, 120)
+        .unwrap();
+    assert_eq!(t2["verdict"], "promising_inconclusive");
+    assert_eq!(t2["epistemic_verdict"], "inconclusive");
+
+    // Bounded max_continuations=1: no second continuation should be enqueued!
+    let open_after_t2 = ctrl.ledger.opportunities().unwrap().top_open(None, 10);
+    assert!(open_after_t2.is_empty());
+
+    // Verify independent dev evidence seed shift on continuation tick
+    let req_lines: Vec<Value> = fs::read_to_string(&seen_reqs)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(req_lines.len(), 2);
+    assert_eq!(req_lines[0]["continuation_depth"], 0);
+    assert_eq!(req_lines[1]["continuation_depth"], 1);
+    assert_eq!(req_lines[1]["independent_dev_evidence"], true);
+    assert_ne!(req_lines[0]["seed"], req_lines[1]["seed"]);
+}
+
+#[test]
+fn paired_mcnemar_trace_guard_manifest_sha256_and_retracted_history() {
+    use hanzo_research::{paired_mcnemar, validate_paired_binary_trace};
+
+    // 1. Reject reconstructed aggregate-rate pseudo-arrays ([true]*170 + [false]*30 vs [true]*160 + [false]*40)
+    let mut fake_base = vec![true; 160];
+    fake_base.resize(200, false);
+    let mut fake_cand = vec![true; 170];
+    fake_cand.resize(200, false);
+    let ex_ids: Vec<String> = (0..200).map(|i| format!("ex-{i:04}")).collect();
+    let valid_sha = "ab".repeat(32);
+
+    let chk_err = validate_paired_binary_trace(
+        &fake_cand,
+        &fake_base,
+        Some(&ex_ids),
+        Some(&valid_sha),
+        true,
+    )
+    .unwrap_err();
+    assert!(chk_err.to_string().contains("reconstructed"));
+    assert!(paired_mcnemar(
+        &fake_cand,
+        &fake_base,
+        Some(&ex_ids),
+        Some(&valid_sha),
+        true,
+        0.05,
+        2.0,
+        None,
+        0.20,
+        true,
+    )
+    .is_err());
+
+    // Reject missing/placeholder manifest sha256 or duplicate example_ids
+    let shuf_base: Vec<bool> = (0..64).map(|i| (i * 7 + 3) % 5 < 3).collect();
+    let shuf_cand: Vec<bool> = (0..64).map(|i| (i * 11 + 1) % 5 < 4).collect();
+    let ex64: Vec<String> = (0..64).map(|i| format!("item-{i:03}")).collect();
+    assert!(paired_mcnemar(
+        &shuf_cand,
+        &shuf_base,
+        Some(&ex64),
+        Some("0000"),
+        true,
+        0.05,
+        2.0,
+        None,
+        0.20,
+        true,
+    )
+    .is_err());
+    assert!(paired_mcnemar(
+        &shuf_cand,
+        &shuf_base,
+        Some(&ex64),
+        Some(&"0".repeat(64)),
+        true,
+        0.05,
+        2.0,
+        None,
+        0.20,
+        true,
+    )
+    .is_err());
+    let mut dup_ids = ex64.clone();
+    dup_ids[10] = dup_ids[0].clone();
+    assert!(paired_mcnemar(
+        &shuf_cand,
+        &shuf_base,
+        Some(&dup_ids),
+        Some(&valid_sha),
+        true,
+        0.05,
+        2.0,
+        None,
+        0.20,
+        true,
+    )
+    .is_err());
+
+    // Authentic trace + valid manifest sha256 succeeds
+    let ok_mcn = paired_mcnemar(
+        &shuf_cand,
+        &shuf_base,
+        Some(&ex64),
+        Some(&valid_sha),
+        true,
+        0.05,
+        2.0,
+        None,
+        0.20,
+        true,
+    )
+    .unwrap();
+    assert_eq!(ok_mcn.n, 64);
+
+    // 2. Retracted records excluded from canonical queries/wins but queryable via include_retracted=true
+    let dir = TempDir::new("retracted-ledger");
+    let ledger = LocalResearchLedger::open(dir.path().join("ledger"), "run-ret").unwrap();
+    let mut rec = ExperimentRecordV2 {
+        project: "default".into(),
+        study: "gsm8k_eval".into(),
+        objective: "gsm8k accuracy".into(),
+        hypothesis: "cot v2".into(),
+        experiment_id: "exp-retract-1".into(),
+        repo: "hanzoai/ml".into(),
+        commit: "abcdef123456".into(),
+        branch: "main".into(),
+        hardware: HardwareSpec {
+            host: "dgx".into(),
+            backend: "CUDA".into(),
+            ..HardwareSpec::default()
+        },
+        workload_manifest: WorkloadManifest {
+            manifest_id: "gsm8k:cot:v2".into(),
+            dataset: "gsm8k".into(),
+            manifest_sha256: valid_sha.clone(),
+            ..WorkloadManifest::default()
+        },
+        baseline: BTreeMap::from([("arm".to_string(), json!("cot_v1"))]),
+        candidate: BTreeMap::from([("arm".to_string(), json!("cot_v2"))]),
+        raw_samples: BTreeMap::from([
+            ("baseline".to_string(), vec![0.70, 0.72, 0.71]),
+            ("candidate".to_string(), vec![0.82, 0.84, 0.83]),
+        ]),
+        statistical_comparison: paired_comparison(
+            "accuracy",
+            "%",
+            &[0.70, 0.72, 0.71],
+            &[0.82, 0.84, 0.83],
+            true,
+        )
+        .unwrap(),
+        correctness: CorrectnessChecks {
+            parity_passed: true,
+            safety_passed: Some(true),
+            ..CorrectnessChecks::default()
+        },
+        example_ids: ex64[..3].to_vec(),
+        verdict: "proven".into(),
+        conclusion: "initial win".into(),
+        ..ExperimentRecordV2::default()
+    };
+    ledger
+        .record_experiment(&mut rec, &[("trace.json", br#"{"ok":true}"#)])
+        .unwrap();
+    assert_eq!(ledger.query_all().unwrap().len(), 1);
+
+    let retracted = ledger
+        .retract_experiment("exp-retract-1", "contaminated split discovered")
+        .unwrap();
+    assert!(retracted.is_retracted());
+    assert!(ledger.query_all().unwrap().is_empty());
+    let with_ret = ledger
+        .query_experiments_with_options(None, None, None, None, None, true, true)
+        .unwrap();
+    assert_eq!(with_ret.len(), 1);
+    assert_eq!(
+        with_ret[0].retracted_reason,
+        "contaminated split discovered"
+    );
+
+    let (base, _st) = spawn_full_mock_cloud(0);
+    let client = test_client(&base);
+    ledger.sync_to_cloud(&client).unwrap();
+    assert!(client.query(None, None).unwrap().is_empty());
+    let cloud_with_ret = client.query_with_options(None, None, None, true).unwrap();
+    assert_eq!(cloud_with_ret.len(), 1);
+    assert_eq!(cloud_with_ret[0].status, "retracted");
+}
+
+#[test]
+fn wait_gpu_job_precheck_sse_timeout_and_401_token_refresh() {
+    use std::time::Duration;
+
+    // 1. Sub-50ms job already completed before wait_gpu_job starts -> immediate pre-SSE return (0 SSE streams opened!)
+    let (base, mock_state) = spawn_full_mock_cloud(0);
+    let client = test_client(&base);
+    mock_state.workflow_jobs.lock().unwrap().insert(
+        "fast-job-1".to_string(),
+        json!({
+            "id": "fast-job-1",
+            "activityId": "fast-job-1",
+            "runId": "fast-job-1",
+            "polls": 1,
+            "sse_completed": true,
+        }),
+    );
+    let fast = client
+        .wait_gpu_job(
+            "fast-job-1",
+            Some("gpu-jobs"),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+    assert_eq!(fast["status"], "ACTIVITY_TASK_STATE_COMPLETED");
+    assert_eq!(mock_state.sse_streams_opened.load(Ordering::SeqCst), 0);
+
+    // 2. Bounded SSE read timeout + 401 token refresh on custom server
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let desc_calls = Arc::new(AtomicUsize::new(0));
+    let sse_calls = Arc::new(AtomicUsize::new(0));
+    let dc_srv = Arc::clone(&desc_calls);
+    let sc_srv = Arc::clone(&sse_calls);
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let dc = Arc::clone(&dc_srv);
+            let sc = Arc::clone(&sc_srv);
+            thread::spawn(move || {
+                let (method, full_path, headers, _body) = read_http_req(&mut s);
+                if method.is_empty() {
+                    return;
+                }
+                let auth = headers.get("authorization").cloned().unwrap_or_default();
+                if auth != "Bearer hk-fresh-token" {
+                    let resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"error\":\"token expired\"}";
+                    let _ = s.write_all(resp.as_bytes());
+                    return;
+                }
+                if full_path
+                    .starts_with("/v1/workflow/namespaces/gpu-jobs/activities/missed-sse-job")
+                {
+                    let n = dc.fetch_add(1, Ordering::SeqCst) + 1;
+                    let state = if n >= 2 {
+                        "ACTIVITY_TASK_STATE_COMPLETED"
+                    } else {
+                        "ACTIVITY_TASK_STATE_STARTED"
+                    };
+                    let payload = serde_json::to_vec(&json!({
+                        "id": "missed-sse-job",
+                        "status": state,
+                        "state": state,
+                        "result": {"ok": true},
+                    }))
+                    .unwrap();
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = s.write_all(hdr.as_bytes());
+                    let _ = s.write_all(&payload);
+                } else if full_path.starts_with("/v1/workflow/events") {
+                    sc.fetch_add(1, Ordering::SeqCst);
+                    // Open SSE stream and hold it silent past the 120ms bounded SSE read timeout (simulating a missed SSE event)
+                    let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n: keepalive\n\n";
+                    let _ = s.write_all(hdr.as_bytes());
+                    let _ = s.flush();
+                    thread::sleep(Duration::from_millis(350));
+                }
+            });
+        }
+    });
+
+    let refresh_count = Arc::new(AtomicUsize::new(0));
+    let rc_provider = Arc::clone(&refresh_count);
+    let rotating_client = Research::new(
+        &format!("http://{addr}"),
+        "hk-expired-token",
+        "default",
+        ".",
+        &[],
+    )
+    .with_token_provider(move || {
+        rc_provider.fetch_add(1, Ordering::SeqCst);
+        Some("hk-fresh-token".to_string())
+    });
+
+    let recovered = rotating_client
+        .wait_gpu_job_with_options(
+            "missed-sse-job",
+            Some("missed-sse-job"),
+            Some("gpu-jobs"),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            Duration::from_millis(120),
+        )
+        .unwrap();
+    assert_eq!(recovered["status"], "ACTIVITY_TASK_STATE_COMPLETED");
+    assert!(refresh_count.load(Ordering::SeqCst) >= 1);
+    assert!(sse_calls.load(Ordering::SeqCst) >= 1);
+    assert!(desc_calls.load(Ordering::SeqCst) >= 2);
+}

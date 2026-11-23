@@ -444,24 +444,38 @@ fn canonical_target_handle(item: &Value) -> String {
     label.to_string()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SseOutcome {
+    Terminal(String),
+    ReadTimeout,
+    Closed,
+}
+
 fn consume_sse_until_terminal(
     reader: &mut BufReader<Box<dyn std::io::Read + Send + Sync + 'static>>,
     ns: &str,
     job_id: &str,
     run_id: &str,
     mut on_defer: impl FnMut(u64),
-) -> Option<String> {
+) -> SseOutcome {
     let mut event_kind = String::new();
     let mut data_lines: Vec<String> = Vec::new();
     let mut line = String::new();
 
     loop {
         line.clear();
-        let Ok(n) = reader.read_line(&mut line) else {
-            return None;
-        };
-        if n == 0 {
-            return None;
+        match reader.read_line(&mut line) {
+            Ok(0) => return SseOutcome::Closed,
+            Ok(_) => {}
+            Err(err) => {
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) {
+                    return SseOutcome::ReadTimeout;
+                }
+                return SseOutcome::Closed;
+            }
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.starts_with(':') {
@@ -501,7 +515,7 @@ fn consume_sse_until_terminal(
                                 | "activity.canceled"
                                 | "activity.timedout"
                         ) {
-                            return Some(kind);
+                            return SseOutcome::Terminal(kind);
                         }
                     }
                 }
@@ -1018,7 +1032,16 @@ impl Research {
             encode(job_id),
             encode(run_id)
         );
-        let mut val: Value = self.get(&path)?;
+        let mut val: Value = match self.get(&path) {
+            Ok(v) => v,
+            Err(Error::Http(http_err))
+                if matches!(&*http_err, ureq::Error::Status(401 | 403, _))
+                    && self.refresh_token() =>
+            {
+                self.get(&path)?
+            }
+            Err(e) => return Err(e),
+        };
         let state = val["status"]
             .as_str()
             .or_else(|| val["state"].as_str())
@@ -1036,7 +1059,7 @@ impl Research {
         Ok(val)
     }
 
-    /// Wait for activity completion via `GET /v1/workflow/events` SSE stream (reconnect backoff only on drop).
+    /// Wait for activity completion via `GET /v1/workflow/events` SSE stream (15s bounded read timeout + pre-SSE check).
     pub fn wait_gpu_job_with_run(
         &self,
         job_id: &str,
@@ -1044,6 +1067,26 @@ impl Research {
         namespace: Option<&str>,
         timeout: Duration,
         poll_interval: Duration,
+    ) -> Result<Value> {
+        self.wait_gpu_job_with_options(
+            job_id,
+            run_id,
+            namespace,
+            timeout,
+            poll_interval,
+            Duration::from_secs(15),
+        )
+    }
+
+    /// Wait for activity completion with explicit bounded SSE read timeout and 401/403 token refresh.
+    pub fn wait_gpu_job_with_options(
+        &self,
+        job_id: &str,
+        run_id: Option<&str>,
+        namespace: Option<&str>,
+        timeout: Duration,
+        poll_interval: Duration,
+        sse_read_timeout: Duration,
     ) -> Result<Value> {
         let ns = namespace
             .filter(|s| !s.trim().is_empty())
@@ -1062,6 +1105,7 @@ impl Research {
         let mut sse_supported = true;
         let mut reconnect_attempt = 0u32;
         let fallback_sleep = poll_interval.max(Duration::from_millis(10));
+        let per_sse_timeout = sse_read_timeout.max(Duration::from_millis(50));
 
         let note_defer = |dc: u64, dl: &mut Instant, seen: &mut u64| {
             if dc > *seen {
@@ -1073,69 +1117,77 @@ impl Research {
         };
 
         loop {
+            // Always check current activity status BEFORE opening SSE or checking timeout,
+            // so sub-50ms jobs on evo/dgx return immediately without opening SSE.
+            let snap0 = self.describe_activity(ns, aid, rid)?;
+            let st0 = snap0["status"].as_str().unwrap_or("");
+            if is_terminal_activity_state(st0) {
+                return Ok(snap0);
+            }
+            note_defer(
+                snap0["deferCount"].as_u64().unwrap_or(0),
+                &mut deadline,
+                &mut seen_defers,
+            );
+
             let now_inst = Instant::now();
             if now_inst >= deadline {
-                let snap = self.describe_activity(ns, aid, rid)?;
-                let st = snap["status"].as_str().unwrap_or("");
-                if is_terminal_activity_state(st) {
-                    return Ok(snap);
-                }
-                let dc = snap["deferCount"].as_u64().unwrap_or(seen_defers);
-                let busy_reason = snap["lastBusyReason"].as_str().unwrap_or("");
+                let dc = snap0["deferCount"].as_u64().unwrap_or(seen_defers);
+                let busy_reason = snap0["lastBusyReason"].as_str().unwrap_or("");
                 let detail = if dc > 0 || !busy_reason.is_empty() {
                     format!(", deferCount={dc}, lastBusyReason={busy_reason}")
                 } else {
                     String::new()
                 };
                 return Err(Error::Message(format!(
-                    "timed out waiting for gpu job {aid} (last state: {st}{detail})"
+                    "timed out waiting for gpu job {aid} (last state: {st0}{detail})"
                 )));
             }
             let remaining = deadline.saturating_duration_since(now_inst);
 
             if sse_supported {
-                let snap0 = self.describe_activity(ns, aid, rid)?;
-                let st0 = snap0["status"].as_str().unwrap_or("");
-                if is_terminal_activity_state(st0) {
-                    return Ok(snap0);
-                }
-                note_defer(
-                    snap0["deferCount"].as_u64().unwrap_or(0),
-                    &mut deadline,
-                    &mut seen_defers,
-                );
-                match self.open_event_stream("/v1/workflow/events", remaining) {
+                let read_window = remaining.min(per_sse_timeout);
+                match self.open_event_stream("/v1/workflow/events", read_window) {
                     Ok(resp) => {
+                        reconnect_attempt = 0;
                         let mut reader = BufReader::new(resp.into_reader());
-                        let term = consume_sse_until_terminal(&mut reader, ns, aid, rid, |dc| {
+                        let outcome = consume_sse_until_terminal(&mut reader, ns, aid, rid, |dc| {
                             note_defer(dc, &mut deadline, &mut seen_defers)
                         });
-                        let snap = self.describe_activity(ns, aid, rid)?;
-                        let st = snap["status"].as_str().unwrap_or("");
-                        if is_terminal_activity_state(st) || term.is_some() {
-                            return Ok(snap);
-                        }
-                        reconnect_attempt = reconnect_attempt.saturating_add(1);
-                    }
-                    Err(Error::Http(http_err)) => {
-                        if matches!(&*http_err, ureq::Error::Status(404 | 405 | 501, _)) {
-                            sse_supported = false;
-                        } else {
-                            reconnect_attempt = reconnect_attempt.saturating_add(1);
-                        }
-                    }
-                    Err(_) => {
-                        if let Ok(snap) = self.describe_activity(ns, aid, rid) {
-                            let st = snap["status"].as_str().unwrap_or("");
-                            if is_terminal_activity_state(st) {
+                        match outcome {
+                            SseOutcome::Terminal(_) => {
+                                let snap = self.describe_activity(ns, aid, rid)?;
                                 return Ok(snap);
                             }
-                            note_defer(
-                                snap["deferCount"].as_u64().unwrap_or(0),
-                                &mut deadline,
-                                &mut seen_defers,
-                            );
+                            SseOutcome::ReadTimeout => {
+                                // Bounded SSE read timeout: re-check activity status immediately on next loop iteration.
+                                continue;
+                            }
+                            SseOutcome::Closed => {
+                                let snap = self.describe_activity(ns, aid, rid)?;
+                                let st = snap["status"].as_str().unwrap_or("");
+                                if is_terminal_activity_state(st) {
+                                    return Ok(snap);
+                                }
+                                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                            }
                         }
+                    }
+                    Err(Error::Http(http_err)) => match &*http_err {
+                        ureq::Error::Status(404 | 405 | 501, _) => {
+                            sse_supported = false;
+                        }
+                        ureq::Error::Status(401 | 403, _) => {
+                            if self.refresh_token() {
+                                continue;
+                            }
+                            return Err(Error::Http(http_err));
+                        }
+                        _ => {
+                            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        }
+                    },
+                    Err(_) => {
                         reconnect_attempt = reconnect_attempt.saturating_add(1);
                     }
                 }
@@ -1151,16 +1203,6 @@ impl Research {
                 }
             }
 
-            let snap = self.describe_activity(ns, aid, rid)?;
-            let st = snap["status"].as_str().unwrap_or("");
-            if is_terminal_activity_state(st) {
-                return Ok(snap);
-            }
-            note_defer(
-                snap["deferCount"].as_u64().unwrap_or(0),
-                &mut deadline,
-                &mut seen_defers,
-            );
             let rem = deadline.saturating_duration_since(Instant::now());
             if !rem.is_zero() {
                 std::thread::sleep(rem.min(fallback_sleep));

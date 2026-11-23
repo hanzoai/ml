@@ -179,7 +179,8 @@ impl TransferEngine {
     }
 
     pub fn dead_end_from(&self, exp: &ExperimentRecordV2) -> Option<DeadEndEntry> {
-        if epistemic_verdict(&exp.statistical_comparison.verdict) != "refuted" {
+        if exp.is_retracted() || epistemic_verdict(&exp.statistical_comparison.verdict) != "refuted"
+        {
             return None;
         }
         Some(DeadEndEntry {
@@ -208,12 +209,58 @@ impl TransferEngine {
     }
 
     pub fn generate(&self, exp: &ExperimentRecordV2) -> Vec<Opportunity> {
-        let verdict = epistemic_verdict(&exp.statistical_comparison.verdict);
+        if exp.is_retracted() {
+            return Vec::new();
+        }
+        let raw_verdict = exp
+            .statistical_comparison
+            .verdict
+            .trim()
+            .to_ascii_lowercase();
         let base_cost = if exp.gpu_time_sec > 0.0 {
             (exp.gpu_time_sec / 60.0).max(0.5)
         } else {
             1.0
         };
+
+        if raw_verdict == "promising_inconclusive" {
+            let cur_cont = exp
+                .config
+                .get("continuation_depth")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let max_cont = exp
+                .config
+                .get("max_continuations")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as usize;
+            if cur_cont >= max_cont {
+                return Vec::new();
+            }
+            let next_cont = cur_cont + 1;
+            let gain = relative_gain(exp);
+            return vec![Opportunity {
+                opportunity_id: format!("{}->dev-continuation:{next_cont}", exp.experiment_id),
+                domain: exp.study.clone(),
+                objective: format!("{}:dev-continuation-{next_cont}", exp.study),
+                current_best: exp.statistical_comparison.candidate_mean,
+                proposed_approach: format!(
+                    "Promising inconclusive dev signal (cand={:.4} vs base={:.4}); run bounded continuation {next_cont}/{max_cont} on an independent dev slice before canonical qualification",
+                    exp.statistical_comparison.candidate_mean,
+                    exp.statistical_comparison.baseline_mean
+                ),
+                expected_improvement: round4(gain),
+                compute_cost: round4(base_cost),
+                related_experiments: vec![exp.experiment_id.clone()],
+                trigger_rule: format!(
+                    "continuation_independent_dev:{next_cont}/{max_cont}:{}",
+                    exp.experiment_id
+                ),
+                status: "open".into(),
+            }];
+        }
+
+        let verdict = epistemic_verdict(&exp.statistical_comparison.verdict);
 
         if verdict == "refuted" {
             if exp.next_hypothesis.trim().is_empty() {

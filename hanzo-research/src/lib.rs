@@ -80,9 +80,11 @@ pub use tasks::{
 };
 pub use testing::{
     beta_binomial_e_value, impacted_benchmarks, one_sided_mixture_e_value, paired_accuracy_look,
-    paired_throughput_anytime_look, planned_looks, stable_order, student_t_one_sided_p,
-    AccuracyLook, ImpactReport, LineageRule, ProgressiveAbPlan, ProgressiveAbResult,
-    ProgressiveAbRunner, ProgressiveStage, ProgressiveStageOutput, ThroughputLook,
+    paired_accuracy_look_checked, paired_mcnemar, paired_throughput_anytime_look, planned_looks,
+    stable_order, student_t_one_sided_p, validate_dataset_manifest_sha256,
+    validate_paired_binary_trace, AccuracyLook, ImpactReport, LineageRule, McNemarResult,
+    PairedTraceCheck, ProgressiveAbPlan, ProgressiveAbResult, ProgressiveAbRunner,
+    ProgressiveStage, ProgressiveStageOutput, ThroughputLook,
 };
 pub use transfer::{generate_transfer_hypotheses, DeadEndEntry, TransferCatalog, TransferEngine};
 pub use wal::ResearchWal;
@@ -197,9 +199,13 @@ impl Verdict {
 
 // ── the client ───────────────────────────────────────────────────────────────────────
 
+type TokenProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 struct Inner {
     base: String,
-    api_key: String,
+    api_key: std::sync::RwLock<String>,
+    token_fn: std::sync::RwLock<Option<TokenProvider>>,
+    refresh_cli_token: bool,
     project: String,
     repo: String,
     // Provenance constant for one checkout on one host — captured once, reused per run.
@@ -257,7 +263,9 @@ impl Research {
                 host: provenance::host(),
                 libs: provenance::lib_versions(&repo, names),
                 base,
-                api_key: api_key.to_string(),
+                api_key: std::sync::RwLock::new(api_key.to_string()),
+                token_fn: std::sync::RwLock::new(None),
+                refresh_cli_token: false,
                 project: project.to_string(),
                 repo,
                 agent,
@@ -265,15 +273,53 @@ impl Research {
         }
     }
 
+    /// Attach a dynamic token provider used to refresh expired tokens on 401/403 during long waits.
+    pub fn with_token_provider<F>(self, provider: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = self.inner.token_fn.write() {
+            *guard = Some(Arc::new(provider));
+        }
+        self
+    }
+
+    /// Re-fetch a fresh auth token from a configured token provider or `hanzo` CLI credential store.
+    pub fn refresh_token(&self) -> bool {
+        let fresh = self
+            .inner
+            .token_fn
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|f| f()))
+            .or_else(|| {
+                if self.inner.refresh_cli_token {
+                    crate::wire::token().ok()
+                } else {
+                    None
+                }
+            })
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        if let Some(tok) = fresh {
+            if let Ok(mut guard) = self.inner.api_key.write() {
+                *guard = tok;
+                return true;
+            }
+        }
+        false
+    }
+
     /// The client built from the environment: `HANZO_API_KEY` else `hanzo auth token`,
     /// `RESEARCH_BASE`, and `RESEARCH_PROJECT` else JWT `project` claim (mirrors Python).
     pub fn from_env() -> Self {
         let base = std::env::var("RESEARCH_BASE").unwrap_or_default();
-        let key = std::env::var("HANZO_API_KEY")
+        let env_key = std::env::var("HANZO_API_KEY")
             .ok()
             .map(|k| k.trim().to_string())
-            .filter(|k| !k.is_empty())
-            .unwrap_or_else(|| crate::wire::token().unwrap_or_default());
+            .filter(|k| !k.is_empty());
+        let from_cli = env_key.is_none();
+        let key = env_key.unwrap_or_else(|| crate::wire::token().unwrap_or_default());
         let project = match std::env::var("RESEARCH_PROJECT")
             .ok()
             .filter(|p| !p.trim().is_empty())
@@ -281,7 +327,13 @@ impl Research {
             Some(p) => crate::wire::scope(&p),
             None => crate::wire::claimed(&key).unwrap_or_else(|| "default".to_string()),
         };
-        Research::new(&base, &key, &project, "", &[])
+        let mut client = Research::new(&base, &key, &project, "", &[]);
+        if from_cli {
+            if let Some(inner) = Arc::get_mut(&mut client.inner) {
+                inner.refresh_cli_token = true;
+            }
+        }
+        client
     }
 
     /// Get/create the experiment for `(kind, subject, task)` and return its handle. Set
@@ -315,6 +367,17 @@ impl Research {
     /// Read canonical experiments (the latest answered version per stable id). `project`
     /// defaults to the client's; `kind` narrows to one discriminator.
     pub fn query(&self, project: Option<&str>, kind: Option<&str>) -> Result<Vec<Record>> {
+        self.query_with_options(project, kind, None, false)
+    }
+
+    /// Read experiments with optional tag filter and optional historical retracted rows.
+    pub fn query_with_options(
+        &self,
+        project: Option<&str>,
+        kind: Option<&str>,
+        tag: Option<&str>,
+        include_retracted: bool,
+    ) -> Result<Vec<Record>> {
         let mut q: Vec<String> = Vec::new();
         let proj = project.unwrap_or(&self.inner.project);
         if !proj.is_empty() {
@@ -323,13 +386,58 @@ impl Research {
         if let Some(k) = kind.filter(|k| !k.is_empty()) {
             q.push(format!("kind={}", encode(k)));
         }
+        if let Some(t) = tag.filter(|t| !t.is_empty()) {
+            q.push(format!("tag={}", encode(t)));
+        }
+        if include_retracted {
+            q.push("include_retracted=true".to_string());
+        }
         let path = if q.is_empty() {
             "/v1/research/experiments".to_string()
         } else {
             format!("/v1/research/experiments?{}", q.join("&"))
         };
         let out: Listing<Record> = self.get(&path)?;
-        Ok(out.data)
+        if include_retracted {
+            Ok(out.data)
+        } else {
+            Ok(out
+                .data
+                .into_iter()
+                .filter(|r| {
+                    !r.status.eq_ignore_ascii_case("retracted")
+                        && r.meta["retracted"].as_bool() != Some(true)
+                })
+                .collect())
+        }
+    }
+
+    /// Read full version history of an experiment (`GET /v1/research/experiments/versions`).
+    pub fn experiment_versions(
+        &self,
+        id: &str,
+        project: Option<&str>,
+        include_retracted: bool,
+    ) -> Result<Vec<Record>> {
+        let mut q = vec![format!("id={}", encode(id))];
+        let proj = project.unwrap_or(&self.inner.project);
+        if !proj.is_empty() {
+            q.push(format!("project={}", encode(proj)));
+        }
+        let path = format!("/v1/research/experiments/versions?{}", q.join("&"));
+        let out: Listing<Record> = self.get(&path)?;
+        if include_retracted {
+            Ok(out.data)
+        } else {
+            Ok(out
+                .data
+                .into_iter()
+                .filter(|r| {
+                    !r.status.eq_ignore_ascii_case("retracted")
+                        && r.meta["retracted"].as_bool() != Some(true)
+                })
+                .collect())
+        }
     }
 
     /// The headline totals (canonical + retained) for the org, or one project.
@@ -598,6 +706,31 @@ impl Research {
         include_failures: bool,
         project: Option<&str>,
     ) -> Result<Vec<Record>> {
+        self.query_experiments_with_options(
+            study,
+            verdict,
+            repo,
+            backend,
+            search,
+            include_failures,
+            false,
+            project,
+        )
+    }
+
+    /// Rich query across cloud experiments with optional historical `retracted` records.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_experiments_with_options(
+        &self,
+        study: Option<&str>,
+        verdict: Option<&str>,
+        repo: Option<&str>,
+        backend: Option<&str>,
+        search: Option<&str>,
+        include_failures: bool,
+        include_retracted: bool,
+        project: Option<&str>,
+    ) -> Result<Vec<Record>> {
         let want_v = verdict.map(epistemic_verdict);
         let want_b = backend.map(str::to_ascii_lowercase);
         let tokens: Vec<String> = search
@@ -606,7 +739,7 @@ impl Research {
             .map(str::to_ascii_lowercase)
             .collect();
         let mut out = Vec::new();
-        for rec in self.query(project, None)? {
+        for rec in self.query_with_options(project, None, None, include_retracted)? {
             let ev = epistemic_verdict(rec.meta["verdict"].as_str().unwrap_or(""));
             if !include_failures && ev == "refuted" {
                 continue;
@@ -806,10 +939,16 @@ impl Research {
     // client never sends X-User-Id/X-Org-Id — a cross-tenant forge the gateway strips.
     fn auth(&self, req: ureq::Request) -> ureq::Request {
         let req = req.set("X-Project-Id", &self.inner.project);
-        if self.inner.api_key.is_empty() {
+        let key = self
+            .inner
+            .api_key
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if key.is_empty() {
             req
         } else {
-            req.set("Authorization", &format!("Bearer {}", self.inner.api_key))
+            req.set("Authorization", &format!("Bearer {key}"))
         }
     }
 
@@ -1121,6 +1260,7 @@ impl Experiment {
             },
             ts: self.ts,
             tags: self.tags.clone(),
+            revision: String::new(),
             received_at: None,
         }
     }
@@ -1196,6 +1336,8 @@ pub struct ExperimentRecord {
     pub ts: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub received_at: Option<i64>,
 }
@@ -1315,6 +1457,10 @@ pub struct Record {
     pub ts: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revision: String,
+    #[serde(default)]
+    pub canonical: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub received_at: Option<i64>,
 }

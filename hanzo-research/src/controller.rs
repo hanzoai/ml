@@ -664,14 +664,31 @@ impl AutonomousController {
     pub fn status(&self) -> Result<Value> {
         let trials = self.trials()?;
         let recs = self.ledger.query_all()?;
+        let all_with_retracted = self.ledger.query_all_with_retracted(true)?;
+        let retracted_count = all_with_retracted
+            .iter()
+            .filter(|r| r.is_retracted())
+            .count();
         let open_ops = self.ledger.recommended_experiments(None, 50)?;
         let wins = recs
             .iter()
-            .filter(|r| epistemic_verdict(&r.statistical_comparison.verdict) == "proven")
+            .filter(|r| {
+                !r.is_retracted()
+                    && epistemic_verdict(&r.statistical_comparison.verdict) == "proven"
+            })
             .count();
         let failures = recs
             .iter()
             .filter(|r| epistemic_verdict(&r.statistical_comparison.verdict) == "refuted")
+            .count();
+        let promising_inc = recs
+            .iter()
+            .filter(|r| {
+                r.statistical_comparison
+                    .verdict
+                    .trim()
+                    .eq_ignore_ascii_case("promising_inconclusive")
+            })
             .count();
         let top_ops: Vec<Value> = open_ops
             .iter()
@@ -687,7 +704,9 @@ impl AutonomousController {
             "host_backends": detect_host_backends().into_iter().collect::<Vec<_>>(),
             "total_experiments": recs.len(),
             "proven_experiments": wins,
+            "promising_inconclusive_experiments": promising_inc,
             "refuted_experiments": failures,
+            "retracted_experiments": retracted_count,
             "open_opportunities": open_ops.len(),
             "top_opportunities": top_ops,
             "exposures_count": self.exposures.records()?.len(),
@@ -921,14 +940,63 @@ impl AutonomousController {
                     .mark_status(&op.opportunity_id, "completed");
                 continue;
             }
+            let mut arm_name = "opportunity_transfer".to_string();
+            let mut arm_variant = op.opportunity_id.clone();
+            let mut arm_cfg = BTreeMap::from([
+                ("opportunity_id".into(), json!(op.opportunity_id)),
+                ("trigger_rule".into(), json!(op.trigger_rule)),
+            ]);
+            if let Some(rest) = op
+                .trigger_rule
+                .strip_prefix("continuation_independent_dev:")
+            {
+                let default_max = self
+                    .registry
+                    .as_ref()
+                    .map(|r| r.plan.max_continuations)
+                    .unwrap_or(1);
+                let mut depth = 1usize;
+                let mut max_cont = default_max.max(1);
+                if let Some((ratio_str, _)) = rest.split_once(':') {
+                    if let Some((d_s, m_s)) = ratio_str.split_once('/') {
+                        if let Ok(d) = d_s.parse::<usize>() {
+                            depth = d.max(1);
+                        }
+                        if let Ok(m) = m_s.parse::<usize>() {
+                            max_cont = m.max(depth);
+                        }
+                    }
+                }
+                if let Some(parent_id) = op.related_experiments.first() {
+                    if let Ok(all_recs) = self.ledger.query_all() {
+                        if let Some(parent_rec) =
+                            all_recs.into_iter().find(|r| &r.experiment_id == parent_id)
+                        {
+                            if let Some(pa) = parent_rec.config.get("arm").and_then(Value::as_str) {
+                                arm_name = pa.to_string();
+                            }
+                            if let Some(pv) =
+                                parent_rec.config.get("variant").and_then(Value::as_str)
+                            {
+                                arm_variant = pv.to_string();
+                            }
+                            let mut merged = parent_rec.config;
+                            for (k, v) in arm_cfg {
+                                merged.insert(k, v);
+                            }
+                            arm_cfg = merged;
+                        }
+                    }
+                }
+                arm_cfg.insert("continuation_depth".into(), json!(depth));
+                arm_cfg.insert("max_continuations".into(), json!(max_cont));
+                arm_cfg.insert("independent_dev_evidence".into(), json!(true));
+            }
             let arm = SearchArm {
-                arm: "opportunity_transfer".into(),
-                variant: op.opportunity_id.clone(),
+                arm: arm_name,
+                variant: arm_variant,
                 hypothesis: op.proposed_approach.clone(),
-                config: BTreeMap::from([
-                    ("opportunity_id".into(), json!(op.opportunity_id)),
-                    ("trigger_rule".into(), json!(op.trigger_rule)),
-                ]),
+                config: arm_cfg,
             };
             selected = Some((matched_obj, arm, Some(op), chosen_backend, exp_id));
             break;
@@ -1145,6 +1213,16 @@ impl AutonomousController {
             config_map.insert("arm".into(), json!(arm.arm));
             config_map.insert("variant".into(), json!(arm.variant));
             config_map.insert("fencing_token".into(), json!(active_lease.fencing_token));
+            let cont_depth = config_map
+                .get("continuation_depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let trial_seed = 17_u64 + cont_depth * 1009;
+            let parent_exp = op
+                .as_ref()
+                .and_then(|o| o.related_experiments.first().cloned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{}:baseline", obj.id));
 
             let mut exp_record = ExperimentRecordV2 {
                 project: "default".into(),
@@ -1167,7 +1245,7 @@ impl AutonomousController {
                     arm.hypothesis.clone()
                 },
                 experiment_id: exp_id.clone(),
-                parent_experiment: format!("{}:baseline", obj.id),
+                parent_experiment: parent_exp,
                 prior_best: obj.baseline,
                 repo: self
                     .registry
@@ -1206,7 +1284,7 @@ impl AutonomousController {
                     },
                     input_lengths: plan.stages.iter().map(|s| s.prompt_len).collect(),
                     batch_size: 1,
-                    seed: 17,
+                    seed: trial_seed,
                     manifest_sha256: String::new(),
                 },
                 statistical_comparison: StatisticalComparison {
@@ -1246,7 +1324,7 @@ impl AutonomousController {
                     );
                     let exp_key = format!("{eval_sha}:{}", &cand_sha[..16]);
 
-                    if is_final {
+                    if is_final && plan.canonical_qualification {
                         lease_mgr.verify_fencing(&active_lease)?;
                         if self.exposures.is_exposed(&obj.id, &exp_key)? {
                             exec_failed_reason =
@@ -1289,6 +1367,9 @@ impl AutonomousController {
                         "reps": stage.reps,
                         "prompt_len": stage.prompt_len,
                         "gen_len": stage.gen_len,
+                        "seed": trial_seed,
+                        "continuation_depth": cont_depth,
+                        "independent_dev_evidence": cont_depth > 0,
                         "commit": commit_full,
                         "eval_sha": eval_sha,
                         "candidate_sha": cand_sha,
@@ -1379,10 +1460,46 @@ impl AutonomousController {
                         .as_array()
                         .map(|a| a.iter().filter_map(Value::as_f64).collect())
                         .unwrap_or_default();
+                    let b_correct: Vec<bool> = res["baseline_correct"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|v| {
+                                    v.as_bool().unwrap_or_else(|| v.as_i64().unwrap_or(0) != 0)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let c_correct: Vec<bool> = res["candidate_correct"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|v| {
+                                    v.as_bool().unwrap_or_else(|| v.as_i64().unwrap_or(0) != 0)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let ex_ids: Vec<String> = res["example_ids"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     Ok(ProgressiveStageOutput {
                         stage_name: stage.name.clone(),
                         baseline_samples: b_samples,
                         candidate_samples: c_samples,
+                        baseline_correct: b_correct,
+                        candidate_correct: c_correct,
+                        example_ids: ex_ids,
+                        dataset_manifest_sha256: res["dataset_manifest_sha256"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
                         parity_passed: res["parity_passed"].as_bool().unwrap_or(true),
                         memory_integrity_passed: res["memory_integrity_passed"]
                             .as_bool()
@@ -1412,14 +1529,21 @@ impl AutonomousController {
                 ));
             }
 
-            let ev = epistemic_verdict(&ab_res.verdict);
-            trial.state = match ev {
+            let raw_verdict = ab_res.verdict.as_str();
+            let ev = epistemic_verdict(raw_verdict);
+            let reported_verdict = if raw_verdict == "promising_inconclusive" {
+                "promising_inconclusive"
+            } else {
+                ev
+            };
+            trial.state = match raw_verdict {
                 "proven" => "qualified",
                 "refuted" => "refuted",
+                "promising_inconclusive" => "promising_inconclusive",
                 _ => "explored",
             }
             .into();
-            trial.verdict = ev.into();
+            trial.verdict = reported_verdict.into();
             trial.score = Some(exp_record.statistical_comparison.candidate_mean);
             trial.finished_at = now();
             trial.message = if ab_res.failure_diagnosis.is_empty() {
@@ -1450,7 +1574,8 @@ impl AutonomousController {
                     "status": trial.state,
                     "trial_id": trial_id,
                     "experiment_id": exp_id,
-                    "verdict": ev,
+                    "verdict": reported_verdict,
+                    "epistemic_verdict": ev,
                     "fencing_token": active_lease.fencing_token,
                     "reclaimed_from": active_lease.reclaimed_from,
                     "stopped_stage": ab_res.stopped_stage,
