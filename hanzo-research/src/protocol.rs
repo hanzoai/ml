@@ -249,7 +249,11 @@ pub struct ExperimentRecordV2 {
     pub statistical_comparison: StatisticalComparison,
     pub correctness: CorrectnessChecks,
     pub raw_samples: BTreeMap<String, Vec<f64>>,
+    pub example_ids: Vec<String>,
     pub verdict: String,
+    pub revision: String,
+    pub retracted: bool,
+    pub retracted_reason: String,
     pub gpu_time_sec: f64,
     pub compute_cost_usd: f64,
     pub conclusion: String,
@@ -532,7 +536,15 @@ impl ExperimentRecordV2 {
         }))?)
     }
 
+    pub fn is_retracted(&self) -> bool {
+        self.retracted || self.revision.trim().eq_ignore_ascii_case("retracted")
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_options(false)
+    }
+
+    pub fn validate_with_options(&self, require_example_ids: bool) -> Result<()> {
         let checks = [
             ("project", &self.project),
             ("study", &self.study),
@@ -580,12 +592,57 @@ impl ExperimentRecordV2 {
             ));
         }
         if !self.historical {
-            let b = self.raw_samples.get("baseline").map_or(0, Vec::len);
-            let c = self.raw_samples.get("candidate").map_or(0, Vec::len);
+            let b_raw = self.raw_samples.get("baseline");
+            let c_raw = self.raw_samples.get("candidate");
+            let b = b_raw.map_or(0, Vec::len);
+            let c = c_raw.map_or(0, Vec::len);
             if b == 0 || c == 0 {
                 return Err(Error::Message(
                     "Reproduced experiment requires raw_samples['baseline'] and raw_samples['candidate']".into(),
                 ));
+            }
+            let req_ids = require_example_ids
+                || self
+                    .config
+                    .get("require_example_ids")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            if req_ids && !self.is_retracted() {
+                crate::testing::validate_dataset_manifest_sha256(
+                    &self.workload_manifest.manifest_sha256,
+                )?;
+                if self.example_ids.len() != self.statistical_comparison.n {
+                    return Err(Error::Message(
+                        "Canonical paired run with require_example_ids=true requires aligned example_ids".into(),
+                    ));
+                }
+                let cleaned: Vec<String> = self
+                    .example_ids
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .collect();
+                let uniq: std::collections::BTreeSet<&str> =
+                    cleaned.iter().map(String::as_str).collect();
+                if cleaned.iter().any(|s| s.is_empty()) || uniq.len() != cleaned.len() {
+                    return Err(Error::Message(
+                        "example_ids must be non-empty and strictly distinct".into(),
+                    ));
+                }
+                if let (Some(bs), Some(cs)) = (b_raw, c_raw) {
+                    if bs.len() == cs.len()
+                        && bs.iter().chain(cs.iter()).all(|&v| v == 0.0 || v == 1.0)
+                    {
+                        let cb: Vec<bool> = cs.iter().map(|&v| v == 1.0).collect();
+                        let bb: Vec<bool> = bs.iter().map(|&v| v == 1.0).collect();
+                        crate::testing::validate_paired_binary_trace(
+                            &cb,
+                            &bb,
+                            Some(&cleaned),
+                            Some(&self.workload_manifest.manifest_sha256),
+                            true,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
@@ -594,6 +651,11 @@ impl ExperimentRecordV2 {
     pub fn to_run(&self) -> Run {
         let n = self.statistical_comparison.n as i64;
         let ev = epistemic_verdict(&self.statistical_comparison.verdict);
+        let raw_v = self
+            .statistical_comparison
+            .verdict
+            .trim()
+            .to_ascii_lowercase();
         let mut r = Run {
             project: self.project.clone(),
             id: self.experiment_id.clone(),
@@ -606,15 +668,24 @@ impl ExperimentRecordV2 {
             system: self.repo.clone(),
             version: self.commit.chars().take(12).collect(),
             study: self.study.clone(),
+            dataset_digest: self.workload_manifest.manifest_sha256.clone(),
             commit: self.commit.clone(),
             questions: Some(n),
             answered: Some(n),
             when: self.recorded_at.clone(),
             ended: self.recorded_at.clone(),
+            revision: if self.is_retracted() {
+                "retracted".into()
+            } else {
+                self.revision.clone()
+            },
             notes: json!({
                 "hypothesis": self.hypothesis,
                 "conclusion": self.conclusion,
                 "verdict": ev,
+                "screen_verdict": if raw_v.is_empty() { ev } else { raw_v.as_str() },
+                "retracted": self.is_retracted(),
+                "retracted_reason": self.retracted_reason,
                 "failure_diagnosis": self.failure_diagnosis,
                 "next_hypothesis": self.next_hypothesis,
                 "historical": self.historical,
@@ -671,6 +742,11 @@ impl ExperimentRecordV2 {
 
     pub fn to_experiment_record(&self) -> ExperimentRecord {
         let ev = epistemic_verdict(&self.statistical_comparison.verdict);
+        let raw_v = self
+            .statistical_comparison
+            .verdict
+            .trim()
+            .to_ascii_lowercase();
         let because = if ev == "refuted" && !self.failure_diagnosis.trim().is_empty() {
             self.failure_diagnosis.trim().to_string()
         } else {
@@ -685,6 +761,10 @@ impl ExperimentRecordV2 {
             "study": self.study,
             "repo": self.repo,
             "backend": self.hardware.backend,
+            "dataset_manifest_sha256": self.workload_manifest.manifest_sha256,
+            "screen_verdict": if raw_v.is_empty() { ev } else { raw_v.as_str() },
+            "retracted": self.is_retracted(),
+            "retracted_reason": self.retracted_reason,
             "failure_diagnosis": self.failure_diagnosis,
             "next_hypothesis": self.next_hypothesis,
         })
@@ -698,7 +778,16 @@ impl ExperimentRecordV2 {
             value: self.statistical_comparison.candidate_mean,
             n: self.statistical_comparison.n as u64,
             n_total: self.statistical_comparison.n as u64,
-            status: "complete".into(),
+            status: if self.is_retracted() {
+                "retracted".into()
+            } else {
+                "complete".into()
+            },
+            revision: if self.is_retracted() {
+                "retracted".into()
+            } else {
+                self.revision.clone()
+            },
             git_sha: self.commit.clone(),
             git_branch: self.branch.clone(),
             git_dirty: false,
@@ -949,13 +1038,83 @@ impl LocalResearchLedger {
         Ok(())
     }
 
+    pub fn retract_experiment(
+        &self,
+        experiment_id: &str,
+        reason: &str,
+    ) -> Result<ExperimentRecordV2> {
+        let why = reason.trim();
+        if why.is_empty() {
+            return Err(Error::Message(
+                "retraction requires a non-empty reason".into(),
+            ));
+        }
+        let safe = Self::safe_name(experiment_id);
+        let rec_path = self.root.join("records").join(format!("{safe}.json"));
+        if !rec_path.is_file() {
+            return Err(Error::Message(format!(
+                "experiment {experiment_id:?} not found in local ledger"
+            )));
+        }
+        let mut rec: ExperimentRecordV2 = serde_json::from_slice(&fs::read(&rec_path)?)?;
+        rec.retracted = true;
+        rec.revision = "retracted".into();
+        rec.retracted_reason = why.to_string();
+        rec.historical = true;
+        let rec_bytes = serde_json::to_vec_pretty(&rec)?;
+        let rec_key = format!("{}:record", rec.experiment_id);
+        let rec_sha = self.store_named_artifact(&rec_key, &rec_bytes)?;
+        let tmp = self.root.join("records").join(format!("{safe}.json.tmp"));
+        fs::write(&tmp, &rec_bytes)?;
+        fs::rename(tmp, rec_path)?;
+
+        let mut wal = ResearchWal::open(&self.root.join("wal"), &self.run_id)?;
+        wal.append(
+            "experiment_retracted",
+            &json!({
+                "experiment_id": rec.experiment_id,
+                "reason": why,
+                "record_sha256": rec_sha,
+            }),
+        )?;
+
+        let art_sha = rec
+            .artifact_hashes
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| rec_sha.clone());
+        let receipt = SyncReceipt {
+            experiment_id: rec.experiment_id.clone(),
+            record_sha256: rec_sha,
+            artifact_sha256: art_sha,
+            uploaded_artifacts: BTreeMap::new(),
+            status: "pending_sync".into(),
+            readback_verified: false,
+            error: String::new(),
+            synced_at: now(),
+        };
+        self.write_receipt(&receipt)?;
+        Ok(rec)
+    }
+
     pub fn query_all(&self) -> Result<Vec<ExperimentRecordV2>> {
+        self.query_all_with_retracted(false)
+    }
+
+    pub fn query_all_with_retracted(
+        &self,
+        include_retracted: bool,
+    ) -> Result<Vec<ExperimentRecordV2>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(self.root.join("records"))? {
             let p = entry?.path();
             if p.extension().and_then(|s| s.to_str()) == Some("json") {
                 let bytes = fs::read(p)?;
                 let rec: ExperimentRecordV2 = serde_json::from_slice(&bytes)?;
+                if !include_retracted && rec.is_retracted() {
+                    continue;
+                }
                 out.push(rec);
             }
         }
@@ -976,6 +1135,29 @@ impl LocalResearchLedger {
         search: Option<&str>,
         include_failures: bool,
     ) -> Result<Vec<ExperimentRecordV2>> {
+        self.query_experiments_with_options(
+            study,
+            verdict,
+            repo,
+            backend,
+            search,
+            include_failures,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_experiments_with_options(
+        &self,
+        study: Option<&str>,
+        verdict: Option<&str>,
+        repo: Option<&str>,
+        backend: Option<&str>,
+        search: Option<&str>,
+        include_failures: bool,
+        include_retracted: bool,
+    ) -> Result<Vec<ExperimentRecordV2>> {
+        let raw_want = verdict.map(|s| s.trim().to_ascii_lowercase());
         let want_v = verdict.map(epistemic_verdict);
         let want_b = backend.map(str::to_ascii_lowercase);
         let tokens: Vec<String> = search
@@ -984,7 +1166,13 @@ impl LocalResearchLedger {
             .map(str::to_ascii_lowercase)
             .collect();
         let mut out = Vec::new();
-        for rec in self.query_all()? {
+        for rec in self.query_all_with_retracted(include_retracted)? {
+            if rec.is_retracted()
+                && want_v == Some("proven")
+                && matches!(raw_want.as_deref(), Some("proven" | "win"))
+            {
+                continue;
+            }
             let ev = epistemic_verdict(&rec.statistical_comparison.verdict);
             if !include_failures && ev == "refuted" {
                 continue;
@@ -999,9 +1187,18 @@ impl LocalResearchLedger {
                     continue;
                 }
             }
-            if let Some(wv) = want_v {
-                let raw_v = verdict.unwrap_or("").trim().to_ascii_lowercase();
-                if ev != wv && rec.statistical_comparison.verdict.to_ascii_lowercase() != raw_v {
+            if raw_want.as_deref() == Some("promising_inconclusive") {
+                if !rec
+                    .statistical_comparison
+                    .verdict
+                    .trim()
+                    .eq_ignore_ascii_case("promising_inconclusive")
+                {
+                    continue;
+                }
+            } else if let Some(wv) = want_v {
+                let rv = raw_want.as_deref().unwrap_or("");
+                if ev != wv && rec.statistical_comparison.verdict.to_ascii_lowercase() != rv {
                     continue;
                 }
             }
@@ -1019,13 +1216,14 @@ impl LocalResearchLedger {
             }
             if !tokens.is_empty() {
                 let blob = format!(
-                    "{} {} {} {} {} {} {} {} {} {} {}",
+                    "{} {} {} {} {} {} {} {} {} {} {} {}",
                     rec.experiment_id,
                     rec.study,
                     rec.objective,
                     rec.hypothesis,
                     rec.conclusion,
                     rec.failure_diagnosis,
+                    rec.retracted_reason,
                     rec.next_hypothesis,
                     rec.hardware.gpu,
                     rec.hardware.backend,
@@ -1143,10 +1341,12 @@ impl LocalResearchLedger {
     }
 
     pub fn sync_to_cloud(&self, client: &Research) -> Result<Vec<SyncReceipt>> {
-        let all_recs = self.query_all()?;
+        let all_recs = self.query_all_with_retracted(true)?;
         let mut by_study: BTreeMap<String, Vec<&ExperimentRecordV2>> = BTreeMap::new();
         for r in &all_recs {
-            by_study.entry(r.study.clone()).or_default().push(r);
+            if !r.is_retracted() {
+                by_study.entry(r.study.clone()).or_default().push(r);
+            }
         }
 
         let mut out = Vec::new();
@@ -1249,10 +1449,15 @@ impl LocalResearchLedger {
                 )?;
                 uploaded_arts.insert("record".into(), verified_rec_sha.clone());
 
-                let rb_runs = client.runs(Some(&rec.experiment_id), None, None, None)?;
-                let got_run = rb_runs.data.iter().any(|r| r.id == rec.experiment_id);
-                let rb_exps = client.query(None, None)?;
-                let got_exp = rb_exps.iter().any(|e| e.id == rec.experiment_id);
+                let (got_run, got_exp) = if rec.is_retracted() {
+                    (true, true)
+                } else {
+                    let rb_runs = client.runs(Some(&rec.experiment_id), None, None, None)?;
+                    let gr = rb_runs.data.iter().any(|r| r.id == rec.experiment_id);
+                    let rb_exps = client.query(None, None)?;
+                    let ge = rb_exps.iter().any(|e| e.id == rec.experiment_id);
+                    (gr, ge)
+                };
 
                 let all_ok = got_run && got_exp && verified_rec_sha == rec_sha;
                 Ok(SyncReceipt {
