@@ -1,0 +1,51 @@
+name: Autonomous ML Research Campaign
+on:
+  pull_request:
+    paths:
+      - "hanzo-research/**"
+      - "campaigns/**"
+      - "bench_lineage.json"
+      - "scripts/ml_research_executor.py"
+      - ".github/workflows/autonomous-research.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  protocol:
+    if: github.event_name != 'schedule'
+    runs-on: linux-amd64
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test hanzo-research SDK and validate ML campaign manifest
+        run: |
+          cargo test --manifest-path hanzo-research/Cargo.toml
+          cargo run --manifest-path hanzo-research/Cargo.toml --bin hanzo-research -- \
+            controller validate --campaign campaigns/ml_kernels_and_quant.json
+          cargo run --manifest-path hanzo-research/Cargo.toml --bin hanzo-research -- \
+            impact --lineage bench_lineage.json --changed-paths hanzo-ml/src/quantized/bitcos.rs
+
+  gpu-tick:
+    if: vars.ML_RESEARCH_CAMPAIGN_ENABLED == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, Linux, gpu]
+    timeout-minutes: 180
+    concurrency:
+      group: ml-autonomous-research-gpu
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run autonomous progressive A/B research tick
+        run: |
+          cargo run --release --manifest-path hanzo-research/Cargo.toml --bin hanzo-research -- \
+            tick \
+            --dir "${HOME}/.hanzo/research" \
+            --campaign campaigns/ml_kernels_and_quant.json \
+            --lineage bench_lineage.json \
+            --executor scripts/ml_research_executor.py \
+            --timeout-minutes 60

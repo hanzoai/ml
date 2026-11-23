@@ -1,0 +1,62 @@
+{
+  "bitcos": {
+    "paths": [
+      "hanzo-ml/src/quantized/bitcos.rs",
+      "hanzo-ml/examples/bitcos_profile.rs"
+    ],
+    "artifacts": []
+  },
+  "pq2_ptq1": {
+    "paths": [
+      "hanzo-ml/src/quantized/bitcos.rs",
+      "hanzo-kernels/src/mmq_gguf/*pq2*",
+      "hanzo-kernels/src/mmq_gguf/*ptq1*",
+      "hanzo-ml/src/quantized/dsl.rs",
+      "hanzo-ml/src/quantized/quant_format.rs"
+    ],
+    "artifacts": []
+  },
+  "flash_attn": {
+    "paths": [
+      "hanzo-ml/src/flash_attn.rs",
+      "hanzo-ml/src/fattn_decode.rs",
+      "hanzo-flash-attn/**"
+    ],
+    "artifacts": []
+  },
+  "gdn": {
+    "paths": [
+      "hanzo-ml/src/gdn.rs"
+    ],
+    "artifacts": []
+  },
+  "fwht": {
+    "paths": [
+      "hanzo-ml/src/fwht.rs"
+    ],
+    "artifacts": []
+  },
+  "vulkan_backend": {
+    "paths": [
+      "hanzo-ml/src/vulkan*",
+      "hanzo-ml/src/dummy_vulkan_backend.rs"
+    ],
+    "artifacts": []
+  },
+  "rocm_backend": {
+    "paths": [
+      "hanzo-ml/src/rocm_backend*",
+      "hanzo-ml/src/quantized/rocm.rs",
+      "hanzo-rocm-kernels/**"
+    ],
+    "artifacts": []
+  },
+  "metal_backend": {
+    "paths": [
+      "hanzo-ml/src/metal*",
+      "hanzo-ml/src/quantized/metal.rs",
+      "hanzo-metal-kernels/**"
+    ],
+    "artifacts": []
+  }
+}

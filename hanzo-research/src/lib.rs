@@ -41,24 +41,55 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub mod canonical;
+pub mod controller;
+pub mod lease;
 pub mod lineage;
+pub mod protocol;
 pub mod provenance;
+pub mod spool;
+pub mod tasks;
+pub mod testing;
+pub mod transfer;
 pub mod wal;
 pub mod wire;
 
 pub use canonical::{
     canonicalize_string, canonicalize_value, rfc8785_canonicalize, rfc8785_digest,
 };
+pub use controller::{
+    arm_candidates, detect_host_backends, execute_subprocess, AutonomousController,
+    CampaignRegistry, ExposureLedger, ExposureRecord, GpuLock, ObjectiveSpec, SearchArm,
+    TrialSummary,
+};
+pub use lease::{CloudLeaseManager, Lease, LeaseOutcome};
 pub use lineage::{
     derive_lineage_policy, verify_promotion_eligibility, ArtifactRef, Claim, ContaminationError,
     DataPurpose, DeterminismReport, EnvironmentV1, GateSpec, LineagePolicy, PairEvidence,
     ResearchEvent, TeacherInteraction,
 };
+pub use protocol::{
+    epistemic_verdict, paired_comparison, research_yield, student_t_ci95, successor_research_lift,
+    CiStats, CorrectnessChecks, CounterEvidence, ExperimentRecordV2, HardwareSpec,
+    HypothesisRecord, LocalResearchLedger, Opportunity, OpportunityQueue, ResearchBudget,
+    StatisticalComparison, SyncReceipt, WorkloadManifest,
+};
+pub use spool::{SpoolCursor, SpoolReport, Spooler};
+pub use tasks::{
+    default_retry_policy, infer_machine_backends, parse_targets, resolve_task_queue, LinkedMachine,
+    OrchestrateOptions, ScheduleOptions, TaskDispatchOptions,
+};
+pub use testing::{
+    beta_binomial_e_value, impacted_benchmarks, one_sided_mixture_e_value, paired_accuracy_look,
+    paired_throughput_anytime_look, planned_looks, stable_order, student_t_one_sided_p,
+    AccuracyLook, ImpactReport, LineageRule, ProgressiveAbPlan, ProgressiveAbResult,
+    ProgressiveAbRunner, ProgressiveStage, ProgressiveStageOutput, ThroughputLook,
+};
+pub use transfer::{generate_transfer_hypotheses, DeadEndEntry, TransferCatalog, TransferEngine};
 pub use wal::ResearchWal;
 pub use wire::{
     claimed, left, now, scope, token, Action, Api, Batch, Benchmark, Charter, Commitment,
     Comparison, Decision, Delta, Depend, Dependent, Dependents, Difference, Evaluation, Evidence,
-    Link, Listing, Measure, Program, Recommendation, Run, Source, Split, Stored, Sysml,
+    Link, Listing, Measure, Program, Recommendation, Run, Source, Split, Stored, Study, Sysml,
 };
 
 use provenance::{Git, Host};
@@ -234,12 +265,22 @@ impl Research {
         }
     }
 
-    /// The client built from the environment: `HANZO_API_KEY`, `RESEARCH_BASE`,
-    /// `RESEARCH_PROJECT` (mirrors the Python defaults). The one call a bench harness makes.
+    /// The client built from the environment: `HANZO_API_KEY` else `hanzo auth token`,
+    /// `RESEARCH_BASE`, and `RESEARCH_PROJECT` else JWT `project` claim (mirrors Python).
     pub fn from_env() -> Self {
         let base = std::env::var("RESEARCH_BASE").unwrap_or_default();
-        let key = std::env::var("HANZO_API_KEY").unwrap_or_default();
-        let project = std::env::var("RESEARCH_PROJECT").unwrap_or_else(|_| "default".to_string());
+        let key = std::env::var("HANZO_API_KEY")
+            .ok()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| crate::wire::token().unwrap_or_default());
+        let project = match std::env::var("RESEARCH_PROJECT")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+        {
+            Some(p) => crate::wire::scope(&p),
+            None => crate::wire::claimed(&key).unwrap_or_else(|| "default".to_string()),
+        };
         Research::new(&base, &key, &project, "", &[])
     }
 
@@ -265,6 +306,8 @@ impl Research {
             because: String::new(),
             log: Vec::new(),
             commits: Vec::new(),
+            tags: Vec::new(),
+            ts: 0,
             started: false,
         }
     }
@@ -345,8 +388,72 @@ impl Research {
             git_branch: g.git_branch.clone(),
             git_dirty: g.git_dirty,
             lib_versions: self.inner.libs.clone(),
+            ..ArtifactRecord::default()
         };
         self.artifact(&record)
+    }
+
+    /// Read artifact metadata feed (`GET /v1/research/artifacts`), newest first.
+    pub fn artifacts(
+        &self,
+        run: Option<&str>,
+        since: Option<i64>,
+        project: Option<&str>,
+    ) -> Result<Vec<ArtifactRecord>> {
+        let mut q = Vec::new();
+        if let Some(r) = run.filter(|s| !s.is_empty()) {
+            q.push(format!("run={}", encode(r)));
+        }
+        if let Some(s) = since {
+            q.push(format!("since={s}"));
+        }
+        if let Some(p) = project.filter(|s| !s.is_empty()) {
+            q.push(format!("project={}", encode(p)));
+        }
+        let path = if q.is_empty() {
+            "/v1/research/artifacts".to_string()
+        } else {
+            format!("/v1/research/artifacts?{}", q.join("&"))
+        };
+        let out: Listing<ArtifactRecord> = self.get(&path)?;
+        Ok(out.data)
+    }
+
+    /// Submit a remote GPU benchmark/compute activity to `/v1/workflow/namespaces/<ns>/activities`.
+    pub fn submit_gpu_job(
+        &self,
+        payload: &serde_json::Value,
+        job_type: &str,
+        gpu: Option<&str>,
+        job_id: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let opts = TaskDispatchOptions {
+            target: gpu.map(str::to_string),
+            activity_type: if job_type.trim().is_empty() {
+                "research.bench".to_string()
+            } else {
+                job_type.trim().to_string()
+            },
+            job_id: job_id.map(str::to_string),
+            namespace: namespace
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("gpu-jobs")
+                .to_string(),
+            ..TaskDispatchOptions::default()
+        };
+        self.dispatch_task(payload, &opts)
+    }
+
+    /// Wait for a submitted GPU workflow activity via `/v1/workflow/events` SSE until terminal.
+    pub fn wait_gpu_job(
+        &self,
+        job_id: &str,
+        namespace: Option<&str>,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<serde_json::Value> {
+        self.wait_gpu_job_with_run(job_id, None, namespace, timeout, poll_interval)
     }
 
     /// Upload an artifact's raw bytes (content-addressed on the server).
@@ -392,6 +499,247 @@ impl Research {
     /// Record one benchmark definition: `POST /v1/research/benchmarks`, `{"benchmarks": [bench]}`.
     pub fn post_benchmark(&self, bench: &Benchmark) -> Result<Batch> {
         self.file("benchmarks", std::slice::from_ref(bench))
+    }
+
+    /// Record studies: `POST /v1/research/studies`, `{"studies": [...]}`.
+    pub fn post_studies(&self, studies: &[Study]) -> Result<Batch> {
+        if studies.is_empty() {
+            return Ok(Batch {
+                project: self.inner.project.clone(),
+                recorded: 0,
+                canonical: 0,
+            });
+        }
+        self.file("studies", studies)
+    }
+
+    /// Read canonical studies (`GET /v1/research/studies`).
+    pub fn studies(&self, id: Option<&str>, project: Option<&str>) -> Result<Vec<Study>> {
+        let mut q = Vec::new();
+        if let Some(i) = id.filter(|s| !s.is_empty()) {
+            q.push(format!("id={}", encode(i)));
+        }
+        if let Some(p) = project.filter(|s| !s.is_empty()) {
+            q.push(format!("project={}", encode(p)));
+        }
+        let path = if q.is_empty() {
+            "/v1/research/studies".to_string()
+        } else {
+            format!("/v1/research/studies?{}", q.join("&"))
+        };
+        let out: Listing<Study> = self.get(&path)?;
+        Ok(out.data)
+    }
+
+    /// Read canonical runs (`GET /v1/research/runs`).
+    pub fn runs(
+        &self,
+        id: Option<&str>,
+        study: Option<&str>,
+        system: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<Listing<Run>> {
+        let mut q = Vec::new();
+        if let Some(i) = id.filter(|s| !s.is_empty()) {
+            q.push(format!("id={}", encode(i)));
+        }
+        if let Some(s) = study.filter(|s| !s.is_empty()) {
+            q.push(format!("study={}", encode(s)));
+        }
+        if let Some(s) = system.filter(|s| !s.is_empty()) {
+            q.push(format!("system={}", encode(s)));
+        }
+        if let Some(p) = project.filter(|s| !s.is_empty()) {
+            q.push(format!("project={}", encode(p)));
+        }
+        let path = if q.is_empty() {
+            "/v1/research/runs".to_string()
+        } else {
+            format!("/v1/research/runs?{}", q.join("&"))
+        };
+        self.get(&path)
+    }
+
+    /// File a versioned evidence record (`POST /v1/research/evidence`) with optional `Idempotency-Key`.
+    pub fn evidence(&self, ev: &Evidence, idempotency_key: Option<&str>) -> Result<Evidence> {
+        let url = format!("{}/v1/research/evidence", self.inner.base);
+        let bytes = serde_json::to_vec(ev)?;
+        let mut req = self
+            .auth(self.inner.agent.post(&url))
+            .set("Content-Type", "application/json");
+        if let Some(k) = idempotency_key.filter(|k| !k.is_empty()) {
+            req = req.set("Idempotency-Key", k);
+        }
+        let resp = req.send_bytes(&bytes)?;
+        read_json(resp)
+    }
+
+    /// Read a uri's evidence versions newest-first (`GET /v1/research/evidence?uri=`).
+    pub fn evidence_versions(&self, uri: &str) -> Result<Vec<Evidence>> {
+        let path = format!("/v1/research/evidence?uri={}", encode(uri));
+        let out: Listing<Evidence> = self.get(&path)?;
+        Ok(out.data)
+    }
+
+    /// Read one evidence version with its content (`GET /v1/research/evidence/{id}`).
+    pub fn get_evidence(&self, id: &str) -> Result<Evidence> {
+        let path = format!("/v1/research/evidence/{}", encode(id));
+        self.get(&path)
+    }
+
+    /// Rich query across canonical cloud experiments by study, verdict, repo, backend, and search.
+    pub fn query_experiments(
+        &self,
+        study: Option<&str>,
+        verdict: Option<&str>,
+        repo: Option<&str>,
+        backend: Option<&str>,
+        search: Option<&str>,
+        include_failures: bool,
+        project: Option<&str>,
+    ) -> Result<Vec<Record>> {
+        let want_v = verdict.map(epistemic_verdict);
+        let want_b = backend.map(str::to_ascii_lowercase);
+        let tokens: Vec<String> = search
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let mut out = Vec::new();
+        for rec in self.query(project, None)? {
+            let ev = epistemic_verdict(rec.meta["verdict"].as_str().unwrap_or(""));
+            if !include_failures && ev == "refuted" {
+                continue;
+            }
+            let rec_study = rec.meta["study"].as_str().unwrap_or(&rec.task);
+            if let Some(st) = study {
+                if rec_study != st
+                    && !rec_study
+                        .to_ascii_lowercase()
+                        .contains(&st.to_ascii_lowercase())
+                {
+                    continue;
+                }
+            }
+            if let Some(wv) = want_v {
+                if ev != wv {
+                    continue;
+                }
+            }
+            let rec_repo = rec.meta["repo"]
+                .as_str()
+                .unwrap_or_else(|| rec.subject.split('/').next().unwrap_or(""));
+            if let Some(rp) = repo {
+                if rec_repo != rp && !rec.subject.contains(rp) {
+                    continue;
+                }
+            }
+            let rec_backend = rec.meta["backend"].as_str().unwrap_or(&rec.subject);
+            if let Some(wb) = &want_b {
+                if !rec_backend.to_ascii_lowercase().contains(wb) {
+                    continue;
+                }
+            }
+            if !tokens.is_empty() {
+                let blob = format!(
+                    "{} {} {} {}",
+                    rec.id,
+                    rec.subject,
+                    rec.task,
+                    serde_json::to_string(&rec.meta).unwrap_or_default()
+                )
+                .to_ascii_lowercase();
+                if !tokens.iter().all(|t| blob.contains(t)) {
+                    continue;
+                }
+            }
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// Return refuted cloud experiments carrying `because` or `failure_diagnosis`.
+    pub fn prior_failures(
+        &self,
+        domain_or_study: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<Vec<Record>> {
+        let needle = domain_or_study.map(|s| s.trim().to_ascii_lowercase());
+        let mut out = Vec::new();
+        for rec in self.query_experiments(None, Some("refuted"), None, None, None, true, project)? {
+            if let Some(n) = &needle {
+                let hay = format!(
+                    "{} {} {} {}",
+                    rec.id,
+                    rec.subject,
+                    rec.task,
+                    serde_json::to_string(&rec.meta).unwrap_or_default()
+                )
+                .to_ascii_lowercase();
+                if !hay.contains(n) {
+                    continue;
+                }
+            }
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// Synthesize ranked open `Opportunity` items from cloud experiments and run notes.
+    pub fn recommended_experiments(
+        &self,
+        domain: Option<&str>,
+        top_k: usize,
+        project: Option<&str>,
+    ) -> Result<Vec<Opportunity>> {
+        let needle = domain.map(|s| s.trim().to_ascii_lowercase());
+        let mut ops: BTreeMap<String, Opportunity> = BTreeMap::new();
+        for rec in self.query(project, None)? {
+            let nxt = rec.meta["next_hypothesis"]
+                .as_str()
+                .map(str::trim)
+                .unwrap_or("");
+            if nxt.is_empty() {
+                continue;
+            }
+            let dom = rec.meta["study"].as_str().unwrap_or(&rec.task);
+            if let Some(n) = &needle {
+                if !dom.to_ascii_lowercase().contains(n) && !rec.id.to_ascii_lowercase().contains(n)
+                {
+                    continue;
+                }
+            }
+            let gain = if epistemic_verdict(rec.meta["verdict"].as_str().unwrap_or("")) == "proven"
+            {
+                0.20
+            } else {
+                0.12
+            };
+            let op_id = format!("{}->cloud-followup", rec.id);
+            ops.insert(
+                op_id.clone(),
+                Opportunity {
+                    opportunity_id: op_id,
+                    domain: dom.to_string(),
+                    objective: format!("{dom}:followup"),
+                    current_best: rec.value,
+                    proposed_approach: nxt.to_string(),
+                    expected_improvement: gain,
+                    compute_cost: 1.0,
+                    related_experiments: vec![rec.id.clone()],
+                    trigger_rule: format!("cloud_next_hypothesis:{}", rec.id),
+                    status: "open".into(),
+                },
+            );
+        }
+        let mut ranked: Vec<Opportunity> = ops.into_values().collect();
+        ranked.sort_by(|a, b| {
+            b.priority_score()
+                .total_cmp(&a.priority_score())
+                .then_with(|| a.opportunity_id.cmp(&b.opportunity_id))
+        });
+        ranked.truncate(top_k);
+        Ok(ranked)
     }
 
     /// Record one run: `POST /v1/research/runs`, `{"runs": [run]}`.
@@ -465,7 +813,11 @@ impl Research {
         }
     }
 
-    fn post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
+    pub(crate) fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<T> {
         let url = format!("{}{path}", self.inner.base);
         let bytes = serde_json::to_vec(body)?;
         let resp = self
@@ -475,10 +827,35 @@ impl Research {
         read_json(resp)
     }
 
-    fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+    pub(crate) fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = format!("{}{path}", self.inner.base);
         let resp = self.auth(self.inner.agent.get(&url)).call()?;
         read_json(resp)
+    }
+
+    pub(crate) fn delete<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{path}", self.inner.base);
+        let resp = self.auth(self.inner.agent.delete(&url)).call()?;
+        read_json(resp)
+    }
+
+    pub(crate) fn open_event_stream(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<ureq::Response> {
+        let url = format!("{}{path}", self.inner.base);
+        let stream_agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(timeout.max(Duration::from_millis(100)))
+            .redirects(0)
+            .build();
+        let resp = self
+            .auth(stream_agent.get(&url))
+            .set("Accept", "text/event-stream")
+            .set("Cache-Control", "no-cache")
+            .call()?;
+        Ok(resp)
     }
 
     /// The git sha of this experiment's last recorded run, for the since-narrative.
@@ -518,11 +895,29 @@ pub struct Experiment {
     // The running "what I saw / thought" trail — meta.log, appended by log().
     log: Vec<String>,
     commits: Vec<String>,
+    tags: Vec<String>,
+    ts: i64,
     started: bool,
 }
 
 impl Experiment {
     // ── builder opts (by value; chain them right after experiment()) ───────────────────
+
+    /// Attach searchable tags to the experiment record.
+    pub fn tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.tags = tags.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self
+    }
+
+    /// Override unix timestamp (seconds); `0` defaults to current unix time on serialize.
+    pub fn ts(mut self, ts: i64) -> Self {
+        self.ts = ts;
+        self
+    }
 
     /// The headline metric name (default `accuracy`; e.g. `ratio_vs_hand`, `tok/s`).
     pub fn metric(mut self, metric: &str) -> Self {
@@ -690,6 +1085,8 @@ impl Experiment {
             git_branch: g.git_branch.clone(),
             git_dirty: g.git_dirty,
             lib_versions: self.client.inner.libs.clone(),
+            tags: self.tags.clone(),
+            ..ArtifactRecord::default()
         })
     }
 
@@ -722,6 +1119,9 @@ impl Experiment {
                 because: self.because.clone(),
                 log: self.log.clone(),
             },
+            ts: self.ts,
+            tags: self.tags.clone(),
+            received_at: None,
         }
     }
 }
@@ -761,10 +1161,22 @@ impl Outcome {
 
 // ── wire records (the exact shape every language's SDK produces) ─────────────────────────
 
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+fn serialize_unix_ts<S: serde::Serializer>(ts: &i64, s: S) -> std::result::Result<S::Ok, S::Error> {
+    let val = if *ts == 0 { unix_now() } else { *ts };
+    s.serialize_i64(val)
+}
+
 /// One experiment version on the wire. Field order mirrors the Python SDK for readability;
 /// JSON objects are unordered and the server keys on (project, id), so records are
 /// semantically identical across languages regardless of serialization.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExperimentRecord {
     pub id: String,
     pub kind: String,
@@ -780,10 +1192,17 @@ pub struct ExperimentRecord {
     pub git_dirty: bool,
     pub lib_versions: BTreeMap<String, String>,
     pub meta: Meta,
+    #[serde(default, serialize_with = "serialize_unix_ts")]
+    pub ts: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<i64>,
 }
 
 /// The scientific frame + self-documenting narrative that travels with a run.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Meta {
     pub doc: String,
     pub commits: Vec<String>,
@@ -797,7 +1216,8 @@ pub struct Meta {
 }
 
 /// One measured attempt on one item.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Attempt {
     pub benchmark: String,
     pub item: String,
@@ -823,13 +1243,13 @@ fn default_artifact_compression() -> String {
 }
 
 /// A research artifact — content-addressed by the server via sha256 of the bytes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ArtifactRecord {
-    #[serde(default)]
     pub artifact_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     pub sha256: String,
-    #[serde(default)]
     pub content_sha256: String,
     #[serde(default = "default_artifact_media_type")]
     pub media_type: String,
@@ -837,14 +1257,27 @@ pub struct ArtifactRecord {
     pub canonicalization: String,
     #[serde(default = "default_artifact_compression")]
     pub compression: String,
-    #[serde(default)]
     pub uncompressed_size: u64,
     pub kind: String,
+    #[serde(default, rename = "ref", skip_serializing_if = "String::is_empty")]
+    pub artifact_ref: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub visibility: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub retention_class: String,
     pub git_sha: String,
     pub git_branch: String,
     pub git_dirty: bool,
     pub lib_versions: BTreeMap<String, String>,
+    #[serde(default, serialize_with = "serialize_unix_ts")]
+    pub ts: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -878,7 +1311,12 @@ pub struct Record {
     pub git_dirty: bool,
     pub lib_versions: BTreeMap<String, String>,
     pub meta: serde_json::Value,
+    #[serde(default, serialize_with = "serialize_unix_ts")]
     pub ts: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<i64>,
 }
 
 /// The ingest acknowledgement — counts after the batch committed.
@@ -944,7 +1382,7 @@ fn read_json<T: serde::de::DeserializeOwned>(resp: ureq::Response) -> Result<T> 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Lowercase hex sha256 of the bytes — the client-side integrity hash the server verifies.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for b in digest {
@@ -956,7 +1394,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Percent-encode a query-parameter value (RFC 3986 unreserved pass through). Defense in
 /// depth: `project`/`kind` reach the URL, so a stray separator can never split the query.
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
@@ -1001,6 +1439,7 @@ mod tests {
             ("hanzo-engine".to_string(), "1.7.92".to_string()),
         ]);
         e.commits = vec!["fix x".into(), "tune y".into()];
+        e.ts = 1_700_000_000;
         e
     }
 
@@ -1041,6 +1480,7 @@ mod tests {
               "value":0.79,"n":0,"n_total":0,"status":"complete",
               "git_sha":"abc123","git_branch":"blue/x","git_dirty":true,
               "lib_versions":{"hanzo-ml":"0.11.94","hanzo-engine":"1.7.92"},
+              "ts":1700000000,
               "meta":{
                 "doc":"","commits":["fix x","tune y"],"note":"cold A/B",
                 "host":{"hostname":"evo","platform":"Linux"},
