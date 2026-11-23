@@ -28,12 +28,15 @@ const PTQ1_QS_STAGE0_BYTES: usize = 16;
 const PTQ1_QS_STAGE1_BYTES: usize = 8;
 const PTQ1_QH_BYTES: usize = 2;
 const PTQ1_POW3: [u8; 5] = [1, 3, 9, 27, 81];
+#[cfg(any(target_arch = "aarch64", test))]
 const TERNARY_BYTE_STATES: usize = 6561; // 3^8 states for 8 ternary weights
+#[cfg(any(target_arch = "aarch64", test))]
 const BYTE_LUT_ENTRIES: usize = 256;
 const TINY_MATRIX_ELEMS: usize = 65_536;
 const BITCOS_PTQ1_MARGIN_BPW: f64 = 0.02;
 const PARALLEL_ROW_THRESHOLD: usize = 64;
 
+#[cfg(any(target_arch = "aarch64", test))]
 const fn build_byte_tables() -> ([u32; BYTE_LUT_ENTRIES], [u64; TERNARY_BYTE_STATES]) {
     let mut meta = [0u32; BYTE_LUT_ENTRIES];
     let mut trits = [0u64; TERNARY_BYTE_STATES];
@@ -68,6 +71,7 @@ const fn build_byte_tables() -> ([u32; BYTE_LUT_ENTRIES], [u64; TERNARY_BYTE_STA
     (meta, trits)
 }
 
+#[cfg(any(target_arch = "aarch64", test))]
 const BYTE_TABLES: ([u32; BYTE_LUT_ENTRIES], [u64; TERNARY_BYTE_STATES]) = build_byte_tables();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2038,5 +2042,37 @@ mod tests {
         for (g, w) in got.iter().zip(want.iter()) {
             assert_eq!(g.to_bits(), w.to_bits());
         }
+    }
+
+    #[test]
+    fn byte_lut_table_invariants() {
+        assert_eq!(TERNARY_BYTE_STATES, 3usize.pow(8));
+        assert_eq!(BYTE_TABLES.0.len(), BYTE_LUT_ENTRIES);
+        assert_eq!(BYTE_TABLES.1.len(), TERNARY_BYTE_STATES);
+        let mut total_states = 0usize;
+        for (b, &m) in BYTE_TABLES.0.iter().enumerate() {
+            let pop = (m >> 24) as usize;
+            let mask = ((m >> 16) & 0xFF) as usize;
+            let base = (m & 0xFFFF) as usize;
+            assert_eq!(pop, (b as u8).count_ones() as usize);
+            assert_eq!(base, total_states);
+            let combos = 1usize << pop;
+            assert_eq!(mask, combos - 1);
+            let all_pos = BYTE_TABLES.1[base];
+            let all_neg = BYTE_TABLES.1[base + combos - 1];
+            for lane in 0..BITS_PER_BYTE {
+                let p_lane = ((all_pos >> (lane * 8)) & 0xFF) as i8;
+                let n_lane = ((all_neg >> (lane * 8)) & 0xFF) as i8;
+                if ((b >> lane) & 1) == 0 {
+                    assert_eq!(p_lane, 0);
+                    assert_eq!(n_lane, 0);
+                } else {
+                    assert_eq!(p_lane, 1);
+                    assert_eq!(n_lane, -1);
+                }
+            }
+            total_states += combos;
+        }
+        assert_eq!(total_states, TERNARY_BYTE_STATES);
     }
 }

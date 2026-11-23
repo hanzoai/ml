@@ -1,0 +1,15 @@
+# Canonical Hanzo Insights caller; delegates code-security, git-history secret
+# scanning, and CI telemetry to hanzoai/ci/.github/workflows/insights.yml.
+name: Hanzo Insights
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  insights:
+    uses: hanzoai/ci/.github/workflows/insights.yml@main
+    with:
+      project: hanzo-ml
+    secrets: inherit
