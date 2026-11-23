@@ -90,6 +90,9 @@ jobs:
         working-directory: ./hanzo-ml-pyo3
         run: |
           set -euo pipefail
+          # Strip host-specific -C target-cpu=native from workspace .cargo/config.toml
+          # so manylinux wheels stay portable and cross-targets (aarch64 on x86_64) build cleanly.
+          rm -f ../.cargo/config.toml
           free_kb=$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}')
           if [ "${free_kb:-0}" -ge $((6 * 1024 * 1024)) ]; then
             export CARGO_TARGET_DIR="/dev/shm/maturin-${GITHUB_RUN_ID}-${{ matrix.target }}"
