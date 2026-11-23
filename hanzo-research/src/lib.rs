@@ -581,6 +581,12 @@ impl Research {
         Ok(out.data)
     }
 
+    /// Read one evidence version with its content (`GET /v1/research/evidence/{id}`).
+    pub fn get_evidence(&self, id: &str) -> Result<Evidence> {
+        let path = format!("/v1/research/evidence/{}", encode(id));
+        self.get(&path)
+    }
+
     /// Rich query across canonical cloud experiments by study, verdict, repo, backend, and search.
     pub fn query_experiments(
         &self,

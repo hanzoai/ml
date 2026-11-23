@@ -54,6 +54,34 @@ fn latest_version(rows: &[Evidence]) -> Option<&Evidence> {
     rows.iter().max_by_key(|e| e.version)
 }
 
+fn hydrate_latest(
+    client: &Research,
+    rows: &[Evidence],
+    filed: Option<&Evidence>,
+) -> Result<Option<Evidence>> {
+    let latest = latest_version(rows);
+    if let Some(f) = filed {
+        if latest.is_none_or(|l| l.version < f.version) {
+            return Ok(Some(f.clone()));
+        }
+    }
+    let Some(l) = latest else {
+        return Ok(None);
+    };
+    if l.content.as_ref().is_some_and(|c| c.is_object()) {
+        return Ok(Some(l.clone()));
+    }
+    if let Some(f) = filed {
+        if !l.id.is_empty() && l.id == f.id && f.content.as_ref().is_some_and(|c| c.is_object()) {
+            return Ok(Some(f.clone()));
+        }
+    }
+    if !l.id.is_empty() {
+        return Ok(Some(client.get_evidence(&l.id)?));
+    }
+    Ok(Some(l.clone()))
+}
+
 fn default_clock() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -211,7 +239,7 @@ impl CloudLeaseManager {
 
         let mut prev_ver = 0i64;
         let mut reclaimed_from = String::new();
-        if let Some(latest) = latest_version(&existing) {
+        if let Some(latest) = hydrate_latest(client, &existing, None)? {
             prev_ver = latest.version;
             if let Some(c) = &latest.content {
                 let state = c["state"].as_str().unwrap_or("");
@@ -261,10 +289,10 @@ impl CloudLeaseManager {
             content: Some(content),
             ..Evidence::default()
         };
-        client.evidence(&ev, None)?;
+        let filed = client.evidence(&ev, None)?;
 
         let verified = client.evidence_versions(&uri)?;
-        let winner = latest_version(&verified)
+        let winner = hydrate_latest(client, &verified, Some(&filed))?
             .ok_or_else(|| Error::Message(format!("lease verification missing for {uri}")))?;
         let w_content = winner.content.as_ref().unwrap_or(&Value::Null);
         let w_holder = w_content["owner_worker_id"].as_str().unwrap_or("");
@@ -346,7 +374,7 @@ impl CloudLeaseManager {
 
         let client = self.client.as_ref().unwrap();
         let rows = client.evidence_versions(&lease.uri)?;
-        let latest = latest_version(&rows)
+        let latest = hydrate_latest(client, &rows, None)?
             .ok_or_else(|| Error::Message(format!("lease missing on {}", lease.uri)))?;
         let lc = latest.content.as_ref().unwrap_or(&Value::Null);
         if lc["owner_worker_id"].as_str() != Some(&self.worker_id)
@@ -371,7 +399,7 @@ impl CloudLeaseManager {
             "reclaimed_from": lease.reclaimed_from,
             "state": "held",
         });
-        client.evidence(
+        let filed = client.evidence(
             &Evidence {
                 uri: lease.uri.clone(),
                 hash: rfc8785_digest(&content)?,
@@ -386,7 +414,7 @@ impl CloudLeaseManager {
             None,
         )?;
         let after_rows = client.evidence_versions(&lease.uri)?;
-        let after = latest_version(&after_rows)
+        let after = hydrate_latest(client, &after_rows, Some(&filed))?
             .ok_or_else(|| Error::Message(format!("lease missing after renew on {}", lease.uri)))?;
         let ac = after.content.as_ref().unwrap_or(&Value::Null);
         if ac["owner_worker_id"].as_str() != Some(&self.worker_id) {
@@ -422,7 +450,7 @@ impl CloudLeaseManager {
         }
         let client = self.client.as_ref().unwrap();
         let rows = client.evidence_versions(&lease.uri)?;
-        let latest = latest_version(&rows)
+        let latest = hydrate_latest(client, &rows, None)?
             .ok_or_else(|| Error::Message(format!("lease missing on {}", lease.uri)))?;
         let lc = latest.content.as_ref().unwrap_or(&Value::Null);
         if lc["owner_worker_id"].as_str() != Some(&self.worker_id)
@@ -474,7 +502,7 @@ impl CloudLeaseManager {
         }
         let client = self.client.as_ref().unwrap();
         let rows = client.evidence_versions(&lease.uri)?;
-        let Some(latest) = latest_version(&rows) else {
+        let Some(latest) = hydrate_latest(client, &rows, None)? else {
             return Ok(None);
         };
         let lc = latest.content.as_ref().unwrap_or(&Value::Null);
