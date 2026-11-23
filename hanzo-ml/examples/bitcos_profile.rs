@@ -1287,7 +1287,12 @@ fn main() -> anyhow::Result<()> {
             std::fs::read(out_path)?
         } else {
             let tmp = std::env::temp_dir().join(format!("bitcos-res-{}.json", std::process::id()));
-            write_json_report(tmp.to_string_lossy().as_ref(), &reports, pq2_ptq1_identical, &benches)?;
+            write_json_report(
+                tmp.to_string_lossy().as_ref(),
+                &reports,
+                pq2_ptq1_identical,
+                &benches,
+            )?;
             let bytes = std::fs::read(&tmp)?;
             let _ = std::fs::remove_file(&tmp);
             bytes
@@ -1304,7 +1309,12 @@ fn main() -> anyhow::Result<()> {
             study: "bitcos-ternary-packing".into(),
             objective: "Reduce ternary FFN matvec latency & bandwidth via zero-density BitcosMatrix packing".into(),
             hypothesis: "Sparse BitcosMatrix-G128 Q8_0 matvec outperforms dense PQ2_0 on sparse FFN weights with 0.0 ULP error".into(),
-            experiment_id: format!("ml:bitcos:{}:{}:{}", b.suite, b.label, &git.git_sha.chars().take(8).collect::<String>()),
+            experiment_id: format!(
+                "ml:bitcos:{}:{}:{}",
+                b.suite,
+                b.label,
+                git.git_sha.chars().take(8).collect::<String>()
+            ),
             parent_experiment: "ml:pq2_0:dense-baseline".into(),
             prior_best: Some(b.mt_pq2_us),
             repo: "hanzoai/ml".into(),
@@ -1370,7 +1380,8 @@ fn main() -> anyhow::Result<()> {
             recorded_at: String::new(),
             ..Default::default()
         };
-        let receipt = ledger.record_experiment(&mut exp, &[("bitcos_profile_json", &report_bytes)])?;
+        let receipt =
+            ledger.record_experiment(&mut exp, &[("bitcos_profile_json", &report_bytes)])?;
         println!(
             "\nRecorded hanzo-ml experiment {} in WAL (status={}, artifact={})",
             exp.experiment_id, receipt.status, receipt.artifact_sha256
