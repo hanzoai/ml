@@ -1,132 +1,205 @@
 name: PyO3-Wheels
 
-# Native (Hanzo Git) copy of .github/workflows/maturin.yml. The fork scans
-# .hanzo/workflows FIRST; GitHub.com ignores .hanzo/, so this is inert on GitHub
-# and only runs on the native forge. Ported verbatim -- no `self-hosted` label to
-# rewrite. The `linux`/`sdist` jobs run on the mapped `linux-amd64`
-# label; the `windows`/`macos` jobs use GitHub-hosted labels that need their own
-# git-runner host daemons registered, or those legs queue on the native forge (a
-# runner-provisioning step, not a workflow change).
+# Builds abi3-py38 wheels and source distribution for hanzo-ml-pyo3.
+# Pod runners on linux-amd64 have no Docker daemon and enforce PEP 668 on system
+# Python, so Linux wheels build inside an isolated venv using maturin[zig]
+# targeting manylinux_2_28 without requiring /var/run/docker.sock.
 on:
   push:
     branches:
       - main
     tags:
-      - '*'
+      - 'v[0-9]*.[0-9]*.[0-9]*'
     paths:
       - hanzo-ml-pyo3/**
+      - .github/workflows/maturin.yml
   pull_request:
     paths:
       - hanzo-ml-pyo3/**
+      - .github/workflows/maturin.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  PROTOC_VERSION: '25.0'
+  PROTOC_VERSION: '28.3'
   FEATURES_FLAG: '--features onnx'
 
 jobs:
+  sdist:
+    runs-on: [linux-amd64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          if ! command -v protoc >/dev/null 2>&1; then
+            curl -fsSL --retry 3 "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+              -o "$RUNNER_TEMP/protoc.zip"
+            mkdir -p "$HOME/.local"
+            unzip -qo "$RUNNER_TEMP/protoc.zip" 'bin/protoc' 'include/*' -d "$HOME/.local"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Build sdist in isolated venv
+        working-directory: ./hanzo-ml-pyo3
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/maturin-venv"
+          "$RUNNER_TEMP/maturin-venv/bin/pip" install --upgrade pip "maturin>=1.0,<2.0"
+          "$RUNNER_TEMP/maturin-venv/bin/maturin" sdist --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: ./hanzo-ml-pyo3/dist
+
   linux:
     runs-on: [linux-amd64]
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64, x86, aarch64, s390x, ppc64le]
+        include:
+          - target: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+          - target: aarch64
+            rust_target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Build wheels
-        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
-          sccache: 'true'
-          manylinux: auto
-          working-directory: ./hanzo-ml-pyo3
+          targets: ${{ matrix.rust_target }}
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          if ! command -v protoc >/dev/null 2>&1; then
+            curl -fsSL --retry 3 "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+              -o "$RUNNER_TEMP/protoc.zip"
+            mkdir -p "$HOME/.local"
+            unzip -qo "$RUNNER_TEMP/protoc.zip" 'bin/protoc' 'include/*' -d "$HOME/.local"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Build manylinux wheel via maturin + zig in venv
+        working-directory: ./hanzo-ml-pyo3
+        run: |
+          set -euo pipefail
+          # Strip host-specific -C target-cpu=native from workspace .cargo/config.toml
+          # so manylinux wheels stay portable and cross-targets (aarch64 on x86_64) build cleanly.
+          rm -f ../.cargo/config.toml
+          free_kb=$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}')
+          if [ "${free_kb:-0}" -ge $((6 * 1024 * 1024)) ]; then
+            export CARGO_TARGET_DIR="/dev/shm/maturin-${GITHUB_RUN_ID}-${{ matrix.target }}"
+          fi
+          python3 -m venv "$RUNNER_TEMP/maturin-venv"
+          export PATH="$RUNNER_TEMP/maturin-venv/bin:$PATH"
+          pip install --upgrade pip "maturin[zig]>=1.0,<2.0"
+          if [ -x "$RUNNER_TEMP/maturin-venv/bin/python-zig" ] && ! command -v zig >/dev/null 2>&1; then
+            ln -sf python-zig "$RUNNER_TEMP/maturin-venv/bin/zig"
+          fi
+          maturin build \
+            --release \
+            --zig \
+            --compatibility manylinux_2_28 \
+            --target "${{ matrix.rust_target }}" \
+            --interpreter python \
+            --out dist \
+            ${{ env.FEATURES_FLAG }}
+          if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+            rm -rf "$CARGO_TARGET_DIR"
+          fi
       - name: Upload wheels
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-${{ matrix.target }}
           path: ./hanzo-ml-pyo3/dist
 
-  windows:
-    runs-on: [windows-latest]
-    strategy:
-      matrix:
-        target: [x64, x86]
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
-        with:
-          python-version: '3.13'
-          architecture: ${{ matrix.target }}
-      - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b  # v3
-        with:
-          version: ${{ env.PROTOC_VERSION }}
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build wheels
-        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter ${{ env.FEATURES_FLAG }}
-          sccache: 'true'
-          working-directory: ./hanzo-ml-pyo3
-      - name: Upload wheels
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
-        with:
-          name: wheels-windows-${{ matrix.target }}
-          path: ./hanzo-ml-pyo3/dist
-
   macos:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: [macos-latest]
     strategy:
+      fail-fast: false
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            rust_target: x86_64-apple-darwin
+          - target: aarch64
+            rust_target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b  # v3
+      - uses: dtolnay/rust-toolchain@stable
         with:
-            version: ${{ env.PROTOC_VERSION }}
-            repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build wheels
-        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter ${{ env.FEATURES_FLAG }}
-          sccache: 'true'
-          working-directory: ./hanzo-ml-pyo3
+          targets: ${{ matrix.rust_target }}
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-universal_binary.zip" \
+            -o "$RUNNER_TEMP/protoc.zip"
+          mkdir -p "$HOME/.local"
+          unzip -qo "$RUNNER_TEMP/protoc.zip" 'bin/protoc' 'include/*' -d "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build macOS wheel in venv
+        working-directory: ./hanzo-ml-pyo3
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/maturin-venv"
+          "$RUNNER_TEMP/maturin-venv/bin/pip" install --upgrade pip "maturin>=1.0,<2.0"
+          "$RUNNER_TEMP/maturin-venv/bin/maturin" build \
+            --release \
+            --target "${{ matrix.rust_target }}" \
+            --interpreter python3 \
+            --out dist \
+            ${{ env.FEATURES_FLAG }}
       - name: Upload wheels
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        uses: actions/upload-artifact@v6
         with:
           name: wheels-macos-${{ matrix.target }}
           path: ./hanzo-ml-pyo3/dist
 
-  sdist:
-    runs-on: [linux-amd64]
+  windows:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: [windows-latest]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x64
+            rust_target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - name: Install Protoc
-        uses: arduino/setup-protoc@a8b67ba40b37d35169e222f3bb352603327985b6  # v2
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          version: ${{ env.PROTOC_VERSION }}
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build sdist
-        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
+          python-version: '3.13'
+          architecture: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          command: sdist
-          args: --out dist
-          working-directory: ./hanzo-ml-pyo3
-      - name: Upload sdist
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+          targets: ${{ matrix.rust_target }}
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\protoc.zip"
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip" -OutFile $zip
+          $dest = "$env:USERPROFILE\.local\protoc"
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          Add-Content -Path $env:GITHUB_PATH -Value "$dest\bin"
+      - name: Build Windows wheel in venv
+        shell: pwsh
+        working-directory: ./hanzo-ml-pyo3
+        run: |
+          python -m venv "$env:RUNNER_TEMP\maturin-venv"
+          & "$env:RUNNER_TEMP\maturin-venv\Scripts\pip.exe" install --upgrade pip "maturin>=1.0,<2.0"
+          & "$env:RUNNER_TEMP\maturin-venv\Scripts\maturin.exe" build --release --target "${{ matrix.rust_target }}" --interpreter python --out dist --features onnx
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
         with:
-          name: wheels-sdist
+          name: wheels-windows-${{ matrix.target }}
           path: ./hanzo-ml-pyo3/dist

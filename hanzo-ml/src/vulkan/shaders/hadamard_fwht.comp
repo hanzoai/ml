@@ -1,0 +1,93 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer S { float signs[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Pc {
+    uint x_off;
+    uint s_off;
+    uint block_size;
+    uint width;
+    uint has_signs;
+    uint is_inverse;
+    uint total_blocks;
+};
+
+shared float smem[4096];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint e_cnt = max(block_size >> 8u, 1u);
+    uint threads = block_size / e_cnt;
+    uint chunk_e = min(e_cnt, 16u);
+    float inv_sqrt_b = inversesqrt(float(block_size));
+    uint blocks_per_row = width / block_size;
+    float v[32];
+
+    for (uint blk = gl_WorkGroupID.x; blk < total_blocks; blk += gl_NumWorkGroups.x) {
+        uint blk_base = x_off + blk * block_size;
+        uint out_base = blk * block_size;
+        uint row_col_base = s_off + (blk % blocks_per_row) * block_size;
+
+        if (tid < threads) {
+            for (uint r = 0u; r < e_cnt; r++) {
+                uint pos = (r << 8u) + tid;
+                float val = x[blk_base + pos];
+                if (is_inverse == 0u && has_signs != 0u) {
+                    val *= signs[row_col_base + pos];
+                }
+                v[r] = val;
+            }
+        }
+
+        for (uint r0 = 0u; r0 < e_cnt; r0 += chunk_e) {
+            if (tid < threads) {
+                for (uint r = 0u; r < chunk_e; r++) {
+                    smem[(r << 8u) + tid] = v[r0 + r];
+                }
+            }
+            barrier();
+            for (uint stride = 1u; stride < threads; stride <<= 1u) {
+                float nv[16];
+                if (tid < threads) {
+                    for (uint r = 0u; r < chunk_e; r++) {
+                        uint pos = (r << 8u) + tid;
+                        float partner = smem[pos ^ stride];
+                        nv[r] = ((pos & stride) != 0u) ? (partner - v[r0 + r]) : (v[r0 + r] + partner);
+                    }
+                }
+                barrier();
+                if (tid < threads) {
+                    for (uint r = 0u; r < chunk_e; r++) {
+                        v[r0 + r] = nv[r];
+                        smem[(r << 8u) + tid] = nv[r];
+                    }
+                }
+                barrier();
+            }
+        }
+
+        if (tid < threads) {
+            for (uint sr = 1u; sr < e_cnt; sr <<= 1u) {
+                for (uint base = 0u; base < e_cnt; base += 2u * sr) {
+                    for (uint off = 0u; off < sr; off++) {
+                        float a = v[base + off];
+                        float b = v[base + off + sr];
+                        v[base + off] = a + b;
+                        v[base + off + sr] = a - b;
+                    }
+                }
+            }
+            for (uint r = 0u; r < e_cnt; r++) {
+                uint pos = (r << 8u) + tid;
+                float val = v[r] * inv_sqrt_b;
+                if (is_inverse != 0u && has_signs != 0u) {
+                    val *= signs[row_col_base + pos];
+                }
+                y[out_base + pos] = val;
+            }
+        }
+        barrier();
+    }
+}

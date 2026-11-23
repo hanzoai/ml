@@ -630,6 +630,7 @@ impl Content {
             metadata.insert(key, value);
         }
         let mut tensor_infos = HashMap::new();
+        let mut all_offsets = Vec::with_capacity(tensor_count as usize);
         for _idx in 0..tensor_count {
             let tensor_name = read_string(reader, &magic, file_size)?;
             let n_dimensions = reader.read_u32::<LittleEndian>()?;
@@ -655,6 +656,7 @@ impl Content {
             dimensions.reverse();
             let ggml_dtype_u32 = reader.read_u32::<LittleEndian>()?;
             let offset = reader.read_u64::<LittleEndian>()?;
+            all_offsets.push(offset);
             // Skip the still-unsupported integer GGML types I8=24, I16=25, I64=27 (auxiliary
             // index tensors with no `GgmlDType`): record nothing, stay aligned, don't hard-fail.
             // I32=26 IS supported (`GgmlDType::I32`) and IS requested by DeepSeek-V4's hash-routing
@@ -682,7 +684,15 @@ impl Content {
             Some(Value::I32(v)) if *v >= 0 => *v as u64,
             _ => DEFAULT_ALIGNMENT,
         };
+        let alignment = alignment.max(1);
         let tensor_data_offset = position.div_ceil(alignment) * alignment;
+        remap_legacy_q2_0_tensors(
+            &mut tensor_infos,
+            &mut all_offsets,
+            &metadata,
+            file_size.saturating_sub(tensor_data_offset),
+            alignment,
+        );
         Ok(Self {
             magic,
             metadata,
@@ -744,6 +754,83 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read_stream(path, self.tensor_data_offset, name)
+    }
+}
+
+const LEGACY_PQ2_0_VERSION_CUTOFF: u64 = 7;
+
+fn remap_legacy_q2_0_tensors(
+    tensor_infos: &mut HashMap<String, TensorInfo>,
+    all_offsets: &mut [u64],
+    metadata: &HashMap<String, Value>,
+    data_end: u64,
+    alignment: u64,
+) {
+    if !tensor_infos
+        .values()
+        .any(|t| t.ggml_dtype == GgmlDType::Q2_0)
+    {
+        return;
+    }
+    all_offsets.sort_unstable();
+    let pq2_blck = super::iq_quants::QK_PQ2_0;
+    let pq2_type_bytes = GgmlDType::PQ2_0.type_size() as u64;
+    let q2_blck = super::iq_quants::QK2_0;
+    let q2_type_bytes = GgmlDType::Q2_0.type_size() as u64;
+
+    let mut legacy_file = match metadata.get("prism.hadamard.version") {
+        Some(Value::U8(v)) => (*v as u64) < LEGACY_PQ2_0_VERSION_CUTOFF,
+        Some(Value::U16(v)) => (*v as u64) < LEGACY_PQ2_0_VERSION_CUTOFF,
+        Some(Value::U32(v)) => (*v as u64) < LEGACY_PQ2_0_VERSION_CUTOFF,
+        Some(Value::U64(v)) => *v < LEGACY_PQ2_0_VERSION_CUTOFF,
+        Some(Value::I32(v)) if *v > 0 => (*v as u64) < LEGACY_PQ2_0_VERSION_CUTOFF,
+        Some(Value::I64(v)) if *v > 0 => (*v as u64) < LEGACY_PQ2_0_VERSION_CUTOFF,
+        _ => false,
+    };
+
+    for info in tensor_infos.values_mut() {
+        if info.ggml_dtype != GgmlDType::Q2_0 {
+            continue;
+        }
+        let elem_count = info.shape.elem_count();
+        let ne0 = info.shape.dims().last().copied().unwrap_or(0);
+        if elem_count == 0 || !ne0.is_multiple_of(pq2_blck) || !elem_count.is_multiple_of(pq2_blck)
+        {
+            continue;
+        }
+        let next_idx = all_offsets.partition_point(|&o| o <= info.offset);
+        let next_offset = all_offsets.get(next_idx).copied().unwrap_or(data_end);
+        let span = next_offset.saturating_sub(info.offset);
+        let pq2_bytes = ((elem_count / pq2_blck) as u64) * pq2_type_bytes;
+        let q2_bytes = ((elem_count / q2_blck) as u64) * q2_type_bytes;
+        if span >= pq2_bytes && span < q2_bytes {
+            info.ggml_dtype = GgmlDType::PQ2_0;
+            legacy_file = true;
+        }
+    }
+
+    if legacy_file {
+        for info in tensor_infos.values_mut() {
+            if info.ggml_dtype != GgmlDType::Q2_0 {
+                continue;
+            }
+            let elem_count = info.shape.elem_count();
+            let ne0 = info.shape.dims().last().copied().unwrap_or(0);
+            if elem_count == 0
+                || !ne0.is_multiple_of(pq2_blck)
+                || !elem_count.is_multiple_of(pq2_blck)
+            {
+                continue;
+            }
+            let next_idx = all_offsets.partition_point(|&o| o <= info.offset);
+            let next_offset = all_offsets.get(next_idx).copied().unwrap_or(data_end);
+            let span = next_offset.saturating_sub(info.offset);
+            let pq2_bytes = ((elem_count / pq2_blck) as u64) * pq2_type_bytes;
+            let pq2_padded = pq2_bytes.div_ceil(alignment) * alignment;
+            if span == pq2_bytes || span == pq2_padded {
+                info.ggml_dtype = GgmlDType::PQ2_0;
+            }
+        }
     }
 }
 

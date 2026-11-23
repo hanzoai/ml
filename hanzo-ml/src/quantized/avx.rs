@@ -975,3 +975,328 @@ pub(crate) fn vec_dot_q8k_q8k_avx512(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K])
         hsum_float_16(acc)
     }
 }
+
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn unpack_q2_0_32_avx2(qs: *const u8) -> __m256i {
+    let mut v = _mm256_cvtepu8_epi32(_mm_loadl_epi64(qs as *const __m128i));
+    v = _mm256_or_si256(v, _mm256_slli_epi32(v, 12));
+    v = _mm256_or_si256(v, _mm256_slli_epi32(v, 6));
+    _mm256_and_si256(v, _mm256_set1_epi32(0x03030303))
+}
+
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn dot32_u8_minus1_f32(codes_u8: __m256i, qy_ptr: *const i8) -> __m256 {
+    let y = _mm256_loadu_si256(qy_ptr as *const __m256i);
+    let p = _mm256_sub_epi16(
+        _mm256_maddubs_epi16(codes_u8, y),
+        _mm256_maddubs_epi16(_mm256_set1_epi8(1), y),
+    );
+    _mm256_cvtepi32_ps(_mm256_madd_epi16(p, _mm256_set1_epi16(1)))
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn vec_dot_q1_0_q8_0(
+    n: usize,
+    xs: &[super::iq_quants::BlockQ1_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    const SUB_BLOCKS: usize = super::iq_quants::QK1_0 / QK8_0;
+    let nb = n / super::iq_quants::QK1_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * SUB_BLOCKS);
+    let byte_shuf = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
+        3, 3,
+    );
+    let bit_masks = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, -128i8, 1, 2, 4, 8, 16, 32, 64, -128i8, 1, 2, 4, 8, 16, 32, 64,
+        -128i8, 1, 2, 4, 8, 16, 32, 64, -128i8,
+    );
+    let zero = _mm256_setzero_si256();
+    let two_u8 = _mm256_set1_epi8(2);
+    let ones_u8 = _mm256_set1_epi8(1);
+    let ones_16 = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_ps();
+
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = _mm256_set1_ps(x.d.to_f32());
+        let mut acc_block = _mm256_setzero_ps();
+        for sub in 0..SUB_BLOCKS {
+            let yb = ys.get_unchecked(i * SUB_BLOCKS + sub);
+            let bits = (x.qs.as_ptr().add(sub * 4) as *const u32).read_unaligned() as i32;
+            let rep = _mm256_shuffle_epi8(_mm256_set1_epi32(bits), byte_shuf);
+            let zero_mask = _mm256_cmpeq_epi8(_mm256_and_si256(rep, bit_masks), zero);
+            let two_bit = _mm256_andnot_si256(zero_mask, two_u8);
+            let qy = _mm256_loadu_si256(yb.qs.as_ptr() as *const __m256i);
+            let diff16 = _mm256_sub_epi16(
+                _mm256_maddubs_epi16(two_bit, qy),
+                _mm256_maddubs_epi16(ones_u8, qy),
+            );
+            let p32 = _mm256_cvtepi32_ps(_mm256_madd_epi16(diff16, ones_16));
+            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(yb.d.to_f32()), p32, acc_block);
+        }
+        acc = _mm256_fmadd_ps(d0, acc_block, acc);
+    }
+    hsum_float_8(acc)
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn vec_dot_q2_0_q8_0(
+    n: usize,
+    xs: &[super::iq_quants::BlockQ2_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    let nb = n / super::iq_quants::QK2_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 2);
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 1 < nb {
+        let x0 = xs.get_unchecked(i);
+        let dx0 = x0.d.to_f32();
+        let y00 = ys.get_unchecked(2 * i);
+        let y01 = ys.get_unchecked(2 * i + 1);
+        acc0 = _mm256_fmadd_ps(
+            _mm256_set1_ps(dx0 * y00.d.to_f32()),
+            dot32_u8_minus1_f32(unpack_q2_0_32_avx2(x0.qs.as_ptr()), y00.qs.as_ptr()),
+            acc0,
+        );
+        acc0 = _mm256_fmadd_ps(
+            _mm256_set1_ps(dx0 * y01.d.to_f32()),
+            dot32_u8_minus1_f32(unpack_q2_0_32_avx2(x0.qs.as_ptr().add(8)), y01.qs.as_ptr()),
+            acc0,
+        );
+
+        let x1 = xs.get_unchecked(i + 1);
+        let dx1 = x1.d.to_f32();
+        let y10 = ys.get_unchecked(2 * i + 2);
+        let y11 = ys.get_unchecked(2 * i + 3);
+        acc1 = _mm256_fmadd_ps(
+            _mm256_set1_ps(dx1 * y10.d.to_f32()),
+            dot32_u8_minus1_f32(unpack_q2_0_32_avx2(x1.qs.as_ptr()), y10.qs.as_ptr()),
+            acc1,
+        );
+        acc1 = _mm256_fmadd_ps(
+            _mm256_set1_ps(dx1 * y11.d.to_f32()),
+            dot32_u8_minus1_f32(unpack_q2_0_32_avx2(x1.qs.as_ptr().add(8)), y11.qs.as_ptr()),
+            acc1,
+        );
+        i += 2;
+    }
+    if i < nb {
+        let x0 = xs.get_unchecked(i);
+        let dx0 = x0.d.to_f32();
+        let y00 = ys.get_unchecked(2 * i);
+        let y01 = ys.get_unchecked(2 * i + 1);
+        acc0 = _mm256_fmadd_ps(
+            _mm256_set1_ps(dx0 * y00.d.to_f32()),
+            dot32_u8_minus1_f32(unpack_q2_0_32_avx2(x0.qs.as_ptr()), y00.qs.as_ptr()),
+            acc0,
+        );
+        acc0 = _mm256_fmadd_ps(
+            _mm256_set1_ps(dx0 * y01.d.to_f32()),
+            dot32_u8_minus1_f32(unpack_q2_0_32_avx2(x0.qs.as_ptr().add(8)), y01.qs.as_ptr()),
+            acc0,
+        );
+    }
+    hsum_float_8(_mm256_add_ps(acc0, acc1))
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn vec_dot_pq2_0_q8_0(
+    n: usize,
+    xs: &[super::iq_quants::BlockPQ2_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    let nb = n / super::iq_quants::QK_PQ2_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 4);
+    let mut acc = _mm256_setzero_ps();
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let dx = x.d.to_f32();
+        let mut acc_blk = _mm256_setzero_ps();
+        for sub in 0..4 {
+            let yb = ys.get_unchecked(i * 4 + sub);
+            let p = dot32_u8_minus1_f32(
+                unpack_q2_0_32_avx2(x.qs.as_ptr().add(sub * 8)),
+                yb.qs.as_ptr(),
+            );
+            acc_blk = _mm256_fmadd_ps(_mm256_set1_ps(yb.d.to_f32()), p, acc_blk);
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dx), acc_blk, acc);
+    }
+    hsum_float_8(acc)
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn vec_dot_ptq1_0_q8_0(
+    n: usize,
+    xs: &[super::iq_quants::BlockPTQ1_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    let nb = n / super::iq_quants::QK_PTQ1_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 4);
+    let mask_ff = _mm256_set1_epi16(0x00FF);
+    let three16 = _mm256_set1_epi16(3);
+    let p_1_3 = _mm256_setr_epi16(1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3);
+    let p_9_27 = _mm256_setr_epi16(9, 9, 9, 9, 9, 9, 9, 9, 27, 27, 27, 27, 27, 27, 27, 27);
+    let p_81_qh = _mm256_setr_epi16(81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27);
+    let mut acc = _mm256_setzero_ps();
+
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let dx = _mm256_set1_ps(x.d.to_f32());
+
+        let qs0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(x.qs.as_ptr() as *const __m128i));
+        let qs1_lo = _mm_loadl_epi64(x.qs.as_ptr().add(16) as *const __m128i);
+        let qs1_dup = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(qs1_lo, qs1_lo));
+        let qh_rep = _mm_set1_epi16(u16::from_le_bytes(x.qh) as i16);
+        let tail16 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(qs1_lo, qh_rep));
+
+        let dec = |b16: __m256i, p16: __m256i| -> __m256i {
+            let q8 = _mm256_and_si256(_mm256_mullo_epi16(b16, p16), mask_ff);
+            _mm256_srli_epi16(_mm256_mullo_epi16(q8, three16), 8)
+        };
+        let pack32 = |a: __m256i, b: __m256i| -> __m256i {
+            _mm256_permute4x64_epi64(_mm256_packus_epi16(a, b), 0xD8)
+        };
+
+        let c0 = pack32(
+            dec(qs0, _mm256_set1_epi16(1)),
+            dec(qs0, _mm256_set1_epi16(3)),
+        );
+        let c1 = pack32(
+            dec(qs0, _mm256_set1_epi16(9)),
+            dec(qs0, _mm256_set1_epi16(27)),
+        );
+        let c2 = pack32(dec(qs0, _mm256_set1_epi16(81)), dec(qs1_dup, p_1_3));
+        let c3 = pack32(dec(qs1_dup, p_9_27), dec(tail16, p_81_qh));
+
+        let y0 = ys.get_unchecked(i * 4);
+        let y1 = ys.get_unchecked(i * 4 + 1);
+        let y2 = ys.get_unchecked(i * 4 + 2);
+        let y3 = ys.get_unchecked(i * 4 + 3);
+
+        let mut acc_blk = _mm256_mul_ps(
+            _mm256_set1_ps(y0.d.to_f32()),
+            dot32_u8_minus1_f32(c0, y0.qs.as_ptr()),
+        );
+        acc_blk = _mm256_fmadd_ps(
+            _mm256_set1_ps(y1.d.to_f32()),
+            dot32_u8_minus1_f32(c1, y1.qs.as_ptr()),
+            acc_blk,
+        );
+        acc_blk = _mm256_fmadd_ps(
+            _mm256_set1_ps(y2.d.to_f32()),
+            dot32_u8_minus1_f32(c2, y2.qs.as_ptr()),
+            acc_blk,
+        );
+        acc_blk = _mm256_fmadd_ps(
+            _mm256_set1_ps(y3.d.to_f32()),
+            dot32_u8_minus1_f32(c3, y3.qs.as_ptr()),
+            acc_blk,
+        );
+        acc = _mm256_fmadd_ps(dx, acc_blk, acc);
+    }
+    hsum_float_8(acc)
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn fwht_block_avx2(blk: &mut [f32]) {
+    let n = blk.len();
+    debug_assert!(n >= 2 && n.is_power_of_two());
+    if n < 8 {
+        let mut stride = 1usize;
+        while stride < n {
+            let step = stride << 1;
+            let mut base = 0usize;
+            while base < n {
+                for off in 0..stride {
+                    let a = blk[base + off];
+                    let b = blk[base + off + stride];
+                    blk[base + off] = a + b;
+                    blk[base + off + stride] = a - b;
+                }
+                base += step;
+            }
+            stride = step;
+        }
+        return;
+    }
+
+    let ptr = blk.as_mut_ptr();
+    let mut j = 0usize;
+    while j < n {
+        let v0 = _mm256_loadu_ps(ptr.add(j));
+        let even = _mm256_moveldup_ps(v0);
+        let odd = _mm256_movehdup_ps(v0);
+        let v1 = _mm256_blend_ps(_mm256_add_ps(even, odd), _mm256_sub_ps(even, odd), 0xAA);
+
+        let lo2 = _mm256_permute_ps(v1, 0x44);
+        let hi2 = _mm256_permute_ps(v1, 0xEE);
+        let v2 = _mm256_blend_ps(_mm256_add_ps(lo2, hi2), _mm256_sub_ps(lo2, hi2), 0xCC);
+
+        let lo4 = _mm256_permute2f128_ps(v2, v2, 0x00);
+        let hi4 = _mm256_permute2f128_ps(v2, v2, 0x11);
+        let v3 = _mm256_blend_ps(_mm256_add_ps(lo4, hi4), _mm256_sub_ps(lo4, hi4), 0xF0);
+        _mm256_storeu_ps(ptr.add(j), v3);
+        j += 8;
+    }
+
+    let mut stride = 8usize;
+    while stride < n {
+        let step = stride << 1;
+        let mut base = 0usize;
+        while base < n {
+            let mut off = 0usize;
+            while off < stride {
+                let p = ptr.add(base + off);
+                let q = p.add(stride);
+                let a = _mm256_loadu_ps(p);
+                let b = _mm256_loadu_ps(q);
+                _mm256_storeu_ps(p, _mm256_add_ps(a, b));
+                _mm256_storeu_ps(q, _mm256_sub_ps(a, b));
+                off += 8;
+            }
+            base += step;
+        }
+        stride = step;
+    }
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn fwht_scale_row_avx2(row: &mut [f32], scale: f32, signs: Option<&[f32]>) {
+    let n = row.len();
+    let ptr = row.as_mut_ptr();
+    let vscale = _mm256_set1_ps(scale);
+    let mut i = 0usize;
+    match signs {
+        Some(s) => {
+            let sptr = s.as_ptr();
+            while i + 8 <= n {
+                let v = _mm256_mul_ps(_mm256_loadu_ps(ptr.add(i)), vscale);
+                _mm256_storeu_ps(ptr.add(i), _mm256_mul_ps(v, _mm256_loadu_ps(sptr.add(i))));
+                i += 8;
+            }
+            while i < n {
+                *ptr.add(i) *= scale * *sptr.add(i);
+                i += 1;
+            }
+        }
+        None => {
+            while i + 8 <= n {
+                _mm256_storeu_ps(
+                    ptr.add(i),
+                    _mm256_mul_ps(_mm256_loadu_ps(ptr.add(i)), vscale),
+                );
+                i += 8;
+            }
+            while i < n {
+                *ptr.add(i) *= scale;
+                i += 1;
+            }
+        }
+    }
+}

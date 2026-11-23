@@ -1,147 +1,13 @@
-# Native (Hanzo Git) copy of .github/workflows/rust-ci.yml. The Hanzo Git fork
-# scans .hanzo/workflows FIRST
-# (GIT__actions__WORKFLOW_DIRS=.hanzo/workflows,.github/workflows,.gitea/workflows);
-# GitHub.com ignores .hanzo/, so this file is inert on GitHub and only runs on the
-# native forge -- zero effect on the GitHub CI lane.
-#
-# `fmt`/`clippy` run on `linux-amd64`; `check`/`test` run on the
-# ubuntu labels the git-runner maps. The windows/macOS/arm legs were REMOVED
-# rather than left to queue: this forge registers no runner for them, and an
-# unrunnable leg does not fail, it queues forever and holds the whole run in a
-# non-terminal state. Restoring that coverage is a runner-provisioning step —
-# register the daemons, then re-add the labels here.
 on:
   push:
     branches:
       - main
   pull_request:
-  # The other three workflows here (gpu-tests, maturin, publish) all declare
-  # this; rust-ci was the only one that could not be re-run on demand. That
-  # matters on this repo specifically: it is a forge MIRROR, so commits usually
-  # arrive by a mirror pull rather than a push, and a pull fires no push event —
-  # fmt/clippy/test then simply never run on the new head, and the last result
-  # shown is whatever some older push left behind. `POST /actions/workflows/
-  # rust-ci.yml/dispatches` answered 422 for exactly this reason.
   workflow_dispatch:
 
 name: Continuous integration
 
-# One build per push. The test job compiles every crate the check job did, and
-# further, so the two `cargo check` legs (baseline and avx2) were the same
-# workspace compiled twice more before the build that mattered, on the one
-# runner. The avx2 leg also answered a question the test binaries answer
-# better: a runner that has avx2 runs them with it.
-#
-# The build is kept between pushes. The runner is a persistent host, so a
-# target directory outside the checkout survives the checkout's cleanup and
-# the next push recompiles what changed rather than everything. A tmpfs is
-# used when it has room, since the box's disk is slow and nearly full.
 jobs:
-  test:
-    name: Test Suite
-    # One leg, so the matrix that carried it was only a place to write a label.
-    runs-on: [linux-amd64]
-    steps:
-      # Best-effort, and it must stay best-effort: it reclaims space, it does not
-      # gate correctness. As written it FAILED the whole matrix leg —
-      #
-      #   rm: cannot remove '/opt/hostedtoolcache': Device or resource busy
-      #   ❌ Failure - Main Free disk space (Linux)   exitcode '1'
-      #
-      # — and because the shell runs with `-e`, that first rm aborted the step and
-      # every later step was skipped, so checkout never ran and the job reported a
-      # failure that had nothing to do with the code.
-      #
-      # Two things are wrong with the original on a self-hosted runner:
-      #
-      #  - /opt/hostedtoolcache is RUNNER_TOOL_CACHE, a MOUNT inside the act
-      #    container, so removing it is impossible (EBUSY) rather than merely
-      #    unnecessary. Emptying it would be worse than useless: the cache is
-      #    shared with other jobs on the same runner, so this would sabotage them
-      #    to reclaim space we do not need. It is left alone deliberately.
-      #  - The other three paths are GitHub-hosted-image idioms. Our runners are
-      #    not that image, so they simply do not exist here.
-      #
-      # And the premise no longer holds anyway: the runner has ~66G free of 98G.
-      # Kept rather than deleted so the step still does its job on a GitHub-hosted
-      # runner, where those directories are real and space is genuinely tight.
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc; do
-            [ -e "$d" ] && sudo rm -rf "$d" || true
-          done
-          df -h
-        continue-on-error: true
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install lld and protoc (Linux only)
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v protoc >/dev/null; then
-            if sudo -n true 2>/dev/null; then
-              sudo apt-get update && sudo apt-get install -y lld protobuf-compiler
-            else
-              mkdir -p /tmp/protoc-root/lists/partial /tmp/protoc-root/cache/archives/partial
-              (cd /tmp/protoc-root && \
-               apt-get -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache -o Debug::NoLocking=1 update -qq && \
-               apt-get -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache -o Debug::NoLocking=1 download $(apt-cache -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances protobuf-compiler | grep "^\w" | grep -v -E "^(libc6|libgcc|libstdc|zlib1g|debconf)" | tr '\n' ' ') && \
-               for deb in *.deb; do dpkg -x "$deb" /tmp/protoc-root; done)
-              echo "/tmp/protoc-root/usr/bin" >> "$GITHUB_PATH"
-              echo "LD_LIBRARY_PATH=/tmp/protoc-root/usr/lib/x86_64-linux-gnu:/tmp/protoc-root/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-              export PATH="/tmp/protoc-root/usr/bin:$PATH"
-              export LD_LIBRARY_PATH="/tmp/protoc-root/usr/lib/x86_64-linux-gnu:/tmp/protoc-root/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
-            fi
-          fi
-          protoc --version
-      # `cargo test --workspace` is the heaviest thing this repo does. `check`
-      # passes on the same runner because it stops before codegen; test runs full
-      # LLVM codegen AND a link for every crate in a workspace that includes the
-      # wasm examples, hanzo-3d, tensor-tools and the pyo3 bindings. It was dying
-      # mid-`Compiling tensor-tools` — log ending with no error, no test result
-      # and no cleanup block, which is a killed process, not a failing test.
-      #
-      # Cargo parallelism is ALREADY bounded to 4 by the runner (runner.envs in
-      # universe infra/k8s/git-runner/config.yaml), so the peak is per-rustc, not
-      # a count of them. These two cut what each one costs:
-      #
-      #   debuginfo=line-tables-only  full debug info is one of the largest
-      #     consumers in codegen, and worse at link time — lld holds the debug
-      #     sections in memory. line-tables-only keeps FILE AND LINE NUMBERS in
-      #     panic backtraces, which is the part a CI failure actually needs, and
-      #     drops the variable/type DWARF nobody reads from a log.
-      #   CARGO_INCREMENTAL=0  incremental compilation buys nothing here — every
-      #     run starts from a cold target dir, so it only adds memory and disk.
-      #
-      # Neither changes which tests run or what they assert. If the job still
-      # dies mid-compile after this, the ceiling is genuinely too low for this
-      # workspace and it is a capacity decision, not a flag.
-      - name: Keep the build between pushes
-        run: |
-          free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
-          if [ -d /dev/shm ] && [ "$(free_gb /dev/shm)" -ge 24 ]; then
-            dir=/dev/shm/ci-target/${GITHUB_REPOSITORY##*/}
-          else
-            dir=$HOME/.cache/ci-target/${GITHUB_REPOSITORY##*/}
-          fi
-          mkdir -p "$dir"
-          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
-          echo "target: $dir ($(du -sh "$dir" 2>/dev/null | cut -f1) warm)"
-      # debuginfo=line-tables-only keeps file and line in a panic backtrace, the
-      # part a CI failure needs, and drops the DWARF nobody reads from a log.
-      - name: Run tests (with lld on Linux)
-        if: runner.os == 'Linux'
-        run: |
-          if command -v ld.lld >/dev/null; then
-            export RUSTFLAGS="-C link-arg=-fuse-ld=lld -C debuginfo=line-tables-only"
-          else
-            export RUSTFLAGS="-C debuginfo=line-tables-only"
-          fi
-          cargo test -p hanzo-nn -p hanzo-transformers --lib
-
   fmt:
     name: Rustfmt
     runs-on: [linux-amd64]
@@ -157,26 +23,99 @@ jobs:
     runs-on: [linux-amd64]
     steps:
       - uses: actions/checkout@v6
-      - name: Install C toolchain and protoc (runner image ships without cc)
+      - name: Install protoc
         run: |
-          if ! command -v protoc >/dev/null; then
-            if sudo -n true 2>/dev/null; then
-              sudo apt-get update && sudo apt-get install -y protobuf-compiler
-            else
-              mkdir -p /tmp/protoc-root/lists/partial /tmp/protoc-root/cache/archives/partial
-              (cd /tmp/protoc-root && \
-               apt-get -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache -o Debug::NoLocking=1 update -qq && \
-               apt-get -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache -o Debug::NoLocking=1 download $(apt-cache -o Dir::State::lists=/tmp/protoc-root/lists -o Dir::Cache=/tmp/protoc-root/cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances protobuf-compiler | grep "^\w" | grep -v -E "^(libc6|libgcc|libstdc|zlib1g|debconf)" | tr '\n' ' ') && \
-               for deb in *.deb; do dpkg -x "$deb" /tmp/protoc-root; done)
-              echo "/tmp/protoc-root/usr/bin" >> "$GITHUB_PATH"
-              echo "LD_LIBRARY_PATH=/tmp/protoc-root/usr/lib/x86_64-linux-gnu:/tmp/protoc-root/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-              export PATH="/tmp/protoc-root/usr/bin:$PATH"
-              export LD_LIBRARY_PATH="/tmp/protoc-root/usr/lib/x86_64-linux-gnu:/tmp/protoc-root/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
-            fi
+          set -euo pipefail
+          if ! command -v protoc >/dev/null 2>&1; then
+            case "$(uname -m)" in
+              x86_64) arch=x86_64 ;;
+              aarch64) arch=aarch_64 ;;
+              *) echo "::error::unsupported arch $(uname -m)"; exit 1 ;;
+            esac
+            version=28.3
+            curl -fsSL --retry 3 "https://github.com/protocolbuffers/protobuf/releases/download/v${version}/protoc-${version}-linux-${arch}.zip" \
+              -o "$RUNNER_TEMP/protoc.zip"
+            mkdir -p "$HOME/.local"
+            unzip -qo "$RUNNER_TEMP/protoc.zip" 'bin/protoc' 'include/*' -d "$HOME/.local"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
           fi
           protoc --version
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --workspace --tests --examples --benches -- -D warnings
+      - name: Run workspace clippy and pyo3 onnx check
+        run: |
+          cargo clippy --workspace --tests --examples --benches -- -D warnings
+          cargo clippy -p hanzo-ml-pyo3 --features onnx -- -D warnings
+      - name: Record Clippy gate verdict in Hanzo Insights
+        if: always()
+        env:
+          HANZO_API_KEY: ${{ secrets.HANZO_API_KEY }}
+          HANZO_INSIGHTS_API_KEY: ${{ secrets.HANZO_INSIGHTS_API_KEY }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          verdict="fail"
+          [ "$JOB_STATUS" = "success" ] && verdict="pass"
+          python3 scripts/ci_security_insights.py \
+            --skip-worktree \
+            --gate-stage clippy \
+            --gate-verdict "$verdict" || true
 
+  test:
+    name: Test Suite
+    runs-on: [linux-amd64]
+    steps:
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc; do
+            [ -e "$d" ] && sudo rm -rf "$d" || true
+          done
+          df -h
+        continue-on-error: true
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if ! command -v protoc >/dev/null 2>&1; then
+            case "$(uname -m)" in
+              x86_64) arch=x86_64 ;;
+              aarch64) arch=aarch_64 ;;
+              *) echo "::error::unsupported arch $(uname -m)"; exit 1 ;;
+            esac
+            version=28.3
+            curl -fsSL --retry 3 "https://github.com/protocolbuffers/protobuf/releases/download/v${version}/protoc-${version}-linux-${arch}.zip" \
+              -o "$RUNNER_TEMP/protoc.zip"
+            mkdir -p "$HOME/.local"
+            unzip -qo "$RUNNER_TEMP/protoc.zip" 'bin/protoc' 'include/*' -d "$HOME/.local"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          protoc --version
+      - name: Keep the build between pushes
+        run: |
+          free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+          if [ -d /dev/shm ] && [ "$(free_gb /dev/shm)" -ge 24 ]; then
+            dir=/dev/shm/ci-target/${GITHUB_REPOSITORY##*/}
+          else
+            dir=$HOME/.cache/ci-target/${GITHUB_REPOSITORY##*/}
+          fi
+          mkdir -p "$dir"
+          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
+          echo "target: $dir ($(du -sh "$dir" 2>/dev/null | cut -f1) warm)"
+      - name: Run tests
+        if: runner.os == 'Linux'
+        run: |
+          if command -v ld.lld >/dev/null; then
+            export RUSTFLAGS="-C link-arg=-fuse-ld=lld -C debuginfo=line-tables-only"
+          else
+            export RUSTFLAGS="-C debuginfo=line-tables-only"
+          fi
+          cargo test -p hanzo-ml --lib quantized::bitcos
+          cargo test -p hanzo-nn -p hanzo-transformers --lib

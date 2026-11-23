@@ -7,10 +7,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The producing repo's git identity at run time.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Git {
     pub git_sha: String,
     pub git_branch: String,
@@ -18,7 +19,8 @@ pub struct Git {
 }
 
 /// The box the run executed on — enough to correlate a result to hardware.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Host {
     pub hostname: String,
     pub platform: String,

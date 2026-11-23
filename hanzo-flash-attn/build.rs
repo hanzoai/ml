@@ -109,7 +109,10 @@ fn main() -> Result<()> {
         println!("cargo::rerun-if-changed={header_file}");
     }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
-    let build_dir = match std::env::var("FLASH_ATTN_BUILD_DIR") {
+    let build_dir = match std::env::var("ML_FLASH_ATTN_BUILD_DIR")
+        .or_else(|_| std::env::var("FLASH_ATTN_BUILD_DIR"))
+        .or_else(|_| std::env::var("HANZO_FLASH_ATTN_BUILD_DIR"))
+    {
         Err(_) =>
         {
             #[allow(clippy::redundant_clone)]

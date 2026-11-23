@@ -14,6 +14,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use std::fmt;
 
+pub use crate::{ArtifactRecord as Artifact, ExperimentRecord as Experiment};
+
 fn list<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
     Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
@@ -129,6 +131,23 @@ impl Run {
             .iter()
             .find(|m| m.category == category && m.metric == metric)
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Study {
+    pub project: String,
+    pub id: String,
+    pub title: String,
+    pub question: String,
+    pub method: String,
+    #[serde(deserialize_with = "list")]
+    pub runs: Vec<String>,
+    pub finding: String,
+    pub limits: String,
+    pub revision: String,
+    pub canonical: bool,
+    pub when: String,
 }
 
 /// What a batch post filed: the project, the records new to it, the canonical ones.

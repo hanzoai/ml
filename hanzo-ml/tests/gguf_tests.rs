@@ -134,3 +134,90 @@ fn rejects_string_length_above_remaining_file_bytes() {
     pad(&mut buf, 64);
     assert_rejects(buf, "string length");
 }
+
+#[test]
+fn legacy_type42_pq2_0_remaps_while_modern_type42_loads_as_q2_0() {
+    use hanzo_ml::quantized::{BlockPQ2_0, BlockQ2_0, GgmlDType, GgmlType};
+
+    fn append_tensor_info(buf: &mut Vec<u8>, name: &[u8], ne0: u64, ggml_type: u32, offset: u64) {
+        buf.extend(length_prefixed(name));
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&ne0.to_le_bytes());
+        buf.extend_from_slice(&ggml_type.to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    let pq_vals: Vec<f32> = (0..128)
+        .map(|i| (((i * 3 + 1) % 3) - 1) as f32 * 0.5)
+        .collect();
+    let mut pq_blk = [BlockPQ2_0::zeros(); 1];
+    BlockPQ2_0::from_float(&pq_vals, &mut pq_blk);
+    let pq_bytes = unsafe { std::slice::from_raw_parts(pq_blk.as_ptr() as *const u8, 34) }.to_vec();
+
+    let q2_vals: Vec<f32> = (0..128)
+        .map(|i| (((i * 5 + 2) % 3) - 1) as f32 * 0.25)
+        .collect();
+    let mut q2_blk = [BlockQ2_0::zeros(); 2];
+    BlockQ2_0::from_float(&q2_vals, &mut q2_blk);
+    let q2_bytes = unsafe { std::slice::from_raw_parts(q2_blk.as_ptr() as *const u8, 36) }.to_vec();
+
+    // Case 1: Single legacy tensor at EOF (34 bytes < 36 bytes needed for Q2_0).
+    let mut legacy_eof = header(1, 0);
+    append_tensor_info(&mut legacy_eof, b"w_legacy", 128, 42, 0);
+    let align_pad = (32 - (legacy_eof.len() % 32)) % 32;
+    pad(&mut legacy_eof, align_pad);
+    legacy_eof.extend_from_slice(&pq_bytes);
+
+    let mut cur1 = Cursor::new(legacy_eof);
+    let c1 = Content::read(&mut cur1).expect("legacy GGUF header should parse");
+    assert_eq!(c1.tensor_infos["w_legacy"].ggml_dtype, GgmlDType::PQ2_0);
+    let qt1 = c1
+        .tensor(&mut cur1, "w_legacy", &Device::Cpu)
+        .expect("legacy PQ2_0 tensor should load");
+    assert_eq!(qt1.dtype(), GgmlDType::PQ2_0);
+    let deq1 = qt1
+        .dequantize(&Device::Cpu)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(deq1, pq_vals);
+
+    // Case 2: Legacy GGUF with prism.hadamard.version = 6 and 32-byte aligned neighbor offset (64 bytes span).
+    let mut legacy_meta = header(2, 1);
+    legacy_meta.extend(length_prefixed(b"prism.hadamard.version"));
+    legacy_meta.extend_from_slice(&4u32.to_le_bytes()); // U32
+    legacy_meta.extend_from_slice(&6u32.to_le_bytes());
+    append_tensor_info(&mut legacy_meta, b"w0", 128, 42, 0);
+    append_tensor_info(&mut legacy_meta, b"w1", 128, 42, 64);
+    let align_pad2 = (32 - (legacy_meta.len() % 32)) % 32;
+    pad(&mut legacy_meta, align_pad2);
+    legacy_meta.extend_from_slice(&pq_bytes);
+    pad(&mut legacy_meta, 64 - 34);
+    legacy_meta.extend_from_slice(&pq_bytes);
+
+    let mut cur2 = Cursor::new(legacy_meta);
+    let c2 = Content::read(&mut cur2).expect("legacy v6 GGUF should parse");
+    assert_eq!(c2.tensor_infos["w0"].ggml_dtype, GgmlDType::PQ2_0);
+    assert_eq!(c2.tensor_infos["w1"].ggml_dtype, GgmlDType::PQ2_0);
+
+    // Case 3: Modern type = 42 tensor (36 bytes for 128 elements) loads as Q2_0.
+    let mut modern = header(1, 0);
+    append_tensor_info(&mut modern, b"w_q2", 128, 42, 0);
+    let align_pad3 = (32 - (modern.len() % 32)) % 32;
+    pad(&mut modern, align_pad3);
+    modern.extend_from_slice(&q2_bytes);
+
+    let mut cur3 = Cursor::new(modern);
+    let c3 = Content::read(&mut cur3).expect("modern Q2_0 GGUF should parse");
+    assert_eq!(c3.tensor_infos["w_q2"].ggml_dtype, GgmlDType::Q2_0);
+    let qt3 = c3
+        .tensor(&mut cur3, "w_q2", &Device::Cpu)
+        .expect("modern Q2_0 tensor should load");
+    assert_eq!(qt3.dtype(), GgmlDType::Q2_0);
+    let deq3 = qt3
+        .dequantize(&Device::Cpu)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(deq3, q2_vals);
+}

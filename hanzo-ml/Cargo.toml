@@ -12,8 +12,8 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { version = "0.3.2", optional = true }
 byteorder = "1.4.3"
-hanzo-kernels = { path = "../hanzo-kernels", version = "0.11.43", optional = true }
-hanzo-metal-kernels = { path = "../hanzo-metal-kernels", version = "0.11.48", optional = true }
+hanzo-kernels = { path = "../hanzo-kernels", version = "0.11.44", optional = true }
+hanzo-metal-kernels = { path = "../hanzo-metal-kernels", version = "0.11.49", optional = true }
 objc2-metal = { version = "0.3.1", optional = true }
 objc2-foundation = { version = "0.3.1", optional = true }
 cudarc = { version = "0.19.8", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8", "cuda-version-from-build-system", "dynamic-linking"], default-features = false, optional = true }
@@ -49,6 +49,8 @@ tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-
 anyhow = { version = "1", features = ["backtrace"] }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
+hanzo-research = { path = "../hanzo-research", version = "0.2.5" }
+serde_json = "1.0.99"
 # Evolutionary autotuner (Space / Evolution / Evaluator). Test-only; `default-features = false` keeps
 # cubecl's runtime backends out of the ml test build -- only the schedule-search algebra is used.
 hanzo-kernel = { path = "../hanzo-kernel", default-features = false }

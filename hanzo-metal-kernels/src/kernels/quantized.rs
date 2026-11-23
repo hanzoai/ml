@@ -38,6 +38,8 @@ pub enum GgmlDType {
     IQ4_XS,
     PQ2_0,
     PTQ1_0,
+    Q1_0,
+    Q2_0,
 }
 
 /// Threadgroup scratch (bytes) the matvec kernel stages its codebook grid into. The IQ2/IQ3 kernels
@@ -189,7 +191,7 @@ pub fn call_quantized_matmul_mv_t_offset(
         | GgmlDType::IQ1_S
         | GgmlDType::IQ1_M => (4, 16, 8),
         GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
-        GgmlDType::PQ2_0 => (4, 16, 16),
+        GgmlDType::PQ2_0 | GgmlDType::Q1_0 | GgmlDType::Q2_0 => (4, 16, 16),
         GgmlDType::PTQ1_0 => (4, 16, 8),
     };
     let thread_groups_count = MTLSize {
@@ -211,6 +213,8 @@ pub fn call_quantized_matmul_mv_t_offset(
             GgmlDType::Q6K => "kernel_mul_mv_q6_K_bf16",
             GgmlDType::PQ2_0 => "kernel_mul_mv_pq2_0_bf16",
             GgmlDType::PTQ1_0 => "kernel_mul_mv_ptq1_0_bf16",
+            GgmlDType::Q1_0 => "kernel_mul_mv_q1_0_bf16",
+            GgmlDType::Q2_0 => "kernel_mul_mv_q2_0_bf16",
             other => {
                 return Err(MetalKernelError::LoadFunctionError(format!(
                     "bf16 activation matvec unsupported for {other:?}"
@@ -245,6 +249,8 @@ pub fn call_quantized_matmul_mv_t_offset(
             GgmlDType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
             GgmlDType::PQ2_0 => "kernel_mul_mv_pq2_0_f32",
             GgmlDType::PTQ1_0 => "kernel_mul_mv_ptq1_0_f32",
+            GgmlDType::Q1_0 => "kernel_mul_mv_q1_0_f32",
+            GgmlDType::Q2_0 => "kernel_mul_mv_q2_0_f32",
         }
     };
 
@@ -395,8 +401,10 @@ pub fn call_quantized_matmul_mm_t_offset(
             GgmlDType::Q6K => "kernel_mul_mm_q6_K_bf16",
             GgmlDType::PQ2_0 => "kernel_mul_mm_pq2_0_bf16",
             GgmlDType::PTQ1_0 => "kernel_mul_mm_ptq1_0_bf16",
+            GgmlDType::Q1_0 => "kernel_mul_mm_q1_0_bf16",
+            GgmlDType::Q2_0 => "kernel_mul_mm_q2_0_bf16",
             _ => Err(MetalKernelError::UnsupportedDTypeForOp(
-                "non-Q4K/Q6K/PQ2_0/PTQ1_0",
+                "non-Q4K/Q6K/PQ2_0/PTQ1_0/Q1_0/Q2_0",
                 "bf16 qmatmul mm",
             ))?,
         }
@@ -426,6 +434,8 @@ pub fn call_quantized_matmul_mm_t_offset(
             GgmlDType::IQ4_XS => "kernel_mul_mm_iq4_xs_f32",
             GgmlDType::PQ2_0 => "kernel_mul_mm_pq2_0_f32",
             GgmlDType::PTQ1_0 => "kernel_mul_mm_ptq1_0_f32",
+            GgmlDType::Q1_0 => "kernel_mul_mm_q1_0_f32",
+            GgmlDType::Q2_0 => "kernel_mul_mm_q2_0_f32",
             GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
             GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
         }
@@ -506,6 +516,8 @@ pub fn call_quantized_get_rows(
         GgmlDType::IQ4_XS => "kernel_get_rows_iq4_xs",
         GgmlDType::PQ2_0 => "kernel_get_rows_pq2_0",
         GgmlDType::PTQ1_0 => "kernel_get_rows_ptq1_0",
+        GgmlDType::Q1_0 => "kernel_get_rows_q1_0",
+        GgmlDType::Q2_0 => "kernel_get_rows_q2_0",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
     };
@@ -631,7 +643,7 @@ pub fn call_mul_mv_id(
         | GgmlDType::IQ1_S
         | GgmlDType::IQ1_M => (4, 16, 8),
         GgmlDType::IQ4_NL | GgmlDType::IQ4_XS => (4, 16, 4),
-        GgmlDType::PQ2_0 => (4, 16, 16),
+        GgmlDType::PQ2_0 | GgmlDType::Q1_0 | GgmlDType::Q2_0 => (4, 16, 16),
         GgmlDType::PTQ1_0 => (4, 16, 8),
     };
 
@@ -659,6 +671,8 @@ pub fn call_mul_mv_id(
         GgmlDType::IQ4_XS => "kernel_mul_mv_id_iq4_xs_f32",
         GgmlDType::PQ2_0 => "kernel_mul_mv_id_pq2_0_f32",
         GgmlDType::PTQ1_0 => "kernel_mul_mv_id_ptq1_0_f32",
+        GgmlDType::Q1_0 => "kernel_mul_mv_id_q1_0_f32",
+        GgmlDType::Q2_0 => "kernel_mul_mv_id_q2_0_f32",
         other => {
             return Err(MetalKernelError::LoadFunctionError(format!(
                 "no kernel_mul_mv_id for {other:?}"
@@ -794,6 +808,8 @@ pub fn call_mul_mm_id(
         GgmlDType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_f32",
         GgmlDType::PQ2_0 => "kernel_mul_mm_id_pq2_0_f32",
         GgmlDType::PTQ1_0 => "kernel_mul_mm_id_ptq1_0_f32",
+        GgmlDType::Q1_0 => "kernel_mul_mm_id_q1_0_f32",
+        GgmlDType::Q2_0 => "kernel_mul_mm_id_q2_0_f32",
         other => {
             return Err(MetalKernelError::LoadFunctionError(format!(
                 "no kernel_mul_mm_id for {other:?}"
@@ -845,6 +861,83 @@ pub fn call_mul_mm_id(
     };
     let threads_per_threadgroup = MTLSize {
         width: 128,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups, threads_per_threadgroup);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_hadamard_fwht(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    in_dtype: crate::DType,
+    out_dtype: crate::DType,
+    x: &Buffer,
+    x_offset: usize,
+    signs: Option<(&Buffer, usize)>,
+    dst: &Buffer,
+    dst_offset: usize,
+    block_size: usize,
+    width: usize,
+    is_inverse: bool,
+    total_blocks: usize,
+) -> Result<(), MetalKernelError> {
+    use crate::DType;
+    let name = match (in_dtype, out_dtype) {
+        (DType::F32, DType::F32) => "kernel_hadamard_fwht_f32_f32",
+        (DType::F16, DType::F32) => "kernel_hadamard_fwht_f16_f32",
+        (DType::F16, DType::F16) => "kernel_hadamard_fwht_f16_f16",
+        (DType::BF16, DType::F32) => "kernel_hadamard_fwht_bf16_f32",
+        (DType::BF16, DType::BF16) => "kernel_hadamard_fwht_bf16_bf16",
+        _ => {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "no kernel_hadamard_fwht for ({in_dtype:?}, {out_dtype:?})"
+            )))
+        }
+    };
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    let (signs_buf, signs_offset, has_signs) = match signs {
+        Some((b, o)) => (b, o, 1i32),
+        None => (x, x_offset, 0i32),
+    };
+    let b_i32 = block_size as i32;
+    let w_i32 = width as i32;
+    let is_inv = i32::from(is_inverse);
+    let total_i64 = total_blocks as i64;
+
+    set_params!(
+        encoder,
+        (
+            (x, x_offset),
+            (signs_buf, signs_offset),
+            Output::with_offset(dst, dst_offset),
+            b_i32,
+            w_i32,
+            has_signs,
+            is_inv,
+            total_i64
+        )
+    );
+
+    let elems_per_thread = (block_size / 256).max(1);
+    let threads = block_size / elems_per_thread;
+    let smem_bytes = block_size.min(4096) * core::mem::size_of::<f32>();
+    encoder.set_threadgroup_memory_length(0, smem_bytes);
+
+    let thread_groups = MTLSize {
+        width: total_blocks.clamp(1, 65_535),
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: threads,
         height: 1,
         depth: 1,
     };

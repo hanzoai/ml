@@ -4301,3 +4301,490 @@ pub(crate) fn vec_dot_8_q4k_q8k(n: usize, xs: &[BlockQ4Kx8], ys: &[BlockQ8K]) ->
     }
     out
 }
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon_dot32_s8_fallback(
+    q0: int8x16_t,
+    q1: int8x16_t,
+    y0: int8x16_t,
+    y1: int8x16_t,
+) -> i32 {
+    let s0 = vaddq_s16(
+        vmull_s8(vget_low_s8(q0), vget_low_s8(y0)),
+        vmull_high_s8(q0, y0),
+    );
+    let s1 = vaddq_s16(
+        vmull_s8(vget_low_s8(q1), vget_low_s8(y1)),
+        vmull_high_s8(q1, y1),
+    );
+    vaddlvq_s16(vaddq_s16(s0, s1))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn unpack_q1_0_signs32(
+    raw4: uint8x16_t,
+    idx_lo: uint8x16_t,
+    idx_hi: uint8x16_t,
+    bit_masks: uint8x16_t,
+    ones_u8: uint8x16_t,
+) -> (int8x16_t, int8x16_t) {
+    let b0 = vqtbl1q_u8(raw4, idx_lo);
+    let b1 = vqtbl1q_u8(raw4, idx_hi);
+    let s0 = vreinterpretq_s8_u8(vorrq_u8(ones_u8, vmvnq_u8(vtstq_u8(b0, bit_masks))));
+    let s1 = vreinterpretq_s8_u8(vorrq_u8(ones_u8, vmvnq_u8(vtstq_u8(b1, bit_masks))));
+    (s0, s1)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn vec_dot_q1_0_q8_0_sdot(
+    n: usize,
+    xs: &[super::iq_quants::BlockQ1_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    const IDX_LO: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1];
+    const IDX_HI: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3];
+    const BIT_MASKS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    const SUB_BLOCKS: usize = super::iq_quants::QK1_0 / QK8_0;
+
+    let nb = n / super::iq_quants::QK1_0;
+    let idx_lo = vld1q_u8(IDX_LO.as_ptr());
+    let idx_hi = vld1q_u8(IDX_HI.as_ptr());
+    let bit_masks = vld1q_u8(BIT_MASKS.as_ptr());
+    let ones_u8 = vdupq_n_u8(1);
+    let mut sumv = vdupq_n_f32(0.0);
+
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = x.d.to_f32();
+        for sub in 0..SUB_BLOCKS {
+            let yb = ys.get_unchecked(i * SUB_BLOCKS + sub);
+            let bits = (x.qs.as_ptr().add(sub * 4) as *const u32).read_unaligned();
+            let raw4 = vreinterpretq_u8_u32(vdupq_n_u32(bits));
+            let (s0, s1) = unpack_q1_0_signs32(raw4, idx_lo, idx_hi, bit_masks, ones_u8);
+            let y0 = vld1q_s8(yb.qs.as_ptr());
+            let y1 = vld1q_s8(yb.qs.as_ptr().add(16));
+            let p = vdotq_s32_pair(s0, y0, s1, y1);
+            sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d0 * yb.d.to_f32());
+        }
+    }
+    vaddvq_f32(sumv)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_dot_q1_0_q8_0_base(
+    n: usize,
+    xs: &[super::iq_quants::BlockQ1_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    const IDX_LO: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1];
+    const IDX_HI: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3];
+    const BIT_MASKS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    const SUB_BLOCKS: usize = super::iq_quants::QK1_0 / QK8_0;
+
+    let nb = n / super::iq_quants::QK1_0;
+    let idx_lo = vld1q_u8(IDX_LO.as_ptr());
+    let idx_hi = vld1q_u8(IDX_HI.as_ptr());
+    let bit_masks = vld1q_u8(BIT_MASKS.as_ptr());
+    let ones_u8 = vdupq_n_u8(1);
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = x.d.to_f32();
+        let mut sumi = 0.0f32;
+        for sub in 0..SUB_BLOCKS {
+            let yb = ys.get_unchecked(i * SUB_BLOCKS + sub);
+            let bits = (x.qs.as_ptr().add(sub * 4) as *const u32).read_unaligned();
+            let raw4 = vreinterpretq_u8_u32(vdupq_n_u32(bits));
+            let (s0, s1) = unpack_q1_0_signs32(raw4, idx_lo, idx_hi, bit_masks, ones_u8);
+            let y0 = vld1q_s8(yb.qs.as_ptr());
+            let y1 = vld1q_s8(yb.qs.as_ptr().add(16));
+            sumi += yb.d.to_f32() * (neon_dot32_s8_fallback(s0, s1, y0, y1) as f32);
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn vec_dot_q1_0_q8_0(
+    n: usize,
+    xs: &[super::iq_quants::BlockQ1_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    debug_assert!(xs.len() >= n / super::iq_quants::QK1_0 && ys.len() >= n / QK8_0);
+    unsafe {
+        if crate::cpu::features::get().dotprod {
+            vec_dot_q1_0_q8_0_sdot(n, xs, ys)
+        } else {
+            vec_dot_q1_0_q8_0_base(n, xs, ys)
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn vec_dot_2bit_q8_0_sdot<const SUB_BLOCKS: usize, B>(
+    nb: usize,
+    xs: &[B],
+    ys: &[BlockQ8_0],
+    get_block: impl Fn(&B) -> (f16, *const u8),
+) -> f32 {
+    const IDX_LO: [u8; 16] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3];
+    const IDX_HI: [u8; 16] = [4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7];
+    const SHIFTS: [i8; 16] = [0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6];
+
+    let idx_lo = vld1q_u8(IDX_LO.as_ptr());
+    let idx_hi = vld1q_u8(IDX_HI.as_ptr());
+    let shifts = vld1q_s8(SHIFTS.as_ptr());
+    let mask3 = vdupq_n_u8(3);
+    let ones = vdupq_n_s8(1);
+    let zero8 = vdup_n_u8(0);
+    let mut sumv = vdupq_n_f32(0.0);
+
+    for i in 0..nb {
+        let (d_f16, qs_ptr) = get_block(xs.get_unchecked(i));
+        let d0 = d_f16.to_f32();
+        for sub in 0..SUB_BLOCKS {
+            let yb = ys.get_unchecked(i * SUB_BLOCKS + sub);
+            let raw = vcombine_u8(vld1_u8(qs_ptr.add(sub * 8)), zero8);
+            let u0 =
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(raw, idx_lo), shifts), mask3));
+            let u1 =
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(raw, idx_hi), shifts), mask3));
+            let y0 = vld1q_s8(yb.qs.as_ptr());
+            let y1 = vld1q_s8(yb.qs.as_ptr().add(16));
+            let p = vsubq_s32(
+                vdotq_s32_pair(u0, y0, u1, y1),
+                vdotq_s32_pair(ones, y0, ones, y1),
+            );
+            sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d0 * yb.d.to_f32());
+        }
+    }
+    vaddvq_f32(sumv)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_dot_2bit_q8_0_base<const SUB_BLOCKS: usize, B>(
+    nb: usize,
+    xs: &[B],
+    ys: &[BlockQ8_0],
+    get_block: impl Fn(&B) -> (f16, *const u8),
+) -> f32 {
+    const IDX_LO: [u8; 16] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3];
+    const IDX_HI: [u8; 16] = [4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7];
+    const SHIFTS: [i8; 16] = [0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6];
+
+    let idx_lo = vld1q_u8(IDX_LO.as_ptr());
+    let idx_hi = vld1q_u8(IDX_HI.as_ptr());
+    let shifts = vld1q_s8(SHIFTS.as_ptr());
+    let mask3 = vdupq_n_u8(3);
+    let ones = vdupq_n_s8(1);
+    let zero8 = vdup_n_u8(0);
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let (d_f16, qs_ptr) = get_block(xs.get_unchecked(i));
+        let d0 = d_f16.to_f32();
+        let mut sumi = 0.0f32;
+        for sub in 0..SUB_BLOCKS {
+            let yb = ys.get_unchecked(i * SUB_BLOCKS + sub);
+            let raw = vcombine_u8(vld1_u8(qs_ptr.add(sub * 8)), zero8);
+            let q0 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(raw, idx_lo), shifts), mask3)),
+                ones,
+            );
+            let q1 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(raw, idx_hi), shifts), mask3)),
+                ones,
+            );
+            let y0 = vld1q_s8(yb.qs.as_ptr());
+            let y1 = vld1q_s8(yb.qs.as_ptr().add(16));
+            sumi += yb.d.to_f32() * (neon_dot32_s8_fallback(q0, q1, y0, y1) as f32);
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn vec_dot_q2_0_q8_0(
+    n: usize,
+    xs: &[super::iq_quants::BlockQ2_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    let nb = n / super::iq_quants::QK2_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 2);
+    unsafe {
+        if crate::cpu::features::get().dotprod {
+            vec_dot_2bit_q8_0_sdot::<2, _>(nb, xs, ys, |b| (b.d, b.qs.as_ptr()))
+        } else {
+            vec_dot_2bit_q8_0_base::<2, _>(nb, xs, ys, |b| (b.d, b.qs.as_ptr()))
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn vec_dot_pq2_0_q8_0(
+    n: usize,
+    xs: &[super::iq_quants::BlockPQ2_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    let nb = n / super::iq_quants::QK_PQ2_0;
+    debug_assert!(xs.len() >= nb && ys.len() >= nb * 4);
+    unsafe {
+        if crate::cpu::features::get().dotprod {
+            vec_dot_2bit_q8_0_sdot::<4, _>(nb, xs, ys, |b| (b.d, b.qs.as_ptr()))
+        } else {
+            vec_dot_2bit_q8_0_base::<4, _>(nb, xs, ys, |b| (b.d, b.qs.as_ptr()))
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ptq1_trit16_u8(v: uint8x16_t) -> int8x16_t {
+    // Exact for all u8: ((q + (q >> 1)) >> 1) >> 6 == ((q as u16) * 3) >> 8.
+    vreinterpretq_s8_u8(vshrq_n_u8::<6>(vhaddq_u8(v, vshrq_n_u8::<1>(v))))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ptq1_trit8_u8(v: uint8x8_t) -> uint8x8_t {
+    vshr_n_u8::<6>(vhadd_u8(v, vshr_n_u8::<1>(v)))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ptq1_decode_u8_blocks(
+    x: &super::iq_quants::BlockPTQ1_0,
+    pow3_qh: uint8x8_t,
+) -> [int8x16_t; 8] {
+    let a = vld1q_u8(x.qs.as_ptr());
+    let u0 = ptq1_trit16_u8(a);
+    let u1 = ptq1_trit16_u8(vmulq_u8(a, vdupq_n_u8(3)));
+    let u2 = ptq1_trit16_u8(vmulq_u8(a, vdupq_n_u8(9)));
+    let u3 = ptq1_trit16_u8(vmulq_u8(a, vdupq_n_u8(27)));
+    let u4 = ptq1_trit16_u8(vmulq_u8(a, vdupq_n_u8(81)));
+
+    let c = vld1_u8(x.qs.as_ptr().add(16));
+    let c0 = ptq1_trit8_u8(c);
+    let c1 = ptq1_trit8_u8(vmul_u8(c, vdup_n_u8(3)));
+    let c2 = ptq1_trit8_u8(vmul_u8(c, vdup_n_u8(9)));
+    let c3 = ptq1_trit8_u8(vmul_u8(c, vdup_n_u8(27)));
+    let c4 = ptq1_trit8_u8(vmul_u8(c, vdup_n_u8(81)));
+
+    let h = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes(x.qh)));
+    let ch = ptq1_trit8_u8(vmul_u8(h, pow3_qh));
+
+    [
+        u0,
+        u1,
+        u2,
+        u3,
+        u4,
+        vreinterpretq_s8_u8(vcombine_u8(c0, c1)),
+        vreinterpretq_s8_u8(vcombine_u8(c2, c3)),
+        vreinterpretq_s8_u8(vcombine_u8(c4, ch)),
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn vec_dot_ptq1_0_q8_0_sdot(
+    n: usize,
+    xs: &[super::iq_quants::BlockPTQ1_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    const POW3_QH: [u8; 8] = [1, 1, 3, 3, 9, 9, 27, 27];
+    let nb = n / super::iq_quants::QK_PTQ1_0;
+    let pow3_qh = vld1_u8(POW3_QH.as_ptr());
+    let ones = vdupq_n_s8(1);
+    let mut sumv = vdupq_n_f32(0.0);
+
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = x.d.to_f32();
+        let u = ptq1_decode_u8_blocks(x, pow3_qh);
+        for k in 0..4 {
+            let yb = ys.get_unchecked(i * 4 + k);
+            let y0 = vld1q_s8(yb.qs.as_ptr());
+            let y1 = vld1q_s8(yb.qs.as_ptr().add(16));
+            let dot_u = vdotq_s32_pair(u[2 * k], y0, u[2 * k + 1], y1);
+            let sum_y = vdotq_s32_pair(ones, y0, ones, y1);
+            let p = vsubq_s32(dot_u, sum_y);
+            sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d0 * yb.d.to_f32());
+        }
+    }
+    vaddvq_f32(sumv)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_dot_ptq1_0_q8_0_base(
+    n: usize,
+    xs: &[super::iq_quants::BlockPTQ1_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    const POW3_QH: [u8; 8] = [1, 1, 3, 3, 9, 9, 27, 27];
+    let nb = n / super::iq_quants::QK_PTQ1_0;
+    let pow3_qh = vld1_u8(POW3_QH.as_ptr());
+    let ones = vdupq_n_s8(1);
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let x = xs.get_unchecked(i);
+        let d0 = x.d.to_f32();
+        let u = ptq1_decode_u8_blocks(x, pow3_qh);
+        let mut sumi = 0.0f32;
+        for k in 0..4 {
+            let yb = ys.get_unchecked(i * 4 + k);
+            let y0 = vld1q_s8(yb.qs.as_ptr());
+            let y1 = vld1q_s8(yb.qs.as_ptr().add(16));
+            let q0 = vsubq_s8(u[2 * k], ones);
+            let q1 = vsubq_s8(u[2 * k + 1], ones);
+            sumi += yb.d.to_f32() * (neon_dot32_s8_fallback(q0, q1, y0, y1) as f32);
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn vec_dot_ptq1_0_q8_0(
+    n: usize,
+    xs: &[super::iq_quants::BlockPTQ1_0],
+    ys: &[BlockQ8_0],
+) -> f32 {
+    debug_assert!(
+        xs.len() >= n / super::iq_quants::QK_PTQ1_0
+            && ys.len() >= (n / super::iq_quants::QK_PTQ1_0) * 4
+    );
+    unsafe {
+        if crate::cpu::features::get().dotprod {
+            vec_dot_ptq1_0_q8_0_sdot(n, xs, ys)
+        } else {
+            vec_dot_ptq1_0_q8_0_base(n, xs, ys)
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn fwht_block_neon(blk: &mut [f32]) {
+    let n = blk.len();
+    debug_assert!(n >= 2 && n.is_power_of_two());
+    if n == 2 {
+        let a = blk[0];
+        let b = blk[1];
+        blk[0] = a + b;
+        blk[1] = a - b;
+        return;
+    }
+    if n == 4 {
+        let (s0, d0) = (blk[0] + blk[1], blk[0] - blk[1]);
+        let (s1, d1) = (blk[2] + blk[3], blk[2] - blk[3]);
+        blk[0] = s0 + s1;
+        blk[1] = d0 + d1;
+        blk[2] = s0 - s1;
+        blk[3] = d0 - d1;
+        return;
+    }
+    unsafe {
+        let ptr = blk.as_mut_ptr();
+        let mut j = 0usize;
+        while j < n {
+            let pair = vld2q_f32(ptr.add(j));
+            let s = vaddq_f32(pair.0, pair.1);
+            let d = vsubq_f32(pair.0, pair.1);
+            let z0 = vzip1q_f32(s, d);
+            let z1 = vzip2q_f32(s, d);
+            let a_lo = vcombine_f32(vget_low_f32(z0), vget_low_f32(z1));
+            let b_lo = vcombine_f32(vget_high_f32(z0), vget_high_f32(z1));
+            let sum2 = vaddq_f32(a_lo, b_lo);
+            let dif2 = vsubq_f32(a_lo, b_lo);
+            vst1q_f32(
+                ptr.add(j),
+                vcombine_f32(vget_low_f32(sum2), vget_low_f32(dif2)),
+            );
+            vst1q_f32(
+                ptr.add(j + 4),
+                vcombine_f32(vget_high_f32(sum2), vget_high_f32(dif2)),
+            );
+            j += 8;
+        }
+        let mut stride = 4usize;
+        while stride < n {
+            let step = stride << 1;
+            let mut base = 0usize;
+            while base < n {
+                let mut off = 0usize;
+                while off + 8 <= stride {
+                    let p0 = ptr.add(base + off);
+                    let q0 = p0.add(stride);
+                    let a0 = vld1q_f32(p0);
+                    let b0 = vld1q_f32(q0);
+                    let a1 = vld1q_f32(p0.add(4));
+                    let b1 = vld1q_f32(q0.add(4));
+                    vst1q_f32(p0, vaddq_f32(a0, b0));
+                    vst1q_f32(q0, vsubq_f32(a0, b0));
+                    vst1q_f32(p0.add(4), vaddq_f32(a1, b1));
+                    vst1q_f32(q0.add(4), vsubq_f32(a1, b1));
+                    off += 8;
+                }
+                while off < stride {
+                    let p0 = ptr.add(base + off);
+                    let q0 = p0.add(stride);
+                    let a0 = vld1q_f32(p0);
+                    let b0 = vld1q_f32(q0);
+                    vst1q_f32(p0, vaddq_f32(a0, b0));
+                    vst1q_f32(q0, vsubq_f32(a0, b0));
+                    off += 4;
+                }
+                base += step;
+            }
+            stride = step;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn fwht_scale_row_neon(row: &mut [f32], scale: f32, signs: Option<&[f32]>) {
+    let n = row.len();
+    unsafe {
+        let ptr = row.as_mut_ptr();
+        let vscale = vdupq_n_f32(scale);
+        let mut i = 0usize;
+        match signs {
+            Some(s) => {
+                let sptr = s.as_ptr();
+                while i + 4 <= n {
+                    let v = vmulq_f32(vld1q_f32(ptr.add(i)), vscale);
+                    vst1q_f32(ptr.add(i), vmulq_f32(v, vld1q_f32(sptr.add(i))));
+                    i += 4;
+                }
+                while i < n {
+                    *ptr.add(i) *= scale * *sptr.add(i);
+                    i += 1;
+                }
+            }
+            None => {
+                while i + 4 <= n {
+                    vst1q_f32(ptr.add(i), vmulq_f32(vld1q_f32(ptr.add(i)), vscale));
+                    i += 4;
+                }
+                while i < n {
+                    *ptr.add(i) *= scale;
+                    i += 1;
+                }
+            }
+        }
+    }
+}

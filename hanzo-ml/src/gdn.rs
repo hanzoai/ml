@@ -1,7 +1,7 @@
 //! Backend-independent production Gated DeltaNet (GDN) operators powered by canonical
 //! `hanzo-kernel` DSL artifacts (Metal, CUDA, Vulkan).
 //!
-//! All operators are gated behind [`crate::quantized::dsl::gdn_impl`] (`HANZO_GDN_IMPL`,
+//! All operators are gated behind [`crate::quantized::dsl::gdn_impl`] (`ML_GDN_IMPL`,
 //! defaulting to `legacy`), returning `Ok(None)` when legacy execution is active or when a
 //! backend/shape/dtype does not have a committed DSL specialization, so callers fall back cleanly
 //! without duplicating backend-specific dispatch logic.
@@ -38,7 +38,7 @@ fn ensure_contiguous_view(t: &Tensor) -> Result<Tensor> {
 /// - `conv_state`: `[batch, conv_dim, 4]` (same dtype as `x`), updated in place (or replaced with
 ///   a contiguous copy if it was non-contiguous)
 ///
-/// Returns `Ok(Some(out))` with shape `[batch, 1, conv_dim]` in `x.dtype()` when `HANZO_GDN_IMPL=dsl`
+/// Returns `Ok(Some(out))` with shape `[batch, 1, conv_dim]` in `x.dtype()` when `ML_GDN_IMPL=dsl`
 /// handled the op, or `Ok(None)` to fall back to the legacy path.
 pub fn try_conv1d_step(
     x: &Tensor,

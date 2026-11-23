@@ -104,6 +104,11 @@ fn kernel_spv(name: &str) -> Result<&'static [u8]> {
         "mul_mat_vec_iq3xxs" => spv!("mul_mat_vec_iq3xxs"),
         "mul_mat_vec_iq2s" => spv!("mul_mat_vec_iq2s"),
         "mul_mat_vec_tq2_0" => spv!("mul_mat_vec_tq2_0"),
+        "mul_mat_vec_q1_0" => spv!("mul_mat_vec_q1_0"),
+        "mul_mat_vec_q2_0" => spv!("mul_mat_vec_q2_0"),
+        "mul_mat_vec_pq2_0" => spv!("mul_mat_vec_pq2_0"),
+        "mul_mat_vec_ptq1_0" => spv!("mul_mat_vec_ptq1_0"),
+        "hadamard_fwht" => spv!("hadamard_fwht"),
         "mul_mat_vec_iq4nl" => spv!("mul_mat_vec_iq4nl"),
         "moe_matvec_q4k" => spv!("moe_matvec_q4k"),
         "moe_matvec_q6k" => spv!("moe_matvec_q6k"),
@@ -4160,7 +4165,7 @@ impl VulkanDevice {
     }
 
     /// Canonical DSL `PQ2_0` / `PTQ1_0` ternary matvec (`m == 1`) and prefill GEMM (`m > 1`)
-    /// over native GGML blocks, gated by `HANZO_PQ2_IMPL` / `HANZO_PTQ1_IMPL` (`legacy` default).
+    /// over native GGML blocks, gated by `ML_PQ2_IMPL` / `ML_PTQ1_IMPL` (`legacy` default).
     /// Returns `Ok(None)` when the legacy fallback should run (default, unsupported subgroup width
     /// for committed SPIR-V, or missing coopmat on `m > 1`).
     pub fn try_dispatch_ternary_dsl(
@@ -4548,6 +4553,7 @@ impl VulkanDevice {
                 crate::quantized::dsl::QkBackend::Vulkan,
                 batch,
                 n_heads,
+                n_kv,
                 seq_q,
                 d,
                 max_ctx_est,
@@ -4703,6 +4709,203 @@ impl VulkanDevice {
         }
         let xs = self.upload_f32(x)?;
         self.matvec_tq2_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    pub fn matvec_q1_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(128) {
+            crate::bail!("matvec_q1_0_gpu: k must be a multiple of 128, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q1_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        if nout > 0 {
+            let push = push_u32(&[nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_vec_q1_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).min(65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
+    }
+
+    pub fn matvec_q1_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q1_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q1_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    pub fn matvec_q2_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(64) {
+            crate::bail!("matvec_q2_0_gpu: k must be a multiple of 64, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_q2_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        if nout > 0 {
+            let push = push_u32(&[nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_vec_q2_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).min(65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
+    }
+
+    pub fn matvec_q2_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_q2_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_q2_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    pub fn matvec_pq2_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(128) {
+            crate::bail!("matvec_pq2_0_gpu: k must be a multiple of 128, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_pq2_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        if nout > 0 {
+            let push = push_u32(&[nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_vec_pq2_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).min(65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
+    }
+
+    pub fn matvec_pq2_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_pq2_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_pq2_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    pub fn matvec_ptq1_0_gpu(
+        &self,
+        wq: &VulkanStorage,
+        x: &VulkanStorage,
+        nout: usize,
+        k: usize,
+    ) -> Result<VulkanStorage> {
+        if !k.is_multiple_of(128) {
+            crate::bail!("matvec_ptq1_0_gpu: k must be a multiple of 128, got {k}");
+        }
+        if x.count < k {
+            crate::bail!("matvec_ptq1_0_gpu: x count {} < k {k}", x.count);
+        }
+        let out = self.alloc_f32(nout)?;
+        if nout > 0 {
+            let push = push_u32(&[nout as u32, k as u32]);
+            self.dispatch(
+                "mul_mat_vec_ptq1_0",
+                &[wq.buffer, x.buffer, out.buffer],
+                &push,
+                ((nout as u32).min(65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
+    }
+
+    pub fn matvec_ptq1_0(
+        &self,
+        wq: &VulkanStorage,
+        x: &[f32],
+        nout: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
+        if x.len() != k {
+            crate::bail!("matvec_ptq1_0: x len {} != k {k}", x.len());
+        }
+        let xs = self.upload_f32(x)?;
+        self.matvec_ptq1_0_gpu(wq, &xs, nout, k)?.to_vec_f32()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hadamard_fwht_gpu(
+        &self,
+        x: &VulkanStorage,
+        x_off: usize,
+        signs: Option<(&VulkanStorage, usize)>,
+        block_size: usize,
+        width: usize,
+        is_inverse: bool,
+        total_blocks: usize,
+    ) -> Result<VulkanStorage> {
+        let elem_count = total_blocks * block_size;
+        let out = self.alloc_f32(elem_count)?;
+        if total_blocks > 0 {
+            let (s_buf, s_off, has_s) = match signs {
+                Some((s, off)) => (s.buffer, off as u32, 1u32),
+                None => (x.buffer, 0u32, 0u32),
+            };
+            let push = push_u32(&[
+                x_off as u32,
+                s_off,
+                block_size as u32,
+                width as u32,
+                has_s,
+                u32::from(is_inverse),
+                total_blocks as u32,
+            ]);
+            self.dispatch(
+                "hadamard_fwht",
+                &[x.buffer, s_buf, out.buffer],
+                &push,
+                ((total_blocks as u32).clamp(1, 65_535), 1, 1),
+            )?;
+        }
+        Ok(out)
     }
 
     // Allocate a storage buffer of `bytes` bytes, returning it plus whether its memory is
@@ -5878,7 +6081,7 @@ impl VulkanDevice {
     // destroyed, so a generous value on a big-memory box merely retains the reusable working set.
     fn pool_free_cap(&self) -> u64 {
         // Explicit override (GiB) for A/B measurement and constrained deployments.
-        if let Some(gb) = std::env::var("HANZO_VK_POOL_CAP_GB")
+        if let Some(gb) = crate::ml_env_var("ML_VK_POOL_CAP_GB", "HANZO_VK_POOL_CAP_GB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -9672,11 +9875,11 @@ mod dsl_dispatch_proof {
     /// 32 MB MALL has evicted. Both are gated bit-exact against the same CPU oracle. `dev.matvec_q4k`
     /// uploads x + reads back per call, an overhead identical for both arms, so the DSL/hand ratio is
     /// the honest in-engine sign (the precise cold kernel GB/s is the matvec-check f32sweep + dp4a
-    /// anchor). HANZO_Q4K_AB=1 arms it; run in a quiet window only (wall-clock timing).
+    /// anchor). ML_Q4K_AB=1 arms it; run in a quiet window only (wall-clock timing).
     #[test]
     fn q4k_dsl_vs_hand_cm_ab() {
-        if std::env::var_os("HANZO_Q4K_AB").is_none() {
-            eprintln!("[q4k-ab] set HANZO_Q4K_AB=1 to run the cold A/B (skipped)");
+        if crate::ml_env_os("ML_Q4K_AB", "HANZO_Q4K_AB").is_none() {
+            eprintln!("[q4k-ab] set ML_Q4K_AB=1 to run the cold A/B (skipped)");
             return;
         }
         use crate::quantized::k_quants::{BlockQ4K, GgmlType};
@@ -10838,7 +11041,7 @@ mod dsl_dispatch_proof {
     /// (raw for dp4a, split for coopmat). Both submit through the same dispatch path, so per-submit
     /// overhead cancels in the ratio -- this same-harness ratio is the go/no-go for routing coopmat
     /// into matmul_q4k_gpu_off (a cache-warm ratio, NOT an absolute in-engine number). Gated on
-    /// HANZO_MMQ_AB=1 so it never runs in normal CI.
+    /// ML_MMQ_AB=1 so it never runs in normal CI.
     ///
     /// Measured on gfx1151/RADV as the sole GPU workload: the DSL i8 coopmat arm (`mmq_q4k_rt`) runs
     /// 0.51-0.78x of the dp4a hand tile across the ffn/attn projection shapes (only the tiny n=256
@@ -10849,7 +11052,7 @@ mod dsl_dispatch_proof {
     /// will not close this.
     #[test]
     fn mmq_q4k_coopmat_vs_dp4a_prefill_ab() {
-        if std::env::var_os("HANZO_MMQ_AB").is_none() {
+        if crate::ml_env_os("ML_MMQ_AB", "HANZO_MMQ_AB").is_none() {
             return;
         }
         let dev = match VulkanDevice::new(0) {
@@ -11141,7 +11344,7 @@ mod dsl_dispatch_proof {
     /// The tiled int8-dp4a Q6_K prefill matmul (mul_mm_q6k_tiled_dp4a) agrees with the trusted column
     /// kernel (mul_mat_q6k) on identical Q6_K weight bytes -- so the in-kernel 6-bit decode is correct;
     /// the only divergence is the q8 activation quantization the dp4a path adds. Also times both at real
-    /// prefill shapes when HANZO_MMQ_AB=1 (the win over the column kernel that dominates Q4_K_M prefill).
+    /// prefill shapes when ML_MMQ_AB=1 (the win over the column kernel that dominates Q4_K_M prefill).
     #[test]
     fn mul_mm_q6k_coopmat_and_dp4a_match_column() {
         let dev = match VulkanDevice::new(0) {
@@ -11162,7 +11365,7 @@ mod dsl_dispatch_proof {
             s ^= s << 17;
             s
         };
-        let ab = std::env::var_os("HANZO_MMQ_AB").is_some();
+        let ab = crate::ml_env_os("ML_MMQ_AB", "HANZO_MMQ_AB").is_some();
         let shapes: &[(usize, usize, usize)] = if ab {
             &[
                 (37, 64, 256),

@@ -1,0 +1,105 @@
+{
+  "campaign": "ml-kernels-and-quant-0.11.124",
+  "repo": "hanzoai/ml",
+  "plan": {
+    "stages": [
+      {"name": "micro", "reps": 3, "prompt_len": 64, "gen_len": 16},
+      {"name": "medium", "reps": 5, "prompt_len": 256, "gen_len": 64},
+      {"name": "qualification", "reps": 8, "prompt_len": 512, "gen_len": 128}
+    ],
+    "higher_is_better": false,
+    "alpha": 0.05,
+    "family_budget": 4,
+    "min_relative_gain": 0.01
+  },
+  "objectives": [
+    {
+      "id": "bitcos",
+      "study": "bitcos-ternary-packing",
+      "objective": "Minimize ternary FFN matvec latency via zero-density BitcosMatrix packing",
+      "metric": "matvec_us",
+      "unit": "us",
+      "direction": "lower",
+      "family": "ternary_quant",
+      "protected": false,
+      "baseline": 420.0,
+      "backends": ["CUDA", "CPU"],
+      "shapes": ["4096x12288"],
+      "dataset": "Bonsai-2-2B-PQ2_0+synthetic_sparse"
+    },
+    {
+      "id": "pq2_ptq1",
+      "study": "dsl-pq2-ptq1-matvec",
+      "objective": "Optimize direct PQ2_0 and PTQ1_0 DSL matvec across backends",
+      "metric": "matvec_us",
+      "unit": "us",
+      "direction": "lower",
+      "family": "ternary_quant",
+      "protected": false,
+      "baseline": 500.0,
+      "backends": ["CUDA", "ROCM", "VULKAN", "METAL", "CPU"],
+      "shapes": ["4096x4096", "4096x12288"],
+      "dataset": "PQ2_0-PTQ1_0-shapes"
+    },
+    {
+      "id": "fwht",
+      "study": "fwht-hadamard-rotation",
+      "objective": "Minimize Fast Walsh-Hadamard Transform activation rotation latency",
+      "metric": "fwht_us",
+      "unit": "us",
+      "direction": "lower",
+      "family": "rotation",
+      "protected": false,
+      "baseline": 85.0,
+      "backends": ["CUDA", "CPU"],
+      "shapes": ["128x4096"],
+      "dataset": "FWHT-block128"
+    },
+    {
+      "id": "flash_attn",
+      "study": "splitkv-4k-32k-l2-coherent",
+      "objective": "Minimize long-context GQA Split-KV decode latency across 4K-32K",
+      "metric": "attn_us",
+      "unit": "us",
+      "direction": "lower",
+      "family": "attention",
+      "protected": false,
+      "baseline": 190.0,
+      "backends": ["CUDA"],
+      "shapes": ["4096", "16384", "32768"],
+      "dataset": "GQA-4K-32K-decode"
+    }
+  ],
+  "search_space": {
+    "ternary_quant": [
+      {
+        "arm": "bitcos_g128",
+        "variant": "q8_0_dotprod",
+        "hypothesis": "BitcosMatrix G128 sparse skip lowers ternary matvec latency vs dense PQ2_0",
+        "config": {"precision": "PQ2_0/Q8_0", "next_hypothesis": "Scale BitcosMatrix G128 to Bonsai-2-9B FFN"}
+      },
+      {
+        "arm": "dsl_pq2_direct",
+        "variant": "coalesced_block128",
+        "hypothesis": "Direct DSL PQ2_0 block128 matvec lowers memory stalls vs indirect dequant",
+        "config": {"precision": "PQ2_0/BF16", "next_hypothesis": "Enable PTQ1_0 shared scale path"}
+      }
+    ],
+    "rotation": [
+      {
+        "arm": "fwht_butterfly",
+        "variant": "in_register_128",
+        "hypothesis": "In-register radix-2 FWHT lowers barrier count vs multi-pass rotation",
+        "config": {"precision": "BF16", "next_hypothesis": "Fuse FWHT into Q8_0 activation quantizer"}
+      }
+    ],
+    "attention": [
+      {
+        "arm": "split_kv_l2",
+        "variant": "gqa_head_major_128",
+        "hypothesis": "L2-coherent GQA Split-KV partition order reduces dram traffic at 4K-32K",
+        "config": {"precision": "BF16", "next_hypothesis": "Evaluate Split-KV CUDA graph replay at 32K"}
+      }
+    ]
+  }
+}

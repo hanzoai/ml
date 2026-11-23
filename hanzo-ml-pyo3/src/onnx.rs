@@ -9,10 +9,10 @@ use hanzo_onnx::onnx::type_proto::{Tensor as ONNXTensor, Value as ONNXValue};
 use hanzo_onnx::onnx::{ModelProto, ValueInfoProto};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{IntoPyDict, PyList, PyTuple};
 
 #[derive(Clone, Debug)]
-#[pyclass(skip_from_py_object, name = "ONNXTensorDescription")]
+#[pyclass(name = "ONNXTensorDescription")]
 /// A wrapper around an ONNX tensor description.
 pub struct PyONNXTensorDescriptor(ONNXTensor);
 
@@ -52,7 +52,7 @@ impl PyONNXTensorDescriptor {
                 }
             }
         }
-        Ok(shape.to_tuple().into())
+        Ok(shape.to_tuple().unbind())
     }
 
     fn __repr__(&self, py: Python) -> String {
@@ -80,7 +80,7 @@ impl PyONNXTensorDescriptor {
 }
 
 #[derive(Clone, Debug)]
-#[pyclass(skip_from_py_object, name = "ONNXModel")]
+#[pyclass(name = "ONNXModel")]
 /// A wrapper around an ONNX model.
 pub struct PyONNXModel(ModelProto);
 
@@ -128,14 +128,14 @@ impl PyONNXModel {
     }
 
     #[getter]
-    /// The producer of the model.  
-    /// &RETURNS&: str      
+    /// The producer of the model.
+    /// &RETURNS&: str
     fn producer_name(&self) -> String {
         self.0.producer_name.clone()
     }
 
     #[getter]
-    /// The version of the producer of the model.       
+    /// The version of the producer of the model.
     /// &RETURNS&: str
     fn producer_version(&self) -> String {
         self.0.producer_version.clone()
@@ -164,16 +164,16 @@ impl PyONNXModel {
 
     /// Get the weights of the model.
     /// &RETURNS&: Dict[str, Tensor]
-    fn initializers(&self) -> PyResult<HashMap<String, PyTensor>> {
-        let mut map = HashMap::new();
+    fn initializers(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let mut entries = Vec::new();
         if let Some(graph) = self.0.graph.as_ref() {
             for tensor_description in graph.initializer.iter() {
                 let tensor = get_tensor(tensor_description, tensor_description.name.as_str())
                     .map_err(wrap_err)?;
-                map.insert(tensor_description.name.to_string(), PyTensor(tensor));
+                entries.push((tensor_description.name.to_string(), PyTensor(tensor)));
             }
         }
-        Ok(map)
+        Ok(entries.into_py_dict(py)?.into_any().unbind())
     }
 
     #[getter]
@@ -199,14 +199,17 @@ impl PyONNXModel {
     #[pyo3(text_signature = "(self, inputs:Dict[str,Tensor])")]
     /// Run the model on the given inputs.
     /// &RETURNS&: Dict[str,Tensor]
-    fn run(&self, inputs: HashMap<String, PyTensor>) -> PyResult<HashMap<String, PyTensor>> {
-        let unwrapped_tensors = inputs.into_iter().map(|(k, v)| (k.clone(), v.0)).collect();
+    fn run(&self, py: Python<'_>, inputs: HashMap<String, PyTensor>) -> PyResult<PyObject> {
+        let unwrapped_tensors: HashMap<String, _> =
+            inputs.into_iter().map(|(k, v)| (k, v.0)).collect();
 
         let result = simple_eval(&self.0, unwrapped_tensors).map_err(wrap_err)?;
 
-        Ok(result
-            .into_iter()
-            .map(|(k, v)| (k.clone(), PyTensor(v)))
-            .collect())
+        let mut entries = Vec::with_capacity(result.len());
+        for (k, v) in result {
+            let t = v.into_tensor().map_err(wrap_err)?;
+            entries.push((k, PyTensor(t)));
+        }
+        Ok(entries.into_py_dict(py)?.into_any().unbind())
     }
 }

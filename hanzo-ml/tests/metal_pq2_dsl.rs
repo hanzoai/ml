@@ -11,7 +11,7 @@
 //!   - Dispatch proof: the DSL call counter moves only when the DSL is selected; legacy is counted too.
 //!   - No hidden codegen: N forwards compile each pipeline exactly once.
 //!
-//! `HANZO_PQ2_GGUF=/path/model.gguf` additionally runs every PQ2_0 tensor of a real model file.
+//! `ML_PQ2_GGUF=/path/model.gguf` additionally runs every PQ2_0 tensor of a real model file.
 #![cfg(feature = "metal")]
 
 use hanzo_ml::quantized::dsl::{self, QkImpl};
@@ -205,15 +205,15 @@ fn pq2_dispatch_proof_and_single_compile() {
 /// Every PQ2_0 2-D tensor of a real model file: DSL vs legacy vs oracle (f32). Opt-in.
 #[test]
 fn pq2_dsl_real_model_tensors() {
-    let Ok(path) = std::env::var("HANZO_PQ2_GGUF") else {
-        eprintln!("HANZO_PQ2_GGUF unset; skipping real-model tensors");
+    let Ok(path) = hanzo_ml::utils::ml_env_var("ML_PQ2_GGUF", "HANZO_PQ2_GGUF") else {
+        eprintln!("ML_PQ2_GGUF unset; skipping real-model tensors");
         return;
     };
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dev = Device::new_metal(0).unwrap();
     let mut f = std::fs::File::open(&path).unwrap();
     let content = hanzo_ml::quantized::gguf_file::Content::read(&mut f).unwrap();
-    let max = std::env::var("HANZO_PQ2_GGUF_MAX")
+    let max = hanzo_ml::utils::ml_env_var("ML_PQ2_GGUF_MAX", "HANZO_PQ2_GGUF_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(24usize);
