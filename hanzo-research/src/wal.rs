@@ -72,7 +72,7 @@ fn mend_wal(path: &Path) -> std::io::Result<bool> {
     // Try to parse tail as JSON
     if serde_json::from_slice::<serde_json::Value>(tail).is_err() {
         // Torn line - truncate at last newline
-        let mut file = OpenOptions::new().write(true).open(path)?;
+        let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(last_newline as u64)?;
         file.sync_data()?;
         return Ok(true);
@@ -522,7 +522,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
-    use std::process::Command;
 
     #[test]
     fn test_wal_append_and_recover() {
@@ -578,9 +577,9 @@ mod tests {
         drop(wal);
 
         // Tamper: change sequence in line 2
-        let content = fs::read_to_string(&temp.join("wal.jsonl")).unwrap();
+        let content = fs::read_to_string(temp.join("wal.jsonl")).unwrap();
         let tampered = content.replace("\"sequence\":2", "\"sequence\":99");
-        fs::write(&temp.join("wal.jsonl"), tampered).unwrap();
+        fs::write(temp.join("wal.jsonl"), tampered).unwrap();
 
         let err = verify(&temp.join("wal.jsonl")).unwrap_err();
         assert!(err.to_string().contains("sequence"));
@@ -598,12 +597,12 @@ mod tests {
         drop(wal);
 
         // Tamper: break the hash chain
-        let content = fs::read_to_string(&temp.join("wal.jsonl")).unwrap();
+        let content = fs::read_to_string(temp.join("wal.jsonl")).unwrap();
         let tampered = content.replace(
             "previous_event_hash\":\"0000000000000000000000000000000000000000000000000000000000000000",
             "previous_event_hash\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
-        fs::write(&temp.join("wal.jsonl"), tampered).unwrap();
+        fs::write(temp.join("wal.jsonl"), tampered).unwrap();
 
         let err = verify(&temp.join("wal.jsonl")).unwrap_err();
         assert!(err.to_string().contains("chain"));
@@ -620,9 +619,9 @@ mod tests {
         drop(wal);
 
         // Tamper: change payload but not payload_hash
-        let content = fs::read_to_string(&temp.join("wal.jsonl")).unwrap();
+        let content = fs::read_to_string(temp.join("wal.jsonl")).unwrap();
         let tampered = content.replace("\"step\":1", "\"step\":999");
-        fs::write(&temp.join("wal.jsonl"), tampered).unwrap();
+        fs::write(temp.join("wal.jsonl"), tampered).unwrap();
 
         let err = verify(&temp.join("wal.jsonl")).unwrap_err();
         assert!(err.to_string().contains("payload hash"));
@@ -639,19 +638,19 @@ mod tests {
         drop(wal);
 
         // Corrupt: truncate the last line (remove newline and partial JSON)
-        let mut content = fs::read(&temp.join("wal.jsonl")).unwrap();
+        let mut content = fs::read(temp.join("wal.jsonl")).unwrap();
         // Remove last newline and a few chars to simulate torn write
         if let Some(pos) = content.iter().rposition(|&b| b == b'\n') {
             content.truncate(pos + 1); // Keep newline
             content.extend_from_slice(b"{\"incomplete");
-            fs::write(&temp.join("wal.jsonl"), content).unwrap();
+            fs::write(temp.join("wal.jsonl"), content).unwrap();
 
             // Verify should mend and succeed
             let digest = verify(&temp.join("wal.jsonl")).unwrap();
             assert_eq!(digest.len(), 64);
 
             // The torn line should be gone
-            let fixed = fs::read_to_string(&temp.join("wal.jsonl")).unwrap();
+            let fixed = fs::read_to_string(temp.join("wal.jsonl")).unwrap();
             assert!(!fixed.contains("incomplete"));
         }
     }
@@ -668,12 +667,12 @@ mod tests {
         drop(wal);
 
         // Corrupt a middle line (not valid JSON)
-        let content = fs::read_to_string(&temp.join("wal.jsonl")).unwrap();
+        let content = fs::read_to_string(temp.join("wal.jsonl")).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         let mut new_lines = lines.clone();
         // Corrupt line 1
         new_lines[0] = "not valid json at all";
-        fs::write(&temp.join("wal.jsonl"), new_lines.join("\n") + "\n").unwrap();
+        fs::write(temp.join("wal.jsonl"), new_lines.join("\n") + "\n").unwrap();
 
         let err = verify(&temp.join("wal.jsonl")).unwrap_err();
         assert!(err.to_string().contains("valid JSON"));
@@ -758,7 +757,7 @@ mod tests {
         assert_eq!(e1.digest().unwrap(), e2.digest().unwrap());
 
         // Only one line in WAL
-        let content = fs::read_to_string(&temp.join("wal.jsonl")).unwrap();
+        let content = fs::read_to_string(temp.join("wal.jsonl")).unwrap();
         assert_eq!(content.lines().count(), 1);
 
         let _ = fs::remove_dir_all(&temp);

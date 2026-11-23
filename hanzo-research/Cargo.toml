@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-research"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Record and query R&D evidence from Rust — the /v1/research client of the Hanzo ML stack."
 repository = "https://github.com/hanzoai/ml"
@@ -20,6 +20,7 @@ sha2 = "0.10"
 ryu = "1.0.20"
 thiserror = "2"
 chrono = "0.4"
+libc = "0.2"
 
 [lints.clippy]
 explicit_counter_loop = "allow"

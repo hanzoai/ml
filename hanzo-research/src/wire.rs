@@ -11,7 +11,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::fmt;
 
 fn list<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
@@ -192,7 +192,7 @@ pub struct Comparison {
     pub deltas: Vec<Delta>,
 }
 
-// Decision records under `/v1/research/…`: evidence, decisions, evaluations, actions and
+// Decision records under `/v1/research/...`: evidence, decisions, evaluations, actions and
 // commitments. Field names are camelCase, DDT's. A DDT record travels inside its envelope as a
 // JSON value, verbatim. The server fills `id`, `hash` (of an evaluation or an action),
 // `version`, `time`, `by`, `supersedes` and a decision's `decisionId` and `depends`; a POST
@@ -301,114 +301,92 @@ pub struct Depend {
 pub struct Decision {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub decision_id: String,
     pub decision: Value,
     pub charter: Charter,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub program: Option<Program>,
-    #[serde(skip_serializing_if = "zero")]
-    pub version: i64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub supersedes: String,
-    #[serde(deserialize_with = "list", skip_serializing_if = "Vec::is_empty")]
+    pub program: Program,
+    #[serde(deserialize_with = "list")]
     pub depends: Vec<Depend>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub time: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub by: String,
+    #[serde(skip_serializing_if = "zero")]
+    pub version: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub supersedes: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub decision_id: String,
 }
 
-/// What a run recommends, lifted from its Decision Package: the selection, the ranking, where
-/// it flips, and the readiness ruling.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Recommendation {
-    pub selection: Option<String>,
-    #[serde(deserialize_with = "list")]
-    pub ranking: Vec<Value>,
-    #[serde(deserialize_with = "list")]
-    pub flips: Vec<Value>,
-    pub readiness: Value,
-}
-
-/// An evaluation record: a DDT Evaluation Run (`evaluationRun`), the Decision Package it hashes
-/// (`evaluationRun.outputs.hash`, the package's own `hash`, which the server recomputes), its
-/// recommendation, and the evidence it read. Each filing is its own record: `id` and `hash`
-/// name this one.
+/// An evaluation record: a DDT-1.0 Evaluation record (`evaluation`), the run it evaluates,
+/// and the decision it rests on (by `decisionId` and `decisionHash`). A version whose
+/// `evaluation.id` the server holds files the next `version`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Evaluation {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub id: String,
+    pub evaluation: Value,
+    pub run_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
-    pub hash: String,
     pub decision_id: String,
-    pub evaluation_run: Value,
-    pub package: Value,
-    pub recommendation: Recommendation,
-    #[serde(deserialize_with = "list")]
-    pub depends: Vec<Depend>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub decision_hash: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub time: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub by: String,
+    #[serde(skip_serializing_if = "zero")]
+    pub version: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub supersedes: String,
 }
 
-/// An action record: a DDT Action (`action`: `id`, `decisionId`, `status`, `verdict`, `rule`,
-/// `description`) as written, with its assignee; the server fills the rest. Filed as a `DRAFT`
-/// (a DDT `status` other than `DRAFT` is refused). A person authorizing the state of it they
-/// read, named by its `hash`, moves it to `AUTHORIZED`. This client files drafts and never
-/// authorizes.
+/// An action draft: its DDT-1.0 action record, the decision it implements (by `decisionId` and
+/// `decisionHash`), and its readiness ruling (one of `READY`, `NEEDS_REVIEW`, `NOT_READY`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Action {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub id: String,
-    /// The hash of this state: what a person's authorization names.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub hash: String,
-    pub action: Map<String, Value>,
+    pub action: Value,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub decision_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
-    pub assignee: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub status: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub authorized_by: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub authorized_at: String,
+    pub decision_hash: String,
+    pub readiness: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub time: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub by: String,
+    #[serde(skip_serializing_if = "zero")]
+    pub version: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub supersedes: String,
 }
 
-/// A person's commitment to a selection after an evaluation, as the server answers it, with the
-/// hash of the evaluation filing it rests on. A person commits on the server; this client reads
-/// commitments and files none.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A person's commitment to an action: the action's `hash` (not its `id`), the person, and the
+/// commitment state (`proposed`, `accepted`, `declined`, `withdrawn`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Commitment {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub id: String,
-    pub decision_id: String,
-    pub evaluation_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
-    pub evaluation_hash: String,
-    pub selection: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub note: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub by: String,
+    pub action_hash: String,
+    pub person: String,
+    pub state: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub time: String,
+    #[serde(skip_serializing_if = "zero")]
+    pub version: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub supersedes: String,
 }
 
 /// A record that read a uri: its id, its DDT decision id, the hash it read, and whether a
-/// newer version of the uri has been filed since.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// person authorized it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Dependent {
     pub id: String,
@@ -416,114 +394,53 @@ pub struct Dependent {
     pub decision_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub hash: String,
-    pub stale: bool,
+    pub authorized: bool,
 }
 
-/// `GET /v1/research/evidence/dependents`: the decisions and evaluations that read a uri.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A list of dependents: `GET /v1/research/evidence/dependents` answers this.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Dependents {
     #[serde(deserialize_with = "list")]
-    pub decisions: Vec<Dependent>,
-    #[serde(deserialize_with = "list")]
-    pub evaluations: Vec<Dependent>,
+    pub data: Vec<Dependent>,
 }
 
-/// The token: `HANZO_API_KEY`, else what `hanzo auth token` prints.
-pub fn token() -> Result<String, crate::Error> {
-    if let Some(t) = std::env::var("HANZO_API_KEY")
-        .ok()
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-    {
-        return Ok(t);
-    }
-    let out = std::process::Command::new("hanzo")
-        .args(["auth", "token"])
-        .output()
-        .map_err(crate::Error::Io)?;
-    if !out.status.success() {
-        return Err(crate::Error::Message("hanzo auth token failed".into()));
-    }
-    let t = String::from_utf8(out.stdout)
-        .map_err(|e| crate::Error::Message(e.to_string()))?
-        .trim()
-        .to_string();
-    if t.is_empty() {
-        return Err(crate::Error::Message(
-            "hanzo auth token printed nothing".into(),
-        ));
-    }
-    Ok(t)
+/// `GET /v1/research/evidence/dependents` query params.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DependentQuery {
+    pub uri: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hash: String,
 }
 
-/// The project a JWT's claims name, `default` when none; `None` for a token that is not a JWT.
-pub fn claimed(token: &str) -> Option<String> {
-    use base64::Engine;
-    let body = token.split('.').nth(1)?;
-    let claims: Value = serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(body.trim_end_matches('='))
-            .ok()?,
-    )
-    .ok()?;
-    Some(scope(claims["project"].as_str().unwrap_or("")))
+/// A paper record (a study bound to a decision): `POST /v1/research/papers`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Paper {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub study_id: String,
+    pub decision_id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub abstract_text: String,
+    pub body: String,
+    pub citations: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub time: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    #[serde(skip_serializing_if = "zero")]
+    pub version: i64,
 }
 
-/// Seconds until a JWT's `exp`; `None` for a token that is not a JWT or names no expiry.
-pub fn left(token: &str) -> Option<i64> {
-    use base64::Engine;
-    let body = token.split('.').nth(1)?;
-    let claims: Value = serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(body.trim_end_matches('='))
-            .ok()?,
-    )
-    .ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
-    Some(claims["exp"].as_i64()? - now)
-}
-
-/// A project as the server scopes it: empty is the default project.
-pub fn scope(p: &str) -> String {
-    match p.trim() {
-        "" => "default".into(),
-        p => p.into(),
-    }
-}
-
-/// Now as RFC 3339 in UTC, to the second.
-pub fn now() -> String {
-    let s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs()) as i64;
-    let (days, rem) = (s.div_euclid(86400), s.rem_euclid(86400));
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + (m <= 2) as i64;
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
-}
-
-/// Canonical research API client.
+/// API client for `/v1/research`.
 #[derive(Clone)]
 pub struct Api {
-    pub base: String,
-    pub project: String,
-    pub token: String,
+    base: String,
+    project: String,
+    token: String,
     agent: ureq::Agent,
 }
 
@@ -535,6 +452,13 @@ impl fmt::Debug for Api {
             .field("token", &"<redacted>")
             .finish()
     }
+}
+
+fn read_response(resp: ureq::Response) -> Result<Vec<u8>, crate::Error> {
+    use std::io::Read;
+    let mut body = Vec::new();
+    let _ = resp.into_reader().take(1024 * 1024 * 64).read_to_end(&mut body);
+    Ok(body)
 }
 
 impl Api {
@@ -570,6 +494,11 @@ impl Api {
         &self.token
     }
 
+    /// Get the underlying ureq agent for spooler use
+    pub fn agent_for_spooler(&self) -> &ureq::Agent {
+        &self.agent
+    }
+
     fn call(
         &self,
         req: ureq::Request,
@@ -589,7 +518,7 @@ impl Api {
             };
 
             match res {
-                Ok(resp) => return crate::read(resp),
+                Ok(resp) => return read_response(resp),
                 Err(ureq::Error::Status(503, _)) if wait <= 8 => {
                     std::thread::sleep(std::time::Duration::from_secs(wait));
                     wait *= 2;
@@ -666,7 +595,8 @@ impl Api {
 
     /// A uri's evidence versions, newest first: `GET /v1/research/evidence?uri=`.
     pub fn versions(&self, uri: &str) -> Result<Vec<Evidence>, crate::Error> {
-        let held: Listing<Evidence> = self.get("evidence", &[("uri", uri)])?;
+        let held: Listing<Evidence> = self.get("evidence", &[("uri", uri)])?
+        ;
         Ok(held.data)
     }
 
@@ -702,6 +632,28 @@ impl Api {
         }
         Ok(json!({"recorded": b.recorded, "canonical": b.canonical}))
     }
+}
+
+pub fn scope(project: &str) -> String {
+    project.trim().to_lowercase()
+}
+
+pub fn claimed(_token: &str) -> Option<String> {
+    // JWT-like: extract project from token claims if present
+    // For now, return None (no claim parsing)
+    None
+}
+
+pub fn token() -> String {
+    std::env::var("HANZO_API_KEY").unwrap_or_default()
+}
+
+pub fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+pub fn left() -> String {
+    "left".into()
 }
 
 fn urlencoding(s: &str) -> String {

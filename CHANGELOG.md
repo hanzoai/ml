@@ -111,3 +111,25 @@ This documents the main changes to the `hanzo-ml` crate.
   [559](https://github.com/hanzoai/ml/pull/559).
 
 ## v0.1.2 - 2023-08-21
+
+### hanzo-research 0.2.5 - 2026-11-23
+
+### Added
+- `wal::verify(path)` — standalone verification function that checks the entire WAL chain (sequence = line number, hash chain, payload hashes) and returns the last event's digest.
+- `wal::ResearchWal::append_idempotent(event_id, event_type, payload)` — idempotent append that returns existing event if the same event_id and payload already exists; errors if event_id exists with different payload. Default event_id is RFC 8785 digest of {run_id, worker_id, event_type, payload}.
+- `spool::Spooler` — drains a WAL file and posts unsent events to `/v1/research` in order with Idempotency-Key headers (event digest). Persists an fsynced cursor (`<wal>.cursor`) so restarts resume without re-sending.
+- Advisory exclusive lock (`flock` on Unix) around each append in `open_worker`, with lock-held re-read of the tail sequence to handle concurrent writers correctly.
+- Torn-tail mending in `open_worker` and `verify`, matching Python `hanzo_research.wal._mend`: truncates invalid JSON tail, adds missing newline to valid JSON tail.
+
+### Modified
+- `wal::ResearchWal::open_worker` now VERIFIES the existing log on open (was silently skipping bad lines with `if let Ok(...)`). Any corruption (bad sequence, broken chain, payload hash mismatch, invalid JSON in middle) returns an error.
+- Bumped `hanzo-research` crate version to 0.2.5.
+- Added `libc` dependency for `flock` on Unix.
+
+### Tests
+- Tampered sequence, broken chain, payload hash mismatch, and corrupted middle lines are detected by `verify`.
+- Torn final line is mended (truncated) and verification passes.
+- Two threads × 500 appends each produce valid independent WALs (500 events each, verified).
+- Idempotent re-append with same payload writes nothing; different payload returns `AlreadyExists` error.
+- Spooler against a local fake HTTP server demonstrates at-least-once delivery, cursor persistence across restarts, and no re-send after success.
+- Existing `tests/canonical.rs` vectors still pass, including Python-written `tests/vectors/wal.jsonl`.

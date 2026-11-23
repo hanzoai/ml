@@ -4,12 +4,11 @@
 //! A cursor file (`<wal>.cursor`) records the last sent sequence plus its digest so restarts
 //! resume cleanly without re-sending.
 
-use crate::canonical::rfc8785_digest;
 use crate::lineage::ResearchEvent;
-use crate::wire::{Api, Research};
+use crate::{Api, Research};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Cursor persisted after each successful batch: the last sent event's sequence and its digest.
@@ -179,82 +178,65 @@ impl Spooler {
                 ));
             }
 
-            events_to_send.push(event);
+            events_to_send.push(event.clone());
             last_event_hash = event.digest().map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, e)
             })?;
         }
 
-        // Send events in batches through the Research client
-        // We'll use the Research client's post method with idempotency key
+        // Send events one by one through the Research client's API
+        // Using the evidence endpoint with the event as JSON payload
+        // The Idempotency-Key is the event digest
         let mut sent_count = 0;
         for event in events_to_send {
-            // Build the request body as the event itself
             let event_digest = event.digest().map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, e)
             })?;
 
-            // Post using the Research client - we'll use the evidence endpoint
-            // The Idempotency-Key is the event digest
-            let api = Api::new(
-                &research.base,
-                &research.project,
-                research.key.clone(),
-            )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            // Build a simple evidence record from the WAL event
+            // We'll post to /v1/research/evidence with the event as content
+            let evidence_payload = serde_json::json!({
+                "uri": format!("wal://{}/{}/{}", event.run_id, event.worker_id, event.sequence),
+                "kind": "wal-event",
+                "source": { "system": "wal-spooler" },
+                "content": {
+                    "event_id": event.event_id,
+                    "run_id": event.run_id,
+                    "worker_id": event.worker_id,
+                    "sequence": event.sequence,
+                    "event_type": event.event_type().unwrap_or_else(|| "unknown".into()),
+                    "payload": event.payload,
+                    "created_at": event.created_at,
+                    "previous_event_hash": event.previous_event_hash,
+                    "payload_hash": event.payload_hash,
+                    "digest": event_digest.clone()
+                }
+            });
 
-            // Post the event as an evidence record
-            let evidence = crate::wire::Evidence {
-                id: event.event_id.clone(),
-                kind: "research-event".into(),
-                subject: event.event_type().unwrap_or_else(|| "unknown".into()),
-                task: event.run_id.clone(),
-                metric: "wal-drain".into(),
-                value: 0.0,
-                n: 1,
-                n_total: 1,
-                status: "complete".into(),
-                git_sha: "".into(),
-                git_branch: "".into(),
-                git_dirty: false,
-                lib_versions: std::collections::BTreeMap::new(),
-                meta: crate::wire::EvidenceMeta {
-                    doc: "".into(),
-                    commits: vec![],
-                    note: format!("WAL event seq {}", event.sequence),
-                    host: crate::wire::Host {
-                        hostname: "".into(),
-                        platform: "".into(),
-                    },
-                    hypothesis: "".into(),
-                    predict: "".into(),
-                    verdict: None,
-                    because: "".into(),
-                    log: vec![],
-                },
-            };
+            let api = Api::new(&research.base, &research.project, research.key.clone())
+                .map_err(std::io::Error::other)?;
 
-            // Use the Research client's post directly with idempotency key
-            // We need to post to a specific endpoint that accepts the event
-            // For now, let's use the evidence endpoint with the event as payload
-            let mut req = api
-                .agent
-                .post(&format!("{}/v1/research/evidence", api.base))
-                .set("Content-Type", "application/json")
-                .set("Idempotency-Key", &event_digest);
-
-            let body = serde_json::to_vec(&evidence).map_err(|e| {
+            // Post with Idempotency-Key header
+            let url = format!("{}/v1/research/evidence", api.base());
+            let body = serde_json::to_vec(&evidence_payload).map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, e)
             })?;
 
-            let resp = req.send(&body);
+            let req = api
+                .agent_for_spooler()
+                .post(&url)
+                .set("Content-Type", "application/json")
+                .set("Authorization", &format!("Bearer {}", api.token()))
+                .set("X-Project-Id", &api.project())
+                .set("Idempotency-Key", &event_digest);
+
+            let resp = req.send(&*body);
             match resp {
                 Ok(response) => {
                     let _status = response.status();
                     // Read and discard the response body
                     let mut resp_reader = response.into_reader();
                     let mut _buf = Vec::new();
-                    use std::io::Read;
                     resp_reader.read_to_end(&mut _buf).ok();
 
                     // Update cursor after successful send
@@ -296,10 +278,10 @@ impl EventTypeExt for ResearchEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rfc8785_digest, ResearchWal};
+    use crate::ResearchWal;
     use serde_json::json;
     use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{TcpListener};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -325,7 +307,7 @@ mod tests {
 
         thread::spawn(move || {
             for stream in listener.incoming() {
-                let mut stream = stream.unwrap();
+                let stream = stream.unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request = Vec::new();
                 loop {
