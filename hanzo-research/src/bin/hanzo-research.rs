@@ -1,14 +1,17 @@
-//! Native Rust CLI for `hanzo-research`: query, failures, next, impact, sync, spool, tick, loop.
+//! Native Rust CLI for `hanzo-research`: query, failures, next, impact, sync, spool, tick, loop,
+//! machines, dispatch, and schedule.
 
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 use hanzo_research::{
-    impacted_benchmarks, AutonomousController, CampaignRegistry, LineageRule, LocalResearchLedger,
-    Research, Spooler,
+    impacted_benchmarks, parse_targets, AutonomousController, CampaignRegistry, LineageRule,
+    LocalResearchLedger, OrchestrateOptions, Research, ScheduleOptions, Spooler,
+    TaskDispatchOptions,
 };
 use serde_json::{json, Value};
 
@@ -46,7 +49,10 @@ fn print_usage() {
          \x20 impact      [--lineage FILE] [--tasks T1,T2] [--changed-paths FILE_OR_CSV]\n\
          \x20 sync        [--dir DIR]\n\
          \x20 spool       --wal FILE --cursor FILE\n\
-         \x20 tick        --executor EXEC [--dir DIR] [--campaign FILE] [--lineage FILE] [--changed-paths P]\n\
+         \x20 machines    [--capability C] [--backend B] [--include-offline] [--exclude-busy]\n\
+         \x20 dispatch    --command CMD [--type T] [--target evo,dgx|any] [--backend B] [--fanout] [--wait]\n\
+         \x20 schedule    <create|list|describe|trigger|pause|resume|delete> [--id ID] [--target evo,dgx|any]\n\
+         \x20 tick        --executor EXEC [--dir DIR] [--campaign FILE] [--via-tasks] [--remote-target evo|dgx|any]\n\
          \x20 loop        --executor EXEC [--dir DIR] [--campaign FILE] [--max-ticks N] [--budget-minutes M]\n\
          \x20 controller  <status|validate|tick|loop> [options]"
     );
@@ -89,6 +95,11 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
             .cloned()
             .ok_or_else(|| "controller requires <status|validate|tick|loop>".to_string())?;
         idx += 1;
+    } else if cmd == "schedule" {
+        sub_action = args.get(idx).cloned().ok_or_else(|| {
+            "schedule requires <create|list|describe|trigger|pause|resume|delete>".to_string()
+        })?;
+        idx += 1;
     }
 
     let mut dir: Option<PathBuf> = None;
@@ -117,6 +128,29 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
     let mut idle_exit = true;
     let mut sleep_seconds = 0.0f64;
     let mut auto_sync = true;
+    let mut via_tasks = false;
+    let mut remote_target: Option<String> = None;
+
+    let mut capability: Option<String> = None;
+    let mut include_offline = false;
+    let mut exclude_busy = false;
+    let mut command_str: Option<String> = None;
+    let mut activity_type: Option<String> = None;
+    let mut workflow_type: Option<String> = None;
+    let mut target_arg: Option<String> = None;
+    let mut min_memory_gb: Option<f64> = None;
+    let mut namespace = "gpu-jobs".to_string();
+    let mut fanout = false;
+    let mut allow_when_busy = false;
+    let mut wait_flag = false;
+    let mut timeout_sec = 600.0f64;
+    let mut schedule_id: Option<String> = None;
+    let mut interval_arg: Option<String> = None;
+    let mut cron_arg: Option<String> = None;
+    let mut max_compute_seconds: Option<u64> = None;
+    let mut paused = false;
+    let mut note = String::new();
+    let mut request_id = String::new();
 
     while idx < args.len() {
         let flag = args[idx].as_str();
@@ -180,6 +214,44 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
             }
             "--auto-sync" => auto_sync = true,
             "--no-auto-sync" => auto_sync = false,
+            "--via-tasks" => via_tasks = true,
+            "--remote-target" => remote_target = Some(next_val(&mut idx)?),
+            "--capability" => capability = Some(next_val(&mut idx)?),
+            "--include-offline" => include_offline = true,
+            "--exclude-busy" => exclude_busy = true,
+            "--command" => command_str = Some(next_val(&mut idx)?),
+            "--type" => activity_type = Some(next_val(&mut idx)?),
+            "--workflow-type" => workflow_type = Some(next_val(&mut idx)?),
+            "--target" => target_arg = Some(next_val(&mut idx)?),
+            "--min-memory-gb" => {
+                min_memory_gb = Some(
+                    next_val(&mut idx)?
+                        .parse()
+                        .map_err(|_| "invalid --min-memory-gb".to_string())?,
+                )
+            }
+            "--namespace" => namespace = next_val(&mut idx)?,
+            "--fanout" => fanout = true,
+            "--allow-when-busy" => allow_when_busy = true,
+            "--wait" => wait_flag = true,
+            "--timeout-sec" => {
+                timeout_sec = next_val(&mut idx)?
+                    .parse()
+                    .map_err(|_| "invalid --timeout-sec".to_string())?
+            }
+            "--id" => schedule_id = Some(next_val(&mut idx)?),
+            "--interval" => interval_arg = Some(next_val(&mut idx)?),
+            "--cron" => cron_arg = Some(next_val(&mut idx)?),
+            "--max-compute-seconds" => {
+                max_compute_seconds = Some(
+                    next_val(&mut idx)?
+                        .parse()
+                        .map_err(|_| "invalid --max-compute-seconds".to_string())?,
+                )
+            }
+            "--paused" => paused = true,
+            "--note" => note = next_val(&mut idx)?,
+            "--request-id" => request_id = next_val(&mut idx)?,
             "--base" => base = next_val(&mut idx)?,
             "--project" => project = next_val(&mut idx)?,
             other => return Err(format!("unknown option: {other}")),
@@ -191,7 +263,6 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
         if base.is_empty() && project.is_empty() {
             Research::from_env()
         } else {
-            let env_c = Research::from_env();
             let key = std::env::var("HANZO_API_KEY")
                 .ok()
                 .filter(|k| !k.trim().is_empty())
@@ -201,12 +272,172 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
             } else {
                 project.clone()
             };
-            let _ = env_c;
             Research::new(&base, &key, &proj, &repo_dir, &[])
         }
     };
 
     match cmd {
+        "machines" => {
+            let client = make_client();
+            let rows = client
+                .list_machines(
+                    !include_offline,
+                    capability.as_deref(),
+                    backend.as_deref(),
+                    exclude_busy,
+                )
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(rows).map_err(|e| e.to_string())
+        }
+        "dispatch" => {
+            let raw_cmd = command_str.ok_or_else(|| "dispatch requires --command".to_string())?;
+            let payload: Value = match serde_json::from_str::<Value>(&raw_cmd) {
+                Ok(v) if v.is_object() => v,
+                _ => json!({"command": raw_cmd}),
+            };
+            let client = make_client();
+            let act_type = activity_type
+                .clone()
+                .unwrap_or_else(|| "research.bench".to_string());
+            let when_idle_only = !allow_when_busy;
+            let targets = parse_targets(target_arg.as_deref());
+            if fanout
+                || targets.is_empty()
+                || targets.len() > 1
+                || targets[0].eq_ignore_ascii_case("any")
+            {
+                let explicit_t = if !targets.is_empty() && !targets[0].eq_ignore_ascii_case("any") {
+                    target_arg.clone()
+                } else {
+                    None
+                };
+                let opts = OrchestrateOptions {
+                    target: explicit_t,
+                    capability: Some(
+                        capability
+                            .clone()
+                            .unwrap_or_else(|| "research.bench".to_string()),
+                    ),
+                    backend: backend.clone(),
+                    activity_type: act_type,
+                    fanout,
+                    wait: wait_flag,
+                    when_idle_only,
+                    min_memory_gb,
+                    namespace,
+                    timeout: Duration::from_secs_f64(timeout_sec.max(0.1)),
+                    poll_interval: Duration::from_secs(2),
+                };
+                let rows = client
+                    .orchestrate_across_machines(&[payload], &opts)
+                    .map_err(|e| e.to_string())?;
+                return Ok(Value::Array(rows));
+            }
+            let d_opts = TaskDispatchOptions {
+                target: Some(targets[0].clone()),
+                activity_type: act_type,
+                when_idle_only,
+                required_backend: backend,
+                min_memory_gb,
+                namespace: namespace.clone(),
+                ..TaskDispatchOptions::default()
+            };
+            let dispatched = client
+                .dispatch_task(&payload, &d_opts)
+                .map_err(|e| e.to_string())?;
+            if wait_flag {
+                let jid = dispatched["id"].as_str().unwrap_or("");
+                let rid = dispatched["runId"].as_str();
+                client
+                    .wait_gpu_job_with_run(
+                        jid,
+                        rid,
+                        Some(&namespace),
+                        Duration::from_secs_f64(timeout_sec.max(0.1)),
+                        Duration::from_secs(2),
+                    )
+                    .map_err(|e| e.to_string())
+            } else {
+                Ok(dispatched)
+            }
+        }
+        "schedule" => {
+            let client = make_client();
+            match sub_action.as_str() {
+                "list" => {
+                    let rows = client
+                        .list_schedules(Some(&namespace))
+                        .map_err(|e| e.to_string())?;
+                    Ok(Value::Array(rows))
+                }
+                "create" => {
+                    let sid =
+                        schedule_id.ok_or_else(|| "schedule create requires --id".to_string())?;
+                    let opts = ScheduleOptions {
+                        interval: interval_arg,
+                        cron: cron_arg,
+                        target: target_arg.or_else(|| Some("any".to_string())),
+                        activity_type: activity_type.unwrap_or_else(|| "research.tick".to_string()),
+                        workflow_type,
+                        input_payload: None,
+                        command: command_str,
+                        campaign: campaign_path.map(|p| p.display().to_string()),
+                        executor: executor_path.map(|p| p.display().to_string()),
+                        max_compute_seconds,
+                        when_idle_only: !allow_when_busy,
+                        required_backend: backend,
+                        paused,
+                        note,
+                        namespace,
+                        ..ScheduleOptions::default()
+                    };
+                    client
+                        .create_schedule(&sid, &opts)
+                        .map_err(|e| e.to_string())
+                }
+                "describe" => {
+                    let sid =
+                        schedule_id.ok_or_else(|| "schedule describe requires --id".to_string())?;
+                    client
+                        .describe_schedule(&sid, Some(&namespace))
+                        .map_err(|e| e.to_string())
+                }
+                "trigger" => {
+                    let sid =
+                        schedule_id.ok_or_else(|| "schedule trigger requires --id".to_string())?;
+                    let req = if request_id.is_empty() {
+                        None
+                    } else {
+                        Some(request_id.as_str())
+                    };
+                    client
+                        .trigger_schedule(&sid, req, Some(&namespace))
+                        .map_err(|e| e.to_string())
+                }
+                "pause" => {
+                    let sid =
+                        schedule_id.ok_or_else(|| "schedule pause requires --id".to_string())?;
+                    client
+                        .pause_schedule(&sid, &note, Some(&namespace))
+                        .map_err(|e| e.to_string())
+                }
+                "resume" => {
+                    let sid =
+                        schedule_id.ok_or_else(|| "schedule resume requires --id".to_string())?;
+                    client
+                        .resume_schedule(&sid, Some(&namespace))
+                        .map_err(|e| e.to_string())
+                }
+                "delete" => {
+                    let sid =
+                        schedule_id.ok_or_else(|| "schedule delete requires --id".to_string())?;
+                    client
+                        .delete_schedule(&sid, Some(&namespace))
+                        .map_err(|e| e.to_string())
+                }
+                other => Err(format!("unknown schedule action: {other}")),
+            }
+        }
         "query" => {
             if let Some(d) = dir {
                 let ledger =
@@ -373,13 +604,13 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
             let exec = executor_path.ok_or_else(|| format!("{action} requires --executor"))?;
             let cpaths = changed_paths_arg.as_deref().map(read_lines_arg);
             let carts = changed_artifacts_arg.as_deref().map(read_lines_arg);
-            let opt_client = if !base.is_empty() {
+            let opt_client = if !base.is_empty() || via_tasks || remote_target.is_some() {
                 Some(make_client())
             } else {
                 None
             };
             if action == "tick" {
-                ctrl.tick(
+                ctrl.tick_with_tasks(
                     &exec,
                     cpaths.as_deref(),
                     lin.as_ref(),
@@ -388,10 +619,12 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
                     auto_sync,
                     opt_client.as_ref(),
                     600,
+                    via_tasks,
+                    remote_target.as_deref(),
                 )
                 .map_err(|e| e.to_string())
             } else if action == "loop" {
-                ctrl.loop_run(
+                ctrl.loop_run_with_tasks(
                     &exec,
                     max_ticks,
                     budget_minutes,
@@ -402,6 +635,8 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
                     carts.as_deref(),
                     auto_sync,
                     opt_client.as_ref(),
+                    via_tasks,
+                    remote_target.as_deref(),
                 )
                 .map_err(|e| e.to_string())
             } else {

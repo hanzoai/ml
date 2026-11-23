@@ -16,8 +16,9 @@ use hanzo_research::{
     research_yield, rfc8785_digest, successor_research_lift, wal, AutonomousController,
     CampaignRegistry, CloudLeaseManager, CorrectnessChecks, CounterEvidence, ExperimentRecordV2,
     HardwareSpec, HypothesisRecord, LineageRule, LocalResearchLedger, ObjectiveSpec,
-    ProgressiveAbPlan, ProgressiveAbRunner, ProgressiveStage, ProgressiveStageOutput, Research,
-    ResearchBudget, ResearchWal, SearchArm, Spooler, TransferCatalog, WorkloadManifest,
+    OrchestrateOptions, ProgressiveAbPlan, ProgressiveAbRunner, ProgressiveStage,
+    ProgressiveStageOutput, Research, ResearchBudget, ResearchWal, ScheduleOptions, SearchArm,
+    Spooler, TransferCatalog, WorkloadManifest,
 };
 use serde_json::{json, Value};
 
@@ -120,7 +121,14 @@ struct MockCloudState {
     exps: Mutex<Vec<Value>>,
     artifacts: Mutex<BTreeMap<String, Vec<u8>>>,
     artifact_meta: Mutex<Vec<Value>>,
-    workflow_jobs: Mutex<BTreeMap<String, usize>>,
+    workflow_jobs: Mutex<BTreeMap<String, Value>>,
+    workflow_schedules: Mutex<BTreeMap<String, Value>>,
+    fleet_workers: Mutex<Vec<Value>>,
+    agent_targets: Mutex<Vec<Value>>,
+    fleet_presence: Mutex<BTreeMap<String, Value>>,
+    busy_defer_queues: Mutex<Vec<String>>,
+    sse_streams_opened: AtomicUsize,
+    stage_mode: AtomicUsize,
 }
 
 fn spawn_full_mock_cloud(fail_first_evidence_posts: usize) -> (String, Arc<MockCloudState>) {
@@ -137,237 +145,480 @@ fn spawn_full_mock_cloud(fail_first_evidence_posts: usize) -> (String, Arc<MockC
         artifacts: Mutex::new(BTreeMap::new()),
         artifact_meta: Mutex::new(Vec::new()),
         workflow_jobs: Mutex::new(BTreeMap::new()),
+        workflow_schedules: Mutex::new(BTreeMap::new()),
+        fleet_workers: Mutex::new(Vec::new()),
+        agent_targets: Mutex::new(Vec::new()),
+        fleet_presence: Mutex::new(BTreeMap::new()),
+        busy_defer_queues: Mutex::new(Vec::new()),
+        sse_streams_opened: AtomicUsize::new(0),
+        stage_mode: AtomicUsize::new(0),
     });
-    let st = Arc::clone(&state);
+    let st_listener = Arc::clone(&state);
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { break };
-            let (method, full_path, headers, body) = read_http_req(&mut s);
-            if method.is_empty() {
-                continue;
-            }
-            let (route, query) = full_path
-                .split_once('?')
-                .map_or((full_path.as_str(), ""), |(r, q)| (r, q));
-            let mut qmap = BTreeMap::new();
-            for pair in query.split('&').filter(|p| !p.is_empty()) {
-                if let Some((k, v)) = pair.split_once('=') {
-                    qmap.insert(percent_decode(k), percent_decode(v));
+            let st = Arc::clone(&st_listener);
+            thread::spawn(move || {
+                let (method, full_path, headers, body) = read_http_req(&mut s);
+                if method.is_empty() {
+                    return;
                 }
-            }
+                let (route, query) = full_path
+                    .split_once('?')
+                    .map_or((full_path.as_str(), ""), |(r, q)| (r, q));
+                let mut qmap = BTreeMap::new();
+                for pair in query.split('&').filter(|p| !p.is_empty()) {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        qmap.insert(percent_decode(k), percent_decode(v));
+                    }
+                }
 
-            let (status, ctype, payload): (u16, &str, Vec<u8>) = if method == "POST"
-                && route == "/v1/research/evidence"
-            {
-                let rem = st.fail_evidence_posts.load(Ordering::SeqCst);
-                if rem > 0 {
-                    st.fail_evidence_posts.fetch_sub(1, Ordering::SeqCst);
-                    (
-                        503,
-                        "application/json",
-                        br#"{"error":"simulated offline"}"#.to_vec(),
-                    )
-                } else {
-                    let idem = headers.get("idempotency-key").cloned().unwrap_or_default();
-                    if !idem.is_empty() {
-                        if let Some(existing) = st.evidence_idem.lock().unwrap().get(&idem).cloned()
-                        {
-                            let raw = serde_json::to_vec(&existing).unwrap();
-                            let resp = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                raw.len()
-                            );
-                            let _ = s.write_all(resp.as_bytes());
-                            let _ = s.write_all(&raw);
-                            continue;
+                if method == "GET" && route == "/v1/workflow/events" {
+                    st.sse_streams_opened.fetch_add(1, Ordering::SeqCst);
+                    let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n: hanzo-tasks event stream\n\n";
+                    let _ = s.write_all(hdr.as_bytes());
+                    let _ = s.flush();
+                    let defer_qs = st.busy_defer_queues.lock().unwrap().clone();
+                    let mut jobs = st.workflow_jobs.lock().unwrap();
+                    for (jid, job) in jobs.iter_mut() {
+                        let tq = job["taskQueue"].as_str().unwrap_or("").to_string();
+                        let rid = job["runId"].as_str().unwrap_or(jid).to_string();
+                        if defer_qs.contains(&tq) {
+                            let dc = job["deferCount"].as_u64().unwrap_or(0).max(1);
+                            job["deferCount"] = json!(dc);
+                            if job["lastBusyReason"].as_str().unwrap_or("").is_empty() {
+                                job["lastBusyReason"] = json!("active_dev_session");
+                            }
+                            let dev = json!({
+                                "kind": "activity.deferred",
+                                "namespace": "gpu-jobs",
+                                "workflow_id": jid,
+                                "run_id": rid,
+                                "data": {"deferCount": dc, "lastBusyReason": job["lastBusyReason"]},
+                            });
+                            let frame = format!("event: activity.deferred\ndata: {dev}\n\n");
+                            let _ = s.write_all(frame.as_bytes());
                         }
+                        job["sse_completed"] = json!(true);
+                        let cev = json!({
+                            "kind": "activity.completed",
+                            "namespace": "gpu-jobs",
+                            "workflow_id": jid,
+                            "run_id": rid,
+                            "data": {"status": "ACTIVITY_TASK_STATE_COMPLETED"},
+                        });
+                        let frame = format!("event: activity.completed\ndata: {cev}\n\n");
+                        let _ = s.write_all(frame.as_bytes());
                     }
-                    let mut v: Value = serde_json::from_slice(&body).unwrap();
-                    let uri = v["uri"].as_str().unwrap_or("").to_string();
-                    let mut by_uri = st.evidence_by_uri.lock().unwrap();
-                    let versions = by_uri.entry(uri).or_default();
-                    let next_ver = (versions.len() + 1) as i64;
-                    v["version"] = json!(next_ver);
-                    v["project"] = json!("default");
-                    versions.push(v.clone());
-                    drop(by_uri);
-                    if !idem.is_empty() {
-                        st.evidence_idem.lock().unwrap().insert(idem, v.clone());
+                    let _ = s.flush();
+                    return;
+                }
+
+                let (status, ctype, payload): (u16, &str, Vec<u8>) = if method == "POST"
+                    && route == "/v1/research/evidence"
+                {
+                    let rem = st.fail_evidence_posts.load(Ordering::SeqCst);
+                    if rem > 0 {
+                        st.fail_evidence_posts.fetch_sub(1, Ordering::SeqCst);
+                        (
+                            503,
+                            "application/json",
+                            br#"{"error":"simulated offline"}"#.to_vec(),
+                        )
+                    } else {
+                        let idem = headers.get("idempotency-key").cloned().unwrap_or_default();
+                        if !idem.is_empty() {
+                            if let Some(existing) =
+                                st.evidence_idem.lock().unwrap().get(&idem).cloned()
+                            {
+                                let raw = serde_json::to_vec(&existing).unwrap();
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    raw.len()
+                                );
+                                let _ = s.write_all(resp.as_bytes());
+                                let _ = s.write_all(&raw);
+                                return;
+                            }
+                        }
+                        let mut v: Value = serde_json::from_slice(&body).unwrap();
+                        let uri = v["uri"].as_str().unwrap_or("").to_string();
+                        let mut by_uri = st.evidence_by_uri.lock().unwrap();
+                        let versions = by_uri.entry(uri).or_default();
+                        let next_ver = (versions.len() + 1) as i64;
+                        v["version"] = json!(next_ver);
+                        v["project"] = json!("default");
+                        versions.push(v.clone());
+                        drop(by_uri);
+                        if !idem.is_empty() {
+                            st.evidence_idem.lock().unwrap().insert(idem, v.clone());
+                        }
+                        (200, "application/json", serde_json::to_vec(&v).unwrap())
                     }
-                    (200, "application/json", serde_json::to_vec(&v).unwrap())
-                }
-            } else if method == "GET" && route == "/v1/research/evidence" {
-                let by_uri = st.evidence_by_uri.lock().unwrap();
-                let rows: Vec<Value> = if let Some(uri) = qmap.get("uri") {
-                    by_uri.get(uri).cloned().unwrap_or_default()
-                } else {
-                    by_uri.values().flatten().cloned().collect()
-                };
-                let data = json!({"data": rows, "total": rows.len()});
-                (200, "application/json", serde_json::to_vec(&data).unwrap())
-            } else if method == "POST" && route == "/v1/research/runs" {
-                let v: Value = serde_json::from_slice(&body).unwrap();
-                let list = v["runs"].as_array().cloned().unwrap_or_default();
-                let mut g = st.runs.lock().unwrap();
-                let n = list.len();
-                g.extend(list);
-                (
-                    200,
-                    "application/json",
-                    serde_json::to_vec(&json!({"project":"default","recorded":n,"canonical":n}))
-                        .unwrap(),
-                )
-            } else if method == "GET" && route == "/v1/research/runs" {
-                let g = st.runs.lock().unwrap();
-                let rows: Vec<Value> = if let Some(id) = qmap.get("id") {
-                    g.iter()
-                        .filter(|r| r["id"].as_str() == Some(id.as_str()))
-                        .cloned()
-                        .collect()
-                } else {
-                    g.clone()
-                };
-                let data = json!({"data": rows, "total": rows.len()});
-                (200, "application/json", serde_json::to_vec(&data).unwrap())
-            } else if method == "POST" && route == "/v1/research/studies" {
-                let v: Value = serde_json::from_slice(&body).unwrap();
-                let list = v["studies"].as_array().cloned().unwrap_or_default();
-                let mut g = st.studies.lock().unwrap();
-                let n = list.len();
-                g.extend(list);
-                (
-                    200,
-                    "application/json",
-                    serde_json::to_vec(&json!({"project":"default","recorded":n,"canonical":n}))
-                        .unwrap(),
-                )
-            } else if method == "GET" && route == "/v1/research/studies" {
-                let g = st.studies.lock().unwrap();
-                let data = json!({"data": *g, "total": g.len()});
-                (200, "application/json", serde_json::to_vec(&data).unwrap())
-            } else if method == "POST" && route == "/v1/research/benchmarks" {
-                let v: Value = serde_json::from_slice(&body).unwrap();
-                let list = v["benchmarks"].as_array().cloned().unwrap_or_default();
-                let mut g = st.benchmarks.lock().unwrap();
-                let n = list.len();
-                g.extend(list);
-                (
-                    200,
-                    "application/json",
-                    serde_json::to_vec(&json!({"project":"default","recorded":n,"canonical":n}))
-                        .unwrap(),
-                )
-            } else if method == "POST" && route == "/v1/research/experiments" {
-                let v: Value = serde_json::from_slice(&body).unwrap();
-                let list = v["experiments"].as_array().cloned().unwrap_or_default();
-                let mut g = st.exps.lock().unwrap();
-                let n = list.len();
-                for item in list {
-                    g.retain(|x| x["id"] != item["id"]);
-                    g.push(item);
-                }
-                (
-                    200,
-                    "application/json",
-                    serde_json::to_vec(
-                        &json!({"project":"default","experiments_ingested":n,"rolled_up":true}),
-                    )
-                    .unwrap(),
-                )
-            } else if method == "GET" && route == "/v1/research/experiments" {
-                let g = st.exps.lock().unwrap();
-                let data = json!({"data": *g, "total": g.len()});
-                (200, "application/json", serde_json::to_vec(&data).unwrap())
-            } else if method == "POST" && route == "/v1/research/artifacts" {
-                let v: Value = serde_json::from_slice(&body).unwrap();
-                let kind = v["kind"].as_str().unwrap_or("");
-                if kind != "snapshot" && kind != "report" {
-                    (
-                        400,
-                        "application/json",
-                        br#"{"error":"invalid artifact kind"}"#.to_vec(),
-                    )
-                } else {
-                    let sha = v["sha256"].as_str().unwrap().to_string();
-                    let b64 = v["content"].as_str().unwrap();
-                    let raw =
-                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                            .unwrap();
-                    let mut stored_meta = v.clone();
-                    stored_meta["received_at"] = json!(1_700_000_999_i64);
-                    st.artifact_meta.lock().unwrap().push(stored_meta);
-                    st.artifacts.lock().unwrap().insert(sha.clone(), raw);
+                } else if method == "GET" && route == "/v1/research/evidence" {
+                    let by_uri = st.evidence_by_uri.lock().unwrap();
+                    let rows: Vec<Value> = if let Some(uri) = qmap.get("uri") {
+                        by_uri.get(uri).cloned().unwrap_or_default()
+                    } else {
+                        by_uri.values().flatten().cloned().collect()
+                    };
+                    let data = json!({"data": rows, "total": rows.len()});
+                    (200, "application/json", serde_json::to_vec(&data).unwrap())
+                } else if method == "POST" && route == "/v1/research/runs" {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let list = v["runs"].as_array().cloned().unwrap_or_default();
+                    let mut g = st.runs.lock().unwrap();
+                    let n = list.len();
+                    g.extend(list);
                     (
                         200,
                         "application/json",
-                        serde_json::to_vec(&json!({"sha256":sha,"artifact_id":v["artifact_id"]}))
-                            .unwrap(),
+                        serde_json::to_vec(
+                            &json!({"project":"default","recorded":n,"canonical":n}),
+                        )
+                        .unwrap(),
                     )
-                }
-            } else if method == "GET" && route == "/v1/research/artifacts" {
-                let g = st.artifact_meta.lock().unwrap();
-                let data = json!({"data": *g, "total": g.len()});
-                (200, "application/json", serde_json::to_vec(&data).unwrap())
-            } else if method == "GET" && route.starts_with("/v1/research/artifacts/") {
-                let sha = route.trim_start_matches("/v1/research/artifacts/");
-                let raw = st
-                    .artifacts
-                    .lock()
-                    .unwrap()
-                    .get(sha)
-                    .cloned()
-                    .unwrap_or_default();
-                (200, "application/octet-stream", raw)
-            } else if method == "POST" && route == "/v1/workflow/namespaces/gpu-jobs/activities" {
-                let v: Value = serde_json::from_slice(&body).unwrap();
-                let jid = v["id"].as_str().unwrap_or("job-1").to_string();
-                st.workflow_jobs.lock().unwrap().insert(jid.clone(), 0);
-                let out = json!({
-                    "id": jid,
-                    "taskQueue": v["taskQueue"],
-                    "type": v["type"],
-                    "state": "ACTIVITY_TASK_STATE_SCHEDULED",
-                });
-                (200, "application/json", serde_json::to_vec(&out).unwrap())
-            } else if method == "GET"
-                && route.starts_with("/v1/workflow/namespaces/gpu-jobs/activities/")
-            {
-                let jid = route
-                    .trim_start_matches("/v1/workflow/namespaces/gpu-jobs/activities/")
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let mut jobs = st.workflow_jobs.lock().unwrap();
-                let polls = jobs.entry(jid.clone()).or_insert(0);
-                *polls += 1;
-                let state_str = if *polls >= 2 {
-                    "ACTIVITY_TASK_STATE_COMPLETED"
+                } else if method == "GET" && route == "/v1/research/runs" {
+                    let g = st.runs.lock().unwrap();
+                    let rows: Vec<Value> = if let Some(id) = qmap.get("id") {
+                        g.iter()
+                            .filter(|r| r["id"].as_str() == Some(id.as_str()))
+                            .cloned()
+                            .collect()
+                    } else {
+                        g.clone()
+                    };
+                    let data = json!({"data": rows, "total": rows.len()});
+                    (200, "application/json", serde_json::to_vec(&data).unwrap())
+                } else if method == "POST" && route == "/v1/research/studies" {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let list = v["studies"].as_array().cloned().unwrap_or_default();
+                    let mut g = st.studies.lock().unwrap();
+                    let n = list.len();
+                    g.extend(list);
+                    (
+                        200,
+                        "application/json",
+                        serde_json::to_vec(
+                            &json!({"project":"default","recorded":n,"canonical":n}),
+                        )
+                        .unwrap(),
+                    )
+                } else if method == "GET" && route == "/v1/research/studies" {
+                    let g = st.studies.lock().unwrap();
+                    let data = json!({"data": *g, "total": g.len()});
+                    (200, "application/json", serde_json::to_vec(&data).unwrap())
+                } else if method == "POST" && route == "/v1/research/benchmarks" {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let list = v["benchmarks"].as_array().cloned().unwrap_or_default();
+                    let mut g = st.benchmarks.lock().unwrap();
+                    let n = list.len();
+                    g.extend(list);
+                    (
+                        200,
+                        "application/json",
+                        serde_json::to_vec(
+                            &json!({"project":"default","recorded":n,"canonical":n}),
+                        )
+                        .unwrap(),
+                    )
+                } else if method == "POST" && route == "/v1/research/experiments" {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let list = v["experiments"].as_array().cloned().unwrap_or_default();
+                    let mut g = st.exps.lock().unwrap();
+                    let n = list.len();
+                    for item in list {
+                        g.retain(|x| x["id"] != item["id"]);
+                        g.push(item);
+                    }
+                    (
+                        200,
+                        "application/json",
+                        serde_json::to_vec(
+                            &json!({"project":"default","experiments_ingested":n,"rolled_up":true}),
+                        )
+                        .unwrap(),
+                    )
+                } else if method == "GET" && route == "/v1/research/experiments" {
+                    let g = st.exps.lock().unwrap();
+                    let data = json!({"data": *g, "total": g.len()});
+                    (200, "application/json", serde_json::to_vec(&data).unwrap())
+                } else if method == "POST" && route == "/v1/research/artifacts" {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let kind = v["kind"].as_str().unwrap_or("");
+                    if kind != "snapshot" && kind != "report" {
+                        (
+                            400,
+                            "application/json",
+                            br#"{"error":"invalid artifact kind"}"#.to_vec(),
+                        )
+                    } else {
+                        let sha = v["sha256"].as_str().unwrap().to_string();
+                        let b64 = v["content"].as_str().unwrap();
+                        let raw =
+                            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                                .unwrap();
+                        let mut stored_meta = v.clone();
+                        stored_meta["received_at"] = json!(1_700_000_999_i64);
+                        st.artifact_meta.lock().unwrap().push(stored_meta);
+                        st.artifacts.lock().unwrap().insert(sha.clone(), raw);
+                        (
+                            200,
+                            "application/json",
+                            serde_json::to_vec(
+                                &json!({"sha256":sha,"artifact_id":v["artifact_id"]}),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                } else if method == "GET" && route == "/v1/research/artifacts" {
+                    let g = st.artifact_meta.lock().unwrap();
+                    let data = json!({"data": *g, "total": g.len()});
+                    (200, "application/json", serde_json::to_vec(&data).unwrap())
+                } else if method == "GET" && route.starts_with("/v1/research/artifacts/") {
+                    let sha = route.trim_start_matches("/v1/research/artifacts/");
+                    let raw = st
+                        .artifacts
+                        .lock()
+                        .unwrap()
+                        .get(sha)
+                        .cloned()
+                        .unwrap_or_default();
+                    (200, "application/octet-stream", raw)
+                } else if method == "GET" && route == "/v1/compute/fleet/workers" {
+                    let rows = st.fleet_workers.lock().unwrap().clone();
+                    (
+                        200,
+                        "application/json",
+                        serde_json::to_vec(&json!({"workers": rows})).unwrap(),
+                    )
+                } else if method == "GET" && route == "/v1/agent/targets" {
+                    let rows = st.agent_targets.lock().unwrap().clone();
+                    (
+                        200,
+                        "application/json",
+                        serde_json::to_vec(&json!({"targets": rows})).unwrap(),
+                    )
+                } else if method == "POST" && route == "/v1/workflow/namespaces" {
+                    let v: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    (200, "application/json", serde_json::to_vec(&v).unwrap())
+                } else if method == "GET"
+                    && route.starts_with("/v1/workflow/namespaces/fleet/activities/")
+                {
+                    let wid = route
+                        .trim_start_matches("/v1/workflow/namespaces/fleet/activities/")
+                        .split('/')
+                        .next()
+                        .unwrap_or("");
+                    if let Some(pres) = st.fleet_presence.lock().unwrap().get(wid).cloned() {
+                        (200, "application/json", serde_json::to_vec(&pres).unwrap())
+                    } else {
+                        (404, "application/json", b"{}".to_vec())
+                    }
+                } else if method == "POST" && route == "/v1/workflow/namespaces/gpu-jobs/activities"
+                {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let jid = v["activityId"]
+                        .as_str()
+                        .or_else(|| v["id"].as_str())
+                        .unwrap_or("job-1")
+                        .to_string();
+                    let rid = v["runId"].as_str().unwrap_or(&jid).to_string();
+                    let act_type = v["activityType"]["name"]
+                        .as_str()
+                        .or_else(|| v["type"].as_str())
+                        .unwrap_or("research.bench")
+                        .to_string();
+                    let rec = json!({
+                        "id": jid,
+                        "activityId": jid,
+                        "runId": rid,
+                        "type": act_type,
+                        "taskQueue": v["taskQueue"],
+                        "input": v["input"],
+                        "retryPolicy": v["retryPolicy"],
+                        "heartbeatTimeout": v["heartbeatTimeout"],
+                        "scheduleToCloseTimeout": v["scheduleToCloseTimeout"],
+                        "polls": 0,
+                        "deferCount": 0,
+                        "lastBusyReason": "",
+                        "sse_completed": false,
+                    });
+                    st.workflow_jobs.lock().unwrap().insert(jid.clone(), rec);
+                    let out = json!({
+                        "id": jid,
+                        "activityId": jid,
+                        "runId": rid,
+                        "execution": {"workflowId": jid, "runId": rid},
+                        "taskQueue": v["taskQueue"],
+                        "type": act_type,
+                        "input": v["input"],
+                        "status": "ACTIVITY_TASK_STATE_SCHEDULED",
+                        "state": "ACTIVITY_TASK_STATE_SCHEDULED",
+                    });
+                    (200, "application/json", serde_json::to_vec(&out).unwrap())
+                } else if method == "POST"
+                    && route.starts_with("/v1/workflow/namespaces/gpu-jobs/activities/")
+                    && route.ends_with("/release")
+                {
+                    let rest =
+                        route.trim_start_matches("/v1/workflow/namespaces/gpu-jobs/activities/");
+                    let jid = rest.split('/').next().unwrap_or("").to_string();
+                    let v: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    let mut jobs = st.workflow_jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(&jid) {
+                        let dc = job["deferCount"].as_u64().unwrap_or(0) + 1;
+                        let reason = v["reason"].as_str().unwrap_or("busy");
+                        job["deferCount"] = json!(dc);
+                        job["lastBusyReason"] = json!(reason);
+                        let out = json!({
+                            "id": jid,
+                            "status": "ACTIVITY_TASK_STATE_SCHEDULED",
+                            "state": "ACTIVITY_TASK_STATE_SCHEDULED",
+                            "deferCount": dc,
+                            "lastBusyReason": reason,
+                        });
+                        (200, "application/json", serde_json::to_vec(&out).unwrap())
+                    } else {
+                        (404, "application/json", b"{}".to_vec())
+                    }
+                } else if method == "GET"
+                    && route.starts_with("/v1/workflow/namespaces/gpu-jobs/activities/")
+                {
+                    let jid = route
+                        .trim_start_matches("/v1/workflow/namespaces/gpu-jobs/activities/")
+                        .split('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let mut jobs = st.workflow_jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(&jid) {
+                        let p = job["polls"].as_u64().unwrap_or(0) + 1;
+                        job["polls"] = json!(p);
+                        let state_str = if job["sse_completed"].as_bool().unwrap_or(false) || p >= 2
+                        {
+                            "ACTIVITY_TASK_STATE_COMPLETED"
+                        } else {
+                            "ACTIVITY_TASK_STATE_STARTED"
+                        };
+                        let out_val = if st.stage_mode.load(Ordering::SeqCst) == 1
+                            && state_str == "ACTIVITY_TASK_STATE_COMPLETED"
+                        {
+                            json!({
+                                "status": "complete",
+                                "trial_id": job["input"]["trial_id"],
+                                "objective_id": job["input"]["objective_id"],
+                                "baseline_samples": [100.0, 100.2, 99.8, 100.1],
+                                "candidate_samples": [172.0, 173.0, 171.5, 172.5],
+                                "parity_passed": true,
+                                "memory_integrity_passed": true,
+                                "gpu_time_sec": 0.12,
+                                "details": "remote dgx stage win",
+                            })
+                        } else {
+                            json!({"tok_per_sec": 182.4})
+                        };
+                        let out = json!({
+                            "id": jid,
+                            "status": state_str,
+                            "state": state_str,
+                            "taskQueue": job["taskQueue"],
+                            "deferCount": job["deferCount"].as_u64().unwrap_or(0),
+                            "lastBusyReason": job["lastBusyReason"].as_str().unwrap_or(""),
+                            "result": out_val,
+                            "output": out_val,
+                        });
+                        (200, "application/json", serde_json::to_vec(&out).unwrap())
+                    } else {
+                        (404, "application/json", b"{}".to_vec())
+                    }
+                } else if method == "POST" && route == "/v1/workflow/namespaces/gpu-jobs/schedules"
+                {
+                    let mut v: Value = serde_json::from_slice(&body).unwrap();
+                    let sid = v["scheduleId"].as_str().unwrap_or("").to_string();
+                    if v["state"].is_null() {
+                        v["state"] = json!({"paused": false, "note": ""});
+                    }
+                    v["info"] = json!({"actionCount": 0});
+                    st.workflow_schedules.lock().unwrap().insert(sid, v.clone());
+                    (200, "application/json", serde_json::to_vec(&v).unwrap())
+                } else if method == "GET" && route == "/v1/workflow/namespaces/gpu-jobs/schedules" {
+                    let rows: Vec<Value> = st
+                        .workflow_schedules
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .cloned()
+                        .collect();
+                    (
+                        200,
+                        "application/json",
+                        serde_json::to_vec(&json!({"schedules": rows})).unwrap(),
+                    )
+                } else if route.starts_with("/v1/workflow/namespaces/gpu-jobs/schedules/") {
+                    let rest =
+                        route.trim_start_matches("/v1/workflow/namespaces/gpu-jobs/schedules/");
+                    let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+                    let mut scheds = st.workflow_schedules.lock().unwrap();
+                    if parts.len() == 1 && method == "GET" {
+                        if let Some(sc) = scheds.get(parts[0]).cloned() {
+                            (200, "application/json", serde_json::to_vec(&sc).unwrap())
+                        } else {
+                            (404, "application/json", b"{}".to_vec())
+                        }
+                    } else if parts.len() == 1 && method == "DELETE" {
+                        scheds.remove(parts[0]);
+                        (
+                            200,
+                            "application/json",
+                            serde_json::to_vec(&json!({"status": "deleted"})).unwrap(),
+                        )
+                    } else if parts.len() == 2 && parts[1] == "trigger" && method == "POST" {
+                        (
+                            200,
+                            "application/json",
+                            serde_json::to_vec(&json!({"status": "triggered"})).unwrap(),
+                        )
+                    } else if parts.len() == 2 && parts[1] == "pause" && method == "POST" {
+                        let v: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                        if let Some(sc) = scheds.get_mut(parts[0]) {
+                            sc["state"] =
+                                json!({"paused": true, "note": v["note"].as_str().unwrap_or("")});
+                        }
+                        (
+                            200,
+                            "application/json",
+                            serde_json::to_vec(&json!({"status": "paused"})).unwrap(),
+                        )
+                    } else if parts.len() == 2 && parts[1] == "unpause" && method == "POST" {
+                        if let Some(sc) = scheds.get_mut(parts[0]) {
+                            sc["state"] = json!({"paused": false, "note": ""});
+                        }
+                        (
+                            200,
+                            "application/json",
+                            serde_json::to_vec(&json!({"status": "running"})).unwrap(),
+                        )
+                    } else {
+                        (404, "application/json", b"{}".to_vec())
+                    }
                 } else {
-                    "ACTIVITY_TASK_STATE_RUNNING"
+                    (404, "application/json", b"{}".to_vec())
                 };
-                let out = json!({
-                    "id": jid,
-                    "state": state_str,
-                    "output": {"tok_per_sec": 182.4},
-                });
-                (200, "application/json", serde_json::to_vec(&out).unwrap())
-            } else {
-                (404, "application/json", b"{}".to_vec())
-            };
 
-            let reason = match status {
-                200 => "OK",
-                400 => "Bad Request",
-                503 => "Service Unavailable",
-                _ => "Not Found",
-            };
-            let header = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                payload.len()
-            );
-            let _ = s.write_all(header.as_bytes());
-            let _ = s.write_all(&payload);
+                let reason = match status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    503 => "Service Unavailable",
+                    _ => "Not Found",
+                };
+                let header = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = s.write_all(header.as_bytes());
+                let _ = s.write_all(&payload);
+            });
         }
     });
     (format!("http://{addr}"), state)
@@ -1170,4 +1421,310 @@ fn cloud_938_timestamps_tags_artifacts_and_gpu_job() {
         .unwrap();
     assert_eq!(done["state"], "ACTIVITY_TASK_STATE_COMPLETED");
     assert_eq!(done["output"]["tok_per_sec"], json!(182.4));
+}
+
+#[test]
+fn test_native_tasks_linked_machines_evo_dgx_sse_schedules_and_cli() {
+    let dir = TempDir::new("native_tasks_evo_dgx");
+    let (base, mock_state) = spawn_full_mock_cloud(0);
+
+    *mock_state.fleet_workers.lock().unwrap() = vec![
+        json!({
+            "id": "dgx",
+            "hostname": "spark-6826",
+            "status": "online",
+            "os": "linux",
+            "arch": "aarch64",
+            "cpus": 20,
+            "memory": 137_438_953_472_u64,
+            "gpus": [{"name": "NVIDIA GB10", "memoryTotal": "131072 MiB", "arch": "sm_121"}],
+            "capabilities": ["research.bench", "research.tick", "fn.run"],
+            "jobQueue": "gpu:dgx",
+            "busy": false,
+        }),
+        json!({
+            "id": "macbook-hanzod",
+            "hostname": "zach-mbp-hanzod",
+            "status": "online",
+            "os": "darwin",
+            "arch": "arm64",
+            "cpus": 16,
+            "memory": 68_719_476_736_u64,
+            "gpus": [{"name": "Apple M4 Max", "memoryTotal": "65536 MiB"}],
+            "capabilities": ["research.bench", "hanzod.run"],
+            "jobQueue": "gpu:macbook-hanzod",
+        }),
+    ];
+    *mock_state.agent_targets.lock().unwrap() = vec![
+        json!({
+            "id": "tgt_dgx_1",
+            "label": "dgx",
+            "host": "spark-6826",
+            "capacity": "1x GB10 / 128G",
+            "status": "online",
+        }),
+        json!({
+            "id": "tgt_evo_1",
+            "label": "evo",
+            "host": "evo",
+            "capacity": "32 vCPU / 102G",
+            "status": "offline",
+            "spec": {
+                "os": "linux",
+                "arch": "x86_64",
+                "cpus": 32,
+                "memory": 109_521_666_048_u64,
+                "gpus": [{"name": "AMD Ryzen AI Max+ 395 (gfx1151)", "memoryTotal": "102 GiB"}],
+            }
+        }),
+    ];
+    mock_state.fleet_presence.lock().unwrap().insert(
+        "macbook-hanzod".to_string(),
+        json!({"input": {"busy": true, "busyReason": "active_dev_session"}}),
+    );
+    mock_state
+        .busy_defer_queues
+        .lock()
+        .unwrap()
+        .push("gpu:macbook-hanzod".to_string());
+
+    let client = test_client(&base);
+
+    // 1. Linked-machine discovery merges fleet workers + agent targets (dgx, macbook-hanzod, evo)
+    let online = client.list_machines(true, None, None, false).unwrap();
+    let online_ids: Vec<&str> = online.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(online_ids, vec!["dgx", "macbook-hanzod"]);
+
+    let all = client.list_machines(false, None, None, false).unwrap();
+    let evo = all.iter().find(|m| m.id == "evo").unwrap();
+    assert_eq!(evo.status, "offline");
+    assert_eq!(evo.task_queue, "gpu:evo");
+    assert!(evo.backends.contains(&"ROCM".to_string()));
+    assert!(evo.backends.contains(&"VULKAN".to_string()));
+
+    let cuda_only = client
+        .list_machines(true, None, Some("CUDA"), false)
+        .unwrap();
+    assert_eq!(cuda_only.len(), 1);
+    assert_eq!(cuda_only[0].id, "dgx");
+
+    let metal_only = client
+        .list_machines(true, None, Some("METAL"), false)
+        .unwrap();
+    assert_eq!(metal_only.len(), 1);
+    assert!(metal_only[0].busy);
+    assert_eq!(metal_only[0].busy_reason, "active_dev_session");
+
+    let idle_only = client.list_machines(true, None, None, true).unwrap();
+    assert_eq!(idle_only.len(), 1);
+    assert_eq!(idle_only[0].id, "dgx");
+
+    // 2. Durable --target evo,dgx queuing (never rejects offline evo) + fanout + SSE wait + release
+    let evo_dgx = client
+        .orchestrate_across_machines(
+            &[json!({"command": "hanzo-research tick", "job_id": "pair"})],
+            &OrchestrateOptions {
+                target: Some("evo,dgx".to_string()),
+                ..OrchestrateOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(evo_dgx.len(), 2);
+    assert_eq!(evo_dgx[0]["machine"], "evo");
+    assert_eq!(evo_dgx[0]["task_queue"], "gpu:evo");
+    assert_eq!(evo_dgx[0]["machine_status"], "queued_until_online");
+    assert_eq!(evo_dgx[0]["scheduleToCloseTimeout"], "72h");
+    assert_eq!(evo_dgx[1]["machine"], "dgx");
+    assert_eq!(evo_dgx[1]["task_queue"], "gpu:dgx");
+    assert_eq!(evo_dgx[1]["machine_status"], "online");
+
+    let fanout_jobs = client
+        .orchestrate_across_machines(
+            &[json!({"command": "hanzo-bench --progressive", "job_id": "xarch"})],
+            &OrchestrateOptions {
+                fanout: true,
+                ..OrchestrateOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(fanout_jobs.len(), 2);
+    assert_eq!(fanout_jobs[0]["taskQueue"], "gpu:dgx");
+    assert_eq!(fanout_jobs[1]["taskQueue"], "gpu:macbook-hanzod");
+
+    let rel = client
+        .release_gpu_job(
+            "xarch-macbook-hanzod",
+            Some("xarch-macbook-hanzod"),
+            "active_dev_session",
+            "macbook-hanzod",
+            5,
+            None,
+        )
+        .unwrap();
+    assert_eq!(rel["status"], "ACTIVITY_TASK_STATE_SCHEDULED");
+    assert_eq!(rel["deferCount"], 1);
+
+    let sse_before = mock_state.sse_streams_opened.load(Ordering::SeqCst);
+    let done_mac = client
+        .wait_gpu_job(
+            "xarch-macbook-hanzod",
+            None,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(mock_state.sse_streams_opened.load(Ordering::SeqCst) > sse_before);
+    assert_eq!(done_mac["status"], "ACTIVITY_TASK_STATE_COMPLETED");
+    assert!(done_mac["deferCount"].as_u64().unwrap_or(0) >= 1);
+
+    // 3. Native hanzoai/tasks schedules CRUD (including multi-target evo,dgx)
+    let multi_sched = client
+        .create_schedule(
+            "ml-nightly",
+            &ScheduleOptions {
+                interval: Some("30m".to_string()),
+                cron: Some("0 */2 * * *".to_string()),
+                target: Some("evo,dgx".to_string()),
+                campaign: Some("campaigns/ml_kernels_and_quant.json".to_string()),
+                executor: Some("scripts/ml_research_executor.py".to_string()),
+                max_compute_seconds: Some(900),
+                ..ScheduleOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        multi_sched["scheduleIds"],
+        json!(["ml-nightly-evo", "ml-nightly-dgx"])
+    );
+    let listed = client.list_schedules(None).unwrap();
+    assert_eq!(listed.len(), 2);
+    let desc_evo = client.describe_schedule("ml-nightly-evo", None).unwrap();
+    assert_eq!(desc_evo["action"]["taskQueue"], "gpu:evo");
+    assert_eq!(desc_evo["action"]["scheduleToCloseTimeout"], "72h");
+
+    let trig = client
+        .trigger_schedule("ml-nightly-dgx", Some("manual-1"), None)
+        .unwrap();
+    assert_eq!(trig["status"], "triggered");
+    assert_eq!(
+        client
+            .pause_schedule("ml-nightly-dgx", "maint", None)
+            .unwrap()["status"],
+        "paused"
+    );
+    assert_eq!(
+        client.describe_schedule("ml-nightly-dgx", None).unwrap()["state"]["paused"],
+        true
+    );
+    assert_eq!(
+        client.resume_schedule("ml-nightly-dgx", None).unwrap()["status"],
+        "running"
+    );
+    assert_eq!(
+        client.delete_schedule("ml-nightly-evo", None).unwrap()["status"],
+        "deleted"
+    );
+    assert_eq!(
+        client.delete_schedule("ml-nightly-dgx", None).unwrap()["status"],
+        "deleted"
+    );
+    assert!(client.list_schedules(None).unwrap().is_empty());
+
+    // 4. Rust CLI binary (`machines`, `dispatch --target evo,dgx`, `schedule`) + remote tick_with_tasks
+    let bin = env!("CARGO_BIN_EXE_hanzo-research");
+    let out_m = Command::new(bin)
+        .env("HANZO_API_KEY", "hk-test-key")
+        .args(["--base", &base, "machines", "--include-offline"])
+        .output()
+        .unwrap();
+    assert!(out_m.status.success());
+    let parsed_m: Value = serde_json::from_slice(&out_m.stdout).unwrap();
+    assert_eq!(parsed_m.as_array().unwrap().len(), 3);
+
+    let out_d = Command::new(bin)
+        .env("HANZO_API_KEY", "hk-test-key")
+        .args([
+            "--base",
+            &base,
+            "dispatch",
+            "--target",
+            "evo,dgx",
+            "--command",
+            "hanzo-bench --progressive",
+        ])
+        .output()
+        .unwrap();
+    assert!(out_d.status.success());
+    let parsed_d: Value = serde_json::from_slice(&out_d.stdout).unwrap();
+    assert_eq!(parsed_d.as_array().unwrap().len(), 2);
+
+    mock_state.stage_mode.store(1, Ordering::SeqCst);
+    let mut space = BTreeMap::new();
+    space.insert(
+        "cuda_kern".to_string(),
+        vec![SearchArm {
+            arm: "marlin".into(),
+            variant: "sm121_v2".into(),
+            hypothesis: "SM121 warp tile".into(),
+            config: BTreeMap::new(),
+        }],
+    );
+    let reg = CampaignRegistry {
+        campaign: "remote-dgx-rust".into(),
+        repo: "hanzoai/ml".into(),
+        objectives: vec![ObjectiveSpec {
+            id: "qmm_cuda".into(),
+            study: "qmm_cuda".into(),
+            family: "cuda_kern".into(),
+            metric: "tok_per_sec".into(),
+            unit: "tok/s".into(),
+            direction: "higher".into(),
+            backends: vec!["CUDA".into()],
+            shapes: vec!["4096x4096".into()],
+            ..ObjectiveSpec::default()
+        }],
+        search_space: space,
+        plan: ProgressiveAbPlan {
+            stages: vec![
+                ProgressiveStage {
+                    name: "micro".into(),
+                    reps: 4,
+                    prompt_len: 64,
+                    gen_len: 16,
+                },
+                ProgressiveStage {
+                    name: "qualification".into(),
+                    reps: 4,
+                    prompt_len: 128,
+                    gen_len: 32,
+                },
+            ],
+            ..ProgressiveAbPlan::default()
+        },
+    };
+    let ctrl = AutonomousController::open(
+        dir.path().join("remote_ledger"),
+        None,
+        Some(reg),
+        ".",
+        16,
+        Some("rust-cpu-orchestrator"),
+    )
+    .unwrap();
+    let r_tick = ctrl
+        .tick_with_tasks(
+            std::path::Path::new("hanzo-bench"),
+            None,
+            None,
+            None,
+            10,
+            true,
+            Some(&client),
+            600,
+            true,
+            Some("dgx"),
+        )
+        .unwrap();
+    assert_eq!(r_tick["verdict"], "proven");
+    assert_eq!(r_tick["stopped_stage"], 2);
 }

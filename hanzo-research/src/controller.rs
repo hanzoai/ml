@@ -706,6 +706,41 @@ impl AutonomousController {
         client_override: Option<&Research>,
         lease_ttl_sec: i64,
     ) -> Result<Value> {
+        self.tick_with_tasks(
+            executor,
+            changed_paths,
+            lineage,
+            changed_artifacts,
+            timeout_minutes,
+            auto_sync,
+            client_override,
+            lease_ttl_sec,
+            false,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_with_tasks(
+        &self,
+        executor: &Path,
+        changed_paths: Option<&[String]>,
+        lineage: Option<&BTreeMap<String, LineageRule>>,
+        changed_artifacts: Option<&[String]>,
+        timeout_minutes: u64,
+        auto_sync: bool,
+        client_override: Option<&Research>,
+        lease_ttl_sec: i64,
+        via_tasks: bool,
+        remote_target: Option<&str>,
+    ) -> Result<Value> {
+        let use_tasks = via_tasks || remote_target.is_some_and(|s| !s.trim().is_empty());
+        let resolved_target = remote_target
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(if use_tasks { "any" } else { "" })
+            .to_string();
+
         for mut t in self.trials()? {
             if t.state == "running" {
                 if t.phase == "qualification" {
@@ -728,12 +763,18 @@ impl AutonomousController {
             }
         }
 
-        let env_client = if client_override.is_none() && auto_sync && token().is_ok() {
-            Some(Research::from_env())
-        } else {
-            None
-        };
+        let env_client =
+            if client_override.is_none() && (use_tasks || (auto_sync && token().is_ok())) {
+                Some(Research::from_env())
+            } else {
+                None
+            };
         let active_client = client_override.or(env_client.as_ref());
+        if use_tasks && active_client.is_none() {
+            return Err(Error::Message(
+                "remote hanzoai/tasks execution requires a Research client".into(),
+            ));
+        }
         if let Some(c) = active_client {
             self.ledger.pull_from_cloud(c);
         }
@@ -762,7 +803,33 @@ impl AutonomousController {
                 None
             };
 
-        let host_backends = detect_host_backends();
+        let host_backends: BTreeSet<String> = if use_tasks {
+            let mut discovered = BTreeSet::new();
+            if let Some(c) = active_client {
+                if let Ok(machines) = c.list_machines(false, None, None, false) {
+                    let targets = crate::tasks::parse_targets(Some(&resolved_target));
+                    for m in machines {
+                        if resolved_target.eq_ignore_ascii_case("any")
+                            || targets.iter().any(|t| {
+                                t.eq_ignore_ascii_case(&m.id) || t.eq_ignore_ascii_case(&m.hostname)
+                            })
+                        {
+                            for b in m.backends {
+                                discovered.insert(b);
+                            }
+                        }
+                    }
+                }
+            }
+            if discovered.is_empty() {
+                for b in ["CUDA", "ROCM", "METAL", "VULKAN", "CPU"] {
+                    discovered.insert(b.to_string());
+                }
+            }
+            discovered
+        } else {
+            detect_host_backends()
+        };
         let git_info = provenance::git_state(&self.repo_dir);
         let commit_full = if git_info.git_sha.is_empty() {
             "0".repeat(40)
@@ -1228,14 +1295,67 @@ impl AutonomousController {
                         "fencing_token": active_lease.fencing_token,
                     });
                     let prefix = format!("stage_{stage_idx}_{}", stage.name);
-                    let res = execute_subprocess(
-                        executor,
-                        "stage",
-                        &req,
-                        &self.state_dir,
-                        timeout_minutes,
-                        Some(&prefix),
-                    );
+                    let res = if use_tasks {
+                        let Some(c) = active_client else {
+                            return Err(Error::Message("missing client for tasks stage".into()));
+                        };
+                        let mut r_payload = req.clone();
+                        r_payload["executor"] = json!(executor.display().to_string());
+                        r_payload["phase"] = json!("stage");
+                        let first_target = crate::tasks::parse_targets(Some(&resolved_target))
+                            .into_iter()
+                            .next()
+                            .unwrap_or_else(|| "any".to_string());
+                        let d_opts = crate::tasks::TaskDispatchOptions {
+                            target: Some(first_target),
+                            activity_type: "research.bench".to_string(),
+                            when_idle_only: true,
+                            required_backend: Some(backend.clone()),
+                            job_id: Some(format!("trial-{trial_id}-s{stage_idx}-{}", stage.name)),
+                            ..crate::tasks::TaskDispatchOptions::default()
+                        };
+                        let dispatched = c.dispatch_task(&r_payload, &d_opts)?;
+                        let jid = dispatched["id"].as_str().unwrap_or("");
+                        let rid = dispatched["runId"].as_str();
+                        let completed = c.wait_gpu_job_with_run(
+                            jid,
+                            rid,
+                            Some(&d_opts.namespace),
+                            Duration::from_secs(timeout_minutes.max(1) * 60),
+                            Duration::from_millis(50),
+                        )?;
+                        let c_state = completed["status"]
+                            .as_str()
+                            .or_else(|| completed["state"].as_str())
+                            .unwrap_or("");
+                        let raw_out = if completed["result"].is_object() {
+                            completed["result"].clone()
+                        } else {
+                            completed["output"].clone()
+                        };
+                        if c_state == "ACTIVITY_TASK_STATE_COMPLETED" && raw_out.is_object() {
+                            let mut ok_out = raw_out;
+                            if ok_out["status"].is_null() {
+                                ok_out["status"] = json!("complete");
+                            }
+                            ok_out
+                        } else {
+                            let reason = completed["failureCause"]
+                                .as_str()
+                                .or_else(|| raw_out["reason"].as_str())
+                                .unwrap_or("remote task failed");
+                            json!({"status": "failed", "reason": reason})
+                        }
+                    } else {
+                        execute_subprocess(
+                            executor,
+                            "stage",
+                            &req,
+                            &self.state_dir,
+                            timeout_minutes,
+                            Some(&prefix),
+                        )
+                    };
                     if res["status"].as_str() != Some("complete") {
                         exec_failed_reason = res["reason"]
                             .as_str()
@@ -1366,6 +1486,7 @@ impl AutonomousController {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn loop_run(
         &self,
         executor: &Path,
@@ -1378,6 +1499,38 @@ impl AutonomousController {
         changed_artifacts: Option<&[String]>,
         auto_sync: bool,
         client_override: Option<&Research>,
+    ) -> Result<Value> {
+        self.loop_run_with_tasks(
+            executor,
+            max_ticks,
+            budget_minutes,
+            idle_exit,
+            sleep_seconds,
+            changed_paths,
+            lineage,
+            changed_artifacts,
+            auto_sync,
+            client_override,
+            false,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn loop_run_with_tasks(
+        &self,
+        executor: &Path,
+        max_ticks: usize,
+        budget_minutes: f64,
+        idle_exit: bool,
+        sleep_seconds: f64,
+        changed_paths: Option<&[String]>,
+        lineage: Option<&BTreeMap<String, LineageRule>>,
+        changed_artifacts: Option<&[String]>,
+        auto_sync: bool,
+        client_override: Option<&Research>,
+        via_tasks: bool,
+        remote_target: Option<&str>,
     ) -> Result<Value> {
         let deadline = Instant::now() + Duration::from_secs_f64(budget_minutes.max(0.1) * 60.0);
         let mut ticks_run = 0usize;
@@ -1397,7 +1550,7 @@ impl AutonomousController {
                 .as_secs()
                 .div_ceil(60)
                 .max(1);
-            let res = self.tick(
+            let res = self.tick_with_tasks(
                 executor,
                 changed_paths,
                 lineage,
@@ -1406,6 +1559,8 @@ impl AutonomousController {
                 auto_sync,
                 client_override,
                 600,
+                via_tasks,
+                remote_target,
             )?;
             ticks_run += 1;
             let st = res["status"].as_str().unwrap_or("").to_string();

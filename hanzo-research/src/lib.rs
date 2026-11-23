@@ -47,6 +47,7 @@ pub mod lineage;
 pub mod protocol;
 pub mod provenance;
 pub mod spool;
+pub mod tasks;
 pub mod testing;
 pub mod transfer;
 pub mod wal;
@@ -73,6 +74,10 @@ pub use protocol::{
     StatisticalComparison, SyncReceipt, WorkloadManifest,
 };
 pub use spool::{SpoolCursor, SpoolReport, Spooler};
+pub use tasks::{
+    default_retry_policy, infer_machine_backends, parse_targets, resolve_task_queue, LinkedMachine,
+    OrchestrateOptions, ScheduleOptions, TaskDispatchOptions,
+};
 pub use testing::{
     beta_binomial_e_value, impacted_benchmarks, one_sided_mixture_e_value, paired_accuracy_look,
     paired_throughput_anytime_look, planned_looks, stable_order, student_t_one_sided_p,
@@ -423,35 +428,24 @@ impl Research {
         job_id: Option<&str>,
         namespace: Option<&str>,
     ) -> Result<serde_json::Value> {
-        let ns = namespace.filter(|s| !s.is_empty()).unwrap_or("gpu-jobs");
-        let queue = match gpu.filter(|g| !g.trim().is_empty()) {
-            Some(g) => format!("gpu:{}", g.trim()),
-            None => "gpu-jobs".to_string(),
+        let opts = TaskDispatchOptions {
+            target: gpu.map(str::to_string),
+            activity_type: if job_type.trim().is_empty() {
+                "research.bench".to_string()
+            } else {
+                job_type.trim().to_string()
+            },
+            job_id: job_id.map(str::to_string),
+            namespace: namespace
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("gpu-jobs")
+                .to_string(),
+            ..TaskDispatchOptions::default()
         };
-        let id = match job_id.filter(|j| !j.trim().is_empty()) {
-            Some(j) => j.trim().to_string(),
-            None => format!(
-                "job-{}-{}",
-                unix_now(),
-                &sha256_hex(&serde_json::to_vec(payload)?)[..12]
-            ),
-        };
-        let jtype = if job_type.trim().is_empty() {
-            "research.bench"
-        } else {
-            job_type.trim()
-        };
-        let body = serde_json::json!({
-            "id": id,
-            "type": jtype,
-            "taskQueue": queue,
-            "input": payload,
-        });
-        let path = format!("/v1/workflow/namespaces/{}/activities", encode(ns));
-        self.post(&path, &body)
+        self.dispatch_task(payload, &opts)
     }
 
-    /// Poll a submitted GPU workflow activity until a terminal state is reached.
+    /// Wait for a submitted GPU workflow activity via `/v1/workflow/events` SSE until terminal.
     pub fn wait_gpu_job(
         &self,
         job_id: &str,
@@ -459,34 +453,7 @@ impl Research {
         timeout: Duration,
         poll_interval: Duration,
     ) -> Result<serde_json::Value> {
-        let ns = namespace.filter(|s| !s.is_empty()).unwrap_or("gpu-jobs");
-        let enc_id = encode(job_id);
-        let path = format!(
-            "/v1/workflow/namespaces/{}/activities/{enc_id}/{enc_id}",
-            encode(ns)
-        );
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let val: serde_json::Value = self.get(&path)?;
-            let state = val["state"]
-                .as_str()
-                .or_else(|| val["status"].as_str())
-                .unwrap_or("");
-            if matches!(
-                state,
-                "ACTIVITY_TASK_STATE_COMPLETED"
-                    | "ACTIVITY_TASK_STATE_FAILED"
-                    | "ACTIVITY_TASK_STATE_CANCELED"
-            ) {
-                return Ok(val);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::Message(format!(
-                    "timed out waiting for gpu job {job_id} (last state: {state})"
-                )));
-            }
-            std::thread::sleep(poll_interval);
-        }
+        self.wait_gpu_job_with_run(job_id, None, namespace, timeout, poll_interval)
     }
 
     /// Upload an artifact's raw bytes (content-addressed on the server).
@@ -840,7 +807,11 @@ impl Research {
         }
     }
 
-    fn post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
+    pub(crate) fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<T> {
         let url = format!("{}{path}", self.inner.base);
         let bytes = serde_json::to_vec(body)?;
         let resp = self
@@ -850,10 +821,35 @@ impl Research {
         read_json(resp)
     }
 
-    fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+    pub(crate) fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = format!("{}{path}", self.inner.base);
         let resp = self.auth(self.inner.agent.get(&url)).call()?;
         read_json(resp)
+    }
+
+    pub(crate) fn delete<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{path}", self.inner.base);
+        let resp = self.auth(self.inner.agent.delete(&url)).call()?;
+        read_json(resp)
+    }
+
+    pub(crate) fn open_event_stream(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<ureq::Response> {
+        let url = format!("{}{path}", self.inner.base);
+        let stream_agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(timeout.max(Duration::from_millis(100)))
+            .redirects(0)
+            .build();
+        let resp = self
+            .auth(stream_agent.get(&url))
+            .set("Accept", "text/event-stream")
+            .set("Cache-Control", "no-cache")
+            .call()?;
+        Ok(resp)
     }
 
     /// The git sha of this experiment's last recorded run, for the since-narrative.
@@ -1159,7 +1155,7 @@ impl Outcome {
 
 // ── wire records (the exact shape every language's SDK produces) ─────────────────────────
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -1380,7 +1376,7 @@ fn read_json<T: serde::de::DeserializeOwned>(resp: ureq::Response) -> Result<T> 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Lowercase hex sha256 of the bytes — the client-side integrity hash the server verifies.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for b in digest {
@@ -1392,7 +1388,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Percent-encode a query-parameter value (RFC 3986 unreserved pass through). Defense in
 /// depth: `project`/`kind` reach the URL, so a stray separator can never split the query.
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
