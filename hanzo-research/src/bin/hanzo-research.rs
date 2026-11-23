@@ -293,6 +293,7 @@ fn run_cli(args: &[String]) -> std::result::Result<Value, String> {
             let raw_cmd = command_str.ok_or_else(|| "dispatch requires --command".to_string())?;
             let payload: Value = match serde_json::from_str::<Value>(&raw_cmd) {
                 Ok(v) if v.is_object() => v,
+                Ok(v) if v.is_array() => json!({"command": v}),
                 _ => json!({"command": raw_cmd}),
             };
             let client = make_client();

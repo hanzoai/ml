@@ -892,8 +892,13 @@ impl Research {
             None => json!({"payload": payload}),
         };
         if let Some(obj) = enriched.as_object_mut() {
-            obj.entry("when_idle_only".to_string())
-                .or_insert_with(|| json!(opts.when_idle_only));
+            let idle_only = obj
+                .entry("when_idle_only".to_string())
+                .or_insert_with(|| json!(opts.when_idle_only))
+                .as_bool()
+                .unwrap_or(opts.when_idle_only);
+            obj.entry("allow_when_busy".to_string())
+                .or_insert_with(|| json!(!idle_only));
             if is_targeted {
                 obj.entry("target_machine".to_string())
                     .or_insert_with(|| json!(machine_name));
