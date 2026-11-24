@@ -168,3 +168,110 @@ fn benchmark_attempts_then_finish_computes_the_score() {
     assert_eq!(first_attempt["attempts"][0]["benchmark"], "gpqa_diamond");
     assert_eq!(first_attempt["attempts"][0]["source"], "hanzo-measured");
 }
+
+fn mock_static_get(resp_body: String) -> (String, Receiver<(String, String, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut s = stream.unwrap();
+            let (method, path, body) = read_request(&mut s);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = s.write_all(resp.as_bytes());
+            let _ = tx.send((method, path, body));
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+#[test]
+fn experiment_versions_reads_versions_and_data_envelopes() {
+    let versions_json = json!({
+        "project": "ml",
+        "id": "kernel-perf:splitkv:gb10",
+        "versions": [
+            {
+                "seq": 1,
+                "received_at": 1750000001,
+                "ts": 1750000000,
+                "revision": "original",
+                "status": "running",
+                "canonical": false,
+                "value": 0.0,
+                "n": 0,
+                "git_sha": "deadbeef"
+            },
+            {
+                "seq": 2,
+                "received_at": 1750000002,
+                "ts": 1750000001,
+                "revision": "retracted",
+                "status": "complete",
+                "canonical": false,
+                "value": 12.0,
+                "n": 5,
+                "git_sha": "deadbeef"
+            },
+            {
+                "seq": 3,
+                "received_at": 1750000003,
+                "ts": 1750000002,
+                "revision": "corrected",
+                "status": "complete",
+                "canonical": true,
+                "value": 27.6,
+                "n": 30,
+                "git_sha": "deadbeef"
+            }
+        ]
+    })
+    .to_string();
+
+    let (base, rx) = mock_static_get(versions_json);
+    let r = Research::new(&base, "test-key", "ml", "", &[]);
+
+    let active = r
+        .experiment_versions("kernel-perf:splitkv:gb10", None, false)
+        .unwrap();
+    assert_eq!(active.len(), 2, "retracted revision filtered by default");
+    assert_eq!(active[0].id, "kernel-perf:splitkv:gb10");
+    assert_eq!(active[0].project, "ml");
+    assert_eq!(active[1].value, 27.6);
+    assert!(active[1].canonical);
+
+    let all = r
+        .experiment_versions("kernel-perf:splitkv:gb10", None, true)
+        .unwrap();
+    assert_eq!(all.len(), 3, "include_retracted returns every version");
+    assert_eq!(all[1].revision, "retracted");
+
+    let (method, path, _) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(method, "GET");
+    assert!(path.starts_with("/v1/research/experiments/versions?"));
+
+    // Legacy `{"data": [...]}` fallback continues to deserialize cleanly.
+    let data_json = json!({
+        "data": [
+            {
+                "project": "ml",
+                "id": "kernel-perf:legacy:gb10",
+                "status": "complete",
+                "value": 1.5,
+                "canonical": true
+            }
+        ]
+    })
+    .to_string();
+    let (base2, _rx2) = mock_static_get(data_json);
+    let r2 = Research::new(&base2, "test-key", "ml", "", &[]);
+    let rows = r2
+        .experiment_versions("kernel-perf:legacy:gb10", None, false)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value, 1.5);
+}

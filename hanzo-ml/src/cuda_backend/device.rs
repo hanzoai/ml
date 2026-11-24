@@ -445,11 +445,13 @@ impl CudaDevice {
         self.id
     }
 
-    pub fn get_or_load_custom_func(
+    /// Load (or fetch from cache) a kernel function from a custom CUDA module image
+    /// (compiled CUBIN binary or PTX source).
+    pub fn get_or_load_custom_module_func(
         &self,
         fn_name: &str,
         module_name: &str,
-        ptx: &str,
+        module: cudarc::nvrtc::Ptx,
     ) -> Result<CudaFunc> {
         let ms = self.custom_modules.read().unwrap();
         if let Some(mdl) = ms.get(module_name).as_ref() {
@@ -462,7 +464,15 @@ impl CudaDevice {
         }
         drop(ms);
         let mut ms = self.custom_modules.write().unwrap();
-        let cuda_module = self.context.load_module(ptx.into()).w()?;
+        if let Some(mdl) = ms.get(module_name).as_ref() {
+            let func = mdl.load_function(fn_name).w()?;
+            return Ok(CudaFunc {
+                func,
+                stream: self.stream.clone(),
+                launches: self.launches.clone(),
+            });
+        }
+        let cuda_module = self.context.load_module(module).w()?;
         ms.insert(module_name.to_string(), cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
         Ok(CudaFunc {
@@ -470,6 +480,15 @@ impl CudaDevice {
             stream: self.stream.clone(),
             launches: self.launches.clone(),
         })
+    }
+
+    pub fn get_or_load_custom_func(
+        &self,
+        fn_name: &str,
+        module_name: &str,
+        ptx: &str,
+    ) -> Result<CudaFunc> {
+        self.get_or_load_custom_module_func(fn_name, module_name, ptx.into())
     }
 
     pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<CudaFunc> {
