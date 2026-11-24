@@ -406,6 +406,7 @@ impl Research {
                 .into_iter()
                 .filter(|r| {
                     !r.status.eq_ignore_ascii_case("retracted")
+                        && !r.revision.eq_ignore_ascii_case("retracted")
                         && r.meta["retracted"].as_bool() != Some(true)
                 })
                 .collect())
@@ -425,15 +426,16 @@ impl Research {
             q.push(format!("project={}", encode(proj)));
         }
         let path = format!("/v1/research/experiments/versions?{}", q.join("&"));
-        let out: Listing<Record> = self.get(&path)?;
+        let out: ExperimentVersionsResponse = self.get(&path)?;
+        let rows = out.into_records();
         if include_retracted {
-            Ok(out.data)
+            Ok(rows)
         } else {
-            Ok(out
-                .data
+            Ok(rows
                 .into_iter()
                 .filter(|r| {
                     !r.status.eq_ignore_ascii_case("retracted")
+                        && !r.revision.eq_ignore_ascii_case("retracted")
                         && r.meta["retracted"].as_bool() != Some(true)
                 })
                 .collect())
@@ -1434,6 +1436,44 @@ struct IngestRequest<'a> {
 // server omits, and unknown fields are ignored — so a server that adds a column, or the
 // Go ack's `_total` vs the spec's `_retained` naming, never breaks a client.
 
+fn deserialize_null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Wire envelope for `GET /v1/research/experiments/versions`.
+///
+/// The `/v1/research` server returns `{"project": ..., "id": ..., "versions": [...]}`.
+/// We accept `"versions"` as the primary field and fall back to `"data"` for backwards
+/// compatibility with older/mock envelopes, backfilling top-level `project`/`id` onto
+/// items that omit them.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct ExperimentVersionsResponse {
+    project: String,
+    id: String,
+    versions: Option<Vec<Record>>,
+    data: Option<Vec<Record>>,
+}
+
+impl ExperimentVersionsResponse {
+    fn into_records(self) -> Vec<Record> {
+        let mut rows = self.versions.or(self.data).unwrap_or_default();
+        for rec in &mut rows {
+            if rec.project.is_empty() && !self.project.is_empty() {
+                rec.project = self.project.clone();
+            }
+            if rec.id.is_empty() && !self.id.is_empty() {
+                rec.id = self.id.clone();
+            }
+        }
+        rows
+    }
+}
+
 /// One stored experiment row, as returned by [`Research::query`] (the canonical view).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -1451,11 +1491,16 @@ pub struct Record {
     pub git_sha: String,
     pub git_branch: String,
     pub git_dirty: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub lib_versions: BTreeMap<String, String>,
     pub meta: serde_json::Value,
     #[serde(default, serialize_with = "serialize_unix_ts")]
     pub ts: i64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub revision: String,
@@ -1718,5 +1763,86 @@ mod tests {
         let dump = format!("{r:?}");
         assert!(!dump.contains("supersecret"));
         assert!(dump.contains("<redacted>"));
+    }
+
+    #[test]
+    fn experiment_versions_deserializes_versions_envelope() {
+        // Exact `/v1/research/experiments/versions` shape returned by `apps/research`.
+        let payload = r#"{
+            "project": "ml",
+            "id": "kernel-perf:splitkv:gb10/32k",
+            "versions": [
+                {
+                    "seq": 1,
+                    "received_at": 1750000001,
+                    "ts": 1750000000,
+                    "content_hash": "aaaa",
+                    "revision": "original",
+                    "status": "running",
+                    "canonical": false,
+                    "value": 0.0,
+                    "n": 0,
+                    "meta": {"hypothesis": "occupancy-bound"},
+                    "git_sha": "abc123",
+                    "tags": ["gb10", "32k"]
+                },
+                {
+                    "seq": 2,
+                    "received_at": 1750000100,
+                    "ts": 1750000099,
+                    "content_hash": "bbbb",
+                    "revision": "original",
+                    "status": "complete",
+                    "canonical": true,
+                    "value": 27.6,
+                    "n": 30,
+                    "meta": {"verdict": "proven"},
+                    "git_sha": "abc123",
+                    "tags": null
+                }
+            ]
+        }"#;
+        let resp: ExperimentVersionsResponse = serde_json::from_str(payload).unwrap();
+        let rows = resp.into_records();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].project, "ml");
+        assert_eq!(rows[0].id, "kernel-perf:splitkv:gb10/32k");
+        assert_eq!(rows[0].status, "running");
+        assert!(!rows[0].canonical);
+        assert_eq!(rows[0].tags, vec!["gb10", "32k"]);
+        assert_eq!(rows[0].received_at, Some(1_750_000_001));
+        assert_eq!(rows[1].project, "ml");
+        assert_eq!(rows[1].id, "kernel-perf:splitkv:gb10/32k");
+        assert_eq!(rows[1].status, "complete");
+        assert!(rows[1].canonical);
+        assert_eq!(rows[1].value, 27.6);
+        assert_eq!(rows[1].n, 30);
+        assert!(rows[1].tags.is_empty());
+    }
+
+    #[test]
+    fn experiment_versions_deserializes_legacy_data_fallback_and_null() {
+        let legacy = r#"{
+            "data": [
+                {
+                    "project": "ml",
+                    "id": "kernel-perf:matvec:cuda",
+                    "status": "complete",
+                    "value": 1.25,
+                    "n": 16,
+                    "canonical": true
+                }
+            ]
+        }"#;
+        let resp: ExperimentVersionsResponse = serde_json::from_str(legacy).unwrap();
+        let rows = resp.into_records();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "kernel-perf:matvec:cuda");
+        assert_eq!(rows[0].value, 1.25);
+
+        // `versions` takes precedence if both keys appear; explicit null yields empty Vec.
+        let null_versions: ExperimentVersionsResponse =
+            serde_json::from_str(r#"{"project":"ml","id":"x","versions":null}"#).unwrap();
+        assert!(null_versions.into_records().is_empty());
     }
 }

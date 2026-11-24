@@ -156,7 +156,7 @@ fn parse_dynamic_shared_mem_bytes(cu: &str) -> u32 {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("// Shared array size:") {
             if let Some(after_comma) = rest.split(',').nth(1) {
-                if let Some(num) = after_comma.trim().split_whitespace().next() {
+                if let Some(num) = after_comma.split_whitespace().next() {
                     pending_bytes = num.parse().unwrap_or(0);
                 }
             }
@@ -206,14 +206,70 @@ fn cuda_include_paths() -> Vec<PathBuf> {
     out
 }
 
-fn compile_cu_to_ptx(src: &str, cc: i32) -> Result<String> {
+/// Build the concrete NVRTC `--gpu-architecture` flag for compute capability
+/// `cc = major * 100 + minor * 10`.
+///
+/// Using a real `sm_*` target (`sm_121a` on GB10, `sm_90a` on Hopper, `sm_89` on Ada, ...)
+/// causes NVRTC to emit a native SASS CUBIN alongside PTX so `cuModuleLoadData` can load the
+/// binary directly without invoking the driver's PTX JIT compiler.
+fn cuda_arch_flag(cc: i32) -> String {
     let major = cc / 100;
     let minor = (cc % 100) / 10;
-    let arch = if major >= 9 {
+    if major >= 9 {
         format!("--gpu-architecture=sm_{major}{minor}a")
     } else {
         format!("--gpu-architecture=sm_{major}{minor}")
-    };
+    }
+}
+
+/// Output of NVRTC compilation: native SASS CUBIN (preferred) or PTX source fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompiledKernel {
+    Cubin(Vec<u8>),
+    Ptx(String),
+}
+
+impl CompiledKernel {
+    fn into_module(self) -> cudarc::nvrtc::Ptx {
+        match self {
+            Self::Cubin(bytes) => cudarc::nvrtc::Ptx::from_binary(bytes),
+            Self::Ptx(src) => cudarc::nvrtc::Ptx::from_src(src),
+        }
+    }
+}
+
+/// Extract the compiled native CUBIN from an NVRTC program when NVRTC produced one.
+///
+/// # Safety
+/// `prog` must be a successfully compiled, live `nvrtcProgram`.
+unsafe fn get_nvrtc_cubin(prog: cudarc::nvrtc::sys::nvrtcProgram) -> Option<Vec<u8>> {
+    let mut size: usize = 0;
+    if cudarc::nvrtc::sys::nvrtcGetCUBINSize(prog, &mut size)
+        .result()
+        .is_err()
+        || size == 0
+    {
+        return None;
+    }
+    let mut cubin = vec![0u8; size];
+    if cudarc::nvrtc::sys::nvrtcGetCUBIN(prog, cubin.as_mut_ptr().cast::<std::ffi::c_char>())
+        .result()
+        .is_err()
+    {
+        return None;
+    }
+    Some(cubin)
+}
+
+/// Compile CUDA `.cu` source via NVRTC for compute capability `cc` (`major * 100 + minor * 10`).
+///
+/// Prefers native ELF CUBIN (`nvrtcGetCUBIN`) emitted for concrete `sm_*` targets (such as
+/// `sm_121a` on GB10) so `cuModuleLoadData` bypasses driver PTX JIT and avoids
+/// `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (222) when the loaded NVRTC toolkit (e.g. CUDA 13.4)
+/// is newer than the kernel driver (e.g. CUDA 13.0). Falls back to PTX only if NVRTC yields
+/// no CUBIN.
+fn compile_cu_to_ptx(src: &str, cc: i32) -> Result<CompiledKernel> {
+    let arch = cuda_arch_flag(cc);
     let inc_opts: Vec<String> = cuda_include_paths()
         .into_iter()
         .map(|p| format!("--include-path={}", p.display()))
@@ -246,6 +302,10 @@ fn compile_cu_to_ptx(src: &str, cc: i32) -> Result<String> {
                 "NVRTC compile failed ({err:?}, arch={arch}):\n{log}"
             )));
         }
+        if let Some(cubin) = get_nvrtc_cubin(prog) {
+            let _ = cudarc::nvrtc::result::destroy_program(prog);
+            return Ok(CompiledKernel::Cubin(cubin));
+        }
         let ptx_raw = cudarc::nvrtc::result::get_ptx(prog);
         let _ = cudarc::nvrtc::result::destroy_program(prog);
         let ptx_bytes = ptx_raw.map_err(|e| Error::Msg(format!("NVRTC get_ptx: {e:?}")))?;
@@ -253,7 +313,7 @@ fn compile_cu_to_ptx(src: &str, cc: i32) -> Result<String> {
             .to_str()
             .map_err(|e| Error::Msg(format!("NVRTC PTX utf8: {e}")))?
             .to_owned();
-        Ok(ptx)
+        Ok(CompiledKernel::Ptx(ptx))
     }
 }
 
@@ -284,9 +344,9 @@ impl CudaDevice {
             return Ok((func, shmem));
         }
         let cc = crate::quantized::fast_mmq::compute_cap(self);
-        let ptx = compile_cu_to_ptx(art.cu, cc)?;
+        let module = compile_cu_to_ptx(art.cu, cc)?.into_module();
         let shmem = parse_dynamic_shared_mem_bytes(art.cu);
-        let func = self.get_or_load_custom_func(art.entry, &mod_key, &ptx)?;
+        let func = self.get_or_load_custom_module_func(art.entry, &mod_key, module)?;
         shmem_map
             .lock()
             .unwrap()
@@ -983,4 +1043,63 @@ fn cuda_storage_ptr_mut<'a>(
         _ => crate::bail!("cuda_storage_ptr_mut: expected dtype {dtype:?}"),
     };
     Ok((base + (elem_offset * dtype.size_in_bytes()) as u64, guard))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendDevice;
+
+    #[test]
+    fn cuda_arch_flag_uses_concrete_sm_targets() {
+        assert_eq!(cuda_arch_flag(1210), "--gpu-architecture=sm_121a");
+        assert_eq!(cuda_arch_flag(1200), "--gpu-architecture=sm_120a");
+        assert_eq!(cuda_arch_flag(1000), "--gpu-architecture=sm_100a");
+        assert_eq!(cuda_arch_flag(900), "--gpu-architecture=sm_90a");
+        assert_eq!(cuda_arch_flag(890), "--gpu-architecture=sm_89");
+        assert_eq!(cuda_arch_flag(800), "--gpu-architecture=sm_80");
+    }
+
+    #[test]
+    fn compiled_kernel_into_module_preserves_ptx_src() {
+        let ptx = CompiledKernel::Ptx(".version 8.0".to_string()).into_module();
+        assert_eq!(ptx.to_src(), ".version 8.0");
+    }
+
+    #[test]
+    fn compile_cu_to_ptx_emits_cubin_and_loads_on_device() {
+        let dev = match CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => return, // no CUDA GPU in this environment
+        };
+        let cc = crate::quantized::fast_mmq::compute_cap(&dev);
+        let src = r#"extern "C" __global__ void noop_cubin_test(float* out) {
+            if (threadIdx.x == 0) out[0] = 42.0f;
+        }"#;
+        let compiled = compile_cu_to_ptx(src, cc).expect("NVRTC compile failed");
+        match &compiled {
+            CompiledKernel::Cubin(bytes) => {
+                assert!(
+                    bytes.starts_with(b"\x7fELF"),
+                    "expected ELF CUBIN binary from NVRTC for cc={cc}, got {} bytes",
+                    bytes.len()
+                );
+            }
+            CompiledKernel::Ptx(_) => {
+                panic!("expected native CUBIN from NVRTC for concrete sm target cc={cc}, got PTX");
+            }
+        }
+        // Must load directly into the driver (even when NVRTC toolkit > CUDA driver version).
+        let _func = dev
+            .get_or_load_custom_module_func(
+                "noop_cubin_test",
+                "dsl::noop_cubin_test",
+                compiled.into_module(),
+            )
+            .expect("CUBIN module load failed");
+        // Also verify a real committed DSL kernel compiles to CUBIN and loads cleanly.
+        let (_dsl_func, _shmem) = dev
+            .dsl_func("flash_attn_paged_split_kv_d128_bf16")
+            .expect("Split-KV DSL kernel CUBIN compile/load failed");
+    }
 }
