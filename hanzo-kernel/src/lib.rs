@@ -66,6 +66,7 @@ pub mod fuse;
 pub mod gdn;
 pub mod glu;
 pub mod grad;
+pub mod grouped_q4k;
 pub mod island;
 pub mod norm;
 pub mod optim;

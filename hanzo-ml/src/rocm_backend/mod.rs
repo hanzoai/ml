@@ -16,6 +16,7 @@ mod error;
 #[cfg(feature = "rocm-miopen")]
 mod miopen;
 mod wrappers;
+use device::GroupedQ4kKernel;
 pub use device::{DeviceId, Graph, RocmDevice, Timer};
 pub use error::{RocmError, WrapErr};
 pub use wrappers::SendSyncDeviceMemory;
@@ -2185,14 +2186,15 @@ impl RocmDevice {
     }
 
     pub(crate) fn grouped_q4k_enabled(&self) -> bool {
-        self.grouped_q4k
+        self.grouped_q4k.is_some()
     }
 
     pub(crate) fn use_grouped_q4k(&self, experts: usize, slots: usize, n: usize, k: usize) -> bool {
         // The HIP Q8_1 quantizer indexes the activation blocks with signed ints.
         const MAX: usize = i32::MAX as usize;
-        self.grouped_q4k
-            && (1..=256).contains(&experts)
+        // The generated projection uses 32-bit element indices.
+        const DSL_MAX: usize = u32::MAX as usize;
+        (1..=256).contains(&experts)
             && (1..=MAX).contains(&slots)
             && (1..=MAX).contains(&n)
             && (256..=MAX).contains(&k)
@@ -2200,6 +2202,18 @@ impl RocmDevice {
             && slots <= MAX / (k / 32)
             && slots.checked_mul(n).is_some()
             && grouped_q4k_tile_capacity(slots, experts) <= MAX / n.div_ceil(4)
+            && match self.grouped_q4k {
+                Some(GroupedQ4kKernel::Hip) => true,
+                Some(GroupedQ4kKernel::Dsl) => {
+                    slots * n <= DSL_MAX
+                        && experts
+                            .checked_mul(n)
+                            .and_then(|rows| rows.checked_mul(k / 256))
+                            .and_then(|blocks| blocks.checked_mul(9))
+                            .is_some_and(|vectors| vectors <= DSL_MAX)
+                }
+                None => false,
+            }
     }
 
     pub(crate) fn plan_grouped_q4k(
@@ -2320,14 +2334,6 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<RocmStorage> {
-        use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
-        use rocm_rs::hip::Dim3;
-        use std::ffi::c_void;
-
-        fn arg<T>(value: &T) -> *mut c_void {
-            std::ptr::from_ref(value).cast_mut().cast()
-        }
-
         let experts = plan.experts;
         let weight_bytes = experts
             .checked_mul(n)
@@ -2341,47 +2347,79 @@ impl RocmDevice {
             (RocmStorageSlice::U8(q), RocmStorageSlice::F16(d)) => (q.as_ptr(), d.as_ptr()),
             _ => crate::bail!("grouped Q4_K: unexpected Q8_1 buffers"),
         };
-        let launch = |name, grid, block, args: &mut [*mut c_void]| unsafe {
-            launch_kernel(
-                self,
-                QuantKernel::NAME,
-                QuantKernel::CODE,
-                name,
-                grid,
-                block,
-                args,
-            )
-        };
         let GroupedQ4kPlan { slots, tiles, .. } = *plan;
+        let cols = n.div_ceil(4) as u32;
+        let grid = tiles as u32 * cols;
+        let out = self.alloc::<f16>(slots * n)?;
         let slot_ptr = plan.slot_map.as_ptr();
         let te_ptr = plan.tile_expert.as_ptr();
         let tp_ptr = plan.tile_pos0.as_ptr();
         let tn_ptr = plan.tile_nrows.as_ptr();
         let count_ptr = plan.tile_count.as_ptr();
-        let out = self.alloc::<f16>(slots * n)?;
         let out_ptr = out.as_ptr();
-        let n_i = n as i32;
-        let k_i = k as i32;
-        let cols = n.div_ceil(4) as i32;
-        launch(
-            "moe_q4k_grouped_gfx1201_wave4_f16",
-            Dim3::from((tiles * cols) as u32),
-            Dim3::from(128u32),
-            &mut [
-                arg(&n_i),
-                arg(&k_i),
-                arg(&cols),
-                arg(&xq_ptr),
-                arg(&xd_ptr),
-                arg(&wbank_ptr),
-                arg(&out_ptr),
-                arg(&slot_ptr),
-                arg(&te_ptr),
-                arg(&tp_ptr),
-                arg(&tn_ptr),
-                arg(&count_ptr),
-            ],
-        )?;
+        // The route planner has already validated the slot IDs and the launch size.
+        match self.grouped_q4k {
+            Some(GroupedQ4kKernel::Dsl) => {
+                let meta = self.dsl_const_u32_slice(&[n as u32, k as u32, cols])?;
+                unsafe {
+                    self.dispatch_dsl_raw(
+                        "moe_grouped_q4k_gfx1201",
+                        &[
+                            wbank_ptr,
+                            xq_ptr,
+                            xd_ptr,
+                            slot_ptr,
+                            te_ptr,
+                            tp_ptr,
+                            tn_ptr,
+                            count_ptr,
+                            meta.as_ptr(),
+                            out_ptr,
+                        ],
+                        (grid, 1, 1),
+                        (128, 1, 1),
+                    )?;
+                }
+            }
+            Some(GroupedQ4kKernel::Hip) => {
+                use hanzo_rocm_kernels::kernel::{KernelSource, QuantKernel};
+                use rocm_rs::hip::Dim3;
+                use std::ffi::c_void;
+
+                fn arg<T>(value: &T) -> *mut c_void {
+                    std::ptr::from_ref(value).cast_mut().cast()
+                }
+
+                let n = n as i32;
+                let k = k as i32;
+                let cols = cols as i32;
+                unsafe {
+                    launch_kernel(
+                        self,
+                        QuantKernel::NAME,
+                        QuantKernel::CODE,
+                        "moe_q4k_grouped_gfx1201_wave4_f16",
+                        Dim3::from(grid),
+                        Dim3::from(128u32),
+                        &mut [
+                            arg(&n),
+                            arg(&k),
+                            arg(&cols),
+                            arg(&xq_ptr),
+                            arg(&xd_ptr),
+                            arg(&wbank_ptr),
+                            arg(&out_ptr),
+                            arg(&slot_ptr),
+                            arg(&te_ptr),
+                            arg(&tp_ptr),
+                            arg(&tn_ptr),
+                            arg(&count_ptr),
+                        ],
+                    )?;
+                }
+            }
+            None => crate::bail!("grouped Q4_K is disabled"),
+        }
         Ok(RocmStorage {
             slice: RocmStorageSlice::F16(out),
             device: self.clone(),

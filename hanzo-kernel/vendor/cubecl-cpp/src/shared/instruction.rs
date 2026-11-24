@@ -252,6 +252,12 @@ pub enum Instruction<D: Dialect> {
     Normalize(UnaryInstruction<D>),
     FastNormalize(UnaryInstruction<D>),
     Dot(BinaryInstruction<D>),
+    // HANZO PATCH (gfx1201-packed-byte-dot)
+    Gfx1201PackedByteDot {
+        lhs: Variable<D>,
+        rhs: Variable<D>,
+        dot: BinaryInstruction<D>,
+    },
     VectorSum(UnaryInstruction<D>),
     Copy {
         input: Variable<D>,
@@ -683,6 +689,18 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
                 Magnitude::<D, FastSqrt>::format(f, &inst.input, &inst.out)
             }
             Instruction::Dot(inst) => Dot::format(f, &inst.lhs, &inst.rhs, &inst.out),
+            Instruction::Gfx1201PackedByteDot { lhs, rhs, dot } => {
+                // HANZO PATCH (gfx1201-packed-byte-dot): signed operands and no clamp.
+                f.write_str("#if defined(__gfx1201__)\n")?;
+                writeln!(
+                    f,
+                    "{} = __builtin_amdgcn_sudot4(true, {lhs}, true, {rhs}, 0, false);",
+                    dot.out.fmt_left()
+                )?;
+                f.write_str("#else\n")?;
+                Dot::format(f, &dot.lhs, &dot.rhs, &dot.out)?;
+                f.write_str("#endif\n")
+            }
             Instruction::VectorSum(inst) => VectorSumFmt::<D>::format(f, &inst.input, &inst.out),
             Instruction::VecInit { inputs, out } => {
                 let item = out.item();

@@ -378,6 +378,9 @@ impl<M: DialectWmmaCompiler<Self>> DialectCubeBuiltins<Self> for HipDialect<M> {
 // Instructions
 
 impl<M: DialectWmmaCompiler<Self>> DialectInstructions<Self> for HipDialect<M> {
+    // HANZO PATCH (gfx1201-packed-byte-dot)
+    const SUPPORTS_GFX1201_PACKED_BYTE_DOT: bool = true;
+
     fn compile_instruction_sync_threads(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "__syncthreads();\n")
     }

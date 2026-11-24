@@ -1457,7 +1457,19 @@ impl<D: Dialect> CppCompiler<D> {
                 ))
             }
             gpu::Arithmetic::Dot(op) => {
-                instructions.push(Instruction::Dot(self.compile_binary(op, out)))
+                // HANZO PATCH (gfx1201-packed-byte-dot): keep the original packed words
+                // only when both operands are provably sign-extended from four i8 lanes.
+                let dot = self.compile_binary(op, out);
+                if D::SUPPORTS_GFX1201_PACKED_BYTE_DOT
+                    && dot.out.elem() == Elem::I32
+                    && dot.out.item().vectorization == 1
+                    && let Some(lhs) = packed_signed_bytes(instructions, dot.lhs)
+                    && let Some(rhs) = packed_signed_bytes(instructions, dot.rhs)
+                {
+                    instructions.push(Instruction::Gfx1201PackedByteDot { lhs, rhs, dot });
+                } else {
+                    instructions.push(Instruction::Dot(dot));
+                }
             }
             gpu::Arithmetic::VectorSum(op) => {
                 instructions.push(Instruction::VectorSum(self.compile_unary(op, out)))
@@ -2099,6 +2111,44 @@ impl<D: Dialect> CppCompiler<D> {
     }
 }
 
+// HANZO PATCH (gfx1201-packed-byte-dot): recognize only the immutable, same-scope
+// u32 -> bitcast<i8x4> -> cast<i32x4> chain. Skipping mutable values also rules out
+// writes to either vector lane or the packed source between these definitions and the dot.
+fn packed_signed_bytes<D: Dialect>(
+    instructions: &[Instruction<D>],
+    wide: Variable<D>,
+) -> Option<Variable<D>> {
+    if !matches!(wide, Variable::LocalConst { .. })
+        || wide.elem() != Elem::I32
+        || wide.item().vectorization != 4
+    {
+        return None;
+    }
+    let (cast_at, lanes) = instructions
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, inst)| match inst {
+            Instruction::Assign(cast) if cast.out == wide => Some((index, cast.input)),
+            _ => None,
+        })?;
+    if !matches!(lanes, Variable::LocalConst { .. })
+        || lanes.elem() != Elem::I8
+        || lanes.item().vectorization != 4
+    {
+        return None;
+    }
+
+    let packed = instructions[..cast_at].iter().rev().find_map(|inst| match inst {
+        Instruction::Bitcast(cast) if cast.out == lanes => Some(cast.input),
+        _ => None,
+    })?;
+    (matches!(packed, Variable::LocalConst { .. } | Variable::Constant(..))
+        && packed.elem() == Elem::U32
+        && packed.item().vectorization == 1)
+        .then_some(packed)
+}
+
 fn is_fp4_fp6_fp8(elem: gpu::ElemType) -> bool {
     match elem {
         gpu::ElemType::Float(kind) => matches!(
@@ -2160,5 +2210,89 @@ pub fn register_supported_types(props: &mut DeviceProperties) {
             Type::new(gpu::StorageType::Atomic(ty)),
             AtomicUsage::Add | AtomicUsage::LoadStore,
         );
+    }
+}
+
+// HANZO PATCH (gfx1201-packed-byte-dot) regression tests.
+#[cfg(test)]
+mod packed_byte_dot_tests {
+    use super::*;
+    use crate::cuda::{CudaDialect, mma::PtxWmmaCompiler};
+    use crate::hip::{HipDialect, mma::WmmaIntrinsicCompiler};
+
+    type Hip = HipDialect<WmmaIntrinsicCompiler>;
+
+    fn dot_source<D: Dialect>(byte_kind: Option<gpu::ElemType>, mutable_rhs: bool) -> String {
+        let mut compiler = CppCompiler::<D>::default();
+        let mut instructions = Vec::new();
+        let packed_ty = Type::from(gpu::UIntKind::U32);
+        let wide_ty = Type::from(gpu::IntKind::I32).with_vector_size(4);
+        let lhs_packed = gpu::Variable::new(gpu::VariableKind::LocalConst { id: 0 }, packed_ty);
+        let rhs_kind = if mutable_rhs {
+            gpu::VariableKind::LocalMut { id: 1 }
+        } else {
+            gpu::VariableKind::LocalConst { id: 1 }
+        };
+        let rhs_packed = gpu::Variable::new(rhs_kind, packed_ty);
+        let lhs = gpu::Variable::new(gpu::VariableKind::LocalConst { id: 4 }, wide_ty);
+        let rhs = gpu::Variable::new(gpu::VariableKind::LocalConst { id: 5 }, wide_ty);
+        let out = gpu::Variable::new(
+            gpu::VariableKind::LocalConst { id: 6 },
+            gpu::IntKind::I32.into(),
+        );
+
+        if let Some(byte_kind) = byte_kind {
+            let lanes_ty = Type::from(byte_kind).with_vector_size(4);
+            for (packed, wide, lane_id) in [(lhs_packed, lhs, 2), (rhs_packed, rhs, 3)] {
+                let lanes = gpu::Variable::new(gpu::VariableKind::LocalConst { id: lane_id }, lanes_ty);
+                compiler.compile_instruction(
+                    &mut instructions,
+                    gpu::Instruction::new(
+                        gpu::Operator::Reinterpret(gpu::UnaryOperator { input: packed }),
+                        lanes,
+                    ),
+                );
+                compiler.compile_instruction(
+                    &mut instructions,
+                    gpu::Instruction::new(
+                        gpu::Operator::Cast(gpu::UnaryOperator { input: lanes }),
+                        wide,
+                    ),
+                );
+            }
+        }
+        compiler.compile_instruction(
+            &mut instructions,
+            gpu::Instruction::new(gpu::Arithmetic::Dot(gpu::BinaryOperator { lhs, rhs }), out),
+        );
+
+        instructions.last().unwrap().to_string()
+    }
+
+    #[test]
+    fn hip_packs_signed_byte_dot_only_on_gfx1201() {
+        let source = dot_source::<Hip>(Some(gpu::IntKind::I8.into()), false);
+        assert!(source.contains("#if defined(__gfx1201__)"), "{source}");
+        assert!(
+            source.contains("__builtin_amdgcn_sudot4(true, l_0, true, l_1, 0, false)"),
+            "{source}"
+        );
+        assert!(
+            source.contains("#else\n") && source.contains("l_4.i_0 * l_5.i_0"),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn hip_scalarizes_unsigned_and_unproven_dots() {
+        for source in [
+            dot_source::<Hip>(Some(gpu::UIntKind::U8.into()), false),
+            dot_source::<Hip>(Some(gpu::IntKind::I8.into()), true),
+            dot_source::<Hip>(None, false),
+            dot_source::<CudaDialect<PtxWmmaCompiler>>(Some(gpu::IntKind::I8.into()), false),
+        ] {
+            assert!(!source.contains("sudot4"), "{source}");
+            assert!(source.contains("l_4.i_0 * l_5.i_0"), "{source}");
+        }
     }
 }

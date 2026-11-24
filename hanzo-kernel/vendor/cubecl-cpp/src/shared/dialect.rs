@@ -396,6 +396,9 @@ pub trait DialectCubeBuiltins<D: Dialect> {
 // Instructions
 
 pub trait DialectInstructions<D: Dialect> {
+    // HANZO PATCH (gfx1201-packed-byte-dot): only the HIP dialect accepts sudot4.
+    const SUPPORTS_GFX1201_PACKED_BYTE_DOT: bool = false;
+
     // atomics
     fn compile_atomic_add(
         f: &mut std::fmt::Formatter<'_>,

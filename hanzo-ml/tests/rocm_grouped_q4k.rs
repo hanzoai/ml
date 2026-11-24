@@ -49,7 +49,7 @@ fn assert_same_bits(stage: &str, expected: &Tensor, actual: &Tensor) -> Result<(
 }
 
 #[test]
-#[ignore = "requires gfx1201 hardware and HANZO_ROCM_GFX1201_GROUPED_Q4K=1"]
+#[ignore = "requires gfx1201 hardware and ML_ROCM_GFX1201_GROUPED_Q4K=hip or dsl"]
 fn grouped_q4k_matches_indexed_f16() -> Result<()> {
     let device = Device::new_rocm(0)?;
     let gate = bank(INTERMEDIATE, HIDDEN, 1, &device)?;

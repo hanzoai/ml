@@ -19,7 +19,9 @@ use hanzo_kernel::prelude::*;
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
-    eprintln!("usage: kernel-gen --target metal|cuda|rocm|vulkan (--out DIR | --check DIR)");
+    eprintln!(
+        "usage: kernel-gen --target metal|cuda|rocm|vulkan (--out DIR | --check DIR) [--only ROCM_ARTIFACT]"
+    );
     std::process::exit(2);
 }
 
@@ -1520,22 +1522,75 @@ fn write_or_check_spv(dir: &Path, check: bool, items: &[(String, Vec<u8>)]) -> b
     ok
 }
 
+#[cfg(feature = "rocm")]
+fn grouped_q4k_fixture<R: Runtime>(client: &ComputeClient<R>) {
+    use half::f16;
+    use hanzo_kernel::grouped_q4k::moe_grouped_q4k_gfx1201;
+
+    // Two expert tiles with an output-column tail and a one-slot tail.
+    let (n, k, slots) = (5usize, 256usize, 9usize);
+    let mut weights = Vec::new();
+    for _ in 0..2 * n {
+        weights.extend([0x0000_3c00u32, 0x0101_0101, 0, 0x0101_0101]);
+        weights.extend([0x1111_1111u32; 32]);
+    }
+    let xq: Vec<u32> = (0..slots)
+        .flat_map(|slot| {
+            std::iter::repeat_n(if slot % 2 == 0 { 0x0101_0101 } else { u32::MAX }, k / 4)
+        })
+        .collect();
+    let xd = vec![f16::ONE; slots * k / 32];
+    let output = client.create_from_slice(f16::as_bytes(&vec![f16::ZERO; slots * n]));
+    let upload_u32 = |data: &[u32]| client.create_from_slice(u32::as_bytes(data));
+    let upload_i32 = |data: &[i32]| client.create_from_slice(i32::as_bytes(data));
+    unsafe {
+        moe_grouped_q4k_gfx1201::launch_unchecked::<R>(
+            client,
+            Grid::Static(2 * n.div_ceil(4) as u32, 1, 1),
+            Block::new_1d(128),
+            ArrayArg::from_raw_parts(upload_u32(&weights), weights.len() / 4),
+            ArrayArg::from_raw_parts(upload_u32(&xq), xq.len() / 4),
+            ArrayArg::from_raw_parts(client.create_from_slice(f16::as_bytes(&xd)), xd.len()),
+            ArrayArg::from_raw_parts(upload_i32(&[8, 0, 2, 4, 6, 1, 3, 5, 7]), slots),
+            ArrayArg::from_raw_parts(upload_i32(&[0, 1]), 2),
+            ArrayArg::from_raw_parts(upload_i32(&[0, 5]), 2),
+            ArrayArg::from_raw_parts(upload_i32(&[5, 4]), 2),
+            ArrayArg::from_raw_parts(upload_i32(&[2]), 1),
+            ArrayArg::from_raw_parts(upload_u32(&[n as u32, k as u32, n.div_ceil(4) as u32]), 3),
+            ArrayArg::from_raw_parts(output.clone(), slots * n),
+        );
+    }
+    let bytes = client.read_one_unchecked(output);
+    for (slot, values) in f16::from_bytes(&bytes).chunks_exact(n).enumerate() {
+        let expected = f16::from_f32(if slot % 2 == 0 { k as f32 } else { -(k as f32) });
+        assert!(
+            values.iter().all(|value| *value == expected),
+            "grouped Q4_K slot {slot}"
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut target = None;
     let mut dir: Option<(PathBuf, bool)> = None;
+    let mut only = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--target" => target = it.next().cloned(),
             "--out" => dir = it.next().map(|d| (PathBuf::from(d), false)),
             "--check" => dir = it.next().map(|d| (PathBuf::from(d), true)),
+            "--only" => only = Some(it.next().unwrap_or_else(|| usage()).as_str()),
             _ => usage(),
         }
     }
     let (Some(target), Some((dir, check))) = (target, dir) else {
         usage()
     };
+    if only.is_some() && target != "rocm" {
+        usage();
+    }
 
     // Must be set before the first client exists: cubecl reads its config once.
     let log = std::env::temp_dir().join(format!("hanzo-kernel-gen-{}.log", std::process::id()));
@@ -1585,6 +1640,18 @@ fn main() {
             let client = HipRuntime::client(&AmdDevice::default());
             let mut specs = ternary_specs::<HipRuntime>();
             specs.extend(gdn_and_flash_prod_specs::<HipRuntime>(false));
+            specs.push(Spec {
+                artifact: "moe_grouped_q4k_gfx1201",
+                entry: "moe_grouped_q4k_gfx1201",
+                launch: grouped_q4k_fixture::<HipRuntime>,
+            });
+            if let Some(artifact) = only {
+                specs.retain(|spec| spec.artifact == artifact);
+                if specs.is_empty() {
+                    eprintln!("unknown ROCm artifact: {artifact}");
+                    std::process::exit(2);
+                }
+            }
             let got = capture(&client, &specs, &log).unwrap_or_else(|e| {
                 eprintln!("{e}");
                 std::process::exit(1)

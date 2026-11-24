@@ -84,8 +84,10 @@ let module = manager.get_or_compile_module(Source::Binary)?;
 
 ### Experimental grouped GGUF MoE prefill on gfx1201
 
-Set `HANZO_ROCM_GFX1201_GROUPED_Q4K=1` before creating a ROCm device.
-This enables the shared Q4_K routing plan for F16 multi-token prefill
+Set `ML_ROCM_GFX1201_GROUPED_Q4K=hip` before creating a ROCm device.
+The original opt-in value `1` also selects HIP. Set the value to
+`dsl` to use the generated projection with the same routing plan.
+Both modes enable the shared Q4_K routing plan for F16 multi-token prefill
 when a model calls `try_moe_shared_q4k`. The gate and up projections
 share Q8_1 activations. A compatible Q4_K down projection reuses the
 routing plan as well. Each wave reuses its packed weights across four
@@ -94,15 +96,38 @@ routes and uses the indexed matvec reduction for remainder routes.
 The plan reads back one tile-count scalar to validate expert IDs before
 scattering the routes. Single-token decode and unsupported expert
 projections on `gfx1201` use the indexed matvec path. If kernel target
-detection selects another architecture, set `ROCM_GFX_ARCH=gfx1201` for
+detection selects another architecture, set `ML_ROCM_ARCH=gfx1201` for
 the ROCm kernel cache.
+
+The explicit HIP fallback remains the faster opt-in on a Radeon AI PRO R9700
+(gfx1201, ROCm 7.2.2). With Qwen3-30B-A3B layer 6 Q4_K weights and synthetic
+activations and routes, the vectorized DSL projection matched HIP bit for bit
+at eight stages in each of eight workloads (65 or 257 tokens, top-2 or top-8,
+concentrated or spread routes). Across these workloads, median paired DSL
+latency relative to HIP was 0.300–17.854% higher for gate/up/SwiGLU and Q8_1
+requantization, 6.145–19.213% higher through combine, and 4.986–16.674% higher
+including route planning and the initial Q8_1 quantization (GPU event timing).
+The corresponding wall-time ranges were 0.424–17.817%, 6.108–19.153%, and
+4.994–16.663%. Each workload and scope used 12 alternating paired samples.
+These are isolated layer measurements on one GPU.
 
 Run the hardware regression from the workspace root on a gfx1201 device
 with ROCm configured:
 
 ```sh
-HANZO_ROCM_GFX1201_GROUPED_Q4K=1 ROCM_GFX_ARCH=gfx1201 \
-  cargo test -p hanzo-ml --features rocm --test rocm_grouped_q4k -- --ignored
+for mode in hip dsl; do
+  ML_ROCM_GFX1201_GROUPED_Q4K="$mode" ML_ROCM_ARCH=gfx1201 \
+    cargo test -p hanzo-ml --features rocm --test rocm_grouped_q4k -- --ignored
+done
+```
+
+Regenerate and check the projection on a gfx1201 device from `hanzo-kernel/`.
+
+```sh
+cargo run --release --no-default-features --features rocm --bin kernel-gen -- \
+  --target rocm --only moe_grouped_q4k_gfx1201 --out ../hanzo-ml/src/rocm/dsl
+cargo run --release --no-default-features --features rocm --bin kernel-gen -- \
+  --target rocm --only moe_grouped_q4k_gfx1201 --check ../hanzo-ml/src/rocm/dsl
 ```
 
 ## Requirements

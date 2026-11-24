@@ -23,6 +23,12 @@ impl DeviceId {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GroupedQ4kKernel {
+    Hip,
+    Dsl,
+}
+
 #[derive(Clone)]
 pub struct RocmDevice {
     id: DeviceId,
@@ -35,7 +41,7 @@ pub struct RocmDevice {
     pub(crate) miopen: Arc<SendSyncMIOpenHandle>,
     kernel_manager: Arc<Mutex<KernelCache>>,
     pub(super) gfx1201: bool,
-    pub(super) grouped_q4k: bool,
+    pub(super) grouped_q4k: Option<GroupedQ4kKernel>,
     /// Caching allocator pool (avoids the synchronizing per-op hipMalloc).
     pool: DevicePool,
 }
@@ -246,11 +252,24 @@ impl RocmDevice {
                 .map(|&c| c as u8)
                 .eq(*b"gfx1201")
             && matches!(props.gcnArchName[7], 0 | 58);
-        let grouped_q4k =
-            gfx1201 && std::env::var("HANZO_ROCM_GFX1201_GROUPED_Q4K").as_deref() == Ok("1");
-        if grouped_q4k && kernel_cache.arch() != "gfx1201" {
+        let grouped_q4k = if gfx1201 {
+            match crate::utils::ml_env_var(
+                "ML_ROCM_GFX1201_GROUPED_Q4K",
+                "HANZO_ROCM_GFX1201_GROUPED_Q4K",
+            )
+            .as_deref()
+            {
+                // The measured gfx1201 HIP fallback preserves the default grouped performance.
+                Ok("1" | "hip") => Some(GroupedQ4kKernel::Hip),
+                Ok("dsl") => Some(GroupedQ4kKernel::Dsl),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if grouped_q4k.is_some() && kernel_cache.arch() != "gfx1201" {
             crate::bail!(
-                "grouped Q4_K requires the gfx1201 ROCm kernel target (set ROCM_GFX_ARCH=gfx1201)"
+                "grouped Q4_K requires the gfx1201 ROCm kernel target (set ML_ROCM_ARCH=gfx1201)"
             );
         }
         let kernel_manager = Arc::new(Mutex::new(kernel_cache));

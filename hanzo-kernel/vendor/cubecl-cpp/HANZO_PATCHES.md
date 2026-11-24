@@ -57,3 +57,13 @@ leaving early rows uninitialized.
 **Regression gate.** `pq2-check --backend rocm --all` and `--all --ptq1` on `evo` (AMD Radeon 8060S,
 ROCm 7.1, `runtime=hip`, `plane_size=32..32`).
 
+## gfx1201-packed-byte-dot (`src/shared/base.rs`, `src/shared/instruction.rs`, HIP dialect)
+
+The default dot emitter expands four products into scalar arithmetic. On gfx1201, operands that
+both come from immutable packed `u32` words reinterpreted as `i8x4` and widened to `i32x4` can use
+one `__builtin_amdgcn_sudot4` with signed operands and no clamp. The matcher requires the complete
+conversion chain in the same scope. The emitted HIP retains the scalar result on other targets.
+
+The `packed_byte_dot_tests` cover the signed conversion, scalar fallback, unsigned lanes, mutable
+inputs, ordinary `i32x4` operands, and the CUDA dialect.
+
