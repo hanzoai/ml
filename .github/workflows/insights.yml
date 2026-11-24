@@ -9,7 +9,7 @@ on:
 
 jobs:
   insights:
-    uses: hanzoai/ci/.github/workflows/insights.yml@main
+    uses: hanzoai/ci/.github/workflows/insights.yml@v1
     with:
       project: hanzo-ml
     secrets: inherit
