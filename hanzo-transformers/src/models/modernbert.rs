@@ -15,6 +15,8 @@ use hanzo_nn::{
 };
 use serde::Deserialize;
 
+pub mod adapter;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -427,12 +429,17 @@ impl ModernBertAttention {
         Tensor::cat(&out, 0)
     }
 
-    fn forward(&self, hidden_states: &Tensor, mask: Mask, place: Place) -> Result<Tensor> {
+    fn forward_routed(
+        &self,
+        hidden_states: &Tensor,
+        mask: Mask,
+        place: Place,
+        route: Option<&adapter::Routing<'_>>,
+    ) -> Result<Tensor> {
         let xs = hidden_states.clone();
         let (b, seq_len, d) = xs.dims3()?;
         let span = tracing::span!(tracing::Level::TRACE, "qkv").entered();
-        let qkv = xs
-            .apply(&self.qkv)?
+        let qkv = adapter::project(&self.qkv, &xs, route, true)?
             .reshape((
                 b,
                 seq_len,
@@ -479,7 +486,8 @@ impl ModernBertAttention {
                             dlsa.local_window,
                         )?;
                         let xs_out = xs_out.transpose(1, 2)?.reshape((b, seq_len, d))?;
-                        return xs_out.apply(&self.proj)?.reshape((b, seq_len, d));
+                        return adapter::project(&self.proj, &xs_out, route, false)?
+                            .reshape((b, seq_len, d));
                     }
                 }
             }
@@ -494,7 +502,7 @@ impl ModernBertAttention {
 
         let _span = tracing::span!(tracing::Level::TRACE, "proj").entered();
         let xs = xs.transpose(1, 2)?.reshape((b, seq_len, d))?;
-        let xs = xs.apply(&self.proj)?;
+        let xs = adapter::project(&self.proj, &xs, route, false)?;
         let xs = xs.reshape((b, seq_len, d))?;
 
         Ok(xs)
@@ -754,6 +762,16 @@ impl ModernBertLayer {
     /// A packed pass through the layer: `xs [T, d]` holds sequences of `lens` tokens; a local
     /// layer's queries read the keys within `window` of them.
     fn packed(&self, xs: &Tensor, lens: &[usize], window: usize) -> Result<Tensor> {
+        self.packed_routed(xs, lens, window, None)
+    }
+
+    fn packed_routed(
+        &self,
+        xs: &Tensor,
+        lens: &[usize],
+        window: usize,
+        route: Option<&adapter::Routing<'_>>,
+    ) -> Result<Tensor> {
         let h = match &self.attn_norm {
             Some(norm) => xs.apply(norm)?,
             None => xs.clone(),
@@ -761,26 +779,36 @@ impl ModernBertLayer {
         let a = &self.attn;
         let att = a.packed(
             &h,
-            &h.apply(&a.qkv)?,
+            &adapter::project(&a.qkv, &h, route, true)?,
             lens,
             self.uses_local_attention.then_some(window),
         )?;
-        let xs = (att.apply(&a.proj)? + xs)?;
+        let xs = (adapter::project(&a.proj, &att, route, false)? + xs)?;
         let mlp = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
         xs + mlp
     }
 
     /// `place` places the tokens for the rotary embedding.
     fn forward(&self, xs: &Tensor, masks: &Masks, place: Place) -> Result<Tensor> {
+        self.forward_routed(xs, masks, place, None)
+    }
+
+    fn forward_routed(
+        &self,
+        xs: &Tensor,
+        masks: &Masks,
+        place: Place,
+        route: Option<&adapter::Routing<'_>>,
+    ) -> Result<Tensor> {
         let residual = xs.clone();
         let mut xs = xs.clone();
         if let Some(norm) = &self.attn_norm {
             xs = xs.apply(norm)?;
         }
 
-        let xs = self
-            .attn
-            .forward(&xs, masks.of(self.uses_local_attention), place)?;
+        let xs =
+            self.attn
+                .forward_routed(&xs, masks.of(self.uses_local_attention), place, route)?;
         let xs = (xs + residual)?;
         let _span = tracing::span!(tracing::Level::TRACE, "mlp").entered();
         let mlp_out = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
