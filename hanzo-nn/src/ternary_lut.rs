@@ -1,5 +1,11 @@
 //! Table-lookup ternary inference on ARM and x86 CPUs (T-MAC style, `W1.58A8`).
 //!
+//! **Status: opt-in experimental operator.** Callers must explicitly construct
+//! [`PackedTernaryMatrix`] / [`TmacLinear`] or invoke [`ternary_lut_matvec_f32`] /
+//! [`ternary_lut_matvec_f32_parallel`]. This module never alters default dispatch for
+//! canonical `hanzo-ml` quantized paths (`PQ2_0`, `PTQ1_0`, `BitcosMatrix`, `QMatMul`)
+//! and introduces no separate model-loading path.
+//!
 //! Clean-room `MIT OR Apache-2.0` implementation inspired by study-only architectural
 //! concepts from:
 //! - Jianyu Wei et al., *T-MAC: CPU Renaissance via Table Lookup for Low-Bit LLM Deployment
@@ -120,20 +126,15 @@ pub fn build_symmetric_lut41(q: [i8; TRITS_PER_BYTE]) -> [i16; SYMMETRIC_GROUP4_
     let q3 = i16::from(q[3]);
     for u in 0..SYMMETRIC_GROUP4_STATES {
         let [t0, t1, t2, t3] = radix81_to_trits(u);
-        table[u] = i16::from(t0) * q0
-            + i16::from(t1) * q1
-            + i16::from(t2) * q2
-            + i16::from(t3) * q3;
+        table[u] =
+            i16::from(t0) * q0 + i16::from(t1) * q1 + i16::from(t2) * q2 + i16::from(t3) * q3;
     }
     table
 }
 
 /// Evaluates a 4-trit dot product from the 41-entry symmetric mirror LUT (`0..81`).
 #[inline]
-pub fn lookup_symmetric_lut41(
-    sym41: &[i16; SYMMETRIC_GROUP4_STATES],
-    radix_idx: usize,
-) -> i16 {
+pub fn lookup_symmetric_lut41(sym41: &[i16; SYMMETRIC_GROUP4_STATES], radix_idx: usize) -> i16 {
     if radix_idx < SYMMETRIC_GROUP4_STATES {
         sym41[radix_idx]
     } else {
@@ -292,7 +293,7 @@ impl PackedTernaryMatrix {
                 for m in 0..TRITS_PER_BYTE {
                     if c0 + m < cols {
                         let v = trits[row_base + c0 + m];
-                        if v < -1 || v > 1 {
+                        if !(-1..=1).contains(&v) {
                             hanzo_ml::bail!("Invalid ternary weight {v} outside {{-1, 0, +1}}");
                         }
                         grp[m] = v;
@@ -327,7 +328,10 @@ impl PackedTernaryMatrix {
     /// Quantizes a 2D `hanzo_ml::Tensor` `[out_features, in_features]` via absmean scaling.
     pub fn from_tensor_absmean(weight: &Tensor, bias: Option<&Tensor>) -> Result<Self> {
         let (rows, cols) = weight.dims2()?;
-        let w_f32 = weight.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let w_f32 = weight
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let b_f32 = match bias {
             Some(b) => Some(b.to_dtype(DType::F32)?.to_vec1::<f32>()?),
             None => None,
@@ -659,13 +663,16 @@ impl TmacKernelBackend {
 fn scalar_tiled4_matvec_i32(
     weights: &PackedTernaryMatrix,
     lut: &ActivationLut,
+    tile_start: usize,
+    tile_end: usize,
     out: &mut [i32],
 ) {
     let groups = weights.groups_per_row;
     let packed = &weights.tiled_packed;
     let lut_groups = &lut.groups[..groups];
+    let row_base = tile_start * N_TILE;
 
-    for tile in 0..weights.num_tiles {
+    for tile in tile_start..tile_end {
         let tile_offset = tile * groups * N_TILE;
         let mut tile_acc = [0i32; N_TILE];
         for sub in (0..N_TILE).step_by(4) {
@@ -686,8 +693,9 @@ fn scalar_tiled4_matvec_i32(
             tile_acc[sub + 3] = acc3;
         }
         let row_start = tile * N_TILE;
+        let local_r0 = row_start - row_base;
         let valid = (weights.rows - row_start).min(N_TILE);
-        out[row_start..row_start + valid].copy_from_slice(&tile_acc[..valid]);
+        out[local_r0..local_r0 + valid].copy_from_slice(&tile_acc[..valid]);
     }
 }
 
@@ -721,23 +729,23 @@ mod x86_kernels {
                 let idx_lo = _mm256_and_si256(wb, mask_0f);
                 let idx_hi = _mm256_and_si256(_mm256_srli_epi16(wb, 4), mask_0f);
 
-                let tbl_lo_l = _mm256_broadcastsi128_si256(
-                    _mm_loadu_si128(lg.lo_lsb.as_ptr().cast::<__m128i>()),
-                );
-                let tbl_lo_m = _mm256_broadcastsi128_si256(
-                    _mm_loadu_si128(lg.lo_msb.as_ptr().cast::<__m128i>()),
-                );
+                let tbl_lo_l = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lg.lo_lsb.as_ptr().cast::<__m128i>(),
+                ));
+                let tbl_lo_m = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lg.lo_msb.as_ptr().cast::<__m128i>(),
+                ));
                 let lo_l = _mm256_shuffle_epi8(tbl_lo_l, idx_lo);
                 let lo_m = _mm256_shuffle_epi8(tbl_lo_m, idx_lo);
                 acc_lo_i16 = _mm256_add_epi16(acc_lo_i16, _mm256_unpacklo_epi8(lo_l, lo_m));
                 acc_hi_i16 = _mm256_add_epi16(acc_hi_i16, _mm256_unpackhi_epi8(lo_l, lo_m));
 
-                let tbl_hi_l = _mm256_broadcastsi128_si256(
-                    _mm_loadu_si128(lg.hi_lsb.as_ptr().cast::<__m128i>()),
-                );
-                let tbl_hi_m = _mm256_broadcastsi128_si256(
-                    _mm_loadu_si128(lg.hi_msb.as_ptr().cast::<__m128i>()),
-                );
+                let tbl_hi_l = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lg.hi_lsb.as_ptr().cast::<__m128i>(),
+                ));
+                let tbl_hi_m = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lg.hi_msb.as_ptr().cast::<__m128i>(),
+                ));
                 let hi_l = _mm256_shuffle_epi8(tbl_hi_l, idx_hi);
                 let hi_m = _mm256_shuffle_epi8(tbl_hi_m, idx_hi);
                 acc_lo_i16 = _mm256_add_epi16(acc_lo_i16, _mm256_unpacklo_epi8(hi_l, hi_m));
@@ -768,6 +776,8 @@ mod x86_kernels {
     pub unsafe fn avx2_matvec_i32(
         weights: &PackedTernaryMatrix,
         lut: &ActivationLut,
+        tile_start: usize,
+        tile_end: usize,
         out: &mut [i32],
     ) {
         let groups = weights.groups_per_row;
@@ -775,9 +785,10 @@ mod x86_kernels {
         let tile_stride = groups * N_TILE;
         let base_ptr = weights.tiled_packed.as_ptr();
         let mask_0f = _mm256_set1_epi8(0x0F);
+        let row_base = tile_start * N_TILE;
 
-        let mut tile = 0usize;
-        while tile + 2 <= weights.num_tiles {
+        let mut tile = tile_start;
+        while tile + 2 <= tile_end {
             let p0 = base_ptr.add(tile * tile_stride);
             let p1 = base_ptr.add((tile + 1) * tile_stride);
 
@@ -800,18 +811,18 @@ mod x86_kernels {
 
                 for (g, lg) in lut_groups[g_start..g_end].iter().enumerate() {
                     let byte_off = (g_start + g) * N_TILE;
-                    let tbl_lo_l = _mm256_broadcastsi128_si256(
-                        _mm_loadu_si128(lg.lo_lsb.as_ptr().cast::<__m128i>()),
-                    );
-                    let tbl_lo_m = _mm256_broadcastsi128_si256(
-                        _mm_loadu_si128(lg.lo_msb.as_ptr().cast::<__m128i>()),
-                    );
-                    let tbl_hi_l = _mm256_broadcastsi128_si256(
-                        _mm_loadu_si128(lg.hi_lsb.as_ptr().cast::<__m128i>()),
-                    );
-                    let tbl_hi_m = _mm256_broadcastsi128_si256(
-                        _mm_loadu_si128(lg.hi_msb.as_ptr().cast::<__m128i>()),
-                    );
+                    let tbl_lo_l = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        lg.lo_lsb.as_ptr().cast::<__m128i>(),
+                    ));
+                    let tbl_lo_m = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        lg.lo_msb.as_ptr().cast::<__m128i>(),
+                    ));
+                    let tbl_hi_l = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        lg.hi_lsb.as_ptr().cast::<__m128i>(),
+                    ));
+                    let tbl_hi_m = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        lg.hi_msb.as_ptr().cast::<__m128i>(),
+                    ));
 
                     let wb0 = _mm256_loadu_si256(p0.add(byte_off).cast::<__m256i>());
                     let i0_lo = _mm256_and_si256(wb0, mask_0f);
@@ -838,14 +849,8 @@ mod x86_kernels {
                     t1_hi = _mm256_add_epi16(t1_hi, _mm256_unpackhi_epi8(h1_l, h1_m));
                 }
 
-                a0_0 = _mm256_add_epi32(
-                    a0_0,
-                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t0_lo)),
-                );
-                a0_1 = _mm256_add_epi32(
-                    a0_1,
-                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t0_hi)),
-                );
+                a0_0 = _mm256_add_epi32(a0_0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t0_lo)));
+                a0_1 = _mm256_add_epi32(a0_1, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t0_hi)));
                 a0_2 = _mm256_add_epi32(
                     a0_2,
                     _mm256_cvtepi16_epi32(_mm256_extracti128_si256(t0_lo, 1)),
@@ -855,14 +860,8 @@ mod x86_kernels {
                     _mm256_cvtepi16_epi32(_mm256_extracti128_si256(t0_hi, 1)),
                 );
 
-                a1_0 = _mm256_add_epi32(
-                    a1_0,
-                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t1_lo)),
-                );
-                a1_1 = _mm256_add_epi32(
-                    a1_1,
-                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t1_hi)),
-                );
+                a1_0 = _mm256_add_epi32(a1_0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t1_lo)));
+                a1_1 = _mm256_add_epi32(a1_1, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t1_hi)));
                 a1_2 = _mm256_add_epi32(
                     a1_2,
                     _mm256_cvtepi16_epi32(_mm256_extracti128_si256(t1_lo, 1)),
@@ -887,19 +886,23 @@ mod x86_kernels {
             _mm256_storeu_si256(buf1.as_mut_ptr().add(24).cast::<__m256i>(), a1_3);
 
             let r0 = tile * N_TILE;
-            out[r0..r0 + N_TILE].copy_from_slice(&buf0);
+            let local_r0 = r0 - row_base;
+            let valid0 = (weights.rows - r0).min(N_TILE);
+            out[local_r0..local_r0 + valid0].copy_from_slice(&buf0[..valid0]);
             let r1 = (tile + 1) * N_TILE;
+            let local_r1 = r1 - row_base;
             let valid1 = (weights.rows - r1).min(N_TILE);
-            out[r1..r1 + valid1].copy_from_slice(&buf1[..valid1]);
+            out[local_r1..local_r1 + valid1].copy_from_slice(&buf1[..valid1]);
             tile += 2;
         }
 
-        while tile < weights.num_tiles {
+        while tile < tile_end {
             let mut buf = [0i32; N_TILE];
             eval_one_tile_avx2(base_ptr.add(tile * tile_stride), lut_groups, &mut buf);
             let r0 = tile * N_TILE;
+            let local_r0 = r0 - row_base;
             let valid = (weights.rows - r0).min(N_TILE);
-            out[r0..r0 + valid].copy_from_slice(&buf[..valid]);
+            out[local_r0..local_r0 + valid].copy_from_slice(&buf[..valid]);
             tile += 1;
         }
     }
@@ -910,6 +913,8 @@ mod x86_kernels {
     pub unsafe fn avx512_wide_matvec_i32(
         weights: &PackedTernaryMatrix,
         lut: &ActivationLut,
+        tile_start: usize,
+        tile_end: usize,
         out: &mut [i32],
     ) {
         let groups = weights.groups_per_row;
@@ -917,9 +922,10 @@ mod x86_kernels {
         let tile_stride = groups * N_TILE;
         let base_ptr = weights.tiled_packed.as_ptr();
         let mask_0f = _mm256_set1_epi8(0x0F);
+        let row_base = tile_start * N_TILE;
 
-        let mut tile = 0usize;
-        while tile + 4 <= weights.num_tiles {
+        let mut tile = tile_start;
+        while tile + 4 <= tile_end {
             let mut tile_i32 = [[0i32; N_TILE]; 4];
             let mut g_start = 0usize;
             while g_start < groups {
@@ -929,18 +935,18 @@ mod x86_kernels {
 
                 for (g, lg) in lut_groups[g_start..g_end].iter().enumerate() {
                     let byte_off = (g_start + g) * N_TILE;
-                    let tbl_lo_l = _mm256_broadcastsi128_si256(
-                        _mm_loadu_si128(lg.lo_lsb.as_ptr().cast::<__m128i>()),
-                    );
-                    let tbl_lo_m = _mm256_broadcastsi128_si256(
-                        _mm_loadu_si128(lg.lo_msb.as_ptr().cast::<__m128i>()),
-                    );
-                    let tbl_hi_l = _mm256_broadcastsi128_si256(
-                        _mm_loadu_si128(lg.hi_lsb.as_ptr().cast::<__m128i>()),
-                    );
-                    let tbl_hi_m = _mm256_broadcastsi128_si256(
-                        _mm_loadu_si128(lg.hi_msb.as_ptr().cast::<__m128i>()),
-                    );
+                    let tbl_lo_l = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        lg.lo_lsb.as_ptr().cast::<__m128i>(),
+                    ));
+                    let tbl_lo_m = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        lg.lo_msb.as_ptr().cast::<__m128i>(),
+                    ));
+                    let tbl_hi_l = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        lg.hi_lsb.as_ptr().cast::<__m128i>(),
+                    ));
+                    let tbl_hi_m = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        lg.hi_msb.as_ptr().cast::<__m128i>(),
+                    ));
 
                     for sub in 0..4usize {
                         let ptr = base_ptr.add((tile + sub) * tile_stride + byte_off);
@@ -951,14 +957,10 @@ mod x86_kernels {
                         let lm = _mm256_shuffle_epi8(tbl_lo_m, idx_lo);
                         let hl = _mm256_shuffle_epi8(tbl_hi_l, idx_hi);
                         let hm = _mm256_shuffle_epi8(tbl_hi_m, idx_hi);
-                        lo_acc[sub] =
-                            _mm256_add_epi16(lo_acc[sub], _mm256_unpacklo_epi8(ll, lm));
-                        hi_acc[sub] =
-                            _mm256_add_epi16(hi_acc[sub], _mm256_unpackhi_epi8(ll, lm));
-                        lo_acc[sub] =
-                            _mm256_add_epi16(lo_acc[sub], _mm256_unpacklo_epi8(hl, hm));
-                        hi_acc[sub] =
-                            _mm256_add_epi16(hi_acc[sub], _mm256_unpackhi_epi8(hl, hm));
+                        lo_acc[sub] = _mm256_add_epi16(lo_acc[sub], _mm256_unpacklo_epi8(ll, lm));
+                        hi_acc[sub] = _mm256_add_epi16(hi_acc[sub], _mm256_unpackhi_epi8(ll, lm));
+                        lo_acc[sub] = _mm256_add_epi16(lo_acc[sub], _mm256_unpacklo_epi8(hl, hm));
+                        hi_acc[sub] = _mm256_add_epi16(hi_acc[sub], _mm256_unpackhi_epi8(hl, hm));
                     }
                 }
 
@@ -992,18 +994,20 @@ mod x86_kernels {
 
             for sub in 0..4usize {
                 let r0 = (tile + sub) * N_TILE;
+                let local_r0 = r0 - row_base;
                 let valid = (weights.rows - r0).min(N_TILE);
-                out[r0..r0 + valid].copy_from_slice(&tile_i32[sub][..valid]);
+                out[local_r0..local_r0 + valid].copy_from_slice(&tile_i32[sub][..valid]);
             }
             tile += 4;
         }
 
-        while tile < weights.num_tiles {
+        while tile < tile_end {
             let mut buf = [0i32; N_TILE];
             eval_one_tile_avx2(base_ptr.add(tile * tile_stride), lut_groups, &mut buf);
             let r0 = tile * N_TILE;
+            let local_r0 = r0 - row_base;
             let valid = (weights.rows - r0).min(N_TILE);
-            out[r0..r0 + valid].copy_from_slice(&buf[..valid]);
+            out[local_r0..local_r0 + valid].copy_from_slice(&buf[..valid]);
             tile += 1;
         }
     }
@@ -1019,6 +1023,8 @@ mod arm_kernels {
     pub unsafe fn neon_matvec_i32(
         weights: &PackedTernaryMatrix,
         lut: &ActivationLut,
+        tile_start: usize,
+        tile_end: usize,
         out: &mut [i32],
     ) {
         let groups = weights.groups_per_row;
@@ -1026,8 +1032,9 @@ mod arm_kernels {
         let tile_stride = groups * N_TILE;
         let base_ptr = weights.tiled_packed.as_ptr();
         let mask_0f = vdupq_n_u8(0x0F);
+        let row_base = tile_start * N_TILE;
 
-        for tile in 0..weights.num_tiles {
+        for tile in tile_start..tile_end {
             let tile_ptr = base_ptr.add(tile * tile_stride);
             let mut acc_i32 = [vdupq_n_s32(0); 8];
 
@@ -1088,8 +1095,59 @@ mod arm_kernels {
                 vst1q_s32(buf.as_mut_ptr().add(q_idx * 4), acc_i32[q_idx]);
             }
             let r0 = tile * N_TILE;
+            let local_r0 = r0 - row_base;
             let valid = (weights.rows - r0).min(N_TILE);
-            out[r0..r0 + valid].copy_from_slice(&buf[..valid]);
+            out[local_r0..local_r0 + valid].copy_from_slice(&buf[..valid]);
+        }
+    }
+}
+
+fn eval_tile_range_i32(
+    weights: &PackedTernaryMatrix,
+    lut: &ActivationLut,
+    resolved: TmacKernelBackend,
+    tile_start: usize,
+    tile_end: usize,
+    out: &mut [i32],
+) {
+    match resolved {
+        TmacKernelBackend::ScalarTiledLut | TmacKernelBackend::Auto => {
+            scalar_tiled4_matvec_i32(weights, lut, tile_start, tile_end, out);
+        }
+        TmacKernelBackend::Avx2Lut => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: `resolve()` verified runtime `avx2` support and slice bounds.
+                unsafe { x86_kernels::avx2_matvec_i32(weights, lut, tile_start, tile_end, out) };
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                scalar_tiled4_matvec_i32(weights, lut, tile_start, tile_end, out);
+            }
+        }
+        TmacKernelBackend::Avx512WideLut => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: `resolve()` verified runtime `avx2` + `avx512bw` support.
+                unsafe {
+                    x86_kernels::avx512_wide_matvec_i32(weights, lut, tile_start, tile_end, out)
+                };
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                scalar_tiled4_matvec_i32(weights, lut, tile_start, tile_end, out);
+            }
+        }
+        TmacKernelBackend::NeonLut => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                // SAFETY: `resolve()` verified runtime `neon` support.
+                unsafe { arm_kernels::neon_matvec_i32(weights, lut, tile_start, tile_end, out) };
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                scalar_tiled4_matvec_i32(weights, lut, tile_start, tile_end, out);
+            }
         }
     }
 }
@@ -1116,48 +1174,11 @@ pub fn ternary_lut_matvec_i32(
         );
     }
 
-    match backend.resolve() {
-        TmacKernelBackend::ScalarTiledLut | TmacKernelBackend::Auto => {
-            scalar_tiled4_matvec_i32(weights, lut, out);
-        }
-        TmacKernelBackend::Avx2Lut => {
-            #[cfg(target_arch = "x86_64")]
-            {
-                // SAFETY: `resolve()` verified runtime `avx2` support and slice bounds.
-                unsafe { x86_kernels::avx2_matvec_i32(weights, lut, out) };
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                scalar_tiled4_matvec_i32(weights, lut, out);
-            }
-        }
-        TmacKernelBackend::Avx512WideLut => {
-            #[cfg(target_arch = "x86_64")]
-            {
-                // SAFETY: `resolve()` verified runtime `avx2` + `avx512bw` support.
-                unsafe { x86_kernels::avx512_wide_matvec_i32(weights, lut, out) };
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                scalar_tiled4_matvec_i32(weights, lut, out);
-            }
-        }
-        TmacKernelBackend::NeonLut => {
-            #[cfg(target_arch = "aarch64")]
-            {
-                // SAFETY: `resolve()` verified runtime `neon` support.
-                unsafe { arm_kernels::neon_matvec_i32(weights, lut, out) };
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                scalar_tiled4_matvec_i32(weights, lut, out);
-            }
-        }
-    }
+    eval_tile_range_i32(weights, lut, backend.resolve(), 0, weights.num_tiles, out);
     Ok(())
 }
 
-/// Computes `y = (W_ternary @ q_x) * (alpha_row * act_scale) + bias` via T-MAC LUT lookup.
+/// Computes `y = (W_ternary @ q_x) * (alpha_row * act_scale) + bias` via single-thread T-MAC LUT.
 pub fn ternary_lut_matvec_f32(
     weights: &PackedTernaryMatrix,
     x: &[f32],
@@ -1191,6 +1212,78 @@ pub fn ternary_lut_matvec_f32(
             }
         }
     }
+    Ok(())
+}
+
+/// Multi-threaded T-MAC LUT matvec parallelized over independent `N_TILE = 32` output tiles
+/// using `hanzo_ml::utils::barrier_pool()` (the same persistent CPU worker pool used by
+/// canonical `QMatMul` and `BitcosMatrix`), producing bit-identical results to
+/// [`ternary_lut_matvec_f32`].
+pub fn ternary_lut_matvec_f32_parallel(
+    weights: &PackedTernaryMatrix,
+    x: &[f32],
+    backend: TmacKernelBackend,
+    out: &mut [f32],
+) -> Result<()> {
+    if x.len() != weights.cols() || out.len() != weights.rows() {
+        hanzo_ml::bail!(
+            "ternary_lut_matvec_f32_parallel shape mismatch x={} out={} vs ({}, {})",
+            x.len(),
+            out.len(),
+            weights.rows(),
+            weights.cols()
+        );
+    }
+    if weights.num_tiles < 4 {
+        return ternary_lut_matvec_f32(weights, x, backend, out);
+    }
+    let lut = ActivationLut::from_f32(x);
+    let resolved = backend.resolve();
+    let act_scale = f64::from(lut.act_scale());
+    let scales = weights.row_scales();
+    let bias = weights.bias();
+    let mut acc_i32 = vec![0i32; weights.rows];
+    let acc_addr = acc_i32.as_mut_ptr() as usize;
+    let out_addr = out.as_mut_ptr() as usize;
+    hanzo_ml::utils::barrier_pool().execute_chunked(weights.num_tiles, |tile_range| {
+        if tile_range.is_empty() {
+            return;
+        }
+        let row_start = tile_range.start * N_TILE;
+        let row_end = (tile_range.end * N_TILE).min(weights.rows);
+        let len = row_end - row_start;
+        // SAFETY: `execute_chunked` assigns disjoint tile ranges so `[row_start..row_end]`
+        // slices never overlap across worker threads and remain within `..weights.rows`.
+        let acc_slice =
+            unsafe { std::slice::from_raw_parts_mut((acc_addr as *mut i32).add(row_start), len) };
+        eval_tile_range_i32(
+            weights,
+            &lut,
+            resolved,
+            tile_range.start,
+            tile_range.end,
+            acc_slice,
+        );
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(row_start), len) };
+        match bias {
+            Some(b) => {
+                for local_r in 0..len {
+                    let r = row_start + local_r;
+                    let scaled =
+                        (f64::from(acc_slice[local_r]) * f64::from(scales[r]) * act_scale) as f32;
+                    out_slice[local_r] = scaled + b[r];
+                }
+            }
+            None => {
+                for local_r in 0..len {
+                    let r = row_start + local_r;
+                    out_slice[local_r] =
+                        (f64::from(acc_slice[local_r]) * f64::from(scales[r]) * act_scale) as f32;
+                }
+            }
+        }
+    });
     Ok(())
 }
 
@@ -1382,9 +1475,7 @@ impl DualProjection {
             OperatorKind::WeightUnpackDeqReference => {
                 weight_unpack_deq_matvec_f32(&self.packed, x, out)
             }
-            OperatorKind::TmacLutOperator => {
-                ternary_lut_matvec_f32(&self.packed, x, backend, out)
-            }
+            OperatorKind::TmacLutOperator => ternary_lut_matvec_f32(&self.packed, x, backend, out),
         }
     }
 
@@ -1614,7 +1705,8 @@ impl TernaryNetworkBlock {
         }
 
         let mut attn_proj = vec![0.0f32; self.hidden_dim];
-        self.o_proj.apply(&attn_concat, op, backend, &mut attn_proj)?;
+        self.o_proj
+            .apply(&attn_concat, op, backend, &mut attn_proj)?;
         for i in 0..self.hidden_dim {
             h[i] += attn_proj[i];
         }
@@ -1802,6 +1894,18 @@ impl TernaryTransformerModel {
             + blk_sum
             + self.lm_head.weight_bytes(op)
     }
+
+    /// Exact number of linear multiply-accumulate operations executed per token across all
+    /// transformer blocks (`Q/K/V/O` + `gate/up/down`) and `LMHead`.
+    pub fn linear_macs_per_token(&self) -> u64 {
+        let h = self.profile.hidden_dim as u64;
+        let ffn = self.profile.ffn_dim as u64;
+        let head_dim = (self.profile.hidden_dim / self.profile.num_heads) as u64;
+        let kv = (self.profile.num_kv_heads as u64) * head_dim;
+        let per_layer = (h * h) + (kv * h) + (kv * h) + (h * h) + (3 * ffn * h);
+        let lm_head = (self.profile.vocab_size as u64) * h;
+        (self.profile.num_layers as u64) * per_layer + lm_head
+    }
 }
 
 /// Hardware/ISA provenance metadata recorded on every scorecard run (#40).
@@ -1814,7 +1918,9 @@ pub struct HardwareMetadata {
     pub accelerator_driver: String,
     pub quantization_format: String,
     pub git_commit: String,
-    pub energy_model: String,
+    /// Hardware energy telemetry source when directly measured (e.g., RAPL / powermetrics),
+    /// or `None` (`null` in JSON) when unprivileged hardware energy counters are unavailable.
+    pub energy_telemetry: Option<String>,
 }
 
 impl HardwareMetadata {
@@ -1839,7 +1945,7 @@ impl HardwareMetadata {
             quantization_format: "T-MAC W1.58A8 (2-bit 4-trit/byte LUT + f32 absmean + i8 act)"
                 .to_string(),
             git_commit: commit,
-            energy_model: "15.0W active single-core CPU + 120 pJ/byte DRAM traffic".to_string(),
+            energy_telemetry: None,
         }
     }
 }
@@ -1857,7 +1963,11 @@ pub struct OperatorScorecardRow {
     pub itl_p95_ms: f64,
     pub agent_20turn_wall_ms: f64,
     pub sustained_tokens_per_sec: f64,
-    pub estimated_joules_per_token: f64,
+    /// Measured linear-layer throughput in GOPS (`2 * linear_macs_per_token * tokens / wall_s / 1e9`).
+    pub effective_gops: f64,
+    /// Directly measured hardware joules/token when energy telemetry is active; `None` (`null`)
+    /// when unprivileged hardware power counters are unavailable (never estimated from fixed watts).
+    pub measured_joules_per_token: Option<f64>,
     pub weight_memory_bytes: usize,
     pub peak_memory_bytes: usize,
     pub max_logit_abs_error_vs_fp32: f32,
@@ -1873,7 +1983,8 @@ pub struct EndToEndGateVerdict {
     pub reason: String,
 }
 
-/// Rejects candidates that regress 20-turn wall time, sustained tok/s, energy/token, or accuracy.
+/// Rejects candidates that regress 20-turn wall time, sustained tok/s, measured energy/token
+/// (when hardware energy telemetry is available for both runs), or numerical accuracy.
 pub fn check_end_to_end_acceptance_gate(
     candidate: &OperatorScorecardRow,
     cpu_reference: &OperatorScorecardRow,
@@ -1905,18 +2016,29 @@ pub fn check_end_to_end_acceptance_gate(
             ),
         };
     }
-    if candidate.estimated_joules_per_token >= cpu_reference.estimated_joules_per_token {
+    if let (Some(cand_j), Some(ref_j)) = (
+        candidate.measured_joules_per_token,
+        cpu_reference.measured_joules_per_token,
+    ) {
+        if cand_j >= ref_j {
+            return EndToEndGateVerdict {
+                accepted: false,
+                reason: format!(
+                    "Rejected: measured joules/token {cand_j:.5} >= reference {ref_j:.5}"
+                ),
+            };
+        }
         return EndToEndGateVerdict {
-            accepted: false,
-            reason: format!(
-                "Rejected: joules/token {:.5} >= reference {:.5}",
-                candidate.estimated_joules_per_token, cpu_reference.estimated_joules_per_token
-            ),
+            accepted: true,
+            reason:
+                "Accepted: superior sustained tok/s, 20-turn wall time, and measured joules/token"
+                    .into(),
         };
     }
     EndToEndGateVerdict {
         accepted: true,
-        reason: "Accepted: superior sustained tok/s, 20-turn wall time, and joules/token".into(),
+        reason: "Accepted: superior sustained tok/s and 20-turn wall time (energy telemetry unavailable)"
+            .into(),
     }
 }
 
@@ -2025,12 +2147,12 @@ pub fn run_tmac_scorecard(
                 }
                 _ => 0,
             };
-            let peak_bytes = weight_bytes
-                + kv_cache.allocated_bytes()
-                + lut_ws
-                + (profile.ffn_dim * 8);
-            let joules_per_token =
-                15.0 * (itl_p50_ms / 1000.0) + 120e-12 * (weight_bytes as f64);
+            let peak_bytes =
+                weight_bytes + kv_cache.allocated_bytes() + lut_ws + (profile.ffn_dim * 8);
+            let total_tokens = (turns * (prefill_per_turn + decode_per_turn)) as f64;
+            let wall_s = (wall_ms / 1000.0).max(1e-9);
+            let effective_gops =
+                (2.0 * (model.linear_macs_per_token() as f64) * total_tokens) / wall_s / 1e9;
 
             let (err_fp32, err_unpack, agreement) = match op {
                 OperatorKind::Fp32Reference => {
@@ -2090,7 +2212,8 @@ pub fn run_tmac_scorecard(
                 itl_p95_ms,
                 agent_20turn_wall_ms: wall_ms,
                 sustained_tokens_per_sec: sustained_tok_s,
-                estimated_joules_per_token: joules_per_token,
+                effective_gops,
+                measured_joules_per_token: None,
                 weight_memory_bytes: weight_bytes,
                 peak_memory_bytes: peak_bytes,
                 max_logit_abs_error_vs_fp32: err_fp32,
@@ -2133,5 +2256,52 @@ mod tests {
             assert_eq!(i32::from(lut81[u]), exact);
             assert_eq!(simd_g.lookup_byte_i32(packed), exact);
         }
+    }
+
+    #[test]
+    fn simd_and_parallel_matvec_parity() -> Result<()> {
+        for &(rows, cols) in &[(65usize, 131usize), (160, 516)] {
+            let mut s = 0x517cc1b727220a95u64 ^ (rows as u64);
+            let trits: Vec<i8> = (0..rows * cols)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    match (s >> 40) % 3 {
+                        0 => -1,
+                        1 => 0,
+                        _ => 1,
+                    }
+                })
+                .collect();
+            let scales: Vec<f32> = (0..rows).map(|r| 0.05 + ((r % 13) as f32) * 0.01).collect();
+            let x: Vec<f32> = (0..cols)
+                .map(|c| (((c * 29 + 7) % 180) as f32 - 90.0) * 0.015)
+                .collect();
+            let packed = PackedTernaryMatrix::from_trits(&trits, rows, cols, scales, None)?;
+
+            let mut y_scalar = vec![0.0f32; rows];
+            ternary_lut_matvec_f32(
+                &packed,
+                &x,
+                TmacKernelBackend::ScalarTiledLut,
+                &mut y_scalar,
+            )?;
+            for backend in [
+                TmacKernelBackend::Avx2Lut,
+                TmacKernelBackend::Avx512WideLut,
+                TmacKernelBackend::NeonLut,
+                TmacKernelBackend::Auto,
+            ] {
+                let mut y_simd = vec![0.0f32; rows];
+                ternary_lut_matvec_f32(&packed, &x, backend, &mut y_simd)?;
+                assert_eq!(y_simd, y_scalar, "1T parity failed on {backend:?}");
+
+                let mut y_mt = vec![0.0f32; rows];
+                ternary_lut_matvec_f32_parallel(&packed, &x, backend, &mut y_mt)?;
+                assert_eq!(y_mt, y_scalar, "MT parity failed on {backend:?}");
+            }
+        }
+        Ok(())
     }
 }
