@@ -47,6 +47,7 @@ macro_rules! rocm_dsl_artifacts {
 }
 
 rocm_dsl_artifacts! {
+    "moe_grouped_q4k_gfx1201" => "moe_grouped_q4k_gfx1201",
     "matvec_pq2_0_gguf_nsg2_nr2_f32" => "matvec_pq2_0_gguf_f_f32",
     "matvec_pq2_0_gguf_nsg2_nr4_f32" => "matvec_pq2_0_gguf_f_f32",
     "matvec_pq2_0_gguf_nsg2_nr8_f32" => "matvec_pq2_0_gguf_f_f32",

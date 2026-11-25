@@ -23,6 +23,12 @@ impl DeviceId {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GroupedQ4kKernel {
+    Hip,
+    Dsl,
+}
+
 #[derive(Clone)]
 pub struct RocmDevice {
     id: DeviceId,
@@ -34,6 +40,8 @@ pub struct RocmDevice {
     #[cfg(feature = "rocm-miopen")]
     pub(crate) miopen: Arc<SendSyncMIOpenHandle>,
     kernel_manager: Arc<Mutex<KernelCache>>,
+    pub(super) gfx1201: bool,
+    pub(super) grouped_q4k: Option<GroupedQ4kKernel>,
     /// Caching allocator pool (avoids the synchronizing per-op hipMalloc).
     pool: DevicePool,
 }
@@ -232,10 +240,39 @@ impl RocmDevice {
         let miopen =
             SendSyncMIOpenHandle::new(&stream).map_err(|e| RocmError::MIOpen(e.to_string()))?;
 
-        let kernel_manager =
-            Arc::new(Mutex::new(KernelCache::new(&device).map_err(|e| {
-                crate::Error::Msg(format!("Failed to create kernel cache: {}", e))
-            })?));
+        let kernel_cache = KernelCache::new(&device)
+            .map_err(|e| crate::Error::Msg(format!("Failed to create kernel cache: {}", e)))?;
+        use rocm_rs::hip::bindings as hip;
+        let mut props = unsafe { std::mem::zeroed::<hip::hipDeviceProp_tR0600>() };
+        let status = unsafe { hip::hipGetDevicePropertiesR0600(&mut props, device.id()) };
+        // The HIP target string can be followed by colon-separated feature flags.
+        let gfx1201 = status == hip::hipError_t_hipSuccess
+            && props.gcnArchName[..7]
+                .iter()
+                .map(|&c| c as u8)
+                .eq(*b"gfx1201")
+            && matches!(props.gcnArchName[7], 0 | 58);
+        let grouped_q4k = if gfx1201 {
+            match crate::utils::ml_env_var(
+                "ML_ROCM_GFX1201_GROUPED_Q4K",
+                "HANZO_ROCM_GFX1201_GROUPED_Q4K",
+            )
+            .as_deref()
+            {
+                // The measured gfx1201 HIP fallback preserves the default grouped performance.
+                Ok("1" | "hip") => Some(GroupedQ4kKernel::Hip),
+                Ok("dsl") => Some(GroupedQ4kKernel::Dsl),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if grouped_q4k.is_some() && kernel_cache.arch() != "gfx1201" {
+            crate::bail!(
+                "grouped Q4_K requires the gfx1201 ROCm kernel target (set ML_ROCM_ARCH=gfx1201)"
+            );
+        }
+        let kernel_manager = Arc::new(Mutex::new(kernel_cache));
 
         // rocBLAS (and MIOpen) handle destructors SIGSEGV under WSL at process teardown. They are
         // process-lifetime handles, so leak one Arc ref to skip the broken destructor; the OS
@@ -259,6 +296,8 @@ impl RocmDevice {
             #[cfg(feature = "rocm-miopen")]
             miopen,
             kernel_manager,
+            gfx1201,
+            grouped_q4k,
             pool: Arc::new(Mutex::new(super::wrappers::PoolInner::default())),
         })
     }
