@@ -91,24 +91,32 @@ pub struct CacheKey {
     pub dataset_digest: u128,
     pub sample_id: u64,
     pub stage: CacheStage,
-    /// Non-zero transform profile hash for deterministic `Transformed` entries;
-    /// `0` for `Encoded` and `Decoded` stages.
+    /// Stage configuration hash:
+    /// - `0` for `Encoded` entries (raw compressed storage bytes depend only on
+    ///   `(dataset_digest, sample_id)`),
+    /// - decoder configuration hash (e.g. modality + `decode_compute_passes`)
+    ///   for `Decoded` entries,
+    /// - full decode + transform profile hash for deterministic `Transformed` entries.
     pub transform_profile_hash: u64,
 }
 
 impl CacheKey {
     /// Constructs a cache key for a given visibility and stage.
+    ///
+    /// Preserves `stage_profile_hash` for both [`CacheStage::Decoded`] and
+    /// [`CacheStage::Transformed`] so jobs with different decoder or transform
+    /// configurations never share incompatible cached tensors.
     #[inline]
     pub fn new(
         visibility: DatasetVisibility,
         dataset_digest: u128,
         sample_id: u64,
         stage: CacheStage,
-        transform_profile_hash: u64,
+        stage_profile_hash: u64,
     ) -> Self {
         let profile = match stage {
-            CacheStage::Encoded | CacheStage::Decoded => 0,
-            CacheStage::Transformed => transform_profile_hash,
+            CacheStage::Encoded => 0,
+            CacheStage::Decoded | CacheStage::Transformed => stage_profile_hash,
         };
         Self {
             visibility,
@@ -710,5 +718,50 @@ mod tests {
         ));
         assert!(cache.get(&k_t2, 2, 2).is_none());
         assert_eq!(cache.get(&k_t1, 2, 2).unwrap().payload, b"profile-A");
+    }
+
+    #[test]
+    fn decoded_entries_with_different_decoder_profiles_never_collide() {
+        let mut cache = MultiStageCache::new(8192);
+        let digest = 0xCAFE_BABE_1349u128;
+        let vis = DatasetVisibility::SharedPublic {
+            dataset_digest: digest,
+        };
+        let scope = ScopeId::from_visibility(vis);
+        let mut b = HashMap::new();
+        b.insert((scope, CacheStage::Encoded), 2048);
+        b.insert((scope, CacheStage::Decoded), 4096);
+        cache.apply_budgets(&b);
+
+        // Encoded keys normalize profile hash to 0 regardless of caller tag.
+        let k_e1 = CacheKey::new(vis, digest, 7, CacheStage::Encoded, 0x1111);
+        let k_e2 = CacheKey::new(vis, digest, 7, CacheStage::Encoded, 0x2222);
+        assert_eq!(k_e1, k_e2);
+        assert_eq!(k_e1.transform_profile_hash, 0);
+
+        // Decoded keys preserve decoder configuration hash and never collide.
+        let k_d1 = CacheKey::new(vis, digest, 7, CacheStage::Decoded, 0xAAAA);
+        let k_d2 = CacheKey::new(vis, digest, 7, CacheStage::Decoded, 0xBBBB);
+        assert_ne!(k_d1, k_d2);
+        assert_eq!(k_d1.transform_profile_hash, 0xAAAA);
+        assert_eq!(k_d2.transform_profile_hash, 0xBBBB);
+
+        assert!(cache.insert(
+            k_d1,
+            CacheEntry::new(b"decode-1pass".to_vec(), crc32(b"decode-1pass"), 0),
+            1,
+            1,
+            true
+        ));
+        assert!(cache.get(&k_d2, 2, 2).is_none());
+        assert!(cache.insert(
+            k_d2,
+            CacheEntry::new(b"decode-2pass".to_vec(), crc32(b"decode-2pass"), 0),
+            2,
+            2,
+            true
+        ));
+        assert_eq!(cache.get(&k_d1, 2, 2).unwrap().payload, b"decode-1pass");
+        assert_eq!(cache.get(&k_d2, 1, 1).unwrap().payload, b"decode-2pass");
     }
 }

@@ -27,7 +27,8 @@ pub mod pipeline;
 pub mod scenarios;
 
 pub use allocator::{
-    AllocationDecision, AllocationPolicy, AllocatorConfig, JobTelemetry, SenecaAllocator,
+    cpu_contention_factor, job_cpu_utilization, AllocationDecision, AllocationPolicy,
+    AllocatorConfig, JobTelemetry, SenecaAllocator,
 };
 pub use cache::{
     CacheEntry, CacheKey, CacheStage, DatasetVisibility, LruPartition, MultiStageCache, ScopeId,
@@ -35,8 +36,9 @@ pub use cache::{
 };
 pub use codec::{compress_lz_rle, content_hash_128, crc32, decompress_lz_rle, hash_u64, Rng64};
 pub use pipeline::{
-    execute_decode, execute_transform, run_scenario, CorpusStore, DatasetStore, EncodedShard,
-    JobConfig, JobMetrics, Modality, PolicyRunMetrics, ScenarioConfig,
+    decode_profile_hash, execute_decode, execute_transform, run_scenario, transform_profile_hash,
+    CorpusStore, DatasetStore, EncodedShard, JobConfig, JobMetrics, Modality, PolicyRunMetrics,
+    ScenarioConfig,
 };
 pub use scenarios::{
     build_all_scenarios, report_to_json, run_full_suite, run_full_suite_with_trials,

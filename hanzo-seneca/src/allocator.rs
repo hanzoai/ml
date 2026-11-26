@@ -51,6 +51,158 @@ impl AllocationPolicy {
     }
 }
 
+/// Exact distinct-sample cap before promoting to bounded HyperLogLog estimation.
+const EXACT_TRACKING_CAP: usize = 100_000;
+/// HyperLogLog precision `p = 14` (`m = 16,384` byte registers = 16 KiB,
+/// standard error `sigma = 1.04 / sqrt(16384) = 0.008125`).
+const HLL_PRECISION: u32 = 14;
+const HLL_REGISTERS: usize = 1 << HLL_PRECISION;
+/// Asymptotic bias-correction constant `alpha_m` for `m = 16,384`.
+const HLL_ALPHA_M: f64 = 0.7213 / (1.0 + 1.079 / (HLL_REGISTERS as f64));
+/// Relative standard error `1.04 / sqrt(m)` used to conservatively upper-bound
+/// distinct cardinality when estimating repeat ratio on massive streams.
+const HLL_REL_STD_ERR: f64 = 1.04 / 128.0;
+
+#[inline]
+fn mix_sample_id(sample_id: u64) -> u64 {
+    let mut z = sample_id.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Bounded 16 KiB HyperLogLog distinct-count estimator (Flajolet et al.).
+#[derive(Debug, Clone)]
+struct HyperLogLog {
+    registers: Vec<u8>,
+}
+
+impl HyperLogLog {
+    fn new() -> Self {
+        Self {
+            registers: vec![0u8; HLL_REGISTERS],
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, sample_id: u64) {
+        let h = mix_sample_id(sample_id);
+        let idx = (h >> (64 - HLL_PRECISION)) as usize;
+        // Shift out register index bits and place a sentinel bit at position
+        // `HLL_PRECISION - 1` so `leading_zeros() + 1` stays in `1..=(65 - p)`.
+        let remaining = (h << HLL_PRECISION) | (1u64 << (HLL_PRECISION - 1));
+        let rho = (remaining.leading_zeros() + 1) as u8;
+        if rho > self.registers[idx] {
+            self.registers[idx] = rho;
+        }
+    }
+
+    fn estimate(&self) -> f64 {
+        let m = HLL_REGISTERS as f64;
+        let mut inv_sum = 0.0f64;
+        let mut zeros = 0usize;
+        for &r in &self.registers {
+            if r == 0 {
+                zeros += 1;
+            }
+            inv_sum += 2.0_f64.powi(-i32::from(r));
+        }
+        let raw = HLL_ALPHA_M * m * m / inv_sum;
+        if raw <= 2.5 * m && zeros > 0 {
+            m * (m / (zeros as f64)).ln()
+        } else {
+            raw
+        }
+    }
+}
+
+/// Hybrid exact-set + bounded HyperLogLog distinct-sample tracker.
+///
+/// Exact up to `100,000` distinct samples; upon exceeding the cap, promotes
+/// existing IDs into a fixed 16 KiB HyperLogLog sketch and drops the `HashSet`
+/// so repeat estimates remain valid (and memory stays bounded) on arbitrarily
+/// large zero-reuse or multi-epoch streams.
+#[derive(Debug, Clone)]
+enum UniqueSampleTracker {
+    Exact(HashSet<u64>),
+    Approximate(Box<HyperLogLog>),
+}
+
+impl UniqueSampleTracker {
+    fn new() -> Self {
+        Self::Exact(HashSet::new())
+    }
+
+    fn insert(&mut self, sample_id: u64) {
+        match self {
+            Self::Exact(set) => {
+                if set.contains(&sample_id) {
+                    return;
+                }
+                if set.len() < EXACT_TRACKING_CAP {
+                    set.insert(sample_id);
+                    return;
+                }
+                let mut hll = Box::new(HyperLogLog::new());
+                for &id in set.iter() {
+                    hll.insert(id);
+                }
+                hll.insert(sample_id);
+                *self = Self::Approximate(hll);
+            }
+            Self::Approximate(hll) => {
+                hll.insert(sample_id);
+            }
+        }
+    }
+
+    #[inline]
+    fn is_approximate(&self) -> bool {
+        matches!(self, Self::Approximate(_))
+    }
+
+    fn estimated_unique(&self) -> f64 {
+        match self {
+            Self::Exact(set) => set.len() as f64,
+            Self::Approximate(hll) => hll.estimate(),
+        }
+    }
+
+    /// Conservative upper-bound distinct count for repeat-ratio estimation:
+    /// exact below the cap, and `estimate * (1 + 2 * sigma)` under HLL so
+    /// zero-reuse streams do not trigger false-positive repeat ratios above the
+    /// streaming-bypass threshold due to sketch variance.
+    fn conservative_unique(&self) -> f64 {
+        match self {
+            Self::Exact(set) => set.len() as f64,
+            Self::Approximate(hll) => hll.estimate() * (1.0 + 2.0 * HLL_REL_STD_ERR),
+        }
+    }
+}
+
+/// Uncontended CPU core utilization in `[0.0, 1.0]` for one job's batch.
+///
+/// A single-stream loader worker for a job cannot consume more than 1.0 core:
+/// its batch period is at least `max(gpu_step_us, io_batch_us + cpu_batch_us)`.
+#[inline]
+pub fn job_cpu_utilization(cpu_batch_us: f64, io_batch_us: f64, gpu_step_us: f64) -> f64 {
+    let cpu = cpu_batch_us.max(0.0);
+    let io = io_batch_us.max(0.0);
+    let cycle_us = gpu_step_us.max(io + cpu).max(1.0);
+    (cpu / cycle_us).clamp(0.0, 1.0)
+}
+
+/// Host-CPU processor-sharing slowdown factor experienced by a runnable job
+/// competing against `other_cpu_util` cores of demand from *other* active jobs.
+///
+/// Never includes the job's own CPU utilization, so a single CPU-bound job on
+/// `>= 1` core always has contention factor `1.0` (linear, never quadratic).
+#[inline]
+pub fn cpu_contention_factor(other_cpu_util: f64, host_cpu_cores: usize) -> f64 {
+    let cores = host_cpu_cores.max(1) as f64;
+    ((1.0 + other_cpu_util.max(0.0)) / cores).max(1.0)
+}
+
 /// Online per-job telemetry continuously updated by the pipeline engine.
 #[derive(Debug, Clone)]
 pub struct JobTelemetry {
@@ -75,7 +227,7 @@ pub struct JobTelemetry {
 
     // Access / reuse tracking.
     pub total_requests: u64,
-    pub seen_samples: HashSet<u64>,
+    unique_tracker: UniqueSampleTracker,
     pub active: bool,
 
     // Observation counts for EMA warmup.
@@ -112,7 +264,7 @@ impl JobTelemetry {
             size_decoded: 0.0,
             size_transformed: 0.0,
             total_requests: 0,
-            seen_samples: HashSet::new(),
+            unique_tracker: UniqueSampleTracker::new(),
             active: true,
             fetch_obs: 0,
             decode_obs: 0,
@@ -120,13 +272,23 @@ impl JobTelemetry {
         }
     }
 
-    /// Records a sample access for reuse estimation.
+    /// Records a sample access for reuse estimation using bounded memory.
     pub fn record_access(&mut self, sample_id: u64) {
         self.total_requests += 1;
-        // Cap tracking set size to keep memory bounded on massive streams.
-        if self.seen_samples.len() < 100_000 {
-            self.seen_samples.insert(sample_id);
-        }
+        self.unique_tracker.insert(sample_id);
+    }
+
+    /// Returns the exact (<= 100k) or HyperLogLog-estimated (> 100k) distinct
+    /// sample count observed so far.
+    pub fn estimated_unique_samples(&self) -> u64 {
+        self.unique_tracker.estimated_unique().round() as u64
+    }
+
+    /// Returns `true` once distinct-sample tracking has promoted from exact
+    /// set tracking to the bounded HyperLogLog estimator.
+    #[inline]
+    pub fn is_unique_tracking_approximate(&self) -> bool {
+        self.unique_tracker.is_approximate()
     }
 
     /// Records an observed S3/VFS fetch latency and encoded byte size.
@@ -146,7 +308,7 @@ impl JobTelemetry {
     pub fn observe_decode(&mut self, latency_us: f64, decoded_bytes: usize) {
         self.decode_obs += 1;
         let alpha = if self.decode_obs <= 8 { 0.5 } else { 0.15 };
-        self.t_decode_us = ema(self.t_decode_us, latency_us, alpha, self.decode_obs == 1);
+        self.t_decode_us = robust_ema(self.t_decode_us, latency_us, alpha, self.decode_obs);
         self.size_decoded = ema(
             self.size_decoded,
             decoded_bytes.max(1) as f64,
@@ -159,12 +321,8 @@ impl JobTelemetry {
     pub fn observe_transform(&mut self, latency_us: f64, transformed_bytes: usize) {
         self.transform_obs += 1;
         let alpha = if self.transform_obs <= 8 { 0.5 } else { 0.15 };
-        self.t_transform_us = ema(
-            self.t_transform_us,
-            latency_us,
-            alpha,
-            self.transform_obs == 1,
-        );
+        self.t_transform_us =
+            robust_ema(self.t_transform_us, latency_us, alpha, self.transform_obs);
         self.size_transformed = ema(
             self.size_transformed,
             transformed_bytes.max(1) as f64,
@@ -184,11 +342,12 @@ impl JobTelemetry {
         if self.total_requests == 0 {
             return 0.0;
         }
-        let unique = self.seen_samples.len() as u64;
-        if unique >= self.total_requests {
+        let total = self.total_requests as f64;
+        let unique = self.unique_tracker.conservative_unique();
+        if unique >= total {
             0.0
         } else {
-            (self.total_requests - unique) as f64 / self.total_requests as f64
+            ((total - unique) / total).clamp(0.0, 1.0)
         }
     }
 
@@ -237,6 +396,20 @@ fn ema(current: f64, sample: f64, alpha: f64, first: bool) -> f64 {
         sample
     } else {
         (1.0 - alpha) * current + alpha * sample
+    }
+}
+
+#[inline]
+fn robust_ema(current: f64, sample: f64, alpha: f64, obs: u64) -> f64 {
+    if obs <= 1 {
+        sample
+    } else {
+        let bounded = if obs >= 4 && current > 0.0 {
+            sample.min(current * 4.0)
+        } else {
+            sample
+        };
+        (1.0 - alpha) * current + alpha * bounded
     }
 }
 
@@ -649,21 +822,24 @@ impl SenecaAllocator {
             cpu_batch_us.push(cpu_us);
         }
 
-        // Shared host-CPU contention across concurrent jobs:
-        // jobs running concurrently contend for `host_cpu_cores`.
-        let total_cpu_rate: f64 = active_jobs
+        // Shared host-CPU contention across concurrent jobs without self-contention:
+        // Each job's uncontended core demand is bounded in [0, 1], and its slowdown
+        // depends only on competing demand from *other* active jobs.
+        let cpu_util: Vec<f64> = active_jobs
             .iter()
-            .zip(cpu_batch_us.iter())
-            .map(|(j, &c)| c / j.gpu_step_us.max(1.0))
-            .sum();
-        let cores = self.config.host_cpu_cores as f64;
-        let contention = (total_cpu_rate / cores).max(1.0);
+            .enumerate()
+            .map(|(idx, job)| {
+                job_cpu_utilization(cpu_batch_us[idx], io_batch_us[idx], job.gpu_step_us)
+            })
+            .collect();
+        let total_cpu_util: f64 = cpu_util.iter().sum();
 
         let mut objective = 0.0f64;
         let mut total_stall = 0.0f64;
         for (idx, job) in active_jobs.iter().enumerate() {
-            let eff_cpu =
-                cpu_batch_us[idx] * contention / cores.min(active_jobs.len() as f64).max(1.0);
+            let other_cpu_util = (total_cpu_util - cpu_util[idx]).max(0.0);
+            let contention = cpu_contention_factor(other_cpu_util, self.config.host_cpu_cores);
+            let eff_cpu = cpu_batch_us[idx] * contention;
             let prep_us = io_batch_us[idx] + eff_cpu;
             let stall_ratio = (prep_us - job.gpu_step_us).max(0.0) / job.gpu_step_us;
             let prep_ratio = prep_us / job.gpu_step_us;
@@ -1112,5 +1288,201 @@ mod tests {
         j1.t_fetch_us *= 1.005;
         let d2 = alloc.rebalance(10, &[j1, j2], false);
         assert!(!d2.rebalance_applied);
+    }
+
+    #[test]
+    fn single_job_does_not_contend_with_its_own_cpu_work() {
+        // Reproduces P1 finding: 1 job on 1 core with 1,000 us CPU work per 100 us GPU step.
+        // Must have effective CPU = 1,000 us (stall_ratio = 9.0), NOT 10,000 us (stall_ratio = 99.0).
+        let scope_a = ScopeId::Private {
+            tenant_id: 1,
+            job_id: 1,
+        };
+        let mut j1 = JobTelemetry::new(1, scope_a, false, 100, 4, 1, 100.0, 1.0);
+        j1.observe_fetch(0.0, 4096);
+        j1.observe_decode(1000.0, 8192);
+        j1.observe_transform(0.0, 8192);
+
+        let alloc_1core = SenecaAllocator::new(AllocatorConfig::new(
+            AllocationPolicy::SenecaDynamic,
+            1_024 * 1024,
+            1,
+        ));
+        let mut sharers = HashMap::new();
+        sharers.insert(scope_a, 1);
+        let empty = HashMap::new();
+
+        let (_, total_stall_1job) = alloc_1core.evaluate_objective(&[&j1], &sharers, &empty);
+        assert!(
+            (total_stall_1job - 9.0).abs() < 1e-6,
+            "expected linear stall_ratio=9.0 with zero self-contention, got {total_stall_1job}"
+        );
+
+        // Two equally CPU-bound jobs on 1 core DO contend (2x slowdown each -> stall_ratio = 19.0 each).
+        let scope_b = ScopeId::Private {
+            tenant_id: 2,
+            job_id: 2,
+        };
+        let mut j2 = JobTelemetry::new(2, scope_b, false, 100, 4, 1, 100.0, 1.0);
+        j2.observe_fetch(0.0, 4096);
+        j2.observe_decode(1000.0, 8192);
+        j2.observe_transform(0.0, 8192);
+        sharers.insert(scope_b, 1);
+
+        let (_, total_stall_2jobs_1core) =
+            alloc_1core.evaluate_objective(&[&j1, &j2], &sharers, &empty);
+        assert!(
+            (total_stall_2jobs_1core - 38.0).abs() < 1e-6,
+            "expected 2 competing CPU-bound jobs on 1 core to have total_stall=38.0, got {total_stall_2jobs_1core}"
+        );
+
+        // Two CPU-bound jobs on 2 cores fit with 1 core each -> zero contention (stall_ratio = 9.0 each).
+        let alloc_2cores = SenecaAllocator::new(AllocatorConfig::new(
+            AllocationPolicy::SenecaDynamic,
+            1_024 * 1024,
+            2,
+        ));
+        let (_, total_stall_2jobs_2cores) =
+            alloc_2cores.evaluate_objective(&[&j1, &j2], &sharers, &empty);
+        assert!(
+            (total_stall_2jobs_2cores - 18.0).abs() < 1e-6,
+            "expected 2 jobs on 2 cores to have zero contention (total_stall=18.0), got {total_stall_2jobs_2cores}"
+        );
+    }
+
+    #[test]
+    fn repeat_estimates_stay_valid_beyond_100k_unique_cap() {
+        // Reproduces P2 finding: 200,000 completely unique accesses previously reported
+        // observed_repeat_ratio() == 0.5 and effective_reuse_rate() == 0.5 due to the 100k cap.
+        let scope_stream = ScopeId::Private {
+            tenant_id: 1,
+            job_id: 1,
+        };
+        let mut stream_job = make_profiled_job(
+            1,
+            scope_stream,
+            false,
+            200_000,
+            1,
+            200.0,
+            100.0,
+            100.0,
+            4096,
+            8192,
+            8192,
+        );
+        for s in 0..200_000u64 {
+            stream_job.record_access(s);
+        }
+        assert!(
+            stream_job.is_unique_tracking_approximate(),
+            "tracker must promote to bounded HyperLogLog once >100k unique IDs are seen"
+        );
+        let obs = stream_job.observed_repeat_ratio();
+        assert!(
+            obs < 0.02,
+            "200k entirely unique accesses must report ~0 repeat ratio, got {obs:.4}"
+        );
+        let eff = stream_job.effective_reuse_rate(1, 512 * 1024);
+        assert!(
+            eff < 0.02,
+            "single-epoch 200k zero-reuse stream must report ~0 effective reuse, got {eff:.4}"
+        );
+
+        // Standalone streaming job must still trigger streaming bypass past 100k samples.
+        let mut alloc = SenecaAllocator::new(AllocatorConfig::new(
+            AllocationPolicy::SenecaDynamic,
+            512 * 1024,
+            2,
+        ));
+        let dec = alloc.rebalance(1, &[stream_job.clone()], true);
+        assert!(dec.streaming_bypass_active);
+        assert!(!dec.admit_enabled);
+        assert_eq!(dec.budgets.values().copied().sum::<usize>(), 0);
+
+        // Mixed cluster: 1 reusable multi-epoch job + 1 huge zero-reuse streaming job (>100k tracked).
+        // The streaming job must receive 0 cache budget while the reusable job gets the cache.
+        let scope_reuse = ScopeId::Private {
+            tenant_id: 2,
+            job_id: 2,
+        };
+        let reuse_job = make_profiled_job(
+            2,
+            scope_reuse,
+            false,
+            200,
+            4,
+            300.0,
+            200.0,
+            100.0,
+            4096,
+            8192,
+            8192,
+        );
+        let mut mixed_alloc = SenecaAllocator::new(AllocatorConfig::new(
+            AllocationPolicy::SenecaDynamic,
+            512 * 1024,
+            2,
+        ));
+        let mixed_dec = mixed_alloc.rebalance(1, &[stream_job, reuse_job], true);
+        assert!(mixed_dec.admit_enabled);
+        let stream_budget: usize = CacheStage::ALL
+            .iter()
+            .map(|&st| {
+                mixed_dec
+                    .budgets
+                    .get(&(scope_stream, st))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum();
+        let reuse_budget: usize = CacheStage::ALL
+            .iter()
+            .map(|&st| {
+                mixed_dec
+                    .budgets
+                    .get(&(scope_reuse, st))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(
+            stream_budget, 0,
+            "zero-reuse >100k streaming job must receive 0 cache budget in mixed cluster"
+        );
+        assert!(
+            reuse_budget > 0,
+            "reusable co-located job must receive cache budget"
+        );
+
+        // Verify genuine repeats past 100k unique IDs are STILL accurately detected:
+        // 120,000 unique IDs visited twice (240,000 total -> true repeat ratio = 0.50).
+        let mut repeated_job = make_profiled_job(
+            3,
+            ScopeId::Private {
+                tenant_id: 3,
+                job_id: 3,
+            },
+            false,
+            120_000,
+            1,
+            200.0,
+            100.0,
+            100.0,
+            4096,
+            8192,
+            8192,
+        );
+        for _epoch in 0..2 {
+            for s in 0..120_000u64 {
+                repeated_job.record_access(s);
+            }
+        }
+        assert!(repeated_job.is_unique_tracking_approximate());
+        let rep_ratio = repeated_job.observed_repeat_ratio();
+        assert!(
+            (0.45..=0.55).contains(&rep_ratio),
+            "expected repeat ratio near 0.50 for 120k x 2 accesses, got {rep_ratio:.4}"
+        );
     }
 }

@@ -476,12 +476,19 @@ pub fn run_full_suite_with_trials(
     let mut scenario_results = Vec::with_capacity(scenarios.len());
 
     for sc in &scenarios {
-        let mut policies = Vec::with_capacity(AllocationPolicy::ALL.len());
-        for &policy in &AllocationPolicy::ALL {
-            let mut samples = Vec::with_capacity(trials);
-            for _ in 0..trials {
-                samples.push(run_scenario(sc, policy));
+        // Interleave trials across all 5 policies so transient host load or
+        // thermal shifts affect policies symmetrically before median selection.
+        let mut per_policy_samples: Vec<Vec<PolicyRunMetrics>> = AllocationPolicy::ALL
+            .iter()
+            .map(|_| Vec::with_capacity(trials))
+            .collect();
+        for _ in 0..trials {
+            for (pi, &policy) in AllocationPolicy::ALL.iter().enumerate() {
+                per_policy_samples[pi].push(run_scenario(sc, policy));
             }
+        }
+        let mut policies = Vec::with_capacity(AllocationPolicy::ALL.len());
+        for mut samples in per_policy_samples {
             samples.sort_by(|a, b| a.makespan_ms.total_cmp(&b.makespan_ms));
             let median = samples.swap_remove(samples.len() / 2);
             policies.push(median);

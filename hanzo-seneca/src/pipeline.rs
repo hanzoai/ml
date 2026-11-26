@@ -16,7 +16,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::allocator::{AllocationPolicy, AllocatorConfig, JobTelemetry, SenecaAllocator};
+use crate::allocator::{
+    cpu_contention_factor, job_cpu_utilization, AllocationPolicy, AllocatorConfig, JobTelemetry,
+    SenecaAllocator,
+};
 use crate::cache::{CacheEntry, CacheKey, CacheStage, DatasetVisibility, MultiStageCache, ScopeId};
 use crate::codec::{compress_lz_rle, content_hash_128, crc32, decompress_lz_rle, hash_u64, Rng64};
 
@@ -680,10 +683,57 @@ impl PartialOrd for ScheduledJob {
     }
 }
 
+/// Computes a deterministic 64-bit identity hash for the Stage-2 decoder configuration
+/// (modality geometry + effective `decode_compute_passes`).
+pub fn decode_profile_hash(modality: Modality, decode_compute_passes: u32) -> u64 {
+    let passes = decode_compute_passes.max(1);
+    let mut material = Vec::with_capacity(32);
+    match modality {
+        Modality::LlmTokenShard { raw_bytes } => {
+            material.push(1u8);
+            material.extend_from_slice(&(raw_bytes as u64).to_le_bytes());
+        }
+        Modality::VisionImageShard {
+            width,
+            height,
+            channels,
+        } => {
+            material.push(2u8);
+            material.extend_from_slice(&(width as u64).to_le_bytes());
+            material.extend_from_slice(&(height as u64).to_le_bytes());
+            material.extend_from_slice(&(channels as u64).to_le_bytes());
+        }
+        Modality::AudioFeatureShard { frames, frame_len } => {
+            material.push(3u8);
+            material.extend_from_slice(&(frames as u64).to_le_bytes());
+            material.extend_from_slice(&(frame_len as u64).to_le_bytes());
+        }
+    }
+    material.extend_from_slice(&passes.to_le_bytes());
+    hash_u64(b"seneca-decode-v1", &material)
+}
+
+/// Computes a deterministic 64-bit identity hash for the Stage-3 deterministic
+/// transform configuration, chained with the upstream `decode_hash` and
+/// effective `transform_compute_passes`.
+pub fn transform_profile_hash(
+    decode_hash: u64,
+    transform_profile: &str,
+    transform_compute_passes: u32,
+) -> u64 {
+    let passes = transform_compute_passes.max(1);
+    let mut material = Vec::with_capacity(12 + transform_profile.len());
+    material.extend_from_slice(&decode_hash.to_le_bytes());
+    material.extend_from_slice(&passes.to_le_bytes());
+    material.extend_from_slice(transform_profile.as_bytes());
+    hash_u64(b"seneca-transform-v1", &material)
+}
+
 /// Per-job runtime state during concurrent scenario execution.
 struct JobRuntime {
     cfg: JobConfig,
     dataset_digest: u128,
+    decode_hash: u64,
     transform_hash: u64,
     scope: ScopeId,
     rng: Rng64,
@@ -712,8 +762,8 @@ struct JobRuntime {
     stochastic_history: HashMap<u64, HashSet<u32>>,
     // Track recent private keys for cross-tenant adversarial isolation audits.
     sample_private_keys: Vec<CacheKey>,
-    // Rolling CPU load per batch (for concurrent host-core contention accounting).
-    last_batch_cpu_us: f64,
+    // Rolling uncontended CPU core utilization in [0, 1] for cross-job contention accounting.
+    last_cpu_util: f64,
     // Last non-zero / active steady-state partition budgets observed while job was active.
     last_active_budget_encoded: usize,
     last_active_budget_decoded: usize,
@@ -722,24 +772,35 @@ struct JobRuntime {
 
 impl JobRuntime {
     fn new(cfg: JobConfig, dataset: &DatasetStore, seed: u64) -> Self {
-        let transform_hash = hash_u64(b"seneca-transform", cfg.transform_profile.as_bytes());
+        let decode_hash = decode_profile_hash(dataset.modality, cfg.decode_compute_passes);
+        let transform_hash = transform_profile_hash(
+            decode_hash,
+            &cfg.transform_profile,
+            cfg.transform_compute_passes,
+        );
         let scope = ScopeId::from_visibility(cfg.visibility);
         let job_seed = seed ^ cfg.job_id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let mut rng = Rng64::new(job_seed);
-        let mut epoch_queue: Vec<u64> = (0..dataset.len() as u64).collect();
+        let finished = dataset.is_empty() || cfg.epochs == 0;
+        let mut epoch_queue: Vec<u64> = if finished {
+            Vec::new()
+        } else {
+            (0..dataset.len() as u64).collect()
+        };
         rng.shuffle(&mut epoch_queue);
 
         let prefetch = cfg.prefetch_batches.max(1);
         Self {
             cfg,
             dataset_digest: dataset.dataset_digest,
+            decode_hash,
             transform_hash,
             scope,
             rng,
             current_epoch: 0,
             epoch_queue,
             epoch_visited: HashSet::new(),
-            finished: false,
+            finished,
             loader_free_us: 0.0,
             gpu_free_us: 0.0,
             gpu_idle_us: 0.0,
@@ -755,7 +816,7 @@ impl JobRuntime {
             s3_bytes_saved: 0,
             stochastic_history: HashMap::new(),
             sample_private_keys: Vec::new(),
-            last_batch_cpu_us: 0.0,
+            last_cpu_util: 0.0,
             last_active_budget_encoded: 0,
             last_active_budget_decoded: 0,
             last_active_budget_transformed: 0,
@@ -766,23 +827,14 @@ impl JobRuntime {
     /// When `enable_ods` is true (Seneca Opportunistic Data Sampling), prefers
     /// unvisited samples within a bounded lookahead window that are already cached,
     /// while guaranteeing every sample is visited **exactly once per epoch**.
+    ///
+    /// Does NOT advance `current_epoch` or refill `epoch_queue`; epoch transitions
+    /// are owned solely by [`Self::refill_epoch_if_needed`].
     fn draw_batch(&mut self, cache: &MultiStageCache, enable_ods: bool) -> Vec<(u64, u32)> {
-        let mut batch = Vec::with_capacity(self.cfg.batch_size);
-        let target = self.cfg.batch_size;
+        let target = self.cfg.batch_size.max(1);
+        let mut batch = Vec::with_capacity(target);
 
-        while batch.len() < target && !self.finished {
-            if self.epoch_queue.is_empty() {
-                self.current_epoch += 1;
-                if self.current_epoch >= self.cfg.epochs {
-                    self.finished = true;
-                    break;
-                }
-                self.epoch_visited.clear();
-                let n = self.epoch_visited.capacity().max(1);
-                let _ = n;
-                break;
-            }
-
+        while batch.len() < target && !self.epoch_queue.is_empty() && !self.finished {
             let chosen_idx = if enable_ods && self.epoch_queue.len() > 1 {
                 let window = self.epoch_queue.len().min(target * 4);
                 let mut best_pos = self.epoch_queue.len() - 1;
@@ -817,10 +869,11 @@ impl JobRuntime {
         batch
     }
 
+    /// Sole owner of epoch advancement and queue refilling once an epoch is exhausted.
     fn refill_epoch_if_needed(&mut self, dataset_len: usize) {
         if self.epoch_queue.is_empty() && !self.finished {
             self.current_epoch += 1;
-            if self.current_epoch >= self.cfg.epochs {
+            if self.current_epoch >= self.cfg.epochs || dataset_len == 0 {
                 self.finished = true;
                 return;
             }
@@ -848,7 +901,7 @@ impl JobRuntime {
             self.dataset_digest,
             sample_id,
             CacheStage::Decoded,
-            0,
+            self.decode_hash,
         );
         if cache.contains_accessible(&kd, self.cfg.tenant_id, self.cfg.job_id) {
             return 2;
@@ -935,9 +988,9 @@ pub fn run_scenario(scenario: &ScenarioConfig, policy: AllocationPolicy) -> Poli
 
         let enable_ods = policy == AllocationPolicy::SenecaDynamic && decision.admit_enabled;
         let batch = runtimes[job_idx].draw_batch(&cache, enable_ods);
-        runtimes[job_idx].refill_epoch_if_needed(dataset.len());
 
         if batch.is_empty() {
+            runtimes[job_idx].finished = true;
             telemetry[job_idx].active = false;
             continue;
         }
@@ -972,10 +1025,11 @@ pub fn run_scenario(scenario: &ScenarioConfig, policy: AllocationPolicy) -> Poli
             let tenant = runtimes[job_idx].cfg.tenant_id;
             let jid = runtimes[job_idx].cfg.job_id;
             let stochastic = runtimes[job_idx].cfg.stochastic_transform;
+            let dhash = runtimes[job_idx].decode_hash;
             let thash = runtimes[job_idx].transform_hash;
 
             let key_t = CacheKey::new(vis, digest, sample_id, CacheStage::Transformed, thash);
-            let key_d = CacheKey::new(vis, digest, sample_id, CacheStage::Decoded, 0);
+            let key_d = CacheKey::new(vis, digest, sample_id, CacheStage::Decoded, dhash);
             let key_e = CacheKey::new(vis, digest, sample_id, CacheStage::Encoded, 0);
 
             if matches!(vis, DatasetVisibility::Private { .. })
@@ -1185,18 +1239,19 @@ pub fn run_scenario(scenario: &ScenarioConfig, policy: AllocationPolicy) -> Poli
             runtimes[job_idx].examples_processed += 1;
         }
 
-        // Model concurrent host CPU core contention across active jobs.
-        runtimes[job_idx].last_batch_cpu_us = batch_cpu_us;
-        let active_cpu_rate: f64 = runtimes
-            .iter()
-            .filter(|r| !r.finished)
-            .map(|r| r.last_batch_cpu_us / r.cfg.gpu_step_us.max(1.0))
-            .sum();
-        let active_jobs_count = runtimes.iter().filter(|r| !r.finished).count().max(1) as f64;
-        let cores = scenario.host_cpu_cores.max(1) as f64;
-        let contention = (active_cpu_rate / cores).max(1.0);
-        let eff_cpu_us = batch_cpu_us * contention / cores.min(active_jobs_count).max(1.0);
+        // Model concurrent host CPU core contention from *other* active jobs only
+        // (never charging a job for contention with its own CPU work).
         let eff_io_us = batch_io_us / runtimes[job_idx].cfg.io_concurrency.max(1.0);
+        runtimes[job_idx].last_cpu_util =
+            job_cpu_utilization(batch_cpu_us, eff_io_us, runtimes[job_idx].cfg.gpu_step_us);
+        let other_cpu_util: f64 = runtimes
+            .iter()
+            .enumerate()
+            .filter(|&(idx, r)| idx != job_idx && !r.finished)
+            .map(|(_, r)| r.last_cpu_util)
+            .sum();
+        let contention = cpu_contention_factor(other_cpu_util, scenario.host_cpu_cores);
+        let eff_cpu_us = batch_cpu_us * contention;
         let batch_prep_us = eff_io_us + eff_cpu_us;
 
         // Producer-consumer GPU timeline with bounded prefetch ring.
@@ -1242,6 +1297,9 @@ pub fn run_scenario(scenario: &ScenarioConfig, policy: AllocationPolicy) -> Poli
             decision = new_dec;
             let _alloc_us = t_alloc.elapsed().as_secs_f64() * 1e6;
         }
+
+        // Advance and refill epoch at most once after this batch completes.
+        runtimes[job_idx].refill_epoch_if_needed(dataset.len());
 
         if runtimes[job_idx].finished {
             telemetry[job_idx].active = false;
@@ -1654,5 +1712,267 @@ mod tests {
             "expected shared public jobs ({pub_fetches} fetches) < private jobs ({priv_fetches} fetches)"
         );
         assert!(m.cache_peak_used_bytes <= m.cache_budget_bytes);
+    }
+
+    #[test]
+    fn partial_batch_advances_epoch_only_once() {
+        // Reproduces P1 finding: 5 samples, batch_size = 2, 4 epochs must process
+        // all 20 examples (5 * 4), NOT 10 (skipping every other epoch).
+        let corpus =
+            CorpusStore::from_bytes(b"partial batch epoch advancement regression ".repeat(256));
+        let ds = DatasetStore::build(
+            "partial_batch_ds",
+            &corpus,
+            Modality::VisionImageShard {
+                width: 16,
+                height: 16,
+                channels: 3,
+            },
+            5,
+            77,
+        );
+        let vis = DatasetVisibility::Private {
+            tenant_id: 1,
+            job_id: 1,
+        };
+        let scenario = ScenarioConfig {
+            name: "partial_batch_regression".to_string(),
+            description: "5 samples, batch_size 2, 4 epochs".to_string(),
+            is_negative_regime: false,
+            total_cache_bytes: 256 * 1024,
+            host_cpu_cores: 2,
+            seed: 1349,
+            datasets: vec![ds.clone()],
+            jobs: vec![JobConfig {
+                job_id: 1,
+                tenant_id: 1,
+                name: "partial_batch_job".to_string(),
+                dataset_index: 0,
+                visibility: vis,
+                stochastic_transform: true,
+                transform_profile: "rand_aug_v1".to_string(),
+                epochs: 4,
+                batch_size: 2,
+                io_rtt_us: 50.0,
+                io_bw_mb_s: 100.0,
+                io_concurrency: 2.0,
+                gpu_step_us: 100.0,
+                decode_compute_passes: 1,
+                transform_compute_passes: 1,
+                prefetch_batches: 2,
+            }],
+        };
+
+        for policy in AllocationPolicy::ALL {
+            let m = run_scenario(&scenario, policy);
+            assert_eq!(
+                m.total_examples,
+                20,
+                "policy={} skipped epochs on partial batch: expected 20 examples, got {}",
+                policy.as_str(),
+                m.total_examples
+            );
+            assert_eq!(m.per_job[0].examples_processed, 20);
+            assert_eq!(
+                m.stochastic_checks_total, 15,
+                "expected 5 samples * 3 post-epoch-0 epochs = 15 checks"
+            );
+            assert_eq!(m.stochastic_checks_passed, 15);
+            assert!((m.stochastic_freshness_pct - 100.0).abs() < 1e-9);
+        }
+
+        // Also verify batch_size > dataset_len (5 samples, batch_size 8, 3 epochs -> 15 examples).
+        let mut big_batch_scenario = scenario;
+        big_batch_scenario.jobs[0].batch_size = 8;
+        big_batch_scenario.jobs[0].epochs = 3;
+        let m_big = run_scenario(&big_batch_scenario, AllocationPolicy::SenecaDynamic);
+        assert_eq!(m_big.total_examples, 15);
+        assert_eq!(m_big.stochastic_checks_total, 10);
+        assert_eq!(m_big.stochastic_checks_passed, 10);
+    }
+
+    #[test]
+    fn single_cpu_bound_job_has_no_quadratic_self_contention() {
+        // Reproduces P1 finding: a single CPU-bound job on 1 core must NOT be charged
+        // contention with its own CPU work. Previously, reducing gpu_step_us by 10x
+        // caused active_cpu_rate to jump 10x and inflated simulated makespan by ~10x
+        // despite identical CPU work.
+        let corpus =
+            CorpusStore::from_bytes(b"single job linear cpu contention regression ".repeat(256));
+        let ds = DatasetStore::build(
+            "cpu_linear_ds",
+            &corpus,
+            Modality::VisionImageShard {
+                width: 24,
+                height: 24,
+                channels: 3,
+            },
+            16,
+            88,
+        );
+        let vis = DatasetVisibility::Private {
+            tenant_id: 1,
+            job_id: 1,
+        };
+        let make_sc = |gpu_step_us: f64| ScenarioConfig {
+            name: "single_cpu_job".to_string(),
+            description: "verify linear single-job CPU timing".to_string(),
+            is_negative_regime: false,
+            total_cache_bytes: 0,
+            host_cpu_cores: 1,
+            seed: 1349,
+            datasets: vec![ds.clone()],
+            jobs: vec![JobConfig {
+                job_id: 1,
+                tenant_id: 1,
+                name: "solo_cpu_heavy".to_string(),
+                dataset_index: 0,
+                visibility: vis,
+                stochastic_transform: false,
+                transform_profile: "norm_v1".to_string(),
+                epochs: 2,
+                batch_size: 4,
+                io_rtt_us: 0.0,
+                io_bw_mb_s: 100_000.0,
+                io_concurrency: 1.0,
+                gpu_step_us,
+                decode_compute_passes: 60,
+                transform_compute_passes: 10,
+                prefetch_batches: 1,
+            }],
+        };
+
+        let m_fast_gpu = run_scenario(&make_sc(10.0), AllocationPolicy::NoCache);
+        let m_slow_gpu = run_scenario(&make_sc(100.0), AllocationPolicy::NoCache);
+
+        // With no self-contention, a faster GPU (10 us vs 100 us) on the exact same
+        // CPU-bound workload cannot make simulated makespan jump 5x-10x above wall time.
+        assert!(
+            m_fast_gpu.makespan_ms <= m_fast_gpu.wall_time_ms * 2.5 + 2.0,
+            "simulated makespan ({:.3} ms) blew up quadratically relative to measured wall_time ({:.3} ms)",
+            m_fast_gpu.makespan_ms,
+            m_fast_gpu.wall_time_ms
+        );
+        assert!(
+            m_fast_gpu.makespan_ms <= m_slow_gpu.makespan_ms * 2.5 + 2.0,
+            "10x faster GPU step should not inflate makespan: fast_gpu={:.3} ms vs slow_gpu={:.3} ms",
+            m_fast_gpu.makespan_ms,
+            m_slow_gpu.makespan_ms
+        );
+    }
+
+    #[test]
+    fn shared_public_jobs_with_different_decode_passes_never_cross_serve_decoded_cache() {
+        // Reproduces P2 finding: two SharedPublic jobs on the same dataset with
+        // decode_compute_passes = 1 vs 2 produce incompatible decoded vision tensors
+        // and must NEVER share Decoded or Transformed cache entries.
+        let corpus =
+            CorpusStore::from_bytes(b"shared public decoder config isolation test ".repeat(256));
+        let modality = Modality::VisionImageShard {
+            width: 24,
+            height: 24,
+            channels: 3,
+        };
+        let ds = DatasetStore::build("shared_vis_dec_cfg", &corpus, modality, 16, 99);
+
+        // Confirm that 1 vs 2 decode passes genuinely produce different decoded bytes.
+        let dec1 = execute_decode(&ds.shards[0].bytes, modality, 1).unwrap();
+        let dec2 = execute_decode(&ds.shards[0].bytes, modality, 2).unwrap();
+        assert_ne!(
+            dec1, dec2,
+            "1-pass and 2-pass vision decode must produce distinct decoded tensors"
+        );
+        let dh1 = decode_profile_hash(modality, 1);
+        let dh2 = decode_profile_hash(modality, 2);
+        assert_ne!(dh1, dh2);
+        assert_ne!(
+            transform_profile_hash(dh1, "same_profile", 1),
+            transform_profile_hash(dh2, "same_profile", 1)
+        );
+
+        let vis = DatasetVisibility::SharedPublic {
+            dataset_digest: ds.dataset_digest,
+        };
+        let make_pair = |passes_job2: u32| ScenarioConfig {
+            name: "shared_decode_cfg_check".to_string(),
+            description: "verify decoded cache keys include decoder configuration".to_string(),
+            is_negative_regime: false,
+            total_cache_bytes: 4 * 1024 * 1024,
+            host_cpu_cores: 2,
+            seed: 1349,
+            datasets: vec![ds.clone()],
+            jobs: vec![
+                JobConfig {
+                    job_id: 1,
+                    tenant_id: 10,
+                    name: "job_decode_1pass".to_string(),
+                    dataset_index: 0,
+                    visibility: vis,
+                    stochastic_transform: false,
+                    transform_profile: "same_profile".to_string(),
+                    epochs: 1,
+                    batch_size: 4,
+                    io_rtt_us: 100.0,
+                    io_bw_mb_s: 100.0,
+                    io_concurrency: 2.0,
+                    gpu_step_us: 200.0,
+                    decode_compute_passes: 1,
+                    transform_compute_passes: 1,
+                    prefetch_batches: 2,
+                },
+                JobConfig {
+                    job_id: 2,
+                    tenant_id: 20,
+                    name: "job_decode_other".to_string(),
+                    dataset_index: 0,
+                    visibility: vis,
+                    stochastic_transform: false,
+                    transform_profile: "same_profile".to_string(),
+                    epochs: 1,
+                    batch_size: 4,
+                    io_rtt_us: 100.0,
+                    io_bw_mb_s: 100.0,
+                    io_concurrency: 2.0,
+                    gpu_step_us: 200.0,
+                    decode_compute_passes: passes_job2,
+                    transform_compute_passes: 1,
+                    prefetch_batches: 2,
+                },
+            ],
+        };
+
+        // Incompatible decode passes (1 vs 2): MUST have 0 Decoded and 0 Transformed hits across 1 epoch!
+        let sc_diff = make_pair(2);
+        let m_dec_diff = run_scenario(&sc_diff, AllocationPolicy::DecodedOnly);
+        assert_eq!(
+            m_dec_diff.per_job[0].decoded_hits + m_dec_diff.per_job[1].decoded_hits,
+            0,
+            "jobs with different decode_compute_passes must NEVER cross-hit Decoded cache"
+        );
+        let m_eq_diff = run_scenario(&sc_diff, AllocationPolicy::StaticEqualSplit);
+        assert_eq!(
+            m_eq_diff.per_job[0].decoded_hits + m_eq_diff.per_job[1].decoded_hits,
+            0,
+            "StaticEqualSplit must NEVER cross-hit Decoded cache across different decode configs"
+        );
+        assert_eq!(
+            m_eq_diff.per_job[0].transformed_hits + m_eq_diff.per_job[1].transformed_hits,
+            0,
+            "StaticEqualSplit must NEVER cross-hit Transformed cache across different decode configs"
+        );
+        // Encoded compressed shards ARE identical and safely shared across both jobs.
+        let m_enc_diff = run_scenario(&sc_diff, AllocationPolicy::EncodedOnly);
+        assert!(
+            m_enc_diff.per_job[0].encoded_hits + m_enc_diff.per_job[1].encoded_hits > 0,
+            "Encoded compressed bytes should still be safely shared across SharedPublic jobs"
+        );
+
+        // Compatible decode passes (1 vs 1): safely share Decoded cache entries!
+        let sc_same = make_pair(1);
+        let m_dec_same = run_scenario(&sc_same, AllocationPolicy::DecodedOnly);
+        assert!(
+            m_dec_same.per_job[0].decoded_hits + m_dec_same.per_job[1].decoded_hits > 0,
+            "SharedPublic jobs with identical decoder configuration should safely share Decoded entries"
+        );
     }
 }
