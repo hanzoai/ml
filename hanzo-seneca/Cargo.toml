@@ -1,0 +1,21 @@
+[package]
+name = "hanzo-seneca"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Seneca multi-stage training data-pipeline cache allocator (Encoded / Decoded / Transformed) for concurrent training jobs (HIP-1349)."
+repository = "https://github.com/hanzoai/ml"
+keywords = ["cache", "dataloader", "training", "pipeline", "machine-learning"]
+categories = ["science", "caching"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[lib]
+name = "hanzo_seneca"
+path = "src/lib.rs"
+
+[[bin]]
+name = "seneca-bench"
+path = "src/bin/seneca-bench.rs"
+
+[dependencies]
+# Intentionally empty: pure Rust std, zero external crate dependencies.
