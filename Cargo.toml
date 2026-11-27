@@ -18,6 +18,7 @@ members = [
     "hanzo-nn",
     "hanzo-onnx",
     "hanzo-research",
+    "hanzo-seneca",
     "hanzo-train",
     "hanzo-training",
     "hanzo-transformers",
