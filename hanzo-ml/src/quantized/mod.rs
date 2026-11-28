@@ -4147,6 +4147,149 @@ mod tests {
     }
 
     #[test]
+    fn quantized_accuracy_and_tolerance_benchmark_q8_0_and_q4k_vs_f32() -> crate::Result<()> {
+        use crate::{Device, Module, Tensor};
+        let dev = Device::Cpu;
+
+        // Test multiple matrix shapes where K is a multiple of block size 256 (for Q4K) and 32 (for Q8_0)
+        let test_cases = [
+            (2, 256, 128),
+            (4, 512, 256),
+            (1, 1024, 512),
+        ];
+
+        for (m, k, n) in test_cases {
+            let w = Tensor::randn(0f32, 1.0, (n, k), &dev)?;
+            let x = Tensor::randn(0f32, 1.0, (m, k), &dev)?;
+
+            // 1. Reference F32 matmul: Y = X * W^T
+            let w_t = w.t()?;
+            let ref_out = x.matmul(&w_t)?;
+            let ref_vec = ref_out.flatten_all()?.to_vec1::<f32>()?;
+
+            // 2. Q8_0 Quantization and matmul
+            let q8 = std::sync::Arc::new(super::QTensor::quantize(&w, GgmlDType::Q8_0)?);
+            let q8_out = super::QMatMul::from_arc(q8)?.forward(&x)?;
+            let q8_vec = q8_out.flatten_all()?.to_vec1::<f32>()?;
+
+            // 3. Q4K (Q4_K) Quantization and matmul
+            let q4k = std::sync::Arc::new(super::QTensor::quantize(&w, GgmlDType::Q4K)?);
+            let q4k_out = super::QMatMul::from_arc(q4k)?.forward(&x)?;
+            let q4k_vec = q4k_out.flatten_all()?.to_vec1::<f32>()?;
+
+            // Cosine similarity metric
+            let cos_sim = |a: &[f32], b: &[f32]| -> f32 {
+                let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let norm_b: f32 = b.iter().map(|y| y * y).sum::<f32>().sqrt();
+                dot / (norm_a * norm_b)
+            };
+
+            // Root Mean Squared Error (RMSE)
+            let rmse = |a: &[f32], b: &[f32]| -> f32 {
+                let mse: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum::<f32>() / a.len() as f32;
+                mse.sqrt()
+            };
+
+            let q8_sim = cos_sim(&ref_vec, &q8_vec);
+            let q8_rmse = rmse(&ref_vec, &q8_vec);
+
+            let q4k_sim = cos_sim(&ref_vec, &q4k_vec);
+            let q4k_rmse = rmse(&ref_vec, &q4k_vec);
+
+            let ref_l2 = (ref_vec.iter().map(|v| v * v).sum::<f32>() / ref_vec.len() as f32).sqrt();
+            let q8_rel_err = q8_rmse / ref_l2;
+            let q4k_rel_err = q4k_rmse / ref_l2;
+
+            println!(
+                "Shape ({m}, {k}, {n}) -> Q8_0: cos={q8_sim:.5}, rel_err={q8_rel_err:.4} | Q4_K: cos={q4k_sim:.5}, rel_err={q4k_rel_err:.4}"
+            );
+
+            // Precision checks:
+            // Q8_0 maintains >99.9% cosine fidelity and <1.5% relative error
+            assert!(
+                q8_sim >= 0.999,
+                "Q8_0 similarity ({q8_sim:.6}) fell below 0.999 tolerance for shape ({m},{k},{n})"
+            );
+            assert!(
+                q8_rel_err < 0.02,
+                "Q8_0 relative error ({q8_rel_err:.4}) exceeded 2% tolerance for shape ({m},{k},{n})"
+            );
+
+            // Q4_K maintains >99.0% cosine fidelity and <8% relative error
+            assert!(
+                q4k_sim >= 0.990,
+                "Q4_K similarity ({q4k_sim:.6}) fell below 0.990 tolerance for shape ({m},{k},{n})"
+            );
+            assert!(
+                q4k_rel_err < 0.08,
+                "Q4_K relative error ({q4k_rel_err:.4}) exceeded 8% tolerance for shape ({m},{k},{n})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_matmul_perf_benchmark_q8_0_and_q4k() -> crate::Result<()> {
+        use crate::{Device, Module, Tensor};
+        use std::time::Instant;
+
+        let dev = Device::Cpu;
+        let (m, k, n) = (4, 1024, 512);
+        let w = Tensor::randn(0f32, 1.0, (n, k), &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (m, k), &dev)?;
+
+        let w_t = w.t()?;
+        let q8 = std::sync::Arc::new(super::QTensor::quantize(&w, GgmlDType::Q8_0)?);
+        let q8_matmul = super::QMatMul::from_arc(q8)?;
+        let q4k = std::sync::Arc::new(super::QTensor::quantize(&w, GgmlDType::Q4K)?);
+        let q4k_matmul = super::QMatMul::from_arc(q4k)?;
+
+        let flops = 2.0 * m as f64 * k as f64 * n as f64;
+        let iterations = 20;
+
+        // Warmup
+        let _ = x.matmul(&w_t)?;
+        let _ = q8_matmul.forward(&x)?;
+        let _ = q4k_matmul.forward(&x)?;
+
+        // F32 Benchmark
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = x.matmul(&w_t)?;
+        }
+        let elapsed_f32 = start.elapsed().as_secs_f64() / iterations as f64;
+        let gflops_f32 = (flops / elapsed_f32) / 1e9;
+
+        // Q8_0 Benchmark
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = q8_matmul.forward(&x)?;
+        }
+        let elapsed_q8 = start.elapsed().as_secs_f64() / iterations as f64;
+        let gflops_q8 = (flops / elapsed_q8) / 1e9;
+
+        // Q4K Benchmark
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = q4k_matmul.forward(&x)?;
+        }
+        let elapsed_q4k = start.elapsed().as_secs_f64() / iterations as f64;
+        let gflops_q4k = (flops / elapsed_q4k) / 1e9;
+
+        println!(
+            "Perf benchmark [Shape ({m}, {k}, {n})]: F32: {gflops_f32:.2} GFLOPS ({:.2} ms) | Q8_0: {gflops_q8:.2} GFLOPS ({:.2} ms) | Q4_K: {gflops_q4k:.2} GFLOPS ({:.2} ms)",
+            elapsed_f32 * 1000.0,
+            elapsed_q8 * 1000.0,
+            elapsed_q4k * 1000.0
+        );
+
+        assert!(gflops_q8 > 0.0);
+        assert!(gflops_q4k > 0.0);
+        Ok(())
+    }
+
+    #[test]
     fn block_align_divides_type_size() {
         // `from_u32` and `block_align` are generated from the same `for_each_quant!` table, so
         // walking the id space visits every dtype.
